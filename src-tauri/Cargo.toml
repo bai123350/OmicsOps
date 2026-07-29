@@ -1,0 +1,25 @@
+[package]
+name = "omicsops-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "omicsops_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+chrono.workspace = true
+omicsops-adapters = { path = "../crates/omicsops-adapters" }
+omicsops-core = { path = "../crates/omicsops-core" }
+omicsops-runner = { path = "../crates/omicsops-runner" }
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tokio.workspace = true
+url.workspace = true
+uuid.workspace = true

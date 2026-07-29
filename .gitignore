@@ -1,0 +1,16 @@
+/target/
+/node_modules/
+/dist/
+/.vite/
+*.tsbuildinfo
+/vite.config.js
+/vite.config.d.ts
+/.superpowers/
+/src-tauri/gen/
+*.db
+*.db-shm
+*.db-wal
+*.log
+.env
+.env.*
+!.env.example
