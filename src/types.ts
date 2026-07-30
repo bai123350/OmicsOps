@@ -101,6 +101,26 @@ export interface RunEvent {
   reason: string;
 }
 
+export interface ApprovalRequest {
+  id: string;
+  run_id: string;
+  reason: string;
+  proposed_action: string;
+  impact: string;
+  alternatives: string[];
+}
+
+export interface RunCheckpoint {
+  run_id: string;
+  profile_id: string;
+  project_id: string;
+  plan_id: string;
+  state: RunEvent["state"];
+  stage_index: number;
+  step_index: number;
+  pending_approval: ApprovalRequest | null;
+}
+
 export interface Artifact {
   remote_path: string;
   kind:

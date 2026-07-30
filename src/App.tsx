@@ -13,9 +13,11 @@ import {
   FolderCog,
   KeyRound,
   Play,
+  RotateCcw,
   Server,
   Settings2,
   ShieldCheck,
+  Square,
   TerminalSquare,
 } from "lucide-react";
 
@@ -26,6 +28,7 @@ import type {
   AuthenticationMethod,
   ConnectionProfile,
   ProjectSpec,
+  RunCheckpoint,
   RunEvent,
   ServerInspection,
 } from "./types";
@@ -83,19 +86,50 @@ export default function App() {
   const [documentText, setDocumentText] = useState("");
   const [plan, setPlan] = useState<AnalysisPlan | null>(null);
   const [runId, setRunId] = useState("RUN-2026-0001");
+  const [runs, setRuns] = useState<RunCheckpoint[]>([]);
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
 
   useEffect(() => {
     let cleanup: () => void = () => {};
+    let disposed = false;
+    api.listRuns().then(async (storedRuns) => {
+      if (disposed) return;
+      setRuns(storedRuns);
+      const selected = storedRuns.at(-1);
+      if (selected) {
+        setRunId(selected.run_id);
+        const storedEvents = await api.listRunEvents(selected.run_id);
+        if (!disposed) setEvents(storedEvents);
+      }
+    }).catch((error) => {
+      if (!disposed) setNotice(error instanceof Error ? error.message : String(error));
+    });
     api.listenRunEvents((event) => {
-      setEvents((current) => [...current, event]);
+      setRunId((current) => {
+        if (current === "RUN-2026-0001") return event.run_id;
+        return current;
+      });
+      setEvents((current) => {
+        if (current.some((item) => item.run_id === event.run_id && item.sequence === event.sequence)) {
+          return current;
+        }
+        return [...current, event];
+      });
+      api.listRuns().then((storedRuns) => {
+        if (!disposed) setRuns(storedRuns);
+      });
       setNotice(event.reason || event.action);
     }).then((unlisten) => {
       cleanup = unlisten;
     });
-    return () => cleanup();
+    return () => {
+      disposed = true;
+      cleanup();
+    };
   }, []);
+
+  const activeRun = runs.find((run) => run.run_id === runId) ?? null;
 
   const completeViews = useMemo(
     () =>
@@ -193,6 +227,7 @@ export default function App() {
       if (!plan?.approved) throw new Error("分析计划尚未批准");
       const id = await api.startRun(profile.id, project, plan);
       setRunId(id);
+      setRuns(await api.listRuns());
       if (!api.isTauri()) {
         setEvents([
           demoEvent(id, 1, "run_started", "running", "开始执行远端阶段"),
@@ -202,6 +237,38 @@ export default function App() {
       }
       setNotice("远端任务已启动，断开桌面不会终止运行");
       setView("run");
+    });
+
+  const selectRun = (checkpoint: RunCheckpoint) =>
+    perform(async () => {
+      setRunId(checkpoint.run_id);
+      setEvents(await api.listRunEvents(checkpoint.run_id));
+      setNotice(`已载入运行 ${checkpoint.run_id}`);
+    });
+
+  const resume = () =>
+    perform(async () => {
+      if (!activeRun) throw new Error("没有可恢复的运行");
+      await api.resumeRun(activeRun.run_id);
+      setNotice("已从最后一个成功步骤恢复运行");
+      setRuns(await api.listRuns());
+    });
+
+  const approvePendingRun = () =>
+    perform(async () => {
+      const approval = activeRun?.pending_approval;
+      if (!activeRun || !approval) throw new Error("没有待处理的审批请求");
+      await api.approveRun(activeRun.run_id, approval.id);
+      setNotice("已批准当前动作并继续运行");
+      setRuns(await api.listRuns());
+    });
+
+  const cancel = () =>
+    perform(async () => {
+      if (!activeRun) throw new Error("没有可取消的运行");
+      await api.cancelRun(activeRun.run_id);
+      setNotice("已请求终止当前步骤");
+      setRuns(await api.listRuns());
     });
 
   const refreshArtifacts = () =>
@@ -298,7 +365,19 @@ export default function App() {
             />
           )}
           {view === "run" && (
-            <RunView runId={runId} events={events} busy={busy} onStart={start} plan={plan} />
+            <RunView
+              runId={runId}
+              runs={runs}
+              activeRun={activeRun}
+              events={events}
+              busy={busy}
+              onStart={start}
+              onSelect={selectRun}
+              onResume={resume}
+              onApprove={approvePendingRun}
+              onCancel={cancel}
+              plan={plan}
+            />
           )}
           {view === "results" && (
             <ResultsView
@@ -447,13 +526,71 @@ function PlanView(props: {
   );
 }
 
-function RunView(props: { runId: string; events: RunEvent[]; busy: boolean; onStart: () => void; plan: AnalysisPlan | null }) {
+function RunView(props: {
+  runId: string;
+  runs: RunCheckpoint[];
+  activeRun: RunCheckpoint | null;
+  events: RunEvent[];
+  busy: boolean;
+  onStart: () => void;
+  onSelect: (run: RunCheckpoint) => void;
+  onResume: () => void;
+  onApprove: () => void;
+  onCancel: () => void;
+  plan: AnalysisPlan | null;
+}) {
+  const terminal = props.activeRun
+    ? ["succeeded", "canceled"].includes(props.activeRun.state)
+    : true;
+  const pendingApproval = props.activeRun?.pending_approval;
   return (
     <div className="content-stack">
       <div className="run-header">
-        <div><span className="eyebrow">ACTIVE RUN</span><h2>{props.runId}</h2></div>
-        <button className="primary" disabled={props.busy || !props.plan?.approved} onClick={props.onStart}><Play size={16} />启动分析</button>
+        <div>
+          <span className="eyebrow">ACTIVE RUN</span>
+          <h2>{props.runId}</h2>
+          {props.activeRun && <span className="kind">{props.activeRun.state}</span>}
+        </div>
+        <div className="actions">
+          <button className="primary" disabled={props.busy || !props.plan?.approved} onClick={props.onStart}><Play size={16} />启动新分析</button>
+          <button className="secondary" disabled={props.busy || !props.activeRun || terminal || Boolean(pendingApproval)} onClick={props.onResume}><RotateCcw size={16} />恢复运行</button>
+          <button className="secondary" disabled={props.busy || !props.activeRun || terminal} onClick={props.onCancel}><Square size={15} />取消运行</button>
+        </div>
       </div>
+      {props.runs.length > 0 && (
+        <div className="run-list" aria-label="已保存运行">
+          {props.runs.map((run) => (
+            <button
+              key={run.run_id}
+              className={run.run_id === props.runId ? "secondary active" : "secondary"}
+              onClick={() => props.onSelect(run)}
+            >
+              <code>{run.run_id.slice(0, 8)}</code>
+              <span>{run.state}</span>
+            </button>
+          ))}
+        </div>
+      )}
+      {pendingApproval && (
+        <Panel title="需要审批" icon={ShieldCheck} subtitle="此动作超出阶段内已批准的安全边界">
+          <div className="approval-card">
+            <strong>{pendingApproval.reason}</strong>
+            <code>{pendingApproval.proposed_action}</code>
+            <p>{pendingApproval.impact}</p>
+            {pendingApproval.alternatives.length > 0 && (
+              <small>替代方案：{pendingApproval.alternatives.join("；")}</small>
+            )}
+            <div className="actions">
+              <button className="primary" disabled={props.busy} onClick={props.onApprove}>
+                <ShieldCheck size={16} />批准并继续
+              </button>
+              <button className="secondary" disabled={props.busy} onClick={props.onCancel}>
+                <Square size={15} />拒绝并取消
+              </button>
+            </div>
+          </div>
+        </Panel>
+      )}
       <Panel title="实时审计流" icon={Activity} subtitle="SSH 断线后从远端 PID、状态与日志继续">
         {props.events.length === 0 ? <Empty text="任务尚未启动" /> : (
           <div className="event-stream">

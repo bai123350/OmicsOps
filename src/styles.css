@@ -90,6 +90,12 @@ input:focus, select:focus { border-color: #249f7e; box-shadow: 0 0 0 3px rgba(36
 .event-row strong { font-size: 13px; }
 .event-row span { color: #6d7e79; font-size: 12px; margin-top: 3px; }
 .event-row small { color: #6d7e79; }
+.run-list { display: flex; gap: 8px; overflow-x: auto; }
+.run-list button { align-items: flex-start; display: flex; flex-direction: column; min-width: 132px; }
+.run-list button.active { border-color: #168366; }
+.approval-card { display: grid; gap: 12px; }
+.approval-card > code { background: #111827; border-radius: 8px; color: #d1fae5; overflow-x: auto; padding: 12px; white-space: pre-wrap; }
+.approval-card p, .approval-card small { color: #6d7e79; margin: 0; }
 .artifact-row { display: grid; grid-template-columns: 24px 1fr 90px 110px 34px; gap: 12px; align-items: center; padding: 13px 4px; border-bottom: 1px solid #e7ecea; }
 .artifact-row > svg { color: #168366; }
 .artifact-row strong, .artifact-row span { display: block; }

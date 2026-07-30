@@ -74,6 +74,25 @@ pub fn validate_relative_remote_path(path: &Path) -> CoreResult<()> {
     Ok(())
 }
 
+pub fn require_remote_descendant(root: &str, candidate: &str) -> CoreResult<()> {
+    let root = root.trim_end_matches('/');
+    let invalid = |value: &str| {
+        !value.starts_with('/')
+            || value.contains('\0')
+            || value.contains('\\')
+            || value.split('/').any(|part| matches!(part, "." | ".."))
+    };
+    if invalid(root)
+        || invalid(candidate)
+        || !candidate
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/') && suffix.len() > 1)
+    {
+        return Err(CoreError::InvalidRemotePath(candidate.to_owned()));
+    }
+    Ok(())
+}
+
 pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }

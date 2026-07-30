@@ -7,6 +7,7 @@ import type {
   Artifact,
   ConnectionProfile,
   ProjectSpec,
+  RunCheckpoint,
   RunEvent,
   ServerInspection,
 } from "./types";
@@ -147,6 +148,31 @@ export async function startRun(
 ): Promise<string> {
   if (!isTauri()) return "RUN-2026-0001";
   return invoke("start_run", { profileId, project, plan });
+}
+
+export async function listRuns(): Promise<RunCheckpoint[]> {
+  if (!isTauri()) return [];
+  return invoke("list_runs");
+}
+
+export async function listRunEvents(runId: string): Promise<RunEvent[]> {
+  if (!isTauri()) return [];
+  return invoke("list_run_events", { runId });
+}
+
+export async function resumeRun(runId: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke("resume_run", { runId });
+}
+
+export async function approveRun(runId: string, approvalId: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke("approve_run", { runId, approvalId });
+}
+
+export async function cancelRun(runId: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke("cancel_run", { runId });
 }
 
 export async function listenRunEvents(

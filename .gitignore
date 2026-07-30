@@ -6,6 +6,7 @@
 /vite.config.js
 /vite.config.d.ts
 /.superpowers/
+/.e2e/
 /src-tauri/gen/
 *.db
 *.db-shm

@@ -26,6 +26,8 @@ pub enum AdapterError {
     HostKeyChanged { expected: String, received: String },
     #[error("remote command failed with status {status}: {stderr}")]
     RemoteCommand { status: u32, stderr: String },
+    #[error("artifact checksum mismatch; expected {expected}, received {received}")]
+    Integrity { expected: String, received: String },
 }
 
 pub type AdapterResult<T> = Result<T, AdapterError>;

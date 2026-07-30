@@ -130,4 +130,18 @@ impl Repository {
         let json: String = row.get(0)?;
         Ok(Some(serde_json::from_str(&json)?))
     }
+
+    pub fn list_json<T: serde::de::DeserializeOwned>(&self, kind: &str) -> AdapterResult<Vec<T>> {
+        let connection = self.connection.lock().expect("database lock");
+        let mut statement = connection.prepare(
+            "SELECT value_json FROM app_objects
+             WHERE kind = ?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map([kind], |row| row.get::<_, String>(0))?;
+        rows.map(|row| {
+            let json = row?;
+            Ok(serde_json::from_str(&json)?)
+        })
+        .collect()
+    }
 }

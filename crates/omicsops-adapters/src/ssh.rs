@@ -11,7 +11,8 @@ use russh::{
 };
 use russh_sftp::{client::SftpSession, protocol::OpenFlags};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use crate::{AdapterError, AdapterResult};
 
@@ -193,25 +194,18 @@ impl SshSession {
         Ok(())
     }
 
-    pub async fn download_atomic(&self, remote_path: &str, local_path: &Path) -> AdapterResult<()> {
-        let temporary = local_path.with_extension(format!(
-            "{}.part",
-            local_path
-                .extension()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default()
-        ));
+    pub async fn download_atomic_verified(
+        &self,
+        remote_path: &str,
+        local_path: &Path,
+        expected_sha256: &str,
+    ) -> AdapterResult<()> {
         let sftp = self.sftp().await?;
         let mut remote = sftp
             .open(remote_path)
             .await
             .map_err(|error| AdapterError::Ssh(error.to_string()))?;
-        let mut local = tokio::fs::File::create(&temporary).await?;
-        tokio::io::copy(&mut remote, &mut local).await?;
-        local.flush().await?;
-        drop(local);
-        tokio::fs::rename(&temporary, local_path).await?;
-        Ok(())
+        write_verified_atomic(&mut remote, local_path, expected_sha256).await
     }
 
     pub async fn disconnect(self) -> AdapterResult<()> {
@@ -220,6 +214,50 @@ impl SshSession {
             .await
             .map_err(ssh_error)
     }
+}
+
+pub async fn write_verified_atomic<R: AsyncRead + Unpin>(
+    source: &mut R,
+    local_path: &Path,
+    expected_sha256: &str,
+) -> AdapterResult<()> {
+    let temporary = local_path.with_extension(format!(
+        "{}.part",
+        local_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+    ));
+    let result = async {
+        let mut local = tokio::fs::File::create(&temporary).await?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            let read = source.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            local.write_all(&buffer[..read]).await?;
+        }
+        local.flush().await?;
+        local.sync_all().await?;
+        drop(local);
+        let received = format!("{:x}", hasher.finalize());
+        if !received.eq_ignore_ascii_case(expected_sha256) {
+            return Err(AdapterError::Integrity {
+                expected: expected_sha256.to_owned(),
+                received,
+            });
+        }
+        tokio::fs::rename(&temporary, local_path).await?;
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+    }
+    result
 }
 
 fn ssh_error(error: russh::Error) -> AdapterError {

@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 
+use crate::{CoreError, CoreResult};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthenticationMethod {
@@ -156,6 +158,103 @@ pub struct RunEvent {
     pub state: RunState,
     pub log_reference: Option<String>,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RunCheckpoint {
+    pub run_id: Uuid,
+    pub profile_id: Uuid,
+    pub project_id: Uuid,
+    pub plan_id: Uuid,
+    pub state: RunState,
+    pub stage_index: usize,
+    pub step_index: usize,
+    pub pending_approval: Option<ApprovalRequest>,
+}
+
+impl RunCheckpoint {
+    pub fn new(run_id: Uuid, profile_id: Uuid, project_id: Uuid, plan_id: Uuid) -> Self {
+        Self {
+            run_id,
+            profile_id,
+            project_id,
+            plan_id,
+            state: RunState::Preparing,
+            stage_index: 0,
+            step_index: 0,
+            pending_approval: None,
+        }
+    }
+
+    pub fn current_step<'a>(
+        &self,
+        plan: &'a AnalysisPlan,
+    ) -> Option<(&'a StageSpec, &'a StepSpec)> {
+        self.current_position(plan)
+            .map(|(stage_index, step_index)| {
+                let stage = &plan.stages[stage_index];
+                (stage, &stage.steps[step_index])
+            })
+    }
+
+    pub fn advance_after_success(&mut self, plan: &AnalysisPlan) -> bool {
+        let Some((stage_index, step_index)) = self.current_position(plan) else {
+            return true;
+        };
+        self.stage_index = stage_index;
+        self.step_index = step_index + 1;
+        if let Some((next_stage, next_step)) = self.current_position(plan) {
+            self.stage_index = next_stage;
+            self.step_index = next_step;
+            false
+        } else {
+            self.stage_index = plan.stages.len();
+            self.step_index = 0;
+            true
+        }
+    }
+
+    pub fn pause_for_approval(&mut self, reason: impl Into<String>, command: impl Into<String>) {
+        self.state = RunState::PausedForApproval;
+        self.pending_approval = Some(ApprovalRequest {
+            id: Uuid::new_v4(),
+            run_id: self.run_id,
+            reason: reason.into(),
+            proposed_action: command.into(),
+            impact: "The approved command will run inside the remote project.".into(),
+            alternatives: vec!["Reject and keep the run paused.".into()],
+        });
+    }
+
+    pub fn approve(&mut self, request_id: Uuid) -> CoreResult<String> {
+        let request = self.pending_approval.as_ref().ok_or_else(|| {
+            CoreError::Validation("the run has no pending approval request".into())
+        })?;
+        if request.id != request_id {
+            return Err(CoreError::Validation(
+                "approval request does not match the pending action".into(),
+            ));
+        }
+        let command = request.proposed_action.clone();
+        self.pending_approval = None;
+        self.state = RunState::Preparing;
+        Ok(command)
+    }
+
+    fn current_position(&self, plan: &AnalysisPlan) -> Option<(usize, usize)> {
+        plan.stages
+            .iter()
+            .enumerate()
+            .skip(self.stage_index)
+            .find_map(|(stage_index, stage)| {
+                let first_step = if stage_index == self.stage_index {
+                    self.step_index
+                } else {
+                    0
+                };
+                (first_step < stage.steps.len()).then_some((stage_index, first_step))
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

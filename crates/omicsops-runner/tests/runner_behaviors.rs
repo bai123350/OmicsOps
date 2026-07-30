@@ -9,7 +9,7 @@ use omicsops_core::domain::{
 };
 use omicsops_runner::{
     AutonomousRunner, ExecutionResult, FailureContext, RemoteExecutor, RepairPlanner, StepOutcome,
-    render_remote_step_script,
+    render_cancel_command, render_remote_step_script,
 };
 
 #[derive(Clone)]
@@ -156,6 +156,32 @@ async fn runner_never_executes_denied_commands() {
     assert!(executor.commands.lock().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn runner_executes_the_exact_high_risk_command_after_explicit_approval() {
+    let executor = FakeExecutor {
+        results: Arc::new(Mutex::new(VecDeque::from([result(0)]))),
+        commands: Arc::new(Mutex::new(Vec::new())),
+    };
+    let planner = FakePlanner {
+        repairs: Arc::new(Mutex::new(VecDeque::new())),
+    };
+    let runner = AutonomousRunner::new("/srv/omicsops/pbmc", &[], executor.clone(), planner);
+    let mut approved_step = step("python export.py --overwrite results/pbmc.h5ad");
+    approved_step.risk = StepRisk::High;
+    let approved_command = approved_step.command.clone();
+
+    let outcome = runner
+        .run_step_with_approval(approved_step, Some(&approved_command))
+        .await
+        .unwrap();
+
+    assert!(matches!(outcome, StepOutcome::Succeeded { attempt: 0, .. }));
+    assert_eq!(
+        *executor.commands.lock().unwrap(),
+        ["python export.py --overwrite results/pbmc.h5ad"]
+    );
+}
+
 #[test]
 fn remote_script_persists_pid_exit_status_and_log_contract() {
     let script = render_remote_step_script("/srv/omicsops/pbmc", &step("python qc.py"), 2);
@@ -165,4 +191,19 @@ fn remote_script_persists_pid_exit_status_and_log_contract() {
     assert!(script.contains(".omicsops/state/qc.2.pid"));
     assert!(script.contains("logs/qc.2.log"));
     assert!(script.contains("mv"));
+}
+
+#[test]
+fn cancellation_targets_only_the_recorded_step_process() {
+    let soft = render_cancel_command("/srv/omicsops/pbmc", "qc", 2, false);
+    let force = render_cancel_command("/srv/omicsops/pbmc", "qc", 2, true);
+
+    assert_eq!(
+        soft,
+        "test -f '/srv/omicsops/pbmc/.omicsops/state/qc.2.pid' && kill -TERM -- \"$(cat '/srv/omicsops/pbmc/.omicsops/state/qc.2.pid')\" 2>/dev/null || true"
+    );
+    assert_eq!(
+        force,
+        "test -f '/srv/omicsops/pbmc/.omicsops/state/qc.2.pid' && kill -KILL -- \"$(cat '/srv/omicsops/pbmc/.omicsops/state/qc.2.pid')\" 2>/dev/null || true"
+    );
 }

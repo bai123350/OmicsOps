@@ -5,8 +5,11 @@ use omicsops_adapters::{
     document::extract_plan_text,
     llm::{SseToolCallAccumulator, parse_tool_call_response},
     persistence::Repository,
+    ssh::write_verified_atomic,
 };
-use omicsops_core::domain::{AuthenticationMethod, ConnectionProfile, RunEvent, RunState};
+use omicsops_core::domain::{
+    AuthenticationMethod, ConnectionProfile, RunCheckpoint, RunEvent, RunState,
+};
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -104,6 +107,41 @@ fn repository_round_trips_profiles_without_secrets_and_orders_events() {
 }
 
 #[test]
+fn repository_lists_persisted_run_checkpoints_for_restart_recovery() {
+    let repository = Repository::open_in_memory().unwrap();
+    let older = RunCheckpoint::new(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    let newer = RunCheckpoint::new(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+
+    repository
+        .put_json("run_checkpoint", &older.run_id.to_string(), &older)
+        .unwrap();
+    repository
+        .put_json("run_checkpoint", &newer.run_id.to_string(), &newer)
+        .unwrap();
+
+    let checkpoints: Vec<RunCheckpoint> = repository.list_json("run_checkpoint").unwrap();
+    let ids = checkpoints
+        .into_iter()
+        .map(|checkpoint| checkpoint.run_id)
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(
+        ids,
+        std::collections::HashSet::from([older.run_id, newer.run_id])
+    );
+}
+
+#[test]
 fn credential_vault_uses_stable_names_and_never_lists_values() {
     let vault = MemoryCredentialVault::default();
     let account = credential_account("ssh", Uuid::nil());
@@ -114,4 +152,20 @@ fn credential_vault_uses_stable_names_and_never_lists_values() {
     assert_eq!(vault.accounts(), vec![account.clone()]);
     vault.delete(&account).unwrap();
     assert_eq!(vault.get(&account).unwrap(), None);
+}
+
+#[tokio::test]
+async fn verified_download_never_replaces_a_target_when_checksum_mismatches() {
+    let directory = tempdir().unwrap();
+    let target = directory.path().join("result.h5ad");
+    fs::write(&target, b"previous verified artifact").unwrap();
+    let mut corrupt_source = std::io::Cursor::new(b"corrupt transfer".to_vec());
+
+    let error = write_verified_atomic(&mut corrupt_source, &target, "deadbeef")
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("checksum"));
+    assert_eq!(fs::read(&target).unwrap(), b"previous verified artifact");
+    assert!(!directory.path().join("result.h5ad.part").exists());
 }

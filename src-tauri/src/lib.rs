@@ -3,6 +3,10 @@ pub mod inspection;
 
 use commands::AppState;
 use omicsops_adapters::{credentials::SystemCredentialVault, persistence::Repository};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 use tauri::Manager;
 
 pub fn run() {
@@ -19,6 +23,7 @@ pub fn run() {
             app.manage(AppState {
                 repository,
                 credentials: SystemCredentialVault,
+                active_runs: Arc::new(Mutex::new(HashMap::new())),
             });
             Ok(())
         })
@@ -35,6 +40,11 @@ pub fn run() {
             commands::generate_plan,
             commands::approve_plan,
             commands::start_run,
+            commands::list_runs,
+            commands::list_run_events,
+            commands::resume_run,
+            commands::approve_run,
+            commands::cancel_run,
             commands::list_artifacts,
             commands::download_artifact,
         ])

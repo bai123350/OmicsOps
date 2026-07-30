@@ -1,4 +1,11 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use omicsops_adapters::{AdapterError, llm::OpenAiCompatibleClient, ssh::SshSession};
@@ -95,10 +102,19 @@ where
         }
     }
 
-    pub async fn run_step(&self, mut step: StepSpec) -> Result<StepOutcome, RunnerError> {
+    pub async fn run_step(&self, step: StepSpec) -> Result<StepOutcome, RunnerError> {
+        self.run_step_with_approval(step, None).await
+    }
+
+    pub async fn run_step_with_approval(
+        &self,
+        mut step: StepSpec,
+        approved_command: Option<&str>,
+    ) -> Result<StepOutcome, RunnerError> {
         let mut attempt = 0_u8;
         let mut strategies = Vec::new();
         let mut command_hashes = HashSet::new();
+        let mut approved_command = approved_command.map(str::to_owned);
         command_hashes.insert(command_hash(&step.command));
 
         loop {
@@ -107,10 +123,14 @@ where
                     return Ok(StepOutcome::Denied { reason });
                 }
                 PolicyDecision::RequiresApproval { reason } => {
-                    return Ok(StepOutcome::AwaitingApproval {
-                        reason,
-                        command: step.command,
-                    });
+                    if approved_command.as_deref() == Some(step.command.as_str()) {
+                        approved_command = None;
+                    } else {
+                        return Ok(StepOutcome::AwaitingApproval {
+                            reason,
+                            command: step.command,
+                        });
+                    }
                 }
                 PolicyDecision::Allowed => {}
             }
@@ -271,6 +291,14 @@ pub fn render_status_command(root: &str, step_id: &str, attempt: u8) -> String {
     )
 }
 
+pub fn render_cancel_command(root: &str, step_id: &str, attempt: u8, force: bool) -> String {
+    let root = root.trim_end_matches('/');
+    let id = safe_identifier(step_id);
+    let pid = shell_quote(&format!("{root}/.omicsops/state/{id}.{attempt}.pid"));
+    let signal = if force { "KILL" } else { "TERM" };
+    format!("test -f {pid} && kill -{signal} -- \"$(cat {pid})\" 2>/dev/null || true")
+}
+
 fn safe_identifier(value: &str) -> String {
     value
         .chars()
@@ -288,6 +316,7 @@ pub struct SshRemoteExecutor {
     session: Arc<SshSession>,
     project_root: String,
     poll_interval: Duration,
+    cancel_requested: Option<Arc<AtomicBool>>,
 }
 
 impl SshRemoteExecutor {
@@ -296,6 +325,52 @@ impl SshRemoteExecutor {
             session,
             project_root: project_root.into().trim_end_matches('/').to_owned(),
             poll_interval: Duration::from_secs(2),
+            cancel_requested: None,
+        }
+    }
+
+    pub fn with_cancellation(mut self, cancel_requested: Arc<AtomicBool>) -> Self {
+        self.cancel_requested = Some(cancel_requested);
+        self
+    }
+
+    async fn cancel_step(&self, step: &StepSpec, attempt: u8) -> Result<(), String> {
+        self.session
+            .execute(&render_cancel_command(
+                &self.project_root,
+                &step.id,
+                attempt,
+                false,
+            ))
+            .await
+            .map_err(|error| error.to_string())?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let output = self
+                .session
+                .execute(&render_status_command(
+                    &self.project_root,
+                    &step.id,
+                    attempt,
+                ))
+                .await
+                .map_err(|error| error.to_string())?;
+            if output.stdout.trim() != "RUNNING" {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                self.session
+                    .execute(&render_cancel_command(
+                        &self.project_root,
+                        &step.id,
+                        attempt,
+                        true,
+                    ))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                return Ok(());
+            }
+            tokio::time::sleep(self.poll_interval).await;
         }
     }
 }
@@ -321,6 +396,14 @@ impl RemoteExecutor for SshRemoteExecutor {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(step.timeout_seconds);
         let status = loop {
+            if self
+                .cancel_requested
+                .as_ref()
+                .is_some_and(|requested| requested.load(Ordering::SeqCst))
+            {
+                self.cancel_step(step, attempt).await?;
+                return Err("execution canceled".into());
+            }
             if tokio::time::Instant::now() >= deadline {
                 break 124;
             }

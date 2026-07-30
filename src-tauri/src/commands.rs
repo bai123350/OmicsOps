@@ -1,4 +1,11 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use chrono::Utc;
 use omicsops_adapters::{
@@ -11,9 +18,9 @@ use omicsops_adapters::{
 use omicsops_core::{
     domain::{
         AnalysisPlan, Artifact, ArtifactKind, AuthenticationMethod, ConnectionProfile, ProjectSpec,
-        RunEvent, RunState,
+        RunCheckpoint, RunEvent, RunState,
     },
-    project::{RemoteProjectLayout, shell_quote},
+    project::{RemoteProjectLayout, require_remote_descendant, shell_quote},
 };
 use omicsops_runner::{
     AutonomousRunner, LlmRepairPlanner, SshRemoteExecutor, StepOutcome, generate_analysis_plan,
@@ -32,6 +39,7 @@ use crate::inspection::{ServerInspection, inspection_command, parse_server_inspe
 pub struct AppState {
     pub repository: Repository,
     pub credentials: SystemCredentialVault,
+    pub active_runs: Arc<Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,167 +298,511 @@ pub async fn start_run(
     }
     let profile = find_profile(&state.repository, profile_id)?;
     require_trusted_host(&profile)?;
+    let run_id = Uuid::new_v4();
+    let checkpoint = RunCheckpoint::new(run_id, profile_id, project.id, plan.id);
+    state
+        .repository
+        .put_json("project", &project.id.to_string(), &project)
+        .map_err(|error| error.to_string())?;
+    state
+        .repository
+        .put_json("analysis_plan", &plan.id.to_string(), &plan)
+        .map_err(|error| error.to_string())?;
+    state
+        .repository
+        .put_json("run_checkpoint", &run_id.to_string(), &checkpoint)
+        .map_err(|error| error.to_string())?;
+
+    let authentication = authentication_for_profile(&state, &profile)?;
+    spawn_checkpoint_run(
+        app,
+        state.repository.clone(),
+        state.active_runs.clone(),
+        profile,
+        authentication,
+        llm_client(&state)?,
+        project,
+        plan,
+        checkpoint,
+        None,
+    )?;
+    Ok(run_id)
+}
+
+#[tauri::command]
+pub fn list_runs(state: State<'_, AppState>) -> Result<Vec<RunCheckpoint>, String> {
+    state
+        .repository
+        .list_json("run_checkpoint")
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn list_run_events(state: State<'_, AppState>, run_id: Uuid) -> Result<Vec<RunEvent>, String> {
+    state
+        .repository
+        .events_for_run(run_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn resume_run(app: AppHandle, state: State<'_, AppState>, run_id: Uuid) -> Result<(), String> {
+    let (mut checkpoint, profile, project, plan) = load_run_context(&state, run_id)?;
+    if matches!(checkpoint.state, RunState::Succeeded | RunState::Canceled) {
+        return Err(format!("run {} is already {}", run_id, checkpoint.state));
+    }
+    if checkpoint.pending_approval.is_some() {
+        return Err("the pending approval must be resolved before resuming".into());
+    }
+    checkpoint.state = RunState::Preparing;
+    state
+        .repository
+        .put_json("run_checkpoint", &run_id.to_string(), &checkpoint)
+        .map_err(|error| error.to_string())?;
+    let authentication = authentication_for_profile(&state, &profile)?;
+    spawn_checkpoint_run(
+        app,
+        state.repository.clone(),
+        state.active_runs.clone(),
+        profile,
+        authentication,
+        llm_client(&state)?,
+        project,
+        plan,
+        checkpoint,
+        None,
+    )
+}
+
+#[tauri::command]
+pub fn approve_run(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    run_id: Uuid,
+    approval_id: Uuid,
+) -> Result<(), String> {
+    let (mut checkpoint, profile, project, plan) = load_run_context(&state, run_id)?;
+    let approved_command = checkpoint
+        .approve(approval_id)
+        .map_err(|error| error.to_string())?;
+    state
+        .repository
+        .put_json("run_checkpoint", &run_id.to_string(), &checkpoint)
+        .map_err(|error| error.to_string())?;
+    let authentication = authentication_for_profile(&state, &profile)?;
+    spawn_checkpoint_run(
+        app,
+        state.repository.clone(),
+        state.active_runs.clone(),
+        profile,
+        authentication,
+        llm_client(&state)?,
+        project,
+        plan,
+        checkpoint,
+        Some(approved_command),
+    )
+}
+
+#[tauri::command]
+pub fn cancel_run(app: AppHandle, state: State<'_, AppState>, run_id: Uuid) -> Result<(), String> {
+    if let Some(requested) = state
+        .active_runs
+        .lock()
+        .map_err(|_| "active run registry is unavailable".to_string())?
+        .get(&run_id)
+        .cloned()
+    {
+        requested.store(true, Ordering::SeqCst);
+        return Ok(());
+    }
+
+    let mut checkpoint: RunCheckpoint = state
+        .repository
+        .get_json("run_checkpoint", &run_id.to_string())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("run {run_id} was not found"))?;
+    if matches!(checkpoint.state, RunState::Succeeded | RunState::Canceled) {
+        return Ok(());
+    }
+    checkpoint.state = RunState::Canceled;
+    checkpoint.pending_approval = None;
+    state
+        .repository
+        .put_json("run_checkpoint", &run_id.to_string(), &checkpoint)
+        .map_err(|error| error.to_string())?;
+    let mut sequence = next_event_sequence(&state.repository, run_id);
+    emit_run_event(
+        &app,
+        &state.repository,
+        &mut sequence,
+        &checkpoint,
+        "run_canceled",
+        "run canceled while no remote step was active".into(),
+        None,
+        None,
+        0,
+    );
+    Ok(())
+}
+
+fn authentication_for_profile(
+    state: &State<'_, AppState>,
+    profile: &ConnectionProfile,
+) -> Result<SshAuthentication, String> {
     let secret = state
         .credentials
         .get(&profile.authentication_reference)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "SSH credential is missing".to_string())?;
-    let authentication = parse_authentication_secret(profile.authentication, &secret)?;
-    let llm = llm_client(&state)?;
-    let repository = state.repository.clone();
-    let run_id = Uuid::new_v4();
+    parse_authentication_secret(profile.authentication, &secret)
+}
+
+fn load_run_context(
+    state: &State<'_, AppState>,
+    run_id: Uuid,
+) -> Result<(RunCheckpoint, ConnectionProfile, ProjectSpec, AnalysisPlan), String> {
+    let checkpoint: RunCheckpoint = state
+        .repository
+        .get_json("run_checkpoint", &run_id.to_string())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("run {run_id} was not found"))?;
+    let profile = find_profile(&state.repository, checkpoint.profile_id)?;
+    require_trusted_host(&profile)?;
+    let project = state
+        .repository
+        .get_json("project", &checkpoint.project_id.to_string())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the run project could not be recovered".to_string())?;
+    let plan = state
+        .repository
+        .get_json("analysis_plan", &checkpoint.plan_id.to_string())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the run analysis plan could not be recovered".to_string())?;
+    Ok((checkpoint, profile, project, plan))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_checkpoint_run(
+    app: AppHandle,
+    repository: Repository,
+    active_runs: Arc<Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
+    profile: ConnectionProfile,
+    authentication: SshAuthentication,
+    llm: OpenAiCompatibleClient,
+    project: ProjectSpec,
+    plan: AnalysisPlan,
+    checkpoint: RunCheckpoint,
+    approved_command: Option<String>,
+) -> Result<(), String> {
+    let run_id = checkpoint.run_id;
+    let cancel_requested = Arc::new(AtomicBool::new(false));
+    {
+        let mut active = active_runs
+            .lock()
+            .map_err(|_| "active run registry is unavailable".to_string())?;
+        if active.contains_key(&run_id) {
+            return Err(format!("run {run_id} is already active"));
+        }
+        active.insert(run_id, cancel_requested.clone());
+    }
 
     tauri::async_runtime::spawn(async move {
-        let mut sequence = 0_u64;
-        let emit = |state_value: RunState,
-                    action: &str,
-                    reason: String,
-                    stage: Option<String>,
-                    step: Option<String>,
-                    attempt: u8,
-                    sequence_value: &mut u64| {
-            *sequence_value += 1;
-            let event = RunEvent {
-                sequence: *sequence_value,
-                timestamp: Utc::now(),
-                run_id,
-                stage_id: stage,
-                step_id: step,
-                attempt,
-                action: action.into(),
-                state: state_value,
-                log_reference: None,
-                reason,
-            };
-            let _ = repository.append_event(&event);
-            let _ = app.emit("run-event", &event);
-        };
+        execute_checkpoint_run(
+            app,
+            repository,
+            profile,
+            authentication,
+            llm,
+            project,
+            plan,
+            checkpoint,
+            approved_command,
+            cancel_requested,
+        )
+        .await;
+        if let Ok(mut active) = active_runs.lock() {
+            active.remove(&run_id);
+        }
+    });
+    Ok(())
+}
 
-        let session = match SshSession::connect(&profile, authentication).await {
-            Ok(session) => Arc::new(session),
-            Err(error) => {
-                emit(
-                    RunState::Failed,
-                    "connect",
-                    error.to_string(),
-                    None,
-                    None,
-                    0,
+#[allow(clippy::too_many_arguments)]
+async fn execute_checkpoint_run(
+    app: AppHandle,
+    repository: Repository,
+    profile: ConnectionProfile,
+    authentication: SshAuthentication,
+    llm: OpenAiCompatibleClient,
+    project: ProjectSpec,
+    plan: AnalysisPlan,
+    mut checkpoint: RunCheckpoint,
+    mut approved_command: Option<String>,
+    cancel_requested: Arc<AtomicBool>,
+) {
+    let run_id = checkpoint.run_id;
+    let mut sequence = next_event_sequence(&repository, run_id);
+    if cancel_requested.load(Ordering::SeqCst) {
+        checkpoint.state = RunState::Canceled;
+        persist_checkpoint(&repository, &checkpoint);
+        emit_run_event(
+            &app,
+            &repository,
+            &mut sequence,
+            &checkpoint,
+            "run_canceled",
+            "run canceled before SSH connection".into(),
+            None,
+            None,
+            0,
+        );
+        return;
+    }
+
+    let session = match SshSession::connect(&profile, authentication).await {
+        Ok(session) => Arc::new(session),
+        Err(error) => {
+            checkpoint.state = RunState::Failed;
+            persist_checkpoint(&repository, &checkpoint);
+            emit_run_event(
+                &app,
+                &repository,
+                &mut sequence,
+                &checkpoint,
+                "connect_failed",
+                error.to_string(),
+                None,
+                None,
+                0,
+            );
+            return;
+        }
+    };
+    checkpoint.state = RunState::Running;
+    persist_checkpoint(&repository, &checkpoint);
+    let run_action = if sequence == 0 {
+        "run_started"
+    } else {
+        "run_resumed"
+    };
+    emit_run_event(
+        &app,
+        &repository,
+        &mut sequence,
+        &checkpoint,
+        run_action,
+        plan.summary.clone(),
+        None,
+        None,
+        0,
+    );
+
+    let allowed = project
+        .allowed_network_domains
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let runner = AutonomousRunner::new(
+        &project.remote_root,
+        &allowed,
+        SshRemoteExecutor::new(session, &project.remote_root)
+            .with_cancellation(cancel_requested.clone()),
+        LlmRepairPlanner::new(llm),
+    );
+
+    loop {
+        if cancel_requested.load(Ordering::SeqCst) {
+            checkpoint.state = RunState::Canceled;
+            checkpoint.pending_approval = None;
+            persist_checkpoint(&repository, &checkpoint);
+            emit_run_event(
+                &app,
+                &repository,
+                &mut sequence,
+                &checkpoint,
+                "run_canceled",
+                "active step terminated by user request".into(),
+                None,
+                None,
+                0,
+            );
+            return;
+        }
+        let Some((stage, step)) = checkpoint.current_step(&plan) else {
+            checkpoint.state = RunState::Succeeded;
+            persist_checkpoint(&repository, &checkpoint);
+            emit_run_event(
+                &app,
+                &repository,
+                &mut sequence,
+                &checkpoint,
+                "run_succeeded",
+                "all stages completed".into(),
+                None,
+                None,
+                0,
+            );
+            return;
+        };
+        let stage_id = stage.id.clone();
+        let step_id = step.id.clone();
+        let step = step.clone();
+        checkpoint.state = RunState::Running;
+        persist_checkpoint(&repository, &checkpoint);
+        emit_run_event(
+            &app,
+            &repository,
+            &mut sequence,
+            &checkpoint,
+            "step_started",
+            step.rationale.clone(),
+            Some(stage_id.clone()),
+            Some(step_id.clone()),
+            0,
+        );
+
+        let outcome = runner
+            .run_step_with_approval(step, approved_command.as_deref())
+            .await;
+        approved_command = None;
+        if cancel_requested.load(Ordering::SeqCst) {
+            continue;
+        }
+        match outcome {
+            Ok(StepOutcome::Succeeded { attempt, .. }) => {
+                let completed = checkpoint.advance_after_success(&plan);
+                checkpoint.state = if completed {
+                    RunState::Succeeded
+                } else {
+                    RunState::Running
+                };
+                persist_checkpoint(&repository, &checkpoint);
+                emit_run_event(
+                    &app,
+                    &repository,
                     &mut sequence,
+                    &checkpoint,
+                    "step_succeeded",
+                    "completion conditions passed".into(),
+                    Some(stage_id),
+                    Some(step_id),
+                    attempt,
+                );
+                if completed {
+                    return;
+                }
+            }
+            Ok(StepOutcome::AwaitingApproval { reason, command }) => {
+                checkpoint.pause_for_approval(reason.clone(), command);
+                persist_checkpoint(&repository, &checkpoint);
+                emit_run_event(
+                    &app,
+                    &repository,
+                    &mut sequence,
+                    &checkpoint,
+                    "approval_required",
+                    reason,
+                    Some(stage_id),
+                    Some(step_id),
+                    0,
                 );
                 return;
             }
-        };
-        emit(
-            RunState::Running,
-            "run_started",
-            plan.summary.clone(),
-            None,
-            None,
-            0,
-            &mut sequence,
-        );
-        let allowed = project
-            .allowed_network_domains
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let runner = AutonomousRunner::new(
-            &project.remote_root,
-            &allowed,
-            SshRemoteExecutor::new(session.clone(), &project.remote_root),
-            LlmRepairPlanner::new(llm),
-        );
-
-        for stage in plan.stages {
-            for step in stage.steps {
-                emit(
-                    RunState::Running,
-                    "step_started",
-                    step.rationale.clone(),
-                    Some(stage.id.clone()),
-                    Some(step.id.clone()),
-                    0,
+            Ok(StepOutcome::Denied { reason }) => {
+                checkpoint.state = RunState::Failed;
+                persist_checkpoint(&repository, &checkpoint);
+                emit_run_event(
+                    &app,
+                    &repository,
                     &mut sequence,
+                    &checkpoint,
+                    "policy_denied",
+                    reason,
+                    Some(stage_id),
+                    Some(step_id),
+                    0,
                 );
-                match runner.run_step(step.clone()).await {
-                    Ok(StepOutcome::Succeeded { attempt, .. }) => emit(
-                        RunState::Running,
-                        "step_succeeded",
-                        "completion conditions passed".into(),
-                        Some(stage.id.clone()),
-                        Some(step.id),
-                        attempt,
-                        &mut sequence,
-                    ),
-                    Ok(StepOutcome::AwaitingApproval { reason, .. }) => {
-                        emit(
-                            RunState::PausedForApproval,
-                            "approval_required",
-                            reason,
-                            Some(stage.id),
-                            Some(step.id),
-                            0,
-                            &mut sequence,
-                        );
-                        return;
-                    }
-                    Ok(StepOutcome::Denied { reason }) => {
-                        emit(
-                            RunState::Failed,
-                            "policy_denied",
-                            reason,
-                            Some(stage.id),
-                            Some(step.id),
-                            0,
-                            &mut sequence,
-                        );
-                        return;
-                    }
-                    Ok(StepOutcome::NeedsAttention {
-                        repairs_attempted,
-                        last_error,
-                    }) => {
-                        emit(
-                            RunState::Failed,
-                            "repair_budget_exhausted",
-                            last_error,
-                            Some(stage.id),
-                            Some(step.id),
-                            repairs_attempted,
-                            &mut sequence,
-                        );
-                        return;
-                    }
-                    Err(error) => {
-                        emit(
-                            RunState::Failed,
-                            "runner_error",
-                            error.to_string(),
-                            Some(stage.id),
-                            Some(step.id),
-                            0,
-                            &mut sequence,
-                        );
-                        return;
-                    }
-                }
+                return;
+            }
+            Ok(StepOutcome::NeedsAttention {
+                repairs_attempted,
+                last_error,
+            }) => {
+                checkpoint.state = RunState::Failed;
+                persist_checkpoint(&repository, &checkpoint);
+                emit_run_event(
+                    &app,
+                    &repository,
+                    &mut sequence,
+                    &checkpoint,
+                    "repair_budget_exhausted",
+                    last_error,
+                    Some(stage_id),
+                    Some(step_id),
+                    repairs_attempted,
+                );
+                return;
+            }
+            Err(error) => {
+                checkpoint.state = RunState::Failed;
+                persist_checkpoint(&repository, &checkpoint);
+                emit_run_event(
+                    &app,
+                    &repository,
+                    &mut sequence,
+                    &checkpoint,
+                    "runner_error",
+                    error.to_string(),
+                    Some(stage_id),
+                    Some(step_id),
+                    0,
+                );
+                return;
             }
         }
-        emit(
-            RunState::Succeeded,
-            "run_succeeded",
-            "all stages completed".into(),
-            None,
-            None,
-            0,
-            &mut sequence,
-        );
-        if let Ok(session) = Arc::try_unwrap(session) {
-            let _ = session.disconnect().await;
-        }
-    });
-    Ok(run_id)
+    }
+}
+
+fn persist_checkpoint(repository: &Repository, checkpoint: &RunCheckpoint) {
+    let _ = repository.put_json("run_checkpoint", &checkpoint.run_id.to_string(), checkpoint);
+}
+
+fn next_event_sequence(repository: &Repository, run_id: Uuid) -> u64 {
+    repository
+        .events_for_run(run_id)
+        .ok()
+        .and_then(|events| events.last().map(|event| event.sequence))
+        .unwrap_or(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_run_event(
+    app: &AppHandle,
+    repository: &Repository,
+    sequence: &mut u64,
+    checkpoint: &RunCheckpoint,
+    action: &str,
+    reason: String,
+    stage_id: Option<String>,
+    step_id: Option<String>,
+    attempt: u8,
+) {
+    *sequence += 1;
+    let event = RunEvent {
+        sequence: *sequence,
+        timestamp: Utc::now(),
+        run_id: checkpoint.run_id,
+        stage_id,
+        step_id,
+        attempt,
+        action: action.into(),
+        state: checkpoint.state,
+        log_reference: None,
+        reason,
+    };
+    let _ = repository.append_event(&event);
+    let _ = app.emit("run-event", &event);
 }
 
 #[tauri::command]
@@ -461,12 +813,28 @@ pub async fn list_artifacts(
 ) -> Result<Vec<Artifact>, String> {
     let profile = find_profile(&state.repository, profile_id)?;
     require_trusted_host(&profile)?;
+    let project = state
+        .repository
+        .list_json::<ProjectSpec>("project")
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|project| {
+            project.connection_id == profile_id
+                && project.remote_root.trim_end_matches('/') == remote_root.trim_end_matches('/')
+        })
+        .ok_or_else(|| "the artifact root is not a persisted project".to_string())?;
     let session = connect_profile(&state, &profile).await?;
-    let results = format!("{}/results", remote_root.trim_end_matches('/'));
+    let results = format!("{}/results", project.remote_root.trim_end_matches('/'));
+    let canonical_results = canonical_remote_directory(
+        &session,
+        project.remote_root.trim_end_matches('/'),
+        &results,
+    )
+    .await?;
     let output = session
         .execute_checked(&format!(
             "find {results} -type f -printf '%p\\t%s\\n' | sort",
-            results = shell_quote(&results)
+            results = shell_quote(&canonical_results)
         ))
         .await
         .map_err(|error| error.to_string())?;
@@ -510,15 +878,94 @@ pub async fn download_artifact(
 ) -> Result<(), String> {
     let profile = find_profile(&state.repository, profile_id)?;
     require_trusted_host(&profile)?;
+    let project = state
+        .repository
+        .list_json::<ProjectSpec>("project")
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|project| {
+            project.connection_id == profile_id
+                && require_remote_descendant(
+                    &format!("{}/results", project.remote_root.trim_end_matches('/')),
+                    &remote_path,
+                )
+                .is_ok()
+        })
+        .ok_or_else(|| "the requested artifact is outside every persisted project".to_string())?;
     let session = connect_profile(&state, &profile).await?;
+    let canonical_path = canonical_remote_descendant(
+        &session,
+        &format!("{}/results", project.remote_root.trim_end_matches('/')),
+        &remote_path,
+    )
+    .await?;
+    let expected_sha256 = session
+        .execute_checked(&format!("sha256sum -- {}", shell_quote(&canonical_path)))
+        .await
+        .map_err(|error| error.to_string())?
+        .stdout
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "remote artifact checksum was empty".to_string())?
+        .to_owned();
     session
-        .download_atomic(&remote_path, PathBuf::from(local_path).as_path())
+        .download_atomic_verified(
+            &canonical_path,
+            PathBuf::from(local_path).as_path(),
+            &expected_sha256,
+        )
         .await
         .map_err(|error| error.to_string())?;
     session
         .disconnect()
         .await
         .map_err(|error| error.to_string())
+}
+
+async fn canonical_remote_descendant(
+    session: &SshSession,
+    root: &str,
+    candidate: &str,
+) -> Result<String, String> {
+    require_remote_descendant(root, candidate).map_err(|error| error.to_string())?;
+    let output = session
+        .execute_checked(&format!(
+            "root=$(realpath -- {root}) && file=$(realpath -- {candidate}) && \
+             case \"$file\" in \"$root\"/*) test -f \"$file\" && printf '%s' \"$file\" ;; \
+             *) printf '%s\\n' 'path escaped project boundary' >&2; exit 73 ;; esac",
+            root = shell_quote(root),
+            candidate = shell_quote(candidate),
+        ))
+        .await
+        .map_err(|error| error.to_string())?;
+    let canonical = output.stdout.trim().to_owned();
+    if canonical.is_empty() {
+        return Err("remote artifact did not resolve to a regular file".into());
+    }
+    Ok(canonical)
+}
+
+async fn canonical_remote_directory(
+    session: &SshSession,
+    root: &str,
+    candidate: &str,
+) -> Result<String, String> {
+    require_remote_descendant(root, candidate).map_err(|error| error.to_string())?;
+    let output = session
+        .execute_checked(&format!(
+            "root=$(realpath -- {root}) && directory=$(realpath -- {candidate}) && \
+             case \"$directory\" in \"$root\"/*) test -d \"$directory\" && printf '%s' \"$directory\" ;; \
+             *) printf '%s\\n' 'path escaped project boundary' >&2; exit 73 ;; esac",
+            root = shell_quote(root),
+            candidate = shell_quote(candidate),
+        ))
+        .await
+        .map_err(|error| error.to_string())?;
+    let canonical = output.stdout.trim().to_owned();
+    if canonical.is_empty() {
+        return Err("remote artifact directory did not resolve".into());
+    }
+    Ok(canonical)
 }
 
 fn find_profile(repository: &Repository, id: Uuid) -> Result<ConnectionProfile, String> {
