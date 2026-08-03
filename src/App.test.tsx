@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
@@ -57,5 +57,43 @@ describe("OmicsOps desktop workflow", () => {
       screen.getByText("python export.py --overwrite results/pbmc.h5ad"),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "批准并继续" })).toBeInTheDocument();
+  });
+
+  it("opens a dialog that keeps server progress visible", async () => {
+    vi.spyOn(api, "listRuns").mockResolvedValue([
+      {
+        run_id: "b0000000-0000-4000-8000-000000000001",
+        profile_id: "b0000000-0000-4000-8000-000000000002",
+        project_id: "b0000000-0000-4000-8000-000000000003",
+        plan_id: "b0000000-0000-4000-8000-000000000004",
+        state: "running",
+        stage_index: 0,
+        step_index: 0,
+        pending_approval: null,
+      },
+    ]);
+    vi.spyOn(api, "listRunEvents").mockResolvedValue([
+      {
+        sequence: 1,
+        timestamp: "2026-07-30T10:00:00Z",
+        run_id: "b0000000-0000-4000-8000-000000000001",
+        stage_id: "analysis",
+        step_id: "qc",
+        attempt: 0,
+        action: "step_started",
+        state: "running",
+        log_reference: null,
+        reason: "服务器正在执行质量控制",
+      },
+    ]);
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: /运行监控/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /查看进度/ }));
+
+    const dialog = screen.getByRole("dialog", { name: "服务器任务进度" });
+    expect(dialog).toBeInTheDocument();
+    expect(within(dialog).getByText("服务器正在执行质量控制")).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "服务器任务完成进度" })).toBeInTheDocument();
   });
 });

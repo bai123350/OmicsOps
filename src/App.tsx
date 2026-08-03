@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   ArrowRight,
@@ -12,6 +12,7 @@ import {
   FileText,
   FolderCog,
   KeyRound,
+  LoaderCircle,
   Play,
   RotateCcw,
   Server,
@@ -19,6 +20,7 @@ import {
   ShieldCheck,
   Square,
   TerminalSquare,
+  X,
 } from "lucide-react";
 
 import * as api from "./tauri-api";
@@ -89,6 +91,12 @@ export default function App() {
   const [runs, setRuns] = useState<RunCheckpoint[]>([]);
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const [progressDialogOpen, setProgressDialogOpen] = useState(false);
+  const selectedRunId = useRef(runId);
+
+  useEffect(() => {
+    selectedRunId.current = runId;
+  }, [runId]);
 
   useEffect(() => {
     let cleanup: () => void = () => {};
@@ -98,6 +106,7 @@ export default function App() {
       setRuns(storedRuns);
       const selected = storedRuns.at(-1);
       if (selected) {
+        selectedRunId.current = selected.run_id;
         setRunId(selected.run_id);
         const storedEvents = await api.listRunEvents(selected.run_id);
         if (!disposed) setEvents(storedEvents);
@@ -106,20 +115,24 @@ export default function App() {
       if (!disposed) setNotice(error instanceof Error ? error.message : String(error));
     });
     api.listenRunEvents((event) => {
-      setRunId((current) => {
-        if (current === "RUN-2026-0001") return event.run_id;
-        return current;
-      });
-      setEvents((current) => {
-        if (current.some((item) => item.run_id === event.run_id && item.sequence === event.sequence)) {
-          return current;
-        }
-        return [...current, event];
-      });
+      const isInitialRun = selectedRunId.current === "RUN-2026-0001";
+      const isSelectedRun = selectedRunId.current === event.run_id;
+      if (isInitialRun) {
+        selectedRunId.current = event.run_id;
+        setRunId(event.run_id);
+      }
+      if (isInitialRun || isSelectedRun) {
+        setEvents((current) => {
+          if (current.some((item) => item.run_id === event.run_id && item.sequence === event.sequence)) {
+            return current;
+          }
+          return [...current, event];
+        });
+      }
       api.listRuns().then((storedRuns) => {
         if (!disposed) setRuns(storedRuns);
       });
-      setNotice(event.reason || event.action);
+      if (isInitialRun || isSelectedRun) setNotice(event.reason || event.action);
     }).then((unlisten) => {
       cleanup = unlisten;
     });
@@ -226,8 +239,21 @@ export default function App() {
     perform(async () => {
       if (!plan?.approved) throw new Error("分析计划尚未批准");
       const id = await api.startRun(profile.id, project, plan);
+      selectedRunId.current = id;
       setRunId(id);
-      setRuns(await api.listRuns());
+      setEvents([]);
+      setProgressDialogOpen(true);
+      const [storedRuns, storedEvents] = await Promise.all([
+        api.listRuns(),
+        api.listRunEvents(id),
+      ]);
+      setRuns(storedRuns);
+      setEvents((current) => {
+        const merged = [...storedEvents, ...current];
+        return merged.filter((event, index) =>
+          merged.findIndex((item) => item.run_id === event.run_id && item.sequence === event.sequence) === index,
+        );
+      });
       if (!api.isTauri()) {
         setEvents([
           demoEvent(id, 1, "run_started", "running", "开始执行远端阶段"),
@@ -241,6 +267,7 @@ export default function App() {
 
   const selectRun = (checkpoint: RunCheckpoint) =>
     perform(async () => {
+      selectedRunId.current = checkpoint.run_id;
       setRunId(checkpoint.run_id);
       setEvents(await api.listRunEvents(checkpoint.run_id));
       setNotice(`已载入运行 ${checkpoint.run_id}`);
@@ -249,6 +276,7 @@ export default function App() {
   const resume = () =>
     perform(async () => {
       if (!activeRun) throw new Error("没有可恢复的运行");
+      setProgressDialogOpen(true);
       await api.resumeRun(activeRun.run_id);
       setNotice("已从最后一个成功步骤恢复运行");
       setRuns(await api.listRuns());
@@ -258,6 +286,7 @@ export default function App() {
     perform(async () => {
       const approval = activeRun?.pending_approval;
       if (!activeRun || !approval) throw new Error("没有待处理的审批请求");
+      setProgressDialogOpen(true);
       await api.approveRun(activeRun.run_id, approval.id);
       setNotice("已批准当前动作并继续运行");
       setRuns(await api.listRuns());
@@ -376,6 +405,7 @@ export default function App() {
               onResume={resume}
               onApprove={approvePendingRun}
               onCancel={cancel}
+              onShowProgress={() => setProgressDialogOpen(true)}
               plan={plan}
             />
           )}
@@ -389,6 +419,17 @@ export default function App() {
           )}
         </section>
       </main>
+      {progressDialogOpen && (
+        <ServerProgressDialog
+          runId={runId}
+          checkpoint={activeRun}
+          plan={plan}
+          events={events.filter((event) => event.run_id === runId)}
+          busy={busy}
+          onCancel={cancel}
+          onClose={() => setProgressDialogOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -537,6 +578,7 @@ function RunView(props: {
   onResume: () => void;
   onApprove: () => void;
   onCancel: () => void;
+  onShowProgress: () => void;
   plan: AnalysisPlan | null;
 }) {
   const terminal = props.activeRun
@@ -553,6 +595,9 @@ function RunView(props: {
         </div>
         <div className="actions">
           <button className="primary" disabled={props.busy || !props.plan?.approved} onClick={props.onStart}><Play size={16} />启动新分析</button>
+          {props.activeRun && (
+            <button className="secondary" onClick={props.onShowProgress}><Activity size={16} />查看进度</button>
+          )}
           <button className="secondary" disabled={props.busy || !props.activeRun || terminal || Boolean(pendingApproval)} onClick={props.onResume}><RotateCcw size={16} />恢复运行</button>
           <button className="secondary" disabled={props.busy || !props.activeRun || terminal} onClick={props.onCancel}><Square size={15} />取消运行</button>
         </div>
@@ -609,6 +654,133 @@ function RunView(props: {
   );
 }
 
+function ServerProgressDialog(props: {
+  runId: string;
+  checkpoint: RunCheckpoint | null;
+  plan: AnalysisPlan | null;
+  events: RunEvent[];
+  busy: boolean;
+  onCancel: () => void;
+  onClose: () => void;
+}) {
+  const latestEvent = props.events.at(-1) ?? null;
+  const state = latestEvent?.state ?? props.checkpoint?.state ?? "preparing";
+  const terminal = ["succeeded", "failed", "canceled"].includes(state);
+  const paused = state === "paused_for_approval";
+  const steps = props.plan?.stages.flatMap((stage) =>
+    stage.steps.map((step) => ({ stage, step })),
+  ) ?? [];
+  const completedSteps = new Set(
+    props.events
+      .filter((event) => event.action === "step_succeeded" && event.step_id)
+      .map((event) => `${event.stage_id ?? ""}/${event.step_id}`),
+  );
+  const completedCount = steps.filter(({ stage, step }) =>
+    completedSteps.has(`${stage.id}/${step.id}`),
+  ).length;
+  const progress = state === "succeeded"
+    ? 100
+    : steps.length > 0
+      ? Math.round((completedCount / steps.length) * 100)
+      : null;
+  const currentStage = props.plan?.stages.find(
+    (stage) => stage.id === latestEvent?.stage_id,
+  ) ?? (props.checkpoint ? props.plan?.stages[props.checkpoint.stage_index] : undefined);
+  const currentStep = currentStage?.steps.find(
+    (step) => step.id === latestEvent?.step_id,
+  ) ?? (currentStage && props.checkpoint ? currentStage.steps[props.checkpoint.step_index] : undefined);
+
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") props.onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [props.onClose]);
+
+  return (
+    <div className="progress-dialog-backdrop" role="presentation" onMouseDown={props.onClose}>
+      <section
+        className="progress-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="server-progress-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header className="progress-dialog-header">
+          <div className={`progress-dialog-icon ${terminal ? state : "active"}`}>
+            {state === "succeeded" ? <CheckCircle2 size={22} /> : terminal ? <Square size={18} /> : <LoaderCircle size={22} />}
+          </div>
+          <div>
+            <span className="eyebrow">REMOTE SERVER</span>
+            <h2 id="server-progress-title">服务器任务进度</h2>
+          </div>
+          <span className={`run-state-badge ${state}`}>{runStateLabel(state)}</span>
+          <button className="dialog-close" aria-label="关闭进度对话框" onClick={props.onClose}><X size={19} /></button>
+        </header>
+
+        <div className="progress-dialog-body">
+          <div className="progress-summary">
+            <div>
+              <span>运行编号</span>
+              <code>{props.runId}</code>
+            </div>
+            <div>
+              <span>当前阶段</span>
+              <strong>{currentStage?.goal ?? (terminal ? "任务已结束" : "连接服务器并准备任务")}</strong>
+            </div>
+            <div>
+              <span>当前步骤</span>
+              <strong>{currentStep?.title ?? latestEvent?.action ?? "等待服务器响应"}</strong>
+            </div>
+          </div>
+
+          <div className="progress-track-heading">
+            <span>{progress === null ? "服务器正在执行" : `已完成 ${completedCount} / ${steps.length} 个步骤`}</span>
+            <strong>{progress === null ? (terminal ? runStateLabel(state) : "进行中") : `${progress}%`}</strong>
+          </div>
+          <div
+            className={`progress-track ${progress === null && !terminal ? "indeterminate" : ""}`}
+            role="progressbar"
+            aria-label="服务器任务完成进度"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={progress ?? undefined}
+          >
+            <span style={progress !== null ? { width: `${progress}%` } : undefined} />
+          </div>
+
+          <div className="dialog-event-heading">
+            <strong>服务器实时消息</strong>
+            <span>{props.events.length} 条</span>
+          </div>
+          <div className="dialog-event-stream" aria-live="polite">
+            {props.events.length === 0 ? (
+              <div className="dialog-waiting"><LoaderCircle size={17} />正在建立 SSH 会话，等待服务器返回进度…</div>
+            ) : props.events.map((event) => (
+              <div className="dialog-event" key={`${event.run_id}-${event.sequence}`}>
+                <span className={`event-state ${event.state}`} />
+                <time>{formatEventTime(event.timestamp)}</time>
+                <div><strong>{event.action}</strong><span>{event.reason}</span></div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <footer className="progress-dialog-footer">
+          <p>{terminal ? "服务器任务已结束，可以关闭此窗口。" : paused ? "任务正在等待审批，关闭窗口不会取消服务器任务。" : "关闭窗口后任务仍会在服务器上继续运行。"}</p>
+          <div className="actions">
+            {!terminal && !paused && (
+              <button className="secondary danger" disabled={props.busy || !props.checkpoint} onClick={props.onCancel}><Square size={15} />取消任务</button>
+            )}
+            <button className="primary" onClick={props.onClose}>{terminal ? "关闭" : "后台运行"}</button>
+          </div>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
 function ResultsView(props: { artifacts: Artifact[]; busy: boolean; onRefresh: () => void; onDownload: (artifact: Artifact) => void }) {
   return (
     <div className="content-stack">
@@ -659,4 +831,29 @@ function formatBytes(value: number) {
   if (value < 1024) return `${value} B`;
   if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KiB`;
   return `${(value / 1024 ** 2).toFixed(1)} MiB`;
+}
+
+function runStateLabel(state: RunEvent["state"]) {
+  return {
+    draft: "草稿",
+    inspecting: "检查中",
+    awaiting_plan_approval: "等待计划审批",
+    preparing: "准备中",
+    running: "运行中",
+    paused_for_approval: "等待审批",
+    succeeded: "已完成",
+    failed: "失败",
+    canceled: "已取消",
+  }[state];
+}
+
+function formatEventTime(timestamp: string) {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return "--:--:--";
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(date);
 }
