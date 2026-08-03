@@ -23,3 +23,8 @@ npm run tauri dev
 
 See `docs/superpowers/specs/2026-07-29-omicsops-agent-design.md` for the
 approved design.
+
+The V2 control plane uses versioned tool contracts, canonical plan approvals,
+append-only hash-chained events, verified checkpoints, process-group recovery,
+and auditable run bundles. See `acceptance/README.md` for the pinned PBMC and
+bulk RNA-seq acceptance procedure.

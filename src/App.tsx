@@ -24,6 +24,8 @@ import {
 } from "lucide-react";
 
 import * as api from "./tauri-api";
+import { V2PlanningView } from "./features/planning/V2PlanningView";
+import { V2RunView } from "./features/runs/V2RunView";
 import type {
   AnalysisPlan,
   Artifact,
@@ -88,6 +90,7 @@ export default function App() {
   const [documentText, setDocumentText] = useState("");
   const [plan, setPlan] = useState<AnalysisPlan | null>(null);
   const [runId, setRunId] = useState("RUN-2026-0001");
+  const [v2RunId, setV2RunId] = useState("");
   const [runs, setRuns] = useState<RunCheckpoint[]>([]);
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
@@ -140,6 +143,16 @@ export default function App() {
       disposed = true;
       cleanup();
     };
+  }, []);
+
+  useEffect(() => {
+    api.listRunsV2().then((storedRuns) => {
+      const selected = storedRuns.at(-1);
+      if (selected) {
+        setV2RunId(selected.run_id);
+        setRunId(selected.run_id);
+      }
+    }).catch(() => undefined);
   }, []);
 
   const activeRun = runs.find((run) => run.run_id === runId) ?? null;
@@ -267,6 +280,7 @@ export default function App() {
 
   const selectRun = (checkpoint: RunCheckpoint) =>
     perform(async () => {
+      setV2RunId("");
       selectedRunId.current = checkpoint.run_id;
       setRunId(checkpoint.run_id);
       setEvents(await api.listRunEvents(checkpoint.run_id));
@@ -383,18 +397,35 @@ export default function App() {
             />
           )}
           {view === "plan" && (
-            <PlanView
-              planPath={planPath}
-              documentText={documentText}
-              plan={plan}
-              busy={busy}
-              onSelect={selectPlan}
-              onCompile={compilePlan}
-              onApprove={approve}
-            />
+            <>
+              <V2PlanningView
+                profileId={profile.id}
+                projectId={project.id}
+                environmentSummary={JSON.stringify(inspection ?? {})}
+                onStarted={(id) => {
+                  setV2RunId(id);
+                  setRunId(id);
+                  selectedRunId.current = id;
+                  setNotice("V2 运行已按冻结审批记录启动");
+                  setView("run");
+                }}
+              />
+              <details>
+                <summary>查看旧版 Shell 计划兼容入口</summary>
+                <PlanView
+                  planPath={planPath}
+                  documentText={documentText}
+                  plan={plan}
+                  busy={busy}
+                  onSelect={selectPlan}
+                  onCompile={compilePlan}
+                  onApprove={approve}
+                />
+              </details>
+            </>
           )}
           {view === "run" && (
-            <RunView
+            v2RunId ? <V2RunView selectedRunId={v2RunId} /> : <RunView
               runId={runId}
               runs={runs}
               activeRun={activeRun}

@@ -136,3 +136,130 @@ export interface Artifact {
   previewable: boolean;
   downloadable: boolean;
 }
+
+export type StepAction =
+  | { kind: "tool"; tool_id: string; version: string; arguments: Record<string, unknown> }
+  | { kind: "legacy_shell"; command: string };
+
+export type VerificationSpec =
+  | { kind: "exit_code"; expected: number }
+  | { kind: "file"; path: string; min_bytes: number; sha256: string | null }
+  | { kind: "json_field"; path: string; pointer: string; expected: string }
+  | { kind: "table"; path: string; delimiter: string; required_columns: string[]; min_rows: number }
+  | { kind: "domain_report"; path: string; validator: string };
+
+export interface PolicyEnvelope {
+  allowed_tools: string[];
+  allowed_domains: string[];
+  max_risk: StepSpec["risk"];
+  allow_legacy_shell: boolean;
+}
+
+export interface StepSpecV2 {
+  id: string;
+  title: string;
+  rationale: string;
+  dependencies: string[];
+  action: StepAction;
+  working_directory: string;
+  resources: ResourceLimits;
+  risk: StepSpec["risk"];
+  verifications: VerificationSpec[];
+  expected_artifacts: string[];
+}
+
+export interface AnalysisPlanV2 {
+  schema_version: 2;
+  id: string;
+  title: string;
+  summary: string;
+  environment: { kind: "micromamba"; channels: string[]; dependencies: string[] };
+  stages: Array<{ id: string; goal: string; dependencies: string[]; steps: StepSpecV2[] }>;
+  resource_budget: ResourceLimits;
+  policy: PolicyEnvelope;
+  metadata: Record<string, string>;
+}
+
+export interface ApprovedPlan {
+  id: string;
+  plan_id: string;
+  plan_hash: string;
+  policy: PolicyEnvelope;
+  approved_at: string;
+}
+
+export interface PlanValidation {
+  valid: boolean;
+  issues: Array<{ code: string; path: string; message: string }>;
+}
+
+export interface ToolSummary {
+  id: string;
+  version: string;
+  title: string;
+  description: string;
+  risk: StepSpec["risk"];
+}
+
+export type PlanningTurn =
+  | { kind: "clarification"; questions: string[] }
+  | { kind: "draft"; plan: AnalysisPlanV2 };
+
+export interface RunCheckpointV2 {
+  run_id: string;
+  profile_id: string;
+  project_id: string;
+  approved_plan_id: string;
+  state: "preparing" | "running" | "paused_for_approval" | "needs_attention" | "succeeded" | "failed" | "canceled";
+  completed_steps: string[];
+  action_hashes: Record<string, string>;
+  attention_reason: string | null;
+}
+
+export interface RunEventV2 {
+  sequence: number;
+  timestamp: string;
+  run_id: string;
+  kind: "run_started" | "run_resumed" | "step_started" | "step_succeeded" | "step_failed" | "approval_required" | "verification_failed" | "needs_attention" | "run_succeeded" | "run_canceled";
+  message: string;
+  prev_hash: string | null;
+  details: Record<string, string>;
+  event_hash: string;
+}
+
+export interface VerificationResult {
+  specification: VerificationSpec;
+  passed: boolean;
+  observed: string;
+}
+
+export interface StepAttempt {
+  run_id: string;
+  step_id: string;
+  attempt: number;
+  action_hash: string;
+  process_group_id: number | null;
+  started_at: string;
+  finished_at: string | null;
+  exit_code: number | null;
+  log_path: string;
+  manifest_path: string;
+  verifications: VerificationResult[];
+}
+
+export interface ArtifactRecordV2 {
+  run_id: string;
+  source_step_id: string;
+  remote_path: string;
+  size_bytes: number;
+  sha256: string;
+  verified: boolean;
+}
+
+export interface EnvironmentLock {
+  run_id: string;
+  backend: string;
+  remote_path: string;
+  sha256: string;
+  declared_dependencies: string[];
+}

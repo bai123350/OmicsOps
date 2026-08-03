@@ -10,6 +10,17 @@ import type {
   RunCheckpoint,
   RunEvent,
   ServerInspection,
+  AnalysisPlanV2,
+  ApprovedPlan,
+  PlanValidation,
+  PlanningTurn,
+  PolicyEnvelope,
+  ToolSummary,
+  RunCheckpointV2,
+  RunEventV2,
+  StepAttempt,
+  ArtifactRecordV2,
+  EnvironmentLock,
 } from "./types";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
@@ -138,7 +149,7 @@ export async function generatePlan(
 
 export async function approvePlan(plan: AnalysisPlan): Promise<AnalysisPlan> {
   if (!isTauri()) return { ...plan, approved: true };
-  return invoke("approve_plan", { plan });
+  return invoke("approve_legacy_plan", { plan });
 }
 
 export async function startRun(
@@ -147,7 +158,7 @@ export async function startRun(
   plan: AnalysisPlan,
 ): Promise<string> {
   if (!isTauri()) return "RUN-2026-0001";
-  return invoke("start_run", { profileId, project, plan });
+  return invoke("legacy_start_run", { profileId, project, plan });
 }
 
 export async function listRuns(): Promise<RunCheckpoint[]> {
@@ -224,4 +235,56 @@ export async function downloadArtifact(
 ): Promise<void> {
   if (!isTauri()) return;
   await invoke("download_artifact", { profileId, remotePath, localPath });
+}
+
+export async function listTools(): Promise<ToolSummary[]> {
+  return isTauri() ? invoke("list_tools") : [];
+}
+
+export async function planningTurn(request: {
+  goal: string;
+  environment_summary: string;
+  answers: Record<string, string>;
+}): Promise<PlanningTurn> {
+  return invoke("planning_turn", { request });
+}
+
+export async function validatePlanV2(plan: AnalysisPlanV2): Promise<PlanValidation> {
+  return invoke("validate_plan", { plan });
+}
+
+export async function approvePlanV2(plan: AnalysisPlanV2, envelope: PolicyEnvelope): Promise<ApprovedPlan> {
+  return invoke("approve_plan", { plan, envelope });
+}
+
+export async function startRunV2(profileId: string, projectId: string, approvedPlanId: string): Promise<string> {
+  return invoke("start_run", { profileId, projectId, approvedPlanId });
+}
+
+export async function exportRunBundle(runId: string, localPath: string): Promise<void> {
+  await invoke("export_run_bundle", { runId, localPath });
+}
+
+export async function listRunsV2(): Promise<RunCheckpointV2[]> {
+  return isTauri() ? invoke("list_runs_v2") : [];
+}
+
+export async function resumeRunV2(runId: string): Promise<void> {
+  await invoke("resume_run_v2", { runId });
+}
+
+export async function listRunEventsV2(runId: string): Promise<RunEventV2[]> {
+  return invoke("list_run_events_v2", { runId });
+}
+
+export async function listStepAttemptsV2(runId: string): Promise<StepAttempt[]> {
+  return invoke("list_step_attempts_v2", { runId });
+}
+
+export async function listArtifactsV2(runId: string): Promise<ArtifactRecordV2[]> {
+  return invoke("list_artifacts_v2", { runId });
+}
+
+export async function getEnvironmentLockV2(runId: string): Promise<EnvironmentLock | null> {
+  return invoke("get_environment_lock_v2", { runId });
 }

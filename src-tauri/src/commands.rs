@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -16,18 +16,24 @@ use omicsops_adapters::{
     ssh::{SshAuthentication, SshSession},
 };
 use omicsops_core::{
+    audit::{RunEventKindV2, RunEventV2},
     domain::{
         AnalysisPlan, Artifact, ArtifactKind, AuthenticationMethod, ConnectionProfile, ProjectSpec,
         RunCheckpoint, RunEvent, RunState,
     },
+    plan_v2::{
+        AnalysisPlanV2, ApprovedPlan, ArtifactRecordV2, EnvironmentLock, PlanEnvironment,
+        PlanningRequest, PlanningTurn, PolicyEnvelope, RepairProposalV2, RunCheckpointV2,
+        RunStateV2, StepAttempt, StepSpecV2, action_hash, canonical_plan_hash, topological_steps,
+    },
     project::{RemoteProjectLayout, require_remote_descendant, shell_quote},
+    redaction::redact_secrets,
+    tools::{ToolCatalog, ToolSummary, builtin_tool_catalog},
+    validation::{PlanValidation, assess_repair, validate_plan_v2},
 };
 use omicsops_runner::{
-    AutonomousRunner, LlmRepairPlanner, SshRemoteExecutor, StepOutcome, generate_analysis_plan,
-    scrna::{
-        PBMC_DOWNLOAD_SCRIPT, PBMC_ENVIRONMENT_YAML, PBMC_REPORT_SCRIPT, PBMC_SCANPY_SCRIPT,
-        SEURAT_CONVERTER_R,
-    },
+    AutonomousRunner, LlmRepairPlanner, SshRemoteExecutor, SshV2Executor, StepOutcome,
+    generate_analysis_plan,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
@@ -189,28 +195,6 @@ pub async fn initialize_project(
         .execute_checked(&layout.initialization_command())
         .await
         .map_err(|error| error.to_string())?;
-    let uploads = [
-        ("scripts/download_pbmc.sh", PBMC_DOWNLOAD_SCRIPT),
-        ("scripts/analyze_pbmc.py", PBMC_SCANPY_SCRIPT),
-        ("scripts/convert_h5ad_to_seurat.R", SEURAT_CONVERTER_R),
-        ("scripts/render_report.py", PBMC_REPORT_SCRIPT),
-        (".omicsops/environment.yml", PBMC_ENVIRONMENT_YAML),
-    ];
-    for (relative, contents) in uploads {
-        session
-            .upload_text(&format!("{}/{}", project.remote_root, relative), contents)
-            .await
-            .map_err(|error| error.to_string())?;
-    }
-    session
-        .execute_checked(&format!(
-            "chmod 700 {}/scripts/*.sh {}/scripts/*.py {}/scripts/*.R",
-            shell_quote(&project.remote_root),
-            shell_quote(&project.remote_root),
-            shell_quote(&project.remote_root)
-        ))
-        .await
-        .map_err(|error| error.to_string())?;
     state
         .repository
         .put_json("project", &project.id.to_string(), &project)
@@ -260,6 +244,340 @@ pub async fn probe_llm(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn list_tools() -> Result<Vec<ToolSummary>, String> {
+    builtin_tool_catalog()
+        .map(|catalog| catalog.summaries())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn planning_turn(
+    state: State<'_, AppState>,
+    request: PlanningRequest,
+) -> Result<PlanningTurn, String> {
+    let catalog = builtin_tool_catalog().map_err(|error| error.to_string())?;
+    let metadata = serde_json::json!({
+        "goal": request.goal,
+        "environment_summary": request.environment_summary,
+        "answers": request.answers,
+        "tools": catalog.summaries(),
+    });
+    let prompt = redact_secrets(&metadata.to_string(), &[] as &[&str]);
+    llm_client(&state)?.call_tool(
+        "Plan a bioinformatics workflow using only the supplied versioned tools. Ask concise clarification questions when inputs, design, organism, reference, or outputs are ambiguous. Never request or reproduce FASTQ reads, matrix rows, result-table rows, credentials, or other analysis data.",
+        &prompt,
+        "submit_planning_turn",
+    ).await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn validate_plan(plan: AnalysisPlanV2) -> Result<PlanValidation, String> {
+    let catalog = builtin_tool_catalog().map_err(|error| error.to_string())?;
+    Ok(validate_plan_v2(&plan, &catalog))
+}
+
+#[tauri::command]
+pub fn approve_plan(
+    state: State<'_, AppState>,
+    mut plan: AnalysisPlanV2,
+    envelope: PolicyEnvelope,
+) -> Result<ApprovedPlan, String> {
+    plan.policy = envelope.clone();
+    let catalog = builtin_tool_catalog().map_err(|error| error.to_string())?;
+    let validation = validate_plan_v2(&plan, &catalog);
+    if !validation.valid {
+        return Err(serde_json::to_string(&validation).map_err(|error| error.to_string())?);
+    }
+    let approved = ApprovedPlan {
+        id: Uuid::new_v4(),
+        plan_id: plan.id,
+        plan_hash: canonical_plan_hash(&plan).map_err(|error| error.to_string())?,
+        policy: envelope,
+        approved_at: Utc::now(),
+    };
+    state
+        .repository
+        .put_json("analysis_plan_v2", &plan.id.to_string(), &plan)
+        .map_err(|error| error.to_string())?;
+    state
+        .repository
+        .save_approved_plan(&approved)
+        .map_err(|error| error.to_string())?;
+    Ok(approved)
+}
+
+#[tauri::command]
+pub async fn start_run(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    profile_id: Uuid,
+    project_id: Uuid,
+    approved_plan_id: Uuid,
+) -> Result<Uuid, String> {
+    let approved = state
+        .repository
+        .get_approved_plan(approved_plan_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "approved plan record does not exist".to_owned())?;
+    let plan: AnalysisPlanV2 = state
+        .repository
+        .get_json("analysis_plan_v2", &approved.plan_id.to_string())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "frozen approved plan does not exist".to_owned())?;
+    if canonical_plan_hash(&plan).map_err(|error| error.to_string())? != approved.plan_hash {
+        return Err("approved plan hash no longer matches the frozen plan".into());
+    }
+    let profile = find_profile(&state.repository, profile_id)?;
+    require_trusted_host(&profile)?;
+    let project: ProjectSpec = state
+        .repository
+        .get_json("project", &project_id.to_string())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project does not exist".to_owned())?;
+    let active = state
+        .repository
+        .list_json::<RunCheckpointV2>("run_checkpoint_v2")
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .any(|run| {
+            run.project_id == project_id
+                && matches!(
+                    run.state,
+                    RunStateV2::Preparing | RunStateV2::Running | RunStateV2::PausedForApproval
+                )
+        });
+    if active {
+        return Err("this project already has an active run".into());
+    }
+    let run_id = Uuid::new_v4();
+    let checkpoint = RunCheckpointV2::new(run_id, profile_id, project_id, approved_plan_id);
+    state
+        .repository
+        .put_json("run_checkpoint_v2", &run_id.to_string(), &checkpoint)
+        .map_err(|error| error.to_string())?;
+    let event = RunEventV2::new(
+        1,
+        run_id,
+        RunEventKindV2::RunStarted,
+        "approved run created",
+        None,
+        std::collections::BTreeMap::from([
+            ("plan_hash".into(), approved.plan_hash),
+            ("approved_plan_id".into(), approved_plan_id.to_string()),
+        ]),
+    )
+    .map_err(|error| error.to_string())?;
+    state
+        .repository
+        .append_audit_event(&event)
+        .map_err(|error| error.to_string())?;
+    let authentication = authentication_for_profile(&state, &profile)?;
+    let repair_llm = llm_client(&state)?;
+    spawn_v2_run(
+        app,
+        state.repository.clone(),
+        state.active_runs.clone(),
+        profile,
+        authentication,
+        project,
+        plan,
+        checkpoint,
+        false,
+        repair_llm,
+    )?;
+    Ok(run_id)
+}
+
+#[tauri::command]
+pub fn export_run_bundle(
+    state: State<'_, AppState>,
+    run_id: Uuid,
+    local_path: String,
+) -> Result<(), String> {
+    let checkpoint: RunCheckpointV2 = state
+        .repository
+        .get_json("run_checkpoint_v2", &run_id.to_string())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "run does not exist".to_owned())?;
+    let approved = state
+        .repository
+        .get_approved_plan(checkpoint.approved_plan_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "approved plan does not exist".to_owned())?;
+    let plan: AnalysisPlanV2 = state
+        .repository
+        .get_json("analysis_plan_v2", &approved.plan_id.to_string())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "frozen plan does not exist".to_owned())?;
+    let events = state
+        .repository
+        .audit_events_for_run(run_id)
+        .map_err(|error| error.to_string())?;
+    if events.iter().any(|event| !event.verify_hash())
+        || events
+            .windows(2)
+            .any(|pair| pair[1].prev_hash.as_deref() != Some(pair[0].event_hash.as_str()))
+    {
+        return Err("audit event hash chain is invalid".into());
+    }
+    let attempts = state
+        .repository
+        .step_attempts_for_run(run_id)
+        .map_err(|error| error.to_string())?;
+    let environment_lock = state
+        .repository
+        .environment_lock_for_run(run_id)
+        .map_err(|error| error.to_string())?;
+    let artifacts = state
+        .repository
+        .list_json::<ArtifactRecordV2>("artifact_v2")
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|artifact| artifact.run_id == run_id)
+        .collect::<Vec<_>>();
+    let tools = builtin_tool_catalog()
+        .map_err(|error| error.to_string())?
+        .manifests();
+    let bundle = serde_json::json!({
+        "schema_version": 2,
+        "exported_at": Utc::now(),
+        "checkpoint": checkpoint,
+        "approved_plan": approved,
+        "plan": plan,
+        "tool_manifests": tools,
+        "step_attempts": attempts,
+        "environment_lock": environment_lock,
+        "artifacts": artifacts,
+        "events": events,
+    });
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let file = options
+        .open(&local_path)
+        .map_err(|error| format!("cannot create run bundle: {error}"))?;
+    serde_json::to_writer_pretty(file, &bundle).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn list_runs_v2(state: State<'_, AppState>) -> Result<Vec<RunCheckpointV2>, String> {
+    state
+        .repository
+        .list_json("run_checkpoint_v2")
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn list_run_events_v2(
+    state: State<'_, AppState>,
+    run_id: Uuid,
+) -> Result<Vec<RunEventV2>, String> {
+    state
+        .repository
+        .audit_events_for_run(run_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn list_artifacts_v2(
+    state: State<'_, AppState>,
+    run_id: Uuid,
+) -> Result<Vec<ArtifactRecordV2>, String> {
+    Ok(state
+        .repository
+        .list_json::<ArtifactRecordV2>("artifact_v2")
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|artifact| artifact.run_id == run_id)
+        .collect())
+}
+
+#[tauri::command]
+pub fn list_step_attempts_v2(
+    state: State<'_, AppState>,
+    run_id: Uuid,
+) -> Result<Vec<StepAttempt>, String> {
+    state
+        .repository
+        .step_attempts_for_run(run_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn get_environment_lock_v2(
+    state: State<'_, AppState>,
+    run_id: Uuid,
+) -> Result<Option<EnvironmentLock>, String> {
+    state
+        .repository
+        .environment_lock_for_run(run_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn resume_run_v2(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    run_id: Uuid,
+) -> Result<(), String> {
+    let checkpoint: RunCheckpointV2 = state
+        .repository
+        .get_json("run_checkpoint_v2", &run_id.to_string())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "run does not exist".to_owned())?;
+    if checkpoint.state == RunStateV2::NeedsAttention {
+        return Err("run needs explicit attention and cannot be silently rerun".into());
+    }
+    if matches!(
+        checkpoint.state,
+        RunStateV2::Succeeded | RunStateV2::Canceled
+    ) {
+        return Err("run is already terminal".into());
+    }
+    let approved = state
+        .repository
+        .get_approved_plan(checkpoint.approved_plan_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "approval record is missing".to_owned())?;
+    let plan: AnalysisPlanV2 = state
+        .repository
+        .get_json("analysis_plan_v2", &approved.plan_id.to_string())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "frozen plan is missing".to_owned())?;
+    if canonical_plan_hash(&plan).map_err(|error| error.to_string())? != approved.plan_hash {
+        return Err("frozen plan hash mismatch".into());
+    }
+    let profile = find_profile(&state.repository, checkpoint.profile_id)?;
+    require_trusted_host(&profile)?;
+    let project: ProjectSpec = state
+        .repository
+        .get_json("project", &checkpoint.project_id.to_string())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project is missing".to_owned())?;
+    let authentication = authentication_for_profile(&state, &profile)?;
+    let repair_llm = llm_client(&state)?;
+    append_v2_event(
+        &app,
+        &state.repository,
+        run_id,
+        RunEventKindV2::RunResumed,
+        "recovery requested; remote state will be reconciled",
+        Default::default(),
+    );
+    spawn_v2_run(
+        app,
+        state.repository.clone(),
+        state.active_runs.clone(),
+        profile,
+        authentication,
+        project,
+        plan,
+        checkpoint,
+        true,
+        repair_llm,
+    )
+}
+
+#[tauri::command]
 pub async fn generate_plan(
     state: State<'_, AppState>,
     document_text: String,
@@ -273,7 +591,7 @@ pub async fn generate_plan(
 }
 
 #[tauri::command]
-pub fn approve_plan(
+pub fn approve_legacy_plan(
     state: State<'_, AppState>,
     mut plan: AnalysisPlan,
 ) -> Result<AnalysisPlan, String> {
@@ -286,7 +604,7 @@ pub fn approve_plan(
 }
 
 #[tauri::command]
-pub async fn start_run(
+pub async fn legacy_start_run(
     app: AppHandle,
     state: State<'_, AppState>,
     profile_id: Uuid,
@@ -417,11 +735,33 @@ pub fn cancel_run(app: AppHandle, state: State<'_, AppState>, run_id: Uuid) -> R
         return Ok(());
     }
 
-    let mut checkpoint: RunCheckpoint = state
+    let legacy: Option<RunCheckpoint> = state
         .repository
         .get_json("run_checkpoint", &run_id.to_string())
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("run {run_id} was not found"))?;
+        .map_err(|error| error.to_string())?;
+    let Some(mut checkpoint) = legacy else {
+        let mut checkpoint: RunCheckpointV2 = state
+            .repository
+            .get_json("run_checkpoint_v2", &run_id.to_string())
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("run {run_id} was not found"))?;
+        if !matches!(
+            checkpoint.state,
+            RunStateV2::Succeeded | RunStateV2::Canceled
+        ) {
+            checkpoint.state = RunStateV2::Canceled;
+            persist_v2_checkpoint(&state.repository, &checkpoint);
+            append_v2_event(
+                &app,
+                &state.repository,
+                run_id,
+                RunEventKindV2::RunCanceled,
+                "run canceled while no remote step was active",
+                Default::default(),
+            );
+        }
+        return Ok(());
+    };
     if matches!(checkpoint.state, RunState::Succeeded | RunState::Canceled) {
         return Ok(());
     }
@@ -480,6 +820,470 @@ fn load_run_context(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "the run analysis plan could not be recovered".to_string())?;
     Ok((checkpoint, profile, project, plan))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_v2_run(
+    app: AppHandle,
+    repository: Repository,
+    active_runs: Arc<Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
+    profile: ConnectionProfile,
+    authentication: SshAuthentication,
+    project: ProjectSpec,
+    plan: AnalysisPlanV2,
+    checkpoint: RunCheckpointV2,
+    recovering: bool,
+    repair_llm: OpenAiCompatibleClient,
+) -> Result<(), String> {
+    let run_id = checkpoint.run_id;
+    let cancel_requested = Arc::new(AtomicBool::new(false));
+    {
+        let mut active = active_runs
+            .lock()
+            .map_err(|_| "active run registry is unavailable".to_owned())?;
+        if active.insert(run_id, cancel_requested.clone()).is_some() {
+            return Err(format!("run {run_id} is already active"));
+        }
+    }
+    tauri::async_runtime::spawn(async move {
+        execute_v2_run(
+            app,
+            repository,
+            profile,
+            authentication,
+            project,
+            plan,
+            checkpoint,
+            cancel_requested,
+            recovering,
+            repair_llm,
+        )
+        .await;
+        if let Ok(mut active) = active_runs.lock() {
+            active.remove(&run_id);
+        }
+    });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_v2_run(
+    app: AppHandle,
+    repository: Repository,
+    profile: ConnectionProfile,
+    authentication: SshAuthentication,
+    project: ProjectSpec,
+    plan: AnalysisPlanV2,
+    mut checkpoint: RunCheckpointV2,
+    cancel_requested: Arc<AtomicBool>,
+    mut recovering: bool,
+    repair_llm: OpenAiCompatibleClient,
+) {
+    let session = match SshSession::connect(&profile, authentication).await {
+        Ok(session) => Arc::new(session),
+        Err(error) => {
+            checkpoint.needs_attention(format!("SSH connection failed: {error}"));
+            persist_v2_checkpoint(&repository, &checkpoint);
+            append_v2_event(
+                &app,
+                &repository,
+                checkpoint.run_id,
+                RunEventKindV2::NeedsAttention,
+                "SSH connection failed",
+                Default::default(),
+            );
+            return;
+        }
+    };
+    checkpoint.state = RunStateV2::Running;
+    persist_v2_checkpoint(&repository, &checkpoint);
+    let catalog = match builtin_tool_catalog() {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            checkpoint.needs_attention(error.to_string());
+            persist_v2_checkpoint(&repository, &checkpoint);
+            return;
+        }
+    };
+    let executor = SshV2Executor::new(
+        session.clone(),
+        &project.remote_root,
+        catalog.clone(),
+        cancel_requested.clone(),
+    );
+    let steps = match topological_steps(&plan) {
+        Ok(steps) => steps,
+        Err(error) => {
+            checkpoint.needs_attention(error.to_string());
+            persist_v2_checkpoint(&repository, &checkpoint);
+            return;
+        }
+    };
+    for step in steps {
+        if checkpoint.completed_steps.contains(&step.id) {
+            let Some(expected_hash) = checkpoint.action_hashes.get(&step.id) else {
+                checkpoint.needs_attention(format!(
+                    "checkpoint is missing the action hash for {}",
+                    step.id
+                ));
+                persist_v2_checkpoint(&repository, &checkpoint);
+                return;
+            };
+            let completed_attempt = repository
+                .step_attempts_for_run(checkpoint.run_id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|attempt| {
+                    attempt.step_id == step.id && attempt.action_hash == *expected_hash
+                })
+                .map(|attempt| attempt.attempt)
+                .max()
+                .unwrap_or(0);
+            if let Err(reason) = executor
+                .verify_completed(step, completed_attempt, expected_hash)
+                .await
+            {
+                checkpoint.needs_attention(reason.clone());
+                persist_v2_checkpoint(&repository, &checkpoint);
+                append_v2_event(
+                    &app,
+                    &repository,
+                    checkpoint.run_id,
+                    RunEventKindV2::NeedsAttention,
+                    &reason,
+                    std::collections::BTreeMap::from([("step_id".into(), step.id.clone())]),
+                );
+                return;
+            }
+            continue;
+        }
+        if cancel_requested.load(Ordering::SeqCst) {
+            checkpoint.state = RunStateV2::Canceled;
+            persist_v2_checkpoint(&repository, &checkpoint);
+            append_v2_event(
+                &app,
+                &repository,
+                checkpoint.run_id,
+                RunEventKindV2::RunCanceled,
+                "run canceled",
+                Default::default(),
+            );
+            return;
+        }
+        let (executed_step, hash) = match execute_v2_step_with_repairs(
+            &app,
+            &repository,
+            &executor,
+            &repair_llm,
+            &plan,
+            &catalog,
+            checkpoint.run_id,
+            step,
+            &project.remote_root,
+            recovering,
+        )
+        .await
+        {
+            Ok(success) => success,
+            Err(reason) => {
+                checkpoint.needs_attention(reason.clone());
+                persist_v2_checkpoint(&repository, &checkpoint);
+                append_v2_event(
+                    &app,
+                    &repository,
+                    checkpoint.run_id,
+                    RunEventKindV2::NeedsAttention,
+                    &reason,
+                    std::collections::BTreeMap::from([("step_id".into(), step.id.clone())]),
+                );
+                return;
+            }
+        };
+        recovering = false;
+        for relative_path in &executed_step.expected_artifacts {
+            let (size_bytes, sha256) = match executor.artifact_metadata(relative_path).await {
+                Ok(metadata) => metadata,
+                Err(reason) => {
+                    checkpoint.needs_attention(format!(
+                        "artifact metadata failed for {relative_path}: {reason}"
+                    ));
+                    persist_v2_checkpoint(&repository, &checkpoint);
+                    return;
+                }
+            };
+            let artifact = ArtifactRecordV2 {
+                run_id: checkpoint.run_id,
+                source_step_id: executed_step.id.clone(),
+                remote_path: format!(
+                    "{}/{}",
+                    project.remote_root.trim_end_matches('/'),
+                    relative_path.trim_start_matches('/')
+                ),
+                size_bytes,
+                sha256,
+                verified: true,
+            };
+            let artifact_id = format!("{}:{}", checkpoint.run_id, relative_path);
+            let _ = repository.put_json("artifact_v2", &artifact_id, &artifact);
+        }
+        checkpoint.mark_verified(&executed_step.id, hash);
+        persist_v2_checkpoint(&repository, &checkpoint);
+        append_v2_event(
+            &app,
+            &repository,
+            checkpoint.run_id,
+            RunEventKindV2::StepSucceeded,
+            "all verifications passed",
+            std::collections::BTreeMap::from([("step_id".into(), executed_step.id.clone())]),
+        );
+    }
+    let lock_path = format!(
+        "{}/.omicsops/environment.lock",
+        project.remote_root.trim_end_matches('/')
+    );
+    let lock_tmp = format!("{lock_path}.tmp");
+    let lock_output = session.execute_checked(&format!(
+        "micromamba list --explicit > {tmp} && mv {tmp} {lock} && stat -c '%s' {lock} && sha256sum {lock}",
+        tmp = shell_quote(&lock_tmp), lock = shell_quote(&lock_path),
+    )).await;
+    let lock_output = match lock_output {
+        Ok(output) => output,
+        Err(error) => {
+            checkpoint.needs_attention(format!("environment lock capture failed: {error}"));
+            persist_v2_checkpoint(&repository, &checkpoint);
+            append_v2_event(
+                &app,
+                &repository,
+                checkpoint.run_id,
+                RunEventKindV2::NeedsAttention,
+                "environment lock capture failed",
+                Default::default(),
+            );
+            return;
+        }
+    };
+    let declared_dependencies = match &plan.environment {
+        PlanEnvironment::Micromamba { dependencies, .. } => dependencies.clone(),
+    };
+    let mut lock_lines = lock_output.stdout.lines();
+    let lock_size = lock_lines
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    let lock_sha = lock_lines
+        .next()
+        .and_then(|value| value.split_whitespace().next())
+        .unwrap_or_default()
+        .to_owned();
+    let lock = EnvironmentLock {
+        run_id: checkpoint.run_id,
+        backend: "micromamba".into(),
+        remote_path: lock_path.clone(),
+        sha256: lock_sha.clone(),
+        declared_dependencies,
+    };
+    let _ = repository.save_environment_lock(&lock);
+    let lock_artifact = ArtifactRecordV2 {
+        run_id: checkpoint.run_id,
+        source_step_id: "environment-lock".into(),
+        remote_path: lock_path,
+        size_bytes: lock_size,
+        sha256: lock_sha,
+        verified: true,
+    };
+    let _ = repository.put_json(
+        "artifact_v2",
+        &format!("{}:environment-lock", checkpoint.run_id),
+        &lock_artifact,
+    );
+    checkpoint.state = RunStateV2::Succeeded;
+    persist_v2_checkpoint(&repository, &checkpoint);
+    append_v2_event(
+        &app,
+        &repository,
+        checkpoint.run_id,
+        RunEventKindV2::RunSucceeded,
+        "all steps verified",
+        Default::default(),
+    );
+    drop(executor);
+    if let Ok(session) = Arc::try_unwrap(session) {
+        let _ = session.disconnect().await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_v2_step_with_repairs(
+    app: &AppHandle,
+    repository: &Repository,
+    executor: &SshV2Executor,
+    repair_llm: &OpenAiCompatibleClient,
+    plan: &AnalysisPlanV2,
+    catalog: &ToolCatalog,
+    run_id: Uuid,
+    approved_step: &StepSpecV2,
+    project_root: &str,
+    recovering: bool,
+) -> Result<(StepSpecV2, String), String> {
+    let mut current = approved_step.clone();
+    let mut action_hashes = HashSet::new();
+    let mut strategies = HashSet::new();
+    for attempt_number in 0_u8..=3 {
+        let hash = action_hash(&current.action).map_err(|error| error.to_string())?;
+        if !action_hashes.insert(hash.clone()) {
+            return Err("repair repeated an already attempted action".into());
+        }
+        append_v2_event(
+            app,
+            repository,
+            run_id,
+            RunEventKindV2::StepStarted,
+            &current.title,
+            std::collections::BTreeMap::from([
+                ("step_id".into(), current.id.clone()),
+                ("attempt".into(), attempt_number.to_string()),
+                ("action_hash".into(), hash.clone()),
+            ]),
+        );
+        let started_at = Utc::now();
+        let result = if recovering && attempt_number == 0 {
+            executor.recover(&current, attempt_number, &hash).await
+        } else {
+            executor.execute(&current, attempt_number).await
+        }
+        .map_err(|error| redact_secrets(&error, &[] as &[&str]))?;
+        let attempt = StepAttempt {
+            run_id,
+            step_id: current.id.clone(),
+            attempt: attempt_number,
+            action_hash: hash.clone(),
+            process_group_id: result.process_group_id,
+            started_at,
+            finished_at: Some(Utc::now()),
+            exit_code: Some(result.exit_status),
+            log_path: format!("{project_root}/logs/{}.{attempt_number}.log", current.id),
+            manifest_path: format!(
+                "{project_root}/.omicsops/state/{}.{attempt_number}.manifest.json",
+                current.id
+            ),
+            verifications: result
+                .verifications
+                .into_iter()
+                .map(|mut verification| {
+                    verification.observed = redact_secrets(&verification.observed, &[] as &[&str]);
+                    verification
+                })
+                .collect(),
+        };
+        repository
+            .save_step_attempt(&attempt)
+            .map_err(|error| error.to_string())?;
+        let passed = attempt.exit_code == Some(0)
+            && attempt
+                .verifications
+                .iter()
+                .all(|verification| verification.passed);
+        if passed {
+            return Ok((current, hash));
+        }
+        append_v2_event(
+            app,
+            repository,
+            run_id,
+            RunEventKindV2::VerificationFailed,
+            "step did not pass all verifications",
+            std::collections::BTreeMap::from([
+                ("step_id".into(), current.id.clone()),
+                ("attempt".into(), attempt_number.to_string()),
+            ]),
+        );
+        if attempt_number == 3 {
+            return Err("three distinct repair strategies were exhausted".into());
+        }
+        let error_tail = attempt
+            .verifications
+            .iter()
+            .filter(|verification| !verification.passed)
+            .map(|verification| verification.observed.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt = serde_json::json!({
+            "tool_action": current.action,
+            "resources": current.resources,
+            "exit_code": attempt.exit_code,
+            "redacted_error_tail": error_tail.chars().rev().take(4000).collect::<String>().chars().rev().collect::<String>(),
+            "previous_strategies": strategies,
+            "allowed_tools": plan.policy.allowed_tools,
+            "allowed_domains": plan.policy.allowed_domains,
+        });
+        let proposal: RepairProposalV2 = repair_llm.call_tool(
+            "Diagnose this failed bioinformatics tool action. Propose one distinct replacement action. Do not change output paths, verifications, risk, resources, tools, versions, or domains beyond the supplied approval envelope. Return metadata and the redacted error context only.",
+            &redact_secrets(&prompt.to_string(), &[] as &[&str]),
+            "submit_v2_repair",
+        ).await.map_err(|error| error.to_string())?;
+        if !strategies.insert(proposal.strategy.clone()) {
+            return Err("repair repeated an already attempted strategy".into());
+        }
+        let mut proposed = current.clone();
+        proposed.action = proposal.replacement_action;
+        proposed.rationale = format!("{} Repair: {}", proposed.rationale, proposal.diagnosis);
+        let assessment = assess_repair(plan, approved_step, &proposed, catalog);
+        if !assessment.within_envelope {
+            append_v2_event(
+                app,
+                repository,
+                run_id,
+                RunEventKindV2::ApprovalRequired,
+                "repair exceeds the approved policy envelope",
+                std::collections::BTreeMap::from([
+                    ("step_id".into(), current.id.clone()),
+                    (
+                        "diffs".into(),
+                        serde_json::to_string(&assessment.diffs).unwrap_or_default(),
+                    ),
+                    (
+                        "validation".into(),
+                        serde_json::to_string(&assessment.validation).unwrap_or_default(),
+                    ),
+                ]),
+            );
+            return Err("repair exceeds the approved policy envelope and requires approval".into());
+        }
+        current = proposed;
+    }
+    Err("repair loop ended unexpectedly".into())
+}
+
+fn persist_v2_checkpoint(repository: &Repository, checkpoint: &RunCheckpointV2) {
+    let _ = repository.put_json(
+        "run_checkpoint_v2",
+        &checkpoint.run_id.to_string(),
+        checkpoint,
+    );
+}
+
+fn append_v2_event(
+    app: &AppHandle,
+    repository: &Repository,
+    run_id: Uuid,
+    kind: RunEventKindV2,
+    message: &str,
+    details: std::collections::BTreeMap<String, String>,
+) {
+    let existing = repository.audit_events_for_run(run_id).unwrap_or_default();
+    let event = RunEventV2::new(
+        existing.last().map_or(1, |event| event.sequence + 1),
+        run_id,
+        kind,
+        message,
+        existing.last().map(|event| event.event_hash.clone()),
+        details,
+    );
+    if let Ok(event) = event {
+        if repository.append_audit_event(&event).is_ok() {
+            let _ = app.emit("run-event-v2", event);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

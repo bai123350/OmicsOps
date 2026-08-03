@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "name": "nf-core rnaseq WT versus RAP1-AID 30 minute induction",
+  "dataset": {
+    "repository": "nf-core/test-datasets",
+    "branch": "rnaseq",
+    "commit": "72a702d346833d5523bc40d032323ea548603b00",
+    "base_url": "https://raw.githubusercontent.com/nf-core/test-datasets/72a702d346833d5523bc40d032323ea548603b00/testdata/GSE110004"
+  },
+  "samples": [
+    { "accession": "SRR6357070", "condition": "WT", "replicate": 1, "paired": true },
+    { "accession": "SRR6357071", "condition": "WT", "replicate": 2, "paired": true },
+    { "accession": "SRR6357072", "condition": "WT", "replicate": 3, "paired": true },
+    { "accession": "SRR6357076", "condition": "RAP1_IAA_30M", "replicate": 1, "paired": true },
+    { "accession": "SRR6357077", "condition": "RAP1_IAA_30M", "replicate": 2, "paired": true },
+    { "accession": "SRR6357078", "condition": "RAP1_IAA_30M", "replicate": 3, "paired": true }
+  ],
+  "workflow": ["core.download", "bio.fastqc", "bio.multiqc", "bio.salmon", "bio.deseq2", "report.html"],
+  "required_outputs": [
+    "results/counts.tsv",
+    "results/differential-expression.tsv",
+    "results/pca.png",
+    "results/volcano.png",
+    "results/report.html",
+    ".omicsops/environment.lock"
+  ]
+}

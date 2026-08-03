@@ -188,7 +188,7 @@ fn remote_script_persists_pid_exit_status_and_log_contract() {
 
     assert!(script.contains("python qc.py"));
     assert!(script.contains(".omicsops/state/qc.2.exit"));
-    assert!(script.contains(".omicsops/state/qc.2.pid"));
+    assert!(script.contains(".omicsops/state/qc.2.pgid"));
     assert!(script.contains("logs/qc.2.log"));
     assert!(script.contains("mv"));
 }
@@ -200,10 +200,10 @@ fn cancellation_targets_only_the_recorded_step_process() {
 
     assert_eq!(
         soft,
-        "test -f '/srv/omicsops/pbmc/.omicsops/state/qc.2.pid' && kill -TERM -- \"$(cat '/srv/omicsops/pbmc/.omicsops/state/qc.2.pid')\" 2>/dev/null || true"
+        "test -f '/srv/omicsops/pbmc/.omicsops/state/qc.2.pgid' && kill -TERM -- -\"$(cat '/srv/omicsops/pbmc/.omicsops/state/qc.2.pgid')\" 2>/dev/null || true"
     );
     assert_eq!(
         force,
-        "test -f '/srv/omicsops/pbmc/.omicsops/state/qc.2.pid' && kill -KILL -- \"$(cat '/srv/omicsops/pbmc/.omicsops/state/qc.2.pid')\" 2>/dev/null || true"
+        "test -f '/srv/omicsops/pbmc/.omicsops/state/qc.2.pgid' && kill -KILL -- -\"$(cat '/srv/omicsops/pbmc/.omicsops/state/qc.2.pgid')\" 2>/dev/null || true"
     );
 }

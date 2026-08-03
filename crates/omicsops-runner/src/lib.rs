@@ -13,12 +13,19 @@ use omicsops_core::{
     domain::{AnalysisPlan, CompletionConditionKind, RepairDecision, StepSpec},
     policy::{CommandPolicy, PolicyDecision},
     project::shell_quote,
+    redaction::redact_secrets,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub mod scrna;
+mod v2;
+
+pub use v2::{
+    ExecutionResultV2, SshV2Executor, compile_step_action, reconcile_manifest,
+    render_remote_step_script_v2, render_verification_command,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionResult {
@@ -259,8 +266,8 @@ pub fn render_remote_step_script(root: &str, step: &StepSpec, attempt: u8) -> St
          printf '%s\\n' \"$status\" > {exit_tmp}\n\
          mv {exit_tmp} {exit}\n\
          exit \"$status\"\n",
-        pid_tmp = shell_quote(&format!("{state_prefix}.pid.tmp")),
-        pid = shell_quote(&format!("{state_prefix}.pid")),
+        pid_tmp = shell_quote(&format!("{state_prefix}.pgid.tmp")),
+        pid = shell_quote(&format!("{state_prefix}.pgid")),
         working = shell_quote(&working),
         command = step.command,
         log = shell_quote(&log),
@@ -273,7 +280,7 @@ pub fn render_start_command(root: &str, step_id: &str, attempt: u8) -> String {
     let root = root.trim_end_matches('/');
     let id = safe_identifier(step_id);
     format!(
-        "nohup bash {} >/dev/null 2>&1 < /dev/null &",
+        "nohup setsid bash {} >/dev/null 2>&1 < /dev/null &",
         shell_quote(&format!("{root}/scripts/{id}.{attempt}.sh"))
     )
 }
@@ -287,16 +294,16 @@ pub fn render_status_command(root: &str, step_id: &str, attempt: u8) -> String {
          elif test -f {pid} && kill -0 \"$(cat {pid})\" 2>/dev/null; then printf RUNNING; \
          else printf LOST; fi",
         exit = shell_quote(&format!("{prefix}.exit")),
-        pid = shell_quote(&format!("{prefix}.pid")),
+        pid = shell_quote(&format!("{prefix}.pgid")),
     )
 }
 
 pub fn render_cancel_command(root: &str, step_id: &str, attempt: u8, force: bool) -> String {
     let root = root.trim_end_matches('/');
     let id = safe_identifier(step_id);
-    let pid = shell_quote(&format!("{root}/.omicsops/state/{id}.{attempt}.pid"));
+    let pgid = shell_quote(&format!("{root}/.omicsops/state/{id}.{attempt}.pgid"));
     let signal = if force { "KILL" } else { "TERM" };
-    format!("test -f {pid} && kill -{signal} -- \"$(cat {pid})\" 2>/dev/null || true")
+    format!("test -f {pgid} && kill -{signal} -- -\"$(cat {pgid})\" 2>/dev/null || true")
 }
 
 fn safe_identifier(value: &str) -> String {
@@ -455,6 +462,7 @@ impl LlmRepairPlanner {
 impl RepairPlanner for LlmRepairPlanner {
     async fn propose_repair(&self, failure: &FailureContext) -> Result<RepairDecision, String> {
         let context = serde_json::to_string_pretty(failure).map_err(|error| error.to_string())?;
+        let context = redact_secrets(&context, &[] as &[&str]);
         self.client
             .call_tool(
                 "Diagnose the failed bioinformatics step. Return one distinct, project-local repair. Never use sudo or access paths outside the project.",
