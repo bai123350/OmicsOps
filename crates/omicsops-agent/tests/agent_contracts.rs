@@ -1,5 +1,6 @@
 use omicsops_agent::{
-    AgentEvent, ApprovalDecision, ApprovalGate, Capability, SpecialistDispatcher, ToolRegistry,
+    AgentEvent, ApprovalDecision, ApprovalGate, Capability, ModelStreamEvent, SpecialistDispatcher,
+    ToolArgumentBuffer, ToolRegistry,
 };
 use uuid::Uuid;
 
@@ -21,6 +22,33 @@ fn every_mutating_or_remote_capability_requires_explicit_approval() {
     assert_eq!(
         gate.decision(Capability::QueryResearchSource),
         ApprovalDecision::Required
+    );
+}
+
+#[test]
+fn provider_neutral_tool_arguments_are_assembled_and_name_checked() {
+    let mut buffer = ToolArgumentBuffer::new("submit_plan");
+    buffer
+        .push(ModelStreamEvent::ToolArgumentsDelta {
+            name: "submit_plan".into(),
+            json_fragment: "{\"schema_".into(),
+        })
+        .unwrap();
+    buffer
+        .push(ModelStreamEvent::ToolArgumentsDelta {
+            name: "".into(),
+            json_fragment: "version\":2}".into(),
+        })
+        .unwrap();
+    assert_eq!(buffer.finish().unwrap()["schema_version"], 2);
+    let mut wrong = ToolArgumentBuffer::new("submit_plan");
+    assert!(
+        wrong
+            .push(ModelStreamEvent::ToolArgumentsDelta {
+                name: "other".into(),
+                json_fragment: "{}".into()
+            })
+            .is_err()
     );
 }
 

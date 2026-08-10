@@ -25,6 +25,9 @@ import type {
   WorkspaceProject,
   WorkspaceTemplate,
   WorkspaceMessage,
+  ModelProfile,
+  AgentEvent,
+  PlanProposal,
 } from "./types";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
@@ -66,6 +69,38 @@ export async function listMessages(conversationId: string): Promise<WorkspaceMes
 export async function submitMessage(request: { project_id: string; conversation_id: string; markdown: string; sequence: number }): Promise<WorkspaceMessage> {
   if (!isTauri()) return { id: crypto.randomUUID(), ...request, role: "user", created_at: new Date().toISOString() };
   return invoke("submit_message", { request });
+}
+
+export async function listModelProfiles(): Promise<ModelProfile[]> {
+  return isTauri() ? invoke("list_model_profiles") : [];
+}
+
+export async function saveModelProfile(request: { id?: string; label: string; provider: ModelProfile["provider"]; base_url: string; model: string; credential?: string }): Promise<ModelProfile> {
+  if (!isTauri()) return { id: request.id ?? crypto.randomUUID(), label: request.label, provider: request.provider, base_url: request.base_url, model: request.model, credential_reference: request.provider === "ollama" ? null : "model/demo", supports_tools: true, supports_vision: false };
+  return invoke("save_model_profile", { request });
+}
+
+export async function probeModelProfile(profileId: string): Promise<void> {
+  if (isTauri()) await invoke("probe_model_profile", { profileId });
+}
+
+export async function runAgentTurn(request: { project_id: string; conversation_id: string; model_profile_id: string; markdown: string; message_sequence: number }): Promise<string> {
+  if (!isTauri()) return crypto.randomUUID();
+  return invoke("run_agent_turn", { request });
+}
+
+export async function proposeAnalysisPlan(request: { project_id: string; model_profile_id: string; goal: string; environment_summary: string }): Promise<PlanProposal> {
+  return invoke("propose_analysis_plan", { request });
+}
+
+export async function onAgentEvent(callback: (event: AgentEvent) => void): Promise<UnlistenFn> {
+  if (!isTauri()) return () => undefined;
+  return listen<AgentEvent>("agent-event", ({ payload }) => callback(payload));
+}
+
+export async function onConversationEvent(callback: (event: { project_id: string; conversation_id: string; message: WorkspaceMessage }) => void): Promise<UnlistenFn> {
+  if (!isTauri()) return () => undefined;
+  return listen("conversation-event", ({ payload }) => callback(payload as { project_id: string; conversation_id: string; message: WorkspaceMessage }));
 }
 
 export async function choosePlan(): Promise<string | null> {

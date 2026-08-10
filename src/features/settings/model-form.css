@@ -1,0 +1,13 @@
+.model-form { margin-top: 14px; padding: 14px; border: 1px solid #cfd8ee; border-radius: 10px; background: #f8faff; }
+.model-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.model-form label { color: #475467; font-size: 10px; font-weight: 600; }
+.model-form label.wide { grid-column: 1 / -1; }
+.model-form input { box-sizing: border-box; display: block; width: 100%; margin-top: 5px; padding: 8px 9px; border: 1px solid #cfd6df; border-radius: 7px; background: white; color: #172033; }
+.model-form-actions { display: flex; justify-content: flex-end; gap: 7px; margin-top: 12px; }
+.model-form-actions button,.configured-models button { border: 1px solid #cfd6df; border-radius: 7px; padding: 6px 10px; background: white; }
+.model-form-actions button.primary { border-color: #315bd4; background: #315bd4; color: white; }
+.configured-models { margin-top: 14px; display: grid; gap: 7px; }
+.configured-models > div { display: flex; align-items: center; gap: 8px; padding: 9px 11px; border: 1px solid #e4e7ec; border-radius: 8px; }
+.configured-models span { flex: 1; }
+.configured-models b,.configured-models small { display: block; }
+.configured-models small { margin-top: 2px; color: #667085; font-size: 9px; }

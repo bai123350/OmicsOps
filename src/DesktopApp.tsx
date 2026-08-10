@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import * as api from "./tauri-api";
-import type { WorkspaceConversation, WorkspaceProject, WorkspaceTemplate } from "./types";
+import type { AgentEvent, ModelProfile, PlanProposal, WorkspaceConversation, WorkspaceMessage, WorkspaceProject, WorkspaceTemplate } from "./types";
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
 import { WorkspaceShell } from "./features/workspace/WorkspaceShell";
 import type { Locale } from "./features/workspace/copy";
@@ -14,19 +14,55 @@ export default function DesktopApp() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [conversation, setConversation] = useState<WorkspaceConversation | null>(null);
   const [messageSequence, setMessageSequence] = useState(1);
+  const [messages, setMessages] = useState<WorkspaceMessage[]>([]);
+  const [streamingAssistant, setStreamingAssistant] = useState("");
+  const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>([]);
+  const [activeModelProfileId, setActiveModelProfileId] = useState<string | null>(null);
+  const [lastGoal, setLastGoal] = useState("");
+  const [planProposal, setPlanProposal] = useState<PlanProposal | null>(null);
+  const [planLoading, setPlanLoading] = useState(false);
+  const [planApproved, setPlanApproved] = useState(false);
+  const [approvedPlanId, setApprovedPlanId] = useState<string | null>(null);
+  const [runId, setRunId] = useState<string | null>(null);
 
-  useEffect(() => { api.listProjects().then((items) => { setProjects(items); setSelected(items[0] ?? null); }).finally(() => setLoading(false)); }, []);
+  useEffect(() => {
+    Promise.all([api.listProjects(), api.listModelProfiles()]).then(([items, profiles]) => {
+      setProjects(items); setSelected(items[0] ?? null);
+      setModelProfiles(profiles); setActiveModelProfileId(profiles[0]?.id ?? null);
+    }).finally(() => setLoading(false));
+  }, []);
   useEffect(() => {
     if (!selected) { setConversation(null); return; }
     api.listConversations(selected.id).then(async (items) => {
       const active = items[0] ?? await api.createConversation(selected.id, locale === "zh-CN" ? "QC 与聚类" : "QC and clustering");
       setConversation(active);
-      const messages = await api.listMessages(active.id);
-      setMessageSequence((messages.at(-1)?.sequence ?? 0) + 1);
+      const storedMessages = await api.listMessages(active.id);
+      setMessages(storedMessages);
+      setMessageSequence((storedMessages.at(-1)?.sequence ?? 0) + 1);
     });
   }, [selected?.id]);
+  useEffect(() => {
+    let disposed = false;
+    const unlisten: Array<() => void> = [];
+    api.onAgentEvent((event: AgentEvent) => {
+      if (event.conversation_id !== conversation?.id) return;
+      if (event.event.kind === "turn-started") setStreamingAssistant("");
+      if (event.event.kind === "text-delta") {
+        const delta = event.event.payload;
+        setStreamingAssistant((value) => value + delta);
+      }
+      if (event.event.kind === "turn-completed" || event.event.kind === "turn-failed") setStreamingAssistant("");
+    }).then((fn) => disposed ? fn() : unlisten.push(fn));
+    api.onConversationEvent((event) => {
+      if (event.conversation_id !== conversation?.id) return;
+      setMessages((current) => current.some((message) => message.id === event.message.id) ? current : [...current, event.message]);
+      setMessageSequence((value) => Math.max(value, event.message.sequence + 1));
+    }).then((fn) => disposed ? fn() : unlisten.push(fn));
+    return () => { disposed = true; unlisten.forEach((fn) => fn()); };
+  }, [conversation?.id]);
   if (loading) return <div className="desktop-loading">OmicsOps</div>;
-  const settings = settingsOpen ? <SettingsPanel locale={locale} onClose={() => setSettingsOpen(false)} /> : null;
+  const settings = settingsOpen ? <SettingsPanel locale={locale} onClose={() => setSettingsOpen(false)} modelProfiles={modelProfiles} onSaveModel={async (request) => { const profile = await api.saveModelProfile(request); setModelProfiles((current) => [profile, ...current.filter((item) => item.id !== profile.id)]); setActiveModelProfileId(profile.id); }} onProbeModel={api.probeModelProfile} /> : null;
   if (!selected) return <><ProjectLibrary projects={projects} locale={locale} onLocaleChange={setLocale} onSettings={() => setSettingsOpen(true)} onOpen={setSelected} onCreate={async (template: WorkspaceTemplate, name: string) => { const localRoot = await api.chooseProjectDirectory(); if (!localRoot) return; const project = await api.createProject({ name, description: "", local_root: localRoot, template }); setProjects((current) => [project, ...current]); setSelected(project); }} />{settings}</>;
-  return <><WorkspaceShell project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template }} locale={locale} onLocaleChange={setLocale} onOpenSettings={() => setSettingsOpen(true)} onSend={async (markdown) => { if (!conversation) return; await api.submitMessage({ project_id: selected.id, conversation_id: conversation.id, markdown, sequence: messageSequence }); setMessageSequence((value) => value + 1); }} />{settings}</>;
+  const activeModel = modelProfiles.find((profile) => profile.id === activeModelProfileId) ?? null;
+  return <><WorkspaceShell project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template }} locale={locale} onLocaleChange={setLocale} onOpenSettings={() => setSettingsOpen(true)} messages={messages} streamingAssistant={streamingAssistant} modelLabel={activeModel?.label} planProposal={planProposal} planLoading={planLoading} planApproved={planApproved} canStartRun={Boolean(selected.connection_id && approvedPlanId)} runStarted={Boolean(runId)} onSend={async (markdown) => { if (!conversation || !activeModel) { setSettingsOpen(true); return false; } setLastGoal(markdown); setPlanProposal(null); setPlanApproved(false); setApprovedPlanId(null); setRunId(null); await api.runAgentTurn({ project_id: selected.id, conversation_id: conversation.id, model_profile_id: activeModel.id, markdown, message_sequence: messageSequence }); return true; }} onRequestPlan={async () => { if (!activeModel || !lastGoal) { if (!activeModel) setSettingsOpen(true); return; } setPlanLoading(true); try { setPlanProposal(await api.proposeAnalysisPlan({ project_id: selected.id, model_profile_id: activeModel.id, goal: lastGoal, environment_summary: selected.remote_root ? `Remote Linux project at ${selected.remote_root}` : "Remote Linux environment not inspected yet" })); } finally { setPlanLoading(false); } }} onApprovePlan={async () => { if (!planProposal) return; const approved = await api.approvePlanV2(planProposal.plan, planProposal.plan.policy); setApprovedPlanId(approved.id); setPlanApproved(true); }} onStartRun={async () => { if (!selected.connection_id || !approvedPlanId) return; setRunId(await api.startRunV2(selected.connection_id, selected.id, approvedPlanId)); }} />{settings}</>;
 }

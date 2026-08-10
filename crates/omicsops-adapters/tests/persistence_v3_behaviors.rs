@@ -2,8 +2,9 @@ use chrono::{TimeZone, Utc};
 use omicsops_adapters::persistence::Repository;
 use omicsops_agent::AgentEvent;
 use omicsops_core::workspace::{
-    Artifact, Conversation, Message, MessageRole, ModelProfile, ModelProviderKind, NotebookEntry,
-    NotebookEntryKind, Project, ProjectTemplate, SkillPackage, SyncDirection, SyncEntry, SyncState,
+    AgentTurn, Artifact, Conversation, Message, MessageRole, ModelProfile, ModelProviderKind,
+    NotebookEntry, NotebookEntryKind, Project, ProjectTemplate, SkillPackage, SyncDirection,
+    SyncEntry, SyncState, TurnStatus,
 };
 use uuid::Uuid;
 
@@ -192,4 +193,36 @@ fn project_research_records_round_trip_through_normalized_v3_tables() {
     );
     assert_eq!(repository.list_model_profiles().unwrap(), vec![model]);
     assert_eq!(repository.list_skill_packages().unwrap(), vec![skill]);
+}
+
+#[test]
+fn agent_turn_state_is_persisted_for_restart_recovery() {
+    let repository = Repository::open_in_memory().unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 8, 11, 0, 0, 0).unwrap();
+    let project = Project::new(
+        Uuid::new_v4(),
+        "PBMC",
+        "E:/PBMC",
+        ProjectTemplate::SingleCellRnaSeq,
+        now,
+    );
+    let conversation = Conversation::new(Uuid::new_v4(), project.id, "QC", now);
+    repository.save_project(&project).unwrap();
+    repository.save_conversation(&conversation).unwrap();
+    let turn = AgentTurn {
+        id: Uuid::new_v4(),
+        project_id: project.id,
+        conversation_id: conversation.id,
+        status: TurnStatus::Streaming,
+        model_profile_id: Uuid::new_v4(),
+        started_at: now,
+        finished_at: None,
+    };
+    repository.save_agent_turn(&turn).unwrap();
+    assert_eq!(
+        repository
+            .agent_turns_for_conversation(conversation.id)
+            .unwrap(),
+        vec![turn]
+    );
 }

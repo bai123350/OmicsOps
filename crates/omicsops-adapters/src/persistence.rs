@@ -6,8 +6,8 @@ use omicsops_core::{
     domain::{AnalysisPlan, ConnectionProfile, RunEvent},
     plan_v2::{ApprovedPlan, EnvironmentLock, StepAttempt, migrate_v1_plan},
     workspace::{
-        Artifact, Conversation, Message, ModelProfile, NotebookEntry, Project, SkillPackage,
-        SyncEntry,
+        AgentTurn, Artifact, Conversation, Message, ModelProfile, NotebookEntry, Project,
+        SkillPackage, SyncEntry,
     },
 };
 use rusqlite::{Connection, params};
@@ -184,6 +184,16 @@ impl Repository {
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
 
+    pub fn get_project(&self, id: Uuid) -> AdapterResult<Option<Project>> {
+        let connection = self.connection.lock().expect("database lock");
+        let mut statement = connection.prepare("SELECT value_json FROM projects WHERE id = ?1")?;
+        let mut rows = statement.query([id.to_string()])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_str(&row.get::<_, String>(0)?)?))
+    }
+
     pub fn save_conversation(&self, conversation: &Conversation) -> AdapterResult<()> {
         self.connection.lock().expect("database lock").execute(
             "INSERT INTO conversations (id, project_id, updated_at, value_json) VALUES (?1, ?2, ?3, ?4)
@@ -239,6 +249,27 @@ impl Repository {
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
 
+    pub fn save_agent_turn(&self, turn: &AgentTurn) -> AdapterResult<()> {
+        self.connection.lock().expect("database lock").execute(
+            "INSERT INTO agent_turns (id, project_id, conversation_id, value_json) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET value_json = excluded.value_json",
+            params![turn.id.to_string(), turn.project_id.to_string(), turn.conversation_id.to_string(), serde_json::to_string(turn)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn agent_turns_for_conversation(
+        &self,
+        conversation_id: Uuid,
+    ) -> AdapterResult<Vec<AgentTurn>> {
+        let connection = self.connection.lock().expect("database lock");
+        let mut statement = connection
+            .prepare("SELECT value_json FROM agent_turns WHERE conversation_id = ?1 ORDER BY id")?;
+        let rows =
+            statement.query_map([conversation_id.to_string()], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
     pub fn save_notebook_entry(&self, entry: &NotebookEntry) -> AdapterResult<()> {
         self.connection.lock().expect("database lock").execute(
             "INSERT INTO notebook_entries (id, project_id, value_json) VALUES (?1, ?2, ?3) ON CONFLICT(id) DO UPDATE SET value_json = excluded.value_json",
@@ -285,6 +316,17 @@ impl Repository {
 
     pub fn list_model_profiles(&self) -> AdapterResult<Vec<ModelProfile>> {
         self.simple_json_rows("model_profiles")
+    }
+
+    pub fn get_model_profile(&self, id: Uuid) -> AdapterResult<Option<ModelProfile>> {
+        let connection = self.connection.lock().expect("database lock");
+        let mut statement =
+            connection.prepare("SELECT value_json FROM model_profiles WHERE id = ?1")?;
+        let mut rows = statement.query([id.to_string()])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_str(&row.get::<_, String>(0)?)?))
     }
 
     pub fn save_skill_package(&self, skill: &SkillPackage) -> AdapterResult<()> {

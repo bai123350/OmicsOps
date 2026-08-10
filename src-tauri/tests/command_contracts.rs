@@ -1,9 +1,13 @@
 use chrono::{TimeZone, Utc};
+use omicsops_agent::{AgentEventKind, ModelStreamEvent};
 use omicsops_core::domain::AuthenticationMethod;
 use omicsops_desktop_lib::{
-    agent_commands::{SubmitMessageRequest, user_message_from_request},
+    agent_commands::{
+        SubmitMessageRequest, agent_event_kind_from_model_event, user_message_from_request,
+    },
     commands::{PrivateKeySecret, parse_authentication_secret},
     inspection::parse_server_inspection,
+    model_commands::{SaveModelProfileRequest, model_profile_from_request},
     workspace_commands::{CreateProjectRequest, project_from_request, write_project_manifest},
 };
 use uuid::Uuid;
@@ -129,5 +133,62 @@ fn submitted_research_messages_receive_stable_sequence_and_identity() {
             Utc::now()
         )
         .is_err()
+    );
+}
+
+#[test]
+fn model_profile_records_only_credential_references() {
+    let id = Uuid::new_v4();
+    let profile = model_profile_from_request(SaveModelProfileRequest {
+        id: Some(id),
+        label: "Lab Claude".into(),
+        provider: "anthropic".into(),
+        base_url: "https://api.anthropic.com/".into(),
+        model: "claude-science".into(),
+        credential: Some("secret-key".into()),
+    })
+    .unwrap();
+    assert_eq!(profile.id, id);
+    assert_eq!(
+        profile.credential_reference.as_deref(),
+        Some(format!("model/{id}").as_str())
+    );
+    assert!(
+        !serde_json::to_string(&profile)
+            .unwrap()
+            .contains("secret-key")
+    );
+
+    let ollama = model_profile_from_request(SaveModelProfileRequest {
+        id: None,
+        label: "Local".into(),
+        provider: "ollama".into(),
+        base_url: "http://127.0.0.1:11434/".into(),
+        model: "qwen3".into(),
+        credential: None,
+    })
+    .unwrap();
+    assert!(ollama.credential_reference.is_none());
+}
+
+#[test]
+fn provider_events_map_to_stable_desktop_agent_events() {
+    assert_eq!(
+        agent_event_kind_from_model_event(ModelStreamEvent::TextDelta("QC".into())),
+        AgentEventKind::TextDelta("QC".into())
+    );
+    assert_eq!(
+        agent_event_kind_from_model_event(ModelStreamEvent::ToolArgumentsDelta {
+            name: "submit_plan".into(),
+            json_fragment: "{}".into()
+        }),
+        AgentEventKind::ToolArgumentsDelta {
+            name: "submit_plan".into(),
+            json_fragment: "{}".into()
+        }
+    );
+    assert_eq!(
+        agent_event_kind_from_model_event(ModelStreamEvent::Completed),
+        AgentEventKind::TurnCompleted
     );
 }

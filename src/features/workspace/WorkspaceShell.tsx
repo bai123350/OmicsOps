@@ -5,6 +5,7 @@ import {
   Search, Send, Settings, Sparkles, X,
 } from "lucide-react";
 import { copy, type Locale } from "./copy";
+import type { PlanProposal } from "../../types";
 import "./workspace.css";
 import "./approval.css";
 
@@ -21,12 +22,23 @@ interface Props {
   onLocaleChange: (locale: Locale) => void;
   onOpenSettings?: () => void;
   onOpenHistory?: () => void;
-  onSend?: (message: string) => Promise<void> | void;
+  onSend?: (message: string) => Promise<boolean | void> | boolean | void;
+  messages?: Array<{ id: string; role: "user" | "assistant" | "tool" | "system"; markdown: string }>;
+  streamingAssistant?: string;
+  modelLabel?: string;
+  planProposal?: PlanProposal | null;
+  planLoading?: boolean;
+  planApproved?: boolean;
+  onRequestPlan?: () => Promise<void> | void;
+  onApprovePlan?: () => Promise<void> | void;
+  onStartRun?: () => Promise<void> | void;
+  canStartRun?: boolean;
+  runStarted?: boolean;
 }
 
 type ContextTab = "files" | "preview" | "notebook" | "runs";
 
-export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onSend }: Props) {
+export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onSend, messages = [], streamingAssistant = "", modelLabel, planProposal, planLoading = false, planApproved = false, onRequestPlan, onApprovePlan, onStartRun, canStartRun = false, runStarted = false }: Props) {
   const t = copy[locale];
   const zh = locale === "zh-CN";
   const [tab, setTab] = useState<ContextTab>("files");
@@ -39,9 +51,13 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   async function send() {
     const message = draft.trim();
     if (!message) return;
-    setSentMessages((current) => [...current, message]);
+    if (onSend) {
+      const accepted = await onSend(message);
+      if (accepted === false) return;
+    } else {
+      setSentMessages((current) => [...current, message]);
+    }
     setDraft("");
-    await onSend?.(message);
   }
 
   return <div className="science-shell">
@@ -59,10 +75,12 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
         <article className="message user-message"><p>{zh ? "比较两批 PBMC，检查批次效应并生成可复现的分析报告。" : "Compare two PBMC batches, assess batch effects, and generate a reproducible report."}</p></article>
         <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><p>{zh ? "我会先核对样本设计和质量阈值，再执行标准化、降维与聚类。正式步骤会在执行前展示审批。" : "I will verify the study design and QC thresholds before normalization, dimensionality reduction, and clustering. Formal steps will be presented for approval."}</p></div></article>
         {sentMessages.map((message, index) => <article className="message user-message" key={`${index}-${message}`}><p>{message}</p></article>)}
-        <article className="approval-card"><div className="task-icon"><Check size={18} /></div><div className="task-body"><div><strong>{zh ? "正式计划等待审批" : "Formal plan awaiting approval"}</strong><span>{approved ? (zh ? "已批准" : "Approved") : (zh ? "需确认" : "Review")}</span></div><p>{zh ? "新增 5 个版本化步骤；将上传 2 个选定文件，不会同步整个工作区。" : "Adds 5 versioned steps; uploads 2 selected files and never mirrors the whole workspace."}</p><div className="task-actions"><button>{zh ? "查看差异" : "View diff"}</button><button disabled={approved} onClick={() => setApproved(true)}>{approved ? (zh ? "已批准" : "Approved") : (zh ? "批准计划" : "Approve plan")}</button></div></div></article>
-        <article className="task-card"><div className="task-icon"><Activity size={18} /></div><div className="task-body"><div><strong>{t.task}</strong><span>65%</span></div><p>{zh ? "远端 Linux · 8 CPU · 32 GiB · 低风险" : "Remote Linux · 8 CPU · 32 GiB · low risk"}</p><div className="task-progress"><i /></div><div className="task-actions"><button>{zh ? "查看日志" : "View logs"}</button><button>{zh ? "查看计划" : "View plan"}</button></div></div></article>
+        {messages.map((message) => message.role === "user" ? <article className="message user-message" key={message.id}><p>{message.markdown}</p></article> : message.role === "assistant" ? <article className="message assistant-message" key={message.id}><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><p>{message.markdown}</p></div></article> : null)}
+        {streamingAssistant && <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent · {zh ? "生成中" : "streaming"}</strong><p>{streamingAssistant}</p></div></article>}
+        {(planProposal || !onRequestPlan) && <article className="approval-card"><div className="task-icon"><Check size={18} /></div><div className="task-body"><div><strong>{planProposal?.plan.title ?? (zh ? "正式计划等待审批" : "Formal plan awaiting approval")}</strong><span>{runStarted ? (zh ? "运行已启动" : "Run started") : (planApproved || approved) ? (zh ? "已批准" : "Approved") : (planProposal?.validation.valid === false ? (zh ? "验证失败" : "Invalid") : (zh ? "需确认" : "Review"))}</span></div><p>{planProposal ? `${planProposal.plan.stages.reduce((count, stage) => count + stage.steps.length, 0)} ${zh ? "个版本化步骤" : "versioned steps"} · SHA-256 ${planProposal.plan_hash.slice(0, 12)}` : (zh ? "新增 5 个版本化步骤；将上传 2 个选定文件，不会同步整个工作区。" : "Adds 5 versioned steps; uploads 2 selected files and never mirrors the whole workspace.")}</p><div className="task-actions"><button>{zh ? "查看差异" : "View diff"}</button><button disabled={planApproved || approved || planProposal?.validation.valid === false} onClick={() => { if (onApprovePlan) void onApprovePlan(); else setApproved(true); }}>{(planApproved || approved) ? (zh ? "已批准" : "Approved") : (zh ? "批准计划" : "Approve plan")}</button>{(planApproved || approved) && onStartRun && <button disabled={!canStartRun || runStarted} onClick={() => void onStartRun()}>{runStarted ? (zh ? "运行中" : "Running") : canStartRun ? (zh ? "开始远端运行" : "Start remote run") : (zh ? "请配置远端连接" : "Configure remote")}</button>}</div></div></article>}
+        <article className="task-card"><div className="task-icon"><Activity size={18} /></div><div className="task-body"><div><strong>{t.task}</strong><span>{planLoading ? "…" : "65%"}</span></div><p>{zh ? "远端 Linux · 8 CPU · 32 GiB · 低风险" : "Remote Linux · 8 CPU · 32 GiB · low risk"}</p><div className="task-progress"><i /></div><div className="task-actions"><button>{zh ? "查看日志" : "View logs"}</button><button disabled={planLoading} onClick={() => void onRequestPlan?.()}>{planLoading ? (zh ? "生成中" : "Generating") : (zh ? "查看计划" : "View plan")}</button></div></div></article>
       </section>
-      <footer className="composer"><div className="composer-input"><textarea aria-label={t.composer} placeholder={t.composer} value={draft} onChange={(event) => setDraft(event.target.value)} /><div><button className="composer-tool"><Folder size={16} /></button><button className="composer-tool"><Play size={16} /></button><button className="send-button" onClick={send}><Send size={16} />{t.send}</button></div></div><small>{zh ? "发送前将显示模型提供方与数据边界" : "Provider and data boundary are shown before sending"}</small></footer>
+      <footer className="composer"><div className="composer-input"><textarea aria-label={t.composer} placeholder={t.composer} value={draft} onChange={(event) => setDraft(event.target.value)} /><div><button className="composer-tool"><Folder size={16} /></button><button className="composer-tool"><Play size={16} /></button><button className="send-button" onClick={send}><Send size={16} />{t.send}</button></div></div><small>{modelLabel ? `${zh ? "当前模型" : "Model"}: ${modelLabel}` : (zh ? "发送前请在设置中配置模型提供方" : "Configure a model provider in Settings before sending")}</small></footer>
     </main>
 
     <aside className="context-pane" aria-label={t.context}>

@@ -1,6 +1,7 @@
 pub mod agent_commands;
 pub mod commands;
 pub mod inspection;
+pub mod model_commands;
 pub mod workspace_commands;
 
 use commands::AppState;
@@ -67,6 +68,11 @@ pub fn run() {
             workspace_commands::create_conversation,
             agent_commands::list_messages,
             agent_commands::submit_message,
+            agent_commands::run_agent_turn,
+            agent_commands::propose_analysis_plan,
+            model_commands::list_model_profiles,
+            model_commands::save_model_profile,
+            model_commands::probe_model_profile,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run OmicsOps desktop");

@@ -300,3 +300,38 @@ export interface WorkspaceMessage {
   markdown: string;
   created_at: string;
 }
+
+export interface ModelProfile {
+  id: string;
+  label: string;
+  provider: "anthropic" | "open_ai_compatible" | "ollama";
+  base_url: string;
+  model: string;
+  credential_reference: string | null;
+  supports_tools: boolean;
+  supports_vision: boolean;
+}
+
+export type AgentEventPayload =
+  | { kind: "turn-started" }
+  | { kind: "text-delta"; payload: string }
+  | { kind: "tool-arguments-delta"; payload: { name: string; json_fragment: string } }
+  | { kind: "approval-required"; payload: { approval_id: string; summary: string } }
+  | { kind: "plan-ready"; payload: { plan_id: string; plan_hash: string } }
+  | { kind: "turn-completed" }
+  | { kind: "turn-failed"; payload: { message: string } };
+
+export interface AgentEvent {
+  project_id: string;
+  conversation_id: string;
+  turn_id: string;
+  sequence: number;
+  occurred_at: string;
+  event: AgentEventPayload;
+}
+
+export interface PlanProposal {
+  plan: AnalysisPlanV2;
+  validation: PlanValidation;
+  plan_hash: string;
+}

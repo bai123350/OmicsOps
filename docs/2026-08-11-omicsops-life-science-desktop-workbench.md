@@ -164,7 +164,7 @@ SQLite schema v3 使用规范化项目、会话、消息、Agent 回合、审批
 - 复用现有 V2 执行器完成真实 SSH 运行、恢复、取消和产物登记。
 - 完成创建 PBMC 项目、执行分析、预览 UMAP/表格和查看方法记录的闭环。
 
-当前状态：**接口和 UI 骨架已完成，真实闭环待接通**。
+当前状态：**真实模型对话、V2 计划、审批和远端启动链路已接通；PBMC 真实环境验收待完成**。
 
 已交付：
 
@@ -172,14 +172,19 @@ SQLite schema v3 使用规范化项目、会话、消息、Agent 回合、审批
 - `AgentSession`、工具注册、审批门、专家并发限制。
 - Anthropic、OpenAI-compatible、Ollama 请求与流事件规范化契约。
 - 会话消息持久化和 `conversation-event`。
-- 对话审批卡、计划差异入口和 PBMC 工作台示例状态。
+- 三类模型的真实 SSE/NDJSON 流式 HTTP 客户端。
+- 模型配置、能力探测和 Windows Credential Manager 凭据隔离。
+- 持久 `AgentTurn`、`agent-event` 和桌面实时增量显示。
+- 从对话目标生成强制工具调用的 `AnalysisPlanV2`，并运行现有 V2 验证器。
+- 对话内计划哈希、验证状态和显式审批。
+- 审批后连接现有 `start_run` SSH 执行入口；仍保留恢复、取消和产物登记底座。
+- Ollama-only 项目在 Agent 回合和计划生成入口强制执行。
 
 待实现：
 
-- Anthropic 和 Ollama 的真实流式 HTTP 调用。
-- 将模型流转换为持久 `agent-event`。
-- 将对话生成的 `AnalysisPlanV2` 连接到现有真实 SSH 执行命令。
-- 用真实运行状态替换工作台示例数据。
+- 使用 WSL SSH fixture 完成 PBMC 对话到 UMAP/表格预览的真实端到端验收。
+- 将运行事件和真实产物完全替换工作台中的剩余示例状态。
+- 在新设置中心补齐远端连接与项目绑定表单。
 
 ### 阶段 3：文件、预览与实验记录
 
@@ -331,7 +336,7 @@ SQLite schema v3 使用规范化项目、会话、消息、Agent 回合、审批
 
 基础提交 `91a31f7` 的验证结果：
 
-- React/Vitest：13 项测试通过。
+- React/Vitest：14 项测试通过。
 - Rust workspace：全部测试通过。
 - 真实 WSL SSH fixture 默认忽略，需要显式启用。
 - TypeScript 编译和 Vite 生产构建通过。

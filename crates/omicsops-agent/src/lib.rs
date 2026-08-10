@@ -117,6 +117,7 @@ impl SpecialistDispatcher {
 pub enum AgentEventKind {
     TurnStarted,
     TextDelta(String),
+    ToolArgumentsDelta { name: String, json_fragment: String },
     ToolProposed { tool: String, arguments: Value },
     ApprovalRequired { approval_id: Uuid, summary: String },
     PlanReady { plan_id: Uuid, plan_hash: String },
@@ -171,6 +172,48 @@ pub enum ModelStreamEvent {
     TextDelta(String),
     ToolArgumentsDelta { name: String, json_fragment: String },
     Completed,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolArgumentBuffer {
+    expected_name: String,
+    arguments: String,
+}
+
+impl ToolArgumentBuffer {
+    pub fn new(expected_name: impl Into<String>) -> Self {
+        Self {
+            expected_name: expected_name.into(),
+            arguments: String::new(),
+        }
+    }
+
+    pub fn push(&mut self, event: ModelStreamEvent) -> AgentResult<()> {
+        if let ModelStreamEvent::ToolArgumentsDelta {
+            name,
+            json_fragment,
+        } = event
+        {
+            if !name.is_empty() && name != self.expected_name {
+                return Err(AgentError::Model(format!(
+                    "expected tool {}, received {name}",
+                    self.expected_name
+                )));
+            }
+            self.arguments.push_str(&json_fragment);
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> AgentResult<Value> {
+        if self.arguments.is_empty() {
+            return Err(AgentError::Model(format!(
+                "model did not call {}",
+                self.expected_name
+            )));
+        }
+        serde_json::from_str(&self.arguments).map_err(|error| AgentError::Model(error.to_string()))
+    }
 }
 
 #[async_trait]
