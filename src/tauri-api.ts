@@ -21,9 +21,52 @@ import type {
   StepAttempt,
   ArtifactRecordV2,
   EnvironmentLock,
+  WorkspaceConversation,
+  WorkspaceProject,
+  WorkspaceTemplate,
+  WorkspaceMessage,
 } from "./types";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
+
+export async function listProjects(): Promise<WorkspaceProject[]> {
+  return isTauri() ? invoke("list_projects") : [];
+}
+
+export async function chooseProjectDirectory(): Promise<string | null> {
+  if (!isTauri()) return "E:/Science/omicsops-demo";
+  const selected = await open({ directory: true, multiple: false });
+  return typeof selected === "string" ? selected : null;
+}
+
+export async function createProject(request: { name: string; description: string; local_root: string; template: WorkspaceTemplate }): Promise<WorkspaceProject> {
+  if (!isTauri()) {
+    const now = new Date().toISOString();
+    return { id: crypto.randomUUID(), ...request, remote_root: null, connection_id: null, status: "ready", ollama_only: false, created_at: now, updated_at: now };
+  }
+  return invoke("create_project", { request });
+}
+
+export async function listConversations(projectId: string): Promise<WorkspaceConversation[]> {
+  return isTauri() ? invoke("list_conversations", { projectId }) : [];
+}
+
+export async function createConversation(projectId: string, title: string): Promise<WorkspaceConversation> {
+  if (!isTauri()) {
+    const now = new Date().toISOString();
+    return { id: crypto.randomUUID(), project_id: projectId, title, status: "idle", model_profile_id: null, created_at: now, updated_at: now };
+  }
+  return invoke("create_conversation", { request: { project_id: projectId, title } });
+}
+
+export async function listMessages(conversationId: string): Promise<WorkspaceMessage[]> {
+  return isTauri() ? invoke("list_messages", { conversationId }) : [];
+}
+
+export async function submitMessage(request: { project_id: string; conversation_id: string; markdown: string; sequence: number }): Promise<WorkspaceMessage> {
+  if (!isTauri()) return { id: crypto.randomUUID(), ...request, role: "user", created_at: new Date().toISOString() };
+  return invoke("submit_message", { request });
+}
 
 export async function choosePlan(): Promise<string | null> {
   if (!isTauri()) return "example-plan.md";

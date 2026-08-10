@@ -1,10 +1,127 @@
 use futures_util::StreamExt;
+use omicsops_agent::{ModelRequest, ModelStreamEvent};
 use schemars::{JsonSchema, schema_for};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use url::Url;
 
 use crate::{AdapterError, AdapterResult};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderProtocol {
+    Anthropic,
+    OpenAiCompatible,
+    Ollama,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderRequest {
+    pub endpoint: Url,
+    pub body: Value,
+    pub requires_credential: bool,
+}
+
+pub fn build_provider_request(
+    protocol: ProviderProtocol,
+    base_url: Url,
+    model: &str,
+    request: &ModelRequest,
+) -> AdapterResult<ProviderRequest> {
+    let tool = request.tool_name.as_ref().map(|name| {
+        json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "Submit a schema-valid OmicsOps control object.",
+                "parameters": request.tool_schema.clone().unwrap_or_else(|| json!({"type":"object"}))
+            }
+        })
+    });
+    let messages: Vec<Value> = request
+        .messages
+        .iter()
+        .map(|message| json!({"role": message.role, "content": message.content}))
+        .collect();
+
+    match protocol {
+        ProviderProtocol::OpenAiCompatible => Ok(ProviderRequest {
+            endpoint: base_url
+                .join("v1/chat/completions")
+                .map_err(|error| AdapterError::Llm(error.to_string()))?,
+            body: json!({
+                "model": model,
+                "stream": true,
+                "messages": std::iter::once(json!({"role":"system", "content":request.system}))
+                    .chain(messages)
+                    .collect::<Vec<_>>(),
+                "tools": tool.into_iter().collect::<Vec<_>>()
+            }),
+            requires_credential: true,
+        }),
+        ProviderProtocol::Anthropic => {
+            let tools: Vec<Value> = tool
+                .into_iter()
+                .map(|tool| {
+                    json!({
+                        "name": tool["function"]["name"],
+                        "description": tool["function"]["description"],
+                        "input_schema": tool["function"]["parameters"]
+                    })
+                })
+                .collect();
+            Ok(ProviderRequest {
+                endpoint: base_url
+                    .join("v1/messages")
+                    .map_err(|error| AdapterError::Llm(error.to_string()))?,
+                body: json!({
+                    "model": model,
+                    "system": request.system,
+                    "max_tokens": 4096,
+                    "stream": true,
+                    "messages": messages,
+                    "tools": tools
+                }),
+                requires_credential: true,
+            })
+        }
+        ProviderProtocol::Ollama => Ok(ProviderRequest {
+            endpoint: base_url
+                .join("api/chat")
+                .map_err(|error| AdapterError::Llm(error.to_string()))?,
+            body: json!({
+                "model": model,
+                "stream": true,
+                "messages": std::iter::once(json!({"role":"system", "content":request.system}))
+                    .chain(messages)
+                    .collect::<Vec<_>>(),
+                "tools": tool.into_iter().collect::<Vec<_>>()
+            }),
+            requires_credential: false,
+        }),
+    }
+}
+
+pub fn parse_provider_event(protocol: ProviderProtocol, value: &Value) -> Option<ModelStreamEvent> {
+    let text = match protocol {
+        ProviderProtocol::OpenAiCompatible => value.pointer("/choices/0/delta/content"),
+        ProviderProtocol::Anthropic => value.pointer("/delta/text"),
+        ProviderProtocol::Ollama => value.pointer("/message/content"),
+    }
+    .and_then(Value::as_str);
+    if let Some(text) = text.filter(|text| !text.is_empty()) {
+        return Some(ModelStreamEvent::TextDelta(text.into()));
+    }
+    let completed = match protocol {
+        ProviderProtocol::OpenAiCompatible => value
+            .pointer("/choices/0/finish_reason")
+            .is_some_and(|reason| !reason.is_null()),
+        ProviderProtocol::Anthropic => {
+            value.get("type").and_then(Value::as_str) == Some("message_stop")
+        }
+        ProviderProtocol::Ollama => value.get("done").and_then(Value::as_bool) == Some(true),
+    };
+    completed.then_some(ModelStreamEvent::Completed)
+}
 
 pub fn parse_tool_call_response(response: &Value, expected_tool: &str) -> AdapterResult<Value> {
     let calls = response

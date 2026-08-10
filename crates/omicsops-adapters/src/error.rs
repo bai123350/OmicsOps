@@ -16,6 +16,8 @@ pub enum AdapterError {
     Document(String),
     #[error("model endpoint failed: {0}")]
     Llm(String),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     #[error("SSH failed: {0}")]
     Ssh(String),
     #[error("authentication failed")]

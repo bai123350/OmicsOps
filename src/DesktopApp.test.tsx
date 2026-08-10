@@ -1,0 +1,38 @@
+import { fireEvent, render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import DesktopApp from "./DesktopApp";
+import * as api from "./tauri-api";
+
+beforeEach(() => vi.restoreAllMocks());
+
+describe("DesktopApp", () => {
+  it("opens the local-first project library when no project exists", async () => {
+    vi.spyOn(api, "listProjects").mockResolvedValue([]);
+    render(<DesktopApp />);
+
+    expect(await screen.findByRole("heading", { name: "生命科学项目" })).toBeInTheDocument();
+    expect(screen.getByText("单细胞 RNA 测序")).toBeInTheDocument();
+    expect(screen.getByText("文献综述")).toBeInTheDocument();
+  });
+
+  it("opens an existing project in the three-pane research workspace", async () => {
+    vi.spyOn(api, "listProjects").mockResolvedValue([{ id: "project-1", name: "PBMC 图谱", description: "", local_root: "E:/Science/pbmc", remote_root: null, connection_id: null, template: "single_cell_rna_seq", status: "running", ollama_only: false, created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" }]);
+    render(<DesktopApp />);
+
+    expect(await screen.findByRole("main", { name: "科研对话" })).toBeInTheDocument();
+    expect(screen.getByRole("complementary", { name: "项目上下文" })).toBeInTheDocument();
+  });
+
+  it("centralizes model, remote compute, privacy, and legacy history settings", async () => {
+    vi.spyOn(api, "listProjects").mockResolvedValue([]);
+    render(<DesktopApp />);
+    fireEvent.click(await screen.findByRole("button", { name: "设置" }));
+
+    const dialog = screen.getByRole("dialog", { name: "工作台设置" });
+    expect(dialog).toHaveTextContent("Anthropic");
+    expect(dialog).toHaveTextContent("OpenAI-compatible");
+    expect(dialog).toHaveTextContent("Ollama");
+    expect(dialog).toHaveTextContent("历史运行只读");
+  });
+});

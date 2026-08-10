@@ -27,7 +27,7 @@ fn opening_a_legacy_database_creates_a_backup_and_migrates_transactionally() {
 
     let repository = Repository::open(&database).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 2);
+    assert_eq!(repository.schema_version().unwrap(), 3);
     assert_eq!(
         repository
             .get_json::<serde_json::Value>("fixture", "one")

@@ -1,0 +1,17 @@
+.approval-card {
+  max-width: 700px;
+  border: 1px solid #b8c8f5;
+  background: #fbfcff;
+  border-radius: 12px;
+  padding: 13px;
+  display: flex;
+  gap: 11px;
+  box-shadow: 0 5px 14px #1822300b;
+}
+
+.task-actions button:disabled {
+  color: #18794e;
+  background: #e9f7ef;
+  border-color: #b7e3ca;
+  cursor: default;
+}

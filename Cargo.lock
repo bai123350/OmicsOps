@@ -2996,6 +2996,7 @@ dependencies = [
  "futures-util",
  "hex",
  "keyring",
+ "omicsops-agent",
  "omicsops-core",
  "pdf-extract",
  "quick-xml 0.38.4",
@@ -3014,6 +3015,21 @@ dependencies = [
  "url",
  "uuid",
  "zip",
+]
+
+[[package]]
+name = "omicsops-agent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "hex",
+ "omicsops-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.19",
+ "uuid",
 ]
 
 [[package]]
@@ -3039,6 +3055,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "omicsops-adapters",
+ "omicsops-agent",
  "omicsops-core",
  "omicsops-runner",
  "serde",
@@ -3046,6 +3063,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "tempfile",
  "tokio",
  "url",
  "uuid",

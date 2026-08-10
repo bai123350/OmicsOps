@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/omicsops-core",
+  "crates/omicsops-agent",
   "crates/omicsops-adapters",
   "crates/omicsops-runner",
   "src-tauri"

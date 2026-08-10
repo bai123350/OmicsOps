@@ -263,3 +263,40 @@ export interface EnvironmentLock {
   sha256: string;
   declared_dependencies: string[];
 }
+
+export type WorkspaceTemplate = "blank" | "single_cell_rna_seq" | "bulk_rna_seq" | "literature_review";
+export type WorkspaceProjectStatus = "ready" | "running" | "waiting_for_input" | "needs_attention" | "archived";
+
+export interface WorkspaceProject {
+  id: string;
+  name: string;
+  description: string;
+  local_root: string;
+  remote_root: string | null;
+  connection_id: string | null;
+  template: WorkspaceTemplate;
+  status: WorkspaceProjectStatus;
+  ollama_only: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WorkspaceConversation {
+  id: string;
+  project_id: string;
+  title: string;
+  status: "idle" | "running" | "waiting_for_input" | "needs_attention" | "completed" | "archived";
+  model_profile_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WorkspaceMessage {
+  id: string;
+  project_id: string;
+  conversation_id: string;
+  sequence: number;
+  role: "user" | "assistant" | "tool" | "system";
+  markdown: string;
+  created_at: string;
+}
