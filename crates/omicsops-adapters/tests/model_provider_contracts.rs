@@ -1,6 +1,6 @@
 use omicsops_adapters::llm::{
     ProviderProtocol, ProviderStreamDecoder, UnifiedModelClient, build_provider_request,
-    parse_provider_event,
+    parse_provider_event, provider_endpoint, provider_models_endpoint,
 };
 use omicsops_agent::{ModelRequest, ModelStreamEvent};
 use serde_json::json;
@@ -34,7 +34,10 @@ fn provider_protocols_map_to_native_desktop_endpoints() {
     );
     assert!(openai.requires_credential);
     assert_eq!(openai.body["stream"], true);
-    assert_eq!(openai.body["tool_choice"]["function"]["name"], "submit_plan");
+    assert_eq!(
+        openai.body["tool_choice"]["function"]["name"],
+        "submit_plan"
+    );
 
     let anthropic = build_provider_request(
         ProviderProtocol::Anthropic,
@@ -59,6 +62,64 @@ fn provider_protocols_map_to_native_desktop_endpoints() {
     .unwrap();
     assert_eq!(ollama.endpoint.as_str(), "http://127.0.0.1:11434/api/chat");
     assert!(!ollama.requires_credential);
+}
+
+#[test]
+fn provider_endpoints_accept_base_urls_with_or_without_api_version_suffixes() {
+    assert_eq!(
+        provider_endpoint(
+            ProviderProtocol::OpenAiCompatible,
+            Url::parse("https://models.example/v1").unwrap()
+        )
+        .unwrap()
+        .as_str(),
+        "https://models.example/v1/chat/completions"
+    );
+    assert_eq!(
+        provider_endpoint(
+            ProviderProtocol::OpenAiCompatible,
+            Url::parse("https://models.example/v1/").unwrap()
+        )
+        .unwrap()
+        .as_str(),
+        "https://models.example/v1/chat/completions"
+    );
+    assert_eq!(
+        provider_endpoint(
+            ProviderProtocol::OpenAiCompatible,
+            Url::parse("https://models.example/").unwrap()
+        )
+        .unwrap()
+        .as_str(),
+        "https://models.example/v1/chat/completions"
+    );
+    assert_eq!(
+        provider_endpoint(
+            ProviderProtocol::Ollama,
+            Url::parse("http://localhost:11434/api").unwrap()
+        )
+        .unwrap()
+        .as_str(),
+        "http://localhost:11434/api/chat"
+    );
+    assert_eq!(
+        provider_models_endpoint(
+            ProviderProtocol::OpenAiCompatible,
+            Url::parse("https://models.example/v1").unwrap()
+        )
+        .unwrap()
+        .as_str(),
+        "https://models.example/v1/models"
+    );
+    assert_eq!(
+        provider_models_endpoint(
+            ProviderProtocol::Ollama,
+            Url::parse("http://localhost:11434/api/").unwrap()
+        )
+        .unwrap()
+        .as_str(),
+        "http://localhost:11434/api/tags"
+    );
 }
 
 #[test]

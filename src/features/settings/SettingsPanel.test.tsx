@@ -15,6 +15,36 @@ describe("SettingsPanel model providers", () => {
     await waitFor(() => expect(screen.queryByDisplayValue("secret")).not.toBeInTheDocument());
   });
 
+  it("shows actionable model test failures and successful endpoint diagnostics", async () => {
+    const profile = { id: "model-1", label: "Lab gateway", provider: "open_ai_compatible" as const, base_url: "https://models.example/v1", model: "science-model", credential_reference: "model/model-1", supports_tools: true, supports_vision: false };
+    const onProbeModel = vi.fn()
+      .mockRejectedValueOnce(new Error("401 Unauthorized: invalid API key"))
+      .mockResolvedValueOnce({ endpoint: "https://models.example/v1/chat/completions", protocol: "OpenAiCompatible", model: "science-model", latency_ms: 42, response_preview: "OK" });
+    render(<SettingsPanel locale="zh-CN" onClose={() => undefined} modelProfiles={[profile]} onProbeModel={onProbeModel} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "测试" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("401 Unauthorized");
+    fireEvent.click(screen.getByRole("button", { name: "测试" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("连接成功");
+    expect(screen.getByRole("status")).toHaveTextContent("/v1/chat/completions");
+    expect(screen.getByRole("status")).toHaveTextContent("42 ms");
+  });
+
+  it("discovers gateway models and opens the selected model for editing", async () => {
+    const profile = { id: "model-1", label: "Lab gateway", provider: "open_ai_compatible" as const, base_url: "https://models.example/v1", model: "missing-model", credential_reference: "model/model-1", supports_tools: true, supports_vision: false };
+    const onListModels = vi.fn().mockResolvedValue(["gpt-5.6-sol", "gpt-5.6-terra"]);
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[profile]} onListModels={onListModels} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Models" }));
+    expect(await screen.findByRole("button", { name: "gpt-5.6-terra" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "gpt-5.6-terra" }));
+
+    expect(onListModels).toHaveBeenCalledWith("model-1");
+    expect(screen.getByLabelText("Model")).toHaveValue("gpt-5.6-terra");
+    expect(screen.getByLabelText("Base URL")).toHaveValue("https://models.example/v1");
+    expect(screen.getByLabelText("API key")).toHaveValue("");
+  });
+
   it("imports versioned skills and keeps them disabled until explicit enablement", async () => {
     const onImportSkill = vi.fn().mockResolvedValue(undefined);
     const onSetSkillEnabled = vi.fn().mockResolvedValue({});

@@ -86,6 +86,7 @@ pub fn run() {
             model_commands::list_model_profiles,
             model_commands::save_model_profile,
             model_commands::probe_model_profile,
+            model_commands::list_model_profile_models,
             skill_commands::list_skill_packages,
             skill_commands::import_skill_directory,
             skill_commands::set_skill_enabled,

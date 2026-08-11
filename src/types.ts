@@ -325,6 +325,14 @@ export interface ModelProfile {
   supports_vision: boolean;
 }
 
+export interface ModelProbeResult {
+  endpoint: string;
+  protocol: string;
+  model: string;
+  latency_ms: number;
+  response_preview: string;
+}
+
 export type AgentEventPayload =
   | { kind: "turn-started" }
   | { kind: "text-delta"; payload: string }

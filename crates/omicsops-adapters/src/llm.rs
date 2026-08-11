@@ -4,6 +4,7 @@ use omicsops_agent::{AgentError, AgentResult, ModelProvider, ModelRequest, Model
 use schemars::{JsonSchema, schema_for};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use std::time::{Duration, Instant};
 use url::Url;
 use uuid::Uuid;
 
@@ -21,6 +22,56 @@ pub struct ProviderRequest {
     pub endpoint: Url,
     pub body: Value,
     pub requires_credential: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ModelProbeResult {
+    pub endpoint: String,
+    pub protocol: String,
+    pub model: String,
+    pub latency_ms: u128,
+    pub response_preview: String,
+}
+
+pub fn provider_endpoint(protocol: ProviderProtocol, mut base_url: Url) -> AdapterResult<Url> {
+    let path = base_url.path().trim_end_matches('/');
+    let suffix = match protocol {
+        ProviderProtocol::OpenAiCompatible if path.ends_with("/v1") => "chat/completions",
+        ProviderProtocol::OpenAiCompatible => "v1/chat/completions",
+        ProviderProtocol::Anthropic if path.ends_with("/v1") => "messages",
+        ProviderProtocol::Anthropic => "v1/messages",
+        ProviderProtocol::Ollama if path.ends_with("/api") => "chat",
+        ProviderProtocol::Ollama => "api/chat",
+    };
+    if !base_url.path().ends_with('/') {
+        base_url.set_path(&format!("{}/", base_url.path()));
+    }
+    base_url
+        .join(suffix)
+        .map_err(|error| AdapterError::Llm(error.to_string()))
+}
+
+pub fn provider_models_endpoint(
+    protocol: ProviderProtocol,
+    mut base_url: Url,
+) -> AdapterResult<Url> {
+    let path = base_url.path().trim_end_matches('/');
+    let suffix = match protocol {
+        ProviderProtocol::OpenAiCompatible | ProviderProtocol::Anthropic
+            if path.ends_with("/v1") =>
+        {
+            "models"
+        }
+        ProviderProtocol::OpenAiCompatible | ProviderProtocol::Anthropic => "v1/models",
+        ProviderProtocol::Ollama if path.ends_with("/api") => "tags",
+        ProviderProtocol::Ollama => "api/tags",
+    };
+    if !base_url.path().ends_with('/') {
+        base_url.set_path(&format!("{}/", base_url.path()));
+    }
+    base_url
+        .join(suffix)
+        .map_err(|error| AdapterError::Llm(error.to_string()))
 }
 
 pub fn build_provider_request(
@@ -59,7 +110,7 @@ pub fn build_provider_request(
                 body["tool_choice"] = json!({"type":"function", "function":{"name":name}});
             }
             Ok(ProviderRequest {
-                endpoint: base_url.join("v1/chat/completions").map_err(|error| AdapterError::Llm(error.to_string()))?,
+                endpoint: provider_endpoint(ProviderProtocol::OpenAiCompatible, base_url)?,
                 body,
                 requires_credential: true,
             })
@@ -87,17 +138,13 @@ pub fn build_provider_request(
                 body["tool_choice"] = json!({"type":"tool", "name":name});
             }
             Ok(ProviderRequest {
-                endpoint: base_url
-                    .join("v1/messages")
-                    .map_err(|error| AdapterError::Llm(error.to_string()))?,
+                endpoint: provider_endpoint(ProviderProtocol::Anthropic, base_url)?,
                 body,
                 requires_credential: true,
             })
         }
         ProviderProtocol::Ollama => Ok(ProviderRequest {
-            endpoint: base_url
-                .join("api/chat")
-                .map_err(|error| AdapterError::Llm(error.to_string()))?,
+            endpoint: provider_endpoint(ProviderProtocol::Ollama, base_url)?,
             body: json!({
                 "model": model,
                 "stream": true,
@@ -279,7 +326,11 @@ impl UnifiedModelClient {
             base_url,
             model: model.into(),
             credential,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .timeout(Duration::from_secs(45))
+                .build()
+                .map_err(|error| AdapterError::Llm(error.to_string()))?,
         })
     }
 
@@ -326,6 +377,130 @@ impl UnifiedModelClient {
             on_event(event);
         }
         Ok(())
+    }
+
+    pub async fn probe(&self) -> AdapterResult<ModelProbeResult> {
+        let endpoint = provider_endpoint(self.protocol, self.base_url.clone())?;
+        let body = match self.protocol {
+            ProviderProtocol::OpenAiCompatible => json!({
+                "model": self.model,
+                "stream": false,
+                "max_tokens": 16,
+                "messages": [{"role":"user", "content":"Reply with OK."}]
+            }),
+            ProviderProtocol::Anthropic => json!({
+                "model": self.model,
+                "stream": false,
+                "max_tokens": 16,
+                "messages": [{"role":"user", "content":"Reply with OK."}]
+            }),
+            ProviderProtocol::Ollama => json!({
+                "model": self.model,
+                "stream": false,
+                "messages": [{"role":"user", "content":"Reply with OK."}]
+            }),
+        };
+        let mut builder = self.http.post(endpoint.clone()).json(&body);
+        match self.protocol {
+            ProviderProtocol::Anthropic => {
+                builder = builder
+                    .header("x-api-key", self.credential.as_deref().unwrap_or_default())
+                    .header("anthropic-version", "2023-06-01");
+            }
+            ProviderProtocol::OpenAiCompatible => {
+                builder = builder.bearer_auth(self.credential.as_deref().unwrap_or_default());
+            }
+            ProviderProtocol::Ollama => {}
+        }
+        let started = Instant::now();
+        let response = builder
+            .send()
+            .await
+            .map_err(|error| AdapterError::Llm(format!("{}: {error}", endpoint)))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|error| AdapterError::Llm(format!("{}: {error}", endpoint)))?;
+        if !status.is_success() {
+            let preview: String = text.chars().take(1200).collect();
+            return Err(AdapterError::Llm(format!(
+                "{} returned {status}: {preview}",
+                endpoint
+            )));
+        }
+        let value: Value = serde_json::from_str(&text).map_err(|error| {
+            AdapterError::Llm(format!("{} returned invalid JSON: {error}", endpoint))
+        })?;
+        let response_text = match self.protocol {
+            ProviderProtocol::OpenAiCompatible => value
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str),
+            ProviderProtocol::Anthropic => value.pointer("/content/0/text").and_then(Value::as_str),
+            ProviderProtocol::Ollama => value.pointer("/message/content").and_then(Value::as_str),
+        }
+        .ok_or_else(|| {
+            AdapterError::Llm(format!(
+                "{} succeeded but the response did not match the selected provider protocol",
+                endpoint
+            ))
+        })?;
+        Ok(ModelProbeResult {
+            endpoint: endpoint.to_string(),
+            protocol: format!("{:?}", self.protocol),
+            model: self.model.clone(),
+            latency_ms: started.elapsed().as_millis(),
+            response_preview: response_text.chars().take(160).collect(),
+        })
+    }
+
+    pub async fn list_models(&self) -> AdapterResult<Vec<String>> {
+        let endpoint = provider_models_endpoint(self.protocol, self.base_url.clone())?;
+        let mut builder = self.http.get(endpoint.clone());
+        match self.protocol {
+            ProviderProtocol::Anthropic => {
+                builder = builder
+                    .header("x-api-key", self.credential.as_deref().unwrap_or_default())
+                    .header("anthropic-version", "2023-06-01");
+            }
+            ProviderProtocol::OpenAiCompatible => {
+                builder = builder.bearer_auth(self.credential.as_deref().unwrap_or_default());
+            }
+            ProviderProtocol::Ollama => {}
+        }
+        let response = builder
+            .send()
+            .await
+            .map_err(|error| AdapterError::Llm(format!("{}: {error}", endpoint)))?;
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(AdapterError::Llm(format!("{} returned {status}", endpoint)));
+        }
+        let value: Value = serde_json::from_str(&text).map_err(|error| {
+            AdapterError::Llm(format!("{} returned invalid JSON: {error}", endpoint))
+        })?;
+        let entries = if self.protocol == ProviderProtocol::Ollama {
+            value.get("models").and_then(Value::as_array)
+        } else {
+            value.get("data").and_then(Value::as_array)
+        }
+        .ok_or_else(|| AdapterError::Llm("model list response had no model array".into()))?;
+        let mut models: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| {
+                if self.protocol == ProviderProtocol::Ollama {
+                    entry.get("name")
+                } else {
+                    entry.get("id")
+                }
+            })
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        models.sort();
+        models.dedup();
+        Ok(models)
     }
 }
 

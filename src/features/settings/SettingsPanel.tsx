@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { Archive, Bot, Cloud, KeyRound, Monitor, Server, ShieldCheck, Wrench, X } from "lucide-react";
-import type { ConnectionProfile, ConnectionTestResult, ModelProfile, SkillPackage, WorkspaceProject } from "../../types";
+import { Archive, Bot, CheckCircle2, Cloud, KeyRound, LoaderCircle, Monitor, Server, ShieldCheck, Wrench, X, XCircle } from "lucide-react";
+import type { ConnectionProfile, ConnectionTestResult, ModelProbeResult, ModelProfile, SkillPackage, WorkspaceProject } from "../../types";
 import type { Locale } from "../workspace/copy";
 import "./settings.css";
 import "./model-form.css";
@@ -14,7 +14,8 @@ interface Props {
   onClose: () => void;
   modelProfiles?: ModelProfile[];
   onSaveModel?: (request: SaveModelRequest) => Promise<void>;
-  onProbeModel?: (profileId: string) => Promise<void>;
+  onProbeModel?: (profileId: string) => Promise<ModelProbeResult>;
+  onListModels?: (profileId: string) => Promise<string[]>;
   skillPackages?: SkillPackage[];
   onImportSkill?: () => Promise<void>;
   onSetSkillEnabled?: (skillId: string, enabled: boolean) => Promise<SkillPackage>;
@@ -32,13 +33,15 @@ const defaults: Record<ModelProfile["provider"], FormState> = {
   ollama: { provider: "ollama", label: "Ollama", base_url: "http://127.0.0.1:11434/", model: "", credential: "" },
 };
 
-export function SettingsPanel({ locale, onClose, modelProfiles = [], onSaveModel, onProbeModel, skillPackages = [], onImportSkill, onSetSkillEnabled, connections = [], selectedProject, onSaveConnection, onTestConnection, onConfirmHostKey, onBindProjectRemote }: Props) {
+export function SettingsPanel({ locale, onClose, modelProfiles = [], onSaveModel, onProbeModel, onListModels, skillPackages = [], onImportSkill, onSetSkillEnabled, connections = [], selectedProject, onSaveConnection, onTestConnection, onConfirmHostKey, onBindProjectRemote }: Props) {
   const zh = locale === "zh-CN";
   const [form, setForm] = useState<FormState | null>(null);
   const [saving, setSaving] = useState(false);
   const [section, setSection] = useState<"models" | "remote" | "skills">("models");
   const [skillsBusy, setSkillsBusy] = useState(false);
   const [skillError, setSkillError] = useState("");
+  const [modelTests, setModelTests] = useState<Record<string, { state: "testing" | "success" | "error"; result?: ModelProbeResult; message?: string }>>({});
+  const [modelChoices, setModelChoices] = useState<Record<string, string[]>>({});
   const configure = (provider: ModelProfile["provider"]) => setForm({ ...defaults[provider] });
 
   async function saveProvider() {
@@ -65,6 +68,27 @@ export function SettingsPanel({ locale, onClose, modelProfiles = [], onSaveModel
     }
   }
 
+  async function testModel(profileId: string) {
+    if (!onProbeModel) return;
+    setModelTests((current) => ({ ...current, [profileId]: { state: "testing" } }));
+    try {
+      const result = await onProbeModel(profileId);
+      setModelTests((current) => ({ ...current, [profileId]: { state: "success", result } }));
+    } catch (error) {
+      setModelTests((current) => ({ ...current, [profileId]: { state: "error", message: error instanceof Error ? error.message : String(error) } }));
+    }
+  }
+
+  async function discoverModels(profileId: string) {
+    if (!onListModels) return;
+    try {
+      const models = await onListModels(profileId);
+      setModelChoices((current) => ({ ...current, [profileId]: models }));
+    } catch (error) {
+      setModelTests((current) => ({ ...current, [profileId]: { state: "error", message: error instanceof Error ? error.message : String(error) } }));
+    }
+  }
+
   return <div className="settings-backdrop"><section className="settings-panel" role="dialog" aria-modal="true" aria-label={zh ? "工作台设置" : "Workspace settings"}>
     <header><div><small>OmicsOps Desktop</small><h2>{zh ? "工作台设置" : "Workspace settings"}</h2></div><button aria-label="Close" onClick={onClose}><X size={19} /></button></header>
     <div className="settings-layout">
@@ -84,7 +108,7 @@ export function SettingsPanel({ locale, onClose, modelProfiles = [], onSaveModel
           </div>
           <div className="model-form-actions"><button onClick={() => setForm(null)}>{zh ? "取消" : "Cancel"}</button><button className="primary" disabled={saving || !form.label.trim() || !form.model.trim()} onClick={saveProvider}>{zh ? "保存提供方" : "Save provider"}</button></div>
         </section>}
-        {modelProfiles.length > 0 && <div className="configured-models">{modelProfiles.map((profile) => <div key={profile.id}><span><b>{profile.label}</b><small>{profile.model} · {profile.provider}</small></span><button onClick={() => onProbeModel?.(profile.id)}>{zh ? "测试" : "Test"}</button></div>)}</div>}
+        {modelProfiles.length > 0 && <div className="configured-models">{modelProfiles.map((profile) => { const probe = modelTests[profile.id]; const choices = modelChoices[profile.id] ?? []; return <div key={profile.id}><span><b>{profile.label}</b><small>{profile.model} · {profile.provider}</small></span><button onClick={() => setForm({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model: profile.model, credential: "" })}>{zh ? "编辑" : "Edit"}</button><button disabled={!onListModels} onClick={() => void discoverModels(profile.id)}>{zh ? "可用模型" : "Models"}</button><button disabled={probe?.state === "testing" || !onProbeModel} onClick={() => void testModel(profile.id)}>{probe?.state === "testing" ? <><LoaderCircle className="spin" size={13} />{zh ? "测试中" : "Testing"}</> : (zh ? "测试" : "Test")}</button>{choices.length > 0 && <div className="model-choices"><small>{zh ? "网关当前可用，点击后保存：" : "Available now; click to edit:"}</small>{choices.map((model) => <button key={model} onClick={() => setForm({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model, credential: "" })}>{model}</button>)}</div>}{probe?.state === "success" && probe.result && <div className="model-probe-result success" role="status"><CheckCircle2 size={15} /><span><b>{zh ? "连接成功" : "Connection succeeded"}</b><small>{probe.result.model} · {probe.result.latency_ms} ms · {probe.result.endpoint}</small><code>{probe.result.response_preview}</code></span></div>}{probe?.state === "error" && <div className="model-probe-result error" role="alert"><XCircle size={15} /><span><b>{zh ? "测试失败" : "Test failed"}</b><small>{probe.message}</small></span></div>}</div>; })}</div>}
         <div className="settings-note"><ShieldCheck size={18} /><span><b>{zh ? "默认无遥测" : "Telemetry off by default"}</b><small>{zh ? "诊断包仅在主动导出时生成，并经过凭据脱敏。" : "Diagnostic bundles are generated only on export and redact credentials."}</small></span></div>
         <div className="legacy-row"><Archive size={18} /><span><b>{zh ? "历史运行只读" : "Read-only legacy runs"}</b><small>{zh ? "旧 V1/V2 计划、日志与审计可查看和导出，但不能启动新任务。" : "Legacy plans, logs, and audit records remain viewable and exportable."}</small></span><button>{zh ? "查看历史" : "View history"}</button></div>
       </main> : section === "remote" ? <RemoteSettings locale={locale} connections={connections} selectedProject={selectedProject} onSave={onSaveConnection} onTest={onTestConnection} onConfirm={onConfirmHostKey} onBind={onBindProjectRemote} /> : <main><div className="settings-heading skill-heading"><div><h3>{zh ? "科研技能" : "Research skills"}</h3><p>{zh ? "从 Agent Skills 兼容目录导入；来源哈希、版本和能力声明会被固定。" : "Import Agent Skills directories with pinned source hashes, versions, and capabilities."}</p></div><button className="skill-import" disabled={skillsBusy || !onImportSkill} onClick={() => void importSkill()}>{skillsBusy ? (zh ? "校验中…" : "Validating…") : (zh ? "导入技能目录" : "Import skill directory")}</button></div>

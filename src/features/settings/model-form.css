@@ -7,7 +7,13 @@
 .model-form-actions button,.configured-models button { border: 1px solid #cfd6df; border-radius: 7px; padding: 6px 10px; background: white; }
 .model-form-actions button.primary { border-color: #315bd4; background: #315bd4; color: white; }
 .configured-models { margin-top: 14px; display: grid; gap: 7px; }
-.configured-models > div { display: flex; align-items: center; gap: 8px; padding: 9px 11px; border: 1px solid #e4e7ec; border-radius: 8px; }
+.configured-models > div { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 9px 11px; border: 1px solid #e4e7ec; border-radius: 8px; }
 .configured-models span { flex: 1; }
 .configured-models b,.configured-models small { display: block; }
 .configured-models small { margin-top: 2px; color: #667085; font-size: 9px; }
+.configured-models button { display: inline-flex; align-items: center; gap: 4px; }.configured-models button:disabled { opacity: .55; cursor: not-allowed; }
+.model-probe-result { flex-basis: 100%; display: flex; align-items: flex-start; gap: 7px; border-radius: 7px; padding: 8px; word-break: break-word; }
+.model-probe-result > span { min-width: 0; }.model-probe-result.success { background: #ecfdf3; color: #067647; }.model-probe-result.error { background: #fff1f0; color: #b42318; }
+.model-probe-result b,.model-probe-result small,.model-probe-result code { display: block; }.model-probe-result small { color: inherit; line-height: 1.45; }.model-probe-result code { margin-top: 4px; font-size: 9px; }
+.spin { animation: model-spin .9s linear infinite; }@keyframes model-spin { to { transform: rotate(360deg); } }
+.model-choices { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 5px; padding: 8px; background: #f8fafc; border-radius: 7px; }.model-choices > small { flex-basis: 100%; }.model-choices > button { color: #254fca; background: #edf2ff; border-color: #cddcff; font-size: 9px; }

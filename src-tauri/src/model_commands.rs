@@ -1,8 +1,7 @@
 use omicsops_adapters::{
     credentials::{CredentialVault, credential_account},
-    llm::{ProviderProtocol, UnifiedModelClient},
+    llm::{ModelProbeResult, ProviderProtocol, UnifiedModelClient},
 };
-use omicsops_agent::{ModelMessage, ModelRequest};
 use omicsops_core::workspace::{ModelProfile, ModelProviderKind};
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -85,7 +84,38 @@ pub fn save_model_profile(
 pub async fn probe_model_profile(
     state: State<'_, AppState>,
     profile_id: Uuid,
-) -> Result<(), String> {
+) -> Result<ModelProbeResult, String> {
+    let client = client_for_profile(&state, profile_id)?;
+    match client.probe().await {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            let available = client.list_models().await.unwrap_or_default();
+            if available.is_empty() {
+                Err(error.to_string())
+            } else {
+                let shown = available
+                    .into_iter()
+                    .take(20)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(format!("{error}; available models: {shown}"))
+            }
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn list_model_profile_models(
+    state: State<'_, AppState>,
+    profile_id: Uuid,
+) -> Result<Vec<String>, String> {
+    client_for_profile(&state, profile_id)?
+        .list_models()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn client_for_profile(state: &AppState, profile_id: Uuid) -> Result<UnifiedModelClient, String> {
     let profile = state
         .repository
         .get_model_profile(profile_id)
@@ -103,33 +133,12 @@ pub async fn probe_model_profile(
         ModelProviderKind::OpenAiCompatible => ProviderProtocol::OpenAiCompatible,
         ModelProviderKind::Ollama => ProviderProtocol::Ollama,
     };
-    let client = UnifiedModelClient::new(
+    UnifiedModelClient::new(
         profile.id,
         protocol,
         Url::parse(&profile.base_url).map_err(|error| error.to_string())?,
         profile.model,
         credential,
     )
-    .map_err(|error| error.to_string())?;
-    let mut completed = false;
-    client
-        .stream_with(
-            ModelRequest {
-                system: "Reply briefly to confirm the model is available.".into(),
-                messages: vec![ModelMessage {
-                    role: "user".into(),
-                    content: "Reply with OK.".into(),
-                }],
-                tool_name: None,
-                tool_schema: None,
-            },
-            |event| completed |= matches!(event, omicsops_agent::ModelStreamEvent::Completed),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    if completed {
-        Ok(())
-    } else {
-        Err("model stream ended without a completion event".into())
-    }
+    .map_err(|error| error.to_string())
 }
