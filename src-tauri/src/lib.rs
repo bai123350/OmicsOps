@@ -76,6 +76,7 @@ pub fn run() {
             commands::download_artifact,
             workspace_commands::list_projects,
             workspace_commands::create_project,
+            workspace_commands::update_project_remote,
             workspace_commands::list_conversations,
             workspace_commands::create_conversation,
             agent_commands::list_messages,

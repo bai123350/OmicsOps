@@ -1,0 +1,21 @@
+.remote-settings { display: flex; flex-direction: column; gap: 16px; }
+.remote-form, .remote-binding { border: 1px solid #dfe3e9; border-radius: 10px; padding: 13px; }
+.remote-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.remote-grid label { color: #475467; font-size: 10px; display: flex; flex-direction: column; gap: 4px; }
+.remote-grid input, .remote-grid select, .remote-binding input, .remote-binding select { border: 1px solid #d0d5dd; border-radius: 7px; padding: 7px 8px; background: white; }
+.remote-form > button { margin-top: 10px; }
+.remote-settings .primary, .remote-binding button { border: 0; background: #254fca; color: white; border-radius: 7px; padding: 7px 10px; }
+.remote-settings button:disabled { opacity: .5; cursor: not-allowed; }
+.connection-list { display: grid; gap: 8px; }
+.connection-list > article { border: 1px solid #dfe3e9; border-radius: 10px; padding: 11px; display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; }
+.connection-list b, .connection-list small { display: block; }
+.connection-list small { color: #667085; font-size: 9px; margin-top: 3px; }
+.connection-actions { display: flex; gap: 5px; }.connection-actions button, .connection-result button { border: 1px solid #d0d5dd; background: white; border-radius: 6px; padding: 5px 8px; font-size: 10px; }
+.connection-result { grid-column: 1 / -1; background: #f8fafc; padding: 8px; border-radius: 7px; display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.connection-result code { word-break: break-all; font-size: 9px; }
+.connection-result span { color: #475467; font-size: 10px; }
+.connection-result small { flex-basis: 100%; }
+.remote-binding { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.remote-binding b { grid-column: 1 / -1; }
+.remote-binding button { grid-column: 1 / -1; justify-self: start; }
+.remote-binding small { grid-column: 1 / -1; color: #b54708; }

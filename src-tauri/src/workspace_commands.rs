@@ -22,6 +22,13 @@ pub struct CreateConversationRequest {
     pub title: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateProjectRemoteRequest {
+    pub project_id: Uuid,
+    pub connection_id: Option<Uuid>,
+    pub remote_root: Option<String>,
+}
+
 pub fn project_from_request(
     request: CreateProjectRequest,
     id: Uuid,
@@ -82,6 +89,69 @@ pub fn create_project(
         .save_project(&project)
         .map_err(|error| error.to_string())?;
     Ok(project)
+}
+
+#[tauri::command]
+pub fn update_project_remote(
+    state: State<'_, AppState>,
+    request: UpdateProjectRemoteRequest,
+) -> Result<Project, String> {
+    let mut project = state
+        .repository
+        .list_projects()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|project| project.id == request.project_id)
+        .ok_or_else(|| "project was not found".to_string())?;
+    let connection_exists = if let Some(connection_id) = request.connection_id {
+        state
+            .repository
+            .list_connections()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|profile| profile.id == connection_id)
+    } else {
+        false
+    };
+    apply_remote_binding(&mut project, request, connection_exists, Utc::now())?;
+    write_project_manifest(&project)?;
+    state
+        .repository
+        .save_project(&project)
+        .map_err(|error| error.to_string())?;
+    Ok(project)
+}
+
+pub fn apply_remote_binding(
+    project: &mut Project,
+    request: UpdateProjectRemoteRequest,
+    connection_exists: bool,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    match (request.connection_id, request.remote_root) {
+        (Some(connection_id), Some(remote_root)) => {
+            let remote_root = remote_root.trim();
+            if !remote_root.starts_with('/')
+                || remote_root.contains('\n')
+                || remote_root.contains('\r')
+                || remote_root.contains('\0')
+            {
+                return Err("remote project root must be an absolute Linux path".into());
+            }
+            if !connection_exists {
+                return Err("remote connection was not found".into());
+            }
+            project.connection_id = Some(connection_id);
+            project.remote_root = Some(remote_root.trim_end_matches('/').to_owned());
+        }
+        (None, None) => {
+            project.connection_id = None;
+            project.remote_root = None;
+        }
+        _ => return Err("connection and remote root must be configured together".into()),
+    }
+    project.updated_at = now;
+    Ok(())
 }
 
 #[tauri::command]

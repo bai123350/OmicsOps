@@ -98,6 +98,35 @@ impl SshJsonlProcess {
 }
 
 impl SshSession {
+    pub async fn probe_host_key(profile: &ConnectionProfile) -> AdapterResult<String> {
+        let observed = Arc::new(Mutex::new(None));
+        let handler = HostKeyHandler {
+            expected: None,
+            observed: observed.clone(),
+        };
+        let config = Arc::new(client::Config {
+            inactivity_timeout: Some(Duration::from_secs(15)),
+            ..Default::default()
+        });
+        let handle = tokio::time::timeout(
+            Duration::from_secs(15),
+            client::connect(config, (profile.host.as_str(), profile.port), handler),
+        )
+        .await
+        .map_err(|_| AdapterError::Ssh("connection timed out during host key probe".into()))?
+        .map_err(ssh_error)?;
+        let fingerprint = observed
+            .lock()
+            .expect("host key lock")
+            .clone()
+            .ok_or_else(|| AdapterError::Ssh("server did not present a host key".into()))?;
+        handle
+            .disconnect(Disconnect::ByApplication, "host key probe complete", "en")
+            .await
+            .map_err(ssh_error)?;
+        Ok(fingerprint)
+    }
+
     pub async fn connect(
         profile: &ConnectionProfile,
         authentication: SshAuthentication,
@@ -111,9 +140,13 @@ impl SshSession {
             inactivity_timeout: Some(Duration::from_secs(30)),
             ..Default::default()
         });
-        let mut handle = client::connect(config, (profile.host.as_str(), profile.port), handler)
-            .await
-            .map_err(ssh_error)?;
+        let mut handle = tokio::time::timeout(
+            Duration::from_secs(15),
+            client::connect(config, (profile.host.as_str(), profile.port), handler),
+        )
+        .await
+        .map_err(|_| AdapterError::Ssh("connection timed out".into()))?
+        .map_err(ssh_error)?;
         let fingerprint = observed
             .lock()
             .expect("host key lock")
@@ -129,27 +162,34 @@ impl SshSession {
         }
 
         let authenticated = match authentication {
-            SshAuthentication::Password(password) => handle
-                .authenticate_password(&profile.username, password)
-                .await
-                .map_err(ssh_error)?
-                .success(),
+            SshAuthentication::Password(password) => tokio::time::timeout(
+                Duration::from_secs(15),
+                handle.authenticate_password(&profile.username, password),
+            )
+            .await
+            .map_err(|_| AdapterError::Ssh("password authentication timed out".into()))?
+            .map_err(ssh_error)?
+            .success(),
             SshAuthentication::PrivateKey { path, passphrase } => {
                 let key = load_secret_key(path, passphrase.as_deref())
                     .map_err(|error| AdapterError::Ssh(error.to_string()))?;
-                let hash = handle
-                    .best_supported_rsa_hash()
-                    .await
-                    .map_err(ssh_error)?
-                    .flatten();
-                handle
-                    .authenticate_publickey(
+                let hash =
+                    tokio::time::timeout(Duration::from_secs(15), handle.best_supported_rsa_hash())
+                        .await
+                        .map_err(|_| AdapterError::Ssh("key negotiation timed out".into()))?
+                        .map_err(ssh_error)?
+                        .flatten();
+                tokio::time::timeout(
+                    Duration::from_secs(15),
+                    handle.authenticate_publickey(
                         &profile.username,
                         PrivateKeyWithHashAlg::new(Arc::new(key), hash),
-                    )
-                    .await
-                    .map_err(ssh_error)?
-                    .success()
+                    ),
+                )
+                .await
+                .map_err(|_| AdapterError::Ssh("public key authentication timed out".into()))?
+                .map_err(ssh_error)?
+                .success()
             }
         };
         if !authenticated {
@@ -214,6 +254,11 @@ impl SshSession {
         SftpSession::new(channel.into_stream())
             .await
             .map_err(|error| AdapterError::Ssh(error.to_string()))
+    }
+
+    pub async fn probe_sftp(&self) -> AdapterResult<()> {
+        let _session = self.sftp().await?;
+        Ok(())
     }
 
     pub async fn upload_text(&self, remote_path: &str, contents: &str) -> AdapterResult<()> {

@@ -29,4 +29,21 @@ describe("SettingsPanel model providers", () => {
     fireEvent.click(screen.getByRole("button", { name: "启用" }));
     expect(onSetSkillEnabled).toHaveBeenCalledWith("skill-1", true);
   });
+
+  it("requires host-key confirmation before authenticated remote diagnostics", async () => {
+    const connection = { id: "connection-1", label: "Lab SSH", host: "compute.example.org", port: 20090, username: "scientist", authentication: "password" as const, authentication_reference: "ssh/connection-1", host_key_fingerprint: null };
+    const onTestConnection = vi.fn()
+      .mockResolvedValueOnce({ fingerprint: "SHA256:test", trusted: false, authenticated: false, latencyMs: 20, serverOs: null, remoteUsername: null, home: null, sftpAvailable: false, pythonAvailable: false, rAvailable: false })
+      .mockResolvedValueOnce({ fingerprint: "SHA256:test", trusted: true, authenticated: true, latencyMs: 31, serverOs: "Linux 6.8", remoteUsername: "scientist", home: "/home/scientist", sftpAvailable: true, pythonAvailable: true, rAvailable: true });
+    const onConfirmHostKey = vi.fn().mockResolvedValue(undefined);
+    render(<SettingsPanel locale="zh-CN" onClose={() => undefined} connections={[connection]} onTestConnection={onTestConnection} onConfirmHostKey={onConfirmHostKey} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "远端计算" }));
+    fireEvent.click(screen.getByRole("button", { name: "测试连接" }));
+    expect(await screen.findByText("等待确认主机指纹")).toBeInTheDocument();
+    expect(screen.queryByText(/Linux 6.8/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "确认此指纹" }));
+    await waitFor(() => expect(onConfirmHostKey).toHaveBeenCalledWith("connection-1", "SHA256:test"));
+    expect(await screen.findByText(/Linux 6.8/)).toBeInTheDocument();
+  });
 });

@@ -64,6 +64,14 @@ pub struct PrivateKeySecret {
 pub struct ConnectionTestResult {
     pub fingerprint: String,
     pub trusted: bool,
+    pub authenticated: bool,
+    pub latency_ms: u128,
+    pub server_os: Option<String>,
+    pub remote_username: Option<String>,
+    pub home: Option<String>,
+    pub sftp_available: bool,
+    pub python_available: bool,
+    pub r_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,20 +113,65 @@ pub fn list_connections(state: State<'_, AppState>) -> Result<Vec<ConnectionProf
 #[tauri::command]
 pub fn save_connection(
     state: State<'_, AppState>,
-    profile: ConnectionProfile,
+    mut profile: ConnectionProfile,
     secret: String,
 ) -> Result<(), String> {
-    if profile.host.trim().is_empty() || profile.username.trim().is_empty() {
-        return Err("host and username are required".into());
+    let previous = state
+        .repository
+        .list_connections()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|item| item.id == profile.id);
+    normalize_connection_profile(&mut profile, previous.as_ref())?;
+    if secret.is_empty() {
+        let existing = state
+            .credentials
+            .get(&profile.authentication_reference)
+            .map_err(|error| error.to_string())?;
+        if existing.is_none()
+            || previous
+                .as_ref()
+                .is_some_and(|item| item.authentication != profile.authentication)
+        {
+            return Err("SSH credential is required for this connection".into());
+        }
+    } else {
+        state
+            .credentials
+            .set(&profile.authentication_reference, &secret)
+            .map_err(|error| error.to_string())?;
     }
-    state
-        .credentials
-        .set(&profile.authentication_reference, &secret)
-        .map_err(|error| error.to_string())?;
     state
         .repository
         .save_connection(&profile)
         .map_err(|error| error.to_string())
+}
+
+pub fn normalize_connection_profile(
+    profile: &mut ConnectionProfile,
+    previous: Option<&ConnectionProfile>,
+) -> Result<(), String> {
+    profile.label = profile.label.trim().to_owned();
+    profile.host = profile.host.trim().to_owned();
+    profile.username = profile.username.trim().to_owned();
+    if profile.label.is_empty() || profile.host.is_empty() || profile.username.is_empty() {
+        return Err("label, host, and username are required".into());
+    }
+    if profile.port == 0 || profile.host.chars().any(char::is_whitespace) {
+        return Err("SSH host or port is invalid".into());
+    }
+    if let Some(previous) = previous {
+        if previous.host != profile.host
+            || previous.port != profile.port
+            || previous.username != profile.username
+        {
+            profile.host_key_fingerprint = None;
+        } else {
+            profile.host_key_fingerprint = previous.host_key_fingerprint.clone();
+        }
+    }
+    profile.authentication_reference = credential_account("ssh", profile.id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -127,10 +180,53 @@ pub async fn test_connection(
     profile_id: Uuid,
 ) -> Result<ConnectionTestResult, String> {
     let profile = find_profile(&state.repository, profile_id)?;
+    let started = std::time::Instant::now();
+    let fingerprint = SshSession::probe_host_key(&profile)
+        .await
+        .map_err(|error| error.to_string())?;
+    if profile.host_key_fingerprint.is_none() {
+        return Ok(ConnectionTestResult {
+            fingerprint,
+            trusted: false,
+            authenticated: false,
+            latency_ms: started.elapsed().as_millis(),
+            server_os: None,
+            remote_username: None,
+            home: None,
+            sftp_available: false,
+            python_available: false,
+            r_available: false,
+        });
+    }
+    if profile.host_key_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+        return Err(format!(
+            "SSH host key changed; expected {}, received {}",
+            profile.host_key_fingerprint.as_deref().unwrap_or_default(),
+            fingerprint
+        ));
+    }
     let session = connect_profile(&state, &profile).await?;
+    let diagnostics = session
+        .execute_checked("printf 'os='; uname -srm; printf 'user='; id -un; printf 'home=%s\\n' \"$HOME\"; command -v python3 >/dev/null && printf 'python=1\\n' || printf 'python=0\\n'; command -v Rscript >/dev/null && printf 'r=1\\n' || printf 'r=0\\n'")
+        .await
+        .map_err(|error| error.to_string())?;
+    let sftp_available = session.probe_sftp().await.is_ok();
+    let fields: HashMap<&str, &str> = diagnostics
+        .stdout
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
     let result = ConnectionTestResult {
-        fingerprint: session.fingerprint().to_owned(),
-        trusted: profile.host_key_fingerprint.as_deref() == Some(session.fingerprint()),
+        fingerprint,
+        trusted: true,
+        authenticated: true,
+        latency_ms: started.elapsed().as_millis(),
+        server_os: fields.get("os").map(|value| (*value).to_owned()),
+        remote_username: fields.get("user").map(|value| (*value).to_owned()),
+        home: fields.get("home").map(|value| (*value).to_owned()),
+        sftp_available,
+        python_available: fields.get("python") == Some(&"1"),
+        r_available: fields.get("r") == Some(&"1"),
     };
     session
         .disconnect()
@@ -140,12 +236,20 @@ pub async fn test_connection(
 }
 
 #[tauri::command]
-pub fn confirm_host_key(
+pub async fn confirm_host_key(
     state: State<'_, AppState>,
     profile_id: Uuid,
     fingerprint: String,
 ) -> Result<(), String> {
     let mut profile = find_profile(&state.repository, profile_id)?;
+    let observed = SshSession::probe_host_key(&profile)
+        .await
+        .map_err(|error| error.to_string())?;
+    if fingerprint != observed {
+        return Err(format!(
+            "host key confirmation did not match the server; received {observed}"
+        ));
+    }
     profile.host_key_fingerprint = Some(fingerprint);
     state
         .repository

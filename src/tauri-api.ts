@@ -6,6 +6,7 @@ import type {
   AnalysisPlan,
   Artifact,
   ConnectionProfile,
+  ConnectionTestResult,
   ProjectSpec,
   RunCheckpoint,
   RunEvent,
@@ -209,13 +210,21 @@ export async function saveConnection(
   await invoke("save_connection", { profile, secret });
 }
 
+export async function listConnections(): Promise<ConnectionProfile[]> {
+  return isTauri() ? invoke("list_connections") : [];
+}
+
 export async function testConnection(
   profileId: string,
-): Promise<{ fingerprint: string; trusted: boolean }> {
+): Promise<ConnectionTestResult> {
   if (!isTauri()) {
-    return { fingerprint: "SHA256:demo-host-key", trusted: false };
+    return { fingerprint: "SHA256:demo-host-key", trusted: false, authenticated: false, latencyMs: 25, serverOs: null, remoteUsername: null, home: null, sftpAvailable: false, pythonAvailable: false, rAvailable: false };
   }
   return invoke("test_connection", { profileId });
+}
+
+export async function updateProjectRemote(projectId: string, connectionId: string | null, remoteRoot: string | null): Promise<WorkspaceProject> {
+  return invoke("update_project_remote", { request: { project_id: projectId, connection_id: connectionId, remote_root: remoteRoot } });
 }
 
 export async function confirmHostKey(

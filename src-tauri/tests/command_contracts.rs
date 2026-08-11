@@ -1,11 +1,11 @@
 use chrono::{TimeZone, Utc};
 use omicsops_agent::{AgentEventKind, ModelStreamEvent};
-use omicsops_core::domain::AuthenticationMethod;
+use omicsops_core::domain::{AuthenticationMethod, ConnectionProfile};
 use omicsops_desktop_lib::{
     agent_commands::{
         SubmitMessageRequest, agent_event_kind_from_model_event, user_message_from_request,
     },
-    commands::{PrivateKeySecret, parse_authentication_secret},
+    commands::{PrivateKeySecret, normalize_connection_profile, parse_authentication_secret},
     inspection::parse_server_inspection,
     kernel_commands::{
         PromoteKernelCellRequest, mark_orphaned_kernels_interrupted, promote_saved_kernel_cell,
@@ -14,7 +14,10 @@ use omicsops_desktop_lib::{
     research_commands::research_cache_key,
     skill_commands::{install_builtin_skills, set_skill_enabled_in_repository},
     sync_commands::{choose_download_relative_path, parse_remote_index, resolve_selected_uploads},
-    workspace_commands::{CreateProjectRequest, project_from_request, write_project_manifest},
+    workspace_commands::{
+        CreateProjectRequest, UpdateProjectRemoteRequest, apply_remote_binding,
+        project_from_request, write_project_manifest,
+    },
 };
 use uuid::Uuid;
 
@@ -26,6 +29,93 @@ fn password_secret_remains_opaque() {
         authentication,
         omicsops_adapters::ssh::SshAuthentication::Password(value) if value == "hunter2"
     ));
+}
+
+#[test]
+fn changed_ssh_endpoints_clear_trust_and_use_a_canonical_credential_reference() {
+    let id = Uuid::new_v4();
+    let previous = ConnectionProfile {
+        id,
+        label: "Old".into(),
+        host: "old.example.org".into(),
+        port: 22,
+        username: "worker".into(),
+        authentication: AuthenticationMethod::Password,
+        authentication_reference: "untrusted/reference".into(),
+        host_key_fingerprint: Some("SHA256:old".into()),
+    };
+    let mut updated = previous.clone();
+    updated.label = "  Lab SSH  ".into();
+    updated.host = "new.example.org".into();
+    normalize_connection_profile(&mut updated, Some(&previous)).unwrap();
+    assert_eq!(updated.label, "Lab SSH");
+    assert_eq!(updated.authentication_reference, format!("ssh/{id}"));
+    assert_eq!(updated.host_key_fingerprint, None);
+
+    let mut same_endpoint = previous.clone();
+    same_endpoint.host_key_fingerprint = Some("SHA256:client-supplied".into());
+    normalize_connection_profile(&mut same_endpoint, Some(&previous)).unwrap();
+    assert_eq!(
+        same_endpoint.host_key_fingerprint.as_deref(),
+        Some("SHA256:old")
+    );
+}
+
+#[test]
+fn project_remote_binding_requires_an_existing_connection_and_absolute_linux_path() {
+    let now = Utc.with_ymd_and_hms(2026, 8, 11, 2, 0, 0).unwrap();
+    let mut project = project_from_request(
+        CreateProjectRequest {
+            name: "PBMC".into(),
+            description: "".into(),
+            local_root: "E:/Science/pbmc".into(),
+            template: "single_cell_rna_seq".into(),
+        },
+        Uuid::new_v4(),
+        now,
+    )
+    .unwrap();
+    let project_id = project.id;
+    let connection_id = Uuid::new_v4();
+    assert!(
+        apply_remote_binding(
+            &mut project,
+            UpdateProjectRemoteRequest {
+                project_id,
+                connection_id: Some(connection_id),
+                remote_root: Some("relative/path".into())
+            },
+            true,
+            now
+        )
+        .is_err()
+    );
+    assert!(
+        apply_remote_binding(
+            &mut project,
+            UpdateProjectRemoteRequest {
+                project_id,
+                connection_id: Some(connection_id),
+                remote_root: Some("/home/worker/pbmc".into())
+            },
+            false,
+            now
+        )
+        .is_err()
+    );
+    apply_remote_binding(
+        &mut project,
+        UpdateProjectRemoteRequest {
+            project_id,
+            connection_id: Some(connection_id),
+            remote_root: Some("/home/worker/pbmc/".into()),
+        },
+        true,
+        now,
+    )
+    .unwrap();
+    assert_eq!(project.connection_id, Some(connection_id));
+    assert_eq!(project.remote_root.as_deref(), Some("/home/worker/pbmc"));
 }
 
 #[test]

@@ -264,6 +264,19 @@ export interface EnvironmentLock {
   declared_dependencies: string[];
 }
 
+export interface ConnectionTestResult {
+  fingerprint: string;
+  trusted: boolean;
+  authenticated: boolean;
+  latencyMs: number;
+  serverOs: string | null;
+  remoteUsername: string | null;
+  home: string | null;
+  sftpAvailable: boolean;
+  pythonAvailable: boolean;
+  rAvailable: boolean;
+}
+
 export type WorkspaceTemplate = "blank" | "single_cell_rna_seq" | "bulk_rna_seq" | "literature_review";
 export type WorkspaceProjectStatus = "ready" | "running" | "waiting_for_input" | "needs_attention" | "archived";
 
