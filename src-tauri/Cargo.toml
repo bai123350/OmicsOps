@@ -17,6 +17,7 @@ omicsops-agent = { path = "../crates/omicsops-agent" }
 omicsops-adapters = { path = "../crates/omicsops-adapters" }
 omicsops-core = { path = "../crates/omicsops-core" }
 omicsops-runner = { path = "../crates/omicsops-runner" }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true

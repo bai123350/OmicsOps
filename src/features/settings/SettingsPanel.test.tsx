@@ -14,4 +14,19 @@ describe("SettingsPanel model providers", () => {
     expect(onSaveModel).toHaveBeenCalledWith(expect.objectContaining({ provider: "anthropic", label: "Lab Claude", model: "claude-science", credential: "secret" }));
     await waitFor(() => expect(screen.queryByDisplayValue("secret")).not.toBeInTheDocument());
   });
+
+  it("imports versioned skills and keeps them disabled until explicit enablement", async () => {
+    const onImportSkill = vi.fn().mockResolvedValue(undefined);
+    const onSetSkillEnabled = vi.fn().mockResolvedValue({});
+    render(<SettingsPanel locale="zh-CN" onClose={() => undefined} skillPackages={[{ id: "skill-1", name: "scrna-qc", version: "1.2.0", source_path: "skills/scrna-qc/hash", sha256: "abcdef1234567890", enabled: false, capabilities: ["read_project_files"] }]} onImportSkill={onImportSkill} onSetSkillEnabled={onSetSkillEnabled} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "技能与 MCP" }));
+    expect(screen.getByText("scrna-qc")).toBeInTheDocument();
+    expect(screen.getByText("read_project_files")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "导入技能目录" }));
+    expect(onImportSkill).toHaveBeenCalledOnce();
+    await waitFor(() => expect(screen.getByRole("button", { name: "启用" })).not.toBeDisabled());
+    fireEvent.click(screen.getByRole("button", { name: "启用" }));
+    expect(onSetSkillEnabled).toHaveBeenCalledWith("skill-1", true);
+  });
 });

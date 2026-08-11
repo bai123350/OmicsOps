@@ -30,6 +30,8 @@ import type {
   PlanProposal,
   RemoteFileEntry,
   SyncEntry,
+  SkillPackage,
+  ResearchSearchResult,
 } from "./types";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
@@ -127,6 +129,28 @@ export async function uploadSelectedFiles(projectId: string, relativePaths: stri
 
 export async function downloadProjectFile(projectId: string, relativePath: string): Promise<{ entry: SyncEntry; conflict: boolean }> {
   return invoke("download_project_file", { request: { project_id: projectId, relative_path: relativePath } });
+}
+
+export async function listSkillPackages(): Promise<SkillPackage[]> {
+  return isTauri() ? invoke("list_skill_packages") : [];
+}
+
+export async function chooseSkillDirectory(): Promise<string | null> {
+  if (!isTauri()) return null;
+  const selected = await open({ directory: true, multiple: false });
+  return typeof selected === "string" ? selected : null;
+}
+
+export async function importSkillDirectory(sourcePath: string): Promise<SkillPackage> {
+  return invoke("import_skill_directory", { request: { source_path: sourcePath } });
+}
+
+export async function setSkillEnabled(skillId: string, enabled: boolean): Promise<SkillPackage> {
+  return invoke("set_skill_enabled", { request: { skill_id: skillId, enabled } });
+}
+
+export async function searchResearch(request: { source: ResearchSearchResult["source"]; query: string; limit?: number; cursor?: string | null; refresh?: boolean }): Promise<ResearchSearchResult> {
+  return invoke("search_research", { request: { source: request.source, query: request.query, limit: request.limit ?? 20, cursor: request.cursor ?? null, refresh: request.refresh ?? false } });
 }
 
 export async function choosePlan(): Promise<string | null> {

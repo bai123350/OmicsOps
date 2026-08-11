@@ -354,3 +354,33 @@ export interface SyncEntry {
   state: "pending" | "transferring" | "synced" | "conflict" | "failed";
   updated_at: string;
 }
+
+export interface SkillPackage {
+  id: string;
+  name: string;
+  version: string;
+  source_path: string;
+  sha256: string;
+  enabled: boolean;
+  capabilities: string[];
+}
+
+export interface ResearchItem {
+  identifier: string;
+  title: string;
+  abstract_text: string | null;
+  authors: string[];
+  year: number | null;
+  doi: string | null;
+  url: string | null;
+  provenance: { source: string; query: string; identifier: string; retrieved_at: string };
+}
+
+export interface ResearchSearchResult {
+  source: "pubmed" | "europe-pmc" | "crossref";
+  query: string;
+  retrieved_at: string;
+  next_cursor: string | null;
+  items: ResearchItem[];
+  cached: boolean;
+}

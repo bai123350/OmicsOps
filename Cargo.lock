@@ -3059,6 +3059,7 @@ dependencies = [
  "omicsops-agent",
  "omicsops-core",
  "omicsops-runner",
+ "reqwest 0.12.28",
  "schemars 1.2.2",
  "serde",
  "serde_json",

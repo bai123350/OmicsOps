@@ -46,6 +46,8 @@ pub struct AppState {
     pub repository: Repository,
     pub credentials: SystemCredentialVault,
     pub active_runs: Arc<Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
+    pub skills_root: PathBuf,
+    pub research_last_request: Arc<tokio::sync::Mutex<HashMap<String, std::time::Instant>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2,6 +2,8 @@ pub mod agent_commands;
 pub mod commands;
 pub mod inspection;
 pub mod model_commands;
+pub mod research_commands;
+pub mod skill_commands;
 pub mod sync_commands;
 pub mod workspace_commands;
 
@@ -22,12 +24,17 @@ pub fn run() {
                 .app_data_dir()
                 .map_err(|error| error.to_string())?;
             std::fs::create_dir_all(&data_dir)?;
+            let skills_root = data_dir.join("skills");
+            std::fs::create_dir_all(&skills_root)?;
             let repository = Repository::open(data_dir.join("omicsops.db"))
                 .map_err(|error| error.to_string())?;
+            skill_commands::install_builtin_skills(&repository, &skills_root)?;
             app.manage(AppState {
                 repository,
                 credentials: SystemCredentialVault,
                 active_runs: Arc::new(Mutex::new(HashMap::new())),
+                skills_root,
+                research_last_request: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             });
             Ok(())
         })
@@ -74,6 +81,10 @@ pub fn run() {
             model_commands::list_model_profiles,
             model_commands::save_model_profile,
             model_commands::probe_model_profile,
+            skill_commands::list_skill_packages,
+            skill_commands::import_skill_directory,
+            skill_commands::set_skill_enabled,
+            research_commands::search_research,
             sync_commands::list_remote_files,
             sync_commands::upload_selected_files,
             sync_commands::download_project_file,

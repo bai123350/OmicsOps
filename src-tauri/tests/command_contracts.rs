@@ -8,6 +8,8 @@ use omicsops_desktop_lib::{
     commands::{PrivateKeySecret, parse_authentication_secret},
     inspection::parse_server_inspection,
     model_commands::{SaveModelProfileRequest, model_profile_from_request},
+    research_commands::research_cache_key,
+    skill_commands::{install_builtin_skills, set_skill_enabled_in_repository},
     sync_commands::{choose_download_relative_path, parse_remote_index, resolve_selected_uploads},
     workspace_commands::{CreateProjectRequest, project_from_request, write_project_manifest},
 };
@@ -254,4 +256,69 @@ fn downloads_use_parallel_conflict_versions_instead_of_overwriting() {
         "results/markers.conflict-1.csv"
     );
     assert!(directory.path().join("results/markers.csv").exists());
+}
+
+#[test]
+fn research_cache_keys_include_source_query_limit_and_page_cursor() {
+    let first = research_cache_key("pubmed", "PBMC", 20, None);
+    assert_eq!(first, research_cache_key("pubmed", "PBMC", 20, None));
+    assert_ne!(first, research_cache_key("europe-pmc", "PBMC", 20, None));
+    assert_ne!(first, research_cache_key("pubmed", "PBMC", 20, Some("20")));
+}
+
+#[test]
+fn builtin_research_skills_are_versioned_hashed_and_enabled() {
+    let repository = omicsops_adapters::persistence::Repository::open_in_memory().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    install_builtin_skills(&repository, directory.path()).unwrap();
+    install_builtin_skills(&repository, directory.path()).unwrap();
+    let skills = repository.list_skill_packages().unwrap();
+    assert_eq!(skills.len(), 3);
+    assert!(skills.iter().all(|skill| skill.version == "1.0.0"));
+    assert!(
+        skills
+            .iter()
+            .all(|skill| skill.sha256.len() == 64 && skill.enabled)
+    );
+}
+
+#[test]
+fn enabling_a_skill_version_disables_other_versions_with_the_same_name() {
+    let repository = omicsops_adapters::persistence::Repository::open_in_memory().unwrap();
+    let mut first = omicsops_core::workspace::SkillPackage {
+        id: Uuid::new_v4(),
+        name: "scrna-qc".into(),
+        version: "1.0.0".into(),
+        source_path: "one".into(),
+        sha256: "1".repeat(64),
+        enabled: true,
+        capabilities: vec![],
+    };
+    let second = omicsops_core::workspace::SkillPackage {
+        id: Uuid::new_v4(),
+        name: "scrna-qc".into(),
+        version: "2.0.0".into(),
+        source_path: "two".into(),
+        sha256: "2".repeat(64),
+        enabled: false,
+        capabilities: vec![],
+    };
+    repository.save_skill_package(&first).unwrap();
+    repository.save_skill_package(&second).unwrap();
+    set_skill_enabled_in_repository(&repository, second.id, true).unwrap();
+    let packages = repository.list_skill_packages().unwrap();
+    first = packages
+        .into_iter()
+        .find(|skill| skill.id == first.id)
+        .unwrap();
+    assert!(!first.enabled);
+    assert!(
+        repository
+            .list_skill_packages()
+            .unwrap()
+            .into_iter()
+            .find(|skill| skill.id == second.id)
+            .unwrap()
+            .enabled
+    );
 }
