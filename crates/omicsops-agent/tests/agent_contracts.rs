@@ -1,6 +1,7 @@
 use omicsops_agent::{
-    AgentEvent, ApprovalDecision, ApprovalGate, Capability, ModelStreamEvent, SpecialistDispatcher,
-    ToolArgumentBuffer, ToolRegistry,
+    ActiveTurnCoordinator, AgentEvent, ApprovalDecision, ApprovalGate, Capability,
+    ModelStreamEvent, SpecialistDispatcher, SpecialistFinding, SpecialistKind,
+    SpecialistProposedAction, SpecialistReport, ToolArgumentBuffer, ToolRegistry,
 };
 use uuid::Uuid;
 
@@ -78,6 +79,45 @@ fn specialist_dispatcher_caps_parallel_work_at_three() {
     assert!(dispatcher.start("fourth").is_err());
     dispatcher.finish("statistics");
     assert!(dispatcher.start("replacement").is_ok());
+}
+
+#[test]
+fn specialist_mutations_return_to_the_main_approval_gate() {
+    let report = SpecialistReport {
+        task_id: Uuid::new_v4(),
+        kind: SpecialistKind::CodeReview,
+        findings: vec![SpecialistFinding {
+            summary: "Use a sparse matrix".into(),
+            evidence: vec!["memory estimate".into()],
+        }],
+        proposed_actions: vec![
+            SpecialistProposedAction {
+                tool: "workspace.read".into(),
+                capability: Capability::ReadLocal,
+                arguments: serde_json::json!({"path":"analysis.py"}),
+            },
+            SpecialistProposedAction {
+                tool: "remote.execute".into(),
+                capability: Capability::ExecuteRemote,
+                arguments: serde_json::json!({"command":"python analysis.py"}),
+            },
+        ],
+    };
+    let required = report.actions_requiring_main_approval(&ApprovalGate);
+    assert_eq!(required.len(), 1);
+    assert_eq!(required[0].tool, "remote.execute");
+}
+
+#[test]
+fn active_conversation_turns_are_capped_at_three() {
+    let mut turns = ActiveTurnCoordinator::default();
+    let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+    for id in ids {
+        turns.start(id).unwrap();
+    }
+    assert!(turns.start(Uuid::new_v4()).is_err());
+    turns.finish(ids[1]);
+    assert!(turns.start(Uuid::new_v4()).is_ok());
 }
 
 #[test]

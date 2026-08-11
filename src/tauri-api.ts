@@ -32,6 +32,11 @@ import type {
   SyncEntry,
   SkillPackage,
   ResearchSearchResult,
+  KernelLanguage,
+  KernelSession,
+  KernelEvent,
+  KernelCellResult,
+  FormalStepProposal,
 } from "./types";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
@@ -151,6 +156,35 @@ export async function setSkillEnabled(skillId: string, enabled: boolean): Promis
 
 export async function searchResearch(request: { source: ResearchSearchResult["source"]; query: string; limit?: number; cursor?: string | null; refresh?: boolean }): Promise<ResearchSearchResult> {
   return invoke("search_research", { request: { source: request.source, query: request.query, limit: request.limit ?? 20, cursor: request.cursor ?? null, refresh: request.refresh ?? false } });
+}
+
+export async function listKernelSessions(): Promise<KernelSession[]> {
+  return isTauri() ? invoke("list_kernel_sessions") : [];
+}
+
+export async function startKernel(projectId: string, language: KernelLanguage, rebuildSessionId?: string): Promise<KernelSession> {
+  return invoke("start_kernel", { request: { project_id: projectId, language, rebuild_session_id: rebuildSessionId ?? null } });
+}
+
+export async function executeKernelCell(sessionId: string, code: string, saveCell: boolean, capturePaths: string[]): Promise<KernelCellResult> {
+  return invoke("execute_kernel_cell", { request: { session_id: sessionId, code, save: saveCell, capture_paths: capturePaths } });
+}
+
+export async function interruptKernel(sessionId: string): Promise<KernelSession> {
+  return invoke("interrupt_kernel", { sessionId });
+}
+
+export async function stopKernel(sessionId: string): Promise<KernelSession> {
+  return invoke("stop_kernel", { sessionId });
+}
+
+export async function promoteKernelCell(sessionId: string, cellIndex: number, name: string, version = 1): Promise<FormalStepProposal> {
+  return invoke("promote_kernel_cell", { request: { session_id: sessionId, cell_index: cellIndex, name, version } });
+}
+
+export async function onKernelEvent(callback: (event: KernelEvent) => void): Promise<UnlistenFn> {
+  if (!isTauri()) return () => undefined;
+  return listen<KernelEvent>("kernel-event", ({ payload }) => callback(payload));
 }
 
 export async function choosePlan(): Promise<string | null> {

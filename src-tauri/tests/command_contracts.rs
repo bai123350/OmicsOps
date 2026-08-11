@@ -7,6 +7,9 @@ use omicsops_desktop_lib::{
     },
     commands::{PrivateKeySecret, parse_authentication_secret},
     inspection::parse_server_inspection,
+    kernel_commands::{
+        PromoteKernelCellRequest, mark_orphaned_kernels_interrupted, promote_saved_kernel_cell,
+    },
     model_commands::{SaveModelProfileRequest, model_profile_from_request},
     research_commands::research_cache_key,
     skill_commands::{install_builtin_skills, set_skill_enabled_in_repository},
@@ -320,5 +323,68 @@ fn enabling_a_skill_version_disables_other_versions_with_the_same_name() {
             .find(|skill| skill.id == second.id)
             .unwrap()
             .enabled
+    );
+}
+
+#[test]
+fn application_restart_marks_running_exploration_kernels_interrupted() {
+    let repository = omicsops_adapters::persistence::Repository::open_in_memory().unwrap();
+    let mut session = omicsops_agent::KernelSession::new(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        omicsops_agent::KernelLanguage::Python,
+    );
+    session.start().unwrap();
+    session.save_cell("x = 1");
+    repository
+        .put_json("kernel_session", &session.id.to_string(), &session)
+        .unwrap();
+    assert_eq!(mark_orphaned_kernels_interrupted(&repository).unwrap(), 1);
+    let restored: omicsops_agent::KernelSession = repository
+        .get_json("kernel_session", &session.id.to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.state, omicsops_agent::KernelState::Interrupted);
+    assert_eq!(restored.rebuild_cells(), vec!["x = 1"]);
+}
+
+#[test]
+fn only_saved_exploration_cells_can_be_promoted_to_formal_steps() {
+    let repository = omicsops_adapters::persistence::Repository::open_in_memory().unwrap();
+    let mut session = omicsops_agent::KernelSession::new(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        omicsops_agent::KernelLanguage::Python,
+    );
+    session.start().unwrap();
+    session.record_executed_cell("x = 1", true).unwrap();
+    session.record_executed_cell("print(x)", false).unwrap();
+    repository
+        .put_json("kernel_session", &session.id.to_string(), &session)
+        .unwrap();
+
+    let proposal = promote_saved_kernel_cell(
+        &repository,
+        &PromoteKernelCellRequest {
+            session_id: session.id,
+            cell_index: 0,
+            name: "prepare inputs".into(),
+            version: 1,
+        },
+    )
+    .unwrap();
+    assert_eq!(proposal.code, "x = 1");
+    assert_eq!(proposal.code_sha256.len(), 64);
+    assert!(
+        promote_saved_kernel_cell(
+            &repository,
+            &PromoteKernelCellRequest {
+                session_id: session.id,
+                cell_index: 1,
+                name: "ephemeral output".into(),
+                version: 1,
+            },
+        )
+        .is_err()
     );
 }

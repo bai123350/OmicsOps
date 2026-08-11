@@ -12,7 +12,9 @@ use russh::{
 use russh_sftp::{client::SftpSession, protocol::OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
+};
 
 use crate::{AdapterError, AdapterResult};
 
@@ -59,6 +61,40 @@ impl client::Handler for HostKeyHandler {
 pub struct SshSession {
     handle: client::Handle<HostKeyHandler>,
     fingerprint: String,
+}
+
+pub struct SshJsonlProcess {
+    reader: BufReader<ReadHalf<russh::ChannelStream<client::Msg>>>,
+    writer: WriteHalf<russh::ChannelStream<client::Msg>>,
+}
+
+impl SshJsonlProcess {
+    pub async fn send<T: Serialize>(&mut self, value: &T) -> AdapterResult<()> {
+        let mut line = serde_json::to_vec(value)?;
+        line.push(b'\n');
+        self.writer.write_all(&line).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+
+    pub async fn receive<T: serde::de::DeserializeOwned>(&mut self) -> AdapterResult<Option<T>> {
+        let mut line = String::new();
+        let bytes = self.reader.read_line(&mut line).await?;
+        if bytes == 0 {
+            return Ok(None);
+        }
+        if bytes > 1024 * 1024 {
+            return Err(AdapterError::InvalidInput(
+                "kernel JSONL message exceeds 1 MiB".into(),
+            ));
+        }
+        Ok(Some(serde_json::from_str(line.trim_end())?))
+    }
+
+    pub async fn shutdown(mut self) -> AdapterResult<()> {
+        self.writer.shutdown().await?;
+        Ok(())
+    }
 }
 
 impl SshSession {
@@ -192,6 +228,21 @@ impl SshSession {
         file.write_all(contents.as_bytes()).await?;
         file.shutdown().await?;
         Ok(())
+    }
+
+    pub async fn open_jsonl_process(&self, command: &str) -> AdapterResult<SshJsonlProcess> {
+        let channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(ssh_error)?;
+        channel.exec(true, command).await.map_err(ssh_error)?;
+        let stream = channel.into_stream();
+        let (reader, writer) = tokio::io::split(stream);
+        Ok(SshJsonlProcess {
+            reader: BufReader::new(reader),
+            writer,
+        })
     }
 
     pub async fn upload_file(&self, local_path: &Path, remote_path: &str) -> AdapterResult<()> {

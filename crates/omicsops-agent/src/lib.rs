@@ -21,8 +21,14 @@ pub enum AgentError {
     SpecialistLimit,
     #[error("specialist task {0} is already active")]
     SpecialistAlreadyActive(String),
+    #[error("at most three conversation turns may be active")]
+    ActiveTurnLimit,
+    #[error("conversation turn {0} is already active")]
+    TurnAlreadyActive(Uuid),
     #[error("model provider error: {0}")]
     Model(String),
+    #[error("kernel protocol error: {0}")]
+    KernelProtocol(String),
 }
 
 pub type AgentResult<T> = Result<T, AgentError>;
@@ -109,6 +115,69 @@ impl SpecialistDispatcher {
 
     pub fn finish(&mut self, specialist: &str) {
         self.active.remove(specialist);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpecialistKind {
+    Literature,
+    Statistics,
+    CodeReview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecialistFinding {
+    pub summary: String,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpecialistProposedAction {
+    pub tool: String,
+    pub capability: Capability,
+    pub arguments: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpecialistReport {
+    pub task_id: Uuid,
+    pub kind: SpecialistKind,
+    pub findings: Vec<SpecialistFinding>,
+    pub proposed_actions: Vec<SpecialistProposedAction>,
+}
+
+impl SpecialistReport {
+    pub fn actions_requiring_main_approval(
+        &self,
+        gate: &ApprovalGate,
+    ) -> Vec<&SpecialistProposedAction> {
+        self.proposed_actions
+            .iter()
+            .filter(|action| gate.decision(action.capability) == ApprovalDecision::Required)
+            .collect()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ActiveTurnCoordinator {
+    active: BTreeSet<Uuid>,
+}
+
+impl ActiveTurnCoordinator {
+    pub fn start(&mut self, turn_id: Uuid) -> AgentResult<()> {
+        if self.active.contains(&turn_id) {
+            return Err(AgentError::TurnAlreadyActive(turn_id));
+        }
+        if self.active.len() >= 3 {
+            return Err(AgentError::ActiveTurnLimit);
+        }
+        self.active.insert(turn_id);
+        Ok(())
+    }
+
+    pub fn finish(&mut self, turn_id: Uuid) {
+        self.active.remove(&turn_id);
     }
 }
 
@@ -297,6 +366,87 @@ pub enum KernelState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum KernelRequest {
+    Execute {
+        session_id: Uuid,
+        request_id: Uuid,
+        code: String,
+        capture_paths: Vec<String>,
+    },
+    Shutdown {
+        session_id: Uuid,
+        request_id: Uuid,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+pub enum KernelEventKind {
+    Started,
+    Stdout(String),
+    Stderr(String),
+    Artifact {
+        relative_path: String,
+        size_bytes: u64,
+        sha256: String,
+    },
+    Completed,
+    Failed {
+        message: String,
+    },
+    Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelEvent {
+    pub project_id: Uuid,
+    pub session_id: Uuid,
+    pub request_id: Uuid,
+    pub sequence: u64,
+    pub occurred_at: DateTime<Utc>,
+    pub event: KernelEventKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct KernelEventDecoder {
+    project_id: Uuid,
+    session_id: Uuid,
+    request_id: Uuid,
+    next_sequence: u64,
+}
+
+impl KernelEventDecoder {
+    pub fn new(project_id: Uuid, session_id: Uuid, request_id: Uuid) -> Self {
+        Self {
+            project_id,
+            session_id,
+            request_id,
+            next_sequence: 1,
+        }
+    }
+
+    pub fn accept(&mut self, event: KernelEvent) -> AgentResult<KernelEvent> {
+        if event.project_id != self.project_id
+            || event.session_id != self.session_id
+            || event.request_id != self.request_id
+        {
+            return Err(AgentError::KernelProtocol(
+                "kernel event identity did not match the active request".into(),
+            ));
+        }
+        if event.sequence != self.next_sequence {
+            return Err(AgentError::KernelProtocol(format!(
+                "expected kernel sequence {}, received {}",
+                self.next_sequence, event.sequence
+            )));
+        }
+        self.next_sequence += 1;
+        Ok(event)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FormalStepProposal {
     pub name: String,
     pub version: u32,
@@ -349,6 +499,34 @@ impl KernelSession {
     }
     pub fn rebuild_cells(&self) -> Vec<&str> {
         self.saved_cells.iter().map(String::as_str).collect()
+    }
+    pub fn saved_cells_owned(&self) -> Vec<String> {
+        self.saved_cells.clone()
+    }
+
+    pub fn record_executed_cell(
+        &mut self,
+        code: impl Into<String>,
+        saved: bool,
+    ) -> AgentResult<Option<usize>> {
+        if self.state != KernelState::Running {
+            return Err(AgentError::KernelProtocol(
+                "kernel must be running before executing a cell".into(),
+            ));
+        }
+        let code = code.into();
+        if saved {
+            self.saved_cells.push(code);
+            Ok(Some(self.saved_cells.len() - 1))
+        } else {
+            self.ephemeral_cells.push(code);
+            Ok(None)
+        }
+    }
+
+    pub fn stop(&mut self) {
+        self.state = KernelState::Stopped;
+        self.ephemeral_cells.clear();
     }
 
     pub fn promote_cell(

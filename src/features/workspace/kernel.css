@@ -1,0 +1,33 @@
+.context-tabs { grid-template-columns: repeat(5, 1fr); }
+.kernel-panel { padding: 14px; display: flex; flex-direction: column; gap: 12px; font-size: 11px; }
+.kernel-panel header { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.kernel-panel header b, .kernel-panel header small { display: block; }
+.kernel-panel header small { color: #667085; margin-top: 3px; font-size: 9px; line-height: 1.4; }
+.kernel-panel header > div:last-child { display: flex; gap: 4px; }
+.kernel-panel button { border: 1px solid #d0d5dd; background: white; border-radius: 6px; padding: 5px 7px; display: inline-flex; align-items: center; gap: 4px; }
+.kernel-panel button:disabled { cursor: not-allowed; opacity: .5; }
+.kernel-empty { color: #667085; line-height: 1.5; background: #f8fafc; padding: 12px; border-radius: 8px; }
+.kernel-sessions { display: flex; flex-direction: column; gap: 5px; }
+.kernel-sessions > button { width: 100%; text-align: left; }
+.kernel-sessions > button.active { border-color: #6688e8; background: #f4f7ff; }
+.kernel-sessions > button > span:nth-child(2) { font-weight: 700; }
+.kernel-state { margin-left: auto; font-style: normal; font-size: 9px; color: #667085; }
+.kernel-state.running { color: #16845b; }
+.kernel-state.interrupted { color: #b54708; }
+.kernel-rebuild { color: #315bd4; display: inline-flex; align-items: center; gap: 2px; }
+.kernel-editor { display: flex; flex-direction: column; gap: 7px; }
+.kernel-editor textarea { min-height: 150px; resize: vertical; border: 1px solid #d0d5dd; border-radius: 8px; background: #111827; color: #d7e0ee; padding: 10px; font: 10px/1.55 Consolas, monospace; }
+.kernel-editor > input { border: 1px solid #d0d5dd; border-radius: 6px; padding: 7px; font-size: 10px; }
+.kernel-editor label { display: flex; gap: 5px; align-items: center; color: #475467; }
+.kernel-actions { display: flex; gap: 5px; }
+.kernel-actions button:first-child, .kernel-promote { background: #315bd4; color: white; border-color: #315bd4; }
+.kernel-output { min-height: 70px; max-height: 190px; overflow: auto; background: #111827; border-radius: 8px; padding: 8px; }
+.kernel-output:empty::before { content: "JSONL output"; color: #667085; }
+.kernel-output pre { margin: 0 0 5px; color: #d7e0ee; white-space: pre-wrap; word-break: break-word; font: 9px/1.5 Consolas, monospace; }
+.kernel-output pre.stderr, .kernel-output pre.failed { color: #fda29b; }
+.kernel-output pre.artifact { color: #75e0a7; }
+.kernel-promote { justify-content: center !important; }
+.kernel-proposal { border-left: 3px solid #315bd4; background: #f4f7ff; padding: 9px; }
+.kernel-proposal > * { display: block; }
+.kernel-proposal code { font-size: 9px; margin: 4px 0; }
+.kernel-proposal small, .kernel-notice { color: #667085; line-height: 1.4; }

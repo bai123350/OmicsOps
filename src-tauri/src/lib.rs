@@ -1,6 +1,7 @@
 pub mod agent_commands;
 pub mod commands;
 pub mod inspection;
+pub mod kernel_commands;
 pub mod model_commands;
 pub mod research_commands;
 pub mod skill_commands;
@@ -29,12 +30,15 @@ pub fn run() {
             let repository = Repository::open(data_dir.join("omicsops.db"))
                 .map_err(|error| error.to_string())?;
             skill_commands::install_builtin_skills(&repository, &skills_root)?;
+            kernel_commands::mark_orphaned_kernels_interrupted(&repository)?;
             app.manage(AppState {
                 repository,
                 credentials: SystemCredentialVault,
                 active_runs: Arc::new(Mutex::new(HashMap::new())),
                 skills_root,
                 research_last_request: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                active_kernels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                project_kernel_queues: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             });
             Ok(())
         })
@@ -85,6 +89,12 @@ pub fn run() {
             skill_commands::import_skill_directory,
             skill_commands::set_skill_enabled,
             research_commands::search_research,
+            kernel_commands::start_kernel,
+            kernel_commands::execute_kernel_cell,
+            kernel_commands::interrupt_kernel,
+            kernel_commands::stop_kernel,
+            kernel_commands::list_kernel_sessions,
+            kernel_commands::promote_kernel_cell,
             sync_commands::list_remote_files,
             sync_commands::upload_selected_files,
             sync_commands::download_project_file,

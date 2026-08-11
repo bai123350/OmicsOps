@@ -1,6 +1,6 @@
 use omicsops_agent::{
-    ApprovalDecision, ApprovalGate, KernelLanguage, KernelSession, KernelState,
-    McpServerDeclaration, McpTransport,
+    ApprovalDecision, ApprovalGate, KernelEvent, KernelEventDecoder, KernelEventKind,
+    KernelLanguage, KernelSession, KernelState, McpServerDeclaration, McpTransport,
 };
 use uuid::Uuid;
 
@@ -27,6 +27,36 @@ fn first_release_mcp_accepts_only_stdio_and_requires_launch_approval() {
         )
         .validate()
         .is_err()
+    );
+}
+
+#[test]
+fn kernel_jsonl_events_require_stable_identity_and_monotonic_sequence() {
+    let project_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let request_id = Uuid::new_v4();
+    let mut decoder = KernelEventDecoder::new(project_id, session_id, request_id);
+    let event = KernelEvent {
+        project_id,
+        session_id,
+        request_id,
+        sequence: 1,
+        occurred_at: chrono::Utc::now(),
+        event: KernelEventKind::Started,
+    };
+    assert!(decoder.accept(event.clone()).is_ok());
+    assert!(decoder.accept(event).is_err());
+    assert!(
+        decoder
+            .accept(KernelEvent {
+                request_id: Uuid::new_v4(),
+                sequence: 2,
+                project_id,
+                session_id,
+                occurred_at: chrono::Utc::now(),
+                event: KernelEventKind::Completed
+            })
+            .is_err()
     );
 }
 

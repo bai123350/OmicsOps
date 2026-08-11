@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { WorkspaceShell } from "./WorkspaceShell";
@@ -59,5 +59,19 @@ describe("WorkspaceShell", () => {
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onBackToProjects={onBackToProjects} />);
     fireEvent.click(screen.getByRole("button", { name: "返回项目主页" }));
     expect(onBackToProjects).toHaveBeenCalledOnce();
+  });
+
+  it("runs and explicitly promotes a saved exploration cell", async () => {
+    const onExecuteKernel = vi.fn().mockResolvedValue(0);
+    const onPromoteKernelCell = vi.fn().mockResolvedValue({ name: "探索代码步骤", version: 1, language: "python", code: "print(1)", code_sha256: "a".repeat(64) });
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} kernelSessions={[{ id: "kernel-1", project_id: project.id, language: "python", state: "running" }]} onExecuteKernel={onExecuteKernel} onPromoteKernelCell={onPromoteKernelCell} />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "探索" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "探索代码" }), { target: { value: "print(1)" } });
+    fireEvent.click(screen.getByRole("button", { name: "执行" }));
+    await waitFor(() => expect(onExecuteKernel).toHaveBeenCalledWith("kernel-1", "print(1)", true, []));
+    fireEvent.click(screen.getByRole("button", { name: "固化已保存单元 #1 为正式步骤" }));
+    await waitFor(() => expect(onPromoteKernelCell).toHaveBeenCalledWith("kernel-1", 0, "探索代码步骤"));
+    expect(await screen.findByText(/仍需进入正式计划审批/)).toBeInTheDocument();
   });
 });

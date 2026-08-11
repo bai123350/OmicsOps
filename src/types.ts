@@ -384,3 +384,45 @@ export interface ResearchSearchResult {
   items: ResearchItem[];
   cached: boolean;
 }
+
+export type KernelLanguage = "python" | "r";
+export type KernelState = "created" | "running" | "interrupted" | "stopped";
+
+export interface KernelSession {
+  id: string;
+  project_id: string;
+  language: KernelLanguage;
+  state: KernelState;
+}
+
+export type KernelEventPayload =
+  | { kind: "started" }
+  | { kind: "stdout"; payload: string }
+  | { kind: "stderr"; payload: string }
+  | { kind: "artifact"; payload: { relative_path: string; size_bytes: number; sha256: string } }
+  | { kind: "completed" }
+  | { kind: "failed"; payload: { message: string } }
+  | { kind: "stopped" };
+
+export interface KernelEvent {
+  project_id: string;
+  session_id: string;
+  request_id: string;
+  sequence: number;
+  occurred_at: string;
+  event: KernelEventPayload;
+}
+
+export interface KernelCellResult {
+  request_id: string;
+  saved_cell_index: number | null;
+  events: KernelEvent[];
+}
+
+export interface FormalStepProposal {
+  name: string;
+  version: number;
+  language: KernelLanguage;
+  code: string;
+  code_sha256: string;
+}
