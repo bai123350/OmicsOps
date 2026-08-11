@@ -335,3 +335,22 @@ export interface PlanProposal {
   validation: PlanValidation;
   plan_hash: string;
 }
+
+export interface RemoteFileEntry {
+  relative_path: string;
+  directory: boolean;
+  size_bytes: number;
+  modified_unix_seconds: number;
+}
+
+export interface SyncEntry {
+  id: string;
+  project_id: string;
+  relative_path: string;
+  remote_path: string | null;
+  direction: "local_to_remote" | "remote_to_local";
+  size_bytes: number;
+  sha256: string;
+  state: "pending" | "transferring" | "synced" | "conflict" | "failed";
+  updated_at: string;
+}

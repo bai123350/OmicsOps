@@ -8,6 +8,7 @@ use omicsops_desktop_lib::{
     commands::{PrivateKeySecret, parse_authentication_secret},
     inspection::parse_server_inspection,
     model_commands::{SaveModelProfileRequest, model_profile_from_request},
+    sync_commands::{choose_download_relative_path, parse_remote_index, resolve_selected_uploads},
     workspace_commands::{CreateProjectRequest, project_from_request, write_project_manifest},
 };
 use uuid::Uuid;
@@ -191,4 +192,66 @@ fn provider_events_map_to_stable_desktop_agent_events() {
         agent_event_kind_from_model_event(ModelStreamEvent::Completed),
         AgentEventKind::TurnCompleted
     );
+}
+
+#[test]
+fn production_tauri_config_never_points_at_a_development_server() {
+    let production: serde_json::Value =
+        serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+    assert!(production.pointer("/build/devUrl").is_none());
+    assert_eq!(
+        production
+            .pointer("/build/frontendDist")
+            .and_then(|value| value.as_str()),
+        Some("../dist")
+    );
+    let development: serde_json::Value =
+        serde_json::from_str(include_str!("../tauri.dev.conf.json")).unwrap();
+    assert_eq!(
+        development
+            .pointer("/build/devUrl")
+            .and_then(|value| value.as_str()),
+        Some("http://localhost:1420")
+    );
+}
+
+#[test]
+fn remote_index_parser_preserves_relative_paths_and_metadata() {
+    let raw = "results/umap.png\0f\01234\01723200000.25\0analysis\0d\00\01723200001.0\0";
+    let entries = parse_remote_index(raw).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].relative_path, "results/umap.png");
+    assert_eq!(entries[0].size_bytes, 1234);
+    assert!(!entries[0].directory);
+    assert!(entries[1].directory);
+}
+
+#[test]
+fn selected_uploads_never_expand_to_unselected_workspace_files() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(directory.path().join("data")).unwrap();
+    std::fs::write(directory.path().join("data/selected.csv"), "a,b\n1,2\n").unwrap();
+    std::fs::write(directory.path().join("data/private.csv"), "secret").unwrap();
+    let selected =
+        resolve_selected_uploads(directory.path(), &["data/selected.csv".into()]).unwrap();
+    assert_eq!(selected.len(), 1);
+    assert!(selected[0].ends_with("selected.csv"));
+}
+
+#[test]
+fn downloads_use_parallel_conflict_versions_instead_of_overwriting() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(directory.path().join("results")).unwrap();
+    std::fs::write(directory.path().join("results/markers.csv"), "local").unwrap();
+    let chosen = choose_download_relative_path(
+        directory.path(),
+        "results/markers.csv",
+        "different-remote-hash",
+    )
+    .unwrap();
+    assert_eq!(
+        chosen.to_string_lossy().replace('\\', "/"),
+        "results/markers.conflict-1.csv"
+    );
+    assert!(directory.path().join("results/markers.csv").exists());
 }

@@ -18,8 +18,23 @@ Prerequisites:
 npm install
 cargo test --workspace
 npm test
-npm run tauri dev
+npm run tauri:dev
 ```
+
+## Production build
+
+Build the Windows application and NSIS installer with:
+
+```powershell
+npm run build:desktop
+```
+
+The standalone production executable is written to
+`target/release/omicsops-desktop.exe`, and the installer is written under
+`target/release/bundle/nsis/`. Do not distribute `target/debug/omicsops-desktop.exe`:
+the default Tauri configuration embeds `dist` and never points at localhost.
+The Vite development URL is isolated in `src-tauri/tauri.dev.conf.json` and is
+used only by `npm run tauri:dev`.
 
 See `docs/superpowers/specs/2026-07-29-omicsops-agent-design.md` for the
 approved design.

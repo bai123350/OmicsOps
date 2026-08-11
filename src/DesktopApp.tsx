@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import * as api from "./tauri-api";
-import type { AgentEvent, ModelProfile, PlanProposal, WorkspaceConversation, WorkspaceMessage, WorkspaceProject, WorkspaceTemplate } from "./types";
+import type { AgentEvent, ModelProfile, PlanProposal, RemoteFileEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject, WorkspaceTemplate } from "./types";
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
 import { WorkspaceShell } from "./features/workspace/WorkspaceShell";
 import type { Locale } from "./features/workspace/copy";
@@ -24,6 +24,9 @@ export default function DesktopApp() {
   const [planApproved, setPlanApproved] = useState(false);
   const [approvedPlanId, setApprovedPlanId] = useState<string | null>(null);
   const [runId, setRunId] = useState<string | null>(null);
+  const [remoteFiles, setRemoteFiles] = useState<RemoteFileEntry[]>([]);
+  const [filesBusy, setFilesBusy] = useState(false);
+  const [fileNotice, setFileNotice] = useState("");
 
   useEffect(() => {
     Promise.all([api.listProjects(), api.listModelProfiles()]).then(([items, profiles]) => {
@@ -41,6 +44,14 @@ export default function DesktopApp() {
       setMessageSequence((storedMessages.at(-1)?.sequence ?? 0) + 1);
     });
   }, [selected?.id]);
+  useEffect(() => {
+    setFileNotice("");
+    if (!selected?.connection_id || !selected.remote_root) {
+      setRemoteFiles([]);
+      return;
+    }
+    void refreshRemoteFiles(selected.id);
+  }, [selected?.id, selected?.connection_id, selected?.remote_root]);
   useEffect(() => {
     let disposed = false;
     const unlisten: Array<() => void> = [];
@@ -60,9 +71,52 @@ export default function DesktopApp() {
     }).then((fn) => disposed ? fn() : unlisten.push(fn));
     return () => { disposed = true; unlisten.forEach((fn) => fn()); };
   }, [conversation?.id]);
+
+  async function refreshRemoteFiles(projectId = selected?.id) {
+    if (!projectId) return;
+    setFilesBusy(true);
+    try {
+      setRemoteFiles(await api.listRemoteFiles(projectId));
+    } catch (error) {
+      setFileNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setFilesBusy(false);
+    }
+  }
+
+  async function uploadFiles() {
+    if (!selected) return;
+    try {
+      const relativePaths = await api.chooseProjectFiles(selected.local_root);
+      if (relativePaths.length === 0) return;
+      setFilesBusy(true);
+      const entries = await api.uploadSelectedFiles(selected.id, relativePaths);
+      setFileNotice(locale === "zh-CN" ? `已校验上传 ${entries.length} 个文件` : `${entries.length} uploaded files verified`);
+      setRemoteFiles(await api.listRemoteFiles(selected.id));
+    } catch (error) {
+      setFileNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setFilesBusy(false);
+    }
+  }
+
+  async function downloadFile(relativePath: string) {
+    if (!selected) return;
+    setFilesBusy(true);
+    try {
+      const result = await api.downloadProjectFile(selected.id, relativePath);
+      setFileNotice(result.conflict
+        ? (locale === "zh-CN" ? `本地文件不同，已保存冲突副本：${result.entry.relative_path}` : `Local file differed; saved conflict copy: ${result.entry.relative_path}`)
+        : (locale === "zh-CN" ? `下载完成并通过 SHA-256 校验：${result.entry.relative_path}` : `Downloaded and SHA-256 verified: ${result.entry.relative_path}`));
+    } catch (error) {
+      setFileNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setFilesBusy(false);
+    }
+  }
   if (loading) return <div className="desktop-loading">OmicsOps</div>;
   const settings = settingsOpen ? <SettingsPanel locale={locale} onClose={() => setSettingsOpen(false)} modelProfiles={modelProfiles} onSaveModel={async (request) => { const profile = await api.saveModelProfile(request); setModelProfiles((current) => [profile, ...current.filter((item) => item.id !== profile.id)]); setActiveModelProfileId(profile.id); }} onProbeModel={api.probeModelProfile} /> : null;
   if (!selected) return <><ProjectLibrary projects={projects} locale={locale} onLocaleChange={setLocale} onSettings={() => setSettingsOpen(true)} onOpen={setSelected} onCreate={async (template: WorkspaceTemplate, name: string) => { const localRoot = await api.chooseProjectDirectory(); if (!localRoot) return; const project = await api.createProject({ name, description: "", local_root: localRoot, template }); setProjects((current) => [project, ...current]); setSelected(project); }} />{settings}</>;
   const activeModel = modelProfiles.find((profile) => profile.id === activeModelProfileId) ?? null;
-  return <><WorkspaceShell project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template }} locale={locale} onLocaleChange={setLocale} onOpenSettings={() => setSettingsOpen(true)} messages={messages} streamingAssistant={streamingAssistant} modelLabel={activeModel?.label} planProposal={planProposal} planLoading={planLoading} planApproved={planApproved} canStartRun={Boolean(selected.connection_id && approvedPlanId)} runStarted={Boolean(runId)} onSend={async (markdown) => { if (!conversation || !activeModel) { setSettingsOpen(true); return false; } setLastGoal(markdown); setPlanProposal(null); setPlanApproved(false); setApprovedPlanId(null); setRunId(null); await api.runAgentTurn({ project_id: selected.id, conversation_id: conversation.id, model_profile_id: activeModel.id, markdown, message_sequence: messageSequence }); return true; }} onRequestPlan={async () => { if (!activeModel || !lastGoal) { if (!activeModel) setSettingsOpen(true); return; } setPlanLoading(true); try { setPlanProposal(await api.proposeAnalysisPlan({ project_id: selected.id, model_profile_id: activeModel.id, goal: lastGoal, environment_summary: selected.remote_root ? `Remote Linux project at ${selected.remote_root}` : "Remote Linux environment not inspected yet" })); } finally { setPlanLoading(false); } }} onApprovePlan={async () => { if (!planProposal) return; const approved = await api.approvePlanV2(planProposal.plan, planProposal.plan.policy); setApprovedPlanId(approved.id); setPlanApproved(true); }} onStartRun={async () => { if (!selected.connection_id || !approvedPlanId) return; setRunId(await api.startRunV2(selected.connection_id, selected.id, approvedPlanId)); }} />{settings}</>;
+  return <><WorkspaceShell project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template }} locale={locale} onLocaleChange={setLocale} onOpenSettings={() => setSettingsOpen(true)} messages={messages} streamingAssistant={streamingAssistant} modelLabel={activeModel?.label} planProposal={planProposal} planLoading={planLoading} planApproved={planApproved} canStartRun={Boolean(selected.connection_id && approvedPlanId)} runStarted={Boolean(runId)} remoteFiles={remoteFiles} filesBusy={filesBusy} fileNotice={fileNotice} onUploadFiles={selected.connection_id && selected.remote_root ? uploadFiles : undefined} onRefreshFiles={selected.connection_id && selected.remote_root ? () => refreshRemoteFiles() : undefined} onDownloadFile={selected.connection_id && selected.remote_root ? downloadFile : undefined} onSend={async (markdown) => { if (!conversation || !activeModel) { setSettingsOpen(true); return false; } setLastGoal(markdown); setPlanProposal(null); setPlanApproved(false); setApprovedPlanId(null); setRunId(null); await api.runAgentTurn({ project_id: selected.id, conversation_id: conversation.id, model_profile_id: activeModel.id, markdown, message_sequence: messageSequence }); return true; }} onRequestPlan={async () => { if (!activeModel || !lastGoal) { if (!activeModel) setSettingsOpen(true); return; } setPlanLoading(true); try { setPlanProposal(await api.proposeAnalysisPlan({ project_id: selected.id, model_profile_id: activeModel.id, goal: lastGoal, environment_summary: selected.remote_root ? `Remote Linux project at ${selected.remote_root}` : "Remote Linux environment not inspected yet" })); } finally { setPlanLoading(false); } }} onApprovePlan={async () => { if (!planProposal) return; const approved = await api.approvePlanV2(planProposal.plan, planProposal.plan.policy); setApprovedPlanId(approved.id); setPlanApproved(true); }} onStartRun={async () => { if (!selected.connection_id || !approvedPlanId) return; setRunId(await api.startRunV2(selected.connection_id, selected.id, approvedPlanId)); }} />{settings}</>;
 }

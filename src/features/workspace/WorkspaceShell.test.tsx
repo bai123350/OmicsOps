@@ -1,5 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { WorkspaceShell } from "./WorkspaceShell";
 
@@ -44,5 +44,13 @@ describe("WorkspaceShell", () => {
     expect(screen.getByText("先检查双细胞率")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "批准计划" }));
     expect(screen.getByRole("button", { name: "已批准" })).toBeDisabled();
+  });
+
+  it("uploads only through the explicit file selection action", () => {
+    const onUploadFiles = vi.fn();
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onUploadFiles={onUploadFiles} remoteFiles={[{ relative_path: "results/umap.png", directory: false, size_bytes: 42, modified_unix_seconds: 1 }]} />);
+    expect(screen.getByText("results/umap.png")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "选择上传文件" }));
+    expect(onUploadFiles).toHaveBeenCalledOnce();
   });
 });

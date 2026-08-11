@@ -1772,7 +1772,7 @@ async fn canonical_remote_directory(
     Ok(canonical)
 }
 
-fn find_profile(repository: &Repository, id: Uuid) -> Result<ConnectionProfile, String> {
+pub(crate) fn find_profile(repository: &Repository, id: Uuid) -> Result<ConnectionProfile, String> {
     repository
         .list_connections()
         .map_err(|error| error.to_string())?
@@ -1781,7 +1781,7 @@ fn find_profile(repository: &Repository, id: Uuid) -> Result<ConnectionProfile, 
         .ok_or_else(|| format!("connection profile {id} was not found"))
 }
 
-fn require_trusted_host(profile: &ConnectionProfile) -> Result<(), String> {
+pub(crate) fn require_trusted_host(profile: &ConnectionProfile) -> Result<(), String> {
     if profile.host_key_fingerprint.is_none() {
         Err("confirm the server host-key fingerprint before remote operations".into())
     } else {
@@ -1789,7 +1789,7 @@ fn require_trusted_host(profile: &ConnectionProfile) -> Result<(), String> {
     }
 }
 
-async fn connect_profile(
+pub(crate) async fn connect_profile(
     state: &State<'_, AppState>,
     profile: &ConnectionProfile,
 ) -> Result<SshSession, String> {

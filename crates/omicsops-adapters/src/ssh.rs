@@ -194,6 +194,22 @@ impl SshSession {
         Ok(())
     }
 
+    pub async fn upload_file(&self, local_path: &Path, remote_path: &str) -> AdapterResult<()> {
+        let mut local = tokio::fs::File::open(local_path).await?;
+        let sftp = self.sftp().await?;
+        let mut remote = sftp
+            .open_with_flags(
+                remote_path,
+                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+            )
+            .await
+            .map_err(|error| AdapterError::Ssh(error.to_string()))?;
+        tokio::io::copy(&mut local, &mut remote).await?;
+        remote.flush().await?;
+        remote.shutdown().await?;
+        Ok(())
+    }
+
     pub async fn download_atomic_verified(
         &self,
         remote_path: &str,

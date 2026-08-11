@@ -6,8 +6,10 @@ import {
 } from "lucide-react";
 import { copy, type Locale } from "./copy";
 import type { PlanProposal } from "../../types";
+import { RemoteFileTree } from "./RemoteFileTree";
 import "./workspace.css";
 import "./approval.css";
+import "./file-actions.css";
 
 export interface WorkspaceProject {
   id: string;
@@ -34,11 +36,17 @@ interface Props {
   onStartRun?: () => Promise<void> | void;
   canStartRun?: boolean;
   runStarted?: boolean;
+  remoteFiles?: import("../../types").RemoteFileEntry[];
+  filesBusy?: boolean;
+  onUploadFiles?: () => Promise<void> | void;
+  onRefreshFiles?: () => Promise<void> | void;
+  onDownloadFile?: (relativePath: string) => Promise<void> | void;
+  fileNotice?: string;
 }
 
 type ContextTab = "files" | "preview" | "notebook" | "runs";
 
-export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onSend, messages = [], streamingAssistant = "", modelLabel, planProposal, planLoading = false, planApproved = false, onRequestPlan, onApprovePlan, onStartRun, canStartRun = false, runStarted = false }: Props) {
+export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onSend, messages = [], streamingAssistant = "", modelLabel, planProposal, planLoading = false, planApproved = false, onRequestPlan, onApprovePlan, onStartRun, canStartRun = false, runStarted = false, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, fileNotice }: Props) {
   const t = copy[locale];
   const zh = locale === "zh-CN";
   const [tab, setTab] = useState<ContextTab>("files");
@@ -85,7 +93,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
 
     <aside className="context-pane" aria-label={t.context}>
       <div className="context-tabs" role="tablist">{(["files", "preview", "notebook", "runs"] as ContextTab[]).map((id) => <button key={id} role="tab" aria-selected={tab === id} onClick={() => setTab(id)}>{id === "files" ? t.files : id === "preview" ? t.preview : id === "notebook" ? t.notebook : t.runs}</button>)}</div>
-      <div className="context-content">{tab === "files" && <FileTree locale={locale} />}{tab === "preview" && <><div className="context-toolbar"><span>{t.overview}</span><button aria-label={t.expand} onClick={() => setExpanded(true)}><Expand size={16} /></button></div>{preview}</>}{tab === "notebook" && <Notebook locale={locale} />}{tab === "runs" && <RunSummary locale={locale} />}</div>
+      <div className="context-content">{tab === "files" && <RemoteFileTree locale={locale} remoteFiles={remoteFiles} busy={filesBusy} notice={fileNotice} onUpload={onUploadFiles} onRefresh={onRefreshFiles} onDownload={onDownloadFile} />}{tab === "preview" && <><div className="context-toolbar"><span>{t.overview}</span><button aria-label={t.expand} onClick={() => setExpanded(true)}><Expand size={16} /></button></div>{preview}</>}{tab === "notebook" && <Notebook locale={locale} />}{tab === "runs" && <RunSummary locale={locale} />}</div>
     </aside>
     {expanded && <div className="preview-overlay" role="dialog" aria-modal="true" aria-label={t.artifactPreview}><header><div><small>{project.name}</small><h2>{t.overview}</h2></div><button aria-label="Close" onClick={() => setExpanded(false)}><X /></button></header>{preview}</div>}
   </div>;

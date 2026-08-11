@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "build:desktop": "tauri build --bundles nsis",
+    "tauri:dev": "tauri dev --config src-tauri/tauri.dev.conf.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "tauri": "tauri"

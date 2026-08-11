@@ -28,6 +28,7 @@ impl SyncManifest {
             let unsafe_path = normalized.is_empty()
                 || normalized.starts_with('/')
                 || normalized.contains(':')
+                || normalized.chars().any(char::is_control)
                 || segments.iter().any(|segment| *segment == "..")
                 || segments.first() == Some(&".omicsops");
             if unsafe_path {

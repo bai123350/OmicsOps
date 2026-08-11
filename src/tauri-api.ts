@@ -28,6 +28,8 @@ import type {
   ModelProfile,
   AgentEvent,
   PlanProposal,
+  RemoteFileEntry,
+  SyncEntry,
 } from "./types";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
@@ -101,6 +103,30 @@ export async function onAgentEvent(callback: (event: AgentEvent) => void): Promi
 export async function onConversationEvent(callback: (event: { project_id: string; conversation_id: string; message: WorkspaceMessage }) => void): Promise<UnlistenFn> {
   if (!isTauri()) return () => undefined;
   return listen("conversation-event", ({ payload }) => callback(payload as { project_id: string; conversation_id: string; message: WorkspaceMessage }));
+}
+
+export async function listRemoteFiles(projectId: string): Promise<RemoteFileEntry[]> {
+  return isTauri() ? invoke("list_remote_files", { projectId }) : [];
+}
+
+export async function chooseProjectFiles(localRoot: string): Promise<string[]> {
+  if (!isTauri()) return [];
+  const selected = await open({ multiple: true, directory: false });
+  const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+  const normalizedRoot = localRoot.replaceAll("\\", "/").replace(/\/$/, "");
+  return paths.map((path) => path.replaceAll("\\", "/")).map((path) => {
+    const sameRoot = path.toLocaleLowerCase().startsWith(`${normalizedRoot.toLocaleLowerCase()}/`);
+    if (!sameRoot) throw new Error("Only files inside the project workspace can be uploaded");
+    return path.slice(normalizedRoot.length + 1);
+  });
+}
+
+export async function uploadSelectedFiles(projectId: string, relativePaths: string[]): Promise<SyncEntry[]> {
+  return invoke("upload_selected_files", { request: { project_id: projectId, relative_paths: relativePaths } });
+}
+
+export async function downloadProjectFile(projectId: string, relativePath: string): Promise<{ entry: SyncEntry; conflict: boolean }> {
+  return invoke("download_project_file", { request: { project_id: projectId, relative_path: relativePath } });
 }
 
 export async function choosePlan(): Promise<string | null> {
