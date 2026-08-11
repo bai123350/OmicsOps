@@ -52,10 +52,10 @@ export async function chooseProjectDirectory(): Promise<string | null> {
   return typeof selected === "string" ? selected : null;
 }
 
-export async function createProject(request: { name: string; description: string; local_root: string; template: WorkspaceTemplate }): Promise<WorkspaceProject> {
+export async function createProject(request: { name: string; description: string; local_root: string; template: WorkspaceTemplate; connection_id?: string | null; remote_root?: string | null }): Promise<WorkspaceProject> {
   if (!isTauri()) {
     const now = new Date().toISOString();
-    return { id: crypto.randomUUID(), ...request, remote_root: null, connection_id: null, status: "ready", ollama_only: false, created_at: now, updated_at: now };
+    return { id: crypto.randomUUID(), ...request, remote_root: request.remote_root ?? null, connection_id: request.connection_id ?? null, status: "ready", ollama_only: false, created_at: now, updated_at: now };
   }
   return invoke("create_project", { request });
 }

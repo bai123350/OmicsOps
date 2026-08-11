@@ -14,6 +14,10 @@ pub struct CreateProjectRequest {
     pub description: String,
     pub local_root: String,
     pub template: String,
+    #[serde(default)]
+    pub connection_id: Option<Uuid>,
+    #[serde(default)]
+    pub remote_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,7 +86,31 @@ pub fn create_project(
     state: State<'_, AppState>,
     request: CreateProjectRequest,
 ) -> Result<Project, String> {
-    let project = project_from_request(request, Uuid::new_v4(), Utc::now())?;
+    let connection_id = request.connection_id;
+    let remote_root = request.remote_root.clone();
+    let now = Utc::now();
+    let mut project = project_from_request(request, Uuid::new_v4(), now)?;
+    let connection_exists = if let Some(connection_id) = connection_id {
+        state
+            .repository
+            .list_connections()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|profile| profile.id == connection_id && profile.host_key_fingerprint.is_some())
+    } else {
+        false
+    };
+    let project_id = project.id;
+    apply_remote_binding(
+        &mut project,
+        UpdateProjectRemoteRequest {
+            project_id,
+            connection_id,
+            remote_root,
+        },
+        connection_exists,
+        now,
+    )?;
     write_project_manifest(&project)?;
     state
         .repository
