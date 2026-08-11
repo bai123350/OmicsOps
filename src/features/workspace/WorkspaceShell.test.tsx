@@ -53,4 +53,11 @@ describe("WorkspaceShell", () => {
     fireEvent.click(screen.getByRole("button", { name: "选择上传文件" }));
     expect(onUploadFiles).toHaveBeenCalledOnce();
   });
+
+  it("returns from the project workspace to the project library", () => {
+    const onBackToProjects = vi.fn();
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onBackToProjects={onBackToProjects} />);
+    fireEvent.click(screen.getByRole("button", { name: "返回项目主页" }));
+    expect(onBackToProjects).toHaveBeenCalledOnce();
+  });
 });

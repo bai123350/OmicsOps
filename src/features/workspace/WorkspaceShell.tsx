@@ -1,6 +1,6 @@
 import { useState } from "react";
 import {
-  Activity, Bot, Check, ChevronRight, Database, Expand, FileBarChart, FileText,
+  Activity, ArrowLeft, Bot, Check, ChevronRight, Database, Expand, FileBarChart, FileText,
   FlaskConical, Folder, Languages, MessageSquarePlus, NotebookPen, Play,
   Search, Send, Settings, Sparkles, X,
 } from "lucide-react";
@@ -10,6 +10,7 @@ import { RemoteFileTree } from "./RemoteFileTree";
 import "./workspace.css";
 import "./approval.css";
 import "./file-actions.css";
+import "./navigation.css";
 
 export interface WorkspaceProject {
   id: string;
@@ -24,6 +25,7 @@ interface Props {
   onLocaleChange: (locale: Locale) => void;
   onOpenSettings?: () => void;
   onOpenHistory?: () => void;
+  onBackToProjects?: () => void;
   onSend?: (message: string) => Promise<boolean | void> | boolean | void;
   messages?: Array<{ id: string; role: "user" | "assistant" | "tool" | "system"; markdown: string }>;
   streamingAssistant?: string;
@@ -46,7 +48,7 @@ interface Props {
 
 type ContextTab = "files" | "preview" | "notebook" | "runs";
 
-export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onSend, messages = [], streamingAssistant = "", modelLabel, planProposal, planLoading = false, planApproved = false, onRequestPlan, onApprovePlan, onStartRun, canStartRun = false, runStarted = false, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, fileNotice }: Props) {
+export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, onSend, messages = [], streamingAssistant = "", modelLabel, planProposal, planLoading = false, planApproved = false, onRequestPlan, onApprovePlan, onStartRun, canStartRun = false, runStarted = false, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, fileNotice }: Props) {
   const t = copy[locale];
   const zh = locale === "zh-CN";
   const [tab, setTab] = useState<ContextTab>("files");
@@ -71,6 +73,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   return <div className="science-shell">
     <nav className="project-rail" aria-label={t.projects}>
       <div className="science-brand"><span className="brand-orbit"><FlaskConical size={20} /></span><div><strong>OmicsOps</strong><small>Life Science Workspace</small></div></div>
+      <button className="rail-home" onClick={onBackToProjects} aria-label={zh ? "返回项目主页" : "Back to project home"}><ArrowLeft size={15} />{zh ? "返回项目主页" : "Project home"}</button>
       <button className="rail-search"><Search size={15} />{zh ? "搜索项目" : "Search projects"}</button>
       <div className="rail-section"><span>{zh ? "项目" : "Projects"}</span><button className="project-row active"><span className="project-glyph"><Database size={16} /></span><span><strong>{project.name}</strong><small>{t.status}</small></span><ChevronRight size={14} /></button></div>
       <div className="rail-section sessions"><span>{zh ? "会话" : "Sessions"}</span><button className="session-row active"><Sparkles size={15} /><span>{zh ? "QC 与聚类" : "QC and clustering"}</span></button><button className="session-row"><FileText size={15} /><span>{zh ? "文献证据" : "Literature evidence"}</span></button><button className="session-row"><FileBarChart size={15} /><span>{zh ? "报告生成" : "Report drafting"}</span></button><button className="new-session"><MessageSquarePlus size={15} />{t.newConversation}</button></div>

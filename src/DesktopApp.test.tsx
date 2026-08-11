@@ -24,6 +24,15 @@ describe("DesktopApp", () => {
     expect(screen.getByRole("complementary", { name: "项目上下文" })).toBeInTheDocument();
   });
 
+  it("returns from an open workspace to the project library", async () => {
+    vi.spyOn(api, "listProjects").mockResolvedValue([{ id: "project-1", name: "PBMC 项目", description: "", local_root: "E:/Science/pbmc", remote_root: null, connection_id: null, template: "single_cell_rna_seq", status: "running", ollama_only: false, created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" }]);
+    render(<DesktopApp />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "返回项目主页" }));
+    expect(await screen.findByRole("heading", { name: "生命科学项目" })).toBeInTheDocument();
+    expect(screen.getByText("PBMC 项目")).toBeInTheDocument();
+  });
+
   it("centralizes model, remote compute, privacy, and legacy history settings", async () => {
     vi.spyOn(api, "listProjects").mockResolvedValue([]);
     render(<DesktopApp />);
