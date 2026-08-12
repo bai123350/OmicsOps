@@ -19,6 +19,7 @@ import type {
   ToolSummary,
   RunCheckpointV2,
   RunEventV2,
+  AgentRunStreamEvent,
   StepAttempt,
   ArtifactRecordV2,
   EnvironmentLock,
@@ -452,6 +453,11 @@ export async function resumeRunV2(runId: string): Promise<void> {
 
 export async function listRunEventsV2(runId: string): Promise<RunEventV2[]> {
   return invoke("list_run_events_v2", { runId });
+}
+
+export async function onAgentRunEvent(callback: (event: AgentRunStreamEvent) => void): Promise<UnlistenFn> {
+  if (!isTauri()) return () => undefined;
+  return listen<AgentRunStreamEvent>("agent-run-event", ({ payload }) => callback(payload));
 }
 
 export async function listStepAttemptsV2(runId: string): Promise<StepAttempt[]> {

@@ -264,6 +264,16 @@ export interface EnvironmentLock {
   declared_dependencies: string[];
 }
 
+export interface AgentRunStreamEvent {
+  run_id: string;
+  sequence: number;
+  timestamp: string;
+  kind: "agent_started" | "model_started" | "model_action" | "tool_started" | "stdout" | "stderr" | "tool_completed" | "agent_completed" | "agent_failed";
+  title: string;
+  content: string;
+  iteration: number | null;
+}
+
 export interface ConnectionTestResult {
   fingerprint: string;
   trusted: boolean;

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import * as api from "./tauri-api";
-import type { AgentEvent, ConnectionProfile, KernelEvent, KernelLanguage, KernelSession, ModelProfile, PlanProposal, RemoteFileEntry, SkillPackage, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
+import type { AgentEvent, AgentRunStreamEvent, ConnectionProfile, KernelEvent, KernelLanguage, KernelSession, ModelProfile, PlanProposal, RemoteFileEntry, SkillPackage, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
 import { WorkspaceShell } from "./features/workspace/WorkspaceShell";
 import type { Locale } from "./features/workspace/copy";
@@ -26,6 +26,7 @@ export default function DesktopApp() {
   const [planApproved, setPlanApproved] = useState(false);
   const [approvedPlanId, setApprovedPlanId] = useState<string | null>(null);
   const [runId, setRunId] = useState<string | null>(null);
+  const [agentRunEvents, setAgentRunEvents] = useState<AgentRunStreamEvent[]>([]);
   const [remoteFiles, setRemoteFiles] = useState<RemoteFileEntry[]>([]);
   const [filesBusy, setFilesBusy] = useState(false);
   const [fileNotice, setFileNotice] = useState("");
@@ -100,6 +101,13 @@ export default function DesktopApp() {
       if (event.project_id !== selected?.id) return;
       setKernelEvents((current) => [...current.slice(-199), event]);
     }).then((fn) => disposed ? fn() : unlisten.push(fn));
+    api.onAgentRunEvent((event) => {
+      setRunId((current) => current ?? event.run_id);
+      setAgentRunEvents((current) => {
+        if (current.some((item) => item.run_id === event.run_id && item.sequence === event.sequence)) return current;
+        return [...current.filter((item) => item.run_id === event.run_id).slice(-399), event];
+      });
+    }).then((fn) => disposed ? fn() : unlisten.push(fn));
     return () => { disposed = true; unlisten.forEach((fn) => fn()); };
   }, [conversation?.id, selected?.id]);
 
@@ -169,7 +177,7 @@ export default function DesktopApp() {
     project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template }}
     locale={locale} onLocaleChange={setLocale} onOpenSettings={() => setSettingsOpen(true)} onBackToProjects={() => setSelected(null)}
     messages={messages} streamingAssistant={streamingAssistant} agentBusy={agentBusy} agentNotice={agentNotice} modelLabel={activeModel?.label}
-    planProposal={planProposal} planLoading={planLoading} planApproved={planApproved} canStartRun={Boolean(selected.connection_id && approvedPlanId)} runStarted={Boolean(runId)}
+    planProposal={planProposal} planLoading={planLoading} planApproved={planApproved} canStartRun={Boolean(selected.connection_id && approvedPlanId)} runStarted={Boolean(runId)} agentRunEvents={agentRunEvents}
     remoteFiles={remoteFiles} filesBusy={filesBusy} fileNotice={fileNotice}
     kernelSessions={kernelSessions} kernelEvents={kernelEvents} kernelBusy={kernelBusy} kernelNotice={kernelNotice}
     onStartKernel={selected.connection_id && selected.remote_root ? startKernel : undefined}
@@ -227,11 +235,11 @@ export default function DesktopApp() {
         const approved = await api.approvePlanV2(planProposal.plan, planProposal.plan.policy);
         setApprovedPlanId(approved.id);
         setPlanApproved(true);
-        if (selected.connection_id) setRunId(await api.startRunV2(selected.connection_id, selected.id, approved.id));
+        if (selected.connection_id) { setAgentRunEvents([]); setRunId(await api.startRunV2(selected.connection_id, selected.id, approved.id)); }
       } catch (error) {
         setAgentNotice(error instanceof Error ? error.message : String(error));
       }
     }}
-    onStartRun={selected.connection_id ? async () => { if (!approvedPlanId) return; setRunId(await api.startRunV2(selected.connection_id!, selected.id, approvedPlanId)); } : undefined}
+    onStartRun={selected.connection_id ? async () => { if (!approvedPlanId) return; setAgentRunEvents([]); setRunId(await api.startRunV2(selected.connection_id!, selected.id, approvedPlanId)); } : undefined}
   />{settings}</>;
 }

@@ -76,6 +76,41 @@ pub struct ConnectionTestResult {
     pub r_available: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentRunStreamEvent {
+    pub run_id: Uuid,
+    pub sequence: u64,
+    pub timestamp: chrono::DateTime<Utc>,
+    pub kind: String,
+    pub title: String,
+    pub content: String,
+    pub iteration: Option<u64>,
+}
+
+fn emit_agent_run_stream(
+    app: &AppHandle,
+    run_id: Uuid,
+    sequence: &mut u64,
+    kind: &str,
+    title: &str,
+    content: impl Into<String>,
+    iteration: Option<u64>,
+) {
+    *sequence += 1;
+    let _ = app.emit(
+        "agent-run-event",
+        AgentRunStreamEvent {
+            run_id,
+            sequence: *sequence,
+            timestamp: Utc::now(),
+            kind: kind.into(),
+            title: title.into(),
+            content: content.into(),
+            iteration,
+        },
+    );
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LlmConfig {
@@ -1069,6 +1104,16 @@ async fn execute_v2_run(
                 );
             }
             Err(reason) => {
+                let mut sequence = u64::MAX - 1;
+                emit_agent_run_stream(
+                    &app,
+                    checkpoint.run_id,
+                    &mut sequence,
+                    "agent_failed",
+                    "Remote agent needs attention",
+                    reason.clone(),
+                    None,
+                );
                 checkpoint.needs_attention(reason.clone());
                 persist_v2_checkpoint(&repository, &checkpoint);
                 append_v2_event(
@@ -1445,6 +1490,7 @@ async fn execute_remote_agent_task(
     run_id: Uuid,
     cancel_requested: &Arc<AtomicBool>,
 ) -> Result<(), String> {
+    let mut stream_sequence = 0_u64;
     let arguments = plan
         .stages
         .iter()
@@ -1493,11 +1539,34 @@ async fn execute_remote_agent_task(
     let mut transcript = format!(
         "APPROVED GOAL:\n{goal}\n\nCOMPLETION CRITERIA:\n{criteria}\n\nREAD-ONLY REMOTE OBSERVATION:\n{observation}\n\nENABLED SKILLS:\n{skills}"
     );
+    emit_agent_run_stream(
+        app,
+        run_id,
+        &mut stream_sequence,
+        "agent_started",
+        "Remote agent connected",
+        format!(
+            "Approved project root: {}\nThe agent will now choose and execute one audited terminal action at a time.",
+            project.remote_root
+        ),
+        None,
+    );
     let mut ran_command = false;
     for iteration in 1..=max_iterations {
         if cancel_requested.load(Ordering::SeqCst) {
             return Err("remote agent run was canceled".into());
         }
+        emit_agent_run_stream(
+            app,
+            run_id,
+            &mut stream_sequence,
+            "model_started",
+            "Agent is choosing the next action",
+            format!(
+                "Iteration {iteration}: evaluating the latest remote observations and completion criteria."
+            ),
+            Some(iteration),
+        );
         let prompt: String = transcript
             .chars()
             .rev()
@@ -1507,6 +1576,15 @@ async fn execute_remote_agent_task(
             .rev()
             .collect();
         let action = next_remote_agent_action(model, &system, &prompt).await?;
+        emit_agent_run_stream(
+            app,
+            run_id,
+            &mut stream_sequence,
+            "model_action",
+            "Agent action selected",
+            action.reason.clone(),
+            Some(iteration),
+        );
         match action.kind.as_str() {
             "run" => {
                 let command = action
@@ -1514,6 +1592,15 @@ async fn execute_remote_agent_task(
                     .as_deref()
                     .ok_or_else(|| "agent run action omitted command".to_string())?;
                 validate_agent_command(command, &project.remote_root)?;
+                emit_agent_run_stream(
+                    app,
+                    run_id,
+                    &mut stream_sequence,
+                    "tool_started",
+                    "SSH command",
+                    redact_secrets(command, &[] as &[&str]),
+                    Some(iteration),
+                );
                 append_v2_event(
                     app,
                     repository,
@@ -1527,10 +1614,35 @@ async fn execute_remote_agent_task(
                     ]),
                 );
                 let wrapped = format!("cd -- {} && {}", shell_quote(&project.remote_root), command);
+                let app_for_output = app.clone();
+                let output_run_id = run_id;
+                let output_iteration = iteration;
+                let output_sequence = std::sync::Arc::new(std::sync::Mutex::new(stream_sequence));
+                let callback_sequence = output_sequence.clone();
                 let output = session
-                    .execute(&wrapped)
+                    .execute_streaming(&wrapped, move |stderr, chunk| {
+                        let content = redact_secrets(chunk, &[] as &[&str]);
+                        if content.is_empty() {
+                            return;
+                        }
+                        if let Ok(mut sequence) = callback_sequence.lock() {
+                            emit_agent_run_stream(
+                                &app_for_output,
+                                output_run_id,
+                                &mut sequence,
+                                if stderr { "stderr" } else { "stdout" },
+                                if stderr { "stderr" } else { "stdout" },
+                                content,
+                                Some(output_iteration),
+                            );
+                        }
+                    })
                     .await
                     .map_err(|error| error.to_string())?;
+                stream_sequence = output_sequence
+                    .lock()
+                    .map(|value| *value)
+                    .unwrap_or(stream_sequence);
                 ran_command = true;
                 let stdout: String = output
                     .stdout
@@ -1574,6 +1686,15 @@ async fn execute_remote_agent_task(
                             redact_secrets(&stderr, &[] as &[&str]),
                         ),
                     ]),
+                );
+                emit_agent_run_stream(
+                    app,
+                    run_id,
+                    &mut stream_sequence,
+                    "tool_completed",
+                    "SSH command completed",
+                    format!("Exit code: {}", output.status),
+                    Some(iteration),
                 );
             }
             "finish" => {
@@ -1639,6 +1760,19 @@ async fn execute_remote_agent_task(
                         "artifacts".into(),
                         action.artifacts.join("\n"),
                     )]),
+                );
+                emit_agent_run_stream(
+                    app,
+                    run_id,
+                    &mut stream_sequence,
+                    "agent_completed",
+                    "Remote agent completed",
+                    format!(
+                        "{}\n\nVerified artifacts:\n{}",
+                        action.reason,
+                        action.artifacts.join("\n")
+                    ),
+                    Some(iteration),
                 );
                 return Ok(());
             }

@@ -5,7 +5,7 @@ import {
   Search, Send, Settings, Sparkles, X,
 } from "lucide-react";
 import { copy, type Locale } from "./copy";
-import type { FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, PlanProposal } from "../../types";
+import type { AgentRunStreamEvent, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, PlanProposal } from "../../types";
 import { RemoteFileTree } from "./RemoteFileTree";
 import { KernelPanel } from "./KernelPanel";
 import "./workspace.css";
@@ -43,6 +43,7 @@ interface Props {
   onStartRun?: () => Promise<void> | void;
   canStartRun?: boolean;
   runStarted?: boolean;
+  agentRunEvents?: AgentRunStreamEvent[];
   remoteFiles?: import("../../types").RemoteFileEntry[];
   filesBusy?: boolean;
   onUploadFiles?: () => Promise<void> | void;
@@ -62,7 +63,7 @@ interface Props {
 
 type ContextTab = "files" | "preview" | "notebook" | "explore" | "runs";
 
-export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", modelLabel, planProposal, planLoading = false, planApproved = false, onRequestPlan, onApprovePlan, onStartRun, canStartRun = false, runStarted = false, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell }: Props) {
+export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", modelLabel, planProposal, planLoading = false, planApproved = false, onRequestPlan, onApprovePlan, onStartRun, canStartRun = false, runStarted = false, agentRunEvents = [], remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell }: Props) {
   const t = copy[locale];
   const zh = locale === "zh-CN";
   const [tab, setTab] = useState<ContextTab>("files");
@@ -80,7 +81,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
       stream.scrollTop = stream.scrollHeight;
     });
     return () => cancelAnimationFrame(frame);
-  }, [messages.length, streamingAssistant, agentBusy, agentNotice, planProposal, planLoading]);
+  }, [messages.length, streamingAssistant, agentBusy, agentNotice, planProposal, planLoading, agentRunEvents.length]);
 
   async function send() {
     const message = draft.trim();
@@ -115,6 +116,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
         {agentBusy && !streamingAssistant && <article className="message assistant-message agent-pending" role="status"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><p>{zh ? "正在等待模型响应…" : "Waiting for the model…"}</p></div></article>}
         {agentNotice && <div className="agent-notice" role="alert"><strong>{zh ? "对话未完成" : "Conversation did not complete"}</strong><span>{agentNotice}</span></div>}
         {(planProposal || !onRequestPlan) && <article className="approval-card"><div className="task-icon"><Check size={18} /></div><div className="task-body"><div><strong>{planProposal?.plan.title ?? (zh ? "正式计划等待审批" : "Formal plan awaiting approval")}</strong><span>{runStarted ? (zh ? "运行已启动" : "Run started") : (planApproved || approved) ? (zh ? "已批准" : "Approved") : (planProposal?.validation.valid === false ? (zh ? "验证失败" : "Invalid") : (zh ? "需确认" : "Review"))}</span></div><p>{planProposal ? `${planProposal.plan.stages.reduce((count, stage) => count + stage.steps.length, 0)} ${zh ? "个版本化步骤" : "versioned steps"} · SHA-256 ${planProposal.plan_hash.slice(0, 12)}` : (zh ? "新增 5 个版本化步骤；将上传 2 个选定文件，不会同步整个工作区。" : "Adds 5 versioned steps; uploads 2 selected files and never mirrors the whole workspace.")}</p><div className="task-actions"><button>{zh ? "查看差异" : "View diff"}</button><button disabled={planApproved || approved || planProposal?.validation.valid === false} onClick={() => { if (onApprovePlan) void onApprovePlan(); else setApproved(true); }}>{(planApproved || approved) ? (zh ? "已批准" : "Approved") : onStartRun ? (zh ? "批准并开始远端运行" : "Approve and run remotely") : (zh ? "批准计划" : "Approve plan")}</button>{(planApproved || approved) && onStartRun && !runStarted && <button disabled={!canStartRun} onClick={() => void onStartRun()}>{canStartRun ? (zh ? "重新开始远端运行" : "Start remote run") : (zh ? "正在启动…" : "Starting…")}</button>}</div></div></article>}
+        {runStarted && <AgentRunTimeline locale={locale} events={agentRunEvents} />}
         {planProposal?.validation.valid === false && <div className="plan-validation" role="alert"><strong>{zh ? "计划未通过本地执行契约" : "Plan failed the local execution contract"}</strong><ul>{planProposal.validation.issues.map((issue) => <li key={`${issue.path}:${issue.code}`}><code>{issue.path}</code><span>{issue.message}</span></li>)}</ul><button disabled={planLoading} onClick={() => void onRequestPlan?.()}>{planLoading ? (zh ? "重新生成中…" : "Regenerating…") : (zh ? "按当前工具契约重新生成" : "Regenerate with current tool contract")}</button></div>}
         {!onSend && <article className="task-card"><div className="task-icon"><Activity size={18} /></div><div className="task-body"><div><strong>{t.task}</strong><span>65%</span></div><p>{zh ? "远端 Linux · 8 CPU · 32 GiB · 低风险" : "Remote Linux · 8 CPU · 32 GiB · low risk"}</p><div className="task-progress"><i /></div><div className="task-actions"><button>{zh ? "查看日志" : "View logs"}</button><button>{zh ? "查看计划" : "View plan"}</button></div></div></article>}
         {onSend && !planProposal && <article className="task-card planning-card"><div className="task-icon"><Activity size={18} /></div><div className="task-body"><div><strong>{zh ? "分析计划" : "Analysis plan"}</strong><span>{planLoading ? (zh ? "生成中" : "Generating") : (zh ? "尚未生成" : "Not generated")}</span></div><p>{zh ? "对话明确目标后，生成版本化计划并在远端执行前审批。" : "After the goal is clear, generate a versioned plan for approval before remote execution."}</p><div className="task-actions"><button disabled={planLoading || agentBusy} onClick={() => void onRequestPlan?.()}>{planLoading ? (zh ? "生成中…" : "Generating…") : (zh ? "生成分析计划" : "Generate plan")}</button></div></div></article>}
@@ -132,5 +134,19 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
 
 function FileTree({ locale }: { locale: Locale }) { const zh = locale === "zh-CN"; return <div className="file-tree"><div className="context-heading"><b>{zh ? "项目文件" : "Project files"}</b><small>{zh ? "选择性同步" : "Selective sync"}</small></div><div className="tree-folder"><Folder size={15} />data <span>{zh ? "远端" : "remote"}</span></div><div className="tree-folder"><Folder size={15} />analysis</div><div className="tree-file"><FileBarChart size={15} />umap.png <em>1.2 MB</em></div><div className="tree-file"><FileText size={15} />markers.csv <em>84 KB</em></div><div className="tree-file"><NotebookPen size={15} />report.md <em>12 KB</em></div></div>; }
 function ArtifactPreview({ title }: { title: string }) { return <div className="artifact-preview"><div className="umap-plot" aria-label={title}>{Array.from({ length: 32 }, (_, index) => <i key={index} style={{ "--x": `${12 + ((index * 29) % 75)}%`, "--y": `${14 + ((index * 43) % 68)}%`, "--c": index % 4 } as React.CSSProperties} />)}</div><div className="artifact-meta"><b>{title}</b><span>12 clusters · 5,842 cells</span><small>results/figures/umap.png · SHA-256 verified</small></div></div>; }
+function AgentRunTimeline({ locale, events }: { locale: Locale; events: AgentRunStreamEvent[] }) {
+  const zh = locale === "zh-CN";
+  const active = !events.some((event) => event.kind === "agent_completed" || event.kind === "agent_failed");
+  return <article className="agent-run-card" aria-label={zh ? "远程 Agent 实时活动" : "Remote agent live activity"}>
+    <header><div><Activity size={17} /><strong>{zh ? "远程 Agent 实时活动" : "Remote agent live activity"}</strong></div><span className={active ? "active" : "complete"}><i />{active ? (zh ? "执行中" : "Running") : (zh ? "已完成" : "Complete")}</span></header>
+    {events.length === 0 ? <div className="agent-run-waiting"><i />{zh ? "正在连接远程终端并等待第一个 Agent 事件…" : "Connecting to the remote terminal and waiting for the first agent event…"}</div> :
+      <div className="agent-run-events">{events.map((event) => <section className={`agent-run-event kind-${event.kind}`} key={`${event.run_id}-${event.sequence}`}>
+        <div className="agent-run-marker" />
+        <div><small>{event.iteration ? `${zh ? "第" : "Iteration "}${event.iteration}${zh ? " 轮" : ""}` : (zh ? "运行" : "Run")} · {new Date(event.timestamp).toLocaleTimeString()}</small><b>{event.title}</b>
+          {(event.kind === "stdout" || event.kind === "stderr" || event.kind === "tool_started") ? <pre>{event.content}</pre> : <p>{event.content}</p>}
+        </div>
+      </section>)}</div>}
+  </article>;
+}
 function Notebook({ locale }: { locale: Locale }) { const zh = locale === "zh-CN"; return <div className="notebook-list"><div><span>{zh ? "方法" : "Method"}</span><b>Scanpy QC</b><p>{zh ? "过滤低质量细胞并保留原始计数层。" : "Filtered low-quality cells while preserving raw counts."}</p></div><div><span>{zh ? "决策" : "Decision"}</span><b>Harmony</b><p>{zh ? "在 PCA 后进行批次校正。" : "Apply batch correction after PCA."}</p></div></div>; }
 function RunSummary({ locale }: { locale: Locale }) { const zh = locale === "zh-CN"; return <div className="run-summary"><Activity size={24} /><b>{zh ? "运行中" : "Running"}</b><span>3 / 5 {zh ? "步骤已验证" : "steps verified"}</span><div className="task-progress"><i style={{ width: "60%" }} /></div></div>; }

@@ -206,6 +206,14 @@ impl SshSession {
     }
 
     pub async fn execute(&self, command: &str) -> AdapterResult<CommandOutput> {
+        self.execute_streaming(command, |_, _| {}).await
+    }
+
+    pub async fn execute_streaming(
+        &self,
+        command: &str,
+        mut on_output: impl FnMut(bool, &str),
+    ) -> AdapterResult<CommandOutput> {
         let mut channel = self
             .handle
             .channel_open_session()
@@ -217,8 +225,14 @@ impl SshSession {
         let mut stderr = Vec::new();
         while let Some(message) = channel.wait().await {
             match message {
-                ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
-                ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
+                ChannelMsg::Data { data } => {
+                    on_output(false, &String::from_utf8_lossy(&data));
+                    stdout.extend_from_slice(&data);
+                }
+                ChannelMsg::ExtendedData { data, .. } => {
+                    on_output(true, &String::from_utf8_lossy(&data));
+                    stderr.extend_from_slice(&data);
+                }
                 ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
                 _ => {}
             }
