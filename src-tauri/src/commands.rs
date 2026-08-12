@@ -11,10 +11,11 @@ use chrono::Utc;
 use omicsops_adapters::{
     credentials::{CredentialVault, SystemCredentialVault, credential_account},
     document::{ExtractedPlan, extract_plan_text},
-    llm::OpenAiCompatibleClient,
+    llm::{OpenAiCompatibleClient, ProviderProtocol, UnifiedModelClient},
     persistence::Repository,
     ssh::{SshAuthentication, SshSession},
 };
+use omicsops_agent::{ModelMessage, ModelRequest, ToolArgumentBuffer};
 use omicsops_core::{
     audit::{RunEventKindV2, RunEventV2},
     domain::{
@@ -35,6 +36,7 @@ use omicsops_runner::{
     AutonomousRunner, LlmRepairPlanner, SshRemoteExecutor, SshV2Executor, StepOutcome,
     generate_analysis_plan,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 use url::Url;
@@ -437,11 +439,7 @@ pub async fn start_run(
     }
     let profile = find_profile(&state.repository, profile_id)?;
     require_trusted_host(&profile)?;
-    let project: ProjectSpec = state
-        .repository
-        .get_json("project", &project_id.to_string())
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "project does not exist".to_owned())?;
+    let project = current_project_spec(&state.repository, project_id)?;
     let active = state
         .repository
         .list_json::<RunCheckpointV2>("run_checkpoint_v2")
@@ -480,7 +478,24 @@ pub async fn start_run(
         .append_audit_event(&event)
         .map_err(|error| error.to_string())?;
     let authentication = authentication_for_profile(&state, &profile)?;
-    let repair_llm = llm_client(&state)?;
+    let agent_model = if plan.metadata.get("execution_mode").map(String::as_str)
+        == Some("remote_agent")
+    {
+        let model_profile_id = plan
+            .metadata
+            .get("model_profile_id")
+            .ok_or_else(|| "approved remote-agent plan has no model profile".to_string())?
+            .parse::<Uuid>()
+            .map_err(|_| "approved remote-agent plan has an invalid model profile".to_string())?;
+        Some(unified_model_client(&state, model_profile_id)?)
+    } else {
+        None
+    };
+    let repair_llm = if agent_model.is_some() {
+        None
+    } else {
+        Some(llm_client(&state)?)
+    };
     spawn_v2_run(
         app,
         state.repository.clone(),
@@ -492,6 +507,7 @@ pub async fn start_run(
         checkpoint,
         false,
         repair_llm,
+        agent_model,
     )?;
     Ok(run_id)
 }
@@ -656,13 +672,25 @@ pub fn resume_run_v2(
     }
     let profile = find_profile(&state.repository, checkpoint.profile_id)?;
     require_trusted_host(&profile)?;
-    let project: ProjectSpec = state
-        .repository
-        .get_json("project", &checkpoint.project_id.to_string())
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "project is missing".to_owned())?;
+    let project = current_project_spec(&state.repository, checkpoint.project_id)?;
     let authentication = authentication_for_profile(&state, &profile)?;
-    let repair_llm = llm_client(&state)?;
+    let agent_model =
+        if plan.metadata.get("execution_mode").map(String::as_str) == Some("remote_agent") {
+            let id = plan
+                .metadata
+                .get("model_profile_id")
+                .ok_or_else(|| "remote-agent plan has no model profile".to_string())?
+                .parse::<Uuid>()
+                .map_err(|_| "remote-agent plan has an invalid model profile".to_string())?;
+            Some(unified_model_client(&state, id)?)
+        } else {
+            None
+        };
+    let repair_llm = if agent_model.is_some() {
+        None
+    } else {
+        Some(llm_client(&state)?)
+    };
     append_v2_event(
         &app,
         &state.repository,
@@ -682,6 +710,7 @@ pub fn resume_run_v2(
         checkpoint,
         true,
         repair_llm,
+        agent_model,
     )
 }
 
@@ -941,7 +970,8 @@ fn spawn_v2_run(
     plan: AnalysisPlanV2,
     checkpoint: RunCheckpointV2,
     recovering: bool,
-    repair_llm: OpenAiCompatibleClient,
+    repair_llm: Option<OpenAiCompatibleClient>,
+    agent_model: Option<UnifiedModelClient>,
 ) -> Result<(), String> {
     let run_id = checkpoint.run_id;
     let cancel_requested = Arc::new(AtomicBool::new(false));
@@ -965,6 +995,7 @@ fn spawn_v2_run(
             cancel_requested,
             recovering,
             repair_llm,
+            agent_model,
         )
         .await;
         if let Ok(mut active) = active_runs.lock() {
@@ -985,7 +1016,8 @@ async fn execute_v2_run(
     mut checkpoint: RunCheckpointV2,
     cancel_requested: Arc<AtomicBool>,
     mut recovering: bool,
-    repair_llm: OpenAiCompatibleClient,
+    repair_llm: Option<OpenAiCompatibleClient>,
+    agent_model: Option<UnifiedModelClient>,
 ) {
     let session = match SshSession::connect(&profile, authentication).await {
         Ok(session) => Arc::new(session),
@@ -1005,6 +1037,65 @@ async fn execute_v2_run(
     };
     checkpoint.state = RunStateV2::Running;
     persist_v2_checkpoint(&repository, &checkpoint);
+    if plan.metadata.get("execution_mode").map(String::as_str) == Some("remote_agent") {
+        let Some(model) = agent_model.as_ref() else {
+            checkpoint.needs_attention("remote-agent model is unavailable");
+            persist_v2_checkpoint(&repository, &checkpoint);
+            return;
+        };
+        match execute_remote_agent_task(
+            &app,
+            &repository,
+            &session,
+            model,
+            &project,
+            &plan,
+            checkpoint.run_id,
+            &cancel_requested,
+        )
+        .await
+        {
+            Ok(()) => {
+                checkpoint.mark_verified("remote-agent-task", "adaptive-agent-loop");
+                checkpoint.state = RunStateV2::Succeeded;
+                persist_v2_checkpoint(&repository, &checkpoint);
+                append_v2_event(
+                    &app,
+                    &repository,
+                    checkpoint.run_id,
+                    RunEventKindV2::RunSucceeded,
+                    "remote agent completed the approved goal",
+                    Default::default(),
+                );
+            }
+            Err(reason) => {
+                checkpoint.needs_attention(reason.clone());
+                persist_v2_checkpoint(&repository, &checkpoint);
+                append_v2_event(
+                    &app,
+                    &repository,
+                    checkpoint.run_id,
+                    RunEventKindV2::NeedsAttention,
+                    &reason,
+                    Default::default(),
+                );
+            }
+        }
+        return;
+    }
+    if let Err(reason) = prepare_v2_environment(&session, &project.remote_root, &plan).await {
+        checkpoint.needs_attention(reason.clone());
+        persist_v2_checkpoint(&repository, &checkpoint);
+        append_v2_event(
+            &app,
+            &repository,
+            checkpoint.run_id,
+            RunEventKindV2::NeedsAttention,
+            &reason,
+            Default::default(),
+        );
+        return;
+    }
     let catalog = match builtin_tool_catalog() {
         Ok(catalog) => catalog,
         Err(error) => {
@@ -1078,11 +1169,16 @@ async fn execute_v2_run(
             );
             return;
         }
+        let Some(repair_llm) = repair_llm.as_ref() else {
+            checkpoint.needs_attention("fixed-tool run has no repair model");
+            persist_v2_checkpoint(&repository, &checkpoint);
+            return;
+        };
         let (executed_step, hash) = match execute_v2_step_with_repairs(
             &app,
             &repository,
             &executor,
-            &repair_llm,
+            repair_llm,
             &plan,
             &catalog,
             checkpoint.run_id,
@@ -1150,9 +1246,13 @@ async fn execute_v2_run(
         project.remote_root.trim_end_matches('/')
     );
     let lock_tmp = format!("{lock_path}.tmp");
+    let environment_path = format!(
+        "{}/.omicsops/env",
+        project.remote_root.trim_end_matches('/')
+    );
     let lock_output = session.execute_checked(&format!(
-        "micromamba list --explicit > {tmp} && mv {tmp} {lock} && stat -c '%s' {lock} && sha256sum {lock}",
-        tmp = shell_quote(&lock_tmp), lock = shell_quote(&lock_path),
+        "micromamba list --prefix {environment} --explicit > {tmp} && mv {tmp} {lock} && stat -c '%s' {lock} && sha256sum {lock}",
+        environment = shell_quote(&environment_path), tmp = shell_quote(&lock_tmp), lock = shell_quote(&lock_path),
     )).await;
     let lock_output = match lock_output {
         Ok(output) => output,
@@ -1218,6 +1318,382 @@ async fn execute_v2_run(
     if let Ok(session) = Arc::try_unwrap(session) {
         let _ = session.disconnect().await;
     }
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct RemoteAgentAction {
+    /// One of `run` or `finish`.
+    kind: String,
+    /// Shell command for a `run` action. It executes from the approved project root.
+    command: Option<String>,
+    /// Why this action is the next safe step, or the final result summary.
+    reason: String,
+    /// Relative project paths to completed result artifacts. Used by `finish`.
+    #[serde(default)]
+    artifacts: Vec<String>,
+}
+
+pub fn validate_agent_command(command: &str, project_root: &str) -> Result<(), String> {
+    let command = command.trim();
+    if command.is_empty() || command.len() > 32_000 || command.contains('\0') {
+        return Err("agent submitted an empty or oversized terminal command".into());
+    }
+    let lowered = command.to_ascii_lowercase();
+    let denied = [
+        "sudo ",
+        "su -",
+        "rm -rf",
+        "rm -fr",
+        "mkfs",
+        "shutdown",
+        "reboot",
+        "poweroff",
+        ":(){",
+        "dd if=",
+        "chmod -r",
+        "chown -r",
+        "git reset --hard",
+        "git clean -f",
+        "> /dev/",
+        "$home",
+        "${home}",
+        "cd /",
+        "cd ~",
+        "../",
+    ];
+    if denied.iter().any(|token| lowered.contains(token)) {
+        return Err(
+            "agent terminal action was blocked by the approved remote safety policy".into(),
+        );
+    }
+    for protected in [
+        "/etc/", "/usr/", "/var/", "/root/", "/boot/", "/sys/", "/proc/",
+    ] {
+        if lowered.contains(protected) && !project_root.to_ascii_lowercase().starts_with(protected)
+        {
+            return Err(format!(
+                "agent terminal action referenced protected path {protected}"
+            ));
+        }
+    }
+    for token in command.split(|character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                '\'' | '"' | '=' | '(' | ')' | ';' | '|' | '<' | '>'
+            )
+    }) {
+        let candidate = token.trim_matches(|character: char| matches!(character, ',' | ':'));
+        if candidate.starts_with('/')
+            && !candidate.starts_with(project_root)
+            && !matches!(
+                candidate,
+                "/dev/null" | "/usr/bin/env" | "/bin/bash" | "/bin/sh"
+            )
+        {
+            return Err(format!(
+                "agent terminal action referenced a path outside the approved project root: {candidate}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn next_remote_agent_action(
+    model: &UnifiedModelClient,
+    system: &str,
+    prompt: &str,
+) -> Result<RemoteAgentAction, String> {
+    let schema = serde_json::to_value(schemars::schema_for!(RemoteAgentAction))
+        .map_err(|error| error.to_string())?;
+    let mut buffer = ToolArgumentBuffer::new("submit_remote_agent_action");
+    let mut event_error = None;
+    model
+        .stream_with(
+            ModelRequest {
+                system: system.into(),
+                messages: vec![ModelMessage {
+                    role: "user".into(),
+                    content: prompt.into(),
+                }],
+                tool_name: Some("submit_remote_agent_action".into()),
+                tool_schema: Some(schema),
+            },
+            |event| {
+                if let Err(error) = buffer.push(event) {
+                    event_error.get_or_insert_with(|| error.to_string());
+                }
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Some(error) = event_error {
+        return Err(error);
+    }
+    serde_json::from_value(buffer.finish().map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_remote_agent_task(
+    app: &AppHandle,
+    repository: &Repository,
+    session: &Arc<SshSession>,
+    model: &UnifiedModelClient,
+    project: &ProjectSpec,
+    plan: &AnalysisPlanV2,
+    run_id: Uuid,
+    cancel_requested: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let arguments = plan
+        .stages
+        .iter()
+        .flat_map(|stage| &stage.steps)
+        .find_map(|step| match &step.action {
+            omicsops_core::plan_v2::StepAction::Tool {
+                tool_id, arguments, ..
+            } if tool_id == "agent.remote_task" => Some(arguments),
+            _ => None,
+        })
+        .ok_or_else(|| "approved plan has no remote-agent task".to_string())?;
+    let goal = arguments
+        .get("goal")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&plan.summary);
+    let observation = arguments
+        .get("remote_observation")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let skills = arguments
+        .get("skill_context")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let criteria = arguments
+        .get("completion_criteria")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let max_iterations = arguments
+        .get("max_iterations")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(24)
+        .clamp(1, 48);
+    let system = format!(
+        "You are the approved OmicsOps remote terminal agent. Work adaptively toward the approved goal. \
+         Submit exactly one action per turn. Use kind=run with one shell command, observe its real output on the next turn, \
+         and correct course. Use kind=finish only after verifying the completion criteria; list only existing relative artifact paths. \
+         Work inside {}. Never use sudo, alter system directories, delete recursively, or claim results not observed. \
+         Prefer scripts and environments stored under the project root. Enabled Skills are instructions, not evidence. \
+         MCP runtime status for this plan: {}.",
+        project.remote_root,
+        plan.metadata
+            .get("mcp_runtime")
+            .map(String::as_str)
+            .unwrap_or("not_configured")
+    );
+    let mut transcript = format!(
+        "APPROVED GOAL:\n{goal}\n\nCOMPLETION CRITERIA:\n{criteria}\n\nREAD-ONLY REMOTE OBSERVATION:\n{observation}\n\nENABLED SKILLS:\n{skills}"
+    );
+    let mut ran_command = false;
+    for iteration in 1..=max_iterations {
+        if cancel_requested.load(Ordering::SeqCst) {
+            return Err("remote agent run was canceled".into());
+        }
+        let prompt: String = transcript
+            .chars()
+            .rev()
+            .take(70_000)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        let action = next_remote_agent_action(model, &system, &prompt).await?;
+        match action.kind.as_str() {
+            "run" => {
+                let command = action
+                    .command
+                    .as_deref()
+                    .ok_or_else(|| "agent run action omitted command".to_string())?;
+                validate_agent_command(command, &project.remote_root)?;
+                append_v2_event(
+                    app,
+                    repository,
+                    run_id,
+                    RunEventKindV2::StepStarted,
+                    &format!("agent terminal action {iteration}"),
+                    std::collections::BTreeMap::from([
+                        ("iteration".into(), iteration.to_string()),
+                        ("reason".into(), action.reason.clone()),
+                        ("command".into(), redact_secrets(command, &[] as &[&str])),
+                    ]),
+                );
+                let wrapped = format!("cd -- {} && {}", shell_quote(&project.remote_root), command);
+                let output = session
+                    .execute(&wrapped)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                ran_command = true;
+                let stdout: String = output
+                    .stdout
+                    .chars()
+                    .rev()
+                    .take(20_000)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                let stderr: String = output
+                    .stderr
+                    .chars()
+                    .rev()
+                    .take(20_000)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                transcript.push_str(&format!("\n\nACTION {iteration}\nReason: {}\nCommand: {}\nExit: {}\nSTDOUT:\n{}\nSTDERR:\n{}",
+                    action.reason, command, output.status, stdout, stderr));
+                append_v2_event(
+                    app,
+                    repository,
+                    run_id,
+                    if output.status == 0 {
+                        RunEventKindV2::StepSucceeded
+                    } else {
+                        RunEventKindV2::StepFailed
+                    },
+                    &format!("agent terminal action {iteration} exited {}", output.status),
+                    std::collections::BTreeMap::from([
+                        ("iteration".into(), iteration.to_string()),
+                        ("exit_code".into(), output.status.to_string()),
+                        (
+                            "stdout_tail".into(),
+                            redact_secrets(&stdout, &[] as &[&str]),
+                        ),
+                        (
+                            "stderr_tail".into(),
+                            redact_secrets(&stderr, &[] as &[&str]),
+                        ),
+                    ]),
+                );
+            }
+            "finish" => {
+                if !ran_command {
+                    return Err(
+                        "agent attempted to finish without executing or verifying the remote task"
+                            .into(),
+                    );
+                }
+                if action.artifacts.is_empty() {
+                    return Err(
+                        "agent attempted to finish without declaring result artifacts".into(),
+                    );
+                }
+                for relative in &action.artifacts {
+                    omicsops_core::project::validate_relative_remote_path(std::path::Path::new(
+                        relative,
+                    ))
+                    .map_err(|error| error.to_string())?;
+                    let remote_path = format!(
+                        "{}/{}",
+                        project.remote_root.trim_end_matches('/'),
+                        relative.trim_start_matches('/')
+                    );
+                    let metadata = session
+                        .execute_checked(&format!(
+                            "test -f {0} && stat -c '%s' {0} && sha256sum {0}",
+                            shell_quote(&remote_path)
+                        ))
+                        .await
+                        .map_err(|error| {
+                            format!("declared artifact {relative} is not a verified file: {error}")
+                        })?;
+                    let mut lines = metadata.stdout.lines();
+                    let size_bytes = lines
+                        .next()
+                        .and_then(|value| value.parse().ok())
+                        .ok_or_else(|| format!("artifact {relative} has no size"))?;
+                    let sha256 = lines
+                        .next()
+                        .and_then(|value| value.split_whitespace().next())
+                        .ok_or_else(|| format!("artifact {relative} has no hash"))?
+                        .to_string();
+                    let record = ArtifactRecordV2 {
+                        run_id,
+                        source_step_id: "remote-agent-task".into(),
+                        remote_path,
+                        size_bytes,
+                        sha256,
+                        verified: true,
+                    };
+                    repository
+                        .put_json("artifact_v2", &format!("{run_id}:{relative}"), &record)
+                        .map_err(|error| error.to_string())?;
+                }
+                append_v2_event(
+                    app,
+                    repository,
+                    run_id,
+                    RunEventKindV2::StepSucceeded,
+                    &action.reason,
+                    std::collections::BTreeMap::from([(
+                        "artifacts".into(),
+                        action.artifacts.join("\n"),
+                    )]),
+                );
+                return Ok(());
+            }
+            other => return Err(format!("agent submitted unsupported action kind {other}")),
+        }
+    }
+    Err(format!(
+        "remote agent exhausted its approved limit of {max_iterations} terminal actions"
+    ))
+}
+
+async fn prepare_v2_environment(
+    session: &SshSession,
+    project_root: &str,
+    plan: &AnalysisPlanV2,
+) -> Result<(), String> {
+    let (channels, dependencies) = match &plan.environment {
+        PlanEnvironment::Micromamba {
+            channels,
+            dependencies,
+        } => (channels, dependencies),
+    };
+    if dependencies.is_empty() {
+        return Err("approved environment has no dependencies".into());
+    }
+    let environment = format!("{}/.omicsops/env", project_root.trim_end_matches('/'));
+    let channel_arguments = channels
+        .iter()
+        .map(|channel| format!("--channel {}", shell_quote(channel)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let dependency_arguments = dependencies
+        .iter()
+        .map(|dependency| shell_quote(dependency))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let base = format!(
+        "micromamba {{operation}} --yes --prefix {} {} {}",
+        shell_quote(&environment),
+        channel_arguments,
+        dependency_arguments
+    );
+    let create = base.replace("{operation}", "create");
+    let install = base.replace("{operation}", "install");
+    session
+        .execute_checked(&format!(
+            "mkdir -p {} && if test -x {}/bin/python; then {}; else {}; fi",
+            shell_quote(&format!("{}/.omicsops", project_root.trim_end_matches('/'))),
+            shell_quote(&environment),
+            install,
+            create
+        ))
+        .await
+        .map_err(|error| format!("environment preparation failed: {error}"))?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1928,6 +2404,59 @@ fn llm_client(state: &State<'_, AppState>) -> Result<OpenAiCompatibleClient, Str
         config.model,
         api_key,
     ))
+}
+
+fn unified_model_client(
+    state: &State<'_, AppState>,
+    model_profile_id: Uuid,
+) -> Result<UnifiedModelClient, String> {
+    let profile = state
+        .repository
+        .get_model_profile(model_profile_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "model profile not found".to_string())?;
+    let credential = match &profile.credential_reference {
+        Some(reference) => state
+            .credentials
+            .get(reference)
+            .map_err(|error| error.to_string())?,
+        None => None,
+    };
+    let protocol = match profile.provider {
+        omicsops_core::workspace::ModelProviderKind::Anthropic => ProviderProtocol::Anthropic,
+        omicsops_core::workspace::ModelProviderKind::OpenAiCompatible => {
+            ProviderProtocol::OpenAiCompatible
+        }
+        omicsops_core::workspace::ModelProviderKind::Ollama => ProviderProtocol::Ollama,
+    };
+    UnifiedModelClient::new(
+        profile.id,
+        protocol,
+        Url::parse(&profile.base_url).map_err(|error| error.to_string())?,
+        profile.model,
+        credential,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn current_project_spec(repository: &Repository, project_id: Uuid) -> Result<ProjectSpec, String> {
+    let project = repository
+        .get_project(project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project does not exist".to_string())?;
+    Ok(ProjectSpec {
+        id: project.id,
+        connection_id: project
+            .connection_id
+            .ok_or_else(|| "project has no remote connection".to_string())?,
+        remote_root: project
+            .remote_root
+            .ok_or_else(|| "project has no remote root".to_string())?,
+        plan_summary: project.description,
+        data_sources: Vec::new(),
+        resource_limits: omicsops_core::domain::ResourceLimits::default(),
+        allowed_network_domains: Vec::new(),
+    })
 }
 
 fn artifact_kind(path: &str) -> ArtifactKind {

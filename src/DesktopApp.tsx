@@ -16,6 +16,8 @@ export default function DesktopApp() {
   const [messageSequence, setMessageSequence] = useState(1);
   const [messages, setMessages] = useState<WorkspaceMessage[]>([]);
   const [streamingAssistant, setStreamingAssistant] = useState("");
+  const [agentBusy, setAgentBusy] = useState(false);
+  const [agentNotice, setAgentNotice] = useState("");
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>([]);
   const [activeModelProfileId, setActiveModelProfileId] = useState<string | null>(null);
   const [lastGoal, setLastGoal] = useState("");
@@ -50,6 +52,7 @@ export default function DesktopApp() {
       const storedMessages = await api.listMessages(active.id);
       setMessages(storedMessages);
       setMessageSequence((storedMessages.at(-1)?.sequence ?? 0) + 1);
+      setLastGoal([...storedMessages].reverse().find((message) => message.role === "user")?.markdown ?? "");
     });
   }, [selected?.id]);
   useEffect(() => {
@@ -73,12 +76,20 @@ export default function DesktopApp() {
     const unlisten: Array<() => void> = [];
     api.onAgentEvent((event: AgentEvent) => {
       if (event.conversation_id !== conversation?.id) return;
-      if (event.event.kind === "turn-started") setStreamingAssistant("");
+      if (event.event.kind === "turn-started") {
+        setStreamingAssistant("");
+        setAgentBusy(true);
+        setAgentNotice("");
+      }
       if (event.event.kind === "text-delta") {
         const delta = event.event.payload;
         setStreamingAssistant((value) => value + delta);
       }
-      if (event.event.kind === "turn-completed" || event.event.kind === "turn-failed") setStreamingAssistant("");
+      if (event.event.kind === "turn-completed" || event.event.kind === "turn-failed") {
+        setStreamingAssistant("");
+        setAgentBusy(false);
+      }
+      if (event.event.kind === "turn-failed") setAgentNotice(event.event.payload.message);
     }).then((fn) => disposed ? fn() : unlisten.push(fn));
     api.onConversationEvent((event) => {
       if (event.conversation_id !== conversation?.id) return;
@@ -154,5 +165,73 @@ export default function DesktopApp() {
   const settings = settingsOpen ? <SettingsPanel locale={locale} onClose={() => setSettingsOpen(false)} modelProfiles={modelProfiles} skillPackages={skillPackages} connections={connections} selectedProject={selected} onSaveConnection={async (profile, secret) => { await api.saveConnection(profile, secret); setConnections(await api.listConnections()); }} onTestConnection={api.testConnection} onConfirmHostKey={async (profileId, fingerprint) => { await api.confirmHostKey(profileId, fingerprint); setConnections(await api.listConnections()); }} onBindProjectRemote={async (connectionId, remoteRoot) => { if (!selected) return; const updated = await api.updateProjectRemote(selected.id, connectionId, remoteRoot); setSelected(updated); setProjects((current) => current.map((project) => project.id === updated.id ? updated : project)); }} onSaveModel={async (request) => { const profile = await api.saveModelProfile(request); setModelProfiles((current) => [profile, ...current.filter((item) => item.id !== profile.id)]); setActiveModelProfileId(profile.id); }} onProbeModel={api.probeModelProfile} onListModels={api.listModelProfileModels} onImportSkill={async () => { const sourcePath = await api.chooseSkillDirectory(); if (!sourcePath) return; const skill = await api.importSkillDirectory(sourcePath); setSkillPackages((current) => [skill, ...current.filter((item) => item.id !== skill.id)]); }} onSetSkillEnabled={async (skillId, enabled) => { const updated = await api.setSkillEnabled(skillId, enabled); setSkillPackages(await api.listSkillPackages()); return updated; }} /> : null;
   if (!selected) return <><ProjectLibrary projects={projects} connections={connections} locale={locale} onLocaleChange={setLocale} onSettings={() => setSettingsOpen(true)} onOpen={setSelected} onChooseLocalRoot={api.chooseProjectDirectory} onCreate={async ({ template, name, localRoot, connectionId, remoteRoot }) => { const project = await api.createProject({ name, description: "", local_root: localRoot, template, connection_id: connectionId, remote_root: remoteRoot }); setProjects((current) => [project, ...current]); setSelected(project); }} />{settings}</>;
   const activeModel = modelProfiles.find((profile) => profile.id === activeModelProfileId) ?? null;
-  return <><WorkspaceShell project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template }} locale={locale} onLocaleChange={setLocale} onOpenSettings={() => setSettingsOpen(true)} onBackToProjects={() => setSelected(null)} messages={messages} streamingAssistant={streamingAssistant} modelLabel={activeModel?.label} planProposal={planProposal} planLoading={planLoading} planApproved={planApproved} canStartRun={Boolean(selected.connection_id && approvedPlanId)} runStarted={Boolean(runId)} remoteFiles={remoteFiles} filesBusy={filesBusy} fileNotice={fileNotice} kernelSessions={kernelSessions} kernelEvents={kernelEvents} kernelBusy={kernelBusy} kernelNotice={kernelNotice} onStartKernel={selected.connection_id && selected.remote_root ? startKernel : undefined} onExecuteKernel={async (sessionId, code, save, capturePaths) => { let savedIndex: number | null = null; await withKernelBusy(async () => { const result = await api.executeKernelCell(sessionId, code, save, capturePaths); savedIndex = result.saved_cell_index; setKernelEvents((current) => { const known = new Set(current.map((event) => `${event.request_id}:${event.sequence}`)); return [...current, ...result.events.filter((event) => !known.has(`${event.request_id}:${event.sequence}`))].slice(-200); }); }); return savedIndex; }} onInterruptKernel={async (sessionId) => withKernelBusy(async () => replaceKernelSession(await api.interruptKernel(sessionId)))} onStopKernel={async (sessionId) => withKernelBusy(async () => replaceKernelSession(await api.stopKernel(sessionId)))} onPromoteKernelCell={api.promoteKernelCell} onUploadFiles={selected.connection_id && selected.remote_root ? uploadFiles : undefined} onRefreshFiles={selected.connection_id && selected.remote_root ? () => refreshRemoteFiles() : undefined} onDownloadFile={selected.connection_id && selected.remote_root ? downloadFile : undefined} onSend={async (markdown) => { if (!conversation || !activeModel) { setSettingsOpen(true); return false; } setLastGoal(markdown); setPlanProposal(null); setPlanApproved(false); setApprovedPlanId(null); setRunId(null); await api.runAgentTurn({ project_id: selected.id, conversation_id: conversation.id, model_profile_id: activeModel.id, markdown, message_sequence: messageSequence }); return true; }} onRequestPlan={async () => { if (!activeModel || !lastGoal) { if (!activeModel) setSettingsOpen(true); return; } setPlanLoading(true); try { setPlanProposal(await api.proposeAnalysisPlan({ project_id: selected.id, model_profile_id: activeModel.id, goal: lastGoal, environment_summary: selected.remote_root ? `Remote Linux project at ${selected.remote_root}` : "Remote Linux environment not inspected yet" })); } finally { setPlanLoading(false); } }} onApprovePlan={async () => { if (!planProposal) return; const approved = await api.approvePlanV2(planProposal.plan, planProposal.plan.policy); setApprovedPlanId(approved.id); setPlanApproved(true); }} onStartRun={async () => { if (!selected.connection_id || !approvedPlanId) return; setRunId(await api.startRunV2(selected.connection_id, selected.id, approvedPlanId)); }} />{settings}</>;
+  return <><WorkspaceShell
+    project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template }}
+    locale={locale} onLocaleChange={setLocale} onOpenSettings={() => setSettingsOpen(true)} onBackToProjects={() => setSelected(null)}
+    messages={messages} streamingAssistant={streamingAssistant} agentBusy={agentBusy} agentNotice={agentNotice} modelLabel={activeModel?.label}
+    planProposal={planProposal} planLoading={planLoading} planApproved={planApproved} canStartRun={Boolean(selected.connection_id && approvedPlanId)} runStarted={Boolean(runId)}
+    remoteFiles={remoteFiles} filesBusy={filesBusy} fileNotice={fileNotice}
+    kernelSessions={kernelSessions} kernelEvents={kernelEvents} kernelBusy={kernelBusy} kernelNotice={kernelNotice}
+    onStartKernel={selected.connection_id && selected.remote_root ? startKernel : undefined}
+    onExecuteKernel={async (sessionId, code, save, capturePaths) => { let savedIndex: number | null = null; await withKernelBusy(async () => { const result = await api.executeKernelCell(sessionId, code, save, capturePaths); savedIndex = result.saved_cell_index; setKernelEvents((current) => { const known = new Set(current.map((event) => `${event.request_id}:${event.sequence}`)); return [...current, ...result.events.filter((event) => !known.has(`${event.request_id}:${event.sequence}`))].slice(-200); }); }); return savedIndex; }}
+    onInterruptKernel={async (sessionId) => withKernelBusy(async () => replaceKernelSession(await api.interruptKernel(sessionId)))}
+    onStopKernel={async (sessionId) => withKernelBusy(async () => replaceKernelSession(await api.stopKernel(sessionId)))} onPromoteKernelCell={api.promoteKernelCell}
+    onUploadFiles={selected.connection_id && selected.remote_root ? uploadFiles : undefined} onRefreshFiles={selected.connection_id && selected.remote_root ? () => refreshRemoteFiles() : undefined} onDownloadFile={selected.connection_id && selected.remote_root ? downloadFile : undefined}
+    onSend={async (markdown) => {
+      if (!conversation || !activeModel) { setSettingsOpen(true); return false; }
+      setLastGoal(markdown); setPlanProposal(null); setPlanApproved(false); setApprovedPlanId(null); setRunId(null); setAgentBusy(true); setAgentNotice("");
+      const remoteContext = selected.connection_id && selected.remote_root
+        ? [
+            `Remote root: ${selected.remote_root}`,
+            `Indexed entries: ${remoteFiles.length}`,
+            ...remoteFiles.slice(0, 200).map((entry) => `${entry.directory ? "directory" : "file"}\t${entry.relative_path}\t${entry.size_bytes} bytes`),
+            ...(remoteFiles.length > 200 ? [`${remoteFiles.length - 200} additional entries omitted`] : []),
+          ].join("\n")
+        : null;
+      try {
+        await api.runAgentTurn({ project_id: selected.id, conversation_id: conversation.id, model_profile_id: activeModel.id, markdown, message_sequence: messageSequence, remote_context: remoteContext });
+        const storedMessages = await api.listMessages(conversation.id);
+        setMessages(storedMessages);
+        setMessageSequence((storedMessages.at(-1)?.sequence ?? 0) + 1);
+        if (selected.connection_id && selected.remote_root) {
+          setAgentBusy(true);
+          setPlanLoading(true);
+          try {
+            setPlanProposal(await api.proposeAnalysisPlan({
+              project_id: selected.id,
+              model_profile_id: activeModel.id,
+              goal: markdown,
+              environment_summary: remoteContext ?? `Remote Linux project at ${selected.remote_root}`,
+            }));
+          } catch (error) {
+            setAgentNotice(`${locale === "zh-CN" ? "对话已完成，但远程计划生成失败" : "Conversation completed, but remote plan generation failed"}: ${error instanceof Error ? error.message : String(error)}`);
+          } finally { setPlanLoading(false); setAgentBusy(false); }
+        }
+        return true;
+      } catch (error) {
+        setAgentNotice(error instanceof Error ? error.message : String(error));
+        return false;
+      } finally { setAgentBusy(false); }
+    }}
+    onRequestPlan={async () => {
+      if (!activeModel || !lastGoal) { if (!activeModel) setSettingsOpen(true); return; }
+      setPlanLoading(true); setAgentNotice("");
+      try { setPlanProposal(await api.proposeAnalysisPlan({ project_id: selected.id, model_profile_id: activeModel.id, goal: lastGoal, environment_summary: selected.remote_root ? `Remote Linux project at ${selected.remote_root}` : "Remote Linux environment not inspected yet" })); }
+      catch (error) { setAgentNotice(error instanceof Error ? error.message : String(error)); }
+      finally { setPlanLoading(false); }
+    }}
+    onApprovePlan={async () => {
+      if (!planProposal) return;
+      setAgentNotice("");
+      try {
+        const approved = await api.approvePlanV2(planProposal.plan, planProposal.plan.policy);
+        setApprovedPlanId(approved.id);
+        setPlanApproved(true);
+        if (selected.connection_id) setRunId(await api.startRunV2(selected.connection_id, selected.id, approved.id));
+      } catch (error) {
+        setAgentNotice(error instanceof Error ? error.message : String(error));
+      }
+    }}
+    onStartRun={selected.connection_id ? async () => { if (!approvedPlanId) return; setRunId(await api.startRunV2(selected.connection_id!, selected.id, approvedPlanId)); } : undefined}
+  />{settings}</>;
 }

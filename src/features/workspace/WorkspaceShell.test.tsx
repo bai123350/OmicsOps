@@ -46,6 +46,32 @@ describe("WorkspaceShell", () => {
     expect(screen.getByRole("button", { name: "已批准" })).toBeDisabled();
   });
 
+  it("shows the real agent state instead of a fixed remote progress value", async () => {
+    let finish!: (value: boolean) => void;
+    const onSend = vi.fn(() => new Promise<boolean>((resolve) => { finish = resolve; }));
+    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={onSend} />);
+
+    expect(screen.queryByText("65%")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: /描述研究目标/ }), { target: { value: "检查 hg19 数据" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toHaveValue("");
+
+    rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={onSend} agentBusy agentNotice="503 model_not_found" />);
+    expect(screen.getByRole("status")).toHaveTextContent("正在等待模型响应");
+    expect(screen.getByRole("alert")).toHaveTextContent("503 model_not_found");
+    finish(true);
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("检查 hg19 数据"));
+  });
+
+  it("keeps the composer available with a long multiline assistant response", () => {
+    const markdown = Array.from({ length: 80 }, (_, index) => `步骤 ${index + 1}\n\`gene_${index}\``).join("\n");
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={() => true} messages={[{ id: "assistant-long", role: "assistant", markdown }]} />);
+
+    expect(screen.getByText(/步骤 80/)).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "发送" })).toBeInTheDocument();
+  });
+
   it("uploads only through the explicit file selection action", () => {
     const onUploadFiles = vi.fn();
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onUploadFiles={onUploadFiles} remoteFiles={[{ relative_path: "results/umap.png", directory: false, size_bytes: 42, modified_unix_seconds: 1 }]} />);

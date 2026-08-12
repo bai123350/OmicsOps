@@ -100,7 +100,7 @@ export async function listModelProfileModels(profileId: string): Promise<string[
   return isTauri() ? invoke("list_model_profile_models", { profileId }) : ["demo-model"];
 }
 
-export async function runAgentTurn(request: { project_id: string; conversation_id: string; model_profile_id: string; markdown: string; message_sequence: number }): Promise<string> {
+export async function runAgentTurn(request: { project_id: string; conversation_id: string; model_profile_id: string; markdown: string; message_sequence: number; remote_context?: string | null }): Promise<string> {
   if (!isTauri()) return crypto.randomUUID();
   return invoke("run_agent_turn", { request });
 }

@@ -71,11 +71,24 @@ pub struct StepSpecV2 {
     #[serde(default)]
     pub dependencies: Vec<String>,
     pub action: StepAction,
+    #[serde(default = "default_working_directory")]
     pub working_directory: String,
+    #[serde(default)]
     pub resources: ResourceLimits,
+    #[serde(default = "default_step_risk")]
     pub risk: StepRisk,
+    #[serde(default)]
     pub verifications: Vec<VerificationSpec>,
+    #[serde(default)]
     pub expected_artifacts: Vec<String>,
+}
+
+fn default_working_directory() -> String {
+    ".".into()
+}
+
+fn default_step_risk() -> StepRisk {
+    StepRisk::Low
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

@@ -1,6 +1,6 @@
 use omicsops_adapters::llm::{
     ProviderProtocol, ProviderStreamDecoder, UnifiedModelClient, build_provider_request,
-    parse_provider_event, provider_endpoint, provider_models_endpoint,
+    parse_provider_event, parse_provider_response, provider_endpoint, provider_models_endpoint,
 };
 use omicsops_agent::{ModelRequest, ModelStreamEvent};
 use serde_json::json;
@@ -174,6 +174,37 @@ fn streaming_decoder_survives_network_chunk_boundaries() {
         vec![
             ModelStreamEvent::TextDelta("ready".into()),
             ModelStreamEvent::Completed
+        ]
+    );
+}
+
+#[test]
+fn non_streaming_responses_normalize_for_transport_fallback() {
+    assert_eq!(
+        parse_provider_response(
+            ProviderProtocol::OpenAiCompatible,
+            &json!({"choices":[{"message":{"content":"QC complete"}}]}),
+            None,
+        )
+        .unwrap(),
+        vec![
+            ModelStreamEvent::TextDelta("QC complete".into()),
+            ModelStreamEvent::Completed,
+        ]
+    );
+    assert_eq!(
+        parse_provider_response(
+            ProviderProtocol::OpenAiCompatible,
+            &json!({"choices":[{"message":{"tool_calls":[{"function":{"name":"submit_plan","arguments":"{\"title\":\"PBMC\"}"}}]}}]}),
+            Some("submit_plan"),
+        )
+        .unwrap(),
+        vec![
+            ModelStreamEvent::ToolArgumentsDelta {
+                name: "submit_plan".into(),
+                json_fragment: "{\"title\":\"PBMC\"}".into(),
+            },
+            ModelStreamEvent::Completed,
         ]
     );
 }

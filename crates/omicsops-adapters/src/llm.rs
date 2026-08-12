@@ -10,6 +10,8 @@ use uuid::Uuid;
 
 use crate::{AdapterError, AdapterResult};
 
+const MODEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderProtocol {
     Anthropic,
@@ -217,6 +219,98 @@ pub fn parse_provider_event(protocol: ProviderProtocol, value: &Value) -> Option
     completed.then_some(ModelStreamEvent::Completed)
 }
 
+pub fn parse_provider_response(
+    protocol: ProviderProtocol,
+    value: &Value,
+    expected_tool: Option<&str>,
+) -> AdapterResult<Vec<ModelStreamEvent>> {
+    let mut events = Vec::new();
+    let text = match protocol {
+        ProviderProtocol::OpenAiCompatible => value.pointer("/choices/0/message/content"),
+        ProviderProtocol::Anthropic => {
+            value
+                .get("content")
+                .and_then(Value::as_array)
+                .and_then(|content| {
+                    content
+                        .iter()
+                        .find(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+                        .and_then(|item| item.get("text"))
+                })
+        }
+        ProviderProtocol::Ollama => value.pointer("/message/content"),
+    }
+    .and_then(Value::as_str);
+    if let Some(text) = text.filter(|text| !text.is_empty()) {
+        events.push(ModelStreamEvent::TextDelta(text.into()));
+    }
+
+    if let Some(expected_tool) = expected_tool {
+        let tool = match protocol {
+            ProviderProtocol::OpenAiCompatible => value
+                .pointer("/choices/0/message/tool_calls")
+                .and_then(Value::as_array)
+                .and_then(|calls| {
+                    calls
+                        .iter()
+                        .filter_map(|call| call.get("function"))
+                        .find(|function| {
+                            function.get("name").and_then(Value::as_str) == Some(expected_tool)
+                        })
+                })
+                .and_then(|function| function.get("arguments"))
+                .map(|arguments| match arguments {
+                    Value::String(arguments) => arguments.clone(),
+                    arguments => arguments.to_string(),
+                }),
+            ProviderProtocol::Anthropic => value
+                .get("content")
+                .and_then(Value::as_array)
+                .and_then(|content| {
+                    content.iter().find(|item| {
+                        item.get("type").and_then(Value::as_str) == Some("tool_use")
+                            && item.get("name").and_then(Value::as_str) == Some(expected_tool)
+                    })
+                })
+                .and_then(|item| item.get("input"))
+                .map(Value::to_string),
+            ProviderProtocol::Ollama => value
+                .pointer("/message/tool_calls")
+                .and_then(Value::as_array)
+                .and_then(|calls| {
+                    calls
+                        .iter()
+                        .filter_map(|call| call.get("function"))
+                        .find(|function| {
+                            function.get("name").and_then(Value::as_str) == Some(expected_tool)
+                        })
+                })
+                .and_then(|function| function.get("arguments"))
+                .map(|arguments| match arguments {
+                    Value::String(arguments) => arguments.clone(),
+                    arguments => arguments.to_string(),
+                }),
+        }
+        .ok_or_else(|| {
+            AdapterError::Llm(format!(
+                "non-streaming response did not contain tool call {expected_tool}"
+            ))
+        })?;
+        events.push(ModelStreamEvent::ToolArgumentsDelta {
+            name: expected_tool.into(),
+            json_fragment: tool,
+        });
+    }
+
+    if events.is_empty() {
+        return Err(AdapterError::Llm(
+            "non-streaming response contained neither text nor the requested tool call".into(),
+        ));
+    }
+    events.push(ModelStreamEvent::Completed);
+    Ok(events)
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderStreamDecoder {
     protocol: ProviderProtocol,
@@ -304,6 +398,19 @@ pub struct UnifiedModelClient {
 }
 
 impl UnifiedModelClient {
+    fn authenticate(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        builder = builder.header(reqwest::header::ACCEPT_ENCODING, "identity");
+        match self.protocol {
+            ProviderProtocol::Anthropic => builder
+                .header("x-api-key", self.credential.as_deref().unwrap_or_default())
+                .header("anthropic-version", "2023-06-01"),
+            ProviderProtocol::OpenAiCompatible => {
+                builder.bearer_auth(self.credential.as_deref().unwrap_or_default())
+            }
+            ProviderProtocol::Ollama => builder,
+        }
+    }
+
     pub fn new(
         profile_id: Uuid,
         protocol: ProviderProtocol,
@@ -328,7 +435,7 @@ impl UnifiedModelClient {
             credential,
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
-                .timeout(Duration::from_secs(45))
+                .timeout(MODEL_REQUEST_TIMEOUT)
                 .build()
                 .map_err(|error| AdapterError::Llm(error.to_string()))?,
         })
@@ -341,25 +448,13 @@ impl UnifiedModelClient {
     ) -> AdapterResult<()> {
         let provider_request =
             build_provider_request(self.protocol, self.base_url.clone(), &self.model, &request)?;
-        let mut builder = self
+        let builder = self
             .http
-            .post(provider_request.endpoint)
+            .post(provider_request.endpoint.clone())
             .json(&provider_request.body);
-        match self.protocol {
-            ProviderProtocol::Anthropic => {
-                builder = builder
-                    .header("x-api-key", self.credential.as_deref().unwrap_or_default())
-                    .header("anthropic-version", "2023-06-01");
-            }
-            ProviderProtocol::OpenAiCompatible => {
-                builder = builder.bearer_auth(self.credential.as_deref().unwrap_or_default());
-            }
-            ProviderProtocol::Ollama => {}
-        }
-        let response = builder
-            .send()
-            .await
-            .map_err(|error| AdapterError::Llm(error.to_string()))?;
+        let response = self.authenticate(builder).send().await.map_err(|error| {
+            AdapterError::Llm(format!("{}: {error}", provider_request.endpoint))
+        })?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
@@ -367,9 +462,60 @@ impl UnifiedModelClient {
         }
         let mut decoder = ProviderStreamDecoder::new(self.protocol);
         let mut bytes = response.bytes_stream();
+        let mut emitted_event = false;
         while let Some(chunk) = bytes.next().await {
-            let chunk = chunk.map_err(|error| AdapterError::Llm(error.to_string()))?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(stream_error) if !emitted_event => {
+                    let mut fallback_body = provider_request.body.clone();
+                    fallback_body["stream"] = Value::Bool(false);
+                    let fallback = self.authenticate(
+                        self.http
+                            .post(provider_request.endpoint.clone())
+                            .json(&fallback_body),
+                    ).send().await.map_err(|fallback_error| {
+                        AdapterError::Llm(format!(
+                            "{} stream failed ({stream_error}); non-streaming fallback failed: {fallback_error}",
+                            provider_request.endpoint
+                        ))
+                    })?;
+                    let status = fallback.status();
+                    let body = fallback.text().await.map_err(|fallback_error| {
+                        AdapterError::Llm(format!(
+                            "{} stream failed ({stream_error}); error reading non-streaming fallback: {fallback_error}",
+                            provider_request.endpoint
+                        ))
+                    })?;
+                    if !status.is_success() {
+                        return Err(AdapterError::Llm(format!(
+                            "{} stream failed ({stream_error}); non-streaming fallback returned {status}: {body}",
+                            provider_request.endpoint
+                        )));
+                    }
+                    let value: Value = serde_json::from_str(&body).map_err(|fallback_error| {
+                        AdapterError::Llm(format!(
+                            "{} stream failed ({stream_error}); non-streaming fallback returned invalid JSON: {fallback_error}",
+                            provider_request.endpoint
+                        ))
+                    })?;
+                    for event in parse_provider_response(
+                        self.protocol,
+                        &value,
+                        request.tool_name.as_deref(),
+                    )? {
+                        on_event(event);
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(AdapterError::Llm(format!(
+                        "{} stream ended after partial output: {error}",
+                        provider_request.endpoint
+                    )));
+                }
+            };
             for event in decoder.push(&chunk)? {
+                emitted_event = true;
                 on_event(event);
             }
         }

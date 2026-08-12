@@ -77,6 +77,51 @@ fn structured_arguments_are_quoted_as_individual_shell_arguments() {
 }
 
 #[test]
+fn scanpy_structured_plan_compiles_to_the_bundled_remote_workflow() {
+    let catalog = builtin_tool_catalog().unwrap();
+    let action = StepAction::Tool {
+        tool_id: "bio.scanpy".into(),
+        version: "1.0.0".into(),
+        arguments: json!({
+            "input_directory": "data/filtered_gene_bc_matrices/hg19",
+            "qc": {"min_genes": 200, "max_mito_percent": 20},
+            "outputs": {
+                "h5ad": "results/scanpy/annotated_qc.h5ad",
+                "qc_metrics": "results/scanpy/qc_metrics.tsv",
+                "cluster_annotations": "results/scanpy/cluster_annotations.tsv",
+                "umap": "results/scanpy/umap.png",
+                "qc_plots": "results/scanpy/qc_plots.png",
+                "marker_scores": "results/scanpy/marker_scores.tsv"
+            }
+        }),
+    };
+
+    let command = compile_step_action(&action, &catalog).unwrap();
+    assert!(command.contains("micromamba run --prefix"));
+    assert!(command.contains("sc.read_10x_mtx"));
+    assert!(command.contains("data/filtered_gene_bc_matrices/hg19"));
+    assert!(!command.contains("../"));
+}
+
+#[test]
+fn structured_html_report_compiles_to_the_bundled_renderer() {
+    let catalog = builtin_tool_catalog().unwrap();
+    let action = StepAction::Tool {
+        tool_id: "report.html".into(),
+        version: "1.0.0".into(),
+        arguments: json!({
+            "inputs": ["results/qc.tsv", "results/umap.png"],
+            "output_path": "results/report.html",
+            "sections": ["QC", "clusters"],
+            "title": "PBMC report"
+        }),
+    };
+    let command = compile_step_action(&action, &catalog).unwrap();
+    assert!(command.contains("Verified analysis outputs"));
+    assert!(command.contains("results/report.html"));
+}
+
+#[test]
 fn v2_script_starts_a_process_group_and_applies_resource_controls() {
     let catalog = builtin_tool_catalog().unwrap();
     let script = render_remote_step_script_v2(

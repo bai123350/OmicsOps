@@ -69,6 +69,21 @@ fn repair_assessment_rejects_changes_outside_approved_outputs_and_resources() {
     );
 }
 use serde_json::json;
+
+#[test]
+fn generated_steps_default_optional_execution_fields() {
+    let value = json!({
+        "id": "agent", "title": "Agent", "rationale": "Adaptive execution",
+        "action": {"kind":"tool", "tool_id":"agent.remote_task", "version":"1.0.0", "arguments":{}}
+    });
+    let step: omicsops_core::plan_v2::StepSpecV2 = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        step.resources,
+        omicsops_core::domain::ResourceLimits::default()
+    );
+    assert!(step.verifications.is_empty());
+    assert!(step.expected_artifacts.is_empty());
+}
 use uuid::Uuid;
 
 fn tool_step(id: &str, tool_id: &str) -> StepSpecV2 {
@@ -119,6 +134,44 @@ fn plan(step: StepSpecV2) -> AnalysisPlanV2 {
         },
         metadata: BTreeMap::new(),
     }
+}
+
+#[test]
+fn generated_steps_default_to_the_project_root_when_working_directory_is_omitted() {
+    let mut value = serde_json::to_value(plan(tool_step("download", "core.download"))).unwrap();
+    value["stages"][0]["steps"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("working_directory");
+
+    let decoded: AnalysisPlanV2 = serde_json::from_value(value).unwrap();
+    assert_eq!(decoded.stages[0].steps[0].working_directory, ".");
+}
+
+#[test]
+fn scanpy_tool_accepts_the_structured_analysis_contract() {
+    let catalog = builtin_tool_catalog().unwrap();
+    let mut candidate = plan(tool_step("scanpy", "bio.scanpy"));
+    candidate.policy.allowed_tools = vec!["bio.scanpy".into()];
+    candidate.stages[0].steps[0].action = StepAction::Tool {
+        tool_id: "bio.scanpy".into(),
+        version: "1.0.0".into(),
+        arguments: json!({
+            "input_directory": "data/filtered_gene_bc_matrices/hg19",
+            "qc": {"min_genes": 200},
+            "outputs": {
+                "h5ad": "results/qc.h5ad",
+                "qc_metrics": "results/qc.tsv",
+                "cluster_annotations": "results/annotations.tsv",
+                "umap": "results/umap.png",
+                "qc_plots": "results/qc.png",
+                "marker_scores": "results/markers.tsv"
+            }
+        }),
+    };
+
+    let validation = validate_plan_v2(&candidate, &catalog);
+    assert!(validation.valid, "{:?}", validation.issues);
 }
 
 #[test]

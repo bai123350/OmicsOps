@@ -3,9 +3,14 @@ use omicsops_agent::{AgentEventKind, ModelStreamEvent};
 use omicsops_core::domain::{AuthenticationMethod, ConnectionProfile};
 use omicsops_desktop_lib::{
     agent_commands::{
-        SubmitMessageRequest, agent_event_kind_from_model_event, user_message_from_request,
+        SubmitMessageRequest, agent_event_kind_from_model_event, agent_user_content,
+        canonical_report_arguments, canonical_scanpy_arguments, merge_declared_dependencies,
+        normalize_generated_plan, user_message_from_request,
     },
-    commands::{PrivateKeySecret, normalize_connection_profile, parse_authentication_secret},
+    commands::{
+        PrivateKeySecret, normalize_connection_profile, parse_authentication_secret,
+        validate_agent_command,
+    },
     inspection::parse_server_inspection,
     kernel_commands::{
         PromoteKernelCellRequest, mark_orphaned_kernels_interrupted, promote_saved_kernel_cell,
@@ -20,6 +25,15 @@ use omicsops_desktop_lib::{
     },
 };
 use uuid::Uuid;
+
+#[test]
+fn approved_remote_agent_blocks_privilege_escalation_and_project_escape() {
+    assert!(validate_agent_command("python scripts/qc.py", "/home/user/project").is_ok());
+    assert!(validate_agent_command("sudo apt-get install r-base", "/home/user/project").is_err());
+    assert!(validate_agent_command("rm -rf results", "/home/user/project").is_err());
+    assert!(validate_agent_command("cd /tmp && touch escaped", "/home/user/project").is_err());
+    assert!(validate_agent_command("touch /tmp/escaped", "/home/user/project").is_err());
+}
 
 #[test]
 fn password_secret_remains_opaque() {
@@ -236,6 +250,168 @@ fn submitted_research_messages_receive_stable_sequence_and_identity() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn agent_receives_the_application_verified_remote_index() {
+    let content = agent_user_content(
+        "Run QC",
+        Some("Remote root: /srv/pbmc\nfile\tdata/matrix.mtx\t42 bytes"),
+    );
+    assert!(content.contains("Run QC"));
+    assert!(content.contains("Application-verified remote project context"));
+    assert!(content.contains("data/matrix.mtx"));
+}
+
+#[test]
+fn generated_plans_inherit_missing_tool_environment_dependencies() {
+    let mut declared = vec!["python=3.11".to_string(), "scanpy".to_string()];
+    let required = [
+        "python".to_string(),
+        "scanpy".to_string(),
+        "python-igraph".to_string(),
+        "leidenalg".to_string(),
+    ];
+    merge_declared_dependencies(&mut declared, required.iter());
+    assert_eq!(
+        declared,
+        vec!["python=3.11", "scanpy", "python-igraph", "leidenalg"]
+    );
+}
+
+#[test]
+fn alternate_scanpy_argument_names_are_normalized_to_the_runtime_contract() {
+    let (arguments, artifacts, verifications) = canonical_scanpy_arguments(&serde_json::json!({
+        "input_path": "data/filtered_gene_bc_matrices/hg19",
+        "output_h5ad": "results/test.h5ad",
+        "qc_metrics_table": "results/qc.tsv",
+        "annotation_table": "results/annotations.tsv",
+        "marker_table": "results/markers.tsv",
+        "figures_directory": "results/figures",
+        "min_genes_per_cell": 200,
+        "max_mitochondrial_fraction": 0.2,
+        "neighbors": 15,
+        "resolution": 0.8
+    }))
+    .unwrap();
+    assert_eq!(
+        arguments["input_directory"],
+        "data/filtered_gene_bc_matrices/hg19"
+    );
+    assert_eq!(arguments["qc"]["max_mito_percent"], 20.0);
+    assert_eq!(arguments["outputs"]["h5ad"], "results/test.h5ad");
+    assert_eq!(artifacts.len(), 6);
+    assert_eq!(verifications.len(), 6);
+}
+
+#[test]
+fn nested_scanpy_aliases_are_normalized_to_the_runtime_contract() {
+    let (arguments, artifacts, _) = canonical_scanpy_arguments(&serde_json::json!({
+        "input_10x_matrix_dir": "data/filtered_gene_bc_matrices/hg19",
+        "outputs": {
+            "annotated_h5ad": "results/scanpy/annotated.h5ad",
+            "cell_metadata_tsv": "results/scanpy/cells.tsv",
+            "cluster_markers_tsv": "results/scanpy/markers.tsv",
+            "figures_dir": "results/scanpy/figures"
+        },
+        "workflow": {
+            "qc_metrics": {"minimum_genes_per_cell": 300, "maximum_mitochondrial_percent": 15},
+            "dimensionality_reduction": {"neighbors_count": 20, "pca_components": 30},
+            "clustering": {"resolution": 0.5},
+            "annotation": {"markers": {"T_cell": ["CD3D"]}, "unknown_label": "Unassigned"}
+        }
+    }))
+    .unwrap();
+    assert_eq!(
+        arguments["input_directory"],
+        "data/filtered_gene_bc_matrices/hg19"
+    );
+    assert_eq!(arguments["qc"]["min_genes"], 300);
+    assert_eq!(arguments["embedding"]["neighbors"], 20);
+    assert_eq!(
+        arguments["outputs"]["h5ad"],
+        "results/scanpy/annotated.h5ad"
+    );
+    assert_eq!(artifacts.len(), 6);
+}
+
+#[test]
+fn report_object_inputs_and_output_html_are_normalized() {
+    let (arguments, artifacts, verifications) = canonical_report_arguments(&serde_json::json!({
+        "inputs": {"annotated_data": "results/a.h5ad", "figures_dir": "results/figures"},
+        "output_html": "results/report.html",
+        "output_manifest": "results/report.json",
+        "language": "zh-CN",
+        "title": "QC report"
+    }))
+    .unwrap();
+    assert_eq!(arguments["inputs"], serde_json::json!(["results/a.h5ad"]));
+    assert_eq!(arguments["output_path"], "results/report.html");
+    assert_eq!(artifacts, vec!["results/report.html"]);
+    assert_eq!(verifications.len(), 1);
+}
+
+#[test]
+fn redundant_environment_stages_are_removed_before_validation() {
+    use omicsops_core::{
+        domain::{ResourceLimits, StepRisk},
+        plan_v2::{
+            AnalysisPlanV2, PlanEnvironment, PlanStageV2, PolicyEnvelope, StepAction, StepSpecV2,
+        },
+    };
+    use std::collections::BTreeMap;
+    let step = |id: &str, tool_id: &str| StepSpecV2 {
+        id: id.into(),
+        title: id.into(),
+        rationale: "test".into(),
+        dependencies: vec![],
+        action: StepAction::Tool {
+            tool_id: tool_id.into(),
+            version: "1.0.0".into(),
+            arguments: serde_json::json!({}),
+        },
+        working_directory: ".".into(),
+        resources: ResourceLimits::default(),
+        risk: StepRisk::Low,
+        verifications: vec![],
+        expected_artifacts: vec![],
+    };
+    let mut plan = AnalysisPlanV2 {
+        schema_version: 2,
+        id: Uuid::new_v4(),
+        title: "test".into(),
+        summary: "test".into(),
+        environment: PlanEnvironment::Micromamba {
+            channels: vec!["conda-forge".into()],
+            dependencies: vec!["python".into()],
+        },
+        stages: vec![
+            PlanStageV2 {
+                id: "environment".into(),
+                goal: "env".into(),
+                dependencies: vec![],
+                steps: vec![step("env", "env.micromamba")],
+            },
+            PlanStageV2 {
+                id: "analysis".into(),
+                goal: "analysis".into(),
+                dependencies: vec!["environment".into()],
+                steps: vec![step("scanpy", "bio.scanpy")],
+            },
+        ],
+        resource_budget: ResourceLimits::default(),
+        policy: PolicyEnvelope {
+            allowed_tools: vec!["env.micromamba".into(), "bio.scanpy".into()],
+            allowed_domains: vec![],
+            max_risk: StepRisk::Low,
+            allow_legacy_shell: false,
+        },
+        metadata: BTreeMap::new(),
+    };
+    normalize_generated_plan(&mut plan);
+    assert_eq!(plan.stages.len(), 1);
+    assert!(plan.stages[0].dependencies.is_empty());
+    assert!(!plan.policy.allowed_tools.contains(&"env.micromamba".into()));
 }
 
 #[test]

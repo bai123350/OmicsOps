@@ -132,7 +132,7 @@ pub fn builtin_tool_catalog() -> CoreResult<ToolCatalog> {
             "bio.scanpy",
             "Scanpy analysis",
             "python",
-            vec!["python", "scanpy", "leidenalg"],
+            vec!["python", "scanpy", "python-igraph", "leidenalg"],
             vec![],
         ),
         (
@@ -147,6 +147,13 @@ pub fn builtin_tool_catalog() -> CoreResult<ToolCatalog> {
             "HTML report",
             "python",
             vec!["python", "jinja2"],
+            vec![],
+        ),
+        (
+            "agent.remote_task",
+            "Approved remote agent task",
+            "omicsops-agent",
+            Vec::new(),
             vec![],
         ),
     ];
@@ -165,6 +172,52 @@ pub fn builtin_tool_catalog() -> CoreResult<ToolCatalog> {
                 "bio.fastqc" => json!({"type":"object","required":["input","outdir"],"properties":{"input":{"type":"string"},"outdir":{"type":"string"},"threads":{"type":"integer"}},"additionalProperties":false}),
                 "bio.multiqc" => json!({"type":"object","required":["input","outdir"],"properties":{"input":{"type":"string"},"outdir":{"type":"string"}},"additionalProperties":false}),
                 "bio.salmon" => json!({"type":"object","required":["index","read1","read2","output"],"properties":{"index":{"type":"string"},"read1":{"type":"string"},"read2":{"type":"string"},"output":{"type":"string"},"threads":{"type":"integer"}},"additionalProperties":false}),
+                "bio.scanpy" => json!({
+                    "type": "object",
+                    "required": ["input_directory", "outputs"],
+                    "properties": {
+                        "script": {"type":"string"},
+                        "input_directory": {"type":"string"},
+                        "input_format": {"type":"string"},
+                        "matrix_path": {"type":"string"},
+                        "genes_path": {"type":"string"},
+                        "barcodes_path": {"type":"string"},
+                        "gene_id_column": {"type":"integer"},
+                        "gene_name_column": {"type":"integer"},
+                        "make_var_names_unique": {"type":"boolean"},
+                        "qc": {"type":"object"},
+                        "normalization": {"type":"object"},
+                        "embedding": {"type":"object"},
+                        "clustering": {"type":"object"},
+                        "annotation": {"type":"object"},
+                        "outputs": {"type":"object"}
+                    },
+                    "additionalProperties": false
+                }),
+                "report.html" => json!({
+                    "type":"object",
+                    "required":["output_path"],
+                    "properties":{
+                        "script":{"type":"string"},
+                        "inputs":{"type":"array"},
+                        "output_path":{"type":"string"},
+                        "sections":{"type":"array"},
+                        "title":{"type":"string"}
+                    },
+                    "additionalProperties":false
+                }),
+                "agent.remote_task" => json!({
+                    "type":"object",
+                    "required":["goal","remote_observation","completion_criteria"],
+                    "properties":{
+                        "goal":{"type":"string"},
+                        "remote_observation":{"type":"string"},
+                        "completion_criteria":{"type":"array"},
+                        "skill_context":{"type":"string"},
+                        "max_iterations":{"type":"integer"}
+                    },
+                    "additionalProperties":false
+                }),
                 _ => json!({"type":"object","required":["script"],"properties":{"script":{"type":"string"},"input":{"type":"string"},"output":{"type":"string"}},"additionalProperties":false}),
             },
             micromamba_dependencies: dependencies.into_iter().map(str::to_owned).collect(),

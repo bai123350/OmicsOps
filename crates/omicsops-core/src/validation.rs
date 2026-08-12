@@ -289,6 +289,12 @@ fn validate_action(
                 );
             }
             validate_argument_schema(arguments, &manifest.argument_schema, base, issues);
+            if tool_id == "bio.scanpy" {
+                validate_scanpy_arguments(arguments, base, issues);
+            }
+            if tool_id == "report.html" {
+                validate_report_arguments(arguments, base, issues);
+            }
             let maximum = &manifest.max_resources;
             if step.resources.max_cpu_cores > maximum.max_cpu_cores
                 || step.resources.max_memory_gib > maximum.max_memory_gib
@@ -331,6 +337,94 @@ fn validate_action(
                         format!("tool requires undeclared domain {domain}"),
                     );
                 }
+            }
+        }
+    }
+}
+
+fn validate_scanpy_arguments(
+    arguments: &serde_json::Value,
+    base: &str,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let Some(arguments) = arguments.as_object() else {
+        return;
+    };
+    for name in [
+        "input_directory",
+        "matrix_path",
+        "genes_path",
+        "barcodes_path",
+    ] {
+        if let Some(path) = arguments.get(name).and_then(serde_json::Value::as_str) {
+            validate_path(path, &format!("{base}.action.arguments.{name}"), issues);
+        }
+    }
+    let Some(outputs) = arguments
+        .get("outputs")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return;
+    };
+    for name in [
+        "h5ad",
+        "qc_metrics",
+        "cluster_annotations",
+        "umap",
+        "qc_plots",
+        "marker_scores",
+    ] {
+        match outputs.get(name).and_then(serde_json::Value::as_str) {
+            Some(path) => validate_path(
+                path,
+                &format!("{base}.action.arguments.outputs.{name}"),
+                issues,
+            ),
+            None => issue(
+                issues,
+                "missing_argument",
+                format!("{base}.action.arguments.outputs.{name}"),
+                format!("required Scanpy output {name} is missing"),
+            ),
+        }
+    }
+}
+
+fn validate_report_arguments(
+    arguments: &serde_json::Value,
+    base: &str,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let Some(arguments) = arguments.as_object() else {
+        return;
+    };
+    if let Some(path) = arguments
+        .get("output_path")
+        .and_then(serde_json::Value::as_str)
+    {
+        validate_path(
+            path,
+            &format!("{base}.action.arguments.output_path"),
+            issues,
+        );
+    }
+    if let Some(inputs) = arguments
+        .get("inputs")
+        .and_then(serde_json::Value::as_array)
+    {
+        for (index, input) in inputs.iter().enumerate() {
+            match input.as_str() {
+                Some(path) => validate_path(
+                    path,
+                    &format!("{base}.action.arguments.inputs[{index}]"),
+                    issues,
+                ),
+                None => issue(
+                    issues,
+                    "invalid_argument_type",
+                    format!("{base}.action.arguments.inputs[{index}]"),
+                    "report input must be a string path",
+                ),
             }
         }
     }

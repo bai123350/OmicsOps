@@ -2,7 +2,7 @@ use omicsops_adapters::ssh::SshSession;
 use omicsops_core::{
     CoreError, CoreResult,
     plan_v2::{StepAction, StepSpecV2, VerificationSpec, action_hash},
-    project::shell_quote,
+    project::{shell_quote, validate_relative_remote_path},
     tools::ToolCatalog,
 };
 use serde::{Deserialize, Serialize};
@@ -25,12 +25,16 @@ pub fn reconcile_manifest(contents: &str, expected_action_hash: &str) -> Result<
 }
 use serde_json::Value;
 use std::{
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
+
+const CONFIGURED_SCANPY_SCRIPT: &str = include_str!("configured_scanpy.py");
+const CONFIGURED_REPORT_SCRIPT: &str = include_str!("configured_report.py");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionResultV2 {
@@ -350,10 +354,81 @@ pub fn compile_step_action(action: &StepAction, catalog: &ToolCatalog) -> CoreRe
                 ]
                 .join(" "));
             }
+            if tool_id == "bio.scanpy" {
+                for name in [
+                    "input_directory",
+                    "matrix_path",
+                    "genes_path",
+                    "barcodes_path",
+                ] {
+                    if let Some(path) = object.get(name).and_then(Value::as_str) {
+                        validate_relative_remote_path(Path::new(path)).map_err(|_| {
+                            CoreError::Validation(format!(
+                                "tool argument {name} must be a project-relative path"
+                            ))
+                        })?;
+                    }
+                }
+                let outputs = object
+                    .get("outputs")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        CoreError::Validation("bio.scanpy outputs must be an object".into())
+                    })?;
+                for name in [
+                    "h5ad",
+                    "qc_metrics",
+                    "cluster_annotations",
+                    "umap",
+                    "qc_plots",
+                    "marker_scores",
+                ] {
+                    let path = required_string(outputs, name)?;
+                    validate_relative_remote_path(Path::new(path)).map_err(|_| {
+                        CoreError::Validation(format!(
+                            "bio.scanpy output {name} must be a project-relative path"
+                        ))
+                    })?;
+                }
+                let configuration = serde_json::to_string(arguments)
+                    .map_err(|error| CoreError::Validation(error.to_string()))?;
+                return Ok(format!(
+                    "micromamba run --prefix \"$OMICSOPS_PROJECT_ROOT/.omicsops/env\" 'python' '-c' {} {}",
+                    shell_quote(CONFIGURED_SCANPY_SCRIPT),
+                    shell_quote(&configuration)
+                ));
+            }
+            if tool_id == "report.html" {
+                let output = required_string(object, "output_path")?;
+                validate_relative_remote_path(Path::new(output)).map_err(|_| {
+                    CoreError::Validation(
+                        "report.html output_path must be a project-relative path".into(),
+                    )
+                })?;
+                if let Some(inputs) = object.get("inputs").and_then(Value::as_array) {
+                    for input in inputs {
+                        let path = input.as_str().ok_or_else(|| {
+                            CoreError::Validation("report.html inputs must be strings".into())
+                        })?;
+                        validate_relative_remote_path(Path::new(path)).map_err(|_| {
+                            CoreError::Validation(
+                                "report.html inputs must be project-relative paths".into(),
+                            )
+                        })?;
+                    }
+                }
+                let configuration = serde_json::to_string(arguments)
+                    .map_err(|error| CoreError::Validation(error.to_string()))?;
+                return Ok(format!(
+                    "micromamba run --prefix \"$OMICSOPS_PROJECT_ROOT/.omicsops/env\" 'python' '-c' {} {}",
+                    shell_quote(CONFIGURED_REPORT_SCRIPT),
+                    shell_quote(&configuration)
+                ));
+            }
             let positional = match tool_id.as_str() {
                 "bio.fastqc" => vec!["input"],
                 "bio.multiqc" => vec!["input"],
-                "bio.deseq2" | "bio.scanpy" | "bio.h5ad_to_seurat" | "report.html" => {
+                "bio.deseq2" | "bio.h5ad_to_seurat" => {
                     vec!["script"]
                 }
                 _ => Vec::new(),
@@ -432,7 +507,7 @@ pub fn render_remote_step_script_v2(
          resolved_root=$(realpath -m {root})\nresolved_working=$(realpath -m {working})\ncase \"$resolved_working\" in \"$resolved_root\"|\"$resolved_root\"/*) ;; *) printf '%s\\n' 'path escapes project root' >&2; exit 126 ;; esac\n\
          usage_kib=$(du -sk {root} | awk '{{print $1}}')\nif test \"$usage_kib\" -ge {disk_kib}; then printf '%s\\n' 'disk budget exceeded before execution' >&2; exit 125; fi\n\
          cd {working}\nset +e\n\
-         export OMP_NUM_THREADS={threads} OPENBLAS_NUM_THREADS={threads} MKL_NUM_THREADS={threads} NUMEXPR_NUM_THREADS={threads}\n\
+         export OMICSOPS_PROJECT_ROOT={root} OMP_NUM_THREADS={threads} OPENBLAS_NUM_THREADS={threads} MKL_NUM_THREADS={threads} NUMEXPR_NUM_THREADS={threads}\n\
          if command -v taskset >/dev/null 2>&1; then cpu_prefix=\"taskset -c 0-$(({threads}-1))\"; else cpu_prefix=; fi\n\
          $cpu_prefix prlimit --as={memory_bytes} -- bash -c {quoted_command} > {log} 2>&1\n\
          status=$?\nusage_kib=$(du -sk {root} | awk '{{print $1}}')\nif test \"$usage_kib\" -gt {disk_kib}; then printf '%s\\n' 'disk budget exceeded after execution' >> {log}; status=125; fi\nprintf '%s\\n' \"$status\" > {exit_tmp}\nmv {exit_tmp} {exit}\n\

@@ -1,0 +1,106 @@
+.agent-pending p {
+  color: #667085;
+}
+
+.agent-notice {
+  max-width: 700px;
+  padding: 10px 12px;
+  border: 1px solid #f2b8b5;
+  border-radius: 9px;
+  background: #fff3f2;
+  color: #912018;
+  font-size: 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.agent-notice span {
+  word-break: break-word;
+}
+
+.send-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.composer textarea:disabled {
+  background: white;
+  color: #667085;
+}
+
+.planning-card .task-body > div:first-child span {
+  color: #667085;
+}
+
+/* Keep long model responses inside the conversation scroller. */
+.science-shell {
+  min-height: 0;
+}
+
+.conversation-pane,
+.context-pane {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.conversation-header,
+.composer {
+  flex: 0 0 auto;
+}
+
+.message-stream {
+  min-height: 0;
+  flex: 1 1 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.composer {
+  position: relative;
+  z-index: 2;
+  background: #f8fafc;
+}
+
+.message,
+.assistant-message > div:last-child {
+  min-width: 0;
+}
+
+.assistant-message p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.plan-validation {
+  max-width: 700px;
+  padding: 12px;
+  border: 1px solid #f2b8b5;
+  border-radius: 10px;
+  background: #fff8f7;
+  color: #7a271a;
+  font-size: 11px;
+}
+
+.plan-validation ul {
+  margin: 8px 0;
+  padding-left: 18px;
+}
+
+.plan-validation li {
+  margin: 5px 0;
+}
+
+.plan-validation code {
+  margin-right: 6px;
+}
+
+.plan-validation button {
+  border: 1px solid #d0d5dd;
+  border-radius: 6px;
+  background: white;
+  padding: 6px 9px;
+}
