@@ -4,7 +4,8 @@ use omicsops_core::domain::{AuthenticationMethod, ConnectionProfile};
 use omicsops_desktop_lib::{
     agent_commands::{
         SubmitMessageRequest, agent_event_kind_from_model_event, agent_user_content,
-        canonical_report_arguments, canonical_scanpy_arguments, merge_declared_dependencies,
+        canonical_report_arguments, canonical_scanpy_arguments,
+        conversation_title_from_first_message, merge_declared_dependencies,
         normalize_generated_plan, user_message_from_request,
     },
     commands::{
@@ -21,7 +22,7 @@ use omicsops_desktop_lib::{
     sync_commands::{choose_download_relative_path, parse_remote_index, resolve_selected_uploads},
     workspace_commands::{
         CreateProjectRequest, UpdateProjectRemoteRequest, apply_remote_binding,
-        project_from_request, write_project_manifest,
+        conversation_title_needs_first_message, project_from_request, write_project_manifest,
     },
 };
 use uuid::Uuid;
@@ -253,6 +254,24 @@ fn submitted_research_messages_receive_stable_sequence_and_identity() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn conversation_title_is_the_users_first_question_not_a_generated_label() {
+    assert_eq!(
+        conversation_title_from_first_message("  对 hg19 单细胞数据\n进行质控和注释  "),
+        "对 hg19 单细胞数据 进行质控和注释"
+    );
+}
+
+#[test]
+fn legacy_generated_conversation_titles_are_migrated() {
+    assert!(conversation_title_needs_first_message("QC 与聚类"));
+    assert!(conversation_title_needs_first_message("QC and clustering"));
+    assert!(conversation_title_needs_first_message(""));
+    assert!(!conversation_title_needs_first_message(
+        "比较两批 PBMC 的批次效应"
+    ));
 }
 
 #[test]

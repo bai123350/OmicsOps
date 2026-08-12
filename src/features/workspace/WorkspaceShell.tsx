@@ -5,7 +5,7 @@ import {
   Search, Send, Settings, Sparkles, Square, X,
 } from "lucide-react";
 import { copy, type Locale } from "./copy";
-import type { AgentRunStreamEvent, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, PlanProposal } from "../../types";
+import type { AgentRunStreamEvent, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, PlanProposal, WorkspaceConversation } from "../../types";
 import { RemoteFileTree } from "./RemoteFileTree";
 import { KernelPanel } from "./KernelPanel";
 import "./workspace.css";
@@ -29,6 +29,10 @@ interface Props {
   onOpenSettings?: () => void;
   onOpenHistory?: () => void;
   onBackToProjects?: () => void;
+  conversations?: WorkspaceConversation[];
+  activeConversationId?: string | null;
+  onSelectConversation?: (conversationId: string) => Promise<void> | void;
+  onNewConversation?: () => Promise<void> | void;
   onSend?: (message: string) => Promise<boolean | void> | boolean | void;
   messages?: Array<{ id: string; role: "user" | "assistant" | "tool" | "system"; markdown: string }>;
   streamingAssistant?: string;
@@ -66,7 +70,7 @@ interface Props {
 
 type ContextTab = "files" | "preview" | "notebook" | "explore" | "runs";
 
-export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, planProposal, planLoading = false, planApproved = false, onRequestPlan, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, agentRunEvents = [], remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell }: Props) {
+export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, conversations = [], activeConversationId, onSelectConversation, onNewConversation, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, planProposal, planLoading = false, planApproved = false, onRequestPlan, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, agentRunEvents = [], remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell }: Props) {
   const t = copy[locale];
   const zh = locale === "zh-CN";
   const [tab, setTab] = useState<ContextTab>("files");
@@ -78,6 +82,8 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const preview = <ArtifactPreview title={t.overview} />;
   const runFinished = agentRunEvents.some((event) => event.kind === "agent_completed" || event.kind === "agent_failed" || event.kind === "agent_canceled");
   const runActive = runStarted && !runFinished;
+  const activeConversation = conversations.find((item) => item.id === activeConversationId);
+  const conversationTitle = activeConversation?.title || (zh ? "新会话" : "New conversation");
 
   useEffect(() => {
     const stream = messageStreamRef.current;
@@ -106,12 +112,12 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
       <button className="rail-home" onClick={onBackToProjects} aria-label={zh ? "返回项目主页" : "Back to project home"}><ArrowLeft size={15} />{zh ? "返回项目主页" : "Project home"}</button>
       <button className="rail-search"><Search size={15} />{zh ? "搜索项目" : "Search projects"}</button>
       <div className="rail-section"><span>{zh ? "项目" : "Projects"}</span><button className="project-row active"><span className="project-glyph"><Database size={16} /></span><span><strong>{project.name}</strong><small>{t.status}</small></span><ChevronRight size={14} /></button></div>
-      <div className="rail-section sessions"><span>{zh ? "会话" : "Sessions"}</span><button className="session-row active"><Sparkles size={15} /><span>{zh ? "QC 与聚类" : "QC and clustering"}</span></button><button className="session-row"><FileText size={15} /><span>{zh ? "文献证据" : "Literature evidence"}</span></button><button className="session-row"><FileBarChart size={15} /><span>{zh ? "报告生成" : "Report drafting"}</span></button><button className="new-session"><MessageSquarePlus size={15} />{t.newConversation}</button></div>
+      <div className="rail-section sessions"><span>{zh ? "会话" : "Sessions"}</span><div className="session-list">{conversations.map((item) => <button className={`session-row ${item.id === activeConversationId ? "active" : ""}`} key={item.id} aria-current={item.id === activeConversationId ? "page" : undefined} onClick={() => void onSelectConversation?.(item.id)}><Sparkles size={15} /><span title={item.title}>{item.title || (zh ? "新会话" : "New conversation")}</span></button>)}</div><button className="new-session" disabled={agentBusy} onClick={() => void onNewConversation?.()}><MessageSquarePlus size={15} />{t.newConversation}</button></div>
       <div className="rail-footer"><button onClick={() => onLocaleChange(zh ? "en-US" : "zh-CN")}><Languages size={16} />{zh ? "English" : "简体中文"}</button><button onClick={onOpenSettings}><Settings size={16} />{t.settings}</button></div>
     </nav>
 
     <main className="conversation-pane" aria-label={t.research}>
-      <header className="conversation-header"><div><small>{project.name}</small><h1>{zh ? "QC 与聚类" : "QC and clustering"}</h1></div><span className="live-status"><i />{t.status}</span></header>
+      <header className="conversation-header"><div><small>{project.name}</small><h1>{conversationTitle}</h1></div><span className="live-status"><i />{t.status}</span></header>
       <section className="message-stream" aria-live="polite" ref={messageStreamRef}>
         {!onSend && <article className="message user-message"><p>{zh ? "比较两批 PBMC，检查批次效应并生成可复现的分析报告。" : "Compare two PBMC batches, assess batch effects, and generate a reproducible report."}</p></article>}
         {messages.length === 0 && <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><p>{zh ? "描述你的研究目标。我会先核对数据与假设，并在任何正式执行前展示计划供你审批。" : "Describe your research goal. I will first check the data and assumptions, then show a plan for approval before any formal execution."}</p></div></article>}

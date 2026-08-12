@@ -7,7 +7,9 @@ use omicsops_agent::{
     AgentEvent, AgentEventKind, ModelMessage, ModelRequest, ModelStreamEvent, ToolArgumentBuffer,
     structured_value_from_text,
 };
-use omicsops_core::workspace::{AgentTurn, Message, MessageRole, ModelProviderKind, TurnStatus};
+use omicsops_core::workspace::{
+    AgentTurn, Conversation, Message, MessageRole, ModelProviderKind, TurnStatus,
+};
 use omicsops_core::{
     domain::{ResourceLimits, StepRisk},
     plan_v2::{
@@ -39,6 +41,50 @@ pub struct ConversationEvent {
     pub project_id: Uuid,
     pub conversation_id: Uuid,
     pub message: Message,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationUpdatedEvent {
+    pub project_id: Uuid,
+    pub conversation: Conversation,
+}
+
+pub fn conversation_title_from_first_message(markdown: &str) -> String {
+    markdown.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn title_conversation_from_first_message(
+    app: &AppHandle,
+    repository: &omicsops_adapters::persistence::Repository,
+    message: &Message,
+) -> Result<(), String> {
+    if repository
+        .messages_for_conversation(message.conversation_id)
+        .map_err(|error| error.to_string())?
+        .iter()
+        .any(|stored| stored.role == MessageRole::User)
+    {
+        return Ok(());
+    }
+    let mut conversation = repository
+        .conversations_for_project(message.project_id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|conversation| conversation.id == message.conversation_id)
+        .ok_or_else(|| "conversation not found".to_string())?;
+    conversation.title = conversation_title_from_first_message(&message.markdown);
+    conversation.updated_at = message.created_at;
+    repository
+        .save_conversation(&conversation)
+        .map_err(|error| error.to_string())?;
+    app.emit(
+        "conversation-updated",
+        ConversationUpdatedEvent {
+            project_id: message.project_id,
+            conversation,
+        },
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -531,6 +577,7 @@ pub fn submit_message(
     request: SubmitMessageRequest,
 ) -> Result<Message, String> {
     let message = user_message_from_request(request, Uuid::new_v4(), Utc::now())?;
+    title_conversation_from_first_message(&app, &state.repository, &message)?;
     state
         .repository
         .save_message(&message)
@@ -596,6 +643,7 @@ pub async fn run_agent_turn(
         Uuid::new_v4(),
         Utc::now(),
     )?;
+    title_conversation_from_first_message(&app, &repository, &user_message)?;
     repository
         .save_message(&user_message)
         .map_err(|error| error.to_string())?;

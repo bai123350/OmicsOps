@@ -147,6 +147,25 @@ describe("WorkspaceShell", () => {
     expect(onBackToProjects).toHaveBeenCalledOnce();
   });
 
+  it("renders persisted conversation titles and wires selection and creation", () => {
+    const onSelectConversation = vi.fn();
+    const onNewConversation = vi.fn();
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined}
+      conversations={[
+        { id: "conversation-2", project_id: project.id, title: "比较两批 PBMC 的批次效应", status: "idle", model_profile_id: null, created_at: "2026-08-12T08:01:00Z", updated_at: "2026-08-12T08:01:00Z" },
+        { id: "conversation-1", project_id: project.id, title: "检查 hg19 单细胞数据质量", status: "idle", model_profile_id: null, created_at: "2026-08-12T08:00:00Z", updated_at: "2026-08-12T08:00:00Z" },
+      ]}
+      activeConversationId="conversation-2" onSelectConversation={onSelectConversation} onNewConversation={onNewConversation} />);
+
+    expect(screen.getByRole("heading", { name: "比较两批 PBMC 的批次效应" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /检查 hg19 单细胞数据质量/ }));
+    expect(onSelectConversation).toHaveBeenCalledWith("conversation-1");
+    fireEvent.click(screen.getByRole("button", { name: "新建会话" }));
+    expect(onNewConversation).toHaveBeenCalledOnce();
+    expect(screen.queryByText("文献证据")).not.toBeInTheDocument();
+    expect(screen.queryByText("报告生成")).not.toBeInTheDocument();
+  });
+
   it("runs and explicitly promotes a saved exploration cell", async () => {
     const onExecuteKernel = vi.fn().mockResolvedValue(0);
     const onPromoteKernelCell = vi.fn().mockResolvedValue({ name: "探索代码步骤", version: 1, language: "python", code: "print(1)", code_sha256: "a".repeat(64) });

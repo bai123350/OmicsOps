@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use omicsops_core::workspace::{Conversation, Project, ProjectTemplate};
+use omicsops_core::workspace::{Conversation, MessageRole, Project, ProjectTemplate};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
@@ -23,7 +23,8 @@ pub struct CreateProjectRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateConversationRequest {
     pub project_id: Uuid,
-    pub title: String,
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,10 +188,48 @@ pub fn list_conversations(
     state: State<'_, AppState>,
     project_id: Uuid,
 ) -> Result<Vec<Conversation>, String> {
-    state
+    let mut conversations = state
         .repository
         .conversations_for_project(project_id)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    for conversation in &mut conversations {
+        if !conversation_title_needs_first_message(&conversation.title) {
+            continue;
+        }
+        let first_question = state
+            .repository
+            .messages_for_conversation(conversation.id)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|message| message.role == MessageRole::User)
+            .map(|message| {
+                message
+                    .markdown
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            });
+        if let Some(title) = first_question.filter(|title| !title.is_empty()) {
+            conversation.title = title;
+            state
+                .repository
+                .save_conversation(conversation)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(conversations)
+}
+
+pub fn conversation_title_needs_first_message(title: &str) -> bool {
+    matches!(
+        title.trim(),
+        "" | "QC 与聚类"
+            | "QC and clustering"
+            | "文献证据"
+            | "Literature evidence"
+            | "报告生成"
+            | "Report drafting"
+    )
 }
 
 #[tauri::command]
@@ -198,15 +237,8 @@ pub fn create_conversation(
     state: State<'_, AppState>,
     request: CreateConversationRequest,
 ) -> Result<Conversation, String> {
-    if request.title.trim().is_empty() {
-        return Err("conversation title is required".into());
-    }
-    let conversation = Conversation::new(
-        Uuid::new_v4(),
-        request.project_id,
-        request.title.trim(),
-        Utc::now(),
-    );
+    let title = request.title.as_deref().unwrap_or_default().trim();
+    let conversation = Conversation::new(Uuid::new_v4(), request.project_id, title, Utc::now());
     state
         .repository
         .save_conversation(&conversation)

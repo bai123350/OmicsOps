@@ -66,12 +66,12 @@ export async function listConversations(projectId: string): Promise<WorkspaceCon
   return isTauri() ? invoke("list_conversations", { projectId }) : [];
 }
 
-export async function createConversation(projectId: string, title: string): Promise<WorkspaceConversation> {
+export async function createConversation(projectId: string, title?: string): Promise<WorkspaceConversation> {
   if (!isTauri()) {
     const now = new Date().toISOString();
-    return { id: crypto.randomUUID(), project_id: projectId, title, status: "idle", model_profile_id: null, created_at: now, updated_at: now };
+    return { id: crypto.randomUUID(), project_id: projectId, title: title ?? "", status: "idle", model_profile_id: null, created_at: now, updated_at: now };
   }
-  return invoke("create_conversation", { request: { project_id: projectId, title } });
+  return invoke("create_conversation", { request: { project_id: projectId, title: title ?? null } });
 }
 
 export async function listMessages(conversationId: string): Promise<WorkspaceMessage[]> {
@@ -118,6 +118,11 @@ export async function onAgentEvent(callback: (event: AgentEvent) => void): Promi
 export async function onConversationEvent(callback: (event: { project_id: string; conversation_id: string; message: WorkspaceMessage }) => void): Promise<UnlistenFn> {
   if (!isTauri()) return () => undefined;
   return listen("conversation-event", ({ payload }) => callback(payload as { project_id: string; conversation_id: string; message: WorkspaceMessage }));
+}
+
+export async function onConversationUpdated(callback: (event: { project_id: string; conversation: WorkspaceConversation }) => void): Promise<UnlistenFn> {
+  if (!isTauri()) return () => undefined;
+  return listen("conversation-updated", ({ payload }) => callback(payload as { project_id: string; conversation: WorkspaceConversation }));
 }
 
 export async function listRemoteFiles(projectId: string): Promise<RemoteFileEntry[]> {

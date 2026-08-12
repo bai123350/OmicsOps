@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import DesktopApp from "./DesktopApp";
@@ -43,5 +43,20 @@ describe("DesktopApp", () => {
     expect(dialog).toHaveTextContent("OpenAI-compatible");
     expect(dialog).toHaveTextContent("Ollama");
     expect(dialog).toHaveTextContent("历史运行只读");
+  });
+
+  it("creates and switches to an empty conversation when New conversation is clicked", async () => {
+    const project = { id: "project-1", name: "PBMC 项目", description: "", local_root: "E:/Science/pbmc", remote_root: null, connection_id: null, template: "single_cell_rna_seq" as const, status: "running" as const, ollama_only: false, created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" };
+    const existing = { id: "conversation-1", project_id: project.id, title: "旧问题", status: "idle" as const, model_profile_id: null, created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" };
+    const created = { ...existing, id: "conversation-2", title: "", created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z" };
+    vi.spyOn(api, "listProjects").mockResolvedValue([project]);
+    vi.spyOn(api, "listConversations").mockResolvedValue([existing]);
+    vi.spyOn(api, "listMessages").mockResolvedValue([]);
+    const createConversation = vi.spyOn(api, "createConversation").mockResolvedValue(created);
+
+    render(<DesktopApp />);
+    fireEvent.click(await screen.findByRole("button", { name: "新建会话" }));
+    await waitFor(() => expect(createConversation).toHaveBeenCalledWith(project.id));
+    expect(await screen.findByRole("heading", { name: "新会话" })).toBeInTheDocument();
   });
 });

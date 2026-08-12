@@ -12,6 +12,7 @@ export default function DesktopApp() {
   const [locale, setLocale] = useState<Locale>("zh-CN");
   const [loading, setLoading] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [conversations, setConversations] = useState<WorkspaceConversation[]>([]);
   const [conversation, setConversation] = useState<WorkspaceConversation | null>(null);
   const [messageSequence, setMessageSequence] = useState(1);
   const [messages, setMessages] = useState<WorkspaceMessage[]>([]);
@@ -48,15 +49,19 @@ export default function DesktopApp() {
     }).finally(() => setLoading(false));
   }, []);
   useEffect(() => {
-    if (!selected) { setConversation(null); return; }
+    let disposed = false;
+    if (!selected) { setConversations([]); setConversation(null); return () => { disposed = true; }; }
     api.listConversations(selected.id).then(async (items) => {
-      const active = items[0] ?? await api.createConversation(selected.id, locale === "zh-CN" ? "QC 与聚类" : "QC and clustering");
+      const active = items[0] ?? await api.createConversation(selected.id);
+      if (disposed) return;
+      setConversations(items.length ? items : [active]);
       setConversation(active);
       const storedMessages = await api.listMessages(active.id);
       setMessages(storedMessages);
       setMessageSequence((storedMessages.at(-1)?.sequence ?? 0) + 1);
       setLastGoal([...storedMessages].reverse().find((message) => message.role === "user")?.markdown ?? "");
-    });
+    }).catch((error) => { if (!disposed) setAgentNotice(error instanceof Error ? error.message : String(error)); });
+    return () => { disposed = true; };
   }, [selected?.id]);
   useEffect(() => {
     setFileNotice("");
@@ -133,6 +138,11 @@ export default function DesktopApp() {
       if (event.conversation_id !== conversation?.id) return;
       setMessages((current) => current.some((message) => message.id === event.message.id) ? current : [...current, event.message]);
       setMessageSequence((value) => Math.max(value, event.message.sequence + 1));
+    }).then((fn) => disposed ? fn() : unlisten.push(fn));
+    api.onConversationUpdated((event) => {
+      if (event.project_id !== selected?.id) return;
+      setConversations((current) => [event.conversation, ...current.filter((item) => item.id !== event.conversation.id)]);
+      setConversation((current) => current?.id === event.conversation.id ? event.conversation : current);
     }).then((fn) => disposed ? fn() : unlisten.push(fn));
     api.onKernelEvent((event) => {
       if (event.project_id !== selected?.id) return;
@@ -218,6 +228,39 @@ export default function DesktopApp() {
       setAgentNotice(error instanceof Error ? error.message : String(error));
     }
   }
+
+  function resetConversationWork() {
+    setMessages([]); setMessageSequence(1); setStreamingAssistant(""); setAgentBusy(false); setAgentNotice(""); setAgentRetryNotice("");
+    setLastGoal(""); setPlanProposal(null); setPlanApproved(false); setApprovedPlanId(null); setRunId(null); setRunStopping(false); setAgentRunEvents([]);
+  }
+
+  async function selectConversation(conversationId: string) {
+    const next = conversations.find((item) => item.id === conversationId);
+    if (!next || next.id === conversation?.id) return;
+    resetConversationWork();
+    setConversation(next);
+    try {
+      const storedMessages = await api.listMessages(next.id);
+      setMessages(storedMessages);
+      setMessageSequence((storedMessages.at(-1)?.sequence ?? 0) + 1);
+      setLastGoal([...storedMessages].reverse().find((message) => message.role === "user")?.markdown ?? "");
+    } catch (error) {
+      setAgentNotice(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function newConversation() {
+    if (!selected || agentBusy) return;
+    setAgentNotice("");
+    try {
+      const created = await api.createConversation(selected.id);
+      setConversations((current) => [created, ...current]);
+      resetConversationWork();
+      setConversation(created);
+    } catch (error) {
+      setAgentNotice(error instanceof Error ? error.message : String(error));
+    }
+  }
   if (loading) return <div className="desktop-loading">OmicsOps</div>;
   const settings = settingsOpen ? <SettingsPanel locale={locale} onClose={() => setSettingsOpen(false)} modelProfiles={modelProfiles} skillPackages={skillPackages} connections={connections} selectedProject={selected} onSaveConnection={async (profile, secret) => { await api.saveConnection(profile, secret); setConnections(await api.listConnections()); }} onTestConnection={api.testConnection} onConfirmHostKey={async (profileId, fingerprint) => { await api.confirmHostKey(profileId, fingerprint); setConnections(await api.listConnections()); }} onBindProjectRemote={async (connectionId, remoteRoot) => { if (!selected) return; const updated = await api.updateProjectRemote(selected.id, connectionId, remoteRoot); setSelected(updated); setProjects((current) => current.map((project) => project.id === updated.id ? updated : project)); }} onSaveModel={async (request) => { const profile = await api.saveModelProfile(request); setModelProfiles((current) => [profile, ...current.filter((item) => item.id !== profile.id)]); setActiveModelProfileId(profile.id); }} onProbeModel={api.probeModelProfile} onListModels={api.listModelProfileModels} onImportSkill={async () => { const sourcePath = await api.chooseSkillDirectory(); if (!sourcePath) return; const skill = await api.importSkillDirectory(sourcePath); setSkillPackages((current) => [skill, ...current.filter((item) => item.id !== skill.id)]); }} onSetSkillEnabled={async (skillId, enabled) => { const updated = await api.setSkillEnabled(skillId, enabled); setSkillPackages(await api.listSkillPackages()); return updated; }} /> : null;
   if (!selected) return <><ProjectLibrary projects={projects} connections={connections} locale={locale} onLocaleChange={setLocale} onSettings={() => setSettingsOpen(true)} onOpen={setSelected} onChooseLocalRoot={api.chooseProjectDirectory} onCreate={async ({ template, name, localRoot, connectionId, remoteRoot }) => { const project = await api.createProject({ name, description: "", local_root: localRoot, template, connection_id: connectionId, remote_root: remoteRoot }); setProjects((current) => [project, ...current]); setSelected(project); }} />{settings}</>;
@@ -225,6 +268,7 @@ export default function DesktopApp() {
   return <><WorkspaceShell
     project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template }}
     locale={locale} onLocaleChange={setLocale} onOpenSettings={() => setSettingsOpen(true)} onBackToProjects={() => setSelected(null)}
+    conversations={conversations} activeConversationId={conversation?.id} onSelectConversation={selectConversation} onNewConversation={newConversation}
     messages={messages} streamingAssistant={streamingAssistant} agentBusy={agentBusy} agentNotice={agentNotice} agentRetryNotice={agentRetryNotice} modelLabel={activeModel?.label}
     planProposal={planProposal} planLoading={planLoading} planApproved={planApproved} canStartRun={Boolean(selected.connection_id && approvedPlanId)} runStarted={Boolean(runId)} agentRunEvents={agentRunEvents}
     runStopping={runStopping}

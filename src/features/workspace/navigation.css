@@ -1,1 +1,2 @@
 .rail-home{width:100%;border:0;background:transparent;color:#aeb8c6;border-radius:8px;padding:8px 10px;margin:-6px 0 8px;display:flex;align-items:center;gap:8px;text-align:left}.rail-home:hover,.rail-home:focus-visible{background:#273448;color:#fff;outline:none}.rail-home:focus-visible{box-shadow:0 0 0 2px #6d8cff}
+.session-list{display:flex;flex-direction:column;gap:2px;max-height:min(38vh,320px);overflow-y:auto}.session-row span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.new-session:disabled{cursor:not-allowed;opacity:.55}
