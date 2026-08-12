@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   Activity, ArrowLeft, Bot, Check, ChevronRight, Database, Expand, FileBarChart, FileText,
   FlaskConical, Folder, Languages, MessageSquarePlus, NotebookPen, Play,
-  Search, Send, Settings, Sparkles, X,
+  Search, Send, Settings, Sparkles, Square, X,
 } from "lucide-react";
 import { copy, type Locale } from "./copy";
 import type { AgentRunStreamEvent, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, PlanProposal } from "../../types";
@@ -42,6 +42,8 @@ interface Props {
   onRequestPlan?: () => Promise<void> | void;
   onApprovePlan?: () => Promise<void> | void;
   onStartRun?: () => Promise<void> | void;
+  onCancelRun?: () => Promise<void> | void;
+  runStopping?: boolean;
   canStartRun?: boolean;
   runStarted?: boolean;
   agentRunEvents?: AgentRunStreamEvent[];
@@ -64,7 +66,7 @@ interface Props {
 
 type ContextTab = "files" | "preview" | "notebook" | "explore" | "runs";
 
-export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, planProposal, planLoading = false, planApproved = false, onRequestPlan, onApprovePlan, onStartRun, canStartRun = false, runStarted = false, agentRunEvents = [], remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell }: Props) {
+export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, planProposal, planLoading = false, planApproved = false, onRequestPlan, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, agentRunEvents = [], remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell }: Props) {
   const t = copy[locale];
   const zh = locale === "zh-CN";
   const [tab, setTab] = useState<ContextTab>("files");
@@ -74,6 +76,8 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const [approved, setApproved] = useState(false);
   const messageStreamRef = useRef<HTMLElement>(null);
   const preview = <ArtifactPreview title={t.overview} />;
+  const runFinished = agentRunEvents.some((event) => event.kind === "agent_completed" || event.kind === "agent_failed" || event.kind === "agent_canceled");
+  const runActive = runStarted && !runFinished;
 
   useEffect(() => {
     const stream = messageStreamRef.current;
@@ -119,6 +123,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
         {agentNotice && <div className="agent-notice" role="alert"><strong>{zh ? "对话未完成" : "Conversation did not complete"}</strong><span>{agentNotice}</span></div>}
         {(planProposal || !onRequestPlan) && <article className="approval-card"><div className="task-icon"><Check size={18} /></div><div className="task-body"><div><strong>{planProposal?.plan.title ?? (zh ? "正式计划等待审批" : "Formal plan awaiting approval")}</strong><span>{runStarted ? (zh ? "运行已启动" : "Run started") : (planApproved || approved) ? (zh ? "已批准" : "Approved") : (planProposal?.validation.valid === false ? (zh ? "验证失败" : "Invalid") : (zh ? "需确认" : "Review"))}</span></div><p>{planProposal ? `${planProposal.plan.stages.reduce((count, stage) => count + stage.steps.length, 0)} ${zh ? "个版本化步骤" : "versioned steps"} · SHA-256 ${planProposal.plan_hash.slice(0, 12)}` : (zh ? "新增 5 个版本化步骤；将上传 2 个选定文件，不会同步整个工作区。" : "Adds 5 versioned steps; uploads 2 selected files and never mirrors the whole workspace.")}</p><div className="task-actions"><button>{zh ? "查看差异" : "View diff"}</button><button disabled={planApproved || approved || planProposal?.validation.valid === false} onClick={() => { if (onApprovePlan) void onApprovePlan(); else setApproved(true); }}>{(planApproved || approved) ? (zh ? "已批准" : "Approved") : onStartRun ? (zh ? "批准并开始远端运行" : "Approve and run remotely") : (zh ? "批准计划" : "Approve plan")}</button>{(planApproved || approved) && onStartRun && !runStarted && <button disabled={!canStartRun} onClick={() => void onStartRun()}>{canStartRun ? (zh ? "重新开始远端运行" : "Start remote run") : (zh ? "正在启动…" : "Starting…")}</button>}</div></div></article>}
         {runStarted && <AgentConversationUpdates locale={locale} events={agentRunEvents} />}
+        {runActive && onCancelRun && <div className="agent-run-controls" role="region" aria-label={zh ? "远程 Agent 运行控制" : "Remote agent run controls"}><div><span className="agent-working"><i />{runStopping ? (zh ? "正在终止当前操作…" : "Stopping current operation…") : (zh ? "远程 Agent 正在运行" : "Remote agent is running")}</span><small>{zh ? "将中断模型请求、当前 SSH 命令及后续操作" : "Stops the model request, current SSH command, and all subsequent actions"}</small></div><button className="stop-agent-button" disabled={runStopping} onClick={() => void onCancelRun()}><Square size={14} fill="currentColor" />{runStopping ? (zh ? "终止中…" : "Stopping…") : (zh ? "终止运行" : "Stop run")}</button></div>}
         {planProposal?.validation.valid === false && <div className="plan-validation" role="alert"><strong>{zh ? "计划未通过本地执行契约" : "Plan failed the local execution contract"}</strong><ul>{planProposal.validation.issues.map((issue) => <li key={`${issue.path}:${issue.code}`}><code>{issue.path}</code><span>{issue.message}</span></li>)}</ul><button disabled={planLoading} onClick={() => void onRequestPlan?.()}>{planLoading ? (zh ? "重新生成中…" : "Regenerating…") : (zh ? "按当前工具契约重新生成" : "Regenerate with current tool contract")}</button></div>}
         {!onSend && <article className="task-card"><div className="task-icon"><Activity size={18} /></div><div className="task-body"><div><strong>{t.task}</strong><span>65%</span></div><p>{zh ? "远端 Linux · 8 CPU · 32 GiB · 低风险" : "Remote Linux · 8 CPU · 32 GiB · low risk"}</p><div className="task-progress"><i /></div><div className="task-actions"><button>{zh ? "查看日志" : "View logs"}</button><button>{zh ? "查看计划" : "View plan"}</button></div></div></article>}
         {onSend && !planProposal && <article className="task-card planning-card"><div className="task-icon"><Activity size={18} /></div><div className="task-body"><div><strong>{zh ? "分析计划" : "Analysis plan"}</strong><span>{planLoading ? (zh ? "生成中" : "Generating") : (zh ? "尚未生成" : "Not generated")}</span></div><p>{zh ? "对话明确目标后，生成版本化计划并在远端执行前审批。" : "After the goal is clear, generate a versioned plan for approval before remote execution."}</p><div className="task-actions"><button disabled={planLoading || agentBusy} onClick={() => void onRequestPlan?.()}>{planLoading ? (zh ? "生成中…" : "Generating…") : (zh ? "生成分析计划" : "Generate plan")}</button></div></div></article>}
@@ -139,8 +144,12 @@ function ArtifactPreview({ title }: { title: string }) { return <div className="
 function coalesceAgentRunEvents(events: AgentRunStreamEvent[]) {
   return events.reduce<AgentRunStreamEvent[]>((result, event) => {
     const previous = result.at(-1);
-    if (previous && (event.kind === "stdout" || event.kind === "stderr") && previous.kind === event.kind && previous.iteration === event.iteration) {
-      previous.content += event.content;
+    if (event.kind === "model_waiting" || event.kind === "tool_waiting") {
+      const existing = result.findIndex((item) => item.kind === event.kind && item.iteration === event.iteration);
+      if (existing >= 0) result.splice(existing, 1);
+    }
+    if (previous && (event.kind === "stdout" || event.kind === "stderr" || event.kind === "model_progress") && previous.kind === event.kind && previous.iteration === event.iteration) {
+      previous.content += event.kind === "model_progress" ? `\n${event.content}` : event.content;
       previous.timestamp = event.timestamp;
       return result;
     }
@@ -151,6 +160,7 @@ function coalesceAgentRunEvents(events: AgentRunStreamEvent[]) {
 
 function AgentConversationUpdates({ locale, events }: { locale: Locale; events: AgentRunStreamEvent[] }) {
   const zh = locale === "zh-CN";
+  const runInactive = events.some((event) => event.kind === "cancel_requested" || event.kind === "agent_canceled" || event.kind === "agent_completed" || event.kind === "agent_failed");
   if (events.length === 0) return <article className="message assistant-message agent-work-update" role="status">
     <div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><p>{zh ? "远程运行已启动。我正在连接服务器；模型的判断、执行的命令和服务器返回将持续显示在这里。" : "The remote run has started. I am connecting to the server; model decisions, commands, and server output will appear here as they happen."}</p><span className="agent-working"><i />{zh ? "正在连接" : "Connecting"}</span></div>
   </article>;
@@ -158,7 +168,7 @@ function AgentConversationUpdates({ locale, events }: { locale: Locale; events: 
     const terminal = event.kind === "stdout" || event.kind === "stderr" || event.kind === "tool_started";
     const label = event.iteration ? (zh ? `第 ${event.iteration} 轮` : `Iteration ${event.iteration}`) : (zh ? "远程运行" : "Remote run");
     return <article className={`message assistant-message agent-work-update kind-${event.kind}`} aria-label={zh ? "远程 Agent 工作消息" : "Remote agent work update"} key={`${event.run_id}-${event.sequence}`}>
-      <div className="assistant-avatar"><Bot size={17} /></div><div><div className="agent-work-heading"><strong>OmicsOps Agent</strong><small>{label} · {new Date(event.timestamp).toLocaleTimeString()}</small></div><b className="agent-work-title">{event.title}</b>{terminal ? <pre>{event.content}</pre> : <p>{event.content}</p>}{event.kind === "model_started" && <span className="agent-working"><i />{zh ? "模型正在决定下一步" : "Model is deciding the next action"}</span>}</div>
+      <div className="assistant-avatar"><Bot size={17} /></div><div><div className="agent-work-heading"><strong>OmicsOps Agent</strong><small>{label} · {new Date(event.timestamp).toLocaleTimeString()}</small></div><b className="agent-work-title">{event.title}</b>{terminal ? <pre>{event.content}</pre> : <p>{event.content}</p>}{!runInactive && (event.kind === "model_started" || event.kind === "model_waiting" || event.kind === "model_recovering" || event.kind === "tool_waiting" || event.kind === "ssh_reconnecting") && <span className="agent-working"><i />{event.kind === "ssh_reconnecting" ? (zh ? "正在恢复远程连接" : "Restoring the remote connection") : event.kind === "tool_waiting" ? (zh ? "远端命令仍在运行" : "The remote command is still running") : event.kind === "model_recovering" ? (zh ? "正在恢复模型请求" : "Recovering the model request") : (zh ? "模型仍在工作" : "The model is still working")}</span>}</div>
     </article>;
   })}</>;
 }

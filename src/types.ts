@@ -269,7 +269,7 @@ export interface AgentRunStreamEvent {
   project_id: string;
   sequence: number;
   timestamp: string;
-  kind: "agent_started" | "model_started" | "model_action" | "tool_started" | "stdout" | "stderr" | "tool_completed" | "agent_completed" | "agent_failed";
+  kind: "agent_started" | "model_started" | "model_waiting" | "model_progress" | "model_assessment" | "model_recovering" | "model_action" | "policy_rejected" | "action_rejected" | "tool_started" | "tool_waiting" | "tool_stopping" | "tool_stopped" | "stdout" | "stderr" | "tool_completed" | "ssh_reconnecting" | "ssh_reconnected" | "cancel_requested" | "agent_canceled" | "agent_completed" | "agent_failed";
   title: string;
   content: string;
   iteration: number | null;

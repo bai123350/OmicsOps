@@ -18,6 +18,29 @@ use tokio::io::{
 
 use crate::{AdapterError, AdapterResult};
 
+fn authenticated_client_config() -> client::Config {
+    client::Config {
+        inactivity_timeout: Some(Duration::from_secs(300)),
+        keepalive_interval: Some(Duration::from_secs(15)),
+        keepalive_max: 3,
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod client_config_tests {
+    use super::authenticated_client_config;
+    use std::time::Duration;
+
+    #[test]
+    fn long_running_sessions_have_protocol_keepalive() {
+        let config = authenticated_client_config();
+        assert_eq!(config.keepalive_interval, Some(Duration::from_secs(15)));
+        assert_eq!(config.keepalive_max, 3);
+        assert_eq!(config.inactivity_timeout, Some(Duration::from_secs(300)));
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum SshAuthentication {
     Password(String),
@@ -136,10 +159,7 @@ impl SshSession {
             expected: profile.host_key_fingerprint.clone(),
             observed: observed.clone(),
         };
-        let config = Arc::new(client::Config {
-            inactivity_timeout: Some(Duration::from_secs(30)),
-            ..Default::default()
-        });
+        let config = Arc::new(authenticated_client_config());
         let mut handle = tokio::time::timeout(
             Duration::from_secs(15),
             client::connect(config, (profile.host.as_str(), profile.port), handler),

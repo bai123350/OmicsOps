@@ -29,7 +29,10 @@ use uuid::Uuid;
 #[test]
 fn approved_remote_agent_blocks_privilege_escalation_and_project_escape() {
     assert!(validate_agent_command("python scripts/qc.py", "/home/user/project").is_ok());
-    assert!(validate_agent_command("sudo apt-get install r-base", "/home/user/project").is_err());
+    let policy_error = validate_agent_command("sudo apt-get install r-base", "/home/user/project")
+        .expect_err("sudo must be rejected");
+    assert!(policy_error.contains("sudo "));
+    assert!(policy_error.contains("rewrite"));
     assert!(validate_agent_command("rm -rf results", "/home/user/project").is_err());
     assert!(validate_agent_command("cd /tmp && touch escaped", "/home/user/project").is_err());
     assert!(validate_agent_command("touch /tmp/escaped", "/home/user/project").is_err());

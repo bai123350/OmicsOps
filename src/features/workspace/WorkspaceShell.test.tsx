@@ -84,6 +84,54 @@ describe("WorkspaceShell", () => {
     expect(screen.getByText("genes=32738 cells=12000")).toBeInTheDocument();
   });
 
+  it("shows public evaluation content and collapses repeated waiting heartbeats", () => {
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} runStarted agentRunEvents={[
+      { run_id: "run-1", project_id: "project-1", sequence: 1, timestamp: "2026-08-12T08:00:00Z", kind: "model_waiting", title: "Evaluating remote evidence", content: "10s elapsed", iteration: 1 },
+      { run_id: "run-1", project_id: "project-1", sequence: 2, timestamp: "2026-08-12T08:00:10Z", kind: "model_waiting", title: "Evaluating remote evidence", content: "20s elapsed", iteration: 1 },
+      { run_id: "run-1", project_id: "project-1", sequence: 3, timestamp: "2026-08-12T08:00:11Z", kind: "model_progress", title: "Agent evaluation", content: "Verified the matrix and barcode files exist.", iteration: 1 },
+      { run_id: "run-1", project_id: "project-1", sequence: 4, timestamp: "2026-08-12T08:00:12Z", kind: "model_progress", title: "Agent evaluation", content: "Next I will inspect their headers without modifying data.", iteration: 1 },
+    ]} />);
+
+    expect(screen.queryByText("10s elapsed")).not.toBeInTheDocument();
+    expect(screen.getByText("20s elapsed")).toBeInTheDocument();
+    expect(screen.getByText(/Verified the matrix.*Next I will inspect/s)).toBeInTheDocument();
+  });
+
+  it("keeps a stop control visible while the remote agent is active", async () => {
+    const onCancelRun = vi.fn();
+    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted onCancelRun={onCancelRun} agentRunEvents={[
+      { run_id: "run-1", project_id: "project-1", sequence: 1, timestamp: "2026-08-12T08:00:00Z", kind: "model_waiting", title: "Evaluating", content: "Working", iteration: 1 },
+    ]} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "终止运行" }));
+    expect(onCancelRun).toHaveBeenCalledOnce();
+
+    rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted runStopping onCancelRun={onCancelRun} agentRunEvents={[
+      { run_id: "run-1", project_id: "project-1", sequence: 2, timestamp: "2026-08-12T08:00:01Z", kind: "cancel_requested", title: "Stopping", content: "Cancellation requested", iteration: null },
+    ]} />);
+    expect(screen.getByRole("button", { name: "终止中…" })).toBeDisabled();
+  });
+
+  it("hides the stop control after cancellation is confirmed", () => {
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted onCancelRun={() => undefined} agentRunEvents={[
+      { run_id: "run-1", project_id: "project-1", sequence: 3, timestamp: "2026-08-12T08:00:02Z", kind: "agent_canceled", title: "Stopped", content: "Canceled", iteration: null },
+    ]} />);
+
+    expect(screen.queryByRole("button", { name: "终止运行" })).not.toBeInTheDocument();
+  });
+
+  it("turns off every historical running indicator as soon as cancellation starts", () => {
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} runStarted runStopping onCancelRun={() => undefined} agentRunEvents={[
+      { run_id: "run-1", project_id: "project-1", sequence: 1, timestamp: "2026-08-12T08:00:00Z", kind: "model_waiting", title: "Evaluating remote evidence", content: "30s elapsed", iteration: 8 },
+      { run_id: "run-1", project_id: "project-1", sequence: 2, timestamp: "2026-08-12T08:00:01Z", kind: "tool_waiting", title: "Remote command is still running", content: "20s elapsed", iteration: 8 },
+      { run_id: "run-1", project_id: "project-1", sequence: 3, timestamp: "2026-08-12T08:00:02Z", kind: "cancel_requested", title: "Stopping remote agent", content: "Cancellation requested", iteration: null },
+    ]} />);
+
+    expect(screen.queryByText("The model is still working")).not.toBeInTheDocument();
+    expect(screen.queryByText("The remote command is still running", { selector: ".agent-working" })).not.toBeInTheDocument();
+    expect(screen.getByText("Stopping current operation…")).toBeInTheDocument();
+  });
+
   it("uploads only through the explicit file selection action", () => {
     const onUploadFiles = vi.fn();
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onUploadFiles={onUploadFiles} remoteFiles={[{ relative_path: "results/umap.png", directory: false, size_bytes: 42, modified_unix_seconds: 1 }]} />);

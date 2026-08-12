@@ -27,6 +27,7 @@ export default function DesktopApp() {
   const [planApproved, setPlanApproved] = useState(false);
   const [approvedPlanId, setApprovedPlanId] = useState<string | null>(null);
   const [runId, setRunId] = useState<string | null>(null);
+  const [runStopping, setRunStopping] = useState(false);
   const [agentRunEvents, setAgentRunEvents] = useState<AgentRunStreamEvent[]>([]);
   const [remoteFiles, setRemoteFiles] = useState<RemoteFileEntry[]>([]);
   const [filesBusy, setFilesBusy] = useState(false);
@@ -77,6 +78,7 @@ export default function DesktopApp() {
     let disposed = false;
     setAgentRunEvents([]);
     setRunId(null);
+    setRunStopping(false);
     if (!selected) return () => { disposed = true; };
     api.listAgentRunEvents(selected.id)
       .then((events) => {
@@ -139,6 +141,7 @@ export default function DesktopApp() {
     api.onAgentRunEvent((event) => {
       if (event.project_id !== selected?.id) return;
       setRunId((current) => current ?? event.run_id);
+      if (event.kind === "agent_canceled" || event.kind === "agent_completed" || event.kind === "agent_failed") setRunStopping(false);
       setAgentRunEvents((current) => {
         if (current.some((item) => item.run_id === event.run_id && item.sequence === event.sequence)) return current;
         return [...current.filter((item) => item.run_id === event.run_id).slice(-399), event];
@@ -205,6 +208,16 @@ export default function DesktopApp() {
       setFilesBusy(false);
     }
   }
+  async function attachRun(start: () => Promise<string>) {
+    setAgentNotice("");
+    try {
+      const id = await start();
+      setRunId(id);
+      setAgentRunEvents(await api.listAgentRunEvents(selected!.id, id));
+    } catch (error) {
+      setAgentNotice(error instanceof Error ? error.message : String(error));
+    }
+  }
   if (loading) return <div className="desktop-loading">OmicsOps</div>;
   const settings = settingsOpen ? <SettingsPanel locale={locale} onClose={() => setSettingsOpen(false)} modelProfiles={modelProfiles} skillPackages={skillPackages} connections={connections} selectedProject={selected} onSaveConnection={async (profile, secret) => { await api.saveConnection(profile, secret); setConnections(await api.listConnections()); }} onTestConnection={api.testConnection} onConfirmHostKey={async (profileId, fingerprint) => { await api.confirmHostKey(profileId, fingerprint); setConnections(await api.listConnections()); }} onBindProjectRemote={async (connectionId, remoteRoot) => { if (!selected) return; const updated = await api.updateProjectRemote(selected.id, connectionId, remoteRoot); setSelected(updated); setProjects((current) => current.map((project) => project.id === updated.id ? updated : project)); }} onSaveModel={async (request) => { const profile = await api.saveModelProfile(request); setModelProfiles((current) => [profile, ...current.filter((item) => item.id !== profile.id)]); setActiveModelProfileId(profile.id); }} onProbeModel={api.probeModelProfile} onListModels={api.listModelProfileModels} onImportSkill={async () => { const sourcePath = await api.chooseSkillDirectory(); if (!sourcePath) return; const skill = await api.importSkillDirectory(sourcePath); setSkillPackages((current) => [skill, ...current.filter((item) => item.id !== skill.id)]); }} onSetSkillEnabled={async (skillId, enabled) => { const updated = await api.setSkillEnabled(skillId, enabled); setSkillPackages(await api.listSkillPackages()); return updated; }} /> : null;
   if (!selected) return <><ProjectLibrary projects={projects} connections={connections} locale={locale} onLocaleChange={setLocale} onSettings={() => setSettingsOpen(true)} onOpen={setSelected} onChooseLocalRoot={api.chooseProjectDirectory} onCreate={async ({ template, name, localRoot, connectionId, remoteRoot }) => { const project = await api.createProject({ name, description: "", local_root: localRoot, template, connection_id: connectionId, remote_root: remoteRoot }); setProjects((current) => [project, ...current]); setSelected(project); }} />{settings}</>;
@@ -214,6 +227,7 @@ export default function DesktopApp() {
     locale={locale} onLocaleChange={setLocale} onOpenSettings={() => setSettingsOpen(true)} onBackToProjects={() => setSelected(null)}
     messages={messages} streamingAssistant={streamingAssistant} agentBusy={agentBusy} agentNotice={agentNotice} agentRetryNotice={agentRetryNotice} modelLabel={activeModel?.label}
     planProposal={planProposal} planLoading={planLoading} planApproved={planApproved} canStartRun={Boolean(selected.connection_id && approvedPlanId)} runStarted={Boolean(runId)} agentRunEvents={agentRunEvents}
+    runStopping={runStopping}
     remoteFiles={remoteFiles} filesBusy={filesBusy} fileNotice={fileNotice}
     kernelSessions={kernelSessions} kernelEvents={kernelEvents} kernelBusy={kernelBusy} kernelNotice={kernelNotice}
     onStartKernel={selected.connection_id && selected.remote_root ? startKernel : undefined}
@@ -271,11 +285,22 @@ export default function DesktopApp() {
         const approved = await api.approvePlanV2(planProposal.plan, planProposal.plan.policy);
         setApprovedPlanId(approved.id);
         setPlanApproved(true);
-        if (selected.connection_id) { setAgentRunEvents([]); setRunId(await api.startRunV2(selected.connection_id, selected.id, approved.id)); }
+        if (selected.connection_id) await attachRun(() => api.startRunV2(selected.connection_id!, selected.id, approved.id));
       } catch (error) {
         setAgentNotice(error instanceof Error ? error.message : String(error));
       }
     }}
-    onStartRun={selected.connection_id ? async () => { if (!approvedPlanId) return; setAgentRunEvents([]); setRunId(await api.startRunV2(selected.connection_id!, selected.id, approvedPlanId)); } : undefined}
+    onStartRun={selected.connection_id ? async () => { if (!approvedPlanId) return; await attachRun(() => api.startRunV2(selected.connection_id!, selected.id, approvedPlanId)); } : undefined}
+    onCancelRun={runId ? async () => {
+      setRunStopping(true);
+      setAgentNotice("");
+      try {
+        await api.cancelRun(runId);
+        setAgentRunEvents(await api.listAgentRunEvents(selected.id, runId));
+      } catch (error) {
+        setAgentNotice(error instanceof Error ? error.message : String(error));
+        setRunStopping(false);
+      }
+    } : undefined}
   />{settings}</>;
 }

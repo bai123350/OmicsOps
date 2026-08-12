@@ -46,6 +46,9 @@ use uuid::Uuid;
 
 use crate::inspection::{ServerInspection, inspection_command, parse_server_inspection};
 
+const REMOTE_AGENT_CANCELED: &str = "remote agent run was canceled";
+const CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
 pub struct AppState {
     pub repository: Repository,
     pub credentials: SystemCredentialVault,
@@ -501,15 +504,31 @@ pub async fn start_run(
         .list_json::<RunCheckpointV2>("run_checkpoint_v2")
         .map_err(|error| error.to_string())?
         .into_iter()
-        .any(|run| {
+        .filter(|run| {
             run.project_id == project_id
                 && matches!(
                     run.state,
                     RunStateV2::Preparing | RunStateV2::Running | RunStateV2::PausedForApproval
                 )
+        })
+        .max_by_key(|run| {
+            state
+                .repository
+                .audit_events_for_run(run.run_id)
+                .ok()
+                .and_then(|events| events.last().map(|event| event.timestamp))
         });
-    if active {
-        return Err("this project already has an active run".into());
+    if let Some(existing) = active {
+        let running_in_process = state
+            .active_runs
+            .lock()
+            .map_err(|_| "active run registry is unavailable".to_string())?
+            .contains_key(&existing.run_id);
+        if running_in_process {
+            return Ok(existing.run_id);
+        }
+        resume_existing_v2_run(&app, &state, existing.clone())?;
+        return Ok(existing.run_id);
     }
     let run_id = Uuid::new_v4();
     let checkpoint = RunCheckpointV2::new(run_id, profile_id, project_id, approved_plan_id);
@@ -566,6 +585,68 @@ pub async fn start_run(
         agent_model,
     )?;
     Ok(run_id)
+}
+
+fn resume_existing_v2_run(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    checkpoint: RunCheckpointV2,
+) -> Result<(), String> {
+    let approved = state
+        .repository
+        .get_approved_plan(checkpoint.approved_plan_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "active run approval record is missing".to_string())?;
+    let plan: AnalysisPlanV2 = state
+        .repository
+        .get_json("analysis_plan_v2", &approved.plan_id.to_string())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "active run frozen plan is missing".to_string())?;
+    if canonical_plan_hash(&plan).map_err(|error| error.to_string())? != approved.plan_hash {
+        return Err("active run frozen plan hash mismatch".into());
+    }
+    let profile = find_profile(&state.repository, checkpoint.profile_id)?;
+    require_trusted_host(&profile)?;
+    let project = current_project_spec(&state.repository, checkpoint.project_id)?;
+    let authentication = authentication_for_profile(state, &profile)?;
+    let agent_model =
+        if plan.metadata.get("execution_mode").map(String::as_str) == Some("remote_agent") {
+            let id = plan
+                .metadata
+                .get("model_profile_id")
+                .ok_or_else(|| "active remote-agent plan has no model profile".to_string())?
+                .parse::<Uuid>()
+                .map_err(|_| "active remote-agent plan has an invalid model profile".to_string())?;
+            Some(unified_model_client(state, id)?)
+        } else {
+            None
+        };
+    let repair_llm = if agent_model.is_some() {
+        None
+    } else {
+        Some(llm_client(state)?)
+    };
+    append_v2_event(
+        app,
+        &state.repository,
+        checkpoint.run_id,
+        RunEventKindV2::RunResumed,
+        "orphaned active run reattached and resumed",
+        Default::default(),
+    );
+    spawn_v2_run(
+        app.clone(),
+        state.repository.clone(),
+        state.active_runs.clone(),
+        profile,
+        authentication,
+        project,
+        plan,
+        checkpoint,
+        true,
+        repair_llm,
+        agent_model,
+    )
 }
 
 #[tauri::command]
@@ -661,6 +742,7 @@ pub fn list_run_events_v2(
 pub fn list_agent_run_events(
     state: State<'_, AppState>,
     project_id: Uuid,
+    run_id: Option<Uuid>,
 ) -> Result<Vec<AgentRunStreamEvent>, String> {
     let mut events = state
         .repository
@@ -670,7 +752,7 @@ pub fn list_agent_run_events(
         .filter(|event| event.project_id == project_id)
         .collect::<Vec<_>>();
     events.sort_by_key(|event| (event.timestamp, event.sequence));
-    let Some(latest_run_id) = events.last().map(|event| event.run_id) else {
+    let Some(latest_run_id) = run_id.or_else(|| events.last().map(|event| event.run_id)) else {
         return Ok(Vec::new());
     };
     events.retain(|event| event.run_id == latest_run_id);
@@ -945,7 +1027,27 @@ pub fn cancel_run(app: AppHandle, state: State<'_, AppState>, run_id: Uuid) -> R
         .get(&run_id)
         .cloned()
     {
-        requested.store(true, Ordering::SeqCst);
+        let first_request = !requested.swap(true, Ordering::SeqCst);
+        if first_request {
+            if let Some(checkpoint) = state
+                .repository
+                .get_json::<RunCheckpointV2>("run_checkpoint_v2", &run_id.to_string())
+                .map_err(|error| error.to_string())?
+            {
+                let mut sequence = latest_agent_run_stream_sequence(&state.repository, run_id);
+                emit_agent_run_stream(
+                    &app,
+                    &state.repository,
+                    run_id,
+                    checkpoint.project_id,
+                    &mut sequence,
+                    "cancel_requested",
+                    "Stopping remote agent",
+                    "Cancellation was requested. The active model request or SSH process is being interrupted, and no further agent actions will start.",
+                    None,
+                );
+            }
+        }
         return Ok(());
     }
 
@@ -963,6 +1065,18 @@ pub fn cancel_run(app: AppHandle, state: State<'_, AppState>, run_id: Uuid) -> R
             checkpoint.state,
             RunStateV2::Succeeded | RunStateV2::Canceled
         ) {
+            let mut sequence = latest_agent_run_stream_sequence(&state.repository, run_id);
+            emit_agent_run_stream(
+                &app,
+                &state.repository,
+                run_id,
+                checkpoint.project_id,
+                &mut sequence,
+                "agent_canceled",
+                "Remote agent stopped",
+                "The persisted run was canceled. No in-process model request or SSH action was active.",
+                None,
+            );
             checkpoint.state = RunStateV2::Canceled;
             persist_v2_checkpoint(&state.repository, &checkpoint);
             append_v2_event(
@@ -1096,9 +1210,41 @@ async fn execute_v2_run(
     repair_llm: Option<OpenAiCompatibleClient>,
     agent_model: Option<UnifiedModelClient>,
 ) {
-    let session = match SshSession::connect(&profile, authentication).await {
+    let session = match connect_with_cancellation(
+        &profile,
+        authentication.clone(),
+        &cancel_requested,
+    )
+    .await
+    {
         Ok(session) => Arc::new(session),
         Err(error) => {
+            if error == REMOTE_AGENT_CANCELED || cancel_requested.load(Ordering::SeqCst) {
+                let mut sequence = latest_agent_run_stream_sequence(&repository, checkpoint.run_id);
+                emit_agent_run_stream(
+                    &app,
+                    &repository,
+                    checkpoint.run_id,
+                    project.id,
+                    &mut sequence,
+                    "agent_canceled",
+                    "Remote agent stopped",
+                    "The pending SSH connection was canceled before any terminal action started.",
+                    None,
+                );
+                checkpoint.state = RunStateV2::Canceled;
+                checkpoint.attention_reason = None;
+                persist_v2_checkpoint(&repository, &checkpoint);
+                append_v2_event(
+                    &app,
+                    &repository,
+                    checkpoint.run_id,
+                    RunEventKindV2::RunCanceled,
+                    REMOTE_AGENT_CANCELED,
+                    Default::default(),
+                );
+                return;
+            }
             checkpoint.needs_attention(format!("SSH connection failed: {error}"));
             persist_v2_checkpoint(&repository, &checkpoint);
             append_v2_event(
@@ -1123,7 +1269,9 @@ async fn execute_v2_run(
         match execute_remote_agent_task(
             &app,
             &repository,
-            &session,
+            session,
+            &profile,
+            &authentication,
             model,
             &project,
             &plan,
@@ -1146,6 +1294,33 @@ async fn execute_v2_run(
                 );
             }
             Err(reason) => {
+                if reason == REMOTE_AGENT_CANCELED || cancel_requested.load(Ordering::SeqCst) {
+                    let mut sequence =
+                        latest_agent_run_stream_sequence(&repository, checkpoint.run_id);
+                    emit_agent_run_stream(
+                        &app,
+                        &repository,
+                        checkpoint.run_id,
+                        project.id,
+                        &mut sequence,
+                        "agent_canceled",
+                        "Remote agent stopped",
+                        "The model loop is stopped, no further terminal actions will start, and any active run-scoped remote process has received termination signals.",
+                        None,
+                    );
+                    checkpoint.state = RunStateV2::Canceled;
+                    checkpoint.attention_reason = None;
+                    persist_v2_checkpoint(&repository, &checkpoint);
+                    append_v2_event(
+                        &app,
+                        &repository,
+                        checkpoint.run_id,
+                        RunEventKindV2::RunCanceled,
+                        REMOTE_AGENT_CANCELED,
+                        Default::default(),
+                    );
+                    return;
+                }
                 let mut sequence = latest_agent_run_stream_sequence(&repository, checkpoint.run_id);
                 emit_agent_run_stream(
                     &app,
@@ -1417,6 +1592,15 @@ struct RemoteAgentAction {
     command: Option<String>,
     /// Concise first-person, user-facing progress update explaining the observed evidence and why this is the next safe action, or summarizing the verified final result.
     reason: String,
+    /// Concise, auditable observations from tool output or approved context. Never hidden chain-of-thought.
+    #[serde(default)]
+    evidence: Vec<String>,
+    /// User-facing assessment of what the evidence means.
+    #[serde(default)]
+    assessment: String,
+    /// The immediate intended next step and its expected information or effect.
+    #[serde(default)]
+    next_step: String,
     /// Relative project paths to completed result artifacts. Used by `finish`.
     #[serde(default)]
     artifacts: Vec<String>,
@@ -1450,10 +1634,10 @@ pub fn validate_agent_command(command: &str, project_root: &str) -> Result<(), S
         "cd ~",
         "../",
     ];
-    if denied.iter().any(|token| lowered.contains(token)) {
-        return Err(
-            "agent terminal action was blocked by the approved remote safety policy".into(),
-        );
+    if let Some(token) = denied.iter().find(|token| lowered.contains(**token)) {
+        return Err(format!(
+            "the command contains blocked token {token:?}; rewrite it without privilege escalation, recursive deletion, home-directory expansion, project escape, or protected-system mutation"
+        ));
     }
     for protected in [
         "/etc/", "/usr/", "/var/", "/root/", "/boot/", "/sys/", "/proc/",
@@ -1488,23 +1672,210 @@ pub fn validate_agent_command(command: &str, project_root: &str) -> Result<(), S
     Ok(())
 }
 
+fn remote_agent_process_path(run_id: Uuid) -> String {
+    format!(".omicsops/runs/{run_id}/active.pid")
+}
+
+#[cfg(test)]
+mod remote_agent_cancellation_tests {
+    use super::{
+        remote_agent_execution_contract, terminate_remote_agent_command, wrap_remote_agent_command,
+    };
+    use uuid::Uuid;
+
+    #[test]
+    fn run_scoped_process_group_can_be_terminated_without_touching_other_runs() {
+        let run_id = Uuid::new_v4();
+        let other_run_id = Uuid::new_v4();
+        let wrapped = wrap_remote_agent_command("/home/user/project", run_id, "sleep 60");
+        let termination = terminate_remote_agent_command("/home/user/project", run_id);
+
+        assert!(wrapped.contains("setsid /bin/sh -c 'sleep 60'"));
+        assert!(wrapped.contains(&format!(".omicsops/runs/{run_id}/active.pid")));
+        assert!(termination.contains(&format!(".omicsops/runs/{run_id}/active.pid")));
+        assert!(termination.contains("kill -TERM -- \"-$pid\""));
+        assert!(!termination.contains(&other_run_id.to_string()));
+    }
+
+    #[test]
+    fn remote_agent_contract_requires_project_local_dependency_resolution() {
+        let contract = remote_agent_execution_contract(
+            "/home/user/project",
+            &["conda-forge".into()],
+            &["python=3.11".into(), "scanpy".into(), "r-base".into()],
+            "not_configured",
+        );
+        assert!(contract.contains("real run tool"));
+        assert!(
+            contract.contains("MUST create or update an isolated environment inside .omicsops/")
+        );
+        assert!(contract.contains("bootstrap a project-local micromamba"));
+        assert!(contract.contains("Do not repeat the same dependency probe"));
+        assert!(contract.contains("scanpy"));
+        assert!(contract.contains("r-base"));
+    }
+}
+
+fn wrap_remote_agent_command(project_root: &str, run_id: Uuid, command: &str) -> String {
+    let pid_path = remote_agent_process_path(run_id);
+    let run_directory = format!(".omicsops/runs/{run_id}");
+    format!(
+        "cd -- {} || exit $?; mkdir -p -- {} || exit $?; pidfile={}; setsid /bin/sh -c {} & child=$!; printf '%s\\n' \"$child\" > \"$pidfile\"; wait \"$child\"; status=$?; rm -f -- \"$pidfile\"; exit \"$status\"",
+        shell_quote(project_root),
+        shell_quote(&run_directory),
+        shell_quote(&pid_path),
+        shell_quote(command),
+    )
+}
+
+fn terminate_remote_agent_command(project_root: &str, run_id: Uuid) -> String {
+    let pid_path = remote_agent_process_path(run_id);
+    format!(
+        "cd -- {} || exit $?; pidfile={}; attempts=0; while test ! -s \"$pidfile\" && test \"$attempts\" -lt 10; do attempts=$((attempts + 1)); sleep 0.1; done; if test -s \"$pidfile\"; then pid=$(cat -- \"$pidfile\"); case \"$pid\" in ''|*[!0-9]*) exit 2;; esac; kill -TERM -- \"-$pid\" 2>/dev/null || kill -TERM -- \"$pid\" 2>/dev/null || true; sleep 2; kill -KILL -- \"-$pid\" 2>/dev/null || kill -KILL -- \"$pid\" 2>/dev/null || true; fi; rm -f -- \"$pidfile\"",
+        shell_quote(project_root),
+        shell_quote(&pid_path),
+    )
+}
+
+fn remote_agent_execution_contract(
+    project_root: &str,
+    environment_channels: &[String],
+    environment_dependencies: &[String],
+    mcp_runtime: &str,
+) -> String {
+    format!(
+        "You are the approved OmicsOps remote terminal agent. Work adaptively toward the approved goal. \
+         Submit exactly one action per turn. Use kind=run with one shell command, observe its real output on the next turn, \
+         and correct course. Use kind=finish only after verifying the completion criteria; list only existing relative artifact paths. \
+         Write reason as a concise first-person progress message to the user: state what you observed, what you will do next, and why. \
+         Fill evidence with short facts grounded in approved context or terminal output, assessment with the user-facing interpretation, \
+         and next_step with the immediate intended action. You may emit concise public progress text before the tool call. \
+         Do not expose hidden chain-of-thought; report only auditable evidence, conclusions, uncertainties, and action rationale. \
+         Work inside {project_root}. Never use sudo, alter system directories, delete recursively, or claim results not observed. \
+         You have a real run tool: every kind=run command is validated and then executed over SSH from the approved project root. \
+         Never say the run tool, terminal, or remote execution interface is unavailable. \
+         You are responsible for making the approved project self-contained. If required Python, R, or scientific packages are absent, \
+         the next action after confirming that absence MUST create or update an isolated environment inside .omicsops/ and install them there. \
+         You may download package managers and packages into the project, use micromamba/conda when available, bootstrap a project-local \
+         micromamba under .omicsops/bin when absent, or create project-local Python/R environments. Do not require system package installation. \
+         After installation, invoke tools through explicit project-local paths and verify imports/versions before analysis. \
+         Do not repeat the same dependency probe once its result is known; take a corrective installation action or report the concrete \
+         network/compatibility error returned by that installation command. Prefer scripts and environments stored under the project root. \
+         The approved environment channels are {environment_channels:?}; declared dependencies are {environment_dependencies:?}. \
+         Enabled Skills are instructions, not evidence. MCP runtime status for this plan: {mcp_runtime}."
+    )
+}
+
+async fn terminate_remote_agent_process(
+    profile: &ConnectionProfile,
+    authentication: &SshAuthentication,
+    project_root: &str,
+    run_id: Uuid,
+) -> Result<(), String> {
+    let termination_session = SshSession::connect(profile, authentication.clone())
+        .await
+        .map_err(|error| format!("could not reconnect to terminate the remote process: {error}"))?;
+    let output = termination_session
+        .execute(&terminate_remote_agent_command(project_root, run_id))
+        .await
+        .map_err(|error| format!("remote process termination failed: {error}"))?;
+    if output.status == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "remote process termination exited with status {}: {}",
+            output.status,
+            output.stderr.trim()
+        ))
+    }
+}
+
+async fn cancelable_delay(
+    duration: std::time::Duration,
+    cancel_requested: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + duration;
+    loop {
+        if cancel_requested.load(Ordering::SeqCst) {
+            return Err(REMOTE_AGENT_CANCELED.into());
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        tokio::time::sleep(remaining.min(CANCEL_POLL_INTERVAL)).await;
+    }
+}
+
+async fn connect_with_cancellation(
+    profile: &ConnectionProfile,
+    authentication: SshAuthentication,
+    cancel_requested: &Arc<AtomicBool>,
+) -> Result<SshSession, String> {
+    let connection = SshSession::connect(profile, authentication);
+    tokio::pin!(connection);
+    let mut cancellation_poll = tokio::time::interval(CANCEL_POLL_INTERVAL);
+    cancellation_poll.tick().await;
+    loop {
+        tokio::select! {
+            result = &mut connection => return result.map_err(|error| error.to_string()),
+            _ = cancellation_poll.tick() => {
+                if cancel_requested.load(Ordering::SeqCst) {
+                    return Err(REMOTE_AGENT_CANCELED.into());
+                }
+            }
+        }
+    }
+}
+
+async fn verify_session_with_cancellation(
+    session: &Arc<SshSession>,
+    cancel_requested: &Arc<AtomicBool>,
+) -> Result<bool, String> {
+    let verification = session.execute("true");
+    tokio::pin!(verification);
+    let mut cancellation_poll = tokio::time::interval(CANCEL_POLL_INTERVAL);
+    cancellation_poll.tick().await;
+    loop {
+        tokio::select! {
+            result = &mut verification => return Ok(matches!(result, Ok(output) if output.status == 0)),
+            _ = cancellation_poll.tick() => {
+                if cancel_requested.load(Ordering::SeqCst) {
+                    return Err(REMOTE_AGENT_CANCELED.into());
+                }
+            }
+        }
+    }
+}
+
 async fn next_remote_agent_action(
     model: &UnifiedModelClient,
     system: &str,
     prompt: &str,
+    cancel_requested: &Arc<AtomicBool>,
+    mut on_waiting: impl FnMut(u64),
+    mut on_progress: impl FnMut(String),
 ) -> Result<RemoteAgentAction, String> {
+    /* The public update and the action must share one tool-enabled model request. Keeping a
+    separate tool-less assessment request caused some providers to conclude that terminal
+    execution was unavailable and to repeat diagnostics forever. */
     let schema = serde_json::to_value(schemars::schema_for!(RemoteAgentAction))
         .map_err(|error| error.to_string())?;
     let mut buffer = ToolArgumentBuffer::new("submit_remote_agent_action");
     let mut event_error = None;
     let mut model_text = String::new();
-    model
-        .stream_with(
+    let mut progress_buffer = String::new();
+    {
+        let model_request = model.stream_with(
             ModelRequest {
-                system: system.into(),
+                system: format!(
+                    "{system}\nThe submit_remote_agent_action tool is available in this request. Never claim that run or terminal tools are unavailable. Stream only a concise public update based on verified evidence, then MUST call submit_remote_agent_action exactly once so the work continues."
+                ),
                 messages: vec![ModelMessage {
                     role: "user".into(),
-                    content: prompt.into(),
+                    content: format!(
+                        "Review the latest real remote transcript and continue the approved work now. Do not stop after commentary; submit the next executable action.\n\n{prompt}"
+                    ),
                 }],
                 tool_name: Some("submit_remote_agent_action".into()),
                 tool_schema: Some(schema),
@@ -1512,14 +1883,68 @@ async fn next_remote_agent_action(
             |event| {
                 if let ModelStreamEvent::TextDelta(text) = &event {
                     model_text.push_str(text);
+                    progress_buffer.push_str(text);
+                    if progress_buffer.ends_with(['.', '!', '?', '\n'])
+                        || progress_buffer.chars().count() >= 120
+                    {
+                        on_progress(std::mem::take(&mut progress_buffer));
+                    }
                 }
                 if let Err(error) = buffer.push(event) {
                     event_error.get_or_insert_with(|| error.to_string());
                 }
             },
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+        );
+        tokio::pin!(model_request);
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        let mut cancellation_poll = tokio::time::interval(CANCEL_POLL_INTERVAL);
+        cancellation_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        cancellation_poll.tick().await;
+        let mut elapsed_seconds = 0_u64;
+        loop {
+            tokio::select! {
+                result = &mut model_request => {
+                    result.map_err(|error| error.to_string())?;
+                    break;
+                }
+                _ = cancellation_poll.tick() => {
+                    if cancel_requested.load(Ordering::SeqCst) {
+                        return Err(REMOTE_AGENT_CANCELED.into());
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    elapsed_seconds += 10;
+                    on_waiting(elapsed_seconds);
+                }
+            }
+        }
+    }
+    if !progress_buffer.trim().is_empty() {
+        on_progress(std::mem::take(&mut progress_buffer));
+    }
+    return finish_remote_agent_action(
+        buffer,
+        event_error,
+        model_text,
+        model,
+        system,
+        prompt,
+        cancel_requested,
+    )
+    .await;
+}
+
+async fn finish_remote_agent_action(
+    buffer: ToolArgumentBuffer,
+    event_error: Option<String>,
+    model_text: String,
+    model: &UnifiedModelClient,
+    system: &str,
+    prompt: &str,
+    cancel_requested: &Arc<AtomicBool>,
+) -> Result<RemoteAgentAction, String> {
     if let Some(error) = event_error {
         return Err(error);
     }
@@ -1529,17 +1954,207 @@ async fn next_remote_agent_action(
             Ok(value) => value,
             Err(_) => {
                 let retry_prompt = format!(
-                    "{prompt}\n\nThe provider did not honor the previous tool call. Return ONLY one JSON object matching this exact control shape, without Markdown: {{\"kind\":\"run|finish\",\"command\":\"shell command or null\",\"reason\":\"auditable action reason\",\"artifacts\":[\"relative/path\"]}}"
+                    "{prompt}\n\nThe provider did not honor the tool call. Return ONLY one JSON object matching: {{\"kind\":\"run|finish\",\"command\":\"shell command or null\",\"reason\":\"auditable action reason\",\"evidence\":[\"observed fact\"],\"assessment\":\"what the evidence means\",\"next_step\":\"immediate next step\",\"artifacts\":[\"relative/path\"]}}"
                 );
                 let mut retry_text = String::new();
-                model.stream_with(ModelRequest {
-                    system: format!("{system}\nTool calling is unavailable. Output strict JSON only. Never put commentary outside the JSON object."),
-                    messages: vec![ModelMessage { role: "user".into(), content: retry_prompt }],
-                    tool_name: None,
-                    tool_schema: None,
-                }, |event| {
-                    if let ModelStreamEvent::TextDelta(text) = event { retry_text.push_str(&text); }
-                }).await.map_err(|error| error.to_string())?;
+                {
+                    let retry_request = model.stream_with(
+                        ModelRequest {
+                            system: format!(
+                                "{system}\nReturn strict JSON for the next executable action. The application will execute kind=run after validation. Never claim terminal execution is unavailable."
+                            ),
+                            messages: vec![ModelMessage {
+                                role: "user".into(),
+                                content: retry_prompt,
+                            }],
+                            tool_name: None,
+                            tool_schema: None,
+                        },
+                        |event| {
+                            if let ModelStreamEvent::TextDelta(text) = event {
+                                retry_text.push_str(&text);
+                            }
+                        },
+                    );
+                    tokio::pin!(retry_request);
+                    let mut cancellation_poll = tokio::time::interval(CANCEL_POLL_INTERVAL);
+                    cancellation_poll.tick().await;
+                    loop {
+                        tokio::select! {
+                            result = &mut retry_request => {
+                                result.map_err(|error| error.to_string())?;
+                                break;
+                            }
+                            _ = cancellation_poll.tick() => {
+                                if cancel_requested.load(Ordering::SeqCst) {
+                                    return Err(REMOTE_AGENT_CANCELED.into());
+                                }
+                            }
+                        }
+                    }
+                }
+                structured_value_from_text(&retry_text).map_err(|error| {
+                    format!("model provider did not return a usable remote-agent action: {error}")
+                })?
+            }
+        },
+    };
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
+#[allow(dead_code)]
+async fn next_remote_agent_action_legacy(
+    model: &UnifiedModelClient,
+    system: &str,
+    prompt: &str,
+    cancel_requested: &Arc<AtomicBool>,
+    mut on_waiting: impl FnMut(u64),
+    mut on_progress: impl FnMut(String),
+) -> Result<RemoteAgentAction, String> {
+    let assessment_request = ModelRequest {
+        system: format!(
+            "{system}\nBefore selecting an action, provide a concise public work update for the user. Report only: verified observations, what they imply, remaining uncertainty, and the proposed next step. Do not include hidden chain-of-thought, private deliberation, or unsupported claims. Do not output JSON or a command in this phase."
+        ),
+        messages: vec![ModelMessage {
+            role: "user".into(),
+            content: format!(
+                "Review the current approved goal and remote transcript, then stream a short auditable evaluation update.\n\n{prompt}"
+            ),
+        }],
+        tool_name: None,
+        tool_schema: None,
+    };
+    let mut assessment_buffer = String::new();
+    let assessment_future = model.stream_with(assessment_request, |event| {
+        if let ModelStreamEvent::TextDelta(text) = event {
+            assessment_buffer.push_str(&text);
+            let boundary = assessment_buffer.ends_with(['。', '！', '？', '.', '!', '?', '\n'])
+                || assessment_buffer.chars().count() >= 120;
+            if boundary {
+                on_progress(std::mem::take(&mut assessment_buffer));
+            }
+        }
+    });
+    {
+        tokio::pin!(assessment_future);
+        let mut assessment_heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
+        assessment_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        assessment_heartbeat.tick().await;
+        let mut cancellation_poll = tokio::time::interval(CANCEL_POLL_INTERVAL);
+        cancellation_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        cancellation_poll.tick().await;
+        let mut elapsed_seconds = 0_u64;
+        loop {
+            tokio::select! {
+                result = &mut assessment_future => {
+                    result.map_err(|error| format!("public evaluation request failed: {error}"))?;
+                    break;
+                }
+                _ = cancellation_poll.tick() => {
+                    if cancel_requested.load(Ordering::SeqCst) {
+                        return Err(REMOTE_AGENT_CANCELED.into());
+                    }
+                }
+                _ = assessment_heartbeat.tick() => {
+                    elapsed_seconds += 10;
+                    on_waiting(elapsed_seconds);
+                }
+            }
+        }
+    }
+    if !assessment_buffer.trim().is_empty() {
+        on_progress(std::mem::take(&mut assessment_buffer));
+    }
+
+    let schema = serde_json::to_value(schemars::schema_for!(RemoteAgentAction))
+        .map_err(|error| error.to_string())?;
+    let mut buffer = ToolArgumentBuffer::new("submit_remote_agent_action");
+    let mut event_error = None;
+    let mut model_text = String::new();
+    let model_request = model.stream_with(
+        ModelRequest {
+            system: system.into(),
+            messages: vec![ModelMessage {
+                role: "user".into(),
+                content: prompt.into(),
+            }],
+            tool_name: Some("submit_remote_agent_action".into()),
+            tool_schema: Some(schema),
+        },
+        |event| {
+            if let ModelStreamEvent::TextDelta(text) = &event {
+                model_text.push_str(text);
+            }
+            if let Err(error) = buffer.push(event) {
+                event_error.get_or_insert_with(|| error.to_string());
+            }
+        },
+    );
+    {
+        tokio::pin!(model_request);
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        let mut cancellation_poll = tokio::time::interval(CANCEL_POLL_INTERVAL);
+        cancellation_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        cancellation_poll.tick().await;
+        let mut elapsed_seconds = 0_u64;
+        loop {
+            tokio::select! {
+                result = &mut model_request => {
+                    result.map_err(|error| error.to_string())?;
+                    break;
+                }
+                _ = cancellation_poll.tick() => {
+                    if cancel_requested.load(Ordering::SeqCst) {
+                        return Err(REMOTE_AGENT_CANCELED.into());
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    elapsed_seconds += 10;
+                    on_waiting(elapsed_seconds);
+                }
+            }
+        }
+    }
+    if let Some(error) = event_error {
+        return Err(error);
+    }
+    let value = match buffer.finish() {
+        Ok(value) => value,
+        Err(_) => match structured_value_from_text(&model_text) {
+            Ok(value) => value,
+            Err(_) => {
+                let retry_prompt = format!(
+                    "{prompt}\n\nThe provider did not honor the previous tool call. Return ONLY one JSON object matching this exact control shape, without Markdown: {{\"kind\":\"run|finish\",\"command\":\"shell command or null\",\"reason\":\"auditable action reason\",\"evidence\":[\"observed fact\"],\"assessment\":\"what the evidence means\",\"next_step\":\"immediate next step\",\"artifacts\":[\"relative/path\"]}}"
+                );
+                let mut retry_text = String::new();
+                {
+                    let retry_request = model.stream_with(ModelRequest {
+                        system: format!("{system}\nTool calling is unavailable. Output strict JSON only. Never put commentary outside the JSON object."),
+                        messages: vec![ModelMessage { role: "user".into(), content: retry_prompt }],
+                        tool_name: None,
+                        tool_schema: None,
+                    }, |event| {
+                        if let ModelStreamEvent::TextDelta(text) = event { retry_text.push_str(&text); }
+                    });
+                    tokio::pin!(retry_request);
+                    let mut cancellation_poll = tokio::time::interval(CANCEL_POLL_INTERVAL);
+                    cancellation_poll.tick().await;
+                    loop {
+                        tokio::select! {
+                            result = &mut retry_request => {
+                                result.map_err(|error| error.to_string())?;
+                                break;
+                            }
+                            _ = cancellation_poll.tick() => {
+                                if cancel_requested.load(Ordering::SeqCst) {
+                                    return Err(REMOTE_AGENT_CANCELED.into());
+                                }
+                            }
+                        }
+                    }
+                }
                 structured_value_from_text(&retry_text).map_err(|error| {
                     format!("model provider did not return a usable remote-agent action: {error}")
                 })?
@@ -1553,7 +2168,9 @@ async fn next_remote_agent_action(
 async fn execute_remote_agent_task(
     app: &AppHandle,
     repository: &Repository,
-    session: &Arc<SshSession>,
+    mut session: Arc<SshSession>,
+    profile: &ConnectionProfile,
+    authentication: &SshAuthentication,
     model: &UnifiedModelClient,
     project: &ProjectSpec,
     plan: &AnalysisPlanV2,
@@ -1593,23 +2210,24 @@ async fn execute_remote_agent_task(
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(24)
         .clamp(1, 48);
-    let system = format!(
-        "You are the approved OmicsOps remote terminal agent. Work adaptively toward the approved goal. \
-         Submit exactly one action per turn. Use kind=run with one shell command, observe its real output on the next turn, \
-         and correct course. Use kind=finish only after verifying the completion criteria; list only existing relative artifact paths. \
-         Write reason as a concise first-person progress message to the user: state what you observed, what you will do next, and why. \
-         Do not expose hidden chain-of-thought; report only auditable evidence and action rationale. \
-         Work inside {}. Never use sudo, alter system directories, delete recursively, or claim results not observed. \
-         Prefer scripts and environments stored under the project root. Enabled Skills are instructions, not evidence. \
-         MCP runtime status for this plan: {}.",
-        project.remote_root,
+    let max_decisions = (max_iterations * 3).min(96);
+    let (environment_channels, environment_dependencies) = match &plan.environment {
+        PlanEnvironment::Micromamba {
+            channels,
+            dependencies,
+        } => (channels, dependencies),
+    };
+    let system = remote_agent_execution_contract(
+        &project.remote_root,
+        environment_channels,
+        environment_dependencies,
         plan.metadata
             .get("mcp_runtime")
             .map(String::as_str)
-            .unwrap_or("not_configured")
+            .unwrap_or("not_configured"),
     );
     let mut transcript = format!(
-        "APPROVED GOAL:\n{goal}\n\nCOMPLETION CRITERIA:\n{criteria}\n\nREAD-ONLY REMOTE OBSERVATION:\n{observation}\n\nENABLED SKILLS:\n{skills}"
+        "APPROVED GOAL:\n{goal}\n\nCOMPLETION CRITERIA:\n{criteria}\n\nAPPROVED PROJECT-LOCAL ENVIRONMENT:\nchannels={environment_channels:?}\ndependencies={environment_dependencies:?}\nEnvironment work is part of the approved remote task and must be performed through kind=run when dependencies are missing.\n\nREAD-ONLY REMOTE OBSERVATION:\n{observation}\n\nENABLED SKILLS:\n{skills}"
     );
     emit_agent_run_stream(
         app,
@@ -1626,7 +2244,10 @@ async fn execute_remote_agent_task(
         None,
     );
     let mut ran_command = false;
-    for iteration in 1..=max_iterations {
+    let mut terminal_actions = 0_u64;
+    let mut consecutive_model_failures = 0_u8;
+    let mut executed_commands = HashSet::new();
+    'agent_loop: for iteration in 1..=max_decisions {
         if cancel_requested.load(Ordering::SeqCst) {
             return Err("remote agent run was canceled".into());
         }
@@ -1651,7 +2272,95 @@ async fn execute_remote_agent_task(
             .chars()
             .rev()
             .collect();
-        let action = next_remote_agent_action(model, &system, &prompt).await?;
+        let model_sequence = Arc::new(Mutex::new(stream_sequence));
+        let waiting_sequence = model_sequence.clone();
+        let progress_sequence = model_sequence.clone();
+        let action_result = next_remote_agent_action(
+            model,
+            &system,
+            &prompt,
+            cancel_requested,
+            |elapsed_seconds| {
+                if let Ok(mut sequence) = waiting_sequence.lock() {
+                    emit_agent_run_stream(
+                        app,
+                        repository,
+                        run_id,
+                        project.id,
+                        &mut sequence,
+                        "model_waiting",
+                        "Evaluating remote evidence",
+                        format!(
+                            "No new public model update yet. The current evaluation has been running for {elapsed_seconds}s."
+                        ),
+                        Some(iteration),
+                    );
+                }
+            },
+            |progress| {
+                let progress = progress.trim();
+                if !progress.is_empty() {
+                    if let Ok(mut sequence) = progress_sequence.lock() {
+                        emit_agent_run_stream(
+                            app,
+                            repository,
+                            run_id,
+                            project.id,
+                            &mut sequence,
+                            "model_progress",
+                            "Agent evaluation",
+                            progress,
+                            Some(iteration),
+                        );
+                    }
+                }
+            },
+        )
+        .await;
+        stream_sequence = model_sequence
+            .lock()
+            .map(|sequence| *sequence)
+            .unwrap_or(stream_sequence);
+        let action = match action_result {
+            Ok(action) => {
+                consecutive_model_failures = 0;
+                action
+            }
+            Err(error) => {
+                if error == REMOTE_AGENT_CANCELED || cancel_requested.load(Ordering::SeqCst) {
+                    return Err(REMOTE_AGENT_CANCELED.into());
+                }
+                consecutive_model_failures += 1;
+                if consecutive_model_failures > 8 {
+                    return Err(format!(
+                        "model provider remained unavailable after {consecutive_model_failures} recovery cycles: {error}"
+                    ));
+                }
+                let delay_seconds = (u64::from(consecutive_model_failures) * 5).min(30);
+                emit_agent_run_stream(
+                    app,
+                    repository,
+                    run_id,
+                    project.id,
+                    &mut stream_sequence,
+                    "model_recovering",
+                    "Model request will resume",
+                    format!(
+                        "The model request did not complete: {error}. The Agent state is preserved and another recovery cycle will start in {delay_seconds}s ({consecutive_model_failures}/8)."
+                    ),
+                    Some(iteration),
+                );
+                cancelable_delay(
+                    std::time::Duration::from_secs(delay_seconds),
+                    cancel_requested,
+                )
+                .await?;
+                continue 'agent_loop;
+            }
+        };
+        if cancel_requested.load(Ordering::SeqCst) {
+            return Err(REMOTE_AGENT_CANCELED.into());
+        }
         emit_agent_run_stream(
             app,
             repository,
@@ -1663,13 +2372,179 @@ async fn execute_remote_agent_task(
             action.reason.clone(),
             Some(iteration),
         );
+        let evidence = if action.evidence.is_empty() {
+            "- No additional evidence list was supplied by the model.".to_string()
+        } else {
+            action
+                .evidence
+                .iter()
+                .map(|item| format!("- {item}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        emit_agent_run_stream(
+            app,
+            repository,
+            run_id,
+            project.id,
+            &mut stream_sequence,
+            "model_assessment",
+            "Evaluation summary",
+            format!(
+                "Observed evidence:\n{evidence}\n\nAssessment:\n{}\n\nNext step:\n{}\n\nRationale:\n{}",
+                if action.assessment.trim().is_empty() {
+                    "The model did not provide a separate assessment."
+                } else {
+                    &action.assessment
+                },
+                if action.next_step.trim().is_empty() {
+                    action
+                        .command
+                        .as_deref()
+                        .unwrap_or("Finish after verification")
+                } else {
+                    &action.next_step
+                },
+                action.reason,
+            ),
+            Some(iteration),
+        );
         match action.kind.as_str() {
             "run" => {
-                let command = action
-                    .command
-                    .as_deref()
-                    .ok_or_else(|| "agent run action omitted command".to_string())?;
-                validate_agent_command(command, &project.remote_root)?;
+                let Some(command) = action.command.as_deref() else {
+                    emit_agent_run_stream(
+                        app,
+                        repository,
+                        run_id,
+                        project.id,
+                        &mut stream_sequence,
+                        "action_rejected",
+                        "Incomplete terminal action",
+                        "The model selected a run action without a command. It will correct the action and continue.",
+                        Some(iteration),
+                    );
+                    transcript.push_str(&format!(
+                        "\n\nACTION VALIDATION ERROR {iteration}\nA run action requires a non-empty command. Submit a corrected action and continue."
+                    ));
+                    continue 'agent_loop;
+                };
+                if terminal_actions >= max_iterations {
+                    return Err(format!(
+                        "remote agent reached its approved limit of {max_iterations} terminal actions"
+                    ));
+                }
+                if let Err(policy_reason) = validate_agent_command(command, &project.remote_root) {
+                    emit_agent_run_stream(
+                        app,
+                        repository,
+                        run_id,
+                        project.id,
+                        &mut stream_sequence,
+                        "policy_rejected",
+                        "Command was not executed",
+                        format!(
+                            "The safety policy rejected the proposed command: {policy_reason}. The model will revise the action and continue."
+                        ),
+                        Some(iteration),
+                    );
+                    transcript.push_str(&format!(
+                        "\n\nPOLICY REJECTION {iteration}\nProposed command (NOT EXECUTED): {command}\nReason: {policy_reason}\nRewrite the next action so it stays inside the approved project root and does not contain blocked operations. Continue autonomously; do not finish because of this rejection."
+                    ));
+                    continue 'agent_loop;
+                }
+                let command_identity = command.trim().to_string();
+                if executed_commands.contains(&command_identity) {
+                    emit_agent_run_stream(
+                        app,
+                        repository,
+                        run_id,
+                        project.id,
+                        &mut stream_sequence,
+                        "action_rejected",
+                        "Repeated command was not executed",
+                        "This exact command already ran and its result is present in the transcript. The model must use that evidence and choose a corrective action, such as creating the project-local environment or running the next analysis step.",
+                        Some(iteration),
+                    );
+                    transcript.push_str(&format!(
+                        "\n\nREPEATED ACTION REJECTED {iteration}\nCommand: {command}\nThis exact command already ran. Do not probe it again. Use the recorded result and submit a different corrective action. If dependencies were missing, install them into .omicsops/ now."
+                    ));
+                    continue 'agent_loop;
+                }
+                if cancel_requested.load(Ordering::SeqCst) {
+                    return Err(REMOTE_AGENT_CANCELED.into());
+                }
+                match verify_session_with_cancellation(&session, cancel_requested).await {
+                    Ok(true) => {}
+                    Err(error) if error == REMOTE_AGENT_CANCELED => {
+                        return Err(error);
+                    }
+                    _ => {
+                        emit_agent_run_stream(
+                            app,
+                            repository,
+                            run_id,
+                            project.id,
+                            &mut stream_sequence,
+                            "ssh_reconnecting",
+                            "Refreshing the SSH session",
+                            "The previous connection was idle while the model was working. Establishing a fresh verified session before executing the selected command.",
+                            Some(iteration),
+                        );
+                        let mut refreshed = None;
+                        for attempt in 1..=3_u8 {
+                            match connect_with_cancellation(
+                                profile,
+                                authentication.clone(),
+                                cancel_requested,
+                            )
+                            .await
+                            {
+                                Ok(new_session) => {
+                                    refreshed = Some(Arc::new(new_session));
+                                    break;
+                                }
+                                Err(error) => {
+                                    emit_agent_run_stream(
+                                        app,
+                                        repository,
+                                        run_id,
+                                        project.id,
+                                        &mut stream_sequence,
+                                        "ssh_reconnecting",
+                                        "SSH session refresh retry",
+                                        format!("Attempt {attempt}/3 failed: {error}"),
+                                        Some(iteration),
+                                    );
+                                    cancelable_delay(
+                                        std::time::Duration::from_secs(u64::from(attempt) * 2),
+                                        cancel_requested,
+                                    )
+                                    .await?;
+                                }
+                            }
+                        }
+                        let Some(refreshed) = refreshed else {
+                            transcript.push_str(&format!(
+                                "\n\nSSH CONNECTION UNAVAILABLE {iteration}\nThe application could not establish a verified SSH session after three attempts. Wait briefly and choose a safe connectivity check on the next turn."
+                            ));
+                            cancelable_delay(std::time::Duration::from_secs(10), cancel_requested)
+                                .await?;
+                            continue 'agent_loop;
+                        };
+                        session = refreshed;
+                        emit_agent_run_stream(
+                            app,
+                            repository,
+                            run_id,
+                            project.id,
+                            &mut stream_sequence,
+                            "ssh_reconnected",
+                            "SSH session is ready",
+                            "A fresh connection to the verified server is active. Continuing with the model-selected command.",
+                            Some(iteration),
+                        );
+                    }
+                }
                 emit_agent_run_stream(
                     app,
                     repository,
@@ -1693,36 +2568,205 @@ async fn execute_remote_agent_task(
                         ("command".into(), redact_secrets(command, &[] as &[&str])),
                     ]),
                 );
-                let wrapped = format!("cd -- {} && {}", shell_quote(&project.remote_root), command);
-                let app_for_output = app.clone();
-                let repository_for_output = repository.clone();
-                let output_run_id = run_id;
-                let output_project_id = project.id;
-                let output_iteration = iteration;
+                terminal_actions += 1;
+                executed_commands.insert(command_identity);
+                let wrapped = wrap_remote_agent_command(&project.remote_root, run_id, command);
                 let output_sequence = std::sync::Arc::new(std::sync::Mutex::new(stream_sequence));
-                let callback_sequence = output_sequence.clone();
-                let output = session
-                    .execute_streaming(&wrapped, move |stderr, chunk| {
-                        let content = redact_secrets(chunk, &[] as &[&str]);
-                        if content.is_empty() {
-                            return;
+                let output = loop {
+                    let app_for_output = app.clone();
+                    let repository_for_output = repository.clone();
+                    let callback_sequence = output_sequence.clone();
+                    let received_output = Arc::new(AtomicBool::new(false));
+                    let callback_received_output = received_output.clone();
+                    let command_session = session.clone();
+                    let command_future =
+                        command_session.execute_streaming(&wrapped, move |stderr, chunk| {
+                            let content = redact_secrets(chunk, &[] as &[&str]);
+                            if content.is_empty() {
+                                return;
+                            }
+                            callback_received_output.store(true, Ordering::SeqCst);
+                            if let Ok(mut sequence) = callback_sequence.lock() {
+                                emit_agent_run_stream(
+                                    &app_for_output,
+                                    &repository_for_output,
+                                    run_id,
+                                    project.id,
+                                    &mut sequence,
+                                    if stderr { "stderr" } else { "stdout" },
+                                    if stderr { "stderr" } else { "stdout" },
+                                    content,
+                                    Some(iteration),
+                                );
+                            }
+                        });
+                    tokio::pin!(command_future);
+                    let mut command_heartbeat =
+                        tokio::time::interval(std::time::Duration::from_secs(10));
+                    command_heartbeat
+                        .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    command_heartbeat.tick().await;
+                    let mut cancellation_poll = tokio::time::interval(CANCEL_POLL_INTERVAL);
+                    cancellation_poll
+                        .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    cancellation_poll.tick().await;
+                    let mut command_elapsed = 0_u64;
+                    let command_result = loop {
+                        tokio::select! {
+                            result = &mut command_future => break Some(result),
+                            _ = cancellation_poll.tick() => {
+                                if cancel_requested.load(Ordering::SeqCst) {
+                                    break None;
+                                }
+                            }
+                            _ = command_heartbeat.tick() => {
+                                command_elapsed += 10;
+                                if let Ok(mut sequence) = output_sequence.lock() {
+                                    emit_agent_run_stream(
+                                        app,
+                                        repository,
+                                        run_id,
+                                        project.id,
+                                        &mut sequence,
+                                        "tool_waiting",
+                                        "Remote command is still running",
+                                        format!("Waiting for the remote process ({command_elapsed}s elapsed). New stdout and stderr will appear immediately."),
+                                        Some(iteration),
+                                    );
+                                }
+                            }
                         }
-                        if let Ok(mut sequence) = callback_sequence.lock() {
+                    };
+                    let Some(command_result) = command_result else {
+                        drop(command_future);
+                        stream_sequence = output_sequence
+                            .lock()
+                            .map(|value| *value)
+                            .unwrap_or(stream_sequence);
+                        emit_agent_run_stream(
+                            app,
+                            repository,
+                            run_id,
+                            project.id,
+                            &mut stream_sequence,
+                            "tool_stopping",
+                            "Stopping SSH command",
+                            "The command channel was interrupted. A separate verified SSH session is terminating the process group started by this run.",
+                            Some(iteration),
+                        );
+                        let termination = terminate_remote_agent_process(
+                            profile,
+                            authentication,
+                            &project.remote_root,
+                            run_id,
+                        )
+                        .await;
+                        emit_agent_run_stream(
+                            app,
+                            repository,
+                            run_id,
+                            project.id,
+                            &mut stream_sequence,
+                            "tool_stopped",
+                            "SSH command stopped",
+                            match termination {
+                                Ok(()) => "The remote process group was terminated and its run-scoped PID record was removed.".into(),
+                                Err(error) => format!("The local operation stopped. Remote cleanup reported: {error}"),
+                            },
+                            Some(iteration),
+                        );
+                        return Err(REMOTE_AGENT_CANCELED.into());
+                    };
+                    match command_result {
+                        Ok(output) => break output,
+                        Err(error) => {
+                            stream_sequence = output_sequence
+                                .lock()
+                                .map(|value| *value)
+                                .unwrap_or(stream_sequence);
+                            let had_output = received_output.load(Ordering::SeqCst);
                             emit_agent_run_stream(
-                                &app_for_output,
-                                &repository_for_output,
-                                output_run_id,
-                                output_project_id,
-                                &mut sequence,
-                                if stderr { "stderr" } else { "stdout" },
-                                if stderr { "stderr" } else { "stdout" },
-                                content,
-                                Some(output_iteration),
+                                app,
+                                repository,
+                                run_id,
+                                project.id,
+                                &mut stream_sequence,
+                                "ssh_reconnecting",
+                                "SSH connection was interrupted",
+                                format!("{error}. Reconnecting to the verified server."),
+                                Some(iteration),
                             );
+                            let mut reconnected = None;
+                            for reconnect_attempt in 1..=3_u8 {
+                                match connect_with_cancellation(
+                                    profile,
+                                    authentication.clone(),
+                                    cancel_requested,
+                                )
+                                .await
+                                {
+                                    Ok(new_session) => {
+                                        reconnected = Some(Arc::new(new_session));
+                                        break;
+                                    }
+                                    Err(reconnect_error) => {
+                                        emit_agent_run_stream(
+                                            app,
+                                            repository,
+                                            run_id,
+                                            project.id,
+                                            &mut stream_sequence,
+                                            "ssh_reconnecting",
+                                            "SSH reconnect retry",
+                                            format!(
+                                                "Reconnect attempt {reconnect_attempt}/3 failed: {reconnect_error}"
+                                            ),
+                                            Some(iteration),
+                                        );
+                                        cancelable_delay(
+                                            std::time::Duration::from_secs(
+                                                u64::from(reconnect_attempt) * 2,
+                                            ),
+                                            cancel_requested,
+                                        )
+                                        .await?;
+                                    }
+                                }
+                            }
+                            let Some(new_session) = reconnected else {
+                                transcript.push_str(&format!(
+                                    "\n\nSSH TRANSPORT FAILURE {iteration}\nThe command could not be completed because the SSH channel disconnected and three reconnect attempts failed. No result may be assumed. Choose a safe recovery check on the next turn."
+                                ));
+                                cancelable_delay(
+                                    std::time::Duration::from_secs(5),
+                                    cancel_requested,
+                                )
+                                .await?;
+                                continue 'agent_loop;
+                            };
+                            session = new_session;
+                            emit_agent_run_stream(
+                                app,
+                                repository,
+                                run_id,
+                                project.id,
+                                &mut stream_sequence,
+                                "ssh_reconnected",
+                                "SSH connection restored",
+                                if had_output {
+                                    "The previous command produced output before disconnecting. It will not be replayed; the model will verify remote state first."
+                                } else {
+                                    "No remote output was observed, but execution state is still uncertain. The model will verify remote state before deciding whether to retry."
+                                },
+                                Some(iteration),
+                            );
+                            transcript.push_str(&format!(
+                                "\n\nSSH TRANSPORT FAILURE {iteration}\nCommand: {command}\nThe channel disconnected after output={had_output}. The application reconnected but did not replay an uncertain command. Inspect remote state before proceeding."
+                            ));
+                            continue 'agent_loop;
                         }
-                    })
-                    .await
-                    .map_err(|error| error.to_string())?;
+                    }
+                };
                 stream_sequence = output_sequence
                     .lock()
                     .map(|value| *value)
@@ -1785,45 +2829,83 @@ async fn execute_remote_agent_task(
             }
             "finish" => {
                 if !ran_command {
-                    return Err(
-                        "agent attempted to finish without executing or verifying the remote task"
-                            .into(),
+                    transcript.push_str(&format!(
+                        "\n\nFINISH REJECTED {iteration}\nNo remote command has completed yet. Continue working and verify the approved goal before finishing."
+                    ));
+                    emit_agent_run_stream(
+                        app,
+                        repository,
+                        run_id,
+                        project.id,
+                        &mut stream_sequence,
+                        "action_rejected",
+                        "Completion was not verified",
+                        "The model attempted to finish before completing a remote verification. It will continue working.",
+                        Some(iteration),
                     );
+                    continue 'agent_loop;
                 }
                 if action.artifacts.is_empty() {
-                    return Err(
-                        "agent attempted to finish without declaring result artifacts".into(),
+                    transcript.push_str(&format!(
+                        "\n\nFINISH REJECTED {iteration}\nNo result artifacts were declared. Verify the expected output files and submit their relative project paths."
+                    ));
+                    emit_agent_run_stream(
+                        app,
+                        repository,
+                        run_id,
+                        project.id,
+                        &mut stream_sequence,
+                        "action_rejected",
+                        "Result artifacts are missing",
+                        "The model will inspect and declare verified result files before finishing.",
+                        Some(iteration),
                     );
+                    continue 'agent_loop;
                 }
+                let mut artifact_error = None;
                 for relative in &action.artifacts {
-                    omicsops_core::project::validate_relative_remote_path(std::path::Path::new(
-                        relative,
-                    ))
-                    .map_err(|error| error.to_string())?;
+                    if let Err(error) = omicsops_core::project::validate_relative_remote_path(
+                        std::path::Path::new(relative),
+                    ) {
+                        artifact_error = Some(format!("invalid artifact path {relative}: {error}"));
+                        break;
+                    }
                     let remote_path = format!(
                         "{}/{}",
                         project.remote_root.trim_end_matches('/'),
                         relative.trim_start_matches('/')
                     );
-                    let metadata = session
+                    let metadata = match session
                         .execute_checked(&format!(
                             "test -f {0} && stat -c '%s' {0} && sha256sum {0}",
                             shell_quote(&remote_path)
                         ))
                         .await
-                        .map_err(|error| {
-                            format!("declared artifact {relative} is not a verified file: {error}")
-                        })?;
+                    {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            artifact_error = Some(format!(
+                                "declared artifact {relative} is not a verified file: {error}"
+                            ));
+                            break;
+                        }
+                    };
                     let mut lines = metadata.stdout.lines();
                     let size_bytes = lines
                         .next()
                         .and_then(|value| value.parse().ok())
-                        .ok_or_else(|| format!("artifact {relative} has no size"))?;
+                        .unwrap_or_default();
                     let sha256 = lines
                         .next()
                         .and_then(|value| value.split_whitespace().next())
-                        .ok_or_else(|| format!("artifact {relative} has no hash"))?
+                        .unwrap_or_default()
                         .to_string();
+                    if size_bytes == 0 || sha256.len() != 64 {
+                        artifact_error = Some(format!(
+                            "artifact {relative} returned incomplete size or SHA-256 metadata"
+                        ));
+                        break;
+                    }
                     let record = ArtifactRecordV2 {
                         run_id,
                         source_step_id: "remote-agent-task".into(),
@@ -1835,6 +2917,23 @@ async fn execute_remote_agent_task(
                     repository
                         .put_json("artifact_v2", &format!("{run_id}:{relative}"), &record)
                         .map_err(|error| error.to_string())?;
+                }
+                if let Some(error) = artifact_error {
+                    transcript.push_str(&format!(
+                        "\n\nFINISH VERIFICATION FAILED {iteration}\n{error}\nInspect or regenerate the artifacts, then continue autonomously."
+                    ));
+                    emit_agent_run_stream(
+                        app,
+                        repository,
+                        run_id,
+                        project.id,
+                        &mut stream_sequence,
+                        "action_rejected",
+                        "Artifact verification failed",
+                        format!("{error}. The model will inspect the remote results and continue."),
+                        Some(iteration),
+                    );
+                    continue 'agent_loop;
                 }
                 append_v2_event(
                     app,
@@ -1864,11 +2963,26 @@ async fn execute_remote_agent_task(
                 );
                 return Ok(());
             }
-            other => return Err(format!("agent submitted unsupported action kind {other}")),
+            other => {
+                transcript.push_str(&format!(
+                    "\n\nACTION VALIDATION ERROR {iteration}\nUnsupported action kind {other:?}. Use only run or finish and continue."
+                ));
+                emit_agent_run_stream(
+                    app,
+                    repository,
+                    run_id,
+                    project.id,
+                    &mut stream_sequence,
+                    "action_rejected",
+                    "Unsupported model action",
+                    format!("Action kind {other:?} is not supported. The model will correct it."),
+                    Some(iteration),
+                );
+            }
         }
     }
     Err(format!(
-        "remote agent exhausted its approved limit of {max_iterations} terminal actions"
+        "remote agent exhausted its recovery limit of {max_decisions} model decisions"
     ))
 }
 
