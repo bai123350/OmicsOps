@@ -11,6 +11,30 @@ use uuid::Uuid;
 use crate::{AdapterError, AdapterResult};
 
 const MODEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+const MODEL_MAX_RETRIES: u8 = 3;
+
+fn retryable_model_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::retryable_model_status;
+
+    #[test]
+    fn retries_only_transient_provider_statuses() {
+        for status in [429, 500, 502, 503, 504] {
+            assert!(retryable_model_status(
+                reqwest::StatusCode::from_u16(status).unwrap()
+            ));
+        }
+        for status in [400, 401, 403, 404, 422] {
+            assert!(!retryable_model_status(
+                reqwest::StatusCode::from_u16(status).unwrap()
+            ));
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderProtocol {
@@ -441,6 +465,54 @@ impl UnifiedModelClient {
         })
     }
 
+    async fn send_with_retry(
+        &self,
+        endpoint: &Url,
+        body: &Value,
+        on_event: &mut impl FnMut(ModelStreamEvent),
+    ) -> AdapterResult<reqwest::Response> {
+        let mut retries = 0_u8;
+        loop {
+            let result = self
+                .authenticate(self.http.post(endpoint.clone()).json(body))
+                .send()
+                .await;
+            match result {
+                Ok(response) if response.status().is_success() => return Ok(response),
+                Ok(response) => {
+                    let status = response.status();
+                    let response_body = response.text().await.unwrap_or_default();
+                    if retryable_model_status(status) && retries < MODEL_MAX_RETRIES {
+                        retries += 1;
+                        let delay_ms = 1_000_u64 << (retries - 1);
+                        on_event(ModelStreamEvent::Retrying {
+                            attempt: retries,
+                            delay_ms,
+                            message: format!("model provider returned {status}"),
+                        });
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    let preview: String = response_body.chars().take(1_200).collect();
+                    return Err(AdapterError::Llm(format!("{status}: {preview}")));
+                }
+                Err(error) if retries < MODEL_MAX_RETRIES => {
+                    retries += 1;
+                    let delay_ms = 1_000_u64 << (retries - 1);
+                    on_event(ModelStreamEvent::Retrying {
+                        attempt: retries,
+                        delay_ms,
+                        message: format!("model provider connection failed: {error}"),
+                    });
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Err(error) => {
+                    return Err(AdapterError::Llm(format!("{endpoint}: {error}")));
+                }
+            }
+        }
+    }
+
     pub async fn stream_with(
         &self,
         request: ModelRequest,
@@ -448,18 +520,13 @@ impl UnifiedModelClient {
     ) -> AdapterResult<()> {
         let provider_request =
             build_provider_request(self.protocol, self.base_url.clone(), &self.model, &request)?;
-        let builder = self
-            .http
-            .post(provider_request.endpoint.clone())
-            .json(&provider_request.body);
-        let response = self.authenticate(builder).send().await.map_err(|error| {
-            AdapterError::Llm(format!("{}: {error}", provider_request.endpoint))
-        })?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AdapterError::Llm(format!("{status}: {body}")));
-        }
+        let response = self
+            .send_with_retry(
+                &provider_request.endpoint,
+                &provider_request.body,
+                &mut on_event,
+            )
+            .await?;
         let mut decoder = ProviderStreamDecoder::new(self.protocol);
         let mut bytes = response.bytes_stream();
         let mut emitted_event = false;
@@ -469,11 +536,11 @@ impl UnifiedModelClient {
                 Err(stream_error) if !emitted_event => {
                     let mut fallback_body = provider_request.body.clone();
                     fallback_body["stream"] = Value::Bool(false);
-                    let fallback = self.authenticate(
-                        self.http
-                            .post(provider_request.endpoint.clone())
-                            .json(&fallback_body),
-                    ).send().await.map_err(|fallback_error| {
+                    let fallback = self.send_with_retry(
+                        &provider_request.endpoint,
+                        &fallback_body,
+                        &mut on_event,
+                    ).await.map_err(|fallback_error| {
                         AdapterError::Llm(format!(
                             "{} stream failed ({stream_error}); non-streaming fallback failed: {fallback_error}",
                             provider_request.endpoint

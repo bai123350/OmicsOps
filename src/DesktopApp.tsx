@@ -18,6 +18,7 @@ export default function DesktopApp() {
   const [streamingAssistant, setStreamingAssistant] = useState("");
   const [agentBusy, setAgentBusy] = useState(false);
   const [agentNotice, setAgentNotice] = useState("");
+  const [agentRetryNotice, setAgentRetryNotice] = useState("");
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>([]);
   const [activeModelProfileId, setActiveModelProfileId] = useState<string | null>(null);
   const [lastGoal, setLastGoal] = useState("");
@@ -74,6 +75,30 @@ export default function DesktopApp() {
   }, [selected?.id]);
   useEffect(() => {
     let disposed = false;
+    setAgentRunEvents([]);
+    setRunId(null);
+    if (!selected) return () => { disposed = true; };
+    api.listAgentRunEvents(selected.id)
+      .then((events) => {
+        if (disposed) return;
+        setAgentRunEvents((current) => {
+          if (events.length === 0) return current;
+          const latestRunId = current.at(-1)?.run_id ?? events.at(-1)?.run_id;
+          const merged = [...events, ...current]
+            .filter((event) => event.run_id === latestRunId)
+            .filter((event, index, all) => all.findIndex((item) => item.run_id === event.run_id && item.sequence === event.sequence) === index)
+            .sort((left, right) => left.sequence - right.sequence);
+          return merged;
+        });
+        setRunId((current) => current ?? events.at(-1)?.run_id ?? null);
+      })
+      .catch((error) => {
+        if (!disposed) setAgentNotice(error instanceof Error ? error.message : String(error));
+      });
+    return () => { disposed = true; };
+  }, [selected?.id]);
+  useEffect(() => {
+    let disposed = false;
     const unlisten: Array<() => void> = [];
     api.onAgentEvent((event: AgentEvent) => {
       if (event.conversation_id !== conversation?.id) return;
@@ -85,11 +110,21 @@ export default function DesktopApp() {
       if (event.event.kind === "text-delta") {
         const delta = event.event.payload;
         setStreamingAssistant((value) => value + delta);
+        setAgentRetryNotice("");
+      }
+      if (event.event.kind === "provider-retrying") {
+        const seconds = Math.max(1, Math.ceil(event.event.payload.delay_ms / 1000));
+        setAgentBusy(true);
+        setAgentRetryNotice(locale === "zh-CN"
+          ? `模型服务暂时不可用，${seconds} 秒后自动重试（第 ${event.event.payload.attempt} 次）`
+          : `The model service is temporarily unavailable. Retrying in ${seconds}s (attempt ${event.event.payload.attempt}).`);
       }
       if (event.event.kind === "turn-completed" || event.event.kind === "turn-failed") {
         setStreamingAssistant("");
         setAgentBusy(false);
+        setAgentRetryNotice("");
       }
+      if (event.event.kind === "turn-completed") setAgentNotice("");
       if (event.event.kind === "turn-failed") setAgentNotice(event.event.payload.message);
     }).then((fn) => disposed ? fn() : unlisten.push(fn));
     api.onConversationEvent((event) => {
@@ -102,6 +137,7 @@ export default function DesktopApp() {
       setKernelEvents((current) => [...current.slice(-199), event]);
     }).then((fn) => disposed ? fn() : unlisten.push(fn));
     api.onAgentRunEvent((event) => {
+      if (event.project_id !== selected?.id) return;
       setRunId((current) => current ?? event.run_id);
       setAgentRunEvents((current) => {
         if (current.some((item) => item.run_id === event.run_id && item.sequence === event.sequence)) return current;
@@ -176,7 +212,7 @@ export default function DesktopApp() {
   return <><WorkspaceShell
     project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template }}
     locale={locale} onLocaleChange={setLocale} onOpenSettings={() => setSettingsOpen(true)} onBackToProjects={() => setSelected(null)}
-    messages={messages} streamingAssistant={streamingAssistant} agentBusy={agentBusy} agentNotice={agentNotice} modelLabel={activeModel?.label}
+    messages={messages} streamingAssistant={streamingAssistant} agentBusy={agentBusy} agentNotice={agentNotice} agentRetryNotice={agentRetryNotice} modelLabel={activeModel?.label}
     planProposal={planProposal} planLoading={planLoading} planApproved={planApproved} canStartRun={Boolean(selected.connection_id && approvedPlanId)} runStarted={Boolean(runId)} agentRunEvents={agentRunEvents}
     remoteFiles={remoteFiles} filesBusy={filesBusy} fileNotice={fileNotice}
     kernelSessions={kernelSessions} kernelEvents={kernelEvents} kernelBusy={kernelBusy} kernelNotice={kernelNotice}
@@ -187,7 +223,7 @@ export default function DesktopApp() {
     onUploadFiles={selected.connection_id && selected.remote_root ? uploadFiles : undefined} onRefreshFiles={selected.connection_id && selected.remote_root ? () => refreshRemoteFiles() : undefined} onDownloadFile={selected.connection_id && selected.remote_root ? downloadFile : undefined}
     onSend={async (markdown) => {
       if (!conversation || !activeModel) { setSettingsOpen(true); return false; }
-      setLastGoal(markdown); setPlanProposal(null); setPlanApproved(false); setApprovedPlanId(null); setRunId(null); setAgentBusy(true); setAgentNotice("");
+      setLastGoal(markdown); setPlanProposal(null); setPlanApproved(false); setApprovedPlanId(null); setRunId(null); setAgentRunEvents([]); setAgentBusy(true); setAgentNotice("");
       const remoteContext = selected.connection_id && selected.remote_root
         ? [
             `Remote root: ${selected.remote_root}`,

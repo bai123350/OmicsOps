@@ -186,12 +186,31 @@ impl ActiveTurnCoordinator {
 pub enum AgentEventKind {
     TurnStarted,
     TextDelta(String),
-    ToolArgumentsDelta { name: String, json_fragment: String },
-    ToolProposed { tool: String, arguments: Value },
-    ApprovalRequired { approval_id: Uuid, summary: String },
-    PlanReady { plan_id: Uuid, plan_hash: String },
+    ToolArgumentsDelta {
+        name: String,
+        json_fragment: String,
+    },
+    ProviderRetrying {
+        attempt: u8,
+        delay_ms: u64,
+        message: String,
+    },
+    ToolProposed {
+        tool: String,
+        arguments: Value,
+    },
+    ApprovalRequired {
+        approval_id: Uuid,
+        summary: String,
+    },
+    PlanReady {
+        plan_id: Uuid,
+        plan_hash: String,
+    },
     TurnCompleted,
-    TurnFailed { message: String },
+    TurnFailed {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -239,7 +258,15 @@ pub struct ModelRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ModelStreamEvent {
     TextDelta(String),
-    ToolArgumentsDelta { name: String, json_fragment: String },
+    ToolArgumentsDelta {
+        name: String,
+        json_fragment: String,
+    },
+    Retrying {
+        attempt: u8,
+        delay_ms: u64,
+        message: String,
+    },
     Completed,
 }
 
@@ -283,6 +310,38 @@ impl ToolArgumentBuffer {
         }
         serde_json::from_str(&self.arguments).map_err(|error| AgentError::Model(error.to_string()))
     }
+}
+
+pub fn structured_value_from_text(text: &str) -> AgentResult<Value> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(AgentError::Model(
+            "model returned no structured text".into(),
+        ));
+    }
+    if let Ok(value) = serde_json::from_str(trimmed) {
+        return Ok(value);
+    }
+    for block in trimmed.split("```").skip(1).step_by(2) {
+        let candidate = block
+            .trim()
+            .strip_prefix("json")
+            .unwrap_or(block.trim())
+            .trim();
+        if let Ok(value) = serde_json::from_str(candidate) {
+            return Ok(value);
+        }
+    }
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if start < end {
+            if let Ok(value) = serde_json::from_str(&trimmed[start..=end]) {
+                return Ok(value);
+            }
+        }
+    }
+    Err(AgentError::Model(
+        "model text did not contain a valid JSON object".into(),
+    ))
 }
 
 #[async_trait]

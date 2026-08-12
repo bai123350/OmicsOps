@@ -2,6 +2,7 @@ use omicsops_agent::{
     ActiveTurnCoordinator, AgentEvent, ApprovalDecision, ApprovalGate, Capability,
     ModelStreamEvent, SpecialistDispatcher, SpecialistFinding, SpecialistKind,
     SpecialistProposedAction, SpecialistReport, ToolArgumentBuffer, ToolRegistry,
+    structured_value_from_text,
 };
 use uuid::Uuid;
 
@@ -24,6 +25,20 @@ fn every_mutating_or_remote_capability_requires_explicit_approval() {
         gate.decision(Capability::QueryResearchSource),
         ApprovalDecision::Required
     );
+}
+
+#[test]
+fn structured_text_fallback_accepts_json_and_fenced_json_only() {
+    assert_eq!(
+        structured_value_from_text("{\"kind\":\"run\"}").unwrap()["kind"],
+        "run"
+    );
+    assert_eq!(
+        structured_value_from_text("Here is the control:\n```json\n{\"kind\":\"finish\"}\n```")
+            .unwrap()["kind"],
+        "finish"
+    );
+    assert!(structured_value_from_text("run python qc.py now").is_err());
 }
 
 #[test]

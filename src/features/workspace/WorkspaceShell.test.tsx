@@ -74,12 +74,12 @@ describe("WorkspaceShell", () => {
 
   it("shows streamed agent decisions, SSH commands, and remote output", () => {
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted agentRunEvents={[
-      { run_id: "run-1", sequence: 1, timestamp: "2026-08-12T08:00:00Z", kind: "model_action", title: "Agent action selected", content: "先核对矩阵维度", iteration: 1 },
-      { run_id: "run-1", sequence: 2, timestamp: "2026-08-12T08:00:01Z", kind: "tool_started", title: "SSH command", content: "python scripts/inspect.py", iteration: 1 },
-      { run_id: "run-1", sequence: 3, timestamp: "2026-08-12T08:00:02Z", kind: "stdout", title: "stdout", content: "genes=32738 cells=12000", iteration: 1 },
+      { run_id: "run-1", project_id: "project-1", sequence: 1, timestamp: "2026-08-12T08:00:00Z", kind: "model_action", title: "Agent action selected", content: "先核对矩阵维度", iteration: 1 },
+      { run_id: "run-1", project_id: "project-1", sequence: 2, timestamp: "2026-08-12T08:00:01Z", kind: "tool_started", title: "SSH command", content: "python scripts/inspect.py", iteration: 1 },
+      { run_id: "run-1", project_id: "project-1", sequence: 3, timestamp: "2026-08-12T08:00:02Z", kind: "stdout", title: "stdout", content: "genes=32738 cells=12000", iteration: 1 },
     ]} />);
 
-    expect(screen.getByRole("article", { name: "远程 Agent 实时活动" })).toHaveTextContent("先核对矩阵维度");
+    expect(screen.getAllByRole("article", { name: "远程 Agent 工作消息" })[0]).toHaveTextContent("先核对矩阵维度");
     expect(screen.getByText("python scripts/inspect.py")).toBeInTheDocument();
     expect(screen.getByText("genes=32738 cells=12000")).toBeInTheDocument();
   });

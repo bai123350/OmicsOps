@@ -266,6 +266,7 @@ export interface EnvironmentLock {
 
 export interface AgentRunStreamEvent {
   run_id: string;
+  project_id: string;
   sequence: number;
   timestamp: string;
   kind: "agent_started" | "model_started" | "model_action" | "tool_started" | "stdout" | "stderr" | "tool_completed" | "agent_completed" | "agent_failed";
@@ -347,6 +348,7 @@ export type AgentEventPayload =
   | { kind: "turn-started" }
   | { kind: "text-delta"; payload: string }
   | { kind: "tool-arguments-delta"; payload: { name: string; json_fragment: string } }
+  | { kind: "provider-retrying"; payload: { attempt: number; delay_ms: number; message: string } }
   | { kind: "approval-required"; payload: { approval_id: string; summary: string } }
   | { kind: "plan-ready"; payload: { plan_id: string; plan_hash: string } }
   | { kind: "turn-completed" }

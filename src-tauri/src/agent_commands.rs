@@ -5,6 +5,7 @@ use omicsops_adapters::{
 };
 use omicsops_agent::{
     AgentEvent, AgentEventKind, ModelMessage, ModelRequest, ModelStreamEvent, ToolArgumentBuffer,
+    structured_value_from_text,
 };
 use omicsops_core::workspace::{AgentTurn, Message, MessageRole, ModelProviderKind, TurnStatus};
 use omicsops_core::{
@@ -71,6 +72,31 @@ struct RemoteAgentPlanDraft {
     title: String,
     summary: String,
     completion_criteria: Vec<String>,
+}
+
+fn fallback_remote_agent_plan_draft(
+    project_name: &str,
+    goal: &str,
+    model_text: &str,
+) -> RemoteAgentPlanDraft {
+    let summary = if model_text.trim().is_empty() {
+        format!(
+            "The remote agent will inspect {project_name}, choose tools from the observed environment, execute the approved goal adaptively, and verify result artifacts."
+        )
+    } else {
+        model_text.trim().chars().take(4_000).collect()
+    };
+    RemoteAgentPlanDraft {
+        title: format!("{} remote agent analysis", project_name.trim()),
+        summary,
+        completion_criteria: vec![
+            "Inspect and validate the actual remote inputs before analysis".into(),
+            format!("Complete the approved research goal: {}", goal.trim()),
+            "Record commands, environment information, and observed failures in the run audit"
+                .into(),
+            "Produce and verify at least one result artifact inside the remote project root".into(),
+        ],
+    }
 }
 
 fn enabled_skill_context(state: &State<'_, AppState>) -> Result<String, String> {
@@ -145,6 +171,15 @@ pub fn agent_event_kind_from_model_event(event: ModelStreamEvent) -> AgentEventK
         } => AgentEventKind::ToolArgumentsDelta {
             name,
             json_fragment,
+        },
+        ModelStreamEvent::Retrying {
+            attempt,
+            delay_ms,
+            message,
+        } => AgentEventKind::ProviderRetrying {
+            attempt,
+            delay_ms,
+            message,
         },
         ModelStreamEvent::Completed => AgentEventKind::TurnCompleted,
     }
@@ -745,12 +780,16 @@ pub async fn propose_analysis_plan(
         .map_err(|error| error.to_string())?;
     let mut buffer = ToolArgumentBuffer::new("submit_remote_agent_plan");
     let mut buffer_error: Option<String> = None;
+    let mut model_text = String::new();
     client.stream_with(ModelRequest {
         system: "You are planning an approved remote research-agent task. Base the plan on the application-verified read-only SSH observation and enabled Skill instructions. Do not invent files, fixed QC thresholds, software, or biological conclusions. Return a concise title, summary of the adaptive approach, and observable completion criteria. The execution agent will choose terminal commands iteratively after approval.".into(),
         messages: vec![ModelMessage { role: "user".into(), content: format!("Project: {}\nGoal: {}\nEnvironment hint: {}\n\nVerified remote observation:\n{}\n\nEnabled Skills:\n{}", project.name, request.goal.trim(), request.environment_summary.trim(), remote_observation, skill_context) }],
         tool_name: Some("submit_remote_agent_plan".into()),
         tool_schema: Some(schema),
     }, |event| {
+        if let ModelStreamEvent::TextDelta(text) = &event {
+            model_text.push_str(text);
+        }
         if let Err(error) = buffer.push(event) {
             buffer_error.get_or_insert_with(|| error.to_string());
         }
@@ -758,9 +797,15 @@ pub async fn propose_analysis_plan(
     if let Some(error) = buffer_error {
         return Err(error);
     }
-    let draft: RemoteAgentPlanDraft =
-        serde_json::from_value(buffer.finish().map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?;
+    let draft: RemoteAgentPlanDraft = match buffer.finish() {
+        Ok(value) => serde_json::from_value(value).map_err(|error| error.to_string())?,
+        Err(_) => structured_value_from_text(&model_text)
+            .ok()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_else(|| {
+                fallback_remote_agent_plan_draft(&project.name, request.goal.trim(), &model_text)
+            }),
+    };
     let plan_id = Uuid::new_v4();
     let resources = ResourceLimits::default();
     let mut plan = AnalysisPlanV2 {

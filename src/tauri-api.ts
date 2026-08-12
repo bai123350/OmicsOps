@@ -460,6 +460,10 @@ export async function onAgentRunEvent(callback: (event: AgentRunStreamEvent) => 
   return listen<AgentRunStreamEvent>("agent-run-event", ({ payload }) => callback(payload));
 }
 
+export async function listAgentRunEvents(projectId: string): Promise<AgentRunStreamEvent[]> {
+  return isTauri() ? invoke("list_agent_run_events", { projectId }) : [];
+}
+
 export async function listStepAttemptsV2(runId: string): Promise<StepAttempt[]> {
   return invoke("list_step_attempts_v2", { runId });
 }

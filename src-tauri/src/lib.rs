@@ -61,6 +61,7 @@ pub fn run() {
             commands::resume_run_v2,
             commands::list_runs_v2,
             commands::list_run_events_v2,
+            commands::list_agent_run_events,
             commands::list_artifacts_v2,
             commands::list_step_attempts_v2,
             commands::get_environment_lock_v2,

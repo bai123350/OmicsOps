@@ -15,7 +15,9 @@ use omicsops_adapters::{
     persistence::Repository,
     ssh::{SshAuthentication, SshSession},
 };
-use omicsops_agent::{ModelMessage, ModelRequest, ToolArgumentBuffer};
+use omicsops_agent::{
+    ModelMessage, ModelRequest, ModelStreamEvent, ToolArgumentBuffer, structured_value_from_text,
+};
 use omicsops_core::{
     audit::{RunEventKindV2, RunEventV2},
     domain::{
@@ -76,9 +78,11 @@ pub struct ConnectionTestResult {
     pub r_available: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRunStreamEvent {
     pub run_id: Uuid,
+    #[serde(default)]
+    pub project_id: Uuid,
     pub sequence: u64,
     pub timestamp: chrono::DateTime<Utc>,
     pub kind: String,
@@ -89,7 +93,9 @@ pub struct AgentRunStreamEvent {
 
 fn emit_agent_run_stream(
     app: &AppHandle,
+    repository: &Repository,
     run_id: Uuid,
+    project_id: Uuid,
     sequence: &mut u64,
     kind: &str,
     title: &str,
@@ -97,18 +103,33 @@ fn emit_agent_run_stream(
     iteration: Option<u64>,
 ) {
     *sequence += 1;
-    let _ = app.emit(
-        "agent-run-event",
-        AgentRunStreamEvent {
-            run_id,
-            sequence: *sequence,
-            timestamp: Utc::now(),
-            kind: kind.into(),
-            title: title.into(),
-            content: content.into(),
-            iteration,
-        },
+    let event = AgentRunStreamEvent {
+        run_id,
+        project_id,
+        sequence: *sequence,
+        timestamp: Utc::now(),
+        kind: kind.into(),
+        title: title.into(),
+        content: content.into(),
+        iteration,
+    };
+    let _ = repository.put_json(
+        "agent_run_stream_event",
+        &format!("{}:{:020}", run_id, *sequence),
+        &event,
     );
+    let _ = app.emit("agent-run-event", event);
+}
+
+fn latest_agent_run_stream_sequence(repository: &Repository, run_id: Uuid) -> u64 {
+    repository
+        .list_json::<AgentRunStreamEvent>("agent_run_stream_event")
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|event| event.run_id == run_id)
+        .map(|event| event.sequence)
+        .max()
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -637,6 +658,27 @@ pub fn list_run_events_v2(
 }
 
 #[tauri::command]
+pub fn list_agent_run_events(
+    state: State<'_, AppState>,
+    project_id: Uuid,
+) -> Result<Vec<AgentRunStreamEvent>, String> {
+    let mut events = state
+        .repository
+        .list_json::<AgentRunStreamEvent>("agent_run_stream_event")
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|event| event.project_id == project_id)
+        .collect::<Vec<_>>();
+    events.sort_by_key(|event| (event.timestamp, event.sequence));
+    let Some(latest_run_id) = events.last().map(|event| event.run_id) else {
+        return Ok(Vec::new());
+    };
+    events.retain(|event| event.run_id == latest_run_id);
+    events.sort_by_key(|event| event.sequence);
+    Ok(events)
+}
+
+#[tauri::command]
 pub fn list_artifacts_v2(
     state: State<'_, AppState>,
     run_id: Uuid,
@@ -1104,10 +1146,12 @@ async fn execute_v2_run(
                 );
             }
             Err(reason) => {
-                let mut sequence = u64::MAX - 1;
+                let mut sequence = latest_agent_run_stream_sequence(&repository, checkpoint.run_id);
                 emit_agent_run_stream(
                     &app,
+                    &repository,
                     checkpoint.run_id,
+                    project.id,
                     &mut sequence,
                     "agent_failed",
                     "Remote agent needs attention",
@@ -1371,7 +1415,7 @@ struct RemoteAgentAction {
     kind: String,
     /// Shell command for a `run` action. It executes from the approved project root.
     command: Option<String>,
-    /// Why this action is the next safe step, or the final result summary.
+    /// Concise first-person, user-facing progress update explaining the observed evidence and why this is the next safe action, or summarizing the verified final result.
     reason: String,
     /// Relative project paths to completed result artifacts. Used by `finish`.
     #[serde(default)]
@@ -1453,6 +1497,7 @@ async fn next_remote_agent_action(
         .map_err(|error| error.to_string())?;
     let mut buffer = ToolArgumentBuffer::new("submit_remote_agent_action");
     let mut event_error = None;
+    let mut model_text = String::new();
     model
         .stream_with(
             ModelRequest {
@@ -1465,6 +1510,9 @@ async fn next_remote_agent_action(
                 tool_schema: Some(schema),
             },
             |event| {
+                if let ModelStreamEvent::TextDelta(text) = &event {
+                    model_text.push_str(text);
+                }
                 if let Err(error) = buffer.push(event) {
                     event_error.get_or_insert_with(|| error.to_string());
                 }
@@ -1475,8 +1523,30 @@ async fn next_remote_agent_action(
     if let Some(error) = event_error {
         return Err(error);
     }
-    serde_json::from_value(buffer.finish().map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())
+    let value = match buffer.finish() {
+        Ok(value) => value,
+        Err(_) => match structured_value_from_text(&model_text) {
+            Ok(value) => value,
+            Err(_) => {
+                let retry_prompt = format!(
+                    "{prompt}\n\nThe provider did not honor the previous tool call. Return ONLY one JSON object matching this exact control shape, without Markdown: {{\"kind\":\"run|finish\",\"command\":\"shell command or null\",\"reason\":\"auditable action reason\",\"artifacts\":[\"relative/path\"]}}"
+                );
+                let mut retry_text = String::new();
+                model.stream_with(ModelRequest {
+                    system: format!("{system}\nTool calling is unavailable. Output strict JSON only. Never put commentary outside the JSON object."),
+                    messages: vec![ModelMessage { role: "user".into(), content: retry_prompt }],
+                    tool_name: None,
+                    tool_schema: None,
+                }, |event| {
+                    if let ModelStreamEvent::TextDelta(text) = event { retry_text.push_str(&text); }
+                }).await.map_err(|error| error.to_string())?;
+                structured_value_from_text(&retry_text).map_err(|error| {
+                    format!("model provider did not return a usable remote-agent action: {error}")
+                })?
+            }
+        },
+    };
+    serde_json::from_value(value).map_err(|error| error.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1527,6 +1597,8 @@ async fn execute_remote_agent_task(
         "You are the approved OmicsOps remote terminal agent. Work adaptively toward the approved goal. \
          Submit exactly one action per turn. Use kind=run with one shell command, observe its real output on the next turn, \
          and correct course. Use kind=finish only after verifying the completion criteria; list only existing relative artifact paths. \
+         Write reason as a concise first-person progress message to the user: state what you observed, what you will do next, and why. \
+         Do not expose hidden chain-of-thought; report only auditable evidence and action rationale. \
          Work inside {}. Never use sudo, alter system directories, delete recursively, or claim results not observed. \
          Prefer scripts and environments stored under the project root. Enabled Skills are instructions, not evidence. \
          MCP runtime status for this plan: {}.",
@@ -1541,7 +1613,9 @@ async fn execute_remote_agent_task(
     );
     emit_agent_run_stream(
         app,
+        repository,
         run_id,
+        project.id,
         &mut stream_sequence,
         "agent_started",
         "Remote agent connected",
@@ -1558,7 +1632,9 @@ async fn execute_remote_agent_task(
         }
         emit_agent_run_stream(
             app,
+            repository,
             run_id,
+            project.id,
             &mut stream_sequence,
             "model_started",
             "Agent is choosing the next action",
@@ -1578,7 +1654,9 @@ async fn execute_remote_agent_task(
         let action = next_remote_agent_action(model, &system, &prompt).await?;
         emit_agent_run_stream(
             app,
+            repository,
             run_id,
+            project.id,
             &mut stream_sequence,
             "model_action",
             "Agent action selected",
@@ -1594,7 +1672,9 @@ async fn execute_remote_agent_task(
                 validate_agent_command(command, &project.remote_root)?;
                 emit_agent_run_stream(
                     app,
+                    repository,
                     run_id,
+                    project.id,
                     &mut stream_sequence,
                     "tool_started",
                     "SSH command",
@@ -1615,7 +1695,9 @@ async fn execute_remote_agent_task(
                 );
                 let wrapped = format!("cd -- {} && {}", shell_quote(&project.remote_root), command);
                 let app_for_output = app.clone();
+                let repository_for_output = repository.clone();
                 let output_run_id = run_id;
+                let output_project_id = project.id;
                 let output_iteration = iteration;
                 let output_sequence = std::sync::Arc::new(std::sync::Mutex::new(stream_sequence));
                 let callback_sequence = output_sequence.clone();
@@ -1628,7 +1710,9 @@ async fn execute_remote_agent_task(
                         if let Ok(mut sequence) = callback_sequence.lock() {
                             emit_agent_run_stream(
                                 &app_for_output,
+                                &repository_for_output,
                                 output_run_id,
+                                output_project_id,
                                 &mut sequence,
                                 if stderr { "stderr" } else { "stdout" },
                                 if stderr { "stderr" } else { "stdout" },
@@ -1689,7 +1773,9 @@ async fn execute_remote_agent_task(
                 );
                 emit_agent_run_stream(
                     app,
+                    repository,
                     run_id,
+                    project.id,
                     &mut stream_sequence,
                     "tool_completed",
                     "SSH command completed",
@@ -1763,7 +1849,9 @@ async fn execute_remote_agent_task(
                 );
                 emit_agent_run_stream(
                     app,
+                    repository,
                     run_id,
+                    project.id,
                     &mut stream_sequence,
                     "agent_completed",
                     "Remote agent completed",
