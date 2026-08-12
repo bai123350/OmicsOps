@@ -214,6 +214,8 @@ pub fn builtin_tool_catalog() -> CoreResult<ToolCatalog> {
                         "remote_observation":{"type":"string"},
                         "completion_criteria":{"type":"array"},
                         "skill_context":{"type":"string"},
+                        "conversation_history":{"type":"string"},
+                        "operational_memory":{"type":"string"},
                         "max_iterations":{"type":"integer"}
                     },
                     "additionalProperties":false

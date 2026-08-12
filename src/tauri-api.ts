@@ -32,6 +32,7 @@ import type {
   AgentEvent,
   PlanProposal,
   RemoteFileEntry,
+  ProjectImagePreview,
   SyncEntry,
   SkillPackage,
   ResearchSearchResult,
@@ -106,7 +107,7 @@ export async function runAgentTurn(request: { project_id: string; conversation_i
   return invoke("run_agent_turn", { request });
 }
 
-export async function proposeAnalysisPlan(request: { project_id: string; model_profile_id: string; goal: string; environment_summary: string }): Promise<PlanProposal> {
+export async function proposeAnalysisPlan(request: { project_id: string; conversation_id: string; model_profile_id: string; goal: string; environment_summary: string }): Promise<PlanProposal> {
   return invoke("propose_analysis_plan", { request });
 }
 
@@ -147,6 +148,10 @@ export async function uploadSelectedFiles(projectId: string, relativePaths: stri
 
 export async function downloadProjectFile(projectId: string, relativePath: string): Promise<{ entry: SyncEntry; conflict: boolean }> {
   return invoke("download_project_file", { request: { project_id: projectId, relative_path: relativePath } });
+}
+
+export async function previewProjectImage(projectId: string, relativePath: string): Promise<ProjectImagePreview> {
+  return invoke("preview_project_image", { request: { project_id: projectId, relative_path: relativePath } });
 }
 
 export async function listSkillPackages(): Promise<SkillPackage[]> {

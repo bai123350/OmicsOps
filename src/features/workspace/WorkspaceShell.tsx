@@ -5,7 +5,7 @@ import {
   Search, Send, Settings, Sparkles, Square, X,
 } from "lucide-react";
 import { copy, type Locale } from "./copy";
-import type { AgentRunStreamEvent, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, PlanProposal, WorkspaceConversation } from "../../types";
+import type { AgentRunStreamEvent, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, PlanProposal, ProjectImagePreview, WorkspaceConversation } from "../../types";
 import { RemoteFileTree } from "./RemoteFileTree";
 import { KernelPanel } from "./KernelPanel";
 import "./workspace.css";
@@ -14,6 +14,7 @@ import "./file-actions.css";
 import "./navigation.css";
 import "./kernel.css";
 import "./agent.css";
+import "./preview.css";
 
 export interface WorkspaceProject {
   id: string;
@@ -56,6 +57,7 @@ interface Props {
   onUploadFiles?: () => Promise<void> | void;
   onRefreshFiles?: () => Promise<void> | void;
   onDownloadFile?: (relativePath: string) => Promise<void> | void;
+  onPreviewImage?: (relativePath: string) => Promise<ProjectImagePreview>;
   fileNotice?: string;
   kernelSessions?: KernelSession[];
   kernelEvents?: KernelEvent[];
@@ -70,7 +72,7 @@ interface Props {
 
 type ContextTab = "files" | "preview" | "notebook" | "explore" | "runs";
 
-export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, conversations = [], activeConversationId, onSelectConversation, onNewConversation, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, planProposal, planLoading = false, planApproved = false, onRequestPlan, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, agentRunEvents = [], remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell }: Props) {
+export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, conversations = [], activeConversationId, onSelectConversation, onNewConversation, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, planProposal, planLoading = false, planApproved = false, onRequestPlan, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, agentRunEvents = [], remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell }: Props) {
   const t = copy[locale];
   const zh = locale === "zh-CN";
   const [tab, setTab] = useState<ContextTab>("files");
@@ -78,8 +80,13 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const [draft, setDraft] = useState("");
   const [sentMessages, setSentMessages] = useState<string[]>([]);
   const [approved, setApproved] = useState(false);
+  const [selectedImagePath, setSelectedImagePath] = useState("");
+  const [imagePreview, setImagePreview] = useState<ProjectImagePreview | null>(null);
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const [previewError, setPreviewError] = useState("");
   const messageStreamRef = useRef<HTMLElement>(null);
-  const preview = <ArtifactPreview title={t.overview} />;
+  const imageFiles = (remoteFiles ?? []).filter((entry) => !entry.directory && isPreviewImage(entry.relative_path));
+  const preview = <ArtifactPreview title={t.overview} locale={locale} images={imageFiles} selectedPath={selectedImagePath} preview={imagePreview} busy={previewBusy} error={previewError} onSelect={setSelectedImagePath} onLoad={loadImagePreview} />;
   const runFinished = agentRunEvents.some((event) => event.kind === "agent_completed" || event.kind === "agent_failed" || event.kind === "agent_canceled");
   const runActive = runStarted && !runFinished;
   const activeConversation = conversations.find((item) => item.id === activeConversationId);
@@ -93,6 +100,27 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     });
     return () => cancelAnimationFrame(frame);
   }, [messages.length, streamingAssistant, agentBusy, agentNotice, planProposal, planLoading, runStarted, agentRunEvents.length]);
+
+  useEffect(() => {
+    if (selectedImagePath && imageFiles.some((entry) => entry.relative_path === selectedImagePath)) return;
+    setSelectedImagePath(imageFiles[0]?.relative_path ?? "");
+    setImagePreview(null);
+    setPreviewError("");
+  }, [remoteFiles, selectedImagePath]);
+
+  async function loadImagePreview() {
+    if (!selectedImagePath || !onPreviewImage) return;
+    setPreviewBusy(true);
+    setPreviewError("");
+    try {
+      setImagePreview(await onPreviewImage(selectedImagePath));
+    } catch (error) {
+      setImagePreview(null);
+      setPreviewError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPreviewBusy(false);
+    }
+  }
 
   async function send() {
     const message = draft.trim();
@@ -146,7 +174,12 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
 }
 
 function FileTree({ locale }: { locale: Locale }) { const zh = locale === "zh-CN"; return <div className="file-tree"><div className="context-heading"><b>{zh ? "项目文件" : "Project files"}</b><small>{zh ? "选择性同步" : "Selective sync"}</small></div><div className="tree-folder"><Folder size={15} />data <span>{zh ? "远端" : "remote"}</span></div><div className="tree-folder"><Folder size={15} />analysis</div><div className="tree-file"><FileBarChart size={15} />umap.png <em>1.2 MB</em></div><div className="tree-file"><FileText size={15} />markers.csv <em>84 KB</em></div><div className="tree-file"><NotebookPen size={15} />report.md <em>12 KB</em></div></div>; }
-function ArtifactPreview({ title }: { title: string }) { return <div className="artifact-preview"><div className="umap-plot" aria-label={title}>{Array.from({ length: 32 }, (_, index) => <i key={index} style={{ "--x": `${12 + ((index * 29) % 75)}%`, "--y": `${14 + ((index * 43) % 68)}%`, "--c": index % 4 } as React.CSSProperties} />)}</div><div className="artifact-meta"><b>{title}</b><span>12 clusters · 5,842 cells</span><small>results/figures/umap.png · SHA-256 verified</small></div></div>; }
+function isPreviewImage(path: string) { return /\.(png|jpe?g|gif|webp|bmp)$/i.test(path); }
+function ArtifactPreview({ title, locale, images, selectedPath, preview, busy, error, onSelect, onLoad }: { title: string; locale: Locale; images: import("../../types").RemoteFileEntry[]; selectedPath: string; preview: ProjectImagePreview | null; busy: boolean; error: string; onSelect: (path: string) => void; onLoad: () => Promise<void> | void }) {
+  const zh = locale === "zh-CN";
+  return <div className="artifact-preview"><div className="preview-picker"><label>{zh ? "选择项目图片" : "Select project image"}<select aria-label={zh ? "选择项目图片" : "Select project image"} value={selectedPath} onChange={(event) => onSelect(event.target.value)}><option value="">{images.length ? (zh ? "请选择图片" : "Choose an image") : (zh ? "未发现图片文件" : "No image files found")}</option>{images.map((entry) => <option value={entry.relative_path} key={entry.relative_path}>{entry.relative_path}</option>)}</select></label><button disabled={!selectedPath || busy} onClick={() => void onLoad()}>{busy ? (zh ? "加载中…" : "Loading…") : (zh ? "显示图片" : "Show image")}</button></div>{error && <div className="preview-error" role="alert">{error}</div>}<div className="project-image-stage" aria-label={title}>{preview ? <img src={preview.data_url} alt={preview.relative_path} /> : <div className="preview-empty">{images.length ? (zh ? "选择图片后点击“显示图片”" : "Choose an image and click Show image") : (zh ? "项目中暂未发现 PNG、JPEG、GIF、WebP 或 BMP 图片" : "No PNG, JPEG, GIF, WebP, or BMP images were found")}</div>}</div><div className="artifact-meta"><b>{preview?.relative_path ?? title}</b>{preview && <><span>{preview.mime_type} · {formatPreviewBytes(preview.size_bytes)}</span><small>SHA-256 {preview.sha256}</small></>}</div></div>;
+}
+function formatPreviewBytes(bytes: number) { return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`; }
 function coalesceAgentRunEvents(events: AgentRunStreamEvent[]) {
   return events.reduce<AgentRunStreamEvent[]>((result, event) => {
     const previous = result.at(-1);

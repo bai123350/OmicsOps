@@ -152,6 +152,7 @@ export default function DesktopApp() {
       if (event.project_id !== selected?.id) return;
       setRunId((current) => current ?? event.run_id);
       if (event.kind === "agent_canceled" || event.kind === "agent_completed" || event.kind === "agent_failed") setRunStopping(false);
+      if (event.kind === "agent_completed") void refreshRemoteFiles(event.project_id);
       setAgentRunEvents((current) => {
         if (current.some((item) => item.run_id === event.run_id && item.sequence === event.sequence)) return current;
         return [...current.filter((item) => item.run_id === event.run_id).slice(-399), event];
@@ -279,6 +280,7 @@ export default function DesktopApp() {
     onInterruptKernel={async (sessionId) => withKernelBusy(async () => replaceKernelSession(await api.interruptKernel(sessionId)))}
     onStopKernel={async (sessionId) => withKernelBusy(async () => replaceKernelSession(await api.stopKernel(sessionId)))} onPromoteKernelCell={api.promoteKernelCell}
     onUploadFiles={selected.connection_id && selected.remote_root ? uploadFiles : undefined} onRefreshFiles={selected.connection_id && selected.remote_root ? () => refreshRemoteFiles() : undefined} onDownloadFile={selected.connection_id && selected.remote_root ? downloadFile : undefined}
+    onPreviewImage={selected.connection_id && selected.remote_root ? (relativePath) => api.previewProjectImage(selected.id, relativePath) : undefined}
     onSend={async (markdown) => {
       if (!conversation || !activeModel) { setSettingsOpen(true); return false; }
       setLastGoal(markdown); setPlanProposal(null); setPlanApproved(false); setApprovedPlanId(null); setRunId(null); setAgentRunEvents([]); setAgentBusy(true); setAgentNotice("");
@@ -301,6 +303,7 @@ export default function DesktopApp() {
           try {
             setPlanProposal(await api.proposeAnalysisPlan({
               project_id: selected.id,
+              conversation_id: conversation.id,
               model_profile_id: activeModel.id,
               goal: markdown,
               environment_summary: remoteContext ?? `Remote Linux project at ${selected.remote_root}`,
@@ -318,7 +321,7 @@ export default function DesktopApp() {
     onRequestPlan={async () => {
       if (!activeModel || !lastGoal) { if (!activeModel) setSettingsOpen(true); return; }
       setPlanLoading(true); setAgentNotice("");
-      try { setPlanProposal(await api.proposeAnalysisPlan({ project_id: selected.id, model_profile_id: activeModel.id, goal: lastGoal, environment_summary: selected.remote_root ? `Remote Linux project at ${selected.remote_root}` : "Remote Linux environment not inspected yet" })); }
+      try { if (!conversation) return; setPlanProposal(await api.proposeAnalysisPlan({ project_id: selected.id, conversation_id: conversation.id, model_profile_id: activeModel.id, goal: lastGoal, environment_summary: selected.remote_root ? `Remote Linux project at ${selected.remote_root}` : "Remote Linux environment not inspected yet" })); }
       catch (error) { setAgentNotice(error instanceof Error ? error.message : String(error)); }
       finally { setPlanLoading(false); }
     }}

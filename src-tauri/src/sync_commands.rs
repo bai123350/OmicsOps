@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::Utc;
 use omicsops_core::{
     project::shell_quote,
@@ -139,6 +140,103 @@ pub struct DownloadProjectFileRequest {
 pub struct DownloadResult {
     pub entry: SyncEntry,
     pub conflict: bool,
+}
+
+const MAX_IMAGE_PREVIEW_BYTES: u64 = 20 * 1024 * 1024;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PreviewProjectImageRequest {
+    pub project_id: Uuid,
+    pub relative_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectImagePreview {
+    pub relative_path: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub data_url: String,
+}
+
+pub fn preview_image_mime(relative_path: &str, bytes: &[u8]) -> Result<&'static str, String> {
+    let extension = Path::new(relative_path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "png" if bytes.starts_with(b"\x89PNG\r\n\x1a\n") => Ok("image/png"),
+        "jpg" | "jpeg" if bytes.starts_with(&[0xff, 0xd8, 0xff]) => Ok("image/jpeg"),
+        "gif" if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") => Ok("image/gif"),
+        "webp" if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" => {
+            Ok("image/webp")
+        }
+        "bmp" if bytes.starts_with(b"BM") => Ok("image/bmp"),
+        _ => Err("selected file is not a supported PNG, JPEG, GIF, WebP, or BMP image".into()),
+    }
+}
+
+#[tauri::command]
+pub async fn preview_project_image(
+    state: State<'_, AppState>,
+    request: PreviewProjectImageRequest,
+) -> Result<ProjectImagePreview, String> {
+    let project = state
+        .repository
+        .get_project(request.project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_string())?;
+    let profile_id = project
+        .connection_id
+        .ok_or_else(|| "project has no remote connection".to_string())?;
+    let remote_root = project
+        .remote_root
+        .ok_or_else(|| "project has no remote root".to_string())?;
+    let manifest =
+        SyncManifest::for_uploads(project.id.to_string(), [request.relative_path.as_str()])
+            .map_err(|error| error.to_string())?;
+    let relative = manifest.paths()[0];
+    let profile = find_profile(&state.repository, profile_id)?;
+    require_trusted_host(&profile)?;
+    let session = connect_profile(&state, &profile).await?;
+    let root = canonical_remote_root(&session, &remote_root).await?;
+    let remote_path = canonical_remote_file(&session, &root, relative).await?;
+    let size_bytes = session
+        .execute_checked(&format!("stat -c %s -- {}", shell_quote(&remote_path)))
+        .await
+        .map_err(|error| error.to_string())?
+        .stdout
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "invalid remote image size".to_string())?;
+    if size_bytes > MAX_IMAGE_PREVIEW_BYTES {
+        return Err(format!(
+            "image preview is limited to {} MiB",
+            MAX_IMAGE_PREVIEW_BYTES / 1024 / 1024
+        ));
+    }
+    let sha256 = remote_sha256(&session, &remote_path).await?;
+    let bytes = session
+        .read_file_limited(&remote_path, MAX_IMAGE_PREVIEW_BYTES)
+        .await
+        .map_err(|error| error.to_string())?;
+    session
+        .disconnect()
+        .await
+        .map_err(|error| error.to_string())?;
+    let received_sha256 = hex::encode(Sha256::digest(&bytes));
+    if !received_sha256.eq_ignore_ascii_case(&sha256) {
+        return Err("remote image checksum changed while loading the preview".into());
+    }
+    let mime_type = preview_image_mime(relative, &bytes)?.to_owned();
+    Ok(ProjectImagePreview {
+        relative_path: relative.to_owned(),
+        mime_type: mime_type.clone(),
+        size_bytes,
+        sha256,
+        data_url: format!("data:{mime_type};base64,{}", STANDARD.encode(bytes)),
+    })
 }
 
 #[tauri::command]

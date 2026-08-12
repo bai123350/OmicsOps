@@ -354,6 +354,27 @@ impl SshSession {
         write_verified_atomic(&mut remote, local_path, expected_sha256).await
     }
 
+    pub async fn read_file_limited(
+        &self,
+        remote_path: &str,
+        max_bytes: u64,
+    ) -> AdapterResult<Vec<u8>> {
+        let sftp = self.sftp().await?;
+        let remote = sftp
+            .open(remote_path)
+            .await
+            .map_err(|error| AdapterError::Ssh(error.to_string()))?;
+        let mut limited = remote.take(max_bytes.saturating_add(1));
+        let mut bytes = Vec::new();
+        limited.read_to_end(&mut bytes).await?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(AdapterError::Ssh(format!(
+                "remote file exceeds preview limit of {max_bytes} bytes"
+            )));
+        }
+        Ok(bytes)
+    }
+
     pub async fn disconnect(self) -> AdapterResult<()> {
         self.handle
             .disconnect(Disconnect::ByApplication, "", "en")

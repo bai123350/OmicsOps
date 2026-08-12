@@ -175,6 +175,33 @@ fn scanpy_tool_accepts_the_structured_analysis_contract() {
 }
 
 #[test]
+fn remote_agent_tool_accepts_read_only_memory_context() {
+    let catalog = builtin_tool_catalog().unwrap();
+    let mut candidate = plan(tool_step("agent", "agent.remote_task"));
+    candidate.policy.allowed_tools = vec!["agent.remote_task".into()];
+    candidate.policy.max_risk = StepRisk::Medium;
+    candidate.stages[0].steps[0].risk = StepRisk::Medium;
+    candidate.stages[0].steps[0].expected_artifacts.clear();
+    candidate.stages[0].steps[0].verifications = vec![VerificationSpec::ExitCode { expected: 0 }];
+    candidate.stages[0].steps[0].action = StepAction::Tool {
+        tool_id: "agent.remote_task".into(),
+        version: "1.0.0".into(),
+        arguments: json!({
+            "goal": "continue the approved analysis",
+            "remote_observation": "data/input.mtx exists",
+            "completion_criteria": ["verify outputs"],
+            "skill_context": "single-cell workflow",
+            "conversation_history": "USER: continue from the previous step",
+            "operational_memory": "scanpy was installed successfully",
+            "max_iterations": 24
+        }),
+    };
+
+    let validation = validate_plan_v2(&candidate, &catalog);
+    assert!(validation.valid, "{:?}", validation.issues);
+}
+
+#[test]
 fn builtin_catalog_exposes_versioned_bioinformatics_tools() {
     let catalog = builtin_tool_catalog().unwrap();
 

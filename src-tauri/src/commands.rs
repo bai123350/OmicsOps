@@ -94,6 +94,88 @@ pub struct AgentRunStreamEvent {
     pub iteration: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteAgentMemoryEntry {
+    pub project_id: Uuid,
+    pub conversation_id: Option<Uuid>,
+    pub run_id: Uuid,
+    pub sequence: u64,
+    pub timestamp: chrono::DateTime<Utc>,
+    pub command: String,
+    pub reason: String,
+    pub exit_code: u32,
+    pub stdout_tail: String,
+    pub stderr_tail: String,
+}
+
+fn remote_agent_memory_entries(
+    repository: &Repository,
+    project_id: Uuid,
+    conversation_id: Option<Uuid>,
+) -> Result<Vec<RemoteAgentMemoryEntry>, String> {
+    let mut entries = repository
+        .list_json::<RemoteAgentMemoryEntry>("remote_agent_memory")
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|entry| {
+            entry.project_id == project_id
+                && conversation_id
+                    .map(|id| entry.conversation_id == Some(id))
+                    .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| (entry.timestamp, entry.sequence));
+    Ok(entries)
+}
+
+pub fn remote_agent_memory_context(
+    repository: &Repository,
+    project_id: Uuid,
+    conversation_id: Option<Uuid>,
+) -> Result<String, String> {
+    let entries = remote_agent_memory_entries(repository, project_id, conversation_id)?;
+    if entries.is_empty() {
+        return Ok(
+            "No prior approved remote terminal actions are recorded for this conversation.".into(),
+        );
+    }
+    let mut sections = Vec::new();
+    let mut used_chars = 0_usize;
+    for entry in entries.iter().rev() {
+        let section = format!(
+            "RUN {} ACTION {} @ {}\nReason: {}\nCommand: {}\nExit: {}\nSTDOUT tail:\n{}\nSTDERR tail:\n{}",
+            entry.run_id,
+            entry.sequence,
+            entry.timestamp,
+            entry.reason,
+            entry.command,
+            entry.exit_code,
+            entry.stdout_tail,
+            entry.stderr_tail,
+        );
+        if !sections.is_empty() && used_chars.saturating_add(section.chars().count()) > 60_000 {
+            break;
+        }
+        used_chars = used_chars.saturating_add(section.chars().count());
+        sections.push(section);
+    }
+    sections.reverse();
+    Ok(sections.join("\n\n"))
+}
+
+fn save_remote_agent_memory(
+    repository: &Repository,
+    entry: &RemoteAgentMemoryEntry,
+) -> Result<(), String> {
+    repository
+        .put_json(
+            "remote_agent_memory",
+            &format!("{}:{:020}", entry.run_id, entry.sequence),
+            entry,
+        )
+        .map_err(|error| error.to_string())
+}
+
 fn emit_agent_run_stream(
     app: &AppHandle,
     repository: &Repository,
@@ -1759,6 +1841,9 @@ fn remote_agent_execution_contract(
          You may download package managers and packages into the project, use micromamba/conda when available, bootstrap a project-local \
          micromamba under .omicsops/bin when absent, or create project-local Python/R environments. Do not require system package installation. \
          After installation, invoke tools through explicit project-local paths and verify imports/versions before analysis. \
+         Persisted operational memory from earlier actions is authoritative evidence: reuse successful project-local environments and artifacts. \
+         Never reinstall a dependency merely because a new run or model turn started; first verify the recorded environment path and only repair \
+         or reinstall when current terminal evidence proves it is absent, broken, or incompatible. \
          Do not repeat the same dependency probe once its result is known; take a corrective installation action or report the concrete \
          network/compatibility error returned by that installation command. Prefer scripts and environments stored under the project root. \
          The approved environment channels are {environment_channels:?}; declared dependencies are {environment_dependencies:?}. \
@@ -2201,6 +2286,20 @@ async fn execute_remote_agent_task(
         .get("skill_context")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
+    let conversation_id = plan
+        .metadata
+        .get("conversation_id")
+        .and_then(|value| value.parse::<Uuid>().ok());
+    let saved_conversation_history = arguments
+        .get("conversation_history")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let saved_operational_memory = arguments
+        .get("operational_memory")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let current_operational_memory =
+        remote_agent_memory_context(repository, project.id, conversation_id)?;
     let criteria = arguments
         .get("completion_criteria")
         .cloned()
@@ -2227,7 +2326,7 @@ async fn execute_remote_agent_task(
             .unwrap_or("not_configured"),
     );
     let mut transcript = format!(
-        "APPROVED GOAL:\n{goal}\n\nCOMPLETION CRITERIA:\n{criteria}\n\nAPPROVED PROJECT-LOCAL ENVIRONMENT:\nchannels={environment_channels:?}\ndependencies={environment_dependencies:?}\nEnvironment work is part of the approved remote task and must be performed through kind=run when dependencies are missing.\n\nREAD-ONLY REMOTE OBSERVATION:\n{observation}\n\nENABLED SKILLS:\n{skills}"
+        "APPROVED GOAL:\n{goal}\n\nSAME-CONVERSATION HISTORY:\n{saved_conversation_history}\n\nPERSISTED OPERATIONAL MEMORY AT PLAN TIME:\n{saved_operational_memory}\n\nLATEST PERSISTED OPERATIONAL MEMORY:\n{current_operational_memory}\n\nCOMPLETION CRITERIA:\n{criteria}\n\nAPPROVED PROJECT-LOCAL ENVIRONMENT:\nchannels={environment_channels:?}\ndependencies={environment_dependencies:?}\nEnvironment work is part of the approved remote task and must be performed through kind=run when dependencies are missing.\n\nREAD-ONLY REMOTE OBSERVATION:\n{observation}\n\nENABLED SKILLS:\n{skills}"
     );
     emit_agent_run_stream(
         app,
@@ -2243,10 +2342,21 @@ async fn execute_remote_agent_task(
         ),
         None,
     );
-    let mut ran_command = false;
-    let mut terminal_actions = 0_u64;
+    let prior_run_memory = remote_agent_memory_entries(repository, project.id, conversation_id)?
+        .into_iter()
+        .filter(|entry| entry.run_id == run_id)
+        .collect::<Vec<_>>();
+    let mut ran_command = prior_run_memory.iter().any(|entry| entry.exit_code == 0);
+    let mut terminal_actions = prior_run_memory
+        .iter()
+        .map(|entry| entry.sequence)
+        .max()
+        .unwrap_or(0);
     let mut consecutive_model_failures = 0_u8;
-    let mut executed_commands = HashSet::new();
+    let mut executed_commands = prior_run_memory
+        .into_iter()
+        .map(|entry| entry.command.trim().to_string())
+        .collect::<HashSet<_>>();
     'agent_loop: for iteration in 1..=max_decisions {
         if cancel_requested.load(Ordering::SeqCst) {
             return Err("remote agent run was canceled".into());
@@ -2792,6 +2902,21 @@ async fn execute_remote_agent_task(
                     .collect();
                 transcript.push_str(&format!("\n\nACTION {iteration}\nReason: {}\nCommand: {}\nExit: {}\nSTDOUT:\n{}\nSTDERR:\n{}",
                     action.reason, command, output.status, stdout, stderr));
+                save_remote_agent_memory(
+                    repository,
+                    &RemoteAgentMemoryEntry {
+                        project_id: project.id,
+                        conversation_id,
+                        run_id,
+                        sequence: terminal_actions,
+                        timestamp: Utc::now(),
+                        command: redact_secrets(command, &[] as &[&str]),
+                        reason: action.reason.clone(),
+                        exit_code: output.status,
+                        stdout_tail: redact_secrets(&stdout, &[] as &[&str]),
+                        stderr_tail: redact_secrets(&stderr, &[] as &[&str]),
+                    },
+                )?;
                 append_v2_event(
                     app,
                     repository,

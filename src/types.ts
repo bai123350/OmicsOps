@@ -376,6 +376,14 @@ export interface RemoteFileEntry {
   modified_unix_seconds: number;
 }
 
+export interface ProjectImagePreview {
+  relative_path: string;
+  mime_type: string;
+  size_bytes: number;
+  sha256: string;
+  data_url: string;
+}
+
 export interface SyncEntry {
   id: string;
   project_id: string;

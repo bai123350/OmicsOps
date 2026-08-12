@@ -101,6 +101,7 @@ pub fn run() {
             sync_commands::list_remote_files,
             sync_commands::upload_selected_files,
             sync_commands::download_project_file,
+            sync_commands::preview_project_image,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run OmicsOps desktop");

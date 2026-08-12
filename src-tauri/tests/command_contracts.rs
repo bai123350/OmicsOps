@@ -4,13 +4,13 @@ use omicsops_core::domain::{AuthenticationMethod, ConnectionProfile};
 use omicsops_desktop_lib::{
     agent_commands::{
         SubmitMessageRequest, agent_event_kind_from_model_event, agent_user_content,
-        canonical_report_arguments, canonical_scanpy_arguments,
+        canonical_report_arguments, canonical_scanpy_arguments, conversation_model_messages,
         conversation_title_from_first_message, merge_declared_dependencies,
         normalize_generated_plan, user_message_from_request,
     },
     commands::{
-        PrivateKeySecret, normalize_connection_profile, parse_authentication_secret,
-        validate_agent_command,
+        PrivateKeySecret, RemoteAgentMemoryEntry, normalize_connection_profile,
+        parse_authentication_secret, remote_agent_memory_context, validate_agent_command,
     },
     inspection::parse_server_inspection,
     kernel_commands::{
@@ -19,7 +19,10 @@ use omicsops_desktop_lib::{
     model_commands::{SaveModelProfileRequest, model_profile_from_request},
     research_commands::research_cache_key,
     skill_commands::{install_builtin_skills, set_skill_enabled_in_repository},
-    sync_commands::{choose_download_relative_path, parse_remote_index, resolve_selected_uploads},
+    sync_commands::{
+        choose_download_relative_path, parse_remote_index, preview_image_mime,
+        resolve_selected_uploads,
+    },
     workspace_commands::{
         CreateProjectRequest, UpdateProjectRemoteRequest, apply_remote_binding,
         conversation_title_needs_first_message, project_from_request, write_project_manifest,
@@ -37,6 +40,16 @@ fn approved_remote_agent_blocks_privilege_escalation_and_project_escape() {
     assert!(validate_agent_command("rm -rf results", "/home/user/project").is_err());
     assert!(validate_agent_command("cd /tmp && touch escaped", "/home/user/project").is_err());
     assert!(validate_agent_command("touch /tmp/escaped", "/home/user/project").is_err());
+}
+
+#[test]
+fn image_preview_requires_matching_extension_and_file_signature() {
+    assert_eq!(
+        preview_image_mime("results/umap.png", b"\x89PNG\r\n\x1a\nrest").unwrap(),
+        "image/png"
+    );
+    assert!(preview_image_mime("results/umap.png", b"not an image").is_err());
+    assert!(preview_image_mime("results/data.csv", b"\x89PNG\r\n\x1a\nrest").is_err());
 }
 
 #[test]
@@ -262,6 +275,78 @@ fn conversation_title_is_the_users_first_question_not_a_generated_label() {
         conversation_title_from_first_message("  对 hg19 单细胞数据\n进行质控和注释  "),
         "对 hg19 单细胞数据 进行质控和注释"
     );
+}
+
+#[test]
+fn conversation_memory_replays_prior_turns_into_the_next_model_request() {
+    let project_id = Uuid::new_v4();
+    let conversation_id = Uuid::new_v4();
+    let first = omicsops_core::workspace::Message::markdown(
+        Uuid::new_v4(),
+        project_id,
+        conversation_id,
+        1,
+        omicsops_core::workspace::MessageRole::User,
+        "先安装 scanpy",
+        chrono::Utc::now(),
+    );
+    let answer = omicsops_core::workspace::Message::markdown(
+        Uuid::new_v4(),
+        project_id,
+        conversation_id,
+        2,
+        omicsops_core::workspace::MessageRole::Assistant,
+        "已记录安装要求",
+        chrono::Utc::now(),
+    );
+    let current = omicsops_core::workspace::Message::markdown(
+        Uuid::new_v4(),
+        project_id,
+        conversation_id,
+        3,
+        omicsops_core::workspace::MessageRole::User,
+        "继续分析",
+        chrono::Utc::now(),
+    );
+    let context = conversation_model_messages(
+        &[first, answer, current.clone()],
+        current.id,
+        Some("Remote root: /project"),
+    );
+    assert_eq!(context.len(), 3);
+    assert_eq!(context[0].role, "user");
+    assert!(context[0].content.contains("先安装 scanpy"));
+    assert_eq!(context[1].role, "assistant");
+    assert!(context[2].content.contains("继续分析"));
+    assert!(context[2].content.contains("Remote root: /project"));
+}
+
+#[test]
+fn remote_action_memory_is_scoped_to_the_same_conversation() {
+    let repository = omicsops_adapters::persistence::Repository::open_in_memory().unwrap();
+    let project_id = Uuid::new_v4();
+    let conversation_id = Uuid::new_v4();
+    let entry = RemoteAgentMemoryEntry {
+        project_id,
+        conversation_id: Some(conversation_id),
+        run_id: Uuid::new_v4(),
+        sequence: 1,
+        timestamp: chrono::Utc::now(),
+        command: ".omicsops/env/bin/python -m pip install scanpy".into(),
+        reason: "install the missing analysis dependency".into(),
+        exit_code: 0,
+        stdout_tail: "Successfully installed scanpy".into(),
+        stderr_tail: String::new(),
+    };
+    repository
+        .put_json("remote_agent_memory", "test:0001", &entry)
+        .unwrap();
+
+    let same = remote_agent_memory_context(&repository, project_id, Some(conversation_id)).unwrap();
+    assert!(same.contains("Successfully installed scanpy"));
+    assert!(same.contains(".omicsops/env/bin/python"));
+    let other = remote_agent_memory_context(&repository, project_id, Some(Uuid::new_v4())).unwrap();
+    assert!(other.contains("No prior approved remote terminal actions"));
 }
 
 #[test]

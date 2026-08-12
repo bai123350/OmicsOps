@@ -30,6 +30,18 @@ describe("WorkspaceShell", () => {
     expect(screen.getByRole("dialog", { name: "产物预览" })).toBeInTheDocument();
   });
 
+  it("loads the selected remote image into the preview", async () => {
+    const onPreviewImage = vi.fn().mockResolvedValue({ relative_path: "results/umap.png", mime_type: "image/png", size_bytes: 1024, sha256: "a".repeat(64), data_url: "data:image/png;base64,iVBORw0KGgo=" });
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} remoteFiles={[{ relative_path: "results/umap.png", directory: false, size_bytes: 1024, modified_unix_seconds: 0 }, { relative_path: "results/markers.csv", directory: false, size_bytes: 20, modified_unix_seconds: 0 }]} onPreviewImage={onPreviewImage} />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "Preview" }));
+    expect(screen.getByRole("combobox", { name: "Select project image" })).toHaveValue("results/umap.png");
+    fireEvent.click(screen.getByRole("button", { name: "Show image" }));
+    expect(await screen.findByRole("img", { name: "results/umap.png" })).toHaveAttribute("src", "data:image/png;base64,iVBORw0KGgo=");
+    expect(onPreviewImage).toHaveBeenCalledWith("results/umap.png");
+    expect(screen.queryByRole("option", { name: "results/markers.csv" })).not.toBeInTheDocument();
+  });
+
   it("renders English copy from the shared locale resource", () => {
     render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} />);
 
