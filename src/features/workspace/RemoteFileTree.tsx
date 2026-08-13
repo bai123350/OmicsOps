@@ -1,6 +1,6 @@
 import { Download, FileText, Folder, RefreshCw, Upload } from "lucide-react";
 
-import type { RemoteFileEntry } from "../../types";
+import type { RemoteFileEntry, SyncEntry } from "../../types";
 import type { Locale } from "./copy";
 
 interface Props {
@@ -11,9 +11,13 @@ interface Props {
   onUpload?: () => Promise<void> | void;
   onRefresh?: () => Promise<void> | void;
   onDownload?: (relativePath: string) => Promise<void> | void;
+  syncEntries?: SyncEntry[];
+  onPauseSync?: (id: string) => Promise<void> | void;
+  onCancelSync?: (id: string) => Promise<void> | void;
+  onRetrySync?: (id: string) => Promise<void> | void;
 }
 
-export function RemoteFileTree({ locale, remoteFiles, busy, notice, onUpload, onRefresh, onDownload }: Props) {
+export function RemoteFileTree({ locale, remoteFiles, busy, notice, onUpload, onRefresh, onDownload, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
   const zh = locale === "zh-CN";
   const demoFiles: RemoteFileEntry[] = [
     { relative_path: "data", directory: true, size_bytes: 0, modified_unix_seconds: 0 },
@@ -32,6 +36,7 @@ export function RemoteFileTree({ locale, remoteFiles, busy, notice, onUpload, on
       </div>
     </div>
     {notice && <div className="file-notice" role="status">{notice}</div>}
+    {syncEntries.length > 0 && <div className="sync-queue"><b>{zh ? "传输任务" : "Transfers"}</b>{syncEntries.slice(-5).reverse().map((entry) => <article key={entry.id}><span>{entry.relative_path}</span><small>{entry.state} · {formatBytes(entry.transferred_bytes)} / {formatBytes(entry.size_bytes)} · {entry.retry_count} retries</small><progress max={Math.max(1, entry.size_bytes)} value={entry.transferred_bytes} />{entry.error && <em>{entry.error}</em>}<div>{entry.state === "transferring" && <><button onClick={() => void onPauseSync?.(entry.id)}>{zh ? "暂停" : "Pause"}</button><button onClick={() => void onCancelSync?.(entry.id)}>{zh ? "取消" : "Cancel"}</button></>}{(["paused", "failed", "canceled"] as string[]).includes(entry.state) && <button onClick={() => void onRetrySync?.(entry.id)}>{zh ? "续传/重试" : "Resume/retry"}</button>}</div></article>)}</div>}
     {files.length === 0 && <div className="empty-file-tree">{zh ? "远端目录为空" : "The remote directory is empty"}</div>}
     {files.map((entry) => entry.directory
       ? <div className="tree-folder" key={entry.relative_path}><Folder size={15} /><span className="tree-path">{entry.relative_path}</span><em>{zh ? "远端" : "remote"}</em></div>

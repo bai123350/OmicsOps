@@ -15,3 +15,4 @@
   border-color: #b7e3ca;
   cursor: default;
 }
+.plan-skills{max-width:700px;display:grid;gap:3px;padding:8px 10px;border:1px solid #dbe3f5;border-radius:8px;background:#f5f8ff}.plan-skills b{font-size:9px;color:#315bd4}.plan-skills small{font-size:8px;color:#667085;overflow-wrap:anywhere}

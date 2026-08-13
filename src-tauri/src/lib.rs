@@ -3,6 +3,7 @@ pub mod commands;
 pub mod inspection;
 pub mod kernel_commands;
 pub mod model_commands;
+pub mod p1_commands;
 pub mod research_commands;
 pub mod skill_commands;
 pub mod sync_commands;
@@ -29,8 +30,10 @@ pub fn run() {
             std::fs::create_dir_all(&skills_root)?;
             let repository = Repository::open(data_dir.join("omicsops.db"))
                 .map_err(|error| error.to_string())?;
+            commands::backfill_agent_run_conversation_ids(&repository)?;
             skill_commands::install_builtin_skills(&repository, &skills_root)?;
             kernel_commands::mark_orphaned_kernels_interrupted(&repository)?;
+            sync_commands::mark_orphaned_sync_transfers_failed(&repository)?;
             app.manage(AppState {
                 repository,
                 credentials: SystemCredentialVault,
@@ -39,6 +42,7 @@ pub fn run() {
                 research_last_request: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 active_kernels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 project_kernel_queues: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                sync_controls: Arc::new(Mutex::new(HashMap::new())),
             });
             Ok(())
         })
@@ -75,6 +79,12 @@ pub fn run() {
             commands::cancel_run,
             commands::list_artifacts,
             commands::download_artifact,
+            p1_commands::search_agent_memory,
+            p1_commands::list_notebook_entries,
+            p1_commands::list_project_artifacts,
+            p1_commands::export_project_notebook,
+            p1_commands::inspect_mcp_server,
+            p1_commands::call_mcp_tool,
             workspace_commands::list_projects,
             workspace_commands::create_project,
             workspace_commands::update_project_remote,
@@ -102,6 +112,10 @@ pub fn run() {
             sync_commands::upload_selected_files,
             sync_commands::download_project_file,
             sync_commands::preview_project_image,
+            sync_commands::list_sync_entries,
+            sync_commands::pause_sync_transfer,
+            sync_commands::cancel_sync_transfer,
+            sync_commands::retry_sync_transfer,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run OmicsOps desktop");

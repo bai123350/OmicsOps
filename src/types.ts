@@ -265,11 +265,12 @@ export interface EnvironmentLock {
 }
 
 export interface AgentRunStreamEvent {
-  run_id: string;
-  project_id: string;
+    run_id: string;
+    project_id: string;
+    conversation_id?: string | null;
   sequence: number;
   timestamp: string;
-  kind: "agent_started" | "model_started" | "model_waiting" | "model_progress" | "model_assessment" | "model_recovering" | "model_action" | "policy_rejected" | "action_rejected" | "tool_started" | "tool_waiting" | "tool_stopping" | "tool_stopped" | "stdout" | "stderr" | "tool_completed" | "ssh_reconnecting" | "ssh_reconnected" | "cancel_requested" | "agent_canceled" | "agent_completed" | "agent_failed";
+  kind: "agent_started" | "skills_applied" | "model_started" | "model_waiting" | "model_progress" | "model_assessment" | "model_recovering" | "model_action" | "policy_rejected" | "action_rejected" | "tool_started" | "tool_waiting" | "tool_stopping" | "tool_stopped" | "stdout" | "stderr" | "tool_completed" | "ssh_reconnecting" | "ssh_reconnected" | "cancel_requested" | "agent_canceled" | "agent_completed" | "agent_failed";
   title: string;
   content: string;
   iteration: number | null;
@@ -388,13 +389,23 @@ export interface SyncEntry {
   id: string;
   project_id: string;
   relative_path: string;
+  local_relative_path: string | null;
   remote_path: string | null;
   direction: "local_to_remote" | "remote_to_local";
   size_bytes: number;
   sha256: string;
-  state: "pending" | "transferring" | "synced" | "conflict" | "failed";
+  state: "pending" | "transferring" | "paused" | "canceled" | "synced" | "conflict" | "failed";
+  transferred_bytes: number;
+  retry_count: number;
+  error: string | null;
   updated_at: string;
 }
+
+export interface EvidenceReference { source_kind: string; source_id: string; excerpt: string; }
+export interface MemoryFact { id: string; project_id: string; conversation_id: string | null; run_id: string | null; dimension: string; key: string; value: string; statement: string; evidence: EvidenceReference[]; conflicted_with: string[]; created_at: string; }
+export interface ProjectArtifact { id: string; project_id: string; run_id: string | null; relative_path: string; remote_path: string | null; media_type: string; size_bytes: number; sha256: string; verified: boolean; created_at: string; }
+export interface NotebookEntry { id: string; project_id: string; conversation_id: string | null; turn_id: string | null; kind: "goal" | "hypothesis" | "method" | "observation" | "decision" | "evidence" | "code" | "environment" | "command"; title: string; markdown: string; confidence: number | null; evidence_ids: string[]; artifact_ids: string[]; created_at: string; updated_at: string; }
+export interface McpResult { server_name: string; capabilities: Record<string, unknown>; tools: Array<Record<string, unknown>>; result: unknown | null; audit_id: string; }
 
 export interface SkillPackage {
   id: string;

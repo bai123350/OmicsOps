@@ -148,11 +148,15 @@ fn project_research_records_round_trip_through_normalized_v3_tables() {
         id: Uuid::new_v4(),
         project_id: project.id,
         relative_path: "results/umap.png".into(),
+        local_relative_path: Some("results/umap.png".into()),
         remote_path: Some("/srv/results/umap.png".into()),
         direction: SyncDirection::RemoteToLocal,
         size_bytes: 42,
         sha256: "abc".into(),
         state: SyncState::Synced,
+        transferred_bytes: 42,
+        retry_count: 0,
+        error: None,
         updated_at: now,
     };
     let model = ModelProfile {

@@ -1,6 +1,10 @@
 use std::{
     io::Read,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -16,6 +20,285 @@ use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
 use crate::commands::{AppState, connect_profile, find_profile, require_trusted_host};
+
+#[tauri::command]
+pub fn list_sync_entries(
+    state: State<'_, AppState>,
+    project_id: Uuid,
+) -> Result<Vec<SyncEntry>, String> {
+    state
+        .repository
+        .sync_entries_for_project(project_id)
+        .map_err(|error| error.to_string())
+}
+
+pub fn mark_orphaned_sync_transfers_failed(
+    repository: &omicsops_adapters::persistence::Repository,
+) -> Result<usize, String> {
+    let mut changed = 0;
+    for project in repository
+        .list_projects()
+        .map_err(|error| error.to_string())?
+    {
+        for mut entry in repository
+            .sync_entries_for_project(project.id)
+            .map_err(|error| error.to_string())?
+        {
+            if entry.state == SyncState::Transferring {
+                entry.state = SyncState::Failed;
+                entry.error = Some("transfer was interrupted by an application restart; retry will resume from verified partial bytes".into());
+                entry.updated_at = Utc::now();
+                repository
+                    .save_sync_entry(&entry)
+                    .map_err(|error| error.to_string())?;
+                changed += 1;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+fn set_sync_control(state: &AppState, transfer_id: Uuid, value: u8) -> Result<(), String> {
+    let controls = state
+        .sync_controls
+        .lock()
+        .map_err(|_| "sync control lock poisoned")?;
+    controls
+        .get(&transfer_id)
+        .ok_or("sync transfer is not active")?
+        .store(value, Ordering::SeqCst);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn pause_sync_transfer(state: State<'_, AppState>, transfer_id: Uuid) -> Result<(), String> {
+    set_sync_control(&state, transfer_id, 1)
+}
+
+#[tauri::command]
+pub fn cancel_sync_transfer(state: State<'_, AppState>, transfer_id: Uuid) -> Result<(), String> {
+    set_sync_control(&state, transfer_id, 2)
+}
+
+#[tauri::command]
+pub async fn retry_sync_transfer(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    transfer_id: Uuid,
+) -> Result<SyncEntry, String> {
+    let original = state
+        .repository
+        .list_projects()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find_map(|project| {
+            state
+                .repository
+                .sync_entries_for_project(project.id)
+                .ok()?
+                .into_iter()
+                .find(|entry| entry.id == transfer_id)
+        });
+    let mut entry = original.ok_or("sync transfer not found")?;
+    if !matches!(
+        entry.state,
+        SyncState::Paused | SyncState::Failed | SyncState::Canceled
+    ) {
+        return Err("only paused, failed, or canceled transfers can be retried".into());
+    }
+    entry.retry_count += 1;
+    entry.state = SyncState::Pending;
+    entry.error = None;
+    entry.updated_at = Utc::now();
+    state
+        .repository
+        .save_sync_entry(&entry)
+        .map_err(|error| error.to_string())?;
+    match entry.direction {
+        SyncDirection::RemoteToLocal => resume_download(&app, &state, entry).await,
+        SyncDirection::LocalToRemote => resume_upload(&app, &state, entry).await,
+    }
+}
+
+async fn finish_transfer(
+    app: &AppHandle,
+    state: &AppState,
+    mut entry: SyncEntry,
+    outcome: omicsops_adapters::ssh::ControlledTransfer,
+) -> Result<SyncEntry, String> {
+    match outcome {
+        omicsops_adapters::ssh::ControlledTransfer::Completed(bytes) => {
+            entry.transferred_bytes = bytes;
+            entry.state = SyncState::Synced;
+            entry.error = None;
+        }
+        omicsops_adapters::ssh::ControlledTransfer::Paused(bytes) => {
+            entry.transferred_bytes = bytes;
+            entry.state = SyncState::Paused;
+        }
+        omicsops_adapters::ssh::ControlledTransfer::Canceled(bytes) => {
+            entry.transferred_bytes = bytes;
+            entry.state = SyncState::Canceled;
+        }
+    }
+    entry.updated_at = Utc::now();
+    state
+        .repository
+        .save_sync_entry(&entry)
+        .map_err(|error| error.to_string())?;
+    let _ = app.emit("artifact-event", &entry);
+    state
+        .sync_controls
+        .lock()
+        .map_err(|_| "sync control lock poisoned")?
+        .remove(&entry.id);
+    Ok(entry)
+}
+
+async fn resume_download(
+    app: &AppHandle,
+    state: &AppState,
+    mut entry: SyncEntry,
+) -> Result<SyncEntry, String> {
+    let project = state
+        .repository
+        .get_project(entry.project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or("project not found")?;
+    let profile = find_profile(
+        &state.repository,
+        project
+            .connection_id
+            .ok_or("project has no remote connection")?,
+    )?;
+    require_trusted_host(&profile)?;
+    let session = connect_profile(state, &profile).await?;
+    let remote = entry
+        .remote_path
+        .clone()
+        .ok_or("sync entry has no remote path")?;
+    let root = Path::new(&project.local_root)
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let local = root.join(&entry.relative_path);
+    ensure_safe_download_parent(&root, &local)?;
+    let part = local.with_extension(format!(
+        "{}.part",
+        local
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+    ));
+    let offset = part
+        .metadata()
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+        .min(entry.size_bytes);
+    entry.transferred_bytes = offset;
+    entry.state = SyncState::Transferring;
+    state
+        .repository
+        .save_sync_entry(&entry)
+        .map_err(|error| error.to_string())?;
+    let control = Arc::new(AtomicU8::new(0));
+    state
+        .sync_controls
+        .lock()
+        .map_err(|_| "sync control lock poisoned")?
+        .insert(entry.id, control.clone());
+    let outcome = session
+        .download_controlled_verified(&remote, &local, &entry.sha256, offset, control, |_| {})
+        .await
+        .map_err(|error| error.to_string());
+    match outcome {
+        Ok(value) => finish_transfer(app, state, entry, value).await,
+        Err(error) => fail_transfer(app, state, entry, error),
+    }
+}
+
+async fn resume_upload(
+    app: &AppHandle,
+    state: &AppState,
+    mut entry: SyncEntry,
+) -> Result<SyncEntry, String> {
+    let project = state
+        .repository
+        .get_project(entry.project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or("project not found")?;
+    let profile = find_profile(
+        &state.repository,
+        project
+            .connection_id
+            .ok_or("project has no remote connection")?,
+    )?;
+    require_trusted_host(&profile)?;
+    let session = connect_profile(state, &profile).await?;
+    let local = Path::new(&project.local_root).join(
+        entry
+            .local_relative_path
+            .as_deref()
+            .unwrap_or(&entry.relative_path),
+    );
+    let remote = entry
+        .remote_path
+        .clone()
+        .ok_or("sync entry has no remote path")?;
+    let offset = session
+        .execute(&format!(
+            "stat -c %s -- {} 2>/dev/null || printf 0",
+            shell_quote(&remote)
+        ))
+        .await
+        .map_err(|error| error.to_string())?
+        .stdout
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0)
+        .min(entry.size_bytes);
+    entry.transferred_bytes = offset;
+    entry.state = SyncState::Transferring;
+    state
+        .repository
+        .save_sync_entry(&entry)
+        .map_err(|error| error.to_string())?;
+    let control = Arc::new(AtomicU8::new(0));
+    state
+        .sync_controls
+        .lock()
+        .map_err(|_| "sync control lock poisoned")?
+        .insert(entry.id, control.clone());
+    let outcome = session
+        .upload_file_controlled(&local, &remote, offset, control, |_| {})
+        .await
+        .map_err(|error| error.to_string());
+    match outcome {
+        Ok(value) => finish_transfer(app, state, entry, value).await,
+        Err(error) => fail_transfer(app, state, entry, error),
+    }
+}
+
+fn fail_transfer(
+    app: &AppHandle,
+    state: &AppState,
+    mut entry: SyncEntry,
+    error: String,
+) -> Result<SyncEntry, String> {
+    entry.state = SyncState::Failed;
+    entry.error = Some(error.clone());
+    entry.updated_at = Utc::now();
+    state
+        .repository
+        .save_sync_entry(&entry)
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("artifact-event", &entry);
+    state
+        .sync_controls
+        .lock()
+        .map_err(|_| "sync control lock poisoned")?
+        .remove(&entry.id);
+    Err(error)
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RemoteFileEntry {
@@ -309,41 +592,82 @@ pub async fn upload_selected_files(
             .map(|value| value.0)
             .unwrap_or(&root);
         ensure_remote_upload_parent(&session, &root, parent).await?;
-        if !already_synced {
-            session
-                .upload_file(&local_path, &remote_path)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-        let remote_sha256 = remote_sha256(&session, &remote_path).await?;
-        if !local_sha256.eq_ignore_ascii_case(&remote_sha256) {
-            return Err(format!("uploaded file checksum mismatch: {relative}"));
-        }
-        let entry = SyncEntry {
+        let mut entry = SyncEntry {
             id: Uuid::new_v4(),
             project_id: project.id,
             relative_path: chosen_relative.clone(),
-            remote_path: Some(remote_path),
+            local_relative_path: Some(relative.to_owned()),
+            remote_path: Some(remote_path.clone()),
             direction: SyncDirection::LocalToRemote,
             size_bytes: local_path
                 .metadata()
                 .map_err(|error| error.to_string())?
                 .len(),
-            sha256: local_sha256,
-            state: if chosen_relative == relative {
-                SyncState::Synced
-            } else {
-                SyncState::Conflict
-            },
+            sha256: local_sha256.clone(),
+            state: SyncState::Pending,
+            transferred_bytes: 0,
+            retry_count: 0,
+            error: None,
             updated_at: Utc::now(),
         };
         state
             .repository
             .save_sync_entry(&entry)
             .map_err(|error| error.to_string())?;
-        app.emit("artifact-event", &entry)
+        let _ = app.emit("artifact-event", &entry);
+        if already_synced {
+            entry.transferred_bytes = entry.size_bytes;
+            entry.state = if chosen_relative == relative {
+                SyncState::Synced
+            } else {
+                SyncState::Conflict
+            };
+            state
+                .repository
+                .save_sync_entry(&entry)
+                .map_err(|error| error.to_string())?;
+            entries.push(entry);
+            continue;
+        }
+        entry.state = SyncState::Transferring;
+        state
+            .repository
+            .save_sync_entry(&entry)
             .map_err(|error| error.to_string())?;
-        entries.push(entry);
+        let _ = app.emit("artifact-event", &entry);
+        let control = Arc::new(AtomicU8::new(0));
+        state
+            .sync_controls
+            .lock()
+            .map_err(|_| "sync control lock poisoned")?
+            .insert(entry.id, control.clone());
+        let progress_repository = state.repository.clone();
+        let progress_app = app.clone();
+        let progress_entry = entry.clone();
+        let outcome = session
+            .upload_file_controlled(&local_path, &remote_path, 0, control, move |bytes| {
+                let mut update = progress_entry.clone();
+                update.transferred_bytes = bytes;
+                update.updated_at = Utc::now();
+                let _ = progress_repository.save_sync_entry(&update);
+                let _ = progress_app.emit("artifact-event", &update);
+            })
+            .await
+            .map_err(|error| error.to_string());
+        let completed = match outcome {
+            Ok(value) => finish_transfer(&app, &state, entry, value).await?,
+            Err(error) => {
+                let _ = fail_transfer(&app, &state, entry, error.clone());
+                return Err(error);
+            }
+        };
+        if matches!(completed.state, SyncState::Synced) {
+            let remote_sha256 = remote_sha256(&session, &remote_path).await?;
+            if !local_sha256.eq_ignore_ascii_case(&remote_sha256) {
+                return Err(format!("uploaded file checksum mismatch: {relative}"));
+            }
+        }
+        entries.push(completed);
     }
     session
         .disconnect()
@@ -455,35 +779,67 @@ pub async fn download_project_file(
         .map_err(|error| error.to_string())?;
     let local_path = local_root.join(&chosen);
     ensure_safe_download_parent(&local_root, &local_path)?;
-    session
-        .download_atomic_verified(&remote_path, &local_path, &sha256)
-        .await
-        .map_err(|error| error.to_string())?;
-    session
-        .disconnect()
-        .await
-        .map_err(|error| error.to_string())?;
-    let entry = SyncEntry {
+    let mut entry = SyncEntry {
         id: Uuid::new_v4(),
         project_id: project.id,
         relative_path: chosen.to_string_lossy().replace('\\', "/"),
-        remote_path: Some(remote_path),
+        local_relative_path: Some(chosen.to_string_lossy().replace('\\', "/")),
+        remote_path: Some(remote_path.clone()),
         direction: SyncDirection::RemoteToLocal,
         size_bytes,
-        sha256,
-        state: if conflict {
-            SyncState::Conflict
-        } else {
-            SyncState::Synced
-        },
+        sha256: sha256.clone(),
+        state: SyncState::Transferring,
+        transferred_bytes: 0,
+        retry_count: 0,
+        error: None,
         updated_at: Utc::now(),
     };
     state
         .repository
         .save_sync_entry(&entry)
         .map_err(|error| error.to_string())?;
-    app.emit("artifact-event", &entry)
-        .map_err(|error| error.to_string())?;
+    let _ = app.emit("artifact-event", &entry);
+    let control = Arc::new(AtomicU8::new(0));
+    state
+        .sync_controls
+        .lock()
+        .map_err(|_| "sync control lock poisoned")?
+        .insert(entry.id, control.clone());
+    let progress_repository = state.repository.clone();
+    let progress_app = app.clone();
+    let progress_entry = entry.clone();
+    let outcome = session
+        .download_controlled_verified(
+            &remote_path,
+            &local_path,
+            &sha256,
+            0,
+            control,
+            move |bytes| {
+                let mut update = progress_entry.clone();
+                update.transferred_bytes = bytes;
+                update.updated_at = Utc::now();
+                let _ = progress_repository.save_sync_entry(&update);
+                let _ = progress_app.emit("artifact-event", &update);
+            },
+        )
+        .await
+        .map_err(|error| error.to_string());
+    entry = match outcome {
+        Ok(value) => finish_transfer(&app, &state, entry, value).await?,
+        Err(error) => {
+            let _ = fail_transfer(&app, &state, entry, error.clone());
+            return Err(error);
+        }
+    };
+    if conflict && matches!(entry.state, SyncState::Synced) {
+        entry.state = SyncState::Conflict;
+        state
+            .repository
+            .save_sync_entry(&entry)
+            .map_err(|error| error.to_string())?;
+    }
+    let _ = session.disconnect().await;
     Ok(DownloadResult { entry, conflict })
 }
 

@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
 };
 
@@ -57,6 +57,7 @@ pub struct AppState {
     pub research_last_request: Arc<tokio::sync::Mutex<HashMap<String, std::time::Instant>>>,
     pub active_kernels: crate::kernel_commands::ActiveKernelMap,
     pub project_kernel_queues: Arc<tokio::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Semaphore>>>>,
+    pub sync_controls: Arc<Mutex<HashMap<Uuid, Arc<AtomicU8>>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,12 +87,99 @@ pub struct AgentRunStreamEvent {
     pub run_id: Uuid,
     #[serde(default)]
     pub project_id: Uuid,
+    #[serde(default)]
+    pub conversation_id: Option<Uuid>,
     pub sequence: u64,
     pub timestamp: chrono::DateTime<Utc>,
     pub kind: String,
     pub title: String,
     pub content: String,
     pub iteration: Option<u64>,
+}
+
+fn conversation_id_for_run(repository: &Repository, run_id: Uuid) -> Option<Uuid> {
+    let checkpoint = repository
+        .get_json::<RunCheckpointV2>("run_checkpoint_v2", &run_id.to_string())
+        .ok()??;
+    let approved = repository
+        .get_approved_plan(checkpoint.approved_plan_id)
+        .ok()??;
+    let plan = repository
+        .get_json::<AnalysisPlanV2>("analysis_plan_v2", &approved.plan_id.to_string())
+        .ok()??;
+    plan.metadata
+        .get("conversation_id")
+        .and_then(|value| value.parse::<Uuid>().ok())
+}
+
+fn inferred_conversation_id_for_legacy_run(
+    repository: &Repository,
+    project_id: Uuid,
+    run_started_at: chrono::DateTime<Utc>,
+) -> Option<Uuid> {
+    repository
+        .conversations_for_project(project_id)
+        .ok()?
+        .into_iter()
+        .flat_map(|conversation| {
+            repository
+                .messages_for_conversation(conversation.id)
+                .unwrap_or_default()
+        })
+        .filter(|message| message.created_at <= run_started_at)
+        .max_by_key(|message| message.created_at)
+        .map(|message| message.conversation_id)
+}
+
+pub fn backfill_agent_run_conversation_ids(repository: &Repository) -> Result<usize, String> {
+    let mut events = repository
+        .list_json::<AgentRunStreamEvent>("agent_run_stream_event")
+        .map_err(|error| error.to_string())?;
+    let run_started_at = events.iter().fold(HashMap::new(), |mut starts, event| {
+        starts
+            .entry(event.run_id)
+            .and_modify(|started_at| {
+                if event.timestamp < *started_at {
+                    *started_at = event.timestamp;
+                }
+            })
+            .or_insert(event.timestamp);
+        starts
+    });
+    let run_conversations = events
+        .iter()
+        .filter(|event| event.conversation_id.is_none())
+        .map(|event| (event.run_id, event.project_id))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(|(run_id, project_id)| {
+            let conversation_id = conversation_id_for_run(repository, run_id).or_else(|| {
+                run_started_at.get(&run_id).and_then(|started_at| {
+                    inferred_conversation_id_for_legacy_run(repository, project_id, *started_at)
+                })
+            });
+            (run_id, conversation_id)
+        })
+        .collect::<HashMap<_, _>>();
+    let mut updated = 0;
+    for event in &mut events {
+        if event.conversation_id.is_some() {
+            continue;
+        }
+        event.conversation_id = run_conversations.get(&event.run_id).copied().flatten();
+        if event.conversation_id.is_none() {
+            continue;
+        }
+        repository
+            .put_json(
+                "agent_run_stream_event",
+                &format!("{}:{:020}", event.run_id, event.sequence),
+                event,
+            )
+            .map_err(|error| error.to_string())?;
+        updated += 1;
+    }
+    Ok(updated)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +279,7 @@ fn emit_agent_run_stream(
     let event = AgentRunStreamEvent {
         run_id,
         project_id,
+        conversation_id: conversation_id_for_run(repository, run_id),
         sequence: *sequence,
         timestamp: Utc::now(),
         kind: kind.into(),
@@ -825,6 +914,7 @@ pub fn list_agent_run_events(
     state: State<'_, AppState>,
     project_id: Uuid,
     run_id: Option<Uuid>,
+    conversation_id: Option<Uuid>,
 ) -> Result<Vec<AgentRunStreamEvent>, String> {
     let mut events = state
         .repository
@@ -833,12 +923,45 @@ pub fn list_agent_run_events(
         .into_iter()
         .filter(|event| event.project_id == project_id)
         .collect::<Vec<_>>();
-    events.sort_by_key(|event| (event.timestamp, event.sequence));
-    let Some(latest_run_id) = run_id.or_else(|| events.last().map(|event| event.run_id)) else {
-        return Ok(Vec::new());
-    };
-    events.retain(|event| event.run_id == latest_run_id);
-    events.sort_by_key(|event| event.sequence);
+    let run_started_at = events.iter().fold(HashMap::new(), |mut starts, event| {
+        starts
+            .entry(event.run_id)
+            .and_modify(|started_at| {
+                if event.timestamp < *started_at {
+                    *started_at = event.timestamp;
+                }
+            })
+            .or_insert(event.timestamp);
+        starts
+    });
+    let run_conversations = events
+        .iter()
+        .map(|event| event.run_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(|id| {
+            let explicit = conversation_id_for_run(&state.repository, id);
+            let inferred = run_started_at.get(&id).and_then(|started_at| {
+                inferred_conversation_id_for_legacy_run(&state.repository, project_id, *started_at)
+            });
+            (id, explicit.or(inferred))
+        })
+        .collect::<HashMap<_, _>>();
+    events.retain(|event| {
+        run_id.map(|id| event.run_id == id).unwrap_or(true)
+            && conversation_id
+                .map(|id| {
+                    event.conversation_id == Some(id)
+                        || run_conversations.get(&event.run_id).copied().flatten() == Some(id)
+                })
+                .unwrap_or(true)
+    });
+    for event in &mut events {
+        if event.conversation_id.is_none() {
+            event.conversation_id = run_conversations.get(&event.run_id).copied().flatten();
+        }
+    }
+    events.sort_by_key(|event| (event.timestamp, event.run_id, event.sequence));
     Ok(events)
 }
 
@@ -1761,8 +1884,13 @@ fn remote_agent_process_path(run_id: Uuid) -> String {
 #[cfg(test)]
 mod remote_agent_cancellation_tests {
     use super::{
-        remote_agent_execution_contract, terminate_remote_agent_command, wrap_remote_agent_command,
+        AgentRunStreamEvent, backfill_agent_run_conversation_ids,
+        inferred_conversation_id_for_legacy_run, remote_agent_execution_contract,
+        terminate_remote_agent_command, wrap_remote_agent_command,
     };
+    use chrono::{TimeZone, Utc};
+    use omicsops_adapters::persistence::Repository;
+    use omicsops_core::workspace::{Conversation, Message, MessageRole, Project, ProjectTemplate};
     use uuid::Uuid;
 
     #[test]
@@ -1795,6 +1923,131 @@ mod remote_agent_cancellation_tests {
         assert!(contract.contains("Do not repeat the same dependency probe"));
         assert!(contract.contains("scanpy"));
         assert!(contract.contains("r-base"));
+    }
+
+    #[test]
+    fn legacy_run_is_assigned_to_the_conversation_with_the_latest_preceding_message() {
+        let repository = Repository::open_in_memory().unwrap();
+        let project_id = Uuid::new_v4();
+        let first_conversation_id = Uuid::new_v4();
+        let second_conversation_id = Uuid::new_v4();
+        let first_time = Utc.with_ymd_and_hms(2026, 8, 12, 8, 0, 0).unwrap();
+        let second_time = Utc.with_ymd_and_hms(2026, 8, 12, 9, 0, 0).unwrap();
+        repository
+            .save_project(&Project::new(
+                project_id,
+                "project",
+                "C:/project",
+                ProjectTemplate::Blank,
+                first_time,
+            ))
+            .unwrap();
+        repository
+            .save_conversation(&Conversation::new(
+                first_conversation_id,
+                project_id,
+                "first",
+                first_time,
+            ))
+            .unwrap();
+        repository
+            .save_conversation(&Conversation::new(
+                second_conversation_id,
+                project_id,
+                "second",
+                second_time,
+            ))
+            .unwrap();
+        repository
+            .save_message(&Message::markdown(
+                Uuid::new_v4(),
+                project_id,
+                first_conversation_id,
+                1,
+                MessageRole::User,
+                "first request",
+                first_time,
+            ))
+            .unwrap();
+        repository
+            .save_message(&Message::markdown(
+                Uuid::new_v4(),
+                project_id,
+                second_conversation_id,
+                1,
+                MessageRole::User,
+                "second request",
+                second_time,
+            ))
+            .unwrap();
+
+        let inferred = inferred_conversation_id_for_legacy_run(
+            &repository,
+            project_id,
+            Utc.with_ymd_and_hms(2026, 8, 12, 9, 5, 0).unwrap(),
+        );
+        assert_eq!(inferred, Some(second_conversation_id));
+    }
+
+    #[test]
+    fn legacy_agent_events_are_backfilled_with_a_stable_conversation_id() {
+        let repository = Repository::open_in_memory().unwrap();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let message_time = Utc.with_ymd_and_hms(2026, 8, 12, 8, 0, 0).unwrap();
+        repository
+            .save_project(&Project::new(
+                project_id,
+                "project",
+                "C:/project",
+                ProjectTemplate::Blank,
+                message_time,
+            ))
+            .unwrap();
+        repository
+            .save_conversation(&Conversation::new(
+                conversation_id,
+                project_id,
+                "conversation",
+                message_time,
+            ))
+            .unwrap();
+        repository
+            .save_message(&Message::markdown(
+                Uuid::new_v4(),
+                project_id,
+                conversation_id,
+                1,
+                MessageRole::User,
+                "request",
+                message_time,
+            ))
+            .unwrap();
+        let event = AgentRunStreamEvent {
+            run_id,
+            project_id,
+            conversation_id: None,
+            sequence: 1,
+            timestamp: Utc.with_ymd_and_hms(2026, 8, 12, 8, 1, 0).unwrap(),
+            kind: "stdout".into(),
+            title: "stdout".into(),
+            content: "server output".into(),
+            iteration: Some(1),
+        };
+        repository
+            .put_json(
+                "agent_run_stream_event",
+                &format!("{}:{:020}", run_id, event.sequence),
+                &event,
+            )
+            .unwrap();
+
+        assert_eq!(backfill_agent_run_conversation_ids(&repository).unwrap(), 1);
+        let stored = repository
+            .list_json::<AgentRunStreamEvent>("agent_run_stream_event")
+            .unwrap();
+        assert_eq!(stored[0].conversation_id, Some(conversation_id));
     }
 }
 
@@ -2286,6 +2539,13 @@ async fn execute_remote_agent_task(
         .get("skill_context")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
+    let skill_citations = plan
+        .metadata
+        .get("skill_citations")
+        .and_then(|value| {
+            serde_json::from_str::<Vec<omicsops_core::workspace::SkillCitation>>(value).ok()
+        })
+        .unwrap_or_default();
     let conversation_id = plan
         .metadata
         .get("conversation_id")
@@ -2342,6 +2602,32 @@ async fn execute_remote_agent_task(
         ),
         None,
     );
+    if !skill_citations.is_empty() {
+        emit_agent_run_stream(
+            app,
+            repository,
+            run_id,
+            project.id,
+            &mut stream_sequence,
+            "skills_applied",
+            "Skill instructions attached",
+            skill_citations
+                .iter()
+                .map(|citation| {
+                    format!(
+                        "{} {} · {} · section {} · excerpt {}",
+                        citation.name,
+                        citation.version,
+                        &citation.package_sha256[..12.min(citation.package_sha256.len())],
+                        citation.section,
+                        &citation.excerpt_sha256[..12.min(citation.excerpt_sha256.len())]
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            None,
+        );
+    }
     let prior_run_memory = remote_agent_memory_entries(repository, project.id, conversation_id)?
         .into_iter()
         .filter(|entry| entry.run_id == run_id)
@@ -2374,6 +2660,30 @@ async fn execute_remote_agent_task(
             ),
             Some(iteration),
         );
+        if !skill_citations.is_empty() {
+            emit_agent_run_stream(
+                app,
+                repository,
+                run_id,
+                project.id,
+                &mut stream_sequence,
+                "skills_applied",
+                "Skill audit linkage",
+                format!(
+                    "This decision is linked to {} enabled Skill citation(s): {}",
+                    skill_citations.len(),
+                    skill_citations
+                        .iter()
+                        .map(|citation| format!(
+                            "{}@{}#{}",
+                            citation.name, citation.version, citation.section
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Some(iteration),
+            );
+        }
         let prompt: String = transcript
             .chars()
             .rev()
@@ -2988,6 +3298,7 @@ async fn execute_remote_agent_task(
                     continue 'agent_loop;
                 }
                 let mut artifact_error = None;
+                let mut registered_artifacts = Vec::new();
                 for relative in &action.artifacts {
                     if let Err(error) = omicsops_core::project::validate_relative_remote_path(
                         std::path::Path::new(relative),
@@ -3042,6 +3353,12 @@ async fn execute_remote_agent_task(
                     repository
                         .put_json("artifact_v2", &format!("{run_id}:{relative}"), &record)
                         .map_err(|error| error.to_string())?;
+                    registered_artifacts.push((
+                        relative.clone(),
+                        record.remote_path.clone(),
+                        size_bytes,
+                        record.sha256.clone(),
+                    ));
                 }
                 if let Some(error) = artifact_error {
                     transcript.push_str(&format!(
@@ -3060,6 +3377,25 @@ async fn execute_remote_agent_task(
                     );
                     continue 'agent_loop;
                 }
+                crate::p1_commands::register_agent_completion(
+                    repository,
+                    project.id,
+                    conversation_id,
+                    run_id,
+                    goal,
+                    &format!(
+                        "Adaptive remote execution with {} approved terminal action(s).",
+                        terminal_actions
+                    ),
+                    if action.assessment.trim().is_empty() {
+                        &action.reason
+                    } else {
+                        &action.assessment
+                    },
+                    &action.reason,
+                    registered_artifacts,
+                    &skill_citations,
+                )?;
                 append_v2_event(
                     app,
                     repository,
@@ -3835,7 +4171,7 @@ pub(crate) fn require_trusted_host(profile: &ConnectionProfile) -> Result<(), St
 }
 
 pub(crate) async fn connect_profile(
-    state: &State<'_, AppState>,
+    state: &AppState,
     profile: &ConnectionProfile,
 ) -> Result<SshSession, String> {
     let secret = state

@@ -1,8 +1,18 @@
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Duration,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlledTransfer {
+    Completed(u64),
+    Paused(u64),
+    Canceled(u64),
+}
 
 use omicsops_core::domain::ConnectionProfile;
 use russh::{
@@ -13,7 +23,8 @@ use russh_sftp::{client::SftpSession, protocol::OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, ReadHalf,
+    WriteHalf,
 };
 
 use crate::{AdapterError, AdapterResult};
@@ -340,6 +351,74 @@ impl SshSession {
         Ok(())
     }
 
+    pub async fn upload_file_resumable(
+        &self,
+        local_path: &Path,
+        remote_path: &str,
+        offset: u64,
+    ) -> AdapterResult<()> {
+        let mut local = tokio::fs::File::open(local_path).await?;
+        local.seek(std::io::SeekFrom::Start(offset)).await?;
+        let sftp = self.sftp().await?;
+        let mut remote = sftp
+            .open_with_flags(remote_path, OpenFlags::CREATE | OpenFlags::WRITE)
+            .await
+            .map_err(|error| AdapterError::Ssh(error.to_string()))?;
+        remote.seek(std::io::SeekFrom::Start(offset)).await?;
+        tokio::io::copy(&mut local, &mut remote).await?;
+        remote.flush().await?;
+        remote.shutdown().await?;
+        Ok(())
+    }
+
+    pub async fn upload_file_controlled<F: Fn(u64)>(
+        &self,
+        local_path: &Path,
+        remote_path: &str,
+        offset: u64,
+        control: Arc<AtomicU8>,
+        progress: F,
+    ) -> AdapterResult<ControlledTransfer> {
+        let mut local = tokio::fs::File::open(local_path).await?;
+        local.seek(std::io::SeekFrom::Start(offset)).await?;
+        let sftp = self.sftp().await?;
+        let flags = if offset == 0 {
+            OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE
+        } else {
+            OpenFlags::CREATE | OpenFlags::WRITE
+        };
+        let mut remote = sftp
+            .open_with_flags(remote_path, flags)
+            .await
+            .map_err(|error| AdapterError::Ssh(error.to_string()))?;
+        remote.seek(std::io::SeekFrom::Start(offset)).await?;
+        let mut transferred = offset;
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            match control.load(Ordering::SeqCst) {
+                1 => {
+                    remote.flush().await?;
+                    return Ok(ControlledTransfer::Paused(transferred));
+                }
+                2 => {
+                    remote.flush().await?;
+                    return Ok(ControlledTransfer::Canceled(transferred));
+                }
+                _ => {}
+            }
+            let read = local.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            remote.write_all(&buffer[..read]).await?;
+            transferred += read as u64;
+            progress(transferred);
+        }
+        remote.flush().await?;
+        remote.shutdown().await?;
+        Ok(ControlledTransfer::Completed(transferred))
+    }
+
     pub async fn download_atomic_verified(
         &self,
         remote_path: &str,
@@ -352,6 +431,111 @@ impl SshSession {
             .await
             .map_err(|error| AdapterError::Ssh(error.to_string()))?;
         write_verified_atomic(&mut remote, local_path, expected_sha256).await
+    }
+
+    pub async fn download_resumable_verified(
+        &self,
+        remote_path: &str,
+        local_path: &Path,
+        expected_sha256: &str,
+        offset: u64,
+    ) -> AdapterResult<()> {
+        let sftp = self.sftp().await?;
+        let mut remote = sftp
+            .open(remote_path)
+            .await
+            .map_err(|error| AdapterError::Ssh(error.to_string()))?;
+        remote.seek(std::io::SeekFrom::Start(offset)).await?;
+        let temporary = local_path.with_extension(format!(
+            "{}.part",
+            local_path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+        ));
+        let mut local = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&temporary)
+            .await?;
+        tokio::io::copy(&mut remote, &mut local).await?;
+        local.flush().await?;
+        local.sync_all().await?;
+        drop(local);
+        let received = sha256_path(&temporary).await?;
+        if !received.eq_ignore_ascii_case(expected_sha256) {
+            return Err(AdapterError::Integrity {
+                expected: expected_sha256.into(),
+                received,
+            });
+        }
+        tokio::fs::rename(&temporary, local_path).await?;
+        Ok(())
+    }
+
+    pub async fn download_controlled_verified<F: Fn(u64)>(
+        &self,
+        remote_path: &str,
+        local_path: &Path,
+        expected_sha256: &str,
+        offset: u64,
+        control: Arc<AtomicU8>,
+        progress: F,
+    ) -> AdapterResult<ControlledTransfer> {
+        let sftp = self.sftp().await?;
+        let mut remote = sftp
+            .open(remote_path)
+            .await
+            .map_err(|error| AdapterError::Ssh(error.to_string()))?;
+        remote.seek(std::io::SeekFrom::Start(offset)).await?;
+        let temporary = local_path.with_extension(format!(
+            "{}.part",
+            local_path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+        ));
+        let mut local = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(offset > 0)
+            .truncate(offset == 0)
+            .write(true)
+            .open(&temporary)
+            .await?;
+        let mut transferred = offset;
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            match control.load(Ordering::SeqCst) {
+                1 => {
+                    local.flush().await?;
+                    return Ok(ControlledTransfer::Paused(transferred));
+                }
+                2 => {
+                    local.flush().await?;
+                    return Ok(ControlledTransfer::Canceled(transferred));
+                }
+                _ => {}
+            }
+            let read = remote.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            local.write_all(&buffer[..read]).await?;
+            transferred += read as u64;
+            progress(transferred);
+        }
+        local.flush().await?;
+        local.sync_all().await?;
+        drop(local);
+        let received = sha256_path(&temporary).await?;
+        if !received.eq_ignore_ascii_case(expected_sha256) {
+            return Err(AdapterError::Integrity {
+                expected: expected_sha256.into(),
+                received,
+            });
+        }
+        tokio::fs::rename(&temporary, local_path).await?;
+        Ok(ControlledTransfer::Completed(transferred))
     }
 
     pub async fn read_file_limited(
@@ -381,6 +565,20 @@ impl SshSession {
             .await
             .map_err(ssh_error)
     }
+}
+
+async fn sha256_path(path: &Path) -> AdapterResult<String> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 pub async fn write_verified_atomic<R: AsyncRead + Unpin>(

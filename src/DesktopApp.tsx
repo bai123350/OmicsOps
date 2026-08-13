@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import * as api from "./tauri-api";
-import type { AgentEvent, AgentRunStreamEvent, ConnectionProfile, KernelEvent, KernelLanguage, KernelSession, ModelProfile, PlanProposal, RemoteFileEntry, SkillPackage, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
+import type { AgentEvent, AgentRunStreamEvent, ConnectionProfile, KernelEvent, KernelLanguage, KernelSession, MemoryFact, ModelProfile, NotebookEntry, PlanProposal, ProjectArtifact, RemoteFileEntry, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
 import { WorkspaceShell } from "./features/workspace/WorkspaceShell";
 import type { Locale } from "./features/workspace/copy";
@@ -39,6 +39,10 @@ export default function DesktopApp() {
   const [kernelBusy, setKernelBusy] = useState(false);
   const [kernelNotice, setKernelNotice] = useState("");
   const [connections, setConnections] = useState<ConnectionProfile[]>([]);
+  const [memoryFacts, setMemoryFacts] = useState<MemoryFact[]>([]);
+  const [notebookEntries, setNotebookEntries] = useState<NotebookEntry[]>([]);
+  const [projectArtifacts, setProjectArtifacts] = useState<ProjectArtifact[]>([]);
+  const [syncEntries, setSyncEntries] = useState<SyncEntry[]>([]);
 
   useEffect(() => {
     Promise.all([api.listProjects(), api.listModelProfiles(), api.listSkillPackages(), api.listConnections()]).then(([items, profiles, skills, savedConnections]) => {
@@ -64,6 +68,12 @@ export default function DesktopApp() {
     return () => { disposed = true; };
   }, [selected?.id]);
   useEffect(() => {
+    if (!selected) { setMemoryFacts([]); setNotebookEntries([]); setProjectArtifacts([]); return; }
+    void Promise.all([api.searchAgentMemory(selected.id), api.listNotebookEntries(selected.id), api.listProjectArtifacts(selected.id), api.listSyncEntries(selected.id)])
+      .then(([facts, notebook, artifacts, transfers]) => { setMemoryFacts(facts); setNotebookEntries(notebook); setProjectArtifacts(artifacts); setSyncEntries(transfers); })
+      .catch((error) => setAgentNotice(error instanceof Error ? error.message : String(error)));
+  }, [selected?.id, agentRunEvents.at(-1)?.kind]);
+  useEffect(() => {
     setFileNotice("");
     if (!selected?.connection_id || !selected.remote_root) {
       setRemoteFiles([]);
@@ -84,26 +94,22 @@ export default function DesktopApp() {
     setAgentRunEvents([]);
     setRunId(null);
     setRunStopping(false);
-    if (!selected) return () => { disposed = true; };
+    if (!selected || !conversation) return () => { disposed = true; };
     api.listAgentRunEvents(selected.id)
       .then((events) => {
         if (disposed) return;
-        setAgentRunEvents((current) => {
-          if (events.length === 0) return current;
-          const latestRunId = current.at(-1)?.run_id ?? events.at(-1)?.run_id;
-          const merged = [...events, ...current]
-            .filter((event) => event.run_id === latestRunId)
-            .filter((event, index, all) => all.findIndex((item) => item.run_id === event.run_id && item.sequence === event.sequence) === index)
-            .sort((left, right) => left.sequence - right.sequence);
-          return merged;
-        });
-        setRunId((current) => current ?? events.at(-1)?.run_id ?? null);
+        const conversationEvents = events.filter((event) => event.conversation_id === conversation.id);
+        setAgentRunEvents(conversationEvents);
+        const latestRunId = conversationEvents.at(-1)?.run_id;
+        const latestRunEvents = latestRunId ? conversationEvents.filter((event) => event.run_id === latestRunId) : [];
+        const latestRunFinished = latestRunEvents.some(isTerminalAgentEvent);
+        setRunId(latestRunFinished ? null : latestRunId ?? null);
       })
       .catch((error) => {
         if (!disposed) setAgentNotice(error instanceof Error ? error.message : String(error));
       });
     return () => { disposed = true; };
-  }, [selected?.id]);
+  }, [selected?.id, conversation?.id]);
   useEffect(() => {
     let disposed = false;
     const unlisten: Array<() => void> = [];
@@ -148,14 +154,22 @@ export default function DesktopApp() {
       if (event.project_id !== selected?.id) return;
       setKernelEvents((current) => [...current.slice(-199), event]);
     }).then((fn) => disposed ? fn() : unlisten.push(fn));
+    api.onSyncEvent((entry) => {
+      if (entry.project_id !== selected?.id) return;
+      setSyncEntries((current) => [entry, ...current.filter((item) => item.id !== entry.id)]);
+    }).then((fn) => disposed ? fn() : unlisten.push(fn));
     api.onAgentRunEvent((event) => {
       if (event.project_id !== selected?.id) return;
+      if (event.conversation_id !== conversation?.id) return;
       setRunId((current) => current ?? event.run_id);
-      if (event.kind === "agent_canceled" || event.kind === "agent_completed" || event.kind === "agent_failed") setRunStopping(false);
+      if (event.kind === "agent_canceled" || event.kind === "agent_completed" || event.kind === "agent_failed") {
+        setRunStopping(false);
+        setRunId((current) => current === event.run_id ? null : current);
+      }
       if (event.kind === "agent_completed") void refreshRemoteFiles(event.project_id);
       setAgentRunEvents((current) => {
         if (current.some((item) => item.run_id === event.run_id && item.sequence === event.sequence)) return current;
-        return [...current.filter((item) => item.run_id === event.run_id).slice(-399), event];
+        return [...current, event];
       });
     }).then((fn) => disposed ? fn() : unlisten.push(fn));
     return () => { disposed = true; unlisten.forEach((fn) => fn()); };
@@ -196,6 +210,7 @@ export default function DesktopApp() {
       if (relativePaths.length === 0) return;
       setFilesBusy(true);
       const entries = await api.uploadSelectedFiles(selected.id, relativePaths);
+      setSyncEntries(await api.listSyncEntries(selected.id));
       setFileNotice(locale === "zh-CN" ? `已校验上传 ${entries.length} 个文件` : `${entries.length} uploaded files verified`);
       setRemoteFiles(await api.listRemoteFiles(selected.id));
     } catch (error) {
@@ -210,6 +225,7 @@ export default function DesktopApp() {
     setFilesBusy(true);
     try {
       const result = await api.downloadProjectFile(selected.id, relativePath);
+      setSyncEntries(await api.listSyncEntries(selected.id));
       setFileNotice(result.conflict
         ? (locale === "zh-CN" ? `本地文件不同，已保存冲突副本：${result.entry.relative_path}` : `Local file differed; saved conflict copy: ${result.entry.relative_path}`)
         : (locale === "zh-CN" ? `下载完成并通过 SHA-256 校验：${result.entry.relative_path}` : `Downloaded and SHA-256 verified: ${result.entry.relative_path}`));
@@ -224,7 +240,8 @@ export default function DesktopApp() {
     try {
       const id = await start();
       setRunId(id);
-      setAgentRunEvents(await api.listAgentRunEvents(selected!.id, id));
+      const events = await api.listAgentRunEvents(selected!.id, id, conversation?.id);
+      setAgentRunEvents((current) => mergeAgentRunEvents(current, events));
     } catch (error) {
       setAgentNotice(error instanceof Error ? error.message : String(error));
     }
@@ -271,10 +288,17 @@ export default function DesktopApp() {
     locale={locale} onLocaleChange={setLocale} onOpenSettings={() => setSettingsOpen(true)} onBackToProjects={() => setSelected(null)}
     conversations={conversations} activeConversationId={conversation?.id} onSelectConversation={selectConversation} onNewConversation={newConversation}
     messages={messages} streamingAssistant={streamingAssistant} agentBusy={agentBusy} agentNotice={agentNotice} agentRetryNotice={agentRetryNotice} modelLabel={activeModel?.label}
-    planProposal={planProposal} planLoading={planLoading} planApproved={planApproved} canStartRun={Boolean(selected.connection_id && approvedPlanId)} runStarted={Boolean(runId)} agentRunEvents={agentRunEvents}
+    planProposal={planProposal} planLoading={planLoading} planApproved={planApproved} canStartRun={Boolean(selected.connection_id && approvedPlanId)} runStarted={Boolean(runId)} activeRunId={runId} agentRunEvents={agentRunEvents}
     runStopping={runStopping}
     remoteFiles={remoteFiles} filesBusy={filesBusy} fileNotice={fileNotice}
+    syncEntries={syncEntries}
+    onPauseSync={async (id) => { await api.pauseSyncTransfer(id); setSyncEntries(await api.listSyncEntries(selected.id)); }}
+    onCancelSync={async (id) => { await api.cancelSyncTransfer(id); setSyncEntries(await api.listSyncEntries(selected.id)); }}
+    onRetrySync={async (id) => { await api.retrySyncTransfer(id); setSyncEntries(await api.listSyncEntries(selected.id)); }}
     kernelSessions={kernelSessions} kernelEvents={kernelEvents} kernelBusy={kernelBusy} kernelNotice={kernelNotice}
+    memoryFacts={memoryFacts} notebookEntries={notebookEntries} projectArtifacts={projectArtifacts}
+    onSearchMemory={async (query, dimension) => { const facts = await api.searchAgentMemory(selected.id, query, dimension, conversation?.id); setMemoryFacts(facts); }}
+    onExportNotebook={async (format) => { const extension = format === "bundle" ? "omicsops.zip" : format === "json" ? "json" : "md"; const path = await api.chooseDownloadPath(`${selected.name}.${extension}`); if (path) await api.exportProjectNotebook(selected.id, format, path); }}
     onStartKernel={selected.connection_id && selected.remote_root ? startKernel : undefined}
     onExecuteKernel={async (sessionId, code, save, capturePaths) => { let savedIndex: number | null = null; await withKernelBusy(async () => { const result = await api.executeKernelCell(sessionId, code, save, capturePaths); savedIndex = result.saved_cell_index; setKernelEvents((current) => { const known = new Set(current.map((event) => `${event.request_id}:${event.sequence}`)); return [...current, ...result.events.filter((event) => !known.has(`${event.request_id}:${event.sequence}`))].slice(-200); }); }); return savedIndex; }}
     onInterruptKernel={async (sessionId) => withKernelBusy(async () => replaceKernelSession(await api.interruptKernel(sessionId)))}
@@ -283,7 +307,7 @@ export default function DesktopApp() {
     onPreviewImage={selected.connection_id && selected.remote_root ? (relativePath) => api.previewProjectImage(selected.id, relativePath) : undefined}
     onSend={async (markdown) => {
       if (!conversation || !activeModel) { setSettingsOpen(true); return false; }
-      setLastGoal(markdown); setPlanProposal(null); setPlanApproved(false); setApprovedPlanId(null); setRunId(null); setAgentRunEvents([]); setAgentBusy(true); setAgentNotice("");
+      setLastGoal(markdown); setPlanProposal(null); setPlanApproved(false); setApprovedPlanId(null); setRunId(null); setAgentBusy(true); setAgentNotice("");
       const remoteContext = selected.connection_id && selected.remote_root
         ? [
             `Remote root: ${selected.remote_root}`,
@@ -343,11 +367,22 @@ export default function DesktopApp() {
       setAgentNotice("");
       try {
         await api.cancelRun(runId);
-        setAgentRunEvents(await api.listAgentRunEvents(selected.id, runId));
+        const events = await api.listAgentRunEvents(selected.id, runId, conversation?.id);
+        setAgentRunEvents((current) => mergeAgentRunEvents(current, events));
       } catch (error) {
         setAgentNotice(error instanceof Error ? error.message : String(error));
         setRunStopping(false);
       }
     } : undefined}
   />{settings}</>;
+}
+
+function mergeAgentRunEvents(current: AgentRunStreamEvent[], incoming: AgentRunStreamEvent[]) {
+  return [...current, ...incoming]
+    .filter((event, index, all) => all.findIndex((item) => item.run_id === event.run_id && item.sequence === event.sequence) === index)
+    .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime() || left.sequence - right.sequence);
+}
+
+function isTerminalAgentEvent(event: AgentRunStreamEvent) {
+  return event.kind === "agent_completed" || event.kind === "agent_failed" || event.kind === "agent_canceled";
 }

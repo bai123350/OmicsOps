@@ -230,9 +230,10 @@ fn enabled_skill_context(state: &State<'_, AppState>) -> Result<String, String> 
         let instruction = std::fs::read_to_string(&instruction_path)
             .map_err(|error| format!("cannot read enabled skill {}: {error}", skill.name))?;
         sections.push(format!(
-            "## {} {}\nCapabilities: {}\n{}",
+            "## {} {}\nPackage SHA-256: {}\nCapabilities: {}\n{}",
             skill.name,
             skill.version,
+            skill.sha256,
             skill.capabilities.join(", "),
             instruction
         ));
@@ -900,6 +901,7 @@ pub async fn propose_analysis_plan(
     let catalog = builtin_tool_catalog().map_err(|error| error.to_string())?;
     let remote_observation = inspect_remote_project(&state, &project).await?;
     let skill_context = enabled_skill_context(&state)?;
+    let skill_citations = crate::p1_commands::enabled_skill_citations(&repository)?;
     let conversation_history = conversation_history_text(&repository, request.conversation_id)?;
     let operational_memory = crate::commands::remote_agent_memory_context(
         &repository,
@@ -986,6 +988,7 @@ pub async fn propose_analysis_plan(
             ("goal".into(), request.goal.trim().into()),
             ("conversation_id".into(), request.conversation_id.to_string()),
             ("mcp_runtime".into(), "not_configured".into()),
+            ("skill_citations".into(), serde_json::to_string(&skill_citations).map_err(|error| error.to_string())?),
         ]),
     };
     normalize_generated_plan(&mut plan);

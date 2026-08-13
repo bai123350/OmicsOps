@@ -301,6 +301,48 @@
   color: #fecdca;
 }
 
+.agent-run-history {
+  width: min(100%, 760px);
+  align-self: center;
+  flex: 0 0 auto;
+  display: grid;
+  gap: 8px;
+}
+
+.agent-run-fold {
+  width: min(100%, 760px);
+  align-self: center;
+  flex: 0 0 auto;
+  overflow: hidden;
+  border: 1px solid #eaecf0;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.agent-run-fold summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  cursor: pointer;
+  color: #667085;
+  font-size: 10px;
+  list-style: none;
+  user-select: none;
+}
+
+.agent-run-fold summary::-webkit-details-marker { display: none; }
+.agent-run-fold summary:hover { background: #f9fafb; }
+.agent-run-fold-title { display: inline-flex; align-items: center; gap: 7px; color: #344054; }
+.agent-run-fold-title > span { display: grid; gap: 2px; }
+.agent-run-fold-title small { color: #98a2b3; font-size: 9px; font-weight: 500; }
+.agent-run-fold-title svg { transition: transform 140ms ease; }
+.agent-run-fold[open] .agent-run-fold-title svg { transform: rotate(90deg); }
+.agent-run-fold.is-active { border-color: #b7e4cc; }
+.agent-run-fold-body { max-height: 560px; padding: 2px 12px 12px; overflow: auto; border-top: 1px solid #f2f4f7; }
+.agent-run-fold-body .agent-work-update { margin-top: 10px; }
+
 .agent-run-controls {
   position: sticky;
   bottom: 4px;

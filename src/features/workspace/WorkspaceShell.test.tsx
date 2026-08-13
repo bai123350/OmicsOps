@@ -96,7 +96,7 @@ describe("WorkspaceShell", () => {
     expect(screen.getByText("genes=32738 cells=12000")).toBeInTheDocument();
   });
 
-  it("shows public evaluation content and collapses repeated waiting heartbeats", () => {
+  it("preserves every streamed evaluation and waiting event inside the fold", () => {
     render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} runStarted agentRunEvents={[
       { run_id: "run-1", project_id: "project-1", sequence: 1, timestamp: "2026-08-12T08:00:00Z", kind: "model_waiting", title: "Evaluating remote evidence", content: "10s elapsed", iteration: 1 },
       { run_id: "run-1", project_id: "project-1", sequence: 2, timestamp: "2026-08-12T08:00:10Z", kind: "model_waiting", title: "Evaluating remote evidence", content: "20s elapsed", iteration: 1 },
@@ -104,9 +104,82 @@ describe("WorkspaceShell", () => {
       { run_id: "run-1", project_id: "project-1", sequence: 4, timestamp: "2026-08-12T08:00:12Z", kind: "model_progress", title: "Agent evaluation", content: "Next I will inspect their headers without modifying data.", iteration: 1 },
     ]} />);
 
-    expect(screen.queryByText("10s elapsed")).not.toBeInTheDocument();
+    expect(screen.getByText("10s elapsed")).toBeInTheDocument();
     expect(screen.getByText("20s elapsed")).toBeInTheDocument();
-    expect(screen.getByText(/Verified the matrix.*Next I will inspect/s)).toBeInTheDocument();
+    expect(screen.getByText("Verified the matrix and barcode files exist.")).toBeInTheDocument();
+    expect(screen.getByText("Next I will inspect their headers without modifying data.")).toBeInTheDocument();
+    expect(screen.getAllByText("Agent stream")).toHaveLength(4);
+  });
+
+  it("retains completed runs as collapsed history while keeping the active run open", () => {
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} runStarted activeRunId="run-2" agentRunEvents={[
+      { run_id: "run-1", project_id: "project-1", conversation_id: "conversation-1", sequence: 1, timestamp: "2026-08-12T08:00:00Z", kind: "stdout", title: "stdout", content: "historical output", iteration: 1 },
+      { run_id: "run-1", project_id: "project-1", conversation_id: "conversation-1", sequence: 2, timestamp: "2026-08-12T08:00:05Z", kind: "agent_completed", title: "Completed", content: "Done", iteration: null },
+      { run_id: "run-2", project_id: "project-1", conversation_id: "conversation-1", sequence: 1, timestamp: "2026-08-12T08:01:00Z", kind: "model_waiting", title: "Evaluating", content: "Working", iteration: 1 },
+    ]} />);
+
+    const historicalRun = screen.getByText("Processed 5s").closest("details");
+    const activeRun = screen.getByText("Processing 0s").closest("details");
+    expect(historicalRun).not.toHaveAttribute("open");
+    expect(activeRun).toHaveAttribute("open");
+    expect(screen.getByText("historical output")).toBeInTheDocument();
+    expect(screen.getByText("Completed · 2 stream events")).toBeInTheDocument();
+    expect(screen.getAllByText("Agent and server interaction")).toHaveLength(2);
+  });
+
+  it("places each persisted run directly after the conversation message that triggered it", () => {
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} messages={[
+      { id: "message-1", role: "assistant", markdown: "First analysis proposal", created_at: "2026-08-12T08:00:00Z" },
+      { id: "message-2", role: "user", markdown: "Please make the second plot", created_at: "2026-08-12T08:02:00Z" },
+      { id: "message-3", role: "assistant", markdown: "Second analysis finished", created_at: "2026-08-12T08:04:00Z" },
+    ]} agentRunEvents={[
+      { run_id: "run-1", project_id: "project-1", sequence: 1, timestamp: "2026-08-12T08:01:00Z", kind: "stdout", title: "stdout", content: "first run", iteration: 1 },
+      { run_id: "run-1", project_id: "project-1", sequence: 2, timestamp: "2026-08-12T08:01:05Z", kind: "agent_completed", title: "Completed", content: "Done", iteration: null },
+      { run_id: "run-2", project_id: "project-1", sequence: 1, timestamp: "2026-08-12T08:03:00Z", kind: "stdout", title: "stdout", content: "second run", iteration: 1 },
+      { run_id: "run-2", project_id: "project-1", sequence: 2, timestamp: "2026-08-12T08:03:07Z", kind: "agent_completed", title: "Completed", content: "Done", iteration: null },
+    ]} />);
+
+    const firstMessage = screen.getByText("First analysis proposal");
+    const firstRun = screen.getByText("Processed 5s");
+    const secondMessage = screen.getByText("Please make the second plot");
+    const secondRun = screen.getByText("Processed 7s");
+    const finalMessage = screen.getByText("Second analysis finished");
+    expect(firstMessage.compareDocumentPosition(firstRun) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(firstRun.compareDocumentPosition(secondMessage) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(secondMessage.compareDocumentPosition(secondRun) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(secondRun.compareDocumentPosition(finalMessage) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("keeps the active stream at the current conversation bottom instead of anchoring it to an older message", () => {
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} runStarted activeRunId="run-live" messages={[
+      { id: "message-1", role: "assistant", markdown: "Plan approved", created_at: "2026-08-12T08:00:00Z" },
+      { id: "message-2", role: "user", markdown: "Use the Seurat R package", created_at: "2026-08-12T09:00:00Z" },
+    ]} agentRunEvents={[
+      { run_id: "run-live", project_id: "project-1", sequence: 1, timestamp: "2026-08-12T08:01:00Z", kind: "tool_started", title: "SSH command", content: "micromamba install r-seurat", iteration: 1 },
+    ]} />);
+
+    const latestMessage = screen.getByText("Use the Seurat R package");
+    const activeFold = screen.getByText("Processing 0s").closest("details");
+    expect(activeFold).toHaveAttribute("open");
+    expect(latestMessage.compareDocumentPosition(activeFold!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByText("micromamba install r-seurat")).toBeInTheDocument();
+  });
+
+  it("keeps the streamed interaction inline and expands it from the processed row", () => {
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} messages={[
+      { id: "message-1", role: "assistant", markdown: "Approved plan", created_at: "2026-08-12T08:00:00Z" },
+      { id: "message-2", role: "user", markdown: "Later message", created_at: "2026-08-12T09:00:00Z" },
+    ]} agentRunEvents={[
+      { run_id: "run-1", project_id: "project-1", sequence: 1, timestamp: "2026-08-12T08:01:00Z", kind: "stdout", title: "stdout", content: "full streamed output", iteration: 1 },
+      { run_id: "run-1", project_id: "project-1", sequence: 2, timestamp: "2026-08-12T08:01:05Z", kind: "agent_completed", title: "Completed", content: "Done", iteration: null },
+    ]} />);
+
+    expect(screen.queryByRole("navigation", { name: "Agent and server interaction navigation" })).not.toBeInTheDocument();
+    const fold = screen.getByRole("group", { name: "Agent run" });
+    expect(fold).not.toHaveAttribute("open");
+    fireEvent.click(screen.getByText("Processed 5s"));
+    expect(fold).toHaveAttribute("open");
+    expect(screen.getByText("full streamed output")).toBeInTheDocument();
   });
 
   it("keeps a stop control visible while the remote agent is active", async () => {
@@ -190,5 +263,24 @@ describe("WorkspaceShell", () => {
     fireEvent.click(screen.getByRole("button", { name: "固化已保存单元 #1 为正式步骤" }));
     await waitFor(() => expect(onPromoteKernelCell).toHaveBeenCalledWith("kernel-1", 0, "探索代码步骤"));
     expect(await screen.findByText(/仍需进入正式计划审批/)).toBeInTheDocument();
+  });
+
+  it("shows traceable notebook facts and controls resumable transfers", async () => {
+    const onSearchMemory = vi.fn();
+    const onRetrySync = vi.fn();
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined}
+      notebookEntries={[{ id: "note-1", project_id: project.id, conversation_id: null, turn_id: null, kind: "method", title: "方法", markdown: "使用项目内环境完成 QC", confidence: null, evidence_ids: ["command:run:1"], artifact_ids: [], created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z" }]}
+      memoryFacts={[{ id: "fact-1", project_id: project.id, conversation_id: null, run_id: "run-1", dimension: "environment", key: "python", value: "3.11", statement: "Python 环境已验证", evidence: [{ source_kind: "command", source_id: "run-1:1", excerpt: "python --version" }], conflicted_with: ["fact-2"], created_at: "2026-08-12T00:00:00Z" }]}
+      syncEntries={[{ id: "sync-1", project_id: project.id, relative_path: "results/large.h5ad", local_relative_path: "results/large.h5ad", remote_path: "/srv/results/large.h5ad", direction: "remote_to_local", size_bytes: 100, sha256: "a".repeat(64), state: "paused", transferred_bytes: 40, retry_count: 1, error: null, updated_at: "2026-08-12T00:00:00Z" }]}
+      onSearchMemory={onSearchMemory} onRetrySync={onRetrySync} />);
+
+    expect(screen.getByText("传输任务")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "续传/重试" }));
+    expect(onRetrySync).toHaveBeenCalledWith("sync-1");
+    fireEvent.click(screen.getByRole("tab", { name: "实验记录" }));
+    expect(screen.getByText("存在冲突事实，已保留双方来源")).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: "检索记忆" }), { target: { value: "Python" } });
+    fireEvent.click(screen.getByRole("button", { name: "检索" }));
+    expect(onSearchMemory).toHaveBeenCalledWith("Python", undefined);
   });
 });

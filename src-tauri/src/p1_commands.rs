@@ -1,0 +1,809 @@
+use std::{collections::BTreeMap, io::Write, path::Path, process::Stdio};
+
+use chrono::Utc;
+use omicsops_adapters::persistence::Repository;
+use omicsops_core::workspace::{
+    Artifact, EvidenceReference, MemoryFact, NotebookEntry, NotebookEntryKind, SkillCitation,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tauri::State;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::{Child, Command},
+};
+use uuid::Uuid;
+
+use crate::commands::{AppState, RemoteAgentMemoryEntry};
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemorySearchRequest {
+    pub project_id: Uuid,
+    pub conversation_id: Option<Uuid>,
+    #[serde(default)]
+    pub query: String,
+    pub dimension: Option<String>,
+}
+
+pub fn memory_facts(
+    repository: &Repository,
+    request: &MemorySearchRequest,
+) -> Result<Vec<MemoryFact>, String> {
+    let query = request.query.trim().to_lowercase();
+    let mut facts = Vec::new();
+    for conversation in repository
+        .conversations_for_project(request.project_id)
+        .map_err(|error| error.to_string())?
+    {
+        if request
+            .conversation_id
+            .is_some_and(|id| id != conversation.id)
+        {
+            continue;
+        }
+        for message in repository
+            .messages_for_conversation(conversation.id)
+            .map_err(|error| error.to_string())?
+        {
+            if !matches!(message.role, omicsops_core::workspace::MessageRole::User) {
+                continue;
+            }
+            facts.push(MemoryFact {
+                id: stable_uuid(&format!("message:{}", message.id)),
+                project_id: request.project_id,
+                conversation_id: Some(conversation.id),
+                run_id: None,
+                dimension: "task".into(),
+                key: format!(
+                    "conversation:{}:message:{}",
+                    conversation.id, message.sequence
+                ),
+                value: message.markdown.clone(),
+                statement: message.markdown.clone(),
+                evidence: vec![EvidenceReference {
+                    source_kind: "message".into(),
+                    source_id: message.id.to_string(),
+                    excerpt: excerpt(&message.markdown, 320),
+                }],
+                conflicted_with: vec![],
+                created_at: message.created_at,
+            });
+        }
+    }
+    for entry in repository
+        .list_json::<RemoteAgentMemoryEntry>("remote_agent_memory")
+        .map_err(|error| error.to_string())?
+    {
+        if entry.project_id != request.project_id
+            || request
+                .conversation_id
+                .is_some_and(|id| entry.conversation_id != Some(id))
+        {
+            continue;
+        }
+        let source_id = format!("{}:{}", entry.run_id, entry.sequence);
+        let (dimension, key, value) = classify_command_fact(&entry);
+        facts.push(MemoryFact {
+            id: stable_uuid(&format!("command:{source_id}")),
+            project_id: request.project_id,
+            conversation_id: entry.conversation_id,
+            run_id: Some(entry.run_id),
+            dimension: dimension.into(),
+            key,
+            value: value.clone(),
+            statement: format!("{} (exit {})", entry.reason, entry.exit_code),
+            evidence: vec![EvidenceReference {
+                source_kind: "command".into(),
+                source_id,
+                excerpt: excerpt(
+                    &format!(
+                        "$ {}\nexit={}\n{}\n{}",
+                        entry.command, entry.exit_code, entry.stdout_tail, entry.stderr_tail
+                    ),
+                    480,
+                ),
+            }],
+            conflicted_with: vec![],
+            created_at: entry.timestamp,
+        });
+    }
+    for artifact in repository
+        .artifacts_for_project(request.project_id)
+        .map_err(|error| error.to_string())?
+    {
+        facts.push(MemoryFact {
+            id: stable_uuid(&format!("artifact:{}", artifact.id)),
+            project_id: request.project_id,
+            conversation_id: None,
+            run_id: artifact.run_id,
+            dimension: "artifact".into(),
+            key: artifact.relative_path.clone(),
+            value: artifact.sha256.clone(),
+            statement: format!(
+                "Verified artifact {} ({} bytes)",
+                artifact.relative_path, artifact.size_bytes
+            ),
+            evidence: vec![EvidenceReference {
+                source_kind: "artifact".into(),
+                source_id: artifact.id.to_string(),
+                excerpt: format!(
+                    "sha256={} media_type={}",
+                    artifact.sha256, artifact.media_type
+                ),
+            }],
+            conflicted_with: vec![],
+            created_at: artifact.created_at,
+        });
+    }
+    mark_conflicts(&mut facts);
+    facts.retain(|fact| {
+        request
+            .dimension
+            .as_deref()
+            .is_none_or(|dimension| dimension == fact.dimension)
+            && (query.is_empty()
+                || format!("{} {} {}", fact.key, fact.value, fact.statement)
+                    .to_lowercase()
+                    .contains(&query))
+    });
+    facts.sort_by_key(|fact| std::cmp::Reverse(fact.created_at));
+    Ok(facts)
+}
+
+#[tauri::command]
+pub fn search_agent_memory(
+    state: State<'_, AppState>,
+    request: MemorySearchRequest,
+) -> Result<Vec<MemoryFact>, String> {
+    memory_facts(&state.repository, &request)
+}
+
+#[tauri::command]
+pub fn list_notebook_entries(
+    state: State<'_, AppState>,
+    project_id: Uuid,
+) -> Result<Vec<NotebookEntry>, String> {
+    state
+        .repository
+        .notebook_for_project(project_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn list_project_artifacts(
+    state: State<'_, AppState>,
+    project_id: Uuid,
+) -> Result<Vec<Artifact>, String> {
+    state
+        .repository
+        .artifacts_for_project(project_id)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExportNotebookRequest {
+    pub project_id: Uuid,
+    pub format: String,
+    pub local_path: String,
+}
+
+#[tauri::command]
+pub fn export_project_notebook(
+    state: State<'_, AppState>,
+    request: ExportNotebookRequest,
+) -> Result<(), String> {
+    let project = state
+        .repository
+        .get_project(request.project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or("project not found")?;
+    let notebook = state
+        .repository
+        .notebook_for_project(request.project_id)
+        .map_err(|error| error.to_string())?;
+    let artifacts = state
+        .repository
+        .artifacts_for_project(request.project_id)
+        .map_err(|error| error.to_string())?;
+    let facts = memory_facts(
+        &state.repository,
+        &MemorySearchRequest {
+            project_id: request.project_id,
+            conversation_id: None,
+            query: String::new(),
+            dimension: None,
+        },
+    )?;
+    let payload = json!({"schema_version":1,"project":project,"notebook":notebook,"artifacts":artifacts,"memory_facts":facts});
+    let target = Path::new(&request.local_path);
+    match request.format.as_str() {
+        "json" => std::fs::write(
+            target,
+            serde_json::to_vec_pretty(&payload).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string()),
+        "markdown" => std::fs::write(
+            target,
+            render_markdown(&project.name, &notebook, &artifacts, &facts),
+        )
+        .map_err(|error| error.to_string()),
+        "bundle" => write_project_bundle(
+            target,
+            &project.name,
+            &payload,
+            &notebook,
+            &artifacts,
+            &facts,
+        ),
+        _ => Err("export format must be markdown, json, or bundle".into()),
+    }
+}
+
+pub fn register_agent_completion(
+    repository: &Repository,
+    project_id: Uuid,
+    conversation_id: Option<Uuid>,
+    run_id: Uuid,
+    goal: &str,
+    method: &str,
+    observation: &str,
+    decision: &str,
+    artifacts: Vec<(String, String, u64, String)>,
+    skill_citations: &[SkillCitation],
+) -> Result<(), String> {
+    let now = Utc::now();
+    let mut artifact_ids = Vec::new();
+    for (relative_path, remote_path, size_bytes, sha256) in artifacts {
+        let id = stable_uuid(&format!("{project_id}:{run_id}:{relative_path}:{sha256}"));
+        repository
+            .save_artifact_v3(&Artifact {
+                id,
+                project_id,
+                run_id: Some(run_id),
+                relative_path: relative_path.clone(),
+                remote_path: Some(remote_path),
+                media_type: media_type(&relative_path),
+                size_bytes,
+                sha256,
+                verified: true,
+                created_at: now,
+            })
+            .map_err(|error| error.to_string())?;
+        artifact_ids.push(id);
+    }
+    let command_ids = repository
+        .list_json::<RemoteAgentMemoryEntry>("remote_agent_memory")
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|entry| entry.run_id == run_id)
+        .map(|entry| format!("command:{}:{}", run_id, entry.sequence))
+        .collect::<Vec<_>>();
+    let command_summary = repository
+        .list_json::<RemoteAgentMemoryEntry>("remote_agent_memory")
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|entry| entry.run_id == run_id)
+        .map(|entry| format!("- `{}` → exit {}", entry.command, entry.exit_code))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let environment_summary = repository
+        .list_json::<RemoteAgentMemoryEntry>("remote_agent_memory")
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|entry| entry.run_id == run_id && classify_command_fact(entry).0 == "environment")
+        .map(|entry| {
+            format!(
+                "- {}\n  - {}",
+                entry.command,
+                excerpt(&entry.stdout_tail, 240)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let skill_evidence = skill_citations
+        .iter()
+        .map(|citation| {
+            format!(
+                "skill:{}@{}:{}:{}",
+                citation.name, citation.version, citation.package_sha256, citation.excerpt_sha256
+            )
+        })
+        .collect::<Vec<_>>();
+    let entries = [
+        (
+            NotebookEntryKind::Goal,
+            "Research goal",
+            goal.to_owned(),
+            vec![],
+        ),
+        (
+            NotebookEntryKind::Method,
+            "Method",
+            method.to_owned(),
+            [command_ids.clone(), skill_evidence].concat(),
+        ),
+        (
+            NotebookEntryKind::Environment,
+            "Environment evidence",
+            if environment_summary.is_empty() {
+                "No separate environment probe was recorded.".into()
+            } else {
+                environment_summary
+            },
+            command_ids.clone(),
+        ),
+        (
+            NotebookEntryKind::Command,
+            "Approved terminal actions",
+            command_summary,
+            command_ids.clone(),
+        ),
+        (
+            NotebookEntryKind::Observation,
+            "Observed result",
+            observation.to_owned(),
+            command_ids.clone(),
+        ),
+        (
+            NotebookEntryKind::Decision,
+            "Completion decision",
+            decision.to_owned(),
+            command_ids.clone(),
+        ),
+        (
+            NotebookEntryKind::Evidence,
+            "Verified artifacts",
+            artifact_ids
+                .iter()
+                .map(|id| format!("artifact:{id}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            artifact_ids
+                .iter()
+                .map(|id| format!("artifact:{id}"))
+                .collect(),
+        ),
+    ];
+    for (kind, title, markdown, evidence_ids) in entries {
+        let id = stable_uuid(&format!("notebook:{run_id}:{title}"));
+        repository
+            .save_notebook_entry(&NotebookEntry {
+                id,
+                project_id,
+                conversation_id,
+                turn_id: None,
+                kind,
+                title: title.into(),
+                markdown,
+                confidence: None,
+                evidence_ids,
+                artifact_ids: artifact_ids.clone(),
+                created_at: now,
+                updated_at: now,
+            })
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+pub fn enabled_skill_citations(repository: &Repository) -> Result<Vec<SkillCitation>, String> {
+    let mut citations = Vec::new();
+    for skill in repository
+        .list_skill_packages()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|skill| skill.enabled)
+    {
+        let markdown = std::fs::read_to_string(Path::new(&skill.source_path).join("SKILL.md"))
+            .map_err(|error| format!("cannot read enabled skill {}: {error}", skill.name))?;
+        for (section, excerpt) in markdown_sections(&markdown).into_iter().take(12) {
+            citations.push(SkillCitation {
+                skill_id: skill.id,
+                name: skill.name.clone(),
+                version: skill.version.clone(),
+                package_sha256: skill.sha256.clone(),
+                section,
+                excerpt_sha256: hex::encode(Sha256::digest(excerpt.as_bytes())),
+            });
+        }
+    }
+    Ok(citations)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpRequest {
+    pub project_id: Uuid,
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub approved: bool,
+    pub tool: Option<String>,
+    pub arguments: Option<Value>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct McpResult {
+    pub server_name: String,
+    pub capabilities: Value,
+    pub tools: Vec<Value>,
+    pub result: Option<Value>,
+    pub audit_id: Uuid,
+}
+
+#[tauri::command]
+pub async fn inspect_mcp_server(
+    state: State<'_, AppState>,
+    request: McpRequest,
+) -> Result<McpResult, String> {
+    run_mcp(&state.repository, request, false).await
+}
+#[tauri::command]
+pub async fn call_mcp_tool(
+    state: State<'_, AppState>,
+    request: McpRequest,
+) -> Result<McpResult, String> {
+    run_mcp(&state.repository, request, true).await
+}
+
+async fn run_mcp(
+    repository: &Repository,
+    request: McpRequest,
+    call_tool: bool,
+) -> Result<McpResult, String> {
+    if !request.approved {
+        return Err("launching an MCP subprocess requires explicit approval".into());
+    }
+    if request.name.trim().is_empty()
+        || request.command.trim().is_empty()
+        || request.command.contains(['\n', '\r', '\0'])
+    {
+        return Err("invalid MCP stdio declaration".into());
+    }
+    let audit_id = Uuid::new_v4();
+    let mut attempts = 0_u8;
+    let outcome = loop {
+        attempts += 1;
+        let result = run_mcp_session(&request, call_tool, audit_id).await;
+        if result.is_ok() || call_tool || attempts >= 2 {
+            break result;
+        }
+    };
+    let audit = json!({"id":audit_id,"project_id":request.project_id,"server":request.name,"command":request.command,"args":request.args,"tool":request.tool,"approved":true,"attempts":attempts,"succeeded":outcome.is_ok(),"error":outcome.as_ref().err(),"timestamp":Utc::now()});
+    repository
+        .put_json("mcp_audit", &audit_id.to_string(), &audit)
+        .map_err(|error| error.to_string())?;
+    outcome
+}
+
+async fn run_mcp_session(
+    request: &McpRequest,
+    call_tool: bool,
+    audit_id: Uuid,
+) -> Result<McpResult, String> {
+    let mut child = Command::new(&request.command)
+        .args(&request.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| format!("could not launch MCP server: {error}"))?;
+    let outcome = async {
+        let initialize = rpc(&mut child, 1, "initialize", json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"OmicsOps","version":env!("CARGO_PKG_VERSION")}})).await?;
+        notify(&mut child, "notifications/initialized", json!({})).await?;
+        let tools_value = rpc(&mut child, 2, "tools/list", json!({})).await?;
+        let tools = tools_value.get("tools").and_then(Value::as_array).cloned().unwrap_or_default();
+        let result = if call_tool {
+            let tool = request.tool.as_deref().ok_or("MCP tool name is required")?;
+            if !tools.iter().any(|entry| entry.get("name").and_then(Value::as_str) == Some(tool)) { return Err(format!("MCP tool {tool} was not advertised by the server")); }
+            Some(rpc(&mut child, 3, "tools/call", json!({"name":tool,"arguments":request.arguments.clone().unwrap_or_else(|| json!({}))})).await?)
+        } else { None };
+        Ok::<_, String>(McpResult { server_name: request.name.clone(), capabilities: initialize.get("capabilities").cloned().unwrap_or_else(|| json!({})), tools, result, audit_id })
+    }.await;
+    let _ = notify(
+        &mut child,
+        "notifications/cancelled",
+        json!({"reason":"client session complete"}),
+    )
+    .await;
+    let _ = child.kill().await;
+    outcome
+}
+
+async fn rpc(child: &mut Child, id: u64, method: &str, params: Value) -> Result<Value, String> {
+    let request = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
+    child
+        .stdin
+        .as_mut()
+        .ok_or("MCP stdin unavailable")?
+        .write_all(format!("{}\n", request).as_bytes())
+        .await
+        .map_err(|error| error.to_string())?;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .flush()
+        .await
+        .map_err(|error| error.to_string())?;
+    let stdout = child.stdout.take().ok_or("MCP stdout unavailable")?;
+    let mut reader = BufReader::new(stdout);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader
+                .read_line(&mut line)
+                .await
+                .map_err(|error| error.to_string())?
+                == 0
+            {
+                return Err::<Value, String>("MCP server exited before replying".into());
+            }
+            let value: Value = serde_json::from_str(line.trim())
+                .map_err(|error| format!("invalid MCP JSON-RPC response: {error}"))?;
+            if value.get("id").and_then(Value::as_u64) == Some(id) {
+                return Ok(value);
+            }
+        }
+    })
+    .await
+    .map_err(|_| "MCP request timed out".to_string())??;
+    child.stdout = Some(reader.into_inner());
+    if let Some(error) = response.get("error") {
+        return Err(format!("MCP JSON-RPC error: {error}"));
+    }
+    Ok(response.get("result").cloned().unwrap_or(Value::Null))
+}
+
+async fn notify(child: &mut Child, method: &str, params: Value) -> Result<(), String> {
+    let request = json!({"jsonrpc":"2.0","method":method,"params":params});
+    child
+        .stdin
+        .as_mut()
+        .ok_or("MCP stdin unavailable")?
+        .write_all(format!("{}\n", request).as_bytes())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn stable_uuid(value: &str) -> Uuid {
+    let digest = Sha256::digest(value.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(bytes)
+}
+fn excerpt(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+fn classify_command_fact(entry: &RemoteAgentMemoryEntry) -> (&'static str, String, String) {
+    let combined =
+        format!("{} {} {}", entry.command, entry.stdout_tail, entry.reason).to_lowercase();
+    if combined.contains("micromamba")
+        || combined.contains("conda")
+        || combined.contains("pip install")
+        || combined.contains("sessioninfo")
+        || combined.contains("--version")
+    {
+        (
+            "environment",
+            entry
+                .command
+                .split_whitespace()
+                .next()
+                .unwrap_or("environment")
+                .into(),
+            format!("exit={}", entry.exit_code),
+        )
+    } else {
+        (
+            "task",
+            format!("run:{}:action:{}", entry.run_id, entry.sequence),
+            format!("exit={}", entry.exit_code),
+        )
+    }
+}
+fn mark_conflicts(facts: &mut [MemoryFact]) {
+    let mut groups: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
+    for (index, fact) in facts.iter().enumerate() {
+        groups
+            .entry((fact.dimension.clone(), fact.key.clone()))
+            .or_default()
+            .push(index);
+    }
+    for indexes in groups.values() {
+        for &left in indexes {
+            for &right in indexes {
+                if left != right && facts[left].value != facts[right].value {
+                    let id = facts[right].id;
+                    if !facts[left].conflicted_with.contains(&id) {
+                        facts[left].conflicted_with.push(id);
+                    }
+                }
+            }
+        }
+    }
+}
+fn media_type(path: &str) -> String {
+    match Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "csv" => "text/csv",
+        "tsv" => "text/tab-separated-values",
+        "json" => "application/json",
+        "html" => "text/html",
+        "md" => "text/markdown",
+        "pdf" => "application/pdf",
+        "ipynb" => "application/x-ipynb+json",
+        _ => "application/octet-stream",
+    }
+    .into()
+}
+fn markdown_sections(markdown: &str) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    let mut title = "Introduction".to_string();
+    let mut body = String::new();
+    for line in markdown.lines() {
+        if line.starts_with('#') {
+            if !body.trim().is_empty() {
+                result.push((title, excerpt(body.trim(), 1000)));
+                body.clear();
+            }
+            title = line.trim_start_matches('#').trim().to_owned();
+        } else {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    if !body.trim().is_empty() {
+        result.push((title, excerpt(body.trim(), 1000)));
+    }
+    result
+}
+fn render_markdown(
+    name: &str,
+    notebook: &[NotebookEntry],
+    artifacts: &[Artifact],
+    facts: &[MemoryFact],
+) -> String {
+    let mut out = format!("# {name}\n\n");
+    for entry in notebook {
+        out.push_str(&format!(
+            "## {:?}: {}\n\n{}\n\nEvidence: {}\n\n",
+            entry.kind,
+            entry.title,
+            entry.markdown,
+            entry.evidence_ids.join(", ")
+        ));
+    }
+    out.push_str("## Artifacts\n\n");
+    for artifact in artifacts {
+        out.push_str(&format!(
+            "- `{}` — {} bytes — SHA-256 `{}`\n",
+            artifact.relative_path, artifact.size_bytes, artifact.sha256
+        ));
+    }
+    out.push_str("\n## Traceable memory facts\n\n");
+    for fact in facts {
+        out.push_str(&format!(
+            "- **{} / {}**: {} (sources: {})\n",
+            fact.dimension,
+            fact.key,
+            fact.statement,
+            fact.evidence
+                .iter()
+                .map(|item| format!("{}:{}", item.source_kind, item.source_id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    out
+}
+fn write_project_bundle(
+    path: &Path,
+    name: &str,
+    payload: &Value,
+    notebook: &[NotebookEntry],
+    artifacts: &[Artifact],
+    facts: &[MemoryFact],
+) -> Result<(), String> {
+    let file = std::fs::File::create(path).map_err(|error| error.to_string())?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    zip.start_file("project.json", options)
+        .map_err(|error| error.to_string())?;
+    zip.write_all(
+        serde_json::to_string_pretty(payload)
+            .map_err(|error| error.to_string())?
+            .as_bytes(),
+    )
+    .map_err(|error| error.to_string())?;
+    zip.start_file("notebook.md", options)
+        .map_err(|error| error.to_string())?;
+    zip.write_all(render_markdown(name, notebook, artifacts, facts).as_bytes())
+        .map_err(|error| error.to_string())?;
+    zip.finish().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn conflicts_keep_both_facts_and_link_sources() {
+        let project_id = Uuid::new_v4();
+        let mut facts = vec![
+            MemoryFact {
+                id: Uuid::new_v4(),
+                project_id,
+                conversation_id: None,
+                run_id: None,
+                dimension: "environment".into(),
+                key: "python".into(),
+                value: "3.10".into(),
+                statement: "a".into(),
+                evidence: vec![],
+                conflicted_with: vec![],
+                created_at: Utc::now(),
+            },
+            MemoryFact {
+                id: Uuid::new_v4(),
+                project_id,
+                conversation_id: None,
+                run_id: None,
+                dimension: "environment".into(),
+                key: "python".into(),
+                value: "3.11".into(),
+                statement: "b".into(),
+                evidence: vec![],
+                conflicted_with: vec![],
+                created_at: Utc::now(),
+            },
+        ];
+        mark_conflicts(&mut facts);
+        assert_eq!(facts[0].conflicted_with, vec![facts[1].id]);
+    }
+    #[test]
+    fn skill_sections_are_individually_hashable() {
+        let parts = markdown_sections("# A\none\n# B\ntwo");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1].0, "B");
+    }
+
+    #[tokio::test]
+    async fn mcp_subprocess_never_launches_without_explicit_approval() {
+        let repository = Repository::open_in_memory().unwrap();
+        let result = run_mcp(
+            &repository,
+            McpRequest {
+                project_id: Uuid::new_v4(),
+                name: "unapproved".into(),
+                command: "this-command-must-not-run".into(),
+                args: vec![],
+                approved: false,
+                tool: None,
+                arguments: None,
+            },
+            false,
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err(),
+            "launching an MCP subprocess requires explicit approval"
+        );
+        assert!(
+            repository
+                .list_json::<Value>("mcp_audit")
+                .unwrap()
+                .is_empty()
+        );
+    }
+}

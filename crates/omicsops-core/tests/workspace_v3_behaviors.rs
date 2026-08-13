@@ -64,11 +64,15 @@ fn sync_conflicts_create_versioned_siblings_instead_of_overwriting() {
         id: Uuid::nil(),
         project_id: Uuid::nil(),
         relative_path: "results/markers.csv".into(),
+        local_relative_path: Some("results/markers.csv".into()),
         remote_path: Some("/srv/pbmc/results/markers.csv".into()),
         direction: SyncDirection::RemoteToLocal,
         size_bytes: 1024,
         sha256: "abc".into(),
         state: SyncState::Conflict,
+        transferred_bytes: 512,
+        retry_count: 1,
+        error: None,
         updated_at: Utc.with_ymd_and_hms(2026, 8, 11, 0, 0, 0).unwrap(),
     };
 

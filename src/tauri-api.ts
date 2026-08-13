@@ -41,6 +41,10 @@ import type {
   KernelEvent,
   KernelCellResult,
   FormalStepProposal,
+  MemoryFact,
+  NotebookEntry,
+  ProjectArtifact,
+  McpResult,
 } from "./types";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
@@ -150,8 +154,41 @@ export async function downloadProjectFile(projectId: string, relativePath: strin
   return invoke("download_project_file", { request: { project_id: projectId, relative_path: relativePath } });
 }
 
+export async function listSyncEntries(projectId: string): Promise<SyncEntry[]> { return isTauri() ? invoke("list_sync_entries", { projectId }) : []; }
+export async function pauseSyncTransfer(transferId: string): Promise<void> { await invoke("pause_sync_transfer", { transferId }); }
+export async function cancelSyncTransfer(transferId: string): Promise<void> { await invoke("cancel_sync_transfer", { transferId }); }
+export async function retrySyncTransfer(transferId: string): Promise<SyncEntry> { return invoke("retry_sync_transfer", { transferId }); }
+export async function onSyncEvent(callback: (entry: SyncEntry) => void): Promise<UnlistenFn> {
+  if (!isTauri()) return () => undefined;
+  return listen<SyncEntry>("artifact-event", ({ payload }) => callback(payload));
+}
+
 export async function previewProjectImage(projectId: string, relativePath: string): Promise<ProjectImagePreview> {
   return invoke("preview_project_image", { request: { project_id: projectId, relative_path: relativePath } });
+}
+
+export async function searchAgentMemory(projectId: string, query = "", dimension?: string, conversationId?: string): Promise<MemoryFact[]> {
+  return isTauri() ? invoke("search_agent_memory", { request: { project_id: projectId, conversation_id: conversationId ?? null, query, dimension: dimension ?? null } }) : [];
+}
+
+export async function listNotebookEntries(projectId: string): Promise<NotebookEntry[]> {
+  return isTauri() ? invoke("list_notebook_entries", { projectId }) : [];
+}
+
+export async function listProjectArtifacts(projectId: string): Promise<ProjectArtifact[]> {
+  return isTauri() ? invoke("list_project_artifacts", { projectId }) : [];
+}
+
+export async function exportProjectNotebook(projectId: string, format: "markdown" | "json" | "bundle", localPath: string): Promise<void> {
+  await invoke("export_project_notebook", { request: { project_id: projectId, format, local_path: localPath } });
+}
+
+export async function inspectMcpServer(request: { project_id: string; name: string; command: string; args?: string[]; approved: boolean }): Promise<McpResult> {
+  return invoke("inspect_mcp_server", { request: { ...request, args: request.args ?? [], tool: null, arguments: null } });
+}
+
+export async function callMcpTool(request: { project_id: string; name: string; command: string; args?: string[]; approved: boolean; tool: string; arguments?: Record<string, unknown> }): Promise<McpResult> {
+  return invoke("call_mcp_tool", { request: { ...request, args: request.args ?? [], arguments: request.arguments ?? {} } });
 }
 
 export async function listSkillPackages(): Promise<SkillPackage[]> {
@@ -470,8 +507,8 @@ export async function onAgentRunEvent(callback: (event: AgentRunStreamEvent) => 
   return listen<AgentRunStreamEvent>("agent-run-event", ({ payload }) => callback(payload));
 }
 
-export async function listAgentRunEvents(projectId: string, runId?: string): Promise<AgentRunStreamEvent[]> {
-  return isTauri() ? invoke("list_agent_run_events", { projectId, runId }) : [];
+export async function listAgentRunEvents(projectId: string, runId?: string, conversationId?: string): Promise<AgentRunStreamEvent[]> {
+  return isTauri() ? invoke("list_agent_run_events", { projectId, runId, conversationId }) : [];
 }
 
 export async function listStepAttemptsV2(runId: string): Promise<StepAttempt[]> {

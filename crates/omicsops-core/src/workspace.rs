@@ -210,12 +210,15 @@ pub struct Artifact {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NotebookEntryKind {
+    Goal,
     Hypothesis,
     Method,
     Observation,
     Decision,
     Evidence,
     Code,
+    Environment,
+    Command,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -243,6 +246,38 @@ pub struct SkillPackage {
     pub sha256: String,
     pub enabled: bool,
     pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct EvidenceReference {
+    pub source_kind: String,
+    pub source_id: String,
+    pub excerpt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryFact {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub conversation_id: Option<Uuid>,
+    pub run_id: Option<Uuid>,
+    pub dimension: String,
+    pub key: String,
+    pub value: String,
+    pub statement: String,
+    pub evidence: Vec<EvidenceReference>,
+    pub conflicted_with: Vec<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SkillCitation {
+    pub skill_id: Uuid,
+    pub name: String,
+    pub version: String,
+    pub package_sha256: String,
+    pub section: String,
+    pub excerpt_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -277,6 +312,8 @@ pub enum SyncDirection {
 pub enum SyncState {
     Pending,
     Transferring,
+    Paused,
+    Canceled,
     Synced,
     Conflict,
     Failed,
@@ -287,11 +324,19 @@ pub struct SyncEntry {
     pub id: Uuid,
     pub project_id: Uuid,
     pub relative_path: String,
+    #[serde(default)]
+    pub local_relative_path: Option<String>,
     pub remote_path: Option<String>,
     pub direction: SyncDirection,
     pub size_bytes: u64,
     pub sha256: String,
     pub state: SyncState,
+    #[serde(default)]
+    pub transferred_bytes: u64,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default)]
+    pub error: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 
