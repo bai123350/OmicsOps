@@ -80,6 +80,11 @@ export async function createConversation(projectId: string, title?: string): Pro
   return invoke("create_conversation", { request: { project_id: projectId, title: title ?? null } });
 }
 
+export async function deleteConversation(projectId: string, conversationId: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke("delete_conversation", { projectId, conversationId });
+}
+
 export async function listMessages(conversationId: string): Promise<WorkspaceMessage[]> {
   return isTauri() ? invoke("list_messages", { conversationId }) : [];
 }

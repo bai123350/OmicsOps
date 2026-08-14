@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Archive, Bot, CheckCircle2, Cloud, KeyRound, LoaderCircle, Monitor, Server, ShieldCheck, Wrench, X, XCircle } from "lucide-react";
+import { Archive, Bot, CheckCircle2, Cloud, FolderOpen, KeyRound, Layers3, LoaderCircle, Monitor, Server, ShieldCheck, Wrench, X, XCircle } from "lucide-react";
 import type { ConnectionProfile, ConnectionTestResult, McpServerProfile, ModelProbeResult, ModelProfile, SkillPackage, WorkspaceProject } from "../../types";
 import type { Locale } from "../workspace/copy";
 import "./settings.css";
@@ -127,6 +127,11 @@ function SkillsAndMcpSettings({ locale, skillPackages, skillsBusy, skillError, o
   const [mcpBusy, setMcpBusy] = useState<string | null>(null);
   const [mcpError, setMcpError] = useState("");
   const [inspectionApprovals, setInspectionApprovals] = useState<Record<string, boolean>>({});
+  const categorizedSkills = skillPackages.filter((skill) => skill.category);
+  const ungroupedSkills = skillPackages.filter((skill) => !skill.category);
+  const skillGroups = Array.from(new Set(categorizedSkills.map((skill) => skill.category!)))
+    .sort()
+    .map((category) => [category, categorizedSkills.filter((skill) => skill.category === category)] as const);
 
   async function saveServer() {
     if (!onSaveMcpServer) return;
@@ -148,7 +153,19 @@ function SkillsAndMcpSettings({ locale, skillPackages, skillsBusy, skillError, o
   return <main className="skills-mcp-settings">
     <div className="settings-heading skill-heading"><div><h3>{zh ? "科研 Skills" : "Research Skills"}</h3><p>{zh ? "随应用提供的单细胞 Skills 来自固定 GitHub 快照；Agent 会读取已启用 Skill 及其依赖、示例和使用指南，并据此生成分析代码。也可以导入其他 Agent Skills 兼容目录。" : "Bundled single-cell Skills come from a pinned GitHub snapshot. The Agent reads enabled Skills, dependencies, examples, and usage guides to generate analysis code. Other Agent Skills directories can also be imported."}</p></div><button className="skill-import" disabled={skillsBusy || !onImportSkill} onClick={() => void onImportSkill?.()}>{skillsBusy ? (zh ? "校验中…" : "Validating…") : (zh ? "导入技能目录" : "Import skill directory")}</button></div>
     {skillError && <div className="skill-error" role="alert">{skillError}</div>}
-    <div className="skill-list">{skillPackages.length === 0 ? <div className="skill-empty">{zh ? "尚未导入科研技能" : "No research skills imported"}</div> : skillPackages.map((skill) => <article key={skill.id}><div className="skill-title"><span><b>{skill.name}</b><small>v{skill.version} · SHA-256 {skill.sha256.slice(0, 12)}</small></span><button disabled={skillsBusy || !onSetSkillEnabled} onClick={() => void onSetSkillEnabled?.(skill.id, !skill.enabled)}>{skill.enabled ? (zh ? "停用" : "Disable") : (zh ? "启用" : "Enable")}</button></div><div className="skill-capabilities">{skill.capabilities.length === 0 ? <em>{zh ? "无额外能力" : "No additional capabilities"}</em> : skill.capabilities.map((capability) => <em key={capability}>{capability}</em>)}</div><small className="skill-state">{skill.enabled ? (zh ? "已启用" : "Enabled") : (zh ? "已安装，等待启用" : "Installed, awaiting enablement")}</small></article>)}</div>
+    {skillPackages.length === 0 ? <div className="skill-empty skill-library-empty">{zh ? "尚未导入科研技能" : "No research skills imported"}</div> : <div className="skill-library">
+      {skillGroups.length > 0 && <section className="skill-domain" aria-label={zh ? "组学技能" : "Omics skills"}>
+        <div className="skill-domain-title"><Layers3 size={18} /><span><b>{zh ? "组学技能" : "Omics skills"}</b><small>{zh ? `${skillGroups.length} 个分区 · ${categorizedSkills.length} Skills` : `${skillGroups.length} categories · ${categorizedSkills.length} Skills`}</small></span></div>
+        <div className="skill-category-list">{skillGroups.map(([category, skills]) => <details className="skill-category" key={category} open>
+          <summary><FolderOpen size={17} /><span><b>{skillCategoryLabel(category, zh)}</b><small>{skills.length} Skills · {skills.filter((skill) => skill.enabled).length} {zh ? "已启用" : "enabled"}</small></span></summary>
+          <div className="skill-list">{skills.map((skill) => <SkillCard key={skill.id} skill={skill} zh={zh} skillsBusy={skillsBusy} onSetSkillEnabled={onSetSkillEnabled} />)}</div>
+        </details>)}</div>
+      </section>}
+      {ungroupedSkills.length > 0 && <section className="skill-domain ungrouped" aria-label={zh ? "未分组技能" : "Uncategorized skills"}>
+        <div className="skill-domain-title"><FolderOpen size={18} /><span><b>{zh ? "未分组技能" : "Uncategorized skills"}</b><small>{zh ? "手动导入或尚未分类" : "Imported manually or not yet categorized"}</small></span></div>
+        <div className="skill-list">{ungroupedSkills.map((skill) => <SkillCard key={skill.id} skill={skill} zh={zh} skillsBusy={skillsBusy} onSetSkillEnabled={onSetSkillEnabled} />)}</div>
+      </section>}
+    </div>}
 
     <div className="mcp-divider" />
     <div className="settings-heading"><h3>{zh ? "MCP servers" : "MCP servers"}</h3><p>{zh ? "配置本地 stdio server，先显式批准一次检查，再逐个批准可调用的工具。保存配置不会启动进程。" : "Configure local stdio servers, explicitly approve inspection, then approve callable tools one by one. Saving never launches a process."}</p></div>
@@ -167,6 +184,15 @@ function SkillsAndMcpSettings({ locale, skillPackages, skillsBusy, skillError, o
     </article>)}</div>
     <div className="settings-note"><ShieldCheck size={18} /><span><b>{zh ? "技能与 MCP 均默认不启用" : "Skills and MCP are disabled by default"}</b><small>{zh ? "MCP 检查、启用和工具权限相互独立；修改启动命令或重新检查都会撤销已有工具授权。" : "Inspection, enablement, and tool approval are separate; changing the launch command or inspecting again revokes tool approvals."}</small></span></div>
   </main>;
+}
+
+function skillCategoryLabel(category: string, zh: boolean) {
+  if (category === "single_cell") return zh ? "单细胞组学" : "Single-cell omics";
+  return category.replace(/_/g, " ");
+}
+
+function SkillCard({ skill, zh, skillsBusy, onSetSkillEnabled }: { skill: SkillPackage; zh: boolean; skillsBusy: boolean; onSetSkillEnabled?: Props["onSetSkillEnabled"] }) {
+  return <article><div className="skill-title"><span><b>{skill.name}</b><small>v{skill.version} · SHA-256 {skill.sha256.slice(0, 12)}</small></span><button disabled={skillsBusy || !onSetSkillEnabled} onClick={() => void onSetSkillEnabled?.(skill.id, !skill.enabled)}>{skill.enabled ? (zh ? "停用" : "Disable") : (zh ? "启用" : "Enable")}</button></div><div className="skill-capabilities">{skill.capabilities.length === 0 ? <em>{zh ? "无额外能力" : "No additional capabilities"}</em> : skill.capabilities.map((capability) => <em key={capability}>{capability}</em>)}</div><small className="skill-state">{skill.enabled ? (zh ? "已启用" : "Enabled") : (zh ? "已安装，等待启用" : "Installed, awaiting enablement")}</small></article>;
 }
 
 function RemoteSettings({ locale, connections, selectedProject, onSave, onTest, onConfirm, onBind }: { locale: Locale; connections: ConnectionProfile[]; selectedProject?: WorkspaceProject | null; onSave?: Props["onSaveConnection"]; onTest?: Props["onTestConnection"]; onConfirm?: Props["onConfirmHostKey"]; onBind?: Props["onBindProjectRemote"] }) {

@@ -703,6 +703,7 @@ fn bundled_skill_config_selects_defaults_and_retires_replaced_packages() {
             sha256: "0".repeat(64),
             enabled: true,
             capabilities: vec![],
+            category: None,
         })
         .unwrap();
     let sources = tempfile::tempdir().unwrap();
@@ -723,7 +724,7 @@ fn bundled_skill_config_selects_defaults_and_retires_replaced_packages() {
     .unwrap();
     std::fs::write(
         sources.path().join("BUNDLE.json"),
-        r#"{"default_enabled":["selected"],"replaces":["old-upstream-skill"]}"#,
+        r#"{"default_enabled":["selected"],"replaces":["old-upstream-skill"],"categories":{"single_cell":["selected","optional"]}}"#,
     )
     .unwrap();
 
@@ -749,6 +750,11 @@ fn bundled_skill_config_selects_defaults_and_retires_replaced_packages() {
             .unwrap()
             .enabled
     );
+    assert!(
+        skills
+            .iter()
+            .all(|skill| skill.category.as_deref() == Some("single_cell"))
+    );
 }
 
 #[test]
@@ -763,6 +769,7 @@ fn vendored_single_cell_snapshot_is_installable_and_agent_readable() {
             sha256: "0".repeat(64),
             enabled: true,
             capabilities: vec![],
+            category: None,
         })
         .unwrap();
     let store = tempfile::tempdir().unwrap();
@@ -776,6 +783,11 @@ fn vendored_single_cell_snapshot_is_installable_and_agent_readable() {
     assert_eq!(skills.len(), 9);
     assert!(skills.iter().all(|skill| skill.name != "scrna-qc"));
     assert_eq!(skills.iter().filter(|skill| skill.enabled).count(), 5);
+    assert!(
+        skills
+            .iter()
+            .all(|skill| skill.category.as_deref() == Some("single_cell"))
+    );
 
     let applied = agent_skill_packages(&repository).unwrap();
     assert_eq!(applied.len(), 5);
@@ -814,6 +826,7 @@ fn enabling_a_skill_version_disables_other_versions_with_the_same_name() {
         sha256: "1".repeat(64),
         enabled: true,
         capabilities: vec![],
+        category: None,
     };
     let second = omicsops_core::workspace::SkillPackage {
         id: Uuid::new_v4(),
@@ -823,6 +836,7 @@ fn enabling_a_skill_version_disables_other_versions_with_the_same_name() {
         sha256: "2".repeat(64),
         enabled: false,
         capabilities: vec![],
+        category: None,
     };
     repository.save_skill_package(&first).unwrap();
     repository.save_skill_package(&second).unwrap();

@@ -7,6 +7,19 @@
     "scanpy",
     "scientific-visualization"
   ],
+  "categories": {
+    "single_cell": [
+      "anndata",
+      "arboreto",
+      "cellxgene-census",
+      "pathway-enrichment",
+      "scanpy",
+      "scientific-visualization",
+      "scvelo",
+      "scvi-tools",
+      "statistical-analysis"
+    ]
+  },
   "replaces": [
     "bio-single-cell-batch-integration",
     "bio-single-cell-cell-annotation",

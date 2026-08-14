@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import {
   Activity, ArrowLeft, Bot, Check, ChevronRight, Database, Expand, FileBarChart, FileText,
   FlaskConical, Folder, Languages, MessageSquarePlus, NotebookPen, Play,
-  Search, Send, Settings, Sparkles, Square, X,
+  Search, Send, Settings, Sparkles, Square, Trash2, X,
 } from "lucide-react";
 import { copy, type Locale } from "./copy";
 import type { AgentRunStreamEvent, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, MemoryFact, NotebookEntry, PlanProposal, ProjectArtifact, ProjectImagePreview, SyncEntry, WorkspaceConversation } from "../../types";
@@ -35,6 +35,7 @@ interface Props {
   activeConversationId?: string | null;
   onSelectConversation?: (conversationId: string) => Promise<void> | void;
   onNewConversation?: () => Promise<void> | void;
+  onDeleteConversation?: (conversationId: string) => Promise<void> | void;
   onSend?: (message: string) => Promise<boolean | void> | boolean | void;
   messages?: Array<{ id: string; role: "user" | "assistant" | "tool" | "system"; markdown: string; created_at?: string }>;
   streamingAssistant?: string;
@@ -83,7 +84,7 @@ interface Props {
 
 type ContextTab = "files" | "preview" | "notebook" | "explore" | "runs";
 
-export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, conversations = [], activeConversationId, onSelectConversation, onNewConversation, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, planProposal, planLoading = false, planApproved = false, onRequestPlan, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, agentRunEvents = [], remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
+export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, conversations = [], activeConversationId, onSelectConversation, onNewConversation, onDeleteConversation, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, planProposal, planLoading = false, planApproved = false, onRequestPlan, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, agentRunEvents = [], remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
   const t = copy[locale];
   const zh = locale === "zh-CN";
   const [tab, setTab] = useState<ContextTab>("files");
@@ -95,6 +96,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const [imagePreview, setImagePreview] = useState<ProjectImagePreview | null>(null);
   const [previewBusy, setPreviewBusy] = useState(false);
   const [previewError, setPreviewError] = useState("");
+  const [deletingConversationId, setDeletingConversationId] = useState<string | null>(null);
   const messageStreamRef = useRef<HTMLElement>(null);
   const imageFiles = (remoteFiles ?? []).filter((entry) => !entry.directory && isPreviewImage(entry.relative_path));
   const preview = <ArtifactPreview title={t.overview} locale={locale} images={imageFiles} selectedPath={selectedImagePath} preview={imagePreview} busy={previewBusy} error={previewError} onSelect={setSelectedImagePath} onLoad={loadImagePreview} />;
@@ -156,13 +158,26 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     }
   }
 
+  async function deleteConversation(item: WorkspaceConversation) {
+    if (!onDeleteConversation) return;
+    const title = item.title || (zh ? "新会话" : "New conversation");
+    const confirmed = window.confirm(zh ? `确定删除会话“${title}”吗？此操作无法撤销。` : `Delete “${title}”? This cannot be undone.`);
+    if (!confirmed) return;
+    setDeletingConversationId(item.id);
+    try {
+      await onDeleteConversation(item.id);
+    } finally {
+      setDeletingConversationId(null);
+    }
+  }
+
   return <div className="science-shell">
     <nav className="project-rail" aria-label={t.projects}>
       <div className="science-brand"><span className="brand-orbit"><FlaskConical size={20} /></span><div><strong>OmicsOps</strong><small>Life Science Workspace</small></div></div>
       <button className="rail-home" onClick={onBackToProjects} aria-label={zh ? "返回项目主页" : "Back to project home"}><ArrowLeft size={15} />{zh ? "返回项目主页" : "Project home"}</button>
       <button className="rail-search"><Search size={15} />{zh ? "搜索项目" : "Search projects"}</button>
       <div className="rail-section"><span>{zh ? "项目" : "Projects"}</span><button className="project-row active"><span className="project-glyph"><Database size={16} /></span><span><strong>{project.name}</strong><small>{t.status}</small></span><ChevronRight size={14} /></button></div>
-      <div className="rail-section sessions"><span>{zh ? "会话" : "Sessions"}</span><div className="session-list">{conversations.map((item) => <button className={`session-row ${item.id === activeConversationId ? "active" : ""}`} key={item.id} aria-current={item.id === activeConversationId ? "page" : undefined} onClick={() => void onSelectConversation?.(item.id)}><Sparkles size={15} /><span title={item.title}>{item.title || (zh ? "新会话" : "New conversation")}</span></button>)}</div><button className="new-session" disabled={agentBusy} onClick={() => void onNewConversation?.()}><MessageSquarePlus size={15} />{t.newConversation}</button></div>
+      <div className="rail-section sessions"><span>{zh ? "会话" : "Sessions"}</span><div className="session-list">{conversations.map((item) => { const title = item.title || (zh ? "新会话" : "New conversation"); const active = item.id === activeConversationId; const deleteDisabled = deletingConversationId !== null || (active && (agentBusy || runActive)); return <div className={`session-entry ${active ? "active" : ""}`} key={item.id}><button className="session-row" aria-current={active ? "page" : undefined} onClick={() => void onSelectConversation?.(item.id)}><Sparkles size={15} /><span title={item.title}>{title}</span></button><button className="session-delete" aria-label={zh ? `删除会话：${title}` : `Delete conversation: ${title}`} title={zh ? "删除会话" : "Delete conversation"} disabled={deleteDisabled || !onDeleteConversation} onClick={() => void deleteConversation(item)}><Trash2 size={14} /></button></div>; })}</div><button className="new-session" disabled={agentBusy} onClick={() => void onNewConversation?.()}><MessageSquarePlus size={15} />{t.newConversation}</button></div>
       <div className="rail-footer"><button onClick={() => onLocaleChange(zh ? "en-US" : "zh-CN")}><Languages size={16} />{zh ? "English" : "简体中文"}</button><button onClick={onOpenSettings}><Settings size={16} />{t.settings}</button></div>
     </nav>
 

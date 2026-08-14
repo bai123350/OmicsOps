@@ -210,6 +210,48 @@ impl Repository {
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
 
+    pub fn delete_conversation(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+    ) -> AdapterResult<bool> {
+        let mut connection = self.connection.lock().expect("database lock");
+        let transaction = connection.transaction()?;
+        let project_id = project_id.to_string();
+        let conversation_id = conversation_id.to_string();
+        let exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1 AND project_id = ?2)",
+            params![conversation_id, project_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            transaction.rollback()?;
+            return Ok(false);
+        }
+        transaction.execute(
+            "DELETE FROM agent_events WHERE turn_id IN (SELECT id FROM agent_turns WHERE conversation_id = ?1)",
+            [&conversation_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM tool_calls WHERE turn_id IN (SELECT id FROM agent_turns WHERE conversation_id = ?1)",
+            [&conversation_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM agent_turns WHERE conversation_id = ?1",
+            [&conversation_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM messages WHERE conversation_id = ?1",
+            [&conversation_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM conversations WHERE id = ?1 AND project_id = ?2",
+            params![conversation_id, project_id],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     pub fn save_message(&self, message: &Message) -> AdapterResult<()> {
         self.connection.lock().expect("database lock").execute(
             "INSERT INTO messages (id, project_id, conversation_id, sequence, value_json) VALUES (?1, ?2, ?3, ?4, ?5)

@@ -90,6 +90,85 @@ fn conversation_messages_and_agent_events_are_replayed_in_sequence() {
 }
 
 #[test]
+fn deleting_a_conversation_is_project_scoped_and_removes_chat_context() {
+    let repository = Repository::open_in_memory().unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 8, 14, 0, 0, 0).unwrap();
+    let project = Project::new(
+        Uuid::new_v4(),
+        "PBMC",
+        "E:/PBMC",
+        ProjectTemplate::SingleCellRnaSeq,
+        now,
+    );
+    let conversation = Conversation::new(Uuid::new_v4(), project.id, "QC", now);
+    let turn = AgentTurn {
+        id: Uuid::new_v4(),
+        project_id: project.id,
+        conversation_id: conversation.id,
+        status: TurnStatus::Succeeded,
+        model_profile_id: Uuid::new_v4(),
+        started_at: now,
+        finished_at: Some(now),
+    };
+    let message = Message::markdown(
+        Uuid::new_v4(),
+        project.id,
+        conversation.id,
+        1,
+        MessageRole::User,
+        "检查 QC",
+        now,
+    );
+    let event = AgentEvent::text_delta(project.id, conversation.id, turn.id, "完成");
+    repository.save_project(&project).unwrap();
+    repository.save_conversation(&conversation).unwrap();
+    repository.save_message(&message).unwrap();
+    repository.save_agent_turn(&turn).unwrap();
+    repository.append_agent_event(&event).unwrap();
+
+    assert!(
+        !repository
+            .delete_conversation(Uuid::new_v4(), conversation.id)
+            .unwrap()
+    );
+    assert_eq!(
+        repository
+            .messages_for_conversation(conversation.id)
+            .unwrap(),
+        vec![message]
+    );
+    assert!(
+        repository
+            .delete_conversation(project.id, conversation.id)
+            .unwrap()
+    );
+    assert!(
+        repository
+            .conversations_for_project(project.id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        repository
+            .messages_for_conversation(conversation.id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        repository
+            .agent_turns_for_conversation(conversation.id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        repository
+            .agent_events_for_turn(turn.id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn opening_v2_database_creates_a_v2_backup_before_migration() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("omicsops.db");
@@ -177,6 +256,7 @@ fn project_research_records_round_trip_through_normalized_v3_tables() {
         sha256: "def".into(),
         enabled: true,
         capabilities: vec!["read_local".into()],
+        category: Some("single_cell".into()),
     };
     repository.save_notebook_entry(&notebook).unwrap();
     repository.save_artifact_v3(&artifact).unwrap();

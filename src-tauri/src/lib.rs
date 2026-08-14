@@ -115,6 +115,7 @@ pub fn run() {
             workspace_commands::update_project_remote,
             workspace_commands::list_conversations,
             workspace_commands::create_conversation,
+            workspace_commands::delete_conversation,
             agent_commands::list_messages,
             agent_commands::submit_message,
             agent_commands::run_agent_turn,

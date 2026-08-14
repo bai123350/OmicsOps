@@ -246,6 +246,8 @@ pub struct SkillPackage {
     pub sha256: String,
     pub enabled: bool,
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub category: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

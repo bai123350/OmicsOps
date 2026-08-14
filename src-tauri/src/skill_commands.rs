@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -23,6 +23,8 @@ struct BundledSkillConfig {
     default_enabled: Vec<String>,
     #[serde(default)]
     replaces: Vec<String>,
+    #[serde(default)]
+    categories: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,6 +53,11 @@ pub fn install_bundled_skills(
 
     let config = bundled_skill_config(bundled_root)?;
     let mut default_enabled_keys = config.default_enabled.into_iter().collect::<BTreeSet<_>>();
+    let category_by_key = config
+        .categories
+        .into_iter()
+        .flat_map(|(category, keys)| keys.into_iter().map(move |key| (key, category.clone())))
+        .collect::<BTreeMap<_, _>>();
     for source in &sources {
         let markdown =
             std::fs::read_to_string(source.join("SKILL.md")).map_err(|error| error.to_string())?;
@@ -70,7 +77,12 @@ pub fn install_bundled_skills(
             .ok_or_else(|| format!("invalid bundled skill directory: {}", source.display()))?;
         let installed =
             install_skill_directory(&source, skills_root).map_err(|error| error.to_string())?;
-        persist_installed(repository, installed, default_enabled_keys.contains(key))?;
+        persist_installed(
+            repository,
+            installed,
+            default_enabled_keys.contains(key),
+            category_by_key.get(key).cloned(),
+        )?;
     }
     Ok(())
 }
@@ -142,20 +154,27 @@ pub fn import_skill_directory(
     }
     let installed = install_skill_directory(Path::new(&request.source_path), &state.skills_root)
         .map_err(|error| error.to_string())?;
-    persist_installed(&state.repository, installed, false)
+    persist_installed(&state.repository, installed, false, None)
 }
 
 fn persist_installed(
     repository: &Repository,
     installed: InstalledSkillPackage,
     enabled_by_default: bool,
+    category: Option<String>,
 ) -> Result<SkillPackage, String> {
-    if let Some(existing) = repository
+    if let Some(mut existing) = repository
         .list_skill_packages()
         .map_err(|error| error.to_string())?
         .into_iter()
         .find(|skill| skill.sha256 == installed.sha256)
     {
+        if category.is_some() && existing.category != category {
+            existing.category = category;
+            repository
+                .save_skill_package(&existing)
+                .map_err(|error| error.to_string())?;
+        }
         return Ok(existing);
     }
     let mut package = SkillPackage {
@@ -166,6 +185,7 @@ fn persist_installed(
         sha256: installed.sha256,
         enabled: false,
         capabilities: installed.capabilities,
+        category,
     };
     repository
         .save_skill_package(&package)

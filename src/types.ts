@@ -436,6 +436,7 @@ export interface SkillPackage {
   sha256: string;
   enabled: boolean;
   capabilities: string[];
+  category?: string | null;
 }
 
 export interface ResearchItem {

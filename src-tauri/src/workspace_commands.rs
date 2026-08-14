@@ -245,3 +245,19 @@ pub fn create_conversation(
         .map_err(|error| error.to_string())?;
     Ok(conversation)
 }
+
+#[tauri::command]
+pub fn delete_conversation(
+    state: State<'_, AppState>,
+    project_id: Uuid,
+    conversation_id: Uuid,
+) -> Result<(), String> {
+    let deleted = state
+        .repository
+        .delete_conversation(project_id, conversation_id)
+        .map_err(|error| error.to_string())?;
+    if !deleted {
+        return Err("conversation was not found in this project".into());
+    }
+    Ok(())
+}
