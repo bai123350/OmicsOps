@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Archive, Bot, CheckCircle2, Cloud, KeyRound, LoaderCircle, Monitor, Server, ShieldCheck, Wrench, X, XCircle } from "lucide-react";
-import type { ConnectionProfile, ConnectionTestResult, ModelProbeResult, ModelProfile, SkillPackage, WorkspaceProject } from "../../types";
+import type { ConnectionProfile, ConnectionTestResult, McpServerProfile, ModelProbeResult, ModelProfile, SkillPackage, WorkspaceProject } from "../../types";
 import type { Locale } from "../workspace/copy";
 import "./settings.css";
 import "./model-form.css";
@@ -19,6 +19,11 @@ interface Props {
   skillPackages?: SkillPackage[];
   onImportSkill?: () => Promise<void>;
   onSetSkillEnabled?: (skillId: string, enabled: boolean) => Promise<SkillPackage>;
+  mcpServers?: McpServerProfile[];
+  onSaveMcpServer?: (request: { id?: string; name: string; command: string; args: string[] }) => Promise<McpServerProfile>;
+  onInspectMcpServer?: (serverId: string) => Promise<void>;
+  onSetMcpServerEnabled?: (serverId: string, enabled: boolean) => Promise<McpServerProfile>;
+  onSetMcpToolApproval?: (serverId: string, tool: string, approved: boolean) => Promise<McpServerProfile>;
   connections?: ConnectionProfile[];
   selectedProject?: WorkspaceProject | null;
   onSaveConnection?: (profile: ConnectionProfile, secret: string) => Promise<void>;
@@ -33,7 +38,7 @@ const defaults: Record<ModelProfile["provider"], FormState> = {
   ollama: { provider: "ollama", label: "Ollama", base_url: "http://127.0.0.1:11434/", model: "", credential: "" },
 };
 
-export function SettingsPanel({ locale, onClose, modelProfiles = [], onSaveModel, onProbeModel, onListModels, skillPackages = [], onImportSkill, onSetSkillEnabled, connections = [], selectedProject, onSaveConnection, onTestConnection, onConfirmHostKey, onBindProjectRemote }: Props) {
+export function SettingsPanel({ locale, onClose, modelProfiles = [], onSaveModel, onProbeModel, onListModels, skillPackages = [], onImportSkill, onSetSkillEnabled, mcpServers = [], onSaveMcpServer, onInspectMcpServer, onSetMcpServerEnabled, onSetMcpToolApproval, connections = [], selectedProject, onSaveConnection, onTestConnection, onConfirmHostKey, onBindProjectRemote }: Props) {
   const zh = locale === "zh-CN";
   const [form, setForm] = useState<FormState | null>(null);
   const [saving, setSaving] = useState(false);
@@ -111,13 +116,57 @@ export function SettingsPanel({ locale, onClose, modelProfiles = [], onSaveModel
         {modelProfiles.length > 0 && <div className="configured-models">{modelProfiles.map((profile) => { const probe = modelTests[profile.id]; const choices = modelChoices[profile.id] ?? []; return <div key={profile.id}><span><b>{profile.label}</b><small>{profile.model} · {profile.provider}</small></span><button onClick={() => setForm({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model: profile.model, credential: "" })}>{zh ? "编辑" : "Edit"}</button><button disabled={!onListModels} onClick={() => void discoverModels(profile.id)}>{zh ? "可用模型" : "Models"}</button><button disabled={probe?.state === "testing" || !onProbeModel} onClick={() => void testModel(profile.id)}>{probe?.state === "testing" ? <><LoaderCircle className="spin" size={13} />{zh ? "测试中" : "Testing"}</> : (zh ? "测试" : "Test")}</button>{choices.length > 0 && <div className="model-choices"><small>{zh ? "网关当前可用，点击后保存：" : "Available now; click to edit:"}</small>{choices.map((model) => <button key={model} onClick={() => setForm({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model, credential: "" })}>{model}</button>)}</div>}{probe?.state === "success" && probe.result && <div className="model-probe-result success" role="status"><CheckCircle2 size={15} /><span><b>{zh ? "连接成功" : "Connection succeeded"}</b><small>{probe.result.model} · {probe.result.latency_ms} ms · {probe.result.endpoint}</small><code>{probe.result.response_preview}</code></span></div>}{probe?.state === "error" && <div className="model-probe-result error" role="alert"><XCircle size={15} /><span><b>{zh ? "测试失败" : "Test failed"}</b><small>{probe.message}</small></span></div>}</div>; })}</div>}
         <div className="settings-note"><ShieldCheck size={18} /><span><b>{zh ? "默认无遥测" : "Telemetry off by default"}</b><small>{zh ? "诊断包仅在主动导出时生成，并经过凭据脱敏。" : "Diagnostic bundles are generated only on export and redact credentials."}</small></span></div>
         <div className="legacy-row"><Archive size={18} /><span><b>{zh ? "历史运行只读" : "Read-only legacy runs"}</b><small>{zh ? "旧 V1/V2 计划、日志与审计可查看和导出，但不能启动新任务。" : "Legacy plans, logs, and audit records remain viewable and exportable."}</small></span><button>{zh ? "查看历史" : "View history"}</button></div>
-      </main> : section === "remote" ? <RemoteSettings locale={locale} connections={connections} selectedProject={selectedProject} onSave={onSaveConnection} onTest={onTestConnection} onConfirm={onConfirmHostKey} onBind={onBindProjectRemote} /> : <main><div className="settings-heading skill-heading"><div><h3>{zh ? "科研技能" : "Research skills"}</h3><p>{zh ? "从 Agent Skills 兼容目录导入；来源哈希、版本和能力声明会被固定。" : "Import Agent Skills directories with pinned source hashes, versions, and capabilities."}</p></div><button className="skill-import" disabled={skillsBusy || !onImportSkill} onClick={() => void importSkill()}>{skillsBusy ? (zh ? "校验中…" : "Validating…") : (zh ? "导入技能目录" : "Import skill directory")}</button></div>
-        {skillError && <div className="skill-error" role="alert">{skillError}</div>}
-        <div className="skill-list">{skillPackages.length === 0 ? <div className="skill-empty">{zh ? "尚未导入科研技能" : "No research skills imported"}</div> : skillPackages.map((skill) => <article key={skill.id}><div className="skill-title"><span><b>{skill.name}</b><small>v{skill.version} · SHA-256 {skill.sha256.slice(0, 12)}</small></span><button disabled={skillsBusy || !onSetSkillEnabled} onClick={() => void onSetSkillEnabled?.(skill.id, !skill.enabled)}>{skill.enabled ? (zh ? "停用" : "Disable") : (zh ? "启用" : "Enable")}</button></div><div className="skill-capabilities">{skill.capabilities.length === 0 ? <em>{zh ? "无额外能力" : "No additional capabilities"}</em> : skill.capabilities.map((capability) => <em key={capability}>{capability}</em>)}</div><small className="skill-state">{skill.enabled ? (zh ? "已启用" : "Enabled") : (zh ? "已安装，等待启用" : "Installed, awaiting enablement")}</small></article>)}</div>
-        <div className="settings-note"><ShieldCheck size={18} /><span><b>{zh ? "导入默认不启用" : "Imports are disabled by default"}</b><small>{zh ? "未知能力、路径穿越、逃逸符号链接和超限软件包会被拒绝。" : "Unknown capabilities, path traversal, escaping symlinks, and oversized packages are rejected."}</small></span></div>
-      </main>}
+      </main> : section === "remote" ? <RemoteSettings locale={locale} connections={connections} selectedProject={selectedProject} onSave={onSaveConnection} onTest={onTestConnection} onConfirm={onConfirmHostKey} onBind={onBindProjectRemote} /> : <SkillsAndMcpSettings locale={locale} skillPackages={skillPackages} skillsBusy={skillsBusy} skillError={skillError} onImportSkill={onImportSkill ? importSkill : undefined} onSetSkillEnabled={onSetSkillEnabled} mcpServers={mcpServers} selectedProject={selectedProject} onSaveMcpServer={onSaveMcpServer} onInspectMcpServer={onInspectMcpServer} onSetMcpServerEnabled={onSetMcpServerEnabled} onSetMcpToolApproval={onSetMcpToolApproval} />}
     </div>
   </section></div>;
+}
+
+function SkillsAndMcpSettings({ locale, skillPackages, skillsBusy, skillError, onImportSkill, onSetSkillEnabled, mcpServers, selectedProject, onSaveMcpServer, onInspectMcpServer, onSetMcpServerEnabled, onSetMcpToolApproval }: { locale: Locale; skillPackages: SkillPackage[]; skillsBusy: boolean; skillError: string; onImportSkill?: () => Promise<void>; onSetSkillEnabled?: Props["onSetSkillEnabled"]; mcpServers: McpServerProfile[]; selectedProject?: WorkspaceProject | null; onSaveMcpServer?: Props["onSaveMcpServer"]; onInspectMcpServer?: Props["onInspectMcpServer"]; onSetMcpServerEnabled?: Props["onSetMcpServerEnabled"]; onSetMcpToolApproval?: Props["onSetMcpToolApproval"] }) {
+  const zh = locale === "zh-CN";
+  const [mcpForm, setMcpForm] = useState<{ id?: string; name: string; command: string; args: string }>({ name: "", command: "", args: "" });
+  const [mcpBusy, setMcpBusy] = useState<string | null>(null);
+  const [mcpError, setMcpError] = useState("");
+  const [inspectionApprovals, setInspectionApprovals] = useState<Record<string, boolean>>({});
+
+  async function saveServer() {
+    if (!onSaveMcpServer) return;
+    setMcpBusy("save"); setMcpError("");
+    try {
+      await onSaveMcpServer({ ...mcpForm, args: mcpForm.args.split(/\r?\n/).map((value) => value.trim()).filter(Boolean) });
+      setMcpForm({ name: "", command: "", args: "" });
+    } catch (reason) { setMcpError(reason instanceof Error ? reason.message : String(reason)); }
+    finally { setMcpBusy(null); }
+  }
+
+  async function runMcpAction(key: string, action: () => Promise<unknown>) {
+    setMcpBusy(key); setMcpError("");
+    try { await action(); }
+    catch (reason) { setMcpError(reason instanceof Error ? reason.message : String(reason)); }
+    finally { setMcpBusy(null); }
+  }
+
+  return <main className="skills-mcp-settings">
+    <div className="settings-heading skill-heading"><div><h3>{zh ? "科研 Skills" : "Research Skills"}</h3><p>{zh ? "随应用提供的单细胞 Skills 来自固定 GitHub 快照；Agent 会读取已启用 Skill 及其依赖、示例和使用指南，并据此生成分析代码。也可以导入其他 Agent Skills 兼容目录。" : "Bundled single-cell Skills come from a pinned GitHub snapshot. The Agent reads enabled Skills, dependencies, examples, and usage guides to generate analysis code. Other Agent Skills directories can also be imported."}</p></div><button className="skill-import" disabled={skillsBusy || !onImportSkill} onClick={() => void onImportSkill?.()}>{skillsBusy ? (zh ? "校验中…" : "Validating…") : (zh ? "导入技能目录" : "Import skill directory")}</button></div>
+    {skillError && <div className="skill-error" role="alert">{skillError}</div>}
+    <div className="skill-list">{skillPackages.length === 0 ? <div className="skill-empty">{zh ? "尚未导入科研技能" : "No research skills imported"}</div> : skillPackages.map((skill) => <article key={skill.id}><div className="skill-title"><span><b>{skill.name}</b><small>v{skill.version} · SHA-256 {skill.sha256.slice(0, 12)}</small></span><button disabled={skillsBusy || !onSetSkillEnabled} onClick={() => void onSetSkillEnabled?.(skill.id, !skill.enabled)}>{skill.enabled ? (zh ? "停用" : "Disable") : (zh ? "启用" : "Enable")}</button></div><div className="skill-capabilities">{skill.capabilities.length === 0 ? <em>{zh ? "无额外能力" : "No additional capabilities"}</em> : skill.capabilities.map((capability) => <em key={capability}>{capability}</em>)}</div><small className="skill-state">{skill.enabled ? (zh ? "已启用" : "Enabled") : (zh ? "已安装，等待启用" : "Installed, awaiting enablement")}</small></article>)}</div>
+
+    <div className="mcp-divider" />
+    <div className="settings-heading"><h3>{zh ? "MCP servers" : "MCP servers"}</h3><p>{zh ? "配置本地 stdio server，先显式批准一次检查，再逐个批准可调用的工具。保存配置不会启动进程。" : "Configure local stdio servers, explicitly approve inspection, then approve callable tools one by one. Saving never launches a process."}</p></div>
+    <section className="mcp-form" aria-label={zh ? "MCP server 配置" : "MCP server configuration"}>
+      <div className="mcp-form-grid"><label>{zh ? "名称" : "Name"}<input aria-label="MCP server name" value={mcpForm.name} onChange={(event) => setMcpForm({ ...mcpForm, name: event.target.value })} /></label><label>{zh ? "启动命令" : "Command"}<input aria-label="MCP server command" placeholder="npx" value={mcpForm.command} onChange={(event) => setMcpForm({ ...mcpForm, command: event.target.value })} /></label><label className="wide">{zh ? "参数（每行一个）" : "Arguments (one per line)"}<textarea aria-label="MCP server arguments" rows={3} placeholder={"-y\n@modelcontextprotocol/server-filesystem\nE:\\Science\\project"} value={mcpForm.args} onChange={(event) => setMcpForm({ ...mcpForm, args: event.target.value })} /></label></div>
+      <div className="mcp-form-actions">{mcpForm.id && <button onClick={() => setMcpForm({ name: "", command: "", args: "" })}>{zh ? "取消编辑" : "Cancel edit"}</button>}<button className="primary" disabled={mcpBusy !== null || !onSaveMcpServer || !mcpForm.name.trim() || !mcpForm.command.trim()} onClick={() => void saveServer()}>{zh ? "保存 MCP server" : "Save MCP server"}</button></div>
+    </section>
+    {mcpError && <div className="skill-error" role="alert">{mcpError}</div>}
+    <div className="mcp-list">{mcpServers.length === 0 ? <div className="skill-empty">{zh ? "尚未配置 MCP server" : "No MCP servers configured"}</div> : mcpServers.map((server) => <article key={server.id}>
+      <div className="mcp-server-title"><span><b>{server.name}</b><code>{[server.command, ...server.args].join(" ")}</code><small>{server.last_inspected_at ? (zh ? `已发现 ${server.tools.length} 个工具` : `${server.tools.length} tools discovered`) : (zh ? "尚未检查" : "Not inspected")}</small></span><div><button disabled={mcpBusy !== null} onClick={() => setMcpForm({ id: server.id, name: server.name, command: server.command, args: server.args.join("\n") })}>{zh ? "编辑" : "Edit"}</button><button disabled={mcpBusy !== null || !server.last_inspected_at || !onSetMcpServerEnabled} onClick={() => void runMcpAction(`enable:${server.id}`, () => onSetMcpServerEnabled!(server.id, !server.enabled))}>{server.enabled ? (zh ? "停用" : "Disable") : (zh ? "启用" : "Enable")}</button></div></div>
+      <label className="mcp-launch-approval"><input type="checkbox" checked={inspectionApprovals[server.id] ?? false} onChange={(event) => setInspectionApprovals((current) => ({ ...current, [server.id]: event.target.checked }))} />{zh ? "我批准本次启动该本地进程，仅用于 initialize 和 tools/list" : "Approve one process launch for initialize and tools/list only"}</label>
+      <button className="mcp-inspect" disabled={mcpBusy !== null || !selectedProject || !inspectionApprovals[server.id] || !onInspectMcpServer} onClick={() => void runMcpAction(`inspect:${server.id}`, async () => { await onInspectMcpServer!(server.id); setInspectionApprovals((current) => ({ ...current, [server.id]: false })); })}>{mcpBusy === `inspect:${server.id}` ? (zh ? "检查中…" : "Inspecting…") : (zh ? "检查并发现工具" : "Inspect and discover tools")}</button>
+      {!selectedProject && <small className="mcp-project-hint">{zh ? "打开一个项目后才能执行隔离检查；配置仍可先保存。" : "Open a project to run an isolated inspection; configuration can still be saved."}</small>}
+      {server.tools.length > 0 && <div className="mcp-tools"><b>{zh ? "逐工具权限" : "Per-tool permissions"}</b>{server.tools.map((tool) => { const approved = server.approved_tools.includes(tool.name); return <div key={tool.name}><span><code>{tool.name}</code><small>{tool.description ?? (zh ? "server 未提供描述" : "No description provided")}</small></span><button className={approved ? "approved" : ""} disabled={mcpBusy !== null || !onSetMcpToolApproval} onClick={() => void runMcpAction(`tool:${server.id}:${tool.name}`, () => onSetMcpToolApproval!(server.id, tool.name, !approved))}>{approved ? (zh ? "已批准，点击撤销" : "Approved · revoke") : (zh ? "批准调用" : "Approve calls")}</button></div>; })}</div>}
+      <small className={`mcp-state ${server.enabled ? "enabled" : ""}`}>{server.enabled ? (zh ? "server 已启用；实际工具调用仍需命中上方批准清单" : "Server enabled; calls must still match the approval list") : (zh ? "默认停用，不会自动启动" : "Disabled by default; never auto-started")}</small>
+    </article>)}</div>
+    <div className="settings-note"><ShieldCheck size={18} /><span><b>{zh ? "技能与 MCP 均默认不启用" : "Skills and MCP are disabled by default"}</b><small>{zh ? "MCP 检查、启用和工具权限相互独立；修改启动命令或重新检查都会撤销已有工具授权。" : "Inspection, enablement, and tool approval are separate; changing the launch command or inspecting again revokes tool approvals."}</small></span></div>
+  </main>;
 }
 
 function RemoteSettings({ locale, connections, selectedProject, onSave, onTest, onConfirm, onBind }: { locale: Locale; connections: ConnectionProfile[]; selectedProject?: WorkspaceProject | null; onSave?: Props["onSaveConnection"]; onTest?: Props["onTestConnection"]; onConfirm?: Props["onConfirmHostKey"]; onBind?: Props["onBindProjectRemote"] }) {

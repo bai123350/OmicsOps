@@ -28,10 +28,29 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir)?;
             let skills_root = data_dir.join("skills");
             std::fs::create_dir_all(&skills_root)?;
+            let packaged_skills_root = app
+                .path()
+                .resource_dir()
+                .map_err(|error| error.to_string())?
+                .join("skills")
+                .join("single-cell");
+            let development_skills_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("skills")
+                .join("single-cell");
+            let bundled_skills_root = if packaged_skills_root.is_dir() {
+                packaged_skills_root
+            } else {
+                development_skills_root
+            };
             let repository = Repository::open(data_dir.join("omicsops.db"))
                 .map_err(|error| error.to_string())?;
             commands::backfill_agent_run_conversation_ids(&repository)?;
-            skill_commands::install_builtin_skills(&repository, &skills_root)?;
+            skill_commands::install_bundled_skills(
+                &repository,
+                &skills_root,
+                &bundled_skills_root,
+            )?;
             kernel_commands::mark_orphaned_kernels_interrupted(&repository)?;
             sync_commands::mark_orphaned_sync_transfers_failed(&repository)?;
             app.manage(AppState {
@@ -85,6 +104,12 @@ pub fn run() {
             p1_commands::export_project_notebook,
             p1_commands::inspect_mcp_server,
             p1_commands::call_mcp_tool,
+            p1_commands::list_mcp_servers,
+            p1_commands::save_mcp_server,
+            p1_commands::set_mcp_server_enabled,
+            p1_commands::inspect_configured_mcp_server,
+            p1_commands::set_mcp_tool_approval,
+            p1_commands::call_configured_mcp_tool,
             workspace_commands::list_projects,
             workspace_commands::create_project,
             workspace_commands::update_project_remote,

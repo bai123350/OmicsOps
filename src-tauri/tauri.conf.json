@@ -24,6 +24,9 @@
   "bundle": {
     "active": true,
     "targets": ["nsis", "msi"],
+    "resources": {
+      "../skills/single-cell/": "skills/single-cell/"
+    },
     "icon": []
   }
 }

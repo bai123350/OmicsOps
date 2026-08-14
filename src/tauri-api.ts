@@ -45,6 +45,7 @@ import type {
   NotebookEntry,
   ProjectArtifact,
   McpResult,
+  McpServerProfile,
 } from "./types";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
@@ -189,6 +190,30 @@ export async function inspectMcpServer(request: { project_id: string; name: stri
 
 export async function callMcpTool(request: { project_id: string; name: string; command: string; args?: string[]; approved: boolean; tool: string; arguments?: Record<string, unknown> }): Promise<McpResult> {
   return invoke("call_mcp_tool", { request: { ...request, args: request.args ?? [], arguments: request.arguments ?? {} } });
+}
+
+export async function listMcpServers(): Promise<McpServerProfile[]> {
+  return isTauri() ? invoke("list_mcp_servers") : [];
+}
+
+export async function saveMcpServer(request: { id?: string; name: string; command: string; args?: string[] }): Promise<McpServerProfile> {
+  return invoke("save_mcp_server", { request: { ...request, args: request.args ?? [] } });
+}
+
+export async function setMcpServerEnabled(serverId: string, enabled: boolean): Promise<McpServerProfile> {
+  return invoke("set_mcp_server_enabled", { request: { server_id: serverId, enabled } });
+}
+
+export async function inspectConfiguredMcpServer(projectId: string, serverId: string): Promise<McpResult> {
+  return invoke("inspect_configured_mcp_server", { request: { project_id: projectId, server_id: serverId, approved: true } });
+}
+
+export async function setMcpToolApproval(serverId: string, tool: string, approved: boolean): Promise<McpServerProfile> {
+  return invoke("set_mcp_tool_approval", { request: { server_id: serverId, tool, approved } });
+}
+
+export async function callConfiguredMcpTool(request: { project_id: string; server_id: string; tool: string; arguments?: Record<string, unknown>; approved: boolean }): Promise<McpResult> {
+  return invoke("call_configured_mcp_tool", { request: { ...request, arguments: request.arguments ?? {} } });
 }
 
 export async function listSkillPackages(): Promise<SkillPackage[]> {

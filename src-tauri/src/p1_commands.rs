@@ -389,12 +389,7 @@ pub fn register_agent_completion(
 
 pub fn enabled_skill_citations(repository: &Repository) -> Result<Vec<SkillCitation>, String> {
     let mut citations = Vec::new();
-    for skill in repository
-        .list_skill_packages()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter(|skill| skill.enabled)
-    {
+    for skill in crate::skill_commands::agent_skill_packages(repository)? {
         let markdown = std::fs::read_to_string(Path::new(&skill.source_path).join("SKILL.md"))
             .map_err(|error| format!("cannot read enabled skill {}: {error}", skill.name))?;
         for (section, excerpt) in markdown_sections(&markdown).into_iter().take(12) {
@@ -431,6 +426,274 @@ pub struct McpResult {
     pub audit_id: Uuid,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerProfile {
+    pub id: Uuid,
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub enabled: bool,
+    #[serde(default)]
+    pub approved_tools: Vec<String>,
+    #[serde(default)]
+    pub tools: Vec<Value>,
+    #[serde(default = "empty_json_object")]
+    pub capabilities: Value,
+    pub last_inspected_at: Option<chrono::DateTime<Utc>>,
+    pub created_at: chrono::DateTime<Utc>,
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SaveMcpServerRequest {
+    pub id: Option<Uuid>,
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetMcpServerEnabledRequest {
+    pub server_id: Uuid,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InspectConfiguredMcpServerRequest {
+    pub project_id: Uuid,
+    pub server_id: Uuid,
+    pub approved: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetMcpToolApprovalRequest {
+    pub server_id: Uuid,
+    pub tool: String,
+    pub approved: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CallConfiguredMcpToolRequest {
+    pub project_id: Uuid,
+    pub server_id: Uuid,
+    pub tool: String,
+    pub arguments: Option<Value>,
+    pub approved: bool,
+}
+
+fn empty_json_object() -> Value {
+    json!({})
+}
+
+fn validate_mcp_declaration(name: &str, command: &str, args: &[String]) -> Result<(), String> {
+    if name.trim().is_empty()
+        || command.trim().is_empty()
+        || command.contains(['\n', '\r', '\0'])
+        || args.iter().any(|arg| arg.contains('\0'))
+    {
+        return Err("invalid MCP stdio declaration".into());
+    }
+    Ok(())
+}
+
+fn mcp_server_profile(repository: &Repository, id: Uuid) -> Result<McpServerProfile, String> {
+    repository
+        .get_json("mcp_server", &id.to_string())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("MCP server {id} was not found"))
+}
+
+fn mcp_profile_from_request(
+    request: SaveMcpServerRequest,
+    existing: Option<&McpServerProfile>,
+    now: chrono::DateTime<Utc>,
+) -> Result<McpServerProfile, String> {
+    validate_mcp_declaration(&request.name, &request.command, &request.args)?;
+    let declaration_changed = existing.is_some_and(|profile| {
+        profile.command != request.command.trim() || profile.args != request.args
+    });
+    Ok(McpServerProfile {
+        id: request.id.unwrap_or_else(Uuid::new_v4),
+        name: request.name.trim().to_string(),
+        command: request.command.trim().to_string(),
+        args: request.args,
+        enabled: existing.is_some_and(|profile| profile.enabled) && !declaration_changed,
+        approved_tools: if declaration_changed {
+            vec![]
+        } else {
+            existing
+                .map(|profile| profile.approved_tools.clone())
+                .unwrap_or_default()
+        },
+        tools: if declaration_changed {
+            vec![]
+        } else {
+            existing
+                .map(|profile| profile.tools.clone())
+                .unwrap_or_default()
+        },
+        capabilities: if declaration_changed {
+            json!({})
+        } else {
+            existing
+                .map(|profile| profile.capabilities.clone())
+                .unwrap_or_else(|| json!({}))
+        },
+        last_inspected_at: if declaration_changed {
+            None
+        } else {
+            existing.and_then(|profile| profile.last_inspected_at)
+        },
+        created_at: existing.map(|profile| profile.created_at).unwrap_or(now),
+        updated_at: now,
+    })
+}
+
+#[tauri::command]
+pub fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerProfile>, String> {
+    let mut profiles = state
+        .repository
+        .list_json("mcp_server")
+        .map_err(|error| error.to_string())?;
+    profiles.sort_by(|left: &McpServerProfile, right| right.updated_at.cmp(&left.updated_at));
+    Ok(profiles)
+}
+
+#[tauri::command]
+pub fn save_mcp_server(
+    state: State<'_, AppState>,
+    request: SaveMcpServerRequest,
+) -> Result<McpServerProfile, String> {
+    let now = Utc::now();
+    let existing = request
+        .id
+        .map(|id| mcp_server_profile(&state.repository, id))
+        .transpose()?;
+    let profile = mcp_profile_from_request(request, existing.as_ref(), now)?;
+    state
+        .repository
+        .put_json("mcp_server", &profile.id.to_string(), &profile)
+        .map_err(|error| error.to_string())?;
+    Ok(profile)
+}
+
+#[tauri::command]
+pub fn set_mcp_server_enabled(
+    state: State<'_, AppState>,
+    request: SetMcpServerEnabledRequest,
+) -> Result<McpServerProfile, String> {
+    let mut profile = mcp_server_profile(&state.repository, request.server_id)?;
+    if request.enabled && profile.last_inspected_at.is_none() {
+        return Err("inspect the MCP server before enabling it".into());
+    }
+    profile.enabled = request.enabled;
+    profile.updated_at = Utc::now();
+    state
+        .repository
+        .put_json("mcp_server", &profile.id.to_string(), &profile)
+        .map_err(|error| error.to_string())?;
+    Ok(profile)
+}
+
+#[tauri::command]
+pub fn set_mcp_tool_approval(
+    state: State<'_, AppState>,
+    request: SetMcpToolApprovalRequest,
+) -> Result<McpServerProfile, String> {
+    let mut profile = mcp_server_profile(&state.repository, request.server_id)?;
+    let tool = request.tool.trim();
+    if !profile
+        .tools
+        .iter()
+        .any(|entry| entry.get("name").and_then(Value::as_str) == Some(tool))
+    {
+        return Err(format!("MCP tool {tool} was not advertised by the server"));
+    }
+    profile.approved_tools.retain(|entry| entry != tool);
+    if request.approved {
+        profile.approved_tools.push(tool.to_string());
+        profile.approved_tools.sort();
+        profile.approved_tools.dedup();
+    }
+    profile.updated_at = Utc::now();
+    state
+        .repository
+        .put_json("mcp_server", &profile.id.to_string(), &profile)
+        .map_err(|error| error.to_string())?;
+    Ok(profile)
+}
+
+#[tauri::command]
+pub async fn inspect_configured_mcp_server(
+    state: State<'_, AppState>,
+    request: InspectConfiguredMcpServerRequest,
+) -> Result<McpResult, String> {
+    let mut profile = mcp_server_profile(&state.repository, request.server_id)?;
+    let result = run_mcp(
+        &state.repository,
+        McpRequest {
+            project_id: request.project_id,
+            name: profile.name.clone(),
+            command: profile.command.clone(),
+            args: profile.args.clone(),
+            approved: request.approved,
+            tool: None,
+            arguments: None,
+        },
+        false,
+    )
+    .await?;
+    // A fresh discovery can change a tool's schema or behavior without changing its name.
+    // Require the user to approve every tool again after each inspection.
+    profile.approved_tools.clear();
+    profile.tools = result.tools.clone();
+    profile.capabilities = result.capabilities.clone();
+    profile.last_inspected_at = Some(Utc::now());
+    profile.updated_at = Utc::now();
+    state
+        .repository
+        .put_json("mcp_server", &profile.id.to_string(), &profile)
+        .map_err(|error| error.to_string())?;
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn call_configured_mcp_tool(
+    state: State<'_, AppState>,
+    request: CallConfiguredMcpToolRequest,
+) -> Result<McpResult, String> {
+    let profile = mcp_server_profile(&state.repository, request.server_id)?;
+    if !profile.enabled {
+        return Err("MCP server is disabled".into());
+    }
+    if !profile
+        .approved_tools
+        .iter()
+        .any(|tool| tool == request.tool.trim())
+    {
+        return Err(format!(
+            "MCP tool {} requires explicit tool approval",
+            request.tool.trim()
+        ));
+    }
+    run_mcp(
+        &state.repository,
+        McpRequest {
+            project_id: request.project_id,
+            name: profile.name,
+            command: profile.command,
+            args: profile.args,
+            approved: request.approved,
+            tool: Some(request.tool),
+            arguments: request.arguments,
+        },
+        true,
+    )
+    .await
+}
+
 #[tauri::command]
 pub async fn inspect_mcp_server(
     state: State<'_, AppState>,
@@ -454,12 +717,7 @@ async fn run_mcp(
     if !request.approved {
         return Err("launching an MCP subprocess requires explicit approval".into());
     }
-    if request.name.trim().is_empty()
-        || request.command.trim().is_empty()
-        || request.command.contains(['\n', '\r', '\0'])
-    {
-        return Err("invalid MCP stdio declaration".into());
-    }
+    validate_mcp_declaration(&request.name, &request.command, &request.args)?;
     let audit_id = Uuid::new_v4();
     let mut attempts = 0_u8;
     let outcome = loop {
@@ -805,5 +1063,45 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn mcp_profiles_start_disabled_and_declaration_changes_revoke_access() {
+        let now = Utc::now();
+        let created = mcp_profile_from_request(
+            SaveMcpServerRequest {
+                id: None,
+                name: "  papers  ".into(),
+                command: "npx".into(),
+                args: vec!["server-a".into()],
+            },
+            None,
+            now,
+        )
+        .unwrap();
+        assert!(!created.enabled);
+        assert!(created.approved_tools.is_empty());
+        assert_eq!(created.name, "papers");
+
+        let mut discovered = created.clone();
+        discovered.enabled = true;
+        discovered.approved_tools = vec!["search".into()];
+        discovered.tools = vec![json!({"name":"search"})];
+        discovered.last_inspected_at = Some(now);
+        let changed = mcp_profile_from_request(
+            SaveMcpServerRequest {
+                id: Some(discovered.id),
+                name: "papers".into(),
+                command: "uvx".into(),
+                args: vec!["server-b".into()],
+            },
+            Some(&discovered),
+            now,
+        )
+        .unwrap();
+        assert!(!changed.enabled);
+        assert!(changed.approved_tools.is_empty());
+        assert!(changed.tools.is_empty());
+        assert!(changed.last_inspected_at.is_none());
     }
 }

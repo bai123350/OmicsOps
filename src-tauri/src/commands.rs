@@ -2089,6 +2089,9 @@ fn remote_agent_execution_contract(
          Work inside {project_root}. Never use sudo, alter system directories, delete recursively, or claim results not observed. \
          You have a real run tool: every kind=run command is validated and then executed over SSH from the approved project root. \
          Never say the run tool, terminal, or remote execution interface is unavailable. \
+         Generate task-specific analysis code at runtime from the enabled Skill instructions and verified data. \
+         Treat bundled code as examples to adapt after inspecting formats, study design, package versions, and observed QC; \
+         do not assume or invoke a fixed PBMC workflow merely because an example exists. \
          You are responsible for making the approved project self-contained. If required Python, R, or scientific packages are absent, \
          the next action after confirming that absence MUST create or update an isolated environment inside .omicsops/ and install them there. \
          You may download package managers and packages into the project, use micromamba/conda when available, bootstrap a project-local \

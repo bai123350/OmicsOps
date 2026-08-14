@@ -341,6 +341,14 @@ impl Repository {
         self.simple_json_rows("skill_packages")
     }
 
+    pub fn delete_skill_package(&self, id: Uuid) -> AdapterResult<()> {
+        self.connection
+            .lock()
+            .expect("database lock")
+            .execute("DELETE FROM skill_packages WHERE id = ?1", [id.to_string()])?;
+        Ok(())
+    }
+
     fn project_json_rows<T: serde::de::DeserializeOwned>(
         &self,
         table: &str,

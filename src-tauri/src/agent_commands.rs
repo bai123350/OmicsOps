@@ -218,31 +218,7 @@ fn fallback_remote_agent_plan_draft(
 }
 
 fn enabled_skill_context(state: &State<'_, AppState>) -> Result<String, String> {
-    let mut sections = Vec::new();
-    for skill in state
-        .repository
-        .list_skill_packages()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter(|skill| skill.enabled)
-    {
-        let instruction_path = std::path::Path::new(&skill.source_path).join("SKILL.md");
-        let instruction = std::fs::read_to_string(&instruction_path)
-            .map_err(|error| format!("cannot read enabled skill {}: {error}", skill.name))?;
-        sections.push(format!(
-            "## {} {}\nPackage SHA-256: {}\nCapabilities: {}\n{}",
-            skill.name,
-            skill.version,
-            skill.sha256,
-            skill.capabilities.join(", "),
-            instruction
-        ));
-    }
-    Ok(if sections.is_empty() {
-        "No project skill package is currently enabled.".into()
-    } else {
-        sections.join("\n\n")
-    })
+    crate::skill_commands::agent_skill_context(&state.repository)
 }
 
 async fn inspect_remote_project(
@@ -914,7 +890,7 @@ pub async fn propose_analysis_plan(
     let mut buffer_error: Option<String> = None;
     let mut model_text = String::new();
     client.stream_with(ModelRequest {
-        system: "You are planning an approved remote research-agent task. Base the plan on the application-verified read-only SSH observation and enabled Skill instructions. Do not invent files, fixed QC thresholds, software, or biological conclusions. Return a concise title, summary of the adaptive approach, and observable completion criteria. The execution agent will choose terminal commands iteratively after approval.".into(),
+        system: "You are planning an approved remote research-agent task. Base the plan on the application-verified read-only SSH observation and enabled Skill packages. Treat Skill code as adaptable examples, not a prewritten workflow: the execution model must generate task-specific analysis code after inspecting the actual data and installed software. Do not invent files, fixed QC thresholds, software, or biological conclusions. Return a concise title, summary of the adaptive approach, and observable completion criteria. The execution agent will choose terminal commands iteratively after approval.".into(),
         messages: vec![ModelMessage { role: "user".into(), content: format!("Project: {}\nGoal: {}\nEnvironment hint: {}\n\nConversation history (same conversation):\n{}\n\nPersisted operational memory from prior approved remote actions:\n{}\n\nVerified remote observation:\n{}\n\nEnabled Skills:\n{}", project.name, request.goal.trim(), request.environment_summary.trim(), conversation_history, operational_memory, remote_observation, skill_context) }],
         tool_name: Some("submit_remote_agent_plan".into()),
         tool_schema: Some(schema),

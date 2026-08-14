@@ -1,4 +1,7 @@
-use std::path::Path;
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use omicsops_adapters::{
     persistence::Repository,
@@ -11,20 +14,8 @@ use uuid::Uuid;
 
 use crate::commands::AppState;
 
-const BUILTIN_SKILLS: &[(&str, &str)] = &[
-    (
-        "scrna-qc",
-        "---\nname: scrna-qc\nversion: 1.0.0\ncapabilities:\n  - read_project_files\n  - submit_remote_job\n---\n# Single-cell RNA-seq QC\n\nReview study design, preserve raw counts, quantify cell and gene QC, and require an approved versioned plan before remote execution.\n",
-    ),
-    (
-        "bulk-rnaseq-de",
-        "---\nname: bulk-rnaseq-de\nversion: 1.0.0\ncapabilities:\n  - read_project_files\n  - submit_remote_job\n---\n# Bulk RNA-seq differential expression\n\nValidate sample metadata and contrasts, retain count-scale provenance, and report effect sizes with multiple-testing correction.\n",
-    ),
-    (
-        "literature-review",
-        "---\nname: literature-review\nversion: 1.0.0\ncapabilities:\n  - query_research_sources\n  - write_project_files\n---\n# Traceable literature review\n\nRecord every query, source identifier, retrieval time, inclusion decision, and citation in the project notebook.\n",
-    ),
-];
+const LEGACY_PLACEHOLDER_SKILLS: &[&str] = &["scrna-qc", "bulk-rnaseq-de", "literature-review"];
+const MAX_AGENT_SKILL_CONTEXT_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImportSkillRequest {
@@ -37,26 +28,79 @@ pub struct SetSkillEnabledRequest {
     pub enabled: bool,
 }
 
-pub fn install_builtin_skills(repository: &Repository, skills_root: &Path) -> Result<(), String> {
-    let sources = skills_root.join(".builtin-sources");
-    std::fs::create_dir_all(&sources).map_err(|error| error.to_string())?;
-    for (directory, contents) in BUILTIN_SKILLS {
-        let source = sources.join(directory);
-        std::fs::create_dir_all(&source).map_err(|error| error.to_string())?;
-        std::fs::write(source.join("SKILL.md"), contents).map_err(|error| error.to_string())?;
+pub fn install_bundled_skills(
+    repository: &Repository,
+    skills_root: &Path,
+    bundled_root: &Path,
+) -> Result<(), String> {
+    let sources = bundled_skill_directories(bundled_root)?;
+    if sources.is_empty() {
+        return Err(format!(
+            "bundled skill directory contains no packages: {}",
+            bundled_root.display()
+        ));
+    }
+
+    let mut default_enabled_keys = BTreeSet::new();
+    for source in &sources {
+        let markdown =
+            std::fs::read_to_string(source.join("SKILL.md")).map_err(|error| error.to_string())?;
+        if frontmatter_bool(&markdown, "workflow") {
+            if let Some(key) = source.file_name().and_then(|value| value.to_str()) {
+                default_enabled_keys.insert(key.to_owned());
+            }
+            default_enabled_keys.extend(skill_dependencies(&markdown));
+        }
+    }
+
+    retire_legacy_placeholder_skills(repository)?;
+    for source in sources {
+        let key = source
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| format!("invalid bundled skill directory: {}", source.display()))?;
         let installed =
             install_skill_directory(&source, skills_root).map_err(|error| error.to_string())?;
-        persist_installed(repository, installed, true)?;
+        persist_installed(repository, installed, default_enabled_keys.contains(key))?;
+    }
+    Ok(())
+}
+
+fn bundled_skill_directories(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut directories = std::fs::read_dir(root)
+        .map_err(|error| format!("cannot read bundled skills {}: {error}", root.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path.join("SKILL.md").is_file())
+        .collect::<Vec<_>>();
+    directories.sort();
+    Ok(directories)
+}
+
+fn retire_legacy_placeholder_skills(repository: &Repository) -> Result<(), String> {
+    for skill in repository
+        .list_skill_packages()
+        .map_err(|error| error.to_string())?
+    {
+        if skill.version == "1.0.0" && LEGACY_PLACEHOLDER_SKILLS.contains(&skill.name.as_str()) {
+            repository
+                .delete_skill_package(skill.id)
+                .map_err(|error| error.to_string())?;
+        }
     }
     Ok(())
 }
 
 #[tauri::command]
 pub fn list_skill_packages(state: State<'_, AppState>) -> Result<Vec<SkillPackage>, String> {
-    state
+    let mut skills = state
         .repository
         .list_skill_packages()
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    skills.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(skills)
 }
 
 #[tauri::command]
@@ -85,19 +129,187 @@ fn persist_installed(
     {
         return Ok(existing);
     }
-    let package = SkillPackage {
+    let mut package = SkillPackage {
         id: Uuid::new_v4(),
         name: installed.name,
         version: installed.version,
         source_path: installed.install_path.to_string_lossy().into_owned(),
         sha256: installed.sha256,
-        enabled: enabled_by_default,
+        enabled: false,
         capabilities: installed.capabilities,
     };
     repository
         .save_skill_package(&package)
         .map_err(|error| error.to_string())?;
+    if enabled_by_default {
+        package = set_skill_enabled_in_repository(repository, package.id, true)?;
+    }
     Ok(package)
+}
+
+pub fn agent_skill_packages(repository: &Repository) -> Result<Vec<SkillPackage>, String> {
+    let packages = repository
+        .list_skill_packages()
+        .map_err(|error| error.to_string())?;
+    let mut selected = packages
+        .iter()
+        .filter(|skill| skill.enabled)
+        .map(|skill| skill.id)
+        .collect::<BTreeSet<_>>();
+
+    loop {
+        let mut discovered = BTreeSet::new();
+        for skill in packages.iter().filter(|skill| selected.contains(&skill.id)) {
+            let markdown = std::fs::read_to_string(Path::new(&skill.source_path).join("SKILL.md"))
+                .map_err(|error| format!("cannot read enabled skill {}: {error}", skill.name))?;
+            for dependency in skill_dependencies(&markdown) {
+                if let Some(package) = packages.iter().find(|candidate| {
+                    candidate.name == dependency
+                        || candidate.name.ends_with(&format!("-{dependency}"))
+                }) {
+                    discovered.insert(package.id);
+                }
+            }
+        }
+        let previous = selected.len();
+        selected.extend(discovered);
+        if selected.len() == previous {
+            break;
+        }
+    }
+
+    let mut result = packages
+        .into_iter()
+        .filter(|skill| selected.contains(&skill.id))
+        .collect::<Vec<_>>();
+    result.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(result)
+}
+
+pub fn agent_skill_context(repository: &Repository) -> Result<String, String> {
+    let packages = agent_skill_packages(repository)?;
+    if packages.is_empty() {
+        return Ok("No project skill package is currently enabled.".into());
+    }
+    let mut sections = Vec::new();
+    let mut total_bytes = 0_usize;
+    for skill in packages {
+        let content = read_skill_package_text(&skill)?;
+        total_bytes = total_bytes.saturating_add(content.len());
+        if total_bytes > MAX_AGENT_SKILL_CONTEXT_BYTES {
+            return Err(format!(
+                "enabled Skill context exceeds {} KiB; disable unrelated packages",
+                MAX_AGENT_SKILL_CONTEXT_BYTES / 1024
+            ));
+        }
+        sections.push(format!(
+            "## {} {}\nPackage SHA-256: {}\nCapabilities: {}\n{}",
+            skill.name,
+            skill.version,
+            skill.sha256,
+            skill.capabilities.join(", "),
+            content
+        ));
+    }
+    Ok(sections.join("\n\n"))
+}
+
+fn read_skill_package_text(skill: &SkillPackage) -> Result<String, String> {
+    fn visit(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+        let mut entries = std::fs::read_dir(directory)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, files)?;
+            } else if path.is_file() && is_agent_text_file(&path) {
+                let canonical = path.canonicalize().map_err(|error| error.to_string())?;
+                if !canonical.starts_with(root) {
+                    return Err(format!(
+                        "skill file escapes package root: {}",
+                        path.display()
+                    ));
+                }
+                files.push(canonical);
+            }
+        }
+        Ok(())
+    }
+
+    let root = Path::new(&skill.source_path)
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve skill {}: {error}", skill.name))?;
+    let mut files = Vec::new();
+    visit(&root, &root, &mut files)?;
+    files.sort_by_key(|path| {
+        let relative = path.strip_prefix(&root).unwrap_or(path);
+        (relative != Path::new("SKILL.md"), relative.to_path_buf())
+    });
+    let mut documents = Vec::new();
+    for path in files {
+        let relative = path
+            .strip_prefix(&root)
+            .map_err(|error| error.to_string())?;
+        let contents = std::fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read skill file {}: {error}", path.display()))?;
+        documents.push(format!(
+            "### Package file: {}\n{}",
+            relative.display(),
+            contents
+        ));
+    }
+    Ok(documents.join("\n\n"))
+}
+
+fn is_agent_text_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "md" | "py" | "r" | "sh" | "yml" | "yaml" | "toml" | "json" | "txt"
+            )
+        })
+}
+
+fn frontmatter_bool(markdown: &str, key: &str) -> bool {
+    frontmatter_lines(markdown).any(|line| {
+        line.split_once(':')
+            .is_some_and(|(candidate, value)| candidate.trim() == key && value.trim() == "true")
+    })
+}
+
+fn skill_dependencies(markdown: &str) -> BTreeSet<String> {
+    let mut dependencies = BTreeSet::new();
+    let mut reading = false;
+    for line in frontmatter_lines(markdown) {
+        let trimmed = line.trim();
+        if trimmed == "depends_on:" {
+            reading = true;
+            continue;
+        }
+        if reading {
+            if let Some(value) = trimmed.strip_prefix('-') {
+                if let Some(key) = value.trim().rsplit('/').next() {
+                    if !key.is_empty() {
+                        dependencies.insert(key.to_owned());
+                    }
+                }
+            } else if !trimmed.is_empty() && !line.starts_with(char::is_whitespace) {
+                reading = false;
+            }
+        }
+    }
+    dependencies
+}
+
+fn frontmatter_lines(markdown: &str) -> impl Iterator<Item = &str> {
+    let mut lines = markdown.lines();
+    let valid = lines.next().is_some_and(|line| line.trim() == "---");
+    lines.take_while(move |line| valid && line.trim() != "---")
 }
 
 #[tauri::command]

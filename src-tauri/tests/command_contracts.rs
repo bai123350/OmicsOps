@@ -18,7 +18,10 @@ use omicsops_desktop_lib::{
     },
     model_commands::{SaveModelProfileRequest, model_profile_from_request},
     research_commands::research_cache_key,
-    skill_commands::{install_builtin_skills, set_skill_enabled_in_repository},
+    skill_commands::{
+        agent_skill_context, agent_skill_packages, install_bundled_skills,
+        set_skill_enabled_in_repository,
+    },
     sync_commands::{
         choose_download_relative_path, parse_remote_index, preview_image_mime,
         resolve_selected_uploads,
@@ -649,18 +652,96 @@ fn research_cache_keys_include_source_query_limit_and_page_cursor() {
 }
 
 #[test]
-fn builtin_research_skills_are_versioned_hashed_and_enabled() {
+fn bundled_workflow_skills_enable_declared_dependencies_and_reach_the_agent() {
     let repository = omicsops_adapters::persistence::Repository::open_in_memory().unwrap();
-    let directory = tempfile::tempdir().unwrap();
-    install_builtin_skills(&repository, directory.path()).unwrap();
-    install_builtin_skills(&repository, directory.path()).unwrap();
+    let sources = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let workflow = sources.path().join("pipeline");
+    let dependency = sources.path().join("preprocessing");
+    std::fs::create_dir_all(workflow.join("examples")).unwrap();
+    std::fs::create_dir_all(dependency.join("examples")).unwrap();
+    std::fs::write(
+        workflow.join("SKILL.md"),
+        "---\nname: bio-workflow\nworkflow: true\ndepends_on:\n  - single-cell/preprocessing\n---\n# Workflow\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dependency.join("SKILL.md"),
+        "---\nname: bio-single-cell-preprocessing\n---\n# Adaptive QC\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dependency.join("examples/generated.py"),
+        "print('model may adapt this example')\n",
+    )
+    .unwrap();
+
+    install_bundled_skills(&repository, store.path(), sources.path()).unwrap();
+    install_bundled_skills(&repository, store.path(), sources.path()).unwrap();
     let skills = repository.list_skill_packages().unwrap();
-    assert_eq!(skills.len(), 3);
-    assert!(skills.iter().all(|skill| skill.version == "1.0.0"));
+    assert_eq!(skills.len(), 2);
+    assert!(skills.iter().all(|skill| skill.sha256.len() == 64));
+    assert!(skills.iter().all(|skill| skill.enabled));
+    assert_eq!(agent_skill_packages(&repository).unwrap().len(), 2);
+    let context = agent_skill_context(&repository).unwrap();
+    assert!(context.contains("# Adaptive QC"));
     assert!(
-        skills
-            .iter()
-            .all(|skill| skill.sha256.len() == 64 && skill.enabled)
+        context.contains("examples\\generated.py") || context.contains("examples/generated.py")
+    );
+    assert!(context.contains("model may adapt this example"));
+}
+
+#[test]
+fn vendored_single_cell_snapshot_is_installable_and_agent_readable() {
+    let repository = omicsops_adapters::persistence::Repository::open_in_memory().unwrap();
+    repository
+        .save_skill_package(&omicsops_core::workspace::SkillPackage {
+            id: Uuid::new_v4(),
+            name: "scrna-qc".into(),
+            version: "1.0.0".into(),
+            source_path: "legacy-placeholder".into(),
+            sha256: "0".repeat(64),
+            enabled: true,
+            capabilities: vec![],
+        })
+        .unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let sources = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("skills")
+        .join("single-cell");
+
+    install_bundled_skills(&repository, store.path(), &sources).unwrap();
+    let skills = repository.list_skill_packages().unwrap();
+    assert_eq!(skills.len(), 18);
+    assert!(skills.iter().all(|skill| skill.name != "scrna-qc"));
+    assert_eq!(skills.iter().filter(|skill| skill.enabled).count(), 6);
+
+    let applied = agent_skill_packages(&repository).unwrap();
+    assert_eq!(applied.len(), 6);
+    let context = agent_skill_context(&repository).unwrap();
+    assert!(context.contains("bio-workflows-scrnaseq-pipeline"));
+    assert!(context.contains("bio-single-cell-preprocessing"));
+    assert!(context.contains("usage-guide.md"));
+    assert!(
+        context.contains("examples\\preprocess_scanpy.py")
+            || context.contains("examples/preprocess_scanpy.py")
+    );
+
+    let pipeline = skills
+        .iter()
+        .find(|skill| skill.name == "bio-workflows-scrnaseq-pipeline")
+        .unwrap();
+    set_skill_enabled_in_repository(&repository, pipeline.id, false).unwrap();
+    install_bundled_skills(&repository, store.path(), &sources).unwrap();
+    assert!(
+        !repository
+            .list_skill_packages()
+            .unwrap()
+            .into_iter()
+            .find(|skill| skill.id == pipeline.id)
+            .unwrap()
+            .enabled
     );
 }
 

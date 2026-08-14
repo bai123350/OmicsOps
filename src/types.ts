@@ -407,6 +407,27 @@ export interface ProjectArtifact { id: string; project_id: string; run_id: strin
 export interface NotebookEntry { id: string; project_id: string; conversation_id: string | null; turn_id: string | null; kind: "goal" | "hypothesis" | "method" | "observation" | "decision" | "evidence" | "code" | "environment" | "command"; title: string; markdown: string; confidence: number | null; evidence_ids: string[]; artifact_ids: string[]; created_at: string; updated_at: string; }
 export interface McpResult { server_name: string; capabilities: Record<string, unknown>; tools: Array<Record<string, unknown>>; result: unknown | null; audit_id: string; }
 
+export interface McpToolDefinition {
+  name: string;
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface McpServerProfile {
+  id: string;
+  name: string;
+  command: string;
+  args: string[];
+  enabled: boolean;
+  approved_tools: string[];
+  tools: McpToolDefinition[];
+  capabilities: Record<string, unknown>;
+  last_inspected_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface SkillPackage {
   id: string;
   name: string;

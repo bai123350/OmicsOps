@@ -51,6 +51,7 @@ describe("SettingsPanel model providers", () => {
     render(<SettingsPanel locale="zh-CN" onClose={() => undefined} skillPackages={[{ id: "skill-1", name: "scrna-qc", version: "1.2.0", source_path: "skills/scrna-qc/hash", sha256: "abcdef1234567890", enabled: false, capabilities: ["read_project_files"] }]} onImportSkill={onImportSkill} onSetSkillEnabled={onSetSkillEnabled} />);
 
     fireEvent.click(screen.getByRole("button", { name: "技能与 MCP" }));
+    expect(screen.getByText(/固定 GitHub 快照/)).toBeInTheDocument();
     expect(screen.getByText("scrna-qc")).toBeInTheDocument();
     expect(screen.getByText("read_project_files")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "导入技能目录" }));
@@ -58,6 +59,31 @@ describe("SettingsPanel model providers", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "启用" })).not.toBeDisabled());
     fireEvent.click(screen.getByRole("button", { name: "启用" }));
     expect(onSetSkillEnabled).toHaveBeenCalledWith("skill-1", true);
+  });
+
+  it("configures MCP without launching it and requires inspection plus per-tool approval", async () => {
+    const server = { id: "mcp-1", name: "paper-search", command: "npx", args: ["paper-mcp"], enabled: false, approved_tools: [], tools: [{ name: "search_papers", description: "Search papers" }], capabilities: { tools: {} }, last_inspected_at: "2026-08-13T12:00:00Z", created_at: "2026-08-13T12:00:00Z", updated_at: "2026-08-13T12:00:00Z" };
+    const onSaveMcpServer = vi.fn().mockResolvedValue(server);
+    const onInspectMcpServer = vi.fn().mockResolvedValue(undefined);
+    const onSetMcpToolApproval = vi.fn().mockResolvedValue(server);
+    render(<SettingsPanel locale="zh-CN" onClose={() => undefined} selectedProject={{ id: "project-1", name: "PBMC", description: "", local_root: "E:/PBMC", remote_root: null, connection_id: null, template: "single_cell_rna_seq", status: "ready", ollama_only: false, created_at: "", updated_at: "" }} mcpServers={[server]} onSaveMcpServer={onSaveMcpServer} onInspectMcpServer={onInspectMcpServer} onSetMcpToolApproval={onSetMcpToolApproval} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "技能与 MCP" }));
+    fireEvent.change(screen.getByLabelText("MCP server name"), { target: { value: "local-files" } });
+    fireEvent.change(screen.getByLabelText("MCP server command"), { target: { value: "npx" } });
+    fireEvent.change(screen.getByLabelText("MCP server arguments"), { target: { value: "-y\nfilesystem-mcp" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存 MCP server" }));
+    await waitFor(() => expect(onSaveMcpServer).toHaveBeenCalledWith({ name: "local-files", command: "npx", args: ["-y", "filesystem-mcp"] }));
+    expect(onInspectMcpServer).not.toHaveBeenCalled();
+
+    const inspect = screen.getByRole("button", { name: "检查并发现工具" });
+    expect(inspect).toBeDisabled();
+    fireEvent.click(screen.getByRole("checkbox"));
+    expect(inspect).not.toBeDisabled();
+    fireEvent.click(inspect);
+    await waitFor(() => expect(onInspectMcpServer).toHaveBeenCalledWith("mcp-1"));
+    fireEvent.click(screen.getByRole("button", { name: "批准调用" }));
+    expect(onSetMcpToolApproval).toHaveBeenCalledWith("mcp-1", "search_papers", true);
   });
 
   it("requires host-key confirmation before authenticated remote diagnostics", async () => {
