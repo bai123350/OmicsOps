@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "default_enabled": [
+    "anndata",
+    "cellxgene-census",
+    "pathway-enrichment",
+    "scanpy",
+    "scientific-visualization"
+  ],
+  "replaces": [
+    "bio-single-cell-batch-integration",
+    "bio-single-cell-cell-annotation",
+    "bio-single-cell-cell-communication",
+    "bio-single-cell-clustering",
+    "bio-single-cell-cnv-inference",
+    "bio-single-cell-data-io",
+    "bio-single-cell-differential-abundance",
+    "bio-single-cell-doublet-detection",
+    "bio-single-cell-hashing-demultiplexing",
+    "bio-single-cell-lineage-tracing",
+    "bio-single-cell-markers-annotation",
+    "bio-single-cell-metabolite-communication",
+    "bio-single-cell-multimodal-integration",
+    "bio-single-cell-perturb-seq",
+    "bio-single-cell-preprocessing",
+    "bio-single-cell-scatac-analysis",
+    "bio-single-cell-trajectory-inference",
+    "bio-workflows-scrnaseq-pipeline"
+  ]
+}

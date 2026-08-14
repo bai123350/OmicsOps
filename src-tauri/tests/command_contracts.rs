@@ -692,6 +692,66 @@ fn bundled_workflow_skills_enable_declared_dependencies_and_reach_the_agent() {
 }
 
 #[test]
+fn bundled_skill_config_selects_defaults_and_retires_replaced_packages() {
+    let repository = omicsops_adapters::persistence::Repository::open_in_memory().unwrap();
+    repository
+        .save_skill_package(&omicsops_core::workspace::SkillPackage {
+            id: Uuid::new_v4(),
+            name: "old-upstream-skill".into(),
+            version: "1.4".into(),
+            source_path: "old-bundle".into(),
+            sha256: "0".repeat(64),
+            enabled: true,
+            capabilities: vec![],
+        })
+        .unwrap();
+    let sources = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let selected = sources.path().join("selected");
+    let optional = sources.path().join("optional");
+    std::fs::create_dir_all(&selected).unwrap();
+    std::fs::create_dir_all(&optional).unwrap();
+    std::fs::write(
+        selected.join("SKILL.md"),
+        "---\nname: selected\n---\n# Selected\n",
+    )
+    .unwrap();
+    std::fs::write(
+        optional.join("SKILL.md"),
+        "---\nname: optional\n---\n# Optional\n",
+    )
+    .unwrap();
+    std::fs::write(
+        sources.path().join("BUNDLE.json"),
+        r#"{"default_enabled":["selected"],"replaces":["old-upstream-skill"]}"#,
+    )
+    .unwrap();
+
+    install_bundled_skills(&repository, store.path(), sources.path()).unwrap();
+    let skills = repository.list_skill_packages().unwrap();
+    assert_eq!(skills.len(), 2);
+    assert!(
+        skills
+            .iter()
+            .all(|skill| skill.name != "old-upstream-skill")
+    );
+    assert!(
+        skills
+            .iter()
+            .find(|skill| skill.name == "selected")
+            .unwrap()
+            .enabled
+    );
+    assert!(
+        !skills
+            .iter()
+            .find(|skill| skill.name == "optional")
+            .unwrap()
+            .enabled
+    );
+}
+
+#[test]
 fn vendored_single_cell_snapshot_is_installable_and_agent_readable() {
     let repository = omicsops_adapters::persistence::Repository::open_in_memory().unwrap();
     repository
@@ -713,33 +773,31 @@ fn vendored_single_cell_snapshot_is_installable_and_agent_readable() {
 
     install_bundled_skills(&repository, store.path(), &sources).unwrap();
     let skills = repository.list_skill_packages().unwrap();
-    assert_eq!(skills.len(), 18);
+    assert_eq!(skills.len(), 9);
     assert!(skills.iter().all(|skill| skill.name != "scrna-qc"));
-    assert_eq!(skills.iter().filter(|skill| skill.enabled).count(), 6);
+    assert_eq!(skills.iter().filter(|skill| skill.enabled).count(), 5);
 
     let applied = agent_skill_packages(&repository).unwrap();
-    assert_eq!(applied.len(), 6);
+    assert_eq!(applied.len(), 5);
     let context = agent_skill_context(&repository).unwrap();
-    assert!(context.contains("bio-workflows-scrnaseq-pipeline"));
-    assert!(context.contains("bio-single-cell-preprocessing"));
-    assert!(context.contains("usage-guide.md"));
+    assert!(context.contains("# Scanpy: Single-Cell Analysis"));
+    assert!(context.contains("# AnnData"));
+    assert!(context.contains("# CZ CELLxGENE Census"));
+    assert!(context.contains("# Pathway Enrichment"));
+    assert!(context.contains("# Scientific Visualization"));
     assert!(
-        context.contains("examples\\preprocess_scanpy.py")
-            || context.contains("examples/preprocess_scanpy.py")
+        context.contains("scripts\\run_pipeline.py") || context.contains("scripts/run_pipeline.py")
     );
 
-    let pipeline = skills
-        .iter()
-        .find(|skill| skill.name == "bio-workflows-scrnaseq-pipeline")
-        .unwrap();
-    set_skill_enabled_in_repository(&repository, pipeline.id, false).unwrap();
+    let scanpy = skills.iter().find(|skill| skill.name == "scanpy").unwrap();
+    set_skill_enabled_in_repository(&repository, scanpy.id, false).unwrap();
     install_bundled_skills(&repository, store.path(), &sources).unwrap();
     assert!(
         !repository
             .list_skill_packages()
             .unwrap()
             .into_iter()
-            .find(|skill| skill.id == pipeline.id)
+            .find(|skill| skill.id == scanpy.id)
             .unwrap()
             .enabled
     );

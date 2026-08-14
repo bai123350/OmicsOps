@@ -17,6 +17,14 @@ use crate::commands::AppState;
 const LEGACY_PLACEHOLDER_SKILLS: &[&str] = &["scrna-qc", "bulk-rnaseq-de", "literature-review"];
 const MAX_AGENT_SKILL_CONTEXT_BYTES: usize = 512 * 1024;
 
+#[derive(Debug, Default, Deserialize)]
+struct BundledSkillConfig {
+    #[serde(default)]
+    default_enabled: Vec<String>,
+    #[serde(default)]
+    replaces: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImportSkillRequest {
     pub source_path: String,
@@ -41,7 +49,8 @@ pub fn install_bundled_skills(
         ));
     }
 
-    let mut default_enabled_keys = BTreeSet::new();
+    let config = bundled_skill_config(bundled_root)?;
+    let mut default_enabled_keys = config.default_enabled.into_iter().collect::<BTreeSet<_>>();
     for source in &sources {
         let markdown =
             std::fs::read_to_string(source.join("SKILL.md")).map_err(|error| error.to_string())?;
@@ -53,7 +62,7 @@ pub fn install_bundled_skills(
         }
     }
 
-    retire_legacy_placeholder_skills(repository)?;
+    retire_replaced_bundled_skills(repository, &config.replaces)?;
     for source in sources {
         let key = source
             .file_name()
@@ -64,6 +73,21 @@ pub fn install_bundled_skills(
         persist_installed(repository, installed, default_enabled_keys.contains(key))?;
     }
     Ok(())
+}
+
+fn bundled_skill_config(root: &Path) -> Result<BundledSkillConfig, String> {
+    let path = root.join("BUNDLE.json");
+    if !path.is_file() {
+        return Ok(BundledSkillConfig::default());
+    }
+    let contents = std::fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "cannot read bundled skill config {}: {error}",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&contents)
+        .map_err(|error| format!("invalid bundled skill config {}: {error}", path.display()))
 }
 
 fn bundled_skill_directories(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -79,12 +103,17 @@ fn bundled_skill_directories(root: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(directories)
 }
 
-fn retire_legacy_placeholder_skills(repository: &Repository) -> Result<(), String> {
+fn retire_replaced_bundled_skills(
+    repository: &Repository,
+    replacements: &[String],
+) -> Result<(), String> {
     for skill in repository
         .list_skill_packages()
         .map_err(|error| error.to_string())?
     {
-        if skill.version == "1.0.0" && LEGACY_PLACEHOLDER_SKILLS.contains(&skill.name.as_str()) {
+        let is_legacy_placeholder =
+            skill.version == "1.0.0" && LEGACY_PLACEHOLDER_SKILLS.contains(&skill.name.as_str());
+        if is_legacy_placeholder || replacements.contains(&skill.name) {
             repository
                 .delete_skill_package(skill.id)
                 .map_err(|error| error.to_string())?;
