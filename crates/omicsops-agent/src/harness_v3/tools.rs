@@ -260,6 +260,19 @@ pub trait ToolAuthorityV3: Send + Sync {
     ) -> AuthorityDecisionV3;
 }
 
+#[derive(Debug, Clone)]
+pub struct StaticToolAuthorityV3(pub AuthorityDecisionV3);
+
+impl ToolAuthorityV3 for StaticToolAuthorityV3 {
+    fn authorize(
+        &self,
+        _definition: &ToolDefinitionV3,
+        _request: &ToolCallRequestV3,
+    ) -> AuthorityDecisionV3 {
+        self.0.clone()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CancellationTokenV3 {
     cancelled: Arc<AtomicBool>,
