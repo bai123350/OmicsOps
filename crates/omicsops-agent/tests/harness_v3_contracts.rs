@@ -5,7 +5,8 @@ use omicsops_agent::harness_v3::{
     CompletionCriterionV3, CompletionLedgerV3, ContextSourceV3, FindingSeverityV3, ModelRequestV2,
     ModelStreamEventV2, ModelToolSpec, ReviewFindingV3, ReviewReportV3, RiskLevelV3, RunLimitsV3,
     RunStatusV3, ToolCallAccumulatorV2, ToolCallRequestV3, ToolConcurrencyV3, ToolDefinitionV3,
-    ToolOutcomeStatusV3, ToolOutcomeV3, build_context, validate_event_chain,
+    ToolOutcomeStatusV3, ToolOutcomeV3, build_context, builtin_tool_definitions_v3,
+    validate_event_chain,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -272,6 +273,42 @@ fn tool_definition_validates_required_arguments_and_mcp_defaults() {
     assert_eq!(mcp.risk, RiskLevelV3::Medium);
     assert_eq!(mcp.concurrency, ToolConcurrencyV3::Serial);
     assert_eq!(mcp.timeout_ms, 30_000);
+}
+
+#[test]
+fn builtin_tool_snapshot_contains_the_eight_v3_contracts() {
+    let definitions = builtin_tool_definitions_v3();
+    assert_eq!(
+        definitions
+            .iter()
+            .map(|definition| definition.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "remote.list",
+            "remote.read",
+            "remote.write",
+            "remote.exec",
+            "kernel.execute",
+            "artifact.verify",
+            "agent.request_input",
+            "agent.complete",
+        ]
+    );
+    assert!(
+        definitions
+            .iter()
+            .find(|definition| definition.id == "remote.read")
+            .unwrap()
+            .read_only
+    );
+    assert_eq!(
+        definitions
+            .iter()
+            .find(|definition| definition.id == "remote.exec")
+            .unwrap()
+            .risk,
+        RiskLevelV3::High
+    );
 }
 
 #[test]
