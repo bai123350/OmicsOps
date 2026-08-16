@@ -4,8 +4,8 @@ use omicsops_agent::harness_v3::{
     AgentRunEventKindV3, AgentRunEventV3, AgentRunSpecV3, AgentRunStateV3, ArtifactEvidenceV3,
     CompletionCriterionV3, CompletionLedgerV3, ContextSourceV3, FindingSeverityV3, ModelRequestV2,
     ModelStreamEventV2, ModelToolSpec, ReviewFindingV3, ReviewReportV3, RiskLevelV3, RunLimitsV3,
-    RunStatusV3, ToolCallRequestV3, ToolConcurrencyV3, ToolDefinitionV3, ToolOutcomeStatusV3,
-    ToolOutcomeV3, build_context, validate_event_chain,
+    RunStatusV3, ToolCallAccumulatorV2, ToolCallRequestV3, ToolConcurrencyV3, ToolDefinitionV3,
+    ToolOutcomeStatusV3, ToolOutcomeV3, build_context, validate_event_chain,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -82,6 +82,68 @@ fn model_protocol_preserves_multiple_call_ids_and_usage() {
         &events[1],
         ModelStreamEventV2::ToolArgumentsDelta { call_id, index: 1, .. } if call_id == "b"
     ));
+}
+
+#[test]
+fn tool_call_accumulator_assembles_interleaved_calls_and_repairs_only_once() {
+    let mut accumulator = ToolCallAccumulatorV2::default();
+    for event in [
+        ModelStreamEventV2::ToolCallStarted {
+            call_id: "a".into(),
+            index: 0,
+            tool_id: "remote.list".into(),
+        },
+        ModelStreamEventV2::ToolCallStarted {
+            call_id: "b".into(),
+            index: 1,
+            tool_id: "remote.read".into(),
+        },
+        ModelStreamEventV2::ToolArgumentsDelta {
+            call_id: "b".into(),
+            index: 1,
+            arguments: "{\"path\":".into(),
+        },
+        ModelStreamEventV2::ToolArgumentsDelta {
+            call_id: "a".into(),
+            index: 0,
+            arguments: "{}".into(),
+        },
+        ModelStreamEventV2::ToolArgumentsDelta {
+            call_id: "b".into(),
+            index: 1,
+            arguments: "\"a.txt\"}".into(),
+        },
+    ] {
+        accumulator.push(&event).unwrap();
+    }
+    let calls = accumulator.finish().unwrap();
+    assert_eq!(calls[0].call_id, "a");
+    assert_eq!(calls[1].arguments, json!({"path":"a.txt"}));
+
+    let mut malformed = ToolCallAccumulatorV2::default();
+    malformed
+        .push(&ModelStreamEventV2::ToolCallStarted {
+            call_id: "bad".into(),
+            index: 0,
+            tool_id: "remote.read".into(),
+        })
+        .unwrap();
+    malformed
+        .push(&ModelStreamEventV2::ToolArgumentsDelta {
+            call_id: "bad".into(),
+            index: 0,
+            arguments: "{path:".into(),
+        })
+        .unwrap();
+    assert!(malformed.finish().is_err());
+    malformed
+        .repair_once("bad", "{\"path\":\"fixed.txt\"}")
+        .unwrap();
+    assert!(malformed.repair_once("bad", "{}").is_err());
+    assert_eq!(
+        malformed.finish().unwrap()[0].arguments,
+        json!({"path":"fixed.txt"})
+    );
 }
 
 #[test]

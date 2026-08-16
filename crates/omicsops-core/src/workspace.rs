@@ -300,6 +300,14 @@ pub struct ModelProfile {
     pub credential_reference: Option<String>,
     pub supports_tools: bool,
     pub supports_vision: bool,
+    #[serde(default)]
+    pub context_window_tokens: Option<u32>,
+}
+
+impl ModelProfile {
+    pub fn effective_context_window_tokens(&self) -> u32 {
+        self.context_window_tokens.unwrap_or(32_768)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

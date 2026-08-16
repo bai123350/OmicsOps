@@ -335,6 +335,7 @@ export interface ModelProfile {
   credential_reference: string | null;
   supports_tools: boolean;
   supports_vision: boolean;
+  context_window_tokens?: number | null;
 }
 
 export interface ModelProbeResult {

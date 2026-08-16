@@ -588,6 +588,7 @@ fn model_profile_records_only_credential_references() {
         base_url: "https://api.anthropic.com/".into(),
         model: "claude-science".into(),
         credential: Some("secret-key".into()),
+        context_window_tokens: None,
     })
     .unwrap();
     assert_eq!(profile.id, id);
@@ -608,6 +609,7 @@ fn model_profile_records_only_credential_references() {
         base_url: "http://127.0.0.1:11434/".into(),
         model: "qwen3".into(),
         credential: None,
+        context_window_tokens: None,
     })
     .unwrap();
     assert!(ollama.credential_reference.is_none());

@@ -18,6 +18,7 @@ pub struct SaveModelProfileRequest {
     pub base_url: String,
     pub model: String,
     pub credential: Option<String>,
+    pub context_window_tokens: Option<u32>,
 }
 
 pub fn model_profile_from_request(
@@ -47,6 +48,7 @@ pub fn model_profile_from_request(
             .then(|| credential_account("model", id)),
         supports_tools: true,
         supports_vision: false,
+        context_window_tokens: request.context_window_tokens,
     })
 }
 

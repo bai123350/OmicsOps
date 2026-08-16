@@ -484,6 +484,7 @@ fn project_research_records_round_trip_through_normalized_v3_tables() {
         credential_reference: None,
         supports_tools: true,
         supports_vision: false,
+        context_window_tokens: None,
     };
     let skill = SkillPackage {
         id: Uuid::new_v4(),
