@@ -1,6 +1,9 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -24,6 +27,37 @@ impl EventSinkV3 for MemorySink {
     fn append(&self, event: &omicsops_agent::harness_v3::AgentRunEventV3) -> Result<(), String> {
         self.0.lock().unwrap().push(event.clone());
         Ok(())
+    }
+}
+
+struct FailOnceRuntime(AtomicUsize);
+
+#[async_trait]
+impl ToolRuntimeV3 for FailOnceRuntime {
+    async fn execute(
+        &self,
+        _definition: &ToolDefinitionV3,
+        request: &ToolCallRequestV3,
+        _cancellation: &CancellationTokenV3,
+    ) -> ToolOutcomeV3 {
+        let first = self.0.fetch_add(1, Ordering::SeqCst) == 0;
+        ToolOutcomeV3 {
+            call_id: request.call_id.clone(),
+            status: if first {
+                ToolOutcomeStatusV3::Failed
+            } else {
+                ToolOutcomeStatusV3::Succeeded
+            },
+            model_content: if first {
+                "temporary read failure".into()
+            } else {
+                "matrix inspected".into()
+            },
+            structured_result: Some(json!({"ok":!first})),
+            error: first.then(|| "temporary read failure".into()),
+            truncated: false,
+            provenance: vec!["fixture:repair".into()],
+        }
     }
 }
 
@@ -289,4 +323,192 @@ async fn reviewer_errors_reopen_executor_twice_then_need_attention() {
 
     assert_eq!(result.status, RunStatusV3::NeedsAttention);
     assert_eq!(executor.requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn black_box_executor_repairs_a_failed_tool_before_completion() {
+    let tools = builtin_tool_definitions_v3();
+    let spec = AgentRunSpecV3::new(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "Inspect and repair",
+        vec![CompletionCriterionV3::new("inspected", "matrix inspected")],
+        tools.clone(),
+        vec![],
+    );
+    let executor = Arc::new(ScriptedProvider::new(vec![
+        tool_call(
+            "read-failed",
+            0,
+            "remote.read",
+            "{\"path\":\"input/matrix.mtx\"}",
+        ),
+        tool_call(
+            "read-repaired",
+            0,
+            "remote.read",
+            "{\"path\":\"input/matrix.mtx\",\"max_bytes\":1024}",
+        ),
+        tool_call(
+            "complete",
+            0,
+            "agent.complete",
+            "{\"criteria\":[{\"id\":\"inspected\",\"evidence_sequences\":[8]}],\"artifacts\":[]}",
+        ),
+    ]));
+    let reviewer = Arc::new(ScriptedProvider::new(vec![vec![ModelStreamEventV2::TextDelta {
+        text: json!({"cycle":0,"findings":[{"severity":"ok","summary":"repair verified","evidence":["event:8"]}]}).to_string(),
+    }]]));
+    let runtime = Arc::new(FailOnceRuntime(AtomicUsize::new(0)));
+    let router = Arc::new(
+        ToolRouterV3::new(
+            tools,
+            Arc::new(StaticToolAuthorityV3(AuthorityDecisionV3::Allowed)),
+            runtime.clone(),
+            Arc::new(NoopToolAuditSinkV3),
+            4,
+        )
+        .unwrap(),
+    );
+
+    let result = HarnessV3Engine::new(
+        spec,
+        executor,
+        reviewer,
+        router,
+        Arc::new(MemorySink::default()),
+    )
+    .run(CancellationTokenV3::new())
+    .await
+    .unwrap();
+
+    assert_eq!(result.status, RunStatusV3::Completed);
+    assert!(result.ledger.unresolved_errors.is_empty());
+    assert_eq!(runtime.0.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn malformed_tool_arguments_receive_exactly_one_strict_json_repair() {
+    let tools = builtin_tool_definitions_v3();
+    let spec = AgentRunSpecV3::new(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "Repair JSON",
+        vec![CompletionCriterionV3::new("done", "read completed")],
+        tools.clone(),
+        vec![],
+    );
+    let malformed = tool_call("broken", 0, "remote.read", "{\"path\":");
+    let repaired = tool_call(
+        "repaired",
+        0,
+        "remote.read",
+        "{\"path\":\"input/matrix.mtx\"}",
+    );
+    let complete = tool_call(
+        "complete",
+        0,
+        "agent.complete",
+        "{\"criteria\":[{\"id\":\"done\",\"evidence_sequences\":[5]}],\"artifacts\":[]}",
+    );
+    let executor = Arc::new(ScriptedProvider::new(vec![malformed, repaired, complete]));
+    let reviewer = Arc::new(ScriptedProvider::new(vec![vec![ModelStreamEventV2::TextDelta {
+        text: json!({"cycle":0,"findings":[{"severity":"ok","summary":"JSON repair worked","evidence":["event:5"]}]}).to_string(),
+    }]]));
+    let router = Arc::new(
+        ToolRouterV3::new(
+            tools,
+            Arc::new(StaticToolAuthorityV3(AuthorityDecisionV3::Allowed)),
+            Arc::new(FixtureRuntime::default()),
+            Arc::new(NoopToolAuditSinkV3),
+            4,
+        )
+        .unwrap(),
+    );
+
+    let result = HarnessV3Engine::new(
+        spec,
+        executor.clone(),
+        reviewer,
+        router,
+        Arc::new(MemorySink::default()),
+    )
+    .run(CancellationTokenV3::new())
+    .await
+    .unwrap();
+
+    assert_eq!(result.status, RunStatusV3::Completed);
+    assert_eq!(executor.requests.lock().unwrap().len(), 3);
+    assert!(
+        executor.requests.lock().unwrap()[1]
+            .system
+            .contains("STRICT_JSON_REPAIR")
+    );
+}
+
+#[tokio::test]
+async fn recovery_never_reexecutes_a_dispatched_side_effect_with_unknown_result() {
+    let tools = builtin_tool_definitions_v3();
+    let spec = AgentRunSpecV3::new(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "Recover",
+        vec![],
+        tools.clone(),
+        vec![],
+    );
+    let first = omicsops_agent::harness_v3::AgentRunEventV3::first(
+        &spec,
+        chrono::Utc::now(),
+        omicsops_agent::harness_v3::AgentRunEventKindV3::RunStarted,
+    )
+    .unwrap();
+    let dispatched = omicsops_agent::harness_v3::AgentRunEventV3::next(
+        &first,
+        chrono::Utc::now(),
+        omicsops_agent::harness_v3::AgentRunEventKindV3::ToolCallDispatched {
+            request: ToolCallRequestV3 {
+                call_id: "write-unknown".into(),
+                tool_id: "remote.write".into(),
+                arguments: json!({"path":"results/a","content":"x"}),
+                idempotency_key: "write-key".into(),
+            },
+            read_only: false,
+        },
+    )
+    .unwrap();
+    let runtime = Arc::new(FixtureRuntime::default());
+    let router = Arc::new(
+        ToolRouterV3::new(
+            tools,
+            Arc::new(StaticToolAuthorityV3(AuthorityDecisionV3::Allowed)),
+            runtime.clone(),
+            Arc::new(NoopToolAuditSinkV3),
+            4,
+        )
+        .unwrap(),
+    );
+    let sink = Arc::new(MemorySink(Mutex::new(vec![
+        first.clone(),
+        dispatched.clone(),
+    ])));
+    let provider = Arc::new(ScriptedProvider::new(vec![]));
+    let result = HarnessV3Engine::resume(
+        spec,
+        provider.clone(),
+        provider,
+        router,
+        sink,
+        vec![first, dispatched],
+    )
+    .unwrap()
+    .run(CancellationTokenV3::new())
+    .await
+    .unwrap();
+
+    assert_eq!(result.status, RunStatusV3::Recovering);
+    assert_eq!(runtime.0.lock().unwrap().len(), 0);
 }

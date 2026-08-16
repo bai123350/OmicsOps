@@ -303,6 +303,27 @@ async fn router_enforces_timeout_cancellation_preview_limit_and_idempotency() {
     assert_eq!(stats.calls.load(Ordering::SeqCst), 1);
     assert_eq!(replayed.call_id, "second");
 
+    let restarted_stats = Arc::new(RuntimeStats::default());
+    let restarted = router(
+        vec![definition("remote.read", true, 1_000)],
+        AuthorityDecisionV3::Allowed,
+        FixedRuntime {
+            stats: restarted_stats.clone(),
+            delay: Duration::ZERO,
+            content: "must not run".into(),
+        },
+    );
+    restarted.seed_successful_outcome("same-key", first.clone());
+    let recovered = restarted
+        .execute(
+            request("after-restart", "remote.read", "same-key"),
+            CancellationTokenV3::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(restarted_stats.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(recovered.call_id, "after-restart");
+
     let cancellation = CancellationTokenV3::new();
     cancellation.cancel();
     let error = cached

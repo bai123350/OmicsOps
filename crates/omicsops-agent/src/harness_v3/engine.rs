@@ -7,10 +7,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::{
-    AgentRunEventKindV3, AgentRunEventV3, AgentRunSpecV3, CancellationTokenV3, ContextSourceV3,
-    FindingSeverityV3, ModelProviderV2, ModelRequestV2, ModelStreamEventV2, ModelToolSpec,
-    ReviewReportV3, RunStatusV3, ToolCallAccumulatorV2, ToolCallRequestV3, ToolOutcomeStatusV3,
-    ToolOutcomeV3, ToolRouterErrorV3, ToolRouterV3, build_context,
+    AgentRunEventKindV3, AgentRunEventV3, AgentRunSpecV3, AssembledToolCallV2, CancellationTokenV3,
+    ContextSourceV3, FindingSeverityV3, ModelProviderV2, ModelRequestV2, ModelStreamEventV2,
+    ModelToolSpec, ReviewReportV3, RunStatusV3, ToolCallAccumulatorV2, ToolCallRequestV3,
+    ToolOutcomeStatusV3, ToolOutcomeV3, ToolRouterErrorV3, ToolRouterV3, build_context,
 };
 use crate::ModelMessage;
 
@@ -102,6 +102,7 @@ pub struct HarnessV3Engine {
     reviewer: Arc<dyn ModelProviderV2>,
     router: Arc<ToolRouterV3>,
     sink: Arc<dyn EventSinkV3>,
+    existing_events: Vec<AgentRunEventV3>,
 }
 
 impl HarnessV3Engine {
@@ -118,20 +119,68 @@ impl HarnessV3Engine {
             reviewer,
             router,
             sink,
+            existing_events: Vec::new(),
         }
+    }
+
+    pub fn resume(
+        spec: AgentRunSpecV3,
+        executor: Arc<dyn ModelProviderV2>,
+        reviewer: Arc<dyn ModelProviderV2>,
+        router: Arc<ToolRouterV3>,
+        sink: Arc<dyn EventSinkV3>,
+        existing_events: Vec<AgentRunEventV3>,
+    ) -> Result<Self, HarnessEngineErrorV3> {
+        super::AgentRunStateV3::replay(&spec, &existing_events)
+            .map_err(|error| HarnessEngineErrorV3::Persistence(error.to_string()))?;
+        Ok(Self {
+            spec,
+            executor,
+            reviewer,
+            router,
+            sink,
+            existing_events,
+        })
     }
 
     pub async fn run(
         self,
         cancellation: CancellationTokenV3,
     ) -> Result<EngineResultV3, HarnessEngineErrorV3> {
-        let mut recorder = EventRecorderV3::start(&self.spec, self.sink.clone())?;
-        let mut ledger = CompletionLedgerV3::from_spec(&self.spec);
-        let mut sources = Vec::new();
-        let mut correction_count = 0_u8;
-        let mut last_review = None;
-        let mut model_step = 0_u32;
-        let mut tool_calls = 0_u32;
+        seed_recovered_outcomes(&self.router, &self.existing_events);
+        let recovered = if self.existing_events.is_empty() {
+            None
+        } else {
+            Some(
+                super::AgentRunStateV3::replay(&self.spec, &self.existing_events)
+                    .map_err(|error| HarnessEngineErrorV3::Persistence(error.to_string()))?,
+            )
+        };
+        if let Some(state) = &recovered
+            && !state.uncertain_side_effects.is_empty()
+        {
+            return Ok(EngineResultV3 {
+                status: RunStatusV3::Recovering,
+                ledger: state.completion_ledger.clone(),
+                review_report: last_review_from_events(&self.existing_events),
+            });
+        }
+        let mut recorder = if let Some(last) = self.existing_events.last() {
+            EventRecorderV3::resume(self.sink.clone(), last.clone())
+        } else {
+            EventRecorderV3::start(&self.spec, self.sink.clone())?
+        };
+        let mut ledger = recovered
+            .as_ref()
+            .map(|state| state.completion_ledger.clone())
+            .unwrap_or_else(|| CompletionLedgerV3::from_spec(&self.spec));
+        let mut sources = sources_from_events(&self.existing_events);
+        let mut correction_count = recovered
+            .as_ref()
+            .map_or(0, |state| state.reviewer_corrections);
+        let mut last_review = last_review_from_events(&self.existing_events);
+        let mut model_step = recovered.as_ref().map_or(0, |state| state.model_steps);
+        let mut tool_calls = recovered.as_ref().map_or(0, |state| state.tool_calls);
         let mut last_compacted_sequence = 0_u64;
 
         loop {
@@ -204,14 +253,57 @@ impl HarnessV3Engine {
                 }
             }
             let calls = match accumulator.finish() {
-                Ok(calls) => calls,
-                Err(error) if self.spec.tool_snapshot.is_empty() && !public_text.is_empty() => {
-                    return Err(HarnessEngineErrorV3::ToolAssembly(error.to_string()));
-                }
-                Err(error) => {
-                    return Err(HarnessEngineErrorV3::ToolAssembly(format!(
-                        "{error}; one strict JSON repair is required before retry"
-                    )));
+                Ok(calls) if !calls.is_empty() => calls,
+                Ok(_) => strict_json_fallback_call(&public_text)
+                    .into_iter()
+                    .collect(),
+                Err(first_error) => {
+                    let repair_events = self.executor.stream_v2(ModelRequestV2 {
+                        system: format!("{}\nSTRICT_JSON_REPAIR: The previous tool call was malformed. Return exactly one valid native tool call or one JSON object with call_id, tool_id, and object arguments. This is the only repair attempt.", executor_system_contract()),
+                        messages: vec![ModelMessage {
+                            role: "user".into(),
+                            content: format!("Malformed call error: {first_error}\nPrevious public output:\n{public_text}"),
+                        }],
+                        tools: self.spec.tool_snapshot.iter().map(tool_model_spec).collect(),
+                        require_strict_json_fallback: true,
+                    }).await.map_err(|error| HarnessEngineErrorV3::Model(error.to_string()))?;
+                    let mut repair_accumulator = ToolCallAccumulatorV2::default();
+                    let mut repair_text = String::new();
+                    for event in &repair_events {
+                        match event {
+                            ModelStreamEventV2::TextDelta { text } => {
+                                repair_text.push_str(text);
+                                recorder.append(AgentRunEventKindV3::ModelText {
+                                    text: text.clone(),
+                                })?;
+                            }
+                            ModelStreamEventV2::Error { code, message, .. } => {
+                                return Err(HarnessEngineErrorV3::Model(format!(
+                                    "{code}: {message}"
+                                )));
+                            }
+                            _ => repair_accumulator.push(event).map_err(|error| {
+                                HarnessEngineErrorV3::ToolAssembly(format!(
+                                    "strict JSON repair failed: {error}"
+                                ))
+                            })?,
+                        }
+                    }
+                    match repair_accumulator.finish() {
+                        Ok(calls) if !calls.is_empty() => calls,
+                        Ok(_) => strict_json_fallback_call(&repair_text)
+                            .map(|call| vec![call])
+                            .ok_or_else(|| {
+                                HarnessEngineErrorV3::ToolAssembly(
+                                    "strict JSON repair returned no usable tool call".into(),
+                                )
+                            })?,
+                        Err(error) => {
+                            return Err(HarnessEngineErrorV3::ToolAssembly(format!(
+                                "strict JSON repair failed: {error}"
+                            )));
+                        }
+                    }
                 }
             };
             if calls.is_empty() {
@@ -270,6 +362,9 @@ impl HarnessV3Engine {
                         &request.arguments,
                         recorder.last_sequence(),
                     )?;
+                    recorder.append(AgentRunEventKindV3::CompletionLedgerUpdated {
+                        ledger: ledger.clone(),
+                    })?;
                     ledger
                         .can_complete()
                         .map_err(|error| HarnessEngineErrorV3::Completion(error.to_string()))?;
@@ -295,6 +390,12 @@ impl HarnessV3Engine {
                     outcome: outcome.clone(),
                 })?;
                 if outcome.status == ToolOutcomeStatusV3::Succeeded {
+                    let error_prefix = format!("tool:{}: ", request.tool_id);
+                    let previous_error_count = ledger.unresolved_errors.len();
+                    ledger
+                        .unresolved_errors
+                        .retain(|error| !error.starts_with(&error_prefix));
+                    let mut ledger_changed = previous_error_count != ledger.unresolved_errors.len();
                     if request.tool_id == "artifact.verify" {
                         if let Some(artifact) =
                             artifact_from_outcome(&outcome, recorder.last_sequence())
@@ -303,7 +404,13 @@ impl HarnessV3Engine {
                                 .verified_artifacts
                                 .retain(|item| item.path != artifact.path);
                             ledger.verified_artifacts.push(artifact);
+                            ledger_changed = true;
                         }
+                    }
+                    if ledger_changed {
+                        recorder.append(AgentRunEventKindV3::CompletionLedgerUpdated {
+                            ledger: ledger.clone(),
+                        })?;
                     }
                     sources.push(ContextSourceV3::ToolStep {
                         sequence: recorder.last_sequence(),
@@ -311,11 +418,15 @@ impl HarnessV3Engine {
                         content: outcome.model_content,
                     });
                 } else {
-                    ledger.unresolved_errors.push(
-                        outcome
-                            .error
-                            .unwrap_or_else(|| format!("{} failed", request.tool_id)),
-                    );
+                    let message = outcome.error.unwrap_or_else(|| "tool call failed".into());
+                    let error = format!("tool:{}: {message}", request.tool_id);
+                    ledger
+                        .unresolved_errors
+                        .retain(|existing| existing != &error);
+                    ledger.unresolved_errors.push(error);
+                    recorder.append(AgentRunEventKindV3::CompletionLedgerUpdated {
+                        ledger: ledger.clone(),
+                    })?;
                 }
             }
             if !completion_requested {
@@ -484,6 +595,25 @@ impl HarnessV3Engine {
     }
 }
 
+fn seed_recovered_outcomes(router: &ToolRouterV3, events: &[AgentRunEventV3]) {
+    let mut dispatched = std::collections::BTreeMap::new();
+    for event in events {
+        match &event.event {
+            AgentRunEventKindV3::ToolCallDispatched { request, .. } => {
+                dispatched.insert(request.call_id.clone(), request.idempotency_key.clone());
+            }
+            AgentRunEventKindV3::ToolCallFinished { outcome }
+                if outcome.status == ToolOutcomeStatusV3::Succeeded =>
+            {
+                if let Some(key) = dispatched.get(&outcome.call_id) {
+                    router.seed_successful_outcome(key, outcome.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 struct EventRecorderV3 {
     sink: Arc<dyn EventSinkV3>,
     previous: AgentRunEventV3,
@@ -504,6 +634,10 @@ impl EventRecorderV3 {
         })
     }
 
+    fn resume(sink: Arc<dyn EventSinkV3>, previous: AgentRunEventV3) -> Self {
+        Self { sink, previous }
+    }
+
     fn append(&mut self, kind: AgentRunEventKindV3) -> Result<(), HarnessEngineErrorV3> {
         let event = AgentRunEventV3::next(&self.previous, Utc::now(), kind)
             .map_err(|error| HarnessEngineErrorV3::Persistence(error.to_string()))?;
@@ -521,6 +655,38 @@ impl EventRecorderV3 {
     fn last_hash(&self) -> &str {
         &self.previous.event_hash
     }
+}
+
+fn sources_from_events(events: &[AgentRunEventV3]) -> Vec<ContextSourceV3> {
+    events
+        .iter()
+        .filter_map(|event| match &event.event {
+            AgentRunEventKindV3::ToolCallFinished { outcome } => Some(ContextSourceV3::ToolStep {
+                sequence: event.sequence,
+                tool_id: format!("recovered:{}", outcome.call_id),
+                content: outcome.model_content.clone(),
+            }),
+            AgentRunEventKindV3::NeedsAttention { reason } => Some(ContextSourceV3::VerifiedFact {
+                sequence: event.sequence,
+                content: reason.clone(),
+            }),
+            AgentRunEventKindV3::UserInputAnswered {
+                question_id,
+                answer,
+            } => Some(ContextSourceV3::VerifiedFact {
+                sequence: event.sequence,
+                content: format!("User answer to {question_id}: {answer}"),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn last_review_from_events(events: &[AgentRunEventV3]) -> Option<ReviewReportV3> {
+    events.iter().rev().find_map(|event| match &event.event {
+        AgentRunEventKindV3::ReviewCompleted { report } => Some(report.clone()),
+        _ => None,
+    })
 }
 
 #[derive(Deserialize)]
@@ -601,6 +767,35 @@ fn idempotency_key(spec: &AgentRunSpecV3, tool_id: &str, arguments: &Value) -> S
     hasher.update(tool_id.as_bytes());
     hasher.update(arguments.to_string().as_bytes());
     hex::encode(hasher.finalize())
+}
+
+fn strict_json_fallback_call(text: &str) -> Option<AssembledToolCallV2> {
+    #[derive(Deserialize)]
+    struct StrictCall {
+        call_id: Option<String>,
+        tool_id: Option<String>,
+        tool: Option<String>,
+        arguments: Value,
+    }
+    let trimmed = text
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let parsed: StrictCall = serde_json::from_str(trimmed).ok()?;
+    if !parsed.arguments.is_object() {
+        return None;
+    }
+    Some(AssembledToolCallV2 {
+        call_id: parsed
+            .call_id
+            .unwrap_or_else(|| "strict-json-fallback".into()),
+        index: 0,
+        tool_id: parsed.tool_id.or(parsed.tool)?,
+        arguments: parsed.arguments,
+        repaired: true,
+    })
 }
 
 fn estimate_tokens(objective: &str, sources: &[ContextSourceV3]) -> u64 {

@@ -7,7 +7,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::{
-    AgentRunSpecV3, ReviewReportV3, ToolCallRequestV3, ToolOutcomeStatusV3, ToolOutcomeV3,
+    AgentRunSpecV3, CompletionLedgerV3, ReviewReportV3, ToolCallRequestV3, ToolOutcomeStatusV3,
+    ToolOutcomeV3,
 };
 
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -63,6 +64,9 @@ pub enum AgentRunEventKindV3 {
         first_sequence: u64,
         last_sequence: u64,
         last_event_hash: String,
+    },
+    CompletionLedgerUpdated {
+        ledger: CompletionLedgerV3,
     },
     CompletionProposed,
     ReviewCompleted {
@@ -257,6 +261,7 @@ pub struct AgentRunStateV3 {
     pub uncertain_side_effects: Vec<String>,
     pub successful_idempotency_keys: BTreeSet<String>,
     pub reviewer_corrections: u8,
+    pub completion_ledger: CompletionLedgerV3,
 }
 
 impl AgentRunStateV3 {
@@ -282,6 +287,7 @@ impl AgentRunStateV3 {
             uncertain_side_effects: Vec::new(),
             successful_idempotency_keys: BTreeSet::new(),
             reviewer_corrections: 0,
+            completion_ledger: CompletionLedgerV3::from_spec(spec),
         };
         let mut dispatched: BTreeMap<String, (ToolCallRequestV3, bool)> = BTreeMap::new();
         for event in events {
@@ -311,6 +317,9 @@ impl AgentRunStateV3 {
                 }
                 AgentRunEventKindV3::UserInputAnswered { .. } => {
                     state.status = RunStatusV3::Running
+                }
+                AgentRunEventKindV3::CompletionLedgerUpdated { ledger } => {
+                    state.completion_ledger = ledger.clone()
                 }
                 AgentRunEventKindV3::CompletionProposed => state.status = RunStatusV3::Reviewing,
                 AgentRunEventKindV3::ReviewCompleted { report } => {

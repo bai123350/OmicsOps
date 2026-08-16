@@ -469,6 +469,21 @@ impl ToolRouterV3 {
         }
         Ok(outcome)
     }
+
+    pub fn seed_successful_outcome(
+        &self,
+        idempotency_key: impl Into<String>,
+        outcome: ToolOutcomeV3,
+    ) {
+        let key = idempotency_key.into();
+        if key.trim().is_empty() || outcome.status != ToolOutcomeStatusV3::Succeeded {
+            return;
+        }
+        self.successful_outcomes
+            .lock()
+            .expect("tool outcome cache lock")
+            .insert(key, outcome);
+    }
 }
 
 fn validate_schema_value(schema: &Value, value: &Value) -> Result<(), String> {

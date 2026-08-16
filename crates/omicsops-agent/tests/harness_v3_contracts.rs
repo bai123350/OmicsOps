@@ -243,6 +243,26 @@ fn successful_idempotent_call_is_reconstructed_from_events() {
 }
 
 #[test]
+fn completion_ledger_is_reconstructed_from_events_not_hidden_state() {
+    let spec = spec();
+    let at = Utc.with_ymd_and_hms(2026, 8, 16, 8, 0, 0).unwrap();
+    let first = AgentRunEventV3::first(&spec, at, AgentRunEventKindV3::RunStarted).unwrap();
+    let mut ledger = CompletionLedgerV3::from_spec(&spec);
+    ledger.satisfy("criterion-1", vec![1]).unwrap();
+    let updated = AgentRunEventV3::next(
+        &first,
+        at,
+        AgentRunEventKindV3::CompletionLedgerUpdated {
+            ledger: ledger.clone(),
+        },
+    )
+    .unwrap();
+
+    let state = AgentRunStateV3::replay(&spec, &[first, updated]).unwrap();
+    assert_eq!(state.completion_ledger, ledger);
+}
+
+#[test]
 fn tool_definition_validates_required_arguments_and_mcp_defaults() {
     let definition = ToolDefinitionV3 {
         id: "remote.read".into(),
