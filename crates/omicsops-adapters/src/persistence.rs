@@ -3,7 +3,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use omicsops_agent::AgentEvent;
+use omicsops_agent::{
+    AgentEvent,
+    harness_v3::{AgentRunEventV3, AgentSnapshotV3, validate_event_chain},
+};
 use omicsops_core::{
     audit::RunEventV2,
     domain::{AnalysisPlan, ConnectionProfile, RunEvent},
@@ -123,7 +126,29 @@ impl Repository {
             CREATE TABLE IF NOT EXISTS skill_packages (id TEXT PRIMARY KEY, value_json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS model_profiles (id TEXT PRIMARY KEY, value_json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS sync_entries (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, value_json TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS agent_run_events_v3 (
+                run_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                previous_hash TEXT NOT NULL,
+                event_hash TEXT NOT NULL UNIQUE,
+                value_json TEXT NOT NULL,
+                PRIMARY KEY(run_id, sequence)
+            );
+            CREATE TABLE IF NOT EXISTS agent_run_snapshots_v3 (
+                run_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                last_sequence INTEGER NOT NULL,
+                last_event_hash TEXT NOT NULL,
+                value_json TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS conversations_project_updated ON conversations(project_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS agent_run_events_v3_project_conversation
+                ON agent_run_events_v3(project_id, conversation_id, run_id, sequence);
+            CREATE INDEX IF NOT EXISTS agent_run_snapshots_v3_project_conversation
+                ON agent_run_snapshots_v3(project_id, conversation_id, run_id);
             PRAGMA user_version = 3;
             ",
         )?;
@@ -347,6 +372,14 @@ impl Repository {
             [&project_id],
         )?;
         transaction.execute(
+            "DELETE FROM agent_run_events_v3 WHERE project_id = ?1",
+            [&project_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM agent_run_snapshots_v3 WHERE project_id = ?1",
+            [&project_id],
+        )?;
+        transaction.execute(
             "DELETE FROM tool_calls WHERE turn_id IN (SELECT id FROM agent_turns WHERE project_id = ?1)",
             [&project_id],
         )?;
@@ -408,6 +441,14 @@ impl Repository {
             [&conversation_id],
         )?;
         transaction.execute(
+            "DELETE FROM agent_run_events_v3 WHERE project_id = ?1 AND conversation_id = ?2",
+            params![project_id, conversation_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM agent_run_snapshots_v3 WHERE project_id = ?1 AND conversation_id = ?2",
+            params![project_id, conversation_id],
+        )?;
+        transaction.execute(
             "DELETE FROM tool_calls WHERE turn_id IN (SELECT id FROM agent_turns WHERE conversation_id = ?1)",
             [&conversation_id],
         )?;
@@ -464,6 +505,153 @@ impl Repository {
             .prepare("SELECT value_json FROM agent_events WHERE turn_id = ?1 ORDER BY sequence")?;
         let rows = statement.query_map([turn_id.to_string()], |row| row.get::<_, String>(0))?;
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    pub fn append_agent_run_event_v3(&self, event: &AgentRunEventV3) -> AdapterResult<()> {
+        event
+            .verify_hash()
+            .map_err(|error| crate::AdapterError::InvalidInput(error.to_string()))?;
+        let mut connection = self.connection.lock().expect("database lock");
+        let transaction = connection.transaction()?;
+        let run_id = event.run_id.to_string();
+        let previous = transaction
+            .query_row(
+                "SELECT sequence, event_hash, project_id, conversation_id
+                 FROM agent_run_events_v3
+                 WHERE run_id = ?1
+                 ORDER BY sequence DESC
+                 LIMIT 1",
+                [&run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .ok();
+        match previous {
+            Some((sequence, event_hash, project_id, conversation_id)) => {
+                if event.sequence != sequence + 1
+                    || event.previous_hash != event_hash
+                    || event.project_id.to_string() != project_id
+                    || event.conversation_id.to_string() != conversation_id
+                {
+                    return Err(crate::AdapterError::InvalidInput(
+                        "v3 event does not extend the stored run hash chain".into(),
+                    ));
+                }
+            }
+            None => {
+                if event.sequence != 1
+                    || event.previous_hash
+                        != "0000000000000000000000000000000000000000000000000000000000000000"
+                {
+                    return Err(crate::AdapterError::InvalidInput(
+                        "v3 run must begin at the genesis event".into(),
+                    ));
+                }
+            }
+        }
+        transaction.execute(
+            "INSERT INTO agent_run_events_v3
+                (run_id, project_id, conversation_id, sequence, previous_hash, event_hash, value_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                run_id,
+                event.project_id.to_string(),
+                event.conversation_id.to_string(),
+                event.sequence,
+                event.previous_hash,
+                event.event_hash,
+                serde_json::to_string(event)?
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn agent_run_events_v3(&self, run_id: Uuid) -> AdapterResult<Vec<AgentRunEventV3>> {
+        let connection = self.connection.lock().expect("database lock");
+        let mut statement = connection.prepare(
+            "SELECT value_json FROM agent_run_events_v3
+             WHERE run_id = ?1 ORDER BY sequence",
+        )?;
+        let rows = statement.query_map([run_id.to_string()], |row| row.get::<_, String>(0))?;
+        let events = rows
+            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .collect::<AdapterResult<Vec<AgentRunEventV3>>>()?;
+        if !events.is_empty() {
+            validate_event_chain(&events)
+                .map_err(|error| crate::AdapterError::InvalidInput(error.to_string()))?;
+        }
+        Ok(events)
+    }
+
+    pub fn save_agent_snapshot_v3(&self, snapshot: &AgentSnapshotV3) -> AdapterResult<()> {
+        if snapshot.state.run_id != snapshot.run_id
+            || snapshot.state.last_sequence != snapshot.last_sequence
+            || snapshot.state.last_event_hash != snapshot.last_event_hash
+        {
+            return Err(crate::AdapterError::InvalidInput(
+                "v3 snapshot state does not match its cache boundary".into(),
+            ));
+        }
+        let connection = self.connection.lock().expect("database lock");
+        let boundary_matches = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM agent_run_events_v3
+                WHERE run_id = ?1 AND project_id = ?2 AND conversation_id = ?3
+                  AND sequence = ?4 AND event_hash = ?5
+            )",
+            params![
+                snapshot.run_id.to_string(),
+                snapshot.project_id.to_string(),
+                snapshot.conversation_id.to_string(),
+                snapshot.last_sequence,
+                snapshot.last_event_hash,
+            ],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !boundary_matches {
+            return Err(crate::AdapterError::InvalidInput(
+                "v3 snapshot is not bound to a verified stored event".into(),
+            ));
+        }
+        connection.execute(
+            "INSERT INTO agent_run_snapshots_v3
+                (run_id, project_id, conversation_id, last_sequence, last_event_hash, value_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(run_id) DO UPDATE SET
+                project_id = excluded.project_id,
+                conversation_id = excluded.conversation_id,
+                last_sequence = excluded.last_sequence,
+                last_event_hash = excluded.last_event_hash,
+                value_json = excluded.value_json
+             WHERE excluded.last_sequence >= agent_run_snapshots_v3.last_sequence",
+            params![
+                snapshot.run_id.to_string(),
+                snapshot.project_id.to_string(),
+                snapshot.conversation_id.to_string(),
+                snapshot.last_sequence,
+                snapshot.last_event_hash,
+                serde_json::to_string(snapshot)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn agent_snapshot_v3(&self, run_id: Uuid) -> AdapterResult<Option<AgentSnapshotV3>> {
+        let connection = self.connection.lock().expect("database lock");
+        let mut statement = connection
+            .prepare("SELECT value_json FROM agent_run_snapshots_v3 WHERE run_id = ?1")?;
+        let mut rows = statement.query([run_id.to_string()])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_str(&row.get::<_, String>(0)?)?))
     }
 
     pub fn save_agent_turn(&self, turn: &AgentTurn) -> AdapterResult<()> {
