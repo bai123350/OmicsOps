@@ -20,6 +20,7 @@ import type {
   RunCheckpointV2,
   RunEventV2,
   AgentRunStreamEvent,
+  AgentRunEventV3,
   StepAttempt,
   ArtifactRecordV2,
   EnvironmentLock,
@@ -544,6 +545,19 @@ export async function onAgentRunEvent(callback: (event: AgentRunStreamEvent) => 
 
 export async function listAgentRunEvents(projectId: string, runId?: string, conversationId?: string): Promise<AgentRunStreamEvent[]> {
   return isTauri() ? invoke("list_agent_run_events", { projectId, runId, conversationId }) : [];
+}
+
+export async function onAgentRunEventV3(callback: (event: AgentRunEventV3) => void): Promise<UnlistenFn> {
+  if (!isTauri()) return () => undefined;
+  return listen<AgentRunEventV3>("agent-run-v3-event", ({ payload }) => callback(payload));
+}
+
+export async function listAgentRunEventsV3(options: { runId?: string; projectId?: string; conversationId?: string }): Promise<AgentRunEventV3[]> {
+  return isTauri() ? invoke("list_agent_run_events_v3", options) : [];
+}
+
+export async function answerAgentRunQuestionV3(runId: string, questionId: string, answer: string): Promise<void> {
+  await invoke("answer_agent_run_question_v3", { runId, questionId, answer });
 }
 
 export async function listStepAttemptsV2(runId: string): Promise<StepAttempt[]> {

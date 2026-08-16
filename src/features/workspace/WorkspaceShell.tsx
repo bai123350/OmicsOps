@@ -5,7 +5,7 @@ import {
   Search, Send, Settings, Sparkles, Square, Trash2, X,
 } from "lucide-react";
 import { copy, type Locale } from "./copy";
-import type { AgentRunStreamEvent, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, MemoryFact, NotebookEntry, PlanProposal, ProjectArtifact, ProjectImagePreview, SyncEntry, WorkspaceConversation } from "../../types";
+import type { AgentRunEventV3, AgentRunStreamEvent, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, MemoryFact, NotebookEntry, PlanProposal, ProjectArtifact, ProjectImagePreview, SyncEntry, WorkspaceConversation } from "../../types";
 import { RemoteFileTree } from "./RemoteFileTree";
 import { KernelPanel } from "./KernelPanel";
 import "./workspace.css";
@@ -55,6 +55,8 @@ interface Props {
   runStarted?: boolean;
   activeRunId?: string | null;
   agentRunEvents?: AgentRunStreamEvent[];
+  agentRunEventsV3?: AgentRunEventV3[];
+  onAnswerAgentQuestionV3?: (runId: string, questionId: string, answer: string) => Promise<void> | void;
   remoteFiles?: import("../../types").RemoteFileEntry[];
   filesBusy?: boolean;
   onUploadFiles?: () => Promise<void> | void;
@@ -84,7 +86,7 @@ interface Props {
 
 type ContextTab = "files" | "preview" | "notebook" | "explore" | "runs";
 
-export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, conversations = [], activeConversationId, onSelectConversation, onNewConversation, onDeleteConversation, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, planProposal, planLoading = false, planApproved = false, onRequestPlan, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, agentRunEvents = [], remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
+export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, conversations = [], activeConversationId, onSelectConversation, onNewConversation, onDeleteConversation, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, planProposal, planLoading = false, planApproved = false, onRequestPlan, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, agentRunEvents = [], agentRunEventsV3 = [], onAnswerAgentQuestionV3, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
   const t = copy[locale];
   const zh = locale === "zh-CN";
   const [tab, setTab] = useState<ContextTab>("files");
@@ -100,9 +102,10 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const messageStreamRef = useRef<HTMLElement>(null);
   const imageFiles = (remoteFiles ?? []).filter((entry) => !entry.directory && isPreviewImage(entry.relative_path));
   const preview = <ArtifactPreview title={t.overview} locale={locale} images={imageFiles} selectedPath={selectedImagePath} preview={imagePreview} busy={previewBusy} error={previewError} onSelect={setSelectedImagePath} onLoad={loadImagePreview} />;
-  const effectiveActiveRunId = activeRunId ?? (runStarted ? agentRunEvents.at(-1)?.run_id ?? null : null);
+  const effectiveActiveRunId = activeRunId ?? (runStarted ? agentRunEventsV3.at(-1)?.run_id ?? agentRunEvents.at(-1)?.run_id ?? null : null);
   const activeRunEvents = effectiveActiveRunId ? agentRunEvents.filter((event) => event.run_id === effectiveActiveRunId) : [];
-  const runFinished = activeRunEvents.some((event) => event.kind === "agent_completed" || event.kind === "agent_failed" || event.kind === "agent_canceled");
+  const activeRunEventsV3 = effectiveActiveRunId ? agentRunEventsV3.filter((event) => event.run_id === effectiveActiveRunId) : [];
+  const runFinished = activeRunEvents.some((event) => event.kind === "agent_completed" || event.kind === "agent_failed" || event.kind === "agent_canceled") || activeRunEventsV3.some(isTerminalAgentEventV3);
   const runActive = runStarted && !runFinished;
   const activeConversation = conversations.find((item) => item.id === activeConversationId);
   const conversationTitle = activeConversation?.title || (zh ? "新会话" : "New conversation");
@@ -115,6 +118,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     : null;
   const runTimeline = placeAgentRunsAfterMessages(messages, historicalAgentRunEvents);
   const latestAgentRunEvent = agentRunEvents.at(-1);
+  const latestAgentRunEventV3 = agentRunEventsV3.at(-1);
 
   useEffect(() => {
     const stream = messageStreamRef.current;
@@ -123,7 +127,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
       stream.scrollTop = stream.scrollHeight;
     });
     return () => cancelAnimationFrame(frame);
-  }, [messages.length, streamingAssistant, agentBusy, agentNotice, planProposal, planLoading, runStarted, latestAgentRunEvent?.run_id, latestAgentRunEvent?.sequence]);
+  }, [messages.length, streamingAssistant, agentBusy, agentNotice, planProposal, planLoading, runStarted, latestAgentRunEvent?.run_id, latestAgentRunEvent?.sequence, latestAgentRunEventV3?.run_id, latestAgentRunEventV3?.sequence]);
 
   useEffect(() => {
     if (selectedImagePath && imageFiles.some((entry) => entry.relative_path === selectedImagePath)) return;
@@ -196,7 +200,8 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
         {plannedSkills.length > 0 && <div className="plan-skills"><b>{zh ? "计划采用的 Skills" : "Skills applied by this plan"}</b>{plannedSkills.map((skill) => <small key={`${skill.name}:${skill.version}:${skill.hash}`}>{skill.name}@{skill.version} · SHA-256 {skill.hash.slice(0, 12)} · {skill.sections} {zh ? "个引用段" : "cited sections"}</small>)}</div>}
         {runTimeline.unanchored.length > 0 && <AgentRunHistory locale={locale} runs={runTimeline.unanchored} activeRunId={effectiveActiveRunId} />}
         {activeRun && <AgentRunFold locale={locale} run={activeRun} activeRunId={effectiveActiveRunId} />}
-        {runStarted && agentRunEvents.length === 0 && <AgentConversationUpdates locale={locale} events={[]} />}
+        {agentRunEventsV3.length > 0 && <HarnessV3History locale={locale} events={agentRunEventsV3} activeRunId={effectiveActiveRunId} onAnswer={onAnswerAgentQuestionV3} />}
+        {runStarted && agentRunEvents.length === 0 && agentRunEventsV3.length === 0 && <AgentConversationUpdates locale={locale} events={[]} />}
         {runActive && onCancelRun && <div className="agent-run-controls" role="region" aria-label={zh ? "远程 Agent 运行控制" : "Remote agent run controls"}><div><span className="agent-working"><i />{runStopping ? (zh ? "正在终止当前操作…" : "Stopping current operation…") : (zh ? "远程 Agent 正在运行" : "Remote agent is running")}</span><small>{zh ? "将中断模型请求、当前 SSH 命令及后续操作" : "Stops the model request, current SSH command, and all subsequent actions"}</small></div><button className="stop-agent-button" disabled={runStopping} onClick={() => void onCancelRun()}><Square size={14} fill="currentColor" />{runStopping ? (zh ? "终止中…" : "Stopping…") : (zh ? "终止运行" : "Stop run")}</button></div>}
         {planProposal?.validation.valid === false && <div className="plan-validation" role="alert"><strong>{zh ? "计划未通过本地执行契约" : "Plan failed the local execution contract"}</strong><ul>{planProposal.validation.issues.map((issue) => <li key={`${issue.path}:${issue.code}`}><code>{issue.path}</code><span>{issue.message}</span></li>)}</ul><button disabled={planLoading} onClick={() => void onRequestPlan?.()}>{planLoading ? (zh ? "重新生成中…" : "Regenerating…") : (zh ? "按当前工具契约重新生成" : "Regenerate with current tool contract")}</button></div>}
         {!onSend && <article className="task-card"><div className="task-icon"><Activity size={18} /></div><div className="task-body"><div><strong>{t.task}</strong><span>65%</span></div><p>{zh ? "远端 Linux · 8 CPU · 32 GiB · 低风险" : "Remote Linux · 8 CPU · 32 GiB · low risk"}</p><div className="task-progress"><i /></div><div className="task-actions"><button>{zh ? "查看日志" : "View logs"}</button><button>{zh ? "查看计划" : "View plan"}</button></div></div></article>}
@@ -299,6 +304,83 @@ function agentEventSource(kind: AgentRunStreamEvent["kind"], zh: boolean) {
   if (kind === "tool_started" || kind === "tool_waiting" || kind === "tool_completed" || kind === "tool_stopping" || kind === "tool_stopped") return zh ? "SSH 命令" : "SSH command";
   if (kind.startsWith("model_")) return zh ? "Agent 流式判断" : "Agent stream";
   return "OmicsOps Agent";
+}
+
+function isTerminalAgentEventV3(event: AgentRunEventV3) {
+  return event.event.kind === "run_completed" || event.event.kind === "run_failed" || event.event.kind === "run_cancelled" || event.event.kind === "needs_attention";
+}
+
+function groupAgentRunEventsV3(events: AgentRunEventV3[]) {
+  const byRun = new Map<string, AgentRunEventV3[]>();
+  for (const event of events) byRun.set(event.run_id, [...(byRun.get(event.run_id) ?? []), event]);
+  return [...byRun].map(([runId, runEvents]) => ({ runId, events: runEvents.sort((left, right) => left.sequence - right.sequence) }));
+}
+
+function HarnessV3History({ locale, events, activeRunId, onAnswer }: { locale: Locale; events: AgentRunEventV3[]; activeRunId: string | null; onAnswer?: Props["onAnswerAgentQuestionV3"] }) {
+  return <section className="harness-v3-history" aria-label={locale === "zh-CN" ? "Harness v3 运行轨迹" : "Harness v3 run trace"}>
+    {groupAgentRunEventsV3(events).map((run) => <HarnessV3RunFold locale={locale} run={run} activeRunId={activeRunId} onAnswer={onAnswer} key={run.runId} />)}
+  </section>;
+}
+
+function HarnessV3RunFold({ locale, run, activeRunId, onAnswer }: { locale: Locale; run: { runId: string; events: AgentRunEventV3[] }; activeRunId: string | null; onAnswer?: Props["onAnswerAgentQuestionV3"] }) {
+  const zh = locale === "zh-CN";
+  const terminal = [...run.events].reverse().find(isTerminalAgentEventV3);
+  const active = run.runId === activeRunId && !terminal;
+  const status = terminal?.event.kind === "run_completed" ? (zh ? "已完成" : "Completed")
+    : terminal?.event.kind === "run_cancelled" ? (zh ? "已终止" : "Canceled")
+    : terminal?.event.kind === "needs_attention" ? (zh ? "需要处理" : "Needs attention")
+    : terminal?.event.kind === "run_failed" ? (zh ? "失败" : "Failed")
+    : (zh ? "运行中" : "Running");
+  return <details className={`agent-run-fold harness-v3-fold ${active ? "is-active" : ""}`} open={active ? true : undefined} aria-label={zh ? "Harness v3 运行" : "Harness v3 run"}>
+    <summary><span className="agent-run-fold-title"><span><b>Harness v3</b><small>{zh ? "可恢复结构化轨迹" : "Recoverable structured trace"}</small></span><ChevronRight size={15} /></span><span>{status} · {run.events.length} {zh ? "条事件" : "events"}</span></summary>
+    <div className="harness-v3-events">{run.events.map((event) => <HarnessV3EventCard locale={locale} event={event} runEvents={run.events} onAnswer={onAnswer} key={`${event.run_id}-${event.sequence}`} />)}</div>
+  </details>;
+}
+
+function HarnessV3EventCard({ locale, event, runEvents, onAnswer }: { locale: Locale; event: AgentRunEventV3; runEvents: AgentRunEventV3[]; onAnswer?: Props["onAnswerAgentQuestionV3"] }) {
+  const zh = locale === "zh-CN";
+  const kind = event.event.kind;
+  const meta = <small>#{event.sequence} · {new Date(event.occurred_at).toLocaleTimeString()} · {event.event_hash.slice(0, 10)}</small>;
+  if (kind === "tool_call_requested" || kind === "tool_call_dispatched") {
+    const request = event.event.payload.request;
+    return <article className="harness-v3-card tool-card"><header><b>{request.tool_id}</b><span>{kind === "tool_call_requested" ? (zh ? "已请求" : "Requested") : (zh ? "执行中" : "Dispatched")}</span></header>{meta}<pre>{JSON.stringify(request.arguments, null, 2)}</pre><small>{zh ? "幂等键" : "Idempotency key"}: {request.idempotency_key}</small></article>;
+  }
+  if (kind === "tool_call_finished") {
+    const outcome = event.event.payload.outcome;
+    return <article className={`harness-v3-card tool-outcome status-${outcome.status}`}><header><b>{zh ? "工具结果" : "Tool outcome"}</b><span>{outcome.status}{outcome.truncated ? ` · ${zh ? "预览已截断" : "preview truncated"}` : ""}</span></header>{meta}{outcome.model_content && <pre>{outcome.model_content}</pre>}{outcome.error && <p>{outcome.error}</p>}<div className="provenance-list">{outcome.provenance.map((item) => <code key={item}>{item}</code>)}</div></article>;
+  }
+  if (kind === "completion_ledger_updated") {
+    const ledger = event.event.payload.ledger;
+    return <article className="harness-v3-card ledger-card"><header><b>{zh ? "完成账本" : "Completion ledger"}</b><span>{ledger.criteria.filter((item) => item.evidence_sequences.length > 0).length}/{ledger.criteria.length}</span></header>{meta}{ledger.criteria.map((item) => <p key={item.id}>{item.evidence_sequences.length > 0 ? "✓" : "○"} {item.description} <small>#{item.evidence_sequences.join(", #")}</small></p>)}{ledger.verified_artifacts.map((artifact) => <div className="verified-artifact" key={artifact.path}><b>{artifact.path}</b><small>{artifact.size_bytes} bytes · SHA-256 {artifact.sha256.slice(0, 12)} · #{artifact.evidence_sequence}</small></div>)}{[...ledger.unresolved_errors, ...ledger.uncertain_side_effects].map((error) => <p className="ledger-error" key={error}>{error}</p>)}</article>;
+  }
+  if (kind === "review_completed") {
+    const report = event.event.payload.report;
+    return <article className="harness-v3-card reviewer-card"><header><b>{zh ? "独立科学审查" : "Independent scientific review"}</b><span>{zh ? `第 ${report.cycle} 轮` : `Cycle ${report.cycle}`}</span></header>{meta}{report.findings.map((finding, index) => <div className={`review-finding severity-${finding.severity}`} key={`${finding.summary}-${index}`}><b>{finding.severity}</b><span>{finding.summary}</span>{finding.evidence.map((evidence) => <code key={evidence}>{evidence}</code>)}</div>)}</article>;
+  }
+  if (kind === "user_input_requested") {
+    const requested = event.event as Extract<AgentRunEventV3["event"], { kind: "user_input_requested" }>;
+    const answered = runEvents.some((candidate) => {
+      const candidateEvent = candidate.event;
+      return candidateEvent.kind === "user_input_answered" && candidateEvent.payload.question_id === requested.payload.question_id;
+    });
+    return <HarnessV3QuestionCard locale={locale} runId={event.run_id} questionId={requested.payload.question_id} question={requested.payload.question} answered={answered} onAnswer={onAnswer} />;
+  }
+  if (kind === "context_compacted") {
+    return <article className="harness-v3-card context-card"><header><b>{zh ? "上下文已压缩" : "Context compacted"}</b><span>#{event.event.payload.first_sequence}–#{event.event.payload.last_sequence}</span></header>{meta}<code>SHA-256 {event.event.payload.last_event_hash.slice(0, 16)}</code></article>;
+  }
+  const message = kind === "model_text" ? event.event.payload.text
+    : kind === "model_step_started" ? `${zh ? "模型步骤" : "Model step"} ${event.event.payload.step}`
+    : kind === "needs_attention" ? event.event.payload.reason
+    : kind === "run_failed" ? event.event.payload.message
+    : kind === "user_input_answered" ? `${zh ? "已回答" : "Answered"}: ${event.event.payload.answer}`
+    : kind.replaceAll("_", " ");
+  return <article className={`harness-v3-card event-${kind}`}><header><b>{message}</b></header>{meta}</article>;
+}
+
+function HarnessV3QuestionCard({ locale, runId, questionId, question, answered, onAnswer }: { locale: Locale; runId: string; questionId: string; question: string; answered: boolean; onAnswer?: Props["onAnswerAgentQuestionV3"] }) {
+  const zh = locale === "zh-CN";
+  const [answer, setAnswer] = useState("");
+  return <article className="harness-v3-card question-card"><header><b>{zh ? "需要用户输入" : "User input required"}</b><span>{answered ? (zh ? "已回答" : "Answered") : (zh ? "等待中" : "Waiting")}</span></header><p>{question}</p>{!answered && <div><input aria-label={`${zh ? "回答" : "Answer"}: ${question}`} value={answer} onChange={(change) => setAnswer(change.target.value)} /><button disabled={!answer.trim()} onClick={() => void onAnswer?.(runId, questionId, answer.trim())}>{zh ? "提交回答" : "Submit answer"}</button></div>}</article>;
 }
 
 function Notebook({ locale, entries, artifacts, facts, onSearch, onExport }: { locale: Locale; entries: NotebookEntry[]; artifacts: ProjectArtifact[]; facts: MemoryFact[]; onSearch?: (query: string, dimension?: string) => Promise<void> | void; onExport?: (format: "markdown" | "json" | "bundle") => Promise<void> | void }) { const zh = locale === "zh-CN"; const [query, setQuery] = useState(""); const [dimension, setDimension] = useState(""); return <div className="notebook-panel"><div className="notebook-actions"><input aria-label={zh ? "检索记忆" : "Search memory"} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={zh ? "按任务、环境或产物检索" : "Search tasks, environments, artifacts"} /><select aria-label={zh ? "记忆维度" : "Memory dimension"} value={dimension} onChange={(event) => setDimension(event.target.value)}><option value="">{zh ? "全部事实" : "All facts"}</option><option value="task">{zh ? "任务" : "Task"}</option><option value="environment">{zh ? "环境" : "Environment"}</option><option value="artifact">{zh ? "产物" : "Artifact"}</option></select><button onClick={() => void onSearch?.(query, dimension || undefined)}>{zh ? "检索" : "Search"}</button></div><div className="notebook-export"><button onClick={() => void onExport?.("markdown")}>Markdown</button><button onClick={() => void onExport?.("json")}>JSON</button><button onClick={() => void onExport?.("bundle")}>{zh ? "项目包" : "Bundle"}</button></div><div className="notebook-list">{entries.length === 0 && <div><span>{zh ? "研究记录" : "Notebook"}</span><b>{zh ? "暂无正式条目" : "No formal entries yet"}</b><p>{zh ? "Agent 完成并验证产物后会自动登记目标、方法、观察、决策与证据。" : "Verified Agent runs automatically register goals, methods, observations, decisions, and evidence."}</p></div>}{entries.map((entry) => <div key={entry.id}><span>{entry.kind}</span><b>{entry.title}</b><p>{entry.markdown}</p><small>{entry.evidence_ids.length} {zh ? "条可追溯引用" : "traceable references"}</small></div>)}</div><div className="artifact-register"><b>{zh ? "已登记产物" : "Registered artifacts"} · {artifacts.length}</b>{artifacts.map((artifact) => <small key={artifact.id}>{artifact.relative_path} · SHA-256 {artifact.sha256.slice(0, 12)}</small>)}</div><div className="memory-results"><b>{zh ? "事实记忆" : "Fact memory"} · {facts.length}</b>{facts.slice(0, 20).map((fact) => <article className={fact.conflicted_with.length ? "conflicted" : ""} key={fact.id}><span>{fact.dimension}</span><p>{fact.statement}</p><small>{fact.evidence.map((evidence) => `${evidence.source_kind}:${evidence.source_id}`).join(" · ")}</small>{fact.conflicted_with.length > 0 && <em>{zh ? "存在冲突事实，已保留双方来源" : "Conflicting fact retained with both sources"}</em>}</article>)}</div></div>; }

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import * as api from "./tauri-api";
-import type { AgentEvent, AgentRunStreamEvent, ConnectionProfile, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, PlanProposal, ProjectArtifact, RemoteFileEntry, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
+import type { AgentEvent, AgentRunEventV3, AgentRunStreamEvent, ConnectionProfile, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, PlanProposal, ProjectArtifact, RemoteFileEntry, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
 import { WorkspaceShell } from "./features/workspace/WorkspaceShell";
 import type { Locale } from "./features/workspace/copy";
@@ -30,6 +30,7 @@ export default function DesktopApp() {
   const [runId, setRunId] = useState<string | null>(null);
   const [runStopping, setRunStopping] = useState(false);
   const [agentRunEvents, setAgentRunEvents] = useState<AgentRunStreamEvent[]>([]);
+  const [agentRunEventsV3, setAgentRunEventsV3] = useState<AgentRunEventV3[]>([]);
   const [remoteFiles, setRemoteFiles] = useState<RemoteFileEntry[]>([]);
   const [filesBusy, setFilesBusy] = useState(false);
   const [fileNotice, setFileNotice] = useState("");
@@ -94,18 +95,23 @@ export default function DesktopApp() {
   useEffect(() => {
     let disposed = false;
     setAgentRunEvents([]);
+    setAgentRunEventsV3([]);
     setRunId(null);
     setRunStopping(false);
     if (!selected || !conversation) return () => { disposed = true; };
-    api.listAgentRunEvents(selected.id)
-      .then((events) => {
+    Promise.all([
+      api.listAgentRunEvents(selected.id),
+      api.listAgentRunEventsV3({ projectId: selected.id, conversationId: conversation.id }),
+    ])
+      .then(([events, eventsV3]) => {
         if (disposed) return;
         const conversationEvents = events.filter((event) => event.conversation_id === conversation.id);
         setAgentRunEvents(conversationEvents);
-        const latestRunId = conversationEvents.at(-1)?.run_id;
-        const latestRunEvents = latestRunId ? conversationEvents.filter((event) => event.run_id === latestRunId) : [];
-        const latestRunFinished = latestRunEvents.some(isTerminalAgentEvent);
-        setRunId(latestRunFinished ? null : latestRunId ?? null);
+        setAgentRunEventsV3(eventsV3);
+        const latest = [...conversationEvents.map((event) => ({ runId: event.run_id, timestamp: event.timestamp })), ...eventsV3.map((event) => ({ runId: event.run_id, timestamp: event.occurred_at }))].sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime()).at(-1);
+        const latestRunEvents = latest ? conversationEvents.filter((event) => event.run_id === latest.runId) : [];
+        const latestRunEventsV3 = latest ? eventsV3.filter((event) => event.run_id === latest.runId) : [];
+        setRunId(latest && !latestRunEvents.some(isTerminalAgentEvent) && !latestRunEventsV3.some(isTerminalAgentEventV3) ? latest.runId : null);
       })
       .catch((error) => {
         if (!disposed) setAgentNotice(error instanceof Error ? error.message : String(error));
@@ -173,6 +179,16 @@ export default function DesktopApp() {
         if (current.some((item) => item.run_id === event.run_id && item.sequence === event.sequence)) return current;
         return [...current, event];
       });
+    }).then((fn) => disposed ? fn() : unlisten.push(fn));
+    api.onAgentRunEventV3((event) => {
+      if (event.project_id !== selected?.id || event.conversation_id !== conversation?.id) return;
+      setRunId((current) => current ?? event.run_id);
+      if (isTerminalAgentEventV3(event)) {
+        setRunStopping(false);
+        setRunId((current) => current === event.run_id ? null : current);
+        if (event.event.kind === "run_completed") void refreshRemoteFiles(event.project_id);
+      }
+      setAgentRunEventsV3((current) => mergeAgentRunEventsV3(current, [event]));
     }).then((fn) => disposed ? fn() : unlisten.push(fn));
     return () => { disposed = true; unlisten.forEach((fn) => fn()); };
   }, [conversation?.id, selected?.id]);
@@ -242,8 +258,12 @@ export default function DesktopApp() {
     try {
       const id = await start();
       setRunId(id);
-      const events = await api.listAgentRunEvents(selected!.id, id, conversation?.id);
+      const [events, eventsV3] = await Promise.all([
+        api.listAgentRunEvents(selected!.id, id, conversation?.id),
+        api.listAgentRunEventsV3({ runId: id }),
+      ]);
       setAgentRunEvents((current) => mergeAgentRunEvents(current, events));
+      setAgentRunEventsV3((current) => mergeAgentRunEventsV3(current, eventsV3));
     } catch (error) {
       setAgentNotice(error instanceof Error ? error.message : String(error));
     }
@@ -251,7 +271,7 @@ export default function DesktopApp() {
 
   function resetConversationWork() {
     setMessages([]); setMessageSequence(1); setStreamingAssistant(""); setAgentBusy(false); setAgentNotice(""); setAgentRetryNotice("");
-    setLastGoal(""); setPlanProposal(null); setPlanApproved(false); setApprovedPlanId(null); setRunId(null); setRunStopping(false); setAgentRunEvents([]);
+    setLastGoal(""); setPlanProposal(null); setPlanApproved(false); setApprovedPlanId(null); setRunId(null); setRunStopping(false); setAgentRunEvents([]); setAgentRunEventsV3([]);
   }
 
   async function selectConversation(conversationId: string) {
@@ -315,7 +335,8 @@ export default function DesktopApp() {
     locale={locale} onLocaleChange={setLocale} onOpenSettings={() => setSettingsOpen(true)} onBackToProjects={() => setSelected(null)}
     conversations={conversations} activeConversationId={conversation?.id} onSelectConversation={selectConversation} onNewConversation={newConversation} onDeleteConversation={deleteConversation}
     messages={messages} streamingAssistant={streamingAssistant} agentBusy={agentBusy} agentNotice={agentNotice} agentRetryNotice={agentRetryNotice} modelLabel={activeModel?.label}
-    planProposal={planProposal} planLoading={planLoading} planApproved={planApproved} canStartRun={Boolean(selected.connection_id && approvedPlanId)} runStarted={Boolean(runId)} activeRunId={runId} agentRunEvents={agentRunEvents}
+    planProposal={planProposal} planLoading={planLoading} planApproved={planApproved} canStartRun={Boolean(selected.connection_id && approvedPlanId)} runStarted={Boolean(runId)} activeRunId={runId} agentRunEvents={agentRunEvents} agentRunEventsV3={agentRunEventsV3}
+    onAnswerAgentQuestionV3={async (answerRunId, questionId, answer) => { await api.answerAgentRunQuestionV3(answerRunId, questionId, answer); await api.resumeRunV2(answerRunId); }}
     runStopping={runStopping}
     remoteFiles={remoteFiles} filesBusy={filesBusy} fileNotice={fileNotice}
     syncEntries={syncEntries}
@@ -394,8 +415,12 @@ export default function DesktopApp() {
       setAgentNotice("");
       try {
         await api.cancelRun(runId);
-        const events = await api.listAgentRunEvents(selected.id, runId, conversation?.id);
+        const [events, eventsV3] = await Promise.all([
+          api.listAgentRunEvents(selected.id, runId, conversation?.id),
+          api.listAgentRunEventsV3({ runId }),
+        ]);
         setAgentRunEvents((current) => mergeAgentRunEvents(current, events));
+        setAgentRunEventsV3((current) => mergeAgentRunEventsV3(current, eventsV3));
       } catch (error) {
         setAgentNotice(error instanceof Error ? error.message : String(error));
         setRunStopping(false);
@@ -410,6 +435,16 @@ function mergeAgentRunEvents(current: AgentRunStreamEvent[], incoming: AgentRunS
     .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime() || left.sequence - right.sequence);
 }
 
+export function mergeAgentRunEventsV3(current: AgentRunEventV3[], incoming: AgentRunEventV3[]) {
+  return [...current, ...incoming]
+    .filter((event, index, all) => all.findIndex((item) => item.run_id === event.run_id && item.sequence === event.sequence) === index)
+    .sort((left, right) => new Date(left.occurred_at).getTime() - new Date(right.occurred_at).getTime() || left.sequence - right.sequence);
+}
+
 function isTerminalAgentEvent(event: AgentRunStreamEvent) {
   return event.kind === "agent_completed" || event.kind === "agent_failed" || event.kind === "agent_canceled";
+}
+
+function isTerminalAgentEventV3(event: AgentRunEventV3) {
+  return event.event.kind === "run_completed" || event.event.kind === "run_failed" || event.event.kind === "run_cancelled" || event.event.kind === "needs_attention";
 }

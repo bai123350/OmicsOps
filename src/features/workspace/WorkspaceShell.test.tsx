@@ -205,6 +205,27 @@ describe("WorkspaceShell", () => {
     expect(screen.queryByRole("button", { name: "终止运行" })).not.toBeInTheDocument();
   });
 
+  it("replays Harness v3 tool, artifact, reviewer, and user-input cards", () => {
+    const onAnswerAgentQuestionV3 = vi.fn();
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined}
+      runStarted activeRunId="run-v3" onAnswerAgentQuestionV3={onAnswerAgentQuestionV3}
+      agentRunEventsV3={[
+        { run_id: "run-v3", project_id: "project-1", conversation_id: "conversation-1", sequence: 1, previous_hash: "0", event_hash: "a", occurred_at: "2026-08-16T08:00:00Z", event: { kind: "run_started" } },
+        { run_id: "run-v3", project_id: "project-1", conversation_id: "conversation-1", sequence: 2, previous_hash: "a", event_hash: "b", occurred_at: "2026-08-16T08:00:01Z", event: { kind: "tool_call_requested", payload: { request: { call_id: "call-1", tool_id: "artifact.verify", arguments: { path: "results/pbmc.h5ad" }, idempotency_key: "verify-1" } } } },
+        { run_id: "run-v3", project_id: "project-1", conversation_id: "conversation-1", sequence: 3, previous_hash: "b", event_hash: "c", occurred_at: "2026-08-16T08:00:02Z", event: { kind: "tool_call_finished", payload: { outcome: { call_id: "call-1", status: "succeeded", model_content: "verified", structured_result: { size_bytes: 42 }, error: null, truncated: false, provenance: ["remote:results/pbmc.h5ad", "sha256:abc"] } } } },
+        { run_id: "run-v3", project_id: "project-1", conversation_id: "conversation-1", sequence: 4, previous_hash: "c", event_hash: "d", occurred_at: "2026-08-16T08:00:03Z", event: { kind: "completion_ledger_updated", payload: { ledger: { criteria: [{ id: "qc", description: "QC complete", evidence_sequences: [3] }], unresolved_errors: [], uncertain_side_effects: [], verified_artifacts: [{ path: "results/pbmc.h5ad", size_bytes: 42, sha256: "a".repeat(64), evidence_sequence: 3 }] } } } },
+        { run_id: "run-v3", project_id: "project-1", conversation_id: "conversation-1", sequence: 5, previous_hash: "d", event_hash: "e", occurred_at: "2026-08-16T08:00:04Z", event: { kind: "review_completed", payload: { report: { cycle: 1, findings: [{ severity: "warn", summary: "Record package versions", evidence: ["results/report.html"] }] } } } },
+        { run_id: "run-v3", project_id: "project-1", conversation_id: "conversation-1", sequence: 6, previous_hash: "e", event_hash: "f", occurred_at: "2026-08-16T08:00:05Z", event: { kind: "user_input_requested", payload: { question_id: "species", question: "Which species?" } } },
+      ]} />);
+
+    expect(screen.getByText("artifact.verify")).toBeInTheDocument();
+    expect(screen.getByText("results/pbmc.h5ad")).toBeInTheDocument();
+    expect(screen.getByText("Record package versions")).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: "Answer: Which species?" }), { target: { value: "human" } });
+    fireEvent.click(screen.getByRole("button", { name: "Submit answer" }));
+    expect(onAnswerAgentQuestionV3).toHaveBeenCalledWith("run-v3", "species", "human");
+  });
+
   it("turns off every historical running indicator as soon as cancellation starts", () => {
     render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} runStarted runStopping onCancelRun={() => undefined} agentRunEvents={[
       { run_id: "run-1", project_id: "project-1", sequence: 1, timestamp: "2026-08-12T08:00:00Z", kind: "model_waiting", title: "Evaluating remote evidence", content: "30s elapsed", iteration: 8 },

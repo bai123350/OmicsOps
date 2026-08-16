@@ -338,6 +338,61 @@ export interface ModelProfile {
   context_window_tokens?: number | null;
 }
 
+export interface ToolCallRequestV3 {
+  call_id: string;
+  tool_id: string;
+  arguments: Record<string, unknown>;
+  idempotency_key: string;
+}
+
+export interface ToolOutcomeV3 {
+  call_id: string;
+  status: "succeeded" | "failed" | "cancelled" | "timed_out" | "rejected" | "uncertain";
+  model_content: string;
+  structured_result?: unknown;
+  error?: string | null;
+  truncated: boolean;
+  provenance: string[];
+}
+
+export interface CompletionLedgerV3 {
+  criteria: Array<{ id: string; description: string; evidence_sequences: number[] }>;
+  unresolved_errors: string[];
+  uncertain_side_effects: string[];
+  verified_artifacts: Array<{ path: string; size_bytes: number; sha256: string; evidence_sequence: number }>;
+}
+
+export interface ReviewReportV3 {
+  cycle: number;
+  findings: Array<{ severity: "error" | "warn" | "ok"; summary: string; evidence: string[] }>;
+}
+
+export type AgentRunEventKindV3 =
+  | { kind: "run_started" | "run_cancelled" | "completion_proposed" | "run_completed" }
+  | { kind: "model_step_started"; payload: { step: number } }
+  | { kind: "model_text"; payload: { text: string } }
+  | { kind: "tool_call_requested"; payload: { request: ToolCallRequestV3 } }
+  | { kind: "tool_call_dispatched"; payload: { request: ToolCallRequestV3; read_only: boolean } }
+  | { kind: "tool_call_finished"; payload: { outcome: ToolOutcomeV3 } }
+  | { kind: "user_input_requested"; payload: { question_id: string; question: string } }
+  | { kind: "user_input_answered"; payload: { question_id: string; answer: string } }
+  | { kind: "context_compacted"; payload: { first_sequence: number; last_sequence: number; last_event_hash: string } }
+  | { kind: "completion_ledger_updated"; payload: { ledger: CompletionLedgerV3 } }
+  | { kind: "review_completed"; payload: { report: ReviewReportV3 } }
+  | { kind: "needs_attention"; payload: { reason: string } }
+  | { kind: "run_failed"; payload: { message: string } };
+
+export interface AgentRunEventV3 {
+  run_id: string;
+  project_id: string;
+  conversation_id: string;
+  sequence: number;
+  previous_hash: string;
+  event_hash: string;
+  occurred_at: string;
+  event: AgentRunEventKindV3;
+}
+
 export interface ModelProbeResult {
   endpoint: string;
   protocol: string;
