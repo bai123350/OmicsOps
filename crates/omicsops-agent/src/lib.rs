@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod harness_v3;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AgentError {
     #[error("tool {0} is not registered")]
