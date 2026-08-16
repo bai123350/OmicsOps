@@ -5,7 +5,7 @@ use omicsops_agent::{AgentError, AgentResult, ModelProvider, ModelRequest, Model
 use schemars::{JsonSchema, schema_for};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 use url::Url;
 use uuid::Uuid;
@@ -197,15 +197,17 @@ pub fn build_provider_request_v2(
         .iter()
         .map(|message| json!({"role": message.role, "content": message.content}))
         .collect::<Vec<_>>();
+    let tool_aliases = provider_tool_aliases(request);
     let openai_tools = request
         .tools
         .iter()
-        .map(|tool| {
+        .zip(&tool_aliases)
+        .map(|(tool, (provider_name, _))| {
             json!({
                 "type": "function",
                 "function": {
-                    "name": tool.id,
-                    "description": tool.description,
+                    "name": provider_name,
+                    "description": provider_tool_description(tool, provider_name),
                     "parameters": tool.input_schema
                 }
             })
@@ -230,10 +232,11 @@ pub fn build_provider_request_v2(
             let tools = request
                 .tools
                 .iter()
-                .map(|tool| {
+                .zip(&tool_aliases)
+                .map(|(tool, (provider_name, _))| {
                     json!({
-                        "name": tool.id,
-                        "description": tool.description,
+                        "name": provider_name,
+                        "description": provider_tool_description(tool, provider_name),
                         "input_schema": tool.input_schema
                     })
                 })
@@ -266,9 +269,80 @@ pub fn build_provider_request_v2(
     }
 }
 
+fn provider_tool_aliases(request: &ModelRequestV2) -> Vec<(String, String)> {
+    let mut occupied = request
+        .tools
+        .iter()
+        .filter(|tool| provider_tool_name_is_valid(&tool.id))
+        .map(|tool| tool.id.clone())
+        .collect::<BTreeSet<_>>();
+    request
+        .tools
+        .iter()
+        .enumerate()
+        .map(|(index, tool)| {
+            if provider_tool_name_is_valid(&tool.id) {
+                return (tool.id.clone(), tool.id.clone());
+            }
+            let mut alias = format!("omicsops_tool_{index}");
+            while occupied.contains(&alias) {
+                alias.push('_');
+            }
+            occupied.insert(alias.clone());
+            (alias, tool.id.clone())
+        })
+        .collect()
+}
+
+fn provider_tool_name_is_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+}
+
+fn provider_tool_description(
+    tool: &omicsops_agent::harness_v3::ModelToolSpec,
+    provider_name: &str,
+) -> String {
+    if provider_name == tool.id {
+        tool.description.clone()
+    } else {
+        format!("{} [OmicsOps tool id: {}]", tool.description, tool.id)
+    }
+}
+
+fn provider_tool_alias_map(request: &ModelRequestV2) -> BTreeMap<String, String> {
+    provider_tool_aliases(request).into_iter().collect()
+}
+
+fn canonical_tool_id(aliases: &BTreeMap<String, String>, provider_name: &str) -> String {
+    aliases
+        .get(provider_name)
+        .cloned()
+        .unwrap_or_else(|| provider_name.to_owned())
+}
+
 pub fn parse_provider_response_v2(
     protocol: ProviderProtocol,
     value: &Value,
+) -> AdapterResult<Vec<ModelStreamEventV2>> {
+    parse_provider_response_v2_with_aliases(protocol, value, &BTreeMap::new())
+}
+
+pub fn parse_provider_response_v2_for_request(
+    protocol: ProviderProtocol,
+    value: &Value,
+    request: &ModelRequestV2,
+) -> AdapterResult<Vec<ModelStreamEventV2>> {
+    parse_provider_response_v2_with_aliases(protocol, value, &provider_tool_alias_map(request))
+}
+
+fn parse_provider_response_v2_with_aliases(
+    protocol: ProviderProtocol,
+    value: &Value,
+    aliases: &BTreeMap<String, String>,
 ) -> AdapterResult<Vec<ModelStreamEventV2>> {
     let mut events = Vec::new();
     let text = match protocol {
@@ -350,7 +424,7 @@ pub fn parse_provider_response_v2(
         events.push(ModelStreamEventV2::ToolCallStarted {
             call_id: call_id.clone(),
             index,
-            tool_id: tool_id.into(),
+            tool_id: canonical_tool_id(aliases, tool_id),
         });
         if let Some(arguments) = arguments {
             events.push(ModelStreamEventV2::ToolArgumentsDelta {
@@ -425,6 +499,7 @@ pub struct ProviderStreamDecoderV2 {
     protocol: ProviderProtocol,
     pending: String,
     active_calls: BTreeMap<u32, (String, String)>,
+    tool_aliases: BTreeMap<String, String>,
 }
 
 impl ProviderStreamDecoderV2 {
@@ -433,6 +508,16 @@ impl ProviderStreamDecoderV2 {
             protocol,
             pending: String::new(),
             active_calls: BTreeMap::new(),
+            tool_aliases: BTreeMap::new(),
+        }
+    }
+
+    pub fn for_request(protocol: ProviderProtocol, request: &ModelRequestV2) -> Self {
+        Self {
+            protocol,
+            pending: String::new(),
+            active_calls: BTreeMap::new(),
+            tool_aliases: provider_tool_alias_map(request),
         }
     }
 
@@ -512,7 +597,7 @@ impl ProviderStreamDecoderV2 {
                 let tool_id = call
                     .pointer("/function/name")
                     .and_then(Value::as_str)
-                    .map(str::to_owned)
+                    .map(|name| canonical_tool_id(&self.tool_aliases, name))
                     .or_else(|| prior.as_ref().map(|entry| entry.1.clone()))
                     .unwrap_or_default();
                 if prior.is_none() && !tool_id.is_empty() {
@@ -574,11 +659,11 @@ impl ProviderStreamDecoderV2 {
                     .and_then(Value::as_str)
                     .map(str::to_owned)
                     .unwrap_or_else(|| format!("anthropic-{index}"));
-                let tool_id = value
+                let provider_name = value
                     .pointer("/content_block/name")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| AdapterError::Llm("Anthropic tool block has no name".into()))?
-                    .to_owned();
+                    .ok_or_else(|| AdapterError::Llm("Anthropic tool block has no name".into()))?;
+                let tool_id = canonical_tool_id(&self.tool_aliases, provider_name);
                 self.active_calls
                     .insert(index, (call_id.clone(), tool_id.clone()));
                 events.push(ModelStreamEventV2::ToolCallStarted {
@@ -653,11 +738,11 @@ impl ProviderStreamDecoderV2 {
                     .and_then(Value::as_str)
                     .map(str::to_owned)
                     .unwrap_or_else(|| format!("ollama-{index}"));
-                let tool_id = call
+                let provider_name = call
                     .pointer("/function/name")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| AdapterError::Llm("Ollama tool call has no name".into()))?
-                    .to_owned();
+                    .ok_or_else(|| AdapterError::Llm("Ollama tool call has no name".into()))?;
+                let tool_id = canonical_tool_id(&self.tool_aliases, provider_name);
                 if !self.active_calls.contains_key(&index) {
                     events.push(ModelStreamEventV2::ToolCallStarted {
                         call_id: call_id.clone(),
@@ -1099,7 +1184,7 @@ impl UnifiedModelClient {
                 &mut on_event,
             )
             .await?;
-        let mut decoder = ProviderStreamDecoderV2::new(self.protocol);
+        let mut decoder = ProviderStreamDecoderV2::for_request(self.protocol, &request);
         let mut bytes = response.bytes_stream();
         let mut emitted_event = false;
         while let Some(chunk) = bytes.next().await {
@@ -1133,7 +1218,9 @@ impl UnifiedModelClient {
                             provider_request.endpoint
                         ))
                     })?;
-                    for event in parse_provider_response_v2(self.protocol, &value)? {
+                    for event in
+                        parse_provider_response_v2_for_request(self.protocol, &value, &request)?
+                    {
                         on_event(event);
                     }
                     return Ok(());

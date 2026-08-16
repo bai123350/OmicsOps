@@ -1,6 +1,6 @@
 use omicsops_adapters::llm::{
     ProviderProtocol, ProviderStreamDecoderV2, UnifiedModelClient, build_provider_request_v2,
-    parse_provider_response_v2,
+    parse_provider_response_v2, parse_provider_response_v2_for_request,
 };
 use omicsops_agent::{
     ModelMessage,
@@ -55,7 +55,55 @@ fn every_provider_request_contains_all_tools_without_forcing_one() {
         .unwrap();
         assert_eq!(built.body["tools"].as_array().unwrap().len(), 2);
         assert!(built.body.get("tool_choice").is_none());
+        for tool in built.body["tools"].as_array().unwrap() {
+            let name = if protocol == ProviderProtocol::Anthropic {
+                tool["name"].as_str().unwrap()
+            } else {
+                tool["function"]["name"].as_str().unwrap()
+            };
+            assert!(name.chars().all(
+                |character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            ));
+            assert!(name.len() <= 64);
+            assert!(!name.contains('.'));
+        }
     }
+}
+
+#[test]
+fn provider_safe_aliases_round_trip_to_canonical_harness_tool_ids() {
+    let request = request();
+    let built = build_provider_request_v2(
+        ProviderProtocol::OpenAiCompatible,
+        Url::parse("https://example.test/v1").unwrap(),
+        "model",
+        &request,
+    )
+    .unwrap();
+    let alias = built.body["tools"][0]["function"]["name"].as_str().unwrap();
+    assert_ne!(alias, "remote.list");
+
+    let mut decoder =
+        ProviderStreamDecoderV2::for_request(ProviderProtocol::OpenAiCompatible, &request);
+    let payload = format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call-a\",\"function\":{{\"name\":\"{alias}\",\"arguments\":\"{{}}\"}}}}]}}}}]}}\n\ndata: [DONE]\n\n"
+    );
+    let events = decoder.push(payload.as_bytes()).unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ModelStreamEventV2::ToolCallStarted { tool_id, .. } if tool_id == "remote.list"
+    )));
+
+    let events = parse_provider_response_v2_for_request(
+        ProviderProtocol::OpenAiCompatible,
+        &json!({"choices":[{"message":{"tool_calls":[{"id":"call-a","function":{"name":alias,"arguments":"{}"}}]}}]}),
+        &request,
+    )
+    .unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ModelStreamEventV2::ToolCallStarted { tool_id, .. } if tool_id == "remote.list"
+    )));
 }
 
 #[test]
