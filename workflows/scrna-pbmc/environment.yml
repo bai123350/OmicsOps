@@ -2,11 +2,14 @@ name: omicsops-pbmc
 channels:
   - conda-forge
   - bioconda
+  - nodefaults
 dependencies:
   - python=3.12
   - scanpy>=1.11,<1.12
+  - scrublet>=0.2.3,<0.3
   - anndata>=0.11,<0.13
   - h5py>=3.12
+  - hdf5>=2.1,<2.2
   - scipy>=1.14
   - pandas>=2.2
   - numpy>=2.0

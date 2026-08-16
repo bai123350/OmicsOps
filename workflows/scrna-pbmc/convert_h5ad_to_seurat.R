@@ -81,9 +81,30 @@ read_sparse_matrix <- function(group) {
 
 read_matrix <- function(node) {
   if (inherits(node, "H5D")) {
-    return(as(node[], "dgCMatrix"))
+    value <- if (length(node$dims) == 2) node[,] else node[]
+    return(as(value, "dgCMatrix"))
   }
   read_sparse_matrix(node)
+}
+
+read_dense_matrix <- function(node) {
+  if (!inherits(node, "H5D") || length(node$dims) != 2) {
+    stop("expected a two-dimensional HDF5 dataset")
+  }
+  as.matrix(node[,])
+}
+
+read_embedding <- function(node, cell_names, prefix) {
+  embedding <- read_dense_matrix(node)
+  if (nrow(embedding) != length(cell_names) && ncol(embedding) == length(cell_names)) {
+    embedding <- t(embedding)
+  }
+  if (nrow(embedding) != length(cell_names)) {
+    stop(sprintf("%s embedding does not match the cell count", prefix))
+  }
+  rownames(embedding) <- cell_names
+  colnames(embedding) <- paste0(prefix, seq_len(ncol(embedding)))
+  embedding
 }
 
 h5 <- H5File$new(input_path, mode = "r")
@@ -105,9 +126,7 @@ seurat <- CreateSeuratObject(
 )
 
 if (h5$exists("obsm/X_pca")) {
-  pca <- as.matrix(h5[["obsm/X_pca"]][])
-  rownames(pca) <- rownames(obs)
-  colnames(pca) <- paste0("PC_", seq_len(ncol(pca)))
+  pca <- read_embedding(h5[["obsm/X_pca"]], rownames(obs), "PC_")
   seurat[["pca"]] <- CreateDimReducObject(
     embeddings = pca,
     key = "PC_",
@@ -115,9 +134,7 @@ if (h5$exists("obsm/X_pca")) {
   )
 }
 if (h5$exists("obsm/X_umap")) {
-  umap <- as.matrix(h5[["obsm/X_umap"]][])
-  rownames(umap) <- rownames(obs)
-  colnames(umap) <- paste0("UMAP_", seq_len(ncol(umap)))
+  umap <- read_embedding(h5[["obsm/X_umap"]], rownames(obs), "UMAP_")
   seurat[["umap"]] <- CreateDimReducObject(
     embeddings = umap,
     key = "UMAP_",
