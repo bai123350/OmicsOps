@@ -28,10 +28,64 @@ use omicsops_desktop_lib::{
     },
     workspace_commands::{
         CreateProjectRequest, UpdateProjectRemoteRequest, apply_remote_binding,
-        conversation_title_needs_first_message, project_from_request, write_project_manifest,
+        conversation_title_needs_first_message, ensure_project_deletable, project_from_request,
+        write_project_manifest,
     },
 };
 use uuid::Uuid;
+
+#[tokio::test]
+async fn active_project_runs_block_project_deletion() {
+    use omicsops_adapters::{credentials::SystemCredentialVault, persistence::Repository};
+    use omicsops_core::workspace::{Project, ProjectTemplate};
+    use omicsops_desktop_lib::commands::AppState;
+    use std::{
+        collections::HashMap,
+        path::PathBuf,
+        sync::{Arc, Mutex, atomic::AtomicBool},
+    };
+
+    let repository = Repository::open_in_memory().unwrap();
+    let project = Project::new(
+        Uuid::new_v4(),
+        "PBMC",
+        "E:/Science/pbmc",
+        ProjectTemplate::SingleCellRnaSeq,
+        Utc::now(),
+    );
+    let run_id = Uuid::new_v4();
+    repository.save_project(&project).unwrap();
+    repository
+        .put_json(
+            "run_checkpoint",
+            &run_id.to_string(),
+            &serde_json::json!({
+                "run_id": run_id,
+                "project_id": project.id,
+                "plan_id": Uuid::new_v4()
+            }),
+        )
+        .unwrap();
+    let state = AppState {
+        repository,
+        credentials: SystemCredentialVault,
+        active_runs: Arc::new(Mutex::new(HashMap::from([(
+            run_id,
+            Arc::new(AtomicBool::new(false)),
+        )]))),
+        skills_root: PathBuf::new(),
+        research_last_request: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        active_kernels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        project_kernel_queues: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        sync_controls: Arc::new(Mutex::new(HashMap::new())),
+    };
+
+    let error = ensure_project_deletable(&state, project.id)
+        .await
+        .expect_err("active run must block deletion");
+    assert!(error.contains("active run"));
+    assert!(state.repository.get_project(project.id).unwrap().is_some());
+}
 
 #[test]
 fn approved_remote_agent_blocks_privilege_escalation_and_project_escape() {

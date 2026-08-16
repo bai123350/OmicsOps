@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
@@ -80,6 +81,82 @@ pub fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String>
         .repository
         .list_projects()
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_project(state: State<'_, AppState>, project_id: Uuid) -> Result<(), String> {
+    if state
+        .repository
+        .get_project(project_id)
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return Err("project was not found".into());
+    }
+    ensure_project_deletable(&state, project_id).await?;
+
+    let deleted = state
+        .repository
+        .delete_project(project_id)
+        .map_err(|error| error.to_string())?;
+    if !deleted {
+        return Err("project was not found".into());
+    }
+    Ok(())
+}
+
+pub async fn ensure_project_deletable(state: &AppState, project_id: Uuid) -> Result<(), String> {
+    if state
+        .repository
+        .has_active_agent_turns(project_id)
+        .map_err(|error| error.to_string())?
+    {
+        return Err("stop the active agent turn before deleting this project".into());
+    }
+
+    let project_run_ids = state
+        .repository
+        .run_ids_for_project(project_id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let has_active_run = state
+        .active_runs
+        .lock()
+        .map_err(|_| "active run lock poisoned")?
+        .keys()
+        .any(|run_id| project_run_ids.contains(run_id));
+    if has_active_run {
+        return Err("stop the active run before deleting this project".into());
+    }
+
+    if state
+        .active_kernels
+        .lock()
+        .await
+        .values()
+        .any(|kernel| kernel.project_id == project_id)
+    {
+        return Err("stop active kernels before deleting this project".into());
+    }
+
+    let project_sync_ids = state
+        .repository
+        .sync_entries_for_project(project_id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect::<HashSet<_>>();
+    if state
+        .sync_controls
+        .lock()
+        .map_err(|_| "sync control lock poisoned")?
+        .keys()
+        .any(|entry_id| project_sync_ids.contains(entry_id))
+    {
+        return Err("stop active sync transfers before deleting this project".into());
+    }
+    Ok(())
 }
 
 #[tauri::command]

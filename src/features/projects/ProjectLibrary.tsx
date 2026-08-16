@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { BookOpen, ChevronRight, Dna, FilePlus2, FlaskConical, FolderOpen, HardDrive, Languages, Library, Plus, Server, Settings, Sparkles, X } from "lucide-react";
+import { BookOpen, ChevronRight, Dna, FilePlus2, FlaskConical, FolderOpen, HardDrive, Languages, Library, Plus, Server, Settings, Sparkles, Trash2, X } from "lucide-react";
 import type { ConnectionProfile, WorkspaceProject, WorkspaceTemplate } from "../../types";
 import type { Locale } from "../workspace/copy";
 import "./project-library.css";
@@ -21,6 +21,7 @@ interface Props {
   onChooseLocalRoot: () => Promise<string | null>;
   onCreate: (options: CreateProjectOptions) => Promise<void>;
   onOpen: (project: WorkspaceProject) => void;
+  onDelete: (projectId: string) => Promise<void>;
   onSettings: () => void;
 }
 
@@ -31,7 +32,7 @@ const templates = [
   { id: "blank", zh: "空白研究项目", en: "Blank research project", zhDescription: "从自由对话、文件和远端环境开始", enDescription: "Start from conversation, files, and remote compute", icon: FilePlus2 },
 ] satisfies Array<{ id: WorkspaceTemplate; zh: string; en: string; zhDescription: string; enDescription: string; icon: typeof Dna }>;
 
-export function ProjectLibrary({ projects, connections = [], locale, onLocaleChange, onChooseLocalRoot, onCreate, onOpen, onSettings }: Props) {
+export function ProjectLibrary({ projects, connections = [], locale, onLocaleChange, onChooseLocalRoot, onCreate, onOpen, onDelete, onSettings }: Props) {
   const zh = locale === "zh-CN";
   const trustedConnections = useMemo(() => connections.filter((connection) => connection.host_key_fingerprint), [connections]);
   const [template, setTemplate] = useState<WorkspaceTemplate | null>(null);
@@ -42,6 +43,8 @@ export function ProjectLibrary({ projects, connections = [], locale, onLocaleCha
   const [remoteRoot, setRemoteRoot] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState("");
   const selectedConnection = connections.find((connection) => connection.id === connectionId);
 
   function beginCreate(id: WorkspaceTemplate, initialName: string) {
@@ -61,11 +64,27 @@ export function ProjectLibrary({ projects, connections = [], locale, onLocaleCha
     finally { setSubmitting(false); }
   }
 
+  async function deleteProject(project: WorkspaceProject) {
+    const confirmed = window.confirm(zh
+      ? `确定删除项目“${project.name}”吗？\n\nOmicsOps 中的会话、运行记录、Notebook 和索引将被清理。\n本地目录 ${project.local_root} 及远端文件不会被删除。\n\n此操作无法撤销。`
+      : `Delete project “${project.name}”?\n\nIts OmicsOps conversations, run history, notebook, and indexes will be removed.\nThe local folder ${project.local_root} and remote files will not be deleted.\n\nThis cannot be undone.`);
+    if (!confirmed) return;
+    setDeletingProjectId(project.id);
+    setDeleteError("");
+    try {
+      await onDelete(project.id);
+    } catch (reason) {
+      setDeleteError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setDeletingProjectId(null);
+    }
+  }
+
   return <div className="library-page">
     <header className="library-topbar"><div className="library-brand"><span><Sparkles size={19} /></span><b>OmicsOps</b></div><div><button onClick={() => onLocaleChange(zh ? "en-US" : "zh-CN")}><Languages size={16} />{zh ? "English" : "简体中文"}</button><button onClick={onSettings}><Settings size={16} />{zh ? "设置" : "Settings"}</button></div></header>
     <main className="library-main">
       <section className="library-hero"><span>LOCAL WORKSPACE · OPTIONAL REMOTE COMPUTE</span><h1>{zh ? "生命科学项目" : "Life science projects"}</h1><p>{zh ? "每个项目都保存在你选择的本地目录；大型分析可显式绑定可信远端 Linux。" : "Every project lives in a local folder you choose; large analyses can explicitly use a trusted remote Linux host."}</p></section>
-      {projects.length > 0 && <section><div className="section-title"><h2>{zh ? "最近项目" : "Recent projects"}</h2></div><div className="recent-projects">{projects.map((project) => { const connection = connections.find((item) => item.id === project.connection_id); return <button key={project.id} onClick={() => onOpen(project)}><span className="recent-icon"><Library size={19} /></span><span><b>{project.name}</b><small><HardDrive size={11} />{project.local_root}</small><small className={connection ? "remote-target" : "local-target"}>{connection ? <><Server size={11} />{connection.username}@{connection.host}:{connection.port} · {project.remote_root}</> : <><HardDrive size={11} />{zh ? "仅本地，未启用远端计算" : "Local only; remote compute disabled"}</>}</small></span><ChevronRight size={17} /></button>; })}</div></section>}
+      {projects.length > 0 && <section><div className="section-title"><h2>{zh ? "最近项目" : "Recent projects"}</h2></div>{deleteError && <p className="project-delete-error" role="alert">{deleteError}</p>}<div className="recent-projects">{projects.map((project) => { const connection = connections.find((item) => item.id === project.connection_id); const deleting = deletingProjectId === project.id; return <article className="recent-project-card" key={project.id}><button className="recent-project-open" disabled={deletingProjectId !== null} onClick={() => onOpen(project)}><span className="recent-icon"><Library size={19} /></span><span><b>{project.name}</b><small><HardDrive size={11} />{project.local_root}</small><small className={connection ? "remote-target" : "local-target"}>{connection ? <><Server size={11} />{connection.username}@{connection.host}:{connection.port} · {project.remote_root}</> : <><HardDrive size={11} />{zh ? "仅本地，未启用远端计算" : "Local only; remote compute disabled"}</>}</small></span><ChevronRight size={17} /></button><button className="recent-project-delete" aria-label={zh ? `删除项目：${project.name}` : `Delete project: ${project.name}`} title={zh ? "删除项目" : "Delete project"} disabled={deletingProjectId !== null} onClick={() => void deleteProject(project)}>{deleting ? <span className="delete-spinner" aria-hidden="true">…</span> : <Trash2 size={17} />}</button></article>; })}</div></section>}
       <section><div className="section-title"><h2>{zh ? "创建新项目" : "Create a project"}</h2><p>{zh ? "模板选择后会确认本地存储位置和计算位置" : "After choosing a template, confirm local storage and compute location"}</p></div><div className="template-grid">{templates.map(({ id, zh: nameZh, en, zhDescription, enDescription, icon: Icon }) => <button key={id} className="template-card" onClick={() => beginCreate(id, zh ? nameZh : en)}><span className="template-icon"><Icon size={22} /></span><span><b>{zh ? nameZh : en}</b><small>{zh ? zhDescription : enDescription}</small></span><span className="template-arrow"><Plus size={17} /></span></button>)}</div></section>
     </main>
     {template && <div className="create-project-backdrop"><section className="create-project-dialog" role="dialog" aria-modal="true" aria-label={zh ? "创建新项目" : "Create project"}><header><div><small>{zh ? "本地工作区与计算位置" : "Workspace and compute location"}</small><h2>{zh ? "创建新项目" : "Create project"}</h2></div><button aria-label="Close" onClick={() => setTemplate(null)}><X size={18} /></button></header><div className="create-project-body">

@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 
 use omicsops_agent::AgentEvent;
 use omicsops_core::{
@@ -7,7 +10,7 @@ use omicsops_core::{
     plan_v2::{ApprovedPlan, EnvironmentLock, StepAttempt, migrate_v1_plan},
     workspace::{
         AgentTurn, Artifact, Conversation, Message, ModelProfile, NotebookEntry, Project,
-        SkillPackage, SyncEntry,
+        SkillPackage, SyncEntry, TurnStatus,
     },
 };
 use rusqlite::{Connection, params};
@@ -192,6 +195,178 @@ impl Repository {
             return Ok(None);
         };
         Ok(Some(serde_json::from_str(&row.get::<_, String>(0)?)?))
+    }
+
+    pub fn run_ids_for_project(&self, project_id: Uuid) -> AdapterResult<Vec<Uuid>> {
+        let project_id = project_id.to_string();
+        let connection = self.connection.lock().expect("database lock");
+        let mut statement = connection.prepare("SELECT value_json FROM app_objects")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut run_ids = HashSet::new();
+        for row in rows {
+            let value = serde_json::from_str::<serde_json::Value>(&row?)?;
+            if value.get("project_id").and_then(|field| field.as_str()) == Some(&project_id)
+                && let Some(run_id) = value
+                    .get("run_id")
+                    .and_then(|field| field.as_str())
+                    .and_then(|field| Uuid::parse_str(field).ok())
+            {
+                run_ids.insert(run_id);
+            }
+        }
+        Ok(run_ids.into_iter().collect())
+    }
+
+    pub fn has_active_agent_turns(&self, project_id: Uuid) -> AdapterResult<bool> {
+        let connection = self.connection.lock().expect("database lock");
+        let mut statement =
+            connection.prepare("SELECT value_json FROM agent_turns WHERE project_id = ?1")?;
+        let rows = statement.query_map([project_id.to_string()], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            let turn = serde_json::from_str::<AgentTurn>(&row?)?;
+            if matches!(
+                turn.status,
+                TurnStatus::Queued | TurnStatus::Streaming | TurnStatus::WaitingForApproval
+            ) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn delete_project(&self, project_id: Uuid) -> AdapterResult<bool> {
+        let mut connection = self.connection.lock().expect("database lock");
+        let transaction = connection.transaction()?;
+        let project_id = project_id.to_string();
+        let exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+            [&project_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            transaction.rollback()?;
+            return Ok(false);
+        }
+
+        let app_objects = {
+            let mut statement =
+                transaction.prepare("SELECT kind, id, value_json FROM app_objects")?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let project_artifacts = {
+            let mut statement =
+                transaction.prepare("SELECT value_json FROM artifacts_v3 WHERE project_id = ?1")?;
+            let rows = statement.query_map([&project_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut run_ids = HashSet::new();
+        let mut plan_ids = HashSet::new();
+        let mut approved_plan_ids = HashSet::new();
+        let mut app_objects_to_delete = HashSet::new();
+        for (kind, id, json) in &app_objects {
+            let value = serde_json::from_str::<serde_json::Value>(json)?;
+            let belongs_to_project = value.get("project_id").and_then(|field| field.as_str())
+                == Some(&project_id)
+                || (kind == "project" && id == &project_id);
+            if !belongs_to_project {
+                continue;
+            }
+            app_objects_to_delete.insert((kind.clone(), id.clone()));
+            collect_uuid_field(&value, "run_id", &mut run_ids);
+            collect_uuid_field(&value, "plan_id", &mut plan_ids);
+            collect_uuid_field(&value, "approved_plan_id", &mut approved_plan_ids);
+        }
+        for json in project_artifacts {
+            let value = serde_json::from_str::<serde_json::Value>(&json)?;
+            collect_uuid_field(&value, "run_id", &mut run_ids);
+        }
+
+        for approved_plan_id in &approved_plan_ids {
+            let plan_json = transaction
+                .query_row(
+                    "SELECT approved_plan_json FROM approved_plans WHERE id = ?1",
+                    [approved_plan_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok();
+            if let Some(plan_json) = plan_json {
+                let value = serde_json::from_str::<serde_json::Value>(&plan_json)?;
+                collect_uuid_field(&value, "plan_id", &mut plan_ids);
+            }
+        }
+
+        for (kind, id, json) in &app_objects {
+            let value = serde_json::from_str::<serde_json::Value>(json)?;
+            let linked_run = value
+                .get("run_id")
+                .and_then(|field| field.as_str())
+                .and_then(|field| Uuid::parse_str(field).ok())
+                .is_some_and(|run_id| run_ids.contains(&run_id));
+            let linked_plan = kind.starts_with("analysis_plan")
+                && Uuid::parse_str(id)
+                    .ok()
+                    .is_some_and(|plan_id| plan_ids.contains(&plan_id));
+            if linked_run || linked_plan {
+                app_objects_to_delete.insert((kind.clone(), id.clone()));
+            }
+        }
+
+        for run_id in &run_ids {
+            let run_id = run_id.to_string();
+            transaction.execute("DELETE FROM run_events WHERE run_id = ?1", [&run_id])?;
+            transaction.execute("DELETE FROM audit_events_v2 WHERE run_id = ?1", [&run_id])?;
+            transaction.execute("DELETE FROM step_attempts_v2 WHERE run_id = ?1", [&run_id])?;
+            transaction.execute(
+                "DELETE FROM environment_locks_v2 WHERE run_id = ?1",
+                [&run_id],
+            )?;
+        }
+        for approved_plan_id in &approved_plan_ids {
+            transaction.execute(
+                "DELETE FROM approved_plans WHERE id = ?1",
+                [approved_plan_id.to_string()],
+            )?;
+        }
+        for (kind, id) in app_objects_to_delete {
+            transaction.execute(
+                "DELETE FROM app_objects WHERE kind = ?1 AND id = ?2",
+                params![kind, id],
+            )?;
+        }
+
+        transaction.execute(
+            "DELETE FROM agent_events WHERE turn_id IN (SELECT id FROM agent_turns WHERE project_id = ?1)",
+            [&project_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM tool_calls WHERE turn_id IN (SELECT id FROM agent_turns WHERE project_id = ?1)",
+            [&project_id],
+        )?;
+        for table in [
+            "agent_turns",
+            "messages",
+            "approvals_v3",
+            "artifacts_v3",
+            "notebook_entries",
+            "sync_entries",
+            "conversations",
+        ] {
+            transaction.execute(
+                &format!("DELETE FROM {table} WHERE project_id = ?1"),
+                [&project_id],
+            )?;
+        }
+        transaction.execute("DELETE FROM projects WHERE id = ?1", [&project_id])?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     pub fn save_conversation(&self, conversation: &Conversation) -> AdapterResult<()> {
@@ -584,5 +759,15 @@ impl Repository {
             Ok(serde_json::from_str(&json)?)
         })
         .collect()
+    }
+}
+
+fn collect_uuid_field(value: &serde_json::Value, field: &str, destination: &mut HashSet<Uuid>) {
+    if let Some(id) = value
+        .get(field)
+        .and_then(|field| field.as_str())
+        .and_then(|field| Uuid::parse_str(field).ok())
+    {
+        destination.insert(id);
     }
 }

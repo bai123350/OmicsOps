@@ -112,6 +112,7 @@ pub fn run() {
             p1_commands::call_configured_mcp_tool,
             workspace_commands::list_projects,
             workspace_commands::create_project,
+            workspace_commands::delete_project,
             workspace_commands::update_project_remote,
             workspace_commands::list_conversations,
             workspace_commands::create_conversation,

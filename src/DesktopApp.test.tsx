@@ -33,6 +33,20 @@ describe("DesktopApp", () => {
     expect(screen.getByText("PBMC 项目")).toBeInTheDocument();
   });
 
+  it("removes a deleted project from the recent project list", async () => {
+    const project = { id: "project-1", name: "待删除项目", description: "", local_root: "E:/Science/delete-me", remote_root: null, connection_id: null, template: "single_cell_rna_seq" as const, status: "ready" as const, ollama_only: false, created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" };
+    vi.spyOn(api, "listProjects").mockResolvedValue([project]);
+    const deleteProject = vi.spyOn(api, "deleteProject").mockResolvedValue(undefined);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<DesktopApp />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "返回项目主页" }));
+    fireEvent.click(screen.getByRole("button", { name: "删除项目：待删除项目" }));
+
+    await waitFor(() => expect(deleteProject).toHaveBeenCalledWith(project.id));
+    await waitFor(() => expect(screen.queryByText("待删除项目")).not.toBeInTheDocument());
+  });
+
   it("centralizes model, remote compute, privacy, and legacy history settings", async () => {
     vi.spyOn(api, "listProjects").mockResolvedValue([]);
     render(<DesktopApp />);
