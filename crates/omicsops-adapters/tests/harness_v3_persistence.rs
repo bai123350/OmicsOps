@@ -59,6 +59,20 @@ fn append_only_events_round_trip_after_chain_validation() {
 }
 
 #[test]
+fn events_can_be_replayed_by_project_and_conversation_after_restart() {
+    let (repository, spec, project, conversation, at) = fixture();
+    let first = AgentRunEventV3::first(&spec, at, AgentRunEventKindV3::RunStarted).unwrap();
+    repository.append_agent_run_event_v3(&first).unwrap();
+
+    assert_eq!(
+        repository
+            .agent_run_events_for_context_v3(project.id, Some(conversation.id))
+            .unwrap(),
+        vec![first]
+    );
+}
+
+#[test]
 fn append_rejects_gaps_wrong_previous_hash_and_tampering() {
     let (repository, spec, _, _, at) = fixture();
     let first = AgentRunEventV3::first(&spec, at, AgentRunEventKindV3::RunStarted).unwrap();

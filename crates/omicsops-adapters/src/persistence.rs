@@ -590,6 +590,43 @@ impl Repository {
         Ok(events)
     }
 
+    pub fn agent_run_events_for_context_v3(
+        &self,
+        project_id: Uuid,
+        conversation_id: Option<Uuid>,
+    ) -> AdapterResult<Vec<AgentRunEventV3>> {
+        let connection = self.connection.lock().expect("database lock");
+        let mut events = if let Some(conversation_id) = conversation_id {
+            let mut statement = connection.prepare(
+                "SELECT value_json FROM agent_run_events_v3
+                 WHERE project_id = ?1 AND conversation_id = ?2
+                 ORDER BY run_id, sequence",
+            )?;
+            let rows = statement.query_map(
+                params![project_id.to_string(), conversation_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )?;
+            rows.map(|row| Ok(serde_json::from_str(&row?)?))
+                .collect::<AdapterResult<Vec<AgentRunEventV3>>>()?
+        } else {
+            let mut statement = connection.prepare(
+                "SELECT value_json FROM agent_run_events_v3
+                 WHERE project_id = ?1
+                 ORDER BY run_id, sequence",
+            )?;
+            let rows =
+                statement.query_map([project_id.to_string()], |row| row.get::<_, String>(0))?;
+            rows.map(|row| Ok(serde_json::from_str(&row?)?))
+                .collect::<AdapterResult<Vec<AgentRunEventV3>>>()?
+        };
+        for run in events.chunk_by(|left, right| left.run_id == right.run_id) {
+            validate_event_chain(run)
+                .map_err(|error| crate::AdapterError::InvalidInput(error.to_string()))?;
+        }
+        events.sort_by_key(|event| (event.occurred_at, event.sequence));
+        Ok(events)
+    }
+
     pub fn save_agent_snapshot_v3(&self, snapshot: &AgentSnapshotV3) -> AdapterResult<()> {
         if snapshot.state.run_id != snapshot.run_id
             || snapshot.state.last_sequence != snapshot.last_sequence
