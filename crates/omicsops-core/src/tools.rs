@@ -156,13 +156,24 @@ pub fn builtin_tool_catalog() -> CoreResult<ToolCatalog> {
             Vec::new(),
             vec![],
         ),
+        (
+            "agent.harness_v3",
+            "Event-sourced multi-tool agent harness",
+            "omicsops-agent",
+            Vec::new(),
+            vec![],
+        ),
     ];
     let limits = ResourceLimits::default();
     let manifests = definitions
         .into_iter()
         .map(|(id, title, executable, dependencies, domains)| ToolManifest {
             id: id.into(),
-            version: "1.0.0".into(),
+            version: if id == "agent.harness_v3" {
+                "3.0.0".into()
+            } else {
+                "1.0.0".into()
+            },
             title: title.into(),
             description: format!("Built-in OmicsOps tool contract for {title}."),
             executable: executable.into(),
@@ -220,11 +231,30 @@ pub fn builtin_tool_catalog() -> CoreResult<ToolCatalog> {
                     },
                     "additionalProperties":false
                 }),
+                "agent.harness_v3" => json!({
+                    "type":"object",
+                    "required":["goal","remote_observation","completion_criteria","tool_snapshot","skill_references"],
+                    "properties":{
+                        "goal":{"type":"string"},
+                        "remote_observation":{"type":"string"},
+                        "completion_criteria":{"type":"array"},
+                        "tool_snapshot":{"type":"array"},
+                        "skill_references":{"type":"array"},
+                        "conversation_history":{"type":"string"},
+                        "operational_memory":{"type":"string"},
+                        "harness_version":{"type":"integer"}
+                    },
+                    "additionalProperties":false
+                }),
                 _ => json!({"type":"object","required":["script"],"properties":{"script":{"type":"string"},"input":{"type":"string"},"output":{"type":"string"}},"additionalProperties":false}),
             },
             micromamba_dependencies: dependencies.into_iter().map(str::to_owned).collect(),
             allowed_domains: domains.into_iter().map(str::to_owned).collect(),
-            default_risk: StepRisk::Low,
+            default_risk: if id == "agent.harness_v3" {
+                StepRisk::Medium
+            } else {
+                StepRisk::Low
+            },
             max_resources: limits.clone(),
         })
         .collect();

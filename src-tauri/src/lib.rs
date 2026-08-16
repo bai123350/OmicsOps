@@ -1,5 +1,6 @@
 pub mod agent_commands;
 pub mod commands;
+pub mod harness_v3;
 pub mod inspection;
 pub mod kernel_commands;
 pub mod model_commands;
@@ -85,6 +86,8 @@ pub fn run() {
             commands::list_runs_v2,
             commands::list_run_events_v2,
             commands::list_agent_run_events,
+            harness_v3::list_agent_run_events_v3,
+            harness_v3::answer_agent_run_question_v3,
             commands::list_artifacts_v2,
             commands::list_step_attempts_v2,
             commands::get_environment_lock_v2,

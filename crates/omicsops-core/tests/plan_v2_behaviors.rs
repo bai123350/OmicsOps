@@ -202,6 +202,13 @@ fn remote_agent_tool_accepts_read_only_memory_context() {
 }
 
 #[test]
+fn harness_v3_is_versioned_without_removing_v2_recovery() {
+    let catalog = builtin_tool_catalog().unwrap();
+    assert!(catalog.get("agent.harness_v3", "3.0.0").is_some());
+    assert!(catalog.get("agent.remote_task", "1.0.0").is_some());
+}
+
+#[test]
 fn builtin_catalog_exposes_versioned_bioinformatics_tools() {
     let catalog = builtin_tool_catalog().unwrap();
 

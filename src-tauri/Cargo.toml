@@ -12,6 +12,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+async-trait.workspace = true
 chrono.workspace = true
 base64.workspace = true
 omicsops-agent = { path = "../crates/omicsops-agent" }

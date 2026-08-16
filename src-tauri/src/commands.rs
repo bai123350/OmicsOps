@@ -670,6 +670,27 @@ pub async fn start_run(
     let profile = find_profile(&state.repository, profile_id)?;
     require_trusted_host(&profile)?;
     let project = current_project_spec(&state.repository, project_id)?;
+    if plan.metadata.get("harness_id").map(String::as_str) == Some("agent.harness_v3@3.0.0") {
+        let model_profile_id = plan
+            .metadata
+            .get("model_profile_id")
+            .ok_or_else(|| "approved Harness v3 plan has no model profile".to_string())?
+            .parse::<Uuid>()
+            .map_err(|_| "approved Harness v3 plan has an invalid model profile".to_string())?;
+        let authentication = authentication_for_profile(&state, &profile)?;
+        let model = unified_model_client(&state, model_profile_id)?;
+        return crate::harness_v3::start(
+            app,
+            &state,
+            profile,
+            authentication,
+            project,
+            approved_plan_id,
+            plan,
+            model_profile_id,
+            model,
+        );
+    }
     let active = state
         .repository
         .list_json::<RunCheckpointV2>("run_checkpoint_v2")
@@ -1007,11 +1028,24 @@ pub fn resume_run_v2(
     state: State<'_, AppState>,
     run_id: Uuid,
 ) -> Result<(), String> {
-    let checkpoint: RunCheckpointV2 = state
+    let checkpoint: Option<RunCheckpointV2> = state
         .repository
         .get_json("run_checkpoint_v2", &run_id.to_string())
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "run does not exist".to_owned())?;
+        .map_err(|error| error.to_string())?;
+    let Some(checkpoint) = checkpoint else {
+        if state
+            .repository
+            .get_json::<omicsops_agent::harness_v3::AgentRunSpecV3>(
+                "agent_run_spec_v3",
+                &run_id.to_string(),
+            )
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return crate::harness_v3::resume(app, &state, run_id);
+        }
+        return Err("run does not exist".into());
+    };
     if checkpoint.state == RunStateV2::NeedsAttention {
         return Err("run needs explicit attention and cannot be silently rerun".into());
     }
@@ -1256,6 +1290,18 @@ pub fn cancel_run(app: AppHandle, state: State<'_, AppState>, run_id: Uuid) -> R
         return Ok(());
     }
 
+    if state
+        .repository
+        .get_json::<omicsops_agent::harness_v3::AgentRunSpecV3>(
+            "agent_run_spec_v3",
+            &run_id.to_string(),
+        )
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return crate::harness_v3::cancel_persisted(&state.repository, &app, run_id);
+    }
+
     let legacy: Option<RunCheckpoint> = state
         .repository
         .get_json("run_checkpoint", &run_id.to_string())
@@ -1319,8 +1365,8 @@ pub fn cancel_run(app: AppHandle, state: State<'_, AppState>, run_id: Uuid) -> R
     Ok(())
 }
 
-fn authentication_for_profile(
-    state: &State<'_, AppState>,
+pub(crate) fn authentication_for_profile(
+    state: &AppState,
     profile: &ConnectionProfile,
 ) -> Result<SshAuthentication, String> {
     let secret = state
@@ -4206,8 +4252,8 @@ fn llm_client(state: &State<'_, AppState>) -> Result<OpenAiCompatibleClient, Str
     ))
 }
 
-fn unified_model_client(
-    state: &State<'_, AppState>,
+pub(crate) fn unified_model_client(
+    state: &AppState,
     model_profile_id: Uuid,
 ) -> Result<UnifiedModelClient, String> {
     let profile = state
@@ -4239,7 +4285,10 @@ fn unified_model_client(
     .map_err(|error| error.to_string())
 }
 
-fn current_project_spec(repository: &Repository, project_id: Uuid) -> Result<ProjectSpec, String> {
+pub(crate) fn current_project_spec(
+    repository: &Repository,
+    project_id: Uuid,
+) -> Result<ProjectSpec, String> {
     let project = repository
         .get_project(project_id)
         .map_err(|error| error.to_string())?

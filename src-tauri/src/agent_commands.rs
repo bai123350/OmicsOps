@@ -5,7 +5,7 @@ use omicsops_adapters::{
 };
 use omicsops_agent::{
     AgentEvent, AgentEventKind, ModelMessage, ModelRequest, ModelStreamEvent, ToolArgumentBuffer,
-    structured_value_from_text,
+    harness_v3::builtin_tool_definitions_v3, structured_value_from_text,
 };
 use omicsops_core::workspace::{
     AgentTurn, Conversation, Message, MessageRole, ModelProviderKind, TurnStatus,
@@ -878,6 +878,10 @@ pub async fn propose_analysis_plan(
     let remote_observation = inspect_remote_project(&state, &project).await?;
     let skill_context = enabled_skill_context(&state)?;
     let skill_citations = crate::p1_commands::enabled_skill_citations(&repository)?;
+    let mut tool_snapshot = builtin_tool_definitions_v3();
+    tool_snapshot.extend(crate::p1_commands::approved_mcp_tool_definitions_v3(
+        &repository,
+    )?);
     let conversation_history = conversation_history_text(&repository, request.conversation_id)?;
     let operational_memory = crate::commands::remote_agent_memory_context(
         &repository,
@@ -932,16 +936,17 @@ pub async fn propose_analysis_plan(
                 rationale: "After approval, inspect, configure, execute, verify, and adapt through the remote terminal within the project root.".into(),
                 dependencies: Vec::new(),
                 action: StepAction::Tool {
-                    tool_id: "agent.remote_task".into(),
-                    version: "1.0.0".into(),
+                    tool_id: "agent.harness_v3".into(),
+                    version: "3.0.0".into(),
                     arguments: json!({
                         "goal": request.goal.trim(),
                         "remote_observation": remote_observation,
                         "completion_criteria": draft.completion_criteria,
-                        "skill_context": skill_context,
+                        "tool_snapshot": tool_snapshot,
+                        "skill_references": skill_citations,
                         "conversation_history": conversation_history,
                         "operational_memory": operational_memory,
-                        "max_iterations": 24
+                        "harness_version": 3
                     }),
                 },
                 working_directory: ".".into(),
@@ -953,13 +958,15 @@ pub async fn propose_analysis_plan(
         }],
         resource_budget: resources,
         policy: PolicyEnvelope {
-            allowed_tools: vec!["agent.remote_task".into()],
+            allowed_tools: vec!["agent.harness_v3".into()],
             allowed_domains: Vec::new(),
             max_risk: StepRisk::Medium,
             allow_legacy_shell: false,
         },
         metadata: std::collections::BTreeMap::from([
-            ("execution_mode".into(), "remote_agent".into()),
+            ("execution_mode".into(), "harness_v3".into()),
+            ("harness_id".into(), "agent.harness_v3@3.0.0".into()),
+            ("harness_version".into(), "3".into()),
             ("model_profile_id".into(), request.model_profile_id.to_string()),
             ("goal".into(), request.goal.trim().into()),
             ("conversation_id".into(), request.conversation_id.to_string()),

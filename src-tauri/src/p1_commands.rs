@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, io::Write, path::Path, process::Stdio};
 
 use chrono::Utc;
 use omicsops_adapters::persistence::Repository;
+use omicsops_agent::harness_v3::ToolDefinitionV3;
 use omicsops_core::workspace::{
     Artifact, EvidenceReference, MemoryFact, NotebookEntry, NotebookEntryKind, SkillCitation,
 };
@@ -1104,4 +1105,117 @@ mod tests {
         assert!(changed.tools.is_empty());
         assert!(changed.last_inspected_at.is_none());
     }
+
+    #[test]
+    fn harness_snapshot_includes_only_enabled_declared_and_approved_mcp_tools() {
+        let repository = Repository::open_in_memory().unwrap();
+        let now = Utc::now();
+        let server_id = Uuid::new_v4();
+        let profile = McpServerProfile {
+            id: server_id,
+            name: "papers".into(),
+            command: "fixture".into(),
+            args: vec![],
+            enabled: true,
+            approved_tools: vec!["search".into()],
+            tools: vec![
+                json!({"name":"search","description":"Search papers","inputSchema":{"type":"object"}}),
+                json!({"name":"write","description":"Not approved","inputSchema":{"type":"object"}}),
+            ],
+            capabilities: json!({}),
+            last_inspected_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        repository
+            .put_json("mcp_server", &server_id.to_string(), &profile)
+            .unwrap();
+
+        let definitions = approved_mcp_tool_definitions_v3(&repository).unwrap();
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].id, format!("mcp::{server_id}::search"));
+    }
+}
+
+pub(crate) fn approved_mcp_tool_definitions_v3(
+    repository: &Repository,
+) -> Result<Vec<ToolDefinitionV3>, String> {
+    let profiles = repository
+        .list_json::<McpServerProfile>("mcp_server")
+        .map_err(|error| error.to_string())?;
+    let mut definitions = Vec::new();
+    for profile in profiles.into_iter().filter(|profile| profile.enabled) {
+        for tool in &profile.tools {
+            let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if !profile
+                .approved_tools
+                .iter()
+                .any(|approved| approved == name)
+            {
+                continue;
+            }
+            let description = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("Approved MCP tool");
+            let input_schema = tool
+                .get("inputSchema")
+                .or_else(|| tool.get("input_schema"))
+                .cloned()
+                .unwrap_or_else(|| json!({"type":"object"}));
+            definitions.push(ToolDefinitionV3::mcp(
+                profile.id.to_string(),
+                name,
+                description,
+                input_schema,
+            ));
+        }
+    }
+    definitions.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(definitions)
+}
+
+pub(crate) async fn invoke_configured_mcp_tool_v3(
+    repository: &Repository,
+    project_id: Uuid,
+    server_id: Uuid,
+    tool: &str,
+    arguments: Value,
+) -> Result<McpResult, String> {
+    let profile = mcp_server_profile(repository, server_id)?;
+    if !profile.enabled {
+        return Err("MCP server is disabled".into());
+    }
+    let declared = profile
+        .tools
+        .iter()
+        .any(|entry| entry.get("name").and_then(Value::as_str) == Some(tool));
+    if !declared {
+        return Err(format!(
+            "MCP tool {tool} is no longer declared by the server"
+        ));
+    }
+    if !profile
+        .approved_tools
+        .iter()
+        .any(|approved| approved == tool)
+    {
+        return Err(format!("MCP tool {tool} approval was revoked"));
+    }
+    run_mcp(
+        repository,
+        McpRequest {
+            project_id,
+            name: profile.name,
+            command: profile.command,
+            args: profile.args,
+            approved: true,
+            tool: Some(tool.into()),
+            arguments: Some(arguments),
+        },
+        true,
+    )
+    .await
 }
