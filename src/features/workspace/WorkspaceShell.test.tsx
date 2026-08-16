@@ -220,7 +220,9 @@ describe("WorkspaceShell", () => {
   it("uploads only through the explicit file selection action", () => {
     const onUploadFiles = vi.fn();
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onUploadFiles={onUploadFiles} remoteFiles={[{ relative_path: "results/umap.png", directory: false, size_bytes: 42, modified_unix_seconds: 1 }]} />);
-    expect(screen.getByText("results/umap.png")).toBeInTheDocument();
+    expect(screen.getByText("results")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("treeitem", { name: "展开文件夹：results" }));
+    expect(screen.getByText("umap.png")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "选择上传文件" }));
     expect(onUploadFiles).toHaveBeenCalledOnce();
   });
