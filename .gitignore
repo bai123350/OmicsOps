@@ -16,3 +16,7 @@
 .env
 .env.*
 !.env.example
+docs/2026-08-11-omicsops-life-science-desktop-workbench.md
+docs/2026-08-11-window-handoff.md
+docs/2026-08-12-window-handoff.md
+docs/2026-08-13-window-handoff.md
