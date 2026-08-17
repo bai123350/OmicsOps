@@ -16,6 +16,7 @@ use omicsops_core::{
         SkillPackage, SyncEntry, TurnStatus,
     },
 };
+use omicsops_protocol::{AgentEventV4, validate_event_chain_v4};
 use rusqlite::{Connection, params};
 use uuid::Uuid;
 
@@ -144,11 +145,30 @@ impl Repository {
                 last_event_hash TEXT NOT NULL,
                 value_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS agent_runs_v4 (
+                run_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                value_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS agent_events_v4 (
+                run_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                previous_hash TEXT NOT NULL,
+                event_hash TEXT NOT NULL UNIQUE,
+                value_json TEXT NOT NULL,
+                PRIMARY KEY(run_id, sequence)
+            );
             CREATE INDEX IF NOT EXISTS conversations_project_updated ON conversations(project_id, updated_at DESC);
             CREATE INDEX IF NOT EXISTS agent_run_events_v3_project_conversation
                 ON agent_run_events_v3(project_id, conversation_id, run_id, sequence);
             CREATE INDEX IF NOT EXISTS agent_run_snapshots_v3_project_conversation
                 ON agent_run_snapshots_v3(project_id, conversation_id, run_id);
+            CREATE INDEX IF NOT EXISTS agent_events_v4_project_conversation
+                ON agent_events_v4(project_id, conversation_id, run_id, sequence);
             PRAGMA user_version = 3;
             ",
         )?;
@@ -380,6 +400,14 @@ impl Repository {
             [&project_id],
         )?;
         transaction.execute(
+            "DELETE FROM agent_events_v4 WHERE project_id = ?1",
+            [&project_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM agent_runs_v4 WHERE project_id = ?1",
+            [&project_id],
+        )?;
+        transaction.execute(
             "DELETE FROM tool_calls WHERE turn_id IN (SELECT id FROM agent_turns WHERE project_id = ?1)",
             [&project_id],
         )?;
@@ -446,6 +474,14 @@ impl Repository {
         )?;
         transaction.execute(
             "DELETE FROM agent_run_snapshots_v3 WHERE project_id = ?1 AND conversation_id = ?2",
+            params![project_id, conversation_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM agent_events_v4 WHERE project_id = ?1 AND conversation_id = ?2",
+            params![project_id, conversation_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM agent_runs_v4 WHERE project_id = ?1 AND conversation_id = ?2",
             params![project_id, conversation_id],
         )?;
         transaction.execute(
@@ -825,6 +861,79 @@ impl Repository {
             Ok(serde_json::from_str(&json)?)
         })
         .collect()
+    }
+
+    pub fn save_agent_run_v4(
+        &self,
+        run_id: Uuid,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        status: &str,
+        value: &serde_json::Value,
+    ) -> AdapterResult<()> {
+        self.connection.lock().expect("repository lock").execute(
+            "INSERT INTO agent_runs_v4 (run_id, project_id, conversation_id, status, value_json) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(run_id) DO UPDATE SET status=excluded.status, value_json=excluded.value_json",
+            params![run_id.to_string(), project_id.to_string(), conversation_id.to_string(), status, serde_json::to_string(value)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn agent_run_v4(&self, run_id: Uuid) -> AdapterResult<Option<serde_json::Value>> {
+        let connection = self.connection.lock().expect("repository lock");
+        let mut statement =
+            connection.prepare("SELECT value_json FROM agent_runs_v4 WHERE run_id=?1")?;
+        let mut rows = statement.query([run_id.to_string()])?;
+        rows.next()?
+            .map(|row| {
+                let value: String = row.get(0)?;
+                serde_json::from_str(&value).map_err(Into::into)
+            })
+            .transpose()
+    }
+
+    pub fn append_agent_event_v4(&self, event: &AgentEventV4) -> AdapterResult<()> {
+        event
+            .verify()
+            .map_err(|error| crate::AdapterError::InvalidInput(error.to_string()))?;
+        let existing = self.agent_events_v4(event.run_id)?;
+        let mut candidate = existing;
+        candidate.push(event.clone());
+        validate_event_chain_v4(&candidate)
+            .map_err(|error| crate::AdapterError::InvalidInput(error.to_string()))?;
+        self.connection.lock().expect("repository lock").execute(
+            "INSERT INTO agent_events_v4 (run_id, project_id, conversation_id, sequence, previous_hash, event_hash, value_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![event.run_id.to_string(), event.project_id.to_string(), event.conversation_id.to_string(), event.sequence, event.previous_hash, event.event_hash, serde_json::to_string(event)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn agent_events_v4(&self, run_id: Uuid) -> AdapterResult<Vec<AgentEventV4>> {
+        let connection = self.connection.lock().expect("repository lock");
+        let mut statement = connection
+            .prepare("SELECT value_json FROM agent_events_v4 WHERE run_id=?1 ORDER BY sequence")?;
+        let events = statement
+            .query_map([run_id.to_string()], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_str::<AgentEventV4>(&row?)?))
+            .collect::<AdapterResult<Vec<_>>>()?;
+        validate_event_chain_v4(&events)
+            .map_err(|error| crate::AdapterError::InvalidInput(error.to_string()))?;
+        Ok(events)
+    }
+
+    pub fn agent_events_for_context_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+    ) -> AdapterResult<Vec<AgentEventV4>> {
+        let connection = self.connection.lock().expect("repository lock");
+        let mut statement = connection.prepare("SELECT value_json FROM agent_events_v4 WHERE project_id=?1 AND conversation_id=?2 ORDER BY run_id, sequence")?;
+        statement
+            .query_map(
+                params![project_id.to_string(), conversation_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )?
+            .map(|row| Ok(serde_json::from_str::<AgentEventV4>(&row?)?))
+            .collect()
     }
 
     pub fn append_event(&self, event: &RunEvent) -> AdapterResult<()> {

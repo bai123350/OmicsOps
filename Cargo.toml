@@ -2,6 +2,10 @@
 members = [
   "crates/omicsops-core",
   "crates/omicsops-agent",
+  "crates/omicsops-protocol",
+  "crates/omicsops-agent-core",
+  "crates/omicsops-tools",
+  "crates/omicsops-runtime",
   "crates/omicsops-adapters",
   "crates/omicsops-runner",
   "src-tauri"

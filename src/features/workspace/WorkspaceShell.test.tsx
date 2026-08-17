@@ -11,6 +11,15 @@ const project = {
 };
 
 describe("WorkspaceShell", () => {
+  it("renders the V4 hash-chained trajectory separately from legacy runs", () => {
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-v4" agentRunEventsV4={[{
+      schema_version: 4, run_id: "run-v4", project_id: project.id, conversation_id: "conversation-1", sequence: 1,
+      occurred_at: "2026-08-17T00:00:00Z", previous_hash: "", event_hash: "a".repeat(64), event: { kind: "run_created", mode: "plan" },
+    }]} />);
+    expect(screen.getByText("Agent Runtime V4")).toBeInTheDocument();
+    expect(screen.getByText(/Plan\/Execute 硬隔离/)).toBeInTheDocument();
+    expect(screen.getByText("规划启动")).toBeInTheDocument();
+  });
   it("keeps projects, scientific conversation, and context visible together", () => {
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} />);
 

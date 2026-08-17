@@ -44,3 +44,21 @@ cargo test -p omicsops-desktop live_harness_v3_dynamically_delivers_pbmc3k_witho
 
 An ignored result means the live SSH/model/MCP acceptance was not executed and
 must not be reported as passed.
+
+## Agent Runtime V4 stage-1 acceptance
+
+`agent_v4::tests::live_v4_model_plan_and_persistent_ssh_python_kernel` uses the
+same explicit live model/SSH variables listed above. It asks the real model for
+an `ExecutionPlanV4`, validates its canonical SHA-256 contract, then launches a
+run-scoped SSH JSONL Python kernel. Cell 1 defines `v4_probe`; cell 2 prints that
+variable without redefining it. The test requires the same kernel session and
+process identity for both cells.
+
+Run only against an empty disposable remote root:
+
+```text
+cargo test -p omicsops-desktop live_v4_model_plan_and_persistent_ssh_python_kernel -- --ignored --exact --nocapture
+```
+
+The V4 route must not become the default new-task route until this live test
+actually passes. An ignored result is not acceptance.

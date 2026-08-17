@@ -393,6 +393,48 @@ export interface AgentRunEventV3 {
   event: AgentRunEventKindV3;
 }
 
+export interface ExecutionPlanV4 {
+  schema_version: 4;
+  objective: string;
+  steps: string[];
+  completion_criteria: string[];
+  requested_capabilities: string[];
+}
+
+export interface RunSummaryV4 {
+  run_id: string;
+  status: string;
+  plan: ExecutionPlanV4 | null;
+  plan_hash: string | null;
+}
+
+export interface ToolCallV4 { call_id: string; tool_id: string; arguments: Record<string, unknown> }
+export interface ToolOutcomeV4 { call_id: string; tool_id: string; succeeded: boolean; model_content: string; data: unknown; provenance: string[] }
+export type AgentEventKindV4 =
+  | { kind: "run_created"; mode: "plan" | "execute" }
+  | { kind: "model_text"; text: string }
+  | { kind: "tool_requested"; call: ToolCallV4 }
+  | { kind: "tool_finished"; outcome: ToolOutcomeV4 }
+  | { kind: "plan_proposed"; plan: ExecutionPlanV4; plan_hash: string }
+  | { kind: "plan_approved"; plan_hash: string }
+  | { kind: "mode_changed"; mode: "plan" | "execute" }
+  | { kind: "input_requested"; question_id: string; question: string }
+  | { kind: "user_input_answered"; question_id: string; answer: string }
+  | { kind: "completion_proposed" | "run_completed" | "run_cancelled" }
+  | { kind: "run_failed"; message: string };
+
+export interface AgentRunEventV4 {
+  schema_version: 4;
+  run_id: string;
+  project_id: string;
+  conversation_id: string;
+  sequence: number;
+  occurred_at: string;
+  previous_hash: string;
+  event_hash: string;
+  event: AgentEventKindV4;
+}
+
 export interface ModelProbeResult {
   endpoint: string;
   protocol: string;

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 omicsops-agent = { path = "../omicsops-agent" }
+omicsops-protocol = { path = "../omicsops-protocol" }
 async-trait.workspace = true
 chrono.workspace = true
 futures-util.workspace = true

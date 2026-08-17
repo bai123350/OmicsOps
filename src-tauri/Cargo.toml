@@ -16,8 +16,12 @@ async-trait.workspace = true
 chrono.workspace = true
 base64.workspace = true
 omicsops-agent = { path = "../crates/omicsops-agent" }
+omicsops-agent-core = { path = "../crates/omicsops-agent-core" }
 omicsops-adapters = { path = "../crates/omicsops-adapters" }
 omicsops-core = { path = "../crates/omicsops-core" }
+omicsops-protocol = { path = "../crates/omicsops-protocol" }
+omicsops-runtime = { path = "../crates/omicsops-runtime" }
+omicsops-tools = { path = "../crates/omicsops-tools" }
 omicsops-runner = { path = "../crates/omicsops-runner" }
 reqwest.workspace = true
 serde.workspace = true

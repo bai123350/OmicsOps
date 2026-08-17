@@ -1,4 +1,5 @@
 pub mod agent_commands;
+pub mod agent_v4;
 pub mod commands;
 pub mod harness_v3;
 pub mod inspection;
@@ -88,6 +89,12 @@ pub fn run() {
             commands::list_agent_run_events,
             harness_v3::list_agent_run_events_v3,
             harness_v3::answer_agent_run_question_v3,
+            agent_v4::agent_v4_start_planning,
+            agent_v4::agent_v4_approve_plan,
+            agent_v4::agent_v4_resume,
+            agent_v4::agent_v4_cancel,
+            agent_v4::agent_v4_answer,
+            agent_v4::agent_v4_events,
             commands::list_artifacts_v2,
             commands::list_step_attempts_v2,
             commands::get_environment_lock_v2,

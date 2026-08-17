@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import * as api from "./tauri-api";
-import type { AgentEvent, AgentRunEventV3, AgentRunStreamEvent, ConnectionProfile, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, PlanProposal, ProjectArtifact, RemoteFileEntry, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
+import type { AgentEvent, AgentRunEventV3, AgentRunEventV4, AgentRunStreamEvent, ConnectionProfile, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, PlanProposal, ProjectArtifact, RemoteFileEntry, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
 import { WorkspaceShell } from "./features/workspace/WorkspaceShell";
 import type { Locale } from "./features/workspace/copy";
@@ -31,6 +31,7 @@ export default function DesktopApp() {
   const [runStopping, setRunStopping] = useState(false);
   const [agentRunEvents, setAgentRunEvents] = useState<AgentRunStreamEvent[]>([]);
   const [agentRunEventsV3, setAgentRunEventsV3] = useState<AgentRunEventV3[]>([]);
+  const [agentRunEventsV4, setAgentRunEventsV4] = useState<AgentRunEventV4[]>([]);
   const [remoteFiles, setRemoteFiles] = useState<RemoteFileEntry[]>([]);
   const [filesBusy, setFilesBusy] = useState(false);
   const [fileNotice, setFileNotice] = useState("");
@@ -96,6 +97,7 @@ export default function DesktopApp() {
     let disposed = false;
     setAgentRunEvents([]);
     setAgentRunEventsV3([]);
+    setAgentRunEventsV4([]);
     setRunId(null);
     setRunStopping(false);
     if (!selected || !conversation) return () => { disposed = true; };
@@ -189,6 +191,16 @@ export default function DesktopApp() {
         if (event.event.kind === "run_completed") void refreshRemoteFiles(event.project_id);
       }
       setAgentRunEventsV3((current) => mergeAgentRunEventsV3(current, [event]));
+    }).then((fn) => disposed ? fn() : unlisten.push(fn));
+    api.onAgentV4Event((event) => {
+      if (event.project_id !== selected?.id || event.conversation_id !== conversation?.id) return;
+      setRunId((current) => current ?? event.run_id);
+      if (event.event.kind === "run_completed" || event.event.kind === "run_failed" || event.event.kind === "run_cancelled") {
+        setRunStopping(false);
+        setRunId((current) => current === event.run_id ? null : current);
+        if (event.event.kind === "run_completed") void refreshRemoteFiles(event.project_id);
+      }
+      setAgentRunEventsV4((current) => current.some((item) => item.run_id === event.run_id && item.sequence === event.sequence) ? current : [...current, event]);
     }).then((fn) => disposed ? fn() : unlisten.push(fn));
     return () => { disposed = true; unlisten.forEach((fn) => fn()); };
   }, [conversation?.id, selected?.id]);
@@ -335,7 +347,7 @@ export default function DesktopApp() {
     locale={locale} onLocaleChange={setLocale} onOpenSettings={() => setSettingsOpen(true)} onBackToProjects={() => setSelected(null)}
     conversations={conversations} activeConversationId={conversation?.id} onSelectConversation={selectConversation} onNewConversation={newConversation} onDeleteConversation={deleteConversation}
     messages={messages} streamingAssistant={streamingAssistant} agentBusy={agentBusy} agentNotice={agentNotice} agentRetryNotice={agentRetryNotice} modelLabel={activeModel?.label}
-    planProposal={planProposal} planLoading={planLoading} planApproved={planApproved} canStartRun={Boolean(selected.connection_id && approvedPlanId)} runStarted={Boolean(runId)} activeRunId={runId} agentRunEvents={agentRunEvents} agentRunEventsV3={agentRunEventsV3}
+    planProposal={planProposal} planLoading={planLoading} planApproved={planApproved} canStartRun={Boolean(selected.connection_id && approvedPlanId)} runStarted={Boolean(runId)} activeRunId={runId} agentRunEvents={agentRunEvents} agentRunEventsV3={agentRunEventsV3} agentRunEventsV4={agentRunEventsV4}
     onAnswerAgentQuestionV3={async (answerRunId, questionId, answer) => { await api.answerAgentRunQuestionV3(answerRunId, questionId, answer); await api.resumeRunV2(answerRunId); }}
     runStopping={runStopping}
     remoteFiles={remoteFiles} filesBusy={filesBusy} fileNotice={fileNotice}

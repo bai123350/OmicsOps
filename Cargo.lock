@@ -2998,6 +2998,7 @@ dependencies = [
  "keyring",
  "omicsops-agent",
  "omicsops-core",
+ "omicsops-protocol",
  "pdf-extract",
  "quick-xml 0.38.4",
  "regex",
@@ -3034,6 +3035,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "omicsops-agent-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "omicsops-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "omicsops-core"
 version = "0.1.0"
 dependencies = [
@@ -3060,8 +3075,12 @@ dependencies = [
  "hex",
  "omicsops-adapters",
  "omicsops-agent",
+ "omicsops-agent-core",
  "omicsops-core",
+ "omicsops-protocol",
  "omicsops-runner",
+ "omicsops-runtime",
+ "omicsops-tools",
  "reqwest 0.12.28",
  "schemars 1.2.2",
  "serde",
@@ -3078,6 +3097,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "omicsops-protocol"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.19",
+ "uuid",
+]
+
+[[package]]
 name = "omicsops-runner"
 version = "0.1.0"
 dependencies = [
@@ -3091,6 +3124,29 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "omicsops-runtime"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "omicsops-protocol",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "omicsops-tools"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "omicsops-agent-core",
+ "omicsops-protocol",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]
