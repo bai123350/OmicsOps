@@ -165,6 +165,22 @@ describe("WorkspaceShell", () => {
     expect(screen.getByText("micromamba install r-seurat")).toBeInTheDocument();
   });
 
+  it("anchors a completed Harness v3 run before a later conversation turn", () => {
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} agentBusy messages={[
+      { id: "message-1", role: "assistant", markdown: "首轮分析计划", created_at: "2026-08-12T08:00:00Z" },
+      { id: "message-2", role: "user", markdown: "用 Seurat R 包跑", created_at: "2026-08-12T09:00:00Z" },
+    ]} agentRunEventsV3={[
+      { run_id: "run-old", project_id: "project-1", conversation_id: "conversation-1", sequence: 1, previous_hash: "0", event_hash: "a", occurred_at: "2026-08-12T08:01:00Z", event: { kind: "run_started" } },
+      { run_id: "run-old", project_id: "project-1", conversation_id: "conversation-1", sequence: 2, previous_hash: "a", event_hash: "b", occurred_at: "2026-08-12T08:02:00Z", event: { kind: "run_failed", payload: { message: "old run failed" } } },
+    ]} />);
+
+    const oldRun = screen.getByText("失败 · 2 条事件").closest("details")!;
+    const newTurn = screen.getByText("用 Seurat R 包跑");
+    const pending = screen.getByRole("status");
+    expect(oldRun.compareDocumentPosition(newTurn) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(newTurn.compareDocumentPosition(pending) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("keeps the streamed interaction inline and expands it from the processed row", () => {
     render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} messages={[
       { id: "message-1", role: "assistant", markdown: "Approved plan", created_at: "2026-08-12T08:00:00Z" },

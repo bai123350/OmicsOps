@@ -113,10 +113,17 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const historicalAgentRunEvents = effectiveActiveRunId
     ? agentRunEvents.filter((event) => event.run_id !== effectiveActiveRunId)
     : agentRunEvents;
+  const historicalAgentRunEventsV3 = effectiveActiveRunId
+    ? agentRunEventsV3.filter((event) => event.run_id !== effectiveActiveRunId)
+    : agentRunEventsV3;
   const activeRun = effectiveActiveRunId
     ? groupAgentRunEvents(activeRunEvents).find((run) => run.runId === effectiveActiveRunId) ?? null
     : null;
+  const activeRunV3 = effectiveActiveRunId
+    ? groupAgentRunEventsV3(activeRunEventsV3).find((run) => run.runId === effectiveActiveRunId) ?? null
+    : null;
   const runTimeline = placeAgentRunsAfterMessages(messages, historicalAgentRunEvents);
+  const runTimelineV3 = placeHarnessV3RunsAfterMessages(messages, historicalAgentRunEventsV3);
   const latestAgentRunEvent = agentRunEvents.at(-1);
   const latestAgentRunEventV3 = agentRunEventsV3.at(-1);
 
@@ -191,7 +198,11 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
         {!onSend && <article className="message user-message"><p>{zh ? "比较两批 PBMC，检查批次效应并生成可复现的分析报告。" : "Compare two PBMC batches, assess batch effects, and generate a reproducible report."}</p></article>}
         {messages.length === 0 && <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><p>{zh ? "描述你的研究目标。我会先核对数据与假设，并在任何正式执行前展示计划供你审批。" : "Describe your research goal. I will first check the data and assumptions, then show a plan for approval before any formal execution."}</p></div></article>}
         {sentMessages.map((message, index) => <article className="message user-message" key={`${index}-${message}`}><p>{message}</p></article>)}
-        {messages.map((message) => <Fragment key={message.id}>{message.role === "user" ? <article className="message user-message"><p>{message.markdown}</p></article> : message.role === "assistant" ? <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><p>{message.markdown}</p></div></article> : null}{runTimeline.afterMessage.get(message.id)?.map((run) => <AgentRunFold locale={locale} run={run} activeRunId={effectiveActiveRunId} key={run.runId} />)}</Fragment>)}
+        {messages.map((message) => <Fragment key={message.id}>
+          {message.role === "user" ? <article className="message user-message"><p>{message.markdown}</p></article> : message.role === "assistant" ? <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><p>{message.markdown}</p></div></article> : null}
+          {runTimeline.afterMessage.get(message.id)?.map((run) => <AgentRunFold locale={locale} run={run} activeRunId={effectiveActiveRunId} key={run.runId} />)}
+          {runTimelineV3.afterMessage.get(message.id)?.map((run) => <HarnessV3RunFold locale={locale} run={run} activeRunId={effectiveActiveRunId} onAnswer={onAnswerAgentQuestionV3} key={run.runId} />)}
+        </Fragment>)}
         {streamingAssistant && <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent · {zh ? "生成中" : "streaming"}</strong><p>{streamingAssistant}</p></div></article>}
         {agentBusy && !streamingAssistant && <article className="message assistant-message agent-pending" role="status"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><p>{zh ? "正在等待模型响应…" : "Waiting for the model…"}</p></div></article>}
         {agentRetryNotice && <div className="agent-retry-notice" role="status"><span className="agent-working"><i />{agentRetryNotice}</span></div>}
@@ -199,8 +210,9 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
         {(planProposal || !onRequestPlan) && <article className="approval-card"><div className="task-icon"><Check size={18} /></div><div className="task-body"><div><strong>{planProposal?.plan.title ?? (zh ? "正式计划等待审批" : "Formal plan awaiting approval")}</strong><span>{runStarted ? (zh ? "运行已启动" : "Run started") : (planApproved || approved) ? (zh ? "已批准" : "Approved") : (planProposal?.validation.valid === false ? (zh ? "验证失败" : "Invalid") : (zh ? "需确认" : "Review"))}</span></div><p>{planProposal ? `${planProposal.plan.stages.reduce((count, stage) => count + stage.steps.length, 0)} ${zh ? "个版本化步骤" : "versioned steps"} · SHA-256 ${planProposal.plan_hash.slice(0, 12)}` : (zh ? "新增 5 个版本化步骤；将上传 2 个选定文件，不会同步整个工作区。" : "Adds 5 versioned steps; uploads 2 selected files and never mirrors the whole workspace.")}</p><div className="task-actions"><button>{zh ? "查看差异" : "View diff"}</button><button disabled={planApproved || approved || planProposal?.validation.valid === false} onClick={() => { if (onApprovePlan) void onApprovePlan(); else setApproved(true); }}>{(planApproved || approved) ? (zh ? "已批准" : "Approved") : onStartRun ? (zh ? "批准并开始远端运行" : "Approve and run remotely") : (zh ? "批准计划" : "Approve plan")}</button>{(planApproved || approved) && onStartRun && !runStarted && <button disabled={!canStartRun} onClick={() => void onStartRun()}>{canStartRun ? (zh ? "重新开始远端运行" : "Start remote run") : (zh ? "正在启动…" : "Starting…")}</button>}</div></div></article>}
         {plannedSkills.length > 0 && <div className="plan-skills"><b>{zh ? "计划采用的 Skills" : "Skills applied by this plan"}</b>{plannedSkills.map((skill) => <small key={`${skill.name}:${skill.version}:${skill.hash}`}>{skill.name}@{skill.version} · SHA-256 {skill.hash.slice(0, 12)} · {skill.sections} {zh ? "个引用段" : "cited sections"}</small>)}</div>}
         {runTimeline.unanchored.length > 0 && <AgentRunHistory locale={locale} runs={runTimeline.unanchored} activeRunId={effectiveActiveRunId} />}
+        {runTimelineV3.unanchored.length > 0 && <HarnessV3History locale={locale} runs={runTimelineV3.unanchored} activeRunId={effectiveActiveRunId} onAnswer={onAnswerAgentQuestionV3} />}
         {activeRun && <AgentRunFold locale={locale} run={activeRun} activeRunId={effectiveActiveRunId} />}
-        {agentRunEventsV3.length > 0 && <HarnessV3History locale={locale} events={agentRunEventsV3} activeRunId={effectiveActiveRunId} onAnswer={onAnswerAgentQuestionV3} />}
+        {activeRunV3 && <HarnessV3RunFold locale={locale} run={activeRunV3} activeRunId={effectiveActiveRunId} onAnswer={onAnswerAgentQuestionV3} />}
         {runStarted && agentRunEvents.length === 0 && agentRunEventsV3.length === 0 && <AgentConversationUpdates locale={locale} events={[]} />}
         {runActive && onCancelRun && <div className="agent-run-controls" role="region" aria-label={zh ? "远程 Agent 运行控制" : "Remote agent run controls"}><div><span className="agent-working"><i />{runStopping ? (zh ? "正在终止当前操作…" : "Stopping current operation…") : (zh ? "远程 Agent 正在运行" : "Remote agent is running")}</span><small>{zh ? "将中断模型请求、当前 SSH 命令及后续操作" : "Stops the model request, current SSH command, and all subsequent actions"}</small></div><button className="stop-agent-button" disabled={runStopping} onClick={() => void onCancelRun()}><Square size={14} fill="currentColor" />{runStopping ? (zh ? "终止中…" : "Stopping…") : (zh ? "终止运行" : "Stop run")}</button></div>}
         {planProposal?.validation.valid === false && <div className="plan-validation" role="alert"><strong>{zh ? "计划未通过本地执行契约" : "Plan failed the local execution contract"}</strong><ul>{planProposal.validation.issues.map((issue) => <li key={`${issue.path}:${issue.code}`}><code>{issue.path}</code><span>{issue.message}</span></li>)}</ul><button disabled={planLoading} onClick={() => void onRequestPlan?.()}>{planLoading ? (zh ? "重新生成中…" : "Regenerating…") : (zh ? "按当前工具契约重新生成" : "Regenerate with current tool contract")}</button></div>}
@@ -316,9 +328,22 @@ function groupAgentRunEventsV3(events: AgentRunEventV3[]) {
   return [...byRun].map(([runId, runEvents]) => ({ runId, events: runEvents.sort((left, right) => left.sequence - right.sequence) }));
 }
 
-function HarnessV3History({ locale, events, activeRunId, onAnswer }: { locale: Locale; events: AgentRunEventV3[]; activeRunId: string | null; onAnswer?: Props["onAnswerAgentQuestionV3"] }) {
+function placeHarnessV3RunsAfterMessages(messages: NonNullable<Props["messages"]>, events: AgentRunEventV3[]) {
+  const timedMessages = messages.filter((message) => (message.role === "user" || message.role === "assistant") && message.created_at && Number.isFinite(Date.parse(message.created_at)));
+  const afterMessage = new Map<string, ReturnType<typeof groupAgentRunEventsV3>>();
+  const unanchored: ReturnType<typeof groupAgentRunEventsV3> = [];
+  groupAgentRunEventsV3(events).forEach((run) => {
+    const startedAt = Date.parse(run.events[0]?.occurred_at ?? "");
+    const anchor = Number.isFinite(startedAt) ? timedMessages.filter((message) => Date.parse(message.created_at!) <= startedAt).at(-1) : undefined;
+    if (!anchor) unanchored.push(run);
+    else afterMessage.set(anchor.id, [...(afterMessage.get(anchor.id) ?? []), run]);
+  });
+  return { afterMessage, unanchored };
+}
+
+function HarnessV3History({ locale, runs, activeRunId, onAnswer }: { locale: Locale; runs: ReturnType<typeof groupAgentRunEventsV3>; activeRunId: string | null; onAnswer?: Props["onAnswerAgentQuestionV3"] }) {
   return <section className="harness-v3-history" aria-label={locale === "zh-CN" ? "Harness v3 运行轨迹" : "Harness v3 run trace"}>
-    {groupAgentRunEventsV3(events).map((run) => <HarnessV3RunFold locale={locale} run={run} activeRunId={activeRunId} onAnswer={onAnswer} key={run.runId} />)}
+    {runs.map((run) => <HarnessV3RunFold locale={locale} run={run} activeRunId={activeRunId} onAnswer={onAnswer} key={run.runId} />)}
   </section>;
 }
 
