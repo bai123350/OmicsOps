@@ -333,14 +333,25 @@ function HarnessV3RunFold({ locale, run, activeRunId, onAnswer }: { locale: Loca
     : (zh ? "运行中" : "Running");
   return <details className={`agent-run-fold harness-v3-fold ${active ? "is-active" : ""}`} open={active ? true : undefined} aria-label={zh ? "Harness v3 运行" : "Harness v3 run"}>
     <summary><span className="agent-run-fold-title"><span><b>Harness v3</b><small>{zh ? "可恢复结构化轨迹" : "Recoverable structured trace"}</small></span><ChevronRight size={15} /></span><span>{status} · {run.events.length} {zh ? "条事件" : "events"}</span></summary>
-    <div className="harness-v3-events">{run.events.map((event) => <HarnessV3EventCard locale={locale} event={event} runEvents={run.events} onAnswer={onAnswer} key={`${event.run_id}-${event.sequence}`} />)}</div>
+    <div className="harness-v3-events">{run.events.map((event, eventIndex) => <HarnessV3EventCard locale={locale} event={event} eventIndex={eventIndex} runEvents={run.events} onAnswer={onAnswer} key={`${event.run_id}-${event.sequence}`} />)}</div>
   </details>;
 }
 
-function HarnessV3EventCard({ locale, event, runEvents, onAnswer }: { locale: Locale; event: AgentRunEventV3; runEvents: AgentRunEventV3[]; onAnswer?: Props["onAnswerAgentQuestionV3"] }) {
+function HarnessV3EventCard({ locale, event, eventIndex, runEvents, onAnswer }: { locale: Locale; event: AgentRunEventV3; eventIndex: number; runEvents: AgentRunEventV3[]; onAnswer?: Props["onAnswerAgentQuestionV3"] }) {
   const zh = locale === "zh-CN";
   const kind = event.event.kind;
   const meta = <small>#{event.sequence} · {new Date(event.occurred_at).toLocaleTimeString()} · {event.event_hash.slice(0, 10)}</small>;
+  if (kind === "model_text") {
+    if (eventIndex > 0 && runEvents[eventIndex - 1]?.event.kind === "model_text") return null;
+    const textEvents: AgentRunEventV3[] = [];
+    for (let index = eventIndex; index < runEvents.length && runEvents[index]?.event.kind === "model_text"; index += 1) {
+      textEvents.push(runEvents[index]);
+    }
+    const text = textEvents.map((item) => item.event.kind === "model_text" ? item.event.payload.text : "").join("");
+    const lastEvent = textEvents[textEvents.length - 1] ?? event;
+    const sequence = lastEvent.sequence === event.sequence ? `#${event.sequence}` : `#${event.sequence}–#${lastEvent.sequence}`;
+    return <article className="harness-v3-card model-output-card" aria-label={zh ? "模型输出" : "Model output"}><header><b>{zh ? "模型输出" : "Model output"}</b><span>{sequence}</span></header><p>{text}</p><small>{new Date(lastEvent.occurred_at).toLocaleTimeString()} · {lastEvent.event_hash.slice(0, 10)}</small></article>;
+  }
   if (kind === "tool_call_requested" || kind === "tool_call_dispatched") {
     const request = event.event.payload.request;
     return <article className="harness-v3-card tool-card"><header><b>{request.tool_id}</b><span>{kind === "tool_call_requested" ? (zh ? "已请求" : "Requested") : (zh ? "执行中" : "Dispatched")}</span></header>{meta}<pre>{JSON.stringify(request.arguments, null, 2)}</pre><small>{zh ? "幂等键" : "Idempotency key"}: {request.idempotency_key}</small></article>;
@@ -368,8 +379,7 @@ function HarnessV3EventCard({ locale, event, runEvents, onAnswer }: { locale: Lo
   if (kind === "context_compacted") {
     return <article className="harness-v3-card context-card"><header><b>{zh ? "上下文已压缩" : "Context compacted"}</b><span>#{event.event.payload.first_sequence}–#{event.event.payload.last_sequence}</span></header>{meta}<code>SHA-256 {event.event.payload.last_event_hash.slice(0, 16)}</code></article>;
   }
-  const message = kind === "model_text" ? event.event.payload.text
-    : kind === "model_step_started" ? `${zh ? "模型步骤" : "Model step"} ${event.event.payload.step}`
+  const message = kind === "model_step_started" ? `${zh ? "模型步骤" : "Model step"} ${event.event.payload.step}`
     : kind === "needs_attention" ? event.event.payload.reason
     : kind === "run_failed" ? event.event.payload.message
     : kind === "user_input_answered" ? `${zh ? "已回答" : "Answered"}: ${event.event.payload.answer}`

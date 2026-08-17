@@ -226,6 +226,22 @@ describe("WorkspaceShell", () => {
     expect(onAnswerAgentQuestionV3).toHaveBeenCalledWith("run-v3", "species", "human");
   });
 
+  it("coalesces adjacent Harness v3 model text deltas into one readable message", () => {
+    const base = { run_id: "run-text", project_id: "project-1", conversation_id: "conversation-1" };
+    const deltas = ["我", "先", "检查", "输入", "目录", "，", "项目", "可", "读"];
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined}
+      runStarted activeRunId="run-text"
+      agentRunEventsV3={[
+        { ...base, sequence: 1, previous_hash: "0", event_hash: "1", occurred_at: "2026-08-17T00:00:00Z", event: { kind: "run_started" } },
+        { ...base, sequence: 2, previous_hash: "1", event_hash: "2", occurred_at: "2026-08-17T00:00:01Z", event: { kind: "model_step_started", payload: { step: 1 } } },
+        ...deltas.map((text, index) => ({ ...base, sequence: index + 3, previous_hash: String(index + 2), event_hash: String(index + 3), occurred_at: "2026-08-17T00:00:02Z", event: { kind: "model_text" as const, payload: { text } } })),
+      ]} />);
+
+    const output = screen.getByRole("article", { name: "模型输出" });
+    expect(output).toHaveTextContent("我先检查输入目录，项目可读");
+    expect(screen.getAllByRole("article", { name: "模型输出" })).toHaveLength(1);
+  });
+
   it("turns off every historical running indicator as soon as cancellation starts", () => {
     render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} runStarted runStopping onCancelRun={() => undefined} agentRunEvents={[
       { run_id: "run-1", project_id: "project-1", sequence: 1, timestamp: "2026-08-12T08:00:00Z", kind: "model_waiting", title: "Evaluating remote evidence", content: "30s elapsed", iteration: 8 },
