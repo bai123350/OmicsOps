@@ -242,6 +242,21 @@ describe("WorkspaceShell", () => {
     expect(screen.getAllByRole("article", { name: "模型输出" })).toHaveLength(1);
   });
 
+  it("shows only the latest Harness v3 completion ledger snapshot", () => {
+    const base = { run_id: "run-ledger", project_id: "project-1", conversation_id: "conversation-1" };
+    const criterion = { id: "input", description: "输入已检查", evidence_sequences: [] as number[] };
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined}
+      runStarted activeRunId="run-ledger"
+      agentRunEventsV3={[
+        { ...base, sequence: 1, previous_hash: "0", event_hash: "1", occurred_at: "2026-08-17T00:00:00Z", event: { kind: "completion_ledger_updated", payload: { ledger: { criteria: [criterion], unresolved_errors: ["tool:remote.list: old transient error"], uncertain_side_effects: [], verified_artifacts: [] } } } },
+        { ...base, sequence: 2, previous_hash: "1", event_hash: "2", occurred_at: "2026-08-17T00:00:01Z", event: { kind: "completion_ledger_updated", payload: { ledger: { criteria: [{ ...criterion, evidence_sequences: [2] }], unresolved_errors: [], uncertain_side_effects: [], verified_artifacts: [] } } } },
+      ]} />);
+
+    expect(screen.getAllByRole("article", { name: "完成账本" })).toHaveLength(1);
+    expect(screen.queryByText("tool:remote.list: old transient error")).not.toBeInTheDocument();
+    expect(screen.getByRole("article", { name: "完成账本" })).toHaveTextContent("1/1");
+  });
+
   it("turns off every historical running indicator as soon as cancellation starts", () => {
     render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} runStarted runStopping onCancelRun={() => undefined} agentRunEvents={[
       { run_id: "run-1", project_id: "project-1", sequence: 1, timestamp: "2026-08-12T08:00:00Z", kind: "model_waiting", title: "Evaluating remote evidence", content: "30s elapsed", iteration: 8 },

@@ -361,8 +361,15 @@ function HarnessV3EventCard({ locale, event, eventIndex, runEvents, onAnswer }: 
     return <article className={`harness-v3-card tool-outcome status-${outcome.status}`}><header><b>{zh ? "工具结果" : "Tool outcome"}</b><span>{outcome.status}{outcome.truncated ? ` · ${zh ? "预览已截断" : "preview truncated"}` : ""}</span></header>{meta}{outcome.model_content && <pre>{outcome.model_content}</pre>}{outcome.error && <p>{outcome.error}</p>}<div className="provenance-list">{outcome.provenance.map((item) => <code key={item}>{item}</code>)}</div></article>;
   }
   if (kind === "completion_ledger_updated") {
+    if (runEvents.slice(eventIndex + 1).some((candidate) => candidate.event.kind === "completion_ledger_updated")) return null;
     const ledger = event.event.payload.ledger;
-    return <article className="harness-v3-card ledger-card"><header><b>{zh ? "完成账本" : "Completion ledger"}</b><span>{ledger.criteria.filter((item) => item.evidence_sequences.length > 0).length}/{ledger.criteria.length}</span></header>{meta}{ledger.criteria.map((item) => <p key={item.id}>{item.evidence_sequences.length > 0 ? "✓" : "○"} {item.description} <small>#{item.evidence_sequences.join(", #")}</small></p>)}{ledger.verified_artifacts.map((artifact) => <div className="verified-artifact" key={artifact.path}><b>{artifact.path}</b><small>{artifact.size_bytes} bytes · SHA-256 {artifact.sha256.slice(0, 12)} · #{artifact.evidence_sequence}</small></div>)}{[...ledger.unresolved_errors, ...ledger.uncertain_side_effects].map((error) => <p className="ledger-error" key={error}>{error}</p>)}</article>;
+    return <article className="harness-v3-card ledger-card" aria-label={zh ? "完成账本" : "Completion ledger"}>
+      <header><b>{zh ? "完成账本" : "Completion ledger"}</b><span>{ledger.criteria.filter((item) => item.evidence_sequences.length > 0).length}/{ledger.criteria.length}</span></header>
+      {meta}
+      {ledger.criteria.map((item) => <p key={item.id}>{item.evidence_sequences.length > 0 ? "✓" : "○"} {item.description} {item.evidence_sequences.length > 0 && <small>#{item.evidence_sequences.join(", #")}</small>}</p>)}
+      {ledger.verified_artifacts.map((artifact) => <div className="verified-artifact" key={artifact.path}><b>{artifact.path}</b><small>{artifact.size_bytes} bytes · SHA-256 {artifact.sha256.slice(0, 12)} · #{artifact.evidence_sequence}</small></div>)}
+      {[...ledger.unresolved_errors, ...ledger.uncertain_side_effects].map((error) => <p className="ledger-error" key={error}>{error}</p>)}
+    </article>;
   }
   if (kind === "review_completed") {
     const report = event.event.payload.report;

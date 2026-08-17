@@ -544,20 +544,29 @@ impl DesktopToolRuntimeV3 {
         &self,
         request: &ToolCallRequestV3,
     ) -> Result<(String, Value, Vec<String>), String> {
-        let relative = request
-            .arguments
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or(".");
+        let relative = remote_list_relative_path(&request.arguments);
         let max_entries = request
             .arguments
             .get("max_entries")
             .and_then(Value::as_u64)
             .unwrap_or(200)
             .clamp(1, 2_000);
+        let (listing, entries) = self.list_remote_directory(relative, max_entries).await?;
+        Ok((
+            listing,
+            json!({"path":relative,"kind":"directory","entries":entries}),
+            vec![format!("remote:{relative}")],
+        ))
+    }
+
+    async fn list_remote_directory(
+        &self,
+        relative: &str,
+        max_entries: u64,
+    ) -> Result<(String, usize), String> {
         let remote = project_path(&self.project_root, relative)?;
         let command = format!(
-            "find {} -maxdepth 2 -mindepth 1 -printf '%y\\t%s\\t%p\\n' | head -n {}",
+            "test -d {0} && find {0} -maxdepth 2 -mindepth 1 -printf '%y\\t%s\\t%p\\n' | head -n {1}",
             shell_quote(&remote),
             max_entries
         );
@@ -567,13 +576,16 @@ impl DesktopToolRuntimeV3 {
             .await
             .map_err(|error| error.to_string())?;
         if output.status != 0 {
-            return Err(output.stderr);
+            let detail = output.stderr.trim();
+            return Err(if detail.is_empty() {
+                format!("remote directory does not exist: {relative}")
+            } else {
+                format!("remote directory cannot be listed: {relative}: {detail}")
+            });
         }
-        Ok((
-            output.stdout.clone(),
-            json!({"path":relative,"entries":output.stdout.lines().count()}),
-            vec![format!("remote:{relative}")],
-        ))
+        let listing = project_relative_listing(&output.stdout, &self.project_root);
+        let entries = listing.lines().count();
+        Ok((listing, entries))
     }
 
     async fn remote_read(
@@ -588,11 +600,23 @@ impl DesktopToolRuntimeV3 {
             .unwrap_or(64 * 1024)
             .clamp(1, 1024 * 1024);
         let remote = project_path(&self.project_root, relative)?;
-        let bytes = self
-            .session
-            .read_file_limited(&remote, max_bytes)
-            .await
-            .map_err(|error| error.to_string())?;
+        let bytes = match self.session.read_file_limited(&remote, max_bytes).await {
+            Ok(bytes) => bytes,
+            Err(read_error) => {
+                if let Ok((listing, entries)) = self.list_remote_directory(relative, 200).await {
+                    return Ok((
+                        format!(
+                            "{relative} is a directory; returned its project-relative listing instead. Use remote.list to browse deeper.\n{listing}"
+                        ),
+                        json!({"path":relative,"kind":"directory","entries":entries}),
+                        vec![format!("remote:{relative}")],
+                    ));
+                }
+                return Err(format!(
+                    "remote file does not exist or cannot be read at project-relative path `{relative}`: {read_error}"
+                ));
+            }
+        };
         let sha256 = sha256_bytes(&bytes);
         let content = String::from_utf8_lossy(&bytes).into_owned();
         Ok((
@@ -809,14 +833,20 @@ impl DesktopToolRuntimeV3 {
 }
 
 fn project_path(root: &str, relative: &str) -> Result<String, String> {
-    let relative = relative.trim().replace('\\', "/");
-    if relative.is_empty()
-        || relative.starts_with('/')
-        || relative.split('/').any(|part| part == "..")
-    {
+    let raw = relative.trim().replace('\\', "/");
+    if raw.is_empty() || raw.starts_with('/') || raw.contains('\0') {
         return Err("tool path must be a non-empty project-relative path".into());
     }
-    let candidate = if relative == "." {
+    let mut components = Vec::new();
+    for component in raw.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => return Err("tool path must be a non-empty project-relative path".into()),
+            value => components.push(value),
+        }
+    }
+    let relative = components.join("/");
+    let candidate = if relative.is_empty() {
         root.trim_end_matches('/').to_owned()
     } else {
         format!("{}/{}", root.trim_end_matches('/'), relative)
@@ -825,6 +855,37 @@ fn project_path(root: &str, relative: &str) -> Result<String, String> {
         require_remote_descendant(root, &candidate).map_err(|error| error.to_string())?;
     }
     Ok(candidate)
+}
+
+fn remote_list_relative_path(arguments: &Value) -> &str {
+    arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .unwrap_or(".")
+}
+
+fn project_relative_listing(stdout: &str, root: &str) -> String {
+    let prefix = format!("{}/", root.trim_end_matches('/'));
+    let mut listing = String::new();
+    for line in stdout.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let (Some(kind), Some(size), Some(path)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let Some(relative) = path.strip_prefix(&prefix).filter(|path| !path.is_empty()) else {
+            continue;
+        };
+        listing.push_str(kind);
+        listing.push('\t');
+        listing.push_str(size);
+        listing.push('\t');
+        listing.push_str(relative);
+        listing.push('\n');
+    }
+    listing
 }
 
 fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, String> {
@@ -911,7 +972,10 @@ fn append_failure(repository: &Repository, app: &AppHandle, spec: &AgentRunSpecV
 
 #[cfg(test)]
 mod tests {
-    use super::{DesktopToolRuntimeV3, project_path, run_spec_from_plan};
+    use super::{
+        DesktopToolRuntimeV3, project_path, project_relative_listing, remote_list_relative_path,
+        run_spec_from_plan,
+    };
     use omicsops_adapters::{
         llm::{ProviderProtocol, UnifiedModelClient},
         persistence::Repository,
@@ -946,6 +1010,27 @@ mod tests {
         assert_eq!(project_path("/srv/project", ".").unwrap(), "/srv/project");
         assert!(project_path("/srv/project", "../secret").is_err());
         assert!(project_path("/srv/project", "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn remote_browsing_normalizes_root_and_never_exposes_absolute_paths() {
+        assert_eq!(remote_list_relative_path(&json!({})), ".");
+        assert_eq!(remote_list_relative_path(&json!({"path":"  "})), ".");
+        assert_eq!(
+            remote_list_relative_path(&json!({"path":" ./data "})),
+            "./data"
+        );
+        assert_eq!(
+            project_path("/srv/project", "./data/filtered").unwrap(),
+            "/srv/project/data/filtered"
+        );
+        assert_eq!(
+            project_relative_listing(
+                "d\t0\t/srv/project/data\nf\t42\t/srv/project/data/matrix.mtx\n",
+                "/srv/project",
+            ),
+            "d\t0\tdata\nf\t42\tdata/matrix.mtx\n"
+        );
     }
 
     #[test]

@@ -142,8 +142,8 @@ pub fn builtin_tool_definitions_v3() -> Vec<ToolDefinitionV3> {
     vec![
         definition(
             "remote.list",
-            "List files below a project-relative remote directory.",
-            json!({"type":"object","properties":{"path":{"type":"string"},"max_entries":{"type":"integer"}}}),
+            "List files below a project-relative remote directory. Omit path or use '.' for the project root.",
+            json!({"type":"object","properties":{"path":{"type":"string","default":"."},"max_entries":{"type":"integer"}}}),
             vec!["remote_read".into()],
             RiskLevelV3::Low,
             true,
@@ -151,7 +151,7 @@ pub fn builtin_tool_definitions_v3() -> Vec<ToolDefinitionV3> {
         ),
         definition(
             "remote.read",
-            "Read a bounded UTF-8 preview from a project-relative remote file.",
+            "Read a bounded UTF-8 preview from a project-relative remote file. A directory path returns a bounded project-relative listing so it can be browsed safely.",
             json!({"type":"object","required":["path"],"properties":{"path":{"type":"string"},"max_bytes":{"type":"integer"}}}),
             vec!["remote_read".into()],
             RiskLevelV3::Low,
