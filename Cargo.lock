@@ -3040,6 +3040,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "futures-util",
  "omicsops-protocol",
  "serde",
  "serde_json",
@@ -3147,6 +3148,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

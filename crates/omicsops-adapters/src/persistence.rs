@@ -16,8 +16,11 @@ use omicsops_core::{
         SkillPackage, SyncEntry, TurnStatus,
     },
 };
-use omicsops_protocol::{AgentEventV4, validate_event_chain_v4};
+use omicsops_protocol::{
+    AgentEventV4, ContextArchiveV4, ContextCheckpointV4, validate_event_chain_v4,
+};
 use rusqlite::{Connection, params};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::AdapterResult;
@@ -162,6 +165,15 @@ impl Repository {
                 value_json TEXT NOT NULL,
                 PRIMARY KEY(run_id, sequence)
             );
+            CREATE TABLE IF NOT EXISTS agent_context_archives_v4 (
+                archive_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                through_sequence INTEGER NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                transcript_json TEXT NOT NULL,
+                checkpoint_json TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS conversations_project_updated ON conversations(project_id, updated_at DESC);
             CREATE INDEX IF NOT EXISTS agent_run_events_v3_project_conversation
                 ON agent_run_events_v3(project_id, conversation_id, run_id, sequence);
@@ -169,6 +181,8 @@ impl Repository {
                 ON agent_run_snapshots_v3(project_id, conversation_id, run_id);
             CREATE INDEX IF NOT EXISTS agent_events_v4_project_conversation
                 ON agent_events_v4(project_id, conversation_id, run_id, sequence);
+            CREATE INDEX IF NOT EXISTS agent_context_archives_v4_run
+                ON agent_context_archives_v4(run_id, through_sequence);
             PRAGMA user_version = 3;
             ",
         )?;
@@ -400,6 +414,10 @@ impl Repository {
             [&project_id],
         )?;
         transaction.execute(
+            "DELETE FROM agent_context_archives_v4 WHERE run_id IN (SELECT run_id FROM agent_runs_v4 WHERE project_id = ?1)",
+            [&project_id],
+        )?;
+        transaction.execute(
             "DELETE FROM agent_events_v4 WHERE project_id = ?1",
             [&project_id],
         )?;
@@ -474,6 +492,10 @@ impl Repository {
         )?;
         transaction.execute(
             "DELETE FROM agent_run_snapshots_v3 WHERE project_id = ?1 AND conversation_id = ?2",
+            params![project_id, conversation_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM agent_context_archives_v4 WHERE run_id IN (SELECT run_id FROM agent_runs_v4 WHERE project_id = ?1 AND conversation_id = ?2)",
             params![project_id, conversation_id],
         )?;
         transaction.execute(
@@ -934,6 +956,43 @@ impl Repository {
             )?
             .map(|row| Ok(serde_json::from_str::<AgentEventV4>(&row?)?))
             .collect()
+    }
+
+    pub fn archive_agent_context_v4(
+        &self,
+        run_id: Uuid,
+        transcript: &str,
+        checkpoint: &ContextCheckpointV4,
+    ) -> AdapterResult<ContextArchiveV4> {
+        let archive = ContextArchiveV4 {
+            archive_id: Uuid::new_v4(),
+            through_sequence: checkpoint.through_sequence,
+            size_bytes: transcript.len() as u64,
+            sha256: hex::encode(Sha256::digest(transcript.as_bytes())),
+        };
+        self.connection.lock().expect("repository lock").execute(
+            "INSERT INTO agent_context_archives_v4 (archive_id, run_id, through_sequence, size_bytes, sha256, transcript_json, checkpoint_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![archive.archive_id.to_string(), run_id.to_string(), archive.through_sequence, archive.size_bytes, archive.sha256, transcript, serde_json::to_string(checkpoint)?],
+        )?;
+        Ok(archive)
+    }
+
+    pub fn agent_context_archive_v4(
+        &self,
+        archive_id: Uuid,
+    ) -> AdapterResult<Option<(String, ContextCheckpointV4)>> {
+        let connection = self.connection.lock().expect("repository lock");
+        let mut statement = connection.prepare(
+            "SELECT transcript_json, checkpoint_json FROM agent_context_archives_v4 WHERE archive_id=?1",
+        )?;
+        let mut rows = statement.query([archive_id.to_string()])?;
+        rows.next()?
+            .map(|row| {
+                let transcript: String = row.get(0)?;
+                let checkpoint: String = row.get(1)?;
+                Ok((transcript, serde_json::from_str(&checkpoint)?))
+            })
+            .transpose()
     }
 
     pub fn append_event(&self, event: &RunEvent) -> AdapterResult<()> {

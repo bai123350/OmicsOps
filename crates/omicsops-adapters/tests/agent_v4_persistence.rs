@@ -1,6 +1,6 @@
 use chrono::Utc;
 use omicsops_adapters::persistence::Repository;
-use omicsops_protocol::{AgentEventKindV4, AgentEventV4, RunModeV4};
+use omicsops_protocol::{AgentEventKindV4, AgentEventV4, ContextCheckpointV4, RunModeV4};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -55,4 +55,31 @@ fn v4_store_rejects_event_gaps() {
     );
     let second = AgentEventV4::next(&first, Utc::now(), AgentEventKindV4::CompletionProposed);
     assert!(repository.append_agent_event_v4(&second).is_err());
+}
+
+#[test]
+fn v4_context_archive_is_durable_and_hash_addressed() {
+    let repository = Repository::open_in_memory().unwrap();
+    let run_id = Uuid::new_v4();
+    let transcript = r#"[{"sequence":1,"event":"large"}]"#;
+    let checkpoint = ContextCheckpointV4 {
+        schema_version: 4,
+        through_sequence: 17,
+        completion_criteria: vec!["artifact verified".into()],
+        unresolved_errors: vec!["one error".into()],
+        recent_steps: vec!["inspect".into()],
+        scientific_state: json!({}),
+    };
+    let archive = repository
+        .archive_agent_context_v4(run_id, transcript, &checkpoint)
+        .unwrap();
+    assert_eq!(archive.size_bytes, transcript.len() as u64);
+    assert_eq!(archive.sha256.len(), 64);
+    assert_eq!(
+        repository
+            .agent_context_archive_v4(archive.archive_id)
+            .unwrap()
+            .unwrap(),
+        (transcript.into(), checkpoint)
+    );
 }

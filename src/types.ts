@@ -413,15 +413,23 @@ export interface ToolOutcomeV4 { call_id: string; tool_id: string; succeeded: bo
 export type AgentEventKindV4 =
   | { kind: "run_created"; mode: "plan" | "execute" }
   | { kind: "model_text"; text: string }
+  | { kind: "model_retrying"; attempt: number; class: string; message: string }
   | { kind: "tool_requested"; call: ToolCallV4 }
+  | { kind: "tool_dispatch_started"; call_id: string; tool_id: string; effect: string; idempotency_key: string }
   | { kind: "tool_finished"; outcome: ToolOutcomeV4 }
+  | { kind: "tool_outcome_reused"; idempotency_key: string; outcome: ToolOutcomeV4 }
+  | { kind: "tool_dispatch_uncertain"; call_id: string; tool_id: string }
+  | { kind: "tool_dispatch_resolved"; call_id: string; resolution: "side_effect_observed" | "side_effect_not_observed" | "compensated"; evidence: string }
   | { kind: "plan_proposed"; plan: ExecutionPlanV4; plan_hash: string }
   | { kind: "plan_approved"; plan_hash: string }
   | { kind: "mode_changed"; mode: "plan" | "execute" }
   | { kind: "input_requested"; question_id: string; question: string }
   | { kind: "user_input_answered"; question_id: string; answer: string }
+  | { kind: "context_archived"; archive: { archive_id: string; through_sequence: number; size_bytes: number; sha256: string } }
+  | { kind: "context_checkpointed"; checkpoint: { schema_version: 4; through_sequence: number; completion_criteria: string[]; unresolved_errors: string[]; recent_steps: string[]; scientific_state: unknown } }
   | { kind: "completion_proposed" | "run_completed" | "run_cancelled" }
-  | { kind: "run_failed"; message: string };
+  | { kind: "run_failed"; message: string }
+  | { kind: "run_needs_attention"; message: string };
 
 export interface AgentRunEventV4 {
   schema_version: 4;

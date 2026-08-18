@@ -65,6 +65,32 @@ impl RuntimeManagerV4 {
         }
         Ok(())
     }
+
+    pub async fn rebuild(
+        &self,
+        key: &ExecutionContextKeyV4,
+    ) -> Result<Arc<dyn KernelProcessV4>, String> {
+        self.interrupt(key).await?;
+        self.acquire(key).await
+    }
+
+    pub async fn interrupt_run(&self, run_id: Uuid) -> Result<(), String> {
+        let sessions = {
+            let mut guard = self.sessions.lock().await;
+            let keys = guard
+                .keys()
+                .filter(|key| key.run_id == run_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| guard.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        for session in sessions {
+            session.interrupt().await?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -109,10 +135,13 @@ mod tests {
                 values.get(code.trim()).cloned().unwrap_or_default()
             };
             Ok(RuntimeResultV4 {
+                request_id: Uuid::new_v4(),
                 session_id: self.id,
                 process_identity: self.identity.clone(),
                 stdout,
                 stderr: String::new(),
+                stdout_capture: None,
+                stderr_capture: None,
                 succeeded: true,
                 artifacts: vec![],
             })
@@ -143,5 +172,31 @@ mod tests {
         assert_eq!(first.session_id, second.session_id);
         assert_eq!(second.stdout, "42");
         assert_eq!(backend.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rebuild_replaces_process_and_interrupt_run_discards_all_languages() {
+        let backend = Arc::new(FakeBackend(AtomicUsize::new(0)));
+        let manager = RuntimeManagerV4::new(backend.clone());
+        let project_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let python = ExecutionContextKeyV4 {
+            project_id,
+            run_id,
+            backend_id: "ssh:test".into(),
+            language: KernelLanguageV4::Python,
+            environment: "project".into(),
+        };
+        let r = ExecutionContextKeyV4 {
+            language: KernelLanguageV4::R,
+            ..python.clone()
+        };
+        let original = manager.acquire(&python).await.unwrap().session_id();
+        manager.acquire(&r).await.unwrap();
+        let rebuilt = manager.rebuild(&python).await.unwrap().session_id();
+        assert_ne!(original, rebuilt);
+        manager.interrupt_run(run_id).await.unwrap();
+        manager.acquire(&r).await.unwrap();
+        assert_eq!(backend.0.load(Ordering::SeqCst), 4);
     }
 }

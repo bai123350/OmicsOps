@@ -10,6 +10,5 @@ omicsops-agent-core = { path = "../omicsops-agent-core" }
 omicsops-protocol = { path = "../omicsops-protocol" }
 serde_json.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
 tokio.workspace = true
+uuid.workspace = true

@@ -573,6 +573,7 @@ export async function agentV4ApprovePlan(runId: string, planHash: string): Promi
 export async function agentV4Resume(runId: string): Promise<void> { await invoke("agent_v4_resume", { runId }); }
 export async function agentV4Cancel(runId: string): Promise<void> { await invoke("agent_v4_cancel", { runId }); }
 export async function agentV4Answer(runId: string, questionId: string, answer: string): Promise<void> { await invoke("agent_v4_answer", { request: { run_id: runId, question_id: questionId, answer } }); }
+export async function agentV4ResolveUncertain(runId: string, callId: string, resolution: "side_effect_observed" | "side_effect_not_observed" | "compensated", evidence: string): Promise<void> { await invoke("agent_v4_resolve_uncertain", { request: { run_id: runId, call_id: callId, resolution, evidence } }); }
 export async function agentV4Events(runId: string): Promise<AgentRunEventV4[]> { return isTauri() ? invoke("agent_v4_events", { runId }) : []; }
 export async function onAgentV4Event(callback: (event: AgentRunEventV4) => void): Promise<UnlistenFn> {
   if (!isTauri()) return () => undefined;

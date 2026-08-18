@@ -27,6 +27,45 @@ pub enum RunStatusV4 {
     Completed,
     Failed,
     Cancelled,
+    NeedsAttention,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelErrorClassV4 {
+    RateLimited,
+    Server,
+    Timeout,
+    Transport,
+    Authentication,
+    InvalidRequest,
+    InvalidResponse,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ModelFailureV4 {
+    pub class: ModelErrorClassV4,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl ModelFailureV4 {
+    pub fn transient(class: ModelErrorClassV4, message: impl Into<String>) -> Self {
+        Self {
+            class,
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    pub fn permanent(class: ModelErrorClassV4, message: impl Into<String>) -> Self {
+        Self {
+            class,
+            message: message.into(),
+            retryable: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -108,6 +147,14 @@ pub enum ToolEffectV4 {
     Delegation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UncertainResolutionV4 {
+    SideEffectObserved,
+    SideEffectNotObserved,
+    Compensated,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolDescriptorV4 {
     pub id: String,
@@ -150,13 +197,43 @@ pub enum KernelLanguageV4 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OutputCaptureV4 {
+    pub excerpt: String,
+    pub total_bytes: u64,
+    pub sha256: String,
+    pub archive_path: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RuntimeResultV4 {
+    pub request_id: Uuid,
     pub session_id: Uuid,
     pub process_identity: String,
     pub stdout: String,
     pub stderr: String,
+    pub stdout_capture: Option<OutputCaptureV4>,
+    pub stderr_capture: Option<OutputCaptureV4>,
     pub succeeded: bool,
     pub artifacts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ContextCheckpointV4 {
+    pub schema_version: u8,
+    pub through_sequence: u64,
+    pub completion_criteria: Vec<String>,
+    pub unresolved_errors: Vec<String>,
+    pub recent_steps: Vec<String>,
+    pub scientific_state: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ContextArchiveV4 {
+    pub archive_id: Uuid,
+    pub through_sequence: u64,
+    pub size_bytes: u64,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -168,11 +245,35 @@ pub enum AgentEventKindV4 {
     ModelText {
         text: String,
     },
+    ModelRetrying {
+        attempt: u8,
+        class: ModelErrorClassV4,
+        message: String,
+    },
     ToolRequested {
         call: ToolCallV4,
     },
+    ToolDispatchStarted {
+        call_id: String,
+        tool_id: String,
+        effect: ToolEffectV4,
+        idempotency_key: String,
+    },
     ToolFinished {
         outcome: ToolOutcomeV4,
+    },
+    ToolOutcomeReused {
+        idempotency_key: String,
+        outcome: ToolOutcomeV4,
+    },
+    ToolDispatchUncertain {
+        call_id: String,
+        tool_id: String,
+    },
+    ToolDispatchResolved {
+        call_id: String,
+        resolution: UncertainResolutionV4,
+        evidence: String,
     },
     PlanProposed {
         plan: ExecutionPlanV4,
@@ -192,9 +293,18 @@ pub enum AgentEventKindV4 {
         question_id: String,
         answer: String,
     },
+    ContextArchived {
+        archive: ContextArchiveV4,
+    },
+    ContextCheckpointed {
+        checkpoint: ContextCheckpointV4,
+    },
     CompletionProposed,
     RunCompleted,
     RunFailed {
+        message: String,
+    },
+    RunNeedsAttention {
         message: String,
     },
     RunCancelled,

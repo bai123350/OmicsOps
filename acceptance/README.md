@@ -62,3 +62,44 @@ cargo test -p omicsops-desktop live_v4_model_plan_and_persistent_ssh_python_kern
 
 The V4 route must not become the default new-task route until this live test
 actually passes. An ignored result is not acceptance.
+
+## Agent Runtime V4 stage-2 acceptance
+
+Stage 2 adds typed provider retry handling, model/tool cancellation, bounded
+tool-call and iteration budgets, repeated-signature termination, four-way
+read-only concurrency, per-project side-effect serialization, archive-first
+context compaction, and crash recovery that never automatically repeats a
+dispatched side effect whose outcome is missing.
+
+An uncertain dispatch moves the run to `needs_attention`. After independently
+checking remote state, record the conclusion with
+`agent_v4_resolve_uncertain` (call id, resolution and non-empty evidence), then
+call `agent_v4_resume`. The resolution is hash-chained and the original side
+effect is never replayed automatically.
+
+Every Python/R cell writes complete stdout and stderr under
+`.omicsops/runs/<run-id>/outputs/`. Events and model context contain only a
+bounded head/tail excerpt plus byte count, SHA-256 and project-relative archive
+path. Project environments live under `.omicsops/environments/<name>` and are
+created only by the explicitly approved `runtime.environment.ensure` tool.
+
+Run the deterministic suite first:
+
+```text
+cargo test --workspace
+npm test -- --run
+npm run build
+```
+
+Then run the real low-privilege SSH test using the same pinned-host variables
+from stage 1. The disposable remote root must have Micromamba available; the
+test creates `stage2-r`, executes a persistent R namespace, emits more than
+100KB from Python, interrupts a long cell, and explicitly rebuilds a kernel:
+
+```text
+cargo test -p omicsops-desktop agent_v4::tests::live_v4_stage2_r_output_cancel_rebuild_and_project_environment -- --ignored --exact --nocapture
+```
+
+The live test is intentionally ignored during normal CI. An ignored result is
+not a pass and stage 2 must not be accepted until it has completed against the
+real acceptance host.

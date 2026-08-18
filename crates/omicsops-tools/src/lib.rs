@@ -8,10 +8,14 @@ use omicsops_agent_core::ToolPortV4;
 use omicsops_protocol::{RunModeV4, ToolCallV4, ToolDescriptorV4, ToolEffectV4, ToolOutcomeV4};
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio::sync::{Mutex, Semaphore};
 
 #[async_trait]
 pub trait ToolExecutorV4: Send + Sync {
     async fn execute(&self, call: &ToolCallV4) -> Result<ToolOutcomeV4, String>;
+    async fn interrupt(&self, _run_id: uuid::Uuid) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -30,6 +34,8 @@ pub struct ToolRegistryV4 {
     definitions: BTreeMap<String, ToolDescriptorV4>,
     executor: Arc<dyn ToolExecutorV4>,
     execute_capabilities: Option<BTreeSet<String>>,
+    read_slots: Semaphore,
+    side_effect_lock: Arc<Mutex<()>>,
 }
 
 impl ToolRegistryV4 {
@@ -47,11 +53,18 @@ impl ToolRegistryV4 {
             definitions: mapped,
             executor,
             execute_capabilities: None,
+            read_slots: Semaphore::new(4),
+            side_effect_lock: Arc::new(Mutex::new(())),
         })
     }
 
     pub fn with_execute_capabilities(mut self, capabilities: BTreeSet<String>) -> Self {
         self.execute_capabilities = Some(capabilities);
+        self
+    }
+
+    pub fn with_side_effect_lock(mut self, lock: Arc<Mutex<()>>) -> Self {
+        self.side_effect_lock = lock;
         self
     }
 
@@ -116,10 +129,38 @@ impl ToolPortV4 for ToolRegistryV4 {
             .collect()
     }
 
+    fn effect(&self, tool_id: &str) -> Option<ToolEffectV4> {
+        self.definitions
+            .get(tool_id)
+            .map(|definition| definition.effect)
+    }
+
+    fn validate(&self, mode: RunModeV4, call: &ToolCallV4) -> Result<(), String> {
+        self.authorize(mode, call)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
     async fn execute(&self, mode: RunModeV4, call: ToolCallV4) -> Result<ToolOutcomeV4, String> {
-        self.authorize(mode, &call)
-            .map_err(|error| error.to_string())?;
-        self.executor.execute(&call).await
+        let effect = self
+            .authorize(mode, &call)
+            .map_err(|error| error.to_string())?
+            .effect;
+        if effect == ToolEffectV4::ReadOnly {
+            let _permit = self
+                .read_slots
+                .acquire()
+                .await
+                .map_err(|_| "V4 read-only tool scheduler is closed".to_string())?;
+            self.executor.execute(&call).await
+        } else {
+            let _guard = self.side_effect_lock.lock().await;
+            self.executor.execute(&call).await
+        }
+    }
+
+    async fn interrupt(&self, run_id: uuid::Uuid) -> Result<(), String> {
+        self.executor.interrupt(run_id).await
     }
 }
 
@@ -171,7 +212,25 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
             "runtime.execute",
             "Execute code in a persistent run-scoped kernel",
             ToolEffectV4::Runtime,
-            json!({"type":"object","required":["language","code"],"properties":{"language":{"type":"string"},"code":{"type":"string"},"capture_paths":{"type":"array"}}}),
+            json!({"type":"object","required":["language","code"],"properties":{"language":{"type":"string"},"environment":{"type":"string","default":"system"},"code":{"type":"string"},"capture_paths":{"type":"array"}}}),
+        ),
+        descriptor(
+            "runtime.environment.ensure",
+            "Create or reuse a project-scoped Micromamba environment",
+            ToolEffectV4::Runtime,
+            json!({"type":"object","required":["environment","language"],"properties":{"environment":{"type":"string"},"language":{"type":"string"}}}),
+        ),
+        descriptor(
+            "runtime.rebuild",
+            "Stop and rebuild a persistent kernel explicitly",
+            ToolEffectV4::Runtime,
+            json!({"type":"object","required":["language"],"properties":{"language":{"type":"string"},"environment":{"type":"string"}}}),
+        ),
+        descriptor(
+            "runtime.interrupt",
+            "Interrupt and discard the selected persistent kernel",
+            ToolEffectV4::Runtime,
+            json!({"type":"object","required":["language"],"properties":{"language":{"type":"string"},"environment":{"type":"string"}}}),
         ),
         descriptor(
             "artifact.verify",
@@ -205,6 +264,7 @@ fn descriptor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     struct Noop;
     #[async_trait]
     impl ToolExecutorV4 for Noop {
@@ -246,5 +306,101 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("forbidden in plan mode"));
+    }
+
+    struct ConcurrencyProbe {
+        active: AtomicUsize,
+        maximum: AtomicUsize,
+    }
+    #[async_trait]
+    impl ToolExecutorV4 for ConcurrencyProbe {
+        async fn execute(&self, call: &ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.maximum.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(ToolOutcomeV4 {
+                call_id: call.call_id.clone(),
+                tool_id: call.tool_id.clone(),
+                succeeded: true,
+                model_content: "ok".into(),
+                data: json!({}),
+                provenance: vec![],
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn read_only_calls_are_bounded_to_four_and_side_effects_are_serial() {
+        let probe = Arc::new(ConcurrencyProbe {
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        });
+        let registry = Arc::new(
+            ToolRegistryV4::new(
+                vec![
+                    descriptor(
+                        "read",
+                        "read",
+                        ToolEffectV4::ReadOnly,
+                        json!({"type":"object"}),
+                    ),
+                    descriptor(
+                        "write",
+                        "write",
+                        ToolEffectV4::Mutating,
+                        json!({"type":"object"}),
+                    ),
+                ],
+                probe.clone(),
+            )
+            .unwrap(),
+        );
+        let reads = (0..8)
+            .map(|index| {
+                let registry = registry.clone();
+                tokio::spawn(async move {
+                    registry
+                        .execute(
+                            RunModeV4::Execute,
+                            ToolCallV4 {
+                                call_id: index.to_string(),
+                                tool_id: "read".into(),
+                                arguments: json!({}),
+                            },
+                        )
+                        .await
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        for task in reads {
+            task.await.unwrap();
+        }
+        assert!((2..=4).contains(&probe.maximum.load(Ordering::SeqCst)));
+
+        probe.maximum.store(0, Ordering::SeqCst);
+        let writes = (0..4)
+            .map(|index| {
+                let registry = registry.clone();
+                tokio::spawn(async move {
+                    registry
+                        .execute(
+                            RunModeV4::Execute,
+                            ToolCallV4 {
+                                call_id: index.to_string(),
+                                tool_id: "write".into(),
+                                arguments: json!({}),
+                            },
+                        )
+                        .await
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        for task in writes {
+            task.await.unwrap();
+        }
+        assert_eq!(probe.maximum.load(Ordering::SeqCst), 1);
     }
 }

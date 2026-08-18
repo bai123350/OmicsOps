@@ -94,6 +94,7 @@ pub fn run() {
             agent_v4::agent_v4_resume,
             agent_v4::agent_v4_cancel,
             agent_v4::agent_v4_answer,
+            agent_v4::agent_v4_resolve_uncertain,
             agent_v4::agent_v4_events,
             commands::list_artifacts_v2,
             commands::list_step_attempts_v2,

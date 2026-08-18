@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, OnceLock, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -12,26 +15,29 @@ use omicsops_adapters::{
     ssh::{SshJsonlProcess, SshSession},
 };
 use omicsops_agent::harness_v3::{
-    ModelProviderV2, ModelRequestV2, ModelStreamEventV2, ModelToolSpec, ToolCallAccumulatorV2,
+    ModelRequestV2, ModelStreamEventV2, ModelToolSpec, ToolCallAccumulatorV2,
 };
 use omicsops_agent::{
     KernelEvent, KernelEventDecoder, KernelEventKind, KernelLanguage, KernelRequest,
 };
 use omicsops_agent_core::{
-    AgentCoreErrorV4, AgentCoreV4, EventStoreV4, ModelPortV4, ModelRequestV4, ModelTurnV4,
+    AgentCoreErrorV4, AgentCoreV4, AgentLimitsV4, EventStoreV4, ModelPortV4, ModelRequestV4,
+    ModelStreamEventV4, ModelTurnV4,
 };
 use omicsops_core::{
     domain::ProjectSpec,
     project::{require_remote_descendant, shell_quote},
 };
 use omicsops_protocol::{
-    AgentEventKindV4, AgentEventV4, ExecutionContextKeyV4, ExecutionPlanV4, KernelLanguageV4,
-    RunSpecV4, RuntimeResultV4, ToolCallV4, ToolOutcomeV4,
+    AgentEventKindV4, AgentEventV4, ContextArchiveV4, ContextCheckpointV4, ExecutionContextKeyV4,
+    ExecutionPlanV4, KernelLanguageV4, ModelErrorClassV4, ModelFailureV4, OutputCaptureV4,
+    RunSpecV4, RuntimeResultV4, ToolCallV4, ToolOutcomeV4, UncertainResolutionV4,
 };
 use omicsops_runtime::{KernelBackendV4, KernelProcessV4, RuntimeManagerV4};
 use omicsops_tools::{ToolExecutorV4, ToolRegistryV4, builtin_tool_definitions_v4};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::Digest;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -40,6 +46,20 @@ use crate::commands::{
     AppState, authentication_for_profile, current_project_spec, find_profile, require_trusted_host,
     unified_model_client,
 };
+
+static PROJECT_SIDE_EFFECT_LOCKS_V4: OnceLock<std::sync::Mutex<HashMap<Uuid, Weak<Mutex<()>>>>> =
+    OnceLock::new();
+
+fn project_side_effect_lock_v4(project_id: Uuid) -> Arc<Mutex<()>> {
+    let locks = PROJECT_SIDE_EFFECT_LOCKS_V4.get_or_init(Default::default);
+    let mut locks = locks.lock().expect("V4 project lock registry");
+    if let Some(lock) = locks.get(&project_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(project_id, Arc::downgrade(&lock));
+    lock
+}
 
 pub const AGENT_V4_EVENT_CHANNEL: &str = "agent-v4-event";
 
@@ -62,6 +82,14 @@ pub struct AnswerV4Request {
     pub run_id: Uuid,
     pub question_id: String,
     pub answer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveUncertainV4Request {
+    pub run_id: Uuid,
+    pub call_id: String,
+    pub resolution: UncertainResolutionV4,
+    pub evidence: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,6 +318,46 @@ pub fn agent_v4_answer(
 }
 
 #[tauri::command]
+pub fn agent_v4_resolve_uncertain(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: ResolveUncertainV4Request,
+) -> Result<(), String> {
+    if request.evidence.trim().is_empty() {
+        return Err("uncertain-dispatch resolution requires verification evidence".into());
+    }
+    let events = state
+        .repository
+        .agent_events_v4(request.run_id)
+        .map_err(|error| error.to_string())?;
+    let marked = events.iter().any(|event| {
+        matches!(&event.event, AgentEventKindV4::ToolDispatchUncertain { call_id, .. } if call_id == &request.call_id)
+    });
+    if !marked {
+        return Err("the referenced call is not marked uncertain".into());
+    }
+    let resolved = events.iter().any(|event| {
+        matches!(&event.event, AgentEventKindV4::ToolDispatchResolved { call_id, .. } if call_id == &request.call_id)
+    });
+    if resolved {
+        return Err("the uncertain dispatch is already resolved".into());
+    }
+    let store = RepositoryEventStoreV4 {
+        repository: state.repository.clone(),
+        app,
+    };
+    append_next(
+        &store,
+        request.run_id,
+        AgentEventKindV4::ToolDispatchResolved {
+            call_id: request.call_id,
+            resolution: request.resolution,
+            evidence: request.evidence,
+        },
+    )
+}
+
+#[tauri::command]
 pub fn agent_v4_events(
     state: State<'_, AppState>,
     run_id: Uuid,
@@ -340,17 +408,14 @@ fn spawn_execution(
             let executor = Arc::new(DesktopToolExecutorV4 {
                 session,
                 root,
-                key: ExecutionContextKeyV4 {
-                    project_id: project.id,
-                    run_id: spec.run_id,
-                    backend_id: format!("ssh:{}", profile.id),
-                    language: KernelLanguageV4::Python,
-                    environment: "system".into(),
-                },
+                project_id: project.id,
+                run_id: spec.run_id,
+                backend_id: format!("ssh:{}", profile.id),
                 runtime,
             });
             let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), executor)
                 .map_err(|error| error.to_string())?
+                .with_side_effect_lock(project_side_effect_lock_v4(project.id))
                 .with_execute_capabilities(spec.plan.requested_capabilities.clone());
             let model = DesktopModelPortV4(model);
             let store = RepositoryEventStoreV4 {
@@ -362,7 +427,7 @@ fn spawn_execution(
                 tools: &registry,
                 events: &store,
             }
-            .execute_with_cancellation(&spec, 32, &cancelled)
+            .execute_with_limits(&spec, AgentLimitsV4::default(), &cancelled)
             .await
             .map_err(|error| error.to_string())
         }
@@ -370,10 +435,15 @@ fn spawn_execution(
         let waiting = outcome
             .as_ref()
             .is_err_and(|error| error == "run is waiting for user input");
+        let uncertain = outcome
+            .as_ref()
+            .is_err_and(|error| error.contains("side-effect dispatch is uncertain"));
         record.status = if outcome.is_ok() {
             "completed"
         } else if waiting {
             "waiting_for_input"
+        } else if uncertain {
+            "needs_attention"
         } else if cancelled.load(Ordering::SeqCst) {
             "cancelled"
         } else {
@@ -386,13 +456,16 @@ fn spawn_execution(
                     repository: repository.clone(),
                     app: app.clone(),
                 };
-                let _ = append_next(
-                    &store,
-                    spec.run_id,
+                let event = if uncertain {
+                    AgentEventKindV4::RunNeedsAttention {
+                        message: error.clone(),
+                    }
+                } else {
                     AgentEventKindV4::RunFailed {
                         message: error.clone(),
-                    },
-                );
+                    }
+                };
+                let _ = append_next(&store, spec.run_id, event);
             }
         }
         let _ = save_record(&repository, &record);
@@ -436,18 +509,15 @@ async fn compose(
     let executor = Arc::new(DesktopToolExecutorV4 {
         session,
         root,
-        key: ExecutionContextKeyV4 {
-            project_id: project.id,
-            run_id,
-            backend_id: format!("ssh:{}", profile.id),
-            language: KernelLanguageV4::Python,
-            environment: "system".into(),
-        },
+        project_id: project.id,
+        run_id,
+        backend_id: format!("ssh:{}", profile.id),
         runtime,
     });
     let registry = Arc::new(
         ToolRegistryV4::new(builtin_tool_definitions_v4(), executor)
-            .map_err(|error| error.to_string())?,
+            .map_err(|error| error.to_string())?
+            .with_side_effect_lock(project_side_effect_lock_v4(project.id)),
     );
     Ok((
         Arc::new(DesktopModelPortV4(unified_model_client(
@@ -461,7 +531,11 @@ async fn compose(
 struct DesktopModelPortV4(UnifiedModelClient);
 #[async_trait]
 impl ModelPortV4 for DesktopModelPortV4 {
-    async fn complete(&self, request: ModelRequestV4) -> Result<ModelTurnV4, String> {
+    async fn stream(
+        &self,
+        request: ModelRequestV4,
+        on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+    ) -> Result<ModelTurnV4, ModelFailureV4> {
         let tools = request
             .tools
             .into_iter()
@@ -471,33 +545,60 @@ impl ModelPortV4 for DesktopModelPortV4 {
                 input_schema: tool.input_schema,
             })
             .collect();
-        let events = self
-            .0
-            .stream_v2(ModelRequestV2 {
-                system: request.system,
-                messages: vec![omicsops_agent::ModelMessage {
-                    role: "user".into(),
-                    content: request.context,
-                }],
-                tools,
-                require_strict_json_fallback: true,
-            })
-            .await
-            .map_err(|error| error.to_string())?;
         let mut text = String::new();
         let mut calls = ToolCallAccumulatorV2::default();
-        for event in events {
-            match event {
-                ModelStreamEventV2::TextDelta { text: delta } => text.push_str(&delta),
-                ModelStreamEventV2::Error { code, message, .. } => {
-                    return Err(format!("{code}: {message}"));
-                }
-                other => calls.push(&other).map_err(|error| error.to_string())?,
-            }
+        let mut provider_error = None;
+        let mut accumulator_error = None;
+        self.0
+            .stream_with_v2(
+                ModelRequestV2 {
+                    system: request.system,
+                    messages: vec![omicsops_agent::ModelMessage {
+                        role: "user".into(),
+                        content: request.context,
+                    }],
+                    tools,
+                    require_strict_json_fallback: true,
+                },
+                |event| match event {
+                    ModelStreamEventV2::TextDelta { text: delta } => {
+                        text.push_str(&delta);
+                        on_event(ModelStreamEventV4::TextDelta(delta));
+                    }
+                    ModelStreamEventV2::Retrying {
+                        attempt,
+                        delay_ms,
+                        message,
+                    } => on_event(ModelStreamEventV4::ProviderRetrying {
+                        attempt,
+                        delay_ms,
+                        message,
+                    }),
+                    ModelStreamEventV2::Error { code, message, .. } => {
+                        provider_error =
+                            Some(classify_model_failure(&format!("{code}: {message}")));
+                    }
+                    other if accumulator_error.is_none() => {
+                        if let Err(error) = calls.push(&other) {
+                            accumulator_error = Some(ModelFailureV4::permanent(
+                                ModelErrorClassV4::InvalidResponse,
+                                error.to_string(),
+                            ));
+                        }
+                    }
+                    _ => {}
+                },
+            )
+            .await
+            .map_err(|error| classify_model_failure(&error.to_string()))?;
+        if let Some(error) = provider_error.or(accumulator_error) {
+            return Err(error);
         }
         let tool_calls = calls
             .finish()
-            .map_err(|error| error.to_string())?
+            .map_err(|error| {
+                ModelFailureV4::permanent(ModelErrorClassV4::InvalidResponse, error.to_string())
+            })?
             .into_iter()
             .map(|call| ToolCallV4 {
                 call_id: call.call_id,
@@ -512,11 +613,52 @@ impl ModelPortV4 for DesktopModelPortV4 {
     }
 }
 
+fn classify_model_failure(message: &str) -> ModelFailureV4 {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("429") || lower.contains("rate limit") {
+        ModelFailureV4::transient(ModelErrorClassV4::RateLimited, message)
+    } else if ["500", "502", "503", "504"]
+        .iter()
+        .any(|status| lower.contains(status))
+    {
+        ModelFailureV4::transient(ModelErrorClassV4::Server, message)
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        ModelFailureV4::transient(ModelErrorClassV4::Timeout, message)
+    } else if lower.contains("connect") || lower.contains("transport") {
+        ModelFailureV4::transient(ModelErrorClassV4::Transport, message)
+    } else if lower.contains("401") || lower.contains("403") || lower.contains("credential") {
+        ModelFailureV4::permanent(ModelErrorClassV4::Authentication, message)
+    } else if lower.contains("400") || lower.contains("422") {
+        ModelFailureV4::permanent(ModelErrorClassV4::InvalidRequest, message)
+    } else {
+        ModelFailureV4::permanent(ModelErrorClassV4::InvalidResponse, message)
+    }
+}
+
 struct DesktopToolExecutorV4 {
     session: Arc<SshSession>,
     root: String,
-    key: ExecutionContextKeyV4,
+    project_id: Uuid,
+    run_id: Uuid,
+    backend_id: String,
     runtime: Arc<RuntimeManagerV4>,
+}
+
+impl DesktopToolExecutorV4 {
+    fn key(
+        &self,
+        language: KernelLanguageV4,
+        environment: &str,
+    ) -> Result<ExecutionContextKeyV4, String> {
+        validate_environment_name(environment)?;
+        Ok(ExecutionContextKeyV4 {
+            project_id: self.project_id,
+            run_id: self.run_id,
+            backend_id: self.backend_id.clone(),
+            language,
+            environment: environment.to_owned(),
+        })
+    }
 }
 #[async_trait]
 impl ToolExecutorV4 for DesktopToolExecutorV4 {
@@ -561,10 +703,12 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                 )
             }
             "runtime.execute" => {
-                let language = required(&call.arguments, "language")?;
-                if language != "python" {
-                    return Err("stage 1 V4 runtime supports python only".into());
-                }
+                let language = parse_language(required(&call.arguments, "language")?)?;
+                let environment = call
+                    .arguments
+                    .get("environment")
+                    .and_then(Value::as_str)
+                    .unwrap_or("system");
                 let code = required(&call.arguments, "code")?.to_owned();
                 let captures = call
                     .arguments
@@ -577,10 +721,31 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                     .collect::<Vec<_>>();
                 validate_kernel_code(&code).map_err(|e| e.to_string())?;
                 validate_capture_paths(&captures).map_err(|e| e.to_string())?;
-                let result = self.runtime.execute(&self.key, code, captures).await?;
+                let key = self.key(language, environment)?;
+                let result = self.runtime.execute(&key, code, captures).await?;
                 let content = format!(
-                    "session={} process={}\nstdout:\n{}\nstderr:\n{}",
-                    result.session_id, result.process_identity, result.stdout, result.stderr
+                    "session={} process={} request={}\nstdout ({} bytes, sha256={}):\n{}\nstderr ({} bytes, sha256={}):\n{}",
+                    result.session_id,
+                    result.process_identity,
+                    result.request_id,
+                    result
+                        .stdout_capture
+                        .as_ref()
+                        .map_or(0, |capture| capture.total_bytes),
+                    result
+                        .stdout_capture
+                        .as_ref()
+                        .map_or("", |capture| capture.sha256.as_str()),
+                    result.stdout,
+                    result
+                        .stderr_capture
+                        .as_ref()
+                        .map_or(0, |capture| capture.total_bytes),
+                    result
+                        .stderr_capture
+                        .as_ref()
+                        .map_or("", |capture| capture.sha256.as_str()),
+                    result.stderr
                 );
                 return Ok(ToolOutcomeV4 {
                     call_id: call.call_id.clone(),
@@ -590,6 +755,69 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                     data: serde_json::to_value(&result).map_err(|e| e.to_string())?,
                     provenance: vec![format!("kernel-session:{}", result.session_id)],
                 });
+            }
+            "runtime.environment.ensure" => {
+                let language = parse_language(required(&call.arguments, "language")?)?;
+                let environment = required(&call.arguments, "environment")?;
+                validate_environment_name(environment)?;
+                if environment == "system" {
+                    return Err("system environment cannot be created or changed".into());
+                }
+                let prefix = environment_path(&self.root, environment);
+                let packages = match language {
+                    KernelLanguageV4::Python => "python",
+                    KernelLanguageV4::R => "r-base r-jsonlite",
+                };
+                let out = self
+                    .session
+                    .execute_checked(&format!(
+                        "prefix={0}; mkdir -p {1}; if test -d \"$prefix/conda-meta\"; then printf 'reused %s\\n' \"$prefix\"; else tool=$(command -v micromamba) || {{ printf 'micromamba is required\\n' >&2; exit 69; }}; \"$tool\" create --yes --prefix \"$prefix\" {2}; fi; \"${{tool:-$(command -v micromamba)}}\" list --prefix \"$prefix\" --explicit",
+                        shell_quote(&prefix),
+                        shell_quote(&format!("{}/.omicsops/environments", self.root.trim_end_matches('/'))),
+                        packages,
+                    ))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let (excerpt, _) = bounded_excerpt(&out.stdout, 16 * 1024);
+                (
+                    excerpt,
+                    json!({"environment":environment,"prefix":prefix,"language":language}),
+                    vec![format!("environment:{environment}")],
+                )
+            }
+            "runtime.rebuild" => {
+                let language = parse_language(required(&call.arguments, "language")?)?;
+                let environment = call
+                    .arguments
+                    .get("environment")
+                    .and_then(Value::as_str)
+                    .unwrap_or("system");
+                let key = self.key(language, environment)?;
+                let session = self.runtime.rebuild(&key).await?;
+                (
+                    format!(
+                        "rebuilt kernel session={} process={}",
+                        session.session_id(),
+                        session.process_identity()
+                    ),
+                    json!({"session_id":session.session_id(),"process_identity":session.process_identity(),"language":language,"environment":environment}),
+                    vec![format!("kernel-session:{}", session.session_id())],
+                )
+            }
+            "runtime.interrupt" => {
+                let language = parse_language(required(&call.arguments, "language")?)?;
+                let environment = call
+                    .arguments
+                    .get("environment")
+                    .and_then(Value::as_str)
+                    .unwrap_or("system");
+                let key = self.key(language, environment)?;
+                self.runtime.interrupt(&key).await?;
+                (
+                    format!("interrupted {language:?} kernel in {environment}"),
+                    json!({"language":language,"environment":environment}),
+                    vec![],
+                )
             }
             "artifact.verify" => {
                 let path = required(&call.arguments, "path")?;
@@ -634,6 +862,10 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
             provenance,
         })
     }
+
+    async fn interrupt(&self, run_id: Uuid) -> Result<(), String> {
+        self.runtime.interrupt_run(run_id).await
+    }
 }
 
 struct SshKernelBackendV4 {
@@ -647,22 +879,46 @@ impl KernelBackendV4 for SshKernelBackendV4 {
         &self,
         key: &ExecutionContextKeyV4,
     ) -> Result<Arc<dyn KernelProcessV4>, String> {
-        if key.language != KernelLanguageV4::Python {
-            return Err("stage 1 supports python only".into());
-        }
+        validate_environment_name(&key.environment)?;
         let session_id = Uuid::new_v4();
         let dir = format!("{}/.omicsops/kernels", self.root.trim_end_matches('/'));
         self.session
             .execute_checked(&format!("mkdir -p {}", shell_quote(&dir)))
             .await
             .map_err(|e| e.to_string())?;
-        let driver = format!("{dir}/v4-{session_id}.driver.py");
+        let (driver_language, extension, executable) = match key.language {
+            KernelLanguageV4::Python => (KernelLanguage::Python, "py", "python -u"),
+            KernelLanguageV4::R => (KernelLanguage::R, "R", "Rscript --vanilla"),
+        };
+        let driver = format!("{dir}/v4-{session_id}.driver.{extension}");
         self.session
-            .upload_text(&driver, kernel_driver(KernelLanguage::Python))
+            .upload_text(&driver, kernel_driver(driver_language))
             .await
             .map_err(|e| e.to_string())?;
+        let executable = if key.environment == "system" {
+            executable.to_owned()
+        } else {
+            let prefix = environment_path(&self.root, &key.environment);
+            let probe = self
+                .session
+                .execute_checked(&format!(
+                    "test -d {0}/conda-meta && command -v micromamba >/dev/null",
+                    shell_quote(&prefix)
+                ))
+                .await;
+            if probe.is_err() {
+                return Err(format!(
+                    "project environment {} is missing; call runtime.environment.ensure first",
+                    key.environment
+                ));
+            }
+            format!(
+                "micromamba run --prefix {} {executable}",
+                shell_quote(&prefix)
+            )
+        };
         let command = format!(
-            "python3 -u {} {} {} {}",
+            "{executable} {} {} {} {}",
             shell_quote(&driver),
             shell_quote(&self.root),
             shell_quote(&self.project_id.to_string()),
@@ -675,8 +931,14 @@ impl KernelBackendV4 for SshKernelBackendV4 {
             .map_err(|e| e.to_string())?;
         Ok(Arc::new(SshKernelProcessV4 {
             id: session_id,
-            identity: format!("ssh-jsonl:{session_id}"),
+            identity: format!("ssh-jsonl:{:?}:{session_id}", key.language).to_ascii_lowercase(),
             project_id: self.project_id,
+            session: self.session.clone(),
+            output_dir: format!(
+                "{}/.omicsops/runs/{}/outputs",
+                self.root.trim_end_matches('/'),
+                key.run_id
+            ),
             process: Mutex::new(Some(process)),
         }))
     }
@@ -686,6 +948,8 @@ struct SshKernelProcessV4 {
     id: Uuid,
     identity: String,
     project_id: Uuid,
+    session: Arc<SshSession>,
+    output_dir: String,
     process: Mutex<Option<SshJsonlProcess>>,
 }
 #[async_trait]
@@ -740,11 +1004,20 @@ impl KernelProcessV4 for SshKernelProcessV4 {
                 _ => {}
             }
         }
+        self.session
+            .execute_checked(&format!("mkdir -p {}", shell_quote(&self.output_dir)))
+            .await
+            .map_err(|e| e.to_string())?;
+        let stdout_capture = self.archive_output(request_id, "stdout", &stdout).await?;
+        let stderr_capture = self.archive_output(request_id, "stderr", &stderr).await?;
         Ok(RuntimeResultV4 {
+            request_id,
             session_id: self.id,
             process_identity: self.identity.clone(),
-            stdout,
-            stderr,
+            stdout: stdout_capture.excerpt.clone(),
+            stderr: stderr_capture.excerpt.clone(),
+            stdout_capture: Some(stdout_capture),
+            stderr_capture: Some(stderr_capture),
             succeeded,
             artifacts,
         })
@@ -754,6 +1027,34 @@ impl KernelProcessV4 for SshKernelProcessV4 {
             process.shutdown().await.map_err(|e| e.to_string())?
         }
         Ok(())
+    }
+}
+
+impl SshKernelProcessV4 {
+    async fn archive_output(
+        &self,
+        request_id: Uuid,
+        stream: &str,
+        contents: &str,
+    ) -> Result<OutputCaptureV4, String> {
+        let remote_path = format!("{}/{}.{}.txt", self.output_dir, request_id, stream);
+        self.session
+            .upload_text(&remote_path, contents)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (excerpt, truncated) = bounded_excerpt(contents, 16 * 1024);
+        let marker = "/.omicsops/";
+        let archive_path = remote_path
+            .find(marker)
+            .map(|index| remote_path[index + 1..].to_owned())
+            .unwrap_or(remote_path);
+        Ok(OutputCaptureV4 {
+            excerpt,
+            total_bytes: contents.len() as u64,
+            sha256: hex::encode(sha2::Sha256::digest(contents.as_bytes())),
+            archive_path,
+            truncated,
+        })
     }
 }
 
@@ -774,6 +1075,17 @@ impl EventStoreV4 for RepositoryEventStoreV4 {
         self.repository
             .agent_events_v4(run_id)
             .map_err(|e| e.to_string())
+    }
+
+    fn archive_context(
+        &self,
+        run_id: Uuid,
+        transcript: &str,
+        checkpoint: &ContextCheckpointV4,
+    ) -> Result<ContextArchiveV4, String> {
+        self.repository
+            .archive_agent_context_v4(run_id, transcript, checkpoint)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -821,6 +1133,60 @@ async fn resolve_root(session: &SshSession, configured: &str) -> Result<String, 
         Ok(root)
     }
 }
+
+fn parse_language(value: &str) -> Result<KernelLanguageV4, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "python" | "py" => Ok(KernelLanguageV4::Python),
+        "r" => Ok(KernelLanguageV4::R),
+        _ => Err(format!("unsupported kernel language: {value}")),
+    }
+}
+
+fn validate_environment_name(value: &str) -> Result<(), String> {
+    if value == "system"
+        || (!value.is_empty()
+            && value.len() <= 64
+            && value
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character)))
+    {
+        Ok(())
+    } else {
+        Err("environment must be 'system' or a safe project environment name".into())
+    }
+}
+
+fn environment_path(root: &str, environment: &str) -> String {
+    format!(
+        "{}/.omicsops/environments/{environment}",
+        root.trim_end_matches('/')
+    )
+}
+
+fn bounded_excerpt(value: &str, max_bytes: usize) -> (String, bool) {
+    if value.len() <= max_bytes {
+        return (value.to_owned(), false);
+    }
+    let half = max_bytes / 2;
+    let mut head_end = half.min(value.len());
+    while !value.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = value.len().saturating_sub(half);
+    while !value.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    (
+        format!(
+            "{}\n… <{} bytes archived; middle omitted> …\n{}",
+            &value[..head_end],
+            value.len(),
+            &value[tail_start..]
+        ),
+        true,
+    )
+}
+
 fn project_path(root: &str, relative: &str) -> Result<String, String> {
     let raw = relative.trim().replace('\\', "/");
     if raw.starts_with('/') || raw.split('/').any(|p| p == "..") {
@@ -869,6 +1235,34 @@ mod tests {
         assert!(project_path("/srv/project", "/etc/passwd").is_err());
     }
 
+    #[test]
+    fn v4_output_excerpt_is_bounded_and_preserves_both_ends() {
+        let output = format!("BEGIN{}END", "x".repeat(100 * 1024));
+        let (excerpt, truncated) = bounded_excerpt(&output, 16 * 1024);
+        assert!(truncated);
+        assert!(excerpt.starts_with("BEGIN"));
+        assert!(excerpt.ends_with("END"));
+        assert!(excerpt.len() < 17 * 1024);
+    }
+
+    #[test]
+    fn v4_provider_errors_are_classified_for_host_retry() {
+        assert!(classify_model_failure("429 rate limit").retryable);
+        assert_eq!(
+            classify_model_failure("request timed out").class,
+            ModelErrorClassV4::Timeout
+        );
+        assert!(!classify_model_failure("401 unauthorized").retryable);
+    }
+
+    #[test]
+    fn v4_environment_names_cannot_escape_project_scope() {
+        assert!(validate_environment_name("analysis-r").is_ok());
+        assert!(validate_environment_name("system").is_ok());
+        assert!(validate_environment_name("../outside").is_err());
+        assert!(validate_environment_name("bad/name").is_err());
+    }
+
     #[tokio::test]
     #[ignore = "requires explicit live model/SSH credentials and an empty disposable OMICSOPS_LIVE_PBMC_ROOT"]
     async fn live_v4_model_plan_and_persistent_ssh_python_kernel() {
@@ -915,7 +1309,28 @@ mod tests {
             )
             .unwrap(),
         );
-        let turn=model.complete(ModelRequestV4{system:"Return exactly one native agent.propose_plan tool call. Do not return prose.".into(),context:"Create schema_version 4 plan for a two-cell Python persistence probe with nonempty steps and completion_criteria; requested_capabilities must contain runtime.execute.".into(),tools:vec![ToolDescriptorV4{id:"agent.propose_plan".into(),description:"submit plan".into(),input_schema:json!({"type":"object","required":["schema_version","objective","steps","completion_criteria","requested_capabilities"],"properties":{}}),effect:ToolEffectV4::ReadOnly}]}).await.unwrap();
+        let mut streamed = String::new();
+        let turn = model
+            .stream(
+                ModelRequestV4 {
+                    system: "Return exactly one native agent.propose_plan tool call. Do not return prose.".into(),
+                    context: "Create schema_version 4 plan for a two-cell Python persistence probe with nonempty steps and completion_criteria; requested_capabilities must contain runtime.execute.".into(),
+                    tools: vec![ToolDescriptorV4 {
+                        id: "agent.propose_plan".into(),
+                        description: "submit plan".into(),
+                        input_schema: json!({"type":"object","required":["schema_version","objective","steps","completion_criteria","requested_capabilities"],"properties":{}}),
+                        effect: ToolEffectV4::ReadOnly,
+                    }],
+                },
+                &mut |event| {
+                    if let ModelStreamEventV4::TextDelta(delta) = event {
+                        streamed.push_str(&delta);
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(streamed, turn.public_text);
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].tool_id, "agent.propose_plan");
         let plan: ExecutionPlanV4 =
@@ -949,5 +1364,119 @@ mod tests {
         assert!(second.stdout.contains("persistent-ok"));
         let _ = runtime.interrupt(&key).await;
         let _ = RunModeV4::Execute;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicit live SSH credentials, R, Micromamba, and an empty disposable OMICSOPS_LIVE_PBMC_ROOT"]
+    async fn live_v4_stage2_r_output_cancel_rebuild_and_project_environment() {
+        let profile = ConnectionProfile {
+            id: Uuid::new_v4(),
+            label: "V4 stage 2 acceptance".into(),
+            host: std::env::var("OMICSOPS_LIVE_SSH_HOST").expect("live host"),
+            port: std::env::var("OMICSOPS_LIVE_SSH_PORT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(22),
+            username: std::env::var("OMICSOPS_LIVE_SSH_USER").expect("live user"),
+            authentication: AuthenticationMethod::Password,
+            authentication_reference: "acceptance".into(),
+            host_key_fingerprint: Some(
+                std::env::var("OMICSOPS_LIVE_SSH_FINGERPRINT").expect("fingerprint"),
+            ),
+        };
+        let session = Arc::new(
+            SshSession::connect(
+                &profile,
+                SshAuthentication::Password(
+                    std::env::var("OMICSOPS_LIVE_SSH_PASSWORD").expect("password"),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        let root = resolve_root(
+            &session,
+            &std::env::var("OMICSOPS_LIVE_PBMC_ROOT").expect("disposable root"),
+        )
+        .await
+        .unwrap();
+        let project_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let backend = Arc::new(SshKernelBackendV4 {
+            session: session.clone(),
+            root: root.clone(),
+            project_id,
+        });
+        let runtime = Arc::new(RuntimeManagerV4::new(backend));
+        let python = ExecutionContextKeyV4 {
+            project_id,
+            run_id,
+            backend_id: "ssh:live-stage2".into(),
+            language: KernelLanguageV4::Python,
+            environment: "system".into(),
+        };
+
+        let large = runtime
+            .execute(&python, "print('x' * (100 * 1024))".into(), vec![])
+            .await
+            .unwrap();
+        let capture = large.stdout_capture.as_ref().unwrap();
+        assert!(capture.total_bytes >= 100 * 1024);
+        assert!(capture.truncated);
+        assert_eq!(capture.sha256.len(), 64);
+        assert!(large.stdout.len() < 17 * 1024);
+
+        let original_session = large.session_id;
+        let rebuilt = runtime.rebuild(&python).await.unwrap();
+        assert_ne!(original_session, rebuilt.session_id());
+
+        let long_runtime = runtime.clone();
+        let long_key = python.clone();
+        let long = tokio::spawn(async move {
+            long_runtime
+                .execute(&long_key, "import time; time.sleep(60)".into(), vec![])
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        long.abort();
+        runtime.interrupt(&python).await.unwrap();
+        let after_interrupt = runtime
+            .execute(&python, "print('after-interrupt')".into(), vec![])
+            .await
+            .unwrap();
+        assert!(after_interrupt.stdout.contains("after-interrupt"));
+
+        let executor = DesktopToolExecutorV4 {
+            session: session.clone(),
+            root: root.clone(),
+            project_id,
+            run_id,
+            backend_id: "ssh:live-stage2".into(),
+            runtime: runtime.clone(),
+        };
+        executor
+            .execute(&ToolCallV4 {
+                call_id: "ensure-r".into(),
+                tool_id: "runtime.environment.ensure".into(),
+                arguments: json!({"environment":"stage2-r","language":"r"}),
+            })
+            .await
+            .unwrap();
+        let r_key = ExecutionContextKeyV4 {
+            language: KernelLanguageV4::R,
+            environment: "stage2-r".into(),
+            ..python
+        };
+        let first = runtime
+            .execute(&r_key, "v4_r_probe <- 'persistent-r'".into(), vec![])
+            .await
+            .unwrap();
+        let second = runtime
+            .execute(&r_key, "cat(v4_r_probe)".into(), vec![])
+            .await
+            .unwrap();
+        assert_eq!(first.session_id, second.session_id);
+        assert!(second.stdout.contains("persistent-r"));
+        runtime.interrupt_run(run_id).await.unwrap();
     }
 }
