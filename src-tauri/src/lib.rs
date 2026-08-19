@@ -118,6 +118,7 @@ pub fn run() {
             p1_commands::list_mcp_servers,
             p1_commands::save_mcp_server,
             p1_commands::set_mcp_server_enabled,
+            p1_commands::set_mcp_launch_approval,
             p1_commands::inspect_configured_mcp_server,
             p1_commands::set_mcp_tool_approval,
             p1_commands::call_configured_mcp_tool,

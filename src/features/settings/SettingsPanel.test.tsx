@@ -64,7 +64,7 @@ describe("SettingsPanel model providers", () => {
   });
 
   it("configures MCP without launching it and requires inspection plus per-tool approval", async () => {
-    const server = { id: "mcp-1", name: "paper-search", command: "npx", args: ["paper-mcp"], enabled: false, approved_tools: [], tools: [{ name: "search_papers", description: "Search papers" }], capabilities: { tools: {} }, last_inspected_at: "2026-08-13T12:00:00Z", created_at: "2026-08-13T12:00:00Z", updated_at: "2026-08-13T12:00:00Z" };
+    const server = { id: "mcp-1", name: "paper-search", command: "npx", args: ["paper-mcp"], enabled: false, launch_approved: false, approved_tools: [], tools: [{ name: "search_papers", description: "Search papers" }], capabilities: { tools: {} }, last_inspected_at: "2026-08-13T12:00:00Z", created_at: "2026-08-13T12:00:00Z", updated_at: "2026-08-13T12:00:00Z" };
     const onSaveMcpServer = vi.fn().mockResolvedValue(server);
     const onInspectMcpServer = vi.fn().mockResolvedValue(undefined);
     const onSetMcpToolApproval = vi.fn().mockResolvedValue(server);

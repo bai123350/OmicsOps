@@ -22,6 +22,7 @@ omicsops-core = { path = "../crates/omicsops-core" }
 omicsops-protocol = { path = "../crates/omicsops-protocol" }
 omicsops-runtime = { path = "../crates/omicsops-runtime" }
 omicsops-science = { path = "../crates/omicsops-science" }
+omicsops-knowledge = { path = "../crates/omicsops-knowledge" }
 omicsops-tools = { path = "../crates/omicsops-tools" }
 omicsops-runner = { path = "../crates/omicsops-runner" }
 reqwest.workspace = true

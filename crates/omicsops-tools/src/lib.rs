@@ -79,7 +79,14 @@ impl ToolRegistryV4 {
             .ok_or_else(|| ToolRegistryErrorV4::Unknown(call.tool_id.clone()))?;
         let planning_allowed = matches!(
             call.tool_id.as_str(),
-            "project.list" | "project.read" | "agent.request_input" | "agent.propose_plan"
+            "project.list"
+                | "project.read"
+                | "search_skills"
+                | "use_skill"
+                | "search_memory"
+                | "search_mcp_tools"
+                | "agent.request_input"
+                | "agent.propose_plan"
         );
         if mode == RunModeV4::Plan
             && (!planning_allowed || definition.effect != ToolEffectV4::ReadOnly)
@@ -113,7 +120,14 @@ impl ToolPortV4 for ToolRegistryV4 {
             .filter(|definition| match mode {
                 RunModeV4::Plan => matches!(
                     definition.id.as_str(),
-                    "project.list" | "project.read" | "agent.request_input" | "agent.propose_plan"
+                    "project.list"
+                        | "project.read"
+                        | "search_skills"
+                        | "use_skill"
+                        | "search_memory"
+                        | "search_mcp_tools"
+                        | "agent.request_input"
+                        | "agent.propose_plan"
                 ),
                 RunModeV4::Execute => {
                     definition.id != "agent.propose_plan"
@@ -195,6 +209,36 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
             "Read a project-relative text file",
             ToolEffectV4::ReadOnly,
             json!({"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}),
+        ),
+        descriptor(
+            "search_skills",
+            "Search enabled Skill metadata and matching section names without loading instructions",
+            ToolEffectV4::ReadOnly,
+            json!({"type":"object","required":["query"],"properties":{"query":{"type":"string"},"limit":{"type":"integer"}}}),
+        ),
+        descriptor(
+            "use_skill",
+            "Load and freeze selected sections from one enabled Skill package",
+            ToolEffectV4::ReadOnly,
+            json!({"type":"object","required":["skill_id"],"properties":{"skill_id":{"type":"string"},"sections":{"type":"array"}}}),
+        ),
+        descriptor(
+            "search_memory",
+            "Search project Memory with Unicode lexical matching, Chinese n-grams, recency, and RRF",
+            ToolEffectV4::ReadOnly,
+            json!({"type":"object","required":["query"],"properties":{"query":{"type":"string"},"dimension":{"type":"string"},"limit":{"type":"integer"}}}),
+        ),
+        descriptor(
+            "search_mcp_tools",
+            "Search stored MCP tool descriptions without launching a server",
+            ToolEffectV4::ReadOnly,
+            json!({"type":"object","required":["query"],"properties":{"query":{"type":"string"},"limit":{"type":"integer"}}}),
+        ),
+        descriptor(
+            "use_mcp_tool",
+            "Call one configured, enabled, launch-approved, and tool-approved MCP stdio tool",
+            ToolEffectV4::Network,
+            json!({"type":"object","required":["server_id","tool","arguments","schema_sha256"],"properties":{"server_id":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"},"schema_sha256":{"type":"string"}}}),
         ),
         descriptor(
             "agent.request_input",
@@ -294,6 +338,16 @@ mod tests {
     #[tokio::test]
     async fn plan_mode_hard_denies_runtime() {
         let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap();
+        let planning = registry
+            .descriptors(RunModeV4::Plan)
+            .into_iter()
+            .map(|tool| tool.id)
+            .collect::<BTreeSet<_>>();
+        assert!(planning.contains("search_skills"));
+        assert!(planning.contains("use_skill"));
+        assert!(planning.contains("search_memory"));
+        assert!(planning.contains("search_mcp_tools"));
+        assert!(!planning.contains("use_mcp_tool"));
         let error = registry
             .execute(
                 RunModeV4::Plan,

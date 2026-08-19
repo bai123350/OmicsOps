@@ -137,6 +137,34 @@ pub fn memory_facts(
             created_at: artifact.created_at,
         });
     }
+    for entry in repository
+        .notebook_for_project(request.project_id)
+        .map_err(|error| error.to_string())?
+    {
+        if request
+            .conversation_id
+            .is_some_and(|id| entry.conversation_id.is_some_and(|entry_id| entry_id != id))
+        {
+            continue;
+        }
+        facts.push(MemoryFact {
+            id: stable_uuid(&format!("notebook:{}", entry.id)),
+            project_id: request.project_id,
+            conversation_id: entry.conversation_id,
+            run_id: None,
+            dimension: format!("{:?}", entry.kind).to_ascii_lowercase(),
+            key: entry.title.clone(),
+            value: entry.markdown.clone(),
+            statement: entry.markdown.clone(),
+            evidence: vec![EvidenceReference {
+                source_kind: "notebook".into(),
+                source_id: entry.id.to_string(),
+                excerpt: excerpt(&entry.markdown, 480),
+            }],
+            conflicted_with: vec![],
+            created_at: entry.updated_at,
+        });
+    }
     mark_conflicts(&mut facts);
     facts.retain(|fact| {
         request
@@ -417,6 +445,8 @@ pub struct McpRequest {
     pub approved: bool,
     pub tool: Option<String>,
     pub arguments: Option<Value>,
+    #[serde(default)]
+    pub expected_schema_sha256: Option<String>,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct McpResult {
@@ -435,6 +465,8 @@ pub struct McpServerProfile {
     #[serde(default)]
     pub args: Vec<String>,
     pub enabled: bool,
+    #[serde(default)]
+    pub launch_approved: bool,
     #[serde(default)]
     pub approved_tools: Vec<String>,
     #[serde(default)]
@@ -459,6 +491,12 @@ pub struct SaveMcpServerRequest {
 pub struct SetMcpServerEnabledRequest {
     pub server_id: Uuid,
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetMcpLaunchApprovalRequest {
+    pub server_id: Uuid,
+    pub approved: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -521,6 +559,8 @@ fn mcp_profile_from_request(
         command: request.command.trim().to_string(),
         args: request.args,
         enabled: existing.is_some_and(|profile| profile.enabled) && !declaration_changed,
+        launch_approved: existing.is_some_and(|profile| profile.launch_approved)
+            && !declaration_changed,
         approved_tools: if declaration_changed {
             vec![]
         } else {
@@ -599,6 +639,25 @@ pub fn set_mcp_server_enabled(
 }
 
 #[tauri::command]
+pub fn set_mcp_launch_approval(
+    state: State<'_, AppState>,
+    request: SetMcpLaunchApprovalRequest,
+) -> Result<McpServerProfile, String> {
+    let mut profile = mcp_server_profile(&state.repository, request.server_id)?;
+    profile.launch_approved = request.approved;
+    if !request.approved {
+        profile.enabled = false;
+        profile.approved_tools.clear();
+    }
+    profile.updated_at = Utc::now();
+    state
+        .repository
+        .put_json("mcp_server", &profile.id.to_string(), &profile)
+        .map_err(|error| error.to_string())?;
+    Ok(profile)
+}
+
+#[tauri::command]
 pub fn set_mcp_tool_approval(
     state: State<'_, AppState>,
     request: SetMcpToolApprovalRequest,
@@ -642,6 +701,7 @@ pub async fn inspect_configured_mcp_server(
             approved: request.approved,
             tool: None,
             arguments: None,
+            expected_schema_sha256: None,
         },
         false,
     )
@@ -649,6 +709,7 @@ pub async fn inspect_configured_mcp_server(
     // A fresh discovery can change a tool's schema or behavior without changing its name.
     // Require the user to approve every tool again after each inspection.
     profile.approved_tools.clear();
+    profile.launch_approved = true;
     profile.tools = result.tools.clone();
     profile.capabilities = result.capabilities.clone();
     profile.last_inspected_at = Some(Utc::now());
@@ -668,6 +729,9 @@ pub async fn call_configured_mcp_tool(
     let profile = mcp_server_profile(&state.repository, request.server_id)?;
     if !profile.enabled {
         return Err("MCP server is disabled".into());
+    }
+    if !profile.launch_approved {
+        return Err("MCP server launch has not been approved".into());
     }
     if !profile
         .approved_tools
@@ -689,6 +753,7 @@ pub async fn call_configured_mcp_tool(
             approved: request.approved,
             tool: Some(request.tool),
             arguments: request.arguments,
+            expected_schema_sha256: None,
         },
         true,
     )
@@ -755,7 +820,12 @@ async fn run_mcp_session(
         let tools = tools_value.get("tools").and_then(Value::as_array).cloned().unwrap_or_default();
         let result = if call_tool {
             let tool = request.tool.as_deref().ok_or("MCP tool name is required")?;
-            if !tools.iter().any(|entry| entry.get("name").and_then(Value::as_str) == Some(tool)) { return Err(format!("MCP tool {tool} was not advertised by the server")); }
+            let advertised = tools.iter().find(|entry| entry.get("name").and_then(Value::as_str) == Some(tool)).ok_or_else(|| format!("MCP tool {tool} was not advertised by the server"))?;
+            if let Some(expected) = &request.expected_schema_sha256 {
+                let schema = advertised.get("inputSchema").or_else(|| advertised.get("input_schema")).cloned().unwrap_or_else(|| json!({"type":"object"}));
+                let actual = hex::encode(Sha256::digest(serde_json::to_vec(&schema).map_err(|error| error.to_string())?));
+                if &actual != expected { return Err("MCP schema changed since search; invocation denied".into()); }
+            }
             Some(rpc(&mut child, 3, "tools/call", json!({"name":tool,"arguments":request.arguments.clone().unwrap_or_else(|| json!({}))})).await?)
         } else { None };
         Ok::<_, String>(McpResult { server_name: request.name.clone(), capabilities: initialize.get("capabilities").cloned().unwrap_or_else(|| json!({})), tools, result, audit_id })
@@ -1050,6 +1120,7 @@ mod tests {
                 approved: false,
                 tool: None,
                 arguments: None,
+                expected_schema_sha256: None,
             },
             false,
         )
@@ -1081,11 +1152,13 @@ mod tests {
         )
         .unwrap();
         assert!(!created.enabled);
+        assert!(!created.launch_approved);
         assert!(created.approved_tools.is_empty());
         assert_eq!(created.name, "papers");
 
         let mut discovered = created.clone();
         discovered.enabled = true;
+        discovered.launch_approved = true;
         discovered.approved_tools = vec!["search".into()];
         discovered.tools = vec![json!({"name":"search"})];
         discovered.last_inspected_at = Some(now);
@@ -1101,6 +1174,7 @@ mod tests {
         )
         .unwrap();
         assert!(!changed.enabled);
+        assert!(!changed.launch_approved);
         assert!(changed.approved_tools.is_empty());
         assert!(changed.tools.is_empty());
         assert!(changed.last_inspected_at.is_none());
@@ -1117,6 +1191,7 @@ mod tests {
             command: "fixture".into(),
             args: vec![],
             enabled: true,
+            launch_approved: true,
             approved_tools: vec!["search".into()],
             tools: vec![
                 json!({"name":"search","description":"Search papers","inputSchema":{"type":"object"}}),
@@ -1144,7 +1219,10 @@ pub(crate) fn approved_mcp_tool_definitions_v3(
         .list_json::<McpServerProfile>("mcp_server")
         .map_err(|error| error.to_string())?;
     let mut definitions = Vec::new();
-    for profile in profiles.into_iter().filter(|profile| profile.enabled) {
+    for profile in profiles
+        .into_iter()
+        .filter(|profile| profile.enabled && profile.launch_approved)
+    {
         for tool in &profile.tools {
             let Some(name) = tool.get("name").and_then(Value::as_str) else {
                 continue;
@@ -1184,9 +1262,42 @@ pub(crate) async fn invoke_configured_mcp_tool_v3(
     tool: &str,
     arguments: Value,
 ) -> Result<McpResult, String> {
+    invoke_configured_mcp_tool(repository, project_id, server_id, tool, arguments, None).await
+}
+
+pub(crate) async fn invoke_configured_mcp_tool_v4(
+    repository: &Repository,
+    project_id: Uuid,
+    server_id: Uuid,
+    tool: &str,
+    arguments: Value,
+    expected_schema_sha256: String,
+) -> Result<McpResult, String> {
+    invoke_configured_mcp_tool(
+        repository,
+        project_id,
+        server_id,
+        tool,
+        arguments,
+        Some(expected_schema_sha256),
+    )
+    .await
+}
+
+async fn invoke_configured_mcp_tool(
+    repository: &Repository,
+    project_id: Uuid,
+    server_id: Uuid,
+    tool: &str,
+    arguments: Value,
+    expected_schema_sha256: Option<String>,
+) -> Result<McpResult, String> {
     let profile = mcp_server_profile(repository, server_id)?;
     if !profile.enabled {
         return Err("MCP server is disabled".into());
+    }
+    if !profile.launch_approved {
+        return Err("MCP server launch approval was revoked".into());
     }
     let declared = profile
         .tools
@@ -1214,6 +1325,7 @@ pub(crate) async fn invoke_configured_mcp_tool_v3(
             approved: true,
             tool: Some(tool.into()),
             arguments: Some(arguments),
+            expected_schema_sha256,
         },
         true,
     )

@@ -22,11 +22,15 @@ use omicsops_agent::{
 };
 use omicsops_agent_core::{
     AgentCoreErrorV4, AgentCoreV4, AgentLimitsV4, EventStoreV4, ModelPortV4, ModelRequestV4,
-    ModelStreamEventV4, ModelTurnV4, ScientificStateStoreV4, ScientificUpdateV4,
+    ModelStreamEventV4, ModelTurnV4, PromptLayersV4, ScientificStateStoreV4, ScientificUpdateV4,
 };
 use omicsops_core::{
     domain::ProjectSpec,
     project::{require_remote_descendant, shell_quote},
+};
+use omicsops_knowledge::{
+    McpToolIndexV4, MemoryDocumentV4, SkillDocumentV4, authorize_mcp_use, freeze_skill,
+    markdown_sections, schema_digest, search_mcp_tools, search_memory, search_skills,
 };
 use omicsops_protocol::{
     AgentEventKindV4, AgentEventV4, ContextArchiveV4, ContextCheckpointV4, ExecutionContextKeyV4,
@@ -50,6 +54,9 @@ use uuid::Uuid;
 use crate::commands::{
     AppState, authentication_for_profile, current_project_spec, find_profile, require_trusted_host,
     unified_model_client,
+};
+use crate::p1_commands::{
+    McpServerProfile, MemorySearchRequest, invoke_configured_mcp_tool_v4, memory_facts,
 };
 
 static PROJECT_SIDE_EFFECT_LOCKS_V4: OnceLock<std::sync::Mutex<HashMap<Uuid, Weak<Mutex<()>>>>> =
@@ -419,6 +426,8 @@ fn spawn_execution(
                     .map_err(|error| error.to_string())?,
             );
             let root = resolve_root(&session, &project.remote_root).await?;
+            let prompt =
+                load_prompt_layers(&session, &root, &format!("ssh:{}", profile.id)).await?;
             let backend = Arc::new(SshKernelBackendV4 {
                 session: session.clone(),
                 root: root.clone(),
@@ -426,6 +435,7 @@ fn spawn_execution(
             });
             let runtime = Arc::new(RuntimeManagerV4::new(backend));
             let executor = Arc::new(DesktopToolExecutorV4 {
+                repository: repository.clone(),
                 session,
                 root,
                 project_id: project.id,
@@ -437,7 +447,10 @@ fn spawn_execution(
                 .map_err(|error| error.to_string())?
                 .with_side_effect_lock(project_side_effect_lock_v4(project.id))
                 .with_execute_capabilities(spec.plan.requested_capabilities.clone());
-            let model = DesktopModelPortV4(model);
+            let model = DesktopModelPortV4 {
+                client: model,
+                prompt,
+            };
             let store = RepositoryEventStoreV4 {
                 repository: repository.clone(),
                 app: app.clone(),
@@ -526,6 +539,7 @@ async fn compose(
             .map_err(|error| error.to_string())?,
     );
     let root = resolve_root(&session, &project.remote_root).await?;
+    let prompt = load_prompt_layers(&session, &root, &format!("ssh:{}", profile.id)).await?;
     let backend = Arc::new(SshKernelBackendV4 {
         session: session.clone(),
         root: root.clone(),
@@ -533,6 +547,7 @@ async fn compose(
     });
     let runtime = Arc::new(RuntimeManagerV4::new(backend));
     let executor = Arc::new(DesktopToolExecutorV4 {
+        repository: state.repository.clone(),
         session,
         root,
         project_id: project.id,
@@ -546,17 +561,24 @@ async fn compose(
             .with_side_effect_lock(project_side_effect_lock_v4(project.id)),
     );
     Ok((
-        Arc::new(DesktopModelPortV4(unified_model_client(
-            state,
-            model_profile_id,
-        )?)),
+        Arc::new(DesktopModelPortV4 {
+            client: unified_model_client(state, model_profile_id)?,
+            prompt,
+        }),
         ComposedToolsV4 { run_id, registry },
     ))
 }
 
-struct DesktopModelPortV4(UnifiedModelClient);
+struct DesktopModelPortV4 {
+    client: UnifiedModelClient,
+    prompt: PromptLayersV4,
+}
 #[async_trait]
 impl ModelPortV4 for DesktopModelPortV4 {
+    fn prompt_layers(&self) -> PromptLayersV4 {
+        self.prompt.clone()
+    }
+
     async fn stream(
         &self,
         request: ModelRequestV4,
@@ -575,7 +597,7 @@ impl ModelPortV4 for DesktopModelPortV4 {
         let mut calls = ToolCallAccumulatorV2::default();
         let mut provider_error = None;
         let mut accumulator_error = None;
-        self.0
+        self.client
             .stream_with_v2(
                 ModelRequestV2 {
                     system: request.system,
@@ -662,6 +684,7 @@ fn classify_model_failure(message: &str) -> ModelFailureV4 {
 }
 
 struct DesktopToolExecutorV4 {
+    repository: Repository,
     session: Arc<SshSession>,
     root: String,
     project_id: Uuid,
@@ -739,6 +762,98 @@ impl DesktopToolExecutorV4 {
             .map(|(name, version)| (name.to_owned(), version.trim().to_owned()))
             .collect()
     }
+
+    fn skill_documents(&self) -> Result<Vec<SkillDocumentV4>, String> {
+        crate::skill_commands::agent_skill_packages(&self.repository)?
+            .into_iter()
+            .map(|package| {
+                let markdown = std::fs::read_to_string(
+                    std::path::Path::new(&package.source_path).join("SKILL.md"),
+                )
+                .map_err(|error| format!("cannot read Skill {}: {error}", package.name))?;
+                Ok(SkillDocumentV4 {
+                    skill_id: package.id,
+                    name: package.name,
+                    version: package.version,
+                    package_sha256: package.sha256,
+                    enabled: true,
+                    sections: markdown_sections(&markdown),
+                })
+            })
+            .collect()
+    }
+
+    fn memory_documents(&self, dimension: Option<&str>) -> Result<Vec<MemoryDocumentV4>, String> {
+        let facts = memory_facts(
+            &self.repository,
+            &MemorySearchRequest {
+                project_id: self.project_id,
+                conversation_id: None,
+                query: String::new(),
+                dimension: dimension.map(str::to_owned),
+            },
+        )?;
+        Ok(facts
+            .into_iter()
+            .map(|fact| {
+                let source = fact.evidence.first();
+                MemoryDocumentV4 {
+                    id: fact.id,
+                    project_id: fact.project_id,
+                    conversation_id: fact.conversation_id,
+                    dimension: fact.dimension,
+                    key: fact.key,
+                    statement: fact.statement,
+                    source_kind: source
+                        .map_or("unknown", |source| source.source_kind.as_str())
+                        .into(),
+                    source_id: source
+                        .map_or("unknown", |source| source.source_id.as_str())
+                        .into(),
+                    conflicted_with: fact.conflicted_with.into_iter().collect(),
+                    created_at: fact.created_at,
+                }
+            })
+            .collect())
+    }
+
+    fn mcp_tool_index(&self) -> Result<Vec<McpToolIndexV4>, String> {
+        let profiles = self
+            .repository
+            .list_json::<McpServerProfile>("mcp_server")
+            .map_err(|error| error.to_string())?;
+        let mut index = Vec::new();
+        for profile in profiles {
+            for tool in &profile.tools {
+                let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let input_schema = tool
+                    .get("inputSchema")
+                    .or_else(|| tool.get("input_schema"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({"type":"object"}));
+                index.push(McpToolIndexV4 {
+                    server_id: profile.id,
+                    server_name: profile.name.clone(),
+                    tool_name: name.into(),
+                    description: tool
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or("MCP tool")
+                        .into(),
+                    schema_sha256: schema_digest(&input_schema),
+                    input_schema,
+                    configured: true,
+                    enabled: profile.enabled,
+                    launch_approved: profile.launch_approved,
+                    tool_approved: profile.approved_tools.iter().any(|tool| tool == name),
+                    updated_at: profile.updated_at,
+                });
+            }
+        }
+        Ok(index)
+    }
 }
 #[async_trait]
 impl ToolExecutorV4 for DesktopToolExecutorV4 {
@@ -780,6 +895,123 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                     out.stdout,
                     json!({"path":path}),
                     vec![format!("remote:{path}")],
+                )
+            }
+            "search_skills" => {
+                let query = required(&call.arguments, "query")?;
+                let limit = call
+                    .arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(8) as usize;
+                let hits = search_skills(query, &self.skill_documents()?, limit);
+                (
+                    serde_json::to_string(&hits).map_err(|error| error.to_string())?,
+                    serde_json::to_value(&hits).map_err(|error| error.to_string())?,
+                    vec![],
+                )
+            }
+            "use_skill" => {
+                let skill_id = required(&call.arguments, "skill_id")?
+                    .parse::<Uuid>()
+                    .map_err(|_| "skill_id must be a UUID")?;
+                let sections = call
+                    .arguments
+                    .get("sections")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let document = self
+                    .skill_documents()?
+                    .into_iter()
+                    .find(|document| document.skill_id == skill_id)
+                    .ok_or("enabled Skill was not found")?;
+                let frozen =
+                    freeze_skill(&document, &sections).map_err(|error| error.to_string())?;
+                (
+                    serde_json::to_string(&frozen).map_err(|error| error.to_string())?,
+                    serde_json::to_value(&frozen).map_err(|error| error.to_string())?,
+                    vec![
+                        format!("skill-package-sha256:{}", frozen.package_sha256),
+                        format!("skill-freeze-sha256:{}", frozen.frozen_sha256),
+                    ],
+                )
+            }
+            "search_memory" => {
+                let query = required(&call.arguments, "query")?;
+                let dimension = call.arguments.get("dimension").and_then(Value::as_str);
+                let limit = call
+                    .arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(12) as usize;
+                let hits =
+                    search_memory(query, &self.memory_documents(dimension)?, Utc::now(), limit);
+                (
+                    serde_json::to_string(&hits).map_err(|error| error.to_string())?,
+                    serde_json::to_value(&hits).map_err(|error| error.to_string())?,
+                    hits.iter()
+                        .map(|hit| {
+                            format!(
+                                "memory-source:{}:{}",
+                                hit.document.source_kind, hit.document.source_id
+                            )
+                        })
+                        .collect(),
+                )
+            }
+            "search_mcp_tools" => {
+                let query = required(&call.arguments, "query")?;
+                let limit = call
+                    .arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(8) as usize;
+                let hits = search_mcp_tools(query, &self.mcp_tool_index()?, limit);
+                (
+                    serde_json::to_string(&hits).map_err(|error| error.to_string())?,
+                    serde_json::to_value(&hits).map_err(|error| error.to_string())?,
+                    vec![],
+                )
+            }
+            "use_mcp_tool" => {
+                let server_id = required(&call.arguments, "server_id")?
+                    .parse::<Uuid>()
+                    .map_err(|_| "server_id must be a UUID")?;
+                let tool = required(&call.arguments, "tool")?;
+                let expected_schema = required(&call.arguments, "schema_sha256")?;
+                let indexed = self
+                    .mcp_tool_index()?
+                    .into_iter()
+                    .find(|entry| entry.server_id == server_id && entry.tool_name == tool)
+                    .ok_or("MCP tool is not currently indexed")?;
+                authorize_mcp_use(&indexed, expected_schema).map_err(|error| error.to_string())?;
+                let result = invoke_configured_mcp_tool_v4(
+                    &self.repository,
+                    self.project_id,
+                    server_id,
+                    tool,
+                    call.arguments
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| json!({})),
+                    expected_schema.into(),
+                )
+                .await?;
+                let value = result.result.unwrap_or_else(|| json!({}));
+                (
+                    serde_json::to_string(&value).map_err(|error| error.to_string())?,
+                    json!({
+                        "server_id":server_id,
+                        "tool":tool,
+                        "schema_sha256":indexed.schema_sha256,
+                        "audit_id":result.audit_id,
+                        "result":value
+                    }),
+                    vec![format!("mcp-audit:{}", result.audit_id)],
                 )
             }
             "runtime.execute" => {
@@ -1517,6 +1749,57 @@ async fn resolve_root(session: &SshSession, configured: &str) -> Result<String, 
     }
 }
 
+async fn load_prompt_layers(
+    session: &SshSession,
+    root: &str,
+    backend_id: &str,
+) -> Result<PromptLayersV4, String> {
+    async fn read_optional(session: &SshSession, path: &str) -> Result<String, String> {
+        let output = session
+            .execute_checked(&format!(
+                "if test -f {0}; then sed -n '1,800p' {0}; fi",
+                shell_quote(path)
+            ))
+            .await
+            .map_err(|error| error.to_string())?;
+        let (excerpt, _) = bounded_excerpt(&output.stdout, 32 * 1024);
+        Ok(excerpt)
+    }
+
+    let agents = read_optional(
+        session,
+        &format!("{}/AGENTS.md", root.trim_end_matches('/')),
+    )
+    .await?;
+    let override_rules = read_optional(
+        session,
+        &format!("{}/.omicsops/AGENT.md", root.trim_end_matches('/')),
+    )
+    .await?;
+    let mut layers = PromptLayersV4::default();
+    layers.project_rules = project_rules_layer(&agents, &override_rules);
+    layers.environment = format!(
+        "backend={backend_id}; persistent Python/R kernels; project-relative paths only; credentials remain Host references"
+    );
+    Ok(layers)
+}
+
+fn project_rules_layer(agents: &str, override_rules: &str) -> String {
+    match (agents.trim().is_empty(), override_rules.trim().is_empty()) {
+        (true, true) => "No project-specific rules were found.".into(),
+        (false, true) => format!("[BASE AGENTS.md]\n{}", agents.trim()),
+        (true, false) => format!(
+            "[HIGHER PRIORITY .omicsops/AGENT.md]\n{}",
+            override_rules.trim()
+        ),
+        (false, false) => format!(
+            "[BASE AGENTS.md]\n{}\n\n[HIGHER PRIORITY .omicsops/AGENT.md; wins on conflict]\n{}",
+            agents.trim(),
+            override_rules.trim()
+        ),
+    }
+}
+
 fn parse_language(value: &str) -> Result<KernelLanguageV4, String> {
     match value.to_ascii_lowercase().as_str() {
         "python" | "py" => Ok(KernelLanguageV4::Python),
@@ -1644,6 +1927,13 @@ mod tests {
         assert!(validate_environment_name("system").is_ok());
         assert!(validate_environment_name("../outside").is_err());
         assert!(validate_environment_name("bad/name").is_err());
+    }
+
+    #[test]
+    fn v4_project_agent_override_is_rendered_after_base_rules() {
+        let rendered = project_rules_layer("base-rule", "override-rule");
+        assert!(rendered.find("base-rule") < rendered.find("override-rule"));
+        assert!(rendered.contains("wins on conflict"));
     }
 
     #[test]
@@ -1793,8 +2083,8 @@ mod tests {
             Ok("ollama") => ProviderProtocol::Ollama,
             _ => ProviderProtocol::OpenAiCompatible,
         };
-        let model = DesktopModelPortV4(
-            UnifiedModelClient::new(
+        let model = DesktopModelPortV4 {
+            client: UnifiedModelClient::new(
                 Uuid::new_v4(),
                 protocol,
                 Url::parse(&std::env::var("OMICSOPS_LIVE_MODEL_BASE_URL").expect("model url"))
@@ -1803,7 +2093,8 @@ mod tests {
                 std::env::var("OMICSOPS_LIVE_MODEL_CREDENTIAL").ok(),
             )
             .unwrap(),
-        );
+            prompt: PromptLayersV4::default(),
+        };
         let mut streamed = String::new();
         let turn = model
             .stream(
@@ -1942,6 +2233,7 @@ mod tests {
         assert!(after_interrupt.stdout.contains("after-interrupt"));
 
         let executor = DesktopToolExecutorV4 {
+            repository: Repository::open_in_memory().unwrap(),
             session: session.clone(),
             root: root.clone(),
             project_id,
@@ -2025,6 +2317,7 @@ mod tests {
             project_id,
         })));
         let executor = DesktopToolExecutorV4 {
+            repository: Repository::open_in_memory().unwrap(),
             session,
             root,
             project_id,
@@ -2097,5 +2390,55 @@ mod tests {
         assert_eq!(artifact.producer_analysis_id, manifest.analysis_id);
         assert!(manifest.complete);
         runtime.interrupt_run(run_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicit live SSH credentials and an empty disposable OMICSOPS_LIVE_PBMC_ROOT"]
+    async fn live_v4_stage4_project_rule_priority() {
+        let profile = ConnectionProfile {
+            id: Uuid::new_v4(),
+            label: "V4 stage 4 acceptance".into(),
+            host: std::env::var("OMICSOPS_LIVE_SSH_HOST").expect("live host"),
+            port: std::env::var("OMICSOPS_LIVE_SSH_PORT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(22),
+            username: std::env::var("OMICSOPS_LIVE_SSH_USER").expect("live user"),
+            authentication: AuthenticationMethod::Password,
+            authentication_reference: "acceptance".into(),
+            host_key_fingerprint: Some(
+                std::env::var("OMICSOPS_LIVE_SSH_FINGERPRINT").expect("fingerprint"),
+            ),
+        };
+        let session = Arc::new(
+            SshSession::connect(
+                &profile,
+                SshAuthentication::Password(
+                    std::env::var("OMICSOPS_LIVE_SSH_PASSWORD").expect("password"),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        let root = resolve_root(
+            &session,
+            &std::env::var("OMICSOPS_LIVE_PBMC_ROOT").expect("disposable root"),
+        )
+        .await
+        .unwrap();
+        session
+            .execute_checked(&format!(
+                "mkdir -p {0}/.omicsops && printf 'base-live-rule\\n' > {0}/AGENTS.md && printf 'override-live-rule\\n' > {0}/.omicsops/AGENT.md",
+                shell_quote(&root)
+            ))
+            .await
+            .unwrap();
+        let prompt = load_prompt_layers(&session, &root, "ssh:live-stage4")
+            .await
+            .unwrap();
+        let rendered = prompt.render(RunModeV4::Plan);
+        assert!(rendered.find("base-live-rule") < rendered.find("override-live-rule"));
+        assert!(rendered.contains("HIGHER PRIORITY"));
+        assert!(!rendered.contains("SKILL.md contents"));
     }
 }

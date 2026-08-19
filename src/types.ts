@@ -526,6 +526,7 @@ export interface McpServerProfile {
   command: string;
   args: string[];
   enabled: boolean;
+  launch_approved: boolean;
   approved_tools: string[];
   tools: McpToolDefinition[];
   capabilities: Record<string, unknown>;

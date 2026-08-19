@@ -217,6 +217,10 @@ export async function setMcpServerEnabled(serverId: string, enabled: boolean): P
   return invoke("set_mcp_server_enabled", { request: { server_id: serverId, enabled } });
 }
 
+export async function setMcpLaunchApproval(serverId: string, approved: boolean): Promise<McpServerProfile> {
+  return invoke("set_mcp_launch_approval", { request: { server_id: serverId, approved } });
+}
+
 export async function inspectConfiguredMcpServer(projectId: string, serverId: string): Promise<McpResult> {
   return invoke("inspect_configured_mcp_server", { request: { project_id: projectId, server_id: serverId, approved: true } });
 }

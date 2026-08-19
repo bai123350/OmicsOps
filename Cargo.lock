@@ -3080,6 +3080,7 @@ dependencies = [
  "omicsops-agent",
  "omicsops-agent-core",
  "omicsops-core",
+ "omicsops-knowledge",
  "omicsops-protocol",
  "omicsops-runner",
  "omicsops-runtime",
@@ -3098,6 +3099,20 @@ dependencies = [
  "url",
  "uuid",
  "zip",
+]
+
+[[package]]
+name = "omicsops-knowledge"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.19",
+ "uuid",
 ]
 
 [[package]]

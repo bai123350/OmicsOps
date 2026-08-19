@@ -7,6 +7,7 @@ members = [
   "crates/omicsops-tools",
   "crates/omicsops-runtime",
   "crates/omicsops-science",
+  "crates/omicsops-knowledge",
   "crates/omicsops-adapters",
   "crates/omicsops-runner",
   "src-tauri"
