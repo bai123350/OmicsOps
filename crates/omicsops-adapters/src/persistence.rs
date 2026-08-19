@@ -19,6 +19,7 @@ use omicsops_core::{
 use omicsops_protocol::{
     AgentEventV4, ContextArchiveV4, ContextCheckpointV4, validate_event_chain_v4,
 };
+use omicsops_science::ScientificStateV4;
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -173,6 +174,45 @@ impl Repository {
                 sha256 TEXT NOT NULL,
                 transcript_json TEXT NOT NULL,
                 checkpoint_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS scientific_states_v4 (
+                project_id TEXT PRIMARY KEY,
+                revision INTEGER NOT NULL,
+                state_sha256 TEXT NOT NULL,
+                value_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS scientific_datasets_v4 (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                active INTEGER NOT NULL,
+                value_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS scientific_analyses_v4 (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                value_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS scientific_artifacts_v4 (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                producer_analysis_id TEXT NOT NULL,
+                valid INTEGER NOT NULL,
+                value_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS scientific_evidence_v4 (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                valid INTEGER NOT NULL,
+                value_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS scientific_provenance_v4 (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                analysis_id TEXT NOT NULL,
+                complete INTEGER NOT NULL,
+                value_json TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS conversations_project_updated ON conversations(project_id, updated_at DESC);
             CREATE INDEX IF NOT EXISTS agent_run_events_v3_project_conversation
@@ -417,6 +457,19 @@ impl Repository {
             "DELETE FROM agent_context_archives_v4 WHERE run_id IN (SELECT run_id FROM agent_runs_v4 WHERE project_id = ?1)",
             [&project_id],
         )?;
+        for table in [
+            "scientific_provenance_v4",
+            "scientific_evidence_v4",
+            "scientific_artifacts_v4",
+            "scientific_analyses_v4",
+            "scientific_datasets_v4",
+            "scientific_states_v4",
+        ] {
+            transaction.execute(
+                &format!("DELETE FROM {table} WHERE project_id = ?1"),
+                [&project_id],
+            )?;
+        }
         transaction.execute(
             "DELETE FROM agent_events_v4 WHERE project_id = ?1",
             [&project_id],
@@ -991,6 +1044,63 @@ impl Repository {
                 let transcript: String = row.get(0)?;
                 let checkpoint: String = row.get(1)?;
                 Ok((transcript, serde_json::from_str(&checkpoint)?))
+            })
+            .transpose()
+    }
+
+    pub fn save_scientific_state_v4(&self, state: &ScientificStateV4) -> AdapterResult<()> {
+        let mut connection = self.connection.lock().expect("repository lock");
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO scientific_states_v4 (project_id, revision, state_sha256, value_json) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(project_id) DO UPDATE SET revision=excluded.revision, state_sha256=excluded.state_sha256, value_json=excluded.value_json",
+            params![state.project_id.to_string(), state.revision, state.digest(), serde_json::to_string(state)?],
+        )?;
+        for dataset in state.datasets.values() {
+            transaction.execute(
+                "INSERT INTO scientific_datasets_v4 (id, project_id, active, value_json) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(id) DO UPDATE SET active=excluded.active, value_json=excluded.value_json",
+                params![dataset.id.to_string(), state.project_id.to_string(), dataset.active, serde_json::to_string(dataset)?],
+            )?;
+        }
+        for analysis in state.analyses.values() {
+            transaction.execute(
+                "INSERT INTO scientific_analyses_v4 (id, project_id, status, value_json) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(id) DO UPDATE SET status=excluded.status, value_json=excluded.value_json",
+                params![analysis.id.to_string(), state.project_id.to_string(), format!("{:?}", analysis.status).to_ascii_lowercase(), serde_json::to_string(analysis)?],
+            )?;
+        }
+        for artifact in state.artifacts.values() {
+            transaction.execute(
+                "INSERT INTO scientific_artifacts_v4 (id, project_id, producer_analysis_id, valid, value_json) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(id) DO UPDATE SET valid=excluded.valid, value_json=excluded.value_json",
+                params![artifact.id.to_string(), state.project_id.to_string(), artifact.producer_analysis_id.to_string(), artifact.valid, serde_json::to_string(artifact)?],
+            )?;
+        }
+        for evidence in state.evidence.values() {
+            transaction.execute(
+                "INSERT INTO scientific_evidence_v4 (id, project_id, valid, value_json) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(id) DO UPDATE SET valid=excluded.valid, value_json=excluded.value_json",
+                params![evidence.id.to_string(), state.project_id.to_string(), evidence.valid, serde_json::to_string(evidence)?],
+            )?;
+        }
+        for manifest in state.provenance.values() {
+            transaction.execute(
+                "INSERT INTO scientific_provenance_v4 (id, project_id, run_id, analysis_id, complete, value_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(id) DO UPDATE SET complete=excluded.complete, value_json=excluded.value_json",
+                params![manifest.id.to_string(), state.project_id.to_string(), manifest.run_id.to_string(), manifest.analysis_id.to_string(), manifest.complete, serde_json::to_string(manifest)?],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn scientific_state_v4(
+        &self,
+        project_id: Uuid,
+    ) -> AdapterResult<Option<ScientificStateV4>> {
+        let connection = self.connection.lock().expect("repository lock");
+        let mut statement = connection
+            .prepare("SELECT value_json FROM scientific_states_v4 WHERE project_id=?1")?;
+        let mut rows = statement.query([project_id.to_string()])?;
+        rows.next()?
+            .map(|row| {
+                let value: String = row.get(0)?;
+                serde_json::from_str(&value).map_err(Into::into)
             })
             .transpose()
     }

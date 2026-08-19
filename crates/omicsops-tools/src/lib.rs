@@ -212,7 +212,19 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
             "runtime.execute",
             "Execute code in a persistent run-scoped kernel",
             ToolEffectV4::Runtime,
-            json!({"type":"object","required":["language","code"],"properties":{"language":{"type":"string"},"environment":{"type":"string","default":"system"},"code":{"type":"string"},"capture_paths":{"type":"array"}}}),
+            json!({"type":"object","required":["language","code"],"properties":{"language":{"type":"string"},"environment":{"type":"string","default":"system"},"code":{"type":"string"},"capture_paths":{"type":"array"},"analysis":{"type":"object","required":["analysis_type","input_dataset_ids","sample_ids","method","parameters"],"properties":{"analysis_type":{"type":"string"},"input_dataset_ids":{"type":"array"},"sample_ids":{"type":"array"},"method":{"type":"string"},"parameters":{"type":"object"},"software_requirements":{"type":"array"},"database_versions":{"type":"object"},"random_seed":{"type":["integer","null"]}}}}}),
+        ),
+        descriptor(
+            "science.register_dataset",
+            "Register a dataset after Host verification of its path, size, and SHA-256",
+            ToolEffectV4::Mutating,
+            json!({"type":"object","required":["modality","species","sample_ids","matrix_shape","stage","path"],"properties":{"modality":{"type":"string"},"species":{"type":"string"},"sample_ids":{"type":"array"},"matrix_shape":{"type":"array"},"stage":{"type":"string","enum":["raw","processed"]},"path":{"type":"string"}}}),
+        ),
+        descriptor(
+            "science.record_evidence",
+            "Record a claim linked to verified artifacts or literature sources",
+            ToolEffectV4::Mutating,
+            json!({"type":"object","required":["claim","sources","strength"],"properties":{"claim":{"type":"string"},"sources":{"type":"array"},"strength":{"type":"string","enum":["exploratory","supporting","strong"]},"conflicts_with":{"type":"array"}}}),
         ),
         descriptor(
             "runtime.environment.ensure",

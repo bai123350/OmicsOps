@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{
         Arc, OnceLock, Weak,
         atomic::{AtomicBool, Ordering},
@@ -22,7 +22,7 @@ use omicsops_agent::{
 };
 use omicsops_agent_core::{
     AgentCoreErrorV4, AgentCoreV4, AgentLimitsV4, EventStoreV4, ModelPortV4, ModelRequestV4,
-    ModelStreamEventV4, ModelTurnV4,
+    ModelStreamEventV4, ModelTurnV4, ScientificStateStoreV4, ScientificUpdateV4,
 };
 use omicsops_core::{
     domain::ProjectSpec,
@@ -31,9 +31,14 @@ use omicsops_core::{
 use omicsops_protocol::{
     AgentEventKindV4, AgentEventV4, ContextArchiveV4, ContextCheckpointV4, ExecutionContextKeyV4,
     ExecutionPlanV4, KernelLanguageV4, ModelErrorClassV4, ModelFailureV4, OutputCaptureV4,
-    RunSpecV4, RuntimeResultV4, ToolCallV4, ToolOutcomeV4, UncertainResolutionV4,
+    RunSpecV4, RuntimeArtifactV4, RuntimeResultV4, ToolCallV4, ToolOutcomeV4,
+    UncertainResolutionV4,
 };
 use omicsops_runtime::{KernelBackendV4, KernelProcessV4, RuntimeManagerV4};
+use omicsops_science::{
+    AnalysisDeclarationV4, AnalysisStatusV4, DatasetStageV4, EvidenceDeclarationV4,
+    RuntimeIdentityV4, ScientificStateV4, VerifiedArtifactFactV4, VerifiedDatasetFactV4,
+};
 use omicsops_tools::{ToolExecutorV4, ToolRegistryV4, builtin_tool_definitions_v4};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -49,6 +54,9 @@ use crate::commands::{
 
 static PROJECT_SIDE_EFFECT_LOCKS_V4: OnceLock<std::sync::Mutex<HashMap<Uuid, Weak<Mutex<()>>>>> =
     OnceLock::new();
+static SCIENTIFIC_STATE_LOCKS_V4: OnceLock<
+    std::sync::Mutex<HashMap<Uuid, Weak<std::sync::Mutex<()>>>>,
+> = OnceLock::new();
 
 fn project_side_effect_lock_v4(project_id: Uuid) -> Arc<Mutex<()>> {
     let locks = PROJECT_SIDE_EFFECT_LOCKS_V4.get_or_init(Default::default);
@@ -142,10 +150,16 @@ pub async fn agent_v4_start_planning(
         repository: state.repository.clone(),
         app: app.clone(),
     };
+    let science_store = RepositoryScientificStateStoreV4 {
+        repository: state.repository.clone(),
+        backend_id: format!("ssh:{}", project.connection_id),
+        mutation_lock: scientific_state_lock_v4(project.id),
+    };
     let core = AgentCoreV4 {
         model: model.as_ref(),
         tools: tools.registry.as_ref(),
         events: &event_store,
+        science: Some(&science_store),
     };
     let plan = match core
         .plan(
@@ -251,10 +265,16 @@ pub async fn agent_v4_resume(
             repository: state.repository.clone(),
             app: app.clone(),
         };
+        let science_store = RepositoryScientificStateStoreV4 {
+            repository: state.repository.clone(),
+            backend_id: format!("ssh:{}", project.connection_id),
+            mutation_lock: scientific_state_lock_v4(project.id),
+        };
         let core = AgentCoreV4 {
             model: model.as_ref(),
             tools: tools.registry.as_ref(),
             events: &store,
+            science: Some(&science_store),
         };
         match core
             .plan(
@@ -422,10 +442,16 @@ fn spawn_execution(
                 repository: repository.clone(),
                 app: app.clone(),
             };
+            let science_store = RepositoryScientificStateStoreV4 {
+                repository: repository.clone(),
+                backend_id: format!("ssh:{}", profile.id),
+                mutation_lock: scientific_state_lock_v4(project.id),
+            };
             AgentCoreV4 {
                 model: &model,
                 tools: &registry,
                 events: &store,
+                science: Some(&science_store),
             }
             .execute_with_limits(&spec, AgentLimitsV4::default(), &cancelled)
             .await
@@ -659,6 +685,60 @@ impl DesktopToolExecutorV4 {
             environment: environment.to_owned(),
         })
     }
+
+    async fn software_versions<'a>(
+        &self,
+        language: KernelLanguageV4,
+        environment: &str,
+        requirements: impl Iterator<Item = &'a str>,
+    ) -> BTreeMap<String, String> {
+        let requirements = requirements
+            .filter(|name| {
+                !name.is_empty()
+                    && name.len() <= 128
+                    && name.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || "._-".contains(character)
+                    })
+            })
+            .collect::<Vec<_>>();
+        let executable_prefix = if environment == "system" {
+            String::new()
+        } else {
+            format!(
+                "micromamba run --prefix {} ",
+                shell_quote(&environment_path(&self.root, environment))
+            )
+        };
+        let command = match language {
+            KernelLanguageV4::Python => {
+                let names = serde_json::to_string(&requirements).unwrap_or_else(|_| "[]".into());
+                let code = format!(
+                    "import importlib.metadata as m,platform\nnames={names}\nprint('python\\t'+platform.python_version())\nfor n in names:\n try: print(n+'\\t'+m.version(n))\n except m.PackageNotFoundError: pass"
+                );
+                format!("{executable_prefix}python -c {}", shell_quote(&code))
+            }
+            KernelLanguageV4::R => {
+                let names = requirements
+                    .iter()
+                    .map(|name| serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into()))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let code = format!(
+                    "cat('R\\t',R.version.string,'\\n',sep=''); for (n in c({names})) if (requireNamespace(n,quietly=TRUE)) cat(n,'\\t',as.character(packageVersion(n)),'\\n',sep='')"
+                );
+                format!("{executable_prefix}Rscript -e {}", shell_quote(&code))
+            }
+        };
+        let Ok(output) = self.session.execute_checked(&command).await else {
+            return BTreeMap::new();
+        };
+        output
+            .stdout
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .map(|(name, version)| (name.to_owned(), version.trim().to_owned()))
+            .collect()
+    }
 }
 #[async_trait]
 impl ToolExecutorV4 for DesktopToolExecutorV4 {
@@ -722,7 +802,20 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                 validate_kernel_code(&code).map_err(|e| e.to_string())?;
                 validate_capture_paths(&captures).map_err(|e| e.to_string())?;
                 let key = self.key(language, environment)?;
-                let result = self.runtime.execute(&key, code, captures).await?;
+                let mut result = self.runtime.execute(&key, code, captures).await?;
+                result.software_versions = self
+                    .software_versions(
+                        language,
+                        environment,
+                        call.arguments
+                            .get("analysis")
+                            .and_then(|analysis| analysis.get("software_requirements"))
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str),
+                    )
+                    .await;
                 let content = format!(
                     "session={} process={} request={}\nstdout ({} bytes, sha256={}):\n{}\nstderr ({} bytes, sha256={}):\n{}",
                     result.session_id,
@@ -819,6 +912,48 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                     vec![],
                 )
             }
+            "science.register_dataset" => {
+                let path = required(&call.arguments, "path")?;
+                let remote = project_path(&self.root, path)?;
+                let out = self
+                    .session
+                    .execute_checked(&format!(
+                        "test -f {0} && stat -c '%s' {0} && sha256sum {0}",
+                        shell_quote(&remote)
+                    ))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let mut lines = out.stdout.lines();
+                let size = lines
+                    .next()
+                    .ok_or("missing dataset size")?
+                    .parse::<u64>()
+                    .map_err(|_| "invalid dataset size")?;
+                let hash = lines
+                    .next()
+                    .and_then(|line| line.split_whitespace().next())
+                    .ok_or("missing dataset hash")?;
+                let data = json!({
+                    "path": path,
+                    "size_bytes": size,
+                    "sha256": hash,
+                    "modality": call.arguments.get("modality"),
+                    "species": call.arguments.get("species"),
+                    "sample_ids": call.arguments.get("sample_ids"),
+                    "matrix_shape": call.arguments.get("matrix_shape"),
+                    "stage": call.arguments.get("stage"),
+                });
+                (
+                    format!("registered verified dataset {path}: {size} bytes sha256={hash}"),
+                    data,
+                    vec![format!("sha256:{hash}")],
+                )
+            }
+            "science.record_evidence" => (
+                "evidence declaration accepted for Host validation".into(),
+                json!({"accepted":true}),
+                vec![],
+            ),
             "artifact.verify" => {
                 let path = required(&call.arguments, "path")?;
                 let remote = project_path(&self.root, path)?;
@@ -992,7 +1127,15 @@ impl KernelProcessV4 for SshKernelProcessV4 {
             match event.event {
                 KernelEventKind::Stdout(content) => stdout.push_str(&content),
                 KernelEventKind::Stderr(content) => stderr.push_str(&content),
-                KernelEventKind::Artifact { relative_path, .. } => artifacts.push(relative_path),
+                KernelEventKind::Artifact {
+                    relative_path,
+                    size_bytes,
+                    sha256,
+                } => artifacts.push(RuntimeArtifactV4 {
+                    relative_path,
+                    size_bytes,
+                    sha256,
+                }),
                 KernelEventKind::Completed => {
                     succeeded = true;
                     break;
@@ -1020,6 +1163,7 @@ impl KernelProcessV4 for SshKernelProcessV4 {
             stderr_capture: Some(stderr_capture),
             succeeded,
             artifacts,
+            software_versions: BTreeMap::new(),
         })
     }
     async fn interrupt(&self) -> Result<(), String> {
@@ -1087,6 +1231,245 @@ impl EventStoreV4 for RepositoryEventStoreV4 {
             .archive_agent_context_v4(run_id, transcript, checkpoint)
             .map_err(|error| error.to_string())
     }
+}
+
+fn scientific_state_lock_v4(project_id: Uuid) -> Arc<std::sync::Mutex<()>> {
+    let locks = SCIENTIFIC_STATE_LOCKS_V4.get_or_init(Default::default);
+    let mut locks = locks.lock().expect("V4 scientific state lock registry");
+    if let Some(lock) = locks.get(&project_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(std::sync::Mutex::new(()));
+    locks.insert(project_id, Arc::downgrade(&lock));
+    lock
+}
+
+struct RepositoryScientificStateStoreV4 {
+    repository: Repository,
+    backend_id: String,
+    mutation_lock: Arc<std::sync::Mutex<()>>,
+}
+
+impl RepositoryScientificStateStoreV4 {
+    fn load(&self, project_id: Uuid) -> Result<ScientificStateV4, String> {
+        Ok(self
+            .repository
+            .scientific_state_v4(project_id)
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| ScientificStateV4::new(project_id)))
+    }
+
+    fn save_update(
+        &self,
+        state: &ScientificStateV4,
+        changes: Vec<String>,
+    ) -> Result<Option<ScientificUpdateV4>, String> {
+        self.repository
+            .save_scientific_state_v4(state)
+            .map_err(|error| error.to_string())?;
+        Ok(Some(ScientificUpdateV4 {
+            revision: state.revision,
+            state_sha256: state.digest(),
+            changes,
+        }))
+    }
+}
+
+impl ScientificStateStoreV4 for RepositoryScientificStateStoreV4 {
+    fn snapshot(&self, project_id: Uuid) -> Result<ScientificStateV4, String> {
+        self.load(project_id)
+    }
+
+    fn before_tool(
+        &self,
+        project_id: Uuid,
+        run_id: Uuid,
+        call: &ToolCallV4,
+    ) -> Result<Option<ScientificUpdateV4>, String> {
+        if call.tool_id != "runtime.execute" || call.arguments.get("analysis").is_none() {
+            return Ok(None);
+        }
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| "scientific state lock is poisoned".to_string())?;
+        let mut state = self.load(project_id)?;
+        if state
+            .analyses
+            .values()
+            .any(|analysis| analysis.source_call_id == call.call_id)
+        {
+            return Ok(None);
+        }
+        let declaration: AnalysisDeclarationV4 = serde_json::from_value(
+            call.arguments
+                .get("analysis")
+                .cloned()
+                .ok_or("analysis declaration is missing")?,
+        )
+        .map_err(|error| format!("invalid analysis declaration: {error}"))?;
+        let language = required(&call.arguments, "language")?.to_ascii_lowercase();
+        let environment = call
+            .arguments
+            .get("environment")
+            .and_then(Value::as_str)
+            .unwrap_or("system")
+            .to_owned();
+        let analysis = state
+            .start_analysis(
+                run_id,
+                call.call_id.clone(),
+                declaration,
+                RuntimeIdentityV4 {
+                    backend_id: self.backend_id.clone(),
+                    language,
+                    environment,
+                    session_id: None,
+                    process_identity: None,
+                },
+                Utc::now(),
+            )
+            .map_err(|error| error.to_string())?;
+        self.save_update(&state, vec![format!("analysis_started:{}", analysis.id)])
+    }
+
+    fn after_tool(
+        &self,
+        project_id: Uuid,
+        _run_id: Uuid,
+        call: &ToolCallV4,
+        outcome: &ToolOutcomeV4,
+    ) -> Result<Option<ScientificUpdateV4>, String> {
+        if !matches!(
+            call.tool_id.as_str(),
+            "runtime.execute" | "science.register_dataset" | "science.record_evidence"
+        ) {
+            return Ok(None);
+        }
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| "scientific state lock is poisoned".to_string())?;
+        let mut state = self.load(project_id)?;
+        match call.tool_id.as_str() {
+            "science.register_dataset" if outcome.succeeded => {
+                let path = required(&outcome.data, "path")?;
+                let hash = required(&outcome.data, "sha256")?;
+                if state.datasets.values().any(|dataset| {
+                    dataset.active && dataset.relative_path == path && dataset.sha256 == hash
+                }) {
+                    return Ok(None);
+                }
+                let stage: DatasetStageV4 = serde_json::from_value(
+                    outcome
+                        .data
+                        .get("stage")
+                        .cloned()
+                        .ok_or("dataset stage missing")?,
+                )
+                .map_err(|error| error.to_string())?;
+                let samples = serde_json::from_value::<BTreeSet<String>>(
+                    outcome
+                        .data
+                        .get("sample_ids")
+                        .cloned()
+                        .ok_or("sample_ids missing")?,
+                )
+                .map_err(|error| error.to_string())?;
+                let matrix_shape = serde_json::from_value::<Vec<u64>>(
+                    outcome
+                        .data
+                        .get("matrix_shape")
+                        .cloned()
+                        .ok_or("matrix_shape missing")?,
+                )
+                .map_err(|error| error.to_string())?;
+                let dataset = state.register_dataset(
+                    VerifiedDatasetFactV4 {
+                        modality: required(&outcome.data, "modality")?.into(),
+                        species: required(&outcome.data, "species")?.into(),
+                        sample_ids: samples,
+                        matrix_shape,
+                        stage,
+                        relative_path: path.into(),
+                        size_bytes: outcome
+                            .data
+                            .get("size_bytes")
+                            .and_then(Value::as_u64)
+                            .ok_or("dataset size missing")?,
+                        sha256: hash.into(),
+                    },
+                    Utc::now(),
+                );
+                self.save_update(&state, vec![format!("dataset_registered:{}", dataset.id)])
+            }
+            "runtime.execute" if call.arguments.get("analysis").is_some() => {
+                if !state.analyses.values().any(|analysis| {
+                    analysis.source_call_id == call.call_id
+                        && analysis.status == AnalysisStatusV4::Running
+                }) {
+                    return Ok(None);
+                }
+                let result: RuntimeResultV4 = serde_json::from_value(outcome.data.clone())
+                    .map_err(|error| format!("invalid runtime result: {error}"))?;
+                let artifacts = result
+                    .artifacts
+                    .iter()
+                    .map(|artifact| VerifiedArtifactFactV4 {
+                        artifact_type: artifact_type_for_path(&artifact.relative_path),
+                        relative_path: artifact.relative_path.clone(),
+                        size_bytes: artifact.size_bytes,
+                        sha256: artifact.sha256.clone(),
+                        preview: None,
+                        metadata: json!({"request_id":result.request_id}),
+                    })
+                    .collect();
+                let (analysis, created, manifest) = state
+                    .finish_analysis(
+                        &call.call_id,
+                        outcome.succeeded && result.succeeded,
+                        Some(result.session_id),
+                        Some(result.process_identity),
+                        artifacts,
+                        result.software_versions,
+                        required(&call.arguments, "code")?.into(),
+                        Utc::now(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                self.save_update(
+                    &state,
+                    vec![
+                        format!("analysis_finished:{}:{:?}", analysis.id, analysis.status),
+                        format!("artifacts_registered:{}", created.len()),
+                        format!("provenance_recorded:{}", manifest.id),
+                    ],
+                )
+            }
+            "science.record_evidence" if outcome.succeeded => {
+                if state
+                    .evidence
+                    .values()
+                    .any(|evidence| evidence.source_call_id == call.call_id)
+                {
+                    return Ok(None);
+                }
+                let declaration: EvidenceDeclarationV4 =
+                    serde_json::from_value(call.arguments.clone())
+                        .map_err(|error| format!("invalid evidence declaration: {error}"))?;
+                let evidence = state
+                    .record_evidence(call.call_id.clone(), declaration, Utc::now())
+                    .map_err(|error| error.to_string())?;
+                self.save_update(&state, vec![format!("evidence_recorded:{}", evidence.id)])
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+fn artifact_type_for_path(path: &str) -> String {
+    path.rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_else(|| "file".into())
 }
 
 fn append_next(
@@ -1261,6 +1644,118 @@ mod tests {
         assert!(validate_environment_name("system").is_ok());
         assert!(validate_environment_name("../outside").is_err());
         assert!(validate_environment_name("bad/name").is_err());
+    }
+
+    #[test]
+    fn v4_scientific_hooks_build_verified_lineage_and_provenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(directory.path().join("science.sqlite")).unwrap();
+        let project_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let store = RepositoryScientificStateStoreV4 {
+            repository,
+            backend_id: "ssh:test".into(),
+            mutation_lock: Arc::new(std::sync::Mutex::new(())),
+        };
+        let dataset_call = ToolCallV4 {
+            call_id: "dataset-call".into(),
+            tool_id: "science.register_dataset".into(),
+            arguments: json!({}),
+        };
+        store
+            .after_tool(
+                project_id,
+                run_id,
+                &dataset_call,
+                &ToolOutcomeV4 {
+                    call_id: dataset_call.call_id.clone(),
+                    tool_id: dataset_call.tool_id.clone(),
+                    succeeded: true,
+                    model_content: "verified".into(),
+                    data: json!({
+                        "path":"data/input.h5ad",
+                        "size_bytes":42,
+                        "sha256":"host-dataset-hash",
+                        "modality":"single_cell_rna",
+                        "species":"human",
+                        "sample_ids":["sample-a","sample-b"],
+                        "matrix_shape":[100,20000],
+                        "stage":"raw"
+                    }),
+                    provenance: vec![],
+                },
+            )
+            .unwrap();
+        let dataset_id = *store
+            .snapshot(project_id)
+            .unwrap()
+            .datasets
+            .keys()
+            .next()
+            .unwrap();
+        let runtime_call = ToolCallV4 {
+            call_id: "runtime-call".into(),
+            tool_id: "runtime.execute".into(),
+            arguments: json!({
+                "language":"python",
+                "environment":"analysis",
+                "code":"print('done')",
+                "analysis": {
+                    "analysis_type":"qc",
+                    "input_dataset_ids":[dataset_id],
+                    "sample_ids":["sample-a","sample-b"],
+                    "method":"dynamic-python",
+                    "parameters":{"min_genes":200},
+                    "software_requirements":["scanpy"],
+                    "database_versions":{},
+                    "random_seed":7
+                }
+            }),
+        };
+        store
+            .before_tool(project_id, run_id, &runtime_call)
+            .unwrap();
+        let runtime_result = RuntimeResultV4 {
+            request_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            process_identity: "ssh-jsonl:python:123".into(),
+            stdout: "done".into(),
+            stderr: String::new(),
+            stdout_capture: None,
+            stderr_capture: None,
+            succeeded: true,
+            artifacts: vec![RuntimeArtifactV4 {
+                relative_path: "results/qc.tsv".into(),
+                size_bytes: 99,
+                sha256: "host-artifact-hash".into(),
+            }],
+            software_versions: BTreeMap::from([("scanpy".into(), "1.11.0".into())]),
+        };
+        store
+            .after_tool(
+                project_id,
+                run_id,
+                &runtime_call,
+                &ToolOutcomeV4 {
+                    call_id: runtime_call.call_id.clone(),
+                    tool_id: runtime_call.tool_id.clone(),
+                    succeeded: true,
+                    model_content: "done".into(),
+                    data: serde_json::to_value(runtime_result).unwrap(),
+                    provenance: vec![],
+                },
+            )
+            .unwrap();
+        let state = store.snapshot(project_id).unwrap();
+        let analysis = state.analyses.values().next().unwrap();
+        let artifact = state.artifacts.values().next().unwrap();
+        let manifest = state.provenance.values().next().unwrap();
+        assert_eq!(analysis.status, AnalysisStatusV4::Succeeded);
+        assert_eq!(artifact.producer_analysis_id, analysis.id);
+        assert_eq!(artifact.sha256, "host-artifact-hash");
+        assert_eq!(manifest.runtime_session_id, analysis.runtime.session_id);
+        assert_eq!(manifest.code, "print('done')");
+        assert!(manifest.complete);
     }
 
     #[tokio::test]
@@ -1477,6 +1972,130 @@ mod tests {
             .unwrap();
         assert_eq!(first.session_id, second.session_id);
         assert!(second.stdout.contains("persistent-r"));
+        runtime.interrupt_run(run_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicit live SSH credentials and an empty disposable OMICSOPS_LIVE_PBMC_ROOT"]
+    async fn live_v4_stage3_host_verified_scientific_lineage() {
+        let profile = ConnectionProfile {
+            id: Uuid::new_v4(),
+            label: "V4 stage 3 acceptance".into(),
+            host: std::env::var("OMICSOPS_LIVE_SSH_HOST").expect("live host"),
+            port: std::env::var("OMICSOPS_LIVE_SSH_PORT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(22),
+            username: std::env::var("OMICSOPS_LIVE_SSH_USER").expect("live user"),
+            authentication: AuthenticationMethod::Password,
+            authentication_reference: "acceptance".into(),
+            host_key_fingerprint: Some(
+                std::env::var("OMICSOPS_LIVE_SSH_FINGERPRINT").expect("fingerprint"),
+            ),
+        };
+        let session = Arc::new(
+            SshSession::connect(
+                &profile,
+                SshAuthentication::Password(
+                    std::env::var("OMICSOPS_LIVE_SSH_PASSWORD").expect("password"),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        let root = resolve_root(
+            &session,
+            &std::env::var("OMICSOPS_LIVE_PBMC_ROOT").expect("disposable root"),
+        )
+        .await
+        .unwrap();
+        session
+            .execute_checked(&format!(
+                "mkdir -p {0}/data {0}/results && printf 'gene\\tsample-a\\ns1\\t1\\n' > {0}/data/input.tsv",
+                shell_quote(&root)
+            ))
+            .await
+            .unwrap();
+        let project_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let backend_id = "ssh:live-stage3".to_string();
+        let runtime = Arc::new(RuntimeManagerV4::new(Arc::new(SshKernelBackendV4 {
+            session: session.clone(),
+            root: root.clone(),
+            project_id,
+        })));
+        let executor = DesktopToolExecutorV4 {
+            session,
+            root,
+            project_id,
+            run_id,
+            backend_id: backend_id.clone(),
+            runtime: runtime.clone(),
+        };
+        let local_state = tempfile::tempdir().unwrap();
+        let repository = Repository::open(local_state.path().join("stage3.sqlite")).unwrap();
+        let science = RepositoryScientificStateStoreV4 {
+            repository,
+            backend_id,
+            mutation_lock: Arc::new(std::sync::Mutex::new(())),
+        };
+        let dataset_call = ToolCallV4 {
+            call_id: "live-dataset".into(),
+            tool_id: "science.register_dataset".into(),
+            arguments: json!({
+                "modality":"expression_matrix",
+                "species":"human",
+                "sample_ids":["sample-a"],
+                "matrix_shape":[1,1],
+                "stage":"raw",
+                "path":"data/input.tsv"
+            }),
+        };
+        let dataset_outcome = executor.execute(&dataset_call).await.unwrap();
+        science
+            .after_tool(project_id, run_id, &dataset_call, &dataset_outcome)
+            .unwrap();
+        let dataset_id = *science
+            .snapshot(project_id)
+            .unwrap()
+            .datasets
+            .keys()
+            .next()
+            .unwrap();
+        let analysis_call = ToolCallV4 {
+            call_id: "live-analysis".into(),
+            tool_id: "runtime.execute".into(),
+            arguments: json!({
+                "language":"python",
+                "code":"open('results/qc.tsv','w').write('metric\\tvalue\\nrows\\t1\\n')",
+                "capture_paths":["results/qc.tsv"],
+                "analysis":{
+                    "analysis_type":"qc",
+                    "input_dataset_ids":[dataset_id],
+                    "sample_ids":["sample-a"],
+                    "method":"dynamic-python",
+                    "parameters":{},
+                    "software_requirements":[],
+                    "database_versions":{},
+                    "random_seed":7
+                }
+            }),
+        };
+        science
+            .before_tool(project_id, run_id, &analysis_call)
+            .unwrap();
+        let analysis_outcome = executor.execute(&analysis_call).await.unwrap();
+        science
+            .after_tool(project_id, run_id, &analysis_call, &analysis_outcome)
+            .unwrap();
+        let state = science.snapshot(project_id).unwrap();
+        let dataset = state.datasets.get(&dataset_id).unwrap();
+        let artifact = state.artifacts.values().next().unwrap();
+        let manifest = state.provenance.values().next().unwrap();
+        assert_eq!(dataset.sha256.len(), 64);
+        assert_eq!(artifact.sha256.len(), 64);
+        assert_eq!(artifact.producer_analysis_id, manifest.analysis_id);
+        assert!(manifest.complete);
         runtime.interrupt_run(run_id).await.unwrap();
     }
 }

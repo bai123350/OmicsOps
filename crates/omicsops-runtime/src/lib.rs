@@ -144,6 +144,7 @@ mod tests {
                 stderr_capture: None,
                 succeeded: true,
                 artifacts: vec![],
+                software_versions: Default::default(),
             })
         }
         async fn interrupt(&self) -> Result<(), String> {

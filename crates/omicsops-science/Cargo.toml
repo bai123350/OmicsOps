@@ -1,17 +1,15 @@
 [package]
-name = "omicsops-agent-core"
+name = "omicsops-science"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-async-trait.workspace = true
 chrono.workspace = true
-futures-util.workspace = true
-omicsops-protocol = { path = "../omicsops-protocol" }
-omicsops-science = { path = "../omicsops-science" }
+hex.workspace = true
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
 uuid.workspace = true

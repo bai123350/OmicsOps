@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
@@ -206,6 +206,13 @@ pub struct OutputCaptureV4 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RuntimeArtifactV4 {
+    pub relative_path: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RuntimeResultV4 {
     pub request_id: Uuid,
     pub session_id: Uuid,
@@ -215,7 +222,9 @@ pub struct RuntimeResultV4 {
     pub stdout_capture: Option<OutputCaptureV4>,
     pub stderr_capture: Option<OutputCaptureV4>,
     pub succeeded: bool,
-    pub artifacts: Vec<String>,
+    pub artifacts: Vec<RuntimeArtifactV4>,
+    #[serde(default)]
+    pub software_versions: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -298,6 +307,11 @@ pub enum AgentEventKindV4 {
     },
     ContextCheckpointed {
         checkpoint: ContextCheckpointV4,
+    },
+    ScientificStateChanged {
+        revision: u64,
+        state_sha256: String,
+        changes: Vec<String>,
     },
     CompletionProposed,
     RunCompleted,

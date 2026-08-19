@@ -6,10 +6,11 @@ use omicsops_protocol::{
     ModelFailureV4, RunModeV4, RunSpecV4, ToolCallV4, ToolDescriptorV4, ToolEffectV4,
     ToolOutcomeV4,
 };
+use omicsops_science::ScientificStateV4;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
@@ -70,6 +71,30 @@ pub trait EventStoreV4: Send + Sync {
         transcript: &str,
         checkpoint: &ContextCheckpointV4,
     ) -> Result<ContextArchiveV4, String>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScientificUpdateV4 {
+    pub revision: u64,
+    pub state_sha256: String,
+    pub changes: Vec<String>,
+}
+
+pub trait ScientificStateStoreV4: Send + Sync {
+    fn snapshot(&self, project_id: Uuid) -> Result<ScientificStateV4, String>;
+    fn before_tool(
+        &self,
+        project_id: Uuid,
+        run_id: Uuid,
+        call: &ToolCallV4,
+    ) -> Result<Option<ScientificUpdateV4>, String>;
+    fn after_tool(
+        &self,
+        project_id: Uuid,
+        run_id: Uuid,
+        call: &ToolCallV4,
+        outcome: &ToolOutcomeV4,
+    ) -> Result<Option<ScientificUpdateV4>, String>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,12 +158,15 @@ pub enum AgentCoreErrorV4 {
     RepeatedToolCall(String),
     #[error("side-effect dispatch is uncertain and requires verification: {0}")]
     UncertainSideEffect(String),
+    #[error("scientific state error: {0}")]
+    Science(String),
 }
 
 pub struct AgentCoreV4<'a> {
     pub model: &'a dyn ModelPortV4,
     pub tools: &'a dyn ToolPortV4,
     pub events: &'a dyn EventStoreV4,
+    pub science: Option<&'a dyn ScientificStateStoreV4>,
 }
 
 impl AgentCoreV4<'_> {
@@ -167,8 +195,11 @@ impl AgentCoreV4<'_> {
         }
         for _ in 0..16 {
             let prior = self.events.load(run_id).map_err(AgentCoreErrorV4::Store)?;
+            let scientific_state = self.scientific_snapshot(project_id)?;
             let context = format!(
-                "OBJECTIVE\n{objective}\nEXECUTE_CAPABILITY_CATALOG (for requested_capabilities only; these tools are not callable in plan mode)\n{}\nEVENTS\n{}",
+                "OBJECTIVE\n{objective}\nSCIENTIFIC_STATE (host verified)\n{}\nEXECUTE_CAPABILITY_CATALOG (for requested_capabilities only; these tools are not callable in plan mode)\n{}\nEVENTS\n{}",
+                serde_json::to_string(&scientific_state)
+                    .map_err(|e| AgentCoreErrorV4::Science(e.to_string()))?,
                 serde_json::to_string(&self.tools.descriptors(RunModeV4::Execute))
                     .map_err(|e| AgentCoreErrorV4::Store(e.to_string()))?,
                 serde_json::to_string(&prior)
@@ -369,7 +400,7 @@ impl AgentCoreV4<'_> {
                     self.push(
                         spec.run_id,
                         AgentEventKindV4::ToolOutcomeReused {
-                            idempotency_key: call.call_id,
+                            idempotency_key: call.call_id.clone(),
                             outcome,
                         },
                     )?;
@@ -388,7 +419,24 @@ impl AgentCoreV4<'_> {
                         },
                     )?;
                 } else {
-                    dispatch.push(call);
+                    match self.science_before_tool(spec, &call) {
+                        Ok(()) => dispatch.push(call),
+                        Err(message) => self.push(
+                            spec.run_id,
+                            AgentEventKindV4::ToolFinished {
+                                outcome: ToolOutcomeV4 {
+                                    call_id: call.call_id,
+                                    tool_id: call.tool_id,
+                                    succeeded: false,
+                                    model_content: format!(
+                                        "host rejected scientific operation: {message}"
+                                    ),
+                                    data: json!({"error_kind":"scientific_validation"}),
+                                    provenance: vec![],
+                                },
+                            },
+                        )?,
+                    }
                 }
             }
             if !dispatch.is_empty() {
@@ -406,6 +454,10 @@ impl AgentCoreV4<'_> {
                         },
                     )?;
                 }
+                let calls_by_id = dispatch
+                    .iter()
+                    .map(|call| (call.call_id.clone(), call.clone()))
+                    .collect::<HashMap<_, _>>();
                 let futures = dispatch
                     .into_iter()
                     .map(|call| self.tools.execute(RunModeV4::Execute, call));
@@ -424,8 +476,25 @@ impl AgentCoreV4<'_> {
                     }
                 };
                 for outcome in outcomes {
-                    let outcome = outcome.map_err(AgentCoreErrorV4::Tool)?;
-                    self.push(spec.run_id, AgentEventKindV4::ToolFinished { outcome })?;
+                    let mut outcome = outcome.map_err(AgentCoreErrorV4::Tool)?;
+                    let scientific_update = calls_by_id
+                        .get(&outcome.call_id)
+                        .map(|call| self.science_after_tool(spec, call, &outcome));
+                    if let Some(Err(error)) = &scientific_update {
+                        outcome.succeeded = false;
+                        outcome.model_content = format!("host rejected scientific result: {error}");
+                        outcome.data = json!({"error_kind":"scientific_validation"});
+                        outcome.provenance.clear();
+                    }
+                    self.push(
+                        spec.run_id,
+                        AgentEventKindV4::ToolFinished {
+                            outcome: outcome.clone(),
+                        },
+                    )?;
+                    if let Some(Ok(update)) = scientific_update {
+                        self.record_scientific_update(spec.run_id, update)?;
+                    }
                 }
             }
             if let Some((question_id, question)) = input_request {
@@ -635,6 +704,7 @@ impl AgentCoreV4<'_> {
             .events
             .load(spec.run_id)
             .map_err(AgentCoreErrorV4::Store)?;
+        let scientific_state = self.scientific_snapshot(spec.project_id)?;
         let latest_checkpoint = events.iter().rev().find_map(|event| match &event.event {
             AgentEventKindV4::ContextCheckpointed { checkpoint } => Some(checkpoint.clone()),
             _ => None,
@@ -651,6 +721,7 @@ impl AgentCoreV4<'_> {
         let candidate = serde_json::to_string(&json!({
             "checkpoint": latest_checkpoint,
             "recent_events": recent,
+            "scientific_state": scientific_state,
         }))
         .map_err(|e| AgentCoreErrorV4::Store(e.to_string()))?;
         if candidate.len() <= limits.context_max_bytes {
@@ -658,7 +729,13 @@ impl AgentCoreV4<'_> {
         }
         let transcript =
             serde_json::to_string(&events).map_err(|e| AgentCoreErrorV4::Store(e.to_string()))?;
-        let checkpoint = build_checkpoint(spec, &events, limits.checkpoint_recent_events);
+        let checkpoint = build_checkpoint(
+            spec,
+            &events,
+            limits.checkpoint_recent_events,
+            serde_json::to_value(&scientific_state)
+                .map_err(|error| AgentCoreErrorV4::Science(error.to_string()))?,
+        );
         let archive = self
             .events
             .archive_context(spec.run_id, &transcript, &checkpoint)
@@ -670,8 +747,59 @@ impl AgentCoreV4<'_> {
                 checkpoint: checkpoint.clone(),
             },
         )?;
-        serde_json::to_string(&json!({"checkpoint":checkpoint,"recent_events":[]}))
+        serde_json::to_string(&json!({"checkpoint":checkpoint,"recent_events":[],"scientific_state":scientific_state}))
             .map_err(|e| AgentCoreErrorV4::Store(e.to_string()))
+    }
+
+    fn scientific_snapshot(&self, project_id: Uuid) -> Result<ScientificStateV4, AgentCoreErrorV4> {
+        self.science
+            .map(|science| {
+                science
+                    .snapshot(project_id)
+                    .map_err(AgentCoreErrorV4::Science)
+            })
+            .unwrap_or_else(|| Ok(ScientificStateV4::new(project_id)))
+    }
+
+    fn record_scientific_update(
+        &self,
+        run_id: Uuid,
+        update: Option<ScientificUpdateV4>,
+    ) -> Result<(), AgentCoreErrorV4> {
+        if let Some(update) = update {
+            self.push(
+                run_id,
+                AgentEventKindV4::ScientificStateChanged {
+                    revision: update.revision,
+                    state_sha256: update.state_sha256,
+                    changes: update.changes,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn science_before_tool(&self, spec: &RunSpecV4, call: &ToolCallV4) -> Result<(), String> {
+        let Some(science) = self.science else {
+            return Ok(());
+        };
+        let update = science.before_tool(spec.project_id, spec.run_id, call)?;
+        self.record_scientific_update(spec.run_id, update)
+            .map_err(|error| error.to_string())
+    }
+
+    fn science_after_tool(
+        &self,
+        spec: &RunSpecV4,
+        call: &ToolCallV4,
+        outcome: &ToolOutcomeV4,
+    ) -> Result<Option<ScientificUpdateV4>, AgentCoreErrorV4> {
+        let Some(science) = self.science else {
+            return Ok(None);
+        };
+        science
+            .after_tool(spec.project_id, spec.run_id, call, outcome)
+            .map_err(AgentCoreErrorV4::Science)
     }
 
     fn record(&self, event: AgentEventV4) -> Result<(), AgentCoreErrorV4> {
@@ -698,6 +826,7 @@ fn build_checkpoint(
     spec: &RunSpecV4,
     events: &[AgentEventV4],
     recent_limit: usize,
+    scientific_state: serde_json::Value,
 ) -> ContextCheckpointV4 {
     let resolved_uncertain = events
         .iter()
@@ -747,7 +876,7 @@ fn build_checkpoint(
         completion_criteria: spec.plan.completion_criteria.clone(),
         unresolved_errors,
         recent_steps,
-        scientific_state: json!({}),
+        scientific_state,
     }
 }
 
@@ -866,6 +995,7 @@ mod tests {
             model: &model,
             tools: &FakeTools,
             events: &store,
+            science: None,
         };
         let result = core
             .plan(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), "analyze")
@@ -930,6 +1060,42 @@ mod tests {
         interrupts: AtomicUsize,
         fail_business: bool,
         delay_ms: u64,
+    }
+
+    struct RecordingScience(AtomicUsize);
+    impl ScientificStateStoreV4 for RecordingScience {
+        fn snapshot(&self, project_id: Uuid) -> Result<ScientificStateV4, String> {
+            Ok(ScientificStateV4::new(project_id))
+        }
+
+        fn before_tool(
+            &self,
+            _: Uuid,
+            _: Uuid,
+            _: &ToolCallV4,
+        ) -> Result<Option<ScientificUpdateV4>, String> {
+            let revision = self.0.fetch_add(1, AtomicOrdering::SeqCst) as u64 + 1;
+            Ok(Some(ScientificUpdateV4 {
+                revision,
+                state_sha256: format!("state-{revision}"),
+                changes: vec!["analysis_started".into()],
+            }))
+        }
+
+        fn after_tool(
+            &self,
+            _: Uuid,
+            _: Uuid,
+            _: &ToolCallV4,
+            _: &ToolOutcomeV4,
+        ) -> Result<Option<ScientificUpdateV4>, String> {
+            let revision = self.0.fetch_add(1, AtomicOrdering::SeqCst) as u64 + 1;
+            Ok(Some(ScientificUpdateV4 {
+                revision,
+                state_sha256: format!("state-{revision}"),
+                changes: vec!["provenance_recorded".into()],
+            }))
+        }
     }
     #[async_trait]
     impl ToolPortV4 for RuntimeTools {
@@ -1006,6 +1172,7 @@ mod tests {
             model: &model,
             tools: &tools,
             events: &store,
+            science: None,
         }
         .execute(&spec, 4)
         .await
@@ -1013,6 +1180,59 @@ mod tests {
         assert!(store.events.lock().unwrap().iter().any(|event| {
             matches!(&event.event, AgentEventKindV4::ToolFinished { outcome } if !outcome.succeeded && outcome.model_content.contains("Traceback"))
         }));
+    }
+
+    #[tokio::test]
+    async fn scientific_state_changes_are_part_of_the_replayable_event_chain() {
+        let run_id = Uuid::new_v4();
+        let spec = execution_spec(run_id);
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = ScriptedModel(Mutex::new(vec![
+            ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![ToolCallV4 {
+                    call_id: "analysis-cell".into(),
+                    tool_id: "runtime.execute".into(),
+                    arguments: json!({"language":"python","code":"print(1)"}),
+                }],
+            },
+            ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![ToolCallV4 {
+                    call_id: "done".into(),
+                    tool_id: "agent.complete".into(),
+                    arguments: json!({}),
+                }],
+            },
+        ]));
+        let tools = RuntimeTools {
+            calls: AtomicUsize::new(0),
+            interrupts: AtomicUsize::new(0),
+            fail_business: false,
+            delay_ms: 0,
+        };
+        let science = RecordingScience(AtomicUsize::new(0));
+        AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: Some(&science),
+        }
+        .execute(&spec, 4)
+        .await
+        .unwrap();
+        let events = store.events.lock().unwrap();
+        let revisions = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEventKindV4::ScientificStateChanged { revision, .. } => Some(*revision),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(revisions, vec![1, 2]);
+        assert!(events.windows(2).all(|pair| pair[1].verify().is_ok()
+            && pair[1].previous_hash == pair[0].event_hash));
     }
 
     struct FlakyPlanModel(AtomicUsize);
@@ -1049,6 +1269,7 @@ mod tests {
             model: &model,
             tools: &FakeTools,
             events: &store,
+            science: None,
         }
         .plan(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), "x")
         .await
@@ -1093,6 +1314,7 @@ mod tests {
             model: &model,
             tools: &tools,
             events: &store,
+            science: None,
         }
         .execute_with_limits(
             &spec,
@@ -1138,6 +1360,7 @@ mod tests {
             model: &model,
             tools: &tools,
             events: &store,
+            science: None,
         }
         .execute_with_limits(&spec, AgentLimitsV4::default(), cancelled.as_ref())
         .await
@@ -1184,6 +1407,7 @@ mod tests {
             model: &SlowModel,
             tools: &tools,
             events: &store,
+            science: None,
         }
         .execute_with_limits(&spec, AgentLimitsV4::default(), cancelled.as_ref())
         .await
@@ -1233,6 +1457,7 @@ mod tests {
             model: &model,
             tools: &tools,
             events: &store,
+            science: None,
         }
         .execute(&spec, 1)
         .await
@@ -1264,6 +1489,7 @@ mod tests {
             model: &completion,
             tools: &tools,
             events: &store,
+            science: None,
         }
         .execute(&spec, 1)
         .await
@@ -1294,6 +1520,7 @@ mod tests {
             model: &model,
             tools: &FakeTools,
             events: &store,
+            science: None,
         };
         let context = core
             .context_for(

@@ -2999,6 +2999,7 @@ dependencies = [
  "omicsops-agent",
  "omicsops-core",
  "omicsops-protocol",
+ "omicsops-science",
  "pdf-extract",
  "quick-xml 0.38.4",
  "regex",
@@ -3042,6 +3043,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "omicsops-protocol",
+ "omicsops-science",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -3081,6 +3083,7 @@ dependencies = [
  "omicsops-protocol",
  "omicsops-runner",
  "omicsops-runtime",
+ "omicsops-science",
  "omicsops-tools",
  "reqwest 0.12.28",
  "schemars 1.2.2",
@@ -3135,6 +3138,20 @@ dependencies = [
  "omicsops-protocol",
  "serde_json",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "omicsops-science"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.19",
  "uuid",
 ]
 
