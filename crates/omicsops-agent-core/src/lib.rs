@@ -5,9 +5,10 @@ use omicsops_protocol::{
     AgentEventKindV4, AgentEventV4, CompletionEvidenceRefV4, CompletionProposalV4,
     ContextArchiveV4, ContextCheckpointV4, DelegatedTaskNodeV4, DelegationGraphOutcomeV4,
     DelegationGraphV4, DelegationIsolationV4, DelegationNodeOutcomeV4, DelegationNodeStatusV4,
-    DeterministicVerificationV4, ExecutionPlanV4, ModelFailureV4, ReviewerReportV4, RunModeV4,
-    RunSpecV4, ToolCallV4, ToolDescriptorV4, ToolEffectV4, ToolOutcomeV4, VerificationFindingV4,
-    VerificationSeverityV4,
+    DeterministicVerificationV4, ExecutionPlanV4, ExternalExecutorOutcomeV4,
+    ExternalExecutorTaskV4, ModelFailureV4, ReviewerReportV4, RunModeV4, RunSpecV4,
+    ScientificBridgeV4, ToolCallV4, ToolDescriptorV4, ToolEffectV4, ToolOutcomeV4,
+    VerificationFindingV4, VerificationSeverityV4,
 };
 use omicsops_science::{AnalysisStatusV4, EvidenceSourceV4, ScientificStateV4};
 use serde::{Deserialize, Serialize};
@@ -139,6 +140,14 @@ pub trait ToolPortV4: Send + Sync {
     async fn interrupt(&self, _run_id: Uuid) -> Result<(), String> {
         Ok(())
     }
+}
+
+#[async_trait]
+pub trait ExternalExecutorPortV4: Send + Sync {
+    async fn execute(
+        &self,
+        task: ExternalExecutorTaskV4,
+    ) -> Result<ExternalExecutorOutcomeV4, String>;
 }
 
 pub trait EventStoreV4: Send + Sync {
@@ -1430,6 +1439,94 @@ fn validate_delegation_graph_v4(
         }
     }
     Ok(nodes)
+}
+
+pub fn build_scientific_bridge_v4(
+    spec: &RunSpecV4,
+    state: &ScientificStateV4,
+    allowed_artifact_paths: BTreeSet<String>,
+) -> Result<ScientificBridgeV4, AgentCoreErrorV4> {
+    for path in &allowed_artifact_paths {
+        validate_bridge_path(path).map_err(AgentCoreErrorV4::Delegation)?;
+    }
+    Ok(ScientificBridgeV4 {
+        schema_version: 4,
+        project_id: spec.project_id,
+        run_id: spec.run_id,
+        scientific_state_sha256: state.digest(),
+        scientific_state: serde_json::to_value(state)
+            .map_err(|error| AgentCoreErrorV4::Science(error.to_string()))?,
+        allowed_artifact_paths,
+    })
+}
+
+pub fn validate_external_executor_task_v4(
+    task: &ExternalExecutorTaskV4,
+    spec: &RunSpecV4,
+    tools: &dyn ToolPortV4,
+) -> Result<(), String> {
+    if task.schema_version != 4
+        || task.objective.trim().is_empty()
+        || !task.output_schema.is_object()
+        || task.bridge.schema_version != 4
+        || task.bridge.project_id != spec.project_id
+        || task.bridge.run_id != spec.run_id
+    {
+        return Err("external executor task does not match the frozen V4 run".into());
+    }
+    let state: ScientificStateV4 = serde_json::from_value(task.bridge.scientific_state.clone())
+        .map_err(|error| format!("invalid Scientific Bridge state: {error}"))?;
+    if state.project_id != spec.project_id || state.digest() != task.bridge.scientific_state_sha256
+    {
+        return Err("Scientific Bridge hash or project identity changed".into());
+    }
+    for path in &task.bridge.allowed_artifact_paths {
+        validate_bridge_path(path)?;
+    }
+    for capability in &task.capabilities {
+        if !spec.plan.requested_capabilities.contains(capability)
+            || tools.effect(capability) != Some(ToolEffectV4::ReadOnly)
+            || capability == "agent.delegate"
+        {
+            return Err(format!(
+                "external executor cannot expand capability {capability}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_external_executor_outcome_v4(
+    task: &ExternalExecutorTaskV4,
+    outcome: &ExternalExecutorOutcomeV4,
+) -> Result<(), String> {
+    if outcome.schema_version != 4 {
+        return Err("external executor outcome schema_version must be 4".into());
+    }
+    validate_json_schema_subset(&task.output_schema, &outcome.output, "$")?;
+    for path in &outcome.proposed_artifacts {
+        validate_bridge_path(path)?;
+        if !task.bridge.allowed_artifact_paths.contains(path) {
+            return Err(format!(
+                "external executor proposed artifact outside Scientific Bridge scope: {path}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_bridge_path(path: &str) -> Result<(), String> {
+    let normalized = path.replace('\\', "/");
+    if normalized.trim().is_empty()
+        || normalized.starts_with('/')
+        || normalized.contains(':')
+        || normalized
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".." | ".omicsops"))
+    {
+        return Err(format!("unsafe Scientific Bridge path: {path}"));
+    }
+    Ok(())
 }
 
 fn delegation_depth(
@@ -3334,6 +3431,66 @@ mod tests {
             )
             .unwrap_err()
             .contains("budget")
+        );
+    }
+
+    #[test]
+    fn external_executor_bridge_rejects_tampering_and_capability_expansion() {
+        let mut spec = execution_spec(Uuid::new_v4());
+        spec.plan
+            .requested_capabilities
+            .insert("project.list".into());
+        let state = ScientificStateV4::new(spec.project_id);
+        let bridge = build_scientific_bridge_v4(
+            &spec,
+            &state,
+            BTreeSet::from(["results/review.json".into()]),
+        )
+        .unwrap();
+        let task = ExternalExecutorTaskV4 {
+            schema_version: 4,
+            executor: omicsops_protocol::ExternalExecutorKindV4::AcpCodex,
+            objective: "review frozen evidence".into(),
+            capabilities: BTreeSet::from(["project.list".into()]),
+            output_schema: json!({
+                "type":"object",
+                "required":["summary"],
+                "properties":{"summary":{"type":"string"}}
+            }),
+            bridge,
+        };
+        assert!(validate_external_executor_task_v4(&task, &spec, &FakeTools).is_ok());
+
+        let mut tampered = task.clone();
+        tampered.bridge.scientific_state_sha256 = "0".repeat(64);
+        assert!(
+            validate_external_executor_task_v4(&tampered, &spec, &FakeTools)
+                .unwrap_err()
+                .contains("hash")
+        );
+
+        let mut expanded = task.clone();
+        expanded.capabilities.insert("runtime.execute".into());
+        assert!(
+            validate_external_executor_task_v4(&expanded, &spec, &FakeTools)
+                .unwrap_err()
+                .contains("cannot expand")
+        );
+
+        let valid_outcome = ExternalExecutorOutcomeV4 {
+            schema_version: 4,
+            succeeded: true,
+            output: json!({"summary":"evidence is consistent"}),
+            proposed_artifacts: vec!["results/review.json".into()],
+            audit: vec!["read project index".into()],
+        };
+        assert!(validate_external_executor_outcome_v4(&task, &valid_outcome).is_ok());
+        let mut escaped = valid_outcome;
+        escaped.proposed_artifacts = vec!["results/unapproved.json".into()];
+        assert!(
+            validate_external_executor_outcome_v4(&task, &escaped)
+                .unwrap_err()
+                .contains("outside")
         );
     }
 }

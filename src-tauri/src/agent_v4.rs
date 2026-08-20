@@ -34,8 +34,9 @@ use omicsops_knowledge::{
     markdown_sections, schema_digest, search_mcp_tools, search_memory, search_skills,
 };
 use omicsops_protocol::{
-    AgentEventKindV4, AgentEventV4, ContextArchiveV4, ContextCheckpointV4, ExecutionContextKeyV4,
-    ExecutionPlanV4, KernelLanguageV4, ModelErrorClassV4, ModelFailureV4, OutputCaptureV4,
+    AgentEventKindV4, AgentEventV4, ComputeBackendDescriptorV4, ComputeBackendKindV4,
+    ContextArchiveV4, ContextCheckpointV4, ExecutionContextKeyV4, ExecutionPlanV4,
+    IsolationStrengthV4, KernelLanguageV4, ModelErrorClassV4, ModelFailureV4, OutputCaptureV4,
     ReviewerReportV4, RunSpecV4, RuntimeArtifactV4, RuntimeResultV4, ToolCallV4, ToolDescriptorV4,
     ToolEffectV4, ToolOutcomeV4, UncertainResolutionV4,
 };
@@ -433,6 +434,7 @@ fn spawn_execution(
                 session: session.clone(),
                 root: root.clone(),
                 project_id: project.id,
+                backend_id: format!("ssh:{}", profile.id),
             });
             let runtime = Arc::new(RuntimeManagerV4::new(backend));
             let executor = Arc::new(DesktopToolExecutorV4 {
@@ -558,6 +560,7 @@ async fn compose(
         session: session.clone(),
         root: root.clone(),
         project_id: project.id,
+        backend_id: format!("ssh:{}", profile.id),
     });
     let runtime = Arc::new(RuntimeManagerV4::new(backend));
     let executor = Arc::new(DesktopToolExecutorV4 {
@@ -1310,13 +1313,30 @@ struct SshKernelBackendV4 {
     session: Arc<SshSession>,
     root: String,
     project_id: Uuid,
+    backend_id: String,
 }
 #[async_trait]
 impl KernelBackendV4 for SshKernelBackendV4 {
+    fn descriptor(&self) -> ComputeBackendDescriptorV4 {
+        ComputeBackendDescriptorV4 {
+            schema_version: 4,
+            backend_id: self.backend_id.clone(),
+            kind: ComputeBackendKindV4::Ssh,
+            isolation: IsolationStrengthV4::Process,
+            available: true,
+            supports_python: true,
+            supports_r: true,
+            supports_network_policy: false,
+        }
+    }
+
     async fn launch(
         &self,
         key: &ExecutionContextKeyV4,
     ) -> Result<Arc<dyn KernelProcessV4>, String> {
+        if key.backend_id != self.backend_id {
+            return Err("SSH backend received a mismatched backend id".into());
+        }
         validate_environment_name(&key.environment)?;
         let session_id = Uuid::new_v4();
         let dir = format!("{}/.omicsops/kernels", self.root.trim_end_matches('/'));
@@ -2199,6 +2219,7 @@ mod tests {
             session,
             root,
             project_id,
+            backend_id: "ssh:live".into(),
         });
         let runtime = RuntimeManagerV4::new(backend);
         let key = ExecutionContextKeyV4 {
@@ -2263,6 +2284,7 @@ mod tests {
             session: session.clone(),
             root: root.clone(),
             project_id,
+            backend_id: "ssh:live-stage2".into(),
         });
         let runtime = Arc::new(RuntimeManagerV4::new(backend));
         let python = ExecutionContextKeyV4 {
@@ -2386,6 +2408,7 @@ mod tests {
             session: session.clone(),
             root: root.clone(),
             project_id,
+            backend_id: backend_id.clone(),
         })));
         let executor = DesktopToolExecutorV4 {
             repository: Repository::open_in_memory().unwrap(),

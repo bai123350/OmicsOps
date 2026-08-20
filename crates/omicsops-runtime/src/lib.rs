@@ -1,7 +1,13 @@
+mod process_backend;
+
+pub use process_backend::{ContainerKernelBackendV4, LocalKernelBackendV4};
+
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
-use omicsops_protocol::{ExecutionContextKeyV4, RuntimeResultV4};
+use omicsops_protocol::{
+    AutonomyModeV4, ComputeBackendDescriptorV4, ExecutionContextKeyV4, RuntimeResultV4,
+};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -19,8 +25,68 @@ pub trait KernelProcessV4: Send + Sync {
 
 #[async_trait]
 pub trait KernelBackendV4: Send + Sync {
+    fn descriptor(&self) -> ComputeBackendDescriptorV4;
+
     async fn launch(&self, key: &ExecutionContextKeyV4)
     -> Result<Arc<dyn KernelProcessV4>, String>;
+}
+
+#[derive(Default)]
+pub struct ComputeBackendRegistryV4 {
+    backends: HashMap<String, Arc<dyn KernelBackendV4>>,
+}
+
+impl ComputeBackendRegistryV4 {
+    pub fn register(&mut self, backend: Arc<dyn KernelBackendV4>) -> Result<(), String> {
+        let descriptor = backend.descriptor();
+        if descriptor.schema_version != 4 || descriptor.backend_id.trim().is_empty() {
+            return Err("invalid V4 compute backend descriptor".into());
+        }
+        if self
+            .backends
+            .insert(descriptor.backend_id.clone(), backend)
+            .is_some()
+        {
+            return Err(format!(
+                "duplicate V4 compute backend {}",
+                descriptor.backend_id
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn descriptors(&self) -> Vec<ComputeBackendDescriptorV4> {
+        let mut descriptors = self
+            .backends
+            .values()
+            .map(|backend| backend.descriptor())
+            .collect::<Vec<_>>();
+        descriptors.sort_by(|left, right| left.backend_id.cmp(&right.backend_id));
+        descriptors
+    }
+
+    pub fn runtime(
+        &self,
+        backend_id: &str,
+        autonomy: AutonomyModeV4,
+    ) -> Result<RuntimeManagerV4, String> {
+        let backend = self
+            .backends
+            .get(backend_id)
+            .ok_or_else(|| format!("compute backend {backend_id} is not registered"))?;
+        let descriptor = backend.descriptor();
+        if !descriptor.permits(autonomy) {
+            return Err(match autonomy {
+                AutonomyModeV4::FullAuto => {
+                    "Full Auto requires an available container-isolated backend".into()
+                }
+                AutonomyModeV4::Supervised => {
+                    format!("compute backend {backend_id} is unavailable")
+                }
+            });
+        }
+        Ok(RuntimeManagerV4::new(backend.clone()))
+    }
 }
 
 pub struct RuntimeManagerV4 {
@@ -34,6 +100,10 @@ impl RuntimeManagerV4 {
             backend,
             sessions: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn backend_descriptor(&self) -> ComputeBackendDescriptorV4 {
+        self.backend.descriptor()
     }
 
     pub async fn acquire(
@@ -96,9 +166,10 @@ impl RuntimeManagerV4 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omicsops_protocol::KernelLanguageV4;
+    use omicsops_protocol::{ComputeBackendKindV4, IsolationStrengthV4, KernelLanguageV4};
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct FakeBackend(AtomicUsize);
+    struct DescribedBackend(ComputeBackendDescriptorV4);
     struct FakeProcess {
         id: Uuid,
         identity: String,
@@ -106,6 +177,19 @@ mod tests {
     }
     #[async_trait]
     impl KernelBackendV4 for FakeBackend {
+        fn descriptor(&self) -> ComputeBackendDescriptorV4 {
+            ComputeBackendDescriptorV4 {
+                schema_version: 4,
+                backend_id: "fake".into(),
+                kind: ComputeBackendKindV4::Local,
+                isolation: IsolationStrengthV4::Process,
+                available: true,
+                supports_python: true,
+                supports_r: true,
+                supports_network_policy: false,
+            }
+        }
+
         async fn launch(
             &self,
             _: &ExecutionContextKeyV4,
@@ -116,6 +200,19 @@ mod tests {
                 identity: "fake-process".into(),
                 values: Mutex::new(HashMap::new()),
             }))
+        }
+    }
+    #[async_trait]
+    impl KernelBackendV4 for DescribedBackend {
+        fn descriptor(&self) -> ComputeBackendDescriptorV4 {
+            self.0.clone()
+        }
+
+        async fn launch(
+            &self,
+            _: &ExecutionContextKeyV4,
+        ) -> Result<Arc<dyn KernelProcessV4>, String> {
+            Err("not used by policy test".into())
         }
     }
     #[async_trait]
@@ -199,5 +296,52 @@ mod tests {
         manager.interrupt_run(run_id).await.unwrap();
         manager.acquire(&r).await.unwrap();
         assert_eq!(backend.0.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn registry_enforces_full_auto_isolation_and_unique_backend_ids() {
+        let descriptor = |backend_id: &str, isolation| ComputeBackendDescriptorV4 {
+            schema_version: 4,
+            backend_id: backend_id.into(),
+            kind: if isolation == IsolationStrengthV4::Container {
+                ComputeBackendKindV4::Docker
+            } else {
+                ComputeBackendKindV4::Local
+            },
+            isolation,
+            available: true,
+            supports_python: true,
+            supports_r: true,
+            supports_network_policy: isolation == IsolationStrengthV4::Container,
+        };
+        let mut registry = ComputeBackendRegistryV4::default();
+        registry
+            .register(Arc::new(DescribedBackend(descriptor(
+                "local",
+                IsolationStrengthV4::Process,
+            ))))
+            .unwrap();
+        registry
+            .register(Arc::new(DescribedBackend(descriptor(
+                "docker",
+                IsolationStrengthV4::Container,
+            ))))
+            .unwrap();
+        assert!(
+            registry
+                .runtime("local", AutonomyModeV4::Supervised)
+                .is_ok()
+        );
+        assert!(registry.runtime("local", AutonomyModeV4::FullAuto).is_err());
+        assert!(registry.runtime("docker", AutonomyModeV4::FullAuto).is_ok());
+        assert!(
+            registry
+                .register(Arc::new(DescribedBackend(descriptor(
+                    "docker",
+                    IsolationStrengthV4::Container,
+                ))))
+                .unwrap_err()
+                .contains("duplicate")
+        );
     }
 }

@@ -196,6 +196,122 @@ pub enum KernelLanguageV4 {
     R,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputeBackendKindV4 {
+    Ssh,
+    Local,
+    Docker,
+    Podman,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationStrengthV4 {
+    Process,
+    Container,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AutonomyModeV4 {
+    Supervised,
+    FullAuto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ComputeBackendDescriptorV4 {
+    pub schema_version: u8,
+    pub backend_id: String,
+    pub kind: ComputeBackendKindV4,
+    pub isolation: IsolationStrengthV4,
+    pub available: bool,
+    pub supports_python: bool,
+    pub supports_r: bool,
+    pub supports_network_policy: bool,
+}
+
+impl ComputeBackendDescriptorV4 {
+    pub fn permits(&self, mode: AutonomyModeV4) -> bool {
+        self.available
+            && (mode != AutonomyModeV4::FullAuto
+                || self.isolation == IsolationStrengthV4::Container)
+    }
+}
+
+/// Evidence gate used before removing the legacy V2/V3 execution paths.
+/// Keeping this as data makes retirement an explicit, auditable decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+pub struct LegacyRetirementReadinessV4 {
+    pub python_kernel_verified: bool,
+    pub r_kernel_verified: bool,
+    pub pbmc3k_verified: bool,
+    pub crash_recovery_verified: bool,
+    pub scientific_verifier_verified: bool,
+    pub security_scenarios_verified: bool,
+}
+
+impl LegacyRetirementReadinessV4 {
+    pub fn ready(&self) -> bool {
+        self.python_kernel_verified
+            && self.r_kernel_verified
+            && self.pbmc3k_verified
+            && self.crash_recovery_verified
+            && self.scientific_verifier_verified
+            && self.security_scenarios_verified
+    }
+
+    pub fn missing_evidence(&self) -> Vec<&'static str> {
+        [
+            (!self.python_kernel_verified).then_some("python_kernel"),
+            (!self.r_kernel_verified).then_some("r_kernel"),
+            (!self.pbmc3k_verified).then_some("pbmc3k"),
+            (!self.crash_recovery_verified).then_some("crash_recovery"),
+            (!self.scientific_verifier_verified).then_some("scientific_verifier"),
+            (!self.security_scenarios_verified).then_some("security_scenarios"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalExecutorKindV4 {
+    AcpCodex,
+    AcpClaudeCode,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ScientificBridgeV4 {
+    pub schema_version: u8,
+    pub project_id: Uuid,
+    pub run_id: Uuid,
+    pub scientific_state_sha256: String,
+    pub scientific_state: Value,
+    pub allowed_artifact_paths: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ExternalExecutorTaskV4 {
+    pub schema_version: u8,
+    pub executor: ExternalExecutorKindV4,
+    pub objective: String,
+    pub capabilities: BTreeSet<String>,
+    pub output_schema: Value,
+    pub bridge: ScientificBridgeV4,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ExternalExecutorOutcomeV4 {
+    pub schema_version: u8,
+    pub succeeded: bool,
+    pub output: Value,
+    pub proposed_artifacts: Vec<String>,
+    pub audit: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct OutputCaptureV4 {
     pub excerpt: String,
@@ -615,5 +731,20 @@ mod tests {
         let mut tampered = second;
         tampered.previous_hash = "bad".into();
         assert!(validate_event_chain_v4(&[first, tampered]).is_err());
+    }
+
+    #[test]
+    fn legacy_retirement_requires_every_acceptance_evidence() {
+        let mut gate = LegacyRetirementReadinessV4::default();
+        assert!(!gate.ready());
+        assert_eq!(gate.missing_evidence().len(), 6);
+        gate.python_kernel_verified = true;
+        gate.r_kernel_verified = true;
+        gate.pbmc3k_verified = true;
+        gate.crash_recovery_verified = true;
+        gate.scientific_verifier_verified = true;
+        gate.security_scenarios_verified = true;
+        assert!(gate.ready());
+        assert!(gate.missing_evidence().is_empty());
     }
 }
