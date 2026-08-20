@@ -295,10 +295,16 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
             json!({"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}),
         ),
         descriptor(
+            "agent.delegate",
+            "Run a bounded read-only DAG of temporary tasks. Nodes cannot expand the frozen run capabilities, write, or delegate recursively",
+            ToolEffectV4::Delegation,
+            json!({"type":"object","required":["schema_version","nodes"],"properties":{"schema_version":{"type":"integer","const":4},"nodes":{"type":"array","maxItems":8,"items":{"type":"object","required":["id","objective","budget","capabilities","output_schema","isolation"],"properties":{"id":{"type":"string"},"objective":{"type":"string"},"dependencies":{"type":"array","items":{"type":"string"}},"budget":{"type":"object","required":["max_turns","max_tool_calls"],"properties":{"max_turns":{"type":"integer","maximum":4},"max_tool_calls":{"type":"integer","maximum":8}}},"capabilities":{"type":"array","items":{"type":"string"}},"output_schema":{"type":"object"},"isolation":{"type":"string","enum":["read_only_project","evidence_only"]}}}}}}),
+        ),
+        descriptor(
             "agent.complete",
-            "Propose completion of the approved plan",
+            "Propose completion with evidence for every frozen completion criterion; the Host verifier and read-only Reviewer decide whether the run can finish",
             ToolEffectV4::Mutating,
-            json!({"type":"object","properties":{}}),
+            json!({"type":"object","required":["schema_version","summary","criteria"],"properties":{"schema_version":{"type":"integer","const":4},"summary":{"type":"string"},"criteria":{"type":"array","items":{"type":"object","required":["criterion","evidence"],"properties":{"criterion":{"type":"string"},"evidence":{"type":"array","items":{"type":"object","required":["kind"],"properties":{"kind":{"type":"string","enum":["event","artifact","evidence"]},"sequence":{"type":"integer"},"artifact_id":{"type":"string"},"evidence_id":{"type":"string"}}}}}}}}}),
         ),
     ]
 }
@@ -372,6 +378,44 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("forbidden in plan mode"));
+    }
+
+    #[test]
+    fn delegation_requires_frozen_execute_capability_and_is_never_visible_in_plan_mode() {
+        let graph = ToolCallV4 {
+            call_id: "delegate".into(),
+            tool_id: "agent.delegate".into(),
+            arguments: json!({"schema_version":4,"nodes":[]}),
+        };
+        let denied = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop))
+            .unwrap()
+            .with_execute_capabilities(BTreeSet::new());
+        assert!(
+            denied
+                .validate(RunModeV4::Execute, &graph)
+                .unwrap_err()
+                .contains("not approved")
+        );
+        assert!(
+            denied
+                .validate(RunModeV4::Plan, &graph)
+                .unwrap_err()
+                .contains("forbidden")
+        );
+        let approved = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop))
+            .unwrap()
+            .with_execute_capabilities(BTreeSet::from(["agent.delegate".into()]));
+        approved.validate(RunModeV4::Execute, &graph).unwrap();
+        assert_eq!(
+            approved.effect("agent.delegate"),
+            Some(ToolEffectV4::Delegation)
+        );
+        assert!(
+            approved
+                .descriptors(RunModeV4::Plan)
+                .iter()
+                .all(|tool| tool.id != "agent.delegate")
+        );
     }
 
     struct ConcurrencyProbe {

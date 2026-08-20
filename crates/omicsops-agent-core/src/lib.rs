@@ -2,15 +2,18 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::future::join_all;
 use omicsops_protocol::{
-    AgentEventKindV4, AgentEventV4, ContextArchiveV4, ContextCheckpointV4, ExecutionPlanV4,
-    ModelFailureV4, RunModeV4, RunSpecV4, ToolCallV4, ToolDescriptorV4, ToolEffectV4,
-    ToolOutcomeV4,
+    AgentEventKindV4, AgentEventV4, CompletionEvidenceRefV4, CompletionProposalV4,
+    ContextArchiveV4, ContextCheckpointV4, DelegatedTaskNodeV4, DelegationGraphOutcomeV4,
+    DelegationGraphV4, DelegationIsolationV4, DelegationNodeOutcomeV4, DelegationNodeStatusV4,
+    DeterministicVerificationV4, ExecutionPlanV4, ModelFailureV4, ReviewerReportV4, RunModeV4,
+    RunSpecV4, ToolCallV4, ToolDescriptorV4, ToolEffectV4, ToolOutcomeV4, VerificationFindingV4,
+    VerificationSeverityV4,
 };
-use omicsops_science::ScientificStateV4;
+use omicsops_science::{AnalysisStatusV4, EvidenceSourceV4, ScientificStateV4};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
@@ -28,6 +31,22 @@ pub struct ModelRequestV4 {
 pub struct ModelTurnV4 {
     pub public_text: String,
     pub tool_calls: Vec<ToolCallV4>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReviewerRequestV4 {
+    pub frozen_objective: String,
+    pub completion_criteria: Vec<String>,
+    pub proposal: CompletionProposalV4,
+    pub deterministic_report: DeterministicVerificationV4,
+    pub scientific_state: ScientificStateV4,
+    pub verified_evidence: Vec<ReviewerEvidenceV4>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReviewerEvidenceV4 {
+    pub reference: CompletionEvidenceRefV4,
+    pub payload: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +70,16 @@ pub trait ModelPortV4: Send + Sync {
         request: ModelRequestV4,
         on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
     ) -> Result<ModelTurnV4, ModelFailureV4>;
+
+    async fn review(
+        &self,
+        _request: ReviewerRequestV4,
+    ) -> Result<ReviewerReportV4, ModelFailureV4> {
+        Err(ModelFailureV4::permanent(
+            omicsops_protocol::ModelErrorClassV4::InvalidRequest,
+            "an independent V4 reviewer is not configured",
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,6 +184,12 @@ pub struct AgentLimitsV4 {
     pub max_model_retries: u8,
     pub context_max_bytes: usize,
     pub checkpoint_recent_events: usize,
+    pub max_reviewer_corrections: u8,
+    pub max_delegation_nodes: usize,
+    pub max_delegation_concurrency: usize,
+    pub max_delegation_depth: usize,
+    pub max_delegated_turns: u8,
+    pub max_delegated_tool_calls: u16,
 }
 
 impl Default for AgentLimitsV4 {
@@ -166,6 +201,12 @@ impl Default for AgentLimitsV4 {
             max_model_retries: 3,
             context_max_bytes: 256 * 1024,
             checkpoint_recent_events: 24,
+            max_reviewer_corrections: 2,
+            max_delegation_nodes: 8,
+            max_delegation_concurrency: 3,
+            max_delegation_depth: 2,
+            max_delegated_turns: 4,
+            max_delegated_tool_calls: 8,
         }
     }
 }
@@ -200,6 +241,10 @@ pub enum AgentCoreErrorV4 {
     UncertainSideEffect(String),
     #[error("scientific state error: {0}")]
     Science(String),
+    #[error("run needs attention: {0}")]
+    NeedsAttention(String),
+    #[error("delegation graph error: {0}")]
+    Delegation(String),
 }
 
 pub struct AgentCoreV4<'a> {
@@ -361,6 +406,15 @@ impl AgentCoreV4<'_> {
             .count() as u32;
         let mut last_signature = None::<String>;
         let mut consecutive_repeats = 0_u32;
+        let mut reviewer_corrections = existing
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event,
+                    AgentEventKindV4::ReviewerCorrectionRequested { .. }
+                )
+            })
+            .count() as u8;
         for event in &existing {
             if let AgentEventKindV4::ToolRequested { call } = &event.event {
                 let signature = tool_signature(call);
@@ -395,8 +449,9 @@ impl AgentCoreV4<'_> {
                 )
                 .await?;
             let mut ordinary = Vec::new();
-            let mut completion_requested = false;
+            let mut completion_proposal = None;
             let mut input_request = None;
+            let mut delegation_requests = Vec::new();
             for call in turn.tool_calls {
                 tool_call_count += 1;
                 if tool_call_count > limits.max_tool_calls {
@@ -417,7 +472,74 @@ impl AgentCoreV4<'_> {
                     AgentEventKindV4::ToolRequested { call: call.clone() },
                 )?;
                 if call.tool_id == "agent.complete" {
-                    completion_requested = true;
+                    let proposal: CompletionProposalV4 =
+                        match serde_json::from_value(call.arguments) {
+                            Ok(proposal) => proposal,
+                            Err(error) => {
+                                self.push(
+                                    spec.run_id,
+                                    AgentEventKindV4::ToolFinished {
+                                        outcome: ToolOutcomeV4 {
+                                            call_id: call.call_id,
+                                            tool_id: call.tool_id,
+                                            succeeded: false,
+                                            model_content: format!(
+                                                "host rejected completion proposal: {error}"
+                                            ),
+                                            data: json!({"error_kind":"completion_schema"}),
+                                            provenance: vec![],
+                                        },
+                                    },
+                                )?;
+                                continue;
+                            }
+                        };
+                    if proposal.schema_version != 4 || proposal.summary.trim().is_empty() {
+                        self.push(
+                            spec.run_id,
+                            AgentEventKindV4::ToolFinished {
+                                outcome: ToolOutcomeV4 {
+                                    call_id: call.call_id,
+                                    tool_id: call.tool_id,
+                                    succeeded: false,
+                                    model_content: "host rejected completion proposal: schema_version 4 and a non-empty summary are required".into(),
+                                    data: json!({"error_kind":"completion_schema"}),
+                                    provenance: vec![],
+                                },
+                            },
+                        )?;
+                        continue;
+                    }
+                    completion_proposal = Some(proposal);
+                    continue;
+                }
+                if call.tool_id == "agent.delegate" {
+                    if let Err(message) = self.tools.validate(RunModeV4::Execute, &call) {
+                        self.push(
+                            spec.run_id,
+                            AgentEventKindV4::ToolFinished {
+                                outcome: rejected_coordinator_outcome(
+                                    call,
+                                    "delegation_authority",
+                                    message,
+                                ),
+                            },
+                        )?;
+                        continue;
+                    }
+                    match serde_json::from_value::<DelegationGraphV4>(call.arguments.clone()) {
+                        Ok(graph) => delegation_requests.push((call.call_id, graph)),
+                        Err(error) => self.push(
+                            spec.run_id,
+                            AgentEventKindV4::ToolFinished {
+                                outcome: rejected_coordinator_outcome(
+                                    call,
+                                    "delegation_schema",
+                                    error.to_string(),
+                                ),
+                            },
+                        )?,
+                    }
                     continue;
                 }
                 if call.tool_id == "agent.request_input" {
@@ -537,6 +659,49 @@ impl AgentCoreV4<'_> {
                     }
                 }
             }
+            for (call_id, graph) in delegation_requests {
+                match self
+                    .execute_delegation_graph(spec, &call_id, graph, limits, cancelled)
+                    .await
+                {
+                    Ok(outcome) => {
+                        let succeeded = outcome
+                            .nodes
+                            .values()
+                            .all(|node| node.status == DelegationNodeStatusV4::Succeeded);
+                        self.push(
+                            spec.run_id,
+                            AgentEventKindV4::ToolFinished {
+                                outcome: ToolOutcomeV4 {
+                                    call_id,
+                                    tool_id: "agent.delegate".into(),
+                                    succeeded,
+                                    model_content: serde_json::to_string(&outcome).map_err(
+                                        |error| AgentCoreErrorV4::Delegation(error.to_string()),
+                                    )?,
+                                    data: serde_json::to_value(&outcome).map_err(|error| {
+                                        AgentCoreErrorV4::Delegation(error.to_string())
+                                    })?,
+                                    provenance: vec!["host-bounded-delegation-v4".into()],
+                                },
+                            },
+                        )?;
+                    }
+                    Err(error) => self.push(
+                        spec.run_id,
+                        AgentEventKindV4::ToolFinished {
+                            outcome: ToolOutcomeV4 {
+                                call_id,
+                                tool_id: "agent.delegate".into(),
+                                succeeded: false,
+                                model_content: format!("host rejected delegation graph: {error}"),
+                                data: json!({"error_kind":"delegation_validation"}),
+                                provenance: vec![],
+                            },
+                        },
+                    )?,
+                }
+            }
             if let Some((question_id, question)) = input_request {
                 self.push(
                     spec.run_id,
@@ -547,13 +712,343 @@ impl AgentCoreV4<'_> {
                 )?;
                 return Err(AgentCoreErrorV4::WaitingForInput);
             }
-            if completion_requested {
+            if let Some(proposal) = completion_proposal {
                 self.push(spec.run_id, AgentEventKindV4::CompletionProposed)?;
+                self.push(
+                    spec.run_id,
+                    AgentEventKindV4::CompletionProposalSubmitted {
+                        proposal: proposal.clone(),
+                    },
+                )?;
+                let events = self
+                    .events
+                    .load(spec.run_id)
+                    .map_err(AgentCoreErrorV4::Store)?;
+                let scientific_state = self.scientific_snapshot(spec.project_id)?;
+                let deterministic =
+                    verify_completion_v4(spec, &scientific_state, &events, &proposal);
+                self.push(
+                    spec.run_id,
+                    AgentEventKindV4::DeterministicVerificationFinished {
+                        report: deterministic.clone(),
+                    },
+                )?;
+                if !deterministic.passed {
+                    continue;
+                }
+                if cancelled.load(Ordering::SeqCst) {
+                    self.push(spec.run_id, AgentEventKindV4::RunCancelled)?;
+                    return Err(AgentCoreErrorV4::Cancelled);
+                }
+                let review = self
+                    .model
+                    .review(ReviewerRequestV4 {
+                        frozen_objective: spec.plan.objective.clone(),
+                        completion_criteria: spec.plan.completion_criteria.clone(),
+                        verified_evidence: materialize_verified_evidence(
+                            &proposal,
+                            &events,
+                            &scientific_state,
+                        )?,
+                        proposal,
+                        deterministic_report: deterministic,
+                        scientific_state,
+                    })
+                    .await
+                    .map_err(|error| AgentCoreErrorV4::Model(error.message))?;
+                review
+                    .validate()
+                    .map_err(|error| AgentCoreErrorV4::Model(error.to_string()))?;
+                self.push(
+                    spec.run_id,
+                    AgentEventKindV4::ReviewerFinished {
+                        report: review.clone(),
+                    },
+                )?;
+                if review.has_errors() {
+                    if reviewer_corrections >= limits.max_reviewer_corrections {
+                        let message = format!(
+                            "scientific reviewer errors remain after {} correction rounds",
+                            limits.max_reviewer_corrections
+                        );
+                        self.push(
+                            spec.run_id,
+                            AgentEventKindV4::RunNeedsAttention {
+                                message: message.clone(),
+                            },
+                        )?;
+                        return Err(AgentCoreErrorV4::NeedsAttention(message));
+                    }
+                    reviewer_corrections += 1;
+                    self.push(
+                        spec.run_id,
+                        AgentEventKindV4::ReviewerCorrectionRequested {
+                            correction: reviewer_corrections,
+                            findings: review
+                                .findings
+                                .into_iter()
+                                .filter(|finding| finding.severity == VerificationSeverityV4::Error)
+                                .collect(),
+                        },
+                    )?;
+                    continue;
+                }
                 self.push(spec.run_id, AgentEventKindV4::RunCompleted)?;
                 return Ok(());
             }
         }
         Err(AgentCoreErrorV4::MissingCompletion)
+    }
+
+    async fn execute_delegation_graph(
+        &self,
+        spec: &RunSpecV4,
+        call_id: &str,
+        graph: DelegationGraphV4,
+        limits: AgentLimitsV4,
+        cancelled: &AtomicBool,
+    ) -> Result<DelegationGraphOutcomeV4, AgentCoreErrorV4> {
+        let nodes = validate_delegation_graph_v4(&graph, spec, self.tools, limits)
+            .map_err(AgentCoreErrorV4::Delegation)?;
+        self.push(
+            spec.run_id,
+            AgentEventKindV4::DelegationGraphStarted {
+                call_id: call_id.into(),
+                graph,
+            },
+        )?;
+        let mut outcomes = BTreeMap::<String, DelegationNodeOutcomeV4>::new();
+        while outcomes.len() < nodes.len() {
+            if cancelled.load(Ordering::SeqCst) {
+                return Err(AgentCoreErrorV4::Cancelled);
+            }
+            let blocked = nodes
+                .values()
+                .filter(|node| !outcomes.contains_key(&node.id))
+                .filter(|node| {
+                    node.dependencies.iter().any(|dependency| {
+                        outcomes.get(dependency).is_some_and(|outcome| {
+                            outcome.status != DelegationNodeStatusV4::Succeeded
+                        })
+                    })
+                })
+                .map(|node| node.id.clone())
+                .collect::<Vec<_>>();
+            for node_id in blocked {
+                let outcome = DelegationNodeOutcomeV4 {
+                    node_id: node_id.clone(),
+                    status: DelegationNodeStatusV4::Blocked,
+                    output: None,
+                    error: Some("a dependency failed or was blocked".into()),
+                    tool_outcomes: vec![],
+                };
+                self.push(
+                    spec.run_id,
+                    AgentEventKindV4::DelegationNodeFinished {
+                        call_id: call_id.into(),
+                        outcome: outcome.clone(),
+                    },
+                )?;
+                outcomes.insert(node_id, outcome);
+            }
+            let ready = nodes
+                .values()
+                .filter(|node| !outcomes.contains_key(&node.id))
+                .filter(|node| {
+                    node.dependencies.iter().all(|dependency| {
+                        outcomes.get(dependency).is_some_and(|outcome| {
+                            outcome.status == DelegationNodeStatusV4::Succeeded
+                        })
+                    })
+                })
+                .take(limits.max_delegation_concurrency)
+                .cloned()
+                .collect::<Vec<_>>();
+            if ready.is_empty() {
+                if outcomes.len() == nodes.len() {
+                    break;
+                }
+                return Err(AgentCoreErrorV4::Delegation(
+                    "delegation scheduler made no progress".into(),
+                ));
+            }
+            let futures = ready.iter().map(|node| {
+                let dependency_outputs = node
+                    .dependencies
+                    .iter()
+                    .filter_map(|dependency| {
+                        outcomes
+                            .get(dependency)
+                            .and_then(|outcome| outcome.output.clone())
+                            .map(|output| (dependency.clone(), output))
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                self.execute_delegated_node(node, dependency_outputs, cancelled)
+            });
+            for outcome in join_all(futures).await {
+                self.push(
+                    spec.run_id,
+                    AgentEventKindV4::DelegationNodeFinished {
+                        call_id: call_id.into(),
+                        outcome: outcome.clone(),
+                    },
+                )?;
+                outcomes.insert(outcome.node_id.clone(), outcome);
+            }
+        }
+        let result = DelegationGraphOutcomeV4 {
+            schema_version: 4,
+            nodes: outcomes,
+        };
+        self.push(
+            spec.run_id,
+            AgentEventKindV4::DelegationGraphFinished {
+                call_id: call_id.into(),
+                outcome: result.clone(),
+            },
+        )?;
+        Ok(result)
+    }
+
+    async fn execute_delegated_node(
+        &self,
+        node: &DelegatedTaskNodeV4,
+        dependency_outputs: BTreeMap<String, Value>,
+        cancelled: &AtomicBool,
+    ) -> DelegationNodeOutcomeV4 {
+        let mut tool_outcomes = Vec::new();
+        let mut feedback = Vec::<String>::new();
+        let mut tool_call_count = 0_u16;
+        let mut descriptors = self
+            .tools
+            .descriptors(RunModeV4::Execute)
+            .into_iter()
+            .filter(|tool| {
+                node.capabilities.contains(&tool.id) && tool.effect == ToolEffectV4::ReadOnly
+            })
+            .collect::<Vec<_>>();
+        descriptors.push(delegated_result_descriptor());
+        for _ in 0..node.budget.max_turns {
+            if cancelled.load(Ordering::SeqCst) {
+                return failed_delegation_node(node, "delegated task was cancelled", tool_outcomes);
+            }
+            let context = json!({
+                "node_id": node.id,
+                "objective": node.objective,
+                "dependency_results": dependency_outputs,
+                "validation_feedback": feedback,
+            });
+            let request = ModelRequestV4 {
+                system: "You are a temporary bounded OmicsOps task node. You receive only your objective and explicit dependency results. You may use only the supplied read-only tools. You cannot write, execute code, use the network, delegate, request approval, or modify the main run. Submit one JSON value through agent.submit_delegated_result that matches the required schema.".into(),
+                context: context.to_string(),
+                tools: descriptors.clone(),
+            };
+            let mut ignore = |_| {};
+            let mut pending = Box::pin(self.model.stream(request, &mut ignore));
+            let model_result = loop {
+                tokio::select! {
+                    result = &mut pending => break Some(result),
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                        if cancelled.load(Ordering::SeqCst) {
+                            break None;
+                        }
+                    }
+                }
+            };
+            drop(pending);
+            let turn = match model_result {
+                None => {
+                    return failed_delegation_node(
+                        node,
+                        "delegated task was cancelled",
+                        tool_outcomes,
+                    );
+                }
+                Some(Ok(turn)) => turn,
+                Some(Err(error)) => {
+                    return failed_delegation_node(
+                        node,
+                        format!("delegated model failed: {}", error.message),
+                        tool_outcomes,
+                    );
+                }
+            };
+            for call in turn.tool_calls {
+                if call.tool_id == "agent.submit_delegated_result" {
+                    let output = call.arguments.get("output").cloned().unwrap_or(Value::Null);
+                    match validate_json_schema_subset(&node.output_schema, &output, "$") {
+                        Ok(()) => {
+                            return DelegationNodeOutcomeV4 {
+                                node_id: node.id.clone(),
+                                status: DelegationNodeStatusV4::Succeeded,
+                                output: Some(output),
+                                error: None,
+                                tool_outcomes,
+                            };
+                        }
+                        Err(error) => {
+                            feedback.push(format!("output schema rejected the result: {error}"));
+                            continue;
+                        }
+                    }
+                }
+                tool_call_count += 1;
+                if tool_call_count > node.budget.max_tool_calls {
+                    return failed_delegation_node(
+                        node,
+                        "delegated tool-call budget exhausted",
+                        tool_outcomes,
+                    );
+                }
+                let allowed = node.capabilities.contains(&call.tool_id)
+                    && self.tools.effect(&call.tool_id) == Some(ToolEffectV4::ReadOnly);
+                let outcome = if !allowed {
+                    ToolOutcomeV4 {
+                        call_id: call.call_id,
+                        tool_id: call.tool_id,
+                        succeeded: false,
+                        model_content: "Host denied capability expansion from delegated node"
+                            .into(),
+                        data: json!({"error_kind":"delegation_capability"}),
+                        provenance: vec![],
+                    }
+                } else if let Err(error) = self.tools.validate(RunModeV4::Execute, &call) {
+                    ToolOutcomeV4 {
+                        call_id: call.call_id,
+                        tool_id: call.tool_id,
+                        succeeded: false,
+                        model_content: format!("Host rejected delegated tool call: {error}"),
+                        data: json!({"error_kind":"delegation_validation"}),
+                        provenance: vec![],
+                    }
+                } else {
+                    match self.tools.execute(RunModeV4::Execute, call.clone()).await {
+                        Ok(outcome) => outcome,
+                        Err(error) => ToolOutcomeV4 {
+                            call_id: call.call_id,
+                            tool_id: call.tool_id,
+                            succeeded: false,
+                            model_content: error,
+                            data: json!({"error_kind":"delegation_tool"}),
+                            provenance: vec![],
+                        },
+                    }
+                };
+                feedback.push(format!(
+                    "tool {}: {}",
+                    outcome.tool_id, outcome.model_content
+                ));
+                tool_outcomes.push(outcome);
+            }
+        }
+        failed_delegation_node(
+            node,
+            feedback
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "delegated node did not submit a result".into()),
+            tool_outcomes,
+        )
     }
 
     async fn model_turn(
@@ -648,7 +1143,10 @@ impl AgentCoreV4<'_> {
                 AgentEventKindV4::ToolRequested { call }
                     if !matches!(
                         call.tool_id.as_str(),
-                        "agent.complete" | "agent.request_input" | "agent.propose_plan"
+                        "agent.complete"
+                            | "agent.request_input"
+                            | "agent.propose_plan"
+                            | "agent.delegate"
                     ) =>
                 {
                     pending.insert(call.call_id.clone(), (call.clone(), false));
@@ -854,12 +1352,515 @@ impl AgentCoreV4<'_> {
     }
 }
 
+fn validate_delegation_graph_v4(
+    graph: &DelegationGraphV4,
+    spec: &RunSpecV4,
+    tools: &dyn ToolPortV4,
+    limits: AgentLimitsV4,
+) -> Result<BTreeMap<String, DelegatedTaskNodeV4>, String> {
+    if graph.schema_version != 4 {
+        return Err("delegation graph schema_version must be 4".into());
+    }
+    if graph.nodes.is_empty() || graph.nodes.len() > limits.max_delegation_nodes {
+        return Err(format!(
+            "delegation graph must contain 1..={} nodes",
+            limits.max_delegation_nodes
+        ));
+    }
+    let mut nodes = BTreeMap::new();
+    for node in &graph.nodes {
+        if node.id.trim().is_empty() || node.objective.trim().is_empty() {
+            return Err("delegated node id and objective must be non-empty".into());
+        }
+        if nodes.insert(node.id.clone(), node.clone()).is_some() {
+            return Err(format!("duplicate delegated node id {}", node.id));
+        }
+        if node.budget.max_turns == 0
+            || node.budget.max_turns > limits.max_delegated_turns
+            || node.budget.max_tool_calls > limits.max_delegated_tool_calls
+        {
+            return Err(format!("delegated node {} exceeds Host budget", node.id));
+        }
+        if !node.output_schema.is_object() {
+            return Err(format!(
+                "delegated node {} output_schema is invalid",
+                node.id
+            ));
+        }
+        if node.isolation == DelegationIsolationV4::EvidenceOnly && !node.capabilities.is_empty() {
+            return Err(format!(
+                "evidence-only delegated node {} cannot receive tools",
+                node.id
+            ));
+        }
+        for capability in &node.capabilities {
+            if capability == "agent.delegate"
+                || !spec.plan.requested_capabilities.contains(capability)
+                || tools.effect(capability) != Some(ToolEffectV4::ReadOnly)
+            {
+                return Err(format!(
+                    "delegated node {} cannot expand capability {}",
+                    node.id, capability
+                ));
+            }
+        }
+    }
+    for node in nodes.values() {
+        let mut unique = BTreeSet::new();
+        for dependency in &node.dependencies {
+            if dependency == &node.id
+                || !nodes.contains_key(dependency)
+                || !unique.insert(dependency)
+            {
+                return Err(format!(
+                    "delegated node {} has an invalid dependency {}",
+                    node.id, dependency
+                ));
+            }
+        }
+    }
+    let mut memo = BTreeMap::<String, usize>::new();
+    for node_id in nodes.keys() {
+        let depth = delegation_depth(node_id, &nodes, &mut BTreeSet::new(), &mut memo)?;
+        if depth > limits.max_delegation_depth {
+            return Err(format!(
+                "delegated node {node_id} exceeds dependency depth {}",
+                limits.max_delegation_depth
+            ));
+        }
+    }
+    Ok(nodes)
+}
+
+fn delegation_depth(
+    node_id: &str,
+    nodes: &BTreeMap<String, DelegatedTaskNodeV4>,
+    visiting: &mut BTreeSet<String>,
+    memo: &mut BTreeMap<String, usize>,
+) -> Result<usize, String> {
+    if let Some(depth) = memo.get(node_id) {
+        return Ok(*depth);
+    }
+    if !visiting.insert(node_id.into()) {
+        return Err("delegation graph contains a cycle".into());
+    }
+    let node = &nodes[node_id];
+    let depth = node
+        .dependencies
+        .iter()
+        .map(|dependency| delegation_depth(dependency, nodes, visiting, memo))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .map_or(0, |depth| depth + 1);
+    visiting.remove(node_id);
+    memo.insert(node_id.into(), depth);
+    Ok(depth)
+}
+
+fn delegated_result_descriptor() -> ToolDescriptorV4 {
+    ToolDescriptorV4 {
+        id: "agent.submit_delegated_result".into(),
+        description: "Submit the delegated node JSON output".into(),
+        input_schema: json!({
+            "type":"object",
+            "required":["output"],
+            "properties":{"output":{}}
+        }),
+        effect: ToolEffectV4::ReadOnly,
+    }
+}
+
+fn failed_delegation_node(
+    node: &DelegatedTaskNodeV4,
+    error: impl Into<String>,
+    tool_outcomes: Vec<ToolOutcomeV4>,
+) -> DelegationNodeOutcomeV4 {
+    DelegationNodeOutcomeV4 {
+        node_id: node.id.clone(),
+        status: DelegationNodeStatusV4::Failed,
+        output: None,
+        error: Some(error.into()),
+        tool_outcomes,
+    }
+}
+
+fn rejected_coordinator_outcome(
+    call: ToolCallV4,
+    error_kind: &str,
+    message: impl Into<String>,
+) -> ToolOutcomeV4 {
+    let message = message.into();
+    ToolOutcomeV4 {
+        call_id: call.call_id,
+        tool_id: call.tool_id,
+        succeeded: false,
+        model_content: format!("Host rejected coordinator request: {message}"),
+        data: json!({"error_kind":error_kind}),
+        provenance: vec![],
+    }
+}
+
+fn validate_json_schema_subset(schema: &Value, value: &Value, path: &str) -> Result<(), String> {
+    if let Some(expected) = schema.get("const") {
+        if expected != value {
+            return Err(format!("{path} does not match const"));
+        }
+    }
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
+        if !allowed.contains(value) {
+            return Err(format!("{path} is not in enum"));
+        }
+    }
+    if let Some(kind) = schema.get("type").and_then(Value::as_str) {
+        let matches = match kind {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "number" => value.is_number(),
+            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+            "boolean" => value.is_boolean(),
+            "null" => value.is_null(),
+            _ => return Err(format!("{path} uses unsupported schema type {kind}")),
+        };
+        if !matches {
+            return Err(format!("{path} must be {kind}"));
+        }
+    }
+    if let Some(object) = value.as_object() {
+        for required in schema
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if !object.contains_key(required) {
+                return Err(format!("{path}.{required} is required"));
+            }
+        }
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            for (key, child_schema) in properties {
+                if let Some(child) = object.get(key) {
+                    validate_json_schema_subset(child_schema, child, &format!("{path}.{key}"))?;
+                }
+            }
+        }
+    }
+    if let (Some(items), Some(array)) = (schema.get("items"), value.as_array()) {
+        for (index, child) in array.iter().enumerate() {
+            validate_json_schema_subset(items, child, &format!("{path}[{index}]"))?;
+        }
+    }
+    Ok(())
+}
+
 fn tool_signature(call: &ToolCallV4) -> String {
     format!(
         "{}:{}",
         call.tool_id,
         serde_json::to_string(&call.arguments).unwrap_or_else(|_| "<invalid>".into())
     )
+}
+
+pub fn verify_completion_v4(
+    spec: &RunSpecV4,
+    state: &ScientificStateV4,
+    events: &[AgentEventV4],
+    proposal: &CompletionProposalV4,
+) -> DeterministicVerificationV4 {
+    let mut findings = Vec::new();
+    let mut proposed = BTreeMap::<&str, Vec<&CompletionEvidenceRefV4>>::new();
+    for criterion in &proposal.criteria {
+        proposed
+            .entry(criterion.criterion.trim())
+            .or_default()
+            .extend(criterion.evidence.iter());
+    }
+    for criterion in &spec.plan.completion_criteria {
+        match proposed.get(criterion.trim()) {
+            None => findings.push(verification_finding(
+                VerificationSeverityV4::Error,
+                "criterion_missing",
+                format!("completion criterion has no proposal entry: {criterion}"),
+                vec![format!("criterion:{criterion}")],
+            )),
+            Some(evidence) if evidence.is_empty() => findings.push(verification_finding(
+                VerificationSeverityV4::Error,
+                "criterion_without_evidence",
+                format!("completion criterion has no evidence: {criterion}"),
+                vec![format!("criterion:{criterion}")],
+            )),
+            Some(evidence) => {
+                for reference in evidence {
+                    verify_evidence_reference(events, state, reference, &mut findings);
+                }
+            }
+        }
+    }
+    for criterion in proposed.keys() {
+        if !spec
+            .plan
+            .completion_criteria
+            .iter()
+            .any(|expected| expected.trim() == *criterion)
+        {
+            findings.push(verification_finding(
+                VerificationSeverityV4::Error,
+                "unknown_criterion",
+                format!("proposal contains a criterion outside the frozen plan: {criterion}"),
+                vec![format!("criterion:{criterion}")],
+            ));
+        }
+    }
+
+    for analysis in state
+        .analyses
+        .values()
+        .filter(|analysis| analysis.run_id == spec.run_id)
+    {
+        if analysis.status == AnalysisStatusV4::Running {
+            findings.push(verification_finding(
+                VerificationSeverityV4::Error,
+                "analysis_still_running",
+                format!("analysis {} is still running", analysis.id),
+                vec![format!("analysis:{}", analysis.id)],
+            ));
+            continue;
+        }
+        if analysis.status != AnalysisStatusV4::Succeeded {
+            continue;
+        }
+        let expected_samples = analysis
+            .input_dataset_ids
+            .iter()
+            .filter_map(|id| state.datasets.get(id))
+            .flat_map(|dataset| dataset.sample_ids.iter().cloned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let missing = expected_samples
+            .difference(&analysis.sample_ids)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            findings.push(verification_finding(
+                VerificationSeverityV4::Error,
+                "samples_omitted",
+                format!(
+                    "analysis {} omitted samples: {}",
+                    analysis.id,
+                    missing.join(", ")
+                ),
+                vec![format!("analysis:{}", analysis.id)],
+            ));
+        }
+        match state
+            .provenance
+            .values()
+            .find(|manifest| manifest.analysis_id == analysis.id)
+        {
+            None => findings.push(verification_finding(
+                VerificationSeverityV4::Error,
+                "provenance_missing",
+                format!("analysis {} has no provenance manifest", analysis.id),
+                vec![format!("analysis:{}", analysis.id)],
+            )),
+            Some(manifest) if !manifest.complete => {
+                for issue in &manifest.issues {
+                    findings.push(verification_finding(
+                        VerificationSeverityV4::Error,
+                        "provenance_incomplete",
+                        issue.message.clone(),
+                        vec![format!("provenance:{}", manifest.id)],
+                    ));
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
+    for artifact in state.artifacts.values().filter(|artifact| {
+        artifact.valid
+            && state
+                .analyses
+                .get(&artifact.producer_analysis_id)
+                .is_some_and(|analysis| analysis.run_id == spec.run_id)
+    }) {
+        if artifact.sha256.trim().is_empty() {
+            findings.push(verification_finding(
+                VerificationSeverityV4::Error,
+                "artifact_hash_missing",
+                format!("artifact {} has no Host-verified SHA-256", artifact.id),
+                vec![format!("artifact:{}", artifact.id)],
+            ));
+        }
+        if let Some(result) = artifact.metadata.get("statistical_result") {
+            let missing = ["n", "effect_size", "p_value"]
+                .into_iter()
+                .filter(|field| result.get(*field).is_none())
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                findings.push(verification_finding(
+                    VerificationSeverityV4::Error,
+                    "statistical_fields_missing",
+                    format!(
+                        "artifact {} statistical result is missing: {}",
+                        artifact.id,
+                        missing.join(", ")
+                    ),
+                    vec![format!("artifact:{}", artifact.id)],
+                ));
+            }
+        }
+        if let (Some(reported), Some(table)) = (
+            artifact
+                .metadata
+                .get("reported_values")
+                .and_then(|v| v.as_object()),
+            artifact
+                .metadata
+                .get("table_values")
+                .and_then(|v| v.as_object()),
+        ) {
+            for (key, reported_value) in reported {
+                if table
+                    .get(key)
+                    .is_some_and(|table_value| table_value != reported_value)
+                {
+                    findings.push(verification_finding(
+                        VerificationSeverityV4::Error,
+                        "report_table_mismatch",
+                        format!(
+                            "artifact {} reports a value for {key} that differs from its table",
+                            artifact.id
+                        ),
+                        vec![format!("artifact:{}", artifact.id)],
+                    ));
+                }
+            }
+        }
+    }
+
+    let passed = !findings
+        .iter()
+        .any(|finding| finding.severity == VerificationSeverityV4::Error);
+    if passed {
+        findings.push(verification_finding(
+            VerificationSeverityV4::Ok,
+            "deterministic_gate_passed",
+            "All frozen completion criteria and deterministic scientific checks passed",
+            vec![format!("scientific_state_sha256:{}", state.digest())],
+        ));
+    }
+    DeterministicVerificationV4 {
+        schema_version: 4,
+        passed,
+        findings,
+    }
+}
+
+fn materialize_verified_evidence(
+    proposal: &CompletionProposalV4,
+    events: &[AgentEventV4],
+    state: &ScientificStateV4,
+) -> Result<Vec<ReviewerEvidenceV4>, AgentCoreErrorV4> {
+    let mut materialized = Vec::new();
+    for reference in proposal
+        .criteria
+        .iter()
+        .flat_map(|criterion| criterion.evidence.iter())
+    {
+        let payload = match reference {
+            CompletionEvidenceRefV4::Event { sequence } => events
+                .iter()
+                .find(|event| event.sequence == *sequence)
+                .map(|event| serde_json::to_value(&event.event))
+                .transpose()
+                .map_err(|error| AgentCoreErrorV4::Store(error.to_string()))?,
+            CompletionEvidenceRefV4::Artifact { artifact_id } => state
+                .artifacts
+                .get(artifact_id)
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|error| AgentCoreErrorV4::Science(error.to_string()))?,
+            CompletionEvidenceRefV4::Evidence { evidence_id } => state
+                .evidence
+                .get(evidence_id)
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|error| AgentCoreErrorV4::Science(error.to_string()))?,
+        };
+        if let Some(payload) = payload {
+            materialized.push(ReviewerEvidenceV4 {
+                reference: reference.clone(),
+                payload,
+            });
+        }
+    }
+    Ok(materialized)
+}
+
+fn verify_evidence_reference(
+    events: &[AgentEventV4],
+    state: &ScientificStateV4,
+    reference: &CompletionEvidenceRefV4,
+    findings: &mut Vec<VerificationFindingV4>,
+) {
+    let valid = match reference {
+        CompletionEvidenceRefV4::Event { sequence } => events.iter().any(|event| {
+            event.sequence == *sequence
+                && (matches!(
+                    &event.event,
+                    AgentEventKindV4::ToolFinished { outcome }
+                        | AgentEventKindV4::ToolOutcomeReused { outcome, .. }
+                        if outcome.succeeded
+                ) || matches!(
+                    &event.event,
+                    AgentEventKindV4::ToolDispatchResolved { evidence, .. }
+                        if !evidence.trim().is_empty()
+                ))
+        }),
+        CompletionEvidenceRefV4::Artifact { artifact_id } => state
+            .artifacts
+            .get(artifact_id)
+            .is_some_and(|artifact| artifact.valid && !artifact.sha256.trim().is_empty()),
+        CompletionEvidenceRefV4::Evidence { evidence_id } => {
+            state.evidence.get(evidence_id).is_some_and(|evidence| {
+                evidence.valid
+                    && evidence.sources.iter().all(|source| match source {
+                        EvidenceSourceV4::Artifact { artifact_id } => state
+                            .artifacts
+                            .get(artifact_id)
+                            .is_some_and(|artifact| artifact.valid),
+                        EvidenceSourceV4::Literature {
+                            source_id,
+                            citation,
+                        } => !source_id.trim().is_empty() && !citation.trim().is_empty(),
+                    })
+            })
+        }
+    };
+    if !valid {
+        findings.push(verification_finding(
+            VerificationSeverityV4::Error,
+            "invalid_evidence_reference",
+            "completion proposal references missing, failed, stale, or unverifiable evidence",
+            vec![format!("{reference:?}")],
+        ));
+    }
+}
+
+fn verification_finding(
+    severity: VerificationSeverityV4,
+    code: impl Into<String>,
+    message: impl Into<String>,
+    evidence: Vec<String>,
+) -> VerificationFindingV4 {
+    VerificationFindingV4 {
+        severity,
+        code: code.into(),
+        message: message.into(),
+        evidence,
+    }
 }
 
 fn build_checkpoint(
@@ -924,7 +1925,14 @@ fn build_checkpoint(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use omicsops_protocol::{AgentEventKindV4, ToolEffectV4};
+    use omicsops_protocol::{
+        AgentEventKindV4, CompletionCriterionEvidenceV4, ReviewerReportV4, ToolEffectV4,
+        VerificationFindingV4, VerificationSeverityV4,
+    };
+    use omicsops_science::{
+        AnalysisDeclarationV4, DatasetStageV4, RuntimeIdentityV4, VerifiedArtifactFactV4,
+        VerifiedDatasetFactV4,
+    };
     use serde_json::json;
     use std::{
         collections::BTreeSet,
@@ -973,6 +1981,19 @@ mod tests {
                 on_event(ModelStreamEventV4::TextDelta(turn.public_text.clone()));
             }
             Ok(turn)
+        }
+
+        async fn review(&self, _: ReviewerRequestV4) -> Result<ReviewerReportV4, ModelFailureV4> {
+            Ok(ReviewerReportV4 {
+                schema_version: 4,
+                summary: "scripted independent review".into(),
+                findings: vec![VerificationFindingV4 {
+                    severity: VerificationSeverityV4::Ok,
+                    code: "scripted_review_ok".into(),
+                    message: "scripted evidence review passed".into(),
+                    evidence: vec!["test_fixture".into()],
+                }],
+            })
         }
     }
     struct FakeTools;
@@ -1121,6 +2142,17 @@ mod tests {
             .unwrap();
     }
 
+    fn completion_arguments(sequence: u64) -> serde_json::Value {
+        json!({
+            "schema_version":4,
+            "summary":"all criteria are evidenced",
+            "criteria":[{
+                "criterion":"verified output",
+                "evidence":[{"kind":"event","sequence":sequence}]
+            }]
+        })
+    }
+
     struct RuntimeTools {
         calls: AtomicUsize,
         interrupts: AtomicUsize,
@@ -1185,11 +2217,12 @@ mod tests {
             if self.delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
             }
+            let failed = self.fail_business && call.call_id == "bad-cell";
             Ok(ToolOutcomeV4 {
                 call_id: call.call_id,
                 tool_id: call.tool_id,
-                succeeded: !self.fail_business,
-                model_content: if self.fail_business {
+                succeeded: !failed,
+                model_content: if failed {
                     "Traceback: repair the generated code".into()
                 } else {
                     "ok".into()
@@ -1222,9 +2255,17 @@ mod tests {
             ModelTurnV4 {
                 public_text: "repaired".into(),
                 tool_calls: vec![ToolCallV4 {
+                    call_id: "repaired-cell".into(),
+                    tool_id: "runtime.execute".into(),
+                    arguments: json!({"language":"python","code":"print('repaired')"}),
+                }],
+            },
+            ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![ToolCallV4 {
                     call_id: "done".into(),
                     tool_id: "agent.complete".into(),
-                    arguments: json!({}),
+                    arguments: json!({"schema_version":4,"summary":"repaired execution completed","criteria":[{"criterion":"verified output","evidence":[{"kind":"event","sequence":9}]}]}),
                 }],
             },
         ]));
@@ -1268,7 +2309,7 @@ mod tests {
                 tool_calls: vec![ToolCallV4 {
                     call_id: "done".into(),
                     tool_id: "agent.complete".into(),
-                    arguments: json!({}),
+                    arguments: json!({"schema_version":4,"summary":"analysis completed","criteria":[{"criterion":"verified output","evidence":[{"kind":"event","sequence":6}]}]}),
                 }],
             },
         ]));
@@ -1548,7 +2589,7 @@ mod tests {
             tool_calls: vec![ToolCallV4 {
                 call_id: "complete".into(),
                 tool_id: "agent.complete".into(),
-                arguments: json!({}),
+                arguments: json!({"schema_version":4,"summary":"verified uncertain dispatch","criteria":[{"criterion":"verified output","evidence":[{"kind":"event","sequence":6}]}]}),
             }],
         }]));
         AgentCoreV4 {
@@ -1604,5 +2645,695 @@ mod tests {
             store.events.lock().unwrap().last().unwrap().event,
             AgentEventKindV4::ContextCheckpointed { .. }
         ));
+    }
+
+    #[test]
+    fn deterministic_gate_detects_omitted_samples_missing_statistics_and_report_mismatch() {
+        let run_id = Uuid::new_v4();
+        let spec = execution_spec(run_id);
+        let mut state = ScientificStateV4::new(spec.project_id);
+        let dataset = state.register_dataset(
+            VerifiedDatasetFactV4 {
+                modality: "single_cell_rna".into(),
+                species: "human".into(),
+                sample_ids: BTreeSet::from(["sample-a".into(), "sample-b".into()]),
+                matrix_shape: vec![100, 20_000],
+                stage: DatasetStageV4::Raw,
+                relative_path: "data.h5ad".into(),
+                size_bytes: 10,
+                sha256: "dataset-hash".into(),
+            },
+            Utc::now(),
+        );
+        let analysis = state
+            .start_analysis(
+                run_id,
+                "analysis-call".into(),
+                AnalysisDeclarationV4 {
+                    analysis_type: "differential_expression".into(),
+                    input_dataset_ids: BTreeSet::from([dataset.id]),
+                    sample_ids: BTreeSet::from(["sample-a".into(), "sample-b".into()]),
+                    method: "dynamic".into(),
+                    parameters: json!({}),
+                    software_requirements: BTreeSet::from(["scanpy".into()]),
+                    database_versions: BTreeMap::new(),
+                    random_seed: None,
+                },
+                RuntimeIdentityV4 {
+                    backend_id: "ssh:test".into(),
+                    language: "python".into(),
+                    environment: "project".into(),
+                    session_id: None,
+                    process_identity: None,
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        state
+            .finish_analysis(
+                "analysis-call",
+                true,
+                Some(Uuid::new_v4()),
+                Some("pid".into()),
+                vec![VerifiedArtifactFactV4 {
+                    artifact_type: "report".into(),
+                    relative_path: "report.json".into(),
+                    size_bytes: 10,
+                    sha256: "artifact-hash".into(),
+                    preview: None,
+                    metadata: json!({
+                        "statistical_result":{"n":100},
+                        "reported_values":{"cells":99},
+                        "table_values":{"cells":100}
+                    }),
+                }],
+                BTreeMap::new(),
+                "print('done')".into(),
+                Utc::now(),
+            )
+            .unwrap();
+        state
+            .analyses
+            .get_mut(&analysis.id)
+            .unwrap()
+            .sample_ids
+            .remove("sample-b");
+
+        let first = AgentEventV4::first(
+            run_id,
+            spec.project_id,
+            spec.conversation_id,
+            Utc::now(),
+            AgentEventKindV4::RunCreated {
+                mode: RunModeV4::Execute,
+            },
+        );
+        let success = AgentEventV4::next(
+            &first,
+            Utc::now(),
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: "analysis-call".into(),
+                    tool_id: "runtime.execute".into(),
+                    succeeded: true,
+                    model_content: "ok".into(),
+                    data: json!({}),
+                    provenance: vec![],
+                },
+            },
+        );
+        let proposal = CompletionProposalV4 {
+            schema_version: 4,
+            summary: "done".into(),
+            criteria: vec![CompletionCriterionEvidenceV4 {
+                criterion: "verified output".into(),
+                evidence: vec![CompletionEvidenceRefV4::Event {
+                    sequence: success.sequence,
+                }],
+            }],
+        };
+        let report = verify_completion_v4(&spec, &state, &[first, success], &proposal);
+        assert!(!report.passed);
+        for expected in [
+            "samples_omitted",
+            "provenance_incomplete",
+            "statistical_fields_missing",
+            "report_table_mismatch",
+        ] {
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|finding| finding.code == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn deterministic_gate_rejects_a_conclusion_without_evidence() {
+        let run_id = Uuid::new_v4();
+        let spec = execution_spec(run_id);
+        let proposal = CompletionProposalV4 {
+            schema_version: 4,
+            summary: "unsupported conclusion".into(),
+            criteria: vec![CompletionCriterionEvidenceV4 {
+                criterion: "verified output".into(),
+                evidence: vec![],
+            }],
+        };
+        let report = verify_completion_v4(
+            &spec,
+            &ScientificStateV4::new(spec.project_id),
+            &[],
+            &proposal,
+        );
+        assert!(!report.passed);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.code == "criterion_without_evidence")
+        );
+    }
+
+    struct ReviewingModel {
+        turns: Mutex<Vec<ModelTurnV4>>,
+        reviews: Mutex<Vec<ReviewerReportV4>>,
+    }
+
+    #[async_trait]
+    impl ModelPortV4 for ReviewingModel {
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            Ok(self.turns.lock().unwrap().remove(0))
+        }
+
+        async fn review(&self, _: ReviewerRequestV4) -> Result<ReviewerReportV4, ModelFailureV4> {
+            Ok(self.reviews.lock().unwrap().remove(0))
+        }
+    }
+
+    fn review(severity: VerificationSeverityV4) -> ReviewerReportV4 {
+        ReviewerReportV4 {
+            schema_version: 4,
+            summary: "independent review".into(),
+            findings: vec![VerificationFindingV4 {
+                severity,
+                code: "review_check".into(),
+                message: "reviewed frozen evidence".into(),
+                evidence: vec!["deterministic_verification_v4".into()],
+            }],
+        }
+    }
+
+    fn seed_success_evidence(store: &MemoryStore, spec: &RunSpecV4) -> u64 {
+        seed_execution(store, spec);
+        let previous = store.events.lock().unwrap().last().unwrap().clone();
+        let event = AgentEventV4::next(
+            &previous,
+            Utc::now(),
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: "verified".into(),
+                    tool_id: "artifact.verify".into(),
+                    succeeded: true,
+                    model_content: "sha256 verified".into(),
+                    data: json!({}),
+                    provenance: vec!["host".into()],
+                },
+            },
+        );
+        let sequence = event.sequence;
+        store.append(&event).unwrap();
+        sequence
+    }
+
+    #[tokio::test]
+    async fn reviewer_errors_allow_two_executor_corrections_then_need_attention() {
+        let run_id = Uuid::new_v4();
+        let spec = execution_spec(run_id);
+        let store = MemoryStore::default();
+        let evidence_sequence = seed_success_evidence(&store, &spec);
+        let turns = (0..3)
+            .map(|index| ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![ToolCallV4 {
+                    call_id: format!("complete-{index}"),
+                    tool_id: "agent.complete".into(),
+                    arguments: completion_arguments(evidence_sequence),
+                }],
+            })
+            .collect();
+        let model = ReviewingModel {
+            turns: Mutex::new(turns),
+            reviews: Mutex::new(vec![
+                review(VerificationSeverityV4::Error),
+                review(VerificationSeverityV4::Error),
+                review(VerificationSeverityV4::Error),
+            ]),
+        };
+        let error = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        }
+        .execute_with_limits(
+            &spec,
+            AgentLimitsV4 {
+                max_turns: 3,
+                max_reviewer_corrections: 2,
+                ..AgentLimitsV4::default()
+            },
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AgentCoreErrorV4::NeedsAttention(_)));
+        let events = store.events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.event,
+                    AgentEventKindV4::ReviewerCorrectionRequested { .. }
+                ))
+                .count(),
+            2
+        );
+        assert!(matches!(
+            events.last().unwrap().event,
+            AgentEventKindV4::RunNeedsAttention { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reviewer_warning_is_persisted_and_does_not_block_completion() {
+        let run_id = Uuid::new_v4();
+        let spec = execution_spec(run_id);
+        let store = MemoryStore::default();
+        let evidence_sequence = seed_success_evidence(&store, &spec);
+        let model = ReviewingModel {
+            turns: Mutex::new(vec![ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![ToolCallV4 {
+                    call_id: "complete".into(),
+                    tool_id: "agent.complete".into(),
+                    arguments: completion_arguments(evidence_sequence),
+                }],
+            }]),
+            reviews: Mutex::new(vec![review(VerificationSeverityV4::Warn)]),
+        };
+        AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        }
+        .execute(&spec, 1)
+        .await
+        .unwrap();
+        let events = store.events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            AgentEventKindV4::ReviewerFinished { report }
+                if report.findings[0].severity == VerificationSeverityV4::Warn
+        )));
+        assert!(matches!(
+            events.last().unwrap().event,
+            AgentEventKindV4::RunCompleted
+        ));
+    }
+
+    fn delegation_spec(run_id: Uuid) -> RunSpecV4 {
+        let plan = ExecutionPlanV4 {
+            schema_version: 4,
+            objective: "bounded delegation".into(),
+            steps: vec!["delegate independent checks".into()],
+            completion_criteria: vec!["verified output".into()],
+            requested_capabilities: BTreeSet::from(["agent.delegate".into()]),
+        };
+        let hash = plan.canonical_hash().unwrap();
+        RunSpecV4::freeze(
+            run_id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            plan,
+            &hash,
+            Utc::now(),
+        )
+        .unwrap()
+    }
+
+    fn delegated_node(id: &str, dependencies: Vec<&str>, turns: u8) -> DelegatedTaskNodeV4 {
+        DelegatedTaskNodeV4 {
+            id: id.into(),
+            objective: id.into(),
+            dependencies: dependencies.into_iter().map(str::to_owned).collect(),
+            budget: omicsops_protocol::DelegationBudgetV4 {
+                max_turns: turns,
+                max_tool_calls: 0,
+            },
+            capabilities: BTreeSet::new(),
+            output_schema: json!({
+                "type":"object",
+                "required":["value"],
+                "properties":{"value":{"type":"string"}}
+            }),
+            isolation: DelegationIsolationV4::EvidenceOnly,
+        }
+    }
+
+    struct DelegationModel {
+        active: AtomicUsize,
+        maximum: AtomicUsize,
+        attempts: Mutex<HashMap<String, usize>>,
+    }
+
+    #[async_trait]
+    impl ModelPortV4 for DelegationModel {
+        async fn stream(
+            &self,
+            request: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            assert!(request.system.contains("temporary bounded"));
+            assert!(request.tools.iter().all(|tool| {
+                tool.id == "agent.submit_delegated_result" || tool.effect == ToolEffectV4::ReadOnly
+            }));
+            let context: Value = serde_json::from_str(&request.context).unwrap();
+            let node_id = context["node_id"].as_str().unwrap().to_owned();
+            let active = self.active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            self.maximum.fetch_max(active, AtomicOrdering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            self.active.fetch_sub(1, AtomicOrdering::SeqCst);
+            let attempt = {
+                let mut attempts = self.attempts.lock().unwrap();
+                let attempt = attempts.entry(node_id.clone()).or_default();
+                *attempt += 1;
+                *attempt
+            };
+            let output = if node_id == "fail" || (node_id == "retry" && attempt == 1) {
+                json!({"wrong":true})
+            } else if node_id == "child" {
+                let parent = context["dependency_results"]["a"]["value"]
+                    .as_str()
+                    .unwrap();
+                json!({"value":format!("child received {parent}")})
+            } else {
+                json!({"value":node_id})
+            };
+            Ok(ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![ToolCallV4 {
+                    call_id: format!("submit-{node_id}-{attempt}"),
+                    tool_id: "agent.submit_delegated_result".into(),
+                    arguments: json!({"output":output}),
+                }],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_caps_concurrency_and_injects_only_dependency_results() {
+        let run_id = Uuid::new_v4();
+        let spec = delegation_spec(run_id);
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = DelegationModel {
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+            attempts: Mutex::new(HashMap::new()),
+        };
+        let graph = DelegationGraphV4 {
+            schema_version: 4,
+            nodes: vec![
+                delegated_node("a", vec![], 1),
+                delegated_node("b", vec![], 1),
+                delegated_node("c", vec![], 1),
+                delegated_node("d", vec![], 1),
+                delegated_node("child", vec!["a"], 1),
+            ],
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let outcome = core
+            .execute_delegation_graph(
+                &spec,
+                "delegate",
+                graph,
+                AgentLimitsV4::default(),
+                &AtomicBool::new(false),
+            )
+            .await
+            .unwrap();
+        assert_eq!(model.maximum.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(
+            outcome.nodes["child"].output.as_ref().unwrap()["value"],
+            "child received a"
+        );
+        assert!(
+            outcome
+                .nodes
+                .values()
+                .all(|node| node.status == DelegationNodeStatusV4::Succeeded)
+        );
+    }
+
+    #[tokio::test]
+    async fn delegation_retries_schema_and_isolates_a_failed_branch() {
+        let run_id = Uuid::new_v4();
+        let spec = delegation_spec(run_id);
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = DelegationModel {
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+            attempts: Mutex::new(HashMap::new()),
+        };
+        let graph = DelegationGraphV4 {
+            schema_version: 4,
+            nodes: vec![
+                delegated_node("retry", vec![], 2),
+                delegated_node("fail", vec![], 1),
+                delegated_node("descendant", vec!["fail"], 1),
+                delegated_node("independent", vec![], 1),
+            ],
+        };
+        let outcome = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        }
+        .execute_delegation_graph(
+            &spec,
+            "delegate",
+            graph,
+            AgentLimitsV4::default(),
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(model.attempts.lock().unwrap()["retry"], 2);
+        assert_eq!(
+            outcome.nodes["retry"].status,
+            DelegationNodeStatusV4::Succeeded
+        );
+        assert_eq!(outcome.nodes["fail"].status, DelegationNodeStatusV4::Failed);
+        assert_eq!(
+            outcome.nodes["descendant"].status,
+            DelegationNodeStatusV4::Blocked
+        );
+        assert_eq!(
+            outcome.nodes["independent"].status,
+            DelegationNodeStatusV4::Succeeded
+        );
+    }
+
+    struct DelegationTools;
+
+    #[async_trait]
+    impl ToolPortV4 for DelegationTools {
+        fn descriptors(&self, mode: RunModeV4) -> Vec<ToolDescriptorV4> {
+            (mode == RunModeV4::Execute)
+                .then(|| ToolDescriptorV4 {
+                    id: "agent.delegate".into(),
+                    description: "delegate".into(),
+                    input_schema: json!({}),
+                    effect: ToolEffectV4::Delegation,
+                })
+                .into_iter()
+                .collect()
+        }
+
+        fn effect(&self, tool_id: &str) -> Option<ToolEffectV4> {
+            (tool_id == "agent.delegate").then_some(ToolEffectV4::Delegation)
+        }
+
+        fn validate(&self, mode: RunModeV4, call: &ToolCallV4) -> Result<(), String> {
+            if mode == RunModeV4::Execute && call.tool_id == "agent.delegate" {
+                Ok(())
+            } else {
+                Err("denied".into())
+            }
+        }
+
+        async fn execute(&self, _: RunModeV4, _: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            panic!("agent.delegate must be coordinated by Core")
+        }
+    }
+
+    struct MainDelegatingModel(AtomicUsize);
+
+    #[async_trait]
+    impl ModelPortV4 for MainDelegatingModel {
+        async fn stream(
+            &self,
+            request: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            if request.system.contains("temporary bounded") {
+                return Ok(ModelTurnV4 {
+                    public_text: String::new(),
+                    tool_calls: vec![ToolCallV4 {
+                        call_id: "node-result".into(),
+                        tool_id: "agent.submit_delegated_result".into(),
+                        arguments: json!({"output":{"value":"checked"}}),
+                    }],
+                });
+            }
+            let turn = self.0.fetch_add(1, AtomicOrdering::SeqCst);
+            if turn == 0 {
+                Ok(ModelTurnV4 {
+                    public_text: String::new(),
+                    tool_calls: vec![ToolCallV4 {
+                        call_id: "delegate".into(),
+                        tool_id: "agent.delegate".into(),
+                        arguments: serde_json::to_value(DelegationGraphV4 {
+                            schema_version: 4,
+                            nodes: vec![delegated_node("check", vec![], 1)],
+                        })
+                        .unwrap(),
+                    }],
+                })
+            } else {
+                Ok(ModelTurnV4 {
+                    public_text: String::new(),
+                    tool_calls: vec![ToolCallV4 {
+                        call_id: "complete".into(),
+                        tool_id: "agent.complete".into(),
+                        arguments: completion_arguments(7),
+                    }],
+                })
+            }
+        }
+
+        async fn review(&self, _: ReviewerRequestV4) -> Result<ReviewerReportV4, ModelFailureV4> {
+            Ok(review(VerificationSeverityV4::Ok))
+        }
+    }
+
+    #[tokio::test]
+    async fn main_agent_delegation_is_coordinated_and_replayed_before_completion() {
+        let run_id = Uuid::new_v4();
+        let spec = delegation_spec(run_id);
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        AgentCoreV4 {
+            model: &MainDelegatingModel(AtomicUsize::new(0)),
+            tools: &DelegationTools,
+            events: &store,
+            science: None,
+        }
+        .execute(&spec, 2)
+        .await
+        .unwrap();
+        let events = store.events.lock().unwrap();
+        assert!(
+            events.iter().any(|event| matches!(
+                event.event,
+                AgentEventKindV4::DelegationGraphStarted { .. }
+            ))
+        );
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            AgentEventKindV4::DelegationNodeFinished { outcome, .. }
+                if outcome.status == DelegationNodeStatusV4::Succeeded
+        )));
+        assert!(matches!(
+            events.last().unwrap().event,
+            AgentEventKindV4::RunCompleted
+        ));
+    }
+
+    #[test]
+    fn delegation_rejects_cycles_depth_budget_and_capability_expansion() {
+        let run_id = Uuid::new_v4();
+        let mut spec = delegation_spec(run_id);
+        spec.plan
+            .requested_capabilities
+            .insert("runtime.execute".into());
+        let limits = AgentLimitsV4::default();
+        let cycle = DelegationGraphV4 {
+            schema_version: 4,
+            nodes: vec![
+                delegated_node("a", vec!["b"], 1),
+                delegated_node("b", vec!["a"], 1),
+            ],
+        };
+        assert!(
+            validate_delegation_graph_v4(
+                &cycle,
+                &spec,
+                &RuntimeTools {
+                    calls: AtomicUsize::new(0),
+                    interrupts: AtomicUsize::new(0),
+                    fail_business: false,
+                    delay_ms: 0,
+                },
+                limits
+            )
+            .unwrap_err()
+            .contains("cycle")
+        );
+        let deep = DelegationGraphV4 {
+            schema_version: 4,
+            nodes: vec![
+                delegated_node("a", vec![], 1),
+                delegated_node("b", vec!["a"], 1),
+                delegated_node("c", vec!["b"], 1),
+                delegated_node("d", vec!["c"], 1),
+            ],
+        };
+        assert!(
+            validate_delegation_graph_v4(&deep, &spec, &FakeTools, limits)
+                .unwrap_err()
+                .contains("depth")
+        );
+        let mut expanded = delegated_node("expanded", vec![], 1);
+        expanded.isolation = DelegationIsolationV4::ReadOnlyProject;
+        expanded.capabilities.insert("runtime.execute".into());
+        assert!(
+            validate_delegation_graph_v4(
+                &DelegationGraphV4 {
+                    schema_version: 4,
+                    nodes: vec![expanded],
+                },
+                &spec,
+                &RuntimeTools {
+                    calls: AtomicUsize::new(0),
+                    interrupts: AtomicUsize::new(0),
+                    fail_business: false,
+                    delay_ms: 0,
+                },
+                limits,
+            )
+            .unwrap_err()
+            .contains("cannot expand")
+        );
+        let mut oversized = delegated_node("oversized", vec![], 1);
+        oversized.budget.max_turns = limits.max_delegated_turns + 1;
+        assert!(
+            validate_delegation_graph_v4(
+                &DelegationGraphV4 {
+                    schema_version: 4,
+                    nodes: vec![oversized],
+                },
+                &spec,
+                &FakeTools,
+                limits,
+            )
+            .unwrap_err()
+            .contains("budget")
+        );
     }
 }

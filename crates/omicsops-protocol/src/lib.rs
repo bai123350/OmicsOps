@@ -245,6 +245,135 @@ pub struct ContextArchiveV4 {
     pub sha256: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CompletionEvidenceRefV4 {
+    Event { sequence: u64 },
+    Artifact { artifact_id: Uuid },
+    Evidence { evidence_id: Uuid },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CompletionCriterionEvidenceV4 {
+    pub criterion: String,
+    pub evidence: Vec<CompletionEvidenceRefV4>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CompletionProposalV4 {
+    pub schema_version: u8,
+    pub summary: String,
+    pub criteria: Vec<CompletionCriterionEvidenceV4>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationSeverityV4 {
+    Error,
+    Warn,
+    Ok,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct VerificationFindingV4 {
+    pub severity: VerificationSeverityV4,
+    pub code: String,
+    pub message: String,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DeterministicVerificationV4 {
+    pub schema_version: u8,
+    pub passed: bool,
+    pub findings: Vec<VerificationFindingV4>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewerReportV4 {
+    pub schema_version: u8,
+    pub summary: String,
+    pub findings: Vec<VerificationFindingV4>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationIsolationV4 {
+    ReadOnlyProject,
+    EvidenceOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DelegationBudgetV4 {
+    pub max_turns: u8,
+    pub max_tool_calls: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DelegatedTaskNodeV4 {
+    pub id: String,
+    pub objective: String,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    pub budget: DelegationBudgetV4,
+    #[serde(default)]
+    pub capabilities: BTreeSet<String>,
+    pub output_schema: Value,
+    pub isolation: DelegationIsolationV4,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DelegationGraphV4 {
+    pub schema_version: u8,
+    pub nodes: Vec<DelegatedTaskNodeV4>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationNodeStatusV4 {
+    Succeeded,
+    Failed,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DelegationNodeOutcomeV4 {
+    pub node_id: String,
+    pub status: DelegationNodeStatusV4,
+    pub output: Option<Value>,
+    pub error: Option<String>,
+    pub tool_outcomes: Vec<ToolOutcomeV4>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DelegationGraphOutcomeV4 {
+    pub schema_version: u8,
+    pub nodes: BTreeMap<String, DelegationNodeOutcomeV4>,
+}
+
+impl ReviewerReportV4 {
+    pub fn validate(&self) -> Result<(), ProtocolErrorV4> {
+        if self.schema_version != 4
+            || self.summary.trim().is_empty()
+            || self.findings.len() > 8
+            || self.findings.iter().any(|finding| {
+                finding.code.trim().is_empty()
+                    || finding.message.trim().is_empty()
+                    || finding.evidence.is_empty()
+            })
+        {
+            return Err(ProtocolErrorV4::InvalidReview);
+        }
+        Ok(())
+    }
+
+    pub fn has_errors(&self) -> bool {
+        self.findings
+            .iter()
+            .any(|finding| finding.severity == VerificationSeverityV4::Error)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentEventKindV4 {
@@ -314,6 +443,31 @@ pub enum AgentEventKindV4 {
         changes: Vec<String>,
     },
     CompletionProposed,
+    CompletionProposalSubmitted {
+        proposal: CompletionProposalV4,
+    },
+    DeterministicVerificationFinished {
+        report: DeterministicVerificationV4,
+    },
+    ReviewerFinished {
+        report: ReviewerReportV4,
+    },
+    ReviewerCorrectionRequested {
+        correction: u8,
+        findings: Vec<VerificationFindingV4>,
+    },
+    DelegationGraphStarted {
+        call_id: String,
+        graph: DelegationGraphV4,
+    },
+    DelegationNodeFinished {
+        call_id: String,
+        outcome: DelegationNodeOutcomeV4,
+    },
+    DelegationGraphFinished {
+        call_id: String,
+        outcome: DelegationGraphOutcomeV4,
+    },
     RunCompleted,
     RunFailed {
         message: String,
@@ -427,6 +581,8 @@ pub enum ProtocolErrorV4 {
     EventHashMismatch,
     #[error("broken V4 event chain")]
     BrokenEventChain,
+    #[error("invalid V4 reviewer report")]
+    InvalidReview,
 }
 
 #[cfg(test)]

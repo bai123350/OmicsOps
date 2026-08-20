@@ -22,7 +22,8 @@ use omicsops_agent::{
 };
 use omicsops_agent_core::{
     AgentCoreErrorV4, AgentCoreV4, AgentLimitsV4, EventStoreV4, ModelPortV4, ModelRequestV4,
-    ModelStreamEventV4, ModelTurnV4, PromptLayersV4, ScientificStateStoreV4, ScientificUpdateV4,
+    ModelStreamEventV4, ModelTurnV4, PromptLayersV4, ReviewerRequestV4, ScientificStateStoreV4,
+    ScientificUpdateV4,
 };
 use omicsops_core::{
     domain::ProjectSpec,
@@ -35,8 +36,8 @@ use omicsops_knowledge::{
 use omicsops_protocol::{
     AgentEventKindV4, AgentEventV4, ContextArchiveV4, ContextCheckpointV4, ExecutionContextKeyV4,
     ExecutionPlanV4, KernelLanguageV4, ModelErrorClassV4, ModelFailureV4, OutputCaptureV4,
-    RunSpecV4, RuntimeArtifactV4, RuntimeResultV4, ToolCallV4, ToolOutcomeV4,
-    UncertainResolutionV4,
+    ReviewerReportV4, RunSpecV4, RuntimeArtifactV4, RuntimeResultV4, ToolCallV4, ToolDescriptorV4,
+    ToolEffectV4, ToolOutcomeV4, UncertainResolutionV4,
 };
 use omicsops_runtime::{KernelBackendV4, KernelProcessV4, RuntimeManagerV4};
 use omicsops_science::{
@@ -477,11 +478,14 @@ fn spawn_execution(
         let uncertain = outcome
             .as_ref()
             .is_err_and(|error| error.contains("side-effect dispatch is uncertain"));
+        let verifier_attention = outcome
+            .as_ref()
+            .is_err_and(|error| error.starts_with("run needs attention:"));
         record.status = if outcome.is_ok() {
             "completed"
         } else if waiting {
             "waiting_for_input"
-        } else if uncertain {
+        } else if uncertain || verifier_attention {
             "needs_attention"
         } else if cancelled.load(Ordering::SeqCst) {
             "cancelled"
@@ -495,7 +499,7 @@ fn spawn_execution(
                     repository: repository.clone(),
                     app: app.clone(),
                 };
-                let event = if uncertain {
+                let event = if uncertain || verifier_attention {
                     AgentEventKindV4::RunNeedsAttention {
                         message: error.clone(),
                     }
@@ -504,7 +508,17 @@ fn spawn_execution(
                         message: error.clone(),
                     }
                 };
-                let _ = append_next(&store, spec.run_id, event);
+                let already_recorded = verifier_attention
+                    && repository
+                        .agent_events_v4(spec.run_id)
+                        .ok()
+                        .and_then(|events| events.last().cloned())
+                        .is_some_and(|event| {
+                            matches!(event.event, AgentEventKindV4::RunNeedsAttention { .. })
+                        });
+                if !already_recorded {
+                    let _ = append_next(&store, spec.run_id, event);
+                }
             }
         }
         let _ = save_record(&repository, &record);
@@ -658,6 +672,63 @@ impl ModelPortV4 for DesktopModelPortV4 {
             public_text: text,
             tool_calls,
         })
+    }
+
+    async fn review(&self, request: ReviewerRequestV4) -> Result<ReviewerReportV4, ModelFailureV4> {
+        let context = serde_json::to_string(&request).map_err(|error| {
+            ModelFailureV4::permanent(ModelErrorClassV4::InvalidRequest, error.to_string())
+        })?;
+        let submit = ToolDescriptorV4 {
+            id: "agent.submit_review".into(),
+            description: "Submit the independent read-only ReviewerReportV4. Every finding must cite evidence present in the frozen review context.".into(),
+            input_schema: json!({
+                "type":"object",
+                "required":["schema_version","summary","findings"],
+                "properties":{
+                    "schema_version":{"type":"integer","const":4},
+                    "summary":{"type":"string"},
+                    "findings":{"type":"array","maxItems":8,"items":{
+                        "type":"object",
+                        "required":["severity","code","message","evidence"],
+                        "properties":{
+                            "severity":{"type":"string","enum":["error","warn","ok"]},
+                            "code":{"type":"string"},
+                            "message":{"type":"string"},
+                            "evidence":{"type":"array","minItems":1,"items":{"type":"string"}}
+                        }
+                    }}
+                }
+            }),
+            effect: ToolEffectV4::ReadOnly,
+        };
+        let turn = self
+            .stream(
+                ModelRequestV4 {
+                    system: "You are an independent read-only scientific Reviewer. You receive only the frozen objective, completion criteria, Host-verified Scientific State, completion proposal, and deterministic verification report. You cannot modify the run. Check sample completeness, numerical/report consistency, evidence support, provenance, seed, versions, and statistical fields. Call agent.submit_review exactly once; cite evidence for every finding.".into(),
+                    context,
+                    tools: vec![submit],
+                },
+                &mut |_| {},
+            )
+            .await?;
+        let arguments = turn
+            .tool_calls
+            .into_iter()
+            .find(|call| call.tool_id == "agent.submit_review")
+            .map(|call| call.arguments)
+            .ok_or_else(|| {
+                ModelFailureV4::permanent(
+                    ModelErrorClassV4::InvalidResponse,
+                    "reviewer did not call agent.submit_review",
+                )
+            })?;
+        let report: ReviewerReportV4 = serde_json::from_value(arguments).map_err(|error| {
+            ModelFailureV4::permanent(ModelErrorClassV4::InvalidResponse, error.to_string())
+        })?;
+        report.validate().map_err(|error| {
+            ModelFailureV4::permanent(ModelErrorClassV4::InvalidResponse, error.to_string())
+        })?;
+        Ok(report)
     }
 }
 
