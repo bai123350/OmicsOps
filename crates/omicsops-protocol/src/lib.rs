@@ -106,6 +106,12 @@ pub struct RunSpecV4 {
     pub model_profile_id: Uuid,
     pub plan: ExecutionPlanV4,
     pub approved_plan_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compute_selection: Option<ComputeSelectionV4>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_hash: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -132,8 +138,120 @@ impl RunSpecV4 {
             model_profile_id,
             plan,
             approved_plan_hash: actual,
+            compute_selection: None,
+            approval_hash: None,
+            spec_hash: None,
             created_at: now,
         })
+    }
+
+    pub fn approval_hash_for(
+        run_id: Uuid,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        model_profile_id: Uuid,
+        plan: &ExecutionPlanV4,
+        selection: &ComputeSelectionV4,
+    ) -> Result<String, ProtocolErrorV4> {
+        selection.validate()?;
+        let plan_hash = plan.canonical_hash()?;
+        let value = serde_json::json!({
+            "schema_version": 4,
+            "runtime_id": AGENT_RUNTIME_V4,
+            "run_id": run_id,
+            "project_id": project_id,
+            "conversation_id": conversation_id,
+            "model_profile_id": model_profile_id,
+            "plan_hash": plan_hash,
+            "compute_selection": selection,
+        });
+        Ok(hex::encode(Sha256::digest(
+            serde_json::to_vec(&value).map_err(|_| ProtocolErrorV4::InvalidComputeSelection)?,
+        )))
+    }
+
+    pub fn freeze_with_compute(
+        run_id: Uuid,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        model_profile_id: Uuid,
+        plan: ExecutionPlanV4,
+        selection: ComputeSelectionV4,
+        approved_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Self, ProtocolErrorV4> {
+        let expected = Self::approval_hash_for(
+            run_id,
+            project_id,
+            conversation_id,
+            model_profile_id,
+            &plan,
+            &selection,
+        )?;
+        if expected != approved_hash {
+            return Err(ProtocolErrorV4::ApprovalHashMismatch);
+        }
+        let plan_hash = plan.canonical_hash()?;
+        let mut spec = Self {
+            schema_version: 4,
+            runtime_id: AGENT_RUNTIME_V4.into(),
+            run_id,
+            project_id,
+            conversation_id,
+            model_profile_id,
+            plan,
+            approved_plan_hash: plan_hash,
+            compute_selection: Some(selection),
+            approval_hash: Some(expected),
+            spec_hash: None,
+            created_at: now,
+        };
+        spec.spec_hash = Some(spec.calculate_spec_hash()?);
+        Ok(spec)
+    }
+
+    pub fn calculate_spec_hash(&self) -> Result<String, ProtocolErrorV4> {
+        let value = serde_json::json!({
+            "schema_version": self.schema_version,
+            "runtime_id": self.runtime_id,
+            "run_id": self.run_id,
+            "project_id": self.project_id,
+            "conversation_id": self.conversation_id,
+            "model_profile_id": self.model_profile_id,
+            "plan": self.plan,
+            "approved_plan_hash": self.approved_plan_hash,
+            "compute_selection": self.compute_selection,
+            "approval_hash": self.approval_hash,
+            "created_at": self.created_at,
+        });
+        Ok(hex::encode(Sha256::digest(
+            serde_json::to_vec(&value).map_err(|_| ProtocolErrorV4::InvalidComputeSelection)?,
+        )))
+    }
+
+    pub fn validate_integrity(&self) -> Result<(), ProtocolErrorV4> {
+        if self.plan.canonical_hash()? != self.approved_plan_hash {
+            return Err(ProtocolErrorV4::PlanHashMismatch);
+        }
+        if let Some(selection) = &self.compute_selection {
+            selection.validate()?;
+            let expected = Self::approval_hash_for(
+                self.run_id,
+                self.project_id,
+                self.conversation_id,
+                self.model_profile_id,
+                &self.plan,
+                selection,
+            )?;
+            if self.approval_hash.as_deref() != Some(expected.as_str()) {
+                return Err(ProtocolErrorV4::ApprovalHashMismatch);
+            }
+            let spec_hash = self.calculate_spec_hash()?;
+            if self.spec_hash.as_deref() != Some(spec_hash.as_str()) {
+                return Err(ProtocolErrorV4::SpecHashMismatch);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -217,6 +335,85 @@ pub enum IsolationStrengthV4 {
 pub enum AutonomyModeV4 {
     Supervised,
     FullAuto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkPolicyV4 {
+    HostInherited,
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ContainerImageSelectionV4 {
+    pub reference: String,
+    pub image_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ComputeSelectionV4 {
+    pub schema_version: u8,
+    pub backend_id: String,
+    pub backend_kind: ComputeBackendKindV4,
+    pub autonomy_mode: AutonomyModeV4,
+    pub environment: String,
+    pub network_policy: NetworkPolicyV4,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_image: Option<ContainerImageSelectionV4>,
+}
+
+impl ComputeSelectionV4 {
+    pub fn validate(&self) -> Result<(), ProtocolErrorV4> {
+        if self.schema_version != 4
+            || self.backend_id.trim().is_empty()
+            || self.environment.trim().is_empty()
+            || self.environment.len() > 128
+            || !self
+                .environment
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+        {
+            return Err(ProtocolErrorV4::InvalidComputeSelection);
+        }
+        let container = matches!(
+            self.backend_kind,
+            ComputeBackendKindV4::Docker | ComputeBackendKindV4::Podman
+        );
+        let backend_matches = match self.backend_kind {
+            ComputeBackendKindV4::Local => self.backend_id == "local",
+            ComputeBackendKindV4::Docker => self.backend_id == "docker",
+            ComputeBackendKindV4::Podman => self.backend_id == "podman",
+            ComputeBackendKindV4::Ssh => {
+                self.backend_id.starts_with("ssh:") && self.backend_id.len() > "ssh:".len()
+            }
+        };
+        if !backend_matches
+            || (container && self.environment != "system")
+            || (self.backend_kind == ComputeBackendKindV4::Local && self.environment != "system")
+            || (container && self.network_policy != NetworkPolicyV4::None)
+            || (!container && self.network_policy != NetworkPolicyV4::HostInherited)
+            || (self.autonomy_mode == AutonomyModeV4::FullAuto && !container)
+        {
+            return Err(ProtocolErrorV4::InvalidComputeSelection);
+        }
+        match (&self.container_image, container) {
+            (Some(image), true)
+                if !image.reference.trim().is_empty()
+                    && !image.image_id.trim().is_empty()
+                    && !image.reference.chars().any(char::is_whitespace)
+                    && !image.image_id.chars().any(char::is_whitespace) => {}
+            (None, false) => {}
+            _ => return Err(ProtocolErrorV4::InvalidComputeSelection),
+        }
+        Ok(())
+    }
+
+    pub fn canonical_hash(&self) -> Result<String, ProtocolErrorV4> {
+        self.validate()?;
+        Ok(hex::encode(Sha256::digest(
+            serde_json::to_vec(self).map_err(|_| ProtocolErrorV4::InvalidComputeSelection)?,
+        )))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -536,6 +733,10 @@ pub enum AgentEventKindV4 {
     PlanApproved {
         plan_hash: String,
     },
+    RunSpecFrozen {
+        approval_hash: String,
+        spec_hash: String,
+    },
     ModeChanged {
         mode: RunModeV4,
     },
@@ -693,6 +894,12 @@ pub enum ProtocolErrorV4 {
     InvalidPlan,
     #[error("approved plan hash does not match the plan")]
     PlanHashMismatch,
+    #[error("invalid V4 compute selection")]
+    InvalidComputeSelection,
+    #[error("approved V4 run hash does not match the plan and compute selection")]
+    ApprovalHashMismatch,
+    #[error("V4 run specification hash mismatch")]
+    SpecHashMismatch,
     #[error("V4 event hash mismatch")]
     EventHashMismatch,
     #[error("broken V4 event chain")]
@@ -746,5 +953,166 @@ mod tests {
         gate.security_scenarios_verified = true;
         assert!(gate.ready());
         assert!(gate.missing_evidence().is_empty());
+    }
+
+    fn local_selection() -> ComputeSelectionV4 {
+        ComputeSelectionV4 {
+            schema_version: 4,
+            backend_id: "local".into(),
+            backend_kind: ComputeBackendKindV4::Local,
+            autonomy_mode: AutonomyModeV4::Supervised,
+            environment: "system".into(),
+            network_policy: NetworkPolicyV4::HostInherited,
+            container_image: None,
+        }
+    }
+
+    #[test]
+    fn compute_selection_is_frozen_into_tamper_evident_run_spec() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let model_profile_id = Uuid::new_v4();
+        let plan = ExecutionPlanV4 {
+            schema_version: 4,
+            objective: "local analysis".into(),
+            steps: vec!["analyze".into()],
+            completion_criteria: vec!["verified".into()],
+            requested_capabilities: BTreeSet::from(["runtime.execute".into()]),
+        };
+        let selection = local_selection();
+        let approval = RunSpecV4::approval_hash_for(
+            run_id,
+            project_id,
+            conversation_id,
+            model_profile_id,
+            &plan,
+            &selection,
+        )
+        .unwrap();
+        let spec = RunSpecV4::freeze_with_compute(
+            run_id,
+            project_id,
+            conversation_id,
+            model_profile_id,
+            plan,
+            selection,
+            &approval,
+            Utc::now(),
+        )
+        .unwrap();
+        assert!(spec.validate_integrity().is_ok());
+
+        let mut backend = spec.clone();
+        backend.compute_selection.as_mut().unwrap().backend_id = "docker".into();
+        assert!(backend.validate_integrity().is_err());
+        let mut autonomy = spec.clone();
+        autonomy.compute_selection.as_mut().unwrap().autonomy_mode = AutonomyModeV4::FullAuto;
+        assert!(autonomy.validate_integrity().is_err());
+        let mut environment = spec.clone();
+        environment.compute_selection.as_mut().unwrap().environment = "other".into();
+        assert!(environment.validate_integrity().is_err());
+        let mut network = spec.clone();
+        network.compute_selection.as_mut().unwrap().network_policy = NetworkPolicyV4::None;
+        assert!(network.validate_integrity().is_err());
+    }
+
+    #[test]
+    fn container_selection_requires_frozen_image_and_no_network() {
+        let mut selection = ComputeSelectionV4 {
+            schema_version: 4,
+            backend_id: "docker".into(),
+            backend_kind: ComputeBackendKindV4::Docker,
+            autonomy_mode: AutonomyModeV4::FullAuto,
+            environment: "system".into(),
+            network_policy: NetworkPolicyV4::None,
+            container_image: Some(ContainerImageSelectionV4 {
+                reference: "omicsops/test:latest".into(),
+                image_id: "sha256:abc".into(),
+            }),
+        };
+        assert!(selection.validate().is_ok());
+        let plan = ExecutionPlanV4 {
+            schema_version: 4,
+            objective: "container analysis".into(),
+            steps: vec!["analyze".into()],
+            completion_criteria: vec!["verified".into()],
+            requested_capabilities: BTreeSet::new(),
+        };
+        let ids = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let approval =
+            RunSpecV4::approval_hash_for(ids.0, ids.1, ids.2, ids.3, &plan, &selection).unwrap();
+        let mut spec = RunSpecV4::freeze_with_compute(
+            ids.0,
+            ids.1,
+            ids.2,
+            ids.3,
+            plan,
+            selection.clone(),
+            &approval,
+            Utc::now(),
+        )
+        .unwrap();
+        spec.compute_selection
+            .as_mut()
+            .unwrap()
+            .container_image
+            .as_mut()
+            .unwrap()
+            .reference = "omicsops/tampered:latest".into();
+        assert!(spec.validate_integrity().is_err());
+        selection.container_image.as_mut().unwrap().image_id = "sha256:def".into();
+        assert_ne!(
+            selection.canonical_hash().unwrap(),
+            ComputeSelectionV4 {
+                container_image: Some(ContainerImageSelectionV4 {
+                    reference: "omicsops/test:latest".into(),
+                    image_id: "sha256:abc".into(),
+                }),
+                ..selection.clone()
+            }
+            .canonical_hash()
+            .unwrap()
+        );
+        selection.network_policy = NetworkPolicyV4::HostInherited;
+        assert_eq!(
+            selection.validate(),
+            Err(ProtocolErrorV4::InvalidComputeSelection)
+        );
+    }
+
+    #[test]
+    fn supported_backend_selection_matrix_is_explicit() {
+        let ssh = ComputeSelectionV4 {
+            schema_version: 4,
+            backend_id: format!("ssh:{}", Uuid::new_v4()),
+            backend_kind: ComputeBackendKindV4::Ssh,
+            autonomy_mode: AutonomyModeV4::Supervised,
+            environment: "analysis-r".into(),
+            network_policy: NetworkPolicyV4::HostInherited,
+            container_image: None,
+        };
+        assert!(ssh.validate().is_ok());
+        let podman = ComputeSelectionV4 {
+            schema_version: 4,
+            backend_id: "podman".into(),
+            backend_kind: ComputeBackendKindV4::Podman,
+            autonomy_mode: AutonomyModeV4::FullAuto,
+            environment: "system".into(),
+            network_policy: NetworkPolicyV4::None,
+            container_image: Some(ContainerImageSelectionV4 {
+                reference: "localhost/omicsops:test".into(),
+                image_id: "sha256:123".into(),
+            }),
+        };
+        assert!(podman.validate().is_ok());
+        let mut invalid = ssh;
+        invalid.autonomy_mode = AutonomyModeV4::FullAuto;
+        assert!(invalid.validate().is_err());
     }
 }

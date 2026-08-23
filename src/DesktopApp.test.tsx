@@ -24,6 +24,62 @@ describe("DesktopApp", () => {
     expect(screen.getByRole("complementary", { name: "项目上下文" })).toBeInTheDocument();
   });
 
+  it("starts a direct V4 agent run instead of planning after an ordinary send", async () => {
+    const project = { id: "project-1", name: "PBMC 图谱", description: "", local_root: "E:/Science/pbmc", remote_root: null, connection_id: null, template: "single_cell_rna_seq" as const, status: "running" as const, ollama_only: false, created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" };
+    const conversation = { id: "conversation-1", project_id: project.id, title: "普通问答", status: "idle" as const, model_profile_id: "model-1", created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" };
+    const model = { id: "model-1", label: "Test model", provider: "ollama" as const, base_url: "http://localhost:11434", model: "test", credential_reference: null, supports_tools: true, supports_vision: false };
+    vi.spyOn(api, "listProjects").mockResolvedValue([project]);
+    vi.spyOn(api, "listConversations").mockResolvedValue([conversation]);
+    vi.spyOn(api, "listMessages").mockResolvedValue([]);
+    vi.spyOn(api, "listModelProfiles").mockResolvedValue([model]);
+    vi.spyOn(api, "agentV4ComputeBackends").mockResolvedValue([{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]);
+    vi.spyOn(api, "submitMessage").mockResolvedValue({ id: "message-1", project_id: project.id, conversation_id: conversation.id, sequence: 1, role: "user", markdown: "先解释一下这个矩阵格式", created_at: "2026-08-21T00:00:00Z" });
+    const startDirect = vi.spyOn(api, "agentV4StartDirect").mockResolvedValue({ run_id: "run-direct", status: "running", plan: null, plan_hash: null, compute_selection: { schema_version: 4, backend_id: "local", backend_kind: "local", autonomy_mode: "supervised", environment: "system", network_policy: "host_inherited", container_image: null }, approval_hash: null });
+    const startPlanning = vi.spyOn(api, "agentV4StartPlanning");
+    vi.spyOn(api, "agentV4Events").mockResolvedValue([]);
+
+    render(<DesktopApp />);
+    const composer = await screen.findByRole("textbox", { name: /描述研究目标/ });
+    await screen.findByText("Agent 模式：发送后直接执行任务");
+    fireEvent.change(composer, { target: { value: "先解释一下这个矩阵格式" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(startDirect).toHaveBeenCalledWith(expect.objectContaining({ objective: "先解释一下这个矩阵格式" })));
+    expect(startPlanning).not.toHaveBeenCalled();
+    expect(await screen.findByRole("button", { name: "添加上下文或选择模式" })).toBeInTheDocument();
+  });
+
+  it("starts planning from the plus-menu Plan mode and continues execution after approval", async () => {
+    const project = { id: "project-1", name: "PBMC 图谱", description: "", local_root: "E:/Science/pbmc", remote_root: null, connection_id: null, template: "single_cell_rna_seq" as const, status: "running" as const, ollama_only: false, created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" };
+    const conversation = { id: "conversation-1", project_id: project.id, title: "分析任务", status: "idle" as const, model_profile_id: "model-1", created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" };
+    const model = { id: "model-1", label: "Test model", provider: "ollama" as const, base_url: "http://localhost:11434", model: "test", credential_reference: null, supports_tools: true, supports_vision: false };
+    const selection = { schema_version: 4 as const, backend_id: "local", backend_kind: "local" as const, autonomy_mode: "supervised" as const, environment: "system", network_policy: "host_inherited" as const, container_image: null };
+    const planned = { run_id: "run-v4", status: "awaiting_approval", plan: { schema_version: 4 as const, objective: "执行完整 QC", steps: ["检查输入", "执行 QC"], completion_criteria: ["报告已生成"], requested_capabilities: ["runtime.execute"] }, plan_hash: "plan-hash", compute_selection: selection, approval_hash: "approval-hash" };
+    vi.spyOn(api, "listProjects").mockResolvedValue([project]);
+    vi.spyOn(api, "listConversations").mockResolvedValue([conversation]);
+    vi.spyOn(api, "listMessages").mockResolvedValue([]);
+    vi.spyOn(api, "listModelProfiles").mockResolvedValue([model]);
+    vi.spyOn(api, "agentV4ComputeBackends").mockResolvedValue([{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]);
+    vi.spyOn(api, "submitMessage").mockResolvedValue({ id: "message-1", project_id: project.id, conversation_id: conversation.id, sequence: 1, role: "user", markdown: "执行完整 QC", created_at: "2026-08-21T00:00:00Z" });
+    const startPlanning = vi.spyOn(api, "agentV4StartPlanning").mockResolvedValue(planned);
+    const approvePlan = vi.spyOn(api, "agentV4ApprovePlan").mockResolvedValue({ ...planned, status: "running" });
+    vi.spyOn(api, "agentV4Events").mockResolvedValue([]);
+
+    render(<DesktopApp />);
+    await screen.findByRole("main", { name: "科研对话" });
+    fireEvent.click(screen.getByRole("button", { name: "添加上下文或选择模式" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Plan 模式/ }));
+    await screen.findByRole("region", { name: "V4 计算后端" });
+    await screen.findByRole("radio", { name: /LOCAL/ });
+    fireEvent.change(screen.getByRole("textbox", { name: /描述研究目标/ }), { target: { value: "执行完整 QC" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(startPlanning).toHaveBeenCalledWith(expect.objectContaining({ objective: "执行完整 QC", compute_selection: selection })));
+    fireEvent.click(await screen.findByRole("button", { name: "批准并运行" }));
+    await waitFor(() => expect(approvePlan).toHaveBeenCalledWith("run-v4", "approval-hash"));
+    expect(await screen.findByText("运行中")).toBeInTheDocument();
+  });
+
   it("returns from an open workspace to the project library", async () => {
     vi.spyOn(api, "listProjects").mockResolvedValue([{ id: "project-1", name: "PBMC 项目", description: "", local_root: "E:/Science/pbmc", remote_root: null, connection_id: null, template: "single_cell_rna_seq", status: "running", ollama_only: false, created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" }]);
     render(<DesktopApp />);

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import * as api from "./tauri-api";
-import type { AgentEvent, AgentRunEventV3, AgentRunEventV4, AgentRunStreamEvent, ConnectionProfile, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, PlanProposal, ProjectArtifact, RemoteFileEntry, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
+import type { AgentEvent, AgentRunEventV3, AgentRunEventV4, AgentRunStreamEvent, AutonomyModeV4, ComputeBackendAvailabilityV4, ComputeSelectionV4, ConnectionProfile, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, PlanProposal, ProjectArtifact, RemoteFileEntry, RunSummaryV4, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
 import { WorkspaceShell } from "./features/workspace/WorkspaceShell";
 import type { Locale } from "./features/workspace/copy";
@@ -24,6 +24,13 @@ export default function DesktopApp() {
   const [activeModelProfileId, setActiveModelProfileId] = useState<string | null>(null);
   const [lastGoal, setLastGoal] = useState("");
   const [planProposal, setPlanProposal] = useState<PlanProposal | null>(null);
+  const [v4Plan, setV4Plan] = useState<RunSummaryV4 | null>(null);
+  const [computeBackends, setComputeBackends] = useState<ComputeBackendAvailabilityV4[]>([]);
+  const [computeBackendId, setComputeBackendId] = useState("local");
+  const [containerImage, setContainerImage] = useState("");
+  const [autonomyMode, setAutonomyMode] = useState<AutonomyModeV4>("supervised");
+  const [computeEnvironment, setComputeEnvironment] = useState("system");
+  const [computeBusy, setComputeBusy] = useState(false);
   const [planLoading, setPlanLoading] = useState(false);
   const [planApproved, setPlanApproved] = useState(false);
   const [approvedPlanId, setApprovedPlanId] = useState<string | null>(null);
@@ -72,6 +79,34 @@ export default function DesktopApp() {
     return () => { disposed = true; };
   }, [selected?.id]);
   useEffect(() => {
+    let disposed = false;
+    if (!selected) { setComputeBackends([]); return () => { disposed = true; }; }
+    const timer = window.setTimeout(() => {
+      setComputeBusy(true);
+      api.agentV4ComputeBackends(selected.id, containerImage)
+        .then((items) => {
+          if (disposed) return;
+          setComputeBackends(items);
+          setComputeBackendId((current) => {
+            if (items.some((item) => item.descriptor.backend_id === current && item.selectable)) return current;
+            const preferred = selected.connection_id
+              ? items.find((item) => item.descriptor.kind === "ssh" && item.selectable)
+              : items.find((item) => item.descriptor.kind === "local" && item.selectable);
+            return preferred?.descriptor.backend_id ?? items.find((item) => item.selectable)?.descriptor.backend_id ?? current;
+          });
+        })
+        .catch((error) => { if (!disposed) setAgentNotice(error instanceof Error ? error.message : String(error)); })
+        .finally(() => { if (!disposed) setComputeBusy(false); });
+    }, 250);
+    return () => { disposed = true; window.clearTimeout(timer); };
+  }, [selected?.id, selected?.connection_id, containerImage]);
+  useEffect(() => {
+    const backend = computeBackends.find((item) => item.descriptor.backend_id === computeBackendId);
+    if (!backend) return;
+    if (backend.descriptor.kind !== "ssh") setComputeEnvironment("system");
+    if (backend.descriptor.isolation !== "container") setAutonomyMode("supervised");
+  }, [computeBackendId, computeBackends]);
+  useEffect(() => {
     if (!selected) { setMemoryFacts([]); setNotebookEntries([]); setProjectArtifacts([]); return; }
     void Promise.all([api.searchAgentMemory(selected.id), api.listNotebookEntries(selected.id), api.listProjectArtifacts(selected.id), api.listSyncEntries(selected.id)])
       .then(([facts, notebook, artifacts, transfers]) => { setMemoryFacts(facts); setNotebookEntries(notebook); setProjectArtifacts(artifacts); setSyncEntries(transfers); })
@@ -104,16 +139,19 @@ export default function DesktopApp() {
     Promise.all([
       api.listAgentRunEvents(selected.id),
       api.listAgentRunEventsV3({ projectId: selected.id, conversationId: conversation.id }),
+      api.agentV4EventsForConversation(selected.id, conversation.id),
     ])
-      .then(([events, eventsV3]) => {
+      .then(([events, eventsV3, eventsV4]) => {
         if (disposed) return;
         const conversationEvents = events.filter((event) => event.conversation_id === conversation.id);
         setAgentRunEvents(conversationEvents);
         setAgentRunEventsV3(eventsV3);
-        const latest = [...conversationEvents.map((event) => ({ runId: event.run_id, timestamp: event.timestamp })), ...eventsV3.map((event) => ({ runId: event.run_id, timestamp: event.occurred_at }))].sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime()).at(-1);
+        setAgentRunEventsV4(mergeAgentRunEventsV4([], eventsV4));
+        const latest = [...conversationEvents.map((event) => ({ runId: event.run_id, timestamp: event.timestamp })), ...eventsV3.map((event) => ({ runId: event.run_id, timestamp: event.occurred_at })), ...eventsV4.map((event) => ({ runId: event.run_id, timestamp: event.occurred_at }))].sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime()).at(-1);
         const latestRunEvents = latest ? conversationEvents.filter((event) => event.run_id === latest.runId) : [];
         const latestRunEventsV3 = latest ? eventsV3.filter((event) => event.run_id === latest.runId) : [];
-        setRunId(latest && !latestRunEvents.some(isTerminalAgentEvent) && !latestRunEventsV3.some(isTerminalAgentEventV3) ? latest.runId : null);
+        const latestRunEventsV4 = latest ? eventsV4.filter((event) => event.run_id === latest.runId) : [];
+        setRunId(latest && !latestRunEvents.some(isTerminalAgentEvent) && !latestRunEventsV3.some(isTerminalAgentEventV3) && !latestRunEventsV4.some(isTerminalAgentEventV4) ? latest.runId : null);
       })
       .catch((error) => {
         if (!disposed) setAgentNotice(error instanceof Error ? error.message : String(error));
@@ -195,7 +233,7 @@ export default function DesktopApp() {
     api.onAgentV4Event((event) => {
       if (event.project_id !== selected?.id || event.conversation_id !== conversation?.id) return;
       setRunId((current) => current ?? event.run_id);
-      if (event.event.kind === "run_completed" || event.event.kind === "run_failed" || event.event.kind === "run_cancelled") {
+      if (isTerminalAgentEventV4(event)) {
         setRunStopping(false);
         setRunId((current) => current === event.run_id ? null : current);
         if (event.event.kind === "run_completed") void refreshRemoteFiles(event.project_id);
@@ -283,7 +321,57 @@ export default function DesktopApp() {
 
   function resetConversationWork() {
     setMessages([]); setMessageSequence(1); setStreamingAssistant(""); setAgentBusy(false); setAgentNotice(""); setAgentRetryNotice("");
-    setLastGoal(""); setPlanProposal(null); setPlanApproved(false); setApprovedPlanId(null); setRunId(null); setRunStopping(false); setAgentRunEvents([]); setAgentRunEventsV3([]);
+    setLastGoal(""); setPlanProposal(null); setV4Plan(null); setPlanApproved(false); setApprovedPlanId(null); setRunId(null); setRunStopping(false); setAgentRunEvents([]); setAgentRunEventsV3([]); setAgentRunEventsV4([]);
+  }
+
+  function currentComputeSelection(): ComputeSelectionV4 {
+    const backend = computeBackends.find((item) => item.descriptor.backend_id === computeBackendId);
+    if (!backend?.selectable) throw new Error(locale === "zh-CN" ? "请选择一个可用的 V4 计算后端。" : "Select an available V4 compute backend.");
+    const container = backend.descriptor.kind === "docker" || backend.descriptor.kind === "podman";
+    if (container && !backend.resolved_image_id) throw new Error(locale === "zh-CN" ? "容器镜像尚未在本机验证。" : "The container image has not been verified locally.");
+    return {
+      schema_version: 4,
+      backend_id: backend.descriptor.backend_id,
+      backend_kind: backend.descriptor.kind,
+      autonomy_mode: container ? autonomyMode : "supervised",
+      environment: backend.descriptor.kind === "ssh" ? (computeEnvironment.trim() || "system") : "system",
+      network_policy: container ? "none" : "host_inherited",
+      container_image: container ? { reference: containerImage.trim(), image_id: backend.resolved_image_id! } : null,
+    };
+  }
+
+  async function startV4Planning(goal: string) {
+    if (!selected || !conversation || !activeModel) throw new Error(locale === "zh-CN" ? "请先选择会话和模型。" : "Select a conversation and model first.");
+    const summary = await api.agentV4StartPlanning({
+      project_id: selected.id,
+      conversation_id: conversation.id,
+      model_profile_id: activeModel.id,
+      objective: goal,
+      compute_selection: currentComputeSelection(),
+    });
+    setV4Plan(summary);
+    setRunId(summary.run_id);
+    setPlanApproved(false);
+    const events = await api.agentV4Events(summary.run_id);
+    setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
+    return summary;
+  }
+
+  async function startV4Direct(goal: string) {
+    if (!selected || !conversation || !activeModel) throw new Error(locale === "zh-CN" ? "请先选择会话和模型。" : "Select a conversation and model first.");
+    const summary = await api.agentV4StartDirect({
+      project_id: selected.id,
+      conversation_id: conversation.id,
+      model_profile_id: activeModel.id,
+      objective: goal,
+      compute_selection: currentComputeSelection(),
+    });
+    setV4Plan(summary);
+    setRunId(summary.run_id);
+    setPlanApproved(false);
+    const events = await api.agentV4Events(summary.run_id);
+    setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
+    return summary;
   }
 
   async function selectConversation(conversationId: string) {
@@ -347,8 +435,11 @@ export default function DesktopApp() {
     locale={locale} onLocaleChange={setLocale} onOpenSettings={() => setSettingsOpen(true)} onBackToProjects={() => setSelected(null)}
     conversations={conversations} activeConversationId={conversation?.id} onSelectConversation={selectConversation} onNewConversation={newConversation} onDeleteConversation={deleteConversation}
     messages={messages} streamingAssistant={streamingAssistant} agentBusy={agentBusy} agentNotice={agentNotice} agentRetryNotice={agentRetryNotice} modelLabel={activeModel?.label}
-    planProposal={planProposal} planLoading={planLoading} planApproved={planApproved} canStartRun={Boolean(selected.connection_id && approvedPlanId)} runStarted={Boolean(runId)} activeRunId={runId} agentRunEvents={agentRunEvents} agentRunEventsV3={agentRunEventsV3} agentRunEventsV4={agentRunEventsV4}
+    planProposal={planProposal} v4Plan={v4Plan} planLoading={planLoading} planApproved={planApproved} canStartRun={false} runStarted={v4Plan?.status === "running" || Boolean(runId && (planApproved || agentRunEventsV4.some((event) => event.run_id === runId)))} activeRunId={runId} agentRunEvents={agentRunEvents} agentRunEventsV3={agentRunEventsV3} agentRunEventsV4={agentRunEventsV4}
+    computeBackends={computeBackends} computeBackendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} computeEnvironment={computeEnvironment} computeBusy={computeBusy}
+    onComputeBackendChange={setComputeBackendId} onContainerImageChange={setContainerImage} onAutonomyModeChange={setAutonomyMode} onComputeEnvironmentChange={setComputeEnvironment}
     onAnswerAgentQuestionV3={async (answerRunId, questionId, answer) => { await api.answerAgentRunQuestionV3(answerRunId, questionId, answer); await api.resumeRunV2(answerRunId); }}
+    onAnswerAgentQuestionV4={async (answerRunId, questionId, answer) => { await api.agentV4Answer(answerRunId, questionId, answer); await api.agentV4Resume(answerRunId); }}
     runStopping={runStopping}
     remoteFiles={remoteFiles} filesBusy={filesBusy} fileNotice={fileNotice}
     syncEntries={syncEntries}
@@ -365,37 +456,30 @@ export default function DesktopApp() {
     onStopKernel={async (sessionId) => withKernelBusy(async () => replaceKernelSession(await api.stopKernel(sessionId)))} onPromoteKernelCell={api.promoteKernelCell}
     onUploadFiles={selected.connection_id && selected.remote_root ? uploadFiles : undefined} onRefreshFiles={selected.connection_id && selected.remote_root ? () => refreshRemoteFiles() : undefined} onDownloadFile={selected.connection_id && selected.remote_root ? downloadFile : undefined}
     onPreviewImage={selected.connection_id && selected.remote_root ? (relativePath) => api.previewProjectImage(selected.id, relativePath) : undefined}
-    onSend={async (markdown) => {
+    onSend={async (markdown, mode) => {
       if (!conversation || !activeModel) { setSettingsOpen(true); return false; }
-      setLastGoal(markdown); setPlanProposal(null); setPlanApproved(false); setApprovedPlanId(null); setRunId(null); setAgentBusy(true); setAgentNotice("");
-      const remoteContext = selected.connection_id && selected.remote_root
-        ? [
-            `Remote root: ${selected.remote_root}`,
-            `Indexed entries: ${remoteFiles.length}`,
-            ...remoteFiles.slice(0, 200).map((entry) => `${entry.directory ? "directory" : "file"}\t${entry.relative_path}\t${entry.size_bytes} bytes`),
-            ...(remoteFiles.length > 200 ? [`${remoteFiles.length - 200} additional entries omitted`] : []),
-          ].join("\n")
-        : null;
-      try {
-        await api.runAgentTurn({ project_id: selected.id, conversation_id: conversation.id, model_profile_id: activeModel.id, markdown, message_sequence: messageSequence, remote_context: remoteContext });
-        const storedMessages = await api.listMessages(conversation.id);
-        setMessages(storedMessages);
-        setMessageSequence((storedMessages.at(-1)?.sequence ?? 0) + 1);
-        if (selected.connection_id && selected.remote_root) {
-          setAgentBusy(true);
-          setPlanLoading(true);
-          try {
-            setPlanProposal(await api.proposeAnalysisPlan({
-              project_id: selected.id,
-              conversation_id: conversation.id,
-              model_profile_id: activeModel.id,
-              goal: markdown,
-              environment_summary: remoteContext ?? `Remote Linux project at ${selected.remote_root}`,
-            }));
-          } catch (error) {
-            setAgentNotice(`${locale === "zh-CN" ? "对话已完成，但远程计划生成失败" : "Conversation completed, but remote plan generation failed"}: ${error instanceof Error ? error.message : String(error)}`);
-          } finally { setPlanLoading(false); setAgentBusy(false); }
+      setLastGoal(markdown); setPlanProposal(null); setV4Plan(null); setPlanApproved(false); setApprovedPlanId(null); setRunId(null); setAgentBusy(true); setAgentNotice("");
+      if (mode === "plan") {
+        setPlanLoading(true);
+        try {
+          const message = await api.submitMessage({ project_id: selected.id, conversation_id: conversation.id, markdown, sequence: messageSequence });
+          setMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message]);
+          setMessageSequence((value) => Math.max(value, message.sequence + 1));
+          await startV4Planning(markdown);
+          return true;
+        } catch (error) {
+          setAgentNotice(error instanceof Error ? error.message : String(error));
+          return false;
+        } finally {
+          setPlanLoading(false);
+          setAgentBusy(false);
         }
+      }
+      try {
+        const message = await api.submitMessage({ project_id: selected.id, conversation_id: conversation.id, markdown, sequence: messageSequence });
+        setMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message]);
+        setMessageSequence((value) => Math.max(value, message.sequence + 1));
+        await startV4Direct(markdown);
         return true;
       } catch (error) {
         setAgentNotice(error instanceof Error ? error.message : String(error));
@@ -405,34 +489,31 @@ export default function DesktopApp() {
     onRequestPlan={async () => {
       if (!activeModel || !lastGoal) { if (!activeModel) setSettingsOpen(true); return; }
       setPlanLoading(true); setAgentNotice("");
-      try { if (!conversation) return; setPlanProposal(await api.proposeAnalysisPlan({ project_id: selected.id, conversation_id: conversation.id, model_profile_id: activeModel.id, goal: lastGoal, environment_summary: selected.remote_root ? `Remote Linux project at ${selected.remote_root}` : "Remote Linux environment not inspected yet" })); }
+      try { await startV4Planning(lastGoal); }
       catch (error) { setAgentNotice(error instanceof Error ? error.message : String(error)); }
       finally { setPlanLoading(false); }
     }}
     onApprovePlan={async () => {
-      if (!planProposal) return;
+      if (!v4Plan?.approval_hash) return;
       setAgentNotice("");
       try {
-        const approved = await api.approvePlanV2(planProposal.plan, planProposal.plan.policy);
-        setApprovedPlanId(approved.id);
+        const approved = await api.agentV4ApprovePlan(v4Plan.run_id, v4Plan.approval_hash);
+        setV4Plan(approved);
+        setRunId(approved.run_id);
         setPlanApproved(true);
-        if (selected.connection_id) await attachRun(() => api.startRunV2(selected.connection_id!, selected.id, approved.id));
+        const events = await api.agentV4Events(approved.run_id);
+        setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
       } catch (error) {
         setAgentNotice(error instanceof Error ? error.message : String(error));
       }
     }}
-    onStartRun={selected.connection_id ? async () => { if (!approvedPlanId) return; await attachRun(() => api.startRunV2(selected.connection_id!, selected.id, approvedPlanId)); } : undefined}
     onCancelRun={runId ? async () => {
       setRunStopping(true);
       setAgentNotice("");
       try {
-        await api.cancelRun(runId);
-        const [events, eventsV3] = await Promise.all([
-          api.listAgentRunEvents(selected.id, runId, conversation?.id),
-          api.listAgentRunEventsV3({ runId }),
-        ]);
-        setAgentRunEvents((current) => mergeAgentRunEvents(current, events));
-        setAgentRunEventsV3((current) => mergeAgentRunEventsV3(current, eventsV3));
+        await api.agentV4Cancel(runId);
+        const events = await api.agentV4Events(runId);
+        setAgentRunEventsV4(events);
       } catch (error) {
         setAgentNotice(error instanceof Error ? error.message : String(error));
         setRunStopping(false);
@@ -453,10 +534,20 @@ export function mergeAgentRunEventsV3(current: AgentRunEventV3[], incoming: Agen
     .sort((left, right) => new Date(left.occurred_at).getTime() - new Date(right.occurred_at).getTime() || left.sequence - right.sequence);
 }
 
+function mergeAgentRunEventsV4(current: AgentRunEventV4[], incoming: AgentRunEventV4[]) {
+  return [...current, ...incoming]
+    .filter((event, index, all) => all.findIndex((item) => item.run_id === event.run_id && item.sequence === event.sequence) === index)
+    .sort((left, right) => new Date(left.occurred_at).getTime() - new Date(right.occurred_at).getTime() || left.sequence - right.sequence);
+}
+
 function isTerminalAgentEvent(event: AgentRunStreamEvent) {
   return event.kind === "agent_completed" || event.kind === "agent_failed" || event.kind === "agent_canceled";
 }
 
 function isTerminalAgentEventV3(event: AgentRunEventV3) {
   return event.event.kind === "run_completed" || event.event.kind === "run_failed" || event.event.kind === "run_cancelled" || event.event.kind === "needs_attention";
+}
+
+function isTerminalAgentEventV4(event: AgentRunEventV4) {
+  return event.event.kind === "run_completed" || event.event.kind === "run_failed" || event.event.kind === "run_cancelled" || event.event.kind === "run_needs_attention";
 }

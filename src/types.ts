@@ -401,11 +401,45 @@ export interface ExecutionPlanV4 {
   requested_capabilities: string[];
 }
 
+export type ComputeBackendKindV4 = "ssh" | "local" | "docker" | "podman";
+export type AutonomyModeV4 = "supervised" | "full_auto";
+export type NetworkPolicyV4 = "host_inherited" | "none";
+
+export interface ComputeSelectionV4 {
+  schema_version: 4;
+  backend_id: string;
+  backend_kind: ComputeBackendKindV4;
+  autonomy_mode: AutonomyModeV4;
+  environment: string;
+  network_policy: NetworkPolicyV4;
+  container_image?: { reference: string; image_id: string } | null;
+}
+
+export interface ComputeBackendAvailabilityV4 {
+  descriptor: {
+    schema_version: 4;
+    backend_id: string;
+    kind: ComputeBackendKindV4;
+    isolation: "process" | "container";
+    available: boolean;
+    supports_python: boolean;
+    supports_r: boolean;
+    supports_network_policy: boolean;
+  };
+  selectable: boolean;
+  reason: string | null;
+  python_status: "available" | "unavailable" | "unverified";
+  r_status: "available" | "unavailable" | "unverified";
+  resolved_image_id: string | null;
+}
+
 export interface RunSummaryV4 {
   run_id: string;
   status: string;
   plan: ExecutionPlanV4 | null;
   plan_hash: string | null;
+  compute_selection: ComputeSelectionV4 | null;
+  approval_hash: string | null;
 }
 
 export interface ToolCallV4 { call_id: string; tool_id: string; arguments: Record<string, unknown> }
@@ -422,6 +456,7 @@ export type AgentEventKindV4 =
   | { kind: "tool_dispatch_resolved"; call_id: string; resolution: "side_effect_observed" | "side_effect_not_observed" | "compensated"; evidence: string }
   | { kind: "plan_proposed"; plan: ExecutionPlanV4; plan_hash: string }
   | { kind: "plan_approved"; plan_hash: string }
+  | { kind: "run_spec_frozen"; approval_hash: string; spec_hash: string }
   | { kind: "mode_changed"; mode: "plan" | "execute" }
   | { kind: "input_requested"; question_id: string; question: string }
   | { kind: "user_input_answered"; question_id: string; answer: string }

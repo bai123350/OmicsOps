@@ -1,5 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
     sync::{
         Arc, OnceLock, Weak,
         atomic::{AtomicBool, Ordering},
@@ -23,24 +26,28 @@ use omicsops_agent::{
 use omicsops_agent_core::{
     AgentCoreErrorV4, AgentCoreV4, AgentLimitsV4, EventStoreV4, ModelPortV4, ModelRequestV4,
     ModelStreamEventV4, ModelTurnV4, PromptLayersV4, ReviewerRequestV4, ScientificStateStoreV4,
-    ScientificUpdateV4,
+    ScientificUpdateV4, ToolPortV4,
 };
 use omicsops_core::{
-    domain::ProjectSpec,
     project::{require_remote_descendant, shell_quote},
+    workspace::Project,
 };
 use omicsops_knowledge::{
     McpToolIndexV4, MemoryDocumentV4, SkillDocumentV4, authorize_mcp_use, freeze_skill,
     markdown_sections, schema_digest, search_mcp_tools, search_memory, search_skills,
 };
 use omicsops_protocol::{
-    AgentEventKindV4, AgentEventV4, ComputeBackendDescriptorV4, ComputeBackendKindV4,
-    ContextArchiveV4, ContextCheckpointV4, ExecutionContextKeyV4, ExecutionPlanV4,
-    IsolationStrengthV4, KernelLanguageV4, ModelErrorClassV4, ModelFailureV4, OutputCaptureV4,
-    ReviewerReportV4, RunSpecV4, RuntimeArtifactV4, RuntimeResultV4, ToolCallV4, ToolDescriptorV4,
-    ToolEffectV4, ToolOutcomeV4, UncertainResolutionV4,
+    AgentEventKindV4, AgentEventV4, AutonomyModeV4, ComputeBackendDescriptorV4,
+    ComputeBackendKindV4, ComputeSelectionV4, ContextArchiveV4, ContextCheckpointV4,
+    ExecutionContextKeyV4, ExecutionPlanV4, IsolationStrengthV4, KernelLanguageV4,
+    ModelErrorClassV4, ModelFailureV4, NetworkPolicyV4, OutputCaptureV4, ReviewerReportV4,
+    RunSpecV4, RuntimeArtifactV4, RuntimeResultV4, ToolCallV4, ToolDescriptorV4, ToolEffectV4,
+    ToolOutcomeV4, UncertainResolutionV4,
 };
-use omicsops_runtime::{KernelBackendV4, KernelProcessV4, RuntimeManagerV4};
+use omicsops_runtime::{
+    ContainerKernelBackendV4, KernelBackendV4, KernelProcessV4, LocalKernelBackendV4,
+    RuntimeManagerV4,
+};
 use omicsops_science::{
     AnalysisDeclarationV4, AnalysisStatusV4, DatasetStageV4, EvidenceDeclarationV4,
     RuntimeIdentityV4, ScientificStateV4, VerifiedArtifactFactV4, VerifiedDatasetFactV4,
@@ -50,12 +57,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Digest;
 use tauri::{AppHandle, Emitter, State};
-use tokio::sync::Mutex;
+use tokio::{process::Command, sync::Mutex};
 use uuid::Uuid;
 
 use crate::commands::{
-    AppState, authentication_for_profile, current_project_spec, find_profile, require_trusted_host,
-    unified_model_client,
+    AppState, authentication_for_profile, find_profile, require_trusted_host, unified_model_client,
 };
 use crate::p1_commands::{
     McpServerProfile, MemorySearchRequest, invoke_configured_mcp_tool_v4, memory_facts,
@@ -86,12 +92,42 @@ pub struct StartPlanningV4Request {
     pub conversation_id: Uuid,
     pub model_profile_id: Uuid,
     pub objective: String,
+    pub compute_selection: ComputeSelectionV4,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartDirectV4Request {
+    pub project_id: Uuid,
+    pub conversation_id: Uuid,
+    pub model_profile_id: Uuid,
+    pub objective: String,
+    pub compute_selection: ComputeSelectionV4,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovePlanV4Request {
     pub run_id: Uuid,
-    pub plan_hash: String,
+    #[serde(default)]
+    pub approval_hash: Option<String>,
+    #[serde(default)]
+    pub plan_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeBackendsV4Request {
+    pub project_id: Uuid,
+    #[serde(default)]
+    pub container_image: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeBackendAvailabilityV4 {
+    pub descriptor: ComputeBackendDescriptorV4,
+    pub selectable: bool,
+    pub reason: Option<String>,
+    pub python_status: String,
+    pub r_status: String,
+    pub resolved_image_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +151,8 @@ pub struct RunSummaryV4 {
     pub status: String,
     pub plan: Option<ExecutionPlanV4>,
     pub plan_hash: Option<String>,
+    pub compute_selection: Option<ComputeSelectionV4>,
+    pub approval_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,7 +165,146 @@ struct RunRecordV4 {
     status: String,
     plan: Option<ExecutionPlanV4>,
     plan_hash: Option<String>,
+    #[serde(default)]
+    compute_selection: Option<ComputeSelectionV4>,
+    #[serde(default)]
+    approval_hash: Option<String>,
     spec: Option<RunSpecV4>,
+}
+
+#[tauri::command]
+pub async fn agent_v4_compute_backends(
+    state: State<'_, AppState>,
+    request: ComputeBackendsV4Request,
+) -> Result<Vec<ComputeBackendAvailabilityV4>, String> {
+    let project = workspace_project(&state.repository, request.project_id)?;
+    let mut backends = Vec::new();
+
+    let local_root = std::fs::canonicalize(&project.local_root);
+    let python = program_available("python").await;
+    let r = program_available("Rscript").await;
+    let local_reason = local_root
+        .as_ref()
+        .err()
+        .map(|error| format!("local project root is unavailable: {error}"));
+    backends.push(ComputeBackendAvailabilityV4 {
+        descriptor: ComputeBackendDescriptorV4 {
+            schema_version: 4,
+            backend_id: "local".into(),
+            kind: ComputeBackendKindV4::Local,
+            isolation: IsolationStrengthV4::Process,
+            available: local_root.is_ok() && (python || r),
+            supports_python: python,
+            supports_r: r,
+            supports_network_policy: false,
+        },
+        selectable: local_root.is_ok() && (python || r),
+        reason: local_reason
+            .or_else(|| (!python && !r).then(|| "Python and R were not found".into())),
+        python_status: if python { "available" } else { "unavailable" }.into(),
+        r_status: if r { "available" } else { "unavailable" }.into(),
+        resolved_image_id: None,
+    });
+
+    if let (Some(connection_id), Some(remote_root)) = (project.connection_id, &project.remote_root)
+    {
+        let profile = find_profile(&state.repository, connection_id)?;
+        let trusted = profile.host_key_fingerprint.is_some();
+        let mut ssh_python = false;
+        let mut ssh_r = false;
+        let mut reason = (!trusted).then(|| "SSH host key is not trusted".to_string());
+        if trusted {
+            let authentication = authentication_for_profile(&state, &profile)?;
+            match SshSession::connect(&profile, authentication).await {
+                Ok(session) => match resolve_root(&session, remote_root).await {
+                    Ok(_) => {
+                        if let Ok(output) = session
+                            .execute_checked("printf 'python='; command -v python >/dev/null && printf yes || printf no; printf '\\nr='; command -v Rscript >/dev/null && printf yes || printf no")
+                            .await
+                        {
+                            ssh_python = output.stdout.contains("python=yes");
+                            ssh_r = output.stdout.contains("r=yes");
+                        }
+                    }
+                    Err(error) => reason = Some(error),
+                },
+                Err(error) => reason = Some(error.to_string()),
+            }
+        }
+        let available = reason.is_none() && (ssh_python || ssh_r);
+        backends.push(ComputeBackendAvailabilityV4 {
+            descriptor: ComputeBackendDescriptorV4 {
+                schema_version: 4,
+                backend_id: format!("ssh:{connection_id}"),
+                kind: ComputeBackendKindV4::Ssh,
+                isolation: IsolationStrengthV4::Process,
+                available,
+                supports_python: ssh_python,
+                supports_r: ssh_r,
+                supports_network_policy: false,
+            },
+            selectable: available,
+            reason: reason
+                .or_else(|| (!available).then(|| "Python and R were not found on SSH".into())),
+            python_status: if ssh_python {
+                "available"
+            } else {
+                "unavailable"
+            }
+            .into(),
+            r_status: if ssh_r { "available" } else { "unavailable" }.into(),
+            resolved_image_id: None,
+        });
+    }
+
+    for (program, kind) in [
+        ("docker", ComputeBackendKindV4::Docker),
+        ("podman", ComputeBackendKindV4::Podman),
+    ] {
+        let engine = program_available(program).await;
+        let (image_id, image_error) = if engine {
+            match request
+                .container_image
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                Some(image) => inspect_container_image(program, image).await,
+                None => (None, Some("enter an existing local container image".into())),
+            }
+        } else {
+            (None, Some(format!("{program} engine was not found")))
+        };
+        let backend_id = program.to_string();
+        let selectable = image_id.is_some();
+        backends.push(ComputeBackendAvailabilityV4 {
+            descriptor: ComputeBackendDescriptorV4 {
+                schema_version: 4,
+                backend_id,
+                kind,
+                isolation: IsolationStrengthV4::Container,
+                available: selectable,
+                supports_python: selectable,
+                supports_r: selectable,
+                supports_network_policy: true,
+            },
+            selectable,
+            reason: image_error,
+            python_status: if selectable {
+                "unverified"
+            } else {
+                "unavailable"
+            }
+            .into(),
+            r_status: if selectable {
+                "unverified"
+            } else {
+                "unavailable"
+            }
+            .into(),
+            resolved_image_id: image_id,
+        });
+    }
+    Ok(backends)
 }
 
 #[tauri::command]
@@ -139,9 +316,17 @@ pub async fn agent_v4_start_planning(
     if request.objective.trim().is_empty() {
         return Err("V4 objective is empty".into());
     }
-    let project = current_project_spec(&state.repository, request.project_id)?;
-    let (model, tools) =
-        compose(&state, &project, request.model_profile_id, Uuid::new_v4()).await?;
+    let project = workspace_project(&state.repository, request.project_id)?;
+    validate_compute_selection(&state, &project, &request.compute_selection).await?;
+    let (model, tools) = compose(
+        &state,
+        &project,
+        &request.compute_selection,
+        request.model_profile_id,
+        Uuid::new_v4(),
+        None,
+    )
+    .await?;
     let run_id = tools.run_id();
     let mut record = RunRecordV4 {
         run_id,
@@ -152,6 +337,8 @@ pub async fn agent_v4_start_planning(
         status: "planning".into(),
         plan: None,
         plan_hash: None,
+        compute_selection: Some(request.compute_selection.clone()),
+        approval_hash: None,
         spec: None,
     };
     save_record(&state.repository, &record)?;
@@ -161,7 +348,7 @@ pub async fn agent_v4_start_planning(
     };
     let science_store = RepositoryScientificStateStoreV4 {
         repository: state.repository.clone(),
-        backend_id: format!("ssh:{}", project.connection_id),
+        backend_id: request.compute_selection.backend_id.clone(),
         mutation_lock: scientific_state_lock_v4(project.id),
     };
     let core = AgentCoreV4 {
@@ -188,21 +375,160 @@ pub async fn agent_v4_start_planning(
                 status: record.status,
                 plan: None,
                 plan_hash: None,
+                compute_selection: Some(request.compute_selection),
+                approval_hash: None,
             });
         }
         Err(error) => return Err(error.to_string()),
     };
     let hash = plan.canonical_hash().map_err(|error| error.to_string())?;
+    let approval_hash = RunSpecV4::approval_hash_for(
+        run_id,
+        request.project_id,
+        request.conversation_id,
+        request.model_profile_id,
+        &plan,
+        &request.compute_selection,
+    )
+    .map_err(|error| error.to_string())?;
     record.status = "awaiting_approval".into();
     record.plan = Some(plan.clone());
     record.plan_hash = Some(hash.clone());
+    record.approval_hash = Some(approval_hash.clone());
     save_record(&state.repository, &record)?;
     Ok(RunSummaryV4 {
         run_id,
         status: record.status,
         plan: Some(plan),
         plan_hash: Some(hash),
+        compute_selection: Some(request.compute_selection),
+        approval_hash: Some(approval_hash),
     })
+}
+
+#[tauri::command]
+pub async fn agent_v4_start_direct(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: StartDirectV4Request,
+) -> Result<RunSummaryV4, String> {
+    if request.objective.trim().is_empty() {
+        return Err("V4 direct objective is empty".into());
+    }
+    let project = workspace_project(&state.repository, request.project_id)?;
+    validate_compute_selection(&state, &project, &request.compute_selection).await?;
+    let (_model, tools) = compose(
+        &state,
+        &project,
+        &request.compute_selection,
+        request.model_profile_id,
+        Uuid::new_v4(),
+        None,
+    )
+    .await?;
+    let run_id = tools.run_id();
+    let capabilities = tools
+        .registry
+        .descriptors(omicsops_protocol::RunModeV4::Execute)
+        .into_iter()
+        .filter(|tool| !matches!(tool.id.as_str(), "agent.request_input" | "agent.complete"))
+        .map(|tool| tool.id)
+        .collect::<BTreeSet<_>>();
+    let messages = state
+        .repository
+        .messages_for_conversation(request.conversation_id)
+        .map_err(|error| error.to_string())?;
+    let conversation = serde_json::to_string(&messages).map_err(|error| error.to_string())?;
+    let (conversation, _) = bounded_excerpt(&conversation, 32 * 1024);
+    let plan = direct_execution_plan(request.objective.trim(), &conversation, capabilities);
+    let approval_hash = RunSpecV4::approval_hash_for(
+        run_id,
+        request.project_id,
+        request.conversation_id,
+        request.model_profile_id,
+        &plan,
+        &request.compute_selection,
+    )
+    .map_err(|error| error.to_string())?;
+    let spec = RunSpecV4::freeze_with_compute(
+        run_id,
+        request.project_id,
+        request.conversation_id,
+        request.model_profile_id,
+        plan.clone(),
+        request.compute_selection.clone(),
+        &approval_hash,
+        Utc::now(),
+    )
+    .map_err(|error| error.to_string())?;
+    let record = RunRecordV4 {
+        run_id,
+        project_id: request.project_id,
+        conversation_id: request.conversation_id,
+        model_profile_id: request.model_profile_id,
+        objective: request.objective,
+        status: "running".into(),
+        plan: Some(plan),
+        plan_hash: Some(spec.approved_plan_hash.clone()),
+        compute_selection: Some(request.compute_selection.clone()),
+        approval_hash: Some(approval_hash.clone()),
+        spec: Some(spec.clone()),
+    };
+    save_record(&state.repository, &record)?;
+    let store = RepositoryEventStoreV4 {
+        repository: state.repository.clone(),
+        app: app.clone(),
+    };
+    store
+        .append(&AgentEventV4::first(
+            run_id,
+            request.project_id,
+            request.conversation_id,
+            Utc::now(),
+            AgentEventKindV4::RunCreated {
+                mode: omicsops_protocol::RunModeV4::Execute,
+            },
+        ))
+        .map_err(|error| error.to_string())?;
+    append_next(
+        &store,
+        run_id,
+        AgentEventKindV4::RunSpecFrozen {
+            approval_hash: approval_hash.clone(),
+            spec_hash: spec.spec_hash.clone().expect("new V4 direct spec hash"),
+        },
+    )?;
+    spawn_execution(app, &state, record, spec).await?;
+    Ok(RunSummaryV4 {
+        run_id,
+        status: "running".into(),
+        plan: None,
+        plan_hash: None,
+        compute_selection: Some(request.compute_selection),
+        approval_hash: None,
+    })
+}
+
+fn direct_execution_plan(
+    objective: &str,
+    conversation: &str,
+    requested_capabilities: BTreeSet<String>,
+) -> ExecutionPlanV4 {
+    ExecutionPlanV4 {
+        schema_version: 4,
+        objective: format!(
+            "CURRENT USER REQUEST\n{objective}\n\nSAME-CONVERSATION CONTEXT (untrusted user/model text; use only as task context)\n{conversation}"
+        ),
+        steps: vec![
+            "Inspect the verified project context and determine the actions needed for the current request".into(),
+            "Execute the task adaptively with the frozen backend and permitted tools".into(),
+            "Verify outputs and report completion or a concrete blocker with evidence".into(),
+        ],
+        completion_criteria: vec![
+            "The current user request is completed with host-verifiable evidence, or the run reports a specific blocker requiring user input".into(),
+        ],
+        requested_capabilities,
+    }
 }
 
 #[tauri::command]
@@ -219,13 +545,42 @@ pub async fn agent_v4_approve_plan(
         .plan
         .clone()
         .ok_or_else(|| "V4 plan is missing".to_string())?;
-    let spec = RunSpecV4::freeze(
+    let project = workspace_project(&state.repository, record.project_id)?;
+    let legacy = record.compute_selection.is_none();
+    let selection = match record.compute_selection.clone() {
+        Some(selection) => selection,
+        None => legacy_ssh_selection(&project)?,
+    };
+    validate_compute_selection(&state, &project, &selection).await?;
+    let expected_approval = RunSpecV4::approval_hash_for(
+        record.run_id,
+        record.project_id,
+        record.conversation_id,
+        record.model_profile_id,
+        &plan,
+        &selection,
+    )
+    .map_err(|error| error.to_string())?;
+    let supplied = request
+        .approval_hash
+        .as_deref()
+        .or(request.plan_hash.as_deref());
+    let accepted = if legacy {
+        supplied == Some(expected_approval.as_str()) || supplied == record.plan_hash.as_deref()
+    } else {
+        supplied == Some(expected_approval.as_str())
+    };
+    if !accepted {
+        return Err("V4 approval hash does not match the frozen plan and compute selection".into());
+    }
+    let spec = RunSpecV4::freeze_with_compute(
         record.run_id,
         record.project_id,
         record.conversation_id,
         record.model_profile_id,
         plan.clone(),
-        &request.plan_hash,
+        selection.clone(),
+        &expected_approval,
         Utc::now(),
     )
     .map_err(|error| error.to_string())?;
@@ -237,7 +592,15 @@ pub async fn agent_v4_approve_plan(
         &store,
         record.run_id,
         AgentEventKindV4::PlanApproved {
-            plan_hash: request.plan_hash.clone(),
+            plan_hash: spec.approved_plan_hash.clone(),
+        },
+    )?;
+    append_next(
+        &store,
+        record.run_id,
+        AgentEventKindV4::RunSpecFrozen {
+            approval_hash: expected_approval.clone(),
+            spec_hash: spec.spec_hash.clone().expect("new V4 spec hash"),
         },
     )?;
     append_next(
@@ -248,14 +611,19 @@ pub async fn agent_v4_approve_plan(
         },
     )?;
     record.status = "running".into();
+    record.compute_selection = Some(selection.clone());
+    record.approval_hash = Some(expected_approval.clone());
     record.spec = Some(spec.clone());
     save_record(&state.repository, &record)?;
-    spawn_execution(app, &state, record.clone(), spec)?;
+    let approved_plan_hash = spec.approved_plan_hash.clone();
+    spawn_execution(app, &state, record.clone(), spec).await?;
     Ok(RunSummaryV4 {
         run_id: record.run_id,
         status: "running".into(),
         plan: Some(plan),
-        plan_hash: Some(request.plan_hash),
+        plan_hash: Some(approved_plan_hash),
+        compute_selection: Some(selection),
+        approval_hash: Some(expected_approval),
     })
 }
 
@@ -265,18 +633,30 @@ pub async fn agent_v4_resume(
     state: State<'_, AppState>,
     run_id: Uuid,
 ) -> Result<(), String> {
-    let record = load_record(&state.repository, run_id)?;
-    let Some(spec) = record.spec.clone() else {
-        let project = current_project_spec(&state.repository, record.project_id)?;
-        let (model, tools) =
-            compose(&state, &project, record.model_profile_id, record.run_id).await?;
+    let mut record = load_record(&state.repository, run_id)?;
+    let Some(mut spec) = record.spec.clone() else {
+        let project = workspace_project(&state.repository, record.project_id)?;
+        let selection = record
+            .compute_selection
+            .clone()
+            .unwrap_or(legacy_ssh_selection(&project)?);
+        validate_compute_selection(&state, &project, &selection).await?;
+        let (model, tools) = compose(
+            &state,
+            &project,
+            &selection,
+            record.model_profile_id,
+            record.run_id,
+            None,
+        )
+        .await?;
         let store = RepositoryEventStoreV4 {
             repository: state.repository.clone(),
             app: app.clone(),
         };
         let science_store = RepositoryScientificStateStoreV4 {
             repository: state.repository.clone(),
-            backend_id: format!("ssh:{}", project.connection_id),
+            backend_id: selection.backend_id.clone(),
             mutation_lock: scientific_state_lock_v4(project.id),
         };
         let core = AgentCoreV4 {
@@ -300,6 +680,18 @@ pub async fn agent_v4_resume(
                 updated.status = "awaiting_approval".into();
                 updated.plan = Some(plan);
                 updated.plan_hash = Some(hash);
+                updated.compute_selection = Some(selection.clone());
+                updated.approval_hash = Some(
+                    RunSpecV4::approval_hash_for(
+                        updated.run_id,
+                        updated.project_id,
+                        updated.conversation_id,
+                        updated.model_profile_id,
+                        updated.plan.as_ref().expect("plan was set"),
+                        &selection,
+                    )
+                    .map_err(|error| error.to_string())?,
+                );
                 save_record(&state.repository, &updated)?;
                 return Ok(());
             }
@@ -310,7 +702,49 @@ pub async fn agent_v4_resume(
     if matches!(record.status.as_str(), "completed" | "cancelled") {
         return Err("V4 run is terminal".into());
     }
-    spawn_execution(app, &state, record, spec)
+    if spec.compute_selection.is_none() {
+        let project = workspace_project(&state.repository, record.project_id)?;
+        let selection = legacy_ssh_selection(&project)?;
+        validate_compute_selection(&state, &project, &selection).await?;
+        let approval_hash = RunSpecV4::approval_hash_for(
+            spec.run_id,
+            spec.project_id,
+            spec.conversation_id,
+            spec.model_profile_id,
+            &spec.plan,
+            &selection,
+        )
+        .map_err(|error| error.to_string())?;
+        spec = RunSpecV4::freeze_with_compute(
+            spec.run_id,
+            spec.project_id,
+            spec.conversation_id,
+            spec.model_profile_id,
+            spec.plan,
+            selection.clone(),
+            &approval_hash,
+            spec.created_at,
+        )
+        .map_err(|error| error.to_string())?;
+        let store = RepositoryEventStoreV4 {
+            repository: state.repository.clone(),
+            app: app.clone(),
+        };
+        append_next(
+            &store,
+            record.run_id,
+            AgentEventKindV4::RunSpecFrozen {
+                approval_hash: approval_hash.clone(),
+                spec_hash: spec.spec_hash.clone().expect("upgraded V4 spec hash"),
+            },
+        )?;
+        record.compute_selection = Some(selection);
+        record.approval_hash = Some(approval_hash);
+        record.spec = Some(spec.clone());
+        save_record(&state.repository, &record)?;
+    }
+    validate_frozen_spec(&state.repository, &spec)?;
+    spawn_execution(app, &state, record, spec).await
 }
 
 #[tauri::command]
@@ -397,12 +831,42 @@ pub fn agent_v4_events(
         .map_err(|error| error.to_string())
 }
 
-fn spawn_execution(
+#[tauri::command]
+pub fn agent_v4_events_for_conversation(
+    state: State<'_, AppState>,
+    project_id: Uuid,
+    conversation_id: Uuid,
+) -> Result<Vec<AgentEventV4>, String> {
+    state
+        .repository
+        .agent_events_for_context_v4(project_id, conversation_id)
+        .map_err(|error| error.to_string())
+}
+
+async fn spawn_execution(
     app: AppHandle,
     state: &AppState,
     mut record: RunRecordV4,
     spec: RunSpecV4,
 ) -> Result<(), String> {
+    spec.validate_integrity()
+        .map_err(|error| error.to_string())?;
+    validate_frozen_spec(&state.repository, &spec)?;
+    let selection = spec
+        .compute_selection
+        .clone()
+        .ok_or("V4 execution spec is missing a compute selection")?;
+    let project = workspace_project(&state.repository, spec.project_id)?;
+    validate_compute_selection(state, &project, &selection).await?;
+    let (model, tools) = compose(
+        state,
+        &project,
+        &selection,
+        spec.model_profile_id,
+        spec.run_id,
+        Some(&spec.plan.requested_capabilities),
+    )
+    .await?;
     let cancelled = Arc::new(AtomicBool::new(false));
     if state
         .active_runs
@@ -415,57 +879,20 @@ fn spawn_execution(
     }
     let repository = state.repository.clone();
     let active = state.active_runs.clone();
-    let project = current_project_spec(&repository, spec.project_id)?;
-    let profile = find_profile(&repository, project.connection_id)?;
-    require_trusted_host(&profile)?;
-    let authentication = authentication_for_profile(state, &profile)?;
-    let model = unified_model_client(state, spec.model_profile_id)?;
     tauri::async_runtime::spawn(async move {
         let outcome = async {
-            let session = Arc::new(
-                SshSession::connect(&profile, authentication)
-                    .await
-                    .map_err(|error| error.to_string())?,
-            );
-            let root = resolve_root(&session, &project.remote_root).await?;
-            let prompt =
-                load_prompt_layers(&session, &root, &format!("ssh:{}", profile.id)).await?;
-            let backend = Arc::new(SshKernelBackendV4 {
-                session: session.clone(),
-                root: root.clone(),
-                project_id: project.id,
-                backend_id: format!("ssh:{}", profile.id),
-            });
-            let runtime = Arc::new(RuntimeManagerV4::new(backend));
-            let executor = Arc::new(DesktopToolExecutorV4 {
-                repository: repository.clone(),
-                session,
-                root,
-                project_id: project.id,
-                run_id: spec.run_id,
-                backend_id: format!("ssh:{}", profile.id),
-                runtime,
-            });
-            let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), executor)
-                .map_err(|error| error.to_string())?
-                .with_side_effect_lock(project_side_effect_lock_v4(project.id))
-                .with_execute_capabilities(spec.plan.requested_capabilities.clone());
-            let model = DesktopModelPortV4 {
-                client: model,
-                prompt,
-            };
             let store = RepositoryEventStoreV4 {
                 repository: repository.clone(),
                 app: app.clone(),
             };
             let science_store = RepositoryScientificStateStoreV4 {
                 repository: repository.clone(),
-                backend_id: format!("ssh:{}", profile.id),
+                backend_id: selection.backend_id.clone(),
                 mutation_lock: scientific_state_lock_v4(project.id),
             };
             AgentCoreV4 {
-                model: &model,
-                tools: &registry,
+                model: model.as_ref(),
+                tools: tools.registry.as_ref(),
                 events: &store,
                 science: Some(&science_store),
             }
@@ -542,47 +969,138 @@ impl ComposedToolsV4 {
 
 async fn compose(
     state: &AppState,
-    project: &ProjectSpec,
+    project: &Project,
+    selection: &ComputeSelectionV4,
     model_profile_id: Uuid,
     run_id: Uuid,
+    execute_capabilities: Option<&BTreeSet<String>>,
 ) -> Result<(Arc<DesktopModelPortV4>, ComposedToolsV4), String> {
-    let profile = find_profile(&state.repository, project.connection_id)?;
-    require_trusted_host(&profile)?;
-    let auth = authentication_for_profile(state, &profile)?;
-    let session = Arc::new(
-        SshSession::connect(&profile, auth)
-            .await
-            .map_err(|error| error.to_string())?,
-    );
-    let root = resolve_root(&session, &project.remote_root).await?;
-    let prompt = load_prompt_layers(&session, &root, &format!("ssh:{}", profile.id)).await?;
-    let backend = Arc::new(SshKernelBackendV4 {
-        session: session.clone(),
-        root: root.clone(),
-        project_id: project.id,
-        backend_id: format!("ssh:{}", profile.id),
-    });
+    let (filesystem, environment_port, backend): (
+        Arc<dyn ProjectFilesystemPortV4>,
+        Arc<dyn RuntimeEnvironmentPortV4>,
+        Arc<dyn KernelBackendV4>,
+    ) = match selection.backend_kind {
+        ComputeBackendKindV4::Ssh => {
+            let connection_id = project
+                .connection_id
+                .ok_or("project has no remote connection")?;
+            if selection.backend_id != format!("ssh:{connection_id}") {
+                return Err("frozen SSH backend does not match the project binding".into());
+            }
+            let profile = find_profile(&state.repository, connection_id)?;
+            require_trusted_host(&profile)?;
+            let auth = authentication_for_profile(state, &profile)?;
+            let session = Arc::new(
+                SshSession::connect(&profile, auth)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            );
+            session
+                .execute_checked(
+                    "if command -v python >/dev/null || command -v Rscript >/dev/null; then :; else printf 'SSH V4 backend requires Python or R\\n' >&2; exit 69; fi",
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let configured_root = project
+                .remote_root
+                .as_deref()
+                .ok_or("project has no remote root")?;
+            let root = resolve_root(&session, configured_root).await?;
+            (
+                Arc::new(SshProjectFilesystemV4 {
+                    session: session.clone(),
+                    root: root.clone(),
+                }),
+                Arc::new(SshEnvironmentPortV4 {
+                    session: session.clone(),
+                    root: root.clone(),
+                }),
+                Arc::new(SshKernelBackendV4 {
+                    session,
+                    root,
+                    project_id: project.id,
+                    backend_id: selection.backend_id.clone(),
+                }),
+            )
+        }
+        ComputeBackendKindV4::Local => {
+            let filesystem = Arc::new(LocalProjectFilesystemV4::new(&project.local_root)?);
+            let backend = Arc::new(LocalKernelBackendV4::new(&project.local_root)?);
+            (filesystem, Arc::new(LocalEnvironmentPortV4), backend)
+        }
+        ComputeBackendKindV4::Docker | ComputeBackendKindV4::Podman => {
+            let image = selection
+                .container_image
+                .as_ref()
+                .ok_or("container image is missing")?;
+            let filesystem = Arc::new(LocalProjectFilesystemV4::new(&project.local_root)?);
+            let backend: Arc<dyn KernelBackendV4> = match selection.backend_kind {
+                ComputeBackendKindV4::Docker => Arc::new(ContainerKernelBackendV4::docker(
+                    &project.local_root,
+                    &image.image_id,
+                )?),
+                ComputeBackendKindV4::Podman => Arc::new(ContainerKernelBackendV4::podman(
+                    &project.local_root,
+                    &image.image_id,
+                )?),
+                _ => unreachable!(),
+            };
+            (
+                filesystem,
+                Arc::new(ContainerEnvironmentPortV4 {
+                    program: match selection.backend_kind {
+                        ComputeBackendKindV4::Docker => "docker".into(),
+                        ComputeBackendKindV4::Podman => "podman".into(),
+                        _ => unreachable!(),
+                    },
+                    image_id: image.image_id.clone(),
+                }),
+                backend,
+            )
+        }
+    };
+    let descriptor = backend.descriptor();
+    if descriptor.backend_id != selection.backend_id
+        || descriptor.kind != selection.backend_kind
+        || !descriptor.permits(selection.autonomy_mode)
+    {
+        return Err(
+            "frozen compute selection does not match the runtime backend descriptor".into(),
+        );
+    }
+    let mut prompt = filesystem.prompt_layers(&selection.backend_id).await?;
+    prompt.environment.push_str(&format!(
+        "; frozen_environment={}; autonomy={:?}; network_policy={:?}; every runtime call must use the frozen environment",
+        selection.environment, selection.autonomy_mode, selection.network_policy
+    ));
     let runtime = Arc::new(RuntimeManagerV4::new(backend));
     let executor = Arc::new(DesktopToolExecutorV4 {
         repository: state.repository.clone(),
-        session,
-        root,
+        filesystem,
+        environment_port,
+        selection: selection.clone(),
         project_id: project.id,
         run_id,
-        backend_id: format!("ssh:{}", profile.id),
+        backend_id: selection.backend_id.clone(),
         runtime,
     });
-    let registry = Arc::new(
-        ToolRegistryV4::new(builtin_tool_definitions_v4(), executor)
-            .map_err(|error| error.to_string())?
-            .with_side_effect_lock(project_side_effect_lock_v4(project.id)),
-    );
+    let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), executor)
+        .map_err(|error| error.to_string())?
+        .with_side_effect_lock(project_side_effect_lock_v4(project.id));
+    let registry = if let Some(capabilities) = execute_capabilities {
+        registry.with_execute_capabilities(capabilities.clone())
+    } else {
+        registry
+    };
     Ok((
         Arc::new(DesktopModelPortV4 {
             client: unified_model_client(state, model_profile_id)?,
             prompt,
         }),
-        ComposedToolsV4 { run_id, registry },
+        ComposedToolsV4 {
+            run_id,
+            registry: Arc::new(registry),
+        },
     ))
 }
 
@@ -757,10 +1275,355 @@ fn classify_model_failure(message: &str) -> ModelFailureV4 {
     }
 }
 
-struct DesktopToolExecutorV4 {
-    repository: Repository,
+#[derive(Debug, Clone)]
+struct VerifiedProjectFileV4 {
+    size_bytes: u64,
+    sha256: String,
+}
+
+#[async_trait]
+trait ProjectFilesystemPortV4: Send + Sync {
+    async fn list(&self, path: &str) -> Result<String, String>;
+    async fn read(&self, path: &str) -> Result<String, String>;
+    async fn verify_file(&self, path: &str) -> Result<VerifiedProjectFileV4, String>;
+    async fn prompt_layers(&self, backend_id: &str) -> Result<PromptLayersV4, String>;
+}
+
+#[async_trait]
+trait RuntimeEnvironmentPortV4: Send + Sync {
+    async fn software_versions(
+        &self,
+        language: KernelLanguageV4,
+        environment: &str,
+        requirements: Vec<String>,
+    ) -> Result<BTreeMap<String, String>, String>;
+    async fn ensure(&self, language: KernelLanguageV4, environment: &str)
+    -> Result<String, String>;
+}
+
+struct LocalProjectFilesystemV4 {
+    root: PathBuf,
+}
+
+impl LocalProjectFilesystemV4 {
+    fn new(root: impl AsRef<Path>) -> Result<Self, String> {
+        Ok(Self {
+            root: std::fs::canonicalize(root).map_err(|error| error.to_string())?,
+        })
+    }
+
+    fn resolve_existing(&self, relative: &str) -> Result<PathBuf, String> {
+        if Path::new(relative).is_absolute() {
+            return Err("project path must be relative".into());
+        }
+        let candidate = self.root.join(relative);
+        let candidate_metadata =
+            std::fs::symlink_metadata(&candidate).map_err(|error| error.to_string())?;
+        if candidate_metadata.file_type().is_symlink() {
+            return Err("project path cannot be a symbolic link".into());
+        }
+        let path = std::fs::canonicalize(candidate).map_err(|error| error.to_string())?;
+        if !path.starts_with(&self.root) {
+            return Err("project path escaped the canonical project root".into());
+        }
+        Ok(path)
+    }
+
+    fn read_optional(&self, relative: &str) -> Result<String, String> {
+        let path = self.root.join(relative);
+        if !path.exists() {
+            return Ok(String::new());
+        }
+        let path = self.resolve_existing(relative)?;
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "project rules path is not a regular file: {relative}"
+            ));
+        }
+        let content = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+        Ok(bounded_excerpt(&content, 32 * 1024).0)
+    }
+}
+
+#[async_trait]
+impl ProjectFilesystemPortV4 for LocalProjectFilesystemV4 {
+    async fn list(&self, path: &str) -> Result<String, String> {
+        let start = self.resolve_existing(path)?;
+        if !start.is_dir() {
+            return Err("project list target is not a directory".into());
+        }
+        let mut rows = Vec::new();
+        let mut pending = vec![(start, 0usize)];
+        while let Some((directory, depth)) = pending.pop() {
+            let entries = std::fs::read_dir(&directory).map_err(|error| error.to_string())?;
+            for entry in entries {
+                let entry = entry.map_err(|error| error.to_string())?;
+                let entry_path = entry.path();
+                let metadata =
+                    std::fs::symlink_metadata(&entry_path).map_err(|error| error.to_string())?;
+                let relative = entry_path
+                    .strip_prefix(&self.root)
+                    .map_err(|_| "project listing escaped root")?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                rows.push(format!(
+                    "{}\t{}\t{}",
+                    if metadata.is_dir() { "d" } else { "f" },
+                    metadata.len(),
+                    relative
+                ));
+                if metadata.is_dir() && depth < 1 && rows.len() < 400 {
+                    pending.push((entry_path, depth + 1));
+                }
+                if rows.len() >= 400 {
+                    break;
+                }
+            }
+            if rows.len() >= 400 {
+                break;
+            }
+        }
+        rows.sort();
+        Ok(rows.join("\n"))
+    }
+
+    async fn read(&self, path: &str) -> Result<String, String> {
+        let path = self.resolve_existing(path)?;
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err("project read target is not a regular file".into());
+        }
+        let content = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+        Ok(content.lines().take(400).collect::<Vec<_>>().join("\n"))
+    }
+
+    async fn verify_file(&self, path: &str) -> Result<VerifiedProjectFileV4, String> {
+        let path = self.resolve_existing(path)?;
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err("verified path is not a regular file".into());
+        }
+        let mut file = File::open(path).map_err(|error| error.to_string())?;
+        let mut digest = sha2::Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        Ok(VerifiedProjectFileV4 {
+            size_bytes: metadata.len(),
+            sha256: hex::encode(digest.finalize()),
+        })
+    }
+
+    async fn prompt_layers(&self, backend_id: &str) -> Result<PromptLayersV4, String> {
+        let agents = self.read_optional("AGENTS.md")?;
+        let override_rules = self.read_optional(".omicsops/AGENT.md")?;
+        let mut layers = PromptLayersV4::default();
+        layers.project_rules = project_rules_layer(&agents, &override_rules);
+        layers.environment = format!(
+            "backend={backend_id}; persistent Python/R kernels; project-relative paths only; credentials remain Host references"
+        );
+        Ok(layers)
+    }
+}
+
+struct SshProjectFilesystemV4 {
     session: Arc<SshSession>,
     root: String,
+}
+
+impl SshProjectFilesystemV4 {
+    async fn resolve_existing(&self, path: &str) -> Result<String, String> {
+        let remote = project_path(&self.root, path)?;
+        let output = self
+            .session
+            .execute_checked(&format!("realpath -- {}", shell_quote(&remote)))
+            .await
+            .map_err(|error| error.to_string())?;
+        let resolved = output.stdout.trim();
+        if resolved == self.root.trim_end_matches('/') {
+            return Ok(resolved.to_owned());
+        }
+        require_remote_descendant(&self.root, resolved).map_err(|error| error.to_string())?;
+        Ok(resolved.to_owned())
+    }
+}
+
+#[async_trait]
+impl ProjectFilesystemPortV4 for SshProjectFilesystemV4 {
+    async fn list(&self, path: &str) -> Result<String, String> {
+        let remote = self.resolve_existing(path).await?;
+        let output = self
+            .session
+            .execute_checked(&format!(
+                "find {} -maxdepth 2 -printf '%y\\t%s\\t%p\\n' | head -400",
+                shell_quote(&remote)
+            ))
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(relative_listing(&output.stdout, &self.root))
+    }
+
+    async fn read(&self, path: &str) -> Result<String, String> {
+        let raw = project_path(&self.root, path)?;
+        let remote = self.resolve_existing(path).await?;
+        self.session
+            .execute_checked(&format!(
+                "test ! -L {0} && test -f {1} && sed -n '1,400p' {1}",
+                shell_quote(&raw),
+                shell_quote(&remote),
+            ))
+            .await
+            .map(|output| output.stdout)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn verify_file(&self, path: &str) -> Result<VerifiedProjectFileV4, String> {
+        let raw = project_path(&self.root, path)?;
+        let remote = self.resolve_existing(path).await?;
+        let output = self
+            .session
+            .execute_checked(&format!(
+                "test ! -L {0} && test -f {1} && stat -c '%s' {1} && sha256sum {1}",
+                shell_quote(&raw),
+                shell_quote(&remote),
+            ))
+            .await
+            .map_err(|error| error.to_string())?;
+        verified_file_from_output(&output.stdout)
+    }
+
+    async fn prompt_layers(&self, backend_id: &str) -> Result<PromptLayersV4, String> {
+        load_prompt_layers(&self.session, &self.root, backend_id).await
+    }
+}
+
+struct LocalEnvironmentPortV4;
+
+#[async_trait]
+impl RuntimeEnvironmentPortV4 for LocalEnvironmentPortV4 {
+    async fn software_versions(
+        &self,
+        language: KernelLanguageV4,
+        environment: &str,
+        requirements: Vec<String>,
+    ) -> Result<BTreeMap<String, String>, String> {
+        if environment != "system" {
+            return Err("local backend only supports the system environment".into());
+        }
+        software_versions_from_command(language, None, requirements).await
+    }
+
+    async fn ensure(&self, _: KernelLanguageV4, _: &str) -> Result<String, String> {
+        Err("local and container environments are immutable in V4".into())
+    }
+}
+
+struct ContainerEnvironmentPortV4 {
+    program: String,
+    image_id: String,
+}
+
+#[async_trait]
+impl RuntimeEnvironmentPortV4 for ContainerEnvironmentPortV4 {
+    async fn software_versions(
+        &self,
+        language: KernelLanguageV4,
+        environment: &str,
+        requirements: Vec<String>,
+    ) -> Result<BTreeMap<String, String>, String> {
+        if environment != "system" {
+            return Err("container environment is frozen in the image".into());
+        }
+        let (executable, flag, code) = software_version_program(language, &requirements)?;
+        let output = Command::new(&self.program)
+            .args([
+                "run",
+                "--rm",
+                "--read-only",
+                "--cap-drop=ALL",
+                "--security-opt=no-new-privileges",
+                "--pids-limit=64",
+                "--network",
+                "none",
+                &self.image_id,
+                executable,
+                flag,
+                &code,
+            ])
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        Ok(parse_software_versions(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
+    }
+
+    async fn ensure(&self, _: KernelLanguageV4, _: &str) -> Result<String, String> {
+        Err("container environments are frozen in the selected image".into())
+    }
+}
+
+struct SshEnvironmentPortV4 {
+    session: Arc<SshSession>,
+    root: String,
+}
+
+#[async_trait]
+impl RuntimeEnvironmentPortV4 for SshEnvironmentPortV4 {
+    async fn software_versions(
+        &self,
+        language: KernelLanguageV4,
+        environment: &str,
+        requirements: Vec<String>,
+    ) -> Result<BTreeMap<String, String>, String> {
+        let prefix = (environment != "system").then(|| environment_path(&self.root, environment));
+        let command = software_version_command(language, prefix.as_deref(), &requirements)?;
+        let output = self
+            .session
+            .execute_checked(&command)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(parse_software_versions(&output.stdout))
+    }
+
+    async fn ensure(
+        &self,
+        language: KernelLanguageV4,
+        environment: &str,
+    ) -> Result<String, String> {
+        if environment == "system" {
+            return Err("system environment cannot be created or changed".into());
+        }
+        let prefix = environment_path(&self.root, environment);
+        let packages = match language {
+            KernelLanguageV4::Python => "python",
+            KernelLanguageV4::R => "r-base r-jsonlite",
+        };
+        let output = self.session.execute_checked(&format!(
+            "prefix={0}; mkdir -p {1}; if test -d \"$prefix/conda-meta\"; then printf 'reused %s\\n' \"$prefix\"; else tool=$(command -v micromamba) || {{ printf 'micromamba is required\\n' >&2; exit 69; }}; \"$tool\" create --yes --prefix \"$prefix\" {2}; fi; \"${{tool:-$(command -v micromamba)}}\" list --prefix \"$prefix\" --explicit",
+            shell_quote(&prefix),
+            shell_quote(&format!("{}/.omicsops/environments", self.root.trim_end_matches('/'))),
+            packages,
+        )).await.map_err(|error| error.to_string())?;
+        Ok(bounded_excerpt(&output.stdout, 16 * 1024).0)
+    }
+}
+
+struct DesktopToolExecutorV4 {
+    repository: Repository,
+    filesystem: Arc<dyn ProjectFilesystemPortV4>,
+    environment_port: Arc<dyn RuntimeEnvironmentPortV4>,
+    selection: ComputeSelectionV4,
     project_id: Uuid,
     run_id: Uuid,
     backend_id: String,
@@ -774,6 +1637,12 @@ impl DesktopToolExecutorV4 {
         environment: &str,
     ) -> Result<ExecutionContextKeyV4, String> {
         validate_environment_name(environment)?;
+        if environment != self.selection.environment {
+            return Err(format!(
+                "runtime environment {environment} does not match frozen selection {}",
+                self.selection.environment
+            ));
+        }
         Ok(ExecutionContextKeyV4 {
             project_id: self.project_id,
             run_id: self.run_id,
@@ -797,44 +1666,12 @@ impl DesktopToolExecutorV4 {
                         character.is_ascii_alphanumeric() || "._-".contains(character)
                     })
             })
+            .map(str::to_owned)
             .collect::<Vec<_>>();
-        let executable_prefix = if environment == "system" {
-            String::new()
-        } else {
-            format!(
-                "micromamba run --prefix {} ",
-                shell_quote(&environment_path(&self.root, environment))
-            )
-        };
-        let command = match language {
-            KernelLanguageV4::Python => {
-                let names = serde_json::to_string(&requirements).unwrap_or_else(|_| "[]".into());
-                let code = format!(
-                    "import importlib.metadata as m,platform\nnames={names}\nprint('python\\t'+platform.python_version())\nfor n in names:\n try: print(n+'\\t'+m.version(n))\n except m.PackageNotFoundError: pass"
-                );
-                format!("{executable_prefix}python -c {}", shell_quote(&code))
-            }
-            KernelLanguageV4::R => {
-                let names = requirements
-                    .iter()
-                    .map(|name| serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into()))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let code = format!(
-                    "cat('R\\t',R.version.string,'\\n',sep=''); for (n in c({names})) if (requireNamespace(n,quietly=TRUE)) cat(n,'\\t',as.character(packageVersion(n)),'\\n',sep='')"
-                );
-                format!("{executable_prefix}Rscript -e {}", shell_quote(&code))
-            }
-        };
-        let Ok(output) = self.session.execute_checked(&command).await else {
-            return BTreeMap::new();
-        };
-        output
-            .stdout
-            .lines()
-            .filter_map(|line| line.split_once('\t'))
-            .map(|(name, version)| (name.to_owned(), version.trim().to_owned()))
-            .collect()
+        self.environment_port
+            .software_versions(language, environment, requirements)
+            .await
+            .unwrap_or_default()
     }
 
     fn skill_documents(&self) -> Result<Vec<SkillDocumentV4>, String> {
@@ -939,36 +1776,18 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                     .get("path")
                     .and_then(Value::as_str)
                     .unwrap_or(".");
-                let remote = project_path(&self.root, path)?;
-                let out = self
-                    .session
-                    .execute_checked(&format!(
-                        "find {} -maxdepth 2 -printf '%y\\t%s\\t%p\\n' | head -400",
-                        shell_quote(&remote)
-                    ))
-                    .await
-                    .map_err(|e| e.to_string())?;
                 (
-                    relative_listing(&out.stdout, &self.root),
+                    self.filesystem.list(path).await?,
                     json!({"path":path}),
-                    vec![format!("remote:{path}")],
+                    vec![format!("project:{path}")],
                 )
             }
             "project.read" => {
                 let path = required(&call.arguments, "path")?;
-                let remote = project_path(&self.root, path)?;
-                let out = self
-                    .session
-                    .execute_checked(&format!(
-                        "test -f {0} && sed -n '1,400p' {0}",
-                        shell_quote(&remote)
-                    ))
-                    .await
-                    .map_err(|e| e.to_string())?;
                 (
-                    out.stdout,
+                    self.filesystem.read(path).await?,
                     json!({"path":path}),
-                    vec![format!("remote:{path}")],
+                    vec![format!("project:{path}")],
                 )
             }
             "search_skills" => {
@@ -1159,28 +1978,13 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                 let language = parse_language(required(&call.arguments, "language")?)?;
                 let environment = required(&call.arguments, "environment")?;
                 validate_environment_name(environment)?;
-                if environment == "system" {
-                    return Err("system environment cannot be created or changed".into());
+                if environment != self.selection.environment {
+                    return Err("environment ensure does not match the frozen selection".into());
                 }
-                let prefix = environment_path(&self.root, environment);
-                let packages = match language {
-                    KernelLanguageV4::Python => "python",
-                    KernelLanguageV4::R => "r-base r-jsonlite",
-                };
-                let out = self
-                    .session
-                    .execute_checked(&format!(
-                        "prefix={0}; mkdir -p {1}; if test -d \"$prefix/conda-meta\"; then printf 'reused %s\\n' \"$prefix\"; else tool=$(command -v micromamba) || {{ printf 'micromamba is required\\n' >&2; exit 69; }}; \"$tool\" create --yes --prefix \"$prefix\" {2}; fi; \"${{tool:-$(command -v micromamba)}}\" list --prefix \"$prefix\" --explicit",
-                        shell_quote(&prefix),
-                        shell_quote(&format!("{}/.omicsops/environments", self.root.trim_end_matches('/'))),
-                        packages,
-                    ))
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let (excerpt, _) = bounded_excerpt(&out.stdout, 16 * 1024);
+                let excerpt = self.environment_port.ensure(language, environment).await?;
                 (
                     excerpt,
-                    json!({"environment":environment,"prefix":prefix,"language":language}),
+                    json!({"environment":environment,"language":language}),
                     vec![format!("environment:{environment}")],
                 )
             }
@@ -1220,29 +2024,13 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
             }
             "science.register_dataset" => {
                 let path = required(&call.arguments, "path")?;
-                let remote = project_path(&self.root, path)?;
-                let out = self
-                    .session
-                    .execute_checked(&format!(
-                        "test -f {0} && stat -c '%s' {0} && sha256sum {0}",
-                        shell_quote(&remote)
-                    ))
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let mut lines = out.stdout.lines();
-                let size = lines
-                    .next()
-                    .ok_or("missing dataset size")?
-                    .parse::<u64>()
-                    .map_err(|_| "invalid dataset size")?;
-                let hash = lines
-                    .next()
-                    .and_then(|line| line.split_whitespace().next())
-                    .ok_or("missing dataset hash")?;
+                let verified = self.filesystem.verify_file(path).await?;
+                let size = verified.size_bytes;
+                let hash = verified.sha256;
                 let data = json!({
                     "path": path,
                     "size_bytes": size,
-                    "sha256": hash,
+                    "sha256": &hash,
                     "modality": call.arguments.get("modality"),
                     "species": call.arguments.get("species"),
                     "sample_ids": call.arguments.get("sample_ids"),
@@ -1262,28 +2050,12 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
             ),
             "artifact.verify" => {
                 let path = required(&call.arguments, "path")?;
-                let remote = project_path(&self.root, path)?;
-                let out = self
-                    .session
-                    .execute_checked(&format!(
-                        "test -f {0} && stat -c '%s' {0} && sha256sum {0}",
-                        shell_quote(&remote)
-                    ))
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let mut lines = out.stdout.lines();
-                let size = lines
-                    .next()
-                    .ok_or("missing size")?
-                    .parse::<u64>()
-                    .map_err(|_| "invalid size")?;
-                let hash = lines
-                    .next()
-                    .and_then(|v| v.split_whitespace().next())
-                    .ok_or("missing hash")?;
+                let verified = self.filesystem.verify_file(path).await?;
+                let size = verified.size_bytes;
+                let hash = verified.sha256;
                 (
                     format!("verified {path}: {size} bytes sha256={hash}"),
-                    json!({"path":path,"size_bytes":size,"sha256":hash}),
+                    json!({"path":path,"size_bytes":size,"sha256":&hash}),
                     vec![format!("sha256:{hash}")],
                 )
             }
@@ -1824,6 +2596,256 @@ fn load_record(repository: &Repository, run_id: Uuid) -> Result<RunRecordV4, Str
     )
     .map_err(|e| e.to_string())
 }
+
+fn workspace_project(repository: &Repository, project_id: Uuid) -> Result<Project, String> {
+    repository
+        .get_project(project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project does not exist".to_string())
+}
+
+fn legacy_ssh_selection(project: &Project) -> Result<ComputeSelectionV4, String> {
+    let connection_id = project
+        .connection_id
+        .ok_or("legacy V4 run has no SSH project binding")?;
+    Ok(ComputeSelectionV4 {
+        schema_version: 4,
+        backend_id: format!("ssh:{connection_id}"),
+        backend_kind: ComputeBackendKindV4::Ssh,
+        autonomy_mode: AutonomyModeV4::Supervised,
+        environment: "system".into(),
+        network_policy: NetworkPolicyV4::HostInherited,
+        container_image: None,
+    })
+}
+
+async fn program_available(program: &str) -> bool {
+    Command::new(program)
+        .arg("--version")
+        .kill_on_drop(true)
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+}
+
+async fn inspect_container_image(program: &str, image: &str) -> (Option<String>, Option<String>) {
+    if image.trim().is_empty() || image.chars().any(char::is_whitespace) {
+        return (None, Some("container image reference is invalid".into()));
+    }
+    match Command::new(program)
+        .args(container_image_inspect_args(image))
+        .kill_on_drop(true)
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            let id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if id.is_empty() {
+                (
+                    None,
+                    Some("container image inspect returned no image ID".into()),
+                )
+            } else {
+                (Some(id), None)
+            }
+        }
+        Ok(output) => (
+            None,
+            Some(format!(
+                "container image is not available locally: {}",
+                bounded_excerpt(&String::from_utf8_lossy(&output.stderr), 2048)
+                    .0
+                    .trim()
+            )),
+        ),
+        Err(error) => (
+            None,
+            Some(format!("container engine probe failed: {error}")),
+        ),
+    }
+}
+
+fn container_image_inspect_args(image: &str) -> [&str; 5] {
+    ["image", "inspect", "--format", "{{.Id}}", image]
+}
+
+async fn validate_compute_selection(
+    state: &AppState,
+    project: &Project,
+    selection: &ComputeSelectionV4,
+) -> Result<(), String> {
+    selection.validate().map_err(|error| error.to_string())?;
+    match selection.backend_kind {
+        ComputeBackendKindV4::Local => {
+            std::fs::canonicalize(&project.local_root)
+                .map_err(|error| format!("local project root is unavailable: {error}"))?;
+            if !program_available("python").await && !program_available("Rscript").await {
+                return Err("local backend requires Python or R".into());
+            }
+        }
+        ComputeBackendKindV4::Ssh => {
+            let connection_id = project
+                .connection_id
+                .ok_or("project has no remote connection")?;
+            if selection.backend_id != format!("ssh:{connection_id}") {
+                return Err("SSH selection does not match the project's trusted binding".into());
+            }
+            let profile = find_profile(&state.repository, connection_id)?;
+            require_trusted_host(&profile)?;
+            if project.remote_root.is_none() {
+                return Err("project has no remote root".into());
+            }
+        }
+        ComputeBackendKindV4::Docker | ComputeBackendKindV4::Podman => {
+            let image = selection
+                .container_image
+                .as_ref()
+                .ok_or("container image is missing")?;
+            let program = if selection.backend_kind == ComputeBackendKindV4::Docker {
+                "docker"
+            } else {
+                "podman"
+            };
+            let (actual, error) = inspect_container_image(program, &image.reference).await;
+            if actual.as_deref() != Some(image.image_id.as_str()) {
+                return Err(error.unwrap_or_else(|| {
+                    "container image tag no longer resolves to the frozen image ID".into()
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_frozen_spec(repository: &Repository, spec: &RunSpecV4) -> Result<(), String> {
+    spec.validate_integrity()
+        .map_err(|error| error.to_string())?;
+    let expected = spec.spec_hash.as_deref().ok_or("V4 spec hash is missing")?;
+    let anchored = repository
+        .agent_events_v4(spec.run_id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .rev()
+        .find_map(|event| match event.event {
+            AgentEventKindV4::RunSpecFrozen { spec_hash, .. } => Some(spec_hash),
+            _ => None,
+        })
+        .ok_or("V4 spec hash is not anchored in the event chain")?;
+    if anchored != expected {
+        return Err("V4 spec differs from the event-chain approval anchor".into());
+    }
+    Ok(())
+}
+
+fn verified_file_from_output(output: &str) -> Result<VerifiedProjectFileV4, String> {
+    let mut lines = output.lines();
+    let size_bytes = lines
+        .next()
+        .ok_or("missing verified file size")?
+        .parse::<u64>()
+        .map_err(|_| "invalid verified file size")?;
+    let sha256 = lines
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .ok_or("missing verified file hash")?
+        .to_owned();
+    Ok(VerifiedProjectFileV4 { size_bytes, sha256 })
+}
+
+fn software_version_program(
+    language: KernelLanguageV4,
+    requirements: &[String],
+) -> Result<(&'static str, &'static str, String), String> {
+    match language {
+        KernelLanguageV4::Python => {
+            let names = serde_json::to_string(requirements).map_err(|error| error.to_string())?;
+            Ok((
+                "python",
+                "-c",
+                format!(
+                    "import importlib.metadata as m,platform\nnames={names}\nprint('python\\t'+platform.python_version())\nfor n in names:\n try: print(n+'\\t'+m.version(n))\n except m.PackageNotFoundError: pass"
+                ),
+            ))
+        }
+        KernelLanguageV4::R => {
+            let names = requirements
+                .iter()
+                .map(|name| serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into()))
+                .collect::<Vec<_>>()
+                .join(",");
+            Ok((
+                "Rscript",
+                "-e",
+                format!(
+                    "cat('R\\t',R.version.string,'\\n',sep=''); for (n in c({names})) if (requireNamespace(n,quietly=TRUE)) cat(n,'\\t',as.character(packageVersion(n)),'\\n',sep='')"
+                ),
+            ))
+        }
+    }
+}
+
+fn software_version_command(
+    language: KernelLanguageV4,
+    environment_prefix: Option<&str>,
+    requirements: &[String],
+) -> Result<String, String> {
+    let executable_prefix = environment_prefix
+        .map(|prefix| format!("micromamba run --prefix {} ", shell_quote(prefix)))
+        .unwrap_or_default();
+    match language {
+        KernelLanguageV4::Python => {
+            let names = serde_json::to_string(requirements).map_err(|error| error.to_string())?;
+            let code = format!(
+                "import importlib.metadata as m,platform\nnames={names}\nprint('python\\t'+platform.python_version())\nfor n in names:\n try: print(n+'\\t'+m.version(n))\n except m.PackageNotFoundError: pass"
+            );
+            Ok(format!(
+                "{executable_prefix}python -c {}",
+                shell_quote(&code)
+            ))
+        }
+        KernelLanguageV4::R => {
+            let names = requirements
+                .iter()
+                .map(|name| serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into()))
+                .collect::<Vec<_>>()
+                .join(",");
+            let code = format!(
+                "cat('R\\t',R.version.string,'\\n',sep=''); for (n in c({names})) if (requireNamespace(n,quietly=TRUE)) cat(n,'\\t',as.character(packageVersion(n)),'\\n',sep='')"
+            );
+            Ok(format!(
+                "{executable_prefix}Rscript -e {}",
+                shell_quote(&code)
+            ))
+        }
+    }
+}
+
+async fn software_versions_from_command(
+    language: KernelLanguageV4,
+    _: Option<&str>,
+    requirements: Vec<String>,
+) -> Result<BTreeMap<String, String>, String> {
+    let (program, flag, code) = software_version_program(language, &requirements)?;
+    let output = Command::new(program)
+        .args([flag, &code])
+        .output()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+    }
+    Ok(parse_software_versions(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn parse_software_versions(output: &str) -> BTreeMap<String, String> {
+    output
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(name, version)| (name.to_owned(), version.trim().to_owned()))
+        .collect()
+}
 async fn resolve_root(session: &SshSession, configured: &str) -> Result<String, String> {
     let out = session
         .execute_checked(&format!(
@@ -1983,6 +3005,19 @@ mod tests {
     use url::Url;
 
     #[test]
+    fn direct_mode_builds_an_execution_contract_without_a_model_generated_plan() {
+        let plan = direct_execution_plan(
+            "run QC now",
+            "[{\"role\":\"user\",\"markdown\":\"use hg19\"}]",
+            BTreeSet::from(["project.read".into(), "runtime.execute".into()]),
+        );
+        assert!(plan.objective.contains("run QC now"));
+        assert!(plan.objective.contains("use hg19"));
+        assert!(plan.requested_capabilities.contains("runtime.execute"));
+        assert!(!plan.requested_capabilities.contains("agent.propose_plan"));
+    }
+
+    #[test]
     fn v4_paths_never_escape_the_project() {
         assert_eq!(
             project_path("/srv/project", "results/a.txt").unwrap(),
@@ -2010,6 +3045,64 @@ mod tests {
             ModelErrorClassV4::Timeout
         );
         assert!(!classify_model_failure("401 unauthorized").retryable);
+    }
+
+    #[test]
+    fn backend_discovery_only_inspects_and_never_pulls_or_runs_images() {
+        assert_eq!(
+            container_image_inspect_args("omicsops/test:latest"),
+            [
+                "image",
+                "inspect",
+                "--format",
+                "{{.Id}}",
+                "omicsops/test:latest"
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_v4_projects_map_to_supervised_system_ssh_selection() {
+        let connection_id = Uuid::new_v4();
+        let mut project = Project::new(
+            Uuid::new_v4(),
+            "legacy",
+            ".",
+            omicsops_core::workspace::ProjectTemplate::Blank,
+            Utc::now(),
+        );
+        project.connection_id = Some(connection_id);
+        project.remote_root = Some("/srv/project".into());
+        let selection = legacy_ssh_selection(&project).unwrap();
+        assert_eq!(selection.backend_id, format!("ssh:{connection_id}"));
+        assert_eq!(selection.autonomy_mode, AutonomyModeV4::Supervised);
+        assert_eq!(selection.environment, "system");
+        assert_eq!(selection.network_policy, NetworkPolicyV4::HostInherited);
+    }
+
+    #[tokio::test]
+    async fn local_project_filesystem_lists_reads_and_hashes_inside_root() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("results")).unwrap();
+        std::fs::write(
+            directory.path().join("results/qc.tsv"),
+            b"metric\tvalue\nrows\t1\n",
+        )
+        .unwrap();
+        let filesystem = LocalProjectFilesystemV4::new(directory.path()).unwrap();
+        let listing = filesystem.list(".").await.unwrap();
+        assert!(listing.contains("results/qc.tsv"));
+        assert!(
+            filesystem
+                .read("results/qc.tsv")
+                .await
+                .unwrap()
+                .contains("rows")
+        );
+        let fact = filesystem.verify_file("results/qc.tsv").await.unwrap();
+        assert_eq!(fact.size_bytes, b"metric\tvalue\nrows\t1\n".len() as u64);
+        assert_eq!(fact.sha256.len(), 64);
+        assert!(filesystem.read("../outside.txt").await.is_err());
     }
 
     #[test]
@@ -2327,8 +3420,23 @@ mod tests {
 
         let executor = DesktopToolExecutorV4 {
             repository: Repository::open_in_memory().unwrap(),
-            session: session.clone(),
-            root: root.clone(),
+            filesystem: Arc::new(SshProjectFilesystemV4 {
+                session: session.clone(),
+                root: root.clone(),
+            }),
+            environment_port: Arc::new(SshEnvironmentPortV4 {
+                session: session.clone(),
+                root: root.clone(),
+            }),
+            selection: ComputeSelectionV4 {
+                schema_version: 4,
+                backend_id: "ssh:live-stage2".into(),
+                backend_kind: ComputeBackendKindV4::Ssh,
+                autonomy_mode: AutonomyModeV4::Supervised,
+                environment: "stage2-r".into(),
+                network_policy: NetworkPolicyV4::HostInherited,
+                container_image: None,
+            },
             project_id,
             run_id,
             backend_id: "ssh:live-stage2".into(),
@@ -2412,8 +3520,20 @@ mod tests {
         })));
         let executor = DesktopToolExecutorV4 {
             repository: Repository::open_in_memory().unwrap(),
-            session,
-            root,
+            filesystem: Arc::new(SshProjectFilesystemV4 {
+                session: session.clone(),
+                root: root.clone(),
+            }),
+            environment_port: Arc::new(SshEnvironmentPortV4 { session, root }),
+            selection: ComputeSelectionV4 {
+                schema_version: 4,
+                backend_id: backend_id.clone(),
+                backend_kind: ComputeBackendKindV4::Ssh,
+                autonomy_mode: AutonomyModeV4::Supervised,
+                environment: "system".into(),
+                network_policy: NetworkPolicyV4::HostInherited,
+                container_image: None,
+            },
             project_id,
             run_id,
             backend_id: backend_id.clone(),

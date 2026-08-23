@@ -20,6 +20,61 @@ describe("WorkspaceShell", () => {
     expect(screen.getByText(/Plan\/Execute 硬隔离/)).toBeInTheDocument();
     expect(screen.getByText("规划启动")).toBeInTheDocument();
   });
+  it("coalesces character-sized V4 model deltas into one completed response", () => {
+    const deltas = ["我", "先", "检查", "输入", "目录", "。"];
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-v4-text" agentRunEventsV4={deltas.map((text, index) => ({
+      schema_version: 4 as const, run_id: "run-v4-text", project_id: project.id, conversation_id: "conversation-1", sequence: index + 1,
+      occurred_at: "2026-08-17T00:00:00Z", previous_hash: String(index), event_hash: String(index + 1), event: { kind: "model_text" as const, text },
+    }))} />);
+    expect(screen.getAllByRole("article", { name: "模型输出" })).toHaveLength(1);
+    expect(screen.getByRole("article", { name: "模型输出" })).toHaveTextContent("我先检查输入目录。");
+  });
+  it("restores a completed V4 run after its persisted user message", () => {
+    const base = { schema_version: 4 as const, run_id: "run-history", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined}
+      messages={[{ id: "message-1", role: "user", markdown: "检查矩阵", created_at: "2026-08-17T00:00:00Z" }]}
+      agentRunEventsV4={[
+        { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "run_created", mode: "execute" } },
+        { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:02Z", event: { kind: "model_text", text: "矩阵检查完成。" } },
+        { ...base, sequence: 3, occurred_at: "2026-08-17T00:00:03Z", event: { kind: "run_completed" } },
+      ]} />);
+    expect(screen.getByText("检查矩阵")).toBeInTheDocument();
+    expect(screen.getByText(/已完成 · 3 条哈希事件/)).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Agent Runtime V4"));
+    expect(screen.getByRole("article", { name: "模型输出" })).toHaveTextContent("矩阵检查完成。");
+  });
+  it("shows backend availability and only enables Full Auto for containers", () => {
+    const onBackendChange = vi.fn();
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={() => true}
+      computeBackendId="local" onComputeBackendChange={onBackendChange}
+      computeBackends={[
+        { descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null },
+        { descriptor: { schema_version: 4, backend_id: "docker", kind: "docker", isolation: "container", available: true, supports_python: true, supports_r: true, supports_network_policy: true }, selectable: true, reason: null, python_status: "unverified", r_status: "unverified", resolved_image_id: "sha256:abc" },
+      ]} />);
+    fireEvent.click(screen.getByRole("button", { name: "添加上下文或选择模式" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Plan 模式/ }));
+    expect(screen.getByRole("region", { name: "V4 计算后端" })).toHaveTextContent("探测不会拉取镜像或启动容器");
+    expect(screen.getByRole("radio", { name: "full auto" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("radio", { name: /DOCKER/ }));
+    expect(onBackendChange).toHaveBeenCalledWith("docker");
+  });
+  it("keeps ordinary questions in chat until the user explicitly selects Plan mode from the plus menu", async () => {
+    const onSend = vi.fn().mockResolvedValue(true);
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={onSend}
+      computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
+
+    fireEvent.change(screen.getByRole("textbox", { name: /描述研究目标/ }), { target: { value: "这个文件是什么格式？" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("这个文件是什么格式？", "chat"));
+    expect(screen.queryByRole("region", { name: "V4 计算后端" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "添加上下文或选择模式" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Plan 模式/ }));
+    expect(screen.getByRole("region", { name: "V4 计算后端" })).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: /描述研究目标/ }), { target: { value: "执行完整 QC" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(onSend).toHaveBeenLastCalledWith("执行完整 QC", "plan"));
+  });
   it("keeps projects, scientific conversation, and context visible together", () => {
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} />);
 
@@ -58,30 +113,31 @@ describe("WorkspaceShell", () => {
     expect(screen.getByRole("tab", { name: "Lab notebook" })).toBeInTheDocument();
   });
 
-  it("sends a research message and requires explicit plan approval", () => {
+  it("sends a demo research message and exposes the dedicated Plan tab", () => {
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} />);
     fireEvent.change(screen.getByRole("textbox", { name: /描述研究目标/ }), { target: { value: "先检查双细胞率" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
     expect(screen.getByText("先检查双细胞率")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "批准计划" }));
-    expect(screen.getByRole("button", { name: "已批准" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("tab", { name: "Plan" }));
+    expect(screen.getByText("尚未进入 Plan 模式")).toBeInTheDocument();
   });
 
   it("shows the real agent state instead of a fixed remote progress value", async () => {
     let finish!: (value: boolean) => void;
     const onSend = vi.fn(() => new Promise<boolean>((resolve) => { finish = resolve; }));
-    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={onSend} />);
+    const backend = { descriptor: { schema_version: 4 as const, backend_id: "local", kind: "local" as const, isolation: "process" as const, available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available" as const, r_status: "unavailable" as const, resolved_image_id: null };
+    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={onSend} computeBackendId="local" computeBackends={[backend]} />);
 
     expect(screen.queryByText("65%")).not.toBeInTheDocument();
     fireEvent.change(screen.getByRole("textbox", { name: /描述研究目标/ }), { target: { value: "检查 hg19 数据" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
     expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toHaveValue("");
 
-    rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={onSend} agentBusy agentNotice="503 model_not_found" />);
+    rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={onSend} computeBackendId="local" computeBackends={[backend]} agentBusy agentNotice="503 model_not_found" />);
     expect(screen.getByRole("status")).toHaveTextContent("正在等待模型响应");
     expect(screen.getByRole("alert")).toHaveTextContent("503 model_not_found");
     finish(true);
-    await waitFor(() => expect(onSend).toHaveBeenCalledWith("检查 hg19 数据"));
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("检查 hg19 数据", "chat"));
   });
 
   it("keeps the composer available with a long multiline assistant response", () => {

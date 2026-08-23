@@ -1,11 +1,11 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import {
-  Activity, ArrowLeft, Bot, Check, ChevronRight, Database, Expand, FileBarChart, FileText,
-  FlaskConical, Folder, Languages, MessageSquarePlus, NotebookPen, Play,
+  Activity, ArrowLeft, Bot, Check, ChevronRight, ClipboardList, Database, Expand, FileBarChart, FileText,
+  FlaskConical, Folder, Languages, MessageSquarePlus, NotebookPen, Plus,
   Search, Send, Settings, Sparkles, Square, Trash2, X,
 } from "lucide-react";
 import { copy, type Locale } from "./copy";
-import type { AgentRunEventV3, AgentRunEventV4, AgentRunStreamEvent, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, MemoryFact, NotebookEntry, PlanProposal, ProjectArtifact, ProjectImagePreview, SyncEntry, WorkspaceConversation } from "../../types";
+import type { AgentRunEventV3, AgentRunEventV4, AgentRunStreamEvent, AutonomyModeV4, ComputeBackendAvailabilityV4, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, MemoryFact, NotebookEntry, PlanProposal, ProjectArtifact, ProjectImagePreview, RunSummaryV4, SyncEntry, WorkspaceConversation } from "../../types";
 import { RemoteFileTree } from "./RemoteFileTree";
 import { KernelPanel } from "./KernelPanel";
 import "./workspace.css";
@@ -36,7 +36,7 @@ interface Props {
   onSelectConversation?: (conversationId: string) => Promise<void> | void;
   onNewConversation?: () => Promise<void> | void;
   onDeleteConversation?: (conversationId: string) => Promise<void> | void;
-  onSend?: (message: string) => Promise<boolean | void> | boolean | void;
+  onSend?: (message: string, mode: "chat" | "plan") => Promise<boolean | void> | boolean | void;
   messages?: Array<{ id: string; role: "user" | "assistant" | "tool" | "system"; markdown: string; created_at?: string }>;
   streamingAssistant?: string;
   agentBusy?: boolean;
@@ -44,6 +44,17 @@ interface Props {
   agentRetryNotice?: string;
   modelLabel?: string;
   planProposal?: PlanProposal | null;
+  v4Plan?: RunSummaryV4 | null;
+  computeBackends?: ComputeBackendAvailabilityV4[];
+  computeBackendId?: string;
+  containerImage?: string;
+  autonomyMode?: AutonomyModeV4;
+  computeEnvironment?: string;
+  computeBusy?: boolean;
+  onComputeBackendChange?: (backendId: string) => void;
+  onContainerImageChange?: (image: string) => void;
+  onAutonomyModeChange?: (mode: AutonomyModeV4) => void;
+  onComputeEnvironmentChange?: (environment: string) => void;
   planLoading?: boolean;
   planApproved?: boolean;
   onRequestPlan?: () => Promise<void> | void;
@@ -58,6 +69,7 @@ interface Props {
   agentRunEventsV3?: AgentRunEventV3[];
   agentRunEventsV4?: AgentRunEventV4[];
   onAnswerAgentQuestionV3?: (runId: string, questionId: string, answer: string) => Promise<void> | void;
+  onAnswerAgentQuestionV4?: (runId: string, questionId: string, answer: string) => Promise<void> | void;
   remoteFiles?: import("../../types").RemoteFileEntry[];
   filesBusy?: boolean;
   onUploadFiles?: () => Promise<void> | void;
@@ -85,14 +97,17 @@ interface Props {
   onRetrySync?: (id: string) => Promise<void> | void;
 }
 
-type ContextTab = "files" | "preview" | "notebook" | "explore" | "runs";
+type ContextTab = "files" | "plan" | "preview" | "notebook" | "explore" | "runs";
 
-export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, conversations = [], activeConversationId, onSelectConversation, onNewConversation, onDeleteConversation, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, planProposal, planLoading = false, planApproved = false, onRequestPlan, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, agentRunEvents = [], agentRunEventsV3 = [], agentRunEventsV4 = [], onAnswerAgentQuestionV3, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
+export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, conversations = [], activeConversationId, onSelectConversation, onNewConversation, onDeleteConversation, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, planProposal, v4Plan, computeBackends = [], computeBackendId = "", containerImage = "", autonomyMode = "supervised", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, agentRunEvents = [], agentRunEventsV3 = [], agentRunEventsV4 = [], onAnswerAgentQuestionV3, onAnswerAgentQuestionV4, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
   const t = copy[locale];
   const zh = locale === "zh-CN";
   const [tab, setTab] = useState<ContextTab>("files");
   const [expanded, setExpanded] = useState(false);
   const [draft, setDraft] = useState("");
+  const [planModeEnabled, setPlanModeEnabled] = useState(false);
+  const [planSessionActive, setPlanSessionActive] = useState(false);
+  const [composerMenuOpen, setComposerMenuOpen] = useState(false);
   const [sentMessages, setSentMessages] = useState<string[]>([]);
   const [approved, setApproved] = useState(false);
   const [selectedImagePath, setSelectedImagePath] = useState("");
@@ -107,7 +122,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const activeRunEvents = effectiveActiveRunId ? agentRunEvents.filter((event) => event.run_id === effectiveActiveRunId) : [];
   const activeRunEventsV3 = effectiveActiveRunId ? agentRunEventsV3.filter((event) => event.run_id === effectiveActiveRunId) : [];
   const activeRunEventsV4 = effectiveActiveRunId ? agentRunEventsV4.filter((event) => event.run_id === effectiveActiveRunId) : [];
-  const runFinished = activeRunEvents.some((event) => event.kind === "agent_completed" || event.kind === "agent_failed" || event.kind === "agent_canceled") || activeRunEventsV3.some(isTerminalAgentEventV3) || activeRunEventsV4.some((event) => event.event.kind === "run_completed" || event.event.kind === "run_failed" || event.event.kind === "run_cancelled");
+  const runFinished = activeRunEvents.some((event) => event.kind === "agent_completed" || event.kind === "agent_failed" || event.kind === "agent_canceled") || activeRunEventsV3.some(isTerminalAgentEventV3) || activeRunEventsV4.some(isTerminalAgentEventV4);
   const runActive = runStarted && !runFinished;
   const activeConversation = conversations.find((item) => item.id === activeConversationId);
   const conversationTitle = activeConversation?.title || (zh ? "新会话" : "New conversation");
@@ -118,6 +133,9 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const historicalAgentRunEventsV3 = effectiveActiveRunId
     ? agentRunEventsV3.filter((event) => event.run_id !== effectiveActiveRunId)
     : agentRunEventsV3;
+  const historicalAgentRunEventsV4 = effectiveActiveRunId
+    ? agentRunEventsV4.filter((event) => event.run_id !== effectiveActiveRunId)
+    : agentRunEventsV4;
   const activeRun = effectiveActiveRunId
     ? groupAgentRunEvents(activeRunEvents).find((run) => run.runId === effectiveActiveRunId) ?? null
     : null;
@@ -126,9 +144,17 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     : null;
   const runTimeline = placeAgentRunsAfterMessages(messages, historicalAgentRunEvents);
   const runTimelineV3 = placeHarnessV3RunsAfterMessages(messages, historicalAgentRunEventsV3);
+  const runTimelineV4 = placeV4RunsAfterMessages(messages, historicalAgentRunEventsV4);
   const latestAgentRunEvent = agentRunEvents.at(-1);
   const latestAgentRunEventV3 = agentRunEventsV3.at(-1);
   const latestAgentRunEventV4 = agentRunEventsV4.at(-1);
+  const computeReady = computeBackends.some((item) => item.descriptor.backend_id === computeBackendId && item.selectable);
+  const showPlanPanel = planModeEnabled || planSessionActive || planLoading || Boolean(v4Plan?.plan) || Boolean(planProposal);
+  const executeStart = activeRunEventsV4.findIndex((event) => event.event.kind === "mode_changed" && event.event.mode === "execute");
+  const visibleActiveRunEventsV4 = v4Plan?.plan && executeStart >= 0 ? activeRunEventsV4.slice(executeStart) : v4Plan?.plan ? [] : activeRunEventsV4;
+
+  useEffect(() => { setPlanModeEnabled(false); setPlanSessionActive(false); }, [activeConversationId]);
+  useEffect(() => { if (showPlanPanel) setTab("plan"); }, [showPlanPanel]);
 
   useEffect(() => {
     const stream = messageStreamRef.current;
@@ -165,8 +191,11 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     if (!message || agentBusy) return;
     setDraft("");
     if (onSend) {
-      const accepted = await onSend(message);
+      const mode = planModeEnabled ? "plan" : "chat";
+      setPlanSessionActive(mode === "plan");
+      const accepted = await onSend(message, mode);
       if (accepted === false) setDraft((current) => current || message);
+      else if (planModeEnabled) setPlanModeEnabled(false);
     } else {
       setSentMessages((current) => [...current, message]);
     }
@@ -205,38 +234,82 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
           {message.role === "user" ? <article className="message user-message"><p>{message.markdown}</p></article> : message.role === "assistant" ? <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><p>{message.markdown}</p></div></article> : null}
           {runTimeline.afterMessage.get(message.id)?.map((run) => <AgentRunFold locale={locale} run={run} activeRunId={effectiveActiveRunId} key={run.runId} />)}
           {runTimelineV3.afterMessage.get(message.id)?.map((run) => <HarnessV3RunFold locale={locale} run={run} activeRunId={effectiveActiveRunId} onAnswer={onAnswerAgentQuestionV3} key={run.runId} />)}
+          {runTimelineV4.afterMessage.get(message.id)?.map((run) => <V4RunTrace locale={locale} events={run.events} onAnswer={onAnswerAgentQuestionV4} historical key={run.runId} />)}
         </Fragment>)}
         {streamingAssistant && <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent · {zh ? "生成中" : "streaming"}</strong><p>{streamingAssistant}</p></div></article>}
         {agentBusy && !streamingAssistant && <article className="message assistant-message agent-pending" role="status"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><p>{zh ? "正在等待模型响应…" : "Waiting for the model…"}</p></div></article>}
         {agentRetryNotice && <div className="agent-retry-notice" role="status"><span className="agent-working"><i />{agentRetryNotice}</span></div>}
         {agentNotice && <div className="agent-notice" role="alert"><strong>{zh ? "对话未完成" : "Conversation did not complete"}</strong><span>{agentNotice}</span></div>}
-        {(planProposal || !onRequestPlan) && <article className="approval-card"><div className="task-icon"><Check size={18} /></div><div className="task-body"><div><strong>{planProposal?.plan.title ?? (zh ? "正式计划等待审批" : "Formal plan awaiting approval")}</strong><span>{runStarted ? (zh ? "运行已启动" : "Run started") : (planApproved || approved) ? (zh ? "已批准" : "Approved") : (planProposal?.validation.valid === false ? (zh ? "验证失败" : "Invalid") : (zh ? "需确认" : "Review"))}</span></div><p>{planProposal ? `${planProposal.plan.stages.reduce((count, stage) => count + stage.steps.length, 0)} ${zh ? "个版本化步骤" : "versioned steps"} · SHA-256 ${planProposal.plan_hash.slice(0, 12)}` : (zh ? "新增 5 个版本化步骤；将上传 2 个选定文件，不会同步整个工作区。" : "Adds 5 versioned steps; uploads 2 selected files and never mirrors the whole workspace.")}</p><div className="task-actions"><button>{zh ? "查看差异" : "View diff"}</button><button disabled={planApproved || approved || planProposal?.validation.valid === false} onClick={() => { if (onApprovePlan) void onApprovePlan(); else setApproved(true); }}>{(planApproved || approved) ? (zh ? "已批准" : "Approved") : onStartRun ? (zh ? "批准并开始远端运行" : "Approve and run remotely") : (zh ? "批准计划" : "Approve plan")}</button>{(planApproved || approved) && onStartRun && !runStarted && <button disabled={!canStartRun} onClick={() => void onStartRun()}>{canStartRun ? (zh ? "重新开始远端运行" : "Start remote run") : (zh ? "正在启动…" : "Starting…")}</button>}</div></div></article>}
-        {plannedSkills.length > 0 && <div className="plan-skills"><b>{zh ? "计划采用的 Skills" : "Skills applied by this plan"}</b>{plannedSkills.map((skill) => <small key={`${skill.name}:${skill.version}:${skill.hash}`}>{skill.name}@{skill.version} · SHA-256 {skill.hash.slice(0, 12)} · {skill.sections} {zh ? "个引用段" : "cited sections"}</small>)}</div>}
+        {v4Plan?.plan && !runStarted && <article className="message assistant-message plan-ready-message"><div className="assistant-avatar"><ClipboardList size={17} /></div><div><strong>OmicsOps Agent</strong><p>{zh ? "计划已生成，请在右侧 Plan 面板审核并决定是否运行。" : "The plan is ready. Review it in the Plan panel and decide whether to run it."}</p></div></article>}
         {runTimeline.unanchored.length > 0 && <AgentRunHistory locale={locale} runs={runTimeline.unanchored} activeRunId={effectiveActiveRunId} />}
         {runTimelineV3.unanchored.length > 0 && <HarnessV3History locale={locale} runs={runTimelineV3.unanchored} activeRunId={effectiveActiveRunId} onAnswer={onAnswerAgentQuestionV3} />}
+        {runTimelineV4.unanchored.map((run) => <V4RunTrace locale={locale} events={run.events} onAnswer={onAnswerAgentQuestionV4} historical key={run.runId} />)}
         {activeRun && <AgentRunFold locale={locale} run={activeRun} activeRunId={effectiveActiveRunId} />}
         {activeRunV3 && <HarnessV3RunFold locale={locale} run={activeRunV3} activeRunId={effectiveActiveRunId} onAnswer={onAnswerAgentQuestionV3} />}
-        {activeRunEventsV4.length > 0 && <V4RunTrace locale={locale} events={activeRunEventsV4} />}
+        {visibleActiveRunEventsV4.length > 0 && <V4RunTrace locale={locale} events={visibleActiveRunEventsV4} onAnswer={onAnswerAgentQuestionV4} />}
         {runStarted && agentRunEvents.length === 0 && agentRunEventsV3.length === 0 && agentRunEventsV4.length === 0 && <AgentConversationUpdates locale={locale} events={[]} />}
         {runActive && onCancelRun && <div className="agent-run-controls" role="region" aria-label={zh ? "远程 Agent 运行控制" : "Remote agent run controls"}><div><span className="agent-working"><i />{runStopping ? (zh ? "正在终止当前操作…" : "Stopping current operation…") : (zh ? "远程 Agent 正在运行" : "Remote agent is running")}</span><small>{zh ? "将中断模型请求、当前 SSH 命令及后续操作" : "Stops the model request, current SSH command, and all subsequent actions"}</small></div><button className="stop-agent-button" disabled={runStopping} onClick={() => void onCancelRun()}><Square size={14} fill="currentColor" />{runStopping ? (zh ? "终止中…" : "Stopping…") : (zh ? "终止运行" : "Stop run")}</button></div>}
-        {planProposal?.validation.valid === false && <div className="plan-validation" role="alert"><strong>{zh ? "计划未通过本地执行契约" : "Plan failed the local execution contract"}</strong><ul>{planProposal.validation.issues.map((issue) => <li key={`${issue.path}:${issue.code}`}><code>{issue.path}</code><span>{issue.message}</span></li>)}</ul><button disabled={planLoading} onClick={() => void onRequestPlan?.()}>{planLoading ? (zh ? "重新生成中…" : "Regenerating…") : (zh ? "按当前工具契约重新生成" : "Regenerate with current tool contract")}</button></div>}
         {!onSend && <article className="task-card"><div className="task-icon"><Activity size={18} /></div><div className="task-body"><div><strong>{t.task}</strong><span>65%</span></div><p>{zh ? "远端 Linux · 8 CPU · 32 GiB · 低风险" : "Remote Linux · 8 CPU · 32 GiB · low risk"}</p><div className="task-progress"><i /></div><div className="task-actions"><button>{zh ? "查看日志" : "View logs"}</button><button>{zh ? "查看计划" : "View plan"}</button></div></div></article>}
-        {onSend && !planProposal && <article className="task-card planning-card"><div className="task-icon"><Activity size={18} /></div><div className="task-body"><div><strong>{zh ? "分析计划" : "Analysis plan"}</strong><span>{planLoading ? (zh ? "生成中" : "Generating") : (zh ? "尚未生成" : "Not generated")}</span></div><p>{zh ? "对话明确目标后，生成版本化计划并在远端执行前审批。" : "After the goal is clear, generate a versioned plan for approval before remote execution."}</p><div className="task-actions"><button disabled={planLoading || agentBusy} onClick={() => void onRequestPlan?.()}>{planLoading ? (zh ? "生成中…" : "Generating…") : (zh ? "生成分析计划" : "Generate plan")}</button></div></div></article>}
       </section>
-      <footer className="composer"><div className="composer-input"><textarea aria-label={t.composer} placeholder={t.composer} value={draft} disabled={agentBusy} onChange={(event) => setDraft(event.target.value)} /><div><button className="composer-tool"><Folder size={16} /></button><button className="composer-tool"><Play size={16} /></button><button className="send-button" disabled={agentBusy || !draft.trim()} onClick={send}><Send size={16} />{agentBusy ? (zh ? "响应中…" : "Responding…") : t.send}</button></div></div><small>{modelLabel ? `${zh ? "当前模型" : "Model"}: ${modelLabel}` : (zh ? "发送前请在设置中配置模型提供方" : "Configure a model provider in Settings before sending")}</small></footer>
+      <footer className="composer"><div className={`composer-input ${planModeEnabled ? "is-plan-mode" : ""}`}><textarea aria-label={t.composer} placeholder={planModeEnabled ? (zh ? "描述需要规划和执行的任务" : "Describe the task to plan and execute") : t.composer} value={draft} disabled={agentBusy} onChange={(event) => setDraft(event.target.value)} /><div><div className="composer-menu-anchor"><button className="composer-tool" aria-label={zh ? "添加上下文或选择模式" : "Add context or choose mode"} aria-expanded={composerMenuOpen} onClick={() => setComposerMenuOpen((open) => !open)}><Plus size={17} /></button>{composerMenuOpen && <div className="composer-add-menu" role="menu"><button role="menuitem" disabled={!onUploadFiles} onClick={() => { setComposerMenuOpen(false); void onUploadFiles?.(); }}><Folder size={16} /><span><b>{zh ? "添加文件" : "Add files"}</b><small>{zh ? "选择项目输入文件" : "Select project input files"}</small></span></button><button role="menuitem" className={planModeEnabled ? "active" : ""} onClick={() => { setPlanModeEnabled(!planModeEnabled); setComposerMenuOpen(false); }}><Activity size={16} /><span><b>{zh ? "Plan 模式" : "Plan mode"}</b><small>{zh ? "先规划并在右侧审核，再批准执行" : "Plan first, review on the right, then approve execution"}</small></span>{planModeEnabled && <Check size={15} />}</button></div>}</div>{planModeEnabled && <button className="composer-mode-chip" onClick={() => setPlanModeEnabled(false)}><Activity size={14} />Plan<X size={13} /></button>}<button className="send-button" disabled={agentBusy || planLoading || !draft.trim() || Boolean(onSend && !computeReady)} onClick={send}><Send size={16} />{agentBusy || planLoading ? (planModeEnabled ? (zh ? "规划中…" : "Planning…") : (zh ? "执行中…" : "Running…")) : t.send}</button></div></div><small>{planModeEnabled ? (zh ? "Plan 模式：计划显示在右侧，批准后才执行" : "Plan mode: review the plan on the right before execution") : computeReady ? (zh ? "Agent 模式：发送后直接执行任务" : "Agent mode: send to execute directly") : onSend ? (zh ? "没有可用的计算后端" : "No compute backend is available") : modelLabel ? `${zh ? "当前模型" : "Model"}: ${modelLabel}` : ""}</small></footer>
     </main>
 
     <aside className="context-pane" aria-label={t.context}>
-      <div className="context-tabs" role="tablist">{(["files", "preview", "notebook", "explore", "runs"] as ContextTab[]).map((id) => <button key={id} role="tab" aria-selected={tab === id} onClick={() => setTab(id)}>{id === "files" ? t.files : id === "preview" ? t.preview : id === "notebook" ? t.notebook : id === "explore" ? t.explore : t.runs}</button>)}</div>
-      <div className="context-content">{tab === "files" && <RemoteFileTree locale={locale} remoteFiles={remoteFiles} busy={filesBusy} notice={fileNotice} onUpload={onUploadFiles} onRefresh={onRefreshFiles} onDownload={onDownloadFile} syncEntries={syncEntries} onPauseSync={onPauseSync} onCancelSync={onCancelSync} onRetrySync={onRetrySync} />}{tab === "preview" && <><div className="context-toolbar"><span>{t.overview}</span><button aria-label={t.expand} onClick={() => setExpanded(true)}><Expand size={16} /></button></div>{preview}</>}{tab === "notebook" && <Notebook locale={locale} entries={notebookEntries} artifacts={projectArtifacts} facts={memoryFacts} onSearch={onSearchMemory} onExport={onExportNotebook} />}{tab === "explore" && <KernelPanel locale={locale} sessions={kernelSessions} events={kernelEvents} busy={kernelBusy} notice={kernelNotice} onStart={onStartKernel} onExecute={onExecuteKernel} onInterrupt={onInterruptKernel} onStop={onStopKernel} onPromote={onPromoteKernelCell} />}{tab === "runs" && <RunSummary locale={locale} />}</div>
+      <div className="context-tabs" role="tablist">{(["files", "plan", "preview", "notebook", "explore", "runs"] as ContextTab[]).map((id) => <button key={id} role="tab" aria-selected={tab === id} onClick={() => setTab(id)}>{id === "files" ? t.files : id === "plan" ? (zh ? "Plan" : "Plan") : id === "preview" ? t.preview : id === "notebook" ? t.notebook : id === "explore" ? t.explore : t.runs}</button>)}</div>
+      <div className="context-content">{tab === "files" && <RemoteFileTree locale={locale} remoteFiles={remoteFiles} busy={filesBusy} notice={fileNotice} onUpload={onUploadFiles} onRefresh={onRefreshFiles} onDownload={onDownloadFile} syncEntries={syncEntries} onPauseSync={onPauseSync} onCancelSync={onCancelSync} onRetrySync={onRetrySync} />}{tab === "plan" && <PlanPanel locale={locale} active={showPlanPanel} planLoading={planLoading} v4Plan={v4Plan} planProposal={planProposal} planApproved={planApproved || approved} runStarted={runStarted} backends={computeBackends} backendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} environment={computeEnvironment} computeBusy={computeBusy} plannedSkills={plannedSkills} events={activeRunEventsV4} onBackendChange={onComputeBackendChange} onImageChange={onContainerImageChange} onAutonomyChange={onAutonomyModeChange} onEnvironmentChange={onComputeEnvironmentChange} onApprove={() => { if (onApprovePlan) return onApprovePlan(); setApproved(true); }} onRegenerate={onRequestPlan} onAnswer={onAnswerAgentQuestionV4} />}{tab === "preview" && <><div className="context-toolbar"><span>{t.overview}</span><button aria-label={t.expand} onClick={() => setExpanded(true)}><Expand size={16} /></button></div>{preview}</>}{tab === "notebook" && <Notebook locale={locale} entries={notebookEntries} artifacts={projectArtifacts} facts={memoryFacts} onSearch={onSearchMemory} onExport={onExportNotebook} />}{tab === "explore" && <KernelPanel locale={locale} sessions={kernelSessions} events={kernelEvents} busy={kernelBusy} notice={kernelNotice} onStart={onStartKernel} onExecute={onExecuteKernel} onInterrupt={onInterruptKernel} onStop={onStopKernel} onPromote={onPromoteKernelCell} />}{tab === "runs" && <RunSummary locale={locale} />}</div>
     </aside>
     {expanded && <div className="preview-overlay" role="dialog" aria-modal="true" aria-label={t.artifactPreview}><header><div><small>{project.name}</small><h2>{t.overview}</h2></div><button aria-label="Close" onClick={() => setExpanded(false)}><X /></button></header>{preview}</div>}
   </div>;
 }
 
+function ComputeBackendSelector({ locale, backends, backendId, containerImage, autonomyMode, environment, busy, onBackendChange, onImageChange, onAutonomyChange, onEnvironmentChange }: { locale: Locale; backends: ComputeBackendAvailabilityV4[]; backendId: string; containerImage: string; autonomyMode: AutonomyModeV4; environment: string; busy: boolean; onBackendChange?: (value: string) => void; onImageChange?: (value: string) => void; onAutonomyChange?: (value: AutonomyModeV4) => void; onEnvironmentChange?: (value: string) => void }) {
+  const zh = locale === "zh-CN";
+  const selected = backends.find((item) => item.descriptor.backend_id === backendId);
+  const container = selected?.descriptor.isolation === "container";
+  return <section className="compute-selector" aria-label={zh ? "V4 计算后端" : "V4 compute backend"}><header><div><b>{zh ? "冻结计算配置" : "Frozen compute selection"}</b><small>{busy ? (zh ? "正在探测…" : "Probing…") : (zh ? "探测不会拉取镜像或启动容器" : "Discovery never pulls images or starts containers")}</small></div><span>{selected?.descriptor.isolation ?? "—"}</span></header><div className="compute-backend-grid">{backends.map((backend) => <label className={backendId === backend.descriptor.backend_id ? "active" : ""} key={backend.descriptor.backend_id}><input type="radio" name="v4-backend" value={backend.descriptor.backend_id} checked={backendId === backend.descriptor.backend_id} disabled={!backend.selectable} onChange={() => onBackendChange?.(backend.descriptor.backend_id)} /><span><b>{backend.descriptor.kind.toUpperCase()}</b><small>Python: {backend.python_status} · R: {backend.r_status}</small>{backend.reason && <em>{backend.reason}</em>}</span></label>)}</div>{container && <label>{zh ? "本地已有容器镜像" : "Existing local image"}<input aria-label={zh ? "容器镜像" : "Container image"} value={containerImage} placeholder="omicsops/science:latest" onChange={(event) => onImageChange?.(event.target.value)} /><small>{selected?.resolved_image_id ? `image ID: ${selected.resolved_image_id}` : (zh ? "输入后只执行 image inspect" : "Only image inspect runs after entry")}</small></label>}{selected?.descriptor.kind === "ssh" && <label>{zh ? "SSH 环境" : "SSH environment"}<input aria-label={zh ? "SSH 环境" : "SSH environment"} value={environment} onChange={(event) => onEnvironmentChange?.(event.target.value)} /><small>{zh ? "system 或安全的 Micromamba 环境名" : "system or a safe Micromamba environment name"}</small></label>}<div className="compute-policy"><label><input type="radio" name="autonomy" checked={autonomyMode === "supervised"} onChange={() => onAutonomyChange?.("supervised")} />supervised</label><label><input type="radio" name="autonomy" checked={autonomyMode === "full_auto"} disabled={!container || !selected?.selectable} onChange={() => onAutonomyChange?.("full_auto")} />full auto</label><span>{container ? "network=none" : "network=host_inherited"}</span></div></section>;
+}
+function PlanPanel({ locale, active, planLoading, v4Plan, planProposal, planApproved, runStarted, backends, backendId, containerImage, autonomyMode, environment, computeBusy, plannedSkills, events, onBackendChange, onImageChange, onAutonomyChange, onEnvironmentChange, onApprove, onRegenerate, onAnswer }: { locale: Locale; active: boolean; planLoading: boolean; v4Plan?: RunSummaryV4 | null; planProposal?: PlanProposal | null; planApproved: boolean; runStarted: boolean; backends: ComputeBackendAvailabilityV4[]; backendId: string; containerImage: string; autonomyMode: AutonomyModeV4; environment: string; computeBusy: boolean; plannedSkills: Array<{ name: string; version: string; hash: string; sections: number }>; events: AgentRunEventV4[]; onBackendChange?: (value: string) => void; onImageChange?: (value: string) => void; onAutonomyChange?: (value: AutonomyModeV4) => void; onEnvironmentChange?: (value: string) => void; onApprove: () => Promise<void> | void; onRegenerate?: () => Promise<void> | void; onAnswer?: (runId: string, questionId: string, answer: string) => Promise<void> | void }) {
+  const zh = locale === "zh-CN";
+  const input = [...events].reverse().find((event) => event.event.kind === "input_requested");
+  if (!active) return <div className="plan-panel-empty"><ClipboardList size={28} /><b>{zh ? "尚未进入 Plan 模式" : "Plan mode is not active"}</b><p>{zh ? "从输入框左侧的 + 菜单选择 Plan。默认 Agent 模式会直接执行任务。" : "Choose Plan from the + menu. Default Agent mode executes tasks directly."}</p></div>;
+  if (!v4Plan?.plan && !planProposal) return <div className="plan-panel"><header><div><small>AGENT RUNTIME V4</small><h2>{planLoading ? (zh ? "正在生成计划" : "Generating plan") : (zh ? "Plan 模式配置" : "Plan mode setup")}</h2></div><span>{planLoading ? "…" : (zh ? "待发送" : "Ready")}</span></header><p className="plan-panel-lead">{zh ? "确认计算后端，然后在主输入框发送任务。规划阶段只会读取和检查，不会执行分析。" : "Confirm the compute backend, then send the task from the main composer. Planning may inspect but cannot execute analysis."}</p><ComputeBackendSelector locale={locale} backends={backends} backendId={backendId} containerImage={containerImage} autonomyMode={autonomyMode} environment={environment} busy={computeBusy} onBackendChange={onBackendChange} onImageChange={onImageChange} onAutonomyChange={onAutonomyChange} onEnvironmentChange={onEnvironmentChange} />{input?.event.kind === "input_requested" && onAnswer && <section className="plan-question"><b>{zh ? "需要补充信息" : "More information required"}</b><p>{input.event.question}</p><V4AnswerForm locale={locale} onSubmit={(answer) => onAnswer(input.run_id, input.event.kind === "input_requested" ? input.event.question_id : "", answer)} /></section>}</div>;
+  const title = v4Plan?.plan?.objective ?? planProposal?.plan.title ?? (zh ? "分析计划" : "Analysis plan");
+  const steps = v4Plan?.plan?.steps ?? planProposal?.plan.stages.flatMap((stage) => stage.steps.map((step) => step.title)) ?? [];
+  const criteria = v4Plan?.plan?.completion_criteria ?? [];
+  const invalid = planProposal?.validation.valid === false;
+  return <div className="plan-panel"><header><div><small>AGENT RUNTIME V4 · PLAN</small><h2>{title}</h2></div><span>{runStarted ? (zh ? "运行中" : "Running") : planApproved ? (zh ? "已批准" : "Approved") : invalid ? (zh ? "无效" : "Invalid") : (zh ? "待审批" : "Review")}</span></header><section><h3>{zh ? "执行步骤" : "Execution steps"}</h3><ol>{steps.map((step, index) => <li key={`${index}-${step}`}>{step}</li>)}</ol></section>{criteria.length > 0 && <section><h3>{zh ? "完成标准" : "Completion criteria"}</h3><ul>{criteria.map((criterion) => <li key={criterion}>{criterion}</li>)}</ul></section>}{v4Plan?.compute_selection && <section className="plan-frozen"><h3>{zh ? "冻结配置" : "Frozen configuration"}</h3><code>{v4Plan.compute_selection.backend_kind}:{v4Plan.compute_selection.backend_id}</code><span>{v4Plan.compute_selection.autonomy_mode} · {v4Plan.compute_selection.environment} · network={v4Plan.compute_selection.network_policy}</span>{v4Plan.compute_selection.container_image && <small>{v4Plan.compute_selection.container_image.reference}<br />{v4Plan.compute_selection.container_image.image_id}</small>}</section>}{plannedSkills.length > 0 && <section><h3>Skills</h3>{plannedSkills.map((skill) => <small className="plan-skill" key={`${skill.name}:${skill.version}:${skill.hash}`}>{skill.name}@{skill.version} · {skill.sections} {zh ? "段" : "sections"} · {skill.hash.slice(0, 12)}</small>)}</section>}{invalid && <section className="plan-panel-errors" role="alert"><h3>{zh ? "计划验证失败" : "Plan validation failed"}</h3><ul>{planProposal!.validation.issues.map((issue) => <li key={`${issue.path}:${issue.code}`}><code>{issue.path}</code> {issue.message}</li>)}</ul><button disabled={planLoading} onClick={() => void onRegenerate?.()}>{zh ? "重新生成" : "Regenerate"}</button></section>}<footer><small>{v4Plan?.approval_hash ? `approval SHA-256 ${v4Plan.approval_hash}` : planProposal ? `plan SHA-256 ${planProposal.plan_hash}` : ""}</small><button disabled={planApproved || runStarted || invalid || Boolean(v4Plan && !v4Plan.approval_hash)} onClick={() => void onApprove()}>{runStarted ? (zh ? "正在运行" : "Running") : planApproved ? (zh ? "已批准" : "Approved") : (zh ? "批准并运行" : "Approve and run")}</button></footer></div>;
+}
 function FileTree({ locale }: { locale: Locale }) { const zh = locale === "zh-CN"; return <div className="file-tree"><div className="context-heading"><b>{zh ? "项目文件" : "Project files"}</b><small>{zh ? "选择性同步" : "Selective sync"}</small></div><div className="tree-folder"><Folder size={15} />data <span>{zh ? "远端" : "remote"}</span></div><div className="tree-folder"><Folder size={15} />analysis</div><div className="tree-file"><FileBarChart size={15} />umap.png <em>1.2 MB</em></div><div className="tree-file"><FileText size={15} />markers.csv <em>84 KB</em></div><div className="tree-file"><NotebookPen size={15} />report.md <em>12 KB</em></div></div>; }
-function V4RunTrace({ locale, events }: { locale: Locale; events: AgentRunEventV4[] }) { const zh = locale === "zh-CN"; return <details className="agent-run-fold harness-v3-run" open><summary><span className="agent-run-fold-title"><span><b>Agent Runtime V4</b><small>{zh ? "Plan/Execute 硬隔离 · 持久 Kernel" : "Hard Plan/Execute boundary · persistent kernel"}</small></span><ChevronRight size={15} /></span><span>{events.length} {zh ? "条哈希事件" : "hash-chained events"}</span></summary><div className="agent-run-fold-body">{events.map((event) => <article className="message assistant-message agent-work-update" key={`${event.run_id}-${event.sequence}`}><div className="assistant-avatar"><Bot size={17} /></div><div><div className="agent-work-heading"><strong>{v4EventLabel(event, zh)}</strong><small>#{event.sequence} · {new Date(event.occurred_at).toLocaleTimeString()}</small></div><p>{v4EventContent(event, zh)}</p></div></article>)}</div></details>; }
-function v4EventLabel(event: AgentRunEventV4, zh: boolean) { const labels: Record<string, string> = { run_created: zh ? "规划启动" : "Planning started", plan_proposed: zh ? "计划已冻结" : "Plan frozen", plan_approved: zh ? "计划获批" : "Plan approved", mode_changed: zh ? "执行模式" : "Execution mode", tool_requested: zh ? "工具请求" : "Tool request", tool_finished: zh ? "工具结果" : "Tool result", completion_proposed: zh ? "完成提案" : "Completion proposed", run_completed: zh ? "运行完成" : "Run completed", run_failed: zh ? "运行失败" : "Run failed", run_cancelled: zh ? "运行取消" : "Run cancelled" }; return labels[event.event.kind] ?? event.event.kind; }
+function V4RunTrace({ locale, events, onAnswer, historical = false }: { locale: Locale; events: AgentRunEventV4[]; onAnswer?: (runId: string, questionId: string, answer: string) => Promise<void> | void; historical?: boolean }) {
+  const zh = locale === "zh-CN";
+  const entries = coalesceV4ModelText(events);
+  const terminal = [...events].reverse().find(isTerminalAgentEventV4);
+  const status = terminal?.event.kind === "run_completed" ? (zh ? "已完成" : "Completed") : terminal?.event.kind === "run_cancelled" ? (zh ? "已终止" : "Cancelled") : terminal?.event.kind === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention") : terminal?.event.kind === "run_failed" ? (zh ? "失败" : "Failed") : (zh ? "运行中" : "Running");
+  return <details className={`agent-run-fold harness-v3-run ${historical ? "" : "is-active"}`} open={historical ? undefined : true}><summary><span className="agent-run-fold-title"><span><b>Agent Runtime V4</b><small>{zh ? "Plan/Execute 硬隔离 · 持久 Kernel" : "Hard Plan/Execute boundary · persistent kernel"}</small></span><ChevronRight size={15} /></span><span>{status} · {events.length} {zh ? "条哈希事件" : "hash-chained events"}</span></summary><div className="agent-run-fold-body">{entries.map(({ event, lastEvent, modelText }) => <article aria-label={modelText === undefined ? undefined : (zh ? "模型输出" : "Model output")} className="message assistant-message agent-work-update" key={`${event.run_id}-${event.sequence}`}><div className="assistant-avatar"><Bot size={17} /></div><div><div className="agent-work-heading"><strong>{modelText === undefined ? v4EventLabel(event, zh) : (zh ? "模型输出" : "Model output")}</strong><small>{lastEvent.sequence === event.sequence ? `#${event.sequence}` : `#${event.sequence}–#${lastEvent.sequence}`} · {new Date(lastEvent.occurred_at).toLocaleTimeString()}</small></div><p>{modelText ?? v4EventContent(event, zh)}</p>{event.event.kind === "input_requested" && onAnswer && <V4AnswerForm locale={locale} onSubmit={(answer) => onAnswer(event.run_id, (event.event as Extract<AgentRunEventV4["event"], { kind: "input_requested" }>).question_id, answer)} />}</div></article>)}</div></details>;
+}
+function coalesceV4ModelText(events: AgentRunEventV4[]): Array<{ event: AgentRunEventV4; lastEvent: AgentRunEventV4; modelText?: string }> {
+  const entries: Array<{ event: AgentRunEventV4; lastEvent: AgentRunEventV4; modelText?: string }> = [];
+  for (let index = 0; index < events.length;) {
+    const event = events[index];
+    if (event.event.kind !== "model_text") {
+      entries.push({ event, lastEvent: event });
+      index += 1;
+      continue;
+    }
+    let lastEvent = event;
+    let modelText = "";
+    while (index < events.length && events[index].event.kind === "model_text") {
+      const textEvent = events[index];
+      modelText += (textEvent.event as Extract<AgentRunEventV4["event"], { kind: "model_text" }>).text;
+      lastEvent = textEvent;
+      index += 1;
+    }
+    entries.push({ event, lastEvent, modelText });
+  }
+  return entries;
+}
+function V4AnswerForm({ locale, onSubmit }: { locale: Locale; onSubmit: (answer: string) => Promise<void> | void }) { const [answer, setAnswer] = useState(""); const zh = locale === "zh-CN"; return <div className="v4-answer"><input aria-label={zh ? "回答 V4 问题" : "Answer V4 question"} value={answer} onChange={(event) => setAnswer(event.target.value)} /><button disabled={!answer.trim()} onClick={() => void onSubmit(answer.trim())}>{zh ? "回答并恢复" : "Answer and resume"}</button></div>; }
+function v4EventLabel(event: AgentRunEventV4, zh: boolean) { if (event.event.kind === "run_created") return event.event.mode === "execute" ? (zh ? "任务启动" : "Task started") : (zh ? "规划启动" : "Planning started"); const labels: Record<string, string> = { plan_proposed: zh ? "计划已冻结" : "Plan frozen", plan_approved: zh ? "计划获批" : "Plan approved", mode_changed: zh ? "执行模式" : "Execution mode", tool_requested: zh ? "工具请求" : "Tool request", tool_finished: zh ? "工具结果" : "Tool result", completion_proposed: zh ? "完成提案" : "Completion proposed", run_completed: zh ? "运行完成" : "Run completed", run_failed: zh ? "运行失败" : "Run failed", run_cancelled: zh ? "运行取消" : "Run cancelled" }; return labels[event.event.kind] ?? event.event.kind; }
 function v4EventContent(event: AgentRunEventV4, zh: boolean) { if (event.event.kind === "tool_requested") return event.event.call.tool_id; if (event.event.kind === "tool_finished") return event.event.outcome.model_content; if (event.event.kind === "plan_proposed") return `${event.event.plan.steps.length} ${zh ? "个步骤" : "steps"} · SHA-256 ${event.event.plan_hash.slice(0, 12)}`; if (event.event.kind === "model_text") return event.event.text; if (event.event.kind === "run_failed") return event.event.message; return zh ? "状态已写入可验证事件链" : "State persisted to the verified event chain"; }
 function isPreviewImage(path: string) { return /\.(png|jpe?g|gif|webp|bmp)$/i.test(path); }
 function ArtifactPreview({ title, locale, images, selectedPath, preview, busy, error, onSelect, onLoad }: { title: string; locale: Locale; images: import("../../types").RemoteFileEntry[]; selectedPath: string; preview: ProjectImagePreview | null; busy: boolean; error: string; onSelect: (path: string) => void; onLoad: () => Promise<void> | void }) {
@@ -327,6 +400,29 @@ function agentEventSource(kind: AgentRunStreamEvent["kind"], zh: boolean) {
 
 function isTerminalAgentEventV3(event: AgentRunEventV3) {
   return event.event.kind === "run_completed" || event.event.kind === "run_failed" || event.event.kind === "run_cancelled" || event.event.kind === "needs_attention";
+}
+
+function isTerminalAgentEventV4(event: AgentRunEventV4) {
+  return event.event.kind === "run_completed" || event.event.kind === "run_failed" || event.event.kind === "run_cancelled" || event.event.kind === "run_needs_attention";
+}
+
+function groupAgentRunEventsV4(events: AgentRunEventV4[]) {
+  const byRun = new Map<string, AgentRunEventV4[]>();
+  for (const event of events) byRun.set(event.run_id, [...(byRun.get(event.run_id) ?? []), event]);
+  return [...byRun].map(([runId, runEvents]) => ({ runId, events: runEvents.sort((left, right) => left.sequence - right.sequence) }));
+}
+
+function placeV4RunsAfterMessages(messages: NonNullable<Props["messages"]>, events: AgentRunEventV4[]) {
+  const timedMessages = messages.filter((message) => (message.role === "user" || message.role === "assistant") && message.created_at && Number.isFinite(Date.parse(message.created_at)));
+  const afterMessage = new Map<string, ReturnType<typeof groupAgentRunEventsV4>>();
+  const unanchored: ReturnType<typeof groupAgentRunEventsV4> = [];
+  groupAgentRunEventsV4(events).forEach((run) => {
+    const startedAt = Date.parse(run.events[0]?.occurred_at ?? "");
+    const anchor = Number.isFinite(startedAt) ? timedMessages.filter((message) => Date.parse(message.created_at!) <= startedAt).at(-1) : undefined;
+    if (!anchor) unanchored.push(run);
+    else afterMessage.set(anchor.id, [...(afterMessage.get(anchor.id) ?? []), run]);
+  });
+  return { afterMessage, unanchored };
 }
 
 function groupAgentRunEventsV3(events: AgentRunEventV3[]) {

@@ -23,6 +23,8 @@ import type {
   AgentRunEventV3,
   AgentRunEventV4,
   RunSummaryV4,
+  ComputeSelectionV4,
+  ComputeBackendAvailabilityV4,
   StepAttempt,
   ArtifactRecordV2,
   EnvironmentLock,
@@ -566,12 +568,21 @@ export async function answerAgentRunQuestionV3(runId: string, questionId: string
   await invoke("answer_agent_run_question_v3", { runId, questionId, answer });
 }
 
-export async function agentV4StartPlanning(request: { project_id: string; conversation_id: string; model_profile_id: string; objective: string }): Promise<RunSummaryV4> {
+export async function agentV4ComputeBackends(projectId: string, containerImage?: string): Promise<ComputeBackendAvailabilityV4[]> {
+  if (!isTauri()) return [];
+  return invoke("agent_v4_compute_backends", { request: { project_id: projectId, container_image: containerImage || null } });
+}
+
+export async function agentV4StartPlanning(request: { project_id: string; conversation_id: string; model_profile_id: string; objective: string; compute_selection: ComputeSelectionV4 }): Promise<RunSummaryV4> {
   return invoke("agent_v4_start_planning", { request });
 }
 
-export async function agentV4ApprovePlan(runId: string, planHash: string): Promise<RunSummaryV4> {
-  return invoke("agent_v4_approve_plan", { request: { run_id: runId, plan_hash: planHash } });
+export async function agentV4StartDirect(request: { project_id: string; conversation_id: string; model_profile_id: string; objective: string; compute_selection: ComputeSelectionV4 }): Promise<RunSummaryV4> {
+  return invoke("agent_v4_start_direct", { request });
+}
+
+export async function agentV4ApprovePlan(runId: string, approvalHash: string): Promise<RunSummaryV4> {
+  return invoke("agent_v4_approve_plan", { request: { run_id: runId, approval_hash: approvalHash } });
 }
 
 export async function agentV4Resume(runId: string): Promise<void> { await invoke("agent_v4_resume", { runId }); }
@@ -579,6 +590,9 @@ export async function agentV4Cancel(runId: string): Promise<void> { await invoke
 export async function agentV4Answer(runId: string, questionId: string, answer: string): Promise<void> { await invoke("agent_v4_answer", { request: { run_id: runId, question_id: questionId, answer } }); }
 export async function agentV4ResolveUncertain(runId: string, callId: string, resolution: "side_effect_observed" | "side_effect_not_observed" | "compensated", evidence: string): Promise<void> { await invoke("agent_v4_resolve_uncertain", { request: { run_id: runId, call_id: callId, resolution, evidence } }); }
 export async function agentV4Events(runId: string): Promise<AgentRunEventV4[]> { return isTauri() ? invoke("agent_v4_events", { runId }) : []; }
+export async function agentV4EventsForConversation(projectId: string, conversationId: string): Promise<AgentRunEventV4[]> {
+  return isTauri() ? invoke("agent_v4_events_for_conversation", { projectId, conversationId }) : [];
+}
 export async function onAgentV4Event(callback: (event: AgentRunEventV4) => void): Promise<UnlistenFn> {
   if (!isTauri()) return () => undefined;
   return listen<AgentRunEventV4>("agent-v4-event", ({ payload }) => callback(payload));

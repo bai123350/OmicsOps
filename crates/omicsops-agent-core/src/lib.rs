@@ -1070,15 +1070,15 @@ impl AgentCoreV4<'_> {
         let mut attempt = 0_u8;
         loop {
             let mut callback_error = None;
-            let mut streamed_text = false;
+            let mut streamed_text = String::new();
             let mut on_event = |event| {
                 if callback_error.is_some() {
                     return;
                 }
                 let kind = match event {
                     ModelStreamEventV4::TextDelta(text) => {
-                        streamed_text = true;
-                        AgentEventKindV4::ModelText { text }
+                        streamed_text.push_str(&text);
+                        return;
                     }
                     ModelStreamEventV4::ProviderRetrying {
                         attempt,
@@ -1113,11 +1113,16 @@ impl AgentCoreV4<'_> {
             }
             match result {
                 Ok(turn) => {
-                    if !streamed_text && !turn.public_text.is_empty() {
+                    let completed_text = if turn.public_text.is_empty() {
+                        streamed_text
+                    } else {
+                        turn.public_text.clone()
+                    };
+                    if !completed_text.is_empty() {
                         self.push(
                             run_id,
                             AgentEventKindV4::ModelText {
-                                text: turn.public_text.clone(),
+                                text: completed_text,
                             },
                         )?;
                     }
@@ -1266,6 +1271,8 @@ impl AgentCoreV4<'_> {
             events.clone()
         };
         let candidate = serde_json::to_string(&json!({
+            "frozen_plan": spec.plan,
+            "compute_selection": spec.compute_selection,
             "checkpoint": latest_checkpoint,
             "recent_events": recent,
             "scientific_state": scientific_state,
@@ -1294,7 +1301,7 @@ impl AgentCoreV4<'_> {
                 checkpoint: checkpoint.clone(),
             },
         )?;
-        serde_json::to_string(&json!({"checkpoint":checkpoint,"recent_events":[],"scientific_state":scientific_state}))
+        serde_json::to_string(&json!({"frozen_plan":spec.plan,"compute_selection":spec.compute_selection,"checkpoint":checkpoint,"recent_events":[],"scientific_state":scientific_state}))
             .map_err(|e| AgentCoreErrorV4::Store(e.to_string()))
     }
 
@@ -2041,6 +2048,29 @@ mod tests {
 
     struct ScriptedModel(Mutex<Vec<ModelTurnV4>>);
 
+    struct CharacterStreamingModel;
+
+    #[async_trait]
+    impl ModelPortV4 for CharacterStreamingModel {
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            for character in "我先检查输入目录。".chars() {
+                on_event(ModelStreamEventV4::TextDelta(character.to_string()));
+            }
+            Ok(ModelTurnV4 {
+                public_text: "我先检查输入目录。".into(),
+                tool_calls: vec![],
+            })
+        }
+
+        async fn review(&self, _: ReviewerRequestV4) -> Result<ReviewerReportV4, ModelFailureV4> {
+            unreachable!("review is not used by this test")
+        }
+    }
+
     #[test]
     fn prompt_layers_are_ordered_testable_and_do_not_preload_skill_content() {
         let layers = PromptLayersV4 {
@@ -2154,6 +2184,52 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn model_text_is_persisted_as_one_completed_response_not_character_deltas() {
+        let run_id = Uuid::new_v4();
+        let store = MemoryStore::default();
+        store
+            .append(&AgentEventV4::first(
+                run_id,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Utc::now(),
+                AgentEventKindV4::RunCreated {
+                    mode: RunModeV4::Plan,
+                },
+            ))
+            .unwrap();
+        let core = AgentCoreV4 {
+            model: &CharacterStreamingModel,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+
+        core.model_turn(
+            run_id,
+            ModelRequestV4 {
+                system: String::new(),
+                context: String::new(),
+                tools: vec![],
+            },
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let model_text = store
+            .load(run_id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.event {
+                AgentEventKindV4::ModelText { text } => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(model_text, vec!["我先检查输入目录。"]);
+    }
+    #[tokio::test]
     async fn planning_can_inspect_then_freeze_a_hashable_plan() {
         let plan = json!({"schema_version":4,"objective":"analyze","steps":["inspect","run"],"completion_criteria":["result"],"requested_capabilities":["runtime.execute"]});
         let model = ScriptedModel(Mutex::new(vec![
@@ -2237,6 +2313,23 @@ mod tests {
                 },
             ))
             .unwrap();
+    }
+
+    #[test]
+    fn execution_context_always_contains_the_frozen_objective_and_plan() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = ScriptedModel(Mutex::new(vec![]));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let context = core.context_for(&spec, AgentLimitsV4::default()).unwrap();
+        assert!(context.contains("frozen_plan"));
+        assert!(context.contains("execute"));
     }
 
     fn completion_arguments(sequence: u64) -> serde_json::Value {
@@ -2738,6 +2831,7 @@ mod tests {
             .unwrap();
         assert_eq!(store.archives.lock().unwrap().len(), 1);
         assert!(context.contains("checkpoint"));
+        assert!(context.contains("frozen_plan"));
         assert!(matches!(
             store.events.lock().unwrap().last().unwrap().event,
             AgentEventKindV4::ContextCheckpointed { .. }
