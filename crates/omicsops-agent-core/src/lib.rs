@@ -2,13 +2,13 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::future::join_all;
 use omicsops_protocol::{
-    AgentEventKindV4, AgentEventV4, CompletionEvidenceRefV4, CompletionProposalV4,
-    ContextArchiveV4, ContextCheckpointV4, DelegatedTaskNodeV4, DelegationGraphOutcomeV4,
-    DelegationGraphV4, DelegationIsolationV4, DelegationNodeOutcomeV4, DelegationNodeStatusV4,
-    DeterministicVerificationV4, ExecutionPlanV4, ExternalExecutorOutcomeV4,
-    ExternalExecutorTaskV4, ModelFailureV4, ReviewerReportV4, RunModeV4, RunSpecV4,
-    ScientificBridgeV4, ToolCallV4, ToolDescriptorV4, ToolEffectV4, ToolOutcomeV4,
-    VerificationFindingV4, VerificationSeverityV4,
+    AgentEventKindV4, AgentEventV4, ApprovalPolicyV4, CompletionEvidenceRefV4,
+    CompletionProposalV4, ComputeBackendKindV4, ContextArchiveV4, ContextCheckpointV4,
+    DelegatedTaskNodeV4, DelegationGraphOutcomeV4, DelegationGraphV4, DelegationIsolationV4,
+    DelegationNodeOutcomeV4, DelegationNodeStatusV4, DeterministicVerificationV4, ExecutionPlanV4,
+    ExternalExecutorOutcomeV4, ExternalExecutorTaskV4, ModelFailureV4, ReviewerReportV4, RunModeV4,
+    RunSpecV4, ScientificBridgeV4, ToolApprovalDecisionV4, ToolApprovalRequestV4, ToolCallV4,
+    ToolDescriptorV4, ToolEffectV4, ToolOutcomeV4, VerificationFindingV4, VerificationSeverityV4,
 };
 use omicsops_science::{AnalysisStatusV4, EvidenceSourceV4, ScientificStateV4};
 use serde::{Deserialize, Serialize};
@@ -242,6 +242,8 @@ pub enum AgentCoreErrorV4 {
     Cancelled,
     #[error("run is waiting for user input")]
     WaitingForInput,
+    #[error("run is waiting for tool approval")]
+    WaitingForApproval,
     #[error("tool-call budget exhausted ({0})")]
     ToolBudgetExceeded(u32),
     #[error("repeated tool-call signature detected: {0}")]
@@ -403,7 +405,7 @@ impl AgentCoreV4<'_> {
         limits: AgentLimitsV4,
         cancelled: &AtomicBool,
     ) -> Result<(), AgentCoreErrorV4> {
-        self.recover_interrupted_dispatches(spec.run_id, cancelled)
+        self.recover_interrupted_dispatches(spec, limits, cancelled)
             .await?;
         let existing = self
             .events
@@ -434,6 +436,18 @@ impl AgentCoreV4<'_> {
                     consecutive_repeats = 1;
                 }
             }
+        }
+        if self
+            .resume_pending_review(
+                spec,
+                &existing,
+                &mut reviewer_corrections,
+                limits,
+                cancelled,
+            )
+            .await?
+        {
+            return Ok(());
         }
         for _ in 0..limits.max_turns {
             if cancelled.load(Ordering::SeqCst) {
@@ -480,6 +494,22 @@ impl AgentCoreV4<'_> {
                     spec.run_id,
                     AgentEventKindV4::ToolRequested { call: call.clone() },
                 )?;
+                if !matches!(
+                    call.tool_id.as_str(),
+                    "agent.complete" | "agent.request_input" | "agent.propose_plan"
+                ) {
+                    let effect = self.tools.effect(&call.tool_id).ok_or_else(|| {
+                        AgentCoreErrorV4::Tool(format!("unknown tool {}", call.tool_id))
+                    })?;
+                    if self.tool_requires_approval(spec, &call, effect, &existing)? {
+                        let request = self.approval_request(spec, call, effect)?;
+                        self.push(
+                            spec.run_id,
+                            AgentEventKindV4::ToolApprovalRequested { request },
+                        )?;
+                        return Err(AgentCoreErrorV4::WaitingForApproval);
+                    }
+                }
                 if call.tool_id == "agent.complete" {
                     let proposal: CompletionProposalV4 =
                         match serde_json::from_value(call.arguments) {
@@ -750,21 +780,24 @@ impl AgentCoreV4<'_> {
                     return Err(AgentCoreErrorV4::Cancelled);
                 }
                 let review = self
-                    .model
-                    .review(ReviewerRequestV4 {
-                        frozen_objective: spec.plan.objective.clone(),
-                        completion_criteria: spec.plan.completion_criteria.clone(),
-                        verified_evidence: materialize_verified_evidence(
-                            &proposal,
-                            &events,
-                            &scientific_state,
-                        )?,
-                        proposal,
-                        deterministic_report: deterministic,
-                        scientific_state,
-                    })
-                    .await
-                    .map_err(|error| AgentCoreErrorV4::Model(error.message))?;
+                    .review_with_retry(
+                        spec.run_id,
+                        ReviewerRequestV4 {
+                            frozen_objective: spec.plan.objective.clone(),
+                            completion_criteria: spec.plan.completion_criteria.clone(),
+                            verified_evidence: materialize_verified_evidence(
+                                &proposal,
+                                &events,
+                                &scientific_state,
+                            )?,
+                            proposal,
+                            deterministic_report: deterministic,
+                            scientific_state,
+                        },
+                        limits.max_model_retries,
+                        Some(cancelled),
+                    )
+                    .await?;
                 review
                     .validate()
                     .map_err(|error| AgentCoreErrorV4::Model(error.to_string()))?;
@@ -1145,11 +1178,174 @@ impl AgentCoreV4<'_> {
         }
     }
 
-    async fn recover_interrupted_dispatches(
+    async fn review_with_retry(
         &self,
         run_id: Uuid,
+        request: ReviewerRequestV4,
+        max_retries: u8,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<ReviewerReportV4, AgentCoreErrorV4> {
+        let mut attempt = 0_u8;
+        loop {
+            if cancelled.is_some_and(|token| token.load(Ordering::SeqCst)) {
+                self.push(run_id, AgentEventKindV4::RunCancelled)?;
+                return Err(AgentCoreErrorV4::Cancelled);
+            }
+            match self.model.review(request.clone()).await {
+                Ok(report) => return Ok(report),
+                Err(error) if error.retryable && attempt < max_retries => {
+                    attempt += 1;
+                    self.push(
+                        run_id,
+                        AgentEventKindV4::ModelRetrying {
+                            attempt,
+                            class: error.class,
+                            message: format!("reviewer: {}", error.message),
+                        },
+                    )?;
+                    tokio::time::sleep(Duration::from_millis(
+                        250 * (1_u64 << u32::from(attempt.saturating_sub(1))),
+                    ))
+                    .await;
+                }
+                Err(error) => return Err(AgentCoreErrorV4::Model(error.message)),
+            }
+        }
+    }
+
+    async fn resume_pending_review(
+        &self,
+        spec: &RunSpecV4,
+        events: &[AgentEventV4],
+        reviewer_corrections: &mut u8,
+        limits: AgentLimitsV4,
+        cancelled: &AtomicBool,
+    ) -> Result<bool, AgentCoreErrorV4> {
+        let Some((proposal_sequence, proposal)) =
+            events.iter().rev().find_map(|event| match &event.event {
+                AgentEventKindV4::CompletionProposalSubmitted { proposal } => {
+                    Some((event.sequence, proposal.clone()))
+                }
+                _ => None,
+            })
+        else {
+            return Ok(false);
+        };
+        let Some((verification_sequence, deterministic)) =
+            events.iter().rev().find_map(|event| match &event.event {
+                AgentEventKindV4::DeterministicVerificationFinished { report }
+                    if event.sequence > proposal_sequence =>
+                {
+                    Some((event.sequence, report.clone()))
+                }
+                _ => None,
+            })
+        else {
+            return Ok(false);
+        };
+        if !deterministic.passed
+            || events.iter().any(|event| {
+                event.sequence > verification_sequence
+                    && matches!(
+                        event.event,
+                        AgentEventKindV4::ReviewerFinished { .. }
+                            | AgentEventKindV4::RunCompleted
+                            | AgentEventKindV4::ReviewerCorrectionRequested { .. }
+                    )
+            })
+        {
+            return Ok(false);
+        }
+        let scientific_state = self.scientific_snapshot(spec.project_id)?;
+        if let Some(expected) = events[..verification_sequence as usize]
+            .iter()
+            .rev()
+            .find_map(|event| match &event.event {
+                AgentEventKindV4::ScientificStateChanged { state_sha256, .. } => {
+                    Some(state_sha256.as_str())
+                }
+                _ => None,
+            })
+        {
+            if scientific_state.digest() != expected {
+                let message =
+                    "scientific state changed after the completion checkpoint".to_string();
+                self.push(
+                    spec.run_id,
+                    AgentEventKindV4::RunNeedsAttention {
+                        message: message.clone(),
+                    },
+                )?;
+                return Err(AgentCoreErrorV4::NeedsAttention(message));
+            }
+        }
+        let review = self
+            .review_with_retry(
+                spec.run_id,
+                ReviewerRequestV4 {
+                    frozen_objective: spec.plan.objective.clone(),
+                    completion_criteria: spec.plan.completion_criteria.clone(),
+                    verified_evidence: materialize_verified_evidence(
+                        &proposal,
+                        events,
+                        &scientific_state,
+                    )?,
+                    proposal,
+                    deterministic_report: deterministic,
+                    scientific_state,
+                },
+                limits.max_model_retries,
+                Some(cancelled),
+            )
+            .await?;
+        review
+            .validate()
+            .map_err(|error| AgentCoreErrorV4::Model(error.to_string()))?;
+        self.push(
+            spec.run_id,
+            AgentEventKindV4::ReviewerFinished {
+                report: review.clone(),
+            },
+        )?;
+        if review.has_errors() {
+            if *reviewer_corrections >= limits.max_reviewer_corrections {
+                let message = format!(
+                    "scientific reviewer errors remain after {} correction rounds",
+                    limits.max_reviewer_corrections
+                );
+                self.push(
+                    spec.run_id,
+                    AgentEventKindV4::RunNeedsAttention {
+                        message: message.clone(),
+                    },
+                )?;
+                return Err(AgentCoreErrorV4::NeedsAttention(message));
+            }
+            *reviewer_corrections += 1;
+            self.push(
+                spec.run_id,
+                AgentEventKindV4::ReviewerCorrectionRequested {
+                    correction: *reviewer_corrections,
+                    findings: review
+                        .findings
+                        .into_iter()
+                        .filter(|finding| finding.severity == VerificationSeverityV4::Error)
+                        .collect(),
+                },
+            )?;
+            return Ok(false);
+        }
+        self.push(spec.run_id, AgentEventKindV4::RunCompleted)?;
+        Ok(true)
+    }
+
+    async fn recover_interrupted_dispatches(
+        &self,
+        spec: &RunSpecV4,
+        limits: AgentLimitsV4,
         cancelled: &AtomicBool,
     ) -> Result<(), AgentCoreErrorV4> {
+        let run_id = spec.run_id;
         let events = self.events.load(run_id).map_err(AgentCoreErrorV4::Store)?;
         let mut pending = BTreeMap::<String, (ToolCallV4, bool)>::new();
         for event in &events {
@@ -1157,10 +1353,7 @@ impl AgentCoreV4<'_> {
                 AgentEventKindV4::ToolRequested { call }
                     if !matches!(
                         call.tool_id.as_str(),
-                        "agent.complete"
-                            | "agent.request_input"
-                            | "agent.propose_plan"
-                            | "agent.delegate"
+                        "agent.complete" | "agent.request_input" | "agent.propose_plan"
                     ) =>
                 {
                     pending.insert(call.call_id.clone(), (call.clone(), false));
@@ -1202,9 +1395,72 @@ impl AgentCoreV4<'_> {
             if cancelled.load(Ordering::SeqCst) {
                 return Err(AgentCoreErrorV4::Cancelled);
             }
+            if self.tool_requires_approval(spec, &call, effect, &events)? {
+                match self.approval_decision(spec, &call, effect, &events)? {
+                    Some(ToolApprovalDecisionV4::Approved) => {}
+                    Some(ToolApprovalDecisionV4::Denied) => {
+                        self.push(
+                            run_id,
+                            AgentEventKindV4::ToolFinished {
+                                outcome: ToolOutcomeV4 {
+                                    call_id: call.call_id,
+                                    tool_id: call.tool_id,
+                                    succeeded: false,
+                                    model_content: "user denied this tool request".into(),
+                                    data: json!({"error_kind":"approval_denied"}),
+                                    provenance: vec!["tool-approval-v4".into()],
+                                },
+                            },
+                        )?;
+                        continue;
+                    }
+                    None => {
+                        if !events.iter().any(|event| {
+                            matches!(&event.event, AgentEventKindV4::ToolApprovalRequested { request } if request.call.call_id == call.call_id)
+                        }) {
+                            let request = self.approval_request(spec, call, effect)?;
+                            self.push(
+                                run_id,
+                                AgentEventKindV4::ToolApprovalRequested { request },
+                            )?;
+                        }
+                        return Err(AgentCoreErrorV4::WaitingForApproval);
+                    }
+                }
+            }
             self.tools
                 .validate(RunModeV4::Execute, &call)
                 .map_err(AgentCoreErrorV4::Tool)?;
+            if call.tool_id == "agent.delegate" {
+                let graph: DelegationGraphV4 = serde_json::from_value(call.arguments.clone())
+                    .map_err(|error| AgentCoreErrorV4::Delegation(error.to_string()))?;
+                let call_id = call.call_id.clone();
+                let outcome = self
+                    .execute_delegation_graph(spec, &call_id, graph, limits, cancelled)
+                    .await?;
+                let succeeded = outcome
+                    .nodes
+                    .values()
+                    .all(|node| node.status == DelegationNodeStatusV4::Succeeded);
+                self.push(
+                    run_id,
+                    AgentEventKindV4::ToolFinished {
+                        outcome: ToolOutcomeV4 {
+                            call_id,
+                            tool_id: "agent.delegate".into(),
+                            succeeded,
+                            model_content: serde_json::to_string(&outcome)
+                                .map_err(|error| AgentCoreErrorV4::Delegation(error.to_string()))?,
+                            data: serde_json::to_value(&outcome)
+                                .map_err(|error| AgentCoreErrorV4::Delegation(error.to_string()))?,
+                            provenance: vec!["host-bounded-delegation-v4".into()],
+                        },
+                    },
+                )?;
+                continue;
+            }
+            self.science_before_tool(spec, &call)
+                .map_err(AgentCoreErrorV4::Science)?;
             self.push(
                 run_id,
                 AgentEventKindV4::ToolDispatchStarted {
@@ -1214,14 +1470,163 @@ impl AgentCoreV4<'_> {
                     idempotency_key: call.call_id.clone(),
                 },
             )?;
-            let outcome = self
+            let mut outcome = self
                 .tools
-                .execute(RunModeV4::Execute, call)
+                .execute(RunModeV4::Execute, call.clone())
                 .await
                 .map_err(AgentCoreErrorV4::Tool)?;
-            self.push(run_id, AgentEventKindV4::ToolFinished { outcome })?;
+            let scientific_update = self.science_after_tool(spec, &call, &outcome);
+            if let Err(error) = &scientific_update {
+                outcome.succeeded = false;
+                outcome.model_content = format!("host rejected scientific result: {error}");
+                outcome.data = json!({"error_kind":"scientific_validation"});
+                outcome.provenance.clear();
+            }
+            self.push(
+                run_id,
+                AgentEventKindV4::ToolFinished {
+                    outcome: outcome.clone(),
+                },
+            )?;
+            if let Ok(update) = scientific_update {
+                self.record_scientific_update(run_id, update)?;
+            }
         }
         Ok(())
+    }
+
+    fn approval_request(
+        &self,
+        spec: &RunSpecV4,
+        call: ToolCallV4,
+        effect: ToolEffectV4,
+    ) -> Result<ToolApprovalRequestV4, AgentCoreErrorV4> {
+        let spec_hash = spec
+            .spec_hash
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| spec.calculate_spec_hash())
+            .map_err(|error| AgentCoreErrorV4::Store(error.to_string()))?;
+        ToolApprovalRequestV4::new(
+            spec.run_id,
+            &spec_hash,
+            call,
+            effect,
+            approval_reason(effect),
+        )
+        .map_err(|error| AgentCoreErrorV4::Store(error.to_string()))
+    }
+
+    fn approval_decision(
+        &self,
+        spec: &RunSpecV4,
+        call: &ToolCallV4,
+        effect: ToolEffectV4,
+        events: &[AgentEventV4],
+    ) -> Result<Option<ToolApprovalDecisionV4>, AgentCoreErrorV4> {
+        let spec_hash = spec
+            .spec_hash
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| spec.calculate_spec_hash())
+            .map_err(|error| AgentCoreErrorV4::Store(error.to_string()))?;
+        let call_hash = call
+            .canonical_hash()
+            .map_err(|error| AgentCoreErrorV4::Store(error.to_string()))?;
+        let mut matching_request = None;
+        for event in events {
+            if let AgentEventKindV4::ToolApprovalRequested { request } = &event.event {
+                if request.call.call_id == call.call_id {
+                    request
+                        .validate(spec.run_id, &spec_hash)
+                        .map_err(|error| AgentCoreErrorV4::Store(error.to_string()))?;
+                    if request.call != *call
+                        || request.effect != effect
+                        || request.call_hash != call_hash
+                    {
+                        return Err(AgentCoreErrorV4::Store(
+                            "tool approval does not match the frozen tool call".into(),
+                        ));
+                    }
+                    matching_request = Some(request);
+                }
+            }
+        }
+        let Some(request) = matching_request else {
+            return Ok(None);
+        };
+        let mut decision = None;
+        for event in events {
+            if let AgentEventKindV4::ToolApprovalDecided {
+                approval_id,
+                call_hash: decided_hash,
+                decision: value,
+            } = &event.event
+            {
+                if approval_id == &request.approval_id {
+                    if decided_hash != &request.call_hash || decision.is_some() {
+                        return Err(AgentCoreErrorV4::Store(
+                            "tool approval decision is duplicated or tampered".into(),
+                        ));
+                    }
+                    decision = Some(*value);
+                }
+            }
+        }
+        Ok(decision)
+    }
+
+    fn tool_requires_approval(
+        &self,
+        spec: &RunSpecV4,
+        call: &ToolCallV4,
+        effect: ToolEffectV4,
+        events: &[AgentEventV4],
+    ) -> Result<bool, AgentCoreErrorV4> {
+        if call.tool_id == "agent.complete" || effect == ToolEffectV4::ReadOnly {
+            return Ok(false);
+        }
+        let Some(selection) = &spec.compute_selection else {
+            return Ok(false);
+        };
+        match selection.approval_policy {
+            ApprovalPolicyV4::FullAccess => Ok(false),
+            ApprovalPolicyV4::RequestApproval => Ok(true),
+            ApprovalPolicyV4::RiskBased => {
+                if call.tool_id == "runtime.execute"
+                    && matches!(
+                        selection.backend_kind,
+                        ComputeBackendKindV4::Local | ComputeBackendKindV4::Ssh
+                    )
+                {
+                    for event in events {
+                        let AgentEventKindV4::ToolApprovalRequested { request } = &event.event
+                        else {
+                            continue;
+                        };
+                        if request.call.tool_id != "runtime.execute" {
+                            continue;
+                        }
+                        if self.approval_decision(spec, &request.call, request.effect, events)?
+                            == Some(ToolApprovalDecisionV4::Approved)
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    return Ok(true);
+                }
+                if call.tool_id == "runtime.environment.ensure" {
+                    return Ok(selection.environment != "system");
+                }
+                Ok(matches!(
+                    effect,
+                    ToolEffectV4::Network | ToolEffectV4::Mutating | ToolEffectV4::Delegation
+                ) || matches!(
+                    call.tool_id.as_str(),
+                    "runtime.rebuild" | "runtime.interrupt"
+                ))
+            }
+        }
     }
 
     fn cached_outcome(
@@ -1665,6 +2070,16 @@ fn tool_signature(call: &ToolCallV4) -> String {
         call.tool_id,
         serde_json::to_string(&call.arguments).unwrap_or_else(|_| "<invalid>".into())
     )
+}
+
+fn approval_reason(effect: ToolEffectV4) -> &'static str {
+    match effect {
+        ToolEffectV4::ReadOnly => "read-only access",
+        ToolEffectV4::Mutating => "this tool may modify project or scientific state",
+        ToolEffectV4::Runtime => "this tool executes or changes a runtime",
+        ToolEffectV4::Network => "this tool may access the network",
+        ToolEffectV4::Delegation => "this tool delegates work to another executor",
+    }
 }
 
 pub fn verify_completion_v4(
@@ -2291,6 +2706,154 @@ mod tests {
             Utc::now(),
         )
         .unwrap()
+    }
+
+    fn supervised_execution_spec(
+        run_id: Uuid,
+        policy: ApprovalPolicyV4,
+        backend_kind: ComputeBackendKindV4,
+    ) -> RunSpecV4 {
+        let plan = ExecutionPlanV4 {
+            schema_version: 4,
+            objective: "execute safely".into(),
+            steps: vec!["run".into()],
+            completion_criteria: vec!["verified output".into()],
+            requested_capabilities: BTreeSet::from(["runtime.execute".into()]),
+        };
+        let selection = omicsops_protocol::ComputeSelectionV4 {
+            schema_version: 4,
+            backend_id: match backend_kind {
+                ComputeBackendKindV4::Local => "local".into(),
+                ComputeBackendKindV4::Ssh => format!("ssh:{}", Uuid::new_v4()),
+                _ => unreachable!("this helper covers supervised host backends"),
+            },
+            backend_kind,
+            autonomy_mode: omicsops_protocol::AutonomyModeV4::Supervised,
+            approval_policy: policy,
+            environment: "system".into(),
+            network_policy: omicsops_protocol::NetworkPolicyV4::HostInherited,
+            container_image: None,
+        };
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let model_profile_id = Uuid::new_v4();
+        let approval_hash = RunSpecV4::approval_hash_for(
+            run_id,
+            project_id,
+            conversation_id,
+            model_profile_id,
+            &plan,
+            &selection,
+        )
+        .unwrap();
+        RunSpecV4::freeze_with_compute(
+            run_id,
+            project_id,
+            conversation_id,
+            model_profile_id,
+            plan,
+            selection,
+            &approval_hash,
+            Utc::now(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn approval_policy_matrix_requires_the_expected_tool_decisions() {
+        let store = MemoryStore::default();
+        let model = ScriptedModel(Mutex::new(vec![]));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let call = ToolCallV4 {
+            call_id: "call-1".into(),
+            tool_id: "runtime.execute".into(),
+            arguments: json!({"code":"print(1)"}),
+        };
+        let request = supervised_execution_spec(
+            Uuid::new_v4(),
+            ApprovalPolicyV4::RequestApproval,
+            ComputeBackendKindV4::Local,
+        );
+        assert!(
+            core.tool_requires_approval(&request, &call, ToolEffectV4::Runtime, &[])
+                .unwrap()
+        );
+        assert!(
+            !core
+                .tool_requires_approval(&request, &call, ToolEffectV4::ReadOnly, &[])
+                .unwrap()
+        );
+        let risk = supervised_execution_spec(
+            Uuid::new_v4(),
+            ApprovalPolicyV4::RiskBased,
+            ComputeBackendKindV4::Ssh,
+        );
+        assert!(
+            core.tool_requires_approval(&risk, &call, ToolEffectV4::Runtime, &[])
+                .unwrap()
+        );
+        assert!(
+            core.tool_requires_approval(&risk, &call, ToolEffectV4::Network, &[])
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn approved_tool_call_is_reused_only_when_the_hash_bound_request_matches() {
+        let spec = supervised_execution_spec(
+            Uuid::new_v4(),
+            ApprovalPolicyV4::RequestApproval,
+            ComputeBackendKindV4::Local,
+        );
+        let call = ToolCallV4 {
+            call_id: "call-1".into(),
+            tool_id: "runtime.execute".into(),
+            arguments: json!({"code":"print(1)"}),
+        };
+        let request = ToolApprovalRequestV4::new(
+            spec.run_id,
+            spec.spec_hash.as_deref().unwrap(),
+            call.clone(),
+            ToolEffectV4::Runtime,
+            "approval required",
+        )
+        .unwrap();
+        let first = AgentEventV4::first(
+            spec.run_id,
+            spec.project_id,
+            spec.conversation_id,
+            Utc::now(),
+            AgentEventKindV4::ToolApprovalRequested {
+                request: request.clone(),
+            },
+        );
+        let decided = AgentEventV4::next(
+            &first,
+            Utc::now(),
+            AgentEventKindV4::ToolApprovalDecided {
+                approval_id: request.approval_id,
+                call_hash: request.call_hash,
+                decision: ToolApprovalDecisionV4::Approved,
+            },
+        );
+        let store = MemoryStore::default();
+        let model = ScriptedModel(Mutex::new(vec![]));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        assert_eq!(
+            core.approval_decision(&spec, &call, ToolEffectV4::Runtime, &[first, decided])
+                .unwrap(),
+            Some(ToolApprovalDecisionV4::Approved)
+        );
     }
 
     fn seed_execution(store: &MemoryStore, spec: &RunSpecV4) {
@@ -3018,6 +3581,133 @@ mod tests {
                 evidence: vec!["deterministic_verification_v4".into()],
             }],
         }
+    }
+
+    struct RetryingReviewer {
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ModelPortV4 for RetryingReviewer {
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            unreachable!("only reviewer retry is exercised")
+        }
+
+        async fn review(&self, _: ReviewerRequestV4) -> Result<ReviewerReportV4, ModelFailureV4> {
+            let attempt = self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            if attempt < 3 {
+                Err(ModelFailureV4::transient(
+                    omicsops_protocol::ModelErrorClassV4::Transport,
+                    "stream ended after partial output: error decoding response body",
+                ))
+            } else {
+                Ok(review(VerificationSeverityV4::Ok))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reviewer_retries_three_transport_failures_and_records_each_retry() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = RetryingReviewer {
+            attempts: AtomicUsize::new(0),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let report = core
+            .review_with_retry(
+                spec.run_id,
+                ReviewerRequestV4 {
+                    frozen_objective: spec.plan.objective.clone(),
+                    completion_criteria: spec.plan.completion_criteria.clone(),
+                    proposal: CompletionProposalV4 {
+                        schema_version: 4,
+                        summary: "done".into(),
+                        criteria: vec![],
+                    },
+                    deterministic_report: DeterministicVerificationV4 {
+                        schema_version: 4,
+                        passed: true,
+                        findings: vec![],
+                    },
+                    scientific_state: ScientificStateV4::new(spec.project_id),
+                    verified_evidence: vec![],
+                },
+                3,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!report.has_errors());
+        assert_eq!(model.attempts.load(AtomicOrdering::SeqCst), 4);
+        assert_eq!(
+            store
+                .load(spec.run_id)
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event.event, AgentEventKindV4::ModelRetrying { .. }))
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewer_resume_reuses_the_persisted_proposal_and_verification() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        let evidence_sequence = seed_success_evidence(&store, &spec);
+        let proposal = CompletionProposalV4 {
+            schema_version: 4,
+            summary: "persisted completion".into(),
+            criteria: vec![CompletionCriterionEvidenceV4 {
+                criterion: "verified output".into(),
+                evidence: vec![CompletionEvidenceRefV4::Event {
+                    sequence: evidence_sequence,
+                }],
+            }],
+        };
+        for kind in [
+            AgentEventKindV4::CompletionProposed,
+            AgentEventKindV4::CompletionProposalSubmitted {
+                proposal: proposal.clone(),
+            },
+            AgentEventKindV4::DeterministicVerificationFinished {
+                report: DeterministicVerificationV4 {
+                    schema_version: 4,
+                    passed: true,
+                    findings: vec![],
+                },
+            },
+        ] {
+            let previous = store.events.lock().unwrap().last().unwrap().clone();
+            store
+                .append(&AgentEventV4::next(&previous, Utc::now(), kind))
+                .unwrap();
+        }
+        let model = ScriptedModel(Mutex::new(vec![]));
+        AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        }
+        .execute_with_limits(&spec, AgentLimitsV4::default(), &AtomicBool::new(false))
+        .await
+        .unwrap();
+        assert!(matches!(
+            store.load(spec.run_id).unwrap().last().unwrap().event,
+            AgentEventKindV4::RunCompleted
+        ));
     }
 
     fn seed_success_evidence(store: &MemoryStore, spec: &RunSpecV4) -> u64 {

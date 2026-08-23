@@ -69,6 +69,7 @@ describe("DesktopApp", () => {
     await screen.findByRole("main", { name: "科研对话" });
     fireEvent.click(screen.getByRole("button", { name: "添加上下文或选择模式" }));
     fireEvent.click(screen.getByRole("menuitem", { name: /Plan 模式/ }));
+    fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
     await screen.findByRole("region", { name: "V4 计算后端" });
     await screen.findByRole("radio", { name: /LOCAL/ }, { timeout: 3000 });
     fireEvent.change(screen.getByRole("textbox", { name: /描述研究目标/ }), { target: { value: "执行完整 QC" } });
@@ -103,7 +104,7 @@ describe("DesktopApp", () => {
     await waitFor(() => expect(screen.queryByText("待删除项目")).not.toBeInTheDocument());
   });
 
-  it("centralizes model, remote compute, privacy, and legacy history settings", async () => {
+  it("centralizes model, remote compute, privacy, and permission settings", async () => {
     vi.spyOn(api, "listProjects").mockResolvedValue([]);
     render(<DesktopApp />);
     fireEvent.click(await screen.findByRole("button", { name: "设置" }));
@@ -112,7 +113,8 @@ describe("DesktopApp", () => {
     expect(dialog).toHaveTextContent("Anthropic");
     expect(dialog).toHaveTextContent("OpenAI-compatible");
     expect(dialog).toHaveTextContent("Ollama");
-    expect(dialog).toHaveTextContent("历史运行只读");
+    expect(dialog).toHaveTextContent("隐私与权限");
+    expect(dialog).not.toHaveTextContent("历史运行只读");
   });
 
   it("creates and switches to an empty conversation when New conversation is clicked", async () => {

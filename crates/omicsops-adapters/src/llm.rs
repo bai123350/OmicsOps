@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use omicsops_agent::harness_v3::{ModelProviderV2, ModelRequestV2, ModelStreamEventV2};
-use omicsops_agent::{AgentError, AgentResult, ModelProvider, ModelRequest, ModelStreamEvent};
+use omicsops_agent::provider::{
+    Provider, ProviderRequest as ProviderModelRequest, ProviderStreamEvent,
+};
+use omicsops_agent::{AgentError, AgentResult};
 use schemars::{JsonSchema, schema_for};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -102,95 +104,11 @@ pub fn provider_models_endpoint(
         .map_err(|error| AdapterError::Llm(error.to_string()))
 }
 
-pub fn build_provider_request(
+pub fn build_provider_request_with_tools(
     protocol: ProviderProtocol,
     base_url: Url,
     model: &str,
-    request: &ModelRequest,
-) -> AdapterResult<ProviderRequest> {
-    let tool = request.tool_name.as_ref().map(|name| {
-        json!({
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": "Submit a schema-valid OmicsOps control object.",
-                "parameters": request.tool_schema.clone().unwrap_or_else(|| json!({"type":"object"}))
-            }
-        })
-    });
-    let messages: Vec<Value> = request
-        .messages
-        .iter()
-        .map(|message| json!({"role": message.role, "content": message.content}))
-        .collect();
-
-    match protocol {
-        ProviderProtocol::OpenAiCompatible => {
-            let mut body = json!({
-                "model": model,
-                "stream": true,
-                "messages": std::iter::once(json!({"role":"system", "content":request.system}))
-                    .chain(messages)
-                    .collect::<Vec<_>>(),
-                "tools": tool.into_iter().collect::<Vec<_>>()
-            });
-            if let Some(name) = &request.tool_name {
-                body["tool_choice"] = json!({"type":"function", "function":{"name":name}});
-            }
-            Ok(ProviderRequest {
-                endpoint: provider_endpoint(ProviderProtocol::OpenAiCompatible, base_url)?,
-                body,
-                requires_credential: true,
-            })
-        }
-        ProviderProtocol::Anthropic => {
-            let tools: Vec<Value> = tool
-                .into_iter()
-                .map(|tool| {
-                    json!({
-                        "name": tool["function"]["name"],
-                        "description": tool["function"]["description"],
-                        "input_schema": tool["function"]["parameters"]
-                    })
-                })
-                .collect();
-            let mut body = json!({
-                "model": model,
-                "system": request.system,
-                "max_tokens": 4096,
-                "stream": true,
-                "messages": messages,
-                "tools": tools
-            });
-            if let Some(name) = &request.tool_name {
-                body["tool_choice"] = json!({"type":"tool", "name":name});
-            }
-            Ok(ProviderRequest {
-                endpoint: provider_endpoint(ProviderProtocol::Anthropic, base_url)?,
-                body,
-                requires_credential: true,
-            })
-        }
-        ProviderProtocol::Ollama => Ok(ProviderRequest {
-            endpoint: provider_endpoint(ProviderProtocol::Ollama, base_url)?,
-            body: json!({
-                "model": model,
-                "stream": true,
-                "messages": std::iter::once(json!({"role":"system", "content":request.system}))
-                    .chain(messages)
-                    .collect::<Vec<_>>(),
-                "tools": tool.into_iter().collect::<Vec<_>>()
-            }),
-            requires_credential: false,
-        }),
-    }
-}
-
-pub fn build_provider_request_v2(
-    protocol: ProviderProtocol,
-    base_url: Url,
-    model: &str,
-    request: &ModelRequestV2,
+    request: &ProviderModelRequest,
 ) -> AdapterResult<ProviderRequest> {
     let messages = request
         .messages
@@ -269,7 +187,7 @@ pub fn build_provider_request_v2(
     }
 }
 
-fn provider_tool_aliases(request: &ModelRequestV2) -> Vec<(String, String)> {
+fn provider_tool_aliases(request: &ProviderModelRequest) -> Vec<(String, String)> {
     let mut occupied = request
         .tools
         .iter()
@@ -303,7 +221,7 @@ fn provider_tool_name_is_valid(name: &str) -> bool {
 }
 
 fn provider_tool_description(
-    tool: &omicsops_agent::harness_v3::ModelToolSpec,
+    tool: &omicsops_agent::provider::ProviderToolSpec,
     provider_name: &str,
 ) -> String {
     if provider_name == tool.id {
@@ -313,7 +231,7 @@ fn provider_tool_description(
     }
 }
 
-fn provider_tool_alias_map(request: &ModelRequestV2) -> BTreeMap<String, String> {
+fn provider_tool_alias_map(request: &ProviderModelRequest) -> BTreeMap<String, String> {
     provider_tool_aliases(request).into_iter().collect()
 }
 
@@ -324,26 +242,26 @@ fn canonical_tool_id(aliases: &BTreeMap<String, String>, provider_name: &str) ->
         .unwrap_or_else(|| provider_name.to_owned())
 }
 
-pub fn parse_provider_response_v2(
+pub fn parse_provider_tool_response(
     protocol: ProviderProtocol,
     value: &Value,
-) -> AdapterResult<Vec<ModelStreamEventV2>> {
-    parse_provider_response_v2_with_aliases(protocol, value, &BTreeMap::new())
+) -> AdapterResult<Vec<ProviderStreamEvent>> {
+    parse_provider_tool_response_with_aliases(protocol, value, &BTreeMap::new())
 }
 
-pub fn parse_provider_response_v2_for_request(
+pub fn parse_provider_tool_response_for_request(
     protocol: ProviderProtocol,
     value: &Value,
-    request: &ModelRequestV2,
-) -> AdapterResult<Vec<ModelStreamEventV2>> {
-    parse_provider_response_v2_with_aliases(protocol, value, &provider_tool_alias_map(request))
+    request: &ProviderModelRequest,
+) -> AdapterResult<Vec<ProviderStreamEvent>> {
+    parse_provider_tool_response_with_aliases(protocol, value, &provider_tool_alias_map(request))
 }
 
-fn parse_provider_response_v2_with_aliases(
+fn parse_provider_tool_response_with_aliases(
     protocol: ProviderProtocol,
     value: &Value,
     aliases: &BTreeMap<String, String>,
-) -> AdapterResult<Vec<ModelStreamEventV2>> {
+) -> AdapterResult<Vec<ProviderStreamEvent>> {
     let mut events = Vec::new();
     let text = match protocol {
         ProviderProtocol::OpenAiCompatible => value.pointer("/choices/0/message/content"),
@@ -362,7 +280,7 @@ fn parse_provider_response_v2_with_aliases(
     }
     .and_then(Value::as_str);
     if let Some(text) = text.filter(|text| !text.is_empty()) {
-        events.push(ModelStreamEventV2::TextDelta { text: text.into() });
+        events.push(ProviderStreamEvent::TextDelta { text: text.into() });
     }
 
     let calls = match protocol {
@@ -421,13 +339,13 @@ fn parse_provider_response_v2_with_aliases(
         let call_id = call_id
             .map(str::to_owned)
             .unwrap_or_else(|| format!("{prefix}-{index}"));
-        events.push(ModelStreamEventV2::ToolCallStarted {
+        events.push(ProviderStreamEvent::ToolCallStarted {
             call_id: call_id.clone(),
             index,
             tool_id: canonical_tool_id(aliases, tool_id),
         });
         if let Some(arguments) = arguments {
-            events.push(ModelStreamEventV2::ToolArgumentsDelta {
+            events.push(ProviderStreamEvent::ToolArgumentsDelta {
                 call_id: call_id.clone(),
                 index,
                 arguments: match arguments {
@@ -436,10 +354,10 @@ fn parse_provider_response_v2_with_aliases(
                 },
             });
         }
-        events.push(ModelStreamEventV2::ToolCallCompleted { call_id, index });
+        events.push(ProviderStreamEvent::ToolCallCompleted { call_id, index });
     }
     if let Some((input_tokens, output_tokens, provider_json)) = usage_from_value(protocol, value) {
-        events.push(ModelStreamEventV2::Usage {
+        events.push(ProviderStreamEvent::Usage {
             input_tokens,
             output_tokens,
             provider_json,
@@ -450,7 +368,7 @@ fn parse_provider_response_v2_with_aliases(
             "non-streaming response contained neither text nor tool calls".into(),
         ));
     }
-    events.push(ModelStreamEventV2::Completed);
+    events.push(ProviderStreamEvent::Completed);
     Ok(events)
 }
 
@@ -495,14 +413,14 @@ fn usage_from_value(protocol: ProviderProtocol, value: &Value) -> Option<(u64, u
 }
 
 #[derive(Debug, Clone)]
-pub struct ProviderStreamDecoderV2 {
+pub struct ProviderToolStreamDecoder {
     protocol: ProviderProtocol,
     pending: String,
     active_calls: BTreeMap<u32, (String, String)>,
     tool_aliases: BTreeMap<String, String>,
 }
 
-impl ProviderStreamDecoderV2 {
+impl ProviderToolStreamDecoder {
     pub fn new(protocol: ProviderProtocol) -> Self {
         Self {
             protocol,
@@ -512,7 +430,7 @@ impl ProviderStreamDecoderV2 {
         }
     }
 
-    pub fn for_request(protocol: ProviderProtocol, request: &ModelRequestV2) -> Self {
+    pub fn for_request(protocol: ProviderProtocol, request: &ProviderModelRequest) -> Self {
         Self {
             protocol,
             pending: String::new(),
@@ -521,7 +439,7 @@ impl ProviderStreamDecoderV2 {
         }
     }
 
-    pub fn push(&mut self, chunk: &[u8]) -> AdapterResult<Vec<ModelStreamEventV2>> {
+    pub fn push(&mut self, chunk: &[u8]) -> AdapterResult<Vec<ProviderStreamEvent>> {
         self.pending.push_str(&String::from_utf8_lossy(chunk));
         let mut events = Vec::new();
         while let Some(newline) = self.pending.find('\n') {
@@ -542,12 +460,12 @@ impl ProviderStreamDecoderV2 {
             };
             if data == "[DONE]" {
                 for (index, (call_id, _)) in &self.active_calls {
-                    events.push(ModelStreamEventV2::ToolCallCompleted {
+                    events.push(ProviderStreamEvent::ToolCallCompleted {
                         call_id: call_id.clone(),
                         index: *index,
                     });
                 }
-                events.push(ModelStreamEventV2::Completed);
+                events.push(ProviderStreamEvent::Completed);
                 continue;
             }
             let value: Value = serde_json::from_str(data)?;
@@ -569,14 +487,14 @@ impl ProviderStreamDecoderV2 {
     fn push_openai(
         &mut self,
         value: &Value,
-        events: &mut Vec<ModelStreamEventV2>,
+        events: &mut Vec<ProviderStreamEvent>,
     ) -> AdapterResult<()> {
         if let Some(text) = value
             .pointer("/choices/0/delta/content")
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
         {
-            events.push(ModelStreamEventV2::TextDelta { text: text.into() });
+            events.push(ProviderStreamEvent::TextDelta { text: text.into() });
         }
         if let Some(calls) = value
             .pointer("/choices/0/delta/tool_calls")
@@ -601,7 +519,7 @@ impl ProviderStreamDecoderV2 {
                     .or_else(|| prior.as_ref().map(|entry| entry.1.clone()))
                     .unwrap_or_default();
                 if prior.is_none() && !tool_id.is_empty() {
-                    events.push(ModelStreamEventV2::ToolCallStarted {
+                    events.push(ProviderStreamEvent::ToolCallStarted {
                         call_id: call_id.clone(),
                         index,
                         tool_id: tool_id.clone(),
@@ -611,7 +529,7 @@ impl ProviderStreamDecoderV2 {
                 if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str)
                     && !arguments.is_empty()
                 {
-                    events.push(ModelStreamEventV2::ToolArgumentsDelta {
+                    events.push(ProviderStreamEvent::ToolArgumentsDelta {
                         call_id,
                         index,
                         arguments: arguments.into(),
@@ -622,7 +540,7 @@ impl ProviderStreamDecoderV2 {
         if let Some((input_tokens, output_tokens, provider_json)) =
             usage_from_value(self.protocol, value)
         {
-            events.push(ModelStreamEventV2::Usage {
+            events.push(ProviderStreamEvent::Usage {
                 input_tokens,
                 output_tokens,
                 provider_json,
@@ -633,12 +551,12 @@ impl ProviderStreamDecoderV2 {
             .is_some_and(|reason| !reason.is_null())
         {
             for (index, (call_id, _)) in &self.active_calls {
-                events.push(ModelStreamEventV2::ToolCallCompleted {
+                events.push(ProviderStreamEvent::ToolCallCompleted {
                     call_id: call_id.clone(),
                     index: *index,
                 });
             }
-            events.push(ModelStreamEventV2::Completed);
+            events.push(ProviderStreamEvent::Completed);
         }
         Ok(())
     }
@@ -646,7 +564,7 @@ impl ProviderStreamDecoderV2 {
     fn push_anthropic(
         &mut self,
         value: &Value,
-        events: &mut Vec<ModelStreamEventV2>,
+        events: &mut Vec<ProviderStreamEvent>,
     ) -> AdapterResult<()> {
         match value.get("type").and_then(Value::as_str) {
             Some("content_block_start")
@@ -666,7 +584,7 @@ impl ProviderStreamDecoderV2 {
                 let tool_id = canonical_tool_id(&self.tool_aliases, provider_name);
                 self.active_calls
                     .insert(index, (call_id.clone(), tool_id.clone()));
-                events.push(ModelStreamEventV2::ToolCallStarted {
+                events.push(ProviderStreamEvent::ToolCallStarted {
                     call_id,
                     index,
                     tool_id,
@@ -682,31 +600,31 @@ impl ProviderStreamDecoderV2 {
                             "Anthropic arguments arrived before tool block {index}"
                         ))
                     })?;
-                    events.push(ModelStreamEventV2::ToolArgumentsDelta {
+                    events.push(ProviderStreamEvent::ToolArgumentsDelta {
                         call_id: call_id.clone(),
                         index,
                         arguments: arguments.into(),
                     });
                 } else if let Some(text) = value.pointer("/delta/text").and_then(Value::as_str) {
-                    events.push(ModelStreamEventV2::TextDelta { text: text.into() });
+                    events.push(ProviderStreamEvent::TextDelta { text: text.into() });
                 }
             }
             Some("content_block_stop") => {
                 let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
                 if let Some((call_id, _)) = self.active_calls.get(&index) {
-                    events.push(ModelStreamEventV2::ToolCallCompleted {
+                    events.push(ProviderStreamEvent::ToolCallCompleted {
                         call_id: call_id.clone(),
                         index,
                     });
                 }
             }
-            Some("message_stop") => events.push(ModelStreamEventV2::Completed),
+            Some("message_stop") => events.push(ProviderStreamEvent::Completed),
             _ => {}
         }
         if let Some((input_tokens, output_tokens, provider_json)) =
             usage_from_value(self.protocol, value)
         {
-            events.push(ModelStreamEventV2::Usage {
+            events.push(ProviderStreamEvent::Usage {
                 input_tokens,
                 output_tokens,
                 provider_json,
@@ -718,14 +636,14 @@ impl ProviderStreamDecoderV2 {
     fn push_ollama(
         &mut self,
         value: &Value,
-        events: &mut Vec<ModelStreamEventV2>,
+        events: &mut Vec<ProviderStreamEvent>,
     ) -> AdapterResult<()> {
         if let Some(text) = value
             .pointer("/message/content")
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
         {
-            events.push(ModelStreamEventV2::TextDelta { text: text.into() });
+            events.push(ProviderStreamEvent::TextDelta { text: text.into() });
         }
         if let Some(calls) = value
             .pointer("/message/tool_calls")
@@ -744,7 +662,7 @@ impl ProviderStreamDecoderV2 {
                     .ok_or_else(|| AdapterError::Llm("Ollama tool call has no name".into()))?;
                 let tool_id = canonical_tool_id(&self.tool_aliases, provider_name);
                 if !self.active_calls.contains_key(&index) {
-                    events.push(ModelStreamEventV2::ToolCallStarted {
+                    events.push(ProviderStreamEvent::ToolCallStarted {
                         call_id: call_id.clone(),
                         index,
                         tool_id: tool_id.clone(),
@@ -752,7 +670,7 @@ impl ProviderStreamDecoderV2 {
                 }
                 self.active_calls.insert(index, (call_id.clone(), tool_id));
                 if let Some(arguments) = call.pointer("/function/arguments") {
-                    events.push(ModelStreamEventV2::ToolArgumentsDelta {
+                    events.push(ProviderStreamEvent::ToolArgumentsDelta {
                         call_id,
                         index,
                         arguments: match arguments {
@@ -766,7 +684,7 @@ impl ProviderStreamDecoderV2 {
         if let Some((input_tokens, output_tokens, provider_json)) =
             usage_from_value(self.protocol, value)
         {
-            events.push(ModelStreamEventV2::Usage {
+            events.push(ProviderStreamEvent::Usage {
                 input_tokens,
                 output_tokens,
                 provider_json,
@@ -774,244 +692,17 @@ impl ProviderStreamDecoderV2 {
         }
         if value.get("done").and_then(Value::as_bool) == Some(true) {
             for (index, (call_id, _)) in &self.active_calls {
-                events.push(ModelStreamEventV2::ToolCallCompleted {
+                events.push(ProviderStreamEvent::ToolCallCompleted {
                     call_id: call_id.clone(),
                     index: *index,
                 });
             }
-            events.push(ModelStreamEventV2::Completed);
+            events.push(ProviderStreamEvent::Completed);
         }
         Ok(())
     }
 
-    pub fn finish(&mut self) -> AdapterResult<Vec<ModelStreamEventV2>> {
-        if self.pending.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-        self.pending.push('\n');
-        self.push(&[])
-    }
-}
-
-pub fn parse_provider_event(protocol: ProviderProtocol, value: &Value) -> Option<ModelStreamEvent> {
-    if protocol == ProviderProtocol::OpenAiCompatible {
-        if let Some(function) = value.pointer("/choices/0/delta/tool_calls/0/function") {
-            let name = function
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let fragment = function
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if !name.is_empty() || !fragment.is_empty() {
-                return Some(ModelStreamEvent::ToolArgumentsDelta {
-                    name: name.into(),
-                    json_fragment: fragment.into(),
-                });
-            }
-        }
-    }
-    if protocol == ProviderProtocol::Ollama {
-        if let Some(function) = value.pointer("/message/tool_calls/0/function") {
-            let name = function
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if !name.is_empty() {
-                let json_fragment = match function.get("arguments") {
-                    Some(Value::String(arguments)) => arguments.clone(),
-                    Some(arguments) => arguments.to_string(),
-                    None => String::new(),
-                };
-                return Some(ModelStreamEvent::ToolArgumentsDelta {
-                    name: name.into(),
-                    json_fragment,
-                });
-            }
-        }
-    }
-    let text = match protocol {
-        ProviderProtocol::OpenAiCompatible => value.pointer("/choices/0/delta/content"),
-        ProviderProtocol::Anthropic => value.pointer("/delta/text"),
-        ProviderProtocol::Ollama => value.pointer("/message/content"),
-    }
-    .and_then(Value::as_str);
-    if let Some(text) = text.filter(|text| !text.is_empty()) {
-        return Some(ModelStreamEvent::TextDelta(text.into()));
-    }
-    let completed = match protocol {
-        ProviderProtocol::OpenAiCompatible => value
-            .pointer("/choices/0/finish_reason")
-            .is_some_and(|reason| !reason.is_null()),
-        ProviderProtocol::Anthropic => {
-            value.get("type").and_then(Value::as_str) == Some("message_stop")
-        }
-        ProviderProtocol::Ollama => value.get("done").and_then(Value::as_bool) == Some(true),
-    };
-    completed.then_some(ModelStreamEvent::Completed)
-}
-
-pub fn parse_provider_response(
-    protocol: ProviderProtocol,
-    value: &Value,
-    expected_tool: Option<&str>,
-) -> AdapterResult<Vec<ModelStreamEvent>> {
-    let mut events = Vec::new();
-    let text = match protocol {
-        ProviderProtocol::OpenAiCompatible => value.pointer("/choices/0/message/content"),
-        ProviderProtocol::Anthropic => {
-            value
-                .get("content")
-                .and_then(Value::as_array)
-                .and_then(|content| {
-                    content
-                        .iter()
-                        .find(|item| item.get("type").and_then(Value::as_str) == Some("text"))
-                        .and_then(|item| item.get("text"))
-                })
-        }
-        ProviderProtocol::Ollama => value.pointer("/message/content"),
-    }
-    .and_then(Value::as_str);
-    if let Some(text) = text.filter(|text| !text.is_empty()) {
-        events.push(ModelStreamEvent::TextDelta(text.into()));
-    }
-
-    if let Some(expected_tool) = expected_tool {
-        let tool = match protocol {
-            ProviderProtocol::OpenAiCompatible => value
-                .pointer("/choices/0/message/tool_calls")
-                .and_then(Value::as_array)
-                .and_then(|calls| {
-                    calls
-                        .iter()
-                        .filter_map(|call| call.get("function"))
-                        .find(|function| {
-                            function.get("name").and_then(Value::as_str) == Some(expected_tool)
-                        })
-                })
-                .and_then(|function| function.get("arguments"))
-                .map(|arguments| match arguments {
-                    Value::String(arguments) => arguments.clone(),
-                    arguments => arguments.to_string(),
-                }),
-            ProviderProtocol::Anthropic => value
-                .get("content")
-                .and_then(Value::as_array)
-                .and_then(|content| {
-                    content.iter().find(|item| {
-                        item.get("type").and_then(Value::as_str) == Some("tool_use")
-                            && item.get("name").and_then(Value::as_str) == Some(expected_tool)
-                    })
-                })
-                .and_then(|item| item.get("input"))
-                .map(Value::to_string),
-            ProviderProtocol::Ollama => value
-                .pointer("/message/tool_calls")
-                .and_then(Value::as_array)
-                .and_then(|calls| {
-                    calls
-                        .iter()
-                        .filter_map(|call| call.get("function"))
-                        .find(|function| {
-                            function.get("name").and_then(Value::as_str) == Some(expected_tool)
-                        })
-                })
-                .and_then(|function| function.get("arguments"))
-                .map(|arguments| match arguments {
-                    Value::String(arguments) => arguments.clone(),
-                    arguments => arguments.to_string(),
-                }),
-        }
-        .ok_or_else(|| {
-            AdapterError::Llm(format!(
-                "non-streaming response did not contain tool call {expected_tool}"
-            ))
-        })?;
-        events.push(ModelStreamEvent::ToolArgumentsDelta {
-            name: expected_tool.into(),
-            json_fragment: tool,
-        });
-    }
-
-    if events.is_empty() {
-        return Err(AdapterError::Llm(
-            "non-streaming response contained neither text nor the requested tool call".into(),
-        ));
-    }
-    events.push(ModelStreamEvent::Completed);
-    Ok(events)
-}
-
-#[derive(Debug, Clone)]
-pub struct ProviderStreamDecoder {
-    protocol: ProviderProtocol,
-    pending: String,
-    active_tool: Option<String>,
-}
-
-impl ProviderStreamDecoder {
-    pub fn new(protocol: ProviderProtocol) -> Self {
-        Self {
-            protocol,
-            pending: String::new(),
-            active_tool: None,
-        }
-    }
-
-    pub fn push(&mut self, chunk: &[u8]) -> AdapterResult<Vec<ModelStreamEvent>> {
-        self.pending.push_str(&String::from_utf8_lossy(chunk));
-        let mut events = Vec::new();
-        while let Some(newline) = self.pending.find('\n') {
-            let line = self.pending[..newline]
-                .trim_end_matches('\r')
-                .trim()
-                .to_owned();
-            self.pending.drain(..=newline);
-            if line.is_empty() || line.starts_with("event:") {
-                continue;
-            }
-            let data = if self.protocol == ProviderProtocol::Ollama {
-                line.as_str()
-            } else if let Some(data) = line.strip_prefix("data:") {
-                data.trim()
-            } else {
-                continue;
-            };
-            if data == "[DONE]" {
-                events.push(ModelStreamEvent::Completed);
-                continue;
-            }
-            let value: Value = serde_json::from_str(data)?;
-            if self.protocol == ProviderProtocol::Anthropic {
-                if value.get("type").and_then(Value::as_str) == Some("content_block_start")
-                    && value.pointer("/content_block/type").and_then(Value::as_str)
-                        == Some("tool_use")
-                {
-                    self.active_tool = value
-                        .pointer("/content_block/name")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
-                    continue;
-                }
-                if let Some(fragment) = value.pointer("/delta/partial_json").and_then(Value::as_str)
-                {
-                    events.push(ModelStreamEvent::ToolArgumentsDelta {
-                        name: self.active_tool.clone().unwrap_or_default(),
-                        json_fragment: fragment.into(),
-                    });
-                    continue;
-                }
-            }
-            if let Some(event) = parse_provider_event(self.protocol, &value) {
-                events.push(event);
-            }
-        }
-        Ok(events)
-    }
-
-    pub fn finish(&mut self) -> AdapterResult<Vec<ModelStreamEvent>> {
+    pub fn finish(&mut self) -> AdapterResult<Vec<ProviderStreamEvent>> {
         if self.pending.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -1074,11 +765,11 @@ impl UnifiedModelClient {
         })
     }
 
-    async fn send_with_retry(
+    async fn send_with_retry_provider(
         &self,
         endpoint: &Url,
         body: &Value,
-        on_event: &mut impl FnMut(ModelStreamEvent),
+        on_event: &mut impl FnMut(ProviderStreamEvent),
     ) -> AdapterResult<reqwest::Response> {
         let mut retries = 0_u8;
         loop {
@@ -1094,55 +785,7 @@ impl UnifiedModelClient {
                     if retryable_model_status(status) && retries < MODEL_MAX_RETRIES {
                         retries += 1;
                         let delay_ms = 1_000_u64 << (retries - 1);
-                        on_event(ModelStreamEvent::Retrying {
-                            attempt: retries,
-                            delay_ms,
-                            message: format!("model provider returned {status}"),
-                        });
-                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                        continue;
-                    }
-                    let preview: String = response_body.chars().take(1_200).collect();
-                    return Err(AdapterError::Llm(format!("{status}: {preview}")));
-                }
-                Err(error) if retries < MODEL_MAX_RETRIES => {
-                    retries += 1;
-                    let delay_ms = 1_000_u64 << (retries - 1);
-                    on_event(ModelStreamEvent::Retrying {
-                        attempt: retries,
-                        delay_ms,
-                        message: format!("model provider connection failed: {error}"),
-                    });
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                }
-                Err(error) => {
-                    return Err(AdapterError::Llm(format!("{endpoint}: {error}")));
-                }
-            }
-        }
-    }
-
-    async fn send_with_retry_v2(
-        &self,
-        endpoint: &Url,
-        body: &Value,
-        on_event: &mut impl FnMut(ModelStreamEventV2),
-    ) -> AdapterResult<reqwest::Response> {
-        let mut retries = 0_u8;
-        loop {
-            let result = self
-                .authenticate(self.http.post(endpoint.clone()).json(body))
-                .send()
-                .await;
-            match result {
-                Ok(response) if response.status().is_success() => return Ok(response),
-                Ok(response) => {
-                    let status = response.status();
-                    let response_body = response.text().await.unwrap_or_default();
-                    if retryable_model_status(status) && retries < MODEL_MAX_RETRIES {
-                        retries += 1;
-                        let delay_ms = 1_000_u64 << (retries - 1);
-                        on_event(ModelStreamEventV2::Retrying {
+                        on_event(ProviderStreamEvent::Retrying {
                             attempt: retries,
                             delay_ms,
                             message: format!("model provider returned {status}"),
@@ -1156,7 +799,7 @@ impl UnifiedModelClient {
                 Err(error) if retries < MODEL_MAX_RETRIES => {
                     retries += 1;
                     let delay_ms = 1_000_u64 << (retries - 1);
-                    on_event(ModelStreamEventV2::Retrying {
+                    on_event(ProviderStreamEvent::Retrying {
                         attempt: retries,
                         delay_ms,
                         message: format!("model provider connection failed: {error}"),
@@ -1170,21 +813,25 @@ impl UnifiedModelClient {
         }
     }
 
-    pub async fn stream_with_v2(
+    pub async fn stream_with_provider(
         &self,
-        request: ModelRequestV2,
-        mut on_event: impl FnMut(ModelStreamEventV2),
+        request: ProviderModelRequest,
+        mut on_event: impl FnMut(ProviderStreamEvent),
     ) -> AdapterResult<()> {
-        let provider_request =
-            build_provider_request_v2(self.protocol, self.base_url.clone(), &self.model, &request)?;
+        let provider_request = build_provider_request_with_tools(
+            self.protocol,
+            self.base_url.clone(),
+            &self.model,
+            &request,
+        )?;
         let response = self
-            .send_with_retry_v2(
+            .send_with_retry_provider(
                 &provider_request.endpoint,
                 &provider_request.body,
                 &mut on_event,
             )
             .await?;
-        let mut decoder = ProviderStreamDecoderV2::for_request(self.protocol, &request);
+        let mut decoder = ProviderToolStreamDecoder::for_request(self.protocol, &request);
         let mut bytes = response.bytes_stream();
         let mut emitted_event = false;
         while let Some(chunk) = bytes.next().await {
@@ -1194,7 +841,7 @@ impl UnifiedModelClient {
                     let mut fallback_body = provider_request.body.clone();
                     fallback_body["stream"] = Value::Bool(false);
                     let fallback = self
-                        .send_with_retry_v2(
+                        .send_with_retry_provider(
                             &provider_request.endpoint,
                             &fallback_body,
                             &mut on_event,
@@ -1219,87 +866,8 @@ impl UnifiedModelClient {
                         ))
                     })?;
                     for event in
-                        parse_provider_response_v2_for_request(self.protocol, &value, &request)?
+                        parse_provider_tool_response_for_request(self.protocol, &value, &request)?
                     {
-                        on_event(event);
-                    }
-                    return Ok(());
-                }
-                Err(error) => {
-                    return Err(AdapterError::Llm(format!(
-                        "{} stream ended after partial output: {error}",
-                        provider_request.endpoint
-                    )));
-                }
-            };
-            for event in decoder.push(&chunk)? {
-                emitted_event = true;
-                on_event(event);
-            }
-        }
-        for event in decoder.finish()? {
-            on_event(event);
-        }
-        Ok(())
-    }
-
-    pub async fn stream_with(
-        &self,
-        request: ModelRequest,
-        mut on_event: impl FnMut(ModelStreamEvent),
-    ) -> AdapterResult<()> {
-        let provider_request =
-            build_provider_request(self.protocol, self.base_url.clone(), &self.model, &request)?;
-        let response = self
-            .send_with_retry(
-                &provider_request.endpoint,
-                &provider_request.body,
-                &mut on_event,
-            )
-            .await?;
-        let mut decoder = ProviderStreamDecoder::new(self.protocol);
-        let mut bytes = response.bytes_stream();
-        let mut emitted_event = false;
-        while let Some(chunk) = bytes.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(stream_error) if !emitted_event => {
-                    let mut fallback_body = provider_request.body.clone();
-                    fallback_body["stream"] = Value::Bool(false);
-                    let fallback = self.send_with_retry(
-                        &provider_request.endpoint,
-                        &fallback_body,
-                        &mut on_event,
-                    ).await.map_err(|fallback_error| {
-                        AdapterError::Llm(format!(
-                            "{} stream failed ({stream_error}); non-streaming fallback failed: {fallback_error}",
-                            provider_request.endpoint
-                        ))
-                    })?;
-                    let status = fallback.status();
-                    let body = fallback.text().await.map_err(|fallback_error| {
-                        AdapterError::Llm(format!(
-                            "{} stream failed ({stream_error}); error reading non-streaming fallback: {fallback_error}",
-                            provider_request.endpoint
-                        ))
-                    })?;
-                    if !status.is_success() {
-                        return Err(AdapterError::Llm(format!(
-                            "{} stream failed ({stream_error}); non-streaming fallback returned {status}: {body}",
-                            provider_request.endpoint
-                        )));
-                    }
-                    let value: Value = serde_json::from_str(&body).map_err(|fallback_error| {
-                        AdapterError::Llm(format!(
-                            "{} stream failed ({stream_error}); non-streaming fallback returned invalid JSON: {fallback_error}",
-                            provider_request.endpoint
-                        ))
-                    })?;
-                    for event in parse_provider_response(
-                        self.protocol,
-                        &value,
-                        request.tool_name.as_deref(),
-                    )? {
                         on_event(event);
                     }
                     return Ok(());
@@ -1448,29 +1016,17 @@ impl UnifiedModelClient {
 }
 
 #[async_trait]
-impl ModelProvider for UnifiedModelClient {
+impl Provider for UnifiedModelClient {
     fn profile_id(&self) -> Uuid {
         self.profile_id
     }
 
-    async fn stream(&self, request: ModelRequest) -> AgentResult<Vec<ModelStreamEvent>> {
+    async fn stream_provider(
+        &self,
+        request: ProviderModelRequest,
+    ) -> AgentResult<Vec<ProviderStreamEvent>> {
         let mut events = Vec::new();
-        self.stream_with(request, |event| events.push(event))
-            .await
-            .map_err(|error| AgentError::Model(error.to_string()))?;
-        Ok(events)
-    }
-}
-
-#[async_trait]
-impl ModelProviderV2 for UnifiedModelClient {
-    fn profile_id(&self) -> Uuid {
-        self.profile_id
-    }
-
-    async fn stream_v2(&self, request: ModelRequestV2) -> AgentResult<Vec<ModelStreamEventV2>> {
-        let mut events = Vec::new();
-        self.stream_with_v2(request, |event| events.push(event))
+        self.stream_with_provider(request, |event| events.push(event))
             .await
             .map_err(|error| AgentError::Model(error.to_string()))?;
         Ok(events)

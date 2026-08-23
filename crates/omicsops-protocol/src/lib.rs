@@ -24,6 +24,7 @@ pub enum RunStatusV4 {
     AwaitingApproval,
     Running,
     WaitingForInput,
+    WaitingForApproval,
     Completed,
     Failed,
     Cancelled,
@@ -288,6 +289,75 @@ pub struct ToolCallV4 {
     pub arguments: Value,
 }
 
+impl ToolCallV4 {
+    pub fn canonical_hash(&self) -> Result<String, ProtocolErrorV4> {
+        if self.call_id.trim().is_empty() || self.tool_id.trim().is_empty() {
+            return Err(ProtocolErrorV4::InvalidToolApproval);
+        }
+        Ok(hex::encode(Sha256::digest(
+            serde_json::to_vec(self).map_err(|_| ProtocolErrorV4::InvalidToolApproval)?,
+        )))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApprovalDecisionV4 {
+    Approved,
+    Denied,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ToolApprovalRequestV4 {
+    pub approval_id: String,
+    pub call: ToolCallV4,
+    pub effect: ToolEffectV4,
+    pub reason: String,
+    pub call_hash: String,
+}
+
+impl ToolApprovalRequestV4 {
+    pub fn new(
+        run_id: Uuid,
+        spec_hash: &str,
+        call: ToolCallV4,
+        effect: ToolEffectV4,
+        reason: impl Into<String>,
+    ) -> Result<Self, ProtocolErrorV4> {
+        let call_hash = call.canonical_hash()?;
+        let approval_id = hex::encode(Sha256::digest(
+            serde_json::to_vec(&serde_json::json!({
+                "run_id": run_id,
+                "spec_hash": spec_hash,
+                "call_hash": call_hash,
+                "effect": effect,
+            }))
+            .map_err(|_| ProtocolErrorV4::InvalidToolApproval)?,
+        ));
+        Ok(Self {
+            approval_id,
+            call,
+            effect,
+            reason: reason.into(),
+            call_hash,
+        })
+    }
+
+    pub fn validate(&self, run_id: Uuid, spec_hash: &str) -> Result<(), ProtocolErrorV4> {
+        let expected = Self::new(
+            run_id,
+            spec_hash,
+            self.call.clone(),
+            self.effect,
+            self.reason.clone(),
+        )?;
+        if self.call_hash != expected.call_hash || self.approval_id != expected.approval_id {
+            return Err(ProtocolErrorV4::InvalidToolApproval);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolOutcomeV4 {
     pub call_id: String,
@@ -454,43 +524,6 @@ impl ComputeBackendDescriptorV4 {
         self.available
             && (mode != AutonomyModeV4::FullAuto
                 || self.isolation == IsolationStrengthV4::Container)
-    }
-}
-
-/// Evidence gate used before removing the legacy V2/V3 execution paths.
-/// Keeping this as data makes retirement an explicit, auditable decision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
-pub struct LegacyRetirementReadinessV4 {
-    pub python_kernel_verified: bool,
-    pub r_kernel_verified: bool,
-    pub pbmc3k_verified: bool,
-    pub crash_recovery_verified: bool,
-    pub scientific_verifier_verified: bool,
-    pub security_scenarios_verified: bool,
-}
-
-impl LegacyRetirementReadinessV4 {
-    pub fn ready(&self) -> bool {
-        self.python_kernel_verified
-            && self.r_kernel_verified
-            && self.pbmc3k_verified
-            && self.crash_recovery_verified
-            && self.scientific_verifier_verified
-            && self.security_scenarios_verified
-    }
-
-    pub fn missing_evidence(&self) -> Vec<&'static str> {
-        [
-            (!self.python_kernel_verified).then_some("python_kernel"),
-            (!self.r_kernel_verified).then_some("r_kernel"),
-            (!self.pbmc3k_verified).then_some("pbmc3k"),
-            (!self.crash_recovery_verified).then_some("crash_recovery"),
-            (!self.scientific_verifier_verified).then_some("scientific_verifier"),
-            (!self.security_scenarios_verified).then_some("security_scenarios"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
     }
 }
 
@@ -725,6 +758,14 @@ pub enum AgentEventKindV4 {
     ToolRequested {
         call: ToolCallV4,
     },
+    ToolApprovalRequested {
+        request: ToolApprovalRequestV4,
+    },
+    ToolApprovalDecided {
+        approval_id: String,
+        call_hash: String,
+        decision: ToolApprovalDecisionV4,
+    },
     ToolDispatchStarted {
         call_id: String,
         tool_id: String,
@@ -927,6 +968,8 @@ pub enum ProtocolErrorV4 {
     BrokenEventChain,
     #[error("invalid V4 reviewer report")]
     InvalidReview,
+    #[error("invalid or tampered V4 tool approval")]
+    InvalidToolApproval,
 }
 
 #[cfg(test)]
@@ -959,21 +1002,6 @@ mod tests {
         let mut tampered = second;
         tampered.previous_hash = "bad".into();
         assert!(validate_event_chain_v4(&[first, tampered]).is_err());
-    }
-
-    #[test]
-    fn legacy_retirement_requires_every_acceptance_evidence() {
-        let mut gate = LegacyRetirementReadinessV4::default();
-        assert!(!gate.ready());
-        assert_eq!(gate.missing_evidence().len(), 6);
-        gate.python_kernel_verified = true;
-        gate.r_kernel_verified = true;
-        gate.pbmc3k_verified = true;
-        gate.crash_recovery_verified = true;
-        gate.scientific_verifier_verified = true;
-        gate.security_scenarios_verified = true;
-        assert!(gate.ready());
-        assert!(gate.missing_evidence().is_empty());
     }
 
     fn local_selection() -> ComputeSelectionV4 {
@@ -1145,5 +1173,45 @@ mod tests {
         let mut mismatched_container = podman;
         mismatched_container.approval_policy = ApprovalPolicyV4::RiskBased;
         assert!(mismatched_container.validate().is_err());
+    }
+
+    #[test]
+    fn tool_approval_is_bound_to_run_spec_call_and_effect() {
+        let run_id = Uuid::new_v4();
+        let call = ToolCallV4 {
+            call_id: "call-1".into(),
+            tool_id: "runtime.execute".into(),
+            arguments: serde_json::json!({"code":"print(1)"}),
+        };
+        let request = ToolApprovalRequestV4::new(
+            run_id,
+            "spec-hash",
+            call,
+            ToolEffectV4::Runtime,
+            "first local execution",
+        )
+        .unwrap();
+        assert!(request.validate(run_id, "spec-hash").is_ok());
+
+        let mut tampered_call = request.clone();
+        tampered_call.call.arguments = serde_json::json!({"code":"print(2)"});
+        assert_eq!(
+            tampered_call.validate(run_id, "spec-hash"),
+            Err(ProtocolErrorV4::InvalidToolApproval)
+        );
+        assert_eq!(
+            request.validate(Uuid::new_v4(), "spec-hash"),
+            Err(ProtocolErrorV4::InvalidToolApproval)
+        );
+        assert_eq!(
+            request.validate(run_id, "other-spec"),
+            Err(ProtocolErrorV4::InvalidToolApproval)
+        );
+        let mut tampered_effect = request;
+        tampered_effect.effect = ToolEffectV4::Network;
+        assert_eq!(
+            tampered_effect.validate(run_id, "spec-hash"),
+            Err(ProtocolErrorV4::InvalidToolApproval)
+        );
     }
 }

@@ -17,8 +17,8 @@ use omicsops_adapters::{
     persistence::Repository,
     ssh::{SshJsonlProcess, SshSession},
 };
-use omicsops_agent::harness_v3::{
-    ModelRequestV2, ModelStreamEventV2, ModelToolSpec, ToolCallAccumulatorV2,
+use omicsops_agent::provider::{
+    ProviderRequest, ProviderStreamEvent, ProviderToolCallAccumulator, ProviderToolSpec,
 };
 use omicsops_agent::{
     KernelEvent, KernelEventDecoder, KernelEventKind, KernelLanguage, KernelRequest,
@@ -41,8 +41,8 @@ use omicsops_protocol::{
     ComputeBackendKindV4, ComputeSelectionV4, ContextArchiveV4, ContextCheckpointV4,
     ExecutionContextKeyV4, ExecutionPlanV4, IsolationStrengthV4, KernelLanguageV4,
     ModelErrorClassV4, ModelFailureV4, NetworkPolicyV4, OutputCaptureV4, ReviewerReportV4,
-    RunSpecV4, RuntimeArtifactV4, RuntimeResultV4, ToolCallV4, ToolDescriptorV4, ToolEffectV4,
-    ToolOutcomeV4, UncertainResolutionV4,
+    RunSpecV4, RuntimeArtifactV4, RuntimeResultV4, ToolApprovalDecisionV4, ToolCallV4,
+    ToolDescriptorV4, ToolEffectV4, ToolOutcomeV4, UncertainResolutionV4,
 };
 use omicsops_runtime::{
     ContainerKernelBackendV4, KernelBackendV4, KernelProcessV4, LocalKernelBackendV4,
@@ -143,6 +143,14 @@ pub struct ResolveUncertainV4Request {
     pub call_id: String,
     pub resolution: UncertainResolutionV4,
     pub evidence: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecideToolApprovalV4Request {
+    pub run_id: Uuid,
+    pub approval_id: String,
+    pub call_hash: String,
+    pub decision: ToolApprovalDecisionV4,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -820,6 +828,11 @@ pub fn agent_v4_answer(
     state: State<'_, AppState>,
     request: AnswerV4Request,
 ) -> Result<(), String> {
+    let events = state
+        .repository
+        .agent_events_v4(request.run_id)
+        .map_err(|error| error.to_string())?;
+    let answer = validate_answer_v4(&events, &request.question_id, &request.answer)?;
     let store = RepositoryEventStoreV4 {
         repository: state.repository.clone(),
         app,
@@ -829,7 +842,91 @@ pub fn agent_v4_answer(
         request.run_id,
         AgentEventKindV4::UserInputAnswered {
             question_id: request.question_id,
-            answer: request.answer,
+            answer,
+        },
+    )
+}
+
+fn validate_answer_v4(
+    events: &[AgentEventV4],
+    requested_question_id: &str,
+    supplied_answer: &str,
+) -> Result<String, String> {
+    let answer = supplied_answer.trim().to_owned();
+    if answer.is_empty() {
+        return Err("answer cannot be empty".into());
+    }
+    let requested = events.iter().any(|event| {
+        matches!(&event.event, AgentEventKindV4::InputRequested { question_id, .. } if question_id == requested_question_id)
+    });
+    if !requested {
+        return Err("the referenced V4 question does not exist".into());
+    }
+    if events.iter().any(|event| {
+        matches!(&event.event, AgentEventKindV4::UserInputAnswered { question_id, .. } if question_id == requested_question_id)
+    }) {
+        return Err("the referenced V4 question was already answered".into());
+    }
+    let latest_unanswered = events.iter().rev().find_map(|event| match &event.event {
+        AgentEventKindV4::InputRequested { question_id, .. }
+            if !events.iter().any(|candidate| {
+                matches!(&candidate.event, AgentEventKindV4::UserInputAnswered { question_id: answered, .. } if answered == question_id)
+            }) => Some(question_id),
+        _ => None,
+    });
+    if latest_unanswered.map(String::as_str) != Some(requested_question_id) {
+        return Err("only the latest unanswered V4 question can be answered".into());
+    }
+    Ok(answer)
+}
+
+#[tauri::command]
+pub fn agent_v4_decide_tool_approval(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: DecideToolApprovalV4Request,
+) -> Result<(), String> {
+    let record = load_record(&state.repository, request.run_id)?;
+    let spec = record.spec.ok_or("V4 run has no frozen execution spec")?;
+    let spec_hash = spec
+        .spec_hash
+        .clone()
+        .ok_or("V4 run has no frozen spec hash")?;
+    let events = state
+        .repository
+        .agent_events_v4(request.run_id)
+        .map_err(|error| error.to_string())?;
+    let approval = events.iter().find_map(|event| match &event.event {
+        AgentEventKindV4::ToolApprovalRequested { request: approval }
+            if approval.approval_id == request.approval_id =>
+        {
+            Some(approval)
+        }
+        _ => None,
+    });
+    let approval = approval.ok_or("tool approval request was not found")?;
+    approval
+        .validate(request.run_id, &spec_hash)
+        .map_err(|error| error.to_string())?;
+    if approval.call_hash != request.call_hash {
+        return Err("tool approval call hash mismatch".into());
+    }
+    if events.iter().any(|event| {
+        matches!(&event.event, AgentEventKindV4::ToolApprovalDecided { approval_id, .. } if approval_id == &request.approval_id)
+    }) {
+        return Err("tool approval request was already decided".into());
+    }
+    let store = RepositoryEventStoreV4 {
+        repository: state.repository.clone(),
+        app,
+    };
+    append_next(
+        &store,
+        request.run_id,
+        AgentEventKindV4::ToolApprovalDecided {
+            approval_id: request.approval_id,
+            call_hash: request.call_hash,
+            decision: request.decision,
         },
     )
 }
@@ -958,6 +1055,9 @@ async fn spawn_execution(
         let waiting = outcome
             .as_ref()
             .is_err_and(|error| error == "run is waiting for user input");
+        let waiting_for_approval = outcome
+            .as_ref()
+            .is_err_and(|error| error == "run is waiting for tool approval");
         let uncertain = outcome
             .as_ref()
             .is_err_and(|error| error.contains("side-effect dispatch is uncertain"));
@@ -968,6 +1068,8 @@ async fn spawn_execution(
             "completed"
         } else if waiting {
             "waiting_for_input"
+        } else if waiting_for_approval {
+            "waiting_for_approval"
         } else if uncertain || verifier_attention {
             "needs_attention"
         } else if cancelled.load(Ordering::SeqCst) {
@@ -977,7 +1079,7 @@ async fn spawn_execution(
         }
         .into();
         if let Err(error) = &outcome {
-            if !cancelled.load(Ordering::SeqCst) && !waiting {
+            if !cancelled.load(Ordering::SeqCst) && !waiting && !waiting_for_approval {
                 let store = RepositoryEventStoreV4 {
                     repository: repository.clone(),
                     app: app.clone(),
@@ -1179,19 +1281,19 @@ impl ModelPortV4 for DesktopModelPortV4 {
         let tools = request
             .tools
             .into_iter()
-            .map(|tool| ModelToolSpec {
+            .map(|tool| ProviderToolSpec {
                 id: tool.id,
                 description: tool.description,
                 input_schema: tool.input_schema,
             })
             .collect();
         let mut text = String::new();
-        let mut calls = ToolCallAccumulatorV2::default();
+        let mut calls = ProviderToolCallAccumulator::default();
         let mut provider_error = None;
         let mut accumulator_error = None;
         self.client
-            .stream_with_v2(
-                ModelRequestV2 {
+            .stream_with_provider(
+                ProviderRequest {
                     system: request.system,
                     messages: vec![omicsops_agent::ModelMessage {
                         role: "user".into(),
@@ -1201,11 +1303,11 @@ impl ModelPortV4 for DesktopModelPortV4 {
                     require_strict_json_fallback: true,
                 },
                 |event| match event {
-                    ModelStreamEventV2::TextDelta { text: delta } => {
+                    ProviderStreamEvent::TextDelta { text: delta } => {
                         text.push_str(&delta);
                         on_event(ModelStreamEventV4::TextDelta(delta));
                     }
-                    ModelStreamEventV2::Retrying {
+                    ProviderStreamEvent::Retrying {
                         attempt,
                         delay_ms,
                         message,
@@ -1214,7 +1316,7 @@ impl ModelPortV4 for DesktopModelPortV4 {
                         delay_ms,
                         message,
                     }),
-                    ModelStreamEventV2::Error { code, message, .. } => {
+                    ProviderStreamEvent::Error { code, message, .. } => {
                         provider_error =
                             Some(classify_model_failure(&format!("{code}: {message}")));
                     }
@@ -1321,7 +1423,14 @@ fn classify_model_failure(message: &str) -> ModelFailureV4 {
         ModelFailureV4::transient(ModelErrorClassV4::Server, message)
     } else if lower.contains("timed out") || lower.contains("timeout") {
         ModelFailureV4::transient(ModelErrorClassV4::Timeout, message)
-    } else if lower.contains("connect") || lower.contains("transport") {
+    } else if lower.contains("connect")
+        || lower.contains("transport")
+        || lower.contains("partial output")
+        || lower.contains("error decoding response body")
+        || lower.contains("unexpected eof")
+        || lower.contains("stream ended")
+        || lower.contains("incomplete message")
+    {
         ModelFailureV4::transient(ModelErrorClassV4::Transport, message)
     } else if lower.contains("401") || lower.contains("403") || lower.contains("credential") {
         ModelFailureV4::permanent(ModelErrorClassV4::Authentication, message)
@@ -3135,11 +3244,55 @@ mod tests {
     #[test]
     fn v4_provider_errors_are_classified_for_host_retry() {
         assert!(classify_model_failure("429 rate limit").retryable);
+        assert!(classify_model_failure("error decoding response body").retryable);
+        assert!(
+            classify_model_failure("stream ended after partial output: unexpected EOF").retryable
+        );
         assert_eq!(
             classify_model_failure("request timed out").class,
             ModelErrorClassV4::Timeout
         );
         assert!(!classify_model_failure("401 unauthorized").retryable);
+    }
+
+    #[test]
+    fn v4_answers_reject_empty_unknown_stale_and_duplicate_questions() {
+        let first = AgentEventV4::first(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Utc::now(),
+            AgentEventKindV4::InputRequested {
+                question_id: "first".into(),
+                question: "First question?".into(),
+            },
+        );
+        let second = AgentEventV4::next(
+            &first,
+            Utc::now(),
+            AgentEventKindV4::InputRequested {
+                question_id: "second".into(),
+                question: "Second question?".into(),
+            },
+        );
+        let events = vec![first, second.clone()];
+        assert!(validate_answer_v4(&events, "second", "  ").is_err());
+        assert!(validate_answer_v4(&events, "missing", "answer").is_err());
+        assert!(validate_answer_v4(&events, "first", "answer").is_err());
+        assert_eq!(
+            validate_answer_v4(&events, "second", "  answer  ").unwrap(),
+            "answer"
+        );
+
+        let answered = AgentEventV4::next(
+            &second,
+            Utc::now(),
+            AgentEventKindV4::UserInputAnswered {
+                question_id: "second".into(),
+                answer: "answer".into(),
+            },
+        );
+        assert!(validate_answer_v4(&[events, vec![answered]].concat(), "second", "again").is_err());
     }
 
     #[test]
@@ -3157,7 +3310,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_legacy_system_ensure_is_safe_to_resume_once() {
+    fn failed_historical_system_ensure_is_safe_to_resume_once() {
         let first = AgentEventV4::first(
             Uuid::new_v4(),
             Uuid::new_v4(),
@@ -3220,7 +3373,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v4_projects_map_to_supervised_system_ssh_selection() {
+    fn historical_v4_projects_map_to_supervised_system_ssh_selection() {
         let connection_id = Uuid::new_v4();
         let mut project = Project::new(
             Uuid::new_v4(),

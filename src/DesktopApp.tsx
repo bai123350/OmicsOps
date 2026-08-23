@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import * as api from "./tauri-api";
-import type { AgentEvent, AgentRunEventV3, AgentRunEventV4, AgentRunStreamEvent, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendAvailabilityV4, ComputeSelectionV4, ConnectionProfile, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, PlanProposal, ProjectArtifact, RemoteFileEntry, RunSummaryV4, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
+import type { AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendAvailabilityV4, ComputeSelectionV4, ConnectionProfile, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, ProjectArtifact, RemoteFileEntry, RunSummaryV4, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
 import { WorkspaceShell } from "./features/workspace/WorkspaceShell";
 import type { Locale } from "./features/workspace/copy";
@@ -16,14 +16,11 @@ export default function DesktopApp() {
   const [conversation, setConversation] = useState<WorkspaceConversation | null>(null);
   const [messageSequence, setMessageSequence] = useState(1);
   const [messages, setMessages] = useState<WorkspaceMessage[]>([]);
-  const [streamingAssistant, setStreamingAssistant] = useState("");
   const [agentBusy, setAgentBusy] = useState(false);
   const [agentNotice, setAgentNotice] = useState("");
-  const [agentRetryNotice, setAgentRetryNotice] = useState("");
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>([]);
   const [activeModelProfileId, setActiveModelProfileId] = useState<string | null>(null);
   const [lastGoal, setLastGoal] = useState("");
-  const [planProposal, setPlanProposal] = useState<PlanProposal | null>(null);
   const [v4Plan, setV4Plan] = useState<RunSummaryV4 | null>(null);
   const [computeBackends, setComputeBackends] = useState<ComputeBackendAvailabilityV4[]>([]);
   const [computeBackendId, setComputeBackendId] = useState("local");
@@ -34,11 +31,8 @@ export default function DesktopApp() {
   const [computeBusy, setComputeBusy] = useState(false);
   const [planLoading, setPlanLoading] = useState(false);
   const [planApproved, setPlanApproved] = useState(false);
-  const [approvedPlanId, setApprovedPlanId] = useState<string | null>(null);
   const [runId, setRunId] = useState<string | null>(null);
   const [runStopping, setRunStopping] = useState(false);
-  const [agentRunEvents, setAgentRunEvents] = useState<AgentRunStreamEvent[]>([]);
-  const [agentRunEventsV3, setAgentRunEventsV3] = useState<AgentRunEventV3[]>([]);
   const [agentRunEventsV4, setAgentRunEventsV4] = useState<AgentRunEventV4[]>([]);
   const [remoteFiles, setRemoteFiles] = useState<RemoteFileEntry[]>([]);
   const [filesBusy, setFilesBusy] = useState(false);
@@ -115,7 +109,7 @@ export default function DesktopApp() {
     void Promise.all([api.searchAgentMemory(selected.id), api.listNotebookEntries(selected.id), api.listProjectArtifacts(selected.id), api.listSyncEntries(selected.id)])
       .then(([facts, notebook, artifacts, transfers]) => { setMemoryFacts(facts); setNotebookEntries(notebook); setProjectArtifacts(artifacts); setSyncEntries(transfers); })
       .catch((error) => setAgentNotice(error instanceof Error ? error.message : String(error)));
-  }, [selected?.id, agentRunEvents.at(-1)?.kind]);
+  }, [selected?.id, agentRunEventsV4.at(-1)?.sequence]);
   useEffect(() => {
     setFileNotice("");
     if (!selected?.connection_id || !selected.remote_root) {
@@ -134,28 +128,17 @@ export default function DesktopApp() {
   }, [selected?.id]);
   useEffect(() => {
     let disposed = false;
-    setAgentRunEvents([]);
-    setAgentRunEventsV3([]);
     setAgentRunEventsV4([]);
     setRunId(null);
     setRunStopping(false);
     if (!selected || !conversation) return () => { disposed = true; };
-    Promise.all([
-      api.listAgentRunEvents(selected.id),
-      api.listAgentRunEventsV3({ projectId: selected.id, conversationId: conversation.id }),
-      api.agentV4EventsForConversation(selected.id, conversation.id),
-    ])
-      .then(([events, eventsV3, eventsV4]) => {
+    api.agentV4EventsForConversation(selected.id, conversation.id)
+      .then((eventsV4) => {
         if (disposed) return;
-        const conversationEvents = events.filter((event) => event.conversation_id === conversation.id);
-        setAgentRunEvents(conversationEvents);
-        setAgentRunEventsV3(eventsV3);
         setAgentRunEventsV4(mergeAgentRunEventsV4([], eventsV4));
-        const latest = [...conversationEvents.map((event) => ({ runId: event.run_id, timestamp: event.timestamp })), ...eventsV3.map((event) => ({ runId: event.run_id, timestamp: event.occurred_at })), ...eventsV4.map((event) => ({ runId: event.run_id, timestamp: event.occurred_at }))].sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime()).at(-1);
-        const latestRunEvents = latest ? conversationEvents.filter((event) => event.run_id === latest.runId) : [];
-        const latestRunEventsV3 = latest ? eventsV3.filter((event) => event.run_id === latest.runId) : [];
+        const latest = eventsV4.map((event) => ({ runId: event.run_id, timestamp: event.occurred_at })).sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime()).at(-1);
         const latestRunEventsV4 = latest ? eventsV4.filter((event) => event.run_id === latest.runId) : [];
-        setRunId(latest && !latestRunEvents.some(isTerminalAgentEvent) && !latestRunEventsV3.some(isTerminalAgentEventV3) && !latestRunEventsV4.some(isTerminalAgentEventV4) ? latest.runId : null);
+        setRunId(latest && !latestRunEventsV4.some(isTerminalAgentEventV4) ? latest.runId : null);
       })
       .catch((error) => {
         if (!disposed) setAgentNotice(error instanceof Error ? error.message : String(error));
@@ -165,33 +148,6 @@ export default function DesktopApp() {
   useEffect(() => {
     let disposed = false;
     const unlisten: Array<() => void> = [];
-    api.onAgentEvent((event: AgentEvent) => {
-      if (event.conversation_id !== conversation?.id) return;
-      if (event.event.kind === "turn-started") {
-        setStreamingAssistant("");
-        setAgentBusy(true);
-        setAgentNotice("");
-      }
-      if (event.event.kind === "text-delta") {
-        const delta = event.event.payload;
-        setStreamingAssistant((value) => value + delta);
-        setAgentRetryNotice("");
-      }
-      if (event.event.kind === "provider-retrying") {
-        const seconds = Math.max(1, Math.ceil(event.event.payload.delay_ms / 1000));
-        setAgentBusy(true);
-        setAgentRetryNotice(locale === "zh-CN"
-          ? `模型服务暂时不可用，${seconds} 秒后自动重试（第 ${event.event.payload.attempt} 次）`
-          : `The model service is temporarily unavailable. Retrying in ${seconds}s (attempt ${event.event.payload.attempt}).`);
-      }
-      if (event.event.kind === "turn-completed" || event.event.kind === "turn-failed") {
-        setStreamingAssistant("");
-        setAgentBusy(false);
-        setAgentRetryNotice("");
-      }
-      if (event.event.kind === "turn-completed") setAgentNotice("");
-      if (event.event.kind === "turn-failed") setAgentNotice(event.event.payload.message);
-    }).then((fn) => disposed ? fn() : unlisten.push(fn));
     api.onConversationEvent((event) => {
       if (event.conversation_id !== conversation?.id) return;
       setMessages((current) => current.some((message) => message.id === event.message.id) ? current : [...current, event.message]);
@@ -209,30 +165,6 @@ export default function DesktopApp() {
     api.onSyncEvent((entry) => {
       if (entry.project_id !== selected?.id) return;
       setSyncEntries((current) => [entry, ...current.filter((item) => item.id !== entry.id)]);
-    }).then((fn) => disposed ? fn() : unlisten.push(fn));
-    api.onAgentRunEvent((event) => {
-      if (event.project_id !== selected?.id) return;
-      if (event.conversation_id !== conversation?.id) return;
-      setRunId((current) => current ?? event.run_id);
-      if (event.kind === "agent_canceled" || event.kind === "agent_completed" || event.kind === "agent_failed") {
-        setRunStopping(false);
-        setRunId((current) => current === event.run_id ? null : current);
-      }
-      if (event.kind === "agent_completed") void refreshRemoteFiles(event.project_id);
-      setAgentRunEvents((current) => {
-        if (current.some((item) => item.run_id === event.run_id && item.sequence === event.sequence)) return current;
-        return [...current, event];
-      });
-    }).then((fn) => disposed ? fn() : unlisten.push(fn));
-    api.onAgentRunEventV3((event) => {
-      if (event.project_id !== selected?.id || event.conversation_id !== conversation?.id) return;
-      setRunId((current) => current ?? event.run_id);
-      if (isTerminalAgentEventV3(event)) {
-        setRunStopping(false);
-        setRunId((current) => current === event.run_id ? null : current);
-        if (event.event.kind === "run_completed") void refreshRemoteFiles(event.project_id);
-      }
-      setAgentRunEventsV3((current) => mergeAgentRunEventsV3(current, [event]));
     }).then((fn) => disposed ? fn() : unlisten.push(fn));
     api.onAgentV4Event((event) => {
       if (event.project_id !== selected?.id || event.conversation_id !== conversation?.id) return;
@@ -307,25 +239,9 @@ export default function DesktopApp() {
       setFilesBusy(false);
     }
   }
-  async function attachRun(start: () => Promise<string>) {
-    setAgentNotice("");
-    try {
-      const id = await start();
-      setRunId(id);
-      const [events, eventsV3] = await Promise.all([
-        api.listAgentRunEvents(selected!.id, id, conversation?.id),
-        api.listAgentRunEventsV3({ runId: id }),
-      ]);
-      setAgentRunEvents((current) => mergeAgentRunEvents(current, events));
-      setAgentRunEventsV3((current) => mergeAgentRunEventsV3(current, eventsV3));
-    } catch (error) {
-      setAgentNotice(error instanceof Error ? error.message : String(error));
-    }
-  }
-
   function resetConversationWork() {
-    setMessages([]); setMessageSequence(1); setStreamingAssistant(""); setAgentBusy(false); setAgentNotice(""); setAgentRetryNotice("");
-    setLastGoal(""); setPlanProposal(null); setV4Plan(null); setPlanApproved(false); setApprovedPlanId(null); setRunId(null); setRunStopping(false); setAgentRunEvents([]); setAgentRunEventsV3([]); setAgentRunEventsV4([]);
+    setMessages([]); setMessageSequence(1); setAgentBusy(false); setAgentNotice("");
+    setLastGoal(""); setV4Plan(null); setPlanApproved(false); setRunId(null); setRunStopping(false); setAgentRunEventsV4([]);
   }
 
   function currentComputeSelection(): ComputeSelectionV4 {
@@ -439,12 +355,46 @@ export default function DesktopApp() {
     project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template }}
     locale={locale} onLocaleChange={setLocale} onOpenSettings={() => setSettingsOpen(true)} onBackToProjects={() => setSelected(null)}
     conversations={conversations} activeConversationId={conversation?.id} onSelectConversation={selectConversation} onNewConversation={newConversation} onDeleteConversation={deleteConversation}
-    messages={messages} streamingAssistant={streamingAssistant} agentBusy={agentBusy} agentNotice={agentNotice} agentRetryNotice={agentRetryNotice} modelLabel={activeModel?.label}
-    planProposal={planProposal} v4Plan={v4Plan} planLoading={planLoading} planApproved={planApproved} canStartRun={false} runStarted={v4Plan?.status === "running" || Boolean(runId && (planApproved || agentRunEventsV4.some((event) => event.run_id === runId)))} activeRunId={runId} agentRunEvents={agentRunEvents} agentRunEventsV3={agentRunEventsV3} agentRunEventsV4={agentRunEventsV4}
+    messages={messages} agentBusy={agentBusy} agentNotice={agentNotice} modelLabel={activeModel?.label}
+    v4Plan={v4Plan} planLoading={planLoading} planApproved={planApproved} canStartRun={false} runStarted={v4Plan?.status === "running" || Boolean(runId && (planApproved || agentRunEventsV4.some((event) => event.run_id === runId)))} activeRunId={runId} agentRunEventsV4={agentRunEventsV4}
     computeBackends={computeBackends} computeBackendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} approvalPolicy={approvalPolicy} computeEnvironment={computeEnvironment} computeBusy={computeBusy}
     onComputeBackendChange={setComputeBackendId} onContainerImageChange={setContainerImage} onAutonomyModeChange={setAutonomyMode} onApprovalPolicyChange={setApprovalPolicy} onComputeEnvironmentChange={setComputeEnvironment}
-    onAnswerAgentQuestionV3={async (answerRunId, questionId, answer) => { await api.answerAgentRunQuestionV3(answerRunId, questionId, answer); await api.resumeRunV2(answerRunId); }}
-    onAnswerAgentQuestionV4={async (answerRunId, questionId, answer) => { await api.agentV4Answer(answerRunId, questionId, answer); await api.agentV4Resume(answerRunId); }}
+    onAnswerAgentQuestionV4={async (answerRunId, questionId, answer) => {
+      setAgentNotice("");
+      try {
+        await api.agentV4Answer(answerRunId, questionId, answer);
+        await api.agentV4Resume(answerRunId);
+        setRunId(answerRunId);
+        const events = await api.agentV4Events(answerRunId);
+        setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
+      } catch (error) {
+        setAgentNotice(error instanceof Error ? error.message : String(error));
+      }
+    }}
+    onDecideToolApprovalV4={async (approvalRunId, approvalId, callHash, decision) => {
+      setAgentNotice("");
+      try {
+        await api.agentV4DecideToolApproval(approvalRunId, approvalId, callHash, decision);
+        await api.agentV4Resume(approvalRunId);
+        setRunId(approvalRunId);
+        const events = await api.agentV4Events(approvalRunId);
+        setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
+      } catch (error) {
+        setAgentNotice(error instanceof Error ? error.message : String(error));
+      }
+    }}
+    onResolveUncertainV4={async (uncertainRunId, callId, resolution, evidence) => {
+      setAgentNotice("");
+      try {
+        await api.agentV4ResolveUncertain(uncertainRunId, callId, resolution, evidence);
+        await api.agentV4Resume(uncertainRunId);
+        setRunId(uncertainRunId);
+        const events = await api.agentV4Events(uncertainRunId);
+        setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
+      } catch (error) {
+        setAgentNotice(error instanceof Error ? error.message : String(error));
+      }
+    }}
     onResumeAgentRunV4={async (resumeRunId) => {
       setAgentNotice("");
       try {
@@ -474,7 +424,7 @@ export default function DesktopApp() {
     onPreviewImage={selected.connection_id && selected.remote_root ? (relativePath) => api.previewProjectImage(selected.id, relativePath) : undefined}
     onSend={async (markdown, mode) => {
       if (!conversation || !activeModel) { setSettingsOpen(true); return false; }
-      setLastGoal(markdown); setPlanProposal(null); setV4Plan(null); setPlanApproved(false); setApprovedPlanId(null); setRunId(null); setAgentBusy(true); setAgentNotice("");
+      setLastGoal(markdown); setV4Plan(null); setPlanApproved(false); setRunId(null); setAgentBusy(true); setAgentNotice("");
       if (mode === "plan") {
         setPlanLoading(true);
         try {
@@ -537,31 +487,10 @@ export default function DesktopApp() {
     } : undefined}
   />{settings}</>;
 }
-
-function mergeAgentRunEvents(current: AgentRunStreamEvent[], incoming: AgentRunStreamEvent[]) {
-  return [...current, ...incoming]
-    .filter((event, index, all) => all.findIndex((item) => item.run_id === event.run_id && item.sequence === event.sequence) === index)
-    .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime() || left.sequence - right.sequence);
-}
-
-export function mergeAgentRunEventsV3(current: AgentRunEventV3[], incoming: AgentRunEventV3[]) {
-  return [...current, ...incoming]
-    .filter((event, index, all) => all.findIndex((item) => item.run_id === event.run_id && item.sequence === event.sequence) === index)
-    .sort((left, right) => new Date(left.occurred_at).getTime() - new Date(right.occurred_at).getTime() || left.sequence - right.sequence);
-}
-
 function mergeAgentRunEventsV4(current: AgentRunEventV4[], incoming: AgentRunEventV4[]) {
   return [...current, ...incoming]
     .filter((event, index, all) => all.findIndex((item) => item.run_id === event.run_id && item.sequence === event.sequence) === index)
     .sort((left, right) => new Date(left.occurred_at).getTime() - new Date(right.occurred_at).getTime() || left.sequence - right.sequence);
-}
-
-function isTerminalAgentEvent(event: AgentRunStreamEvent) {
-  return event.kind === "agent_completed" || event.kind === "agent_failed" || event.kind === "agent_canceled";
-}
-
-function isTerminalAgentEventV3(event: AgentRunEventV3) {
-  return event.event.kind === "run_completed" || event.event.kind === "run_failed" || event.event.kind === "run_cancelled" || event.event.kind === "needs_attention";
 }
 
 function isTerminalAgentEventV4(event: AgentRunEventV4) {
