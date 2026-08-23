@@ -43,20 +43,48 @@ describe("WorkspaceShell", () => {
     fireEvent.click(screen.getByText("Agent Runtime V4"));
     expect(screen.getByRole("article", { name: "模型输出" })).toHaveTextContent("矩阵检查完成。");
   });
-  it("shows backend availability and only enables Full Auto for containers", () => {
+  it("offers to resume a failed V4 run and treats later events as running", () => {
+    const onResume = vi.fn();
+    const base = { schema_version: 4 as const, run_id: "run-recover", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
+    const failed = [
+      { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "run_created" as const, mode: "execute" as const } },
+      { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:02Z", event: { kind: "run_failed" as const, message: "system environment cannot be created or changed" } },
+    ];
+    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} agentRunEventsV4={failed} onResumeAgentRunV4={onResume} />);
+
+    fireEvent.click(screen.getByText("Agent Runtime V4"));
+    fireEvent.click(screen.getByRole("button", { name: "继续运行" }));
+    expect(onResume).toHaveBeenCalledWith("run-recover");
+
+    rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-recover" agentRunEventsV4={[...failed,
+      { ...base, sequence: 3, occurred_at: "2026-08-17T00:00:03Z", event: { kind: "tool_dispatch_resolved" as const, call_id: "call-1", resolution: "side_effect_not_observed" as const, evidence: "legacy immutable system ensure" } },
+    ]} onResumeAgentRunV4={onResume} />);
+    expect(screen.getByText(/运行中 · 3 条哈希事件/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "继续运行" })).not.toBeInTheDocument();
+  });
+  it("shows all compute choices in chat and keeps full access container-only", () => {
     const onBackendChange = vi.fn();
+    const onApprovalPolicyChange = vi.fn();
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={() => true}
-      computeBackendId="local" onComputeBackendChange={onBackendChange}
+      computeBackendId="local" onComputeBackendChange={onBackendChange} onApprovalPolicyChange={onApprovalPolicyChange}
       computeBackends={[
         { descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null },
+        { descriptor: { schema_version: 4, backend_id: "ssh:server", kind: "ssh", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null },
         { descriptor: { schema_version: 4, backend_id: "docker", kind: "docker", isolation: "container", available: true, supports_python: true, supports_r: true, supports_network_policy: true }, selectable: true, reason: null, python_status: "unverified", r_status: "unverified", resolved_image_id: "sha256:abc" },
+        { descriptor: { schema_version: 4, backend_id: "podman", kind: "podman", isolation: "container", available: false, supports_python: false, supports_r: false, supports_network_policy: true }, selectable: false, reason: "engine unavailable", python_status: "unavailable", r_status: "unavailable", resolved_image_id: null },
       ]} />);
-    fireEvent.click(screen.getByRole("button", { name: "添加上下文或选择模式" }));
-    fireEvent.click(screen.getByRole("menuitem", { name: /Plan 模式/ }));
+    fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
     expect(screen.getByRole("region", { name: "V4 计算后端" })).toHaveTextContent("探测不会拉取镜像或启动容器");
-    expect(screen.getByRole("radio", { name: "full auto" })).toBeDisabled();
+    expect(screen.getByRole("radio", { name: /LOCAL/ })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /SSH/ })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /DOCKER/ })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /PODMAN/ })).toBeDisabled();
     fireEvent.click(screen.getByRole("radio", { name: /DOCKER/ }));
     expect(onBackendChange).toHaveBeenCalledWith("docker");
+    fireEvent.click(screen.getByRole("button", { name: "Agent 权限" }));
+    expect(screen.getByRole("menuitemradio", { name: /^请求批准/ })).toBeInTheDocument();
+    expect(screen.getByRole("menuitemradio", { name: /^帮我批准/ })).toBeInTheDocument();
+    expect(screen.getByRole("menuitemradio", { name: /^完全访问权限/ })).toBeDisabled();
   });
   it("keeps ordinary questions in chat until the user explicitly selects Plan mode from the plus menu", async () => {
     const onSend = vi.fn().mockResolvedValue(true);

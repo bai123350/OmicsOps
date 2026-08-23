@@ -37,7 +37,7 @@ use omicsops_knowledge::{
     markdown_sections, schema_digest, search_mcp_tools, search_memory, search_skills,
 };
 use omicsops_protocol::{
-    AgentEventKindV4, AgentEventV4, AutonomyModeV4, ComputeBackendDescriptorV4,
+    AgentEventKindV4, AgentEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendDescriptorV4,
     ComputeBackendKindV4, ComputeSelectionV4, ContextArchiveV4, ContextCheckpointV4,
     ExecutionContextKeyV4, ExecutionPlanV4, IsolationStrengthV4, KernelLanguageV4,
     ModelErrorClassV4, ModelFailureV4, NetworkPolicyV4, OutputCaptureV4, ReviewerReportV4,
@@ -744,7 +744,61 @@ pub async fn agent_v4_resume(
         save_record(&state.repository, &record)?;
     }
     validate_frozen_spec(&state.repository, &spec)?;
+    let existing_events = state
+        .repository
+        .agent_events_v4(run_id)
+        .map_err(|error| error.to_string())?;
+    if let Some(call_id) = recoverable_system_environment_ensure(
+        &existing_events,
+        spec.compute_selection
+            .as_ref()
+            .map(|selection| selection.environment.as_str()),
+    ) {
+        let store = RepositoryEventStoreV4 {
+            repository: state.repository.clone(),
+            app: app.clone(),
+        };
+        append_next(
+            &store,
+            run_id,
+            AgentEventKindV4::ToolDispatchResolved {
+                call_id,
+                resolution: UncertainResolutionV4::SideEffectNotObserved,
+                evidence: "legacy system environment ensure failed before mutation; V4 system ensure is now an immutable readiness check".into(),
+            },
+        )?;
+    }
     spawn_execution(app, &state, record, spec).await
+}
+
+fn recoverable_system_environment_ensure(
+    events: &[AgentEventV4],
+    frozen_environment: Option<&str>,
+) -> Option<String> {
+    if frozen_environment != Some("system")
+        || !events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEventKindV4::RunFailed { message }
+                    if message.contains("system environment cannot be created or changed")
+                        || message.contains("environments are immutable in V4")
+            )
+        })
+    {
+        return None;
+    }
+    let call_id = events.iter().rev().find_map(|event| match &event.event {
+        AgentEventKindV4::ToolDispatchStarted {
+            call_id, tool_id, ..
+        } if tool_id == "runtime.environment.ensure" => Some(call_id.clone()),
+        _ => None,
+    })?;
+    let resolved = events.iter().any(|event| {
+        matches!(&event.event, AgentEventKindV4::ToolFinished { outcome } if outcome.call_id == call_id)
+            || matches!(&event.event, AgentEventKindV4::ToolOutcomeReused { outcome, .. } if outcome.call_id == call_id)
+            || matches!(&event.event, AgentEventKindV4::ToolDispatchResolved { call_id: resolved, .. } if resolved == &call_id)
+    });
+    (!resolved).then_some(call_id)
 }
 
 #[tauri::command]
@@ -1070,8 +1124,11 @@ async fn compose(
     }
     let mut prompt = filesystem.prompt_layers(&selection.backend_id).await?;
     prompt.environment.push_str(&format!(
-        "; frozen_environment={}; autonomy={:?}; network_policy={:?}; every runtime call must use the frozen environment",
-        selection.environment, selection.autonomy_mode, selection.network_policy
+        "; frozen_environment={}; autonomy={:?}; approval_policy={:?}; network_policy={:?}; every runtime call must use the frozen environment",
+        selection.environment,
+        selection.autonomy_mode,
+        selection.approval_policy,
+        selection.network_policy
     ));
     let runtime = Arc::new(RuntimeManagerV4::new(backend));
     let executor = Arc::new(DesktopToolExecutorV4 {
@@ -1519,8 +1576,18 @@ impl RuntimeEnvironmentPortV4 for LocalEnvironmentPortV4 {
         software_versions_from_command(language, None, requirements).await
     }
 
-    async fn ensure(&self, _: KernelLanguageV4, _: &str) -> Result<String, String> {
-        Err("local and container environments are immutable in V4".into())
+    async fn ensure(
+        &self,
+        language: KernelLanguageV4,
+        environment: &str,
+    ) -> Result<String, String> {
+        if environment != "system" {
+            return Err("local backend only supports the system environment".into());
+        }
+        let versions = self
+            .software_versions(language, environment, vec![])
+            .await?;
+        system_environment_ready(language, versions)
     }
 }
 
@@ -1568,8 +1635,18 @@ impl RuntimeEnvironmentPortV4 for ContainerEnvironmentPortV4 {
         )))
     }
 
-    async fn ensure(&self, _: KernelLanguageV4, _: &str) -> Result<String, String> {
-        Err("container environments are frozen in the selected image".into())
+    async fn ensure(
+        &self,
+        language: KernelLanguageV4,
+        environment: &str,
+    ) -> Result<String, String> {
+        if environment != "system" {
+            return Err("container environment is frozen in the selected image".into());
+        }
+        let versions = self
+            .software_versions(language, environment, vec![])
+            .await?;
+        system_environment_ready(language, versions)
     }
 }
 
@@ -1602,7 +1679,10 @@ impl RuntimeEnvironmentPortV4 for SshEnvironmentPortV4 {
         environment: &str,
     ) -> Result<String, String> {
         if environment == "system" {
-            return Err("system environment cannot be created or changed".into());
+            let versions = self
+                .software_versions(language, environment, vec![])
+                .await?;
+            return system_environment_ready(language, versions);
         }
         let prefix = environment_path(&self.root, environment);
         let packages = match language {
@@ -1617,6 +1697,20 @@ impl RuntimeEnvironmentPortV4 for SshEnvironmentPortV4 {
         )).await.map_err(|error| error.to_string())?;
         Ok(bounded_excerpt(&output.stdout, 16 * 1024).0)
     }
+}
+
+fn system_environment_ready(
+    language: KernelLanguageV4,
+    versions: BTreeMap<String, String>,
+) -> Result<String, String> {
+    serde_json::to_string(&json!({
+        "environment": "system",
+        "language": language,
+        "status": "ready",
+        "mutated": false,
+        "software_versions": versions,
+    }))
+    .map_err(|error| error.to_string())
 }
 
 struct DesktopToolExecutorV4 {
@@ -2613,6 +2707,7 @@ fn legacy_ssh_selection(project: &Project) -> Result<ComputeSelectionV4, String>
         backend_id: format!("ssh:{connection_id}"),
         backend_kind: ComputeBackendKindV4::Ssh,
         autonomy_mode: AutonomyModeV4::Supervised,
+        approval_policy: ApprovalPolicyV4::RiskBased,
         environment: "system".into(),
         network_policy: NetworkPolicyV4::HostInherited,
         container_image: None,
@@ -3048,6 +3143,69 @@ mod tests {
     }
 
     #[test]
+    fn system_environment_ensure_reports_ready_without_mutation() {
+        let content = system_environment_ready(
+            KernelLanguageV4::Python,
+            BTreeMap::from([("python".into(), "3.12.0".into())]),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(value["environment"], "system");
+        assert_eq!(value["status"], "ready");
+        assert_eq!(value["mutated"], false);
+        assert_eq!(value["software_versions"]["python"], "3.12.0");
+    }
+
+    #[test]
+    fn failed_legacy_system_ensure_is_safe_to_resume_once() {
+        let first = AgentEventV4::first(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Utc::now(),
+            AgentEventKindV4::RunCreated {
+                mode: RunModeV4::Execute,
+            },
+        );
+        let dispatch = AgentEventV4::next(
+            &first,
+            Utc::now(),
+            AgentEventKindV4::ToolDispatchStarted {
+                call_id: "ensure-system".into(),
+                tool_id: "runtime.environment.ensure".into(),
+                effect: ToolEffectV4::Runtime,
+                idempotency_key: "ensure-system".into(),
+            },
+        );
+        let failed = AgentEventV4::next(
+            &dispatch,
+            Utc::now(),
+            AgentEventKindV4::RunFailed {
+                message: "tool error: system environment cannot be created or changed".into(),
+            },
+        );
+        let mut events = vec![first, dispatch, failed];
+        assert_eq!(
+            recoverable_system_environment_ensure(&events, Some("system")).as_deref(),
+            Some("ensure-system")
+        );
+        let resolved = AgentEventV4::next(
+            events.last().unwrap(),
+            Utc::now(),
+            AgentEventKindV4::ToolDispatchResolved {
+                call_id: "ensure-system".into(),
+                resolution: UncertainResolutionV4::SideEffectNotObserved,
+                evidence: "known pre-mutation failure".into(),
+            },
+        );
+        events.push(resolved);
+        assert_eq!(
+            recoverable_system_environment_ensure(&events, Some("system")),
+            None
+        );
+    }
+
+    #[test]
     fn backend_discovery_only_inspects_and_never_pulls_or_runs_images() {
         assert_eq!(
             container_image_inspect_args("omicsops/test:latest"),
@@ -3433,6 +3591,7 @@ mod tests {
                 backend_id: "ssh:live-stage2".into(),
                 backend_kind: ComputeBackendKindV4::Ssh,
                 autonomy_mode: AutonomyModeV4::Supervised,
+                approval_policy: ApprovalPolicyV4::RiskBased,
                 environment: "stage2-r".into(),
                 network_policy: NetworkPolicyV4::HostInherited,
                 container_image: None,
@@ -3530,6 +3689,7 @@ mod tests {
                 backend_id: backend_id.clone(),
                 backend_kind: ComputeBackendKindV4::Ssh,
                 autonomy_mode: AutonomyModeV4::Supervised,
+                approval_policy: ApprovalPolicyV4::RiskBased,
                 environment: "system".into(),
                 network_policy: NetworkPolicyV4::HostInherited,
                 container_image: None,

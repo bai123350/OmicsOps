@@ -152,6 +152,42 @@
   gap: 4px;
 }
 
+.composer-policy-button {
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #475467;
+  padding: 6px 8px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+}
+.composer-policy-button:hover, .composer-policy-button[aria-expanded="true"] { background: #f2f4f7; color: #172033; }
+.composer-policy-button svg:last-child { transform: rotate(-90deg); }
+.permission-menu, .composer-compute-menu {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 8px);
+  z-index: 30;
+  border: 1px solid #d0d5dd;
+  border-radius: 13px;
+  background: white;
+  box-shadow: 0 16px 42px #1018282e;
+}
+.permission-menu { width: 330px; padding: 7px; }
+.permission-menu header { padding: 6px 8px 8px; display: flex; justify-content: space-between; color: #667085; font-size: 10px; }
+.permission-menu > button { width: 100%; border: 0; border-radius: 9px; background: transparent; padding: 9px; display: grid; grid-template-columns: 24px minmax(0, 1fr) 18px; align-items: center; gap: 7px; text-align: left; }
+.permission-menu > button:hover, .permission-menu > button.active { background: #f2f4f7; }
+.permission-menu > button.danger { color: #b54708; }
+.permission-menu > button:disabled { opacity: .45; cursor: not-allowed; }
+.permission-menu > button > span:nth-child(2) { display: flex; flex-direction: column; gap: 2px; }
+.permission-menu small { color: #667085; font-size: 9px; line-height: 1.35; }
+.permission-icon { display: grid; place-items: center; }
+.composer-compute-menu { width: min(620px, 76vw); padding: 8px; }
+.composer-compute-menu .compute-selector { max-height: 440px; overflow: auto; }
+.compute-anchor .composer-compute-menu { left: -150px; }
+
 .context-tabs { grid-template-columns: repeat(6, minmax(0, 1fr)); }
 .plan-ready-message { padding: 10px 12px; border: 1px solid #cddcff; border-radius: 10px; background: #f8faff; }
 .plan-panel { padding: 16px; display: flex; flex-direction: column; gap: 16px; color: #344054; }
@@ -559,6 +595,30 @@
 .agent-run-fold.is-active { border-color: #b7e4cc; }
 .agent-run-fold-body { max-height: 560px; padding: 2px 12px 12px; overflow: auto; border-top: 1px solid #f2f4f7; }
 .agent-run-fold-body .agent-work-update { margin-top: 10px; }
+
+.v4-resume-run {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+  padding: 9px 10px;
+  border: 1px solid #f0b7b2;
+  border-radius: 8px;
+  background: #fff8f7;
+  color: #7a271a;
+  font-size: 10px;
+}
+
+.v4-resume-run button {
+  flex: 0 0 auto;
+  padding: 6px 9px;
+  border: 1px solid #d92d20;
+  border-radius: 6px;
+  background: #fff;
+  color: #b42318;
+  font-weight: 700;
+}
 
 .agent-run-controls {
   position: sticky;

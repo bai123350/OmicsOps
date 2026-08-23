@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import * as api from "./tauri-api";
-import type { AgentEvent, AgentRunEventV3, AgentRunEventV4, AgentRunStreamEvent, AutonomyModeV4, ComputeBackendAvailabilityV4, ComputeSelectionV4, ConnectionProfile, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, PlanProposal, ProjectArtifact, RemoteFileEntry, RunSummaryV4, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
+import type { AgentEvent, AgentRunEventV3, AgentRunEventV4, AgentRunStreamEvent, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendAvailabilityV4, ComputeSelectionV4, ConnectionProfile, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, PlanProposal, ProjectArtifact, RemoteFileEntry, RunSummaryV4, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
 import { WorkspaceShell } from "./features/workspace/WorkspaceShell";
 import type { Locale } from "./features/workspace/copy";
@@ -29,6 +29,7 @@ export default function DesktopApp() {
   const [computeBackendId, setComputeBackendId] = useState("local");
   const [containerImage, setContainerImage] = useState("");
   const [autonomyMode, setAutonomyMode] = useState<AutonomyModeV4>("supervised");
+  const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicyV4>("risk_based");
   const [computeEnvironment, setComputeEnvironment] = useState("system");
   const [computeBusy, setComputeBusy] = useState(false);
   const [planLoading, setPlanLoading] = useState(false);
@@ -104,7 +105,10 @@ export default function DesktopApp() {
     const backend = computeBackends.find((item) => item.descriptor.backend_id === computeBackendId);
     if (!backend) return;
     if (backend.descriptor.kind !== "ssh") setComputeEnvironment("system");
-    if (backend.descriptor.isolation !== "container") setAutonomyMode("supervised");
+    if (backend.descriptor.isolation !== "container") {
+      setAutonomyMode("supervised");
+      setApprovalPolicy((current) => current === "full_access" ? "risk_based" : current);
+    }
   }, [computeBackendId, computeBackends]);
   useEffect(() => {
     if (!selected) { setMemoryFacts([]); setNotebookEntries([]); setProjectArtifacts([]); return; }
@@ -333,7 +337,8 @@ export default function DesktopApp() {
       schema_version: 4,
       backend_id: backend.descriptor.backend_id,
       backend_kind: backend.descriptor.kind,
-      autonomy_mode: container ? autonomyMode : "supervised",
+      autonomy_mode: container && approvalPolicy === "full_access" ? "full_auto" : "supervised",
+      approval_policy: approvalPolicy,
       environment: backend.descriptor.kind === "ssh" ? (computeEnvironment.trim() || "system") : "system",
       network_policy: container ? "none" : "host_inherited",
       container_image: container ? { reference: containerImage.trim(), image_id: backend.resolved_image_id! } : null,
@@ -436,10 +441,21 @@ export default function DesktopApp() {
     conversations={conversations} activeConversationId={conversation?.id} onSelectConversation={selectConversation} onNewConversation={newConversation} onDeleteConversation={deleteConversation}
     messages={messages} streamingAssistant={streamingAssistant} agentBusy={agentBusy} agentNotice={agentNotice} agentRetryNotice={agentRetryNotice} modelLabel={activeModel?.label}
     planProposal={planProposal} v4Plan={v4Plan} planLoading={planLoading} planApproved={planApproved} canStartRun={false} runStarted={v4Plan?.status === "running" || Boolean(runId && (planApproved || agentRunEventsV4.some((event) => event.run_id === runId)))} activeRunId={runId} agentRunEvents={agentRunEvents} agentRunEventsV3={agentRunEventsV3} agentRunEventsV4={agentRunEventsV4}
-    computeBackends={computeBackends} computeBackendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} computeEnvironment={computeEnvironment} computeBusy={computeBusy}
-    onComputeBackendChange={setComputeBackendId} onContainerImageChange={setContainerImage} onAutonomyModeChange={setAutonomyMode} onComputeEnvironmentChange={setComputeEnvironment}
+    computeBackends={computeBackends} computeBackendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} approvalPolicy={approvalPolicy} computeEnvironment={computeEnvironment} computeBusy={computeBusy}
+    onComputeBackendChange={setComputeBackendId} onContainerImageChange={setContainerImage} onAutonomyModeChange={setAutonomyMode} onApprovalPolicyChange={setApprovalPolicy} onComputeEnvironmentChange={setComputeEnvironment}
     onAnswerAgentQuestionV3={async (answerRunId, questionId, answer) => { await api.answerAgentRunQuestionV3(answerRunId, questionId, answer); await api.resumeRunV2(answerRunId); }}
     onAnswerAgentQuestionV4={async (answerRunId, questionId, answer) => { await api.agentV4Answer(answerRunId, questionId, answer); await api.agentV4Resume(answerRunId); }}
+    onResumeAgentRunV4={async (resumeRunId) => {
+      setAgentNotice("");
+      try {
+        await api.agentV4Resume(resumeRunId);
+        setRunId(resumeRunId);
+        const events = await api.agentV4Events(resumeRunId);
+        setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
+      } catch (error) {
+        setAgentNotice(error instanceof Error ? error.message : String(error));
+      }
+    }}
     runStopping={runStopping}
     remoteFiles={remoteFiles} filesBusy={filesBusy} fileNotice={fileNotice}
     syncEntries={syncEntries}

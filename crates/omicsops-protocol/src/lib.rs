@@ -337,6 +337,21 @@ pub enum AutonomyModeV4 {
     FullAuto,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPolicyV4 {
+    RequestApproval,
+    #[default]
+    RiskBased,
+    FullAccess,
+}
+
+impl ApprovalPolicyV4 {
+    fn is_default(value: &Self) -> bool {
+        *value == Self::RiskBased
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkPolicyV4 {
@@ -356,6 +371,8 @@ pub struct ComputeSelectionV4 {
     pub backend_id: String,
     pub backend_kind: ComputeBackendKindV4,
     pub autonomy_mode: AutonomyModeV4,
+    #[serde(default, skip_serializing_if = "ApprovalPolicyV4::is_default")]
+    pub approval_policy: ApprovalPolicyV4,
     pub environment: String,
     pub network_policy: NetworkPolicyV4,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -393,6 +410,10 @@ impl ComputeSelectionV4 {
             || (container && self.network_policy != NetworkPolicyV4::None)
             || (!container && self.network_policy != NetworkPolicyV4::HostInherited)
             || (self.autonomy_mode == AutonomyModeV4::FullAuto && !container)
+            || (self.approval_policy == ApprovalPolicyV4::FullAccess
+                && self.autonomy_mode != AutonomyModeV4::FullAuto)
+            || (self.approval_policy != ApprovalPolicyV4::FullAccess
+                && self.autonomy_mode != AutonomyModeV4::Supervised)
         {
             return Err(ProtocolErrorV4::InvalidComputeSelection);
         }
@@ -961,6 +982,7 @@ mod tests {
             backend_id: "local".into(),
             backend_kind: ComputeBackendKindV4::Local,
             autonomy_mode: AutonomyModeV4::Supervised,
+            approval_policy: ApprovalPolicyV4::RiskBased,
             environment: "system".into(),
             network_policy: NetworkPolicyV4::HostInherited,
             container_image: None,
@@ -1024,6 +1046,7 @@ mod tests {
             backend_id: "docker".into(),
             backend_kind: ComputeBackendKindV4::Docker,
             autonomy_mode: AutonomyModeV4::FullAuto,
+            approval_policy: ApprovalPolicyV4::FullAccess,
             environment: "system".into(),
             network_policy: NetworkPolicyV4::None,
             container_image: Some(ContainerImageSelectionV4 {
@@ -1093,6 +1116,7 @@ mod tests {
             backend_id: format!("ssh:{}", Uuid::new_v4()),
             backend_kind: ComputeBackendKindV4::Ssh,
             autonomy_mode: AutonomyModeV4::Supervised,
+            approval_policy: ApprovalPolicyV4::RiskBased,
             environment: "analysis-r".into(),
             network_policy: NetworkPolicyV4::HostInherited,
             container_image: None,
@@ -1103,6 +1127,7 @@ mod tests {
             backend_id: "podman".into(),
             backend_kind: ComputeBackendKindV4::Podman,
             autonomy_mode: AutonomyModeV4::FullAuto,
+            approval_policy: ApprovalPolicyV4::FullAccess,
             environment: "system".into(),
             network_policy: NetworkPolicyV4::None,
             container_image: Some(ContainerImageSelectionV4 {
@@ -1114,5 +1139,11 @@ mod tests {
         let mut invalid = ssh;
         invalid.autonomy_mode = AutonomyModeV4::FullAuto;
         assert!(invalid.validate().is_err());
+        invalid.autonomy_mode = AutonomyModeV4::Supervised;
+        invalid.approval_policy = ApprovalPolicyV4::FullAccess;
+        assert!(invalid.validate().is_err());
+        let mut mismatched_container = podman;
+        mismatched_container.approval_policy = ApprovalPolicyV4::RiskBased;
+        assert!(mismatched_container.validate().is_err());
     }
 }
