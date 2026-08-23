@@ -29,6 +29,24 @@ describe("WorkspaceShell", () => {
     expect(screen.getAllByRole("article", { name: "模型输出" })).toHaveLength(1);
     expect(screen.getByRole("article", { name: "模型输出" })).toHaveTextContent("我先检查输入目录。");
   });
+  it("shows the V4 input question and hides the answer form after it is answered", () => {
+    const onAnswer = vi.fn();
+    const base = { schema_version: 4 as const, run_id: "run-question", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
+    const requested = { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "input_requested" as const, question_id: "species", question: "该数据来自人还是小鼠？" } };
+    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-question" agentRunEventsV4={[requested]} onAnswerAgentQuestionV4={onAnswer} />);
+
+    expect(screen.getByText("需要补充信息")).toBeInTheDocument();
+    expect(screen.getByText("该数据来自人还是小鼠？")).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: "回答 V4 问题" }), { target: { value: "人" } });
+    fireEvent.click(screen.getByRole("button", { name: "回答并恢复" }));
+    expect(onAnswer).toHaveBeenCalledWith("run-question", "species", "人");
+
+    rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-question" agentRunEventsV4={[requested,
+      { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:02Z", event: { kind: "user_input_answered" as const, question_id: "species", answer: "人" } },
+    ]} onAnswerAgentQuestionV4={onAnswer} />);
+    expect(screen.getByText("已提交回答：人")).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "回答 V4 问题" })).not.toBeInTheDocument();
+  });
   it("restores a completed V4 run after its persisted user message", () => {
     const base = { schema_version: 4 as const, run_id: "run-history", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined}
