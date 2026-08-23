@@ -139,60 +139,6 @@ impl Message {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnStatus {
-    Queued,
-    Streaming,
-    WaitingForApproval,
-    Succeeded,
-    Failed,
-    Interrupted,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct AgentTurn {
-    pub id: Uuid,
-    pub project_id: Uuid,
-    pub conversation_id: Uuid,
-    pub status: TurnStatus,
-    pub model_profile_id: Uuid,
-    pub started_at: DateTime<Utc>,
-    pub finished_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolCallState {
-    Proposed,
-    WaitingForApproval,
-    Running,
-    Succeeded,
-    Failed,
-    Denied,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct ToolCall {
-    pub id: Uuid,
-    pub turn_id: Uuid,
-    pub name: String,
-    pub arguments: serde_json::Value,
-    pub state: ToolCallState,
-    pub risk: crate::domain::StepRisk,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct Approval {
-    pub id: Uuid,
-    pub project_id: Uuid,
-    pub tool_call_id: Uuid,
-    pub reason: String,
-    pub approved: Option<bool>,
-    pub decided_at: Option<DateTime<Utc>>,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Artifact {
     pub id: Uuid,

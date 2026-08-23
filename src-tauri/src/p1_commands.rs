@@ -2,9 +2,8 @@ use std::{collections::BTreeMap, io::Write, path::Path, process::Stdio};
 
 use chrono::Utc;
 use omicsops_adapters::persistence::Repository;
-use omicsops_agent::harness_v3::ToolDefinitionV3;
 use omicsops_core::workspace::{
-    Artifact, EvidenceReference, MemoryFact, NotebookEntry, NotebookEntryKind, SkillCitation,
+    Artifact, EvidenceReference, MemoryFact, NotebookEntry, SkillCitation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -16,7 +15,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::commands::{AppState, RemoteAgentMemoryEntry};
+use crate::commands::AppState;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemorySearchRequest {
@@ -71,43 +70,6 @@ pub fn memory_facts(
                 created_at: message.created_at,
             });
         }
-    }
-    for entry in repository
-        .list_json::<RemoteAgentMemoryEntry>("remote_agent_memory")
-        .map_err(|error| error.to_string())?
-    {
-        if entry.project_id != request.project_id
-            || request
-                .conversation_id
-                .is_some_and(|id| entry.conversation_id != Some(id))
-        {
-            continue;
-        }
-        let source_id = format!("{}:{}", entry.run_id, entry.sequence);
-        let (dimension, key, value) = classify_command_fact(&entry);
-        facts.push(MemoryFact {
-            id: stable_uuid(&format!("command:{source_id}")),
-            project_id: request.project_id,
-            conversation_id: entry.conversation_id,
-            run_id: Some(entry.run_id),
-            dimension: dimension.into(),
-            key,
-            value: value.clone(),
-            statement: format!("{} (exit {})", entry.reason, entry.exit_code),
-            evidence: vec![EvidenceReference {
-                source_kind: "command".into(),
-                source_id,
-                excerpt: excerpt(
-                    &format!(
-                        "$ {}\nexit={}\n{}\n{}",
-                        entry.command, entry.exit_code, entry.stdout_tail, entry.stderr_tail
-                    ),
-                    480,
-                ),
-            }],
-            conflicted_with: vec![],
-            created_at: entry.timestamp,
-        });
     }
     for artifact in repository
         .artifacts_for_project(request.project_id)
@@ -267,153 +229,6 @@ pub fn export_project_notebook(
         ),
         _ => Err("export format must be markdown, json, or bundle".into()),
     }
-}
-
-pub fn register_agent_completion(
-    repository: &Repository,
-    project_id: Uuid,
-    conversation_id: Option<Uuid>,
-    run_id: Uuid,
-    goal: &str,
-    method: &str,
-    observation: &str,
-    decision: &str,
-    artifacts: Vec<(String, String, u64, String)>,
-    skill_citations: &[SkillCitation],
-) -> Result<(), String> {
-    let now = Utc::now();
-    let mut artifact_ids = Vec::new();
-    for (relative_path, remote_path, size_bytes, sha256) in artifacts {
-        let id = stable_uuid(&format!("{project_id}:{run_id}:{relative_path}:{sha256}"));
-        repository
-            .save_artifact_v3(&Artifact {
-                id,
-                project_id,
-                run_id: Some(run_id),
-                relative_path: relative_path.clone(),
-                remote_path: Some(remote_path),
-                media_type: media_type(&relative_path),
-                size_bytes,
-                sha256,
-                verified: true,
-                created_at: now,
-            })
-            .map_err(|error| error.to_string())?;
-        artifact_ids.push(id);
-    }
-    let command_ids = repository
-        .list_json::<RemoteAgentMemoryEntry>("remote_agent_memory")
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter(|entry| entry.run_id == run_id)
-        .map(|entry| format!("command:{}:{}", run_id, entry.sequence))
-        .collect::<Vec<_>>();
-    let command_summary = repository
-        .list_json::<RemoteAgentMemoryEntry>("remote_agent_memory")
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter(|entry| entry.run_id == run_id)
-        .map(|entry| format!("- `{}` → exit {}", entry.command, entry.exit_code))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let environment_summary = repository
-        .list_json::<RemoteAgentMemoryEntry>("remote_agent_memory")
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter(|entry| entry.run_id == run_id && classify_command_fact(entry).0 == "environment")
-        .map(|entry| {
-            format!(
-                "- {}\n  - {}",
-                entry.command,
-                excerpt(&entry.stdout_tail, 240)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let skill_evidence = skill_citations
-        .iter()
-        .map(|citation| {
-            format!(
-                "skill:{}@{}:{}:{}",
-                citation.name, citation.version, citation.package_sha256, citation.excerpt_sha256
-            )
-        })
-        .collect::<Vec<_>>();
-    let entries = [
-        (
-            NotebookEntryKind::Goal,
-            "Research goal",
-            goal.to_owned(),
-            vec![],
-        ),
-        (
-            NotebookEntryKind::Method,
-            "Method",
-            method.to_owned(),
-            [command_ids.clone(), skill_evidence].concat(),
-        ),
-        (
-            NotebookEntryKind::Environment,
-            "Environment evidence",
-            if environment_summary.is_empty() {
-                "No separate environment probe was recorded.".into()
-            } else {
-                environment_summary
-            },
-            command_ids.clone(),
-        ),
-        (
-            NotebookEntryKind::Command,
-            "Approved terminal actions",
-            command_summary,
-            command_ids.clone(),
-        ),
-        (
-            NotebookEntryKind::Observation,
-            "Observed result",
-            observation.to_owned(),
-            command_ids.clone(),
-        ),
-        (
-            NotebookEntryKind::Decision,
-            "Completion decision",
-            decision.to_owned(),
-            command_ids.clone(),
-        ),
-        (
-            NotebookEntryKind::Evidence,
-            "Verified artifacts",
-            artifact_ids
-                .iter()
-                .map(|id| format!("artifact:{id}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            artifact_ids
-                .iter()
-                .map(|id| format!("artifact:{id}"))
-                .collect(),
-        ),
-    ];
-    for (kind, title, markdown, evidence_ids) in entries {
-        let id = stable_uuid(&format!("notebook:{run_id}:{title}"));
-        repository
-            .save_notebook_entry(&NotebookEntry {
-                id,
-                project_id,
-                conversation_id,
-                turn_id: None,
-                kind,
-                title: title.into(),
-                markdown,
-                confidence: None,
-                evidence_ids,
-                artifact_ids: artifact_ids.clone(),
-                created_at: now,
-                updated_at: now,
-            })
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(())
 }
 
 pub fn enabled_skill_citations(repository: &Repository) -> Result<Vec<SkillCitation>, String> {
@@ -906,33 +721,6 @@ fn stable_uuid(value: &str) -> Uuid {
 fn excerpt(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
-fn classify_command_fact(entry: &RemoteAgentMemoryEntry) -> (&'static str, String, String) {
-    let combined =
-        format!("{} {} {}", entry.command, entry.stdout_tail, entry.reason).to_lowercase();
-    if combined.contains("micromamba")
-        || combined.contains("conda")
-        || combined.contains("pip install")
-        || combined.contains("sessioninfo")
-        || combined.contains("--version")
-    {
-        (
-            "environment",
-            entry
-                .command
-                .split_whitespace()
-                .next()
-                .unwrap_or("environment")
-                .into(),
-            format!("exit={}", entry.exit_code),
-        )
-    } else {
-        (
-            "task",
-            format!("run:{}:action:{}", entry.run_id, entry.sequence),
-            format!("exit={}", entry.exit_code),
-        )
-    }
-}
 fn mark_conflicts(facts: &mut [MemoryFact]) {
     let mut groups: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
     for (index, fact) in facts.iter().enumerate() {
@@ -953,27 +741,6 @@ fn mark_conflicts(facts: &mut [MemoryFact]) {
             }
         }
     }
-}
-fn media_type(path: &str) -> String {
-    match Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("")
-        .to_lowercase()
-        .as_str()
-    {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "csv" => "text/csv",
-        "tsv" => "text/tab-separated-values",
-        "json" => "application/json",
-        "html" => "text/html",
-        "md" => "text/markdown",
-        "pdf" => "application/pdf",
-        "ipynb" => "application/x-ipynb+json",
-        _ => "application/octet-stream",
-    }
-    .into()
 }
 fn markdown_sections(markdown: &str) -> Vec<(String, String)> {
     let mut result = Vec::new();
@@ -1179,90 +946,6 @@ mod tests {
         assert!(changed.tools.is_empty());
         assert!(changed.last_inspected_at.is_none());
     }
-
-    #[test]
-    fn harness_snapshot_includes_only_enabled_declared_and_approved_mcp_tools() {
-        let repository = Repository::open_in_memory().unwrap();
-        let now = Utc::now();
-        let server_id = Uuid::new_v4();
-        let profile = McpServerProfile {
-            id: server_id,
-            name: "papers".into(),
-            command: "fixture".into(),
-            args: vec![],
-            enabled: true,
-            launch_approved: true,
-            approved_tools: vec!["search".into()],
-            tools: vec![
-                json!({"name":"search","description":"Search papers","inputSchema":{"type":"object"}}),
-                json!({"name":"write","description":"Not approved","inputSchema":{"type":"object"}}),
-            ],
-            capabilities: json!({}),
-            last_inspected_at: Some(now),
-            created_at: now,
-            updated_at: now,
-        };
-        repository
-            .put_json("mcp_server", &server_id.to_string(), &profile)
-            .unwrap();
-
-        let definitions = approved_mcp_tool_definitions_v3(&repository).unwrap();
-        assert_eq!(definitions.len(), 1);
-        assert_eq!(definitions[0].id, format!("mcp::{server_id}::search"));
-    }
-}
-
-pub(crate) fn approved_mcp_tool_definitions_v3(
-    repository: &Repository,
-) -> Result<Vec<ToolDefinitionV3>, String> {
-    let profiles = repository
-        .list_json::<McpServerProfile>("mcp_server")
-        .map_err(|error| error.to_string())?;
-    let mut definitions = Vec::new();
-    for profile in profiles
-        .into_iter()
-        .filter(|profile| profile.enabled && profile.launch_approved)
-    {
-        for tool in &profile.tools {
-            let Some(name) = tool.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            if !profile
-                .approved_tools
-                .iter()
-                .any(|approved| approved == name)
-            {
-                continue;
-            }
-            let description = tool
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or("Approved MCP tool");
-            let input_schema = tool
-                .get("inputSchema")
-                .or_else(|| tool.get("input_schema"))
-                .cloned()
-                .unwrap_or_else(|| json!({"type":"object"}));
-            definitions.push(ToolDefinitionV3::mcp(
-                profile.id.to_string(),
-                name,
-                description,
-                input_schema,
-            ));
-        }
-    }
-    definitions.sort_by(|left, right| left.id.cmp(&right.id));
-    Ok(definitions)
-}
-
-pub(crate) async fn invoke_configured_mcp_tool_v3(
-    repository: &Repository,
-    project_id: Uuid,
-    server_id: Uuid,
-    tool: &str,
-    arguments: Value,
-) -> Result<McpResult, String> {
-    invoke_configured_mcp_tool(repository, project_id, server_id, tool, arguments, None).await
 }
 
 pub(crate) async fn invoke_configured_mcp_tool_v4(

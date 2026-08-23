@@ -106,17 +106,9 @@ pub async fn delete_project(state: State<'_, AppState>, project_id: Uuid) -> Res
 }
 
 pub async fn ensure_project_deletable(state: &AppState, project_id: Uuid) -> Result<(), String> {
-    if state
-        .repository
-        .has_active_agent_turns(project_id)
-        .map_err(|error| error.to_string())?
-    {
-        return Err("stop the active agent turn before deleting this project".into());
-    }
-
     let project_run_ids = state
         .repository
-        .run_ids_for_project(project_id)
+        .agent_run_ids_v4_for_project(project_id)
         .map_err(|error| error.to_string())?
         .into_iter()
         .collect::<HashSet<_>>();

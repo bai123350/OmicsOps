@@ -1,19 +1,10 @@
-use std::{
-    collections::HashSet,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
-use omicsops_agent::{
-    AgentEvent,
-    harness_v3::{AgentRunEventV3, AgentSnapshotV3, validate_event_chain},
-};
 use omicsops_core::{
-    audit::RunEventV2,
-    domain::{AnalysisPlan, ConnectionProfile, RunEvent},
-    plan_v2::{ApprovedPlan, EnvironmentLock, StepAttempt, migrate_v1_plan},
+    domain::ConnectionProfile,
     workspace::{
-        AgentTurn, Artifact, Conversation, Message, ModelProfile, NotebookEntry, Project,
-        SkillPackage, SyncEntry, TurnStatus,
+        Artifact, Conversation, Message, ModelProfile, NotebookEntry, Project, SkillPackage,
+        SyncEntry,
     },
 };
 use omicsops_protocol::{
@@ -24,7 +15,7 @@ use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::AdapterResult;
+use crate::{AdapterError, AdapterResult};
 
 #[derive(Clone)]
 pub struct Repository {
@@ -226,24 +217,6 @@ impl Repository {
             PRAGMA user_version = 3;
             ",
         )?;
-        let legacy_plans = {
-            let mut statement = transaction
-                .prepare("SELECT id, value_json FROM app_objects WHERE kind = 'analysis_plan'")?;
-            let rows = statement.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        for (id, json) in legacy_plans {
-            let Ok(plan) = serde_json::from_str::<AnalysisPlan>(&json) else {
-                continue;
-            };
-            let migrated = migrate_v1_plan(&plan);
-            transaction.execute(
-                "INSERT OR IGNORE INTO app_objects (kind, id, value_json) VALUES ('analysis_plan_v2', ?1, ?2)",
-                params![id, serde_json::to_string(&migrated)?],
-            )?;
-        }
         transaction.commit()?;
         Ok(())
     }
@@ -296,41 +269,17 @@ impl Repository {
         Ok(Some(serde_json::from_str(&row.get::<_, String>(0)?)?))
     }
 
-    pub fn run_ids_for_project(&self, project_id: Uuid) -> AdapterResult<Vec<Uuid>> {
-        let project_id = project_id.to_string();
-        let connection = self.connection.lock().expect("database lock");
-        let mut statement = connection.prepare("SELECT value_json FROM app_objects")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        let mut run_ids = HashSet::new();
-        for row in rows {
-            let value = serde_json::from_str::<serde_json::Value>(&row?)?;
-            if value.get("project_id").and_then(|field| field.as_str()) == Some(&project_id)
-                && let Some(run_id) = value
-                    .get("run_id")
-                    .and_then(|field| field.as_str())
-                    .and_then(|field| Uuid::parse_str(field).ok())
-            {
-                run_ids.insert(run_id);
-            }
-        }
-        Ok(run_ids.into_iter().collect())
-    }
-
-    pub fn has_active_agent_turns(&self, project_id: Uuid) -> AdapterResult<bool> {
+    pub fn agent_run_ids_v4_for_project(&self, project_id: Uuid) -> AdapterResult<Vec<Uuid>> {
         let connection = self.connection.lock().expect("database lock");
         let mut statement =
-            connection.prepare("SELECT value_json FROM agent_turns WHERE project_id = ?1")?;
+            connection.prepare("SELECT run_id FROM agent_runs_v4 WHERE project_id = ?1")?;
         let rows = statement.query_map([project_id.to_string()], |row| row.get::<_, String>(0))?;
-        for row in rows {
-            let turn = serde_json::from_str::<AgentTurn>(&row?)?;
-            if matches!(
-                turn.status,
-                TurnStatus::Queued | TurnStatus::Streaming | TurnStatus::WaitingForApproval
-            ) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        rows.map(|row| {
+            Uuid::parse_str(&row?).map_err(|error| {
+                AdapterError::InvalidInput(format!("invalid V4 run id in database: {error}"))
+            })
+        })
+        .collect()
     }
 
     pub fn delete_project(&self, project_id: Uuid) -> AdapterResult<bool> {
@@ -347,112 +296,6 @@ impl Repository {
             return Ok(false);
         }
 
-        let app_objects = {
-            let mut statement =
-                transaction.prepare("SELECT kind, id, value_json FROM app_objects")?;
-            let rows = statement.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        let project_artifacts = {
-            let mut statement =
-                transaction.prepare("SELECT value_json FROM artifacts_v3 WHERE project_id = ?1")?;
-            let rows = statement.query_map([&project_id], |row| row.get::<_, String>(0))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-
-        let mut run_ids = HashSet::new();
-        let mut plan_ids = HashSet::new();
-        let mut approved_plan_ids = HashSet::new();
-        let mut app_objects_to_delete = HashSet::new();
-        for (kind, id, json) in &app_objects {
-            let value = serde_json::from_str::<serde_json::Value>(json)?;
-            let belongs_to_project = value.get("project_id").and_then(|field| field.as_str())
-                == Some(&project_id)
-                || (kind == "project" && id == &project_id);
-            if !belongs_to_project {
-                continue;
-            }
-            app_objects_to_delete.insert((kind.clone(), id.clone()));
-            collect_uuid_field(&value, "run_id", &mut run_ids);
-            collect_uuid_field(&value, "plan_id", &mut plan_ids);
-            collect_uuid_field(&value, "approved_plan_id", &mut approved_plan_ids);
-        }
-        for json in project_artifacts {
-            let value = serde_json::from_str::<serde_json::Value>(&json)?;
-            collect_uuid_field(&value, "run_id", &mut run_ids);
-        }
-
-        for approved_plan_id in &approved_plan_ids {
-            let plan_json = transaction
-                .query_row(
-                    "SELECT approved_plan_json FROM approved_plans WHERE id = ?1",
-                    [approved_plan_id.to_string()],
-                    |row| row.get::<_, String>(0),
-                )
-                .ok();
-            if let Some(plan_json) = plan_json {
-                let value = serde_json::from_str::<serde_json::Value>(&plan_json)?;
-                collect_uuid_field(&value, "plan_id", &mut plan_ids);
-            }
-        }
-
-        for (kind, id, json) in &app_objects {
-            let value = serde_json::from_str::<serde_json::Value>(json)?;
-            let linked_run = value
-                .get("run_id")
-                .and_then(|field| field.as_str())
-                .and_then(|field| Uuid::parse_str(field).ok())
-                .is_some_and(|run_id| run_ids.contains(&run_id));
-            let linked_plan = kind.starts_with("analysis_plan")
-                && Uuid::parse_str(id)
-                    .ok()
-                    .is_some_and(|plan_id| plan_ids.contains(&plan_id));
-            if linked_run || linked_plan {
-                app_objects_to_delete.insert((kind.clone(), id.clone()));
-            }
-        }
-
-        for run_id in &run_ids {
-            let run_id = run_id.to_string();
-            transaction.execute("DELETE FROM run_events WHERE run_id = ?1", [&run_id])?;
-            transaction.execute("DELETE FROM audit_events_v2 WHERE run_id = ?1", [&run_id])?;
-            transaction.execute("DELETE FROM step_attempts_v2 WHERE run_id = ?1", [&run_id])?;
-            transaction.execute(
-                "DELETE FROM environment_locks_v2 WHERE run_id = ?1",
-                [&run_id],
-            )?;
-        }
-        for approved_plan_id in &approved_plan_ids {
-            transaction.execute(
-                "DELETE FROM approved_plans WHERE id = ?1",
-                [approved_plan_id.to_string()],
-            )?;
-        }
-        for (kind, id) in app_objects_to_delete {
-            transaction.execute(
-                "DELETE FROM app_objects WHERE kind = ?1 AND id = ?2",
-                params![kind, id],
-            )?;
-        }
-
-        transaction.execute(
-            "DELETE FROM agent_events WHERE turn_id IN (SELECT id FROM agent_turns WHERE project_id = ?1)",
-            [&project_id],
-        )?;
-        transaction.execute(
-            "DELETE FROM agent_run_events_v3 WHERE project_id = ?1",
-            [&project_id],
-        )?;
-        transaction.execute(
-            "DELETE FROM agent_run_snapshots_v3 WHERE project_id = ?1",
-            [&project_id],
-        )?;
         transaction.execute(
             "DELETE FROM agent_context_archives_v4 WHERE run_id IN (SELECT run_id FROM agent_runs_v4 WHERE project_id = ?1)",
             [&project_id],
@@ -478,14 +321,8 @@ impl Repository {
             "DELETE FROM agent_runs_v4 WHERE project_id = ?1",
             [&project_id],
         )?;
-        transaction.execute(
-            "DELETE FROM tool_calls WHERE turn_id IN (SELECT id FROM agent_turns WHERE project_id = ?1)",
-            [&project_id],
-        )?;
         for table in [
-            "agent_turns",
             "messages",
-            "approvals_v3",
             "artifacts_v3",
             "notebook_entries",
             "sync_entries",
@@ -500,7 +337,6 @@ impl Repository {
         transaction.commit()?;
         Ok(true)
     }
-
     pub fn save_conversation(&self, conversation: &Conversation) -> AdapterResult<()> {
         self.connection.lock().expect("database lock").execute(
             "INSERT INTO conversations (id, project_id, updated_at, value_json) VALUES (?1, ?2, ?3, ?4)
@@ -536,18 +372,6 @@ impl Repository {
             return Ok(false);
         }
         transaction.execute(
-            "DELETE FROM agent_events WHERE turn_id IN (SELECT id FROM agent_turns WHERE conversation_id = ?1)",
-            [&conversation_id],
-        )?;
-        transaction.execute(
-            "DELETE FROM agent_run_events_v3 WHERE project_id = ?1 AND conversation_id = ?2",
-            params![project_id, conversation_id],
-        )?;
-        transaction.execute(
-            "DELETE FROM agent_run_snapshots_v3 WHERE project_id = ?1 AND conversation_id = ?2",
-            params![project_id, conversation_id],
-        )?;
-        transaction.execute(
             "DELETE FROM agent_context_archives_v4 WHERE run_id IN (SELECT run_id FROM agent_runs_v4 WHERE project_id = ?1 AND conversation_id = ?2)",
             params![project_id, conversation_id],
         )?;
@@ -558,14 +382,6 @@ impl Repository {
         transaction.execute(
             "DELETE FROM agent_runs_v4 WHERE project_id = ?1 AND conversation_id = ?2",
             params![project_id, conversation_id],
-        )?;
-        transaction.execute(
-            "DELETE FROM tool_calls WHERE turn_id IN (SELECT id FROM agent_turns WHERE conversation_id = ?1)",
-            [&conversation_id],
-        )?;
-        transaction.execute(
-            "DELETE FROM agent_turns WHERE conversation_id = ?1",
-            [&conversation_id],
         )?;
         transaction.execute(
             "DELETE FROM messages WHERE conversation_id = ?1",
@@ -593,231 +409,6 @@ impl Repository {
         let mut statement = connection.prepare(
             "SELECT value_json FROM messages WHERE conversation_id = ?1 ORDER BY sequence, id",
         )?;
-        let rows =
-            statement.query_map([conversation_id.to_string()], |row| row.get::<_, String>(0))?;
-        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
-    }
-
-    pub fn append_agent_event(&self, event: &AgentEvent) -> AdapterResult<()> {
-        self.connection.lock().expect("database lock").execute(
-            "INSERT INTO agent_events (turn_id, sequence, value_json) VALUES (?1, ?2, ?3)",
-            params![
-                event.turn_id.to_string(),
-                event.sequence,
-                serde_json::to_string(event)?
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn agent_events_for_turn(&self, turn_id: Uuid) -> AdapterResult<Vec<AgentEvent>> {
-        let connection = self.connection.lock().expect("database lock");
-        let mut statement = connection
-            .prepare("SELECT value_json FROM agent_events WHERE turn_id = ?1 ORDER BY sequence")?;
-        let rows = statement.query_map([turn_id.to_string()], |row| row.get::<_, String>(0))?;
-        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
-    }
-
-    pub fn append_agent_run_event_v3(&self, event: &AgentRunEventV3) -> AdapterResult<()> {
-        event
-            .verify_hash()
-            .map_err(|error| crate::AdapterError::InvalidInput(error.to_string()))?;
-        let mut connection = self.connection.lock().expect("database lock");
-        let transaction = connection.transaction()?;
-        let run_id = event.run_id.to_string();
-        let previous = transaction
-            .query_row(
-                "SELECT sequence, event_hash, project_id, conversation_id
-                 FROM agent_run_events_v3
-                 WHERE run_id = ?1
-                 ORDER BY sequence DESC
-                 LIMIT 1",
-                [&run_id],
-                |row| {
-                    Ok((
-                        row.get::<_, u64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                },
-            )
-            .ok();
-        match previous {
-            Some((sequence, event_hash, project_id, conversation_id)) => {
-                if event.sequence != sequence + 1
-                    || event.previous_hash != event_hash
-                    || event.project_id.to_string() != project_id
-                    || event.conversation_id.to_string() != conversation_id
-                {
-                    return Err(crate::AdapterError::InvalidInput(
-                        "v3 event does not extend the stored run hash chain".into(),
-                    ));
-                }
-            }
-            None => {
-                if event.sequence != 1
-                    || event.previous_hash
-                        != "0000000000000000000000000000000000000000000000000000000000000000"
-                {
-                    return Err(crate::AdapterError::InvalidInput(
-                        "v3 run must begin at the genesis event".into(),
-                    ));
-                }
-            }
-        }
-        transaction.execute(
-            "INSERT INTO agent_run_events_v3
-                (run_id, project_id, conversation_id, sequence, previous_hash, event_hash, value_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                run_id,
-                event.project_id.to_string(),
-                event.conversation_id.to_string(),
-                event.sequence,
-                event.previous_hash,
-                event.event_hash,
-                serde_json::to_string(event)?
-            ],
-        )?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub fn agent_run_events_v3(&self, run_id: Uuid) -> AdapterResult<Vec<AgentRunEventV3>> {
-        let connection = self.connection.lock().expect("database lock");
-        let mut statement = connection.prepare(
-            "SELECT value_json FROM agent_run_events_v3
-             WHERE run_id = ?1 ORDER BY sequence",
-        )?;
-        let rows = statement.query_map([run_id.to_string()], |row| row.get::<_, String>(0))?;
-        let events = rows
-            .map(|row| Ok(serde_json::from_str(&row?)?))
-            .collect::<AdapterResult<Vec<AgentRunEventV3>>>()?;
-        if !events.is_empty() {
-            validate_event_chain(&events)
-                .map_err(|error| crate::AdapterError::InvalidInput(error.to_string()))?;
-        }
-        Ok(events)
-    }
-
-    pub fn agent_run_events_for_context_v3(
-        &self,
-        project_id: Uuid,
-        conversation_id: Option<Uuid>,
-    ) -> AdapterResult<Vec<AgentRunEventV3>> {
-        let connection = self.connection.lock().expect("database lock");
-        let mut events = if let Some(conversation_id) = conversation_id {
-            let mut statement = connection.prepare(
-                "SELECT value_json FROM agent_run_events_v3
-                 WHERE project_id = ?1 AND conversation_id = ?2
-                 ORDER BY run_id, sequence",
-            )?;
-            let rows = statement.query_map(
-                params![project_id.to_string(), conversation_id.to_string()],
-                |row| row.get::<_, String>(0),
-            )?;
-            rows.map(|row| Ok(serde_json::from_str(&row?)?))
-                .collect::<AdapterResult<Vec<AgentRunEventV3>>>()?
-        } else {
-            let mut statement = connection.prepare(
-                "SELECT value_json FROM agent_run_events_v3
-                 WHERE project_id = ?1
-                 ORDER BY run_id, sequence",
-            )?;
-            let rows =
-                statement.query_map([project_id.to_string()], |row| row.get::<_, String>(0))?;
-            rows.map(|row| Ok(serde_json::from_str(&row?)?))
-                .collect::<AdapterResult<Vec<AgentRunEventV3>>>()?
-        };
-        for run in events.chunk_by(|left, right| left.run_id == right.run_id) {
-            validate_event_chain(run)
-                .map_err(|error| crate::AdapterError::InvalidInput(error.to_string()))?;
-        }
-        events.sort_by_key(|event| (event.occurred_at, event.sequence));
-        Ok(events)
-    }
-
-    pub fn save_agent_snapshot_v3(&self, snapshot: &AgentSnapshotV3) -> AdapterResult<()> {
-        if snapshot.state.run_id != snapshot.run_id
-            || snapshot.state.last_sequence != snapshot.last_sequence
-            || snapshot.state.last_event_hash != snapshot.last_event_hash
-        {
-            return Err(crate::AdapterError::InvalidInput(
-                "v3 snapshot state does not match its cache boundary".into(),
-            ));
-        }
-        let connection = self.connection.lock().expect("database lock");
-        let boundary_matches = connection.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM agent_run_events_v3
-                WHERE run_id = ?1 AND project_id = ?2 AND conversation_id = ?3
-                  AND sequence = ?4 AND event_hash = ?5
-            )",
-            params![
-                snapshot.run_id.to_string(),
-                snapshot.project_id.to_string(),
-                snapshot.conversation_id.to_string(),
-                snapshot.last_sequence,
-                snapshot.last_event_hash,
-            ],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !boundary_matches {
-            return Err(crate::AdapterError::InvalidInput(
-                "v3 snapshot is not bound to a verified stored event".into(),
-            ));
-        }
-        connection.execute(
-            "INSERT INTO agent_run_snapshots_v3
-                (run_id, project_id, conversation_id, last_sequence, last_event_hash, value_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(run_id) DO UPDATE SET
-                project_id = excluded.project_id,
-                conversation_id = excluded.conversation_id,
-                last_sequence = excluded.last_sequence,
-                last_event_hash = excluded.last_event_hash,
-                value_json = excluded.value_json
-             WHERE excluded.last_sequence >= agent_run_snapshots_v3.last_sequence",
-            params![
-                snapshot.run_id.to_string(),
-                snapshot.project_id.to_string(),
-                snapshot.conversation_id.to_string(),
-                snapshot.last_sequence,
-                snapshot.last_event_hash,
-                serde_json::to_string(snapshot)?,
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn agent_snapshot_v3(&self, run_id: Uuid) -> AdapterResult<Option<AgentSnapshotV3>> {
-        let connection = self.connection.lock().expect("database lock");
-        let mut statement = connection
-            .prepare("SELECT value_json FROM agent_run_snapshots_v3 WHERE run_id = ?1")?;
-        let mut rows = statement.query([run_id.to_string()])?;
-        let Some(row) = rows.next()? else {
-            return Ok(None);
-        };
-        Ok(Some(serde_json::from_str(&row.get::<_, String>(0)?)?))
-    }
-
-    pub fn save_agent_turn(&self, turn: &AgentTurn) -> AdapterResult<()> {
-        self.connection.lock().expect("database lock").execute(
-            "INSERT INTO agent_turns (id, project_id, conversation_id, value_json) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET value_json = excluded.value_json",
-            params![turn.id.to_string(), turn.project_id.to_string(), turn.conversation_id.to_string(), serde_json::to_string(turn)?],
-        )?;
-        Ok(())
-    }
-
-    pub fn agent_turns_for_conversation(
-        &self,
-        conversation_id: Uuid,
-    ) -> AdapterResult<Vec<AgentTurn>> {
-        let connection = self.connection.lock().expect("database lock");
-        let mut statement = connection
-            .prepare("SELECT value_json FROM agent_turns WHERE conversation_id = ?1 ORDER BY id")?;
         let rows =
             statement.query_map([conversation_id.to_string()], |row| row.get::<_, String>(0))?;
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
@@ -1105,121 +696,6 @@ impl Repository {
             .transpose()
     }
 
-    pub fn append_event(&self, event: &RunEvent) -> AdapterResult<()> {
-        self.connection.lock().expect("database lock").execute(
-            "INSERT INTO run_events (run_id, sequence, event_json)
-                 VALUES (?1, ?2, ?3)",
-            params![
-                event.run_id.to_string(),
-                event.sequence,
-                serde_json::to_string(event)?
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn events_for_run(&self, run_id: Uuid) -> AdapterResult<Vec<RunEvent>> {
-        let connection = self.connection.lock().expect("database lock");
-        let mut statement = connection.prepare(
-            "SELECT event_json FROM run_events
-             WHERE run_id = ?1 ORDER BY sequence",
-        )?;
-        let rows = statement.query_map([run_id.to_string()], |row| row.get::<_, String>(0))?;
-        rows.map(|row| {
-            let json = row?;
-            Ok(serde_json::from_str(&json)?)
-        })
-        .collect()
-    }
-
-    pub fn save_approved_plan(&self, approved: &ApprovedPlan) -> AdapterResult<()> {
-        self.connection.lock().expect("database lock").execute(
-            "INSERT INTO approved_plans (id, plan_id, plan_hash, approved_plan_json)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                approved.id.to_string(),
-                approved.plan_id.to_string(),
-                approved.plan_hash,
-                serde_json::to_string(approved)?
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn get_approved_plan(&self, id: Uuid) -> AdapterResult<Option<ApprovedPlan>> {
-        let connection = self.connection.lock().expect("database lock");
-        let mut statement =
-            connection.prepare("SELECT approved_plan_json FROM approved_plans WHERE id = ?1")?;
-        let mut rows = statement.query([id.to_string()])?;
-        let Some(row) = rows.next()? else {
-            return Ok(None);
-        };
-        let json: String = row.get(0)?;
-        Ok(Some(serde_json::from_str(&json)?))
-    }
-
-    pub fn append_audit_event(&self, event: &RunEventV2) -> AdapterResult<()> {
-        self.connection.lock().expect("database lock").execute(
-            "INSERT INTO audit_events_v2 (run_id, sequence, event_hash, event_json)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                event.run_id.to_string(),
-                event.sequence,
-                event.event_hash,
-                serde_json::to_string(event)?
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn audit_events_for_run(&self, run_id: Uuid) -> AdapterResult<Vec<RunEventV2>> {
-        let connection = self.connection.lock().expect("database lock");
-        let mut statement = connection.prepare(
-            "SELECT event_json FROM audit_events_v2 WHERE run_id = ?1 ORDER BY sequence",
-        )?;
-        let rows = statement.query_map([run_id.to_string()], |row| row.get::<_, String>(0))?;
-        rows.map(|row| {
-            let json = row?;
-            Ok(serde_json::from_str(&json)?)
-        })
-        .collect()
-    }
-
-    pub fn save_step_attempt(&self, attempt: &StepAttempt) -> AdapterResult<()> {
-        self.connection.lock().expect("database lock").execute(
-            "INSERT INTO step_attempts_v2 (run_id, step_id, attempt, attempt_json) VALUES (?1, ?2, ?3, ?4)",
-            params![attempt.run_id.to_string(), attempt.step_id, attempt.attempt, serde_json::to_string(attempt)?],
-        )?;
-        Ok(())
-    }
-
-    pub fn step_attempts_for_run(&self, run_id: Uuid) -> AdapterResult<Vec<StepAttempt>> {
-        let connection = self.connection.lock().expect("database lock");
-        let mut statement = connection.prepare(
-            "SELECT attempt_json FROM step_attempts_v2 WHERE run_id = ?1 ORDER BY step_id, attempt",
-        )?;
-        let rows = statement.query_map([run_id.to_string()], |row| row.get::<_, String>(0))?;
-        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
-    }
-
-    pub fn save_environment_lock(&self, lock: &EnvironmentLock) -> AdapterResult<()> {
-        self.connection.lock().expect("database lock").execute(
-            "INSERT INTO environment_locks_v2 (run_id, environment_id, lock_json) VALUES (?1, 'micromamba', ?2)",
-            params![lock.run_id.to_string(), serde_json::to_string(lock)?],
-        )?;
-        Ok(())
-    }
-
-    pub fn environment_lock_for_run(&self, run_id: Uuid) -> AdapterResult<Option<EnvironmentLock>> {
-        let connection = self.connection.lock().expect("database lock");
-        let mut statement = connection.prepare("SELECT lock_json FROM environment_locks_v2 WHERE run_id = ?1 AND environment_id = 'micromamba'")?;
-        let mut rows = statement.query([run_id.to_string()])?;
-        let Some(row) = rows.next()? else {
-            return Ok(None);
-        };
-        Ok(Some(serde_json::from_str(&row.get::<_, String>(0)?)?))
-    }
-
     pub fn put_json<T: serde::Serialize>(
         &self,
         kind: &str,
@@ -1262,15 +738,5 @@ impl Repository {
             Ok(serde_json::from_str(&json)?)
         })
         .collect()
-    }
-}
-
-fn collect_uuid_field(value: &serde_json::Value, field: &str, destination: &mut HashSet<Uuid>) {
-    if let Some(id) = value
-        .get(field)
-        .and_then(|field| field.as_str())
-        .and_then(|field| Uuid::parse_str(field).ok())
-    {
-        destination.insert(id);
     }
 }

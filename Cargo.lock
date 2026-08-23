@@ -3082,7 +3082,6 @@ dependencies = [
  "omicsops-core",
  "omicsops-knowledge",
  "omicsops-protocol",
- "omicsops-runner",
  "omicsops-runtime",
  "omicsops-science",
  "omicsops-tools",
@@ -3126,22 +3125,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.19",
- "uuid",
-]
-
-[[package]]
-name = "omicsops-runner"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "omicsops-adapters",
- "omicsops-core",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.19",
- "tokio",
  "uuid",
 ]
 

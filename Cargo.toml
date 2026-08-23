@@ -9,7 +9,6 @@ members = [
   "crates/omicsops-science",
   "crates/omicsops-knowledge",
   "crates/omicsops-adapters",
-  "crates/omicsops-runner",
   "src-tauri"
 ]
 resolver = "2"

@@ -24,7 +24,6 @@ omicsops-runtime = { path = "../crates/omicsops-runtime" }
 omicsops-science = { path = "../crates/omicsops-science" }
 omicsops-knowledge = { path = "../crates/omicsops-knowledge" }
 omicsops-tools = { path = "../crates/omicsops-tools" }
-omicsops-runner = { path = "../crates/omicsops-runner" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

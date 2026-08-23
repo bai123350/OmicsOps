@@ -1,7 +1,6 @@
 pub mod agent_commands;
 pub mod agent_v4;
 pub mod commands;
-pub mod harness_v3;
 pub mod inspection;
 pub mod kernel_commands;
 pub mod model_commands;
@@ -47,7 +46,6 @@ pub fn run() {
             };
             let repository = Repository::open(data_dir.join("omicsops.db"))
                 .map_err(|error| error.to_string())?;
-            commands::backfill_agent_run_conversation_ids(&repository)?;
             skill_commands::install_bundled_skills(
                 &repository,
                 &skills_root,
@@ -74,21 +72,6 @@ pub fn run() {
             commands::confirm_host_key,
             commands::inspect_project,
             commands::initialize_project,
-            commands::extract_plan,
-            commands::save_llm_config,
-            commands::probe_llm,
-            commands::list_tools,
-            commands::planning_turn,
-            commands::validate_plan,
-            commands::approve_plan,
-            commands::start_run,
-            commands::export_run_bundle,
-            commands::resume_run_v2,
-            commands::list_runs_v2,
-            commands::list_run_events_v2,
-            commands::list_agent_run_events,
-            harness_v3::list_agent_run_events_v3,
-            harness_v3::answer_agent_run_question_v3,
             agent_v4::agent_v4_start_planning,
             agent_v4::agent_v4_start_direct,
             agent_v4::agent_v4_compute_backends,
@@ -96,22 +79,10 @@ pub fn run() {
             agent_v4::agent_v4_resume,
             agent_v4::agent_v4_cancel,
             agent_v4::agent_v4_answer,
+            agent_v4::agent_v4_decide_tool_approval,
             agent_v4::agent_v4_resolve_uncertain,
             agent_v4::agent_v4_events,
             agent_v4::agent_v4_events_for_conversation,
-            commands::list_artifacts_v2,
-            commands::list_step_attempts_v2,
-            commands::get_environment_lock_v2,
-            commands::generate_plan,
-            commands::approve_legacy_plan,
-            commands::legacy_start_run,
-            commands::list_runs,
-            commands::list_run_events,
-            commands::resume_run,
-            commands::approve_run,
-            commands::cancel_run,
-            commands::list_artifacts,
-            commands::download_artifact,
             p1_commands::search_agent_memory,
             p1_commands::list_notebook_entries,
             p1_commands::list_project_artifacts,
@@ -134,8 +105,6 @@ pub fn run() {
             workspace_commands::delete_conversation,
             agent_commands::list_messages,
             agent_commands::submit_message,
-            agent_commands::run_agent_turn,
-            agent_commands::propose_analysis_plan,
             model_commands::list_model_profiles,
             model_commands::save_model_profile,
             model_commands::probe_model_profile,
