@@ -193,6 +193,22 @@ fn validate_required(schema: &Value, input: &Value) -> Result<(), String> {
             return Err(format!("missing required field {field}"));
         }
     }
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        for (field, field_schema) in properties {
+            let Some(value) = object.get(field) else {
+                continue;
+            };
+            if let Some(min_length) = field_schema.get("minLength").and_then(Value::as_u64)
+                && value
+                    .as_str()
+                    .is_some_and(|text| text.chars().count() < min_length as usize)
+            {
+                return Err(format!(
+                    "field {field} must contain at least {min_length} character(s)"
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -302,9 +318,9 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "agent.complete",
-            "Propose completion with evidence for every frozen completion criterion; the Host verifier and read-only Reviewer decide whether the run can finish",
+            "Propose completion with a user-visible final Markdown answer and evidence for every frozen completion criterion; the Host verifier and read-only Reviewer decide whether the run can finish",
             ToolEffectV4::Mutating,
-            json!({"type":"object","required":["schema_version","summary","criteria"],"properties":{"schema_version":{"type":"integer","const":4},"summary":{"type":"string"},"criteria":{"type":"array","items":{"type":"object","required":["criterion","evidence"],"properties":{"criterion":{"type":"string"},"evidence":{"type":"array","items":{"type":"object","required":["kind"],"properties":{"kind":{"type":"string","enum":["event","artifact","evidence"]},"sequence":{"type":"integer"},"artifact_id":{"type":"string"},"evidence_id":{"type":"string"}}}}}}}}}),
+            json!({"type":"object","required":["schema_version","summary","answer_markdown","criteria"],"properties":{"schema_version":{"type":"integer","const":4},"summary":{"type":"string"},"answer_markdown":{"type":"string","minLength":1,"description":"User-visible final response rendered as Markdown. Include the actual result, key evidence or artifacts, and limitations or follow-up actions."},"criteria":{"type":"array","items":{"type":"object","required":["criterion","evidence"],"properties":{"criterion":{"type":"string"},"evidence":{"type":"array","items":{"type":"object","required":["kind"],"properties":{"kind":{"type":"string","enum":["event","artifact","evidence"]},"sequence":{"type":"integer"},"artifact_id":{"type":"string"},"evidence_id":{"type":"string"}}}}}}}}}),
         ),
     ]
 }
@@ -416,6 +432,31 @@ mod tests {
                 .iter()
                 .all(|tool| tool.id != "agent.delegate")
         );
+    }
+
+    #[test]
+    fn completion_schema_requires_non_empty_user_visible_answer() {
+        let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap();
+        let base = json!({
+            "schema_version": 4,
+            "summary": "done",
+            "criteria": []
+        });
+        let missing = ToolCallV4 {
+            call_id: "missing-answer".into(),
+            tool_id: "agent.complete".into(),
+            arguments: base.clone(),
+        };
+        assert!(registry.validate(RunModeV4::Execute, &missing).is_err());
+
+        let mut empty = base;
+        empty["answer_markdown"] = json!("");
+        let empty = ToolCallV4 {
+            call_id: "empty-answer".into(),
+            tool_id: "agent.complete".into(),
+            arguments: empty,
+        };
+        assert!(registry.validate(RunModeV4::Execute, &empty).is_err());
     }
 
     struct ConcurrencyProbe {

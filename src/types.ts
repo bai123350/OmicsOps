@@ -159,6 +159,12 @@ export interface ToolCallV4 { call_id: string; tool_id: string; arguments: Recor
 export interface ToolOutcomeV4 { call_id: string; tool_id: string; succeeded: boolean; model_content: string; data: unknown; provenance: string[] }
 export type ToolEffectV4 = "read_only" | "mutating" | "runtime" | "network" | "delegation";
 export interface ToolApprovalRequestV4 { approval_id: string; call: ToolCallV4; effect: ToolEffectV4; reason: string; call_hash: string }
+export interface CompletionProposalV4 {
+  schema_version: number;
+  summary: string;
+  answer_markdown: string;
+  criteria: Array<{ criterion: string; evidence: Array<Record<string, unknown>> }>;
+}
 export type AgentEventKindV4 =
   | { kind: "run_created"; mode: "plan" | "execute" }
   | { kind: "model_text"; text: string }
@@ -181,7 +187,7 @@ export type AgentEventKindV4 =
   | { kind: "context_checkpointed"; checkpoint: { schema_version: 4; through_sequence: number; completion_criteria: string[]; unresolved_errors: string[]; recent_steps: string[]; scientific_state: unknown } }
   | { kind: "scientific_state_changed"; revision: number; state_sha256: string; changes: string[] }
   | { kind: "completion_proposed" | "run_completed" | "run_cancelled" }
-  | { kind: "completion_proposal_submitted"; proposal: unknown }
+  | { kind: "completion_proposal_submitted"; proposal: CompletionProposalV4 }
   | { kind: "deterministic_verification_finished"; report: unknown }
   | { kind: "reviewer_finished"; report: unknown }
   | { kind: "reviewer_correction_requested"; correction: number; findings: unknown[] }

@@ -630,6 +630,10 @@ pub struct CompletionCriterionEvidenceV4 {
 pub struct CompletionProposalV4 {
     pub schema_version: u8,
     pub summary: String,
+    /// User-visible final response in Markdown. Kept serde-defaulted so older
+    /// persisted proposals remain readable during the protocol migration.
+    #[serde(default)]
+    pub answer_markdown: String,
     pub criteria: Vec<CompletionCriterionEvidenceV4>,
 }
 
@@ -975,6 +979,18 @@ pub enum ProtocolErrorV4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_proposal_old_json_defaults_answer_markdown() {
+        let proposal: CompletionProposalV4 = serde_json::from_value(serde_json::json!({
+            "schema_version": 4,
+            "summary": "legacy completion",
+            "criteria": []
+        }))
+        .expect("legacy completion proposal remains readable");
+        assert!(proposal.answer_markdown.is_empty());
+    }
+
     #[test]
     fn plan_hash_and_event_chain_are_deterministic_and_tamper_evident() {
         let plan = ExecutionPlanV4 {

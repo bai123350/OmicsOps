@@ -16,8 +16,8 @@ describe("WorkspaceShell", () => {
       schema_version: 4, run_id: "run-v4", project_id: project.id, conversation_id: "conversation-1", sequence: 1,
       occurred_at: "2026-08-17T00:00:00Z", previous_hash: "", event_hash: "a".repeat(64), event: { kind: "run_created", mode: "plan" },
     }]} />);
-    expect(screen.getByText("Agent Runtime V4")).toBeInTheDocument();
-    expect(screen.getByText(/Plan\/Execute 硬隔离/)).toBeInTheDocument();
+    expect(screen.getByText("执行过程")).toBeInTheDocument();
+    expect(screen.getByText("Agent 正在处理任务")).toBeInTheDocument();
     expect(screen.getByText("规划启动")).toBeInTheDocument();
   });
   it("coalesces character-sized V4 model deltas into one completed response", () => {
@@ -57,8 +57,8 @@ describe("WorkspaceShell", () => {
         { ...base, sequence: 3, occurred_at: "2026-08-17T00:00:03Z", event: { kind: "run_completed" } },
       ]} />);
     expect(screen.getByText("检查矩阵")).toBeInTheDocument();
-    expect(screen.getByText(/已完成 · 3 条哈希事件/)).toBeInTheDocument();
-    fireEvent.click(screen.getByText("Agent Runtime V4"));
+    expect(screen.getByText(/已完成 · 0 个步骤/)).toBeInTheDocument();
+    fireEvent.click(screen.getByText("执行过程"));
     expect(screen.getByRole("article", { name: "模型输出" })).toHaveTextContent("矩阵检查完成。");
   });
   it("offers to resume a failed V4 run and treats later events as running", () => {
@@ -70,14 +70,14 @@ describe("WorkspaceShell", () => {
     ];
     const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} agentRunEventsV4={failed} onResumeAgentRunV4={onResume} />);
 
-    fireEvent.click(screen.getByText("Agent Runtime V4"));
+    fireEvent.click(screen.getByText("执行过程"));
     fireEvent.click(screen.getByRole("button", { name: "继续运行" }));
     expect(onResume).toHaveBeenCalledWith("run-recover");
 
     rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-recover" agentRunEventsV4={[...failed,
       { ...base, sequence: 3, occurred_at: "2026-08-17T00:00:03Z", event: { kind: "tool_dispatch_resolved" as const, call_id: "call-1", resolution: "side_effect_not_observed" as const, evidence: "immutable system ensure" } },
     ]} onResumeAgentRunV4={onResume} />);
-    expect(screen.getByText(/运行中 · 3 条哈希事件/)).toBeInTheDocument();
+    expect(screen.getByText(/运行中 · 0 个步骤/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "继续运行" })).not.toBeInTheDocument();
   });
   it("shows all compute choices in chat and keeps full access container-only", () => {
@@ -215,7 +215,7 @@ describe("WorkspaceShell", () => {
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-approval" onCancelRun={vi.fn()} onDecideToolApprovalV4={decide} agentRunEventsV4={[{
       schema_version: 4, run_id: "run-approval", project_id: project.id, conversation_id: "conversation-1", sequence: 1, occurred_at: "2026-08-17T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "tool_approval_requested", request },
     }]} />);
-    expect(screen.getByText(/等待工具审批 · 1 条哈希事件/)).toBeInTheDocument();
+    expect(screen.getByText(/等待工具审批 · 0 个步骤/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "终止运行" })).not.toBeInTheDocument();
     expect(screen.getByRole("region", { name: "工具审批" })).toHaveTextContent("runtime.execute");
     fireEvent.click(screen.getByRole("button", { name: "批准并继续" }));
@@ -232,5 +232,90 @@ describe("WorkspaceShell", () => {
     fireEvent.change(screen.getByRole("textbox", { name: "核验证据" }), { target: { value: "远端输出文件不存在" } });
     fireEvent.click(save);
     expect(resolve).toHaveBeenCalledWith("run-uncertain", "call-1", "side_effect_not_observed", "远端输出文件不存在");
+  });
+
+  it("renders user and assistant messages as safe GFM markdown", () => {
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} messages={[
+      { id: "user-md", role: "user", markdown: "**检查**矩阵" },
+      { id: "assistant-md", role: "assistant", markdown: "## Results\n\n| gene | status |\n| --- | --- |\n| CD3D | pass |" },
+    ]} />);
+    expect(screen.getByText("检查")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Results" })).toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: "CD3D" })).toBeInTheDocument();
+  });
+
+  it("keeps technical trajectory collapsed and omits persistence placeholder text", () => {
+    const base = { schema_version: 4 as const, run_id: "run-technical", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-technical" onLocaleChange={() => undefined} agentRunEventsV4={[
+      { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "run_spec_frozen" as const, approval_hash: "a", spec_hash: "b" } },
+      { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "tool_dispatch_started" as const, call_id: "call-1", tool_id: "runtime.execute", effect: "runtime", idempotency_key: "key" } },
+    ]} />);
+    expect(screen.getByText("执行过程").closest("details")).not.toHaveAttribute("open");
+    expect(screen.queryByText(/状态已写入可验证事件链/)).not.toBeInTheDocument();
+  });
+
+  it("keeps agent.complete internal and shows a clean verification status", () => {
+    const base = { schema_version: 4 as const, run_id: "run-completing", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-completing" onLocaleChange={() => undefined} agentRunEventsV4={[
+      { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "tool_requested" as const, call: { call_id: "complete-1", tool_id: "agent.complete", arguments: { schema_version: 4, summary: "done", answer_markdown: "## 不应显示在工具卡片中", criteria: [] } } } },
+    ]} />);
+    expect(screen.getByText("正在核验最终结果…")).toBeInTheDocument();
+    expect(screen.getByText(/运行中 · 0 个步骤/)).toBeInTheDocument();
+    expect(screen.queryByText("agent.complete")).not.toBeInTheDocument();
+    expect(screen.queryByText("不应显示在工具卡片中")).not.toBeInTheDocument();
+  });
+
+  it("renders tool calls as human-readable collapsed steps", () => {
+    const base = { schema_version: 4 as const, run_id: "run-readable-tool", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-readable-tool" onLocaleChange={() => undefined} agentRunEventsV4={[
+      { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "tool_requested" as const, call: { call_id: "read-1", tool_id: "project.read", arguments: { path: "results/audit.md" } } } },
+      { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "tool_finished" as const, outcome: { call_id: "read-1", tool_id: "project.read", succeeded: true, model_content: "large internal report", data: null, provenance: [] } } },
+    ]} />);
+    fireEvent.click(screen.getByText("执行过程"));
+    const step = screen.getByText("读取项目文件").closest("details");
+    expect(step).not.toHaveAttribute("open");
+    expect(step).toHaveTextContent("results/audit.md");
+    expect(screen.getByText(/运行中 · 1 个步骤/)).toBeInTheDocument();
+  });
+
+  it("merges tool request, dispatch, finish, and reuse events into one detail", () => {
+    const base = { schema_version: 4 as const, run_id: "run-tools", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-tools" onLocaleChange={() => undefined} agentRunEventsV4={[
+      { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "tool_requested" as const, call: { call_id: "call-1", tool_id: "runtime.execute", arguments: { code: "print(1)", secret: "hidden" } } } },
+      { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "tool_dispatch_started" as const, call_id: "call-1", tool_id: "runtime.execute", effect: "runtime", idempotency_key: "key" } },
+      { ...base, sequence: 3, occurred_at: "2026-08-17T00:00:02Z", event: { kind: "tool_finished" as const, outcome: { call_id: "call-1", tool_id: "runtime.execute", succeeded: true, model_content: "QC complete", data: null, provenance: [] } } },
+      { ...base, sequence: 4, occurred_at: "2026-08-17T00:00:03Z", event: { kind: "tool_outcome_reused" as const, idempotency_key: "key", outcome: { call_id: "call-1", tool_id: "runtime.execute", succeeded: true, model_content: "QC complete", data: null, provenance: [] } } },
+      { ...base, sequence: 5, occurred_at: "2026-08-17T00:00:04Z", event: { kind: "tool_requested" as const, call: { call_id: "call-2", tool_id: "runtime.execute", arguments: {} } } },
+      { ...base, sequence: 6, occurred_at: "2026-08-17T00:00:05Z", event: { kind: "tool_finished" as const, outcome: { call_id: "call-2", tool_id: "runtime.execute", succeeded: true, model_content: "second result", data: null, provenance: [] } } },
+      { ...base, sequence: 7, occurred_at: "2026-08-17T00:00:06Z", event: { kind: "tool_requested" as const, call: { call_id: "call-3", tool_id: "runtime.execute", arguments: {} } } },
+      { ...base, sequence: 8, occurred_at: "2026-08-17T00:00:07Z", event: { kind: "tool_finished" as const, outcome: { call_id: "call-3", tool_id: "runtime.execute", succeeded: false, model_content: "failed result", data: null, provenance: [] } } },
+    ]} />);
+    fireEvent.click(screen.getByText("执行过程"));
+    expect(screen.getAllByText(/runtime\.execute/)).toHaveLength(3);
+    expect(document.querySelector(".v4-tool-status.reused")).toBeInTheDocument();
+    expect(document.querySelector(".v4-tool-status.succeeded")).toBeInTheDocument();
+    expect(document.querySelector(".v4-tool-status.failed")).toBeInTheDocument();
+    expect(document.querySelector(".v4-tool-status.succeeded")).toBeInTheDocument();
+    expect(screen.getByText("QC complete")).toBeInTheDocument();
+    expect(screen.getByText(/print\(1\)/)).toBeInTheDocument();
+    expect(screen.getByText(/\[REDACTED\]/)).toBeInTheDocument();
+    expect(screen.queryByText(/hidden/)).not.toBeInTheDocument();
+  });
+
+  it("auto-expands blocked runs while keeping the interaction card available", () => {
+    const base = { schema_version: 4 as const, run_id: "run-blocked", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
+    const request = { approval_id: "approval-blocked", call: { call_id: "call-1", tool_id: "runtime.execute", arguments: {} }, effect: "runtime" as const, reason: "需要批准", call_hash: "c".repeat(64) };
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-blocked" onLocaleChange={() => undefined} onDecideToolApprovalV4={vi.fn()} agentRunEventsV4={[{ ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "tool_approval_requested" as const, request } }]} />);
+    expect(screen.getByText("执行过程").closest("details")).toHaveAttribute("open");
+    expect(screen.getByRole("button", { name: "批准并继续" })).toBeEnabled();
+  });
+
+  it("disables the composer for an active run but leaves approval controls enabled", () => {
+    const base = { schema_version: 4 as const, run_id: "run-composer-lock", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
+    const request = { approval_id: "approval-composer", call: { call_id: "call-1", tool_id: "runtime.execute", arguments: {} }, effect: "runtime" as const, reason: "需要批准", call_hash: "c".repeat(64) };
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={vi.fn()} runStarted activeRunId="run-composer-lock" agentRunEventsV4={[{ ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "tool_approval_requested" as const, request } }]} onDecideToolApprovalV4={vi.fn()} />);
+    expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "执行中…" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "批准并继续" })).toBeEnabled();
   });
 });

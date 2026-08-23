@@ -2506,12 +2506,26 @@ struct RepositoryEventStoreV4 {
 }
 impl EventStoreV4 for RepositoryEventStoreV4 {
     fn append(&self, event: &AgentEventV4) -> Result<(), String> {
-        self.repository
-            .append_agent_event_v4(event)
+        let message = self
+            .repository
+            .append_agent_event_v4_with_conversation(event)
             .map_err(|e| e.to_string())?;
         self.app
             .emit(AGENT_V4_EVENT_CHANNEL, event)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        if let Some(message) = message {
+            self.app
+                .emit(
+                    "conversation-event",
+                    crate::agent_commands::ConversationEvent {
+                        project_id: message.project_id,
+                        conversation_id: message.conversation_id,
+                        message,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
     fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String> {
         self.repository

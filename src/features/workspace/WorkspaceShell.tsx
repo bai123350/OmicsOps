@@ -1,4 +1,6 @@
 import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   Activity, ArrowLeft, Bot, Check, ChevronRight, ClipboardList, Database, Expand, FileBarChart, FileText,
   FlaskConical, Folder, Hand, Languages, MessageSquarePlus, NotebookPen, Plus,
@@ -125,6 +127,9 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const runFinished = Boolean(activeRunEventsV4.at(-1) && isTerminalAgentEventV4(activeRunEventsV4.at(-1)!));
   const runPaused = getV4PauseReason(activeRunEventsV4) !== null;
   const runActive = runStarted && !runFinished && !runPaused;
+  // A paused run still owns the conversation sequence. Keep the composer
+  // locked while approval/input cards remain usable inside the run trace.
+  const composerDisabled = agentBusy || (runStarted && !runFinished);
   const activeConversation = conversations.find((item) => item.id === activeConversationId);
   const conversationTitle = activeConversation?.title || (zh ? "新会话" : "New conversation");
   const historicalAgentRunEventsV4 = effectiveActiveRunId
@@ -174,7 +179,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
 
   async function send() {
     const message = draft.trim();
-    if (!message || agentBusy) return;
+    if (!message || composerDisabled) return;
     setDraft("");
     if (onSend) {
       const mode = planModeEnabled ? "plan" : "chat";
@@ -213,14 +218,14 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     <main className="conversation-pane" aria-label={t.research}>
       <header className="conversation-header"><div><small>{project.name}</small><h1>{conversationTitle}</h1></div><span className="live-status"><i />{t.status}</span></header>
       <section className="message-stream" aria-live="polite" ref={messageStreamRef}>
-        {!onSend && <article className="message user-message"><p>{zh ? "比较两批 PBMC，检查批次效应并生成可复现的分析报告。" : "Compare two PBMC batches, assess batch effects, and generate a reproducible report."}</p></article>}
-        {messages.length === 0 && <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><p>{zh ? "描述你的研究目标。我会先核对数据与假设，并在任何正式执行前展示计划供你审批。" : "Describe your research goal. I will first check the data and assumptions, then show a plan for approval before any formal execution."}</p></div></article>}
-        {sentMessages.map((message, index) => <article className="message user-message" key={`${index}-${message}`}><p>{message}</p></article>)}
+        {!onSend && <article className="message user-message"><MarkdownContent markdown={zh ? "比较两批 PBMC，检查批次效应并生成可复现的分析报告。" : "Compare two PBMC batches, assess batch effects, and generate a reproducible report."} /></article>}
+        {messages.length === 0 && <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><MarkdownContent markdown={zh ? "描述你的研究目标。我会先核对数据与假设，并在任何正式执行前展示计划供你审批。" : "Describe your research goal. I will first check the data and assumptions, then show a plan for approval before any formal execution."} /></div></article>}
+        {sentMessages.map((message, index) => <article className="message user-message" key={`${index}-${message}`}><MarkdownContent markdown={message} /></article>)}
         {messages.map((message) => <Fragment key={message.id}>
-          {message.role === "user" ? <article className="message user-message"><p>{message.markdown}</p></article> : message.role === "assistant" ? <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><p>{message.markdown}</p></div></article> : null}
+          {message.role === "user" ? <article className="message user-message"><MarkdownContent markdown={message.markdown} /></article> : message.role === "assistant" ? <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><MarkdownContent markdown={message.markdown} /></div></article> : null}
           {runTimelineV4.afterMessage.get(message.id)?.map((run) => <V4RunTrace locale={locale} events={run.events} onAnswer={onAnswerAgentQuestionV4} onDecideApproval={onDecideToolApprovalV4} onResolveUncertain={onResolveUncertainV4} onResume={onResumeAgentRunV4} historical key={run.runId} />)}
         </Fragment>)}
-        {streamingAssistant && <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent · {zh ? "生成中" : "streaming"}</strong><p>{streamingAssistant}</p></div></article>}
+        {streamingAssistant && <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent · {zh ? "生成中" : "streaming"}</strong><MarkdownContent markdown={streamingAssistant} /></div></article>}
         {agentBusy && !streamingAssistant && <article className="message assistant-message agent-pending" role="status"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><p>{zh ? "正在等待模型响应…" : "Waiting for the model…"}</p></div></article>}
         {agentRetryNotice && <div className="agent-retry-notice" role="status"><span className="agent-working"><i />{agentRetryNotice}</span></div>}
         {agentNotice && <div className="agent-notice" role="alert"><strong>{zh ? "对话未完成" : "Conversation did not complete"}</strong><span>{agentNotice}</span></div>}
@@ -233,7 +238,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
       </section>
       <footer className="composer">
         <div className={`composer-input ${planModeEnabled ? "is-plan-mode" : ""}`}>
-          <textarea aria-label={t.composer} placeholder={planModeEnabled ? (zh ? "描述需要规划和执行的任务" : "Describe the task to plan and execute") : t.composer} value={draft} disabled={agentBusy} onChange={(event) => setDraft(event.target.value)} />
+          <textarea aria-label={t.composer} placeholder={planModeEnabled ? (zh ? "描述需要规划和执行的任务" : "Describe the task to plan and execute") : t.composer} value={draft} disabled={composerDisabled} onChange={(event) => setDraft(event.target.value)} />
           <div>
             <div className="composer-menu-anchor"><button className="composer-tool" aria-label={zh ? "添加上下文或选择模式" : "Add context or choose mode"} aria-expanded={composerMenuOpen} onClick={() => { setComposerMenuOpen((open) => !open); setPermissionMenuOpen(false); setComputeMenuOpen(false); }}><Plus size={17} /></button>{composerMenuOpen && <div className="composer-add-menu" role="menu"><button role="menuitem" disabled={!onUploadFiles} onClick={() => { setComposerMenuOpen(false); void onUploadFiles?.(); }}><Folder size={16} /><span><b>{zh ? "添加文件" : "Add files"}</b><small>{zh ? "选择项目输入文件" : "Select project input files"}</small></span></button><button role="menuitem" className={planModeEnabled ? "active" : ""} onClick={() => { setPlanModeEnabled(!planModeEnabled); setComposerMenuOpen(false); }}><Activity size={16} /><span><b>{zh ? "Plan 模式" : "Plan mode"}</b><small>{zh ? "先规划并在右侧审核，再批准执行" : "Plan first, review on the right, then approve execution"}</small></span>{planModeEnabled && <Check size={15} />}</button></div>}</div>
             <div className="composer-menu-anchor permission-anchor">
@@ -250,7 +255,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
               {computeMenuOpen && <div className="composer-compute-menu"><ComputeBackendSelector locale={locale} backends={computeBackends} backendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} environment={computeEnvironment} busy={computeBusy} onBackendChange={onComputeBackendChange} onImageChange={onContainerImageChange} onAutonomyChange={onAutonomyModeChange} onEnvironmentChange={onComputeEnvironmentChange} /></div>}
             </div>
             {planModeEnabled && <button className="composer-mode-chip" onClick={() => setPlanModeEnabled(false)}><Activity size={14} />Plan<X size={13} /></button>}
-            <button className="send-button" disabled={agentBusy || planLoading || !draft.trim() || Boolean(onSend && !computeReady)} onClick={send}><Send size={16} />{agentBusy || planLoading ? (planModeEnabled ? (zh ? "规划中…" : "Planning…") : (zh ? "执行中…" : "Running…")) : t.send}</button>
+            <button className="send-button" disabled={composerDisabled || planLoading || !draft.trim() || Boolean(onSend && !computeReady)} onClick={send}><Send size={16} />{composerDisabled || planLoading ? (planModeEnabled ? (zh ? "规划中…" : "Planning…") : (zh ? "执行中…" : "Running…")) : t.send}</button>
           </div>
         </div>
         <small>{planModeEnabled ? (zh ? "Plan 模式：计划显示在右侧，批准后才执行" : "Plan mode: review the plan on the right before execution") : computeReady ? (zh ? `Agent 模式：${selectedBackend?.descriptor.kind.toUpperCase()} · ${approvalPolicy === "request_approval" ? "请求批准" : approvalPolicy === "full_access" ? "完全访问" : "风险审批"}` : `Agent mode: ${selectedBackend?.descriptor.kind.toUpperCase()} · ${approvalPolicy}`) : onSend ? (zh ? "请选择一个可用的计算后端" : "Choose an available compute backend") : modelLabel ? `${zh ? "当前模型" : "Model"}: ${modelLabel}` : ""}</small>
@@ -279,18 +284,45 @@ function FileTree({ locale }: { locale: Locale }) { const zh = locale === "zh-CN
 function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncertain, onResume, historical = false }: { locale: Locale; events: AgentRunEventV4[]; onAnswer?: (runId: string, questionId: string, answer: string) => Promise<void> | void; onDecideApproval?: (runId: string, approvalId: string, callHash: string, decision: "approved" | "denied") => Promise<void> | void; onResolveUncertain?: (runId: string, callId: string, resolution: "side_effect_observed" | "side_effect_not_observed" | "compensated", evidence: string) => Promise<void> | void; onResume?: (runId: string) => Promise<void> | void; historical?: boolean }) {
   const zh = locale === "zh-CN";
   const entries = coalesceV4ModelText(events);
+  const progress = entries.filter(({ modelText }) => modelText !== undefined && modelText.trim());
+  const technicalEntries = entries.filter(({ event, modelText }) => modelText === undefined && !isToolTrajectoryEvent(event) && !isHiddenTrajectoryEvent(event));
+  const tools = mergeV4ToolCalls(events);
   const latest = events.at(-1);
   const terminal = latest && isTerminalAgentEventV4(latest) ? latest : undefined;
+  const completionPending = !terminal && Boolean(latest && (
+    latest.event.kind === "completion_proposed"
+    || latest.event.kind === "completion_proposal_submitted"
+    || latest.event.kind === "deterministic_verification_finished"
+    || latest.event.kind === "reviewer_finished"
+    || (latest.event.kind === "tool_requested" && latest.event.call.tool_id === "agent.complete")
+  ));
   const pauseReason = getV4PauseReason(events);
   const status = terminal?.event.kind === "run_completed" ? (zh ? "已完成" : "Completed") : terminal?.event.kind === "run_cancelled" ? (zh ? "已终止" : "Cancelled") : terminal?.event.kind === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention") : terminal?.event.kind === "run_failed" ? (zh ? "失败" : "Failed") : pauseReason === "approval" ? (zh ? "等待工具审批" : "Waiting for approval") : pauseReason === "input" ? (zh ? "等待回答" : "Waiting for input") : pauseReason === "uncertain" ? (zh ? "等待副作用核验" : "Waiting for verification") : (zh ? "运行中" : "Running");
   const failed = terminal?.event.kind === "run_failed";
-  return <details className={`agent-run-fold agent-v4-run ${historical ? "" : "is-active"}`} open={historical ? undefined : true}>
-    <summary><span className="agent-run-fold-title"><span><b>Agent Runtime V4</b><small>{zh ? "Plan/Execute 硬隔离 · 持久 Kernel" : "Hard Plan/Execute boundary · persistent kernel"}</small></span><ChevronRight size={15} /></span><span>{status} · {events.length} {zh ? "条哈希事件" : "hash-chained events"}</span></summary>
+  const shouldExpand = !historical && (Boolean(pauseReason) || terminal?.event.kind === "run_failed" || terminal?.event.kind === "run_needs_attention");
+  return <>
+    {progress.map(({ event, lastEvent, modelText }) => <article aria-label={zh ? "模型输出" : "Model output"} className="message assistant-message agent-work-update agent-public-progress" key={`${event.run_id}-${event.sequence}`}>
+      <div className="assistant-avatar"><Bot size={17} /></div>
+      <div><div className="agent-work-heading"><strong>{zh ? "进度" : "Progress"}</strong><small>{new Date(lastEvent.occurred_at).toLocaleTimeString()}</small></div><MarkdownContent markdown={modelText ?? ""} /></div>
+    </article>)}
+    {completionPending && <div className="agent-completion-pending" role="status"><span className="agent-working"><i />{zh ? "正在核验最终结果…" : "Verifying the final result…"}</span></div>}
+    <details className={`agent-run-fold agent-v4-run ${historical ? "" : "is-active"}`} open={shouldExpand}>
+    <summary><span className="agent-run-fold-title"><span><b>{zh ? "执行过程" : "Process"}</b><small>{terminal ? (zh ? "工具调用与验证记录" : "Tool calls and verification") : (zh ? "Agent 正在处理任务" : "Agent is working")}</small></span><ChevronRight size={15} /></span><span>{status} · {tools.length} {zh ? "个步骤" : tools.length === 1 ? "step" : "steps"}</span></summary>
     <div className="agent-run-fold-body">
-      {entries.map(({ event, lastEvent, modelText }) => <article aria-label={modelText === undefined ? undefined : (zh ? "模型输出" : "Model output")} className="message assistant-message agent-work-update" key={`${event.run_id}-${event.sequence}`}>
+      {tools.length > 0 && <section className="v4-tool-traces" aria-label={zh ? "工具调用详情" : "Tool call details"}>
+        {tools.map((tool) => <details className="v4-tool-trace" key={tool.callId}>
+          <summary className="v4-tool-trace-heading"><ChevronRight size={13} /><strong>{toolDisplayLabel(tool.toolId, zh)}</strong>{tool.subject && <span className="v4-tool-subject">{tool.subject}</span>}<span className={`v4-tool-status ${tool.status}`}>{toolStatusLabel(tool.status, zh)}</span></summary>
+          <div className="v4-tool-trace-body">
+            <small>{tool.toolId} · #{tool.firstSequence}–#{tool.lastSequence}</small>
+            {tool.argumentsPreview && <><b>{zh ? "输入" : "Input"}</b><code>{tool.argumentsPreview}</code></>}
+            {tool.outcome && <><b>{zh ? "结果" : "Result"}</b><MarkdownContent markdown={limitText(tool.outcome, 800)} /></>}
+          </div>
+        </details>)}
+      </section>}
+      {technicalEntries.map(({ event, lastEvent }) => <article className="message assistant-message agent-work-update" key={`${event.run_id}-${event.sequence}`}>
         <div className="assistant-avatar"><Bot size={17} /></div>
-        <div><div className="agent-work-heading"><strong>{modelText === undefined ? v4EventLabel(event, zh) : (zh ? "模型输出" : "Model output")}</strong><small>{lastEvent.sequence === event.sequence ? `#${event.sequence}` : `#${event.sequence}–#${lastEvent.sequence}`} · {new Date(lastEvent.occurred_at).toLocaleTimeString()}</small></div>
-          <p>{modelText ?? v4EventContent(event, zh)}</p>
+        <div><div className="agent-work-heading"><strong>{v4EventLabel(event, zh)}</strong><small>{lastEvent.sequence === event.sequence ? `#${event.sequence}` : `#${event.sequence}–#${lastEvent.sequence}`} · {new Date(lastEvent.occurred_at).toLocaleTimeString()}</small></div>
+          {v4EventContent(event, zh) && <MarkdownContent markdown={v4EventContent(event, zh)} />}
           {event.event.kind === "input_requested" && onAnswer && !isV4QuestionAnswered(events, event.event.question_id) && <V4AnswerForm locale={locale} onSubmit={(answer) => onAnswer(event.run_id, event.event.kind === "input_requested" ? event.event.question_id : "", answer)} />}
           {event.event.kind === "tool_approval_requested" && onDecideApproval && !isV4ApprovalDecided(events, event.event.request.approval_id) && <V4ApprovalCard locale={locale} request={event.event.request} onDecide={(decision) => onDecideApproval(event.run_id, event.event.kind === "tool_approval_requested" ? event.event.request.approval_id : "", event.event.kind === "tool_approval_requested" ? event.event.request.call_hash : "", decision)} />}
           {event.event.kind === "tool_dispatch_uncertain" && onResolveUncertain && !isV4UncertainResolved(events, event.event.call_id) && <V4UncertainCard locale={locale} onResolve={(resolution, evidence) => onResolveUncertain(event.run_id, event.event.kind === "tool_dispatch_uncertain" ? event.event.call_id : "", resolution, evidence)} />}
@@ -298,7 +330,8 @@ function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncer
       </article>)}
       {failed && onResume && <div className="v4-resume-run"><span>{zh ? "修正运行条件后可从已验证事件链继续。" : "Resume from the verified event chain after fixing the runtime condition."}</span><button onClick={() => void onResume(events[0].run_id)}>{zh ? "继续运行" : "Resume run"}</button></div>}
     </div>
-  </details>;
+    </details>
+  </>;
 }
 function V4ApprovalCard({ locale, request, onDecide }: { locale: Locale; request: Extract<AgentRunEventV4["event"], { kind: "tool_approval_requested" }>['request']; onDecide: (decision: "approved" | "denied") => Promise<void> | void }) {
   const zh = locale === "zh-CN";
@@ -321,6 +354,9 @@ function isV4UncertainResolved(events: AgentRunEventV4[], callId: string) {
 function isV4QuestionAnswered(events: AgentRunEventV4[], questionId: string) {
   return events.some((event) => event.event.kind === "user_input_answered" && event.event.question_id === questionId);
 }
+function MarkdownContent({ markdown }: { markdown: string }) {
+  return <div className="markdown-content"><ReactMarkdown remarkPlugins={[remarkGfm]}>{markdown}</ReactMarkdown></div>;
+}
 function coalesceV4ModelText(events: AgentRunEventV4[]): Array<{ event: AgentRunEventV4; lastEvent: AgentRunEventV4; modelText?: string }> {
   const entries: Array<{ event: AgentRunEventV4; lastEvent: AgentRunEventV4; modelText?: string }> = [];
   for (let index = 0; index < events.length;) {
@@ -338,13 +374,94 @@ function coalesceV4ModelText(events: AgentRunEventV4[]): Array<{ event: AgentRun
       lastEvent = textEvent;
       index += 1;
     }
-    entries.push({ event, lastEvent, modelText });
+    if (modelText.trim()) entries.push({ event, lastEvent, modelText });
   }
   return entries;
 }
+
+type MergedV4ToolCall = {
+  callId: string;
+  toolId: string;
+  argumentsPreview: string;
+  firstSequence: number;
+  lastSequence: number;
+  outcome?: string;
+  subject?: string;
+  status: "requested" | "running" | "succeeded" | "failed" | "reused";
+};
+function mergeV4ToolCalls(events: AgentRunEventV4[]): MergedV4ToolCall[] {
+  const byCall = new Map<string, MergedV4ToolCall>();
+  const update = (callId: string, sequence: number, toolId: string, args?: Record<string, unknown>, status?: MergedV4ToolCall["status"], outcome?: string) => {
+    if (isInternalAgentTool(toolId)) return;
+    const current = byCall.get(callId);
+    if (!current) {
+      byCall.set(callId, { callId, toolId, argumentsPreview: args ? limitText(JSON.stringify(redactToolArguments(args)), 500) : "", firstSequence: sequence, lastSequence: sequence, outcome, subject: toolSubject(args), status: status ?? "requested" });
+      return;
+    }
+    current.lastSequence = Math.max(current.lastSequence, sequence);
+    if (toolId) current.toolId = toolId;
+    if (args) {
+      current.argumentsPreview = limitText(JSON.stringify(redactToolArguments(args)), 500);
+      current.subject = toolSubject(args);
+    }
+    if (outcome) current.outcome = outcome;
+    if (status) current.status = status;
+  };
+  for (const item of events) {
+    const event = item.event;
+    if (event.kind === "tool_requested") update(event.call.call_id, item.sequence, event.call.tool_id, event.call.arguments, "requested");
+    else if (event.kind === "tool_dispatch_started") update(event.call_id, item.sequence, event.tool_id, undefined, "running");
+    else if (event.kind === "tool_finished") update(event.outcome.call_id, item.sequence, event.outcome.tool_id, undefined, event.outcome.succeeded ? "succeeded" : "failed", event.outcome.model_content);
+    else if (event.kind === "tool_outcome_reused") update(event.outcome.call_id, item.sequence, event.outcome.tool_id, undefined, "reused", event.outcome.model_content);
+  }
+  return [...byCall.values()];
+}
+function isInternalAgentTool(toolId: string) {
+  return toolId === "agent.complete" || toolId === "agent.request_input" || toolId === "agent.propose_plan";
+}
+function toolSubject(args?: Record<string, unknown>) {
+  if (!args) return undefined;
+  for (const key of ["path", "relative_path", "artifact_id", "query"]) {
+    const value = args[key];
+    if (typeof value === "string" && value.trim()) return limitText(value.trim(), 90);
+  }
+  return undefined;
+}
+function toolDisplayLabel(toolId: string, zh: boolean) {
+  const labels: Record<string, [string, string]> = {
+    "project.read": ["读取项目文件", "Read project file"],
+    "project.list": ["浏览项目文件", "List project files"],
+    "project.write": ["写入项目文件", "Write project file"],
+    "artifact.verify": ["验证分析产物", "Verify artifact"],
+    "runtime.execute": ["运行分析代码", "Run analysis code"],
+    "runtime.python": ["运行 Python", "Run Python"],
+    "runtime.r": ["运行 R", "Run R"],
+    "agent.delegate": ["执行子任务", "Run delegated task"],
+  };
+  const label = labels[toolId];
+  return label ? label[zh ? 0 : 1] : toolId;
+}
+function toolStatusLabel(status: MergedV4ToolCall["status"], zh: boolean) {
+  return status === "requested" ? (zh ? "已请求" : "Requested") : status === "running" ? (zh ? "执行中" : "Running") : status === "succeeded" ? (zh ? "成功" : "Succeeded") : status === "failed" ? (zh ? "失败" : "Failed") : (zh ? "复用结果" : "Reused");
+}
+function limitText(value: string, max: number) {
+  return value.length > max ? `${value.slice(0, max)}…` : value;
+}
+function redactToolArguments(value: unknown, key = ""): unknown {
+  if (/(?:password|passwd|token|secret|credential|authorization|api[_-]?key|private[_-]?key)/i.test(key)) return "[REDACTED]";
+  if (Array.isArray(value)) return value.map((item) => redactToolArguments(item));
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([childKey, child]) => [childKey, redactToolArguments(child, childKey)]));
+  return value;
+}
+function isToolTrajectoryEvent(event: AgentRunEventV4) {
+  return event.event.kind === "tool_requested" || event.event.kind === "tool_dispatch_started" || event.event.kind === "tool_finished" || event.event.kind === "tool_outcome_reused";
+}
+function isHiddenTrajectoryEvent(event: AgentRunEventV4) {
+  return event.event.kind === "run_spec_frozen" || event.event.kind === "completion_proposal_submitted" || event.event.kind === "deterministic_verification_finished" || event.event.kind === "reviewer_finished" || event.event.kind === "reviewer_correction_requested";
+}
 function V4AnswerForm({ locale, onSubmit }: { locale: Locale; onSubmit: (answer: string) => Promise<void> | void }) { const [answer, setAnswer] = useState(""); const zh = locale === "zh-CN"; return <div className="v4-answer"><input aria-label={zh ? "回答 V4 问题" : "Answer V4 question"} value={answer} onChange={(event) => setAnswer(event.target.value)} /><button disabled={!answer.trim()} onClick={() => void onSubmit(answer.trim())}>{zh ? "回答并恢复" : "Answer and resume"}</button></div>; }
 function v4EventLabel(event: AgentRunEventV4, zh: boolean) { if (event.event.kind === "run_created") return event.event.mode === "execute" ? (zh ? "任务启动" : "Task started") : (zh ? "规划启动" : "Planning started"); const labels: Record<string, string> = { plan_proposed: zh ? "计划已冻结" : "Plan frozen", plan_approved: zh ? "计划获批" : "Plan approved", mode_changed: zh ? "执行模式" : "Execution mode", tool_requested: zh ? "工具请求" : "Tool request", tool_approval_requested: zh ? "等待工具审批" : "Tool approval required", tool_approval_decided: zh ? "工具审批已决定" : "Tool approval decided", tool_dispatch_uncertain: zh ? "工具状态不确定" : "Tool dispatch uncertain", tool_dispatch_resolved: zh ? "不确定状态已核实" : "Uncertain dispatch resolved", tool_finished: zh ? "工具结果" : "Tool result", input_requested: zh ? "需要补充信息" : "Input required", user_input_answered: zh ? "用户已回答" : "User answered", completion_proposed: zh ? "完成提案" : "Completion proposed", run_completed: zh ? "运行完成" : "Run completed", run_failed: zh ? "运行失败" : "Run failed", run_cancelled: zh ? "运行取消" : "Run cancelled" }; return labels[event.event.kind] ?? event.event.kind; }
-function v4EventContent(event: AgentRunEventV4, zh: boolean) { if (event.event.kind === "tool_requested") return event.event.call.tool_id; if (event.event.kind === "tool_approval_requested") return `${event.event.request.call.tool_id}: ${event.event.request.reason}`; if (event.event.kind === "tool_approval_decided") return event.event.decision === "approved" ? (zh ? "用户已批准" : "Approved by user") : (zh ? "用户已拒绝" : "Denied by user"); if (event.event.kind === "tool_dispatch_uncertain") return zh ? `调用 ${event.event.tool_id} 的副作用尚未确认` : `The side effect of ${event.event.tool_id} is not yet known`; if (event.event.kind === "tool_dispatch_resolved") return event.event.evidence; if (event.event.kind === "tool_finished") return event.event.outcome.model_content; if (event.event.kind === "plan_proposed") return `${event.event.plan.steps.length} ${zh ? "个步骤" : "steps"} · SHA-256 ${event.event.plan_hash.slice(0, 12)}`; if (event.event.kind === "model_text") return event.event.text; if (event.event.kind === "input_requested") return event.event.question; if (event.event.kind === "user_input_answered") return zh ? `已提交回答：${event.event.answer}` : `Answer submitted: ${event.event.answer}`; if (event.event.kind === "run_failed") return event.event.message; return zh ? "状态已写入可验证事件链" : "State persisted to the verified event chain"; }
+function v4EventContent(event: AgentRunEventV4, zh: boolean) { if (event.event.kind === "tool_requested") return event.event.call.tool_id; if (event.event.kind === "tool_approval_requested") return `${event.event.request.call.tool_id}: ${event.event.request.reason}`; if (event.event.kind === "tool_approval_decided") return event.event.decision === "approved" ? (zh ? "用户已批准" : "Approved by user") : (zh ? "用户已拒绝" : "Denied by user"); if (event.event.kind === "tool_dispatch_uncertain") return zh ? `调用 ${event.event.tool_id} 的副作用尚未确认` : `The side effect of ${event.event.tool_id} is not yet known`; if (event.event.kind === "tool_dispatch_resolved") return event.event.evidence; if (event.event.kind === "tool_finished") return event.event.outcome.model_content; if (event.event.kind === "plan_proposed") return `${event.event.plan.steps.length} ${zh ? "个步骤" : "steps"} · SHA-256 ${event.event.plan_hash.slice(0, 12)}`; if (event.event.kind === "model_text") return event.event.text; if (event.event.kind === "input_requested") return event.event.question; if (event.event.kind === "user_input_answered") return zh ? `已提交回答：${event.event.answer}` : `Answer submitted: ${event.event.answer}`; if (event.event.kind === "run_failed") return event.event.message; return ""; }
 function isPreviewImage(path: string) { return /\.(png|jpe?g|gif|webp|bmp)$/i.test(path); }
 function ArtifactPreview({ title, locale, images, selectedPath, preview, busy, error, onSelect, onLoad }: { title: string; locale: Locale; images: import("../../types").RemoteFileEntry[]; selectedPath: string; preview: ProjectImagePreview | null; busy: boolean; error: string; onSelect: (path: string) => void; onLoad: () => Promise<void> | void }) {
   const zh = locale === "zh-CN";

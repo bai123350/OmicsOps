@@ -3,15 +3,15 @@ use std::sync::{Arc, Mutex};
 use omicsops_core::{
     domain::ConnectionProfile,
     workspace::{
-        Artifact, Conversation, Message, ModelProfile, NotebookEntry, Project, SkillPackage,
-        SyncEntry,
+        Artifact, Conversation, Message, MessageRole, ModelProfile, NotebookEntry, Project,
+        SkillPackage, SyncEntry,
     },
 };
 use omicsops_protocol::{
     AgentEventV4, ContextArchiveV4, ContextCheckpointV4, validate_event_chain_v4,
 };
 use omicsops_science::ScientificStateV4;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -557,20 +557,78 @@ impl Repository {
             .transpose()
     }
 
-    pub fn append_agent_event_v4(&self, event: &AgentEventV4) -> AdapterResult<()> {
+    /// Append a V4 event and, for a successful completion, persist its public
+    /// assistant answer in the same SQLite transaction.
+    ///
+    /// The returned message is intended for the UI event emitter.  Keeping the
+    /// message creation in the repository transaction means a completed run
+    /// can never be observed without its answer (or vice versa).
+    pub fn append_agent_event_v4_with_conversation(
+        &self,
+        event: &AgentEventV4,
+    ) -> AdapterResult<Option<Message>> {
         event
             .verify()
             .map_err(|error| crate::AdapterError::InvalidInput(error.to_string()))?;
-        let existing = self.agent_events_v4(event.run_id)?;
+        let mut connection = self.connection.lock().expect("repository lock");
+        let transaction = connection.transaction()?;
+        let mut statement = transaction
+            .prepare("SELECT value_json FROM agent_events_v4 WHERE run_id=?1 ORDER BY sequence")?;
+        let existing = statement
+            .query_map([event.run_id.to_string()], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_str::<AgentEventV4>(&row?)?))
+            .collect::<AdapterResult<Vec<_>>>()?;
+        drop(statement);
+
+        // Replaying an already durable event is safe.  If an old process
+        // wrote RunCompleted without its message, repair the missing message
+        // here using the same transaction.
+        if let Some(stored) = existing
+            .iter()
+            .find(|stored| stored.sequence == event.sequence)
+        {
+            if stored.event_hash != event.event_hash || stored != event {
+                return Err(crate::AdapterError::InvalidInput(format!(
+                    "event sequence {} is already occupied by a different event",
+                    event.sequence
+                )));
+            }
+            if matches!(
+                event.event,
+                omicsops_protocol::AgentEventKindV4::RunCompleted
+            ) {
+                let message = persist_completion_message(&transaction, &existing, event)?;
+                transaction.commit()?;
+                return Ok(message);
+            }
+            transaction.commit()?;
+            return Ok(None);
+        }
+
         let mut candidate = existing;
         candidate.push(event.clone());
         validate_event_chain_v4(&candidate)
             .map_err(|error| crate::AdapterError::InvalidInput(error.to_string()))?;
-        self.connection.lock().expect("repository lock").execute(
+        transaction.execute(
             "INSERT INTO agent_events_v4 (run_id, project_id, conversation_id, sequence, previous_hash, event_hash, value_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![event.run_id.to_string(), event.project_id.to_string(), event.conversation_id.to_string(), event.sequence, event.previous_hash, event.event_hash, serde_json::to_string(event)?],
         )?;
-        Ok(())
+        let message = if matches!(
+            event.event,
+            omicsops_protocol::AgentEventKindV4::RunCompleted
+        ) {
+            persist_completion_message(&transaction, &candidate, event)?
+        } else {
+            None
+        };
+        transaction.commit()?;
+        Ok(message)
+    }
+
+    /// Compatibility wrapper for callers that only need the event store.
+    pub fn append_agent_event_v4(&self, event: &AgentEventV4) -> AdapterResult<()> {
+        self.append_agent_event_v4_with_conversation(event)
+            .map(|_| ())
     }
 
     pub fn agent_events_v4(&self, run_id: Uuid) -> AdapterResult<Vec<AgentEventV4>> {
@@ -739,4 +797,105 @@ impl Repository {
         })
         .collect()
     }
+}
+
+fn completion_answer(events: &[AgentEventV4]) -> AdapterResult<String> {
+    let proposal = events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.event {
+            omicsops_protocol::AgentEventKindV4::CompletionProposalSubmitted { proposal } => {
+                Some(proposal)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            crate::AdapterError::InvalidInput(
+                "RunCompleted has no persisted CompletionProposalSubmitted event".into(),
+            )
+        })?;
+
+    // Read answer_markdown dynamically so repositories can replay pre-answer
+    // protocol records while the protocol crate evolves.  Legacy records use
+    // summary as their public answer.
+    let value = serde_json::to_value(proposal)?;
+    let answer = value
+        .get("answer_markdown")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .or_else(|| {
+            value
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+        })
+        .map(str::trim)
+        .unwrap_or_default();
+    if answer.is_empty() {
+        return Err(crate::AdapterError::InvalidInput(
+            "RunCompleted cannot be persisted without a non-empty assistant answer".into(),
+        ));
+    }
+    Ok(answer.to_owned())
+}
+
+fn persist_completion_message(
+    transaction: &rusqlite::Transaction<'_>,
+    events: &[AgentEventV4],
+    completed: &AgentEventV4,
+) -> AdapterResult<Option<Message>> {
+    let markdown = completion_answer(events)?;
+    let message_id = completed.run_id.to_string();
+
+    let existing = transaction
+        .query_row(
+            "SELECT value_json FROM messages WHERE id=?1",
+            [&message_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(value) = existing {
+        let message: Message = serde_json::from_str(&value)?;
+        if message.project_id != completed.project_id
+            || message.conversation_id != completed.conversation_id
+            || message.role != MessageRole::Assistant
+            || message.markdown != markdown
+        {
+            return Err(crate::AdapterError::InvalidInput(
+                "run completion message id is already used by a different message".into(),
+            ));
+        }
+        // The event replay is idempotent; only a newly inserted (or repaired)
+        // message should produce a second UI conversation event.
+        return Ok(None);
+    }
+
+    let sequence = transaction.query_row(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM messages WHERE conversation_id=?1",
+        [completed.conversation_id.to_string()],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let sequence = u64::try_from(sequence).map_err(|_| {
+        crate::AdapterError::InvalidInput("conversation message sequence overflow".into())
+    })?;
+    let message = Message::markdown(
+        completed.run_id,
+        completed.project_id,
+        completed.conversation_id,
+        sequence,
+        MessageRole::Assistant,
+        markdown,
+        completed.occurred_at,
+    );
+    transaction.execute(
+        "INSERT INTO messages (id, project_id, conversation_id, sequence, value_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            message.id.to_string(),
+            message.project_id.to_string(),
+            message.conversation_id.to_string(),
+            message.sequence,
+            serde_json::to_string(&message)?
+        ],
+    )?;
+    Ok(Some(message))
 }
