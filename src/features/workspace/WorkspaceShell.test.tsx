@@ -318,4 +318,77 @@ describe("WorkspaceShell", () => {
     expect(screen.getByRole("button", { name: "执行中…" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "批准并继续" })).toBeEnabled();
   });
+
+  it("does not submit the composer twice while the first request is pending", async () => {
+    let release!: (accepted: boolean) => void;
+    const onSend = vi.fn(() => new Promise<boolean>((resolve) => { release = resolve; }));
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={onSend}
+      computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
+    const composer = screen.getByRole("textbox", { name: /描述研究目标/ });
+    fireEvent.change(composer, { target: { value: "检查矩阵" } });
+    const send = screen.getByRole("button", { name: "发送" });
+    fireEvent.click(send);
+    fireEvent.click(send);
+    expect(onSend).toHaveBeenCalledTimes(1);
+    release(true);
+    await waitFor(() => expect(composer).toBeEnabled());
+  });
+
+  it("guards plan approval and resume actions against double clicks", async () => {
+    let releaseApproval!: () => void;
+    const onApprovePlan = vi.fn(() => new Promise<void>((resolve) => { releaseApproval = resolve; }));
+    const plan = { schema_version: 4 as const, objective: "执行 QC", steps: ["检查输入"], completion_criteria: ["报告完成"], requested_capabilities: [] };
+    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined}
+      v4Plan={{ run_id: "run-plan-guard", status: "awaiting_approval", plan, plan_hash: "plan", compute_selection: null, approval_hash: "approval" }} onApprovePlan={onApprovePlan} />);
+    const approve = screen.getByRole("button", { name: "批准并运行" });
+    fireEvent.click(approve);
+    fireEvent.click(approve);
+    expect(onApprovePlan).toHaveBeenCalledTimes(1);
+    expect(approve).toBeDisabled();
+    releaseApproval();
+    await waitFor(() => expect(screen.getByRole("button", { name: "批准并运行" })).toBeEnabled());
+
+    let releaseResume!: () => void;
+    const onResume = vi.fn(() => new Promise<void>((resolve) => { releaseResume = resolve; }));
+    const base = { schema_version: 4 as const, run_id: "run-resume-guard", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
+    const failed = [{ ...base, sequence: 1, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "run_created" as const, mode: "execute" as const } }, { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:02Z", event: { kind: "run_failed" as const, message: "temporary failure" } }];
+    rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} agentRunEventsV4={failed} onResumeAgentRunV4={onResume} />);
+    const resume = screen.getByRole("button", { name: "继续运行" });
+    fireEvent.click(resume);
+    fireEvent.click(resume);
+    expect(onResume).toHaveBeenCalledTimes(1);
+    expect(resume).toBeDisabled();
+    releaseResume();
+    await waitFor(() => expect(screen.getByRole("button", { name: "继续运行" })).toBeEnabled());
+  });
+
+  it("guards answer and uncertain-dispatch recovery actions while preserving their controls during a run", async () => {
+    let releaseAnswer!: () => void;
+    const onAnswer = vi.fn(() => new Promise<void>((resolve) => { releaseAnswer = resolve; }));
+    const base = { schema_version: 4 as const, run_id: "run-input-guard", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
+    const requested = { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "input_requested" as const, question_id: "species", question: "物种？" } };
+    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-input-guard" agentRunEventsV4={[requested]} onAnswerAgentQuestionV4={onAnswer} />);
+    fireEvent.change(screen.getByRole("textbox", { name: "回答 V4 问题" }), { target: { value: "人" } });
+    const answer = screen.getByRole("button", { name: "回答并恢复" });
+    fireEvent.click(answer);
+    fireEvent.click(answer);
+    expect(onAnswer).toHaveBeenCalledTimes(1);
+    expect(answer).toBeDisabled();
+    releaseAnswer();
+    await waitFor(() => expect(screen.getByRole("button", { name: "回答并恢复" })).toBeEnabled());
+
+    let releaseResolve!: () => void;
+    const onResolve = vi.fn(() => new Promise<void>((resolve) => { releaseResolve = resolve; }));
+    const uncertain = { ...base, run_id: "run-uncertain-guard", sequence: 1, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "tool_dispatch_uncertain" as const, call_id: "call-1", tool_id: "runtime.execute" } };
+    rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-uncertain-guard" agentRunEventsV4={[uncertain]} onResolveUncertainV4={onResolve} />);
+    fireEvent.click(screen.getByText("执行过程"));
+    fireEvent.change(screen.getByRole("textbox", { name: "核验证据" }), { target: { value: "已检查" } });
+    const resolve = screen.getByRole("button", { name: "保存证据并继续" });
+    fireEvent.click(resolve);
+    fireEvent.click(resolve);
+    expect(onResolve).toHaveBeenCalledTimes(1);
+    expect(resolve).toBeDisabled();
+    releaseResolve();
+    await waitFor(() => expect(screen.getByRole("button", { name: "保存证据并继续" })).toBeEnabled());
+  });
 });

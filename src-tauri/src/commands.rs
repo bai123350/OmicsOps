@@ -17,6 +17,7 @@ use omicsops_core::{
     domain::{AuthenticationMethod, ConnectionProfile, ProjectSpec},
     project::RemoteProjectLayout,
 };
+use omicsops_mcp::McpSessionManager;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use url::Url;
@@ -27,6 +28,7 @@ use crate::inspection::{ServerInspection, inspection_command, parse_server_inspe
 pub struct AppState {
     pub repository: Repository,
     pub credentials: SystemCredentialVault,
+    pub mcp_sessions: McpSessionManager,
     pub active_runs: Arc<Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
     pub skills_root: PathBuf,
     pub research_last_request: Arc<tokio::sync::Mutex<HashMap<String, std::time::Instant>>>,

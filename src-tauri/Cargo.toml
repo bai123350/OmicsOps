@@ -23,11 +23,15 @@ omicsops-protocol = { path = "../crates/omicsops-protocol" }
 omicsops-runtime = { path = "../crates/omicsops-runtime" }
 omicsops-science = { path = "../crates/omicsops-science" }
 omicsops-knowledge = { path = "../crates/omicsops-knowledge" }
+omicsops-mcp = { path = "../crates/omicsops-mcp" }
 omicsops-tools = { path = "../crates/omicsops-tools" }
 reqwest.workspace = true
+rmcp.workspace = true
+quick-xml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true
+thiserror.workspace = true
 sha2.workspace = true
 hex.workspace = true
 tauri = { version = "2", features = [] }

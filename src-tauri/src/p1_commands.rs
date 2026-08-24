@@ -1,10 +1,12 @@
 use std::{collections::BTreeMap, io::Write, path::Path, process::Stdio};
 
 use chrono::Utc;
-use omicsops_adapters::persistence::Repository;
+use omicsops_adapters::{credentials::CredentialVault, persistence::Repository};
 use omicsops_core::workspace::{
     Artifact, EvidenceReference, MemoryFact, NotebookEntry, SkillCitation,
 };
+use omicsops_knowledge::schema_digest;
+use omicsops_mcp::{McpEnvBinding, McpServerConfig, McpSessionManager};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -279,6 +281,12 @@ pub struct McpServerProfile {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default = "default_mcp_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default, alias = "env")]
+    pub env_bindings: Vec<McpEnvBinding>,
     pub enabled: bool,
     #[serde(default)]
     pub launch_approved: bool,
@@ -288,6 +296,18 @@ pub struct McpServerProfile {
     pub tools: Vec<Value>,
     #[serde(default = "empty_json_object")]
     pub capabilities: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_catalog_sha256: Option<String>,
+    #[serde(default)]
+    pub catalog_generation: u64,
+    #[serde(default)]
+    pub config_version: u64,
+    #[serde(default = "default_mcp_status")]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_tail: Option<String>,
     pub last_inspected_at: Option<chrono::DateTime<Utc>>,
     pub created_at: chrono::DateTime<Utc>,
     pub updated_at: chrono::DateTime<Utc>,
@@ -300,6 +320,18 @@ pub struct SaveMcpServerRequest {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default = "default_mcp_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default, alias = "env")]
+    pub env_bindings: Vec<McpEnvBinding>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddPubMedMcpServerRequest {
+    pub api_key: Option<String>,
+    pub admin_email: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -341,6 +373,14 @@ fn empty_json_object() -> Value {
     json!({})
 }
 
+fn default_mcp_timeout_secs() -> u64 {
+    60
+}
+
+fn default_mcp_status() -> String {
+    "disconnected".into()
+}
+
 fn validate_mcp_declaration(name: &str, command: &str, args: &[String]) -> Result<(), String> {
     if name.trim().is_empty()
         || command.trim().is_empty()
@@ -359,6 +399,46 @@ fn mcp_server_profile(repository: &Repository, id: Uuid) -> Result<McpServerProf
         .ok_or_else(|| format!("MCP server {id} was not found"))
 }
 
+/// Resolve a persisted MCP profile only at process-launch time.  Credential
+/// references are deliberately converted to an in-memory value here; the
+/// returned config is never persisted or included in audit payloads.
+fn resolved_mcp_config(
+    profile: &McpServerProfile,
+    project_id: Uuid,
+    credentials: &dyn CredentialVault,
+) -> Result<McpServerConfig, String> {
+    let mut env = Vec::with_capacity(profile.env_bindings.len());
+    for binding in &profile.env_bindings {
+        binding.validate().map_err(|error| error.to_string())?;
+        let value = match (&binding.value, &binding.credential_reference) {
+            (Some(value), None) if !value.is_empty() => value.clone(),
+            (None, Some(reference)) if !reference.trim().is_empty() => credentials
+                .get(reference)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("MCP credential {reference} is missing"))?,
+            _ => {
+                return Err(format!(
+                    "MCP environment binding {} has no usable value",
+                    binding.name
+                ));
+            }
+        };
+        env.push((binding.name.clone(), value));
+    }
+    McpServerConfig {
+        project_id,
+        server_id: profile.id,
+        name: profile.name.clone(),
+        command: profile.command.clone(),
+        args: profile.args.clone(),
+        cwd: profile.cwd.clone(),
+        env,
+        timeout_secs: profile.timeout_secs,
+    }
+    .normalized()
+    .map_err(|error| error.to_string())
+}
+
 fn mcp_profile_from_request(
     request: SaveMcpServerRequest,
     existing: Option<&McpServerProfile>,
@@ -366,13 +446,20 @@ fn mcp_profile_from_request(
 ) -> Result<McpServerProfile, String> {
     validate_mcp_declaration(&request.name, &request.command, &request.args)?;
     let declaration_changed = existing.is_some_and(|profile| {
-        profile.command != request.command.trim() || profile.args != request.args
+        profile.command != request.command.trim()
+            || profile.args != request.args
+            || profile.cwd != request.cwd
+            || profile.timeout_secs != request.timeout_secs.clamp(1, 3_600)
+            || profile.env_bindings != request.env_bindings
     });
     Ok(McpServerProfile {
         id: request.id.unwrap_or_else(Uuid::new_v4),
         name: request.name.trim().to_string(),
         command: request.command.trim().to_string(),
         args: request.args,
+        cwd: request.cwd,
+        timeout_secs: request.timeout_secs.clamp(1, 3_600),
+        env_bindings: request.env_bindings,
         enabled: existing.is_some_and(|profile| profile.enabled) && !declaration_changed,
         launch_approved: existing.is_some_and(|profile| profile.launch_approved)
             && !declaration_changed,
@@ -397,6 +484,34 @@ fn mcp_profile_from_request(
                 .map(|profile| profile.capabilities.clone())
                 .unwrap_or_else(|| json!({}))
         },
+        tool_catalog_sha256: if declaration_changed {
+            None
+        } else {
+            existing.and_then(|profile| profile.tool_catalog_sha256.clone())
+        },
+        catalog_generation: if declaration_changed {
+            0
+        } else {
+            existing.map_or(0, |profile| profile.catalog_generation)
+        },
+        config_version: existing.map_or(1, |profile| profile.config_version.saturating_add(1)),
+        status: if declaration_changed {
+            "disconnected".into()
+        } else {
+            existing
+                .map(|profile| profile.status.clone())
+                .unwrap_or_else(default_mcp_status)
+        },
+        last_error: if declaration_changed {
+            None
+        } else {
+            existing.and_then(|profile| profile.last_error.clone())
+        },
+        stderr_tail: if declaration_changed {
+            None
+        } else {
+            existing.and_then(|profile| profile.stderr_tail.clone())
+        },
         last_inspected_at: if declaration_changed {
             None
         } else {
@@ -418,7 +533,7 @@ pub fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerProfi
 }
 
 #[tauri::command]
-pub fn save_mcp_server(
+pub async fn save_mcp_server(
     state: State<'_, AppState>,
     request: SaveMcpServerRequest,
 ) -> Result<McpServerProfile, String> {
@@ -428,6 +543,9 @@ pub fn save_mcp_server(
         .map(|id| mcp_server_profile(&state.repository, id))
         .transpose()?;
     let profile = mcp_profile_from_request(request, existing.as_ref(), now)?;
+    if existing.is_some() {
+        state.mcp_sessions.invalidate_server(profile.id).await;
+    }
     state
         .repository
         .put_json("mcp_server", &profile.id.to_string(), &profile)
@@ -436,7 +554,103 @@ pub fn save_mcp_server(
 }
 
 #[tauri::command]
-pub fn set_mcp_server_enabled(
+pub async fn add_pubmed_mcp_server(
+    state: State<'_, AppState>,
+    request: AddPubMedMcpServerRequest,
+) -> Result<McpServerProfile, String> {
+    let existing = state
+        .repository
+        .list_json::<McpServerProfile>("mcp_server")
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|profile| {
+            profile
+                .args
+                .iter()
+                .any(|arg| arg == "--omicsops-pubmed-mcp")
+        });
+    let id = existing
+        .as_ref()
+        .map_or_else(Uuid::new_v4, |profile| profile.id);
+    let api_key_account = format!("mcp/{id}/NCBI_API_KEY");
+    if let Some(api_key) = request
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        state
+            .credentials
+            .set(&api_key_account, api_key)
+            .map_err(|error| error.to_string())?;
+    }
+    let mut env_bindings = existing
+        .as_ref()
+        .map(|profile| profile.env_bindings.clone())
+        .unwrap_or_default();
+    env_bindings
+        .retain(|binding| binding.name != "NCBI_API_KEY" && binding.name != "NCBI_ADMIN_EMAIL");
+    if state
+        .credentials
+        .get(&api_key_account)
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        env_bindings.push(McpEnvBinding {
+            name: "NCBI_API_KEY".into(),
+            value: None,
+            credential_reference: Some(api_key_account),
+        });
+    }
+    if let Some(email) = request
+        .admin_email
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            existing.as_ref().and_then(|profile| {
+                profile
+                    .env_bindings
+                    .iter()
+                    .find(|binding| binding.name == "NCBI_ADMIN_EMAIL")
+                    .and_then(|binding| binding.value.clone())
+            })
+        })
+    {
+        env_bindings.push(McpEnvBinding {
+            name: "NCBI_ADMIN_EMAIL".into(),
+            value: Some(email),
+            credential_reference: None,
+        });
+    }
+    let command = std::env::current_exe()
+        .map_err(|error| format!("could not locate OmicsOps executable: {error}"))?
+        .to_string_lossy()
+        .into_owned();
+    let profile = mcp_profile_from_request(
+        SaveMcpServerRequest {
+            id: Some(id),
+            name: "PubMed".into(),
+            command,
+            args: vec!["--omicsops-pubmed-mcp".into()],
+            cwd: None,
+            timeout_secs: 60,
+            env_bindings,
+        },
+        existing.as_ref(),
+        Utc::now(),
+    )?;
+    state.mcp_sessions.invalidate_server(id).await;
+    state
+        .repository
+        .put_json("mcp_server", &id.to_string(), &profile)
+        .map_err(|error| error.to_string())?;
+    Ok(profile)
+}
+
+#[tauri::command]
+pub async fn set_mcp_server_enabled(
     state: State<'_, AppState>,
     request: SetMcpServerEnabledRequest,
 ) -> Result<McpServerProfile, String> {
@@ -445,24 +659,8 @@ pub fn set_mcp_server_enabled(
         return Err("inspect the MCP server before enabling it".into());
     }
     profile.enabled = request.enabled;
-    profile.updated_at = Utc::now();
-    state
-        .repository
-        .put_json("mcp_server", &profile.id.to_string(), &profile)
-        .map_err(|error| error.to_string())?;
-    Ok(profile)
-}
-
-#[tauri::command]
-pub fn set_mcp_launch_approval(
-    state: State<'_, AppState>,
-    request: SetMcpLaunchApprovalRequest,
-) -> Result<McpServerProfile, String> {
-    let mut profile = mcp_server_profile(&state.repository, request.server_id)?;
-    profile.launch_approved = request.approved;
-    if !request.approved {
-        profile.enabled = false;
-        profile.approved_tools.clear();
+    if !request.enabled {
+        state.mcp_sessions.invalidate_server(profile.id).await;
     }
     profile.updated_at = Utc::now();
     state
@@ -473,7 +671,27 @@ pub fn set_mcp_launch_approval(
 }
 
 #[tauri::command]
-pub fn set_mcp_tool_approval(
+pub async fn set_mcp_launch_approval(
+    state: State<'_, AppState>,
+    request: SetMcpLaunchApprovalRequest,
+) -> Result<McpServerProfile, String> {
+    let mut profile = mcp_server_profile(&state.repository, request.server_id)?;
+    profile.launch_approved = request.approved;
+    if !request.approved {
+        profile.enabled = false;
+        profile.approved_tools.clear();
+        state.mcp_sessions.invalidate_server(profile.id).await;
+    }
+    profile.updated_at = Utc::now();
+    state
+        .repository
+        .put_json("mcp_server", &profile.id.to_string(), &profile)
+        .map_err(|error| error.to_string())?;
+    Ok(profile)
+}
+
+#[tauri::command]
+pub async fn set_mcp_tool_approval(
     state: State<'_, AppState>,
     request: SetMcpToolApprovalRequest,
 ) -> Result<McpServerProfile, String> {
@@ -487,6 +705,9 @@ pub fn set_mcp_tool_approval(
         return Err(format!("MCP tool {tool} was not advertised by the server"));
     }
     profile.approved_tools.retain(|entry| entry != tool);
+    if !request.approved {
+        state.mcp_sessions.invalidate_server(profile.id).await;
+    }
     if request.approved {
         profile.approved_tools.push(tool.to_string());
         profile.approved_tools.sort();
@@ -506,32 +727,81 @@ pub async fn inspect_configured_mcp_server(
     request: InspectConfiguredMcpServerRequest,
 ) -> Result<McpResult, String> {
     let mut profile = mcp_server_profile(&state.repository, request.server_id)?;
-    let result = run_mcp(
-        &state.repository,
-        McpRequest {
-            project_id: request.project_id,
-            name: profile.name.clone(),
-            command: profile.command.clone(),
-            args: profile.args.clone(),
-            approved: request.approved,
-            tool: None,
-            arguments: None,
-            expected_schema_sha256: None,
-        },
-        false,
-    )
-    .await?;
+    if !request.approved {
+        return Err("inspecting an MCP subprocess requires explicit approval".into());
+    }
+    state.mcp_sessions.invalidate_server(profile.id).await;
+    profile.status = "connecting".into();
+    profile.last_error = None;
+    profile.updated_at = Utc::now();
+    state
+        .repository
+        .put_json("mcp_server", &profile.id.to_string(), &profile)
+        .map_err(|error| error.to_string())?;
+    let config = match resolved_mcp_config(&profile, request.project_id, &state.credentials) {
+        Ok(config) => config,
+        Err(error) => {
+            profile.status = "failed".into();
+            profile.last_error = Some(error.clone());
+            profile.updated_at = Utc::now();
+            let _ = state
+                .repository
+                .put_json("mcp_server", &profile.id.to_string(), &profile);
+            return Err(error);
+        }
+    };
+    let inspection = match state.mcp_sessions.inspect(config).await {
+        Ok(inspection) => inspection,
+        Err(error) => {
+            let error = error.to_string();
+            profile.status = "failed".into();
+            profile.last_error = Some(error.clone());
+            profile.updated_at = Utc::now();
+            let _ = state
+                .repository
+                .put_json("mcp_server", &profile.id.to_string(), &profile);
+            return Err(error);
+        }
+    };
+    let audit_id = Uuid::new_v4();
+    let result = McpResult {
+        server_name: inspection.server_name.clone(),
+        capabilities: inspection.capabilities.clone(),
+        tools: inspection.tools.clone(),
+        result: None,
+        audit_id,
+    };
     // A fresh discovery can change a tool's schema or behavior without changing its name.
     // Require the user to approve every tool again after each inspection.
     profile.approved_tools.clear();
     profile.launch_approved = true;
     profile.tools = result.tools.clone();
     profile.capabilities = result.capabilities.clone();
+    profile.tool_catalog_sha256 = Some(inspection.tool_catalog_sha256);
+    profile.catalog_generation = inspection.generation;
+    profile.status = "ready".into();
+    profile.last_error = None;
+    profile.stderr_tail = (!inspection.stderr_tail.is_empty()).then_some(inspection.stderr_tail);
     profile.last_inspected_at = Some(Utc::now());
     profile.updated_at = Utc::now();
     state
         .repository
         .put_json("mcp_server", &profile.id.to_string(), &profile)
+        .map_err(|error| error.to_string())?;
+    let audit = json!({
+        "id": audit_id,
+        "project_id": request.project_id,
+        "server": profile.name,
+        "command": profile.command,
+        "args": profile.args,
+        "operation": "inspect",
+        "approved": true,
+        "succeeded": true,
+        "timestamp": Utc::now(),
+    });
+    state
+        .repository
+        .put_json("mcp_audit", &audit_id.to_string(), &audit)
         .map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -541,6 +811,9 @@ pub async fn call_configured_mcp_tool(
     state: State<'_, AppState>,
     request: CallConfiguredMcpToolRequest,
 ) -> Result<McpResult, String> {
+    if !request.approved {
+        return Err("calling an MCP subprocess requires explicit approval".into());
+    }
     let profile = mcp_server_profile(&state.repository, request.server_id)?;
     if !profile.enabled {
         return Err("MCP server is disabled".into());
@@ -558,19 +831,26 @@ pub async fn call_configured_mcp_tool(
             request.tool.trim()
         ));
     }
-    run_mcp(
+    let schema = profile
+        .tools
+        .iter()
+        .find(|entry| entry.get("name").and_then(Value::as_str) == Some(request.tool.trim()))
+        .and_then(|entry| {
+            entry
+                .get("inputSchema")
+                .or_else(|| entry.get("input_schema"))
+                .cloned()
+        })
+        .unwrap_or_else(|| json!({"type":"object"}));
+    invoke_configured_mcp_tool_v4(
         &state.repository,
-        McpRequest {
-            project_id: request.project_id,
-            name: profile.name,
-            command: profile.command,
-            args: profile.args,
-            approved: request.approved,
-            tool: Some(request.tool),
-            arguments: request.arguments,
-            expected_schema_sha256: None,
-        },
-        true,
+        &state.mcp_sessions,
+        &state.credentials,
+        request.project_id,
+        request.server_id,
+        request.tool.trim(),
+        request.arguments.unwrap_or_else(|| json!({})),
+        schema_digest(&schema),
     )
     .await
 }
@@ -913,6 +1193,9 @@ mod tests {
                 name: "  papers  ".into(),
                 command: "npx".into(),
                 args: vec!["server-a".into()],
+                cwd: None,
+                timeout_secs: 60,
+                env_bindings: vec![],
             },
             None,
             now,
@@ -935,6 +1218,9 @@ mod tests {
                 name: "papers".into(),
                 command: "uvx".into(),
                 args: vec!["server-b".into()],
+                cwd: None,
+                timeout_secs: 60,
+                env_bindings: vec![],
             },
             Some(&discovered),
             now,
@@ -950,46 +1236,20 @@ mod tests {
 
 pub(crate) async fn invoke_configured_mcp_tool_v4(
     repository: &Repository,
+    sessions: &McpSessionManager,
+    credentials: &dyn CredentialVault,
     project_id: Uuid,
     server_id: Uuid,
     tool: &str,
     arguments: Value,
     expected_schema_sha256: String,
 ) -> Result<McpResult, String> {
-    invoke_configured_mcp_tool(
-        repository,
-        project_id,
-        server_id,
-        tool,
-        arguments,
-        Some(expected_schema_sha256),
-    )
-    .await
-}
-
-async fn invoke_configured_mcp_tool(
-    repository: &Repository,
-    project_id: Uuid,
-    server_id: Uuid,
-    tool: &str,
-    arguments: Value,
-    expected_schema_sha256: Option<String>,
-) -> Result<McpResult, String> {
-    let profile = mcp_server_profile(repository, server_id)?;
+    let mut profile = mcp_server_profile(repository, server_id)?;
     if !profile.enabled {
         return Err("MCP server is disabled".into());
     }
     if !profile.launch_approved {
         return Err("MCP server launch approval was revoked".into());
-    }
-    let declared = profile
-        .tools
-        .iter()
-        .any(|entry| entry.get("name").and_then(Value::as_str) == Some(tool));
-    if !declared {
-        return Err(format!(
-            "MCP tool {tool} is no longer declared by the server"
-        ));
     }
     if !profile
         .approved_tools
@@ -998,19 +1258,69 @@ async fn invoke_configured_mcp_tool(
     {
         return Err(format!("MCP tool {tool} approval was revoked"));
     }
-    run_mcp(
-        repository,
-        McpRequest {
-            project_id,
-            name: profile.name,
-            command: profile.command,
-            args: profile.args,
-            approved: true,
-            tool: Some(tool.into()),
-            arguments: Some(arguments),
-            expected_schema_sha256,
-        },
-        true,
-    )
-    .await
+    let config = resolved_mcp_config(&profile, project_id, credentials)?;
+    let invocation = match sessions
+        .call(
+            config,
+            tool,
+            arguments,
+            profile.tool_catalog_sha256.as_deref(),
+            Some(expected_schema_sha256.as_str()),
+        )
+        .await
+    {
+        Ok(invocation) => invocation,
+        Err(error) => {
+            let error = error.to_string();
+            let stale = error.contains("stale") || error.contains("schema changed");
+            profile.status = if stale {
+                "stale".into()
+            } else {
+                "failed".into()
+            };
+            if stale {
+                profile.enabled = false;
+                profile.approved_tools.clear();
+                profile.last_inspected_at = None;
+            }
+            profile.last_error = Some(error.clone());
+            profile.updated_at = Utc::now();
+            let _ = repository.put_json("mcp_server", &profile.id.to_string(), &profile);
+            return Err(error);
+        }
+    };
+    profile.status = "ready".into();
+    profile.last_error = None;
+    profile.tool_catalog_sha256 = Some(invocation.tool_catalog_sha256.clone());
+    profile.catalog_generation = invocation.generation;
+    profile.stderr_tail = (!invocation.stderr_tail.is_empty()).then_some(invocation.stderr_tail);
+    profile.updated_at = Utc::now();
+    repository
+        .put_json("mcp_server", &profile.id.to_string(), &profile)
+        .map_err(|error| error.to_string())?;
+    let audit_id = Uuid::new_v4();
+    let audit = json!({
+        "id": audit_id,
+        "project_id": project_id,
+        "server": profile.name,
+        "command": profile.command,
+        "args": profile.args,
+        "tool": tool,
+        "approved": true,
+        "attempts": 1,
+        "succeeded": true,
+        "catalog_sha256": invocation.tool_catalog_sha256,
+        "schema_sha256": expected_schema_sha256,
+        "timestamp": Utc::now(),
+    });
+    repository
+        .put_json("mcp_audit", &audit_id.to_string(), &audit)
+        .map_err(|error| error.to_string())?;
+    Ok(McpResult {
+        server_name: invocation.server_name,
+        capabilities: profile.capabilities,
+        tools: profile.tools,
+        result: Some(invocation.result),
+        audit_id,
+    })
 }

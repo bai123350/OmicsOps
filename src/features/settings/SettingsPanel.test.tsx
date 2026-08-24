@@ -88,6 +88,51 @@ describe("SettingsPanel model providers", () => {
     expect(onSetMcpToolApproval).toHaveBeenCalledWith("mcp-1", "search_papers", true);
   });
 
+  it("adds the native PubMed preset without skipping the approval workflow", async () => {
+    const onAddPubMedMcp = vi.fn().mockResolvedValue({});
+    render(<SettingsPanel locale="zh-CN" onClose={() => undefined} onAddPubMedMcp={onAddPubMedMcp} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "技能与 MCP" }));
+    fireEvent.change(screen.getByLabelText("NCBI API key"), { target: { value: "ncbi-secret" } });
+    fireEvent.change(screen.getByLabelText("NCBI admin email"), { target: { value: "scientist@example.org" } });
+    fireEvent.click(screen.getByRole("button", { name: "一键添加 PubMed MCP" }));
+
+    await waitFor(() => expect(onAddPubMedMcp).toHaveBeenCalledWith({ api_key: "ncbi-secret", admin_email: "scientist@example.org" }));
+    expect(screen.getByRole("button", { name: "一键添加 PubMed MCP" })).toBeInTheDocument();
+  });
+
+  it("persists MCP working directory, timeout, and credential environment bindings", async () => {
+    const onSaveMcpServer = vi.fn().mockResolvedValue({});
+    render(<SettingsPanel locale="zh-CN" onClose={() => undefined} onSaveMcpServer={onSaveMcpServer} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "技能与 MCP" }));
+    fireEvent.change(screen.getByLabelText("MCP server name"), { target: { value: "pubmed" } });
+    fireEvent.change(screen.getByLabelText("MCP server command"), { target: { value: "omicsops-desktop" } });
+    fireEvent.change(screen.getByLabelText("MCP working directory"), { target: { value: "E:/Science/project" } });
+    fireEvent.change(screen.getByLabelText("MCP timeout seconds"), { target: { value: "120" } });
+    fireEvent.click(screen.getByRole("button", { name: "添加变量" }));
+    fireEvent.change(screen.getByLabelText("MCP env name 1"), { target: { value: "NCBI_API_KEY" } });
+    fireEvent.change(screen.getByLabelText("MCP credential reference 1"), { target: { value: "ncbi/api-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存 MCP server" }));
+
+    await waitFor(() => expect(onSaveMcpServer).toHaveBeenCalledWith(expect.objectContaining({
+      name: "pubmed",
+      command: "omicsops-desktop",
+      cwd: "E:/Science/project",
+      timeout_secs: 120,
+      env_bindings: [{ name: "NCBI_API_KEY", credential_reference: "ncbi/api-key" }],
+    })));
+  });
+
+  it("shows MCP runtime status and bounded diagnostics", async () => {
+    const server = { id: "mcp-failed", name: "pubmed", command: "omicsops-desktop", args: ["--mcp-server", "pubmed"], enabled: false, launch_approved: false, approved_tools: [], tools: [], capabilities: {}, status: "failed", last_error: "server exited with code 1", stderr_tail: "invalid configuration", last_inspected_at: null, created_at: "", updated_at: "" };
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} mcpServers={[server]} />);
+    fireEvent.click(screen.getByRole("button", { name: "Skills and MCP" }));
+    expect(screen.getByText("Last run failed")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Latest diagnostics"));
+    expect(screen.getByText(/server exited with code 1/)).toBeInTheDocument();
+  });
+
   it("requires host-key confirmation before authenticated remote diagnostics", async () => {
     const connection = { id: "connection-1", label: "Lab SSH", host: "compute.example.org", port: 20090, username: "scientist", authentication: "password" as const, authentication_reference: "ssh/connection-1", host_key_fingerprint: null };
     const onTestConnection = vi.fn()

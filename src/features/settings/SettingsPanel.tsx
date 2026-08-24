@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Bot, CheckCircle2, Cloud, FolderOpen, KeyRound, Layers3, LoaderCircle, Monitor, Server, ShieldCheck, Wrench, X, XCircle } from "lucide-react";
-import type { ConnectionProfile, ConnectionTestResult, McpServerProfile, ModelProbeResult, ModelProfile, SkillPackage, WorkspaceProject } from "../../types";
+import type { ConnectionProfile, ConnectionTestResult, McpEnvBinding, McpServerProfile, ModelProbeResult, ModelProfile, SkillPackage, WorkspaceProject } from "../../types";
 import type { Locale } from "../workspace/copy";
 import "./settings.css";
 import "./model-form.css";
@@ -9,6 +9,8 @@ import "./remote-form.css";
 
 type SaveModelRequest = { id?: string; label: string; provider: ModelProfile["provider"]; base_url: string; model: string; credential?: string };
 type FormState = SaveModelRequest & { credential: string };
+type McpEnvFormBinding = McpEnvBinding & { mode: "literal" | "credential" };
+type SaveMcpServerRequest = { id?: string; name: string; command: string; args: string[]; cwd?: string | null; timeout_secs?: number | null; env_bindings?: McpEnvBinding[] };
 
 interface Props {
   locale: Locale;
@@ -21,11 +23,12 @@ interface Props {
   onImportSkill?: () => Promise<void>;
   onSetSkillEnabled?: (skillId: string, enabled: boolean) => Promise<SkillPackage>;
   mcpServers?: McpServerProfile[];
-  onSaveMcpServer?: (request: { id?: string; name: string; command: string; args: string[] }) => Promise<McpServerProfile>;
+  onSaveMcpServer?: (request: SaveMcpServerRequest) => Promise<McpServerProfile>;
   onInspectMcpServer?: (serverId: string) => Promise<void>;
   onSetMcpServerEnabled?: (serverId: string, enabled: boolean) => Promise<McpServerProfile>;
   onSetMcpLaunchApproval?: (serverId: string, approved: boolean) => Promise<McpServerProfile>;
   onSetMcpToolApproval?: (serverId: string, tool: string, approved: boolean) => Promise<McpServerProfile>;
+  onAddPubMedMcp?: (request: { api_key?: string; admin_email?: string }) => Promise<McpServerProfile>;
   connections?: ConnectionProfile[];
   selectedProject?: WorkspaceProject | null;
   onSaveConnection?: (profile: ConnectionProfile, secret: string) => Promise<void>;
@@ -40,7 +43,7 @@ const defaults: Record<ModelProfile["provider"], FormState> = {
   ollama: { provider: "ollama", label: "Ollama", base_url: "http://127.0.0.1:11434/", model: "", credential: "" },
 };
 
-export function SettingsPanel({ locale, onClose, modelProfiles = [], onSaveModel, onProbeModel, onListModels, skillPackages = [], onImportSkill, onSetSkillEnabled, mcpServers = [], onSaveMcpServer, onInspectMcpServer, onSetMcpServerEnabled, onSetMcpLaunchApproval, onSetMcpToolApproval, connections = [], selectedProject, onSaveConnection, onTestConnection, onConfirmHostKey, onBindProjectRemote }: Props) {
+export function SettingsPanel({ locale, onClose, modelProfiles = [], onSaveModel, onProbeModel, onListModels, skillPackages = [], onImportSkill, onSetSkillEnabled, mcpServers = [], onSaveMcpServer, onInspectMcpServer, onSetMcpServerEnabled, onSetMcpLaunchApproval, onSetMcpToolApproval, onAddPubMedMcp, connections = [], selectedProject, onSaveConnection, onTestConnection, onConfirmHostKey, onBindProjectRemote }: Props) {
   const zh = locale === "zh-CN";
   const [form, setForm] = useState<FormState | null>(null);
   const [saving, setSaving] = useState(false);
@@ -117,17 +120,23 @@ export function SettingsPanel({ locale, onClose, modelProfiles = [], onSaveModel
         </section>}
         {modelProfiles.length > 0 && <div className="configured-models">{modelProfiles.map((profile) => { const probe = modelTests[profile.id]; const choices = modelChoices[profile.id] ?? []; return <div key={profile.id}><span><b>{profile.label}</b><small>{profile.model} · {profile.provider}</small></span><button onClick={() => setForm({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model: profile.model, credential: "" })}>{zh ? "编辑" : "Edit"}</button><button disabled={!onListModels} onClick={() => void discoverModels(profile.id)}>{zh ? "可用模型" : "Models"}</button><button disabled={probe?.state === "testing" || !onProbeModel} onClick={() => void testModel(profile.id)}>{probe?.state === "testing" ? <><LoaderCircle className="spin" size={13} />{zh ? "测试中" : "Testing"}</> : (zh ? "测试" : "Test")}</button>{choices.length > 0 && <div className="model-choices"><small>{zh ? "网关当前可用，点击后保存：" : "Available now; click to edit:"}</small>{choices.map((model) => <button key={model} onClick={() => setForm({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model, credential: "" })}>{model}</button>)}</div>}{probe?.state === "success" && probe.result && <div className="model-probe-result success" role="status"><CheckCircle2 size={15} /><span><b>{zh ? "连接成功" : "Connection succeeded"}</b><small>{probe.result.model} · {probe.result.latency_ms} ms · {probe.result.endpoint}</small><code>{probe.result.response_preview}</code></span></div>}{probe?.state === "error" && <div className="model-probe-result error" role="alert"><XCircle size={15} /><span><b>{zh ? "测试失败" : "Test failed"}</b><small>{probe.message}</small></span></div>}</div>; })}</div>}
         <div className="settings-note"><ShieldCheck size={18} /><span><b>{zh ? "默认无遥测" : "Telemetry off by default"}</b><small>{zh ? "诊断包仅在主动导出时生成，并经过凭据脱敏。" : "Diagnostic bundles are generated only on export and redact credentials."}</small></span></div>
-      </main> : section === "remote" ? <RemoteSettings locale={locale} connections={connections} selectedProject={selectedProject} onSave={onSaveConnection} onTest={onTestConnection} onConfirm={onConfirmHostKey} onBind={onBindProjectRemote} /> : <SkillsAndMcpSettings locale={locale} skillPackages={skillPackages} skillsBusy={skillsBusy} skillError={skillError} onImportSkill={onImportSkill ? importSkill : undefined} onSetSkillEnabled={onSetSkillEnabled} mcpServers={mcpServers} selectedProject={selectedProject} onSaveMcpServer={onSaveMcpServer} onInspectMcpServer={onInspectMcpServer} onSetMcpServerEnabled={onSetMcpServerEnabled} onSetMcpLaunchApproval={onSetMcpLaunchApproval} onSetMcpToolApproval={onSetMcpToolApproval} />}
+      </main> : section === "remote" ? <RemoteSettings locale={locale} connections={connections} selectedProject={selectedProject} onSave={onSaveConnection} onTest={onTestConnection} onConfirm={onConfirmHostKey} onBind={onBindProjectRemote} /> : <SkillsAndMcpSettings locale={locale} skillPackages={skillPackages} skillsBusy={skillsBusy} skillError={skillError} onImportSkill={onImportSkill ? importSkill : undefined} onSetSkillEnabled={onSetSkillEnabled} mcpServers={mcpServers} selectedProject={selectedProject} onSaveMcpServer={onSaveMcpServer} onInspectMcpServer={onInspectMcpServer} onSetMcpServerEnabled={onSetMcpServerEnabled} onSetMcpLaunchApproval={onSetMcpLaunchApproval} onSetMcpToolApproval={onSetMcpToolApproval} onAddPubMedMcp={onAddPubMedMcp} />}
     </div>
   </section></div>;
 }
 
-function SkillsAndMcpSettings({ locale, skillPackages, skillsBusy, skillError, onImportSkill, onSetSkillEnabled, mcpServers, selectedProject, onSaveMcpServer, onInspectMcpServer, onSetMcpServerEnabled, onSetMcpLaunchApproval, onSetMcpToolApproval }: { locale: Locale; skillPackages: SkillPackage[]; skillsBusy: boolean; skillError: string; onImportSkill?: () => Promise<void>; onSetSkillEnabled?: Props["onSetSkillEnabled"]; mcpServers: McpServerProfile[]; selectedProject?: WorkspaceProject | null; onSaveMcpServer?: Props["onSaveMcpServer"]; onInspectMcpServer?: Props["onInspectMcpServer"]; onSetMcpServerEnabled?: Props["onSetMcpServerEnabled"]; onSetMcpLaunchApproval?: Props["onSetMcpLaunchApproval"]; onSetMcpToolApproval?: Props["onSetMcpToolApproval"] }) {
+function emptyMcpForm() {
+  return { name: "", command: "", args: "", cwd: "", timeout_secs: 60, env_bindings: [] as McpEnvFormBinding[] };
+}
+
+function SkillsAndMcpSettings({ locale, skillPackages, skillsBusy, skillError, onImportSkill, onSetSkillEnabled, mcpServers, selectedProject, onSaveMcpServer, onInspectMcpServer, onSetMcpServerEnabled, onSetMcpLaunchApproval, onSetMcpToolApproval, onAddPubMedMcp }: { locale: Locale; skillPackages: SkillPackage[]; skillsBusy: boolean; skillError: string; onImportSkill?: () => Promise<void>; onSetSkillEnabled?: Props["onSetSkillEnabled"]; mcpServers: McpServerProfile[]; selectedProject?: WorkspaceProject | null; onSaveMcpServer?: Props["onSaveMcpServer"]; onInspectMcpServer?: Props["onInspectMcpServer"]; onSetMcpServerEnabled?: Props["onSetMcpServerEnabled"]; onSetMcpLaunchApproval?: Props["onSetMcpLaunchApproval"]; onSetMcpToolApproval?: Props["onSetMcpToolApproval"]; onAddPubMedMcp?: Props["onAddPubMedMcp"] }) {
   const zh = locale === "zh-CN";
-  const [mcpForm, setMcpForm] = useState<{ id?: string; name: string; command: string; args: string }>({ name: "", command: "", args: "" });
+  const [mcpForm, setMcpForm] = useState<{ id?: string; name: string; command: string; args: string; cwd: string; timeout_secs: number; env_bindings: McpEnvFormBinding[] }>(emptyMcpForm());
   const [mcpBusy, setMcpBusy] = useState<string | null>(null);
   const [mcpError, setMcpError] = useState("");
   const [inspectionApprovals, setInspectionApprovals] = useState<Record<string, boolean>>({});
+  const [pubmedApiKey, setPubmedApiKey] = useState("");
+  const [pubmedEmail, setPubmedEmail] = useState("");
   const categorizedSkills = skillPackages.filter((skill) => skill.category);
   const ungroupedSkills = skillPackages.filter((skill) => !skill.category);
   const skillGroups = Array.from(new Set(categorizedSkills.map((skill) => skill.category!)))
@@ -138,8 +147,35 @@ function SkillsAndMcpSettings({ locale, skillPackages, skillsBusy, skillError, o
     if (!onSaveMcpServer) return;
     setMcpBusy("save"); setMcpError("");
     try {
-      await onSaveMcpServer({ ...mcpForm, args: mcpForm.args.split(/\r?\n/).map((value) => value.trim()).filter(Boolean) });
-      setMcpForm({ name: "", command: "", args: "" });
+      const env_bindings: McpEnvBinding[] = mcpForm.env_bindings.map((binding): McpEnvBinding => ({
+        name: binding.name.trim(),
+        ...(binding.mode === "credential"
+          ? { credential_reference: binding.credential_reference?.trim() || null }
+          : { value: binding.value ?? "" }),
+      })).filter((binding) => binding.name.length > 0);
+      if (mcpForm.env_bindings.some((binding) => !binding.name.trim())) {
+        throw new Error(zh ? "环境变量名称不能为空。" : "Environment variable names cannot be empty.");
+      }
+      if (env_bindings.some((binding) => !binding.value && !binding.credential_reference)) {
+        throw new Error(zh ? "请为每个环境变量填写值或凭据引用。" : "Provide a value or credential reference for every environment variable.");
+      }
+      if (!Number.isInteger(mcpForm.timeout_secs) || mcpForm.timeout_secs < 1 || mcpForm.timeout_secs > 3600) {
+        throw new Error(zh ? "超时必须是 1–3600 秒。" : "Timeout must be between 1 and 3600 seconds.");
+      }
+      const request: SaveMcpServerRequest = {
+        ...(mcpForm.id ? { id: mcpForm.id } : {}),
+        name: mcpForm.name,
+        command: mcpForm.command,
+        args: mcpForm.args.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+      };
+      // Keep the original request shape for new installations whose host has
+      // not yet migrated the advanced MCP columns. Existing profiles send the
+      // explicit values so clearing an advanced field is possible.
+      if (mcpForm.id || mcpForm.cwd.trim()) request.cwd = mcpForm.cwd.trim() || null;
+      if (mcpForm.id || mcpForm.timeout_secs !== 60) request.timeout_secs = mcpForm.timeout_secs;
+      if (mcpForm.id || env_bindings.length > 0) request.env_bindings = env_bindings;
+      await onSaveMcpServer(request);
+      setMcpForm(emptyMcpForm());
     } catch (reason) { setMcpError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setMcpBusy(null); }
   }
@@ -149,6 +185,37 @@ function SkillsAndMcpSettings({ locale, skillPackages, skillsBusy, skillError, o
     try { await action(); }
     catch (reason) { setMcpError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setMcpBusy(null); }
+  }
+
+  function editMcpServer(server: McpServerProfile) {
+    setMcpForm({
+      id: server.id,
+      name: server.name,
+      command: server.command,
+      args: server.args.join("\n"),
+      cwd: server.cwd ?? "",
+      timeout_secs: server.timeout_secs ?? 60,
+      // Literal values are intentionally not loaded into the webview. The
+      // host may keep them, or the user can enter a replacement value.
+      env_bindings: (server.env_bindings ?? []).map((binding) => ({
+        name: binding.name,
+        mode: binding.credential_reference ? "credential" : "literal",
+        value: "",
+        credential_reference: binding.credential_reference ?? "",
+      })),
+    });
+  }
+
+  function addEnvBinding() {
+    setMcpForm((current) => ({ ...current, env_bindings: [...current.env_bindings, { name: "", mode: "credential", credential_reference: "" }] }));
+  }
+
+  function updateEnvBinding(index: number, update: Partial<McpEnvFormBinding>) {
+    setMcpForm((current) => ({ ...current, env_bindings: current.env_bindings.map((binding, candidate) => candidate === index ? { ...binding, ...update } : binding) }));
+  }
+
+  function removeEnvBinding(index: number) {
+    setMcpForm((current) => ({ ...current, env_bindings: current.env_bindings.filter((_, candidate) => candidate !== index) }));
   }
 
   return <main className="skills-mcp-settings">
@@ -170,13 +237,21 @@ function SkillsAndMcpSettings({ locale, skillPackages, skillsBusy, skillError, o
 
     <div className="mcp-divider" />
     <div className="settings-heading"><h3>{zh ? "MCP servers" : "MCP servers"}</h3><p>{zh ? "配置本地 stdio server，先显式批准一次检查，再逐个批准可调用的工具。保存配置不会启动进程。" : "Configure local stdio servers, explicitly approve inspection, then approve callable tools one by one. Saving never launches a process."}</p></div>
+    <section className="mcp-preset" aria-label={zh ? "PubMed MCP 预设" : "PubMed MCP preset"}>
+      <div><b>{zh ? "添加 PubMed MCP" : "Add PubMed MCP"}</b><small>{zh ? "使用应用内置的原生 E-utilities server；添加后仍需检查、启用和逐工具授权。API key 仅发送到桌面主进程保存。" : "Use the native E-utilities server bundled with the app. Inspection, enablement, and per-tool approval are still required. The API key is sent only to the desktop host for storage."}</small></div>
+      <div className="mcp-preset-grid"><label>{zh ? "NCBI API key（可选）" : "NCBI API key (optional)"}<input aria-label="NCBI API key" type="password" autoComplete="new-password" value={pubmedApiKey} onChange={(event) => setPubmedApiKey(event.target.value)} /></label><label>{zh ? "管理员邮箱（可选）" : "Admin email (optional)"}<input aria-label="NCBI admin email" type="email" value={pubmedEmail} onChange={(event) => setPubmedEmail(event.target.value)} /></label></div>
+      <div className="mcp-form-actions"><button className="primary" disabled={mcpBusy !== null || !onAddPubMedMcp} onClick={() => void runMcpAction("pubmed", async () => { await onAddPubMedMcp!({ api_key: pubmedApiKey, admin_email: pubmedEmail }); setPubmedApiKey(""); })}>{mcpBusy === "pubmed" ? (zh ? "添加中…" : "Adding…") : (zh ? "一键添加 PubMed MCP" : "Add PubMed MCP")}</button></div>
+    </section>
     <section className="mcp-form" aria-label={zh ? "MCP server 配置" : "MCP server configuration"}>
-      <div className="mcp-form-grid"><label>{zh ? "名称" : "Name"}<input aria-label="MCP server name" value={mcpForm.name} onChange={(event) => setMcpForm({ ...mcpForm, name: event.target.value })} /></label><label>{zh ? "启动命令" : "Command"}<input aria-label="MCP server command" placeholder="npx" value={mcpForm.command} onChange={(event) => setMcpForm({ ...mcpForm, command: event.target.value })} /></label><label className="wide">{zh ? "参数（每行一个）" : "Arguments (one per line)"}<textarea aria-label="MCP server arguments" rows={3} placeholder={"-y\n@modelcontextprotocol/server-filesystem\nE:\\Science\\project"} value={mcpForm.args} onChange={(event) => setMcpForm({ ...mcpForm, args: event.target.value })} /></label></div>
-      <div className="mcp-form-actions">{mcpForm.id && <button onClick={() => setMcpForm({ name: "", command: "", args: "" })}>{zh ? "取消编辑" : "Cancel edit"}</button>}<button className="primary" disabled={mcpBusy !== null || !onSaveMcpServer || !mcpForm.name.trim() || !mcpForm.command.trim()} onClick={() => void saveServer()}>{zh ? "保存 MCP server" : "Save MCP server"}</button></div>
+      <div className="mcp-form-grid"><label>{zh ? "名称" : "Name"}<input aria-label="MCP server name" value={mcpForm.name} onChange={(event) => setMcpForm({ ...mcpForm, name: event.target.value })} /></label><label>{zh ? "启动命令" : "Command"}<input aria-label="MCP server command" placeholder="npx" value={mcpForm.command} onChange={(event) => setMcpForm({ ...mcpForm, command: event.target.value })} /></label><label>{zh ? "工作目录（可选）" : "Working directory (optional)"}<input aria-label="MCP working directory" placeholder={zh ? "继承项目目录" : "Inherit project directory"} value={mcpForm.cwd} onChange={(event) => setMcpForm({ ...mcpForm, cwd: event.target.value })} /></label><label>{zh ? "超时（秒）" : "Timeout (seconds)"}<input aria-label="MCP timeout seconds" type="number" min={1} max={3600} step={1} value={mcpForm.timeout_secs} onChange={(event) => setMcpForm({ ...mcpForm, timeout_secs: Number(event.target.value) })} /></label><label className="wide">{zh ? "参数（每行一个）" : "Arguments (one per line)"}<textarea aria-label="MCP server arguments" rows={3} placeholder={"-y\n@modelcontextprotocol/server-filesystem\nE:\\Science\\project"} value={mcpForm.args} onChange={(event) => setMcpForm({ ...mcpForm, args: event.target.value })} /></label></div>
+      <div className="mcp-env-bindings"><div className="mcp-subheading"><span><b>{zh ? "环境变量绑定" : "Environment bindings"}</b><small>{zh ? "建议使用凭据引用；literal 值不会显示在已保存的 server 卡片中。" : "Credential references are preferred; literal values are never shown on saved server cards."}</small></span><button type="button" onClick={addEnvBinding}>{zh ? "添加变量" : "Add variable"}</button></div>{mcpForm.env_bindings.length === 0 ? <small className="mcp-muted">{zh ? "未配置环境变量" : "No environment variables configured"}</small> : mcpForm.env_bindings.map((binding, index) => <div className="mcp-env-row" key={`${index}-${binding.name}`}><input aria-label={`MCP env name ${index + 1}`} placeholder="NCBI_API_KEY" value={binding.name} onChange={(event) => updateEnvBinding(index, { name: event.target.value })} /><select aria-label={`MCP env mode ${index + 1}`} value={binding.mode} onChange={(event) => updateEnvBinding(index, { mode: event.target.value as McpEnvFormBinding["mode"], value: "", credential_reference: "" })}><option value="credential">{zh ? "凭据引用" : "Credential reference"}</option><option value="literal">literal</option></select>{binding.mode === "credential" ? <input aria-label={`MCP credential reference ${index + 1}`} placeholder="ncbi/api-key" value={binding.credential_reference ?? ""} onChange={(event) => updateEnvBinding(index, { credential_reference: event.target.value })} /> : <input aria-label={`MCP literal value ${index + 1}`} type="password" autoComplete="new-password" placeholder={zh ? "仅在保存时提交" : "Sent only when saved"} value={binding.value ?? ""} onChange={(event) => updateEnvBinding(index, { value: event.target.value })} />}<button type="button" aria-label={`${zh ? "移除环境变量" : "Remove environment variable"} ${index + 1}`} onClick={() => removeEnvBinding(index)}>×</button></div>)}</div>
+      <div className="mcp-form-actions">{mcpForm.id && <button onClick={() => setMcpForm(emptyMcpForm())}>{zh ? "取消编辑" : "Cancel edit"}</button>}<button className="primary" disabled={mcpBusy !== null || !onSaveMcpServer || !mcpForm.name.trim() || !mcpForm.command.trim()} onClick={() => void saveServer()}>{zh ? "保存 MCP server" : "Save MCP server"}</button></div>
     </section>
     {mcpError && <div className="skill-error" role="alert">{mcpError}</div>}
     <div className="mcp-list">{mcpServers.length === 0 ? <div className="skill-empty">{zh ? "尚未配置 MCP server" : "No MCP servers configured"}</div> : mcpServers.map((server) => <article key={server.id}>
-      <div className="mcp-server-title"><span><b>{server.name}</b><code>{[server.command, ...server.args].join(" ")}</code><small>{server.last_inspected_at ? (zh ? `已发现 ${server.tools.length} 个工具` : `${server.tools.length} tools discovered`) : (zh ? "尚未检查" : "Not inspected")}</small></span><div><button disabled={mcpBusy !== null} onClick={() => setMcpForm({ id: server.id, name: server.name, command: server.command, args: server.args.join("\n") })}>{zh ? "编辑" : "Edit"}</button><button disabled={mcpBusy !== null || !server.last_inspected_at || !onSetMcpServerEnabled} onClick={() => void runMcpAction(`enable:${server.id}`, () => onSetMcpServerEnabled!(server.id, !server.enabled))}>{server.enabled ? (zh ? "停用" : "Disable") : (zh ? "启用" : "Enable")}</button></div></div>
+      <div className="mcp-server-title"><span><b>{server.name}</b><code>{[server.command, ...server.args].join(" ")}</code><small>{server.last_inspected_at ? (zh ? `已发现 ${server.tools.length} 个工具` : `${server.tools.length} tools discovered`) : (zh ? "尚未检查" : "Not inspected")}</small></span><div><button disabled={mcpBusy !== null} onClick={() => editMcpServer(server)}>{zh ? "编辑" : "Edit"}</button><button disabled={mcpBusy !== null || !server.last_inspected_at || !onSetMcpServerEnabled} onClick={() => void runMcpAction(`enable:${server.id}`, () => onSetMcpServerEnabled!(server.id, !server.enabled))}>{server.enabled ? (zh ? "停用" : "Disable") : (zh ? "启用" : "Enable")}</button></div></div>
+      <div className="mcp-profile-meta"><span className={`mcp-status-badge ${server.status === "ready" || server.enabled ? "ready" : server.status === "failed" || server.last_error ? "failed" : ""}`}>{mcpStatusLabel(server, zh)}</span>{server.timeout_secs && <small>{server.timeout_secs}s timeout</small>}{server.cwd && <small>{server.cwd}</small>}{server.env_bindings && server.env_bindings.length > 0 && <small>{server.env_bindings.length} env bindings</small>}</div>
+      {(server.last_error || server.stderr_tail) && <details className="mcp-error-details"><summary>{zh ? "最近一次诊断" : "Latest diagnostics"}</summary><code>{[server.last_error, server.stderr_tail].filter(Boolean).join("\n")}</code></details>}
       <label className="mcp-launch-approval"><input type="checkbox" checked={inspectionApprovals[server.id] ?? false} onChange={(event) => setInspectionApprovals((current) => ({ ...current, [server.id]: event.target.checked }))} />{zh ? "我批准本次启动该本地进程，仅用于 initialize 和 tools/list" : "Approve one process launch for initialize and tools/list only"}</label>
       <button className="mcp-inspect" disabled={mcpBusy !== null || !selectedProject || !inspectionApprovals[server.id] || !onInspectMcpServer} onClick={() => void runMcpAction(`inspect:${server.id}`, async () => { await onInspectMcpServer!(server.id); setInspectionApprovals((current) => ({ ...current, [server.id]: false })); })}>{mcpBusy === `inspect:${server.id}` ? (zh ? "检查中…" : "Inspecting…") : (zh ? "检查并发现工具" : "Inspect and discover tools")}</button>
       {server.launch_approved && <button className="mcp-inspect" disabled={mcpBusy !== null} onClick={() => void runMcpAction(`launch:${server.id}`, async () => { const updated = onSetMcpLaunchApproval ? await onSetMcpLaunchApproval(server.id, false) : await invoke<McpServerProfile>("set_mcp_launch_approval", { request: { server_id: server.id, approved: false } }); Object.assign(server, updated); })}>{zh ? "撤销启动授权" : "Revoke launch approval"}</button>}
@@ -186,6 +261,16 @@ function SkillsAndMcpSettings({ locale, skillPackages, skillsBusy, skillError, o
     </article>)}</div>
     <div className="settings-note"><ShieldCheck size={18} /><span><b>{zh ? "技能与 MCP 均默认不启用" : "Skills and MCP are disabled by default"}</b><small>{zh ? "MCP 检查、启用和工具权限相互独立；修改启动命令或重新检查都会撤销已有工具授权。" : "Inspection, enablement, and tool approval are separate; changing the launch command or inspecting again revokes tool approvals."}</small></span></div>
   </main>;
+}
+
+function mcpStatusLabel(server: McpServerProfile, zh: boolean) {
+  if (server.status === "connecting") return zh ? "连接中" : "Connecting";
+  if (server.status === "stale") return zh ? "工具目录已过期，请重新检查" : "Tool catalog stale; inspect again";
+  if (server.status === "failed" || server.last_error) return zh ? "最近一次运行失败" : "Last run failed";
+  if (server.status === "ready") return zh ? "连接就绪" : "Ready";
+  if (server.status === "stopping") return zh ? "正在停止" : "Stopping";
+  if (server.enabled) return zh ? "已启用，等待调用" : "Enabled; waiting for a call";
+  return server.last_inspected_at ? (zh ? "已检查，默认停用" : "Inspected; disabled by default") : (zh ? "未检查" : "Not inspected");
 }
 
 function skillCategoryLabel(category: string, zh: boolean) {

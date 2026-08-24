@@ -5,6 +5,7 @@ pub mod inspection;
 pub mod kernel_commands;
 pub mod model_commands;
 pub mod p1_commands;
+pub mod pubmed_mcp;
 pub mod research_commands;
 pub mod skill_commands;
 pub mod sync_commands;
@@ -56,6 +57,7 @@ pub fn run() {
             app.manage(AppState {
                 repository,
                 credentials: SystemCredentialVault,
+                mcp_sessions: omicsops_mcp::McpSessionManager::new(),
                 active_runs: Arc::new(Mutex::new(HashMap::new())),
                 skills_root,
                 research_last_request: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -91,6 +93,7 @@ pub fn run() {
             p1_commands::call_mcp_tool,
             p1_commands::list_mcp_servers,
             p1_commands::save_mcp_server,
+            p1_commands::add_pubmed_mcp_server,
             p1_commands::set_mcp_server_enabled,
             p1_commands::set_mcp_launch_approval,
             p1_commands::inspect_configured_mcp_server,

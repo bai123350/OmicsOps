@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as api from "./tauri-api";
 import type { AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendAvailabilityV4, ComputeSelectionV4, ConnectionProfile, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, ProjectArtifact, RemoteFileEntry, RunSummaryV4, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
@@ -48,6 +48,7 @@ export default function DesktopApp() {
   const [notebookEntries, setNotebookEntries] = useState<NotebookEntry[]>([]);
   const [projectArtifacts, setProjectArtifacts] = useState<ProjectArtifact[]>([]);
   const [syncEntries, setSyncEntries] = useState<SyncEntry[]>([]);
+  const runActionGuards = useRef(new Set<string>());
 
   useEffect(() => {
     Promise.all([api.listProjects(), api.listModelProfiles(), api.listSkillPackages(), api.listMcpServers(), api.listConnections()]).then(([items, profiles, skills, servers, savedConnections]) => {
@@ -348,7 +349,7 @@ export default function DesktopApp() {
     }
   }
   if (loading) return <div className="desktop-loading">OmicsOps</div>;
-  const settings = settingsOpen ? <SettingsPanel locale={locale} onClose={() => setSettingsOpen(false)} modelProfiles={modelProfiles} skillPackages={skillPackages} mcpServers={mcpServers} connections={connections} selectedProject={selected} onSaveConnection={async (profile, secret) => { await api.saveConnection(profile, secret); setConnections(await api.listConnections()); }} onTestConnection={api.testConnection} onConfirmHostKey={async (profileId, fingerprint) => { await api.confirmHostKey(profileId, fingerprint); setConnections(await api.listConnections()); }} onBindProjectRemote={async (connectionId, remoteRoot) => { if (!selected) return; const updated = await api.updateProjectRemote(selected.id, connectionId, remoteRoot); setSelected(updated); setProjects((current) => current.map((project) => project.id === updated.id ? updated : project)); }} onSaveModel={async (request) => { const profile = await api.saveModelProfile(request); setModelProfiles((current) => [profile, ...current.filter((item) => item.id !== profile.id)]); setActiveModelProfileId(profile.id); }} onProbeModel={api.probeModelProfile} onListModels={api.listModelProfileModels} onImportSkill={async () => { const sourcePath = await api.chooseSkillDirectory(); if (!sourcePath) return; const skill = await api.importSkillDirectory(sourcePath); setSkillPackages((current) => [skill, ...current.filter((item) => item.id !== skill.id)]); }} onSetSkillEnabled={async (skillId, enabled) => { const updated = await api.setSkillEnabled(skillId, enabled); setSkillPackages(await api.listSkillPackages()); return updated; }} onSaveMcpServer={async (request) => { const updated = await api.saveMcpServer(request); setMcpServers(await api.listMcpServers()); return updated; }} onInspectMcpServer={async (serverId) => { if (!selected) throw new Error(locale === "zh-CN" ? "请先打开一个项目，再检查 MCP server。" : "Open a project before inspecting an MCP server."); await api.inspectConfiguredMcpServer(selected.id, serverId); setMcpServers(await api.listMcpServers()); }} onSetMcpServerEnabled={async (serverId, enabled) => { const updated = await api.setMcpServerEnabled(serverId, enabled); setMcpServers(await api.listMcpServers()); return updated; }} onSetMcpToolApproval={async (serverId, tool, approved) => { const updated = await api.setMcpToolApproval(serverId, tool, approved); setMcpServers(await api.listMcpServers()); return updated; }} /> : null;
+  const settings = settingsOpen ? <SettingsPanel locale={locale} onClose={() => setSettingsOpen(false)} modelProfiles={modelProfiles} skillPackages={skillPackages} mcpServers={mcpServers} connections={connections} selectedProject={selected} onSaveConnection={async (profile, secret) => { await api.saveConnection(profile, secret); setConnections(await api.listConnections()); }} onTestConnection={api.testConnection} onConfirmHostKey={async (profileId, fingerprint) => { await api.confirmHostKey(profileId, fingerprint); setConnections(await api.listConnections()); }} onBindProjectRemote={async (connectionId, remoteRoot) => { if (!selected) return; const updated = await api.updateProjectRemote(selected.id, connectionId, remoteRoot); setSelected(updated); setProjects((current) => current.map((project) => project.id === updated.id ? updated : project)); }} onSaveModel={async (request) => { const profile = await api.saveModelProfile(request); setModelProfiles((current) => [profile, ...current.filter((item) => item.id !== profile.id)]); setActiveModelProfileId(profile.id); }} onProbeModel={api.probeModelProfile} onListModels={api.listModelProfileModels} onImportSkill={async () => { const sourcePath = await api.chooseSkillDirectory(); if (!sourcePath) return; const skill = await api.importSkillDirectory(sourcePath); setSkillPackages((current) => [skill, ...current.filter((item) => item.id !== skill.id)]); }} onSetSkillEnabled={async (skillId, enabled) => { const updated = await api.setSkillEnabled(skillId, enabled); setSkillPackages(await api.listSkillPackages()); return updated; }} onSaveMcpServer={async (request) => { const updated = await api.saveMcpServer(request); setMcpServers(await api.listMcpServers()); return updated; }} onAddPubMedMcp={async (request) => { const updated = await api.addPubMedMcpServer(request); setMcpServers(await api.listMcpServers()); return updated; }} onInspectMcpServer={async (serverId) => { if (!selected) throw new Error(locale === "zh-CN" ? "请先打开一个项目，再检查 MCP server。" : "Open a project before inspecting an MCP server."); await api.inspectConfiguredMcpServer(selected.id, serverId); setMcpServers(await api.listMcpServers()); }} onSetMcpServerEnabled={async (serverId, enabled) => { const updated = await api.setMcpServerEnabled(serverId, enabled); setMcpServers(await api.listMcpServers()); return updated; }} onSetMcpToolApproval={async (serverId, tool, approved) => { const updated = await api.setMcpToolApproval(serverId, tool, approved); setMcpServers(await api.listMcpServers()); return updated; }} /> : null;
   if (!selected) return <><ProjectLibrary projects={projects} connections={connections} locale={locale} onLocaleChange={setLocale} onSettings={() => setSettingsOpen(true)} onOpen={setSelected} onDelete={async (projectId) => { await api.deleteProject(projectId); setProjects((current) => current.filter((project) => project.id !== projectId)); }} onChooseLocalRoot={api.chooseProjectDirectory} onCreate={async ({ template, name, localRoot, connectionId, remoteRoot }) => { const project = await api.createProject({ name, description: "", local_root: localRoot, template, connection_id: connectionId, remote_root: remoteRoot }); setProjects((current) => [project, ...current]); setSelected(project); }} />{settings}</>;
   const activeModel = modelProfiles.find((profile) => profile.id === activeModelProfileId) ?? null;
   return <><WorkspaceShell
@@ -360,6 +361,9 @@ export default function DesktopApp() {
     computeBackends={computeBackends} computeBackendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} approvalPolicy={approvalPolicy} computeEnvironment={computeEnvironment} computeBusy={computeBusy}
     onComputeBackendChange={setComputeBackendId} onContainerImageChange={setContainerImage} onAutonomyModeChange={setAutonomyMode} onApprovalPolicyChange={setApprovalPolicy} onComputeEnvironmentChange={setComputeEnvironment}
     onAnswerAgentQuestionV4={async (answerRunId, questionId, answer) => {
+      const actionKey = `answer:${answerRunId}:${questionId}`;
+      if (runActionGuards.current.has(actionKey)) return;
+      runActionGuards.current.add(actionKey);
       setAgentNotice("");
       try {
         await api.agentV4Answer(answerRunId, questionId, answer);
@@ -369,9 +373,14 @@ export default function DesktopApp() {
         setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
       } catch (error) {
         setAgentNotice(error instanceof Error ? error.message : String(error));
+      } finally {
+        runActionGuards.current.delete(actionKey);
       }
     }}
     onDecideToolApprovalV4={async (approvalRunId, approvalId, callHash, decision) => {
+      const actionKey = `approval:${approvalRunId}:${approvalId}`;
+      if (runActionGuards.current.has(actionKey)) return;
+      runActionGuards.current.add(actionKey);
       setAgentNotice("");
       try {
         await api.agentV4DecideToolApproval(approvalRunId, approvalId, callHash, decision);
@@ -381,9 +390,14 @@ export default function DesktopApp() {
         setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
       } catch (error) {
         setAgentNotice(error instanceof Error ? error.message : String(error));
+      } finally {
+        runActionGuards.current.delete(actionKey);
       }
     }}
     onResolveUncertainV4={async (uncertainRunId, callId, resolution, evidence) => {
+      const actionKey = `uncertain:${uncertainRunId}:${callId}`;
+      if (runActionGuards.current.has(actionKey)) return;
+      runActionGuards.current.add(actionKey);
       setAgentNotice("");
       try {
         await api.agentV4ResolveUncertain(uncertainRunId, callId, resolution, evidence);
@@ -393,9 +407,14 @@ export default function DesktopApp() {
         setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
       } catch (error) {
         setAgentNotice(error instanceof Error ? error.message : String(error));
+      } finally {
+        runActionGuards.current.delete(actionKey);
       }
     }}
     onResumeAgentRunV4={async (resumeRunId) => {
+      const actionKey = `resume:${resumeRunId}`;
+      if (runActionGuards.current.has(actionKey)) return;
+      runActionGuards.current.add(actionKey);
       setAgentNotice("");
       try {
         await api.agentV4Resume(resumeRunId);
@@ -404,6 +423,8 @@ export default function DesktopApp() {
         setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
       } catch (error) {
         setAgentNotice(error instanceof Error ? error.message : String(error));
+      } finally {
+        runActionGuards.current.delete(actionKey);
       }
     }}
     runStopping={runStopping}
@@ -461,6 +482,9 @@ export default function DesktopApp() {
     }}
     onApprovePlan={async () => {
       if (!v4Plan?.approval_hash) return;
+      const actionKey = `approve:${v4Plan.run_id}`;
+      if (runActionGuards.current.has(actionKey)) return;
+      runActionGuards.current.add(actionKey);
       setAgentNotice("");
       try {
         const approved = await api.agentV4ApprovePlan(v4Plan.run_id, v4Plan.approval_hash);
@@ -471,6 +495,8 @@ export default function DesktopApp() {
         setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
       } catch (error) {
         setAgentNotice(error instanceof Error ? error.message : String(error));
+      } finally {
+        runActionGuards.current.delete(actionKey);
       }
     }}
     onCancelRun={runId ? async () => {

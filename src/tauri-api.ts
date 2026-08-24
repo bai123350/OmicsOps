@@ -31,6 +31,7 @@ import type {
   NotebookEntry,
   ProjectArtifact,
   McpResult,
+  McpEnvBinding,
   McpServerProfile,
 } from "./types";
 
@@ -177,8 +178,35 @@ export async function listMcpServers(): Promise<McpServerProfile[]> {
   return isTauri() ? invoke("list_mcp_servers") : [];
 }
 
-export async function saveMcpServer(request: { id?: string; name: string; command: string; args?: string[] }): Promise<McpServerProfile> {
+export interface SaveMcpServerRequest {
+  id?: string;
+  name: string;
+  command: string;
+  args?: string[];
+  cwd?: string | null;
+  timeout_secs?: number | null;
+  env_bindings?: McpEnvBinding[];
+}
+
+export async function saveMcpServer(request: SaveMcpServerRequest): Promise<McpServerProfile> {
   return invoke("save_mcp_server", { request: { ...request, args: request.args ?? [] } });
+}
+
+/**
+ * Create or update the native PubMed MCP preset.  The key is sent only for
+ * this command so the desktop host can put it in the system credential vault;
+ * it is never part of the persisted MCP profile returned to the UI.
+ *
+ * The command is intentionally kept small so older hosts can implement the
+ * preset without exposing the MCP runtime to the webview.
+ */
+export async function addPubMedMcpServer(request: { api_key?: string; admin_email?: string } = {}): Promise<McpServerProfile> {
+  return invoke("add_pubmed_mcp_server", {
+    request: {
+      api_key: request.api_key?.trim() || null,
+      admin_email: request.admin_email?.trim() || null,
+    },
+  });
 }
 
 export async function setMcpServerEnabled(serverId: string, enabled: boolean): Promise<McpServerProfile> {

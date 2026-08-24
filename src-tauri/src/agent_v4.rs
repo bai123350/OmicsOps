@@ -12,6 +12,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use omicsops_adapters::{
+    credentials::SystemCredentialVault,
     kernel::{kernel_driver, validate_capture_paths, validate_kernel_code},
     llm::UnifiedModelClient,
     persistence::Repository,
@@ -36,6 +37,7 @@ use omicsops_knowledge::{
     McpToolIndexV4, MemoryDocumentV4, SkillDocumentV4, authorize_mcp_use, freeze_skill,
     markdown_sections, schema_digest, search_mcp_tools, search_memory, search_skills,
 };
+use omicsops_mcp::McpSessionManager;
 use omicsops_protocol::{
     AgentEventKindV4, AgentEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendDescriptorV4,
     ComputeBackendKindV4, ComputeSelectionV4, ContextArchiveV4, ContextCheckpointV4,
@@ -641,6 +643,13 @@ pub async fn agent_v4_resume(
     state: State<'_, AppState>,
     run_id: Uuid,
 ) -> Result<(), String> {
+    // A waiting execution removes itself from the active registry immediately
+    // after emitting its pause event. An approval can arrive in that narrow
+    // window, so give the old task time to yield before starting the resume.
+    // If another resume already won the slot, this request is idempotent.
+    if !wait_for_active_run_to_yield(&state.active_runs, run_id).await? {
+        return Ok(());
+    }
     let mut record = load_record(&state.repository, run_id)?;
     let Some(mut spec) = record.spec.clone() else {
         let project = workspace_project(&state.repository, record.project_id)?;
@@ -1019,14 +1028,11 @@ async fn spawn_execution(
     )
     .await?;
     let cancelled = Arc::new(AtomicBool::new(false));
-    if state
-        .active_runs
-        .lock()
-        .map_err(|_| "active run registry unavailable".to_string())?
-        .insert(spec.run_id, cancelled.clone())
-        .is_some()
-    {
-        return Err("V4 run is already active".into());
+    if !register_active_run(&state.active_runs, spec.run_id, cancelled.clone())? {
+        // Resume/approval actions are idempotent. A duplicate UI submission
+        // must not replace the cancellation token of the execution already
+        // running for this run ID.
+        return Ok(());
     }
     let repository = state.repository.clone();
     let active = state.active_runs.clone();
@@ -1107,9 +1113,60 @@ async fn spawn_execution(
             }
         }
         let _ = save_record(&repository, &record);
-        active.lock().expect("active runs").remove(&spec.run_id);
+        remove_active_run(&active, spec.run_id, &cancelled);
     });
     Ok(())
+}
+
+fn register_active_run(
+    active_runs: &Arc<std::sync::Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
+    run_id: Uuid,
+    token: Arc<AtomicBool>,
+) -> Result<bool, String> {
+    let mut active = active_runs
+        .lock()
+        .map_err(|_| "active run registry unavailable".to_string())?;
+    match active.entry(run_id) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(token);
+            Ok(true)
+        }
+        std::collections::hash_map::Entry::Occupied(_) => Ok(false),
+    }
+}
+
+fn remove_active_run(
+    active_runs: &Arc<std::sync::Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
+    run_id: Uuid,
+    token: &Arc<AtomicBool>,
+) {
+    let Ok(mut active) = active_runs.lock() else {
+        return;
+    };
+    if active
+        .get(&run_id)
+        .is_some_and(|current| Arc::ptr_eq(current, token))
+    {
+        active.remove(&run_id);
+    }
+}
+
+async fn wait_for_active_run_to_yield(
+    active_runs: &Arc<std::sync::Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
+    run_id: Uuid,
+) -> Result<bool, String> {
+    const POLL_ATTEMPTS: usize = 100;
+    for _ in 0..POLL_ATTEMPTS {
+        let is_active = active_runs
+            .lock()
+            .map_err(|_| "active run registry unavailable".to_string())?
+            .contains_key(&run_id);
+        if !is_active {
+            return Ok(true);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    Ok(false)
 }
 
 // Keeps V4 composition independent from Tauri internals; concrete credentials are resolved before spawning.
@@ -1235,6 +1292,8 @@ async fn compose(
     let runtime = Arc::new(RuntimeManagerV4::new(backend));
     let executor = Arc::new(DesktopToolExecutorV4 {
         repository: state.repository.clone(),
+        mcp_sessions: state.mcp_sessions.clone(),
+        credentials: state.credentials,
         filesystem,
         environment_port,
         selection: selection.clone(),
@@ -1824,6 +1883,8 @@ fn system_environment_ready(
 
 struct DesktopToolExecutorV4 {
     repository: Repository,
+    mcp_sessions: McpSessionManager,
+    credentials: SystemCredentialVault,
     filesystem: Arc<dyn ProjectFilesystemPortV4>,
     environment_port: Arc<dyn RuntimeEnvironmentPortV4>,
     selection: ComputeSelectionV4,
@@ -2087,6 +2148,8 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                 authorize_mcp_use(&indexed, expected_schema).map_err(|error| error.to_string())?;
                 let result = invoke_configured_mcp_tool_v4(
                     &self.repository,
+                    &self.mcp_sessions,
+                    &self.credentials,
                     self.project_id,
                     server_id,
                     tool,
@@ -3223,6 +3286,45 @@ mod tests {
     use url::Url;
 
     #[test]
+    fn duplicate_active_run_registration_preserves_the_original_token() {
+        let runs = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let run_id = Uuid::new_v4();
+        let original = Arc::new(AtomicBool::new(false));
+        let duplicate = Arc::new(AtomicBool::new(false));
+
+        assert!(register_active_run(&runs, run_id, original.clone()).unwrap());
+        assert!(!register_active_run(&runs, run_id, duplicate.clone()).unwrap());
+        let registered = runs.lock().unwrap().get(&run_id).unwrap().clone();
+        assert!(Arc::ptr_eq(&registered, &original));
+
+        registered.store(true, Ordering::SeqCst);
+        assert!(original.load(Ordering::SeqCst));
+        assert!(!duplicate.load(Ordering::SeqCst));
+
+        remove_active_run(&runs, run_id, &duplicate);
+        assert!(runs.lock().unwrap().contains_key(&run_id));
+        remove_active_run(&runs, run_id, &original);
+        assert!(!runs.lock().unwrap().contains_key(&run_id));
+    }
+
+    #[tokio::test]
+    async fn resume_waits_for_a_finishing_execution_to_release_its_slot() {
+        let runs = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let run_id = Uuid::new_v4();
+        let token = Arc::new(AtomicBool::new(false));
+        assert!(register_active_run(&runs, run_id, token.clone()).unwrap());
+
+        let releasing_runs = runs.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            remove_active_run(&releasing_runs, run_id, &token);
+        });
+
+        assert!(wait_for_active_run_to_yield(&runs, run_id).await.unwrap());
+        assert!(!runs.lock().unwrap().contains_key(&run_id));
+    }
+
+    #[test]
     fn direct_mode_builds_an_execution_contract_without_a_model_generated_plan() {
         let plan = direct_execution_plan(
             "run QC now",
@@ -3745,6 +3847,8 @@ mod tests {
 
         let executor = DesktopToolExecutorV4 {
             repository: Repository::open_in_memory().unwrap(),
+            mcp_sessions: McpSessionManager::new(),
+            credentials: SystemCredentialVault,
             filesystem: Arc::new(SshProjectFilesystemV4 {
                 session: session.clone(),
                 root: root.clone(),
@@ -3846,6 +3950,8 @@ mod tests {
         })));
         let executor = DesktopToolExecutorV4 {
             repository: Repository::open_in_memory().unwrap(),
+            mcp_sessions: McpSessionManager::new(),
+            credentials: SystemCredentialVault,
             filesystem: Arc::new(SshProjectFilesystemV4 {
                 session: session.clone(),
                 root: root.clone(),

@@ -261,16 +261,41 @@ export interface McpToolDefinition {
   [key: string]: unknown;
 }
 
+/**
+ * Environment variables supplied to an MCP process.
+ *
+ * Only one of `value` and `credential_reference` should be populated.  The
+ * latter is intentionally a reference rather than the secret itself; the
+ * desktop host resolves it immediately before spawning the process.
+ */
+export interface McpEnvBinding {
+  name: string;
+  value?: string | null;
+  credential_reference?: string | null;
+}
+
 export interface McpServerProfile {
   id: string;
   name: string;
   command: string;
   args: string[];
+  /** Optional working directory for the stdio process. */
+  cwd?: string | null;
+  /** MCP call timeout in seconds; the host defaults to 60 when omitted. */
+  timeout_secs?: number | null;
+  /** Persisted environment declarations; literal values are never rendered in the UI. */
+  env_bindings?: McpEnvBinding[];
   enabled: boolean;
   launch_approved: boolean;
   approved_tools: string[];
   tools: McpToolDefinition[];
   capabilities: Record<string, unknown>;
+  /** Configuration/schema state supplied by newer desktop runtimes. */
+  config_version?: number;
+  tool_catalog_sha256?: string | null;
+  status?: "disconnected" | "connecting" | "ready" | "stale" | "failed" | "stopping" | string;
+  last_error?: string | null;
+  stderr_tail?: string | null;
   last_inspected_at: string | null;
   created_at: string;
   updated_at: string;

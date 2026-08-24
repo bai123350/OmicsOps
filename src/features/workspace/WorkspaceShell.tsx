@@ -114,6 +114,10 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const [permissionMenuOpen, setPermissionMenuOpen] = useState(false);
   const [sentMessages, setSentMessages] = useState<string[]>([]);
   const [approved, setApproved] = useState(false);
+  const [sendBusy, setSendBusy] = useState(false);
+  const sendBusyRef = useRef(false);
+  const [approvePlanBusy, setApprovePlanBusy] = useState(false);
+  const approvePlanBusyRef = useRef(false);
   const [selectedImagePath, setSelectedImagePath] = useState("");
   const [imagePreview, setImagePreview] = useState<ProjectImagePreview | null>(null);
   const [previewBusy, setPreviewBusy] = useState(false);
@@ -129,7 +133,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const runActive = runStarted && !runFinished && !runPaused;
   // A paused run still owns the conversation sequence. Keep the composer
   // locked while approval/input cards remain usable inside the run trace.
-  const composerDisabled = agentBusy || (runStarted && !runFinished);
+  const composerDisabled = sendBusy || agentBusy || (runStarted && !runFinished);
   const activeConversation = conversations.find((item) => item.id === activeConversationId);
   const conversationTitle = activeConversation?.title || (zh ? "新会话" : "New conversation");
   const historicalAgentRunEventsV4 = effectiveActiveRunId
@@ -179,16 +183,36 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
 
   async function send() {
     const message = draft.trim();
-    if (!message || composerDisabled) return;
+    if (!message || composerDisabled || sendBusyRef.current) return;
+    sendBusyRef.current = true;
+    setSendBusy(true);
     setDraft("");
-    if (onSend) {
-      const mode = planModeEnabled ? "plan" : "chat";
-      setPlanSessionActive(mode === "plan");
-      const accepted = await onSend(message, mode);
-      if (accepted === false) setDraft((current) => current || message);
-      else if (planModeEnabled) setPlanModeEnabled(false);
-    } else {
-      setSentMessages((current) => [...current, message]);
+    try {
+      if (onSend) {
+        const mode = planModeEnabled ? "plan" : "chat";
+        setPlanSessionActive(mode === "plan");
+        const accepted = await onSend(message, mode);
+        if (accepted === false) setDraft((current) => current || message);
+        else if (planModeEnabled) setPlanModeEnabled(false);
+      } else {
+        setSentMessages((current) => [...current, message]);
+      }
+    } finally {
+      sendBusyRef.current = false;
+      setSendBusy(false);
+    }
+  }
+
+  async function approvePlan() {
+    if (approvePlanBusyRef.current) return;
+    approvePlanBusyRef.current = true;
+    setApprovePlanBusy(true);
+    try {
+      if (onApprovePlan) await onApprovePlan();
+      else setApproved(true);
+    } finally {
+      approvePlanBusyRef.current = false;
+      setApprovePlanBusy(false);
     }
   }
 
@@ -264,7 +288,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
 
     <aside className="context-pane" aria-label={t.context}>
       <div className="context-tabs" role="tablist">{(["files", "plan", "preview", "notebook", "explore", "runs"] as ContextTab[]).map((id) => <button key={id} role="tab" aria-selected={tab === id} onClick={() => setTab(id)}>{id === "files" ? t.files : id === "plan" ? (zh ? "Plan" : "Plan") : id === "preview" ? t.preview : id === "notebook" ? t.notebook : id === "explore" ? t.explore : t.runs}</button>)}</div>
-      <div className="context-content">{tab === "files" && <RemoteFileTree locale={locale} remoteFiles={remoteFiles} busy={filesBusy} notice={fileNotice} onUpload={onUploadFiles} onRefresh={onRefreshFiles} onDownload={onDownloadFile} syncEntries={syncEntries} onPauseSync={onPauseSync} onCancelSync={onCancelSync} onRetrySync={onRetrySync} />}{tab === "plan" && <V4PlanPanel locale={locale} active={showPlanPanel} planLoading={planLoading} v4Plan={v4Plan} planApproved={planApproved || approved} runStarted={runStarted} events={activeRunEventsV4} onApprove={() => { if (onApprovePlan) return onApprovePlan(); setApproved(true); }} onRegenerate={onRequestPlan} />}{tab === "preview" && <><div className="context-toolbar"><span>{t.overview}</span><button aria-label={t.expand} onClick={() => setExpanded(true)}><Expand size={16} /></button></div>{preview}</>}{tab === "notebook" && <Notebook locale={locale} entries={notebookEntries} artifacts={projectArtifacts} facts={memoryFacts} onSearch={onSearchMemory} onExport={onExportNotebook} />}{tab === "explore" && <KernelPanel locale={locale} sessions={kernelSessions} events={kernelEvents} busy={kernelBusy} notice={kernelNotice} onStart={onStartKernel} onExecute={onExecuteKernel} onInterrupt={onInterruptKernel} onStop={onStopKernel} onPromote={onPromoteKernelCell} />}{tab === "runs" && <RunSummary locale={locale} />}</div>
+      <div className="context-content">{tab === "files" && <RemoteFileTree locale={locale} remoteFiles={remoteFiles} busy={filesBusy} notice={fileNotice} onUpload={onUploadFiles} onRefresh={onRefreshFiles} onDownload={onDownloadFile} syncEntries={syncEntries} onPauseSync={onPauseSync} onCancelSync={onCancelSync} onRetrySync={onRetrySync} />}{tab === "plan" && <V4PlanPanel locale={locale} active={showPlanPanel} planLoading={planLoading} v4Plan={v4Plan} planApproved={planApproved || approved || approvePlanBusy} runStarted={runStarted} events={activeRunEventsV4} onApprove={approvePlan} onRegenerate={onRequestPlan} />}{tab === "preview" && <><div className="context-toolbar"><span>{t.overview}</span><button aria-label={t.expand} onClick={() => setExpanded(true)}><Expand size={16} /></button></div>{preview}</>}{tab === "notebook" && <Notebook locale={locale} entries={notebookEntries} artifacts={projectArtifacts} facts={memoryFacts} onSearch={onSearchMemory} onExport={onExportNotebook} />}{tab === "explore" && <KernelPanel locale={locale} sessions={kernelSessions} events={kernelEvents} busy={kernelBusy} notice={kernelNotice} onStart={onStartKernel} onExecute={onExecuteKernel} onInterrupt={onInterruptKernel} onStop={onStopKernel} onPromote={onPromoteKernelCell} />}{tab === "runs" && <RunSummary locale={locale} />}</div>
     </aside>
     {expanded && <div className="preview-overlay" role="dialog" aria-modal="true" aria-label={t.artifactPreview}><header><div><small>{project.name}</small><h2>{t.overview}</h2></div><button aria-label="Close" onClick={() => setExpanded(false)}><X /></button></header>{preview}</div>}
   </div>;
@@ -283,6 +307,8 @@ function PermissionOption({ icon, active, danger = false, disabled = false, titl
 function FileTree({ locale }: { locale: Locale }) { const zh = locale === "zh-CN"; return <div className="file-tree"><div className="context-heading"><b>{zh ? "项目文件" : "Project files"}</b><small>{zh ? "选择性同步" : "Selective sync"}</small></div><div className="tree-folder"><Folder size={15} />data <span>{zh ? "远端" : "remote"}</span></div><div className="tree-folder"><Folder size={15} />analysis</div><div className="tree-file"><FileBarChart size={15} />umap.png <em>1.2 MB</em></div><div className="tree-file"><FileText size={15} />markers.csv <em>84 KB</em></div><div className="tree-file"><NotebookPen size={15} />report.md <em>12 KB</em></div></div>; }
 function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncertain, onResume, historical = false }: { locale: Locale; events: AgentRunEventV4[]; onAnswer?: (runId: string, questionId: string, answer: string) => Promise<void> | void; onDecideApproval?: (runId: string, approvalId: string, callHash: string, decision: "approved" | "denied") => Promise<void> | void; onResolveUncertain?: (runId: string, callId: string, resolution: "side_effect_observed" | "side_effect_not_observed" | "compensated", evidence: string) => Promise<void> | void; onResume?: (runId: string) => Promise<void> | void; historical?: boolean }) {
   const zh = locale === "zh-CN";
+  const [resumeBusy, setResumeBusy] = useState(false);
+  const resumeBusyRef = useRef(false);
   const entries = coalesceV4ModelText(events);
   const progress = entries.filter(({ modelText }) => modelText !== undefined && modelText.trim());
   const technicalEntries = entries.filter(({ event, modelText }) => modelText === undefined && !isToolTrajectoryEvent(event) && !isHiddenTrajectoryEvent(event));
@@ -300,6 +326,17 @@ function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncer
   const status = terminal?.event.kind === "run_completed" ? (zh ? "已完成" : "Completed") : terminal?.event.kind === "run_cancelled" ? (zh ? "已终止" : "Cancelled") : terminal?.event.kind === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention") : terminal?.event.kind === "run_failed" ? (zh ? "失败" : "Failed") : pauseReason === "approval" ? (zh ? "等待工具审批" : "Waiting for approval") : pauseReason === "input" ? (zh ? "等待回答" : "Waiting for input") : pauseReason === "uncertain" ? (zh ? "等待副作用核验" : "Waiting for verification") : (zh ? "运行中" : "Running");
   const failed = terminal?.event.kind === "run_failed";
   const shouldExpand = !historical && (Boolean(pauseReason) || terminal?.event.kind === "run_failed" || terminal?.event.kind === "run_needs_attention");
+  async function resumeRun() {
+    if (!onResume || !events[0] || resumeBusyRef.current) return;
+    resumeBusyRef.current = true;
+    setResumeBusy(true);
+    try {
+      await onResume(events[0].run_id);
+    } finally {
+      resumeBusyRef.current = false;
+      setResumeBusy(false);
+    }
+  }
   return <>
     {progress.map(({ event, lastEvent, modelText }) => <article aria-label={zh ? "模型输出" : "Model output"} className="message assistant-message agent-work-update agent-public-progress" key={`${event.run_id}-${event.sequence}`}>
       <div className="assistant-avatar"><Bot size={17} /></div>
@@ -328,7 +365,7 @@ function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncer
           {event.event.kind === "tool_dispatch_uncertain" && onResolveUncertain && !isV4UncertainResolved(events, event.event.call_id) && <V4UncertainCard locale={locale} onResolve={(resolution, evidence) => onResolveUncertain(event.run_id, event.event.kind === "tool_dispatch_uncertain" ? event.event.call_id : "", resolution, evidence)} />}
         </div>
       </article>)}
-      {failed && onResume && <div className="v4-resume-run"><span>{zh ? "修正运行条件后可从已验证事件链继续。" : "Resume from the verified event chain after fixing the runtime condition."}</span><button onClick={() => void onResume(events[0].run_id)}>{zh ? "继续运行" : "Resume run"}</button></div>}
+      {failed && onResume && <div className="v4-resume-run"><span>{zh ? "修正运行条件后可从已验证事件链继续。" : "Resume from the verified event chain after fixing the runtime condition."}</span><button disabled={resumeBusy} onClick={() => void resumeRun()}>{resumeBusy ? (zh ? "恢复中…" : "Resuming…") : (zh ? "继续运行" : "Resume run")}</button></div>}
     </div>
     </details>
   </>;
@@ -336,14 +373,29 @@ function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncer
 function V4ApprovalCard({ locale, request, onDecide }: { locale: Locale; request: Extract<AgentRunEventV4["event"], { kind: "tool_approval_requested" }>['request']; onDecide: (decision: "approved" | "denied") => Promise<void> | void }) {
   const zh = locale === "zh-CN";
   const [busy, setBusy] = useState(false);
-  const decide = async (decision: "approved" | "denied") => { setBusy(true); try { await onDecide(decision); } finally { setBusy(false); } };
+  const busyRef = useRef(false);
+  const decide = async (decision: "approved" | "denied") => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    try { await onDecide(decision); } finally { busyRef.current = false; setBusy(false); }
+  };
   return <section className="v4-approval-card" aria-label={zh ? "工具审批" : "Tool approval"}><b>{zh ? "等待工具审批" : "Tool approval required"}</b><code>{request.call.tool_id}</code><p>{request.reason}</p><small>{request.effect} · SHA-256 {request.call_hash.slice(0, 12)}</small><div><button disabled={busy} onClick={() => void decide("denied")}>{zh ? "拒绝" : "Deny"}</button><button disabled={busy} onClick={() => void decide("approved")}>{zh ? "批准并继续" : "Approve and continue"}</button></div></section>;
 }
 function V4UncertainCard({ locale, onResolve }: { locale: Locale; onResolve: (resolution: "side_effect_observed" | "side_effect_not_observed" | "compensated", evidence: string) => Promise<void> | void }) {
   const zh = locale === "zh-CN";
   const [resolution, setResolution] = useState<"side_effect_observed" | "side_effect_not_observed" | "compensated">("side_effect_not_observed");
   const [evidence, setEvidence] = useState("");
-  return <section className="v4-uncertain-card" aria-label={zh ? "不确定副作用处理" : "Uncertain dispatch resolution"}><b>{zh ? "需要核实工具副作用" : "Verify the possible side effect"}</b><select value={resolution} onChange={(event) => setResolution(event.target.value as typeof resolution)}><option value="side_effect_not_observed">{zh ? "未观察到副作用，可安全重试" : "No side effect observed"}</option><option value="side_effect_observed">{zh ? "已观察到副作用，不要重试" : "Side effect observed"}</option><option value="compensated">{zh ? "副作用已补偿" : "Side effect compensated"}</option></select><input aria-label={zh ? "核验证据" : "Verification evidence"} value={evidence} onChange={(event) => setEvidence(event.target.value)} placeholder={zh ? "填写核验证据" : "Describe verification evidence"} /><button disabled={!evidence.trim()} onClick={() => void onResolve(resolution, evidence.trim())}>{zh ? "保存证据并继续" : "Save evidence and continue"}</button></section>;
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  async function resolve() {
+    const trimmedEvidence = evidence.trim();
+    if (!trimmedEvidence || busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    try { await onResolve(resolution, trimmedEvidence); } finally { busyRef.current = false; setBusy(false); }
+  }
+  return <section className="v4-uncertain-card" aria-label={zh ? "不确定副作用处理" : "Uncertain dispatch resolution"}><b>{zh ? "需要核实工具副作用" : "Verify the possible side effect"}</b><select disabled={busy} value={resolution} onChange={(event) => setResolution(event.target.value as typeof resolution)}><option value="side_effect_not_observed">{zh ? "未观察到副作用，可安全重试" : "No side effect observed"}</option><option value="side_effect_observed">{zh ? "已观察到副作用，不要重试" : "Side effect observed"}</option><option value="compensated">{zh ? "副作用已补偿" : "Side effect compensated"}</option></select><input disabled={busy} aria-label={zh ? "核验证据" : "Verification evidence"} value={evidence} onChange={(event) => setEvidence(event.target.value)} placeholder={zh ? "填写核验证据" : "Describe verification evidence"} /><button disabled={busy || !evidence.trim()} onClick={() => void resolve()}>{busy ? (zh ? "处理中…" : "Resolving…") : (zh ? "保存证据并继续" : "Save evidence and continue")}</button></section>;
 }
 function isV4ApprovalDecided(events: AgentRunEventV4[], approvalId: string) {
   return events.some((event) => event.event.kind === "tool_approval_decided" && event.event.approval_id === approvalId);
@@ -459,7 +511,20 @@ function isToolTrajectoryEvent(event: AgentRunEventV4) {
 function isHiddenTrajectoryEvent(event: AgentRunEventV4) {
   return event.event.kind === "run_spec_frozen" || event.event.kind === "completion_proposal_submitted" || event.event.kind === "deterministic_verification_finished" || event.event.kind === "reviewer_finished" || event.event.kind === "reviewer_correction_requested";
 }
-function V4AnswerForm({ locale, onSubmit }: { locale: Locale; onSubmit: (answer: string) => Promise<void> | void }) { const [answer, setAnswer] = useState(""); const zh = locale === "zh-CN"; return <div className="v4-answer"><input aria-label={zh ? "回答 V4 问题" : "Answer V4 question"} value={answer} onChange={(event) => setAnswer(event.target.value)} /><button disabled={!answer.trim()} onClick={() => void onSubmit(answer.trim())}>{zh ? "回答并恢复" : "Answer and resume"}</button></div>; }
+function V4AnswerForm({ locale, onSubmit }: { locale: Locale; onSubmit: (answer: string) => Promise<void> | void }) {
+  const [answer, setAnswer] = useState("");
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  const zh = locale === "zh-CN";
+  async function submit() {
+    const trimmedAnswer = answer.trim();
+    if (!trimmedAnswer || busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    try { await onSubmit(trimmedAnswer); } finally { busyRef.current = false; setBusy(false); }
+  }
+  return <div className="v4-answer"><input disabled={busy} aria-label={zh ? "回答 V4 问题" : "Answer V4 question"} value={answer} onChange={(event) => setAnswer(event.target.value)} /><button disabled={busy || !answer.trim()} onClick={() => void submit()}>{busy ? (zh ? "恢复中…" : "Resuming…") : (zh ? "回答并恢复" : "Answer and resume")}</button></div>;
+}
 function v4EventLabel(event: AgentRunEventV4, zh: boolean) { if (event.event.kind === "run_created") return event.event.mode === "execute" ? (zh ? "任务启动" : "Task started") : (zh ? "规划启动" : "Planning started"); const labels: Record<string, string> = { plan_proposed: zh ? "计划已冻结" : "Plan frozen", plan_approved: zh ? "计划获批" : "Plan approved", mode_changed: zh ? "执行模式" : "Execution mode", tool_requested: zh ? "工具请求" : "Tool request", tool_approval_requested: zh ? "等待工具审批" : "Tool approval required", tool_approval_decided: zh ? "工具审批已决定" : "Tool approval decided", tool_dispatch_uncertain: zh ? "工具状态不确定" : "Tool dispatch uncertain", tool_dispatch_resolved: zh ? "不确定状态已核实" : "Uncertain dispatch resolved", tool_finished: zh ? "工具结果" : "Tool result", input_requested: zh ? "需要补充信息" : "Input required", user_input_answered: zh ? "用户已回答" : "User answered", completion_proposed: zh ? "完成提案" : "Completion proposed", run_completed: zh ? "运行完成" : "Run completed", run_failed: zh ? "运行失败" : "Run failed", run_cancelled: zh ? "运行取消" : "Run cancelled" }; return labels[event.event.kind] ?? event.event.kind; }
 function v4EventContent(event: AgentRunEventV4, zh: boolean) { if (event.event.kind === "tool_requested") return event.event.call.tool_id; if (event.event.kind === "tool_approval_requested") return `${event.event.request.call.tool_id}: ${event.event.request.reason}`; if (event.event.kind === "tool_approval_decided") return event.event.decision === "approved" ? (zh ? "用户已批准" : "Approved by user") : (zh ? "用户已拒绝" : "Denied by user"); if (event.event.kind === "tool_dispatch_uncertain") return zh ? `调用 ${event.event.tool_id} 的副作用尚未确认` : `The side effect of ${event.event.tool_id} is not yet known`; if (event.event.kind === "tool_dispatch_resolved") return event.event.evidence; if (event.event.kind === "tool_finished") return event.event.outcome.model_content; if (event.event.kind === "plan_proposed") return `${event.event.plan.steps.length} ${zh ? "个步骤" : "steps"} · SHA-256 ${event.event.plan_hash.slice(0, 12)}`; if (event.event.kind === "model_text") return event.event.text; if (event.event.kind === "input_requested") return event.event.question; if (event.event.kind === "user_input_answered") return zh ? `已提交回答：${event.event.answer}` : `Answer submitted: ${event.event.answer}`; if (event.event.kind === "run_failed") return event.event.message; return ""; }
 function isPreviewImage(path: string) { return /\.(png|jpe?g|gif|webp|bmp)$/i.test(path); }

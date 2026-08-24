@@ -9,6 +9,7 @@ members = [
   "crates/omicsops-science",
   "crates/omicsops-knowledge",
   "crates/omicsops-adapters",
+  "crates/omicsops-mcp",
   "src-tauri"
 ]
 resolver = "2"
@@ -29,6 +30,7 @@ pdf-extract = "0.10"
 quick-xml = "0.38"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rmcp = { version = "3.0.1", default-features = false, features = ["client", "server", "macros", "schemars", "transport-child-process", "transport-io"] }
 russh = { version = "0.62.4", default-features = false, features = ["ring", "rsa"] }
 russh-sftp = "2.3.0"
 rusqlite = { version = "0.32", features = ["bundled", "chrono", "uuid"] }
@@ -37,7 +39,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "sync", "time", "io-util"] }
 url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 zip = "4"
