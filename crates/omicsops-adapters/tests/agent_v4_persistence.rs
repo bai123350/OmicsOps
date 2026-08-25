@@ -3,6 +3,7 @@ use omicsops_adapters::persistence::Repository;
 use omicsops_core::workspace::{Message, MessageRole};
 use omicsops_protocol::{
     AgentEventKindV4, AgentEventV4, CompletionProposalV4, ContextCheckpointV4, RunModeV4,
+    ToolOutcomeV4,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -51,6 +52,47 @@ fn v4_run_and_hash_chained_events_round_trip_independently() {
     assert_eq!(
         repository.agent_run_v4(run).unwrap().unwrap()["objective"],
         "test"
+    );
+}
+
+#[test]
+fn v4_tool_outcome_fractional_scores_keep_their_durable_hash() {
+    let repository = Repository::open_in_memory().unwrap();
+    let first = AgentEventV4::first(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Utc::now(),
+        AgentEventKindV4::RunCreated {
+            mode: RunModeV4::Execute,
+        },
+    );
+    let finished = AgentEventV4::next(
+        &first,
+        Utc::now(),
+        AgentEventKindV4::ToolFinished {
+            outcome: ToolOutcomeV4 {
+                call_id: "search".into(),
+                tool_id: "search_mcp_tools".into(),
+                succeeded: true,
+                model_content: "search result".into(),
+                data: json!({"tools":[{"score":6.0_f64 / 13.0_f64}]}),
+                provenance: vec![],
+            },
+        },
+    );
+    repository.append_agent_event_v4(&first).unwrap();
+    repository.append_agent_event_v4(&finished).unwrap();
+
+    assert_eq!(
+        repository.agent_events_v4(first.run_id).unwrap(),
+        vec![first.clone(), finished.clone()]
+    );
+    assert_eq!(
+        repository
+            .agent_events_for_context_v4(first.project_id, first.conversation_id)
+            .unwrap(),
+        vec![first, finished]
     );
 }
 

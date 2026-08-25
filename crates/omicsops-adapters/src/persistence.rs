@@ -8,7 +8,7 @@ use omicsops_core::{
     },
 };
 use omicsops_protocol::{
-    AgentEventV4, ContextArchiveV4, ContextCheckpointV4, validate_event_chain_v4,
+    AgentEventV4, ContextArchiveV4, ContextCheckpointV4, deserialize_event_chain_v4,
 };
 use omicsops_science::ScientificStateV4;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -557,6 +557,24 @@ impl Repository {
             .transpose()
     }
 
+    pub fn agent_runs_for_context_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+    ) -> AdapterResult<Vec<serde_json::Value>> {
+        let connection = self.connection.lock().expect("repository lock");
+        let mut statement = connection.prepare(
+            "SELECT value_json FROM agent_runs_v4 WHERE project_id=?1 AND conversation_id=?2 ORDER BY rowid",
+        )?;
+        statement
+            .query_map(
+                params![project_id.to_string(), conversation_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )?
+            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .collect()
+    }
+
     /// Append a V4 event and, for a successful completion, persist its public
     /// assistant answer in the same SQLite transaction.
     ///
@@ -574,11 +592,12 @@ impl Repository {
         let transaction = connection.transaction()?;
         let mut statement = transaction
             .prepare("SELECT value_json FROM agent_events_v4 WHERE run_id=?1 ORDER BY sequence")?;
-        let existing = statement
+        let serialized = statement
             .query_map([event.run_id.to_string()], |row| row.get::<_, String>(0))?
-            .map(|row| Ok(serde_json::from_str::<AgentEventV4>(&row?)?))
-            .collect::<AdapterResult<Vec<_>>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
+        let existing = deserialize_event_chain_v4(&serialized)
+            .map_err(|error| crate::AdapterError::InvalidInput(error.to_string()))?;
 
         // Replaying an already durable event is safe.  If an old process
         // wrote RunCompleted without its message, repair the missing message
@@ -605,10 +624,20 @@ impl Repository {
             return Ok(None);
         }
 
+        let chain_continues = existing.last().map_or_else(
+            || event.sequence == 1 && event.previous_hash.is_empty(),
+            |previous| {
+                event.sequence == previous.sequence + 1
+                    && event.previous_hash == previous.event_hash
+            },
+        );
+        if !chain_continues {
+            return Err(crate::AdapterError::InvalidInput(
+                "broken V4 event chain".into(),
+            ));
+        }
         let mut candidate = existing;
         candidate.push(event.clone());
-        validate_event_chain_v4(&candidate)
-            .map_err(|error| crate::AdapterError::InvalidInput(error.to_string()))?;
         transaction.execute(
             "INSERT INTO agent_events_v4 (run_id, project_id, conversation_id, sequence, previous_hash, event_hash, value_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![event.run_id.to_string(), event.project_id.to_string(), event.conversation_id.to_string(), event.sequence, event.previous_hash, event.event_hash, serde_json::to_string(event)?],
@@ -635,13 +664,11 @@ impl Repository {
         let connection = self.connection.lock().expect("repository lock");
         let mut statement = connection
             .prepare("SELECT value_json FROM agent_events_v4 WHERE run_id=?1 ORDER BY sequence")?;
-        let events = statement
+        let serialized = statement
             .query_map([run_id.to_string()], |row| row.get::<_, String>(0))?
-            .map(|row| Ok(serde_json::from_str::<AgentEventV4>(&row?)?))
-            .collect::<AdapterResult<Vec<_>>>()?;
-        validate_event_chain_v4(&events)
-            .map_err(|error| crate::AdapterError::InvalidInput(error.to_string()))?;
-        Ok(events)
+            .collect::<Result<Vec<_>, _>>()?;
+        deserialize_event_chain_v4(&serialized)
+            .map_err(|error| crate::AdapterError::InvalidInput(error.to_string()))
     }
 
     pub fn agent_events_for_context_v4(
@@ -650,14 +677,33 @@ impl Repository {
         conversation_id: Uuid,
     ) -> AdapterResult<Vec<AgentEventV4>> {
         let connection = self.connection.lock().expect("repository lock");
-        let mut statement = connection.prepare("SELECT value_json FROM agent_events_v4 WHERE project_id=?1 AND conversation_id=?2 ORDER BY run_id, sequence")?;
-        statement
+        let mut statement = connection.prepare("SELECT run_id, value_json FROM agent_events_v4 WHERE project_id=?1 AND conversation_id=?2 ORDER BY run_id, sequence")?;
+        let rows = statement
             .query_map(
                 params![project_id.to_string(), conversation_id.to_string()],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )?
-            .map(|row| Ok(serde_json::from_str::<AgentEventV4>(&row?)?))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut events = Vec::new();
+        let mut offset = 0;
+        while offset < rows.len() {
+            let run_id = &rows[offset].0;
+            let end = rows[offset..]
+                .iter()
+                .position(|(candidate, _)| candidate != run_id)
+                .map(|relative| offset + relative)
+                .unwrap_or(rows.len());
+            let serialized = rows[offset..end]
+                .iter()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>();
+            events.extend(
+                deserialize_event_chain_v4(&serialized)
+                    .map_err(|error| crate::AdapterError::InvalidInput(error.to_string()))?,
+            );
+            offset = end;
+        }
+        Ok(events)
     }
 
     pub fn archive_agent_context_v4(

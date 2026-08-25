@@ -92,3 +92,20 @@ fn provider_aliases_round_trip_to_canonical_tool_ids() {
         ProviderStreamEvent::ToolCallStarted { tool_id, .. } if tool_id == "remote.list"
     )));
 }
+
+#[test]
+fn streaming_decoder_preserves_utf8_split_across_network_chunks() {
+    let mut decoder = ProviderToolStreamDecoder::new(ProviderProtocol::OpenAiCompatible);
+    let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"我会检索肝癌文献。\"}}]}\n\n";
+    let bytes = payload.as_bytes();
+    let chinese = payload.find('肝').unwrap();
+    let split = chinese + 1;
+
+    assert!(decoder.push(&bytes[..split]).unwrap().is_empty());
+    let events = decoder.push(&bytes[split..]).unwrap();
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ProviderStreamEvent::TextDelta { text } if text == "我会检索肝癌文献。"
+    )));
+}

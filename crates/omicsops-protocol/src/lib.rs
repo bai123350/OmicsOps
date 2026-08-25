@@ -954,6 +954,56 @@ pub fn validate_event_chain_v4(events: &[AgentEventV4]) -> Result<(), ProtocolEr
     Ok(())
 }
 
+/// Validate durable events against their original JSON representation before
+/// deserializing them into the current schema. This preserves the exact JSON
+/// number spelling used by the writer and permits additive fields with serde
+/// defaults without weakening the hash chain.
+pub fn deserialize_event_chain_v4(
+    serialized: &[String],
+) -> Result<Vec<AgentEventV4>, ProtocolErrorV4> {
+    let mut events: Vec<AgentEventV4> = Vec::with_capacity(serialized.len());
+    for (index, serialized) in serialized.iter().enumerate() {
+        let value: serde_json::Value =
+            serde_json::from_str(serialized).map_err(|_| ProtocolErrorV4::InvalidEventEncoding)?;
+        let stored_hash = value
+            .get("event_hash")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ProtocolErrorV4::InvalidEventEncoding)?;
+        let field = |name: &str| {
+            value
+                .get(name)
+                .cloned()
+                .ok_or(ProtocolErrorV4::InvalidEventEncoding)
+        };
+        let envelope = serde_json::json!({
+            "schema_version": field("schema_version")?,
+            "run_id": field("run_id")?,
+            "project_id": field("project_id")?,
+            "conversation_id": field("conversation_id")?,
+            "sequence": field("sequence")?,
+            "occurred_at": field("occurred_at")?,
+            "previous_hash": field("previous_hash")?,
+            "event": field("event")?,
+        });
+        let calculated = hex::encode(Sha256::digest(
+            serde_json::to_vec(&envelope).map_err(|_| ProtocolErrorV4::InvalidEventEncoding)?,
+        ));
+        if stored_hash != calculated {
+            return Err(ProtocolErrorV4::EventHashMismatch);
+        }
+        let event: AgentEventV4 =
+            serde_json::from_value(value).map_err(|_| ProtocolErrorV4::InvalidEventEncoding)?;
+        if event.sequence != index as u64 + 1
+            || (index == 0 && !event.previous_hash.is_empty())
+            || (index > 0 && event.previous_hash != events[index - 1].event_hash)
+        {
+            return Err(ProtocolErrorV4::BrokenEventChain);
+        }
+        events.push(event);
+    }
+    Ok(events)
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ProtocolErrorV4 {
     #[error("invalid V4 execution plan")]
@@ -968,6 +1018,8 @@ pub enum ProtocolErrorV4 {
     SpecHashMismatch,
     #[error("V4 event hash mismatch")]
     EventHashMismatch,
+    #[error("invalid V4 event encoding")]
+    InvalidEventEncoding,
     #[error("broken V4 event chain")]
     BrokenEventChain,
     #[error("invalid V4 reviewer report")]
@@ -988,6 +1040,49 @@ mod tests {
             "criteria": []
         }))
         .expect("legacy completion proposal remains readable");
+        assert!(proposal.answer_markdown.is_empty());
+    }
+
+    #[test]
+    fn durable_event_verification_accepts_additive_schema_defaults() {
+        let event = AgentEventV4::first(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Utc::now(),
+            AgentEventKindV4::CompletionProposalSubmitted {
+                proposal: CompletionProposalV4 {
+                    schema_version: 4,
+                    summary: "legacy completion".into(),
+                    answer_markdown: String::new(),
+                    criteria: vec![],
+                },
+            },
+        );
+        let mut value = serde_json::to_value(&event).unwrap();
+        value["event"]["proposal"]
+            .as_object_mut()
+            .unwrap()
+            .remove("answer_markdown");
+        let envelope = serde_json::json!({
+            "schema_version": value["schema_version"],
+            "run_id": value["run_id"],
+            "project_id": value["project_id"],
+            "conversation_id": value["conversation_id"],
+            "sequence": value["sequence"],
+            "occurred_at": value["occurred_at"],
+            "previous_hash": value["previous_hash"],
+            "event": value["event"],
+        });
+        value["event_hash"] = serde_json::Value::String(hex::encode(Sha256::digest(
+            serde_json::to_vec(&envelope).unwrap(),
+        )));
+        let serialized = serde_json::to_string(&value).unwrap();
+
+        let decoded = deserialize_event_chain_v4(&[serialized]).unwrap();
+        let AgentEventKindV4::CompletionProposalSubmitted { proposal } = &decoded[0].event else {
+            panic!("expected completion proposal");
+        };
         assert!(proposal.answer_markdown.is_empty());
     }
 

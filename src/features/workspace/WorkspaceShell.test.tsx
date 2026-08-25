@@ -20,6 +20,17 @@ describe("WorkspaceShell", () => {
     expect(screen.getByText("Agent 正在处理任务")).toBeInTheDocument();
     expect(screen.getByText("规划启动")).toBeInTheDocument();
   });
+  it("warns when an active run has been silent for 90 seconds without hiding stop", () => {
+    const onCancel = vi.fn();
+    const lastActivity = new Date(Date.now() - 90_001).toISOString();
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-stalled" activeRunLastActivityAt={lastActivity} onCancelRun={onCancel} agentRunEventsV4={[{
+      schema_version: 4, run_id: "run-stalled", project_id: project.id, conversation_id: "conversation-1", sequence: 1,
+      occurred_at: lastActivity, previous_hash: "", event_hash: "a".repeat(64), event: { kind: "run_created", mode: "execute" },
+    }]} />);
+
+    expect(screen.getByRole("status")).toHaveTextContent("超过 90 秒未收到新的 Agent 事件");
+    expect(screen.getByRole("button", { name: "终止运行" })).toBeInTheDocument();
+  });
   it("coalesces character-sized V4 model deltas into one completed response", () => {
     const deltas = ["我", "先", "检查", "输入", "目录", "。"];
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-v4-text" agentRunEventsV4={deltas.map((text, index) => ({

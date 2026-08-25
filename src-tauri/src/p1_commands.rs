@@ -851,6 +851,7 @@ pub async fn call_configured_mcp_tool(
         request.tool.trim(),
         request.arguments.unwrap_or_else(|| json!({})),
         schema_digest(&schema),
+        false,
     )
     .await
 }
@@ -1243,6 +1244,7 @@ pub(crate) async fn invoke_configured_mcp_tool_v4(
     tool: &str,
     arguments: Value,
     expected_schema_sha256: String,
+    schema_bound_run_approved: bool,
 ) -> Result<McpResult, String> {
     let mut profile = mcp_server_profile(repository, server_id)?;
     if !profile.enabled {
@@ -1251,11 +1253,11 @@ pub(crate) async fn invoke_configured_mcp_tool_v4(
     if !profile.launch_approved {
         return Err("MCP server launch approval was revoked".into());
     }
-    if !profile
+    let persistently_approved = profile
         .approved_tools
         .iter()
-        .any(|approved| approved == tool)
-    {
+        .any(|approved| approved == tool);
+    if !persistently_approved && !schema_bound_run_approved {
         return Err(format!("MCP tool {tool} approval was revoked"));
     }
     let config = resolved_mcp_config(&profile, project_id, credentials)?;
@@ -1307,6 +1309,7 @@ pub(crate) async fn invoke_configured_mcp_tool_v4(
         "args": profile.args,
         "tool": tool,
         "approved": true,
+        "approval_scope": if persistently_approved { "persistent" } else { "run_schema_bound" },
         "attempts": 1,
         "succeeded": true,
         "catalog_sha256": invocation.tool_catalog_sha256,

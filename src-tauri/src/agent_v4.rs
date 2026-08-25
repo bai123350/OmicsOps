@@ -982,9 +982,11 @@ pub fn agent_v4_resolve_uncertain(
 
 #[tauri::command]
 pub fn agent_v4_events(
+    app: AppHandle,
     state: State<'_, AppState>,
     run_id: Uuid,
 ) -> Result<Vec<AgentEventV4>, String> {
+    reconcile_run_terminal_event(&app, &state, run_id)?;
     state
         .repository
         .agent_events_v4(run_id)
@@ -993,14 +995,98 @@ pub fn agent_v4_events(
 
 #[tauri::command]
 pub fn agent_v4_events_for_conversation(
+    app: AppHandle,
     state: State<'_, AppState>,
     project_id: Uuid,
     conversation_id: Uuid,
 ) -> Result<Vec<AgentEventV4>, String> {
+    let records = state
+        .repository
+        .agent_runs_for_context_v4(project_id, conversation_id)
+        .map_err(|error| error.to_string())?;
+    for value in records {
+        let record: RunRecordV4 =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
+        reconcile_run_terminal_event(&app, &state, record.run_id)?;
+    }
     state
         .repository
         .agent_events_for_context_v4(project_id, conversation_id)
         .map_err(|error| error.to_string())
+}
+
+fn reconcile_run_terminal_event(
+    app: &AppHandle,
+    state: &AppState,
+    run_id: Uuid,
+) -> Result<(), String> {
+    let mut record = load_record(&state.repository, run_id)?;
+    let events = state
+        .repository
+        .agent_events_v4(run_id)
+        .map_err(|error| error.to_string())?;
+    if has_terminal_event(&events) {
+        return Ok(());
+    }
+    let active = state
+        .active_runs
+        .lock()
+        .map_err(|_| "active run registry unavailable".to_string())?
+        .contains_key(&run_id);
+    let terminal = missing_terminal_event(&record, &events, active, Utc::now());
+    if terminal.is_some() && matches!(record.status.as_str(), "completed" | "running") {
+        record.status = "failed".into();
+    }
+    if let Some(terminal) = terminal {
+        let store = RepositoryEventStoreV4 {
+            repository: state.repository.clone(),
+            app: app.clone(),
+        };
+        append_terminal_event(&store, run_id, terminal)?;
+        save_record(&state.repository, &record)?;
+    }
+    Ok(())
+}
+
+fn has_terminal_event(events: &[AgentEventV4]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            &event.event,
+            AgentEventKindV4::RunCompleted
+                | AgentEventKindV4::RunFailed { .. }
+                | AgentEventKindV4::RunNeedsAttention { .. }
+                | AgentEventKindV4::RunCancelled
+        )
+    })
+}
+
+fn missing_terminal_event(
+    record: &RunRecordV4,
+    events: &[AgentEventV4],
+    active: bool,
+    now: chrono::DateTime<Utc>,
+) -> Option<AgentEventKindV4> {
+    let stale_running = record.status == "running"
+        && !active
+        && events.last().is_some_and(|last| {
+            now.signed_duration_since(last.occurred_at) > chrono::Duration::minutes(2)
+        });
+    match record.status.as_str() {
+        "failed" => Some(AgentEventKindV4::RunFailed {
+            message: "the previous execution stopped without persisting its final error; retry from the verified event chain".into(),
+        }),
+        "cancelled" => Some(AgentEventKindV4::RunCancelled),
+        "needs_attention" => Some(AgentEventKindV4::RunNeedsAttention {
+            message: "the previous execution requires attention but its final event was interrupted".into(),
+        }),
+        "completed" => Some(AgentEventKindV4::RunFailed {
+            message: "the previous execution ended without a durable completion response; retry from the verified event chain".into(),
+        }),
+        "running" if stale_running => Some(AgentEventKindV4::RunFailed {
+            message: "the desktop process stopped while this run was active; retry from the verified event chain".into(),
+        }),
+        _ => None,
+    }
 }
 
 async fn spawn_execution(
@@ -1108,7 +1194,11 @@ async fn spawn_execution(
                             matches!(event.event, AgentEventKindV4::RunNeedsAttention { .. })
                         });
                 if !already_recorded {
-                    let _ = append_next(&store, spec.run_id, event);
+                    if append_terminal_event(&store, spec.run_id, event).is_err() {
+                        // The status row lets the reconciliation path repair a
+                        // missing terminal event on the next UI poll/startup.
+                        record.status = "failed".into();
+                    }
                 }
             }
         }
@@ -1116,6 +1206,34 @@ async fn spawn_execution(
         remove_active_run(&active, spec.run_id, &cancelled);
     });
     Ok(())
+}
+
+fn append_terminal_event(
+    store: &RepositoryEventStoreV4,
+    run_id: Uuid,
+    event: AgentEventKindV4,
+) -> Result<(), String> {
+    let mut last_error = None;
+    for _ in 0..3 {
+        let events = store.load(run_id)?;
+        if events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEventKindV4::RunCompleted
+                    | AgentEventKindV4::RunFailed { .. }
+                    | AgentEventKindV4::RunNeedsAttention { .. }
+                    | AgentEventKindV4::RunCancelled
+            )
+        }) {
+            return Ok(());
+        }
+        let previous = events.last().ok_or("V4 run has no event")?;
+        match store.append(&AgentEventV4::next(previous, Utc::now(), event.clone())) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "failed to persist terminal V4 event".into()))
 }
 
 fn register_active_run(
@@ -2029,6 +2147,38 @@ impl DesktopToolExecutorV4 {
         }
         Ok(index)
     }
+
+    fn run_approved_tool_call(&self, call: &ToolCallV4) -> Result<bool, String> {
+        let events = self
+            .repository
+            .agent_events_v4(self.run_id)
+            .map_err(|error| error.to_string())?;
+        run_has_approved_tool_call(&events, call)
+    }
+}
+
+fn run_has_approved_tool_call(events: &[AgentEventV4], call: &ToolCallV4) -> Result<bool, String> {
+    let call_hash = call.canonical_hash().map_err(|error| error.to_string())?;
+    let request = events.iter().rev().find_map(|event| match &event.event {
+        AgentEventKindV4::ToolApprovalRequested { request }
+            if request.call_hash == call_hash && request.call == *call =>
+        {
+            Some(request)
+        }
+        _ => None,
+    });
+    Ok(request.is_some_and(|request| {
+        events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEventKindV4::ToolApprovalDecided {
+                    approval_id,
+                    call_hash: decided_hash,
+                    decision: ToolApprovalDecisionV4::Approved,
+                } if approval_id == &request.approval_id && decided_hash == &request.call_hash
+            )
+        })
+    }))
 }
 #[async_trait]
 impl ToolExecutorV4 for DesktopToolExecutorV4 {
@@ -2128,9 +2278,21 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                     .and_then(Value::as_u64)
                     .unwrap_or(8) as usize;
                 let hits = search_mcp_tools(query, &self.mcp_tool_index()?, limit);
+                let needs_run_approval = hits.iter().any(|hit| {
+                    hit.tool.configured
+                        && hit.tool.enabled
+                        && hit.tool.launch_approved
+                        && !hit.tool.tool_approved
+                });
+                let guidance = if needs_run_approval {
+                    "A matching MCP tool is configured and launch-approved but not persistently tool-approved. Call use_mcp_tool with its exact server_id, tool, schema_sha256, and arguments; the Host will request explicit schema-bound approval for this run. Do not replace literature MCP access with ad-hoc runtime HTTP code."
+                } else {
+                    "Call use_mcp_tool with the selected tool's exact server_id, tool, schema_sha256, and arguments."
+                };
+                let payload = json!({"tools":hits,"guidance":guidance});
                 (
-                    serde_json::to_string(&hits).map_err(|error| error.to_string())?,
-                    serde_json::to_value(&hits).map_err(|error| error.to_string())?,
+                    serde_json::to_string(&payload).map_err(|error| error.to_string())?,
+                    payload,
                     vec![],
                 )
             }
@@ -2140,11 +2302,15 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                     .map_err(|_| "server_id must be a UUID")?;
                 let tool = required(&call.arguments, "tool")?;
                 let expected_schema = required(&call.arguments, "schema_sha256")?;
-                let indexed = self
+                let mut indexed = self
                     .mcp_tool_index()?
                     .into_iter()
                     .find(|entry| entry.server_id == server_id && entry.tool_name == tool)
                     .ok_or("MCP tool is not currently indexed")?;
+                let schema_bound_run_approved = self.run_approved_tool_call(call)?;
+                if !indexed.tool_approved && schema_bound_run_approved {
+                    indexed.tool_approved = true;
+                }
                 authorize_mcp_use(&indexed, expected_schema).map_err(|error| error.to_string())?;
                 let result = invoke_configured_mcp_tool_v4(
                     &self.repository,
@@ -2158,6 +2324,7 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                         .cloned()
                         .unwrap_or_else(|| json!({})),
                     expected_schema.into(),
+                    schema_bound_run_approved,
                 )
                 .await?;
                 let value = result.result.unwrap_or_else(|| json!({}));
@@ -3282,7 +3449,7 @@ mod tests {
     use super::*;
     use omicsops_adapters::{llm::ProviderProtocol, ssh::SshAuthentication};
     use omicsops_core::domain::{AuthenticationMethod, ConnectionProfile};
-    use omicsops_protocol::{RunModeV4, ToolDescriptorV4, ToolEffectV4};
+    use omicsops_protocol::{RunModeV4, ToolApprovalRequestV4, ToolDescriptorV4, ToolEffectV4};
     use url::Url;
 
     #[test]
@@ -3322,6 +3489,106 @@ mod tests {
 
         assert!(wait_for_active_run_to_yield(&runs, run_id).await.unwrap());
         assert!(!runs.lock().unwrap().contains_key(&run_id));
+    }
+
+    #[test]
+    fn missing_terminal_events_are_repaired_without_interrupting_live_runs() {
+        let now = Utc::now();
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let mut record = RunRecordV4 {
+            run_id,
+            project_id,
+            conversation_id,
+            model_profile_id: Uuid::new_v4(),
+            objective: "search literature".into(),
+            status: "running".into(),
+            plan: None,
+            plan_hash: None,
+            compute_selection: None,
+            approval_hash: None,
+            spec: None,
+        };
+        let recent = vec![AgentEventV4::first(
+            run_id,
+            project_id,
+            conversation_id,
+            now - chrono::Duration::seconds(30),
+            AgentEventKindV4::RunCreated {
+                mode: omicsops_protocol::RunModeV4::Execute,
+            },
+        )];
+        assert!(missing_terminal_event(&record, &recent, false, now).is_none());
+
+        let stale = vec![AgentEventV4::first(
+            run_id,
+            project_id,
+            conversation_id,
+            now - chrono::Duration::minutes(3),
+            AgentEventKindV4::RunCreated {
+                mode: omicsops_protocol::RunModeV4::Execute,
+            },
+        )];
+        assert!(matches!(
+            missing_terminal_event(&record, &stale, false, now),
+            Some(AgentEventKindV4::RunFailed { .. })
+        ));
+        assert!(missing_terminal_event(&record, &stale, true, now).is_none());
+
+        record.status = "failed".into();
+        assert!(matches!(
+            missing_terminal_event(&record, &recent, false, now),
+            Some(AgentEventKindV4::RunFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn schema_bound_run_approval_can_authorize_one_exact_mcp_call() {
+        let run_id = Uuid::new_v4();
+        let call = ToolCallV4 {
+            call_id: "pubmed".into(),
+            tool_id: "use_mcp_tool".into(),
+            arguments: json!({
+                "server_id":Uuid::new_v4(),
+                "tool":"pubmed_search",
+                "schema_sha256":"schema",
+                "arguments":{"query":"HCC single-cell"}
+            }),
+        };
+        let request = ToolApprovalRequestV4::new(
+            run_id,
+            "frozen-spec",
+            call.clone(),
+            ToolEffectV4::Network,
+            "network access",
+        )
+        .unwrap();
+        let first = AgentEventV4::first(
+            run_id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Utc::now(),
+            AgentEventKindV4::ToolApprovalRequested {
+                request: request.clone(),
+            },
+        );
+        assert!(!run_has_approved_tool_call(&[first.clone()], &call).unwrap());
+        let approved = AgentEventV4::next(
+            &first,
+            Utc::now(),
+            AgentEventKindV4::ToolApprovalDecided {
+                approval_id: request.approval_id,
+                call_hash: request.call_hash,
+                decision: ToolApprovalDecisionV4::Approved,
+            },
+        );
+        let events = [first, approved];
+        assert!(run_has_approved_tool_call(&events, &call).unwrap());
+
+        let mut changed = call.clone();
+        changed.arguments["arguments"]["query"] = json!("different query");
+        assert!(!run_has_approved_tool_call(&events, &changed).unwrap());
     }
 
     #[test]

@@ -32,6 +32,7 @@ export default function DesktopApp() {
   const [planLoading, setPlanLoading] = useState(false);
   const [planApproved, setPlanApproved] = useState(false);
   const [runId, setRunId] = useState<string | null>(null);
+  const [runStartedAt, setRunStartedAt] = useState<string | null>(null);
   const [runStopping, setRunStopping] = useState(false);
   const [agentRunEventsV4, setAgentRunEventsV4] = useState<AgentRunEventV4[]>([]);
   const [remoteFiles, setRemoteFiles] = useState<RemoteFileEntry[]>([]);
@@ -49,6 +50,20 @@ export default function DesktopApp() {
   const [projectArtifacts, setProjectArtifacts] = useState<ProjectArtifact[]>([]);
   const [syncEntries, setSyncEntries] = useState<SyncEntry[]>([]);
   const runActionGuards = useRef(new Set<string>());
+  const runPollingNotice = useRef("");
+
+  function reportRunPollingFailure(error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    runPollingNotice.current = message;
+    setAgentNotice(message);
+  }
+
+  function clearRecoveredRunPollingFailure() {
+    const recovered = runPollingNotice.current;
+    if (!recovered) return;
+    runPollingNotice.current = "";
+    setAgentNotice((current) => current === recovered ? "" : current);
+  }
 
   useEffect(() => {
     Promise.all([api.listProjects(), api.listModelProfiles(), api.listSkillPackages(), api.listMcpServers(), api.listConnections()]).then(([items, profiles, skills, servers, savedConnections]) => {
@@ -131,18 +146,21 @@ export default function DesktopApp() {
     let disposed = false;
     setAgentRunEventsV4([]);
     setRunId(null);
+    setRunStartedAt(null);
     setRunStopping(false);
     if (!selected || !conversation) return () => { disposed = true; };
     api.agentV4EventsForConversation(selected.id, conversation.id)
       .then((eventsV4) => {
         if (disposed) return;
+        clearRecoveredRunPollingFailure();
         setAgentRunEventsV4(mergeAgentRunEventsV4([], eventsV4));
         const latest = eventsV4.map((event) => ({ runId: event.run_id, timestamp: event.occurred_at })).sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime()).at(-1);
         const latestRunEventsV4 = latest ? eventsV4.filter((event) => event.run_id === latest.runId) : [];
         setRunId(latest && !latestRunEventsV4.some(isTerminalAgentEventV4) ? latest.runId : null);
+        setRunStartedAt(latest && !latestRunEventsV4.some(isTerminalAgentEventV4) ? (latestAgentRunEventV4(latestRunEventsV4)?.occurred_at ?? latest.timestamp) : null);
       })
       .catch((error) => {
-        if (!disposed) setAgentNotice(error instanceof Error ? error.message : String(error));
+        if (!disposed) reportRunPollingFailure(error);
       });
     return () => { disposed = true; };
   }, [selected?.id, conversation?.id]);
@@ -153,32 +171,75 @@ export default function DesktopApp() {
       if (event.conversation_id !== conversation?.id) return;
       setMessages((current) => current.some((message) => message.id === event.message.id) ? current : [...current, event.message]);
       setMessageSequence((value) => Math.max(value, event.message.sequence + 1));
-    }).then((fn) => disposed ? fn() : unlisten.push(fn));
+    }).then((fn) => disposed ? fn() : unlisten.push(fn)).catch((error) => {
+      if (!disposed) setAgentNotice(subscriptionError("conversation", error));
+    });
     api.onConversationUpdated((event) => {
       if (event.project_id !== selected?.id) return;
       setConversations((current) => [event.conversation, ...current.filter((item) => item.id !== event.conversation.id)]);
       setConversation((current) => current?.id === event.conversation.id ? event.conversation : current);
-    }).then((fn) => disposed ? fn() : unlisten.push(fn));
+    }).then((fn) => disposed ? fn() : unlisten.push(fn)).catch((error) => {
+      if (!disposed) setAgentNotice(subscriptionError("conversation updates", error));
+    });
     api.onKernelEvent((event) => {
       if (event.project_id !== selected?.id) return;
       setKernelEvents((current) => [...current.slice(-199), event]);
-    }).then((fn) => disposed ? fn() : unlisten.push(fn));
+    }).then((fn) => disposed ? fn() : unlisten.push(fn)).catch((error) => {
+      if (!disposed) setAgentNotice(subscriptionError("kernel", error));
+    });
     api.onSyncEvent((entry) => {
       if (entry.project_id !== selected?.id) return;
       setSyncEntries((current) => [entry, ...current.filter((item) => item.id !== entry.id)]);
-    }).then((fn) => disposed ? fn() : unlisten.push(fn));
+    }).then((fn) => disposed ? fn() : unlisten.push(fn)).catch((error) => {
+      if (!disposed) setAgentNotice(subscriptionError("sync", error));
+    });
     api.onAgentV4Event((event) => {
       if (event.project_id !== selected?.id || event.conversation_id !== conversation?.id) return;
-      setRunId((current) => current ?? event.run_id);
       if (isTerminalAgentEventV4(event)) {
         setRunStopping(false);
+        setRunStartedAt(null);
         setRunId((current) => current === event.run_id ? null : current);
         if (event.event.kind === "run_completed") void refreshRemoteFiles(event.project_id);
+      } else {
+        setRunId((current) => current ?? event.run_id);
+        setRunStartedAt((current) => current ?? event.occurred_at);
       }
-      setAgentRunEventsV4((current) => current.some((item) => item.run_id === event.run_id && item.sequence === event.sequence) ? current : [...current, event]);
-    }).then((fn) => disposed ? fn() : unlisten.push(fn));
+      setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, [event]));
+    }).then((fn) => disposed ? fn() : unlisten.push(fn)).catch((error) => {
+      if (!disposed) setAgentNotice(subscriptionError("Agent V4", error));
+    });
     return () => { disposed = true; unlisten.forEach((fn) => fn()); };
   }, [conversation?.id, selected?.id]);
+
+  useEffect(() => {
+    const activeRunId = runId;
+    if (!activeRunId) return;
+    let disposed = false;
+    let inFlight = false;
+    const reconcile = async () => {
+      if (disposed || inFlight) return;
+      inFlight = true;
+      try {
+        const events = await api.agentV4Events(activeRunId);
+        if (disposed) return;
+        const runEvents = events.filter((event) => event.run_id === activeRunId);
+        clearRecoveredRunPollingFailure();
+        setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, runEvents));
+        if (runEvents.some(isTerminalAgentEventV4)) {
+          setRunStopping(false);
+          setRunStartedAt(null);
+          setRunId((current) => current === activeRunId ? null : current);
+        }
+      } catch (error) {
+        if (!disposed) reportRunPollingFailure(error);
+      } finally {
+        inFlight = false;
+      }
+    };
+    void reconcile();
+    const timer = window.setInterval(() => { void reconcile(); }, 3_000);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [runId]);
 
   function replaceKernelSession(session: KernelSession) {
     setKernelSessions((current) => [session, ...current.filter((item) => item.id !== session.id)]);
@@ -242,7 +303,7 @@ export default function DesktopApp() {
   }
   function resetConversationWork() {
     setMessages([]); setMessageSequence(1); setAgentBusy(false); setAgentNotice("");
-    setLastGoal(""); setV4Plan(null); setPlanApproved(false); setRunId(null); setRunStopping(false); setAgentRunEventsV4([]);
+    setLastGoal(""); setV4Plan(null); setPlanApproved(false); setRunId(null); setRunStartedAt(null); setRunStopping(false); setAgentRunEventsV4([]);
   }
 
   function currentComputeSelection(): ComputeSelectionV4 {
@@ -273,6 +334,7 @@ export default function DesktopApp() {
     });
     setV4Plan(summary);
     setRunId(summary.run_id);
+    setRunStartedAt(new Date().toISOString());
     setPlanApproved(false);
     const events = await api.agentV4Events(summary.run_id);
     setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
@@ -290,6 +352,7 @@ export default function DesktopApp() {
     });
     setV4Plan(summary);
     setRunId(summary.run_id);
+    setRunStartedAt(new Date().toISOString());
     setPlanApproved(false);
     const events = await api.agentV4Events(summary.run_id);
     setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
@@ -352,12 +415,19 @@ export default function DesktopApp() {
   const settings = settingsOpen ? <SettingsPanel locale={locale} onClose={() => setSettingsOpen(false)} modelProfiles={modelProfiles} skillPackages={skillPackages} mcpServers={mcpServers} connections={connections} selectedProject={selected} onSaveConnection={async (profile, secret) => { await api.saveConnection(profile, secret); setConnections(await api.listConnections()); }} onTestConnection={api.testConnection} onConfirmHostKey={async (profileId, fingerprint) => { await api.confirmHostKey(profileId, fingerprint); setConnections(await api.listConnections()); }} onBindProjectRemote={async (connectionId, remoteRoot) => { if (!selected) return; const updated = await api.updateProjectRemote(selected.id, connectionId, remoteRoot); setSelected(updated); setProjects((current) => current.map((project) => project.id === updated.id ? updated : project)); }} onSaveModel={async (request) => { const profile = await api.saveModelProfile(request); setModelProfiles((current) => [profile, ...current.filter((item) => item.id !== profile.id)]); setActiveModelProfileId(profile.id); }} onProbeModel={api.probeModelProfile} onListModels={api.listModelProfileModels} onImportSkill={async () => { const sourcePath = await api.chooseSkillDirectory(); if (!sourcePath) return; const skill = await api.importSkillDirectory(sourcePath); setSkillPackages((current) => [skill, ...current.filter((item) => item.id !== skill.id)]); }} onSetSkillEnabled={async (skillId, enabled) => { const updated = await api.setSkillEnabled(skillId, enabled); setSkillPackages(await api.listSkillPackages()); return updated; }} onSaveMcpServer={async (request) => { const updated = await api.saveMcpServer(request); setMcpServers(await api.listMcpServers()); return updated; }} onAddPubMedMcp={async (request) => { const updated = await api.addPubMedMcpServer(request); setMcpServers(await api.listMcpServers()); return updated; }} onInspectMcpServer={async (serverId) => { if (!selected) throw new Error(locale === "zh-CN" ? "请先打开一个项目，再检查 MCP server。" : "Open a project before inspecting an MCP server."); await api.inspectConfiguredMcpServer(selected.id, serverId); setMcpServers(await api.listMcpServers()); }} onSetMcpServerEnabled={async (serverId, enabled) => { const updated = await api.setMcpServerEnabled(serverId, enabled); setMcpServers(await api.listMcpServers()); return updated; }} onSetMcpToolApproval={async (serverId, tool, approved) => { const updated = await api.setMcpToolApproval(serverId, tool, approved); setMcpServers(await api.listMcpServers()); return updated; }} /> : null;
   if (!selected) return <><ProjectLibrary projects={projects} connections={connections} locale={locale} onLocaleChange={setLocale} onSettings={() => setSettingsOpen(true)} onOpen={setSelected} onDelete={async (projectId) => { await api.deleteProject(projectId); setProjects((current) => current.filter((project) => project.id !== projectId)); }} onChooseLocalRoot={api.chooseProjectDirectory} onCreate={async ({ template, name, localRoot, connectionId, remoteRoot }) => { const project = await api.createProject({ name, description: "", local_root: localRoot, template, connection_id: connectionId, remote_root: remoteRoot }); setProjects((current) => [project, ...current]); setSelected(project); }} />{settings}</>;
   const activeModel = modelProfiles.find((profile) => profile.id === activeModelProfileId) ?? null;
+  const activeRunLastActivityAt = runId
+    ? latestAgentRunEventV4(agentRunEventsV4.filter((event) => event.run_id === runId))?.occurred_at ?? runStartedAt
+    : null;
+  const currentRunEventsV4 = runId ? agentRunEventsV4.filter((event) => event.run_id === runId) : [];
+  const currentRunAwaitsPlanApproval = v4Plan?.status === "awaiting_approval"
+    || (currentRunEventsV4.some((event) => event.event.kind === "plan_proposed")
+      && !currentRunEventsV4.some((event) => event.event.kind === "mode_changed" && event.event.mode === "execute"));
   return <><WorkspaceShell
     project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template }}
     locale={locale} onLocaleChange={setLocale} onOpenSettings={() => setSettingsOpen(true)} onBackToProjects={() => setSelected(null)}
     conversations={conversations} activeConversationId={conversation?.id} onSelectConversation={selectConversation} onNewConversation={newConversation} onDeleteConversation={deleteConversation}
     messages={messages} agentBusy={agentBusy} agentNotice={agentNotice} modelLabel={activeModel?.label}
-    v4Plan={v4Plan} planLoading={planLoading} planApproved={planApproved} canStartRun={false} runStarted={v4Plan?.status === "running" || Boolean(runId && (planApproved || agentRunEventsV4.some((event) => event.run_id === runId)))} activeRunId={runId} agentRunEventsV4={agentRunEventsV4}
+    v4Plan={v4Plan} planLoading={planLoading} planApproved={planApproved} canStartRun={false} runStarted={Boolean(runId && !currentRunAwaitsPlanApproval)} activeRunId={runId} activeRunLastActivityAt={activeRunLastActivityAt} agentRunEventsV4={agentRunEventsV4}
     computeBackends={computeBackends} computeBackendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} approvalPolicy={approvalPolicy} computeEnvironment={computeEnvironment} computeBusy={computeBusy}
     onComputeBackendChange={setComputeBackendId} onContainerImageChange={setContainerImage} onAutonomyModeChange={setAutonomyMode} onApprovalPolicyChange={setApprovalPolicy} onComputeEnvironmentChange={setComputeEnvironment}
     onAnswerAgentQuestionV4={async (answerRunId, questionId, answer) => {
@@ -369,6 +439,7 @@ export default function DesktopApp() {
         await api.agentV4Answer(answerRunId, questionId, answer);
         await api.agentV4Resume(answerRunId);
         setRunId(answerRunId);
+        setRunStartedAt((current) => current ?? new Date().toISOString());
         const events = await api.agentV4Events(answerRunId);
         setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
       } catch (error) {
@@ -386,6 +457,7 @@ export default function DesktopApp() {
         await api.agentV4DecideToolApproval(approvalRunId, approvalId, callHash, decision);
         await api.agentV4Resume(approvalRunId);
         setRunId(approvalRunId);
+        setRunStartedAt((current) => current ?? new Date().toISOString());
         const events = await api.agentV4Events(approvalRunId);
         setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
       } catch (error) {
@@ -403,6 +475,7 @@ export default function DesktopApp() {
         await api.agentV4ResolveUncertain(uncertainRunId, callId, resolution, evidence);
         await api.agentV4Resume(uncertainRunId);
         setRunId(uncertainRunId);
+        setRunStartedAt((current) => current ?? new Date().toISOString());
         const events = await api.agentV4Events(uncertainRunId);
         setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
       } catch (error) {
@@ -419,6 +492,7 @@ export default function DesktopApp() {
       try {
         await api.agentV4Resume(resumeRunId);
         setRunId(resumeRunId);
+        setRunStartedAt((current) => current ?? new Date().toISOString());
         const events = await api.agentV4Events(resumeRunId);
         setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
       } catch (error) {
@@ -445,7 +519,7 @@ export default function DesktopApp() {
     onPreviewImage={selected.connection_id && selected.remote_root ? (relativePath) => api.previewProjectImage(selected.id, relativePath) : undefined}
     onSend={async (markdown, mode) => {
       if (!conversation || !activeModel) { setSettingsOpen(true); return false; }
-      setLastGoal(markdown); setV4Plan(null); setPlanApproved(false); setRunId(null); setAgentBusy(true); setAgentNotice("");
+      setLastGoal(markdown); setV4Plan(null); setPlanApproved(false); setRunId(null); setRunStartedAt(null); setAgentBusy(true); setAgentNotice("");
       if (mode === "plan") {
         setPlanLoading(true);
         try {
@@ -490,6 +564,7 @@ export default function DesktopApp() {
         const approved = await api.agentV4ApprovePlan(v4Plan.run_id, v4Plan.approval_hash);
         setV4Plan(approved);
         setRunId(approved.run_id);
+        setRunStartedAt(new Date().toISOString());
         setPlanApproved(true);
         const events = await api.agentV4Events(approved.run_id);
         setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
@@ -500,14 +575,24 @@ export default function DesktopApp() {
       }
     }}
     onCancelRun={runId ? async () => {
+      const targetRunId = runId;
       setRunStopping(true);
       setAgentNotice("");
       try {
-        await api.agentV4Cancel(runId);
-        const events = await api.agentV4Events(runId);
-        setAgentRunEventsV4(events);
+        await api.agentV4Cancel(targetRunId);
+        const events = await api.agentV4Events(targetRunId);
+        const runEvents = events.filter((event) => event.run_id === targetRunId);
+        setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, runEvents));
+        if (runEvents.some(isTerminalAgentEventV4)) {
+          setRunStartedAt(null);
+          setRunId((current) => current === targetRunId ? null : current);
+        }
       } catch (error) {
         setAgentNotice(error instanceof Error ? error.message : String(error));
+      } finally {
+        // Cancellation is asynchronous in the host. The reconciliation loop
+        // will clear the run when the terminal event is persisted; this
+        // fallback keeps the control usable if that event is delayed/lost.
         setRunStopping(false);
       }
     } : undefined}
@@ -517,6 +602,15 @@ function mergeAgentRunEventsV4(current: AgentRunEventV4[], incoming: AgentRunEve
   return [...current, ...incoming]
     .filter((event, index, all) => all.findIndex((item) => item.run_id === event.run_id && item.sequence === event.sequence) === index)
     .sort((left, right) => new Date(left.occurred_at).getTime() - new Date(right.occurred_at).getTime() || left.sequence - right.sequence);
+}
+
+function latestAgentRunEventV4(events: AgentRunEventV4[]) {
+  return [...events].sort((left, right) => left.sequence - right.sequence || new Date(left.occurred_at).getTime() - new Date(right.occurred_at).getTime()).at(-1);
+}
+
+function subscriptionError(channel: string, error: unknown) {
+  const detail = error instanceof Error ? error.message : String(error);
+  return `${channel} event subscription failed: ${detail}`;
 }
 
 function isTerminalAgentEventV4(event: AgentRunEventV4) {

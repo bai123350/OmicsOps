@@ -179,9 +179,13 @@ impl ToolPortV4 for ToolRegistryV4 {
 }
 
 fn validate_required(schema: &Value, input: &Value) -> Result<(), String> {
+    validate_required_at(schema, input, "")
+}
+
+fn validate_required_at(schema: &Value, input: &Value, path: &str) -> Result<(), String> {
     let object = input
         .as_object()
-        .ok_or_else(|| "arguments must be an object".to_string())?;
+        .ok_or_else(|| format!("{} must be an object", display_path(path)))?;
     for field in schema
         .get("required")
         .and_then(Value::as_array)
@@ -190,7 +194,7 @@ fn validate_required(schema: &Value, input: &Value) -> Result<(), String> {
         .filter_map(Value::as_str)
     {
         if !object.contains_key(field) {
-            return Err(format!("missing required field {field}"));
+            return Err(format!("missing required field {}", join_path(path, field)));
         }
     }
     if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
@@ -198,18 +202,41 @@ fn validate_required(schema: &Value, input: &Value) -> Result<(), String> {
             let Some(value) = object.get(field) else {
                 continue;
             };
+            let field_path = join_path(path, field);
             if let Some(min_length) = field_schema.get("minLength").and_then(Value::as_u64)
                 && value
                     .as_str()
                     .is_some_and(|text| text.chars().count() < min_length as usize)
             {
                 return Err(format!(
-                    "field {field} must contain at least {min_length} character(s)"
+                    "field {field_path} must contain at least {min_length} character(s)"
                 ));
+            }
+            if field_schema.get("type").and_then(Value::as_str) == Some("object") {
+                validate_required_at(field_schema, value, &field_path)?;
+            }
+            if let (Some(items), Some(values)) = (field_schema.get("items"), value.as_array()) {
+                for (index, item) in values.iter().enumerate() {
+                    if items.get("type").and_then(Value::as_str) == Some("object") {
+                        validate_required_at(items, item, &format!("{field_path}[{index}]"))?;
+                    }
+                }
             }
         }
     }
     Ok(())
+}
+
+fn join_path(prefix: &str, field: &str) -> String {
+    if prefix.is_empty() {
+        field.into()
+    } else {
+        format!("{prefix}.{field}")
+    }
+}
+
+fn display_path(path: &str) -> &str {
+    if path.is_empty() { "arguments" } else { path }
 }
 
 pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
@@ -252,7 +279,7 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "use_mcp_tool",
-            "Call one configured, enabled, launch-approved, and tool-approved MCP stdio tool",
+            "Call one configured, enabled, launch-approved MCP stdio tool. A persistently approved tool is callable immediately; otherwise the Host can require explicit schema-bound approval for this run",
             ToolEffectV4::Network,
             json!({"type":"object","required":["server_id","tool","arguments","schema_sha256"],"properties":{"server_id":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"},"schema_sha256":{"type":"string"}}}),
         ),
@@ -394,6 +421,28 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("forbidden in plan mode"));
+    }
+
+    #[test]
+    fn runtime_analysis_schema_rejects_missing_nested_sample_ids_before_approval() {
+        let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap();
+        let call = ToolCallV4 {
+            call_id: "literature".into(),
+            tool_id: "runtime.execute".into(),
+            arguments: json!({
+                "language":"python",
+                "code":"print('search')",
+                "analysis":{
+                    "analysis_type":"literature_search",
+                    "input_dataset_ids":[],
+                    "method":"PubMed",
+                    "parameters":{}
+                }
+            }),
+        };
+
+        let error = registry.validate(RunModeV4::Execute, &call).unwrap_err();
+        assert!(error.contains("analysis.sample_ids"));
     }
 
     #[test]

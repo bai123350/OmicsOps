@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import DesktopApp from "./DesktopApp";
@@ -36,6 +36,7 @@ describe("DesktopApp", () => {
     vi.spyOn(api, "submitMessage").mockResolvedValue({ id: "message-1", project_id: project.id, conversation_id: conversation.id, sequence: 1, role: "user", markdown: "先解释一下这个矩阵格式", created_at: "2026-08-21T00:00:00Z" });
     const startDirect = vi.spyOn(api, "agentV4StartDirect").mockResolvedValue({ run_id: "run-direct", status: "running", plan: null, plan_hash: null, compute_selection: { schema_version: 4, backend_id: "local", backend_kind: "local", autonomy_mode: "supervised", environment: "system", network_policy: "host_inherited", container_image: null }, approval_hash: null });
     const startPlanning = vi.spyOn(api, "agentV4StartPlanning");
+    const cancelRun = vi.spyOn(api, "agentV4Cancel").mockResolvedValue();
     vi.spyOn(api, "agentV4Events").mockResolvedValue([]);
 
     render(<DesktopApp />);
@@ -47,6 +48,61 @@ describe("DesktopApp", () => {
     await waitFor(() => expect(startDirect).toHaveBeenCalledWith(expect.objectContaining({ objective: "先解释一下这个矩阵格式" })));
     expect(startPlanning).not.toHaveBeenCalled();
     expect(await screen.findByRole("button", { name: "添加上下文或选择模式" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "终止运行" }));
+    await waitFor(() => expect(cancelRun).toHaveBeenCalledWith("run-direct"));
+    expect(screen.getByRole("button", { name: "终止运行" })).toBeEnabled();
+  });
+
+  it("surfaces an Agent event subscription failure instead of silently waiting", async () => {
+    vi.spyOn(api, "listProjects").mockResolvedValue([{ id: "project-1", name: "PBMC 图谱", description: "", local_root: "E:/Science/pbmc", remote_root: null, connection_id: null, template: "single_cell_rna_seq", status: "running", ollama_only: false, created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" }]);
+    vi.spyOn(api, "onAgentV4Event").mockRejectedValue(new Error("listen unavailable"));
+
+    render(<DesktopApp />);
+
+    expect(await screen.findByText("Agent V4 event subscription failed: listen unavailable")).toBeInTheDocument();
+  });
+
+  it("reconciles persisted Agent events every three seconds when live events are silent", async () => {
+    vi.useFakeTimers();
+    try {
+      const project = { id: "project-1", name: "PBMC 图谱", description: "", local_root: "E:/Science/pbmc", remote_root: null, connection_id: null, template: "single_cell_rna_seq" as const, status: "running" as const, ollama_only: false, created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" };
+      const conversation = { id: "conversation-1", project_id: project.id, title: "长期运行", status: "running" as const, model_profile_id: "model-1", created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" };
+      const model = { id: "model-1", label: "Test model", provider: "ollama" as const, base_url: "http://localhost:11434", model: "test", credential_reference: null, supports_tools: true, supports_vision: false };
+      const base = { schema_version: 4 as const, run_id: "run-poll", project_id: project.id, conversation_id: conversation.id, previous_hash: "", event_hash: "hash" };
+      const started = { ...base, sequence: 1, occurred_at: "2026-08-24T00:00:01Z", event: { kind: "run_created" as const, mode: "execute" as const } };
+      const progress = { ...base, sequence: 2, occurred_at: "2026-08-24T00:00:02Z", event: { kind: "model_text" as const, text: "轮询恢复了进度。" } };
+      vi.spyOn(api, "listProjects").mockResolvedValue([project]);
+      vi.spyOn(api, "listConversations").mockResolvedValue([conversation]);
+      vi.spyOn(api, "listMessages").mockResolvedValue([]);
+      vi.spyOn(api, "listModelProfiles").mockResolvedValue([model]);
+      vi.spyOn(api, "agentV4ComputeBackends").mockResolvedValue([{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]);
+      vi.spyOn(api, "agentV4EventsForConversation").mockResolvedValue([started]);
+      let persistedReads = 0;
+      const readEvents = vi.spyOn(api, "agentV4Events").mockImplementation(async () => {
+        persistedReads += 1;
+        if (persistedReads === 1) throw new Error("temporary event verification failure");
+        return [started, progress];
+      });
+
+      render(<DesktopApp />);
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(250);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(screen.getByRole("main", { name: "科研对话" })).toBeInTheDocument();
+      expect(screen.getByText("temporary event verification failure")).toBeInTheDocument();
+      const readsBeforeInterval = readEvents.mock.calls.length;
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+      expect(readEvents.mock.calls.length).toBeGreaterThan(readsBeforeInterval);
+      expect(screen.getByText("轮询恢复了进度。")).toBeInTheDocument();
+      expect(screen.queryByText("temporary event verification failure")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("starts planning from the plus-menu Plan mode and continues execution after approval", async () => {

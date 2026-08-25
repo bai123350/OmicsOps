@@ -415,7 +415,7 @@ fn usage_from_value(protocol: ProviderProtocol, value: &Value) -> Option<(u64, u
 #[derive(Debug, Clone)]
 pub struct ProviderToolStreamDecoder {
     protocol: ProviderProtocol,
-    pending: String,
+    pending: Vec<u8>,
     active_calls: BTreeMap<u32, (String, String)>,
     tool_aliases: BTreeMap<String, String>,
 }
@@ -424,7 +424,7 @@ impl ProviderToolStreamDecoder {
     pub fn new(protocol: ProviderProtocol) -> Self {
         Self {
             protocol,
-            pending: String::new(),
+            pending: Vec::new(),
             active_calls: BTreeMap::new(),
             tool_aliases: BTreeMap::new(),
         }
@@ -433,21 +433,24 @@ impl ProviderToolStreamDecoder {
     pub fn for_request(protocol: ProviderProtocol, request: &ProviderModelRequest) -> Self {
         Self {
             protocol,
-            pending: String::new(),
+            pending: Vec::new(),
             active_calls: BTreeMap::new(),
             tool_aliases: provider_tool_alias_map(request),
         }
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> AdapterResult<Vec<ProviderStreamEvent>> {
-        self.pending.push_str(&String::from_utf8_lossy(chunk));
+        self.pending.extend_from_slice(chunk);
         let mut events = Vec::new();
-        while let Some(newline) = self.pending.find('\n') {
-            let line = self.pending[..newline]
+        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line_bytes = self.pending.drain(..=newline).collect::<Vec<_>>();
+            let line = std::str::from_utf8(&line_bytes[..newline])
+                .map_err(|error| {
+                    AdapterError::Llm(format!("model stream returned invalid UTF-8: {error}"))
+                })?
                 .trim_end_matches('\r')
                 .trim()
                 .to_owned();
-            self.pending.drain(..=newline);
             if line.is_empty() || line.starts_with("event:") {
                 continue;
             }
@@ -703,10 +706,10 @@ impl ProviderToolStreamDecoder {
     }
 
     pub fn finish(&mut self) -> AdapterResult<Vec<ProviderStreamEvent>> {
-        if self.pending.trim().is_empty() {
+        if self.pending.iter().all(u8::is_ascii_whitespace) {
             return Ok(Vec::new());
         }
-        self.pending.push('\n');
+        self.pending.push(b'\n');
         self.push(&[])
     }
 }
@@ -1167,14 +1170,19 @@ impl OpenAiCompatibleClient {
         }
 
         let mut stream = response.bytes_stream();
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         let mut accumulator = SseToolCallAccumulator::new(tool_name);
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|error| AdapterError::Llm(error.to_string()))?;
-            pending.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(newline) = pending.find('\n') {
-                let line = pending[..newline].trim().to_owned();
-                pending.drain(..=newline);
+            pending.extend_from_slice(&chunk);
+            while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+                let line_bytes = pending.drain(..=newline).collect::<Vec<_>>();
+                let line = std::str::from_utf8(&line_bytes[..newline])
+                    .map_err(|error| {
+                        AdapterError::Llm(format!("model stream returned invalid UTF-8: {error}"))
+                    })?
+                    .trim()
+                    .to_owned();
                 if let Some(data) = line.strip_prefix("data:") {
                     accumulator.push_data(data.trim())?;
                 }
