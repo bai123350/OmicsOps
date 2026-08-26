@@ -155,13 +155,12 @@ async fn deleting_a_conversation_removes_its_persisted_mode_in_the_same_transact
         .set_conversation_agent_mode(project.id, conversation.id, SessionAgentModeV4::Plan)
         .await
         .unwrap();
-    let before: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM settings WHERE scope='global' AND key=?1",
-    )
-    .bind(&setting_key)
-    .fetch_one(store.pool())
-    .await
-    .unwrap();
+    let before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM settings WHERE scope='global' AND key=?1")
+            .bind(&setting_key)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
     assert_eq!(before, 1);
 
     assert!(
@@ -171,12 +170,11 @@ async fn deleting_a_conversation_removes_its_persisted_mode_in_the_same_transact
             .unwrap()
     );
 
-    let after: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM settings WHERE scope='global' AND key=?1",
-    )
-    .bind(&setting_key)
-    .fetch_one(store.pool())
-    .await
-    .unwrap();
+    let after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM settings WHERE scope='global' AND key=?1")
+            .bind(&setting_key)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
     assert_eq!(after, 0);
 }
