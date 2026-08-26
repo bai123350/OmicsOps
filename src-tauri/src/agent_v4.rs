@@ -65,6 +65,7 @@ use uuid::Uuid;
 use crate::commands::{
     AppState, authentication_for_profile, find_profile, require_trusted_host, unified_model_client,
 };
+pub use crate::dto::{RunSummaryV4, SessionAgentModeV4};
 use crate::p1_commands::{
     McpServerProfile, MemorySearchRequest, invoke_configured_mcp_tool_v4, memory_facts,
 };
@@ -152,16 +153,6 @@ pub struct DecideToolApprovalV4Request {
     pub approval_id: String,
     pub call_hash: String,
     pub decision: ToolApprovalDecisionV4,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunSummaryV4 {
-    pub run_id: Uuid,
-    pub status: String,
-    pub plan: Option<ExecutionPlanV4>,
-    pub plan_hash: Option<String>,
-    pub compute_selection: Option<ComputeSelectionV4>,
-    pub approval_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,6 +377,8 @@ pub async fn agent_v4_start_planning(
                 plan_hash: None,
                 compute_selection: Some(request.compute_selection),
                 approval_hash: None,
+                plan_revision: None,
+                session_mode: Some(SessionAgentModeV4::Plan),
             });
         }
         Err(error) => return Err(error.to_string()),
@@ -412,6 +405,8 @@ pub async fn agent_v4_start_planning(
         plan_hash: Some(hash),
         compute_selection: Some(request.compute_selection),
         approval_hash: Some(approval_hash),
+        plan_revision: None,
+        session_mode: Some(SessionAgentModeV4::Plan),
     })
 }
 
@@ -518,6 +513,8 @@ pub async fn agent_v4_start_direct(
         plan_hash: None,
         compute_selection: Some(request.compute_selection),
         approval_hash: None,
+        plan_revision: None,
+        session_mode: Some(SessionAgentModeV4::Agent),
     })
 }
 
@@ -639,6 +636,8 @@ pub async fn agent_v4_approve_plan(
         plan_hash: Some(approved_plan_hash),
         compute_selection: Some(selection),
         approval_hash: Some(expected_approval),
+        plan_revision: None,
+        session_mode: Some(SessionAgentModeV4::Agent),
     })
 }
 

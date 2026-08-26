@@ -3225,6 +3225,7 @@ dependencies = [
  "omicsops-agent",
  "omicsops-agent-core",
  "omicsops-core",
+ "omicsops-dto",
  "omicsops-knowledge",
  "omicsops-mcp",
  "omicsops-protocol",
@@ -3248,6 +3249,16 @@ dependencies = [
  "url",
  "uuid",
  "zip",
+]
+
+[[package]]
+name = "omicsops-dto"
+version = "0.1.0"
+dependencies = [
+ "omicsops-protocol",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -3329,6 +3340,7 @@ dependencies = [
  "chrono",
  "hex",
  "omicsops-core",
+ "omicsops-dto",
  "omicsops-protocol",
  "omicsops-science",
  "rusqlite",

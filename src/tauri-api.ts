@@ -9,6 +9,9 @@ import type {
   ServerInspection,
   AgentRunEventV4,
   RunSummaryV4,
+  GetConversationAgentModeResponseV4,
+  SetConversationAgentModeRequestV4,
+  SetConversationAgentModeResponseV4,
   ComputeSelectionV4,
   ComputeBackendAvailabilityV4,
   WorkspaceConversation,
@@ -74,6 +77,23 @@ export async function createConversation(projectId: string, title?: string): Pro
 export async function deleteConversation(projectId: string, conversationId: string): Promise<void> {
   if (!isTauri()) return;
   await invoke("delete_conversation", { projectId, conversationId });
+}
+
+export async function getConversationAgentMode(
+  projectId: string,
+  conversationId: string,
+): Promise<GetConversationAgentModeResponseV4> {
+  if (!isTauri()) {
+    return { project_id: projectId, conversation_id: conversationId, mode: "agent" };
+  }
+  return invoke("get_conversation_agent_mode", { projectId, conversationId });
+}
+
+export async function setConversationAgentMode(
+  request: SetConversationAgentModeRequestV4,
+): Promise<SetConversationAgentModeResponseV4> {
+  if (!isTauri()) return request;
+  return invoke("set_conversation_agent_mode", { request });
 }
 
 export async function listMessages(conversationId: string): Promise<WorkspaceMessage[]> {

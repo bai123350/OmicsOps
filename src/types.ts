@@ -153,7 +153,26 @@ export interface RunSummaryV4 {
   plan_hash: string | null;
   compute_selection: ComputeSelectionV4 | null;
   approval_hash: string | null;
+  plan_revision?: number | null;
+  session_mode?: SessionAgentModeV4 | null;
 }
+
+export type SessionAgentModeV4 = "agent" | "plan";
+
+export interface GetConversationAgentModeRequestV4 {
+  project_id: string;
+  conversation_id: string;
+}
+
+export interface GetConversationAgentModeResponseV4 extends GetConversationAgentModeRequestV4 {
+  mode: SessionAgentModeV4;
+}
+
+export interface SetConversationAgentModeRequestV4 extends GetConversationAgentModeRequestV4 {
+  mode: SessionAgentModeV4;
+}
+
+export interface SetConversationAgentModeResponseV4 extends SetConversationAgentModeRequestV4 {}
 
 export interface ToolCallV4 { call_id: string; tool_id: string; arguments: Record<string, unknown> }
 export interface ToolOutcomeV4 { call_id: string; tool_id: string; succeeded: boolean; model_content: string; data: unknown; provenance: string[] }

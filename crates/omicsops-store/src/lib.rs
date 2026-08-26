@@ -17,6 +17,7 @@ use omicsops_core::{
         SkillPackage, SyncEntry,
     },
 };
+use omicsops_dto::SessionAgentModeV4;
 use omicsops_protocol::{
     AgentEventV4, ContextArchiveV4, ContextCheckpointV4, deserialize_event_chain_v4,
 };
@@ -33,6 +34,8 @@ use uuid::Uuid;
 
 const SCHEMA_VERSION: u32 = 4;
 const INIT_SQL: &str = include_str!("../migrations/init.sql");
+const SETTINGS_GLOBAL_SCOPE: &str = "global";
+const CONVERSATION_AGENT_MODE_SETTING_PREFIX: &str = "conversation_agent_mode:";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -284,6 +287,84 @@ impl Store {
         Ok(())
     }
 
+    /// Read the durable Agent/Plan mode for a conversation.
+    ///
+    /// The project id is part of the lookup contract rather than merely a
+    /// caller hint: a conversation must belong to that project before its
+    /// setting is read. Missing settings are the legacy behavior and default
+    /// to Agent without creating a row.
+    pub async fn get_conversation_agent_mode(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+    ) -> Result<SessionAgentModeV4, StoreError> {
+        self.ensure_conversation_owner(project_id, conversation_id)
+            .await?;
+        let key = conversation_agent_mode_setting_key(conversation_id);
+        let row = sqlx::query("SELECT value_json FROM settings WHERE scope=?1 AND key=?2")
+            .bind(SETTINGS_GLOBAL_SCOPE)
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(SessionAgentModeV4::default());
+        };
+        let value = row.try_get::<String, _>(0)?;
+        parse_conversation_agent_mode(&value)
+    }
+
+    /// Persist the Agent/Plan mode for a conversation.
+    ///
+    /// Ownership validation and the setting upsert share one transaction so a
+    /// cross-project request cannot leave behind a setting row.
+    pub async fn set_conversation_agent_mode(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        mode: SessionAgentModeV4,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        ensure_conversation_owner_executor(&mut tx, project_id, conversation_id).await?;
+        let key = conversation_agent_mode_setting_key(conversation_id);
+        sqlx::query(
+            "INSERT INTO settings (scope,key,value_json,updated_at)
+             VALUES (?1,?2,?3,?4)
+             ON CONFLICT(scope,key) DO UPDATE SET value_json=excluded.value_json,
+             updated_at=excluded.updated_at",
+        )
+        .bind(SETTINGS_GLOBAL_SCOPE)
+        .bind(key)
+        .bind(serde_json::to_string(&mode)?)
+        .bind(timestamp(Utc::now()))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn ensure_conversation_owner(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+    ) -> Result<(), StoreError> {
+        let owns: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM conversation_records
+                WHERE frame_id=?1 AND project_id=?2
+            )",
+        )
+        .bind(conversation_id.to_string())
+        .bind(project_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        if owns == 0 {
+            return Err(StoreError::InvalidInput(format!(
+                "conversation {conversation_id} does not belong to project {project_id}"
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn conversations_for_project(
         &self,
         project_id: Uuid,
@@ -304,6 +385,7 @@ impl Store {
         conversation_id: Uuid,
     ) -> Result<bool, StoreError> {
         let mut tx = self.pool.begin().await?;
+        let conversation_setting_key = conversation_agent_mode_setting_key(conversation_id);
         let project_id = project_id.to_string();
         let conversation_id = conversation_id.to_string();
         let exists: i64 = sqlx::query_scalar(
@@ -336,6 +418,11 @@ impl Store {
         }
         sqlx::query("DELETE FROM frames WHERE id=?1")
             .bind(&conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM settings WHERE scope=?1 AND key=?2")
+            .bind(SETTINGS_GLOBAL_SCOPE)
+            .bind(conversation_setting_key)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -2187,6 +2274,41 @@ fn project_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Project, StoreError>
         created_at: from_timestamp(row.try_get(4)?, "project created_at")?,
         updated_at: from_timestamp(row.try_get(5)?, "project updated_at")?,
     })
+}
+
+fn conversation_agent_mode_setting_key(conversation_id: Uuid) -> String {
+    format!("{CONVERSATION_AGENT_MODE_SETTING_PREFIX}{conversation_id}")
+}
+
+fn parse_conversation_agent_mode(value: &str) -> Result<SessionAgentModeV4, StoreError> {
+    serde_json::from_str(value)
+        .or_else(|_| serde_json::from_value(Value::String(value.to_owned())))
+        .map_err(|error| {
+            StoreError::InvalidInput(format!("invalid conversation agent mode setting: {error}"))
+        })
+}
+
+async fn ensure_conversation_owner_executor(
+    tx: &mut Transaction<'_, Sqlite>,
+    project_id: Uuid,
+    conversation_id: Uuid,
+) -> Result<(), StoreError> {
+    let owns: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM conversation_records
+            WHERE frame_id=?1 AND project_id=?2
+        )",
+    )
+    .bind(conversation_id.to_string())
+    .bind(project_id.to_string())
+    .fetch_one(&mut **tx)
+    .await?;
+    if owns == 0 {
+        return Err(StoreError::InvalidInput(format!(
+            "conversation {conversation_id} does not belong to project {project_id}"
+        )));
+    }
+    Ok(())
 }
 
 fn conversation_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Conversation, StoreError> {

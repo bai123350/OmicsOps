@@ -1,6 +1,12 @@
 pub mod agent_commands;
 pub mod agent_v4;
 pub mod commands;
+pub mod conversation_mode;
+#[cfg(test)]
+mod conversation_mode_tests;
+pub mod dto;
+#[cfg(test)]
+mod dto_contract_tests;
 pub mod inspection;
 pub mod kernel_commands;
 pub mod model_commands;
@@ -81,6 +87,8 @@ pub fn run() {
             commands::confirm_host_key,
             commands::inspect_project,
             commands::initialize_project,
+            conversation_mode::get_conversation_agent_mode,
+            conversation_mode::set_conversation_agent_mode,
             agent_v4::agent_v4_start_planning,
             agent_v4::agent_v4_start_direct,
             agent_v4::agent_v4_compute_backends,

@@ -19,6 +19,7 @@ omicsops-agent = { path = "../crates/omicsops-agent" }
 omicsops-agent-core = { path = "../crates/omicsops-agent-core" }
 omicsops-adapters = { path = "../crates/omicsops-adapters" }
 omicsops-core = { path = "../crates/omicsops-core" }
+omicsops-dto = { path = "../crates/omicsops-dto" }
 omicsops-protocol = { path = "../crates/omicsops-protocol" }
 omicsops-runtime = { path = "../crates/omicsops-runtime" }
 omicsops-science = { path = "../crates/omicsops-science" }

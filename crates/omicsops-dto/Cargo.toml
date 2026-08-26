@@ -1,0 +1,13 @@
+[package]
+name = "omicsops-dto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+omicsops-protocol = { path = "../omicsops-protocol" }
+serde.workspace = true
+uuid = { workspace = true, features = ["js"] }
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -8,6 +8,7 @@ license.workspace = true
 chrono.workspace = true
 hex.workspace = true
 omicsops-core = { path = "../omicsops-core" }
+omicsops-dto = { path = "../omicsops-dto" }
 omicsops-protocol = { path = "../omicsops-protocol" }
 omicsops-science = { path = "../omicsops-science" }
 serde.workspace = true
