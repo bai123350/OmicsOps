@@ -1,0 +1,2394 @@
+//! Async SQLite persistence for OmicsOps.
+//!
+//! `Store` is the sole owner of the SQLite connection pool. Desktop commands
+//! and persistence-aware orchestration use its native async API directly.
+
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
+
+use chrono::{DateTime, Utc};
+use omicsops_core::{
+    domain::ConnectionProfile,
+    workspace::{
+        Artifact, Conversation, Message, MessageRole, ModelProfile, NotebookEntry, Project,
+        SkillPackage, SyncEntry,
+    },
+};
+use omicsops_protocol::{
+    AgentEventV4, ContextArchiveV4, ContextCheckpointV4, deserialize_event_chain_v4,
+};
+use omicsops_science::ScientificStateV4;
+use serde::{Serialize, de::DeserializeOwned};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use sqlx::{
+    Row, Sqlite, SqlitePool, Transaction,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
+use thiserror::Error;
+use uuid::Uuid;
+
+const SCHEMA_VERSION: u32 = 4;
+const INIT_SQL: &str = include_str!("../migrations/init.sql");
+
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("database failed: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON failed: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+    #[error("migration failed: {0}")]
+    Migration(String),
+}
+
+/// Optional deterministic migration fault injection used by tests and by
+/// recovery diagnostics.  A value of `Some(0)` fails before the first legacy
+/// row is copied; the transaction then rolls back all DDL and data writes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MigrationOptions {
+    pub fail_after_rows: Option<usize>,
+}
+
+#[derive(Clone)]
+pub struct Store {
+    pool: SqlitePool,
+}
+
+impl Store {
+    /// Open (or create) a file-backed Store and run the idempotent schema
+    /// upgrade. Existing pre-v4 files are copied to
+    /// `<db>.pre-store-v4.<timestamp>-<id>.bak` before their transaction
+    /// begins.
+    pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_with_options(path, MigrationOptions::default()).await
+    }
+
+    /// Open an in-memory Store. A single pool connection is intentional:
+    /// SQLite in-memory databases are connection-local.
+    pub async fn open_in_memory() -> Result<Self, StoreError> {
+        let options = SqliteConnectOptions::new()
+            .filename(":memory:")
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+        initialize(&pool, 0, MigrationOptions::default()).await?;
+        Ok(Self { pool })
+    }
+
+    /// Test/recovery entry point that injects a rollback after a deterministic
+    /// number of copied v3 rows.
+    pub async fn open_with_migration_failure(
+        path: impl AsRef<Path>,
+        fail_after_rows: usize,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_options(
+            path,
+            MigrationOptions {
+                fail_after_rows: Some(fail_after_rows),
+            },
+        )
+        .await
+    }
+
+    pub async fn open_with_options(
+        path: impl AsRef<Path>,
+        options: MigrationOptions,
+    ) -> Result<Self, StoreError> {
+        let path = path.as_ref().to_path_buf();
+        let existed = path.exists();
+        let version = if existed {
+            read_schema_version(&path).await?
+        } else {
+            0
+        };
+        if version > SCHEMA_VERSION {
+            return Err(StoreError::Migration(format!(
+                "database schema version {version} is newer than supported version {SCHEMA_VERSION}"
+            )));
+        }
+        if existed && version < SCHEMA_VERSION {
+            create_backup(&path, version)?;
+        }
+        let connect_options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(connect_options)
+            .await?;
+        if let Err(error) = initialize(&pool, version, options).await {
+            pool.close().await;
+            return Err(error);
+        }
+        Ok(Self { pool })
+    }
+
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    pub async fn schema_version(&self) -> Result<u32, StoreError> {
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&self.pool)
+            .await?;
+        u32::try_from(version)
+            .map_err(|_| StoreError::InvalidInput("invalid SQLite schema version".into()))
+    }
+
+    pub async fn foreign_keys_enabled(&self) -> Result<bool, StoreError> {
+        let enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(enabled == 1)
+    }
+
+    pub async fn has_table(&self, table: &str) -> Result<bool, StoreError> {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        )
+        .bind(table)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists == 1)
+    }
+
+    pub async fn save_connection(&self, profile: &ConnectionProfile) -> Result<(), StoreError> {
+        let json = serde_json::to_string(profile)?;
+        sqlx::query(
+            "INSERT INTO connections (id,label,profile_json) VALUES (?1,?2,?3)
+             ON CONFLICT(id) DO UPDATE SET label=excluded.label, profile_json=excluded.profile_json",
+        )
+        .bind(profile.id.to_string())
+        .bind(&profile.label)
+        .bind(json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_connections(&self) -> Result<Vec<ConnectionProfile>, StoreError> {
+        let rows = sqlx::query("SELECT profile_json FROM connections ORDER BY label,id")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| Ok(serde_json::from_str(row.try_get::<String, _>(0)?.as_str())?))
+            .collect()
+    }
+
+    pub async fn save_project(&self, project: &Project) -> Result<(), StoreError> {
+        validate_project_input(project)?;
+        let mut tx = self.pool.begin().await?;
+        insert_project(&mut tx, project).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn list_projects(&self) -> Result<Vec<Project>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT p.id,p.name,p.description,p.workspace_dir,p.created_at,p.updated_at,
+                    e.local_root,e.remote_root,e.connection_id,e.template,e.status,e.ollama_only
+             FROM projects p LEFT JOIN project_omicsops e ON e.project_id=p.id
+             ORDER BY p.updated_at DESC,p.id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(project_from_row).collect()
+    }
+
+    pub async fn get_project(&self, id: Uuid) -> Result<Option<Project>, StoreError> {
+        let row = sqlx::query(
+            "SELECT p.id,p.name,p.description,p.workspace_dir,p.created_at,p.updated_at,
+                    e.local_root,e.remote_root,e.connection_id,e.template,e.status,e.ollama_only
+             FROM projects p LEFT JOIN project_omicsops e ON e.project_id=p.id WHERE p.id=?1",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(project_from_row).transpose()
+    }
+
+    pub async fn agent_run_ids_v4_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<Uuid>, StoreError> {
+        let rows =
+            sqlx::query("SELECT run_id FROM agent_runs_v4 WHERE project_id=?1 ORDER BY rowid")
+                .bind(project_id.to_string())
+                .fetch_all(&self.pool)
+                .await?;
+        rows.into_iter()
+            .map(|row| parse_uuid(row.try_get::<String, _>(0)?, "V4 run id"))
+            .collect()
+    }
+
+    pub async fn delete_project(&self, project_id: Uuid) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let project_id = project_id.to_string();
+        let exists: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1)")
+            .bind(&project_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if exists == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "DELETE FROM agent_context_archives_v4 WHERE run_id IN
+             (SELECT run_id FROM agent_runs_v4 WHERE project_id=?1)",
+        )
+        .bind(&project_id)
+        .execute(&mut *tx)
+        .await?;
+        for table in [
+            "scientific_provenance_v4",
+            "scientific_evidence_v4",
+            "scientific_artifacts_v4",
+            "scientific_analyses_v4",
+            "scientific_datasets_v4",
+            "scientific_states_v4",
+            "agent_events_v4",
+            "agent_runs_v4",
+            "runs",
+            "remote_staging",
+            "sync_entries",
+            "notebook_entries",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE project_id=?1"))
+                .bind(&project_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("DELETE FROM projects WHERE id=?1")
+            .bind(&project_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn save_conversation(&self, conversation: &Conversation) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        insert_conversation(&mut tx, conversation).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn conversations_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<Conversation>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT frame_id,project_id,title,status,model_profile_id,created_at,updated_at
+             FROM conversation_records WHERE project_id=?1 ORDER BY updated_at DESC,frame_id",
+        )
+        .bind(project_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(conversation_from_row).collect()
+    }
+
+    pub async fn delete_conversation(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let project_id = project_id.to_string();
+        let conversation_id = conversation_id.to_string();
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conversation_records WHERE frame_id=?1 AND project_id=?2)",
+        )
+        .bind(&conversation_id)
+        .bind(&project_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if exists == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "DELETE FROM agent_context_archives_v4 WHERE run_id IN
+             (SELECT run_id FROM agent_runs_v4 WHERE project_id=?1 AND conversation_id=?2)",
+        )
+        .bind(&project_id)
+        .bind(&conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        for table in ["agent_events_v4", "agent_runs_v4"] {
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE project_id=?1 AND conversation_id=?2"
+            ))
+            .bind(&project_id)
+            .bind(&conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query("DELETE FROM frames WHERE id=?1")
+            .bind(&conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn save_message(&self, message: &Message) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        ensure_frame(
+            &mut tx,
+            message.project_id,
+            message.conversation_id,
+            message.created_at,
+        )
+        .await?;
+        insert_message(&mut tx, message).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn messages_for_conversation(
+        &self,
+        conversation_id: Uuid,
+    ) -> Result<Vec<Message>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT m.id,m.project_id,m.conversation_id,m.seq,m.role,m.content,m.ts,
+                    COALESCE(m.project_id,c.project_id) AS resolved_project_id
+             FROM messages m LEFT JOIN conversation_records c ON c.frame_id=m.frame_id
+             WHERE m.frame_id=?1 ORDER BY m.seq,m.id",
+        )
+        .bind(conversation_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(message_from_row).collect()
+    }
+
+    pub async fn save_notebook_entry(&self, entry: &NotebookEntry) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO notebook_entries (id,project_id,conversation_id,turn_id,kind,title,
+             markdown,confidence,evidence_json,artifact_ids_json,created_at,updated_at,value_json)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+             ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,
+             conversation_id=excluded.conversation_id,turn_id=excluded.turn_id,kind=excluded.kind,
+             title=excluded.title,markdown=excluded.markdown,confidence=excluded.confidence,
+             evidence_json=excluded.evidence_json,artifact_ids_json=excluded.artifact_ids_json,
+             created_at=excluded.created_at,updated_at=excluded.updated_at,value_json=excluded.value_json",
+        )
+        .bind(entry.id.to_string())
+        .bind(entry.project_id.to_string())
+        .bind(entry.conversation_id.map(|id| id.to_string()))
+        .bind(entry.turn_id.map(|id| id.to_string()))
+        .bind(enum_string(&entry.kind)?)
+        .bind(&entry.title)
+        .bind(&entry.markdown)
+        .bind(entry.confidence.map(f64::from))
+        .bind(serde_json::to_string(&entry.evidence_ids)?)
+        .bind(serde_json::to_string(&entry.artifact_ids)?)
+        .bind(timestamp(entry.created_at))
+        .bind(timestamp(entry.updated_at))
+        .bind(serde_json::to_string(entry)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn notebook_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<NotebookEntry>, StoreError> {
+        self.project_json_rows("notebook_entries", project_id).await
+    }
+
+    /// Kept as a source-compatible name while writing only the normalized v4
+    /// `artifacts` table. The retired `artifacts_v3` table is never modified.
+    pub async fn save_artifact_v3(&self, artifact: &Artifact) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO artifacts (id,project_id,root_frame_id,filename,content_type,storage_path,
+             created_at,logical_key,source_run_id,remote_path,size_bytes,sha256,verified)
+             VALUES (?1,?2,NULL,?3,?4,?5,?6,NULL,?7,?8,?9,?10,?11)
+             ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,filename=excluded.filename,
+             content_type=excluded.content_type,storage_path=excluded.storage_path,
+             created_at=excluded.created_at,source_run_id=excluded.source_run_id,
+             remote_path=excluded.remote_path,size_bytes=excluded.size_bytes,sha256=excluded.sha256,
+             verified=excluded.verified",
+        )
+        .bind(artifact.id.to_string())
+        .bind(artifact.project_id.to_string())
+        .bind(&artifact.relative_path)
+        .bind(&artifact.media_type)
+        .bind(&artifact.relative_path)
+        .bind(timestamp(artifact.created_at))
+        .bind(artifact.run_id.map(|id| id.to_string()))
+        .bind(&artifact.remote_path)
+        .bind(i64::try_from(artifact.size_bytes).map_err(|_| StoreError::InvalidInput("artifact size exceeds SQLite integer range".into()))?)
+        .bind(&artifact.sha256)
+        .bind(if artifact.verified { 1_i64 } else { 0_i64 })
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn artifacts_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<Artifact>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id,project_id,source_run_id,filename,remote_path,content_type,size_bytes,sha256,
+                    verified,created_at FROM artifacts WHERE project_id=?1 ORDER BY id",
+        )
+        .bind(project_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(artifact_from_row).collect()
+    }
+
+    pub async fn save_sync_entry(&self, entry: &SyncEntry) -> Result<(), StoreError> {
+        if entry.relative_path.trim().is_empty() {
+            return Err(StoreError::InvalidInput(
+                "sync entry relative_path cannot be blank".into(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO sync_entries (id,project_id,relative_path,value_json) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,
+                 relative_path=excluded.relative_path,value_json=excluded.value_json",
+        )
+        .bind(entry.id.to_string())
+        .bind(entry.project_id.to_string())
+        .bind(&entry.relative_path)
+        .bind(serde_json::to_string(entry)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn sync_entries_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<SyncEntry>, StoreError> {
+        self.project_json_rows("sync_entries", project_id).await
+    }
+
+    pub async fn save_model_profile(&self, profile: &ModelProfile) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO model_profiles (id,value_json) VALUES (?1,?2)
+             ON CONFLICT(id) DO UPDATE SET value_json=excluded.value_json",
+        )
+        .bind(profile.id.to_string())
+        .bind(serde_json::to_string(profile)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_model_profiles(&self) -> Result<Vec<ModelProfile>, StoreError> {
+        self.simple_json_rows("model_profiles").await
+    }
+
+    pub async fn get_model_profile(&self, id: Uuid) -> Result<Option<ModelProfile>, StoreError> {
+        self.get_simple_json("model_profiles", &id.to_string())
+            .await
+    }
+
+    pub async fn save_skill_package(&self, skill: &SkillPackage) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO skill_packages (id,value_json) VALUES (?1,?2)
+             ON CONFLICT(id) DO UPDATE SET value_json=excluded.value_json",
+        )
+        .bind(skill.id.to_string())
+        .bind(serde_json::to_string(skill)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_skill_packages(&self) -> Result<Vec<SkillPackage>, StoreError> {
+        self.simple_json_rows("skill_packages").await
+    }
+
+    pub async fn delete_skill_package(&self, id: Uuid) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM skill_packages WHERE id=?1")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn put_json<T: Serialize>(
+        &self,
+        kind: &str,
+        id: &str,
+        value: &T,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO app_objects (kind,id,value_json) VALUES (?1,?2,?3)
+             ON CONFLICT(kind,id) DO UPDATE SET value_json=excluded.value_json",
+        )
+        .bind(kind)
+        .bind(id)
+        .bind(serde_json::to_string(value)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_json<T: DeserializeOwned>(
+        &self,
+        kind: &str,
+        id: &str,
+    ) -> Result<Option<T>, StoreError> {
+        let row = sqlx::query("SELECT value_json FROM app_objects WHERE kind=?1 AND id=?2")
+            .bind(kind)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| Ok(serde_json::from_str(row.try_get::<String, _>(0)?.as_str())?))
+            .transpose()
+    }
+
+    pub async fn list_json<T: DeserializeOwned>(&self, kind: &str) -> Result<Vec<T>, StoreError> {
+        let rows = sqlx::query("SELECT value_json FROM app_objects WHERE kind=?1 ORDER BY id")
+            .bind(kind)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| Ok(serde_json::from_str(row.try_get::<String, _>(0)?.as_str())?))
+            .collect()
+    }
+
+    pub async fn save_agent_run_v4(
+        &self,
+        run_id: Uuid,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        status: &str,
+        value: &Value,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO agent_runs_v4 (run_id,project_id,conversation_id,status,value_json)
+             VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(run_id) DO UPDATE SET project_id=excluded.project_id,
+             conversation_id=excluded.conversation_id,status=excluded.status,value_json=excluded.value_json",
+        )
+        .bind(run_id.to_string())
+        .bind(project_id.to_string())
+        .bind(conversation_id.to_string())
+        .bind(status)
+        .bind(serde_json::to_string(value)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn agent_run_v4(&self, run_id: Uuid) -> Result<Option<Value>, StoreError> {
+        let row = sqlx::query("SELECT value_json FROM agent_runs_v4 WHERE run_id=?1")
+            .bind(run_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| Ok(serde_json::from_str(row.try_get::<String, _>(0)?.as_str())?))
+            .transpose()
+    }
+
+    pub async fn agent_runs_for_context_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+    ) -> Result<Vec<Value>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT value_json FROM agent_runs_v4 WHERE project_id=?1 AND conversation_id=?2 ORDER BY rowid",
+        )
+        .bind(project_id.to_string())
+        .bind(conversation_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| Ok(serde_json::from_str(row.try_get::<String, _>(0)?.as_str())?))
+            .collect()
+    }
+
+    /// Validate and append one event. A terminal completion and its public
+    /// assistant message are committed together, so a restart cannot expose
+    /// one without the other.
+    pub async fn append_agent_event_v4_with_conversation(
+        &self,
+        event: &AgentEventV4,
+    ) -> Result<Option<Message>, StoreError> {
+        if event.schema_version != 4 {
+            return Err(StoreError::InvalidInput(
+                "only Agent Event schema version 4 is supported".into(),
+            ));
+        }
+        event
+            .verify()
+            .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+        let mut tx = self.pool.begin().await?;
+        ensure_event_context(&mut tx, event).await?;
+        let serialized =
+            sqlx::query("SELECT value_json FROM agent_events_v4 WHERE run_id=?1 ORDER BY sequence")
+                .bind(event.run_id.to_string())
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .map(|row| row.try_get::<String, _>(0))
+                .collect::<Result<Vec<_>, _>>()?;
+        let existing = deserialize_event_chain_v4(&serialized)
+            .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+
+        if let Some(stored) = existing
+            .iter()
+            .find(|stored| stored.sequence == event.sequence)
+        {
+            if stored.event_hash != event.event_hash || stored != event {
+                return Err(StoreError::InvalidInput(format!(
+                    "event sequence {} is already occupied by a different event",
+                    event.sequence
+                )));
+            }
+            let message = if is_run_completed(event) {
+                persist_completion_message(&mut tx, &existing, event).await?
+            } else {
+                None
+            };
+            tx.commit().await?;
+            return Ok(message);
+        }
+
+        let chain_continues = existing.last().map_or_else(
+            || event.sequence == 1 && event.previous_hash.is_empty(),
+            |previous| {
+                event.sequence == previous.sequence + 1
+                    && event.previous_hash == previous.event_hash
+            },
+        );
+        if !chain_continues {
+            return Err(StoreError::InvalidInput("broken V4 event chain".into()));
+        }
+        let mut candidate = existing;
+        candidate.push(event.clone());
+        let sequence = i64::try_from(event.sequence)
+            .map_err(|_| StoreError::InvalidInput("event sequence exceeds SQLite range".into()))?;
+        sqlx::query(
+            "INSERT INTO agent_events_v4
+             (run_id,project_id,conversation_id,sequence,previous_hash,event_hash,value_json,occurred_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        )
+        .bind(event.run_id.to_string())
+        .bind(event.project_id.to_string())
+        .bind(event.conversation_id.to_string())
+        .bind(sequence)
+        .bind(&event.previous_hash)
+        .bind(&event.event_hash)
+        .bind(serde_json::to_string(event)?)
+        .bind(timestamp(event.occurred_at))
+        .execute(&mut *tx)
+        .await?;
+        let message = if is_run_completed(event) {
+            persist_completion_message(&mut tx, &candidate, event).await?
+        } else {
+            None
+        };
+        tx.commit().await?;
+        Ok(message)
+    }
+
+    pub async fn append_agent_event_v4(&self, event: &AgentEventV4) -> Result<(), StoreError> {
+        self.append_agent_event_v4_with_conversation(event)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn agent_events_v4(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, StoreError> {
+        let rows =
+            sqlx::query("SELECT value_json FROM agent_events_v4 WHERE run_id=?1 ORDER BY sequence")
+                .bind(run_id.to_string())
+                .fetch_all(&self.pool)
+                .await?;
+        let serialized = rows
+            .into_iter()
+            .map(|row| row.try_get::<String, _>(0))
+            .collect::<Result<Vec<_>, _>>()?;
+        deserialize_event_chain_v4(&serialized)
+            .map_err(|error| StoreError::InvalidInput(error.to_string()))
+    }
+
+    pub async fn agent_events_for_context_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+    ) -> Result<Vec<AgentEventV4>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT run_id,value_json FROM agent_events_v4
+             WHERE project_id=?1 AND conversation_id=?2 ORDER BY run_id,sequence",
+        )
+        .bind(project_id.to_string())
+        .bind(conversation_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut chains: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for row in rows {
+            chains
+                .entry(row.try_get::<String, _>(0)?)
+                .or_default()
+                .push(row.try_get::<String, _>(1)?);
+        }
+        let mut events = Vec::new();
+        for serialized in chains.values() {
+            events.extend(
+                deserialize_event_chain_v4(serialized)
+                    .map_err(|error| StoreError::InvalidInput(error.to_string()))?,
+            );
+        }
+        Ok(events)
+    }
+
+    pub async fn archive_agent_context_v4(
+        &self,
+        run_id: Uuid,
+        transcript: &str,
+        checkpoint: &ContextCheckpointV4,
+    ) -> Result<ContextArchiveV4, StoreError> {
+        if checkpoint.schema_version != 4 {
+            return Err(StoreError::InvalidInput(
+                "only context checkpoint schema version 4 is supported".into(),
+            ));
+        }
+        let run_exists: i64 =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_runs_v4 WHERE run_id=?1)")
+                .bind(run_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        if run_exists == 0 {
+            return Err(StoreError::InvalidInput(format!(
+                "context archive references unknown run {run_id}"
+            )));
+        }
+        let archive = ContextArchiveV4 {
+            archive_id: Uuid::new_v4(),
+            through_sequence: checkpoint.through_sequence,
+            size_bytes: u64::try_from(transcript.len())
+                .map_err(|_| StoreError::InvalidInput("transcript size exceeds range".into()))?,
+            sha256: hex::encode(Sha256::digest(transcript.as_bytes())),
+        };
+        sqlx::query(
+            "INSERT INTO agent_context_archives_v4
+             (archive_id,run_id,through_sequence,size_bytes,sha256,transcript_json,checkpoint_json)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        )
+        .bind(archive.archive_id.to_string())
+        .bind(run_id.to_string())
+        .bind(i64::try_from(archive.through_sequence).map_err(|_| {
+            StoreError::InvalidInput("checkpoint sequence exceeds SQLite range".into())
+        })?)
+        .bind(
+            i64::try_from(archive.size_bytes).map_err(|_| {
+                StoreError::InvalidInput("archive size exceeds SQLite range".into())
+            })?,
+        )
+        .bind(&archive.sha256)
+        .bind(transcript)
+        .bind(serde_json::to_string(checkpoint)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(archive)
+    }
+
+    pub async fn agent_context_archive_v4(
+        &self,
+        archive_id: Uuid,
+    ) -> Result<Option<(String, ContextCheckpointV4)>, StoreError> {
+        let row = sqlx::query(
+            "SELECT transcript_json,checkpoint_json FROM agent_context_archives_v4 WHERE archive_id=?1",
+        )
+        .bind(archive_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok((
+                row.try_get::<String, _>(0)?,
+                serde_json::from_str(row.try_get::<String, _>(1)?.as_str())?,
+            ))
+        })
+        .transpose()
+    }
+
+    pub async fn save_scientific_state_v4(
+        &self,
+        state: &ScientificStateV4,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO scientific_states_v4 (project_id,revision,state_sha256,value_json)
+             VALUES (?1,?2,?3,?4)
+             ON CONFLICT(project_id) DO UPDATE SET revision=excluded.revision,
+             state_sha256=excluded.state_sha256,value_json=excluded.value_json",
+        )
+        .bind(state.project_id.to_string())
+        .bind(i64::try_from(state.revision).map_err(|_| {
+            StoreError::InvalidInput("scientific revision exceeds SQLite range".into())
+        })?)
+        .bind(state.digest())
+        .bind(serde_json::to_string(state)?)
+        .execute(&mut *tx)
+        .await?;
+        for dataset in state.datasets.values() {
+            sqlx::query(
+                "INSERT INTO scientific_datasets_v4 (id,project_id,active,value_json)
+                 VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(id) DO UPDATE SET active=excluded.active,value_json=excluded.value_json",
+            )
+            .bind(dataset.id.to_string())
+            .bind(state.project_id.to_string())
+            .bind(if dataset.active { 1_i64 } else { 0_i64 })
+            .bind(serde_json::to_string(dataset)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+        for analysis in state.analyses.values() {
+            sqlx::query(
+                "INSERT INTO scientific_analyses_v4 (id,project_id,status,value_json)
+                 VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(id) DO UPDATE SET status=excluded.status,value_json=excluded.value_json",
+            )
+            .bind(analysis.id.to_string())
+            .bind(state.project_id.to_string())
+            .bind(enum_string(&analysis.status)?)
+            .bind(serde_json::to_string(analysis)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+        for artifact in state.artifacts.values() {
+            sqlx::query(
+                "INSERT INTO scientific_artifacts_v4
+                 (id,project_id,producer_analysis_id,valid,value_json) VALUES (?1,?2,?3,?4,?5)
+                 ON CONFLICT(id) DO UPDATE SET valid=excluded.valid,value_json=excluded.value_json",
+            )
+            .bind(artifact.id.to_string())
+            .bind(state.project_id.to_string())
+            .bind(artifact.producer_analysis_id.to_string())
+            .bind(if artifact.valid { 1_i64 } else { 0_i64 })
+            .bind(serde_json::to_string(artifact)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+        for evidence in state.evidence.values() {
+            sqlx::query(
+                "INSERT INTO scientific_evidence_v4 (id,project_id,valid,value_json)
+                 VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(id) DO UPDATE SET valid=excluded.valid,value_json=excluded.value_json",
+            )
+            .bind(evidence.id.to_string())
+            .bind(state.project_id.to_string())
+            .bind(if evidence.valid { 1_i64 } else { 0_i64 })
+            .bind(serde_json::to_string(evidence)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+        for manifest in state.provenance.values() {
+            sqlx::query(
+                "INSERT INTO scientific_provenance_v4
+                 (id,project_id,run_id,analysis_id,complete,value_json) VALUES (?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(id) DO UPDATE SET complete=excluded.complete,value_json=excluded.value_json",
+            )
+            .bind(manifest.id.to_string())
+            .bind(state.project_id.to_string())
+            .bind(manifest.run_id.to_string())
+            .bind(manifest.analysis_id.to_string())
+            .bind(if manifest.complete { 1_i64 } else { 0_i64 })
+            .bind(serde_json::to_string(manifest)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn scientific_state_v4(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Option<ScientificStateV4>, StoreError> {
+        let row = sqlx::query("SELECT value_json FROM scientific_states_v4 WHERE project_id=?1")
+            .bind(project_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| Ok(serde_json::from_str(row.try_get::<String, _>(0)?.as_str())?))
+            .transpose()
+    }
+
+    async fn project_json_rows<T: DeserializeOwned>(
+        &self,
+        table: &str,
+        project_id: Uuid,
+    ) -> Result<Vec<T>, StoreError> {
+        let query = match table {
+            "notebook_entries" | "sync_entries" => {
+                format!("SELECT value_json FROM {table} WHERE project_id=?1 ORDER BY id")
+            }
+            _ => {
+                return Err(StoreError::InvalidInput(
+                    "unsupported project registry".into(),
+                ));
+            }
+        };
+        let rows = sqlx::query(&query)
+            .bind(project_id.to_string())
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| Ok(serde_json::from_str(row.try_get::<String, _>(0)?.as_str())?))
+            .collect()
+    }
+
+    async fn simple_json_rows<T: DeserializeOwned>(
+        &self,
+        table: &str,
+    ) -> Result<Vec<T>, StoreError> {
+        let query = match table {
+            "model_profiles" | "skill_packages" => {
+                format!("SELECT value_json FROM {table} ORDER BY id")
+            }
+            _ => {
+                return Err(StoreError::InvalidInput(
+                    "unsupported simple registry".into(),
+                ));
+            }
+        };
+        let rows = sqlx::query(&query).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| Ok(serde_json::from_str(row.try_get::<String, _>(0)?.as_str())?))
+            .collect()
+    }
+
+    async fn get_simple_json<T: DeserializeOwned>(
+        &self,
+        table: &str,
+        id: &str,
+    ) -> Result<Option<T>, StoreError> {
+        let query = match table {
+            "model_profiles" | "skill_packages" => {
+                format!("SELECT value_json FROM {table} WHERE id=?1")
+            }
+            _ => {
+                return Err(StoreError::InvalidInput(
+                    "unsupported simple registry".into(),
+                ));
+            }
+        };
+        let row = sqlx::query(&query)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| Ok(serde_json::from_str(row.try_get::<String, _>(0)?.as_str())?))
+            .transpose()
+    }
+}
+
+async fn read_schema_version(path: &Path) -> Result<u32, StoreError> {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .foreign_keys(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&pool)
+        .await?;
+    pool.close().await;
+    u32::try_from(version)
+        .map_err(|_| StoreError::InvalidInput("invalid SQLite schema version".into()))
+}
+
+fn create_backup(path: &Path, _version: u32) -> Result<PathBuf, StoreError> {
+    create_backup_with_id_factory(path, Utc::now().timestamp_millis().max(0), || {
+        Uuid::new_v4().simple().to_string()
+    })
+}
+
+fn create_backup_with_id_factory<F>(
+    path: &Path,
+    timestamp: i64,
+    mut id_factory: F,
+) -> Result<PathBuf, StoreError>
+where
+    F: FnMut() -> String,
+{
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let database_name = path
+        .file_name()
+        .ok_or_else(|| StoreError::InvalidInput("database path has no file name".into()))?
+        .to_string_lossy();
+    loop {
+        let identifier = id_factory();
+        let backup = directory.join(format!(
+            "{database_name}.pre-store-v4.{timestamp}-{identifier}.bak"
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)
+        {
+            Ok(file) => {
+                drop(file);
+                if let Err(error) = fs::copy(path, &backup) {
+                    let _ = fs::remove_file(&backup);
+                    return Err(error.into());
+                }
+                return Ok(backup);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+async fn initialize(
+    pool: &SqlitePool,
+    version: u32,
+    options: MigrationOptions,
+) -> Result<(), StoreError> {
+    if version > SCHEMA_VERSION {
+        return Err(StoreError::Migration(format!(
+            "database schema version {version} is newer than supported version {SCHEMA_VERSION}"
+        )));
+    }
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(pool)
+        .await?;
+    let mut tx = pool.begin().await?;
+    if version < SCHEMA_VERSION {
+        rename_legacy_tables(&mut tx).await?;
+    }
+    sqlx::raw_sql(INIT_SQL).execute(&mut *tx).await?;
+    if version < SCHEMA_VERSION {
+        migrate_legacy_rows(&mut tx, options).await?;
+    }
+    ensure_schema_extensions(&mut tx).await?;
+    validate_before_commit(&mut tx).await?;
+    sqlx::query("PRAGMA user_version = 4")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn ensure_schema_extensions(tx: &mut Transaction<'_, Sqlite>) -> Result<(), StoreError> {
+    // These additive columns make opening a pre-release v4 database safe when
+    // it already contains the table but predates the final compatibility
+    // projection. Every operation is idempotent and remains transactional.
+    for (table, column, definition) in [
+        ("messages", "project_id", "TEXT"),
+        ("messages", "conversation_id", "TEXT"),
+        ("artifacts", "source_run_id", "TEXT"),
+        ("artifacts", "remote_path", "TEXT"),
+        ("artifacts", "size_bytes", "INTEGER NOT NULL DEFAULT 0"),
+        ("artifacts", "sha256", "TEXT NOT NULL DEFAULT ''"),
+        ("artifacts", "verified", "INTEGER NOT NULL DEFAULT 0"),
+        ("notebook_entries", "conversation_id", "TEXT"),
+        ("notebook_entries", "turn_id", "TEXT"),
+        ("notebook_entries", "kind", "TEXT"),
+        ("notebook_entries", "title", "TEXT"),
+        ("notebook_entries", "markdown", "TEXT"),
+        ("notebook_entries", "confidence", "REAL"),
+        ("notebook_entries", "evidence_json", "TEXT"),
+        ("notebook_entries", "artifact_ids_json", "TEXT"),
+        ("notebook_entries", "created_at", "INTEGER"),
+        ("notebook_entries", "updated_at", "INTEGER"),
+        (
+            "agent_events_v4",
+            "occurred_at",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        if table_exists(tx, table).await? && !table_has_column(tx, table, column).await? {
+            sqlx::query(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+            ))
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn table_exists(tx: &mut Transaction<'_, Sqlite>, table: &str) -> Result<bool, StoreError> {
+    let exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+    )
+    .bind(table)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(exists == 1)
+}
+
+async fn table_has_column(
+    tx: &mut Transaction<'_, Sqlite>,
+    table: &str,
+    column: &str,
+) -> Result<bool, StoreError> {
+    // Table names are selected from a fixed internal list by callers. The
+    // value is escaped defensively because SQLite PRAGMA does not accept a
+    // bind parameter for its table argument.
+    let escaped = table.replace('"', "\"\"");
+    let rows = sqlx::query(&format!("PRAGMA table_info(\"{escaped}\")"))
+        .fetch_all(&mut **tx)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| row.try_get::<String, _>(1).ok())
+        .any(|name| name == column))
+}
+
+async fn table_column_is_not_null(
+    tx: &mut Transaction<'_, Sqlite>,
+    table: &str,
+    column: &str,
+) -> Result<bool, StoreError> {
+    let escaped = table.replace('"', "\"\"");
+    let rows = sqlx::query(&format!("PRAGMA table_info(\"{escaped}\")"))
+        .fetch_all(&mut **tx)
+        .await?;
+    Ok(rows.into_iter().any(|row| {
+        row.try_get::<String, _>(1).ok().as_deref() == Some(column)
+            && row.try_get::<i64, _>(3).ok() == Some(1)
+    }))
+}
+
+async fn rename_legacy_tables(tx: &mut Transaction<'_, Sqlite>) -> Result<(), StoreError> {
+    for (current, legacy) in [
+        ("projects", "projects_v3_legacy"),
+        ("conversations", "conversations_v3_legacy"),
+        ("messages", "messages_v3_legacy"),
+    ] {
+        if table_exists(tx, current).await? && table_has_column(tx, current, "value_json").await? {
+            if table_exists(tx, legacy).await? {
+                return Err(StoreError::Migration(format!(
+                    "legacy table {legacy} already exists while {current} still has v3 columns"
+                )));
+            }
+            sqlx::query(&format!("ALTER TABLE {current} RENAME TO {legacy}"))
+                .execute(&mut **tx)
+                .await?;
+        }
+    }
+    if table_exists(tx, "sync_entries").await?
+        && (!table_has_column(tx, "sync_entries", "relative_path").await?
+            || !table_column_is_not_null(tx, "sync_entries", "relative_path").await?)
+    {
+        if table_exists(tx, "sync_entries_v3_legacy").await? {
+            return Err(StoreError::Migration(
+                "legacy table sync_entries_v3_legacy already exists while sync_entries still needs migration"
+                    .into(),
+            ));
+        }
+        sqlx::query("ALTER TABLE sync_entries RENAME TO sync_entries_v3_legacy")
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
+fn migration_checkpoint(
+    copied_rows: &mut usize,
+    options: MigrationOptions,
+) -> Result<(), StoreError> {
+    if options
+        .fail_after_rows
+        .is_some_and(|limit| *copied_rows >= limit)
+    {
+        return Err(StoreError::Migration(
+            "injected failure while copying legacy rows".into(),
+        ));
+    }
+    *copied_rows = copied_rows.saturating_add(1);
+    Ok(())
+}
+
+async fn migrate_legacy_rows(
+    tx: &mut Transaction<'_, Sqlite>,
+    options: MigrationOptions,
+) -> Result<(), StoreError> {
+    let mut copied_rows = 0_usize;
+    if table_exists(tx, "projects_v3_legacy").await? {
+        let rows =
+            sqlx::query("SELECT id,updated_at,value_json FROM projects_v3_legacy ORDER BY id")
+                .fetch_all(&mut **tx)
+                .await?;
+        for row in rows {
+            migration_checkpoint(&mut copied_rows, options)?;
+            let row_id = row.try_get::<String, _>(0)?;
+            let row_updated_at = parse_legacy_timestamp(
+                row.try_get::<String, _>(1)?.as_str(),
+                "project updated_at",
+            )?;
+            let project: Project = serde_json::from_str(row.try_get::<String, _>(2)?.as_str())
+                .map_err(|error| StoreError::Migration(format!("project {row_id}: {error}")))?;
+            if project.id.to_string() != row_id {
+                return Err(StoreError::Migration(format!(
+                    "project row id {row_id} does not match its JSON identifier {}",
+                    project.id
+                )));
+            }
+            if project.updated_at.timestamp_millis() != row_updated_at.timestamp_millis() {
+                return Err(StoreError::Migration(format!(
+                    "project row {row_id} has inconsistent updated_at"
+                )));
+            }
+            insert_project(tx, &project).await?;
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM projects")
+            .fetch_one(&mut **tx)
+            .await?;
+        let expected = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM projects_v3_legacy")
+            .fetch_one(&mut **tx)
+            .await?;
+        if count != expected {
+            return Err(StoreError::Migration(
+                "project migration count validation failed".into(),
+            ));
+        }
+        let extension_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project_omicsops")
+            .fetch_one(&mut **tx)
+            .await?;
+        if extension_count != expected {
+            return Err(StoreError::Migration(
+                "project extension migration count validation failed".into(),
+            ));
+        }
+        let missing_extensions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM projects p
+             LEFT JOIN project_omicsops e ON e.project_id=p.id
+             WHERE e.project_id IS NULL",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        if missing_extensions != 0 {
+            return Err(StoreError::Migration(
+                "project extension identifier set validation failed".into(),
+            ));
+        }
+        let orphan_extensions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM project_omicsops e
+             LEFT JOIN projects p ON p.id=e.project_id
+             WHERE p.id IS NULL",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        if orphan_extensions != 0 {
+            return Err(StoreError::Migration(
+                "project extension contains an unknown project id".into(),
+            ));
+        }
+        let unknown_projects: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM projects p
+             LEFT JOIN projects_v3_legacy l ON l.id=p.id
+             WHERE l.id IS NULL",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        let missing_projects: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM projects_v3_legacy l
+             LEFT JOIN projects p ON p.id=l.id
+             WHERE p.id IS NULL",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        if unknown_projects != 0 || missing_projects != 0 {
+            return Err(StoreError::Migration(
+                "project identifier sets are not an exact match".into(),
+            ));
+        }
+    }
+
+    if table_exists(tx, "sync_entries_v3_legacy").await? {
+        let rows =
+            sqlx::query("SELECT id,project_id,value_json FROM sync_entries_v3_legacy ORDER BY id")
+                .fetch_all(&mut **tx)
+                .await?;
+        for row in rows {
+            migration_checkpoint(&mut copied_rows, options)?;
+            let row_id = row.try_get::<String, _>(0)?;
+            let row_project_id = row.try_get::<String, _>(1)?;
+            let value_json = row.try_get::<String, _>(2)?;
+            let entry: SyncEntry = serde_json::from_str(&value_json)
+                .map_err(|error| StoreError::Migration(format!("sync entry {row_id}: {error}")))?;
+            if entry.id.to_string() != row_id
+                || entry.project_id.to_string() != row_project_id
+                || entry.relative_path.trim().is_empty()
+            {
+                return Err(StoreError::Migration(format!(
+                    "sync entry {row_id} has inconsistent id, project, or relative_path"
+                )));
+            }
+            let project_exists: i64 =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1)")
+                    .bind(&row_project_id)
+                    .fetch_one(&mut **tx)
+                    .await?;
+            if project_exists == 0 {
+                return Err(StoreError::Migration(format!(
+                    "sync entry {row_id} references missing project {row_project_id}"
+                )));
+            }
+            sqlx::query(
+                "INSERT INTO sync_entries (id,project_id,relative_path,value_json)
+                 VALUES (?1,?2,?3,?4)",
+            )
+            .bind(&row_id)
+            .bind(&row_project_id)
+            .bind(&entry.relative_path)
+            .bind(&value_json)
+            .execute(&mut **tx)
+            .await?;
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_entries")
+            .fetch_one(&mut **tx)
+            .await?;
+        let expected = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sync_entries_v3_legacy")
+            .fetch_one(&mut **tx)
+            .await?;
+        if count != expected {
+            return Err(StoreError::Migration(
+                "sync entry migration count validation failed".into(),
+            ));
+        }
+        let unknown_entries: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sync_entries s
+             LEFT JOIN sync_entries_v3_legacy l ON l.id=s.id
+             WHERE l.id IS NULL",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        let missing_entries: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sync_entries_v3_legacy l
+             LEFT JOIN sync_entries s ON s.id=l.id
+             WHERE s.id IS NULL",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        if unknown_entries != 0 || missing_entries != 0 {
+            return Err(StoreError::Migration(
+                "sync entry identifier set validation failed".into(),
+            ));
+        }
+    }
+
+    if table_exists(tx, "conversations_v3_legacy").await? {
+        let rows = sqlx::query(
+            "SELECT id,project_id,updated_at,value_json FROM conversations_v3_legacy ORDER BY id",
+        )
+        .fetch_all(&mut **tx)
+        .await?;
+        for row in rows {
+            migration_checkpoint(&mut copied_rows, options)?;
+            let row_id = row.try_get::<String, _>(0)?;
+            let row_project_id = row.try_get::<String, _>(1)?;
+            let row_updated_at = parse_legacy_timestamp(
+                row.try_get::<String, _>(2)?.as_str(),
+                "conversation updated_at",
+            )?;
+            let conversation: Conversation =
+                serde_json::from_str(row.try_get::<String, _>(3)?.as_str()).map_err(|error| {
+                    StoreError::Migration(format!("conversation {row_id}: {error}"))
+                })?;
+            if conversation.id.to_string() != row_id
+                || conversation.project_id.to_string() != row_project_id
+            {
+                return Err(StoreError::Migration(format!(
+                    "conversation row {row_id} has inconsistent identifiers"
+                )));
+            }
+            if conversation.updated_at.timestamp_millis() != row_updated_at.timestamp_millis() {
+                return Err(StoreError::Migration(format!(
+                    "conversation row {row_id} has inconsistent updated_at"
+                )));
+            }
+            let project_exists: i64 =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1)")
+                    .bind(&row_project_id)
+                    .fetch_one(&mut **tx)
+                    .await?;
+            if project_exists == 0 {
+                return Err(StoreError::Migration(format!(
+                    "conversation {row_id} references missing project {row_project_id}"
+                )));
+            }
+            insert_conversation(tx, &conversation).await?;
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_records")
+            .fetch_one(&mut **tx)
+            .await?;
+        let expected = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversations_v3_legacy")
+            .fetch_one(&mut **tx)
+            .await?;
+        if count != expected {
+            return Err(StoreError::Migration(
+                "conversation migration count validation failed".into(),
+            ));
+        }
+        let unknown_conversations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_records c
+             LEFT JOIN conversations_v3_legacy l ON l.id=c.frame_id
+             WHERE l.id IS NULL",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        if unknown_conversations != 0 {
+            return Err(StoreError::Migration(
+                "conversation identifier set validation failed".into(),
+            ));
+        }
+        let missing_conversations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversations_v3_legacy l
+             LEFT JOIN conversation_records c ON c.frame_id=l.id
+             WHERE c.frame_id IS NULL",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        if missing_conversations != 0 {
+            return Err(StoreError::Migration(
+                "conversation identifier set validation failed".into(),
+            ));
+        }
+    }
+
+    if table_exists(tx, "messages_v3_legacy").await? {
+        let rows = sqlx::query(
+            "SELECT id,project_id,conversation_id,sequence,value_json
+             FROM messages_v3_legacy ORDER BY conversation_id,sequence,id",
+        )
+        .fetch_all(&mut **tx)
+        .await?;
+        let mut previous: Option<(String, i64)> = None;
+        for row in rows {
+            migration_checkpoint(&mut copied_rows, options)?;
+            let row_id = row.try_get::<String, _>(0)?;
+            let row_project_id = row.try_get::<String, _>(1)?;
+            let row_conversation_id = row.try_get::<String, _>(2)?;
+            let sequence = row.try_get::<i64, _>(3)?;
+            if sequence < 0 {
+                return Err(StoreError::Migration(format!(
+                    "message {row_id} has a negative sequence"
+                )));
+            }
+            let message: Message = serde_json::from_str(row.try_get::<String, _>(4)?.as_str())
+                .map_err(|error| StoreError::Migration(format!("message {row_id}: {error}")))?;
+            if message.id.to_string() != row_id
+                || message.project_id.to_string() != row_project_id
+                || message.conversation_id.to_string() != row_conversation_id
+                || i64::try_from(message.sequence).ok() != Some(sequence)
+            {
+                return Err(StoreError::Migration(format!(
+                    "message row {row_id} has inconsistent identifiers or sequence"
+                )));
+            }
+            if previous
+                .as_ref()
+                .is_some_and(|(conversation_id, previous_sequence)| {
+                    conversation_id == &row_conversation_id && sequence <= *previous_sequence
+                })
+            {
+                return Err(StoreError::Migration(format!(
+                    "message sequence is not strictly ordered for conversation {row_conversation_id}"
+                )));
+            }
+            previous = Some((row_conversation_id.clone(), sequence));
+            let frame_exists: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM conversation_records WHERE frame_id=?1 AND project_id=?2)",
+            )
+            .bind(&row_conversation_id)
+            .bind(&row_project_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            if frame_exists == 0 {
+                return Err(StoreError::Migration(format!(
+                    "message {row_id} references missing conversation {row_conversation_id}"
+                )));
+            }
+            insert_message(tx, &message).await?;
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(&mut **tx)
+            .await?;
+        let expected = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages_v3_legacy")
+            .fetch_one(&mut **tx)
+            .await?;
+        if count != expected {
+            return Err(StoreError::Migration(
+                "message migration count validation failed".into(),
+            ));
+        }
+        let unknown_messages: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages m
+             LEFT JOIN messages_v3_legacy l ON l.id=m.id
+             WHERE l.id IS NULL",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        if unknown_messages != 0 {
+            return Err(StoreError::Migration(
+                "message identifier set validation failed".into(),
+            ));
+        }
+        let missing_messages: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages_v3_legacy l
+             LEFT JOIN messages m ON m.id=l.id
+             WHERE m.id IS NULL",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        if missing_messages != 0 {
+            return Err(StoreError::Migration(
+                "message identifier set validation failed".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn validate_before_commit(tx: &mut Transaction<'_, Sqlite>) -> Result<(), StoreError> {
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(&mut **tx)
+        .await?;
+    if integrity.to_ascii_lowercase() != "ok" {
+        return Err(StoreError::Migration(format!(
+            "SQLite integrity check failed: {integrity}"
+        )));
+    }
+    // Validate archive ownership before the generic FK report so a damaged
+    // archive identifies the missing run that caused the failure.
+    validate_context_archives(tx).await?;
+    validate_sync_entries(tx).await?;
+    if !sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&mut **tx)
+        .await?
+        .is_empty()
+    {
+        return Err(StoreError::Migration(
+            "SQLite foreign-key validation failed".into(),
+        ));
+    }
+    validate_projects(tx).await?;
+    validate_project_extensions(tx).await?;
+    validate_conversation_ownership(tx).await?;
+    validate_message_ownership(tx).await?;
+    validate_agent_runs(tx).await?;
+    validate_agent_events(tx).await?;
+    validate_scientific_states(tx).await?;
+    Ok(())
+}
+
+async fn validate_projects(tx: &mut Transaction<'_, Sqlite>) -> Result<(), StoreError> {
+    let rows = sqlx::query("SELECT id,name,workspace_dir FROM projects ORDER BY id")
+        .fetch_all(&mut **tx)
+        .await?;
+    for row in rows {
+        let id = row.try_get::<String, _>(0)?;
+        let name = row.try_get::<String, _>(1)?;
+        let workspace_dir = row.try_get::<String, _>(2)?;
+        if id.trim().is_empty() || name.trim().is_empty() || workspace_dir.trim().is_empty() {
+            return Err(StoreError::Migration(format!(
+                "project {id} has a blank identity, name, or path"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn validate_project_extensions(tx: &mut Transaction<'_, Sqlite>) -> Result<(), StoreError> {
+    let missing: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM projects p
+         LEFT JOIN project_omicsops e ON e.project_id=p.id
+         WHERE e.project_id IS NULL",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    let orphan: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM project_omicsops e
+         LEFT JOIN projects p ON p.id=e.project_id
+         WHERE p.id IS NULL",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if missing != 0 || orphan != 0 {
+        return Err(StoreError::Migration(
+            "project/project_omicsops identifier sets are not one-to-one".into(),
+        ));
+    }
+    let rows = sqlx::query("SELECT project_id,local_root,remote_root FROM project_omicsops")
+        .fetch_all(&mut **tx)
+        .await?;
+    for row in rows {
+        let project_id = row.try_get::<String, _>(0)?;
+        let local_root = row.try_get::<String, _>(1)?;
+        let remote_root = row.try_get::<Option<String>, _>(2)?;
+        if local_root.trim().is_empty()
+            || remote_root
+                .as_deref()
+                .is_some_and(|root| root.trim().is_empty())
+        {
+            return Err(StoreError::Migration(format!(
+                "project extension {project_id} has a blank path"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn validate_conversation_ownership(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> Result<(), StoreError> {
+    let rows = sqlx::query(
+        "SELECT c.frame_id,c.project_id,f.project_id
+         FROM conversation_records c JOIN frames f ON f.id=c.frame_id",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    for row in rows {
+        let frame_id = row.try_get::<String, _>(0)?;
+        let conversation_project = row.try_get::<String, _>(1)?;
+        let frame_project = row.try_get::<Option<String>, _>(2)?;
+        if frame_project.as_deref() != Some(conversation_project.as_str()) {
+            return Err(StoreError::Migration(format!(
+                "conversation {frame_id} has inconsistent frame/project ownership"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn validate_message_ownership(tx: &mut Transaction<'_, Sqlite>) -> Result<(), StoreError> {
+    let rows = sqlx::query(
+        "SELECT m.id,m.project_id,m.conversation_id,m.frame_id,m.seq,c.project_id
+         FROM messages m LEFT JOIN conversation_records c ON c.frame_id=m.frame_id",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    for row in rows {
+        let message_id = row.try_get::<String, _>(0)?;
+        let project_id = row.try_get::<String, _>(1)?;
+        let conversation_id = row.try_get::<String, _>(2)?;
+        let frame_id = row.try_get::<String, _>(3)?;
+        let sequence = row.try_get::<i64, _>(4)?;
+        let conversation_project = row.try_get::<Option<String>, _>(5)?;
+        if sequence < 0
+            || conversation_id != frame_id
+            || conversation_project.as_deref() != Some(project_id.as_str())
+        {
+            return Err(StoreError::Migration(format!(
+                "message {message_id} has inconsistent project/conversation/sequence columns"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn validate_agent_runs(tx: &mut Transaction<'_, Sqlite>) -> Result<(), StoreError> {
+    let rows = sqlx::query(
+        "SELECT run_id,project_id,conversation_id,value_json
+         FROM agent_runs_v4 ORDER BY run_id",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    for row in rows {
+        let run_id = row.try_get::<String, _>(0)?;
+        parse_uuid(run_id.as_str(), "V4 run id")
+            .map_err(|error| StoreError::Migration(error.to_string()))?;
+        parse_uuid(row.try_get::<String, _>(1)?.as_str(), "V4 run project id")
+            .map_err(|error| StoreError::Migration(error.to_string()))?;
+        parse_uuid(
+            row.try_get::<String, _>(2)?.as_str(),
+            "V4 run conversation id",
+        )
+        .map_err(|error| StoreError::Migration(error.to_string()))?;
+        let owns_context: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conversation_records
+             WHERE frame_id=?1 AND project_id=?2)",
+        )
+        .bind(row.try_get::<String, _>(2)?)
+        .bind(row.try_get::<String, _>(1)?)
+        .fetch_one(&mut **tx)
+        .await?;
+        if owns_context == 0 {
+            return Err(StoreError::Migration(format!(
+                "V4 run {run_id} references an unknown project or conversation"
+            )));
+        }
+        serde_json::from_str::<Value>(row.try_get::<String, _>(3)?.as_str()).map_err(|error| {
+            StoreError::Migration(format!("V4 run {run_id} has invalid JSON: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
+async fn validate_agent_events(tx: &mut Transaction<'_, Sqlite>) -> Result<(), StoreError> {
+    let rows = sqlx::query(
+        "SELECT event.run_id,event.project_id,event.conversation_id,event.sequence,
+                event.previous_hash,event.event_hash,
+                event.value_json,event.occurred_at,run.project_id,run.conversation_id
+         FROM agent_events_v4 event
+         LEFT JOIN agent_runs_v4 run ON run.run_id=event.run_id
+         ORDER BY event.run_id,event.sequence",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut chains: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in rows {
+        let run_id = row.try_get::<String, _>(0)?;
+        let event = serde_json::from_str::<AgentEventV4>(row.try_get::<String, _>(6)?.as_str())
+            .map_err(|error| {
+                StoreError::Migration(format!("event {run_id}: invalid JSON: {error}"))
+            })?;
+        let sql_sequence = row.try_get::<i64, _>(3)?;
+        let sql_project_id = row.try_get::<String, _>(1)?;
+        let sql_conversation_id = row.try_get::<String, _>(2)?;
+        let sql_previous_hash = row.try_get::<String, _>(4)?;
+        let sql_event_hash = row.try_get::<String, _>(5)?;
+        let sql_occurred_at = row.try_get::<i64, _>(7)?;
+        let run_project_id = row.try_get::<Option<String>, _>(8)?;
+        let run_conversation_id = row.try_get::<Option<String>, _>(9)?;
+        let owns_context: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conversation_records
+             WHERE frame_id=?1 AND project_id=?2)",
+        )
+        .bind(&sql_conversation_id)
+        .bind(&sql_project_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if event.schema_version != 4
+            || event.run_id.to_string() != run_id
+            || i64::try_from(event.sequence).ok() != Some(sql_sequence)
+            || event.project_id.to_string() != sql_project_id
+            || event.conversation_id.to_string() != sql_conversation_id
+            || run_project_id.as_deref() != Some(sql_project_id.as_str())
+            || run_conversation_id.as_deref() != Some(sql_conversation_id.as_str())
+            || owns_context == 0
+            || event.previous_hash != sql_previous_hash
+            || event.event_hash != sql_event_hash
+            || event.occurred_at.timestamp_millis() != sql_occurred_at
+        {
+            return Err(StoreError::Migration(format!(
+                "event {run_id} has inconsistent durable columns"
+            )));
+        }
+        parse_uuid(run_id.as_str(), "V4 event run id")
+            .map_err(|error| StoreError::Migration(error.to_string()))?;
+        chains
+            .entry(run_id)
+            .or_default()
+            .push(row.try_get::<String, _>(6)?);
+    }
+    for (run_id, serialized) in chains {
+        deserialize_event_chain_v4(&serialized).map_err(|error| {
+            StoreError::Migration(format!("event {run_id} hash validation failed: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
+async fn validate_context_archives(tx: &mut Transaction<'_, Sqlite>) -> Result<(), StoreError> {
+    let rows = sqlx::query(
+        "SELECT a.archive_id,a.run_id,a.through_sequence,a.size_bytes,a.sha256,a.transcript_json,
+                a.checkpoint_json,run.run_id
+         FROM agent_context_archives_v4 a
+         LEFT JOIN agent_runs_v4 run ON run.run_id=a.run_id
+         ORDER BY a.archive_id",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    for row in rows {
+        let archive_id = row.try_get::<String, _>(0)?;
+        let run_id = row.try_get::<String, _>(1)?;
+        let through_sequence = row.try_get::<i64, _>(2)?;
+        let size_bytes = row.try_get::<i64, _>(3)?;
+        let sha256 = row.try_get::<String, _>(4)?;
+        let transcript = row.try_get::<String, _>(5)?;
+        let owner_run_id = row.try_get::<Option<String>, _>(7)?;
+        let checkpoint: ContextCheckpointV4 =
+            serde_json::from_str(row.try_get::<String, _>(6)?.as_str()).map_err(|error| {
+                StoreError::Migration(format!(
+                    "context archive {archive_id} has invalid checkpoint JSON: {error}"
+                ))
+            })?;
+        let expected_size = i64::try_from(transcript.len()).map_err(|_| {
+            StoreError::Migration(format!("context archive {archive_id} size exceeds range"))
+        })?;
+        let expected_hash = hex::encode(Sha256::digest(transcript.as_bytes()));
+        if parse_uuid(run_id.as_str(), "context archive run id").is_err()
+            || parse_uuid(archive_id.as_str(), "context archive id").is_err()
+            || owner_run_id.as_deref() != Some(run_id.as_str())
+            || checkpoint.schema_version != 4
+            || i64::try_from(checkpoint.through_sequence).ok() != Some(through_sequence)
+            || size_bytes != expected_size
+            || sha256 != expected_hash
+        {
+            return Err(StoreError::Migration(format!(
+                "context archive {archive_id} has inconsistent durable columns"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn validate_sync_entries(tx: &mut Transaction<'_, Sqlite>) -> Result<(), StoreError> {
+    let rows = sqlx::query(
+        "SELECT id,project_id,relative_path,value_json
+         FROM sync_entries ORDER BY id",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    for row in rows {
+        let row_id = row.try_get::<String, _>(0)?;
+        let row_project_id = row.try_get::<String, _>(1)?;
+        let relative_path = row.try_get::<String, _>(2)?;
+        let value_json = row.try_get::<String, _>(3)?;
+        let entry: SyncEntry = serde_json::from_str(&value_json).map_err(|error| {
+            StoreError::Migration(format!("sync entry {row_id}: invalid JSON: {error}"))
+        })?;
+        let project_exists: i64 =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1)")
+                .bind(&row_project_id)
+                .fetch_one(&mut **tx)
+                .await?;
+        if entry.id.to_string() != row_id
+            || entry.project_id.to_string() != row_project_id
+            || entry.relative_path != relative_path
+            || relative_path.trim().is_empty()
+            || project_exists == 0
+        {
+            return Err(StoreError::Migration(format!(
+                "sync entry {row_id} has inconsistent durable columns or owner"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn validate_scientific_states(tx: &mut Transaction<'_, Sqlite>) -> Result<(), StoreError> {
+    let rows =
+        sqlx::query("SELECT project_id,revision,state_sha256,value_json FROM scientific_states_v4")
+            .fetch_all(&mut **tx)
+            .await?;
+    for row in rows {
+        let project_id = row.try_get::<String, _>(0)?;
+        let revision = row.try_get::<i64, _>(1)?;
+        let stored_digest = row.try_get::<String, _>(2)?;
+        let state: ScientificStateV4 = serde_json::from_str(row.try_get::<String, _>(3)?.as_str())
+            .map_err(|error| {
+                StoreError::Migration(format!(
+                    "scientific state {project_id}: invalid JSON: {error}"
+                ))
+            })?;
+        if state.project_id.to_string() != project_id
+            || i64::try_from(state.revision).ok() != Some(revision)
+            || state.digest() != stored_digest
+        {
+            return Err(StoreError::Migration(format!(
+                "scientific state {project_id} has inconsistent durable columns"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn insert_project(
+    tx: &mut Transaction<'_, Sqlite>,
+    project: &Project,
+) -> Result<(), StoreError> {
+    validate_project_input(project)?;
+    sqlx::query(
+        "INSERT INTO projects (id,name,description,workspace_dir,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6)
+         ON CONFLICT(id) DO UPDATE SET name=excluded.name,description=excluded.description,
+         workspace_dir=excluded.workspace_dir,created_at=excluded.created_at,updated_at=excluded.updated_at",
+    )
+    .bind(project.id.to_string())
+    .bind(&project.name)
+    .bind(&project.description)
+    .bind(&project.local_root)
+    .bind(timestamp(project.created_at))
+    .bind(timestamp(project.updated_at))
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO project_omicsops
+         (project_id,local_root,remote_root,connection_id,template,status,ollama_only,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+         ON CONFLICT(project_id) DO UPDATE SET local_root=excluded.local_root,
+         remote_root=excluded.remote_root,connection_id=excluded.connection_id,
+         template=excluded.template,status=excluded.status,ollama_only=excluded.ollama_only,
+         updated_at=excluded.updated_at",
+    )
+    .bind(project.id.to_string())
+    .bind(&project.local_root)
+    .bind(&project.remote_root)
+    .bind(project.connection_id.map(|id| id.to_string()))
+    .bind(enum_string(&project.template)?)
+    .bind(enum_string(&project.status)?)
+    .bind(if project.ollama_only { 1_i64 } else { 0_i64 })
+    .bind(timestamp(project.updated_at))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn insert_conversation(
+    tx: &mut Transaction<'_, Sqlite>,
+    conversation: &Conversation,
+) -> Result<(), StoreError> {
+    let project_exists: i64 =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1)")
+            .bind(conversation.project_id.to_string())
+            .fetch_one(&mut **tx)
+            .await?;
+    if project_exists == 0 {
+        return Err(StoreError::InvalidInput(format!(
+            "conversation {} references unknown project {}",
+            conversation.id, conversation.project_id
+        )));
+    }
+    let project_id = conversation.project_id.to_string();
+    let existing_project = sqlx::query_scalar::<_, String>(
+        "SELECT project_id FROM conversation_records WHERE frame_id=?1",
+    )
+    .bind(conversation.id.to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if existing_project
+        .as_deref()
+        .is_some_and(|stored| stored != project_id.as_str())
+    {
+        return Err(StoreError::InvalidInput(format!(
+            "conversation {} already belongs to another project",
+            conversation.id
+        )));
+    }
+    sqlx::query(
+        "INSERT INTO frames
+         (id,parent_frame_id,root_frame_id,agent_name,status,project_id,created_at,updated_at)
+         VALUES (?1,NULL,?1,'omicsops',?2,?3,?4,?5)
+         ON CONFLICT(id) DO UPDATE SET root_frame_id=excluded.root_frame_id,
+         status=excluded.status,project_id=excluded.project_id,updated_at=excluded.updated_at",
+    )
+    .bind(conversation.id.to_string())
+    .bind(enum_string(&conversation.status)?)
+    .bind(&project_id)
+    .bind(timestamp(conversation.created_at))
+    .bind(timestamp(conversation.updated_at))
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO conversation_records
+         (frame_id,project_id,title,status,model_profile_id,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)
+         ON CONFLICT(frame_id) DO UPDATE SET project_id=excluded.project_id,title=excluded.title,
+         status=excluded.status,model_profile_id=excluded.model_profile_id,
+         created_at=excluded.created_at,updated_at=excluded.updated_at",
+    )
+    .bind(conversation.id.to_string())
+    .bind(conversation.project_id.to_string())
+    .bind(&conversation.title)
+    .bind(enum_string(&conversation.status)?)
+    .bind(conversation.model_profile_id.map(|id| id.to_string()))
+    .bind(timestamp(conversation.created_at))
+    .bind(timestamp(conversation.updated_at))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn ensure_frame(
+    tx: &mut Transaction<'_, Sqlite>,
+    project_id: Uuid,
+    conversation_id: Uuid,
+    at: DateTime<Utc>,
+) -> Result<(), StoreError> {
+    let project_id_text = project_id.to_string();
+    let conversation_id_text = conversation_id.to_string();
+    let conversation_exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM conversation_records WHERE frame_id=?1 AND project_id=?2)",
+    )
+    .bind(&conversation_id_text)
+    .bind(&project_id_text)
+    .fetch_one(&mut **tx)
+    .await?;
+    if conversation_exists == 0 {
+        return Err(StoreError::InvalidInput(format!(
+            "message references unknown project or conversation: {project_id}/{conversation_id}"
+        )));
+    }
+    let exists: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM frames WHERE id=?1)")
+        .bind(&conversation_id_text)
+        .fetch_one(&mut **tx)
+        .await?;
+    if exists == 0 {
+        sqlx::query(
+            "INSERT INTO frames
+             (id,parent_frame_id,root_frame_id,agent_name,status,project_id,created_at,updated_at)
+             VALUES (?1,NULL,?1,'omicsops','idle',?2,?3,?3)",
+        )
+        .bind(&conversation_id_text)
+        .bind(&project_id_text)
+        .bind(timestamp(at))
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO conversation_records
+             (frame_id,project_id,title,status,created_at,updated_at)
+             VALUES (?1,?2,'','idle',?3,?3)",
+        )
+        .bind(&conversation_id_text)
+        .bind(&project_id_text)
+        .bind(timestamp(at))
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+fn validate_project_input(project: &Project) -> Result<(), StoreError> {
+    if project.name.trim().is_empty() {
+        return Err(StoreError::InvalidInput(
+            "project name cannot be blank".into(),
+        ));
+    }
+    if project.local_root.trim().is_empty() {
+        return Err(StoreError::InvalidInput(
+            "project local root cannot be blank".into(),
+        ));
+    }
+    if project
+        .remote_root
+        .as_deref()
+        .is_some_and(|root| root.trim().is_empty())
+    {
+        return Err(StoreError::InvalidInput(
+            "project remote root cannot be blank".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn insert_message(
+    tx: &mut Transaction<'_, Sqlite>,
+    message: &Message,
+) -> Result<(), StoreError> {
+    let sequence = i64::try_from(message.sequence)
+        .map_err(|_| StoreError::InvalidInput("message sequence exceeds SQLite range".into()))?;
+    sqlx::query(
+        "INSERT INTO messages
+         (id,frame_id,project_id,conversation_id,seq,role,content,ts)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+         ON CONFLICT(id) DO UPDATE SET frame_id=excluded.frame_id,project_id=excluded.project_id,
+         conversation_id=excluded.conversation_id,seq=excluded.seq,role=excluded.role,
+         content=excluded.content,ts=excluded.ts",
+    )
+    .bind(message.id.to_string())
+    .bind(message.conversation_id.to_string())
+    .bind(message.project_id.to_string())
+    .bind(message.conversation_id.to_string())
+    .bind(sequence)
+    .bind(enum_string(&message.role)?)
+    .bind(&message.markdown)
+    .bind(timestamp(message.created_at))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn ensure_event_context(
+    tx: &mut Transaction<'_, Sqlite>,
+    event: &AgentEventV4,
+) -> Result<(), StoreError> {
+    let project_id = event.project_id.to_string();
+    let conversation_id = event.conversation_id.to_string();
+    let owns_conversation: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM conversation_records WHERE frame_id=?1 AND project_id=?2)",
+    )
+    .bind(&conversation_id)
+    .bind(&project_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if owns_conversation == 0 {
+        return Err(StoreError::InvalidInput(format!(
+            "event {} references unknown project or conversation: {project_id}/{conversation_id}",
+            event.run_id
+        )));
+    }
+
+    let run_id = event.run_id.to_string();
+    let existing =
+        sqlx::query("SELECT project_id,conversation_id FROM agent_runs_v4 WHERE run_id=?1")
+            .bind(&run_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if let Some(row) = existing {
+        let stored_project = row.try_get::<String, _>(0)?;
+        let stored_conversation = row.try_get::<String, _>(1)?;
+        if stored_project != project_id || stored_conversation != conversation_id {
+            return Err(StoreError::InvalidInput(format!(
+                "event {} does not match its persisted run context",
+                event.run_id
+            )));
+        }
+    } else {
+        sqlx::query(
+            "INSERT INTO agent_runs_v4
+             (run_id,project_id,conversation_id,status,value_json)
+             VALUES (?1,?2,?3,'event_only','{}')",
+        )
+        .bind(&run_id)
+        .bind(&project_id)
+        .bind(&conversation_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+fn project_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Project, StoreError> {
+    let id = parse_uuid(row.try_get::<String, _>(0)?, "project id")?;
+    let workspace_dir = row.try_get::<String, _>(3)?;
+    let local_root = row
+        .try_get::<Option<String>, _>(6)?
+        .unwrap_or(workspace_dir);
+    Ok(Project {
+        id,
+        name: row.try_get(1)?,
+        description: row.try_get(2)?,
+        local_root,
+        remote_root: row.try_get(7)?,
+        connection_id: row
+            .try_get::<Option<String>, _>(8)?
+            .map(|value| parse_uuid(value.as_str(), "project connection id"))
+            .transpose()?,
+        template: parse_json_enum(
+            row.try_get::<Option<String>, _>(9)?
+                .as_deref()
+                .unwrap_or("blank"),
+            "project template",
+        )?,
+        status: parse_json_enum(
+            row.try_get::<Option<String>, _>(10)?
+                .as_deref()
+                .unwrap_or("ready"),
+            "project status",
+        )?,
+        ollama_only: row.try_get::<Option<i64>, _>(11)?.unwrap_or(0) != 0,
+        created_at: from_timestamp(row.try_get(4)?, "project created_at")?,
+        updated_at: from_timestamp(row.try_get(5)?, "project updated_at")?,
+    })
+}
+
+fn conversation_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Conversation, StoreError> {
+    Ok(Conversation {
+        id: parse_uuid(row.try_get::<String, _>(0)?, "conversation id")?,
+        project_id: parse_uuid(row.try_get::<String, _>(1)?, "conversation project id")?,
+        title: row.try_get(2)?,
+        status: parse_json_enum(row.try_get::<String, _>(3)?.as_str(), "conversation status")?,
+        model_profile_id: row
+            .try_get::<Option<String>, _>(4)?
+            .map(|value| parse_uuid(value.as_str(), "conversation model profile id"))
+            .transpose()?,
+        created_at: from_timestamp(row.try_get(5)?, "conversation created_at")?,
+        updated_at: from_timestamp(row.try_get(6)?, "conversation updated_at")?,
+    })
+}
+
+fn message_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Message, StoreError> {
+    let project_id = row
+        .try_get::<Option<String>, _>(7)?
+        .ok_or_else(|| StoreError::InvalidInput("message has no project id".into()))?;
+    Ok(Message {
+        id: parse_uuid(row.try_get::<String, _>(0)?, "message id")?,
+        project_id: parse_uuid(project_id.as_str(), "message project id")?,
+        conversation_id: parse_uuid(
+            row.try_get::<Option<String>, _>(2)?
+                .as_deref()
+                .unwrap_or_default(),
+            "message conversation id",
+        )?,
+        sequence: u64::try_from(row.try_get::<i64, _>(3)?)
+            .map_err(|_| StoreError::InvalidInput("message sequence is negative".into()))?,
+        role: parse_json_enum(row.try_get::<String, _>(4)?.as_str(), "message role")?,
+        markdown: row.try_get::<Option<String>, _>(5)?.unwrap_or_default(),
+        created_at: from_timestamp(row.try_get(6)?, "message timestamp")?,
+    })
+}
+
+fn artifact_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Artifact, StoreError> {
+    Ok(Artifact {
+        id: parse_uuid(row.try_get::<String, _>(0)?, "artifact id")?,
+        project_id: parse_uuid(row.try_get::<String, _>(1)?, "artifact project id")?,
+        run_id: row
+            .try_get::<Option<String>, _>(2)?
+            .map(|value| parse_uuid(value.as_str(), "artifact run id"))
+            .transpose()?,
+        relative_path: row.try_get(3)?,
+        remote_path: row.try_get(4)?,
+        media_type: row.try_get(5)?,
+        size_bytes: u64::try_from(row.try_get::<i64, _>(6)?)
+            .map_err(|_| StoreError::InvalidInput("artifact size is negative".into()))?,
+        sha256: row.try_get(7)?,
+        verified: row.try_get::<i64, _>(8)? != 0,
+        created_at: from_timestamp(row.try_get(9)?, "artifact created_at")?,
+    })
+}
+
+fn timestamp(value: DateTime<Utc>) -> i64 {
+    value.timestamp_millis()
+}
+
+fn from_timestamp(value: i64, label: &str) -> Result<DateTime<Utc>, StoreError> {
+    DateTime::<Utc>::from_timestamp_millis(value).ok_or_else(|| {
+        StoreError::InvalidInput(format!("{label} is outside the supported timestamp range"))
+    })
+}
+
+fn parse_legacy_timestamp(value: &str, label: &str) -> Result<DateTime<Utc>, StoreError> {
+    if let Ok(millis) = value.parse::<i64>() {
+        return from_timestamp(millis, label);
+    }
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|error| StoreError::Migration(format!("{label} is invalid: {error}")))
+}
+
+fn parse_uuid(value: impl AsRef<str>, label: &str) -> Result<Uuid, StoreError> {
+    Uuid::parse_str(value.as_ref())
+        .map_err(|error| StoreError::InvalidInput(format!("invalid {label}: {error}")))
+}
+
+fn enum_string<T: Serialize>(value: &T) -> Result<String, StoreError> {
+    let value = serde_json::to_value(value)?;
+    value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| StoreError::InvalidInput("enum did not serialize as a string".into()))
+}
+
+fn parse_json_enum<T: DeserializeOwned>(value: &str, label: &str) -> Result<T, StoreError> {
+    serde_json::from_value(Value::String(value.to_owned()))
+        .map_err(|error| StoreError::InvalidInput(format!("invalid {label}: {error}")))
+}
+
+fn is_run_completed(event: &AgentEventV4) -> bool {
+    matches!(
+        event.event,
+        omicsops_protocol::AgentEventKindV4::RunCompleted
+    )
+}
+
+fn completion_answer(events: &[AgentEventV4]) -> Result<String, StoreError> {
+    let proposal = events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.event {
+            omicsops_protocol::AgentEventKindV4::CompletionProposalSubmitted { proposal } => {
+                Some(proposal)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            StoreError::InvalidInput(
+                "RunCompleted has no persisted CompletionProposalSubmitted event".into(),
+            )
+        })?;
+    let value = serde_json::to_value(proposal)?;
+    let answer = value
+        .get("answer_markdown")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .or_else(|| {
+            value
+                .get("summary")
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+        })
+        .map(str::trim)
+        .unwrap_or_default();
+    if answer.is_empty() {
+        return Err(StoreError::InvalidInput(
+            "RunCompleted cannot be persisted without a non-empty assistant answer".into(),
+        ));
+    }
+    Ok(answer.to_owned())
+}
+
+async fn persist_completion_message(
+    tx: &mut Transaction<'_, Sqlite>,
+    events: &[AgentEventV4],
+    completed: &AgentEventV4,
+) -> Result<Option<Message>, StoreError> {
+    let markdown = completion_answer(events)?;
+    let message_id = completed.run_id.to_string();
+    let existing = sqlx::query(
+        "SELECT id,project_id,conversation_id,seq,role,content,ts FROM messages WHERE id=?1",
+    )
+    .bind(&message_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(row) = existing {
+        let message = Message {
+            id: parse_uuid(row.try_get::<String, _>(0)?.as_str(), "message id")?,
+            project_id: parse_uuid(row.try_get::<String, _>(1)?.as_str(), "message project id")?,
+            conversation_id: parse_uuid(
+                row.try_get::<String, _>(2)?.as_str(),
+                "message conversation id",
+            )?,
+            sequence: u64::try_from(row.try_get::<i64, _>(3)?).map_err(|_| {
+                StoreError::InvalidInput("stored message sequence is negative".into())
+            })?,
+            role: parse_json_enum(row.try_get::<String, _>(4)?.as_str(), "message role")?,
+            markdown: row.try_get::<Option<String>, _>(5)?.unwrap_or_default(),
+            created_at: from_timestamp(row.try_get(6)?, "message timestamp")?,
+        };
+        if message.project_id != completed.project_id
+            || message.conversation_id != completed.conversation_id
+            || message.role != MessageRole::Assistant
+            || message.markdown != markdown
+        {
+            return Err(StoreError::InvalidInput(
+                "run completion message id is already used by a different message".into(),
+            ));
+        }
+        return Ok(None);
+    }
+    ensure_frame(
+        tx,
+        completed.project_id,
+        completed.conversation_id,
+        completed.occurred_at,
+    )
+    .await?;
+    let sequence: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(seq),0)+1 FROM messages WHERE frame_id=?1")
+            .bind(completed.conversation_id.to_string())
+            .fetch_one(&mut **tx)
+            .await?;
+    let sequence = u64::try_from(sequence)
+        .map_err(|_| StoreError::InvalidInput("conversation message sequence overflow".into()))?;
+    let message = Message::markdown(
+        completed.run_id,
+        completed.project_id,
+        completed.conversation_id,
+        sequence,
+        MessageRole::Assistant,
+        markdown,
+        completed.occurred_at,
+    );
+    insert_message(tx, &message).await?;
+    Ok(Some(message))
+}
+
+#[cfg(test)]
+mod lifecycle_tests;

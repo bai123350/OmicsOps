@@ -12,7 +12,8 @@ pub mod sync_commands;
 pub mod workspace_commands;
 
 use commands::AppState;
-use omicsops_adapters::{credentials::SystemCredentialVault, persistence::Repository};
+use omicsops_adapters::credentials::SystemCredentialVault;
+use omicsops_store::Store;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -45,15 +46,21 @@ pub fn run() {
             } else {
                 development_skills_root
             };
-            let repository = Repository::open(data_dir.join("omicsops.db"))
-                .map_err(|error| error.to_string())?;
-            skill_commands::install_bundled_skills(
-                &repository,
-                &skills_root,
-                &bundled_skills_root,
-            )?;
-            kernel_commands::mark_orphaned_kernels_interrupted(&repository)?;
-            sync_commands::mark_orphaned_sync_transfers_failed(&repository)?;
+            let repository = tauri::async_runtime::block_on(async {
+                let repository = Store::open(data_dir.join("omicsops.db"))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                skill_commands::install_bundled_skills(
+                    &repository,
+                    &skills_root,
+                    &bundled_skills_root,
+                )
+                .await?;
+                kernel_commands::mark_orphaned_kernels_interrupted(&repository).await?;
+                sync_commands::mark_orphaned_sync_transfers_failed(&repository).await?;
+                Ok::<_, String>(repository)
+            })
+            .map_err(std::io::Error::other)?;
             app.manage(AppState {
                 repository,
                 credentials: SystemCredentialVault,

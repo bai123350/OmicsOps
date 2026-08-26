@@ -76,10 +76,11 @@ pub fn write_project_manifest(project: &Project) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String> {
+pub async fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String> {
     state
         .repository
         .list_projects()
+        .await
         .map_err(|error| error.to_string())
 }
 
@@ -88,6 +89,7 @@ pub async fn delete_project(state: State<'_, AppState>, project_id: Uuid) -> Res
     if state
         .repository
         .get_project(project_id)
+        .await
         .map_err(|error| error.to_string())?
         .is_none()
     {
@@ -98,6 +100,7 @@ pub async fn delete_project(state: State<'_, AppState>, project_id: Uuid) -> Res
     let deleted = state
         .repository
         .delete_project(project_id)
+        .await
         .map_err(|error| error.to_string())?;
     if !deleted {
         return Err("project was not found".into());
@@ -109,6 +112,7 @@ pub async fn ensure_project_deletable(state: &AppState, project_id: Uuid) -> Res
     let project_run_ids = state
         .repository
         .agent_run_ids_v4_for_project(project_id)
+        .await
         .map_err(|error| error.to_string())?
         .into_iter()
         .collect::<HashSet<_>>();
@@ -135,6 +139,7 @@ pub async fn ensure_project_deletable(state: &AppState, project_id: Uuid) -> Res
     let project_sync_ids = state
         .repository
         .sync_entries_for_project(project_id)
+        .await
         .map_err(|error| error.to_string())?
         .into_iter()
         .map(|entry| entry.id)
@@ -152,7 +157,7 @@ pub async fn ensure_project_deletable(state: &AppState, project_id: Uuid) -> Res
 }
 
 #[tauri::command]
-pub fn create_project(
+pub async fn create_project(
     state: State<'_, AppState>,
     request: CreateProjectRequest,
 ) -> Result<Project, String> {
@@ -164,6 +169,7 @@ pub fn create_project(
         state
             .repository
             .list_connections()
+            .await
             .map_err(|error| error.to_string())?
             .iter()
             .any(|profile| profile.id == connection_id && profile.host_key_fingerprint.is_some())
@@ -185,18 +191,20 @@ pub fn create_project(
     state
         .repository
         .save_project(&project)
+        .await
         .map_err(|error| error.to_string())?;
     Ok(project)
 }
 
 #[tauri::command]
-pub fn update_project_remote(
+pub async fn update_project_remote(
     state: State<'_, AppState>,
     request: UpdateProjectRemoteRequest,
 ) -> Result<Project, String> {
     let mut project = state
         .repository
         .list_projects()
+        .await
         .map_err(|error| error.to_string())?
         .into_iter()
         .find(|project| project.id == request.project_id)
@@ -205,6 +213,7 @@ pub fn update_project_remote(
         state
             .repository
             .list_connections()
+            .await
             .map_err(|error| error.to_string())?
             .iter()
             .any(|profile| profile.id == connection_id)
@@ -216,6 +225,7 @@ pub fn update_project_remote(
     state
         .repository
         .save_project(&project)
+        .await
         .map_err(|error| error.to_string())?;
     Ok(project)
 }
@@ -253,13 +263,14 @@ pub fn apply_remote_binding(
 }
 
 #[tauri::command]
-pub fn list_conversations(
+pub async fn list_conversations(
     state: State<'_, AppState>,
     project_id: Uuid,
 ) -> Result<Vec<Conversation>, String> {
     let mut conversations = state
         .repository
         .conversations_for_project(project_id)
+        .await
         .map_err(|error| error.to_string())?;
     for conversation in &mut conversations {
         if !conversation_title_needs_first_message(&conversation.title) {
@@ -268,6 +279,7 @@ pub fn list_conversations(
         let first_question = state
             .repository
             .messages_for_conversation(conversation.id)
+            .await
             .map_err(|error| error.to_string())?
             .into_iter()
             .find(|message| message.role == MessageRole::User)
@@ -283,6 +295,7 @@ pub fn list_conversations(
             state
                 .repository
                 .save_conversation(conversation)
+                .await
                 .map_err(|error| error.to_string())?;
         }
     }
@@ -302,7 +315,7 @@ pub fn conversation_title_needs_first_message(title: &str) -> bool {
 }
 
 #[tauri::command]
-pub fn create_conversation(
+pub async fn create_conversation(
     state: State<'_, AppState>,
     request: CreateConversationRequest,
 ) -> Result<Conversation, String> {
@@ -311,12 +324,13 @@ pub fn create_conversation(
     state
         .repository
         .save_conversation(&conversation)
+        .await
         .map_err(|error| error.to_string())?;
     Ok(conversation)
 }
 
 #[tauri::command]
-pub fn delete_conversation(
+pub async fn delete_conversation(
     state: State<'_, AppState>,
     project_id: Uuid,
     conversation_id: Uuid,
@@ -324,6 +338,7 @@ pub fn delete_conversation(
     let deleted = state
         .repository
         .delete_conversation(project_id, conversation_id)
+        .await
         .map_err(|error| error.to_string())?;
     if !deleted {
         return Err("conversation was not found in this project".into());

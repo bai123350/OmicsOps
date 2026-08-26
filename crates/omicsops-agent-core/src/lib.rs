@@ -150,10 +150,11 @@ pub trait ExternalExecutorPortV4: Send + Sync {
     ) -> Result<ExternalExecutorOutcomeV4, String>;
 }
 
+#[async_trait]
 pub trait EventStoreV4: Send + Sync {
-    fn append(&self, event: &AgentEventV4) -> Result<(), String>;
-    fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String>;
-    fn archive_context(
+    async fn append(&self, event: &AgentEventV4) -> Result<(), String>;
+    async fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String>;
+    async fn archive_context(
         &self,
         run_id: Uuid,
         transcript: &str,
@@ -168,15 +169,16 @@ pub struct ScientificUpdateV4 {
     pub changes: Vec<String>,
 }
 
+#[async_trait]
 pub trait ScientificStateStoreV4: Send + Sync {
-    fn snapshot(&self, project_id: Uuid) -> Result<ScientificStateV4, String>;
-    fn before_tool(
+    async fn snapshot(&self, project_id: Uuid) -> Result<ScientificStateV4, String>;
+    async fn before_tool(
         &self,
         project_id: Uuid,
         run_id: Uuid,
         call: &ToolCallV4,
     ) -> Result<Option<ScientificUpdateV4>, String>;
-    fn after_tool(
+    async fn after_tool(
         &self,
         project_id: Uuid,
         run_id: Uuid,
@@ -278,6 +280,7 @@ impl AgentCoreV4<'_> {
         if self
             .events
             .load(run_id)
+            .await
             .map_err(AgentCoreErrorV4::Store)?
             .is_empty()
         {
@@ -289,11 +292,16 @@ impl AgentCoreV4<'_> {
                 AgentEventKindV4::RunCreated {
                     mode: RunModeV4::Plan,
                 },
-            ))?;
+            ))
+            .await?;
         }
         for _ in 0..16 {
-            let prior = self.events.load(run_id).map_err(AgentCoreErrorV4::Store)?;
-            let scientific_state = self.scientific_snapshot(project_id)?;
+            let prior = self
+                .events
+                .load(run_id)
+                .await
+                .map_err(AgentCoreErrorV4::Store)?;
+            let scientific_state = self.scientific_snapshot(project_id).await?;
             let context = format!(
                 "OBJECTIVE\n{objective}\nSCIENTIFIC_STATE (host verified)\n{}\nEXECUTE_CAPABILITY_CATALOG (for requested_capabilities only; these tools are not callable in plan mode)\n{}\nEVENTS\n{}",
                 serde_json::to_string(&scientific_state)
@@ -320,7 +328,8 @@ impl AgentCoreV4<'_> {
                 self.push(
                     run_id,
                     AgentEventKindV4::ToolRequested { call: call.clone() },
-                )?;
+                )
+                .await?;
                 if call.tool_id == "agent.propose_plan" {
                     let plan: ExecutionPlanV4 = serde_json::from_value(call.arguments)
                         .map_err(|e| AgentCoreErrorV4::InvalidArguments(e.to_string()))?;
@@ -333,7 +342,8 @@ impl AgentCoreV4<'_> {
                             plan: plan.clone(),
                             plan_hash,
                         },
-                    )?;
+                    )
+                    .await?;
                     return Ok(plan);
                 }
                 if call.tool_id == "agent.request_input" {
@@ -351,7 +361,8 @@ impl AgentCoreV4<'_> {
                             question_id: call.call_id,
                             question,
                         },
-                    )?;
+                    )
+                    .await?;
                     return Err(AgentCoreErrorV4::WaitingForInput);
                 }
                 let outcome = self
@@ -359,25 +370,28 @@ impl AgentCoreV4<'_> {
                     .execute(RunModeV4::Plan, call)
                     .await
                     .map_err(AgentCoreErrorV4::Tool)?;
-                self.push(run_id, AgentEventKindV4::ToolFinished { outcome })?;
+                self.push(run_id, AgentEventKindV4::ToolFinished { outcome })
+                    .await?;
             }
         }
         Err(AgentCoreErrorV4::MissingPlan)
     }
 
-    pub fn approve(&self, spec: &RunSpecV4) -> Result<(), AgentCoreErrorV4> {
+    pub async fn approve(&self, spec: &RunSpecV4) -> Result<(), AgentCoreErrorV4> {
         self.push(
             spec.run_id,
             AgentEventKindV4::PlanApproved {
                 plan_hash: spec.approved_plan_hash.clone(),
             },
-        )?;
+        )
+        .await?;
         self.push(
             spec.run_id,
             AgentEventKindV4::ModeChanged {
                 mode: RunModeV4::Execute,
             },
         )
+        .await
     }
 
     pub async fn execute(&self, spec: &RunSpecV4, max_turns: u32) -> Result<(), AgentCoreErrorV4> {
@@ -413,6 +427,7 @@ impl AgentCoreV4<'_> {
         let existing = self
             .events
             .load(spec.run_id)
+            .await
             .map_err(AgentCoreErrorV4::Store)?;
         let mut tool_call_count = existing
             .iter()
@@ -458,10 +473,11 @@ impl AgentCoreV4<'_> {
                     .interrupt(spec.run_id)
                     .await
                     .map_err(AgentCoreErrorV4::Tool)?;
-                self.push(spec.run_id, AgentEventKindV4::RunCancelled)?;
+                self.push(spec.run_id, AgentEventKindV4::RunCancelled)
+                    .await?;
                 return Err(AgentCoreErrorV4::Cancelled);
             }
-            let context = self.context_for(spec, limits)?;
+            let context = self.context_for(spec, limits).await?;
             let turn = self
                 .model_turn(
                     spec.run_id,
@@ -497,7 +513,8 @@ impl AgentCoreV4<'_> {
                 self.push(
                     spec.run_id,
                     AgentEventKindV4::ToolRequested { call: call.clone() },
-                )?;
+                )
+                .await?;
                 if !matches!(
                     call.tool_id.as_str(),
                     "agent.complete" | "agent.request_input" | "agent.propose_plan"
@@ -520,7 +537,8 @@ impl AgentCoreV4<'_> {
                                     provenance: vec![],
                                 },
                             },
-                        )?;
+                        )
+                        .await?;
                         continue;
                     }
                     if self.tool_requires_approval(spec, &call, effect, &existing)? {
@@ -528,7 +546,8 @@ impl AgentCoreV4<'_> {
                         self.push(
                             spec.run_id,
                             AgentEventKindV4::ToolApprovalRequested { request },
-                        )?;
+                        )
+                        .await?;
                         return Err(AgentCoreErrorV4::WaitingForApproval);
                     }
                 }
@@ -551,7 +570,8 @@ impl AgentCoreV4<'_> {
                                             provenance: vec![],
                                         },
                                     },
-                                )?;
+                                )
+                                .await?;
                                 continue;
                             }
                         };
@@ -571,7 +591,8 @@ impl AgentCoreV4<'_> {
                                     provenance: vec![],
                                 },
                             },
-                        )?;
+                        )
+                        .await?;
                         continue;
                     }
                     completion_proposal = Some(proposal);
@@ -588,21 +609,25 @@ impl AgentCoreV4<'_> {
                                     message,
                                 ),
                             },
-                        )?;
+                        )
+                        .await?;
                         continue;
                     }
                     match serde_json::from_value::<DelegationGraphV4>(call.arguments.clone()) {
                         Ok(graph) => delegation_requests.push((call.call_id, graph)),
-                        Err(error) => self.push(
-                            spec.run_id,
-                            AgentEventKindV4::ToolFinished {
-                                outcome: rejected_coordinator_outcome(
-                                    call,
-                                    "delegation_schema",
-                                    error.to_string(),
-                                ),
-                            },
-                        )?,
+                        Err(error) => {
+                            self.push(
+                                spec.run_id,
+                                AgentEventKindV4::ToolFinished {
+                                    outcome: rejected_coordinator_outcome(
+                                        call,
+                                        "delegation_schema",
+                                        error.to_string(),
+                                    ),
+                                },
+                            )
+                            .await?
+                        }
                     }
                     continue;
                 }
@@ -622,14 +647,15 @@ impl AgentCoreV4<'_> {
             }
             let mut dispatch = Vec::new();
             for call in ordinary {
-                if let Some(outcome) = self.cached_outcome(spec.run_id, &call)? {
+                if let Some(outcome) = self.cached_outcome(spec.run_id, &call).await? {
                     self.push(
                         spec.run_id,
                         AgentEventKindV4::ToolOutcomeReused {
                             idempotency_key: call.call_id.clone(),
                             outcome,
                         },
-                    )?;
+                    )
+                    .await?;
                 } else if let Err(message) = self.tools.validate(RunModeV4::Execute, &call) {
                     self.push(
                         spec.run_id,
@@ -643,9 +669,10 @@ impl AgentCoreV4<'_> {
                                 provenance: vec![],
                             },
                         },
-                    )?;
+                    )
+                    .await?;
                 } else {
-                    match self.science_before_tool(spec, &call) {
+                    match self.science_before_tool(spec, &call).await {
                         Ok(()) => dispatch.push(call),
                         Err(message) if recoverable_scientific_declaration_error(&message) => {
                             self.push(
@@ -662,7 +689,8 @@ impl AgentCoreV4<'_> {
                                         provenance: vec![],
                                     },
                                 },
-                            )?;
+                            )
+                            .await?;
                         }
                         Err(message) => return Err(AgentCoreErrorV4::Science(message)),
                     }
@@ -681,7 +709,8 @@ impl AgentCoreV4<'_> {
                             effect,
                             idempotency_key: call.call_id.clone(),
                         },
-                    )?;
+                    )
+                    .await?;
                 }
                 let futures = dispatch.into_iter().map(|call| async move {
                     let result = self.tools.execute(RunModeV4::Execute, call.clone()).await;
@@ -695,7 +724,8 @@ impl AgentCoreV4<'_> {
                             if cancelled.load(Ordering::SeqCst) {
                                 drop(batch);
                                 self.tools.interrupt(spec.run_id).await.map_err(AgentCoreErrorV4::Tool)?;
-                                self.push(spec.run_id, AgentEventKindV4::RunCancelled)?;
+                                self.push(spec.run_id, AgentEventKindV4::RunCancelled)
+                                    .await?;
                                 return Err(AgentCoreErrorV4::Cancelled);
                             }
                         }
@@ -727,16 +757,19 @@ impl AgentCoreV4<'_> {
                                     call_id: call.call_id.clone(),
                                     tool_id: call.tool_id.clone(),
                                 },
-                            )?;
+                            )
+                            .await?;
                             return Err(AgentCoreErrorV4::UncertainSideEffect(format!(
                                 "{}: {error}",
                                 call.call_id
                             )));
                         }
                     };
-                    let scientific_update = outcome
-                        .succeeded
-                        .then(|| self.science_after_tool(spec, &call, &outcome));
+                    let scientific_update = if outcome.succeeded {
+                        Some(self.science_after_tool(spec, &call, &outcome).await)
+                    } else {
+                        None
+                    };
                     if let Some(Err(error)) = &scientific_update {
                         outcome.succeeded = false;
                         outcome.model_content = format!("host rejected scientific result: {error}");
@@ -748,9 +781,10 @@ impl AgentCoreV4<'_> {
                         AgentEventKindV4::ToolFinished {
                             outcome: outcome.clone(),
                         },
-                    )?;
+                    )
+                    .await?;
                     if let Some(Ok(update)) = scientific_update {
-                        self.record_scientific_update(spec.run_id, update)?;
+                        self.record_scientific_update(spec.run_id, update).await?;
                     }
                 }
             }
@@ -780,21 +814,27 @@ impl AgentCoreV4<'_> {
                                     provenance: vec!["host-bounded-delegation-v4".into()],
                                 },
                             },
-                        )?;
+                        )
+                        .await?;
                     }
-                    Err(error) => self.push(
-                        spec.run_id,
-                        AgentEventKindV4::ToolFinished {
-                            outcome: ToolOutcomeV4 {
-                                call_id,
-                                tool_id: "agent.delegate".into(),
-                                succeeded: false,
-                                model_content: format!("host rejected delegation graph: {error}"),
-                                data: json!({"error_kind":"delegation_validation"}),
-                                provenance: vec![],
+                    Err(error) => {
+                        self.push(
+                            spec.run_id,
+                            AgentEventKindV4::ToolFinished {
+                                outcome: ToolOutcomeV4 {
+                                    call_id,
+                                    tool_id: "agent.delegate".into(),
+                                    succeeded: false,
+                                    model_content: format!(
+                                        "host rejected delegation graph: {error}"
+                                    ),
+                                    data: json!({"error_kind":"delegation_validation"}),
+                                    provenance: vec![],
+                                },
                             },
-                        },
-                    )?,
+                        )
+                        .await?
+                    }
                 }
             }
             if let Some((question_id, question)) = input_request {
@@ -804,22 +844,26 @@ impl AgentCoreV4<'_> {
                         question_id,
                         question,
                     },
-                )?;
+                )
+                .await?;
                 return Err(AgentCoreErrorV4::WaitingForInput);
             }
             if let Some(proposal) = completion_proposal {
-                self.push(spec.run_id, AgentEventKindV4::CompletionProposed)?;
+                self.push(spec.run_id, AgentEventKindV4::CompletionProposed)
+                    .await?;
                 self.push(
                     spec.run_id,
                     AgentEventKindV4::CompletionProposalSubmitted {
                         proposal: proposal.clone(),
                     },
-                )?;
+                )
+                .await?;
                 let events = self
                     .events
                     .load(spec.run_id)
+                    .await
                     .map_err(AgentCoreErrorV4::Store)?;
-                let scientific_state = self.scientific_snapshot(spec.project_id)?;
+                let scientific_state = self.scientific_snapshot(spec.project_id).await?;
                 let deterministic =
                     verify_completion_v4(spec, &scientific_state, &events, &proposal);
                 self.push(
@@ -827,12 +871,14 @@ impl AgentCoreV4<'_> {
                     AgentEventKindV4::DeterministicVerificationFinished {
                         report: deterministic.clone(),
                     },
-                )?;
+                )
+                .await?;
                 if !deterministic.passed {
                     continue;
                 }
                 if cancelled.load(Ordering::SeqCst) {
-                    self.push(spec.run_id, AgentEventKindV4::RunCancelled)?;
+                    self.push(spec.run_id, AgentEventKindV4::RunCancelled)
+                        .await?;
                     return Err(AgentCoreErrorV4::Cancelled);
                 }
                 let review = self
@@ -863,7 +909,8 @@ impl AgentCoreV4<'_> {
                     AgentEventKindV4::ReviewerFinished {
                         report: review.clone(),
                     },
-                )?;
+                )
+                .await?;
                 if review.has_errors() {
                     if reviewer_corrections >= limits.max_reviewer_corrections {
                         let message = format!(
@@ -875,7 +922,8 @@ impl AgentCoreV4<'_> {
                             AgentEventKindV4::RunNeedsAttention {
                                 message: message.clone(),
                             },
-                        )?;
+                        )
+                        .await?;
                         return Err(AgentCoreErrorV4::NeedsAttention(message));
                     }
                     reviewer_corrections += 1;
@@ -889,10 +937,12 @@ impl AgentCoreV4<'_> {
                                 .filter(|finding| finding.severity == VerificationSeverityV4::Error)
                                 .collect(),
                         },
-                    )?;
+                    )
+                    .await?;
                     continue;
                 }
-                self.push(spec.run_id, AgentEventKindV4::RunCompleted)?;
+                self.push(spec.run_id, AgentEventKindV4::RunCompleted)
+                    .await?;
                 return Ok(());
             }
         }
@@ -915,7 +965,8 @@ impl AgentCoreV4<'_> {
                 call_id: call_id.into(),
                 graph,
             },
-        )?;
+        )
+        .await?;
         let mut outcomes = BTreeMap::<String, DelegationNodeOutcomeV4>::new();
         while outcomes.len() < nodes.len() {
             if cancelled.load(Ordering::SeqCst) {
@@ -947,7 +998,8 @@ impl AgentCoreV4<'_> {
                         call_id: call_id.into(),
                         outcome: outcome.clone(),
                     },
-                )?;
+                )
+                .await?;
                 outcomes.insert(node_id, outcome);
             }
             let ready = nodes
@@ -991,7 +1043,8 @@ impl AgentCoreV4<'_> {
                         call_id: call_id.into(),
                         outcome: outcome.clone(),
                     },
-                )?;
+                )
+                .await?;
                 outcomes.insert(outcome.node_id.clone(), outcome);
             }
         }
@@ -1005,7 +1058,8 @@ impl AgentCoreV4<'_> {
                 call_id: call_id.into(),
                 outcome: result.clone(),
             },
-        )?;
+        )
+        .await?;
         Ok(result)
     }
 
@@ -1160,12 +1214,9 @@ impl AgentCoreV4<'_> {
     ) -> Result<ModelTurnV4, AgentCoreErrorV4> {
         let mut attempt = 0_u8;
         loop {
-            let mut callback_error = None;
+            let mut callback_events = Vec::new();
             let mut streamed_text = String::new();
             let mut on_event = |event| {
-                if callback_error.is_some() {
-                    return;
-                }
                 let kind = match event {
                     ModelStreamEventV4::TextDelta(text) => {
                         streamed_text.push_str(&text);
@@ -1181,9 +1232,7 @@ impl AgentCoreV4<'_> {
                         message: format!("{message}; retry delay {delay_ms}ms"),
                     },
                 };
-                if let Err(error) = self.push(run_id, kind) {
-                    callback_error = Some(error);
-                }
+                callback_events.push(kind);
             };
             let mut completion = Box::pin(self.model.stream(request.clone(), &mut on_event));
             let deadline = tokio::time::sleep(attempt_timeout);
@@ -1199,7 +1248,8 @@ impl AgentCoreV4<'_> {
                     }
                     _ = tokio::time::sleep(Duration::from_millis(50)), if cancelled.is_some() => {
                         if cancelled.is_some_and(|token| token.load(Ordering::SeqCst)) {
-                            self.push(run_id, AgentEventKindV4::RunCancelled)?;
+                            self.push(run_id, AgentEventKindV4::RunCancelled)
+                                .await?;
                             return Err(AgentCoreErrorV4::Cancelled);
                         }
                     }
@@ -1207,8 +1257,8 @@ impl AgentCoreV4<'_> {
             };
             drop(completion);
             drop(on_event);
-            if let Some(error) = callback_error {
-                return Err(error);
+            for kind in callback_events {
+                self.push(run_id, kind).await?;
             }
             match result {
                 Ok(turn) => {
@@ -1223,7 +1273,8 @@ impl AgentCoreV4<'_> {
                             AgentEventKindV4::ModelText {
                                 text: completed_text,
                             },
-                        )?;
+                        )
+                        .await?;
                     }
                     return Ok(turn);
                 }
@@ -1236,7 +1287,8 @@ impl AgentCoreV4<'_> {
                             class: error.class,
                             message: error.message,
                         },
-                    )?;
+                    )
+                    .await?;
                     tokio::time::sleep(Duration::from_millis(25 * u64::from(attempt))).await;
                 }
                 Err(error) => return Err(AgentCoreErrorV4::Model(error.message)),
@@ -1255,7 +1307,7 @@ impl AgentCoreV4<'_> {
         let mut attempt = 0_u8;
         loop {
             if cancelled.is_some_and(|token| token.load(Ordering::SeqCst)) {
-                self.push(run_id, AgentEventKindV4::RunCancelled)?;
+                self.push(run_id, AgentEventKindV4::RunCancelled).await?;
                 return Err(AgentCoreErrorV4::Cancelled);
             }
             let review = tokio::time::timeout(attempt_timeout, self.model.review(request.clone()))
@@ -1280,7 +1332,8 @@ impl AgentCoreV4<'_> {
                             class: error.class,
                             message: format!("reviewer: {}", error.message),
                         },
-                    )?;
+                    )
+                    .await?;
                     tokio::time::sleep(Duration::from_millis(
                         250 * (1_u64 << u32::from(attempt.saturating_sub(1))),
                     ))
@@ -1334,7 +1387,7 @@ impl AgentCoreV4<'_> {
         {
             return Ok(false);
         }
-        let scientific_state = self.scientific_snapshot(spec.project_id)?;
+        let scientific_state = self.scientific_snapshot(spec.project_id).await?;
         if let Some(expected) = events[..verification_sequence as usize]
             .iter()
             .rev()
@@ -1353,7 +1406,8 @@ impl AgentCoreV4<'_> {
                     AgentEventKindV4::RunNeedsAttention {
                         message: message.clone(),
                     },
-                )?;
+                )
+                .await?;
                 return Err(AgentCoreErrorV4::NeedsAttention(message));
             }
         }
@@ -1385,7 +1439,8 @@ impl AgentCoreV4<'_> {
             AgentEventKindV4::ReviewerFinished {
                 report: review.clone(),
             },
-        )?;
+        )
+        .await?;
         if review.has_errors() {
             if *reviewer_corrections >= limits.max_reviewer_corrections {
                 let message = format!(
@@ -1397,7 +1452,8 @@ impl AgentCoreV4<'_> {
                     AgentEventKindV4::RunNeedsAttention {
                         message: message.clone(),
                     },
-                )?;
+                )
+                .await?;
                 return Err(AgentCoreErrorV4::NeedsAttention(message));
             }
             *reviewer_corrections += 1;
@@ -1411,10 +1467,12 @@ impl AgentCoreV4<'_> {
                         .filter(|finding| finding.severity == VerificationSeverityV4::Error)
                         .collect(),
                 },
-            )?;
+            )
+            .await?;
             return Ok(false);
         }
-        self.push(spec.run_id, AgentEventKindV4::RunCompleted)?;
+        self.push(spec.run_id, AgentEventKindV4::RunCompleted)
+            .await?;
         Ok(true)
     }
 
@@ -1425,7 +1483,11 @@ impl AgentCoreV4<'_> {
         cancelled: &AtomicBool,
     ) -> Result<(), AgentCoreErrorV4> {
         let run_id = spec.run_id;
-        let events = self.events.load(run_id).map_err(AgentCoreErrorV4::Store)?;
+        let events = self
+            .events
+            .load(run_id)
+            .await
+            .map_err(AgentCoreErrorV4::Store)?;
         let mut pending = BTreeMap::<String, (ToolCallV4, bool)>::new();
         for event in &events {
             match &event.event {
@@ -1438,7 +1500,7 @@ impl AgentCoreV4<'_> {
                     pending.insert(call.call_id.clone(), (call.clone(), false));
                 }
                 AgentEventKindV4::ToolDispatchStarted { call_id, .. } => {
-                    if let Some((_, dispatched)) = pending.get_mut(call_id) {
+                    if let Some((_, dispatched)) = pending.get_mut(call_id.as_str()) {
                         *dispatched = true;
                     }
                 }
@@ -1447,7 +1509,7 @@ impl AgentCoreV4<'_> {
                     pending.remove(&outcome.call_id);
                 }
                 AgentEventKindV4::ToolDispatchResolved { call_id, .. } => {
-                    pending.remove(call_id);
+                    pending.remove(call_id.as_str());
                 }
                 _ => {}
             }
@@ -1467,7 +1529,8 @@ impl AgentCoreV4<'_> {
                             call_id: call.call_id.clone(),
                             tool_id: call.tool_id.clone(),
                         },
-                    )?;
+                    )
+                    .await?;
                 }
                 return Err(AgentCoreErrorV4::UncertainSideEffect(call.call_id));
             }
@@ -1490,7 +1553,8 @@ impl AgentCoreV4<'_> {
                                     provenance: vec!["tool-approval-v4".into()],
                                 },
                             },
-                        )?;
+                        )
+                        .await?;
                         continue;
                     }
                     None => {
@@ -1501,7 +1565,8 @@ impl AgentCoreV4<'_> {
                             self.push(
                                 run_id,
                                 AgentEventKindV4::ToolApprovalRequested { request },
-                            )?;
+                            )
+                            .await?;
                         }
                         return Err(AgentCoreErrorV4::WaitingForApproval);
                     }
@@ -1522,7 +1587,8 @@ impl AgentCoreV4<'_> {
                             provenance: vec![],
                         },
                     },
-                )?;
+                )
+                .await?;
                 continue;
             }
             if call.tool_id == "agent.delegate" {
@@ -1550,10 +1616,11 @@ impl AgentCoreV4<'_> {
                             provenance: vec!["host-bounded-delegation-v4".into()],
                         },
                     },
-                )?;
+                )
+                .await?;
                 continue;
             }
-            if let Err(message) = self.science_before_tool(spec, &call) {
+            if let Err(message) = self.science_before_tool(spec, &call).await {
                 if !recoverable_scientific_declaration_error(&message) {
                     return Err(AgentCoreErrorV4::Science(message));
                 }
@@ -1571,7 +1638,8 @@ impl AgentCoreV4<'_> {
                             provenance: vec![],
                         },
                     },
-                )?;
+                )
+                .await?;
                 continue;
             }
             self.push(
@@ -1582,7 +1650,8 @@ impl AgentCoreV4<'_> {
                     effect,
                     idempotency_key: call.call_id.clone(),
                 },
-            )?;
+            )
+            .await?;
             let mut outcome = match self.tools.execute(RunModeV4::Execute, call.clone()).await {
                 Ok(outcome) => outcome,
                 Err(error) if effect == ToolEffectV4::ReadOnly => ToolOutcomeV4 {
@@ -1605,16 +1674,19 @@ impl AgentCoreV4<'_> {
                             call_id: call.call_id.clone(),
                             tool_id: call.tool_id.clone(),
                         },
-                    )?;
+                    )
+                    .await?;
                     return Err(AgentCoreErrorV4::UncertainSideEffect(format!(
                         "{}: {error}",
                         call.call_id
                     )));
                 }
             };
-            let scientific_update = outcome
-                .succeeded
-                .then(|| self.science_after_tool(spec, &call, &outcome));
+            let scientific_update = if outcome.succeeded {
+                Some(self.science_after_tool(spec, &call, &outcome).await)
+            } else {
+                None
+            };
             if let Some(Err(error)) = &scientific_update {
                 outcome.succeeded = false;
                 outcome.model_content = format!("host rejected scientific result: {error}");
@@ -1626,9 +1698,10 @@ impl AgentCoreV4<'_> {
                 AgentEventKindV4::ToolFinished {
                     outcome: outcome.clone(),
                 },
-            )?;
+            )
+            .await?;
             if let Some(Ok(update)) = scientific_update {
-                self.record_scientific_update(run_id, update)?;
+                self.record_scientific_update(run_id, update).await?;
             }
         }
         Ok(())
@@ -1768,12 +1841,16 @@ impl AgentCoreV4<'_> {
         }
     }
 
-    fn cached_outcome(
+    async fn cached_outcome(
         &self,
         run_id: Uuid,
         call: &ToolCallV4,
     ) -> Result<Option<ToolOutcomeV4>, AgentCoreErrorV4> {
-        let events = self.events.load(run_id).map_err(AgentCoreErrorV4::Store)?;
+        let events = self
+            .events
+            .load(run_id)
+            .await
+            .map_err(AgentCoreErrorV4::Store)?;
         let original_matches = events.iter().any(|event| {
             matches!(&event.event, AgentEventKindV4::ToolRequested { call: prior } if prior.call_id == call.call_id && prior.tool_id == call.tool_id && prior.arguments == call.arguments)
         });
@@ -1791,7 +1868,7 @@ impl AgentCoreV4<'_> {
         }))
     }
 
-    fn context_for(
+    async fn context_for(
         &self,
         spec: &RunSpecV4,
         limits: AgentLimitsV4,
@@ -1799,8 +1876,9 @@ impl AgentCoreV4<'_> {
         let events = self
             .events
             .load(spec.run_id)
+            .await
             .map_err(AgentCoreErrorV4::Store)?;
-        let scientific_state = self.scientific_snapshot(spec.project_id)?;
+        let scientific_state = self.scientific_snapshot(spec.project_id).await?;
         let latest_checkpoint = events.iter().rev().find_map(|event| match &event.event {
             AgentEventKindV4::ContextCheckpointed { checkpoint } => Some(checkpoint.clone()),
             _ => None,
@@ -1837,29 +1915,35 @@ impl AgentCoreV4<'_> {
         let archive = self
             .events
             .archive_context(spec.run_id, &transcript, &checkpoint)
+            .await
             .map_err(AgentCoreErrorV4::Store)?;
-        self.push(spec.run_id, AgentEventKindV4::ContextArchived { archive })?;
+        self.push(spec.run_id, AgentEventKindV4::ContextArchived { archive })
+            .await?;
         self.push(
             spec.run_id,
             AgentEventKindV4::ContextCheckpointed {
                 checkpoint: checkpoint.clone(),
             },
-        )?;
+        )
+        .await?;
         serde_json::to_string(&json!({"frozen_plan":spec.plan,"compute_selection":spec.compute_selection,"checkpoint":checkpoint,"recent_events":[],"scientific_state":scientific_state}))
             .map_err(|e| AgentCoreErrorV4::Store(e.to_string()))
     }
 
-    fn scientific_snapshot(&self, project_id: Uuid) -> Result<ScientificStateV4, AgentCoreErrorV4> {
-        self.science
-            .map(|science| {
-                science
-                    .snapshot(project_id)
-                    .map_err(AgentCoreErrorV4::Science)
-            })
-            .unwrap_or_else(|| Ok(ScientificStateV4::new(project_id)))
+    async fn scientific_snapshot(
+        &self,
+        project_id: Uuid,
+    ) -> Result<ScientificStateV4, AgentCoreErrorV4> {
+        match self.science {
+            Some(science) => science
+                .snapshot(project_id)
+                .await
+                .map_err(AgentCoreErrorV4::Science),
+            None => Ok(ScientificStateV4::new(project_id)),
+        }
     }
 
-    fn record_scientific_update(
+    async fn record_scientific_update(
         &self,
         run_id: Uuid,
         update: Option<ScientificUpdateV4>,
@@ -1872,21 +1956,25 @@ impl AgentCoreV4<'_> {
                     state_sha256: update.state_sha256,
                     changes: update.changes,
                 },
-            )?;
+            )
+            .await?;
         }
         Ok(())
     }
 
-    fn science_before_tool(&self, spec: &RunSpecV4, call: &ToolCallV4) -> Result<(), String> {
+    async fn science_before_tool(&self, spec: &RunSpecV4, call: &ToolCallV4) -> Result<(), String> {
         let Some(science) = self.science else {
             return Ok(());
         };
-        let update = science.before_tool(spec.project_id, spec.run_id, call)?;
+        let update = science
+            .before_tool(spec.project_id, spec.run_id, call)
+            .await?;
         self.record_scientific_update(spec.run_id, update)
+            .await
             .map_err(|error| error.to_string())
     }
 
-    fn science_after_tool(
+    async fn science_after_tool(
         &self,
         spec: &RunSpecV4,
         call: &ToolCallV4,
@@ -1897,18 +1985,27 @@ impl AgentCoreV4<'_> {
         };
         science
             .after_tool(spec.project_id, spec.run_id, call, outcome)
+            .await
             .map_err(AgentCoreErrorV4::Science)
     }
 
-    fn record(&self, event: AgentEventV4) -> Result<(), AgentCoreErrorV4> {
-        self.events.append(&event).map_err(AgentCoreErrorV4::Store)
+    async fn record(&self, event: AgentEventV4) -> Result<(), AgentCoreErrorV4> {
+        self.events
+            .append(&event)
+            .await
+            .map_err(AgentCoreErrorV4::Store)
     }
-    fn push(&self, run_id: Uuid, kind: AgentEventKindV4) -> Result<(), AgentCoreErrorV4> {
-        let events = self.events.load(run_id).map_err(AgentCoreErrorV4::Store)?;
+    async fn push(&self, run_id: Uuid, kind: AgentEventKindV4) -> Result<(), AgentCoreErrorV4> {
+        let events = self
+            .events
+            .load(run_id)
+            .await
+            .map_err(AgentCoreErrorV4::Store)?;
         let previous = events
             .last()
             .ok_or_else(|| AgentCoreErrorV4::Store("run has no first event".into()))?;
         self.record(AgentEventV4::next(previous, Utc::now(), kind))
+            .await
     }
 }
 
@@ -2716,12 +2813,13 @@ mod tests {
         events: Mutex<Vec<AgentEventV4>>,
         archives: Mutex<Vec<String>>,
     }
-    impl EventStoreV4 for MemoryStore {
-        fn append(&self, event: &AgentEventV4) -> Result<(), String> {
+    impl MemoryStore {
+        fn append_direct(&self, event: &AgentEventV4) -> Result<(), String> {
             self.events.lock().unwrap().push(event.clone());
             Ok(())
         }
-        fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String> {
+
+        fn load_direct(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String> {
             Ok(self
                 .events
                 .lock()
@@ -2731,7 +2829,16 @@ mod tests {
                 .cloned()
                 .collect())
         }
-        fn archive_context(
+    }
+    #[async_trait]
+    impl EventStoreV4 for MemoryStore {
+        async fn append(&self, event: &AgentEventV4) -> Result<(), String> {
+            self.append_direct(event)
+        }
+        async fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String> {
+            self.load_direct(run_id)
+        }
+        async fn archive_context(
             &self,
             _: Uuid,
             transcript: &str,
@@ -2751,7 +2858,7 @@ mod tests {
         let run_id = Uuid::new_v4();
         let store = MemoryStore::default();
         store
-            .append(&AgentEventV4::first(
+            .append_direct(&AgentEventV4::first(
                 run_id,
                 Uuid::new_v4(),
                 Uuid::new_v4(),
@@ -2783,7 +2890,7 @@ mod tests {
         .unwrap();
 
         let model_text = store
-            .load(run_id)
+            .load_direct(run_id)
             .unwrap()
             .into_iter()
             .filter_map(|event| match event.event {
@@ -3015,9 +3122,9 @@ mod tests {
                 mode: RunModeV4::Plan,
             },
         );
-        store.append(&first).unwrap();
+        store.append_direct(&first).unwrap();
         store
-            .append(&AgentEventV4::next(
+            .append_direct(&AgentEventV4::next(
                 &first,
                 Utc::now(),
                 AgentEventKindV4::ModeChanged {
@@ -3027,8 +3134,8 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn execution_context_always_contains_the_frozen_objective_and_plan() {
+    #[tokio::test]
+    async fn execution_context_always_contains_the_frozen_objective_and_plan() {
         let spec = execution_spec(Uuid::new_v4());
         let store = MemoryStore::default();
         seed_execution(&store, &spec);
@@ -3039,7 +3146,10 @@ mod tests {
             events: &store,
             science: None,
         };
-        let context = core.context_for(&spec, AgentLimitsV4::default()).unwrap();
+        let context = core
+            .context_for(&spec, AgentLimitsV4::default())
+            .await
+            .unwrap();
         assert!(context.contains("frozen_plan"));
         assert!(context.contains("execute"));
     }
@@ -3106,12 +3216,13 @@ mod tests {
     }
 
     struct RecordingScience(AtomicUsize);
+    #[async_trait]
     impl ScientificStateStoreV4 for RecordingScience {
-        fn snapshot(&self, project_id: Uuid) -> Result<ScientificStateV4, String> {
+        async fn snapshot(&self, project_id: Uuid) -> Result<ScientificStateV4, String> {
             Ok(ScientificStateV4::new(project_id))
         }
 
-        fn before_tool(
+        async fn before_tool(
             &self,
             _: Uuid,
             _: Uuid,
@@ -3125,7 +3236,7 @@ mod tests {
             }))
         }
 
-        fn after_tool(
+        async fn after_tool(
             &self,
             _: Uuid,
             _: Uuid,
@@ -3665,9 +3776,9 @@ mod tests {
                 },
             },
         );
-        store.append(&requested).unwrap();
+        store.append_direct(&requested).unwrap();
         store
-            .append(&AgentEventV4::next(
+            .append_direct(&AgentEventV4::next(
                 &requested,
                 Utc::now(),
                 AgentEventKindV4::ToolDispatchStarted {
@@ -3699,7 +3810,7 @@ mod tests {
 
         let previous = store.events.lock().unwrap().last().unwrap().clone();
         store
-            .append(&AgentEventV4::next(
+            .append_direct(&AgentEventV4::next(
                 &previous,
                 Utc::now(),
                 AgentEventKindV4::ToolDispatchResolved {
@@ -3729,8 +3840,8 @@ mod tests {
         assert_eq!(tools.calls.load(AtomicOrdering::SeqCst), 0);
     }
 
-    #[test]
-    fn archive_is_written_before_checkpoint_context_is_used() {
+    #[tokio::test]
+    async fn archive_is_written_before_checkpoint_context_is_used() {
         let run_id = Uuid::new_v4();
         let spec = execution_spec(run_id);
         let store = MemoryStore::default();
@@ -3738,7 +3849,7 @@ mod tests {
         for index in 0..20 {
             let previous = store.events.lock().unwrap().last().unwrap().clone();
             store
-                .append(&AgentEventV4::next(
+                .append_direct(&AgentEventV4::next(
                     &previous,
                     Utc::now(),
                     AgentEventKindV4::ModelText {
@@ -3763,6 +3874,7 @@ mod tests {
                     ..AgentLimitsV4::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(store.archives.lock().unwrap().len(), 1);
         assert!(context.contains("checkpoint"));
@@ -4028,7 +4140,7 @@ mod tests {
         assert_eq!(model.attempts.load(AtomicOrdering::SeqCst), 4);
         assert_eq!(
             store
-                .load(spec.run_id)
+                .load_direct(spec.run_id)
                 .unwrap()
                 .iter()
                 .filter(|event| matches!(event.event, AgentEventKindV4::ModelRetrying { .. }))
@@ -4068,7 +4180,7 @@ mod tests {
         ] {
             let previous = store.events.lock().unwrap().last().unwrap().clone();
             store
-                .append(&AgentEventV4::next(&previous, Utc::now(), kind))
+                .append_direct(&AgentEventV4::next(&previous, Utc::now(), kind))
                 .unwrap();
         }
         let model = ScriptedModel(Mutex::new(vec![]));
@@ -4082,7 +4194,12 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(
-            store.load(spec.run_id).unwrap().last().unwrap().event,
+            store
+                .load_direct(spec.run_id)
+                .unwrap()
+                .last()
+                .unwrap()
+                .event,
             AgentEventKindV4::RunCompleted
         ));
     }
@@ -4105,7 +4222,7 @@ mod tests {
             },
         );
         let sequence = event.sequence;
-        store.append(&event).unwrap();
+        store.append_direct(&event).unwrap();
         sequence
     }
 

@@ -1,10 +1,10 @@
-use omicsops_adapters::persistence::Repository;
 use omicsops_core::workspace::{Project, ProjectTemplate};
+use omicsops_store::Store;
 use rusqlite::{Connection, params};
 use uuid::Uuid;
 
-#[test]
-fn opening_an_existing_database_preserves_retired_runtime_tables_and_rows() {
+#[tokio::test]
+async fn opening_an_existing_database_preserves_retired_runtime_tables_and_rows() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("existing.sqlite3");
     let connection = Connection::open(&path).unwrap();
@@ -41,7 +41,7 @@ fn opening_an_existing_database_preserves_retired_runtime_tables_and_rows() {
         .unwrap();
     drop(connection);
 
-    drop(Repository::open(&path).unwrap());
+    drop(Store::open(&path).await.unwrap());
 
     let connection = Connection::open(path).unwrap();
     let rows: i64 = connection
@@ -62,38 +62,37 @@ fn opening_an_existing_database_preserves_retired_runtime_tables_and_rows() {
     assert_eq!(table_count, 1);
 }
 
-#[test]
-fn deleting_a_current_project_does_not_clear_retired_runtime_rows() {
+#[tokio::test]
+async fn deleting_a_current_project_does_not_clear_retired_runtime_rows() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("delete.sqlite3");
-    let repository = Repository::open(&path).unwrap();
-    let project_id = Uuid::new_v4();
-    repository
-        .save_project(&Project::new(
-            project_id,
-            "current",
-            directory.path().display().to_string(),
-            ProjectTemplate::Blank,
-            chrono::Utc::now(),
-        ))
-        .unwrap();
-    drop(repository);
+    let project = Project::new(
+        Uuid::new_v4(),
+        "current",
+        directory.path().display().to_string(),
+        ProjectTemplate::Blank,
+        chrono::Utc::now(),
+    );
+    {
+        let store = Store::open(&path).await.unwrap();
+        store.save_project(&project).await.unwrap();
+    }
     let connection = Connection::open(&path).unwrap();
     connection
         .execute(
             "INSERT INTO agent_run_events_v3 VALUES (?1, ?2, ?3, 1, '', 'retired-hash', '{}')",
             params![
                 "retired-run",
-                project_id.to_string(),
+                project.id.to_string(),
                 "retired-conversation"
             ],
         )
         .unwrap();
     drop(connection);
 
-    let repository = Repository::open(&path).unwrap();
-    assert!(repository.delete_project(project_id).unwrap());
-    drop(repository);
+    let store = Store::open(&path).await.unwrap();
+    assert!(store.delete_project(project.id).await.unwrap());
+    drop(store);
 
     let connection = Connection::open(path).unwrap();
     let rows: i64 = connection

@@ -19,7 +19,7 @@ use tokio::sync::{Mutex, Semaphore};
 use uuid::Uuid;
 
 use crate::commands::{AppState, connect_profile, find_profile, require_trusted_host};
-use omicsops_adapters::persistence::Repository;
+use omicsops_store::Store;
 
 pub type ActiveKernelMap = Arc<Mutex<HashMap<Uuid, Arc<ActiveKernel>>>>;
 
@@ -67,16 +67,18 @@ pub struct PromoteKernelCellRequest {
     pub version: u32,
 }
 
-pub fn mark_orphaned_kernels_interrupted(repository: &Repository) -> Result<usize, String> {
+pub async fn mark_orphaned_kernels_interrupted(repository: &Store) -> Result<usize, String> {
     let mut changed = 0;
     for mut session in repository
         .list_json::<KernelSession>("kernel_session")
+        .await
         .map_err(|error| error.to_string())?
     {
         if session.state == KernelState::Running {
             session.interrupt();
             repository
                 .put_json("kernel_session", &session.id.to_string(), &session)
+                .await
                 .map_err(|error| error.to_string())?;
             changed += 1;
         }
@@ -85,15 +87,18 @@ pub fn mark_orphaned_kernels_interrupted(repository: &Repository) -> Result<usiz
 }
 
 #[tauri::command]
-pub fn list_kernel_sessions(state: State<'_, AppState>) -> Result<Vec<KernelSession>, String> {
+pub async fn list_kernel_sessions(
+    state: State<'_, AppState>,
+) -> Result<Vec<KernelSession>, String> {
     state
         .repository
         .list_json("kernel_session")
+        .await
         .map_err(|error| error.to_string())
 }
 
-pub fn promote_saved_kernel_cell(
-    repository: &Repository,
+pub async fn promote_saved_kernel_cell(
+    repository: &Store,
     request: &PromoteKernelCellRequest,
 ) -> Result<FormalStepProposal, String> {
     if request.name.trim().is_empty() || request.version == 0 {
@@ -101,6 +106,7 @@ pub fn promote_saved_kernel_cell(
     }
     let session = repository
         .get_json::<KernelSession>("kernel_session", &request.session_id.to_string())
+        .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "kernel session was not found".to_string())?;
     session
@@ -109,11 +115,11 @@ pub fn promote_saved_kernel_cell(
 }
 
 #[tauri::command]
-pub fn promote_kernel_cell(
+pub async fn promote_kernel_cell(
     state: State<'_, AppState>,
     request: PromoteKernelCellRequest,
 ) -> Result<FormalStepProposal, String> {
-    promote_saved_kernel_cell(&state.repository, &request)
+    promote_saved_kernel_cell(&state.repository, &request).await
 }
 
 #[tauri::command]
@@ -122,7 +128,7 @@ pub async fn start_kernel(
     state: State<'_, AppState>,
     request: StartKernelRequest,
 ) -> Result<KernelSession, String> {
-    let project = project_for_kernel(&state, request.project_id)?;
+    let project = project_for_kernel(&state, request.project_id).await?;
     let active_count = state
         .active_kernels
         .lock()
@@ -137,6 +143,7 @@ pub async fn start_kernel(
         let session = state
             .repository
             .get_json::<KernelSession>("kernel_session", &session_id.to_string())
+            .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "interrupted kernel session was not found".to_string())?;
         if session.project_id != project.id || session.language != request.language {
@@ -174,6 +181,7 @@ pub async fn start_kernel(
     state
         .repository
         .put_json("kernel_session", &metadata.id.to_string(), &metadata)
+        .await
         .map_err(|error| error.to_string())?;
     let active = Arc::new(ActiveKernel {
         project_id: project.id,
@@ -240,6 +248,7 @@ pub async fn execute_kernel_cell(
             state
                 .repository
                 .put_json("kernel_session", &session_id.to_string(), &kernel.metadata)
+                .await
                 .map_err(|error| error.to_string())?;
             drop(kernel);
             state.active_kernels.lock().await.remove(&session_id);
@@ -279,6 +288,7 @@ pub async fn execute_kernel_cell(
             state
                 .repository
                 .save_artifact_v3(&artifact)
+                .await
                 .map_err(|error| error.to_string())?;
             app.emit("artifact-event", &artifact)
                 .map_err(|error| error.to_string())?;
@@ -287,6 +297,7 @@ pub async fn execute_kernel_cell(
     state
         .repository
         .put_json("kernel_session", &session_id.to_string(), &kernel.metadata)
+        .await
         .map_err(|error| error.to_string())?;
     Ok(KernelCellResult {
         request_id,
@@ -345,6 +356,7 @@ async fn finish_kernel(
     state
         .repository
         .put_json("kernel_session", &session_id.to_string(), &kernel.metadata)
+        .await
         .map_err(|error| error.to_string())?;
     Ok(kernel.metadata.clone())
 }
@@ -401,7 +413,7 @@ async fn launch_remote_kernel(
         .remote_root
         .as_deref()
         .ok_or_else(|| "project has no remote root".to_string())?;
-    let profile = find_profile(&state.repository, profile_id)?;
+    let profile = find_profile(&state.repository, profile_id).await?;
     require_trusted_host(&profile)?;
     let ssh = connect_profile(state, &profile).await?;
     let root = ssh
@@ -511,10 +523,14 @@ async fn project_queue(state: &State<'_, AppState>, project_id: Uuid) -> Arc<Sem
         .clone()
 }
 
-fn project_for_kernel(state: &State<'_, AppState>, project_id: Uuid) -> Result<Project, String> {
+async fn project_for_kernel(
+    state: &State<'_, AppState>,
+    project_id: Uuid,
+) -> Result<Project, String> {
     state
         .repository
         .get_project(project_id)
+        .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "project was not found".into())
 }

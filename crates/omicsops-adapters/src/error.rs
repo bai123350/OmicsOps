@@ -6,8 +6,6 @@ pub enum AdapterError {
     Io(#[from] std::io::Error),
     #[error("JSON failed: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("database failed: {0}")]
-    Database(#[from] rusqlite::Error),
     #[error("credential store failed: {0}")]
     Credential(String),
     #[error("unsupported plan document: {0}")]

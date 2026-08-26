@@ -2,7 +2,6 @@ pub mod credentials;
 pub mod document;
 pub mod kernel;
 pub mod llm;
-pub mod persistence;
 pub mod research;
 pub mod skills;
 pub mod ssh;

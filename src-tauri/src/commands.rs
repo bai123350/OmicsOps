@@ -10,7 +10,6 @@ use std::{
 use omicsops_adapters::{
     credentials::{CredentialVault, SystemCredentialVault, credential_account},
     llm::{ProviderProtocol, UnifiedModelClient},
-    persistence::Repository,
     ssh::{SshAuthentication, SshSession},
 };
 use omicsops_core::{
@@ -18,6 +17,7 @@ use omicsops_core::{
     project::RemoteProjectLayout,
 };
 use omicsops_mcp::McpSessionManager;
+use omicsops_store::Store;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use url::Url;
@@ -26,7 +26,7 @@ use uuid::Uuid;
 use crate::inspection::{ServerInspection, inspection_command, parse_server_inspection};
 
 pub struct AppState {
-    pub repository: Repository,
+    pub repository: Store,
     pub credentials: SystemCredentialVault,
     pub mcp_sessions: McpSessionManager,
     pub active_runs: Arc<Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
@@ -80,15 +80,18 @@ pub fn parse_authentication_secret(
 }
 
 #[tauri::command]
-pub fn list_connections(state: State<'_, AppState>) -> Result<Vec<ConnectionProfile>, String> {
+pub async fn list_connections(
+    state: State<'_, AppState>,
+) -> Result<Vec<ConnectionProfile>, String> {
     state
         .repository
         .list_connections()
+        .await
         .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-pub fn save_connection(
+pub async fn save_connection(
     state: State<'_, AppState>,
     mut profile: ConnectionProfile,
     secret: String,
@@ -96,6 +99,7 @@ pub fn save_connection(
     let previous = state
         .repository
         .list_connections()
+        .await
         .map_err(|error| error.to_string())?
         .into_iter()
         .find(|item| item.id == profile.id);
@@ -121,6 +125,7 @@ pub fn save_connection(
     state
         .repository
         .save_connection(&profile)
+        .await
         .map_err(|error| error.to_string())
 }
 
@@ -156,7 +161,7 @@ pub async fn test_connection(
     state: State<'_, AppState>,
     profile_id: Uuid,
 ) -> Result<ConnectionTestResult, String> {
-    let profile = find_profile(&state.repository, profile_id)?;
+    let profile = find_profile(&state.repository, profile_id).await?;
     let started = std::time::Instant::now();
     let fingerprint = SshSession::probe_host_key(&profile)
         .await
@@ -215,7 +220,7 @@ pub async fn confirm_host_key(
     profile_id: Uuid,
     fingerprint: String,
 ) -> Result<(), String> {
-    let mut profile = find_profile(&state.repository, profile_id)?;
+    let mut profile = find_profile(&state.repository, profile_id).await?;
     let observed = SshSession::probe_host_key(&profile)
         .await
         .map_err(|error| error.to_string())?;
@@ -228,6 +233,7 @@ pub async fn confirm_host_key(
     state
         .repository
         .save_connection(&profile)
+        .await
         .map_err(|error| error.to_string())
 }
 
@@ -237,7 +243,7 @@ pub async fn inspect_project(
     profile_id: Uuid,
     remote_root: String,
 ) -> Result<ServerInspection, String> {
-    let profile = find_profile(&state.repository, profile_id)?;
+    let profile = find_profile(&state.repository, profile_id).await?;
     require_trusted_host(&profile)?;
     let session = connect_profile(&state, &profile).await?;
     let output = session
@@ -257,7 +263,7 @@ pub async fn initialize_project(
     profile_id: Uuid,
     project: ProjectSpec,
 ) -> Result<ServerInspection, String> {
-    let profile = find_profile(&state.repository, profile_id)?;
+    let profile = find_profile(&state.repository, profile_id).await?;
     require_trusted_host(&profile)?;
     let session = connect_profile(&state, &profile).await?;
     let before = session
@@ -278,6 +284,7 @@ pub async fn initialize_project(
     state
         .repository
         .put_json("project", &project.id.to_string(), &project)
+        .await
         .map_err(|error| error.to_string())?;
     session
         .disconnect()
@@ -298,9 +305,13 @@ pub(crate) fn authentication_for_profile(
     parse_authentication_secret(profile.authentication, &secret)
 }
 
-pub(crate) fn find_profile(repository: &Repository, id: Uuid) -> Result<ConnectionProfile, String> {
+pub(crate) async fn find_profile(
+    repository: &Store,
+    id: Uuid,
+) -> Result<ConnectionProfile, String> {
     repository
         .list_connections()
+        .await
         .map_err(|error| error.to_string())?
         .into_iter()
         .find(|profile| profile.id == id)
@@ -325,13 +336,14 @@ pub(crate) async fn connect_profile(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn unified_model_client(
+pub(crate) async fn unified_model_client(
     state: &AppState,
     model_profile_id: Uuid,
 ) -> Result<UnifiedModelClient, String> {
     let profile = state
         .repository
         .get_model_profile(model_profile_id)
+        .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "model profile not found".to_string())?;
     let credential = match &profile.credential_reference {

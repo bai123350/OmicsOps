@@ -56,6 +56,7 @@ pub async fn search_research(
         if let Some(mut cached) = state
             .repository
             .get_json::<ResearchSearchResult>("research_search_cache", &cache_key)
+            .await
             .map_err(|error| error.to_string())?
             .filter(|cached| {
                 Utc::now()
@@ -126,6 +127,7 @@ pub async fn search_research(
     state
         .repository
         .put_json("research_search_cache", &cache_key, &result)
+        .await
         .map_err(|error| error.to_string())?;
     Ok(result)
 }

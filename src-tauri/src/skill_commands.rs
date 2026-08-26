@@ -3,11 +3,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use omicsops_adapters::{
-    persistence::Repository,
-    skills::{InstalledSkillPackage, install_skill_directory},
-};
+use omicsops_adapters::skills::{InstalledSkillPackage, install_skill_directory};
 use omicsops_core::workspace::SkillPackage;
+use omicsops_store::Store;
 use serde::Deserialize;
 use tauri::State;
 use uuid::Uuid;
@@ -38,8 +36,8 @@ pub struct SetSkillEnabledRequest {
     pub enabled: bool,
 }
 
-pub fn install_bundled_skills(
-    repository: &Repository,
+pub async fn install_bundled_skills(
+    repository: &Store,
     skills_root: &Path,
     bundled_root: &Path,
 ) -> Result<(), String> {
@@ -69,7 +67,7 @@ pub fn install_bundled_skills(
         }
     }
 
-    retire_replaced_bundled_skills(repository, &config.replaces)?;
+    retire_replaced_bundled_skills(repository, &config.replaces).await?;
     for source in sources {
         let key = source
             .file_name()
@@ -82,7 +80,8 @@ pub fn install_bundled_skills(
             installed,
             default_enabled_keys.contains(key),
             category_by_key.get(key).cloned(),
-        )?;
+        )
+        .await?;
     }
     Ok(())
 }
@@ -115,12 +114,13 @@ fn bundled_skill_directories(root: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(directories)
 }
 
-fn retire_replaced_bundled_skills(
-    repository: &Repository,
+async fn retire_replaced_bundled_skills(
+    repository: &Store,
     replacements: &[String],
 ) -> Result<(), String> {
     for skill in repository
         .list_skill_packages()
+        .await
         .map_err(|error| error.to_string())?
     {
         let is_legacy_placeholder =
@@ -128,6 +128,7 @@ fn retire_replaced_bundled_skills(
         if is_legacy_placeholder || replacements.contains(&skill.name) {
             repository
                 .delete_skill_package(skill.id)
+                .await
                 .map_err(|error| error.to_string())?;
         }
     }
@@ -135,17 +136,18 @@ fn retire_replaced_bundled_skills(
 }
 
 #[tauri::command]
-pub fn list_skill_packages(state: State<'_, AppState>) -> Result<Vec<SkillPackage>, String> {
+pub async fn list_skill_packages(state: State<'_, AppState>) -> Result<Vec<SkillPackage>, String> {
     let mut skills = state
         .repository
         .list_skill_packages()
+        .await
         .map_err(|error| error.to_string())?;
     skills.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(skills)
 }
 
 #[tauri::command]
-pub fn import_skill_directory(
+pub async fn import_skill_directory(
     state: State<'_, AppState>,
     request: ImportSkillRequest,
 ) -> Result<SkillPackage, String> {
@@ -154,17 +156,18 @@ pub fn import_skill_directory(
     }
     let installed = install_skill_directory(Path::new(&request.source_path), &state.skills_root)
         .map_err(|error| error.to_string())?;
-    persist_installed(&state.repository, installed, false, None)
+    persist_installed(&state.repository, installed, false, None).await
 }
 
-fn persist_installed(
-    repository: &Repository,
+async fn persist_installed(
+    repository: &Store,
     installed: InstalledSkillPackage,
     enabled_by_default: bool,
     category: Option<String>,
 ) -> Result<SkillPackage, String> {
     if let Some(mut existing) = repository
         .list_skill_packages()
+        .await
         .map_err(|error| error.to_string())?
         .into_iter()
         .find(|skill| skill.sha256 == installed.sha256)
@@ -173,6 +176,7 @@ fn persist_installed(
             existing.category = category;
             repository
                 .save_skill_package(&existing)
+                .await
                 .map_err(|error| error.to_string())?;
         }
         return Ok(existing);
@@ -189,16 +193,18 @@ fn persist_installed(
     };
     repository
         .save_skill_package(&package)
+        .await
         .map_err(|error| error.to_string())?;
     if enabled_by_default {
-        package = set_skill_enabled_in_repository(repository, package.id, true)?;
+        package = set_skill_enabled_in_repository(repository, package.id, true).await?;
     }
     Ok(package)
 }
 
-pub fn agent_skill_packages(repository: &Repository) -> Result<Vec<SkillPackage>, String> {
+pub async fn agent_skill_packages(repository: &Store) -> Result<Vec<SkillPackage>, String> {
     let packages = repository
         .list_skill_packages()
+        .await
         .map_err(|error| error.to_string())?;
     let mut selected = packages
         .iter()
@@ -235,8 +241,8 @@ pub fn agent_skill_packages(repository: &Repository) -> Result<Vec<SkillPackage>
     Ok(result)
 }
 
-pub fn agent_skill_context(repository: &Repository) -> Result<String, String> {
-    let packages = agent_skill_packages(repository)?;
+pub async fn agent_skill_context(repository: &Store) -> Result<String, String> {
+    let packages = agent_skill_packages(repository).await?;
     if packages.is_empty() {
         return Ok("No project skill package is currently enabled.".into());
     }
@@ -362,20 +368,21 @@ fn frontmatter_lines(markdown: &str) -> impl Iterator<Item = &str> {
 }
 
 #[tauri::command]
-pub fn set_skill_enabled(
+pub async fn set_skill_enabled(
     state: State<'_, AppState>,
     request: SetSkillEnabledRequest,
 ) -> Result<SkillPackage, String> {
-    set_skill_enabled_in_repository(&state.repository, request.skill_id, request.enabled)
+    set_skill_enabled_in_repository(&state.repository, request.skill_id, request.enabled).await
 }
 
-pub fn set_skill_enabled_in_repository(
-    repository: &Repository,
+pub async fn set_skill_enabled_in_repository(
+    repository: &Store,
     skill_id: Uuid,
     enabled: bool,
 ) -> Result<SkillPackage, String> {
     let mut packages = repository
         .list_skill_packages()
+        .await
         .map_err(|error| error.to_string())?;
     let index = packages
         .iter()
@@ -391,6 +398,7 @@ pub fn set_skill_enabled_in_repository(
                 skill.enabled = false;
                 repository
                     .save_skill_package(skill)
+                    .await
                     .map_err(|error| error.to_string())?;
             }
         }
@@ -398,6 +406,7 @@ pub fn set_skill_enabled_in_repository(
     packages[index].enabled = enabled;
     repository
         .save_skill_package(&packages[index])
+        .await
         .map_err(|error| error.to_string())?;
     Ok(packages[index].clone())
 }

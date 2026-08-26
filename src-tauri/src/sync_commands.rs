@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
 };
 
@@ -14,34 +14,37 @@ use omicsops_core::{
     sync::SyncManifest,
     workspace::{SyncDirection, SyncEntry, SyncState, conflict_sibling_path},
 };
+use omicsops_store::Store;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, State};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::commands::{AppState, connect_profile, find_profile, require_trusted_host};
 
 #[tauri::command]
-pub fn list_sync_entries(
+pub async fn list_sync_entries(
     state: State<'_, AppState>,
     project_id: Uuid,
 ) -> Result<Vec<SyncEntry>, String> {
     state
         .repository
         .sync_entries_for_project(project_id)
+        .await
         .map_err(|error| error.to_string())
 }
 
-pub fn mark_orphaned_sync_transfers_failed(
-    repository: &omicsops_adapters::persistence::Repository,
-) -> Result<usize, String> {
+pub async fn mark_orphaned_sync_transfers_failed(repository: &Store) -> Result<usize, String> {
     let mut changed = 0;
     for project in repository
         .list_projects()
+        .await
         .map_err(|error| error.to_string())?
     {
         for mut entry in repository
             .sync_entries_for_project(project.id)
+            .await
             .map_err(|error| error.to_string())?
         {
             if entry.state == SyncState::Transferring {
@@ -50,6 +53,7 @@ pub fn mark_orphaned_sync_transfers_failed(
                 entry.updated_at = Utc::now();
                 repository
                     .save_sync_entry(&entry)
+                    .await
                     .map_err(|error| error.to_string())?;
                 changed += 1;
             }
@@ -70,13 +74,106 @@ fn set_sync_control(state: &AppState, transfer_id: Uuid, value: u8) -> Result<()
     Ok(())
 }
 
+struct SyncProgressState {
+    latest_bytes: AtomicU64,
+    closed: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl SyncProgressState {
+    fn report(&self, bytes: u64) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        self.latest_bytes.fetch_max(bytes, Ordering::AcqRel);
+        self.notify.notify_one();
+    }
+}
+
+struct SyncProgressPersistence {
+    state: Arc<SyncProgressState>,
+    worker: Option<JoinHandle<Result<(), String>>>,
+}
+
+impl SyncProgressPersistence {
+    // Progress callbacks are synchronous, so they only publish the latest
+    // byte count. A single awaited worker owns all Store writes and is
+    // drained before the transfer writes any terminal state.
+    fn start(repository: Store, entry: &SyncEntry) -> Self {
+        let state = Arc::new(SyncProgressState {
+            latest_bytes: AtomicU64::new(entry.transferred_bytes),
+            closed: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        });
+        let worker_state = state.clone();
+        let worker_entry = entry.clone();
+        let worker = tokio::spawn(async move {
+            persist_sync_progress(repository, worker_entry, worker_state).await
+        });
+        Self {
+            state,
+            worker: Some(worker),
+        }
+    }
+
+    async fn finish(mut self) -> Result<(), String> {
+        self.state.closed.store(true, Ordering::Release);
+        self.state.notify.notify_one();
+        self.worker
+            .take()
+            .ok_or_else(|| "sync progress worker was already finished".to_owned())?
+            .await
+            .map_err(|error| format!("sync progress worker failed: {error}"))?
+    }
+}
+
+impl Drop for SyncProgressPersistence {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            worker.abort();
+        }
+    }
+}
+
+async fn persist_sync_progress(
+    repository: Store,
+    entry: SyncEntry,
+    state: Arc<SyncProgressState>,
+) -> Result<(), String> {
+    let mut persisted_bytes = entry.transferred_bytes;
+    loop {
+        let latest_bytes = state.latest_bytes.load(Ordering::Acquire);
+        if latest_bytes > persisted_bytes {
+            let mut update = entry.clone();
+            update.transferred_bytes = latest_bytes;
+            update.updated_at = Utc::now();
+            repository
+                .save_sync_entry(&update)
+                .await
+                .map_err(|error| format!("failed to persist sync progress: {error}"))?;
+            persisted_bytes = latest_bytes;
+            continue;
+        }
+        if state.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        state.notify.notified().await;
+    }
+}
+
 #[tauri::command]
-pub fn pause_sync_transfer(state: State<'_, AppState>, transfer_id: Uuid) -> Result<(), String> {
+pub async fn pause_sync_transfer(
+    state: State<'_, AppState>,
+    transfer_id: Uuid,
+) -> Result<(), String> {
     set_sync_control(&state, transfer_id, 1)
 }
 
 #[tauri::command]
-pub fn cancel_sync_transfer(state: State<'_, AppState>, transfer_id: Uuid) -> Result<(), String> {
+pub async fn cancel_sync_transfer(
+    state: State<'_, AppState>,
+    transfer_id: Uuid,
+) -> Result<(), String> {
     set_sync_control(&state, transfer_id, 2)
 }
 
@@ -86,19 +183,25 @@ pub async fn retry_sync_transfer(
     state: State<'_, AppState>,
     transfer_id: Uuid,
 ) -> Result<SyncEntry, String> {
-    let original = state
+    let mut original = None;
+    for project in state
         .repository
         .list_projects()
+        .await
         .map_err(|error| error.to_string())?
-        .into_iter()
-        .find_map(|project| {
-            state
-                .repository
-                .sync_entries_for_project(project.id)
-                .ok()?
-                .into_iter()
-                .find(|entry| entry.id == transfer_id)
-        });
+    {
+        if let Some(entry) = state
+            .repository
+            .sync_entries_for_project(project.id)
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|entry| entry.id == transfer_id)
+        {
+            original = Some(entry);
+            break;
+        }
+    }
     let mut entry = original.ok_or("sync transfer not found")?;
     if !matches!(
         entry.state,
@@ -113,6 +216,7 @@ pub async fn retry_sync_transfer(
     state
         .repository
         .save_sync_entry(&entry)
+        .await
         .map_err(|error| error.to_string())?;
     match entry.direction {
         SyncDirection::RemoteToLocal => resume_download(&app, &state, entry).await,
@@ -145,6 +249,7 @@ async fn finish_transfer(
     state
         .repository
         .save_sync_entry(&entry)
+        .await
         .map_err(|error| error.to_string())?;
     let _ = app.emit("artifact-event", &entry);
     state
@@ -163,6 +268,7 @@ async fn resume_download(
     let project = state
         .repository
         .get_project(entry.project_id)
+        .await
         .map_err(|error| error.to_string())?
         .ok_or("project not found")?;
     let profile = find_profile(
@@ -170,7 +276,8 @@ async fn resume_download(
         project
             .connection_id
             .ok_or("project has no remote connection")?,
-    )?;
+    )
+    .await?;
     require_trusted_host(&profile)?;
     let session = connect_profile(state, &profile).await?;
     let remote = entry
@@ -199,6 +306,7 @@ async fn resume_download(
     state
         .repository
         .save_sync_entry(&entry)
+        .await
         .map_err(|error| error.to_string())?;
     let control = Arc::new(AtomicU8::new(0));
     state
@@ -212,7 +320,7 @@ async fn resume_download(
         .map_err(|error| error.to_string());
     match outcome {
         Ok(value) => finish_transfer(app, state, entry, value).await,
-        Err(error) => fail_transfer(app, state, entry, error),
+        Err(error) => fail_transfer(app, state, entry, error).await,
     }
 }
 
@@ -224,6 +332,7 @@ async fn resume_upload(
     let project = state
         .repository
         .get_project(entry.project_id)
+        .await
         .map_err(|error| error.to_string())?
         .ok_or("project not found")?;
     let profile = find_profile(
@@ -231,7 +340,8 @@ async fn resume_upload(
         project
             .connection_id
             .ok_or("project has no remote connection")?,
-    )?;
+    )
+    .await?;
     require_trusted_host(&profile)?;
     let session = connect_profile(state, &profile).await?;
     let local = Path::new(&project.local_root).join(
@@ -261,6 +371,7 @@ async fn resume_upload(
     state
         .repository
         .save_sync_entry(&entry)
+        .await
         .map_err(|error| error.to_string())?;
     let control = Arc::new(AtomicU8::new(0));
     state
@@ -274,11 +385,11 @@ async fn resume_upload(
         .map_err(|error| error.to_string());
     match outcome {
         Ok(value) => finish_transfer(app, state, entry, value).await,
-        Err(error) => fail_transfer(app, state, entry, error),
+        Err(error) => fail_transfer(app, state, entry, error).await,
     }
 }
 
-fn fail_transfer(
+async fn fail_transfer(
     app: &AppHandle,
     state: &AppState,
     mut entry: SyncEntry,
@@ -290,6 +401,7 @@ fn fail_transfer(
     state
         .repository
         .save_sync_entry(&entry)
+        .await
         .map_err(|e| e.to_string())?;
     let _ = app.emit("artifact-event", &entry);
     state
@@ -468,6 +580,7 @@ pub async fn preview_project_image(
     let project = state
         .repository
         .get_project(request.project_id)
+        .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "project not found".to_string())?;
     let profile_id = project
@@ -480,7 +593,7 @@ pub async fn preview_project_image(
         SyncManifest::for_uploads(project.id.to_string(), [request.relative_path.as_str()])
             .map_err(|error| error.to_string())?;
     let relative = manifest.paths()[0];
-    let profile = find_profile(&state.repository, profile_id)?;
+    let profile = find_profile(&state.repository, profile_id).await?;
     require_trusted_host(&profile)?;
     let session = connect_profile(&state, &profile).await?;
     let root = canonical_remote_root(&session, &remote_root).await?;
@@ -530,6 +643,7 @@ pub async fn list_remote_files(
     let project = state
         .repository
         .get_project(project_id)
+        .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "project not found".to_string())?;
     let profile_id = project
@@ -538,7 +652,7 @@ pub async fn list_remote_files(
     let remote_root = project
         .remote_root
         .ok_or_else(|| "project has no remote root".to_string())?;
-    let profile = find_profile(&state.repository, profile_id)?;
+    let profile = find_profile(&state.repository, profile_id).await?;
     require_trusted_host(&profile)?;
     let session = connect_profile(&state, &profile).await?;
     let root = canonical_remote_root(&session, &remote_root).await?;
@@ -562,6 +676,7 @@ pub async fn upload_selected_files(
     let project = state
         .repository
         .get_project(request.project_id)
+        .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "project not found".to_string())?;
     let profile_id = project
@@ -578,7 +693,7 @@ pub async fn upload_selected_files(
         request.relative_paths.iter().map(String::as_str),
     )
     .map_err(|error| error.to_string())?;
-    let profile = find_profile(&state.repository, profile_id)?;
+    let profile = find_profile(&state.repository, profile_id).await?;
     require_trusted_host(&profile)?;
     let session = connect_profile(&state, &profile).await?;
     let root = canonical_remote_root(&session, &remote_root).await?;
@@ -613,6 +728,7 @@ pub async fn upload_selected_files(
         state
             .repository
             .save_sync_entry(&entry)
+            .await
             .map_err(|error| error.to_string())?;
         let _ = app.emit("artifact-event", &entry);
         if already_synced {
@@ -625,6 +741,7 @@ pub async fn upload_selected_files(
             state
                 .repository
                 .save_sync_entry(&entry)
+                .await
                 .map_err(|error| error.to_string())?;
             entries.push(entry);
             continue;
@@ -633,6 +750,7 @@ pub async fn upload_selected_files(
         state
             .repository
             .save_sync_entry(&entry)
+            .await
             .map_err(|error| error.to_string())?;
         let _ = app.emit("artifact-event", &entry);
         let control = Arc::new(AtomicU8::new(0));
@@ -641,7 +759,8 @@ pub async fn upload_selected_files(
             .lock()
             .map_err(|_| "sync control lock poisoned")?
             .insert(entry.id, control.clone());
-        let progress_repository = state.repository.clone();
+        let progress = SyncProgressPersistence::start(state.repository.clone(), &entry);
+        let progress_state = progress.state.clone();
         let progress_app = app.clone();
         let progress_entry = entry.clone();
         let outcome = session
@@ -649,16 +768,24 @@ pub async fn upload_selected_files(
                 let mut update = progress_entry.clone();
                 update.transferred_bytes = bytes;
                 update.updated_at = Utc::now();
-                let _ = progress_repository.save_sync_entry(&update);
+                progress_state.report(bytes);
                 let _ = progress_app.emit("artifact-event", &update);
             })
             .await
             .map_err(|error| error.to_string());
-        let completed = match outcome {
-            Ok(value) => finish_transfer(&app, &state, entry, value).await?,
-            Err(error) => {
-                let _ = fail_transfer(&app, &state, entry, error.clone());
-                return Err(error);
+        let progress_result = progress.finish().await;
+        let terminal_result = match outcome {
+            Ok(value) => finish_transfer(&app, &state, entry, value).await,
+            Err(error) => fail_transfer(&app, &state, entry, error).await,
+        };
+        let completed = match (terminal_result, progress_result) {
+            (Ok(completed), Ok(())) => completed,
+            (Ok(_), Err(progress_error)) => return Err(progress_error),
+            (Err(terminal_error), Ok(())) => return Err(terminal_error),
+            (Err(terminal_error), Err(progress_error)) => {
+                return Err(format!(
+                    "{terminal_error}; sync progress persistence failed: {progress_error}"
+                ));
             }
         };
         if matches!(completed.state, SyncState::Synced) {
@@ -745,6 +872,7 @@ pub async fn download_project_file(
     let project = state
         .repository
         .get_project(request.project_id)
+        .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "project not found".to_string())?;
     let profile_id = project
@@ -758,7 +886,7 @@ pub async fn download_project_file(
         SyncManifest::for_uploads(project.id.to_string(), [request.relative_path.as_str()])
             .map_err(|error| error.to_string())?;
     let relative = manifest.paths()[0];
-    let profile = find_profile(&state.repository, profile_id)?;
+    let profile = find_profile(&state.repository, profile_id).await?;
     require_trusted_host(&profile)?;
     let session = connect_profile(&state, &profile).await?;
     let root = canonical_remote_root(&session, &remote_root).await?;
@@ -797,6 +925,7 @@ pub async fn download_project_file(
     state
         .repository
         .save_sync_entry(&entry)
+        .await
         .map_err(|error| error.to_string())?;
     let _ = app.emit("artifact-event", &entry);
     let control = Arc::new(AtomicU8::new(0));
@@ -805,7 +934,8 @@ pub async fn download_project_file(
         .lock()
         .map_err(|_| "sync control lock poisoned")?
         .insert(entry.id, control.clone());
-    let progress_repository = state.repository.clone();
+    let progress = SyncProgressPersistence::start(state.repository.clone(), &entry);
+    let progress_state = progress.state.clone();
     let progress_app = app.clone();
     let progress_entry = entry.clone();
     let outcome = session
@@ -819,17 +949,25 @@ pub async fn download_project_file(
                 let mut update = progress_entry.clone();
                 update.transferred_bytes = bytes;
                 update.updated_at = Utc::now();
-                let _ = progress_repository.save_sync_entry(&update);
+                progress_state.report(bytes);
                 let _ = progress_app.emit("artifact-event", &update);
             },
         )
         .await
         .map_err(|error| error.to_string());
-    entry = match outcome {
-        Ok(value) => finish_transfer(&app, &state, entry, value).await?,
-        Err(error) => {
-            let _ = fail_transfer(&app, &state, entry, error.clone());
-            return Err(error);
+    let progress_result = progress.finish().await;
+    let terminal_result = match outcome {
+        Ok(value) => finish_transfer(&app, &state, entry, value).await,
+        Err(error) => fail_transfer(&app, &state, entry, error).await,
+    };
+    entry = match (terminal_result, progress_result) {
+        (Ok(entry), Ok(())) => entry,
+        (Ok(_), Err(progress_error)) => return Err(progress_error),
+        (Err(terminal_error), Ok(())) => return Err(terminal_error),
+        (Err(terminal_error), Err(progress_error)) => {
+            return Err(format!(
+                "{terminal_error}; sync progress persistence failed: {progress_error}"
+            ));
         }
     };
     if conflict && matches!(entry.state, SyncState::Synced) {
@@ -837,6 +975,7 @@ pub async fn download_project_file(
         state
             .repository
             .save_sync_entry(&entry)
+            .await
             .map_err(|error| error.to_string())?;
     }
     let _ = session.disconnect().await;
@@ -912,4 +1051,83 @@ async fn remote_sha256(
         .next()
         .map(str::to_owned)
         .ok_or_else(|| "remote checksum was empty".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_sync_entry(project_id: Uuid) -> SyncEntry {
+        SyncEntry {
+            id: Uuid::new_v4(),
+            project_id,
+            relative_path: "results/example.txt".into(),
+            local_relative_path: Some("results/example.txt".into()),
+            remote_path: Some("/remote/results/example.txt".into()),
+            direction: SyncDirection::RemoteToLocal,
+            size_bytes: 100,
+            sha256: "sha256".into(),
+            state: SyncState::Transferring,
+            transferred_bytes: 0,
+            retry_count: 0,
+            error: None,
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn progress_reports_after_worker_close_are_ignored() {
+        let state = SyncProgressState {
+            latest_bytes: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        };
+
+        state.report(64);
+        state.closed.store(true, Ordering::Release);
+        state.report(96);
+
+        assert_eq!(state.latest_bytes.load(Ordering::Acquire), 64);
+    }
+
+    #[tokio::test]
+    async fn terminal_state_is_saved_after_progress_worker_drains() {
+        let repository = Store::open_in_memory().await.unwrap();
+        let project_id = Uuid::new_v4();
+        repository
+            .save_project(&omicsops_core::workspace::Project::new(
+                project_id,
+                "sync progress test",
+                "C:\\OmicsOps\\sync-progress-test",
+                omicsops_core::workspace::ProjectTemplate::Blank,
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
+        let entry = test_sync_entry(project_id);
+        repository.save_sync_entry(&entry).await.unwrap();
+
+        let progress = SyncProgressPersistence::start(repository.clone(), &entry);
+        let progress_state = progress.state.clone();
+        progress_state.report(64);
+        progress.finish().await.unwrap();
+
+        // A callback racing with terminal cleanup must be ignored once the
+        // progress worker has drained and closed.
+        progress_state.report(96);
+        let mut terminal = entry.clone();
+        terminal.transferred_bytes = terminal.size_bytes;
+        terminal.state = SyncState::Synced;
+        repository.save_sync_entry(&terminal).await.unwrap();
+
+        let stored = repository
+            .sync_entries_for_project(project_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == entry.id)
+            .unwrap();
+        assert_eq!(stored.state, SyncState::Synced);
+        assert_eq!(stored.transferred_bytes, terminal.size_bytes);
+    }
 }

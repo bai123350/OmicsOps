@@ -53,15 +53,16 @@ pub fn model_profile_from_request(
 }
 
 #[tauri::command]
-pub fn list_model_profiles(state: State<'_, AppState>) -> Result<Vec<ModelProfile>, String> {
+pub async fn list_model_profiles(state: State<'_, AppState>) -> Result<Vec<ModelProfile>, String> {
     state
         .repository
         .list_model_profiles()
+        .await
         .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-pub fn save_model_profile(
+pub async fn save_model_profile(
     state: State<'_, AppState>,
     request: SaveModelProfileRequest,
 ) -> Result<ModelProfile, String> {
@@ -78,6 +79,7 @@ pub fn save_model_profile(
     state
         .repository
         .save_model_profile(&profile)
+        .await
         .map_err(|error| error.to_string())?;
     Ok(profile)
 }
@@ -87,7 +89,7 @@ pub async fn probe_model_profile(
     state: State<'_, AppState>,
     profile_id: Uuid,
 ) -> Result<ModelProbeResult, String> {
-    let client = client_for_profile(&state, profile_id)?;
+    let client = client_for_profile(&state, profile_id).await?;
     match client.probe().await {
         Ok(result) => Ok(result),
         Err(error) => {
@@ -111,16 +113,21 @@ pub async fn list_model_profile_models(
     state: State<'_, AppState>,
     profile_id: Uuid,
 ) -> Result<Vec<String>, String> {
-    client_for_profile(&state, profile_id)?
+    client_for_profile(&state, profile_id)
+        .await?
         .list_models()
         .await
         .map_err(|error| error.to_string())
 }
 
-fn client_for_profile(state: &AppState, profile_id: Uuid) -> Result<UnifiedModelClient, String> {
+async fn client_for_profile(
+    state: &AppState,
+    profile_id: Uuid,
+) -> Result<UnifiedModelClient, String> {
     let profile = state
         .repository
         .get_model_profile(profile_id)
+        .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "model profile not found".to_string())?;
     let credential = match &profile.credential_reference {

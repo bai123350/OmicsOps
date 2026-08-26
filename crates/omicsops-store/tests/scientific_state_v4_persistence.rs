@@ -1,19 +1,27 @@
 use std::collections::BTreeSet;
 
 use chrono::Utc;
-use omicsops_adapters::persistence::Repository;
+use omicsops_core::workspace::{Project, ProjectTemplate};
 use omicsops_science::{DatasetStageV4, ScientificStateV4, VerifiedDatasetFactV4};
+use omicsops_store::Store;
 use uuid::Uuid;
 
-#[test]
-fn scientific_state_and_normalized_registries_survive_restart() {
+#[tokio::test]
+async fn scientific_state_and_normalized_registries_survive_restart() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("state.sqlite");
-    let project_id = Uuid::new_v4();
+    let project = Project::new(
+        Uuid::new_v4(),
+        "scientific fixture",
+        "C:\\data\\scientific-fixture",
+        ProjectTemplate::Blank,
+        Utc::now(),
+    );
     let dataset_id;
     {
-        let repository = Repository::open(&database).unwrap();
-        let mut state = ScientificStateV4::new(project_id);
+        let store = Store::open(&database).await.unwrap();
+        store.save_project(&project).await.unwrap();
+        let mut state = ScientificStateV4::new(project.id);
         dataset_id = state
             .register_dataset(
                 VerifiedDatasetFactV4 {
@@ -29,10 +37,14 @@ fn scientific_state_and_normalized_registries_survive_restart() {
                 Utc::now(),
             )
             .id;
-        repository.save_scientific_state_v4(&state).unwrap();
+        store.save_scientific_state_v4(&state).await.unwrap();
     }
-    let reopened = Repository::open(&database).unwrap();
-    let restored = reopened.scientific_state_v4(project_id).unwrap().unwrap();
+    let reopened = Store::open(&database).await.unwrap();
+    let restored = reopened
+        .scientific_state_v4(project.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(restored.revision, 1);
     assert_eq!(restored.datasets[&dataset_id].sha256, "abc");
     assert!(restored.datasets[&dataset_id].active);

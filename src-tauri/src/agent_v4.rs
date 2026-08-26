@@ -15,7 +15,6 @@ use omicsops_adapters::{
     credentials::SystemCredentialVault,
     kernel::{kernel_driver, validate_capture_paths, validate_kernel_code},
     llm::UnifiedModelClient,
-    persistence::Repository,
     ssh::{SshJsonlProcess, SshSession},
 };
 use omicsops_agent::provider::{
@@ -54,6 +53,7 @@ use omicsops_science::{
     AnalysisDeclarationV4, AnalysisStatusV4, DatasetStageV4, EvidenceDeclarationV4,
     RuntimeIdentityV4, ScientificStateV4, VerifiedArtifactFactV4, VerifiedDatasetFactV4,
 };
+use omicsops_store::Store;
 use omicsops_tools::{ToolExecutorV4, ToolRegistryV4, builtin_tool_definitions_v4};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -71,9 +71,8 @@ use crate::p1_commands::{
 
 static PROJECT_SIDE_EFFECT_LOCKS_V4: OnceLock<std::sync::Mutex<HashMap<Uuid, Weak<Mutex<()>>>>> =
     OnceLock::new();
-static SCIENTIFIC_STATE_LOCKS_V4: OnceLock<
-    std::sync::Mutex<HashMap<Uuid, Weak<std::sync::Mutex<()>>>>,
-> = OnceLock::new();
+static SCIENTIFIC_STATE_LOCKS_V4: OnceLock<std::sync::Mutex<HashMap<Uuid, Weak<Mutex<()>>>>> =
+    OnceLock::new();
 
 fn project_side_effect_lock_v4(project_id: Uuid) -> Arc<Mutex<()>> {
     let locks = PROJECT_SIDE_EFFECT_LOCKS_V4.get_or_init(Default::default);
@@ -187,7 +186,7 @@ pub async fn agent_v4_compute_backends(
     state: State<'_, AppState>,
     request: ComputeBackendsV4Request,
 ) -> Result<Vec<ComputeBackendAvailabilityV4>, String> {
-    let project = workspace_project(&state.repository, request.project_id)?;
+    let project = workspace_project(&state.repository, request.project_id).await?;
     let mut backends = Vec::new();
 
     let local_root = std::fs::canonicalize(&project.local_root);
@@ -218,7 +217,7 @@ pub async fn agent_v4_compute_backends(
 
     if let (Some(connection_id), Some(remote_root)) = (project.connection_id, &project.remote_root)
     {
-        let profile = find_profile(&state.repository, connection_id)?;
+        let profile = find_profile(&state.repository, connection_id).await?;
         let trusted = profile.host_key_fingerprint.is_some();
         let mut ssh_python = false;
         let mut ssh_r = false;
@@ -326,7 +325,7 @@ pub async fn agent_v4_start_planning(
     if request.objective.trim().is_empty() {
         return Err("V4 objective is empty".into());
     }
-    let project = workspace_project(&state.repository, request.project_id)?;
+    let project = workspace_project(&state.repository, request.project_id).await?;
     validate_compute_selection(&state, &project, &request.compute_selection).await?;
     let (model, tools) = compose(
         &state,
@@ -351,7 +350,7 @@ pub async fn agent_v4_start_planning(
         approval_hash: None,
         spec: None,
     };
-    save_record(&state.repository, &record)?;
+    save_record(&state.repository, &record).await?;
     let event_store = RepositoryEventStoreV4 {
         repository: state.repository.clone(),
         app: app.clone(),
@@ -379,7 +378,7 @@ pub async fn agent_v4_start_planning(
         Ok(plan) => plan,
         Err(AgentCoreErrorV4::WaitingForInput) => {
             record.status = "waiting_for_input".into();
-            save_record(&state.repository, &record)?;
+            save_record(&state.repository, &record).await?;
             return Ok(RunSummaryV4 {
                 run_id,
                 status: record.status,
@@ -405,7 +404,7 @@ pub async fn agent_v4_start_planning(
     record.plan = Some(plan.clone());
     record.plan_hash = Some(hash.clone());
     record.approval_hash = Some(approval_hash.clone());
-    save_record(&state.repository, &record)?;
+    save_record(&state.repository, &record).await?;
     Ok(RunSummaryV4 {
         run_id,
         status: record.status,
@@ -425,7 +424,7 @@ pub async fn agent_v4_start_direct(
     if request.objective.trim().is_empty() {
         return Err("V4 direct objective is empty".into());
     }
-    let project = workspace_project(&state.repository, request.project_id)?;
+    let project = workspace_project(&state.repository, request.project_id).await?;
     validate_compute_selection(&state, &project, &request.compute_selection).await?;
     let (_model, tools) = compose(
         &state,
@@ -447,6 +446,7 @@ pub async fn agent_v4_start_direct(
     let messages = state
         .repository
         .messages_for_conversation(request.conversation_id)
+        .await
         .map_err(|error| error.to_string())?;
     let conversation = serde_json::to_string(&messages).map_err(|error| error.to_string())?;
     let (conversation, _) = bounded_excerpt(&conversation, 32 * 1024);
@@ -484,7 +484,7 @@ pub async fn agent_v4_start_direct(
         approval_hash: Some(approval_hash.clone()),
         spec: Some(spec.clone()),
     };
-    save_record(&state.repository, &record)?;
+    save_record(&state.repository, &record).await?;
     let store = RepositoryEventStoreV4 {
         repository: state.repository.clone(),
         app: app.clone(),
@@ -499,6 +499,7 @@ pub async fn agent_v4_start_direct(
                 mode: omicsops_protocol::RunModeV4::Execute,
             },
         ))
+        .await
         .map_err(|error| error.to_string())?;
     append_next(
         &store,
@@ -507,7 +508,8 @@ pub async fn agent_v4_start_direct(
             approval_hash: approval_hash.clone(),
             spec_hash: spec.spec_hash.clone().expect("new V4 direct spec hash"),
         },
-    )?;
+    )
+    .await?;
     spawn_execution(app, &state, record, spec).await?;
     Ok(RunSummaryV4 {
         run_id,
@@ -547,7 +549,7 @@ pub async fn agent_v4_approve_plan(
     state: State<'_, AppState>,
     request: ApprovePlanV4Request,
 ) -> Result<RunSummaryV4, String> {
-    let mut record = load_record(&state.repository, request.run_id)?;
+    let mut record = load_record(&state.repository, request.run_id).await?;
     if record.status != "awaiting_approval" {
         return Err("V4 run is not awaiting approval".into());
     }
@@ -555,7 +557,7 @@ pub async fn agent_v4_approve_plan(
         .plan
         .clone()
         .ok_or_else(|| "V4 plan is missing".to_string())?;
-    let project = workspace_project(&state.repository, record.project_id)?;
+    let project = workspace_project(&state.repository, record.project_id).await?;
     let legacy = record.compute_selection.is_none();
     let selection = match record.compute_selection.clone() {
         Some(selection) => selection,
@@ -604,7 +606,8 @@ pub async fn agent_v4_approve_plan(
         AgentEventKindV4::PlanApproved {
             plan_hash: spec.approved_plan_hash.clone(),
         },
-    )?;
+    )
+    .await?;
     append_next(
         &store,
         record.run_id,
@@ -612,19 +615,21 @@ pub async fn agent_v4_approve_plan(
             approval_hash: expected_approval.clone(),
             spec_hash: spec.spec_hash.clone().expect("new V4 spec hash"),
         },
-    )?;
+    )
+    .await?;
     append_next(
         &store,
         record.run_id,
         AgentEventKindV4::ModeChanged {
             mode: omicsops_protocol::RunModeV4::Execute,
         },
-    )?;
+    )
+    .await?;
     record.status = "running".into();
     record.compute_selection = Some(selection.clone());
     record.approval_hash = Some(expected_approval.clone());
     record.spec = Some(spec.clone());
-    save_record(&state.repository, &record)?;
+    save_record(&state.repository, &record).await?;
     let approved_plan_hash = spec.approved_plan_hash.clone();
     spawn_execution(app, &state, record.clone(), spec).await?;
     Ok(RunSummaryV4 {
@@ -650,9 +655,9 @@ pub async fn agent_v4_resume(
     if !wait_for_active_run_to_yield(&state.active_runs, run_id).await? {
         return Ok(());
     }
-    let mut record = load_record(&state.repository, run_id)?;
+    let mut record = load_record(&state.repository, run_id).await?;
     let Some(mut spec) = record.spec.clone() else {
-        let project = workspace_project(&state.repository, record.project_id)?;
+        let project = workspace_project(&state.repository, record.project_id).await?;
         let selection = record
             .compute_selection
             .clone()
@@ -709,7 +714,7 @@ pub async fn agent_v4_resume(
                     )
                     .map_err(|error| error.to_string())?,
                 );
-                save_record(&state.repository, &updated)?;
+                save_record(&state.repository, &updated).await?;
                 return Ok(());
             }
             Err(AgentCoreErrorV4::WaitingForInput) => return Ok(()),
@@ -720,7 +725,7 @@ pub async fn agent_v4_resume(
         return Err("V4 run is terminal".into());
     }
     if spec.compute_selection.is_none() {
-        let project = workspace_project(&state.repository, record.project_id)?;
+        let project = workspace_project(&state.repository, record.project_id).await?;
         let selection = legacy_ssh_selection(&project)?;
         validate_compute_selection(&state, &project, &selection).await?;
         let approval_hash = RunSpecV4::approval_hash_for(
@@ -754,16 +759,18 @@ pub async fn agent_v4_resume(
                 approval_hash: approval_hash.clone(),
                 spec_hash: spec.spec_hash.clone().expect("upgraded V4 spec hash"),
             },
-        )?;
+        )
+        .await?;
         record.compute_selection = Some(selection);
         record.approval_hash = Some(approval_hash);
         record.spec = Some(spec.clone());
-        save_record(&state.repository, &record)?;
+        save_record(&state.repository, &record).await?;
     }
-    validate_frozen_spec(&state.repository, &spec)?;
+    validate_frozen_spec(&state.repository, &spec).await?;
     let existing_events = state
         .repository
         .agent_events_v4(run_id)
+        .await
         .map_err(|error| error.to_string())?;
     if let Some(call_id) = recoverable_system_environment_ensure(
         &existing_events,
@@ -783,7 +790,8 @@ pub async fn agent_v4_resume(
                 resolution: UncertainResolutionV4::SideEffectNotObserved,
                 evidence: "legacy system environment ensure failed before mutation; V4 system ensure is now an immutable readiness check".into(),
             },
-        )?;
+        )
+        .await?;
     }
     spawn_execution(app, &state, record, spec).await
 }
@@ -832,7 +840,7 @@ pub fn agent_v4_cancel(state: State<'_, AppState>, run_id: Uuid) -> Result<(), S
 }
 
 #[tauri::command]
-pub fn agent_v4_answer(
+pub async fn agent_v4_answer(
     app: AppHandle,
     state: State<'_, AppState>,
     request: AnswerV4Request,
@@ -840,6 +848,7 @@ pub fn agent_v4_answer(
     let events = state
         .repository
         .agent_events_v4(request.run_id)
+        .await
         .map_err(|error| error.to_string())?;
     let answer = validate_answer_v4(&events, &request.question_id, &request.answer)?;
     let store = RepositoryEventStoreV4 {
@@ -854,6 +863,7 @@ pub fn agent_v4_answer(
             answer,
         },
     )
+    .await
 }
 
 fn validate_answer_v4(
@@ -890,12 +900,12 @@ fn validate_answer_v4(
 }
 
 #[tauri::command]
-pub fn agent_v4_decide_tool_approval(
+pub async fn agent_v4_decide_tool_approval(
     app: AppHandle,
     state: State<'_, AppState>,
     request: DecideToolApprovalV4Request,
 ) -> Result<(), String> {
-    let record = load_record(&state.repository, request.run_id)?;
+    let record = load_record(&state.repository, request.run_id).await?;
     let spec = record.spec.ok_or("V4 run has no frozen execution spec")?;
     let spec_hash = spec
         .spec_hash
@@ -904,6 +914,7 @@ pub fn agent_v4_decide_tool_approval(
     let events = state
         .repository
         .agent_events_v4(request.run_id)
+        .await
         .map_err(|error| error.to_string())?;
     let approval = events.iter().find_map(|event| match &event.event {
         AgentEventKindV4::ToolApprovalRequested { request: approval }
@@ -938,10 +949,11 @@ pub fn agent_v4_decide_tool_approval(
             decision: request.decision,
         },
     )
+    .await
 }
 
 #[tauri::command]
-pub fn agent_v4_resolve_uncertain(
+pub async fn agent_v4_resolve_uncertain(
     app: AppHandle,
     state: State<'_, AppState>,
     request: ResolveUncertainV4Request,
@@ -952,6 +964,7 @@ pub fn agent_v4_resolve_uncertain(
     let events = state
         .repository
         .agent_events_v4(request.run_id)
+        .await
         .map_err(|error| error.to_string())?;
     let marked = events.iter().any(|event| {
         matches!(&event.event, AgentEventKindV4::ToolDispatchUncertain { call_id, .. } if call_id == &request.call_id)
@@ -978,23 +991,25 @@ pub fn agent_v4_resolve_uncertain(
             evidence: request.evidence,
         },
     )
+    .await
 }
 
 #[tauri::command]
-pub fn agent_v4_events(
+pub async fn agent_v4_events(
     app: AppHandle,
     state: State<'_, AppState>,
     run_id: Uuid,
 ) -> Result<Vec<AgentEventV4>, String> {
-    reconcile_run_terminal_event(&app, &state, run_id)?;
+    reconcile_run_terminal_event(&app, &state, run_id).await?;
     state
         .repository
         .agent_events_v4(run_id)
+        .await
         .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-pub fn agent_v4_events_for_conversation(
+pub async fn agent_v4_events_for_conversation(
     app: AppHandle,
     state: State<'_, AppState>,
     project_id: Uuid,
@@ -1003,27 +1018,30 @@ pub fn agent_v4_events_for_conversation(
     let records = state
         .repository
         .agent_runs_for_context_v4(project_id, conversation_id)
+        .await
         .map_err(|error| error.to_string())?;
     for value in records {
         let record: RunRecordV4 =
             serde_json::from_value(value).map_err(|error| error.to_string())?;
-        reconcile_run_terminal_event(&app, &state, record.run_id)?;
+        reconcile_run_terminal_event(&app, &state, record.run_id).await?;
     }
     state
         .repository
         .agent_events_for_context_v4(project_id, conversation_id)
+        .await
         .map_err(|error| error.to_string())
 }
 
-fn reconcile_run_terminal_event(
+async fn reconcile_run_terminal_event(
     app: &AppHandle,
     state: &AppState,
     run_id: Uuid,
 ) -> Result<(), String> {
-    let mut record = load_record(&state.repository, run_id)?;
+    let mut record = load_record(&state.repository, run_id).await?;
     let events = state
         .repository
         .agent_events_v4(run_id)
+        .await
         .map_err(|error| error.to_string())?;
     if has_terminal_event(&events) {
         return Ok(());
@@ -1042,8 +1060,8 @@ fn reconcile_run_terminal_event(
             repository: state.repository.clone(),
             app: app.clone(),
         };
-        append_terminal_event(&store, run_id, terminal)?;
-        save_record(&state.repository, &record)?;
+        append_terminal_event(&store, run_id, terminal).await?;
+        save_record(&state.repository, &record).await?;
     }
     Ok(())
 }
@@ -1097,12 +1115,12 @@ async fn spawn_execution(
 ) -> Result<(), String> {
     spec.validate_integrity()
         .map_err(|error| error.to_string())?;
-    validate_frozen_spec(&state.repository, &spec)?;
+    validate_frozen_spec(&state.repository, &spec).await?;
     let selection = spec
         .compute_selection
         .clone()
         .ok_or("V4 execution spec is missing a compute selection")?;
-    let project = workspace_project(&state.repository, spec.project_id)?;
+    let project = workspace_project(&state.repository, spec.project_id).await?;
     validate_compute_selection(state, &project, &selection).await?;
     let (model, tools) = compose(
         state,
@@ -1188,13 +1206,17 @@ async fn spawn_execution(
                 let already_recorded = verifier_attention
                     && repository
                         .agent_events_v4(spec.run_id)
+                        .await
                         .ok()
                         .and_then(|events| events.last().cloned())
                         .is_some_and(|event| {
                             matches!(event.event, AgentEventKindV4::RunNeedsAttention { .. })
                         });
                 if !already_recorded {
-                    if append_terminal_event(&store, spec.run_id, event).is_err() {
+                    if append_terminal_event(&store, spec.run_id, event)
+                        .await
+                        .is_err()
+                    {
                         // The status row lets the reconciliation path repair a
                         // missing terminal event on the next UI poll/startup.
                         record.status = "failed".into();
@@ -1202,20 +1224,20 @@ async fn spawn_execution(
                 }
             }
         }
-        let _ = save_record(&repository, &record);
+        let _ = save_record(&repository, &record).await;
         remove_active_run(&active, spec.run_id, &cancelled);
     });
     Ok(())
 }
 
-fn append_terminal_event(
+async fn append_terminal_event(
     store: &RepositoryEventStoreV4,
     run_id: Uuid,
     event: AgentEventKindV4,
 ) -> Result<(), String> {
     let mut last_error = None;
     for _ in 0..3 {
-        let events = store.load(run_id)?;
+        let events = store.load(run_id).await?;
         if events.iter().any(|event| {
             matches!(
                 &event.event,
@@ -1228,7 +1250,10 @@ fn append_terminal_event(
             return Ok(());
         }
         let previous = events.last().ok_or("V4 run has no event")?;
-        match store.append(&AgentEventV4::next(previous, Utc::now(), event.clone())) {
+        match store
+            .append(&AgentEventV4::next(previous, Utc::now(), event.clone()))
+            .await
+        {
             Ok(()) => return Ok(()),
             Err(error) => last_error = Some(error),
         }
@@ -1318,7 +1343,7 @@ async fn compose(
             if selection.backend_id != format!("ssh:{connection_id}") {
                 return Err("frozen SSH backend does not match the project binding".into());
             }
-            let profile = find_profile(&state.repository, connection_id)?;
+            let profile = find_profile(&state.repository, connection_id).await?;
             require_trusted_host(&profile)?;
             let auth = authentication_for_profile(state, &profile)?;
             let session = Arc::new(
@@ -1430,7 +1455,7 @@ async fn compose(
     };
     Ok((
         Arc::new(DesktopModelPortV4 {
-            client: unified_model_client(state, model_profile_id)?,
+            client: unified_model_client(state, model_profile_id).await?,
             prompt,
         }),
         ComposedToolsV4 {
@@ -2000,7 +2025,7 @@ fn system_environment_ready(
 }
 
 struct DesktopToolExecutorV4 {
-    repository: Repository,
+    repository: Store,
     mcp_sessions: McpSessionManager,
     credentials: SystemCredentialVault,
     filesystem: Arc<dyn ProjectFilesystemPortV4>,
@@ -2056,8 +2081,9 @@ impl DesktopToolExecutorV4 {
             .unwrap_or_default()
     }
 
-    fn skill_documents(&self) -> Result<Vec<SkillDocumentV4>, String> {
-        crate::skill_commands::agent_skill_packages(&self.repository)?
+    async fn skill_documents(&self) -> Result<Vec<SkillDocumentV4>, String> {
+        crate::skill_commands::agent_skill_packages(&self.repository)
+            .await?
             .into_iter()
             .map(|package| {
                 let markdown = std::fs::read_to_string(
@@ -2076,7 +2102,10 @@ impl DesktopToolExecutorV4 {
             .collect()
     }
 
-    fn memory_documents(&self, dimension: Option<&str>) -> Result<Vec<MemoryDocumentV4>, String> {
+    async fn memory_documents(
+        &self,
+        dimension: Option<&str>,
+    ) -> Result<Vec<MemoryDocumentV4>, String> {
         let facts = memory_facts(
             &self.repository,
             &MemorySearchRequest {
@@ -2085,7 +2114,8 @@ impl DesktopToolExecutorV4 {
                 query: String::new(),
                 dimension: dimension.map(str::to_owned),
             },
-        )?;
+        )
+        .await?;
         Ok(facts
             .into_iter()
             .map(|fact| {
@@ -2110,10 +2140,11 @@ impl DesktopToolExecutorV4 {
             .collect())
     }
 
-    fn mcp_tool_index(&self) -> Result<Vec<McpToolIndexV4>, String> {
+    async fn mcp_tool_index(&self) -> Result<Vec<McpToolIndexV4>, String> {
         let profiles = self
             .repository
             .list_json::<McpServerProfile>("mcp_server")
+            .await
             .map_err(|error| error.to_string())?;
         let mut index = Vec::new();
         for profile in profiles {
@@ -2148,10 +2179,11 @@ impl DesktopToolExecutorV4 {
         Ok(index)
     }
 
-    fn run_approved_tool_call(&self, call: &ToolCallV4) -> Result<bool, String> {
+    async fn run_approved_tool_call(&self, call: &ToolCallV4) -> Result<bool, String> {
         let events = self
             .repository
             .agent_events_v4(self.run_id)
+            .await
             .map_err(|error| error.to_string())?;
         run_has_approved_tool_call(&events, call)
     }
@@ -2211,7 +2243,7 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                     .get("limit")
                     .and_then(Value::as_u64)
                     .unwrap_or(8) as usize;
-                let hits = search_skills(query, &self.skill_documents()?, limit);
+                let hits = search_skills(query, &self.skill_documents().await?, limit);
                 (
                     serde_json::to_string(&hits).map_err(|error| error.to_string())?,
                     serde_json::to_value(&hits).map_err(|error| error.to_string())?,
@@ -2232,7 +2264,8 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                     .map(str::to_owned)
                     .collect::<Vec<_>>();
                 let document = self
-                    .skill_documents()?
+                    .skill_documents()
+                    .await?
                     .into_iter()
                     .find(|document| document.skill_id == skill_id)
                     .ok_or("enabled Skill was not found")?;
@@ -2255,8 +2288,12 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                     .get("limit")
                     .and_then(Value::as_u64)
                     .unwrap_or(12) as usize;
-                let hits =
-                    search_memory(query, &self.memory_documents(dimension)?, Utc::now(), limit);
+                let hits = search_memory(
+                    query,
+                    &self.memory_documents(dimension).await?,
+                    Utc::now(),
+                    limit,
+                );
                 (
                     serde_json::to_string(&hits).map_err(|error| error.to_string())?,
                     serde_json::to_value(&hits).map_err(|error| error.to_string())?,
@@ -2277,7 +2314,7 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                     .get("limit")
                     .and_then(Value::as_u64)
                     .unwrap_or(8) as usize;
-                let hits = search_mcp_tools(query, &self.mcp_tool_index()?, limit);
+                let hits = search_mcp_tools(query, &self.mcp_tool_index().await?, limit);
                 let needs_run_approval = hits.iter().any(|hit| {
                     hit.tool.configured
                         && hit.tool.enabled
@@ -2303,11 +2340,12 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                 let tool = required(&call.arguments, "tool")?;
                 let expected_schema = required(&call.arguments, "schema_sha256")?;
                 let mut indexed = self
-                    .mcp_tool_index()?
+                    .mcp_tool_index()
+                    .await?
                     .into_iter()
                     .find(|entry| entry.server_id == server_id && entry.tool_name == tool)
                     .ok_or("MCP tool is not currently indexed")?;
-                let schema_bound_run_approved = self.run_approved_tool_call(call)?;
+                let schema_bound_run_approved = self.run_approved_tool_call(call).await?;
                 if !indexed.tool_approved && schema_bound_run_approved {
                     indexed.tool_approved = true;
                 }
@@ -2731,14 +2769,16 @@ impl SshKernelProcessV4 {
 }
 
 struct RepositoryEventStoreV4 {
-    repository: Repository,
+    repository: Store,
     app: AppHandle,
 }
+#[async_trait]
 impl EventStoreV4 for RepositoryEventStoreV4 {
-    fn append(&self, event: &AgentEventV4) -> Result<(), String> {
+    async fn append(&self, event: &AgentEventV4) -> Result<(), String> {
         let message = self
             .repository
             .append_agent_event_v4_with_conversation(event)
+            .await
             .map_err(|e| e.to_string())?;
         self.app
             .emit(AGENT_V4_EVENT_CHANNEL, event)
@@ -2757,13 +2797,14 @@ impl EventStoreV4 for RepositoryEventStoreV4 {
         }
         Ok(())
     }
-    fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String> {
+    async fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String> {
         self.repository
             .agent_events_v4(run_id)
+            .await
             .map_err(|e| e.to_string())
     }
 
-    fn archive_context(
+    async fn archive_context(
         &self,
         run_id: Uuid,
         transcript: &str,
@@ -2771,43 +2812,46 @@ impl EventStoreV4 for RepositoryEventStoreV4 {
     ) -> Result<ContextArchiveV4, String> {
         self.repository
             .archive_agent_context_v4(run_id, transcript, checkpoint)
+            .await
             .map_err(|error| error.to_string())
     }
 }
 
-fn scientific_state_lock_v4(project_id: Uuid) -> Arc<std::sync::Mutex<()>> {
+fn scientific_state_lock_v4(project_id: Uuid) -> Arc<Mutex<()>> {
     let locks = SCIENTIFIC_STATE_LOCKS_V4.get_or_init(Default::default);
     let mut locks = locks.lock().expect("V4 scientific state lock registry");
     if let Some(lock) = locks.get(&project_id).and_then(Weak::upgrade) {
         return lock;
     }
-    let lock = Arc::new(std::sync::Mutex::new(()));
+    let lock = Arc::new(Mutex::new(()));
     locks.insert(project_id, Arc::downgrade(&lock));
     lock
 }
 
 struct RepositoryScientificStateStoreV4 {
-    repository: Repository,
+    repository: Store,
     backend_id: String,
-    mutation_lock: Arc<std::sync::Mutex<()>>,
+    mutation_lock: Arc<Mutex<()>>,
 }
 
 impl RepositoryScientificStateStoreV4 {
-    fn load(&self, project_id: Uuid) -> Result<ScientificStateV4, String> {
+    async fn load(&self, project_id: Uuid) -> Result<ScientificStateV4, String> {
         Ok(self
             .repository
             .scientific_state_v4(project_id)
+            .await
             .map_err(|error| error.to_string())?
             .unwrap_or_else(|| ScientificStateV4::new(project_id)))
     }
 
-    fn save_update(
+    async fn save_update(
         &self,
         state: &ScientificStateV4,
         changes: Vec<String>,
     ) -> Result<Option<ScientificUpdateV4>, String> {
         self.repository
             .save_scientific_state_v4(state)
+            .await
             .map_err(|error| error.to_string())?;
         Ok(Some(ScientificUpdateV4 {
             revision: state.revision,
@@ -2817,12 +2861,13 @@ impl RepositoryScientificStateStoreV4 {
     }
 }
 
+#[async_trait]
 impl ScientificStateStoreV4 for RepositoryScientificStateStoreV4 {
-    fn snapshot(&self, project_id: Uuid) -> Result<ScientificStateV4, String> {
-        self.load(project_id)
+    async fn snapshot(&self, project_id: Uuid) -> Result<ScientificStateV4, String> {
+        self.load(project_id).await
     }
 
-    fn before_tool(
+    async fn before_tool(
         &self,
         project_id: Uuid,
         run_id: Uuid,
@@ -2831,11 +2876,8 @@ impl ScientificStateStoreV4 for RepositoryScientificStateStoreV4 {
         if call.tool_id != "runtime.execute" || call.arguments.get("analysis").is_none() {
             return Ok(None);
         }
-        let _guard = self
-            .mutation_lock
-            .lock()
-            .map_err(|_| "scientific state lock is poisoned".to_string())?;
-        let mut state = self.load(project_id)?;
+        let _guard = self.mutation_lock.lock().await;
+        let mut state = self.load(project_id).await?;
         if state
             .analyses
             .values()
@@ -2873,9 +2915,10 @@ impl ScientificStateStoreV4 for RepositoryScientificStateStoreV4 {
             )
             .map_err(|error| error.to_string())?;
         self.save_update(&state, vec![format!("analysis_started:{}", analysis.id)])
+            .await
     }
 
-    fn after_tool(
+    async fn after_tool(
         &self,
         project_id: Uuid,
         _run_id: Uuid,
@@ -2888,11 +2931,8 @@ impl ScientificStateStoreV4 for RepositoryScientificStateStoreV4 {
         ) {
             return Ok(None);
         }
-        let _guard = self
-            .mutation_lock
-            .lock()
-            .map_err(|_| "scientific state lock is poisoned".to_string())?;
-        let mut state = self.load(project_id)?;
+        let _guard = self.mutation_lock.lock().await;
+        let mut state = self.load(project_id).await?;
         match call.tool_id.as_str() {
             "science.register_dataset" if outcome.succeeded => {
                 let path = required(&outcome.data, "path")?;
@@ -2944,6 +2984,7 @@ impl ScientificStateStoreV4 for RepositoryScientificStateStoreV4 {
                     Utc::now(),
                 );
                 self.save_update(&state, vec![format!("dataset_registered:{}", dataset.id)])
+                    .await
             }
             "runtime.execute" if call.arguments.get("analysis").is_some() => {
                 if !state.analyses.values().any(|analysis| {
@@ -2986,6 +3027,7 @@ impl ScientificStateStoreV4 for RepositoryScientificStateStoreV4 {
                         format!("provenance_recorded:{}", manifest.id),
                     ],
                 )
+                .await
             }
             "science.record_evidence" if outcome.succeeded => {
                 if state
@@ -3002,6 +3044,7 @@ impl ScientificStateStoreV4 for RepositoryScientificStateStoreV4 {
                     .record_evidence(call.call_id.clone(), declaration, Utc::now())
                     .map_err(|error| error.to_string())?;
                 self.save_update(&state, vec![format!("evidence_recorded:{}", evidence.id)])
+                    .await
             }
             _ => Ok(None),
         }
@@ -3014,16 +3057,18 @@ fn artifact_type_for_path(path: &str) -> String {
         .unwrap_or_else(|| "file".into())
 }
 
-fn append_next(
+async fn append_next(
     store: &RepositoryEventStoreV4,
     run_id: Uuid,
     event: AgentEventKindV4,
 ) -> Result<(), String> {
-    let events = store.load(run_id)?;
+    let events = store.load(run_id).await?;
     let previous = events.last().ok_or("V4 run has no event")?;
-    store.append(&AgentEventV4::next(previous, Utc::now(), event))
+    store
+        .append(&AgentEventV4::next(previous, Utc::now(), event))
+        .await
 }
-fn save_record(repository: &Repository, record: &RunRecordV4) -> Result<(), String> {
+async fn save_record(repository: &Store, record: &RunRecordV4) -> Result<(), String> {
     repository
         .save_agent_run_v4(
             record.run_id,
@@ -3032,21 +3077,24 @@ fn save_record(repository: &Repository, record: &RunRecordV4) -> Result<(), Stri
             &record.status,
             &serde_json::to_value(record).map_err(|e| e.to_string())?,
         )
+        .await
         .map_err(|e| e.to_string())
 }
-fn load_record(repository: &Repository, run_id: Uuid) -> Result<RunRecordV4, String> {
+async fn load_record(repository: &Store, run_id: Uuid) -> Result<RunRecordV4, String> {
     serde_json::from_value(
         repository
             .agent_run_v4(run_id)
+            .await
             .map_err(|e| e.to_string())?
             .ok_or("V4 run not found")?,
     )
     .map_err(|e| e.to_string())
 }
 
-fn workspace_project(repository: &Repository, project_id: Uuid) -> Result<Project, String> {
+async fn workspace_project(repository: &Store, project_id: Uuid) -> Result<Project, String> {
     repository
         .get_project(project_id)
+        .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "project does not exist".to_string())
 }
@@ -3138,7 +3186,7 @@ async fn validate_compute_selection(
             if selection.backend_id != format!("ssh:{connection_id}") {
                 return Err("SSH selection does not match the project's trusted binding".into());
             }
-            let profile = find_profile(&state.repository, connection_id)?;
+            let profile = find_profile(&state.repository, connection_id).await?;
             require_trusted_host(&profile)?;
             if project.remote_root.is_none() {
                 return Err("project has no remote root".into());
@@ -3165,12 +3213,13 @@ async fn validate_compute_selection(
     Ok(())
 }
 
-fn validate_frozen_spec(repository: &Repository, spec: &RunSpecV4) -> Result<(), String> {
+async fn validate_frozen_spec(repository: &Store, spec: &RunSpecV4) -> Result<(), String> {
     spec.validate_integrity()
         .map_err(|error| error.to_string())?;
     let expected = spec.spec_hash.as_deref().ok_or("V4 spec hash is missing")?;
     let anchored = repository
         .agent_events_v4(spec.run_id)
+        .await
         .map_err(|error| error.to_string())?
         .into_iter()
         .rev()
@@ -3814,16 +3863,26 @@ mod tests {
         assert!(rendered.contains("wins on conflict"));
     }
 
-    #[test]
-    fn v4_scientific_hooks_build_verified_lineage_and_provenance() {
+    #[tokio::test]
+    async fn v4_scientific_hooks_build_verified_lineage_and_provenance() {
         let directory = tempfile::tempdir().unwrap();
-        let repository = Repository::open(directory.path().join("science.sqlite")).unwrap();
         let project_id = Uuid::new_v4();
         let run_id = Uuid::new_v4();
+        let repository = Store::open(directory.path().join("science.sqlite"))
+            .await
+            .unwrap();
+        let project = Project::new(
+            project_id,
+            "scientific test",
+            directory.path().display().to_string(),
+            omicsops_core::workspace::ProjectTemplate::Blank,
+            Utc::now(),
+        );
+        repository.save_project(&project).await.unwrap();
         let store = RepositoryScientificStateStoreV4 {
             repository,
             backend_id: "ssh:test".into(),
-            mutation_lock: Arc::new(std::sync::Mutex::new(())),
+            mutation_lock: Arc::new(Mutex::new(())),
         };
         let dataset_call = ToolCallV4 {
             call_id: "dataset-call".into(),
@@ -3853,9 +3912,11 @@ mod tests {
                     provenance: vec![],
                 },
             )
+            .await
             .unwrap();
         let dataset_id = *store
             .snapshot(project_id)
+            .await
             .unwrap()
             .datasets
             .keys()
@@ -3882,6 +3943,7 @@ mod tests {
         };
         store
             .before_tool(project_id, run_id, &runtime_call)
+            .await
             .unwrap();
         let runtime_result = RuntimeResultV4 {
             request_id: Uuid::new_v4(),
@@ -3913,8 +3975,9 @@ mod tests {
                     provenance: vec![],
                 },
             )
+            .await
             .unwrap();
-        let state = store.snapshot(project_id).unwrap();
+        let state = store.snapshot(project_id).await.unwrap();
         let analysis = state.analyses.values().next().unwrap();
         let artifact = state.artifacts.values().next().unwrap();
         let manifest = state.provenance.values().next().unwrap();
@@ -4113,7 +4176,7 @@ mod tests {
         assert!(after_interrupt.stdout.contains("after-interrupt"));
 
         let executor = DesktopToolExecutorV4 {
-            repository: Repository::open_in_memory().unwrap(),
+            repository: Store::open_in_memory().await.unwrap(),
             mcp_sessions: McpSessionManager::new(),
             credentials: SystemCredentialVault,
             filesystem: Arc::new(SshProjectFilesystemV4 {
@@ -4216,14 +4279,17 @@ mod tests {
             backend_id: backend_id.clone(),
         })));
         let executor = DesktopToolExecutorV4 {
-            repository: Repository::open_in_memory().unwrap(),
+            repository: Store::open_in_memory().await.unwrap(),
             mcp_sessions: McpSessionManager::new(),
             credentials: SystemCredentialVault,
             filesystem: Arc::new(SshProjectFilesystemV4 {
                 session: session.clone(),
                 root: root.clone(),
             }),
-            environment_port: Arc::new(SshEnvironmentPortV4 { session, root }),
+            environment_port: Arc::new(SshEnvironmentPortV4 {
+                session,
+                root: root.clone(),
+            }),
             selection: ComputeSelectionV4 {
                 schema_version: 4,
                 backend_id: backend_id.clone(),
@@ -4240,11 +4306,21 @@ mod tests {
             runtime: runtime.clone(),
         };
         let local_state = tempfile::tempdir().unwrap();
-        let repository = Repository::open(local_state.path().join("stage3.sqlite")).unwrap();
+        let repository = Store::open(local_state.path().join("stage3.sqlite"))
+            .await
+            .unwrap();
+        let project = Project::new(
+            project_id,
+            "live scientific test",
+            root.clone(),
+            omicsops_core::workspace::ProjectTemplate::Blank,
+            Utc::now(),
+        );
+        repository.save_project(&project).await.unwrap();
         let science = RepositoryScientificStateStoreV4 {
             repository,
             backend_id,
-            mutation_lock: Arc::new(std::sync::Mutex::new(())),
+            mutation_lock: Arc::new(Mutex::new(())),
         };
         let dataset_call = ToolCallV4 {
             call_id: "live-dataset".into(),
@@ -4261,9 +4337,11 @@ mod tests {
         let dataset_outcome = executor.execute(&dataset_call).await.unwrap();
         science
             .after_tool(project_id, run_id, &dataset_call, &dataset_outcome)
+            .await
             .unwrap();
         let dataset_id = *science
             .snapshot(project_id)
+            .await
             .unwrap()
             .datasets
             .keys()
@@ -4290,12 +4368,14 @@ mod tests {
         };
         science
             .before_tool(project_id, run_id, &analysis_call)
+            .await
             .unwrap();
         let analysis_outcome = executor.execute(&analysis_call).await.unwrap();
         science
             .after_tool(project_id, run_id, &analysis_call, &analysis_outcome)
+            .await
             .unwrap();
-        let state = science.snapshot(project_id).unwrap();
+        let state = science.snapshot(project_id).await.unwrap();
         let dataset = state.datasets.get(&dataset_id).unwrap();
         let artifact = state.artifacts.values().next().unwrap();
         let manifest = state.provenance.values().next().unwrap();

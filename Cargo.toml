@@ -7,6 +7,7 @@ members = [
   "crates/omicsops-tools",
   "crates/omicsops-runtime",
   "crates/omicsops-science",
+  "crates/omicsops-store",
   "crates/omicsops-knowledge",
   "crates/omicsops-adapters",
   "crates/omicsops-mcp",
@@ -35,6 +36,7 @@ russh = { version = "0.62.4", default-features = false, features = ["ring", "rsa
 russh-sftp = "2.3.0"
 rusqlite = { version = "0.32", features = ["bundled", "chrono", "uuid"] }
 schemars = { version = "1", features = ["chrono04", "uuid1", "url2"] }
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio-rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 sha2 = "0.10"

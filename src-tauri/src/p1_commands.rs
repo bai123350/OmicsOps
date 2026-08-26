@@ -1,12 +1,13 @@
 use std::{collections::BTreeMap, io::Write, path::Path, process::Stdio};
 
 use chrono::Utc;
-use omicsops_adapters::{credentials::CredentialVault, persistence::Repository};
+use omicsops_adapters::credentials::CredentialVault;
 use omicsops_core::workspace::{
     Artifact, EvidenceReference, MemoryFact, NotebookEntry, SkillCitation,
 };
 use omicsops_knowledge::schema_digest;
 use omicsops_mcp::{McpEnvBinding, McpServerConfig, McpSessionManager};
+use omicsops_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -28,14 +29,15 @@ pub struct MemorySearchRequest {
     pub dimension: Option<String>,
 }
 
-pub fn memory_facts(
-    repository: &Repository,
+pub async fn memory_facts(
+    repository: &Store,
     request: &MemorySearchRequest,
 ) -> Result<Vec<MemoryFact>, String> {
     let query = request.query.trim().to_lowercase();
     let mut facts = Vec::new();
     for conversation in repository
         .conversations_for_project(request.project_id)
+        .await
         .map_err(|error| error.to_string())?
     {
         if request
@@ -46,6 +48,7 @@ pub fn memory_facts(
         }
         for message in repository
             .messages_for_conversation(conversation.id)
+            .await
             .map_err(|error| error.to_string())?
         {
             if !matches!(message.role, omicsops_core::workspace::MessageRole::User) {
@@ -75,6 +78,7 @@ pub fn memory_facts(
     }
     for artifact in repository
         .artifacts_for_project(request.project_id)
+        .await
         .map_err(|error| error.to_string())?
     {
         facts.push(MemoryFact {
@@ -103,6 +107,7 @@ pub fn memory_facts(
     }
     for entry in repository
         .notebook_for_project(request.project_id)
+        .await
         .map_err(|error| error.to_string())?
     {
         if request
@@ -145,32 +150,34 @@ pub fn memory_facts(
 }
 
 #[tauri::command]
-pub fn search_agent_memory(
+pub async fn search_agent_memory(
     state: State<'_, AppState>,
     request: MemorySearchRequest,
 ) -> Result<Vec<MemoryFact>, String> {
-    memory_facts(&state.repository, &request)
+    memory_facts(&state.repository, &request).await
 }
 
 #[tauri::command]
-pub fn list_notebook_entries(
+pub async fn list_notebook_entries(
     state: State<'_, AppState>,
     project_id: Uuid,
 ) -> Result<Vec<NotebookEntry>, String> {
     state
         .repository
         .notebook_for_project(project_id)
+        .await
         .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-pub fn list_project_artifacts(
+pub async fn list_project_artifacts(
     state: State<'_, AppState>,
     project_id: Uuid,
 ) -> Result<Vec<Artifact>, String> {
     state
         .repository
         .artifacts_for_project(project_id)
+        .await
         .map_err(|error| error.to_string())
 }
 
@@ -182,22 +189,25 @@ pub struct ExportNotebookRequest {
 }
 
 #[tauri::command]
-pub fn export_project_notebook(
+pub async fn export_project_notebook(
     state: State<'_, AppState>,
     request: ExportNotebookRequest,
 ) -> Result<(), String> {
     let project = state
         .repository
         .get_project(request.project_id)
+        .await
         .map_err(|error| error.to_string())?
         .ok_or("project not found")?;
     let notebook = state
         .repository
         .notebook_for_project(request.project_id)
+        .await
         .map_err(|error| error.to_string())?;
     let artifacts = state
         .repository
         .artifacts_for_project(request.project_id)
+        .await
         .map_err(|error| error.to_string())?;
     let facts = memory_facts(
         &state.repository,
@@ -207,7 +217,8 @@ pub fn export_project_notebook(
             query: String::new(),
             dimension: None,
         },
-    )?;
+    )
+    .await?;
     let payload = json!({"schema_version":1,"project":project,"notebook":notebook,"artifacts":artifacts,"memory_facts":facts});
     let target = Path::new(&request.local_path);
     match request.format.as_str() {
@@ -233,9 +244,9 @@ pub fn export_project_notebook(
     }
 }
 
-pub fn enabled_skill_citations(repository: &Repository) -> Result<Vec<SkillCitation>, String> {
+pub async fn enabled_skill_citations(repository: &Store) -> Result<Vec<SkillCitation>, String> {
     let mut citations = Vec::new();
-    for skill in crate::skill_commands::agent_skill_packages(repository)? {
+    for skill in crate::skill_commands::agent_skill_packages(repository).await? {
         let markdown = std::fs::read_to_string(Path::new(&skill.source_path).join("SKILL.md"))
             .map_err(|error| format!("cannot read enabled skill {}: {error}", skill.name))?;
         for (section, excerpt) in markdown_sections(&markdown).into_iter().take(12) {
@@ -392,9 +403,10 @@ fn validate_mcp_declaration(name: &str, command: &str, args: &[String]) -> Resul
     Ok(())
 }
 
-fn mcp_server_profile(repository: &Repository, id: Uuid) -> Result<McpServerProfile, String> {
+async fn mcp_server_profile(repository: &Store, id: Uuid) -> Result<McpServerProfile, String> {
     repository
         .get_json("mcp_server", &id.to_string())
+        .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("MCP server {id} was not found"))
 }
@@ -523,10 +535,11 @@ fn mcp_profile_from_request(
 }
 
 #[tauri::command]
-pub fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerProfile>, String> {
+pub async fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerProfile>, String> {
     let mut profiles = state
         .repository
         .list_json("mcp_server")
+        .await
         .map_err(|error| error.to_string())?;
     profiles.sort_by(|left: &McpServerProfile, right| right.updated_at.cmp(&left.updated_at));
     Ok(profiles)
@@ -538,10 +551,10 @@ pub async fn save_mcp_server(
     request: SaveMcpServerRequest,
 ) -> Result<McpServerProfile, String> {
     let now = Utc::now();
-    let existing = request
-        .id
-        .map(|id| mcp_server_profile(&state.repository, id))
-        .transpose()?;
+    let existing = match request.id {
+        Some(id) => Some(mcp_server_profile(&state.repository, id).await?),
+        None => None,
+    };
     let profile = mcp_profile_from_request(request, existing.as_ref(), now)?;
     if existing.is_some() {
         state.mcp_sessions.invalidate_server(profile.id).await;
@@ -549,6 +562,7 @@ pub async fn save_mcp_server(
     state
         .repository
         .put_json("mcp_server", &profile.id.to_string(), &profile)
+        .await
         .map_err(|error| error.to_string())?;
     Ok(profile)
 }
@@ -561,6 +575,7 @@ pub async fn add_pubmed_mcp_server(
     let existing = state
         .repository
         .list_json::<McpServerProfile>("mcp_server")
+        .await
         .map_err(|error| error.to_string())?
         .into_iter()
         .find(|profile| {
@@ -645,6 +660,7 @@ pub async fn add_pubmed_mcp_server(
     state
         .repository
         .put_json("mcp_server", &id.to_string(), &profile)
+        .await
         .map_err(|error| error.to_string())?;
     Ok(profile)
 }
@@ -654,7 +670,7 @@ pub async fn set_mcp_server_enabled(
     state: State<'_, AppState>,
     request: SetMcpServerEnabledRequest,
 ) -> Result<McpServerProfile, String> {
-    let mut profile = mcp_server_profile(&state.repository, request.server_id)?;
+    let mut profile = mcp_server_profile(&state.repository, request.server_id).await?;
     if request.enabled && profile.last_inspected_at.is_none() {
         return Err("inspect the MCP server before enabling it".into());
     }
@@ -666,6 +682,7 @@ pub async fn set_mcp_server_enabled(
     state
         .repository
         .put_json("mcp_server", &profile.id.to_string(), &profile)
+        .await
         .map_err(|error| error.to_string())?;
     Ok(profile)
 }
@@ -675,7 +692,7 @@ pub async fn set_mcp_launch_approval(
     state: State<'_, AppState>,
     request: SetMcpLaunchApprovalRequest,
 ) -> Result<McpServerProfile, String> {
-    let mut profile = mcp_server_profile(&state.repository, request.server_id)?;
+    let mut profile = mcp_server_profile(&state.repository, request.server_id).await?;
     profile.launch_approved = request.approved;
     if !request.approved {
         profile.enabled = false;
@@ -686,6 +703,7 @@ pub async fn set_mcp_launch_approval(
     state
         .repository
         .put_json("mcp_server", &profile.id.to_string(), &profile)
+        .await
         .map_err(|error| error.to_string())?;
     Ok(profile)
 }
@@ -695,7 +713,7 @@ pub async fn set_mcp_tool_approval(
     state: State<'_, AppState>,
     request: SetMcpToolApprovalRequest,
 ) -> Result<McpServerProfile, String> {
-    let mut profile = mcp_server_profile(&state.repository, request.server_id)?;
+    let mut profile = mcp_server_profile(&state.repository, request.server_id).await?;
     let tool = request.tool.trim();
     if !profile
         .tools
@@ -717,6 +735,7 @@ pub async fn set_mcp_tool_approval(
     state
         .repository
         .put_json("mcp_server", &profile.id.to_string(), &profile)
+        .await
         .map_err(|error| error.to_string())?;
     Ok(profile)
 }
@@ -726,7 +745,7 @@ pub async fn inspect_configured_mcp_server(
     state: State<'_, AppState>,
     request: InspectConfiguredMcpServerRequest,
 ) -> Result<McpResult, String> {
-    let mut profile = mcp_server_profile(&state.repository, request.server_id)?;
+    let mut profile = mcp_server_profile(&state.repository, request.server_id).await?;
     if !request.approved {
         return Err("inspecting an MCP subprocess requires explicit approval".into());
     }
@@ -737,6 +756,7 @@ pub async fn inspect_configured_mcp_server(
     state
         .repository
         .put_json("mcp_server", &profile.id.to_string(), &profile)
+        .await
         .map_err(|error| error.to_string())?;
     let config = match resolved_mcp_config(&profile, request.project_id, &state.credentials) {
         Ok(config) => config,
@@ -746,7 +766,8 @@ pub async fn inspect_configured_mcp_server(
             profile.updated_at = Utc::now();
             let _ = state
                 .repository
-                .put_json("mcp_server", &profile.id.to_string(), &profile);
+                .put_json("mcp_server", &profile.id.to_string(), &profile)
+                .await;
             return Err(error);
         }
     };
@@ -759,7 +780,8 @@ pub async fn inspect_configured_mcp_server(
             profile.updated_at = Utc::now();
             let _ = state
                 .repository
-                .put_json("mcp_server", &profile.id.to_string(), &profile);
+                .put_json("mcp_server", &profile.id.to_string(), &profile)
+                .await;
             return Err(error);
         }
     };
@@ -787,6 +809,7 @@ pub async fn inspect_configured_mcp_server(
     state
         .repository
         .put_json("mcp_server", &profile.id.to_string(), &profile)
+        .await
         .map_err(|error| error.to_string())?;
     let audit = json!({
         "id": audit_id,
@@ -802,6 +825,7 @@ pub async fn inspect_configured_mcp_server(
     state
         .repository
         .put_json("mcp_audit", &audit_id.to_string(), &audit)
+        .await
         .map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -814,7 +838,7 @@ pub async fn call_configured_mcp_tool(
     if !request.approved {
         return Err("calling an MCP subprocess requires explicit approval".into());
     }
-    let profile = mcp_server_profile(&state.repository, request.server_id)?;
+    let profile = mcp_server_profile(&state.repository, request.server_id).await?;
     if !profile.enabled {
         return Err("MCP server is disabled".into());
     }
@@ -872,7 +896,7 @@ pub async fn call_mcp_tool(
 }
 
 async fn run_mcp(
-    repository: &Repository,
+    repository: &Store,
     request: McpRequest,
     call_tool: bool,
 ) -> Result<McpResult, String> {
@@ -892,6 +916,7 @@ async fn run_mcp(
     let audit = json!({"id":audit_id,"project_id":request.project_id,"server":request.name,"command":request.command,"args":request.args,"tool":request.tool,"approved":true,"attempts":attempts,"succeeded":outcome.is_ok(),"error":outcome.as_ref().err(),"timestamp":Utc::now()});
     repository
         .put_json("mcp_audit", &audit_id.to_string(), &audit)
+        .await
         .map_err(|error| error.to_string())?;
     outcome
 }
@@ -1157,7 +1182,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_subprocess_never_launches_without_explicit_approval() {
-        let repository = Repository::open_in_memory().unwrap();
+        let repository = Store::open_in_memory().await.unwrap();
         let result = run_mcp(
             &repository,
             McpRequest {
@@ -1180,6 +1205,7 @@ mod tests {
         assert!(
             repository
                 .list_json::<Value>("mcp_audit")
+                .await
                 .unwrap()
                 .is_empty()
         );
@@ -1236,7 +1262,7 @@ mod tests {
 }
 
 pub(crate) async fn invoke_configured_mcp_tool_v4(
-    repository: &Repository,
+    repository: &Store,
     sessions: &McpSessionManager,
     credentials: &dyn CredentialVault,
     project_id: Uuid,
@@ -1246,7 +1272,7 @@ pub(crate) async fn invoke_configured_mcp_tool_v4(
     expected_schema_sha256: String,
     schema_bound_run_approved: bool,
 ) -> Result<McpResult, String> {
-    let mut profile = mcp_server_profile(repository, server_id)?;
+    let mut profile = mcp_server_profile(repository, server_id).await?;
     if !profile.enabled {
         return Err("MCP server is disabled".into());
     }
@@ -1287,7 +1313,9 @@ pub(crate) async fn invoke_configured_mcp_tool_v4(
             }
             profile.last_error = Some(error.clone());
             profile.updated_at = Utc::now();
-            let _ = repository.put_json("mcp_server", &profile.id.to_string(), &profile);
+            let _ = repository
+                .put_json("mcp_server", &profile.id.to_string(), &profile)
+                .await;
             return Err(error);
         }
     };
@@ -1299,6 +1327,7 @@ pub(crate) async fn invoke_configured_mcp_tool_v4(
     profile.updated_at = Utc::now();
     repository
         .put_json("mcp_server", &profile.id.to_string(), &profile)
+        .await
         .map_err(|error| error.to_string())?;
     let audit_id = Uuid::new_v4();
     let audit = json!({
@@ -1318,6 +1347,7 @@ pub(crate) async fn invoke_configured_mcp_tool_v4(
     });
     repository
         .put_json("mcp_audit", &audit_id.to_string(), &audit)
+        .await
         .map_err(|error| error.to_string())?;
     Ok(McpResult {
         server_name: invocation.server_name,

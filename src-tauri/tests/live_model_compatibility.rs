@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use omicsops_adapters::{
     credentials::{CredentialVault, SystemCredentialVault},
     llm::{ProviderProtocol, UnifiedModelClient},
-    persistence::Repository,
 };
 use omicsops_core::workspace::ModelProviderKind;
+use omicsops_store::Store;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -22,9 +22,10 @@ async fn configured_desktop_model_accepts_a_minimal_chat_probe() {
     let snapshot_dir = tempfile::tempdir().unwrap();
     let snapshot_path = snapshot_dir.path().join("omicsops.db");
     std::fs::copy(data_dir.join("omicsops.db"), &snapshot_path).unwrap();
-    let repository = Repository::open(snapshot_path).unwrap();
-    let profile = repository
+    let store = Store::open(snapshot_path).await.unwrap();
+    let profile = store
         .get_model_profile(profile_id)
+        .await
         .unwrap()
         .expect("selected model profile was not found");
     let credential = profile

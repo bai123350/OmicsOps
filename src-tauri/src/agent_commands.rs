@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use omicsops_core::workspace::{Conversation, Message, MessageRole};
+use omicsops_store::Store;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
@@ -31,13 +32,14 @@ pub fn conversation_title_from_first_message(markdown: &str) -> String {
     markdown.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn title_conversation_from_first_message(
+async fn title_conversation_from_first_message(
     app: &AppHandle,
-    repository: &omicsops_adapters::persistence::Repository,
+    repository: &Store,
     message: &Message,
 ) -> Result<(), String> {
     if repository
         .messages_for_conversation(message.conversation_id)
+        .await
         .map_err(|error| error.to_string())?
         .iter()
         .any(|stored| stored.role == MessageRole::User)
@@ -46,6 +48,7 @@ fn title_conversation_from_first_message(
     }
     let mut conversation = repository
         .conversations_for_project(message.project_id)
+        .await
         .map_err(|error| error.to_string())?
         .into_iter()
         .find(|conversation| conversation.id == message.conversation_id)
@@ -54,6 +57,7 @@ fn title_conversation_from_first_message(
     conversation.updated_at = message.created_at;
     repository
         .save_conversation(&conversation)
+        .await
         .map_err(|error| error.to_string())?;
     app.emit(
         "conversation-updated",
@@ -86,27 +90,29 @@ pub fn user_message_from_request(
 }
 
 #[tauri::command]
-pub fn list_messages(
+pub async fn list_messages(
     state: State<'_, AppState>,
     conversation_id: Uuid,
 ) -> Result<Vec<Message>, String> {
     state
         .repository
         .messages_for_conversation(conversation_id)
+        .await
         .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-pub fn submit_message(
+pub async fn submit_message(
     app: AppHandle,
     state: State<'_, AppState>,
     request: SubmitMessageRequest,
 ) -> Result<Message, String> {
     let message = user_message_from_request(request, Uuid::new_v4(), Utc::now())?;
-    title_conversation_from_first_message(&app, &state.repository, &message)?;
+    title_conversation_from_first_message(&app, &state.repository, &message).await?;
     state
         .repository
         .save_message(&message)
+        .await
         .map_err(|error| error.to_string())?;
     app.emit(
         "conversation-event",

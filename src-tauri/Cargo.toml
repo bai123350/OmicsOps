@@ -22,6 +22,7 @@ omicsops-core = { path = "../crates/omicsops-core" }
 omicsops-protocol = { path = "../crates/omicsops-protocol" }
 omicsops-runtime = { path = "../crates/omicsops-runtime" }
 omicsops-science = { path = "../crates/omicsops-science" }
+omicsops-store = { path = "../crates/omicsops-store" }
 omicsops-knowledge = { path = "../crates/omicsops-knowledge" }
 omicsops-mcp = { path = "../crates/omicsops-mcp" }
 omicsops-tools = { path = "../crates/omicsops-tools" }
