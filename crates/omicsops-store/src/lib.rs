@@ -20,7 +20,8 @@ use omicsops_core::{
 use omicsops_dto::{PlanRevisionStatusV4, ProposedPlanRevisionV4, SessionAgentModeV4};
 use omicsops_protocol::{
     AgentEventKindV4, AgentEventV4, ComputeSelectionV4, ContextArchiveV4, ContextCheckpointV4,
-    ExecutionPlanV4, RunModeV4, RunSpecV4, deserialize_event_chain_v4,
+    ExecutionPlanV4, PlanApprovalScopeV4, RunModeV4, RunSpecV4, ToolApprovalDecisionV4,
+    ToolApprovalRequestV4, ToolEffectV4, deserialize_event_chain_v4,
 };
 use omicsops_science::ScientificStateV4;
 use serde::{Serialize, de::DeserializeOwned};
@@ -54,7 +55,7 @@ WHEN NOT (
     AND (
         NEW.status IS OLD.status
         OR (OLD.status = 'generating' AND NEW.status IN ('revising','cancelled','superseded'))
-        OR (OLD.status = 'revising' AND NEW.status IN ('cancelled','superseded'))
+        OR (OLD.status = 'revising' AND NEW.status IN ('generating','cancelled','superseded'))
         OR (OLD.status = 'pending' AND NEW.status IN ('approved','revising','cancelled','superseded'))
         OR (OLD.status = 'approved' AND NEW.status = 'superseded')
     )
@@ -1118,6 +1119,217 @@ impl Store {
             true,
         )
         .await
+    }
+
+    /// Pause a model-driven plan generation for one exact tool-approval
+    /// request. The immutable revision stays in place and the conversation
+    /// lock remains held; only the lifecycle status and run snapshot move to
+    /// their approval-waiting states. This is intentionally separate from
+    /// `terminate_plan_generation_v4`, whose revising transition means that a
+    /// user asked for plan changes and therefore starts a new revision on
+    /// resume.
+    pub async fn pause_plan_generation_for_approval_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        revision: u64,
+        feedback: Option<&str>,
+    ) -> Result<ProposedPlanRevisionV4, StoreError> {
+        let mut connection = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let result: Result<ProposedPlanRevisionV4, StoreError> = async {
+            ensure_conversation_owner_executor(&mut *connection, project_id, conversation_id)
+                .await?;
+            ensure_run_owner_executor(&mut *connection, project_id, conversation_id, run_id).await?;
+            let run_status: String =
+                sqlx::query_scalar("SELECT status FROM agent_runs_v4 WHERE run_id=?1")
+                    .bind(run_id.to_string())
+                    .fetch_one(&mut *connection)
+                    .await?;
+            if run_status != "planning" {
+                return Err(StoreError::InvalidInput(format!(
+                    "plan generation run is not planning (status={run_status})"
+                )));
+            }
+            let row = sqlx::query(
+                "SELECT id,project_id,frame_id,run_id,revision,plan_json,markdown,plan_hash,status,feedback,created_at,updated_at
+                 FROM proposed_plans WHERE project_id=?1 AND frame_id=?2 AND run_id=?3 AND revision=?4",
+            )
+            .bind(project_id.to_string())
+            .bind(conversation_id.to_string())
+            .bind(run_id.to_string())
+            .bind(i64::try_from(revision).map_err(|_| {
+                StoreError::InvalidInput("plan revision exceeds SQLite integer range".into())
+            })?)
+            .fetch_optional(&mut *connection)
+            .await?
+            .ok_or_else(|| StoreError::InvalidInput("plan generation revision was not found".into()))?;
+            let current = proposed_plan_revision_from_row(row)?;
+            if current.status != PlanRevisionStatusV4::Generating {
+                return Err(StoreError::InvalidInput(
+                    "plan generation is no longer generating; approval pause was already applied".into(),
+                ));
+            }
+            let scope = PlanApprovalScopeV4 {
+                project_id,
+                conversation_id,
+                run_id,
+                revision_id: current.id,
+                revision: current.revision,
+            };
+            let events = load_agent_events_in_tx(&mut *connection, run_id).await?;
+            // A decision can legitimately win the narrow request -> pause
+            // race. Validate the exact current request (and any decision),
+            // then still persist the waiting state so a subsequent resume
+            // observes one coherent lifecycle instead of leaving the
+            // conversation locked in planning/generating.
+            plan_approval_request_state(&events, scope)?;
+            let now = Utc::now();
+            let stored_now = from_timestamp(timestamp(now), "plan revision timestamp")?;
+            let updated = sqlx::query(
+                "UPDATE proposed_plans SET status='revising',feedback=?1,updated_at=?2
+                 WHERE id=?3 AND status='generating'",
+            )
+            .bind(feedback)
+            .bind(timestamp(stored_now))
+            .bind(current.id.to_string())
+            .execute(&mut *connection)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Err(StoreError::InvalidInput(
+                    "plan generation changed before approval pause could be recorded".into(),
+                ));
+            }
+            set_agent_run_status_in_tx(&mut *connection, run_id, "waiting_for_approval").await?;
+            Ok(ProposedPlanRevisionV4 {
+                status: PlanRevisionStatusV4::Revising,
+                feedback: feedback.map(ToOwned::to_owned),
+                updated_at: stored_now,
+                ..current
+            })
+        }
+        .await;
+        match result {
+            Ok(value) => {
+                connection.commit().await?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = connection.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Resume a Plan generation after its exact pending approval was decided.
+    /// Unlike a user-requested revision resume, this transitions the same
+    /// revision row back to `generating`, preserving the revision UUID and
+    /// number that are part of the approval scope hash.
+    pub async fn resume_plan_generation_after_approval_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        revision_id: Uuid,
+        revision: u64,
+        now: DateTime<Utc>,
+    ) -> Result<ProposedPlanRevisionV4, StoreError> {
+        let timestamp = timestamp(now);
+        let stored_now = from_timestamp(timestamp, "plan revision timestamp")?;
+        let mut connection = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let result: Result<ProposedPlanRevisionV4, StoreError> = async {
+            ensure_conversation_owner_executor(&mut *connection, project_id, conversation_id)
+                .await?;
+            ensure_run_owner_executor(&mut *connection, project_id, conversation_id, run_id).await?;
+            let run_status: String =
+                sqlx::query_scalar("SELECT status FROM agent_runs_v4 WHERE run_id=?1")
+                    .bind(run_id.to_string())
+                    .fetch_one(&mut *connection)
+                    .await?;
+            if run_status != "waiting_for_approval" {
+                return Err(StoreError::InvalidInput(format!(
+                    "plan generation run is not waiting for approval (status={run_status})"
+                )));
+            }
+            let row = sqlx::query(
+                "SELECT id,project_id,frame_id,run_id,revision,plan_json,markdown,plan_hash,status,feedback,created_at,updated_at
+                 FROM proposed_plans WHERE id=?1 AND project_id=?2 AND frame_id=?3 AND run_id=?4 AND revision=?5",
+            )
+            .bind(revision_id.to_string())
+            .bind(project_id.to_string())
+            .bind(conversation_id.to_string())
+            .bind(run_id.to_string())
+            .bind(i64::try_from(revision).map_err(|_| {
+                StoreError::InvalidInput("plan revision exceeds SQLite integer range".into())
+            })?)
+            .fetch_optional(&mut *connection)
+            .await?
+            .ok_or_else(|| StoreError::InvalidInput("approval revision was not found".into()))?;
+            let current = proposed_plan_revision_from_row(row)?;
+            if current.status != PlanRevisionStatusV4::Revising {
+                return Err(StoreError::InvalidInput(
+                    "approval revision is no longer revising".into(),
+                ));
+            }
+            let latest_id: String = sqlx::query_scalar(
+                "SELECT id FROM proposed_plans
+                 WHERE project_id=?1 AND frame_id=?2
+                 ORDER BY revision DESC,id DESC LIMIT 1",
+            )
+            .bind(project_id.to_string())
+            .bind(conversation_id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+            if latest_id != revision_id.to_string() {
+                return Err(StoreError::InvalidInput(
+                    "approval revision is no longer the latest revision".into(),
+                ));
+            }
+            let scope = PlanApprovalScopeV4 {
+                project_id,
+                conversation_id,
+                run_id,
+                revision_id: current.id,
+                revision: current.revision,
+            };
+            let events = load_agent_events_in_tx(&mut *connection, run_id).await?;
+            let decision = plan_approval_request_state(&events, scope)?;
+            if decision.is_none() {
+                return Err(StoreError::InvalidInput(
+                    "Plan approval must be decided before the revision can resume".into(),
+                ));
+            }
+            let updated = sqlx::query(
+                "UPDATE proposed_plans SET status='generating',updated_at=?1
+                 WHERE id=?2 AND status='revising'",
+            )
+            .bind(timestamp)
+            .bind(revision_id.to_string())
+            .execute(&mut *connection)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Err(StoreError::InvalidInput(
+                    "approval revision changed before it could resume".into(),
+                ));
+            }
+            set_agent_run_status_in_tx(&mut *connection, run_id, "planning").await?;
+            Ok(ProposedPlanRevisionV4 {
+                status: PlanRevisionStatusV4::Generating,
+                updated_at: stored_now,
+                ..current
+            })
+        }
+        .await;
+        match result {
+            Ok(value) => {
+                connection.commit().await?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = connection.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     async fn acquire_plan_revision_generation_v4(
@@ -2760,6 +2972,200 @@ impl Store {
         self.append_agent_event_v4_with_conversation(event)
             .await
             .map(|_| ())
+    }
+
+    /// Validate and append exactly one tool-approval decision while holding a
+    /// SQLite write lock. The caller supplies the binding that is valid for
+    /// the current phase: the historical Execute spec hash, or the current
+    /// Plan revision scope hash. This prevents two concurrent decide calls
+    /// from both observing an undecided request and appending decisions.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn decide_tool_approval_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        approval_id: &str,
+        call_hash: &str,
+        decision: ToolApprovalDecisionV4,
+        binding_hash: &str,
+        expected_mode: RunModeV4,
+        expected_scope_hash: Option<&str>,
+    ) -> Result<AgentEventV4, StoreError> {
+        if approval_id.trim().is_empty() || call_hash.trim().is_empty() {
+            return Err(StoreError::InvalidInput(
+                "tool approval decision identifiers cannot be empty".into(),
+            ));
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let result: Result<AgentEventV4, StoreError> = async {
+            ensure_conversation_owner_executor(&mut *tx, project_id, conversation_id).await?;
+            ensure_run_owner_executor(&mut *tx, project_id, conversation_id, run_id).await?;
+            let mut current_plan_scope = None;
+            if expected_mode == RunModeV4::Plan {
+                let status: String =
+                    sqlx::query_scalar("SELECT status FROM agent_runs_v4 WHERE run_id=?1")
+                        .bind(run_id.to_string())
+                        .fetch_one(&mut *tx)
+                        .await?;
+                let latest = sqlx::query(
+                    "SELECT id,revision,run_id,status FROM proposed_plans
+                     WHERE project_id=?1 AND frame_id=?2
+                     ORDER BY revision DESC,id DESC LIMIT 1",
+                )
+                .bind(project_id.to_string())
+                .bind(conversation_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    StoreError::InvalidInput("Plan approval has no current revision".into())
+                })?;
+                let latest_id = Uuid::parse_str(&latest.try_get::<String, _>(0)?).map_err(|_| {
+                    StoreError::InvalidInput("Plan approval current revision has an invalid id".into())
+                })?;
+                let latest_revision = u64::try_from(latest.try_get::<i64, _>(1)?).map_err(|_| {
+                    StoreError::InvalidInput("Plan approval current revision is invalid".into())
+                })?;
+                let latest_run = latest.try_get::<String, _>(2)?;
+                let latest_status = latest.try_get::<String, _>(3)?;
+                let consistent_phase =
+                    (status == "planning" && latest_status == "generating")
+                        || (status == "waiting_for_approval" && latest_status == "revising");
+                if !consistent_phase || latest_run != run_id.to_string() {
+                    return Err(StoreError::InvalidInput(
+                        "Plan tool approval is not in a consistent planning or approval-waiting phase".into(),
+                    ));
+                }
+                let expected_scope_hash = expected_scope_hash.ok_or_else(|| {
+                    StoreError::InvalidInput("Plan tool approval requires a revision scope hash".into())
+                })?;
+                let current_scope = PlanApprovalScopeV4 {
+                    project_id,
+                    conversation_id,
+                    run_id,
+                    revision_id: latest_id,
+                    revision: latest_revision,
+                };
+                if expected_scope_hash != current_scope.hash() {
+                    return Err(StoreError::InvalidInput(
+                        "Plan approval scope does not match the current revision".into(),
+                    ));
+                }
+                current_plan_scope = Some(current_scope);
+            } else if expected_scope_hash.is_some() {
+                return Err(StoreError::InvalidInput(
+                    "Execute tool approval cannot carry a Plan scope hash".into(),
+                ));
+            }
+            let existing = load_agent_events_in_tx(&mut *tx, run_id).await?;
+            let request = existing
+                .iter()
+                .find_map(|event| match &event.event {
+                    AgentEventKindV4::ToolApprovalRequested { request }
+                        if request.approval_id == approval_id => Some(request),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    StoreError::InvalidInput("tool approval request was not found".into())
+                })?;
+            if request.call_hash != call_hash {
+                return Err(StoreError::InvalidInput(
+                    "tool approval call hash mismatch".into(),
+                ));
+            }
+            match expected_mode {
+                RunModeV4::Plan => {
+                    if request.mode != RunModeV4::Plan
+                        || request.scope_hash.is_none()
+                        || request.effect != omicsops_protocol::ToolEffectV4::ReadOnly
+                        || request.call.tool_id != "use_mcp_tool"
+                    {
+                        return Err(StoreError::InvalidInput(
+                            "Plan approval request is not a concrete read-only MCP request".into(),
+                        ));
+                    }
+                    request
+                        .validate_with_scope(
+                            run_id,
+                            expected_scope_hash.expect("validated above"),
+                            RunModeV4::Plan,
+                        )
+                        .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+                    let current_request = current_plan_approval_request(
+                        &existing,
+                        current_plan_scope.expect("validated Plan scope above"),
+                    )?;
+                    if current_request.approval_id != request.approval_id {
+                        return Err(StoreError::InvalidInput(
+                            "Plan approval request is not the current unfinished request".into(),
+                        ));
+                    }
+                }
+                RunModeV4::Execute => {
+                    if request.mode != RunModeV4::Execute || request.scope_hash.is_some() {
+                        return Err(StoreError::InvalidInput(
+                            "Execute approval request has a Plan binding".into(),
+                        ));
+                    }
+                    let run_value = load_agent_run_value_in_tx(&mut *tx, run_id).await?;
+                    let stored_spec_hash = run_value
+                        .get("spec")
+                        .and_then(Value::as_object)
+                        .and_then(|spec| spec.get("spec_hash"))
+                        .and_then(Value::as_str)
+                        .filter(|hash| !hash.trim().is_empty())
+                        .ok_or_else(|| {
+                            StoreError::InvalidInput(
+                                "Execute approval requires a persisted frozen spec_hash".into(),
+                            )
+                        })?;
+                    if stored_spec_hash != binding_hash {
+                        return Err(StoreError::InvalidInput(
+                            "Execute approval binding does not match the frozen spec".into(),
+                        ));
+                    }
+                    request
+                        .validate(run_id, binding_hash)
+                        .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+                }
+            }
+            if existing.iter().any(|event| {
+                matches!(
+                    &event.event,
+                    AgentEventKindV4::ToolApprovalDecided { approval_id: decided, .. }
+                        if decided == approval_id
+                )
+            }) {
+                return Err(StoreError::InvalidInput(
+                    "tool approval request was already decided".into(),
+                ));
+            }
+            let previous = existing.last().ok_or_else(|| {
+                StoreError::InvalidInput("V4 run has no event chain".into())
+            })?;
+            let event = AgentEventV4::next(
+                previous,
+                Utc::now(),
+                AgentEventKindV4::ToolApprovalDecided {
+                    approval_id: approval_id.to_owned(),
+                    call_hash: call_hash.to_owned(),
+                    decision,
+                },
+            );
+            insert_agent_event_in_tx(&mut *tx, &event).await?;
+            Ok(event)
+        }
+        .await;
+        match result {
+            Ok(event) => {
+                tx.commit().await?;
+                Ok(event)
+            }
+            Err(error) => {
+                let _ = tx.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     pub async fn agent_events_v4(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, StoreError> {
@@ -5142,6 +5548,106 @@ async fn load_agent_events_in_tx(
         .collect::<Result<Vec<_>, _>>()?;
     deserialize_event_chain_v4(&serialized)
         .map_err(|error| StoreError::InvalidInput(error.to_string()))
+}
+
+/// Find and validate the one unfinished, current-revision Plan MCP approval
+/// request. A request whose dispatch has already started is not a resumable
+/// approval: it must be handled by uncertain-side-effect recovery instead.
+fn current_plan_approval_request<'a>(
+    events: &'a [AgentEventV4],
+    scope: PlanApprovalScopeV4,
+) -> Result<&'a ToolApprovalRequestV4, StoreError> {
+    let scope_hash = scope.hash();
+    let mut pending: Option<&ToolApprovalRequestV4> = None;
+    for event in events {
+        let AgentEventKindV4::ToolApprovalRequested { request } = &event.event else {
+            continue;
+        };
+        if request.mode != RunModeV4::Plan
+            || request.scope_hash.as_deref() != Some(scope_hash.as_str())
+            || request.effect != ToolEffectV4::ReadOnly
+            || request.call.tool_id != "use_mcp_tool"
+        {
+            continue;
+        }
+        let requested = events.iter().any(|candidate| {
+            matches!(
+                &candidate.event,
+                AgentEventKindV4::ToolRequested { call } if call == &request.call
+            )
+        });
+        let finished = events.iter().any(|candidate| {
+            matches!(
+                &candidate.event,
+                AgentEventKindV4::ToolFinished { outcome }
+                    if outcome.call_id == request.call.call_id
+            ) || matches!(
+                &candidate.event,
+                AgentEventKindV4::ToolOutcomeReused { outcome, .. }
+                    if outcome.call_id == request.call.call_id
+            )
+        });
+        let dispatched = events.iter().any(|candidate| {
+            matches!(
+                &candidate.event,
+                AgentEventKindV4::ToolDispatchStarted { call_id, .. }
+                    if call_id == &request.call.call_id
+            ) || matches!(
+                &candidate.event,
+                AgentEventKindV4::ToolDispatchUncertain { call_id, .. }
+                    if call_id == &request.call.call_id
+            ) || matches!(
+                &candidate.event,
+                AgentEventKindV4::ToolDispatchResolved { call_id, .. }
+                    if call_id == &request.call.call_id
+            )
+        });
+        if requested && !finished && !dispatched {
+            if pending.is_some() {
+                return Err(StoreError::InvalidInput(
+                    "multiple pending Plan tool approvals are not supported".into(),
+                ));
+            }
+            request
+                .validate_with_scope(scope.run_id, &scope_hash, RunModeV4::Plan)
+                .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+            pending = Some(request);
+        }
+    }
+    pending.ok_or_else(|| {
+        StoreError::InvalidInput(
+            "current revision has no unfinished Plan tool approval request".into(),
+        )
+    })
+}
+
+/// Find the one unfinished, current-revision Plan MCP approval request and
+/// validate its optional decision. `None` means the request is still waiting;
+/// `Some` is the single approved/denied decision that may unlock resume.
+fn plan_approval_request_state(
+    events: &[AgentEventV4],
+    scope: PlanApprovalScopeV4,
+) -> Result<Option<ToolApprovalDecisionV4>, StoreError> {
+    let request = current_plan_approval_request(events, scope)?;
+    let mut decision = None;
+    for event in events {
+        if let AgentEventKindV4::ToolApprovalDecided {
+            approval_id,
+            call_hash,
+            decision: value,
+        } = &event.event
+        {
+            if approval_id == &request.approval_id {
+                if call_hash != &request.call_hash || decision.is_some() {
+                    return Err(StoreError::InvalidInput(
+                        "tool approval decision is duplicated or tampered".into(),
+                    ));
+                }
+                decision = Some(*value);
+            }
+        }
+    }
+    Ok(decision)
 }
 
 fn is_terminal_event(event: &AgentEventV4) -> bool {

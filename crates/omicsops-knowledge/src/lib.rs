@@ -76,7 +76,14 @@ pub struct McpToolIndexV4 {
     pub tool_name: String,
     pub description: String,
     pub input_schema: Value,
+    /// The catalog digest observed when this tool was indexed. A call must
+    /// carry the same digest; the profile value is never substituted for a
+    /// missing caller expectation.
+    pub tool_catalog_sha256: String,
     pub schema_sha256: String,
+    /// `None` represents a missing third-party annotation and is therefore
+    /// not equivalent to `Some(false)` or `Some(true)`.
+    pub read_only_hint: Option<bool>,
     pub configured: bool,
     pub enabled: bool,
     pub launch_approved: bool,
@@ -104,13 +111,58 @@ pub enum KnowledgeErrorV4 {
     McpLaunchNotApproved,
     #[error("MCP tool is not approved")]
     McpToolNotApproved,
+    #[error("MCP tool readOnlyHint annotation is missing")]
+    McpReadOnlyHintMissing,
+    #[error("MCP tool readOnlyHint annotation is not true")]
+    McpReadOnlyHintNotTrue,
+    #[error("MCP tool catalog changed after search")]
+    McpCatalogChanged,
     #[error("MCP schema changed after search")]
     McpSchemaChanged,
 }
 
 pub fn authorize_mcp_use(
     tool: &McpToolIndexV4,
+    expected_tool_catalog_sha256: &str,
     expected_schema_sha256: &str,
+) -> Result<(), KnowledgeErrorV4> {
+    authorize_mcp_target(
+        tool,
+        expected_tool_catalog_sha256,
+        expected_schema_sha256,
+        tool.tool_approved,
+    )
+}
+
+/// Authorize one concrete MCP target using caller-supplied snapshots. The
+/// optional run approval is deliberately an explicit argument: persistent
+/// approval and a one-time exact-call decision share the same dynamic checks,
+/// while a missing decision remains a pause request rather than authority.
+pub fn authorize_mcp_read_only_target(
+    tool: &McpToolIndexV4,
+    expected_tool_catalog_sha256: &str,
+    expected_schema_sha256: &str,
+    tool_approval: bool,
+) -> Result<(), KnowledgeErrorV4> {
+    if tool.read_only_hint.is_none() {
+        return Err(KnowledgeErrorV4::McpReadOnlyHintMissing);
+    }
+    if tool.read_only_hint != Some(true) {
+        return Err(KnowledgeErrorV4::McpReadOnlyHintNotTrue);
+    }
+    authorize_mcp_target(
+        tool,
+        expected_tool_catalog_sha256,
+        expected_schema_sha256,
+        tool_approval,
+    )
+}
+
+fn authorize_mcp_target(
+    tool: &McpToolIndexV4,
+    expected_tool_catalog_sha256: &str,
+    expected_schema_sha256: &str,
+    tool_approval: bool,
 ) -> Result<(), KnowledgeErrorV4> {
     if !tool.configured {
         return Err(KnowledgeErrorV4::McpNotConfigured);
@@ -121,7 +173,10 @@ pub fn authorize_mcp_use(
     if !tool.launch_approved {
         return Err(KnowledgeErrorV4::McpLaunchNotApproved);
     }
-    if !tool.tool_approved {
+    if tool.tool_catalog_sha256 != expected_tool_catalog_sha256 {
+        return Err(KnowledgeErrorV4::McpCatalogChanged);
+    }
+    if !tool_approval && !tool.tool_approved {
         return Err(KnowledgeErrorV4::McpToolNotApproved);
     }
     if tool.schema_sha256 != expected_schema_sha256 {
@@ -471,7 +526,9 @@ mod tests {
             tool_name: "search_papers".into(),
             description: "Search biomedical literature".into(),
             input_schema: serde_json::json!({"type":"object"}),
+            tool_catalog_sha256: "catalog".into(),
             schema_sha256: "schema".into(),
+            read_only_hint: Some(true),
             configured: true,
             enabled: true,
             launch_approved: false,
@@ -501,7 +558,9 @@ mod tests {
             tool_name: "search".into(),
             description: "search".into(),
             input_schema: serde_json::json!({}),
+            tool_catalog_sha256: "catalog".into(),
             schema_sha256: "expected".into(),
+            read_only_hint: Some(true),
             configured: true,
             enabled: true,
             launch_approved: false,
@@ -509,14 +568,84 @@ mod tests {
             updated_at: Utc::now(),
         };
         assert_eq!(
-            authorize_mcp_use(&tool, "expected").unwrap_err(),
+            authorize_mcp_use(&tool, "catalog", "expected").unwrap_err(),
             KnowledgeErrorV4::McpLaunchNotApproved
         );
         tool.launch_approved = true;
         assert_eq!(
-            authorize_mcp_use(&tool, "changed").unwrap_err(),
+            authorize_mcp_use(&tool, "catalog", "changed").unwrap_err(),
             KnowledgeErrorV4::McpSchemaChanged
         );
-        assert!(authorize_mcp_use(&tool, "expected").is_ok());
+        assert!(authorize_mcp_use(&tool, "catalog", "expected").is_ok());
+    }
+
+    fn read_only_mcp_fixture() -> McpToolIndexV4 {
+        McpToolIndexV4 {
+            server_id: Uuid::new_v4(),
+            server_name: "papers".into(),
+            tool_name: "search".into(),
+            description: "search papers".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+            tool_catalog_sha256: "catalog".into(),
+            schema_sha256: "schema".into(),
+            read_only_hint: Some(true),
+            configured: true,
+            enabled: true,
+            launch_approved: true,
+            tool_approved: true,
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn mcp_read_only_gate_requires_exact_true_annotation() {
+        let mut tool = read_only_mcp_fixture();
+        tool.read_only_hint = None;
+        assert_eq!(
+            authorize_mcp_read_only_target(&tool, "catalog", "schema", false).unwrap_err(),
+            KnowledgeErrorV4::McpReadOnlyHintMissing
+        );
+        tool.read_only_hint = Some(false);
+        assert_eq!(
+            authorize_mcp_read_only_target(&tool, "catalog", "schema", false).unwrap_err(),
+            KnowledgeErrorV4::McpReadOnlyHintNotTrue
+        );
+        tool.read_only_hint = Some(true);
+        assert!(authorize_mcp_read_only_target(&tool, "catalog", "schema", false).is_ok());
+    }
+
+    #[test]
+    fn mcp_read_only_gate_rejects_catalog_or_schema_changes() {
+        let mut tool = read_only_mcp_fixture();
+        assert_eq!(
+            authorize_mcp_use(&tool, "different-catalog", "schema").unwrap_err(),
+            KnowledgeErrorV4::McpCatalogChanged
+        );
+        tool.tool_catalog_sha256 = "different-catalog".into();
+        tool.schema_sha256 = "different-schema".into();
+        assert_eq!(
+            authorize_mcp_use(&tool, "different-catalog", "schema").unwrap_err(),
+            KnowledgeErrorV4::McpSchemaChanged
+        );
+    }
+
+    #[test]
+    fn mcp_one_time_approval_still_requires_current_read_only_facts() {
+        let mut tool = read_only_mcp_fixture();
+        tool.tool_approved = false;
+        assert_eq!(
+            authorize_mcp_read_only_target(&tool, "catalog", "schema", false).unwrap_err(),
+            KnowledgeErrorV4::McpToolNotApproved
+        );
+        assert!(authorize_mcp_read_only_target(&tool, "catalog", "schema", true).is_ok());
+        tool.read_only_hint = Some(false);
+        assert!(authorize_mcp_read_only_target(&tool, "catalog", "schema", true).is_err());
+    }
+
+    #[test]
+    fn generic_mcp_execute_authorization_does_not_treat_missing_hint_as_host_failure() {
+        let mut tool = read_only_mcp_fixture();
+        tool.read_only_hint = None;
+        assert!(authorize_mcp_use(&tool, "catalog", "schema").is_ok());
     }
 }

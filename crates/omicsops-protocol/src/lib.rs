@@ -17,6 +17,39 @@ pub enum RunModeV4 {
     Execute,
 }
 
+/// Stable identity used to bind a one-time Plan approval to the exact
+/// generating revision that requested it. The revision UUID is intentionally
+/// included in addition to the human-visible number so an old decision cannot
+/// be replayed after a revision is replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PlanApprovalScopeV4 {
+    pub project_id: Uuid,
+    pub conversation_id: Uuid,
+    pub run_id: Uuid,
+    pub revision_id: Uuid,
+    pub revision: u64,
+}
+
+impl PlanApprovalScopeV4 {
+    pub fn hash(self) -> String {
+        let value = serde_json::json!({
+            "mode": "plan",
+            "project_id": self.project_id,
+            "conversation_id": self.conversation_id,
+            "run_id": self.run_id,
+            "revision_id": self.revision_id,
+            "revision": self.revision,
+        });
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(&value).expect("plan approval scope is serializable"),
+        ))
+    }
+}
+
+pub fn plan_approval_scope_hash(scope: PlanApprovalScopeV4) -> String {
+    scope.hash()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatusV4 {
@@ -314,6 +347,16 @@ pub struct ToolApprovalRequestV4 {
     pub effect: ToolEffectV4,
     pub reason: String,
     pub call_hash: String,
+    /// Execute approvals retain the historical `None` scope for wire
+    /// compatibility. Plan approvals set this to a stable revision-bound
+    /// hash so an execute decision cannot be replayed during planning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_hash: Option<String>,
+    #[serde(
+        default = "default_tool_approval_mode",
+        skip_serializing_if = "is_execute_mode"
+    )]
+    pub mode: RunModeV4,
 }
 
 impl ToolApprovalRequestV4 {
@@ -324,15 +367,57 @@ impl ToolApprovalRequestV4 {
         effect: ToolEffectV4,
         reason: impl Into<String>,
     ) -> Result<Self, ProtocolErrorV4> {
+        Self::new_with_scope_and_mode(
+            run_id,
+            spec_hash,
+            call,
+            effect,
+            reason,
+            None,
+            RunModeV4::Execute,
+        )
+    }
+
+    pub fn new_with_scope(
+        run_id: Uuid,
+        scope_hash: &str,
+        call: ToolCallV4,
+        effect: ToolEffectV4,
+        reason: impl Into<String>,
+    ) -> Result<Self, ProtocolErrorV4> {
+        Self::new_with_scope_and_mode(
+            run_id,
+            scope_hash,
+            call,
+            effect,
+            reason,
+            Some(scope_hash.to_owned()),
+            RunModeV4::Plan,
+        )
+    }
+
+    fn new_with_scope_and_mode(
+        run_id: Uuid,
+        binding_hash: &str,
+        call: ToolCallV4,
+        effect: ToolEffectV4,
+        reason: impl Into<String>,
+        scope_hash: Option<String>,
+        mode: RunModeV4,
+    ) -> Result<Self, ProtocolErrorV4> {
         let call_hash = call.canonical_hash()?;
+        let mut binding = serde_json::json!({
+            "run_id": run_id,
+            "spec_hash": binding_hash,
+            "call_hash": call_hash,
+            "effect": effect,
+        });
+        if mode == RunModeV4::Plan {
+            binding["mode"] = serde_json::json!("plan");
+            binding["scope_hash"] = serde_json::json!(scope_hash.as_deref().unwrap_or_default());
+        }
         let approval_id = hex::encode(Sha256::digest(
-            serde_json::to_vec(&serde_json::json!({
-                "run_id": run_id,
-                "spec_hash": spec_hash,
-                "call_hash": call_hash,
-                "effect": effect,
-            }))
-            .map_err(|_| ProtocolErrorV4::InvalidToolApproval)?,
+            serde_json::to_vec(&binding).map_err(|_| ProtocolErrorV4::InvalidToolApproval)?,
         ));
         Ok(Self {
             approval_id,
@@ -340,22 +425,49 @@ impl ToolApprovalRequestV4 {
             effect,
             reason: reason.into(),
             call_hash,
+            scope_hash,
+            mode,
         })
     }
 
     pub fn validate(&self, run_id: Uuid, spec_hash: &str) -> Result<(), ProtocolErrorV4> {
-        let expected = Self::new(
+        let expected = Self::new_with_scope_and_mode(
             run_id,
             spec_hash,
             self.call.clone(),
             self.effect,
             self.reason.clone(),
+            self.scope_hash.clone(),
+            self.mode,
         )?;
         if self.call_hash != expected.call_hash || self.approval_id != expected.approval_id {
             return Err(ProtocolErrorV4::InvalidToolApproval);
         }
+        if self.scope_hash != expected.scope_hash || self.mode != expected.mode {
+            return Err(ProtocolErrorV4::InvalidToolApproval);
+        }
         Ok(())
     }
+
+    pub fn validate_with_scope(
+        &self,
+        run_id: Uuid,
+        scope_hash: &str,
+        expected_mode: RunModeV4,
+    ) -> Result<(), ProtocolErrorV4> {
+        if self.scope_hash.as_deref() != Some(scope_hash) || self.mode != expected_mode {
+            return Err(ProtocolErrorV4::InvalidToolApproval);
+        }
+        self.validate(run_id, scope_hash)
+    }
+}
+
+fn default_tool_approval_mode() -> RunModeV4 {
+    RunModeV4::Execute
+}
+
+fn is_execute_mode(mode: &RunModeV4) -> bool {
+    *mode == RunModeV4::Execute
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1413,5 +1525,90 @@ mod tests {
             tampered_effect.validate(run_id, "spec-hash"),
             Err(ProtocolErrorV4::InvalidToolApproval)
         );
+    }
+
+    #[test]
+    fn plan_tool_approval_is_bound_to_scope_and_keeps_execute_compatibility() {
+        let run_id = Uuid::new_v4();
+        let call = ToolCallV4 {
+            call_id: "plan-mcp".into(),
+            tool_id: "use_mcp_tool".into(),
+            arguments: serde_json::json!({
+                "server_id": Uuid::new_v4(),
+                "tool": "search",
+                "catalog_sha256": "catalog",
+                "schema_sha256": "schema",
+                "arguments": {"q":"x"}
+            }),
+        };
+        let request = ToolApprovalRequestV4::new_with_scope(
+            run_id,
+            "plan-scope",
+            call,
+            ToolEffectV4::Network,
+            "third-party readOnlyHint is an unverified hint trusted by the user, not a Host guarantee",
+        )
+        .unwrap();
+        assert_eq!(request.mode, RunModeV4::Plan);
+        assert_eq!(request.scope_hash.as_deref(), Some("plan-scope"));
+        assert!(
+            request
+                .validate_with_scope(run_id, "plan-scope", RunModeV4::Plan)
+                .is_ok()
+        );
+        assert!(
+            request
+                .validate_with_scope(run_id, "other-scope", RunModeV4::Plan)
+                .is_err()
+        );
+        assert!(
+            request
+                .validate_with_scope(run_id, "plan-scope", RunModeV4::Execute)
+                .is_err()
+        );
+
+        let legacy = ToolApprovalRequestV4::new(
+            run_id,
+            "spec-hash",
+            ToolCallV4 {
+                call_id: "execute".into(),
+                tool_id: "runtime.execute".into(),
+                arguments: serde_json::json!({"code":"x"}),
+            },
+            ToolEffectV4::Runtime,
+            "legacy",
+        )
+        .unwrap();
+        assert!(legacy.validate(run_id, "spec-hash").is_ok());
+        assert!(legacy.scope_hash.is_none());
+    }
+
+    #[test]
+    fn historical_execute_approval_json_defaults_without_changing_its_id() {
+        let run_id = Uuid::new_v4();
+        let request = ToolApprovalRequestV4::new(
+            run_id,
+            "legacy-spec",
+            ToolCallV4 {
+                call_id: "legacy-call".into(),
+                tool_id: "runtime.execute".into(),
+                arguments: serde_json::json!({"code":"print(1)"}),
+            },
+            ToolEffectV4::Runtime,
+            "legacy approval",
+        )
+        .unwrap();
+        let mut historical = serde_json::to_value(&request).unwrap();
+        let object = historical.as_object_mut().unwrap();
+        object.remove("mode");
+        object.remove("scope_hash");
+        let decoded: ToolApprovalRequestV4 = serde_json::from_value(historical).unwrap();
+        assert_eq!(decoded.mode, RunModeV4::Execute);
+        assert!(decoded.scope_hash.is_none());
+        assert_eq!(decoded.approval_id, request.approval_id);
+        assert!(decoded.validate(run_id, "legacy-spec").is_ok());
+        let serialized = serde_json::to_string(&decoded).unwrap();
+        assert!(!serialized.contains("\"mode\""));
+        assert!(!serialized.contains("\"scope_hash\""));
     }
 }

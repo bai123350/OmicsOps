@@ -29,7 +29,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
-    sync::{Mutex, RwLock},
+    sync::{Mutex, OwnedMutexGuard, RwLock},
 };
 use uuid::Uuid;
 
@@ -223,6 +223,10 @@ pub enum McpRuntimeError {
     ToolNotFound(String),
     #[error("MCP tool schema changed since approval")]
     SchemaChanged,
+    #[error("MCP tool readOnlyHint annotation is missing")]
+    ReadOnlyHintMissing,
+    #[error("MCP tool readOnlyHint annotation is not true")]
+    ReadOnlyHintNotTrue,
     #[error("MCP session is stale; inspect and approve the server again")]
     Stale,
     #[error("MCP call arguments must be a JSON object")]
@@ -274,11 +278,27 @@ struct McpSession {
 #[derive(Clone, Default)]
 pub struct McpSessionManager {
     sessions: Arc<Mutex<HashMap<McpSessionKey, Arc<McpSession>>>>,
+    server_locks: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>,
 }
 
 impl McpSessionManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Serialize profile reads, calls, and invalidation for one server. The
+    /// desktop uses this guard around a profile-backed operation so a caller
+    /// that read an old enabled profile cannot recreate a session after a
+    /// revoke has been durably persisted.
+    pub async fn lock_server(&self, server_id: Uuid) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.server_locks.lock().await;
+            locks
+                .entry(server_id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
     }
 
     /// Inspect using an isolated process.  The process is always closed before
@@ -325,6 +345,54 @@ impl McpSessionManager {
         expected_catalog_sha256: Option<&str>,
         expected_schema_sha256: Option<&str>,
     ) -> Result<McpInvocation, McpRuntimeError> {
+        self.call_with_policy(
+            config,
+            tool,
+            arguments,
+            expected_catalog_sha256,
+            expected_schema_sha256,
+            false,
+        )
+        .await
+    }
+
+    /// Plan-mode MCP call. In addition to catalog/schema snapshots, the live
+    /// advertisement must carry the exact `annotations.readOnlyHint=true`
+    /// value. Execute-mode callers intentionally use [`Self::call`] so the
+    /// historical network authorization semantics remain compatible.
+    pub async fn call_read_only(
+        &self,
+        config: McpServerConfig,
+        tool: &str,
+        arguments: Value,
+        expected_catalog_sha256: Option<&str>,
+        expected_schema_sha256: Option<&str>,
+    ) -> Result<McpInvocation, McpRuntimeError> {
+        self.call_with_policy(
+            config,
+            tool,
+            arguments,
+            expected_catalog_sha256,
+            expected_schema_sha256,
+            true,
+        )
+        .await
+    }
+
+    async fn call_with_policy(
+        &self,
+        config: McpServerConfig,
+        tool: &str,
+        arguments: Value,
+        expected_catalog_sha256: Option<&str>,
+        expected_schema_sha256: Option<&str>,
+        require_read_only_hint: bool,
+    ) -> Result<McpInvocation, McpRuntimeError> {
+        if require_read_only_hint
+            && (expected_catalog_sha256.is_none() || expected_schema_sha256.is_none())
+        {
+            return Err(McpRuntimeError::SchemaChanged);
+        }
         let config = config.normalized()?;
         let key = McpSessionKey::new(config.project_id, config.server_id);
         let session = self.session_for(&config).await?;
@@ -344,6 +412,20 @@ impl McpSessionManager {
             .iter()
             .find(|entry| entry.get("name").and_then(Value::as_str) == Some(tool))
             .ok_or_else(|| McpRuntimeError::ToolNotFound(tool.to_owned()))?;
+        // Supplying both frozen digests is the read-only target path. The
+        // raw third-party annotation is a necessary current fact, but never a
+        // host guarantee; the user approval policy remains authoritative.
+        if require_read_only_hint {
+            match advertised
+                .get("annotations")
+                .and_then(Value::as_object)
+                .and_then(|annotations| annotations.get("readOnlyHint").and_then(Value::as_bool))
+            {
+                None => return Err(McpRuntimeError::ReadOnlyHintMissing),
+                Some(false) => return Err(McpRuntimeError::ReadOnlyHintNotTrue),
+                Some(true) => {}
+            }
+        }
         if let Some(expected) = expected_schema_sha256 {
             let schema = advertised
                 .get("inputSchema")
@@ -360,6 +442,17 @@ impl McpSessionManager {
             .cloned()
             .ok_or(McpRuntimeError::InvalidArguments)?;
         let params = CallToolRequestParams::new(tool.to_owned()).with_arguments(args);
+        // A tools/list_changed notification can arrive after the refresh
+        // snapshot but before the request is sent. Re-check the live session
+        // immediately before crossing the peer boundary and fail closed
+        // without clearing the stale marker, so the next attempt must refresh
+        // again instead of dispatching against a changed catalog.
+        if session.stale.load(Ordering::Acquire)
+            || matches!(session.state().await, McpSessionState::Stale)
+        {
+            session.set_state(McpSessionState::Stale).await;
+            return Err(McpRuntimeError::Stale);
+        }
         let result = tokio::time::timeout(config.timeout(), session.peer.call_tool(params)).await;
         let result = match result {
             Ok(Ok(result)) => result,

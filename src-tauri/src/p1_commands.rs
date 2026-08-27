@@ -5,7 +5,7 @@ use omicsops_adapters::credentials::CredentialVault;
 use omicsops_core::workspace::{
     Artifact, EvidenceReference, MemoryFact, NotebookEntry, SkillCitation,
 };
-use omicsops_knowledge::schema_digest;
+use omicsops_knowledge::{McpToolIndexV4, authorize_mcp_read_only_target, schema_digest};
 use omicsops_mcp::{McpEnvBinding, McpServerConfig, McpSessionManager};
 use omicsops_store::Store;
 use serde::{Deserialize, Serialize};
@@ -550,20 +550,24 @@ pub async fn save_mcp_server(
     state: State<'_, AppState>,
     request: SaveMcpServerRequest,
 ) -> Result<McpServerProfile, String> {
+    let _server_lock = match request.id {
+        Some(server_id) => Some(state.mcp_sessions.lock_server(server_id).await),
+        None => None,
+    };
     let now = Utc::now();
     let existing = match request.id {
         Some(id) => Some(mcp_server_profile(&state.repository, id).await?),
         None => None,
     };
     let profile = mcp_profile_from_request(request, existing.as_ref(), now)?;
-    if existing.is_some() {
-        state.mcp_sessions.invalidate_server(profile.id).await;
-    }
     state
         .repository
         .put_json("mcp_server", &profile.id.to_string(), &profile)
         .await
         .map_err(|error| error.to_string())?;
+    if existing.is_some() {
+        state.mcp_sessions.invalidate_server(profile.id).await;
+    }
     Ok(profile)
 }
 
@@ -572,7 +576,7 @@ pub async fn add_pubmed_mcp_server(
     state: State<'_, AppState>,
     request: AddPubMedMcpServerRequest,
 ) -> Result<McpServerProfile, String> {
-    let existing = state
+    let existing_id = state
         .repository
         .list_json::<McpServerProfile>("mcp_server")
         .await
@@ -583,10 +587,15 @@ pub async fn add_pubmed_mcp_server(
                 .args
                 .iter()
                 .any(|arg| arg == "--omicsops-pubmed-mcp")
-        });
-    let id = existing
-        .as_ref()
-        .map_or_else(Uuid::new_v4, |profile| profile.id);
+        })
+        .map(|profile| profile.id);
+    let id = existing_id.unwrap_or_else(Uuid::new_v4);
+    let _server_lock = state.mcp_sessions.lock_server(id).await;
+    let existing = state
+        .repository
+        .get_json::<McpServerProfile>("mcp_server", &id.to_string())
+        .await
+        .map_err(|error| error.to_string())?;
     let api_key_account = format!("mcp/{id}/NCBI_API_KEY");
     if let Some(api_key) = request
         .api_key
@@ -656,12 +665,12 @@ pub async fn add_pubmed_mcp_server(
         existing.as_ref(),
         Utc::now(),
     )?;
-    state.mcp_sessions.invalidate_server(id).await;
     state
         .repository
         .put_json("mcp_server", &id.to_string(), &profile)
         .await
         .map_err(|error| error.to_string())?;
+    state.mcp_sessions.invalidate_server(id).await;
     Ok(profile)
 }
 
@@ -670,20 +679,21 @@ pub async fn set_mcp_server_enabled(
     state: State<'_, AppState>,
     request: SetMcpServerEnabledRequest,
 ) -> Result<McpServerProfile, String> {
+    let _server_lock = state.mcp_sessions.lock_server(request.server_id).await;
     let mut profile = mcp_server_profile(&state.repository, request.server_id).await?;
     if request.enabled && profile.last_inspected_at.is_none() {
         return Err("inspect the MCP server before enabling it".into());
     }
     profile.enabled = request.enabled;
-    if !request.enabled {
-        state.mcp_sessions.invalidate_server(profile.id).await;
-    }
     profile.updated_at = Utc::now();
     state
         .repository
         .put_json("mcp_server", &profile.id.to_string(), &profile)
         .await
         .map_err(|error| error.to_string())?;
+    if !request.enabled {
+        state.mcp_sessions.invalidate_server(profile.id).await;
+    }
     Ok(profile)
 }
 
@@ -692,12 +702,12 @@ pub async fn set_mcp_launch_approval(
     state: State<'_, AppState>,
     request: SetMcpLaunchApprovalRequest,
 ) -> Result<McpServerProfile, String> {
+    let _server_lock = state.mcp_sessions.lock_server(request.server_id).await;
     let mut profile = mcp_server_profile(&state.repository, request.server_id).await?;
     profile.launch_approved = request.approved;
     if !request.approved {
         profile.enabled = false;
         profile.approved_tools.clear();
-        state.mcp_sessions.invalidate_server(profile.id).await;
     }
     profile.updated_at = Utc::now();
     state
@@ -705,6 +715,9 @@ pub async fn set_mcp_launch_approval(
         .put_json("mcp_server", &profile.id.to_string(), &profile)
         .await
         .map_err(|error| error.to_string())?;
+    if !request.approved {
+        state.mcp_sessions.invalidate_server(profile.id).await;
+    }
     Ok(profile)
 }
 
@@ -713,6 +726,7 @@ pub async fn set_mcp_tool_approval(
     state: State<'_, AppState>,
     request: SetMcpToolApprovalRequest,
 ) -> Result<McpServerProfile, String> {
+    let _server_lock = state.mcp_sessions.lock_server(request.server_id).await;
     let mut profile = mcp_server_profile(&state.repository, request.server_id).await?;
     let tool = request.tool.trim();
     if !profile
@@ -723,9 +737,6 @@ pub async fn set_mcp_tool_approval(
         return Err(format!("MCP tool {tool} was not advertised by the server"));
     }
     profile.approved_tools.retain(|entry| entry != tool);
-    if !request.approved {
-        state.mcp_sessions.invalidate_server(profile.id).await;
-    }
     if request.approved {
         profile.approved_tools.push(tool.to_string());
         profile.approved_tools.sort();
@@ -737,6 +748,9 @@ pub async fn set_mcp_tool_approval(
         .put_json("mcp_server", &profile.id.to_string(), &profile)
         .await
         .map_err(|error| error.to_string())?;
+    if !request.approved {
+        state.mcp_sessions.invalidate_server(profile.id).await;
+    }
     Ok(profile)
 }
 
@@ -745,11 +759,11 @@ pub async fn inspect_configured_mcp_server(
     state: State<'_, AppState>,
     request: InspectConfiguredMcpServerRequest,
 ) -> Result<McpResult, String> {
+    let _server_lock = state.mcp_sessions.lock_server(request.server_id).await;
     let mut profile = mcp_server_profile(&state.repository, request.server_id).await?;
     if !request.approved {
         return Err("inspecting an MCP subprocess requires explicit approval".into());
     }
-    state.mcp_sessions.invalidate_server(profile.id).await;
     profile.status = "connecting".into();
     profile.last_error = None;
     profile.updated_at = Utc::now();
@@ -758,6 +772,7 @@ pub async fn inspect_configured_mcp_server(
         .put_json("mcp_server", &profile.id.to_string(), &profile)
         .await
         .map_err(|error| error.to_string())?;
+    state.mcp_sessions.invalidate_server(profile.id).await;
     let config = match resolved_mcp_config(&profile, request.project_id, &state.credentials) {
         Ok(config) => config,
         Err(error) => {
@@ -874,7 +889,12 @@ pub async fn call_configured_mcp_tool(
         request.server_id,
         request.tool.trim(),
         request.arguments.unwrap_or_else(|| json!({})),
+        profile
+            .tool_catalog_sha256
+            .clone()
+            .ok_or("MCP tool catalog is missing; inspect the server again")?,
         schema_digest(&schema),
+        false,
         false,
     )
     .await
@@ -1269,38 +1289,122 @@ pub(crate) async fn invoke_configured_mcp_tool_v4(
     server_id: Uuid,
     tool: &str,
     arguments: Value,
+    expected_tool_catalog_sha256: String,
     expected_schema_sha256: String,
+    require_read_only_hint: bool,
     schema_bound_run_approved: bool,
 ) -> Result<McpResult, String> {
+    let _server_lock = sessions.lock_server(server_id).await;
     let mut profile = mcp_server_profile(repository, server_id).await?;
+    let tool = tool.trim();
+    if expected_tool_catalog_sha256.trim().is_empty() {
+        return Err("MCP tool catalog_sha256 is required".into());
+    }
+    if expected_schema_sha256.trim().is_empty() {
+        return Err("MCP tool schema_sha256 is required".into());
+    }
     if !profile.enabled {
         return Err("MCP server is disabled".into());
     }
     if !profile.launch_approved {
         return Err("MCP server launch approval was revoked".into());
     }
-    let persistently_approved = profile
-        .approved_tools
+    let profile_catalog = profile
+        .tool_catalog_sha256
+        .as_deref()
+        .ok_or("MCP tool catalog is missing; inspect and approve the server again")?;
+    if profile_catalog != expected_tool_catalog_sha256 {
+        return Err("MCP tool catalog changed since search; invocation denied".into());
+    }
+    let advertised = profile
+        .tools
         .iter()
-        .any(|approved| approved == tool);
-    if !persistently_approved && !schema_bound_run_approved {
-        return Err(format!("MCP tool {tool} approval was revoked"));
+        .find(|entry| entry.get("name").and_then(Value::as_str) == Some(tool))
+        .ok_or_else(|| format!("MCP tool {tool} is not currently advertised"))?;
+    let input_schema = advertised
+        .get("inputSchema")
+        .or_else(|| advertised.get("input_schema"))
+        .cloned()
+        .unwrap_or_else(|| json!({"type":"object"}));
+    let mut indexed = McpToolIndexV4 {
+        server_id: profile.id,
+        server_name: profile.name.clone(),
+        tool_name: tool.to_owned(),
+        description: advertised
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("MCP tool")
+            .to_owned(),
+        input_schema,
+        tool_catalog_sha256: expected_tool_catalog_sha256.clone(),
+        schema_sha256: schema_digest(
+            advertised
+                .get("inputSchema")
+                .or_else(|| advertised.get("input_schema"))
+                .unwrap_or(&json!({"type":"object"})),
+        ),
+        read_only_hint: advertised
+            .get("annotations")
+            .and_then(Value::as_object)
+            .and_then(|annotations| annotations.get("readOnlyHint").and_then(Value::as_bool)),
+        configured: true,
+        enabled: profile.enabled,
+        launch_approved: profile.launch_approved,
+        tool_approved: profile
+            .approved_tools
+            .iter()
+            .any(|approved| approved == tool),
+        updated_at: profile.updated_at,
+    };
+    let persistently_approved = indexed.tool_approved;
+    if schema_bound_run_approved {
+        indexed.tool_approved = true;
+    }
+    if require_read_only_hint {
+        authorize_mcp_read_only_target(
+            &indexed,
+            &expected_tool_catalog_sha256,
+            &expected_schema_sha256,
+            schema_bound_run_approved,
+        )
+        .map_err(|error| error.to_string())?;
+    } else {
+        omicsops_knowledge::authorize_mcp_use(
+            &indexed,
+            &expected_tool_catalog_sha256,
+            &expected_schema_sha256,
+        )
+        .map_err(|error| error.to_string())?;
     }
     let config = resolved_mcp_config(&profile, project_id, credentials)?;
-    let invocation = match sessions
-        .call(
-            config,
-            tool,
-            arguments,
-            profile.tool_catalog_sha256.as_deref(),
-            Some(expected_schema_sha256.as_str()),
-        )
-        .await
-    {
+    let invocation = match if require_read_only_hint {
+        sessions
+            .call_read_only(
+                config,
+                tool,
+                arguments,
+                Some(expected_tool_catalog_sha256.as_str()),
+                Some(expected_schema_sha256.as_str()),
+            )
+            .await
+    } else {
+        sessions
+            .call(
+                config,
+                tool,
+                arguments,
+                Some(expected_tool_catalog_sha256.as_str()),
+                Some(expected_schema_sha256.as_str()),
+            )
+            .await
+    } {
         Ok(invocation) => invocation,
         Err(error) => {
             let error = error.to_string();
-            let stale = error.contains("stale") || error.contains("schema changed");
+            let stale = error.contains("stale")
+                || error.contains("schema changed")
+                || error.contains("catalog changed")
+                || error.contains("readOnlyHint");
             profile.status = if stale {
                 "stale".into()
             } else {

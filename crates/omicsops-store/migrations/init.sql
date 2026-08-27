@@ -217,7 +217,7 @@ WHEN NOT (
     AND (
         NEW.status IS OLD.status
         OR (OLD.status = 'generating' AND NEW.status IN ('revising','cancelled','superseded'))
-        OR (OLD.status = 'revising' AND NEW.status IN ('cancelled','superseded'))
+        OR (OLD.status = 'revising' AND NEW.status IN ('generating','cancelled','superseded'))
         OR (OLD.status = 'pending' AND NEW.status IN ('approved','revising','cancelled','superseded'))
         OR (OLD.status = 'approved' AND NEW.status = 'superseded')
     )

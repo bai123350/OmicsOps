@@ -4,7 +4,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use omicsops_agent_core::ToolPortV4;
+use omicsops_agent_core::{PlanToolAuthorizationV4, ToolPortV4};
 use omicsops_protocol::{RunModeV4, ToolCallV4, ToolDescriptorV4, ToolEffectV4, ToolOutcomeV4};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -13,6 +13,21 @@ use tokio::sync::{Mutex, Semaphore};
 #[async_trait]
 pub trait ToolExecutorV4: Send + Sync {
     async fn execute(&self, call: &ToolCallV4) -> Result<ToolOutcomeV4, String>;
+    /// Dynamic authority for the generic MCP wrapper in Plan mode. Ordinary
+    /// executors do not expose Network tools to planning; the desktop
+    /// executor overrides this only after checking the concrete target.
+    async fn authorize_plan_call(
+        &self,
+        _call: &ToolCallV4,
+    ) -> Result<PlanToolAuthorizationV4, String> {
+        Err("dynamic Plan tool authorization is unavailable".into())
+    }
+    /// Execute a call already authorized in Plan mode. This separate seam
+    /// lets a host re-run dynamic checks with an explicit Plan context while
+    /// preserving ordinary Execute authorization for the same wrapper.
+    async fn execute_plan(&self, call: &ToolCallV4) -> Result<ToolOutcomeV4, String> {
+        self.execute(call).await
+    }
     async fn interrupt(&self, _run_id: uuid::Uuid) -> Result<(), String> {
         Ok(())
     }
@@ -77,20 +92,12 @@ impl ToolRegistryV4 {
             .definitions
             .get(&call.tool_id)
             .ok_or_else(|| ToolRegistryErrorV4::Unknown(call.tool_id.clone()))?;
-        let planning_allowed = matches!(
-            call.tool_id.as_str(),
-            "project.list"
-                | "project.read"
-                | "search_skills"
-                | "use_skill"
-                | "search_memory"
-                | "search_mcp_tools"
-                | "agent.request_input"
-                | "agent.propose_plan"
-        );
-        if mode == RunModeV4::Plan
-            && (!planning_allowed || definition.effect != ToolEffectV4::ReadOnly)
-        {
+        let planning_allowed = definition.effect == ToolEffectV4::ReadOnly
+            || matches!(
+                call.tool_id.as_str(),
+                "agent.request_input" | "agent.propose_plan" | "use_mcp_tool"
+            );
+        if mode == RunModeV4::Plan && !planning_allowed {
             return Err(ToolRegistryErrorV4::PlanModeDenied(call.tool_id.clone()));
         }
         let coordinator = matches!(
@@ -110,6 +117,42 @@ impl ToolRegistryV4 {
             .map_err(|error| ToolRegistryErrorV4::InvalidArguments(call.tool_id.clone(), error))?;
         Ok(definition)
     }
+
+    async fn authorize_plan_call(
+        &self,
+        call: &ToolCallV4,
+    ) -> Result<PlanToolAuthorizationV4, String> {
+        let definition = self
+            .authorize(RunModeV4::Plan, call)
+            .map_err(|error| error.to_string())?;
+        if call.tool_id == "use_mcp_tool" {
+            let authorization = self.executor.authorize_plan_call(call).await?;
+            return match &authorization {
+                PlanToolAuthorizationV4::Allowed {
+                    effect: ToolEffectV4::ReadOnly,
+                }
+                | PlanToolAuthorizationV4::RequiresApproval {
+                    effect: ToolEffectV4::ReadOnly,
+                    ..
+                } => Ok(authorization),
+                PlanToolAuthorizationV4::Allowed { .. }
+                | PlanToolAuthorizationV4::RequiresApproval { .. } => {
+                    Err(ToolRegistryErrorV4::PlanModeDenied(call.tool_id.clone()).to_string())
+                }
+            };
+        }
+        if definition.effect == ToolEffectV4::ReadOnly
+            || matches!(
+                call.tool_id.as_str(),
+                "agent.request_input" | "agent.propose_plan"
+            )
+        {
+            return Ok(PlanToolAuthorizationV4::Allowed {
+                effect: definition.effect,
+            });
+        }
+        Err(ToolRegistryErrorV4::PlanModeDenied(call.tool_id.clone()).to_string())
+    }
 }
 
 #[async_trait]
@@ -118,17 +161,13 @@ impl ToolPortV4 for ToolRegistryV4 {
         self.definitions
             .values()
             .filter(|definition| match mode {
-                RunModeV4::Plan => matches!(
-                    definition.id.as_str(),
-                    "project.list"
-                        | "project.read"
-                        | "search_skills"
-                        | "use_skill"
-                        | "search_memory"
-                        | "search_mcp_tools"
-                        | "agent.request_input"
-                        | "agent.propose_plan"
-                ),
+                RunModeV4::Plan => {
+                    definition.effect == ToolEffectV4::ReadOnly
+                        || matches!(
+                            definition.id.as_str(),
+                            "agent.request_input" | "agent.propose_plan" | "use_mcp_tool"
+                        )
+                }
                 RunModeV4::Execute => {
                     definition.id != "agent.propose_plan"
                         && self.execute_capabilities.as_ref().is_none_or(|allowed| {
@@ -155,18 +194,47 @@ impl ToolPortV4 for ToolRegistryV4 {
             .map_err(|error| error.to_string())
     }
 
+    async fn authorize_plan_call(
+        &self,
+        call: &ToolCallV4,
+    ) -> Result<PlanToolAuthorizationV4, String> {
+        self.authorize_plan_call(call).await
+    }
+
     async fn execute(&self, mode: RunModeV4, call: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+        let plan_effect = if mode == RunModeV4::Plan {
+            match ToolPortV4::authorize_plan_call(self, &call).await? {
+                PlanToolAuthorizationV4::Allowed { effect } => Some(effect),
+                PlanToolAuthorizationV4::RequiresApproval { .. } => {
+                    return Err(format!(
+                        "tool {} requires explicit approval in plan mode",
+                        call.tool_id
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let effect = self
             .authorize(mode, &call)
             .map_err(|error| error.to_string())?
             .effect;
+        let effect = plan_effect.unwrap_or(effect);
         if effect == ToolEffectV4::ReadOnly {
             let _permit = self
                 .read_slots
                 .acquire()
                 .await
                 .map_err(|_| "V4 read-only tool scheduler is closed".to_string())?;
-            self.executor.execute(&call).await
+            if mode == RunModeV4::Plan {
+                self.executor.execute_plan(&call).await
+            } else {
+                self.executor.execute(&call).await
+            }
+        } else if mode == RunModeV4::Plan {
+            // The only non-read-only descriptor visible in Plan is the
+            // generic MCP wrapper; its concrete target was authorized above.
+            self.executor.execute_plan(&call).await
         } else {
             let _guard = self.side_effect_lock.lock().await;
             self.executor.execute(&call).await
@@ -281,7 +349,10 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
             "use_mcp_tool",
             "Call one configured, enabled, launch-approved MCP stdio tool. A persistently approved tool is callable immediately; otherwise the Host can require explicit schema-bound approval for this run",
             ToolEffectV4::Network,
-            json!({"type":"object","required":["server_id","tool","arguments","schema_sha256"],"properties":{"server_id":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"},"schema_sha256":{"type":"string"}}}),
+            // `catalog_sha256` is required by the dynamic Plan gate, but it
+            // remains optional at the shared descriptor boundary so legacy
+            // Execute calls (which predate catalog binding) stay readable.
+            json!({"type":"object","required":["server_id","tool","arguments","schema_sha256"],"properties":{"server_id":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"},"catalog_sha256":{"type":"string","minLength":1},"schema_sha256":{"type":"string","minLength":1}}}),
         ),
         descriptor(
             "agent.request_input",
@@ -384,6 +455,73 @@ mod tests {
             })
         }
     }
+
+    struct DynamicPlanExecutor {
+        authorization: PlanToolAuthorizationV4,
+        dispatches: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ToolExecutorV4 for DynamicPlanExecutor {
+        async fn execute(&self, call: &ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            self.dispatches.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutcomeV4 {
+                call_id: call.call_id.clone(),
+                tool_id: call.tool_id.clone(),
+                succeeded: true,
+                model_content: "unexpected dispatch".into(),
+                data: json!({}),
+                provenance: vec![],
+            })
+        }
+
+        async fn authorize_plan_call(
+            &self,
+            _call: &ToolCallV4,
+        ) -> Result<PlanToolAuthorizationV4, String> {
+            Ok(self.authorization.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_plan_mcp_authorization_must_be_read_only_before_dispatch() {
+        for authorization in [
+            PlanToolAuthorizationV4::Allowed {
+                effect: ToolEffectV4::Network,
+            },
+            PlanToolAuthorizationV4::RequiresApproval {
+                effect: ToolEffectV4::Network,
+                reason: "untrusted dynamic effect".into(),
+            },
+        ] {
+            let executor = Arc::new(DynamicPlanExecutor {
+                authorization,
+                dispatches: AtomicUsize::new(0),
+            });
+            let registry =
+                ToolRegistryV4::new(builtin_tool_definitions_v4(), executor.clone()).unwrap();
+            let error = registry
+                .execute(
+                    RunModeV4::Plan,
+                    ToolCallV4 {
+                        call_id: "dynamic-mcp".into(),
+                        tool_id: "use_mcp_tool".into(),
+                        arguments: json!({
+                            "server_id": "server",
+                            "tool": "read",
+                            "arguments": {},
+                            "catalog_sha256": "catalog",
+                            "schema_sha256": "schema"
+                        }),
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(error.contains("forbidden in plan mode"), "{error}");
+            assert_eq!(executor.dispatches.load(Ordering::SeqCst), 0);
+        }
+    }
+
     #[tokio::test]
     async fn plan_mode_hard_denies_runtime() {
         let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap();
@@ -396,7 +534,10 @@ mod tests {
         assert!(planning.contains("use_skill"));
         assert!(planning.contains("search_memory"));
         assert!(planning.contains("search_mcp_tools"));
-        assert!(!planning.contains("use_mcp_tool"));
+        // The generic MCP wrapper remains visible so the planner can request
+        // a concrete target; its Network effect is dynamically gated by the
+        // host rather than being treated as a permanently read-only tool.
+        assert!(planning.contains("use_mcp_tool"));
         let error = registry
             .execute(
                 RunModeV4::Plan,
@@ -409,18 +550,119 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("forbidden in plan mode"));
-        let error = registry
+        let result = registry
             .execute(
                 RunModeV4::Plan,
                 ToolCallV4 {
-                    call_id: "2".into(),
+                    call_id: "3".into(),
                     tool_id: "artifact.verify".into(),
                     arguments: json!({"path":"a"}),
                 },
             )
             .await
+            .unwrap();
+        assert!(result.succeeded);
+    }
+
+    #[tokio::test]
+    async fn any_custom_read_only_descriptor_is_visible_and_executable_in_plan() {
+        let registry = ToolRegistryV4::new(
+            vec![descriptor(
+                "custom.inspect",
+                "custom read-only inspection",
+                ToolEffectV4::ReadOnly,
+                json!({"type":"object"}),
+            )],
+            Arc::new(Noop),
+        )
+        .unwrap();
+        assert!(
+            registry
+                .descriptors(RunModeV4::Plan)
+                .iter()
+                .any(|tool| tool.id == "custom.inspect")
+        );
+        registry
+            .validate(
+                RunModeV4::Plan,
+                &ToolCallV4 {
+                    call_id: "custom".into(),
+                    tool_id: "custom.inspect".into(),
+                    arguments: json!({}),
+                },
+            )
+            .unwrap();
+        assert!(
+            registry
+                .execute(
+                    RunModeV4::Plan,
+                    ToolCallV4 {
+                        call_id: "custom".into(),
+                        tool_id: "custom.inspect".into(),
+                        arguments: json!({}),
+                    },
+                )
+                .await
+                .unwrap()
+                .succeeded
+        );
+    }
+
+    #[test]
+    fn all_non_read_only_effects_are_denied_in_plan_by_default() {
+        for (id, effect) in [
+            ("custom.runtime", ToolEffectV4::Runtime),
+            ("custom.mutating", ToolEffectV4::Mutating),
+            ("custom.network", ToolEffectV4::Network),
+            ("custom.delegation", ToolEffectV4::Delegation),
+        ] {
+            let registry = ToolRegistryV4::new(
+                vec![descriptor(id, id, effect, json!({"type":"object"}))],
+                Arc::new(Noop),
+            )
+            .unwrap();
+            let error = registry
+                .validate(
+                    RunModeV4::Plan,
+                    &ToolCallV4 {
+                        call_id: id.into(),
+                        tool_id: id.into(),
+                        arguments: json!({}),
+                    },
+                )
+                .unwrap_err();
+            assert!(error.contains("forbidden in plan mode"), "{id}: {error}");
+            assert!(
+                registry
+                    .descriptors(RunModeV4::Plan)
+                    .iter()
+                    .all(|tool| tool.id != id)
+            );
+        }
+    }
+
+    #[test]
+    fn delegation_is_denied_in_plan_even_when_execute_capability_exists() {
+        let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop))
+            .unwrap()
+            .with_execute_capabilities(BTreeSet::from(["agent.delegate".into()]));
+        let error = registry
+            .validate(
+                RunModeV4::Plan,
+                &ToolCallV4 {
+                    call_id: "delegate-plan".into(),
+                    tool_id: "agent.delegate".into(),
+                    arguments: json!({"schema_version":4,"nodes":[]}),
+                },
+            )
             .unwrap_err();
         assert!(error.contains("forbidden in plan mode"));
+        assert!(
+            !registry
+                .descriptors(RunModeV4::Plan)
+                .iter()
+                .any(|tool| tool.id == "agent.delegate")
+        );
     }
 
     #[test]

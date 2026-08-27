@@ -37,6 +37,10 @@ pub struct ModelTurnV4 {
     pub tool_calls: Vec<ToolCallV4>,
 }
 
+/// Re-export the protocol-owned scope/hash helpers for callers that already
+/// depend on the agent-core planning API.
+pub use omicsops_protocol::{PlanApprovalScopeV4, plan_approval_scope_hash};
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReviewerRequestV4 {
     pub frozen_objective: String,
@@ -139,10 +143,48 @@ pub trait ToolPortV4: Send + Sync {
     fn validate(&self, _mode: RunModeV4, _call: &ToolCallV4) -> Result<(), String> {
         Ok(())
     }
+    /// Authorize one Plan-mode call after the caller has supplied its
+    /// arguments. Implementations may perform a dynamic host check here (for
+    /// example, re-reading a configured MCP profile and its live catalog).
+    /// Static read-only descriptors are allowed by default; all other effects
+    /// require an explicit implementation-specific dynamic seam.
+    async fn authorize_plan_call(
+        &self,
+        call: &ToolCallV4,
+    ) -> Result<PlanToolAuthorizationV4, String> {
+        let effect = self
+            .effect(&call.tool_id)
+            .ok_or_else(|| format!("unknown tool {}", call.tool_id))?;
+        if effect == ToolEffectV4::ReadOnly
+            || matches!(
+                call.tool_id.as_str(),
+                "agent.request_input" | "agent.propose_plan"
+            )
+        {
+            Ok(PlanToolAuthorizationV4::Allowed { effect })
+        } else {
+            Err(format!("tool {} is forbidden in plan mode", call.tool_id))
+        }
+    }
     async fn execute(&self, mode: RunModeV4, call: ToolCallV4) -> Result<ToolOutcomeV4, String>;
     async fn interrupt(&self, _run_id: Uuid) -> Result<(), String> {
         Ok(())
     }
+}
+
+/// Result of the dynamic Plan-mode authorization seam. A pending approval is
+/// deliberately distinct from denial so the orchestrator can persist one
+/// exact-call approval request and pause without treating it as a tool
+/// failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanToolAuthorizationV4 {
+    Allowed {
+        effect: ToolEffectV4,
+    },
+    RequiresApproval {
+        effect: ToolEffectV4,
+        reason: String,
+    },
 }
 
 #[async_trait]
@@ -299,6 +341,63 @@ impl AgentCoreV4<'_> {
         objective: &str,
         cancelled: Arc<AtomicBool>,
     ) -> Result<ExecutionPlanV4, AgentCoreErrorV4> {
+        self.plan_with_cancellation_scoped(
+            run_id,
+            project_id,
+            conversation_id,
+            objective,
+            PlanApprovalScopeV4 {
+                project_id,
+                conversation_id,
+                run_id,
+                revision_id: Uuid::nil(),
+                revision: 0,
+            },
+            cancelled,
+        )
+        .await
+    }
+
+    /// Plan entry point used by the desktop lifecycle. The supplied revision
+    /// identity is retained in any one-time tool approval request and is
+    /// therefore stable across a pause/resume cycle.
+    pub async fn plan_with_scope(
+        &self,
+        run_id: Uuid,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        objective: &str,
+        scope: PlanApprovalScopeV4,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<ExecutionPlanV4, AgentCoreErrorV4> {
+        if scope.project_id != project_id
+            || scope.conversation_id != conversation_id
+            || scope.run_id != run_id
+        {
+            return Err(AgentCoreErrorV4::Tool(
+                "Plan approval scope does not match the planning run".into(),
+            ));
+        }
+        self.plan_with_cancellation_scoped(
+            run_id,
+            project_id,
+            conversation_id,
+            objective,
+            scope,
+            cancelled,
+        )
+        .await
+    }
+
+    async fn plan_with_cancellation_scoped(
+        &self,
+        run_id: Uuid,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        objective: &str,
+        scope: PlanApprovalScopeV4,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<ExecutionPlanV4, AgentCoreErrorV4> {
         if self.stop_if_cancelled(run_id, &cancelled).await? {
             return Err(AgentCoreErrorV4::Cancelled);
         }
@@ -320,6 +419,8 @@ impl AgentCoreV4<'_> {
             ))
             .await?;
         }
+        self.recover_pending_plan_tool_call(scope, &cancelled)
+            .await?;
         for _ in 0..16 {
             if self.stop_if_cancelled(run_id, &cancelled).await? {
                 return Err(AgentCoreErrorV4::Cancelled);
@@ -405,11 +506,58 @@ impl AgentCoreV4<'_> {
                 if self.stop_if_cancelled(run_id, &cancelled).await? {
                     return Err(AgentCoreErrorV4::Cancelled);
                 }
-                let outcome = self
+                self.tools
+                    .validate(RunModeV4::Plan, &call)
+                    .map_err(AgentCoreErrorV4::Tool)?;
+                let authorization = self
                     .tools
-                    .execute(RunModeV4::Plan, call)
+                    .authorize_plan_call(&call)
                     .await
                     .map_err(AgentCoreErrorV4::Tool)?;
+                let effect = match authorization {
+                    PlanToolAuthorizationV4::Allowed { effect }
+                    | PlanToolAuthorizationV4::RequiresApproval { effect, .. }
+                        if effect != ToolEffectV4::ReadOnly =>
+                    {
+                        return Err(AgentCoreErrorV4::Tool(
+                            "Plan tool authorization must be read-only".into(),
+                        ));
+                    }
+                    PlanToolAuthorizationV4::Allowed { effect } => effect,
+                    PlanToolAuthorizationV4::RequiresApproval { effect, reason } => {
+                        let request = self.plan_approval_request(scope, call, effect, reason)?;
+                        self.push(run_id, AgentEventKindV4::ToolApprovalRequested { request })
+                            .await?;
+                        return Err(AgentCoreErrorV4::WaitingForApproval);
+                    }
+                };
+                self.push(
+                    run_id,
+                    AgentEventKindV4::ToolDispatchStarted {
+                        call_id: call.call_id.clone(),
+                        tool_id: call.tool_id.clone(),
+                        effect,
+                        idempotency_key: call.call_id.clone(),
+                    },
+                )
+                .await?;
+                let outcome = match self.tools.execute(RunModeV4::Plan, call.clone()).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        self.push(
+                            run_id,
+                            AgentEventKindV4::ToolDispatchUncertain {
+                                call_id: call.call_id.clone(),
+                                tool_id: call.tool_id.clone(),
+                            },
+                        )
+                        .await?;
+                        return Err(AgentCoreErrorV4::UncertainSideEffect(format!(
+                            "{}: {error}",
+                            call.call_id
+                        )));
+                    }
+                };
                 if self.stop_if_cancelled(run_id, &cancelled).await? {
                     return Err(AgentCoreErrorV4::Cancelled);
                 }
@@ -797,24 +945,8 @@ impl AgentCoreV4<'_> {
                     }
                 };
                 for (call, result) in outcomes {
-                    let effect = self.tools.effect(&call.tool_id).ok_or_else(|| {
-                        AgentCoreErrorV4::Tool(format!("unknown tool {}", call.tool_id))
-                    })?;
                     let mut outcome = match result {
                         Ok(outcome) => outcome,
-                        Err(error) if effect == ToolEffectV4::ReadOnly => ToolOutcomeV4 {
-                            call_id: call.call_id.clone(),
-                            tool_id: call.tool_id.clone(),
-                            succeeded: false,
-                            model_content: format!(
-                                "tool execution failed; inspect the error, correct the approach, and try a repaired call: {error}"
-                            ),
-                            data: json!({
-                                "error_kind": "tool_execution",
-                                "recoverable": true,
-                            }),
-                            provenance: vec![],
-                        },
                         Err(error) => {
                             self.push(
                                 spec.run_id,
@@ -1722,19 +1854,6 @@ impl AgentCoreV4<'_> {
             .await?;
             let mut outcome = match self.tools.execute(RunModeV4::Execute, call.clone()).await {
                 Ok(outcome) => outcome,
-                Err(error) if effect == ToolEffectV4::ReadOnly => ToolOutcomeV4 {
-                    call_id: call.call_id.clone(),
-                    tool_id: call.tool_id.clone(),
-                    succeeded: false,
-                    model_content: format!(
-                        "tool execution failed; inspect the error, correct the approach, and try a repaired call: {error}"
-                    ),
-                    data: json!({
-                        "error_kind": "tool_execution",
-                        "recoverable": true,
-                    }),
-                    provenance: vec![],
-                },
                 Err(error) => {
                     self.push(
                         run_id,
@@ -1773,6 +1892,224 @@ impl AgentCoreV4<'_> {
             }
         }
         Ok(())
+    }
+
+    async fn recover_pending_plan_tool_call(
+        &self,
+        scope: PlanApprovalScopeV4,
+        cancelled: &AtomicBool,
+    ) -> Result<(), AgentCoreErrorV4> {
+        let events = self
+            .events
+            .load(scope.run_id)
+            .await
+            .map_err(AgentCoreErrorV4::Store)?;
+        let mut pending = BTreeMap::<String, (ToolCallV4, bool)>::new();
+        for event in &events {
+            match &event.event {
+                AgentEventKindV4::ToolRequested { call }
+                    if !matches!(
+                        call.tool_id.as_str(),
+                        "agent.complete" | "agent.request_input" | "agent.propose_plan"
+                    ) =>
+                {
+                    pending.insert(call.call_id.clone(), (call.clone(), false));
+                }
+                AgentEventKindV4::ToolDispatchStarted { call_id, .. } => {
+                    if let Some((_, dispatched)) = pending.get_mut(call_id.as_str()) {
+                        *dispatched = true;
+                    }
+                }
+                AgentEventKindV4::ToolFinished { outcome }
+                | AgentEventKindV4::ToolOutcomeReused { outcome, .. } => {
+                    pending.remove(&outcome.call_id);
+                }
+                _ => {}
+            }
+        }
+        let Some((call, dispatched)) = pending.into_values().next() else {
+            return Ok(());
+        };
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(AgentCoreErrorV4::Cancelled);
+        }
+        if dispatched {
+            if !events.iter().any(|event| {
+                matches!(
+                    &event.event,
+                    AgentEventKindV4::ToolDispatchUncertain { call_id, .. }
+                        if call_id == &call.call_id
+                )
+            }) {
+                self.push(
+                    scope.run_id,
+                    AgentEventKindV4::ToolDispatchUncertain {
+                        call_id: call.call_id.clone(),
+                        tool_id: call.tool_id.clone(),
+                    },
+                )
+                .await?;
+            }
+            return Err(AgentCoreErrorV4::UncertainSideEffect(call.call_id));
+        }
+        self.tools
+            .validate(RunModeV4::Plan, &call)
+            .map_err(AgentCoreErrorV4::Tool)?;
+        let decision = self.plan_approval_decision(scope, &call, &events)?;
+        if let Some(ToolApprovalDecisionV4::Denied) = decision {
+            self.push(
+                scope.run_id,
+                AgentEventKindV4::ToolFinished {
+                    outcome: ToolOutcomeV4 {
+                        call_id: call.call_id,
+                        tool_id: call.tool_id,
+                        succeeded: false,
+                        model_content: "user denied this Plan-mode MCP request".into(),
+                        data: json!({"error_kind":"approval_denied","recoverable":true}),
+                        provenance: vec!["tool-approval-v4".into()],
+                    },
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+        let authorization = self
+            .tools
+            .authorize_plan_call(&call)
+            .await
+            .map_err(AgentCoreErrorV4::Tool)?;
+        let authorization_effect = match &authorization {
+            PlanToolAuthorizationV4::Allowed { effect }
+            | PlanToolAuthorizationV4::RequiresApproval { effect, .. } => *effect,
+        };
+        if authorization_effect != ToolEffectV4::ReadOnly {
+            return Err(AgentCoreErrorV4::Tool(
+                "Plan tool authorization must be read-only".into(),
+            ));
+        }
+        let effect = match authorization {
+            PlanToolAuthorizationV4::Allowed { effect } => effect,
+            PlanToolAuthorizationV4::RequiresApproval { effect, .. }
+                if decision == Some(ToolApprovalDecisionV4::Approved) =>
+            {
+                effect
+            }
+            PlanToolAuthorizationV4::RequiresApproval { .. } => {
+                if decision.is_none() {
+                    return Err(AgentCoreErrorV4::WaitingForApproval);
+                }
+                return Err(AgentCoreErrorV4::Tool(
+                    "approved Plan tool no longer satisfies its dynamic authorization".into(),
+                ));
+            }
+        };
+        self.push(
+            scope.run_id,
+            AgentEventKindV4::ToolDispatchStarted {
+                call_id: call.call_id.clone(),
+                tool_id: call.tool_id.clone(),
+                effect,
+                idempotency_key: call.call_id.clone(),
+            },
+        )
+        .await?;
+        let outcome = match self.tools.execute(RunModeV4::Plan, call.clone()).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.push(
+                    scope.run_id,
+                    AgentEventKindV4::ToolDispatchUncertain {
+                        call_id: call.call_id.clone(),
+                        tool_id: call.tool_id.clone(),
+                    },
+                )
+                .await?;
+                return Err(AgentCoreErrorV4::UncertainSideEffect(format!(
+                    "{}: {error}",
+                    call.call_id
+                )));
+            }
+        };
+        self.push(scope.run_id, AgentEventKindV4::ToolFinished { outcome })
+            .await?;
+        Ok(())
+    }
+
+    fn plan_approval_request(
+        &self,
+        scope: PlanApprovalScopeV4,
+        call: ToolCallV4,
+        effect: ToolEffectV4,
+        reason: String,
+    ) -> Result<ToolApprovalRequestV4, AgentCoreErrorV4> {
+        if effect != ToolEffectV4::ReadOnly || call.tool_id != "use_mcp_tool" {
+            return Err(AgentCoreErrorV4::Tool(
+                "only a concrete read-only MCP target can request Plan approval".into(),
+            ));
+        }
+        let reason = if reason.trim().is_empty() {
+            plan_approval_reason().to_owned()
+        } else {
+            reason
+        };
+        ToolApprovalRequestV4::new_with_scope(scope.run_id, &scope.hash(), call, effect, reason)
+            .map_err(|error| AgentCoreErrorV4::Store(error.to_string()))
+    }
+
+    fn plan_approval_decision(
+        &self,
+        scope: PlanApprovalScopeV4,
+        call: &ToolCallV4,
+        events: &[AgentEventV4],
+    ) -> Result<Option<ToolApprovalDecisionV4>, AgentCoreErrorV4> {
+        let call_hash = call
+            .canonical_hash()
+            .map_err(|error| AgentCoreErrorV4::Store(error.to_string()))?;
+        let request = events.iter().find_map(|event| match &event.event {
+            AgentEventKindV4::ToolApprovalRequested { request }
+                if request.mode == RunModeV4::Plan
+                    && request.call == *call
+                    && request.call_hash == call_hash
+                    && request.effect == ToolEffectV4::ReadOnly
+                    && request.scope_hash.is_some() =>
+            {
+                Some(request)
+            }
+            _ => None,
+        });
+        let Some(request) = request else {
+            return Ok(None);
+        };
+        let scope_hash = request.scope_hash.as_deref().ok_or_else(|| {
+            AgentCoreErrorV4::Store("Plan approval request has no scope hash".into())
+        })?;
+        if scope_hash != scope.hash() {
+            return Err(AgentCoreErrorV4::Store(
+                "Plan approval request belongs to an older or different revision".into(),
+            ));
+        }
+        request
+            .validate_with_scope(scope.run_id, &scope.hash(), RunModeV4::Plan)
+            .map_err(|error| AgentCoreErrorV4::Store(error.to_string()))?;
+        let mut decision = None;
+        for event in events {
+            if let AgentEventKindV4::ToolApprovalDecided {
+                approval_id,
+                call_hash: decided_hash,
+                decision: value,
+            } = &event.event
+            {
+                if approval_id == &request.approval_id {
+                    if decided_hash != &request.call_hash || decision.is_some() {
+                        return Err(AgentCoreErrorV4::Store(
+                            "tool approval decision is duplicated or tampered".into(),
+                        ));
+                    }
+                    decision = Some(*value);
+                }
+            }
+        }
+        Ok(decision)
     }
 
     fn approval_request(
@@ -1816,6 +2153,12 @@ impl AgentCoreV4<'_> {
         let mut matching_request = None;
         for event in events {
             if let AgentEventKindV4::ToolApprovalRequested { request } = &event.event {
+                // Execute approvals are intentionally disjoint from Plan
+                // approvals. A shared call_id is not sufficient to bind a
+                // decision because Plan requests carry a revision scope.
+                if request.mode != RunModeV4::Execute || request.scope_hash.is_some() {
+                    continue;
+                }
                 if request.call.call_id == call.call_id {
                     request
                         .validate(spec.run_id, &spec_hash)
@@ -2396,6 +2739,10 @@ fn approval_reason(effect: ToolEffectV4) -> &'static str {
     }
 }
 
+fn plan_approval_reason() -> &'static str {
+    "The third-party readOnlyHint is an unverified hint trusted by the user, not a host guarantee; approve this exact MCP read-only call only if you trust the configured server and arguments."
+}
+
 fn recoverable_scientific_declaration_error(message: &str) -> bool {
     message.starts_with("invalid analysis declaration:")
         || (message.starts_with("dataset ") && message.ends_with(" is missing or inactive"))
@@ -2912,6 +3259,207 @@ mod tests {
             })
         }
     }
+
+    struct PlanApprovalTools {
+        execute_count: Arc<AtomicUsize>,
+        live_authorization: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ToolPortV4 for PlanApprovalTools {
+        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
+            vec![
+                ToolDescriptorV4 {
+                    id: "use_mcp_tool".into(),
+                    description: "read-only MCP fixture".into(),
+                    input_schema: json!({"type":"object"}),
+                    effect: ToolEffectV4::Network,
+                },
+                ToolDescriptorV4 {
+                    id: "agent.propose_plan".into(),
+                    description: "propose plan".into(),
+                    input_schema: json!({"type":"object"}),
+                    effect: ToolEffectV4::ReadOnly,
+                },
+            ]
+        }
+
+        fn effect(&self, tool_id: &str) -> Option<ToolEffectV4> {
+            match tool_id {
+                "use_mcp_tool" => Some(ToolEffectV4::Network),
+                "agent.propose_plan" => Some(ToolEffectV4::ReadOnly),
+                _ => None,
+            }
+        }
+
+        async fn authorize_plan_call(
+            &self,
+            call: &ToolCallV4,
+        ) -> Result<PlanToolAuthorizationV4, String> {
+            if call.tool_id != "use_mcp_tool" {
+                return Ok(PlanToolAuthorizationV4::Allowed {
+                    effect: ToolEffectV4::ReadOnly,
+                });
+            }
+            if !self.live_authorization.load(AtomicOrdering::SeqCst) {
+                return Err("live MCP authorization changed".into());
+            }
+            Ok(PlanToolAuthorizationV4::RequiresApproval {
+                effect: ToolEffectV4::ReadOnly,
+                reason: "fixture approval".into(),
+            })
+        }
+
+        async fn execute(&self, _: RunModeV4, call: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            self.execute_count.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(ToolOutcomeV4 {
+                call_id: call.call_id,
+                tool_id: call.tool_id,
+                succeeded: true,
+                model_content: "fixture result".into(),
+                data: json!({"ok":true}),
+                provenance: vec!["plan-approval-fixture".into()],
+            })
+        }
+    }
+
+    struct PlanDispatchTools {
+        execute_count: Arc<AtomicUsize>,
+        authorization: PlanToolAuthorizationV4,
+        execute_error: bool,
+    }
+
+    #[async_trait]
+    impl ToolPortV4 for PlanDispatchTools {
+        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
+            vec![
+                ToolDescriptorV4 {
+                    id: "use_mcp_tool".into(),
+                    description: "read-only MCP fixture".into(),
+                    input_schema: json!({"type":"object"}),
+                    effect: ToolEffectV4::Network,
+                },
+                ToolDescriptorV4 {
+                    id: "agent.propose_plan".into(),
+                    description: "propose plan".into(),
+                    input_schema: json!({"type":"object"}),
+                    effect: ToolEffectV4::ReadOnly,
+                },
+            ]
+        }
+
+        fn effect(&self, tool_id: &str) -> Option<ToolEffectV4> {
+            match tool_id {
+                "use_mcp_tool" => Some(ToolEffectV4::Network),
+                "agent.propose_plan" => Some(ToolEffectV4::ReadOnly),
+                _ => None,
+            }
+        }
+
+        async fn authorize_plan_call(
+            &self,
+            call: &ToolCallV4,
+        ) -> Result<PlanToolAuthorizationV4, String> {
+            if call.tool_id == "use_mcp_tool" {
+                Ok(self.authorization.clone())
+            } else {
+                Ok(PlanToolAuthorizationV4::Allowed {
+                    effect: ToolEffectV4::ReadOnly,
+                })
+            }
+        }
+
+        async fn execute(&self, _: RunModeV4, call: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            self.execute_count.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.execute_error {
+                return Err("fixture transport failed after dispatch".into());
+            }
+            Ok(ToolOutcomeV4 {
+                call_id: call.call_id,
+                tool_id: call.tool_id,
+                succeeded: true,
+                model_content: "fixture result".into(),
+                data: json!({"ok":true}),
+                provenance: vec!["plan-dispatch-fixture".into()],
+            })
+        }
+    }
+
+    fn plan_approval_fixture_call() -> ToolCallV4 {
+        ToolCallV4 {
+            call_id: "plan-mcp-call".into(),
+            tool_id: "use_mcp_tool".into(),
+            arguments: json!({
+                "server_id": Uuid::new_v4(),
+                "tool": "search",
+                "catalog_sha256": "catalog",
+                "schema_sha256": "schema",
+                "arguments": {"query":"fixture"}
+            }),
+        }
+    }
+
+    fn plan_approval_scope(
+        run_id: Uuid,
+        project_id: Uuid,
+        conversation_id: Uuid,
+    ) -> PlanApprovalScopeV4 {
+        PlanApprovalScopeV4 {
+            project_id,
+            conversation_id,
+            run_id,
+            revision_id: Uuid::new_v4(),
+            revision: 1,
+        }
+    }
+
+    fn append_plan_approval_decision(
+        store: &MemoryStore,
+        scope: PlanApprovalScopeV4,
+        call: &ToolCallV4,
+        decision: ToolApprovalDecisionV4,
+    ) {
+        let events = store.events.lock().unwrap().clone();
+        let request = events
+            .iter()
+            .find_map(|event| match &event.event {
+                AgentEventKindV4::ToolApprovalRequested { request } if request.call == *call => {
+                    Some(request.clone())
+                }
+                _ => None,
+            })
+            .expect("Plan approval request fixture");
+        assert_eq!(request.scope_hash.as_deref(), Some(scope.hash().as_str()));
+        let previous = events.last().expect("event chain fixture");
+        store
+            .append_direct(&AgentEventV4::next(
+                previous,
+                Utc::now(),
+                AgentEventKindV4::ToolApprovalDecided {
+                    approval_id: request.approval_id,
+                    call_hash: request.call_hash,
+                    decision,
+                },
+            ))
+            .unwrap();
+    }
+
+    fn append_plan_dispatch_started(store: &MemoryStore, call: &ToolCallV4) {
+        let events = store.events.lock().unwrap().clone();
+        let previous = events.last().expect("event chain fixture");
+        store
+            .append_direct(&AgentEventV4::next(
+                previous,
+                Utc::now(),
+                AgentEventKindV4::ToolDispatchStarted {
+                    call_id: call.call_id.clone(),
+                    tool_id: call.tool_id.clone(),
+                    effect: ToolEffectV4::ReadOnly,
+                    idempotency_key: call.call_id.clone(),
+                },
+            ))
+            .unwrap();
+    }
     #[derive(Default)]
     struct MemoryStore {
         events: Mutex<Vec<AgentEventV4>>,
@@ -3045,6 +3593,669 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e.event, AgentEventKindV4::PlanProposed { .. }))
         );
+    }
+
+    #[tokio::test]
+    async fn plan_approval_request_pauses_before_any_dispatch() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let scope = plan_approval_scope(run_id, project_id, conversation_id);
+        let call = plan_approval_fixture_call();
+        let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
+            public_text: String::new(),
+            tool_calls: vec![call],
+        }]));
+        let store = MemoryStore::default();
+        let execute_count = Arc::new(AtomicUsize::new(0));
+        let tools = PlanApprovalTools {
+            execute_count: execute_count.clone(),
+            live_authorization: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        let result = core
+            .plan_with_scope(
+                run_id,
+                project_id,
+                conversation_id,
+                "inspect literature",
+                scope,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await;
+        assert!(matches!(result, Err(AgentCoreErrorV4::WaitingForApproval)));
+        assert_eq!(execute_count.load(AtomicOrdering::SeqCst), 0);
+        let events = store.load_direct(run_id).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::ToolApprovalRequested { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::ToolDispatchStarted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn undecided_plan_approval_never_dispatches_on_resume() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let scope = plan_approval_scope(run_id, project_id, conversation_id);
+        let call = plan_approval_fixture_call();
+        let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
+            public_text: String::new(),
+            tool_calls: vec![call],
+        }]));
+        let store = MemoryStore::default();
+        let execute_count = Arc::new(AtomicUsize::new(0));
+        let tools = PlanApprovalTools {
+            execute_count: execute_count.clone(),
+            live_authorization: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first = core
+            .plan_with_scope(
+                run_id,
+                project_id,
+                conversation_id,
+                "inspect literature",
+                scope,
+                cancelled.clone(),
+            )
+            .await;
+        assert!(matches!(first, Err(AgentCoreErrorV4::WaitingForApproval)));
+        let second = core
+            .plan_with_scope(
+                run_id,
+                project_id,
+                conversation_id,
+                "inspect literature",
+                scope,
+                cancelled,
+            )
+            .await;
+        assert!(matches!(second, Err(AgentCoreErrorV4::WaitingForApproval)));
+        assert_eq!(execute_count.load(AtomicOrdering::SeqCst), 0);
+        assert!(
+            !store
+                .load_direct(run_id)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::ToolDispatchStarted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_plan_approval_records_no_dispatch_and_can_finish_planning() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let scope = plan_approval_scope(run_id, project_id, conversation_id);
+        let call = plan_approval_fixture_call();
+        let proposal = ExecutionPlanV4 {
+            schema_version: 4,
+            objective: "inspect literature".into(),
+            steps: vec!["summarize".into()],
+            completion_criteria: vec!["summary".into()],
+            requested_capabilities: BTreeSet::new(),
+        };
+        let model = ScriptedModel(Mutex::new(vec![
+            ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![call.clone()],
+            },
+            ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![ToolCallV4 {
+                    call_id: "proposal-after-denial".into(),
+                    tool_id: "agent.propose_plan".into(),
+                    arguments: serde_json::to_value(proposal.clone()).unwrap(),
+                }],
+            },
+        ]));
+        let store = MemoryStore::default();
+        let execute_count = Arc::new(AtomicUsize::new(0));
+        let tools = PlanApprovalTools {
+            execute_count: execute_count.clone(),
+            live_authorization: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first = core
+            .plan_with_scope(
+                run_id,
+                project_id,
+                conversation_id,
+                "inspect literature",
+                scope,
+                cancelled.clone(),
+            )
+            .await;
+        assert!(matches!(first, Err(AgentCoreErrorV4::WaitingForApproval)));
+        append_plan_approval_decision(&store, scope, &call, ToolApprovalDecisionV4::Denied);
+        let resumed = core
+            .plan_with_scope(
+                run_id,
+                project_id,
+                conversation_id,
+                "inspect literature",
+                scope,
+                cancelled,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed, proposal);
+        assert_eq!(execute_count.load(AtomicOrdering::SeqCst), 0);
+        let events = store.load_direct(run_id).unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            AgentEventKindV4::ToolFinished { outcome }
+                if outcome.call_id == call.call_id
+                    && !outcome.succeeded
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::ToolDispatchStarted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_plan_approval_dispatches_exactly_once() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let scope = plan_approval_scope(run_id, project_id, conversation_id);
+        let call = plan_approval_fixture_call();
+        let proposal = ExecutionPlanV4 {
+            schema_version: 4,
+            objective: "inspect literature".into(),
+            steps: vec!["summarize".into()],
+            completion_criteria: vec!["summary".into()],
+            requested_capabilities: BTreeSet::new(),
+        };
+        let model = ScriptedModel(Mutex::new(vec![
+            ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![call.clone()],
+            },
+            ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![ToolCallV4 {
+                    call_id: "proposal-after-approval".into(),
+                    tool_id: "agent.propose_plan".into(),
+                    arguments: serde_json::to_value(proposal.clone()).unwrap(),
+                }],
+            },
+        ]));
+        let store = MemoryStore::default();
+        let execute_count = Arc::new(AtomicUsize::new(0));
+        let tools = PlanApprovalTools {
+            execute_count: execute_count.clone(),
+            live_authorization: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first = core
+            .plan_with_scope(
+                run_id,
+                project_id,
+                conversation_id,
+                "inspect literature",
+                scope,
+                cancelled.clone(),
+            )
+            .await;
+        assert!(matches!(first, Err(AgentCoreErrorV4::WaitingForApproval)));
+        append_plan_approval_decision(&store, scope, &call, ToolApprovalDecisionV4::Approved);
+        let resumed = core
+            .plan_with_scope(
+                run_id,
+                project_id,
+                conversation_id,
+                "inspect literature",
+                scope,
+                cancelled.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed, proposal);
+        assert_eq!(execute_count.load(AtomicOrdering::SeqCst), 1);
+        let before = store.load_direct(run_id).unwrap().len();
+        core.recover_pending_plan_tool_call(scope, &cancelled)
+            .await
+            .unwrap();
+        assert_eq!(execute_count.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(store.load_direct(run_id).unwrap().len(), before);
+    }
+
+    #[tokio::test]
+    async fn approved_plan_call_is_not_dispatched_when_live_reauthorization_changes() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let scope = plan_approval_scope(run_id, project_id, conversation_id);
+        let call = plan_approval_fixture_call();
+        let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
+            public_text: String::new(),
+            tool_calls: vec![call.clone()],
+        }]));
+        let store = MemoryStore::default();
+        let execute_count = Arc::new(AtomicUsize::new(0));
+        let live_authorization = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let tools = PlanApprovalTools {
+            execute_count: execute_count.clone(),
+            live_authorization: live_authorization.clone(),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first = core
+            .plan_with_scope(
+                run_id,
+                project_id,
+                conversation_id,
+                "inspect literature",
+                scope,
+                cancelled.clone(),
+            )
+            .await;
+        assert!(matches!(first, Err(AgentCoreErrorV4::WaitingForApproval)));
+        append_plan_approval_decision(&store, scope, &call, ToolApprovalDecisionV4::Approved);
+        live_authorization.store(false, AtomicOrdering::SeqCst);
+        let resumed = core
+            .plan_with_scope(
+                run_id,
+                project_id,
+                conversation_id,
+                "inspect literature",
+                scope,
+                cancelled,
+            )
+            .await;
+        assert!(
+            matches!(resumed, Err(AgentCoreErrorV4::Tool(message)) if message.contains("live MCP authorization changed"))
+        );
+        assert_eq!(execute_count.load(AtomicOrdering::SeqCst), 0);
+        assert!(
+            !store
+                .load_direct(run_id)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::ToolDispatchStarted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_plan_dispatch_started_is_never_replayed() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let scope = plan_approval_scope(run_id, project_id, conversation_id);
+        let call = plan_approval_fixture_call();
+        let store = MemoryStore::default();
+        let seed = AgentEventV4::first(
+            run_id,
+            project_id,
+            conversation_id,
+            Utc::now(),
+            AgentEventKindV4::RunCreated {
+                mode: RunModeV4::Plan,
+            },
+        );
+        store.append_direct(&seed).unwrap();
+        store
+            .append_direct(&AgentEventV4::next(
+                &seed,
+                Utc::now(),
+                AgentEventKindV4::ToolRequested { call: call.clone() },
+            ))
+            .unwrap();
+        let request = ToolApprovalRequestV4::new_with_scope(
+            run_id,
+            &scope.hash(),
+            call.clone(),
+            ToolEffectV4::ReadOnly,
+            "fixture approval",
+        )
+        .unwrap();
+        let events = store.events.lock().unwrap().clone();
+        let requested = AgentEventV4::next(
+            events.last().unwrap(),
+            Utc::now(),
+            AgentEventKindV4::ToolApprovalRequested {
+                request: request.clone(),
+            },
+        );
+        store.append_direct(&requested).unwrap();
+        append_plan_approval_decision(&store, scope, &call, ToolApprovalDecisionV4::Approved);
+        append_plan_dispatch_started(&store, &call);
+        let execute_count = Arc::new(AtomicUsize::new(0));
+        let tools = PlanApprovalTools {
+            execute_count: execute_count.clone(),
+            live_authorization: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let model = ScriptedModel(Mutex::new(vec![]));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        let result = core
+            .recover_pending_plan_tool_call(scope, &std::sync::atomic::AtomicBool::new(false))
+            .await;
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::UncertainSideEffect(id)) if id == call.call_id)
+        );
+        assert_eq!(execute_count.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(
+            store
+                .load_direct(run_id)
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event.event, AgentEventKindV4::ToolDispatchStarted { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_plan_dispatch_is_recorded_before_execute() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let scope = plan_approval_scope(run_id, project_id, conversation_id);
+        let call = plan_approval_fixture_call();
+        let proposal = ExecutionPlanV4 {
+            schema_version: 4,
+            objective: "inspect literature".into(),
+            steps: vec!["summarize".into()],
+            completion_criteria: vec!["summary".into()],
+            requested_capabilities: BTreeSet::new(),
+        };
+        let model = ScriptedModel(Mutex::new(vec![
+            ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![call.clone()],
+            },
+            ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![ToolCallV4 {
+                    call_id: "proposal-after-allowed".into(),
+                    tool_id: "agent.propose_plan".into(),
+                    arguments: serde_json::to_value(proposal.clone()).unwrap(),
+                }],
+            },
+        ]));
+        let store = MemoryStore::default();
+        let execute_count = Arc::new(AtomicUsize::new(0));
+        let tools = PlanDispatchTools {
+            execute_count: execute_count.clone(),
+            authorization: PlanToolAuthorizationV4::Allowed {
+                effect: ToolEffectV4::ReadOnly,
+            },
+            execute_error: false,
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        assert_eq!(
+            core.plan_with_scope(
+                run_id,
+                project_id,
+                conversation_id,
+                "inspect literature",
+                scope,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await
+            .unwrap(),
+            proposal
+        );
+        assert_eq!(execute_count.load(AtomicOrdering::SeqCst), 1);
+        let events = store.load_direct(run_id).unwrap();
+        let started = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.event,
+                    AgentEventKindV4::ToolDispatchStarted { call_id, effect, .. }
+                        if call_id == &call.call_id && *effect == ToolEffectV4::ReadOnly
+                )
+            })
+            .unwrap();
+        let finished = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.event,
+                    AgentEventKindV4::ToolFinished { outcome }
+                        if outcome.call_id == call.call_id
+                )
+            })
+            .unwrap();
+        assert!(started < finished);
+    }
+
+    #[tokio::test]
+    async fn plan_dynamic_network_authorization_is_fail_closed_on_initial_dispatch() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let scope = plan_approval_scope(run_id, project_id, conversation_id);
+        let call = plan_approval_fixture_call();
+        let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
+            public_text: String::new(),
+            tool_calls: vec![call],
+        }]));
+        let store = MemoryStore::default();
+        let execute_count = Arc::new(AtomicUsize::new(0));
+        let tools = PlanDispatchTools {
+            execute_count: execute_count.clone(),
+            authorization: PlanToolAuthorizationV4::Allowed {
+                effect: ToolEffectV4::Network,
+            },
+            execute_error: false,
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        let result = core
+            .plan_with_scope(
+                run_id,
+                project_id,
+                conversation_id,
+                "inspect literature",
+                scope,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::Tool(message)) if message.contains("read-only"))
+        );
+        assert_eq!(execute_count.load(AtomicOrdering::SeqCst), 0);
+        assert!(
+            !store.load_direct(run_id).unwrap().iter().any(|event| {
+                matches!(event.event, AgentEventKindV4::ToolDispatchStarted { .. })
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_dynamic_network_authorization_is_fail_closed_on_recovery() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let scope = plan_approval_scope(run_id, project_id, conversation_id);
+        let call = plan_approval_fixture_call();
+        let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
+            public_text: String::new(),
+            tool_calls: vec![call.clone()],
+        }]));
+        let store = MemoryStore::default();
+        let initial_execute_count = Arc::new(AtomicUsize::new(0));
+        let initial_tools = PlanApprovalTools {
+            execute_count: initial_execute_count,
+            live_authorization: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let initial_core = AgentCoreV4 {
+            model: &model,
+            tools: &initial_tools,
+            events: &store,
+            science: None,
+        };
+        assert!(matches!(
+            initial_core
+                .plan_with_scope(
+                    run_id,
+                    project_id,
+                    conversation_id,
+                    "inspect literature",
+                    scope,
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                )
+                .await,
+            Err(AgentCoreErrorV4::WaitingForApproval)
+        ));
+        append_plan_approval_decision(&store, scope, &call, ToolApprovalDecisionV4::Approved);
+
+        let execute_count = Arc::new(AtomicUsize::new(0));
+        let tools = PlanDispatchTools {
+            execute_count: execute_count.clone(),
+            authorization: PlanToolAuthorizationV4::RequiresApproval {
+                effect: ToolEffectV4::Network,
+                reason: "malicious dynamic effect".into(),
+            },
+            execute_error: false,
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        let result = core
+            .recover_pending_plan_tool_call(scope, &std::sync::atomic::AtomicBool::new(false))
+            .await;
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::Tool(message)) if message.contains("read-only"))
+        );
+        assert_eq!(execute_count.load(AtomicOrdering::SeqCst), 0);
+        assert!(
+            !store.load_direct(run_id).unwrap().iter().any(|event| {
+                matches!(event.event, AgentEventKindV4::ToolDispatchStarted { .. })
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_dispatch_error_is_uncertain_and_never_replayed() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let scope = plan_approval_scope(run_id, project_id, conversation_id);
+        let call = plan_approval_fixture_call();
+        let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
+            public_text: String::new(),
+            tool_calls: vec![call.clone()],
+        }]));
+        let store = MemoryStore::default();
+        let execute_count = Arc::new(AtomicUsize::new(0));
+        let tools = PlanDispatchTools {
+            execute_count: execute_count.clone(),
+            authorization: PlanToolAuthorizationV4::Allowed {
+                effect: ToolEffectV4::ReadOnly,
+            },
+            execute_error: true,
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        let result = core
+            .plan_with_scope(
+                run_id,
+                project_id,
+                conversation_id,
+                "inspect literature",
+                scope,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(AgentCoreErrorV4::UncertainSideEffect(message))
+                if message.contains(&call.call_id)
+        ));
+        let events = store.load_direct(run_id).unwrap();
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEventKindV4::ToolDispatchStarted { call_id, .. }
+                    if call_id == &call.call_id
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEventKindV4::ToolDispatchUncertain { call_id, .. }
+                    if call_id == &call.call_id
+            )
+        }));
+        assert!(!events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEventKindV4::ToolFinished { outcome }
+                    if outcome.call_id == call.call_id
+            )
+        }));
+        assert_eq!(execute_count.load(AtomicOrdering::SeqCst), 1);
+        let recovery = core
+            .recover_pending_plan_tool_call(scope, &std::sync::atomic::AtomicBool::new(false))
+            .await;
+        assert!(matches!(
+            recovery,
+            Err(AgentCoreErrorV4::UncertainSideEffect(message))
+                if message == call.call_id
+        ));
+        assert_eq!(execute_count.load(AtomicOrdering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -3321,6 +4532,110 @@ mod tests {
         );
     }
 
+    #[test]
+    fn execute_approval_ignores_plan_and_scoped_requests_with_the_same_call_id() {
+        let spec = supervised_execution_spec(
+            Uuid::new_v4(),
+            ApprovalPolicyV4::RequestApproval,
+            ComputeBackendKindV4::Local,
+        );
+        let call = ToolCallV4 {
+            call_id: "shared-call-id".into(),
+            tool_id: "runtime.execute".into(),
+            arguments: json!({"code":"print(1)"}),
+        };
+        let plan_request = ToolApprovalRequestV4::new_with_scope(
+            spec.run_id,
+            "plan-scope",
+            call.clone(),
+            ToolEffectV4::Runtime,
+            "plan approval",
+        )
+        .unwrap();
+        let plan_requested = AgentEventV4::first(
+            spec.run_id,
+            spec.project_id,
+            spec.conversation_id,
+            Utc::now(),
+            AgentEventKindV4::ToolApprovalRequested {
+                request: plan_request.clone(),
+            },
+        );
+        let plan_decided = AgentEventV4::next(
+            &plan_requested,
+            Utc::now(),
+            AgentEventKindV4::ToolApprovalDecided {
+                approval_id: plan_request.approval_id,
+                call_hash: plan_request.call_hash,
+                decision: ToolApprovalDecisionV4::Denied,
+            },
+        );
+        let mut scoped_execute_request = ToolApprovalRequestV4::new(
+            spec.run_id,
+            spec.spec_hash.as_deref().unwrap(),
+            call.clone(),
+            ToolEffectV4::Runtime,
+            "scoped execute approval",
+        )
+        .unwrap();
+        scoped_execute_request.scope_hash = Some("unexpected-plan-scope".into());
+        let scoped_execute_requested = AgentEventV4::next(
+            &plan_decided,
+            Utc::now(),
+            AgentEventKindV4::ToolApprovalRequested {
+                request: scoped_execute_request,
+            },
+        );
+        let execute_request = ToolApprovalRequestV4::new(
+            spec.run_id,
+            spec.spec_hash.as_deref().unwrap(),
+            call.clone(),
+            ToolEffectV4::Runtime,
+            "execute approval",
+        )
+        .unwrap();
+        let execute_requested = AgentEventV4::next(
+            &scoped_execute_requested,
+            Utc::now(),
+            AgentEventKindV4::ToolApprovalRequested {
+                request: execute_request.clone(),
+            },
+        );
+        let execute_decided = AgentEventV4::next(
+            &execute_requested,
+            Utc::now(),
+            AgentEventKindV4::ToolApprovalDecided {
+                approval_id: execute_request.approval_id,
+                call_hash: execute_request.call_hash,
+                decision: ToolApprovalDecisionV4::Approved,
+            },
+        );
+        let store = MemoryStore::default();
+        let model = ScriptedModel(Mutex::new(vec![]));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        assert_eq!(
+            core.approval_decision(
+                &spec,
+                &call,
+                ToolEffectV4::Runtime,
+                &[
+                    plan_requested,
+                    plan_decided,
+                    scoped_execute_requested,
+                    execute_requested,
+                    execute_decided
+                ],
+            )
+            .unwrap(),
+            Some(ToolApprovalDecisionV4::Approved)
+        );
+    }
+
     fn seed_execution(store: &MemoryStore, spec: &RunSpecV4) {
         let first = AgentEventV4::first(
             spec.run_id,
@@ -3590,41 +4905,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executor_error_is_recorded_and_the_model_gets_a_repair_turn() {
+    async fn executor_error_after_dispatch_is_uncertain_and_not_finished() {
         let run_id = Uuid::new_v4();
         let spec = execution_spec(run_id);
         let store = MemoryStore::default();
         seed_execution(&store, &spec);
-        let model = ScriptedModel(Mutex::new(vec![
-            ModelTurnV4 {
-                public_text: "creating report".into(),
-                tool_calls: vec![ToolCallV4 {
-                    call_id: "missing-artifact".into(),
-                    tool_id: "project.read".into(),
-                    arguments: json!({"path":"results/missing-report.md"}),
-                }],
-            },
-            ModelTurnV4 {
-                public_text: "repairing output path".into(),
-                tool_calls: vec![ToolCallV4 {
-                    call_id: "repaired-artifact".into(),
-                    tool_id: "project.read".into(),
-                    arguments: json!({"path":"results/report.md"}),
-                }],
-            },
-            ModelTurnV4 {
-                public_text: String::new(),
-                tool_calls: vec![ToolCallV4 {
-                    call_id: "done".into(),
-                    tool_id: "agent.complete".into(),
-                    arguments: json!({"schema_version":4,"summary":"repaired execution completed","answer_markdown":"## Result\n\nThe missing artifact path was repaired.","criteria":[{"criterion":"verified output","evidence":[{"kind":"event","sequence":10}]}]}),
-                }],
-            },
-        ]));
+        let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
+            public_text: "creating report".into(),
+            tool_calls: vec![ToolCallV4 {
+                call_id: "missing-artifact".into(),
+                tool_id: "project.read".into(),
+                arguments: json!({"path":"results/missing-report.md"}),
+            }],
+        }]));
         let tools = RecoverableExecutorErrorTools {
             calls: AtomicUsize::new(0),
         };
-        AgentCoreV4 {
+        let error = AgentCoreV4 {
             model: &model,
             tools: &tools,
             events: &store,
@@ -3632,13 +4929,34 @@ mod tests {
         }
         .execute(&spec, 4)
         .await
-        .unwrap();
-        assert_eq!(tools.calls.load(AtomicOrdering::SeqCst), 2);
-        assert!(store.events.lock().unwrap().iter().any(|event| {
-            matches!(&event.event, AgentEventKindV4::ToolFinished { outcome }
-                if !outcome.succeeded
-                    && outcome.model_content.contains("correct the approach")
-                    && outcome.model_content.contains("No such file"))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AgentCoreErrorV4::UncertainSideEffect(message)
+                if message.contains("missing-artifact")
+        ));
+        assert_eq!(tools.calls.load(AtomicOrdering::SeqCst), 1);
+        let events = store.load_direct(run_id).unwrap();
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEventKindV4::ToolDispatchStarted { call_id, .. }
+                    if call_id == "missing-artifact"
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEventKindV4::ToolDispatchUncertain { call_id, .. }
+                    if call_id == "missing-artifact"
+            )
+        }));
+        assert!(!events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEventKindV4::ToolFinished { outcome }
+                    if outcome.call_id == "missing-artifact"
+            )
         }));
     }
 

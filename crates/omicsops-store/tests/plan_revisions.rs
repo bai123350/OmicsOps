@@ -1,7 +1,10 @@
 use chrono::Utc;
 use omicsops_core::workspace::{Conversation, Message, MessageRole, Project, ProjectTemplate};
 use omicsops_dto::{PlanRevisionStatusV4, ProposedPlanRevisionV4};
-use omicsops_protocol::{AgentEventKindV4, AgentEventV4, ExecutionPlanV4, RunModeV4, RunSpecV4};
+use omicsops_protocol::{
+    AgentEventKindV4, AgentEventV4, ExecutionPlanV4, PlanApprovalScopeV4, RunModeV4, RunSpecV4,
+    ToolApprovalDecisionV4, ToolApprovalRequestV4, ToolCallV4, ToolEffectV4,
+};
 use omicsops_store::{ApprovalOptionsV4, Store};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -103,6 +106,72 @@ async fn save_revision(
         )
         .await
         .unwrap()
+}
+
+async fn append_plan_approval_request(
+    fixture: &Fixture,
+    generation: &ProposedPlanRevisionV4,
+) -> (PlanApprovalScopeV4, ToolCallV4, ToolApprovalRequestV4) {
+    let run_id = generation.run_id;
+    let scope = PlanApprovalScopeV4 {
+        project_id: generation.project_id,
+        conversation_id: generation.conversation_id,
+        run_id,
+        revision_id: generation.id,
+        revision: generation.revision,
+    };
+    let call = ToolCallV4 {
+        call_id: "plan-mcp-call".into(),
+        tool_id: "use_mcp_tool".into(),
+        arguments: json!({
+            "server_id": Uuid::new_v4(),
+            "tool": "search",
+            "arguments": {"q": "x"},
+            "catalog_sha256": "catalog",
+            "schema_sha256": "schema"
+        }),
+    };
+    let request = ToolApprovalRequestV4::new_with_scope(
+        run_id,
+        &scope.hash(),
+        call.clone(),
+        ToolEffectV4::ReadOnly,
+        "third-party readOnlyHint is an unverified hint trusted by the user, not a Host guarantee",
+    )
+    .unwrap();
+    let seed = AgentEventV4::first(
+        run_id,
+        generation.project_id,
+        generation.conversation_id,
+        Utc::now(),
+        AgentEventKindV4::RunCreated {
+            mode: RunModeV4::Plan,
+        },
+    );
+    fixture.store.append_agent_event_v4(&seed).await.unwrap();
+    let requested = AgentEventV4::next(
+        &seed,
+        Utc::now(),
+        AgentEventKindV4::ToolRequested { call: call.clone() },
+    );
+    fixture
+        .store
+        .append_agent_event_v4(&requested)
+        .await
+        .unwrap();
+    let approval = AgentEventV4::next(
+        &requested,
+        Utc::now(),
+        AgentEventKindV4::ToolApprovalRequested {
+            request: request.clone(),
+        },
+    );
+    fixture
+        .store
+        .append_agent_event_v4(&approval)
+        .await
+        .unwrap();
+    (scope, call, request)
 }
 
 fn assert_send<T: Send>(_: T) {}
@@ -740,6 +809,616 @@ async fn plan_start_transaction_writes_run_and_generation_lock_together() {
             .unwrap()
             .len(),
         1
+    );
+}
+
+#[tokio::test]
+async fn plan_tool_approval_pause_and_resume_keep_the_same_revision_scope() {
+    let fixture = fixture().await;
+    let run_id = Uuid::new_v4();
+    let generation = fixture
+        .store
+        .start_plan_run_v4(
+            run_id,
+            fixture.project.id,
+            fixture.conversation.id,
+            "planning",
+            &json!({
+                "run_id": run_id,
+                "project_id": fixture.project.id,
+                "conversation_id": fixture.conversation.id,
+                "model_profile_id": Uuid::new_v4(),
+                "objective": "approval pause",
+                "status": "planning",
+                "plan": null,
+                "plan_hash": null,
+                "compute_selection": null,
+                "approval_hash": null,
+                "plan_revision": null,
+                "spec": null
+            }),
+            "approval pause",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+
+    let (scope, call, approval) = append_plan_approval_request(&fixture, &generation).await;
+    let paused = fixture
+        .store
+        .pause_plan_generation_for_approval_v4(
+            fixture.project.id,
+            fixture.conversation.id,
+            run_id,
+            generation.revision,
+            Some("waiting for exact MCP approval"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(paused.id, generation.id);
+    assert_eq!(paused.revision, generation.revision);
+    assert_eq!(paused.status, PlanRevisionStatusV4::Revising);
+    assert_eq!(
+        fixture.store.agent_run_v4(run_id).await.unwrap().unwrap()["status"],
+        "waiting_for_approval"
+    );
+    fixture
+        .store
+        .decide_tool_approval_v4(
+            fixture.project.id,
+            fixture.conversation.id,
+            run_id,
+            &approval.approval_id,
+            &call.canonical_hash().unwrap(),
+            ToolApprovalDecisionV4::Approved,
+            &scope.hash(),
+            RunModeV4::Plan,
+            Some(&scope.hash()),
+        )
+        .await
+        .unwrap();
+
+    let resumed = fixture
+        .store
+        .resume_plan_generation_after_approval_v4(
+            fixture.project.id,
+            fixture.conversation.id,
+            run_id,
+            paused.id,
+            paused.revision,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resumed.id, generation.id);
+    assert_eq!(resumed.revision, generation.revision);
+    assert_eq!(resumed.status, PlanRevisionStatusV4::Generating);
+    assert_eq!(
+        fixture.store.agent_run_v4(run_id).await.unwrap().unwrap()["status"],
+        "planning"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .proposed_plan_revisions_v4(fixture.project.id, fixture.conversation.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn plan_tool_decision_is_single_writer_and_decision_before_pause_can_resume() {
+    let fixture = fixture().await;
+    let run_id = Uuid::new_v4();
+    let generation = fixture
+        .store
+        .start_plan_run_v4(
+            run_id,
+            fixture.project.id,
+            fixture.conversation.id,
+            "planning",
+            &json!({
+                "run_id": run_id,
+                "project_id": fixture.project.id,
+                "conversation_id": fixture.conversation.id,
+                "model_profile_id": Uuid::new_v4(),
+                "objective": "decision race",
+                "status": "planning",
+                "plan": null,
+                "plan_hash": null,
+                "compute_selection": null,
+                "approval_hash": null,
+                "plan_revision": null,
+                "spec": null
+            }),
+            "decision race",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let (scope, call, approval) = append_plan_approval_request(&fixture, &generation).await;
+    let call_hash = call.canonical_hash().unwrap();
+    let scope_hash = scope.hash();
+    let first = fixture.store.decide_tool_approval_v4(
+        fixture.project.id,
+        fixture.conversation.id,
+        run_id,
+        &approval.approval_id,
+        &call_hash,
+        ToolApprovalDecisionV4::Approved,
+        &scope_hash,
+        RunModeV4::Plan,
+        Some(&scope_hash),
+    );
+    let second = fixture.store.decide_tool_approval_v4(
+        fixture.project.id,
+        fixture.conversation.id,
+        run_id,
+        &approval.approval_id,
+        &call_hash,
+        ToolApprovalDecisionV4::Approved,
+        &scope_hash,
+        RunModeV4::Plan,
+        Some(&scope_hash),
+    );
+    let (first, second) = tokio::join!(first, second);
+    assert_eq!(first.is_ok() as u8 + second.is_ok() as u8, 1);
+    let pause = fixture
+        .store
+        .pause_plan_generation_for_approval_v4(
+            fixture.project.id,
+            fixture.conversation.id,
+            run_id,
+            generation.revision,
+            Some("already decided"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pause.id, generation.id);
+    assert_eq!(pause.status, PlanRevisionStatusV4::Revising);
+    assert_eq!(
+        fixture.store.agent_run_v4(run_id).await.unwrap().unwrap()["status"],
+        "waiting_for_approval"
+    );
+    let resumed = fixture
+        .store
+        .resume_plan_generation_after_approval_v4(
+            fixture.project.id,
+            fixture.conversation.id,
+            run_id,
+            generation.id,
+            generation.revision,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resumed.id, generation.id);
+    assert_eq!(resumed.status, PlanRevisionStatusV4::Generating);
+    let events = fixture.store.agent_events_v4(run_id).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.event, AgentEventKindV4::ToolApprovalDecided { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn plan_approval_resume_rejects_an_undecided_request_without_changing_state() {
+    let fixture = fixture().await;
+    let run_id = Uuid::new_v4();
+    let generation = fixture
+        .store
+        .start_plan_run_v4(
+            run_id,
+            fixture.project.id,
+            fixture.conversation.id,
+            "planning",
+            &json!({
+                "run_id": run_id,
+                "project_id": fixture.project.id,
+                "conversation_id": fixture.conversation.id,
+                "model_profile_id": Uuid::new_v4(),
+                "objective": "undecided resume",
+                "status": "planning",
+                "plan": null,
+                "plan_hash": null,
+                "compute_selection": null,
+                "approval_hash": null,
+                "plan_revision": null,
+                "spec": null
+            }),
+            "undecided resume",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    append_plan_approval_request(&fixture, &generation).await;
+    let paused = fixture
+        .store
+        .pause_plan_generation_for_approval_v4(
+            fixture.project.id,
+            fixture.conversation.id,
+            run_id,
+            generation.revision,
+            Some("waiting"),
+        )
+        .await
+        .unwrap();
+    let error = fixture
+        .store
+        .resume_plan_generation_after_approval_v4(
+            fixture.project.id,
+            fixture.conversation.id,
+            run_id,
+            paused.id,
+            paused.revision,
+            Utc::now(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("decided"));
+    assert_eq!(
+        fixture
+            .store
+            .proposed_plan_revision_v4(paused.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        PlanRevisionStatusV4::Revising
+    );
+    assert_eq!(
+        fixture.store.agent_run_v4(run_id).await.unwrap().unwrap()["status"],
+        "waiting_for_approval"
+    );
+}
+
+#[tokio::test]
+async fn plan_tool_decision_rejects_an_old_revision_scope() {
+    let fixture = fixture().await;
+    let run_id = Uuid::new_v4();
+    let first = fixture
+        .store
+        .start_plan_run_v4(
+            run_id,
+            fixture.project.id,
+            fixture.conversation.id,
+            "planning",
+            &json!({
+                "run_id": run_id,
+                "project_id": fixture.project.id,
+                "conversation_id": fixture.conversation.id,
+                "model_profile_id": Uuid::new_v4(),
+                "objective": "old scope",
+                "status": "planning",
+                "plan": null,
+                "plan_hash": null,
+                "compute_selection": null,
+                "approval_hash": null,
+                "plan_revision": null,
+                "spec": null
+            }),
+            "old scope",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let (old_scope, call, approval) = append_plan_approval_request(&fixture, &first).await;
+    fixture
+        .store
+        .pause_plan_generation_for_approval_v4(
+            fixture.project.id,
+            fixture.conversation.id,
+            run_id,
+            first.revision,
+            Some("request changes"),
+        )
+        .await
+        .unwrap();
+    let old_call_hash = call.canonical_hash().unwrap();
+    let old_scope_hash = old_scope.hash();
+    fixture
+        .store
+        .decide_tool_approval_v4(
+            fixture.project.id,
+            fixture.conversation.id,
+            run_id,
+            &approval.approval_id,
+            &old_call_hash,
+            ToolApprovalDecisionV4::Approved,
+            &old_scope_hash,
+            RunModeV4::Plan,
+            Some(&old_scope_hash),
+        )
+        .await
+        .unwrap();
+    fixture
+        .store
+        .resume_plan_generation_after_approval_v4(
+            fixture.project.id,
+            fixture.conversation.id,
+            run_id,
+            first.id,
+            first.revision,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let second = fixture
+        .store
+        .create_next_proposed_plan_revision_v4(
+            fixture.project.id,
+            fixture.conversation.id,
+            run_id,
+            plan("new scope"),
+            "# new scope".into(),
+            plan("new scope").canonical_hash().unwrap(),
+            PlanRevisionStatusV4::Generating,
+            None,
+            Utc::now(),
+        )
+        .await;
+    assert!(second.is_err());
+    // The old approval is invalid as soon as its revision is no longer the
+    // latest one. Materialize a new revision through the normal user-change
+    // transition and then check the low-level decision gate.
+    fixture
+        .store
+        .terminate_plan_generation_v4(
+            fixture.project.id,
+            fixture.conversation.id,
+            run_id,
+            first.revision,
+            PlanRevisionStatusV4::Revising,
+            Some("new revision"),
+        )
+        .await
+        .unwrap();
+    let next = fixture
+        .store
+        .acquire_plan_revision_resume_v4(
+            fixture.project.id,
+            fixture.conversation.id,
+            run_id,
+            "new revision",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let error = fixture
+        .store
+        .decide_tool_approval_v4(
+            fixture.project.id,
+            fixture.conversation.id,
+            run_id,
+            &approval.approval_id,
+            &old_call_hash,
+            ToolApprovalDecisionV4::Approved,
+            &old_scope_hash,
+            RunModeV4::Plan,
+            Some(&old_scope_hash),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("scope") || error.to_string().contains("current"));
+    assert_eq!(next.revision, 2);
+}
+
+#[tokio::test]
+async fn execute_approval_store_gate_preserves_legacy_hash_and_rejects_plan_binding() {
+    let fixture = fixture().await;
+    let run_id = Uuid::new_v4();
+    let spec_hash = "legacy-spec";
+    fixture
+        .store
+        .save_agent_run_v4(
+            run_id,
+            fixture.project.id,
+            fixture.conversation.id,
+            "awaiting_approval",
+            &json!({
+                "run_id": run_id,
+                "project_id": fixture.project.id,
+                "conversation_id": fixture.conversation.id,
+                "model_profile_id": Uuid::new_v4(),
+                "objective": "plan",
+                "status": "awaiting_approval",
+                "plan": null,
+                "plan_hash": null,
+                "compute_selection": null,
+                "approval_hash": null,
+                "plan_revision": null,
+                "spec": {"spec_hash": spec_hash}
+            }),
+        )
+        .await
+        .unwrap();
+    let seed = AgentEventV4::first(
+        run_id,
+        fixture.project.id,
+        fixture.conversation.id,
+        Utc::now(),
+        AgentEventKindV4::RunCreated {
+            mode: RunModeV4::Execute,
+        },
+    );
+    fixture.store.append_agent_event_v4(&seed).await.unwrap();
+    let call = ToolCallV4 {
+        call_id: "execute-approval".into(),
+        tool_id: "runtime.execute".into(),
+        arguments: json!({"code":"print(1)"}),
+    };
+    let approval = ToolApprovalRequestV4::new(
+        run_id,
+        spec_hash,
+        call.clone(),
+        ToolEffectV4::Runtime,
+        "legacy execute approval",
+    )
+    .unwrap();
+    let requested = AgentEventV4::next(
+        &seed,
+        Utc::now(),
+        AgentEventKindV4::ToolApprovalRequested {
+            request: approval.clone(),
+        },
+    );
+    fixture
+        .store
+        .append_agent_event_v4(&requested)
+        .await
+        .unwrap();
+    let decided = fixture
+        .store
+        .decide_tool_approval_v4(
+            fixture.project.id,
+            fixture.conversation.id,
+            run_id,
+            &approval.approval_id,
+            &approval.call_hash,
+            ToolApprovalDecisionV4::Approved,
+            spec_hash,
+            RunModeV4::Execute,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        decided.event,
+        AgentEventKindV4::ToolApprovalDecided {
+            decision: ToolApprovalDecisionV4::Approved,
+            ..
+        }
+    ));
+
+    let plan_call = ToolCallV4 {
+        call_id: "plan-approval-in-execute-run".into(),
+        tool_id: "use_mcp_tool".into(),
+        arguments: json!({
+            "server_id": Uuid::new_v4(),
+            "tool": "search",
+            "catalog_sha256": "catalog",
+            "schema_sha256": "schema",
+            "arguments": {"q":"x"}
+        }),
+    };
+    let plan_request = ToolApprovalRequestV4::new_with_scope(
+        run_id,
+        "plan-scope",
+        plan_call,
+        ToolEffectV4::ReadOnly,
+        "plan approval",
+    )
+    .unwrap();
+    let events = fixture.store.agent_events_v4(run_id).await.unwrap();
+    let plan_event = AgentEventV4::next(
+        events.last().unwrap(),
+        Utc::now(),
+        AgentEventKindV4::ToolApprovalRequested {
+            request: plan_request.clone(),
+        },
+    );
+    fixture
+        .store
+        .append_agent_event_v4(&plan_event)
+        .await
+        .unwrap();
+    let wrong_mode = fixture
+        .store
+        .decide_tool_approval_v4(
+            fixture.project.id,
+            fixture.conversation.id,
+            run_id,
+            &approval.approval_id,
+            &approval.call_hash,
+            ToolApprovalDecisionV4::Approved,
+            "scope",
+            RunModeV4::Plan,
+            Some("scope"),
+        )
+        .await
+        .unwrap_err();
+    assert!(wrong_mode.to_string().contains("phase") || wrong_mode.to_string().contains("current"));
+    let plan_as_execute = fixture
+        .store
+        .decide_tool_approval_v4(
+            fixture.project.id,
+            fixture.conversation.id,
+            run_id,
+            &plan_request.approval_id,
+            &plan_request.call_hash,
+            ToolApprovalDecisionV4::Approved,
+            spec_hash,
+            RunModeV4::Execute,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(plan_as_execute.to_string().contains("Plan binding"));
+}
+
+#[tokio::test]
+async fn execute_approval_requires_the_frozen_spec_hash_in_run_json() {
+    let fixture = fixture().await;
+    let run_id = Uuid::new_v4();
+    save_run(&fixture, run_id).await;
+    let seed = AgentEventV4::first(
+        run_id,
+        fixture.project.id,
+        fixture.conversation.id,
+        Utc::now(),
+        AgentEventKindV4::RunCreated {
+            mode: RunModeV4::Execute,
+        },
+    );
+    fixture.store.append_agent_event_v4(&seed).await.unwrap();
+    let call = ToolCallV4 {
+        call_id: "missing-spec-approval".into(),
+        tool_id: "runtime.execute".into(),
+        arguments: json!({"code":"print(1)"}),
+    };
+    let approval = ToolApprovalRequestV4::new(
+        run_id,
+        "legacy-spec",
+        call,
+        ToolEffectV4::Runtime,
+        "legacy execute approval",
+    )
+    .unwrap();
+    fixture
+        .store
+        .append_agent_event_v4(&AgentEventV4::next(
+            &seed,
+            Utc::now(),
+            AgentEventKindV4::ToolApprovalRequested {
+                request: approval.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+    let error = fixture
+        .store
+        .decide_tool_approval_v4(
+            fixture.project.id,
+            fixture.conversation.id,
+            run_id,
+            &approval.approval_id,
+            &approval.call_hash,
+            ToolApprovalDecisionV4::Approved,
+            "legacy-spec",
+            RunModeV4::Execute,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("persisted frozen spec_hash"));
+    assert_eq!(
+        fixture.store.agent_events_v4(run_id).await.unwrap().len(),
+        2
     );
 }
 

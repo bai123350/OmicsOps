@@ -25,8 +25,8 @@ use omicsops_agent::{
 };
 use omicsops_agent_core::{
     AgentCoreErrorV4, AgentCoreV4, AgentLimitsV4, EventStoreV4, ModelPortV4, ModelRequestV4,
-    ModelStreamEventV4, ModelTurnV4, PromptLayersV4, ReviewerRequestV4, ScientificStateStoreV4,
-    ScientificUpdateV4, ToolPortV4,
+    ModelStreamEventV4, ModelTurnV4, PlanApprovalScopeV4, PlanToolAuthorizationV4, PromptLayersV4,
+    ReviewerRequestV4, ScientificStateStoreV4, ScientificUpdateV4, ToolPortV4,
 };
 use omicsops_core::{
     project::{require_remote_descendant, shell_quote},
@@ -37,8 +37,9 @@ pub use omicsops_dto::{
     RequestPlanRevisionResponseV4,
 };
 use omicsops_knowledge::{
-    McpToolIndexV4, MemoryDocumentV4, SkillDocumentV4, authorize_mcp_use, freeze_skill,
-    markdown_sections, schema_digest, search_mcp_tools, search_memory, search_skills,
+    KnowledgeErrorV4, McpToolIndexV4, MemoryDocumentV4, SkillDocumentV4,
+    authorize_mcp_read_only_target, authorize_mcp_use, freeze_skill, markdown_sections,
+    schema_digest, search_mcp_tools, search_memory, search_skills,
 };
 use omicsops_mcp::McpSessionManager;
 use omicsops_protocol::{
@@ -509,15 +510,24 @@ pub async fn agent_v4_start_planning(
         science: Some(&science_store),
     };
     let plan_result = core
-        .plan_with_cancellation(
+        .plan_with_scope(
             run_id,
             request.project_id,
             request.conversation_id,
             &request.objective,
+            PlanApprovalScopeV4 {
+                project_id: request.project_id,
+                conversation_id: request.conversation_id,
+                run_id,
+                revision_id: generation.id,
+                revision: generation.revision,
+            },
             planning_cancelled.clone(),
         )
         .await;
-    if !plan_generation_is_active(&state.repository, generation.id).await? {
+    if !plan_generation_is_active(&state.repository, generation.id).await?
+        && !matches!(&plan_result, Err(AgentCoreErrorV4::WaitingForApproval))
+    {
         return Err("V4 planning was cancelled".into());
     }
     let plan = match plan_result {
@@ -538,6 +548,42 @@ pub async fn agent_v4_start_planning(
             return Ok(RunSummaryV4 {
                 run_id,
                 status: "waiting_for_input".into(),
+                plan: None,
+                plan_hash: None,
+                compute_selection: Some(request.compute_selection),
+                approval_hash: None,
+                plan_revision: Some(generation.revision),
+                session_mode: Some(SessionAgentModeV4::Plan),
+            });
+        }
+        Err(AgentCoreErrorV4::WaitingForApproval) => {
+            if planning_cancelled.load(Ordering::SeqCst) {
+                let message = "V4 planning was cancelled";
+                return Err(terminate_plan_generation_with_diagnostics(
+                    &state.repository,
+                    request.project_id,
+                    request.conversation_id,
+                    run_id,
+                    generation.revision,
+                    PlanRevisionStatusV4::Cancelled,
+                    message,
+                )
+                .await);
+            }
+            state
+                .repository
+                .pause_plan_generation_for_approval_v4(
+                    request.project_id,
+                    request.conversation_id,
+                    run_id,
+                    generation.revision,
+                    Some("planning is waiting for exact MCP tool approval"),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(RunSummaryV4 {
+                run_id,
+                status: "waiting_for_approval".into(),
                 plan: None,
                 plan_hash: None,
                 compute_selection: Some(request.compute_selection),
@@ -1159,9 +1205,7 @@ pub async fn agent_v4_resume(
     // after emitting its pause event. An approval can arrive in that narrow
     // window, so give the old task time to yield before starting the resume.
     // If another resume already won the slot, this request is idempotent.
-    if !wait_for_active_run_to_yield(&state.active_runs, run_id).await? {
-        return Ok(());
-    }
+    wait_for_active_run_to_yield(&state.active_runs, run_id).await?;
     let mut record = load_record(&state.repository, run_id).await?;
     if matches!(
         record.status.as_str(),
@@ -1173,14 +1217,49 @@ pub async fn agent_v4_resume(
         // Reject pending/cancelled/replayed plan runs before any legacy
         // compute-selection fallback or model composition can obscure the
         // request -> revising -> resume contract.
-        ensure_v4_resume_allowed(&state.repository, run_id).await?;
+        let latest = ensure_v4_resume_allowed(&state.repository, run_id).await?;
+        let approval_resume = record.status == "waiting_for_approval";
+        if approval_resume {
+            let events = state
+                .repository
+                .agent_events_v4(run_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let scope = PlanApprovalScopeV4 {
+                project_id: record.project_id,
+                conversation_id: record.conversation_id,
+                run_id: record.run_id,
+                revision_id: latest.id,
+                revision: latest.revision,
+            };
+            plan_approval_resume_decision(&events, scope)?;
+        } else if record.status != "waiting_for_input" {
+            return Err(
+                "only a waiting-for-input or waiting-for-approval Plan run can be resumed".into(),
+            );
+        }
         let project = workspace_project(&state.repository, record.project_id).await?;
         let selection = record
             .compute_selection
             .clone()
             .unwrap_or(legacy_ssh_selection(&project)?);
         validate_compute_selection(&state, &project, &selection).await?;
-        let generation = begin_v4_plan_resume(&state.repository, run_id).await?;
+        let generation = if approval_resume {
+            state
+                .repository
+                .resume_plan_generation_after_approval_v4(
+                    record.project_id,
+                    record.conversation_id,
+                    record.run_id,
+                    latest.id,
+                    latest.revision,
+                    Utc::now(),
+                )
+                .await
+                .map_err(|error| error.to_string())?
+        } else {
+            begin_v4_plan_resume(&state.repository, run_id).await?
+        };
         let planning_cancelled = Arc::new(AtomicBool::new(false));
         let _planning_guard = match register_active_run_guard(
             &state.active_runs,
@@ -1259,15 +1338,24 @@ pub async fn agent_v4_resume(
             science: Some(&science_store),
         };
         let plan_result = core
-            .plan_with_cancellation(
+            .plan_with_scope(
                 record.run_id,
                 record.project_id,
                 record.conversation_id,
                 &record.objective,
+                PlanApprovalScopeV4 {
+                    project_id: record.project_id,
+                    conversation_id: record.conversation_id,
+                    run_id: record.run_id,
+                    revision_id: generation.id,
+                    revision: generation.revision,
+                },
                 planning_cancelled.clone(),
             )
             .await;
-        if !plan_generation_is_active(&state.repository, generation.id).await? {
+        if !plan_generation_is_active(&state.repository, generation.id).await?
+            && !matches!(&plan_result, Err(AgentCoreErrorV4::WaitingForApproval))
+        {
             return Err("V4 planning was cancelled".into());
         }
         match plan_result {
@@ -1366,6 +1454,33 @@ pub async fn agent_v4_resume(
                         generation.revision,
                         PlanRevisionStatusV4::Revising,
                         Some("planning is waiting for user input"),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                return Ok(());
+            }
+            Err(AgentCoreErrorV4::WaitingForApproval) => {
+                if planning_cancelled.load(Ordering::SeqCst) {
+                    let message = "V4 planning was cancelled";
+                    return Err(terminate_plan_generation_with_diagnostics(
+                        &state.repository,
+                        record.project_id,
+                        record.conversation_id,
+                        record.run_id,
+                        generation.revision,
+                        PlanRevisionStatusV4::Cancelled,
+                        message,
+                    )
+                    .await);
+                }
+                state
+                    .repository
+                    .pause_plan_generation_for_approval_v4(
+                        record.project_id,
+                        record.conversation_id,
+                        record.run_id,
+                        generation.revision,
+                        Some("planning is waiting for exact MCP tool approval"),
                     )
                     .await
                     .map_err(|error| error.to_string())?;
@@ -1576,6 +1691,87 @@ fn validate_answer_v4(
     Ok(answer)
 }
 
+fn plan_approval_resume_decision(
+    events: &[AgentEventV4],
+    scope: PlanApprovalScopeV4,
+) -> Result<ToolApprovalDecisionV4, String> {
+    let mut found = None;
+    for event in events {
+        let AgentEventKindV4::ToolApprovalRequested { request } = &event.event else {
+            continue;
+        };
+        let call_is_pending = events.iter().any(|candidate| {
+            matches!(
+                &candidate.event,
+                AgentEventKindV4::ToolRequested { call }
+                    if call == &request.call
+            )
+        }) && !events.iter().any(|candidate| {
+            matches!(
+                &candidate.event,
+                AgentEventKindV4::ToolFinished { outcome }
+                    if outcome.call_id == request.call.call_id
+            ) || matches!(
+                &candidate.event,
+                AgentEventKindV4::ToolOutcomeReused { outcome, .. }
+                    if outcome.call_id == request.call.call_id
+            )
+        }) && !events.iter().any(|candidate| {
+            matches!(
+                &candidate.event,
+                AgentEventKindV4::ToolDispatchStarted { call_id, .. }
+                    if call_id == &request.call.call_id
+            ) || matches!(
+                &candidate.event,
+                AgentEventKindV4::ToolDispatchUncertain { call_id, .. }
+                    if call_id == &request.call.call_id
+            ) || matches!(
+                &candidate.event,
+                AgentEventKindV4::ToolDispatchResolved { call_id, .. }
+                    if call_id == &request.call.call_id
+            )
+        });
+        if request.mode != omicsops_protocol::RunModeV4::Plan
+            || request.scope_hash.as_deref() != Some(scope.hash().as_str())
+            || request.effect != ToolEffectV4::ReadOnly
+            || request.call.tool_id != "use_mcp_tool"
+            || !call_is_pending
+        {
+            continue;
+        }
+        request
+            .validate_with_scope(
+                scope.run_id,
+                &scope.hash(),
+                omicsops_protocol::RunModeV4::Plan,
+            )
+            .map_err(|error| error.to_string())?;
+        if found.is_some() {
+            return Err("multiple pending Plan tool approvals are not supported".into());
+        }
+        let mut decision = None;
+        for candidate in events {
+            if let AgentEventKindV4::ToolApprovalDecided {
+                approval_id,
+                call_hash,
+                decision: value,
+            } = &candidate.event
+            {
+                if approval_id == &request.approval_id {
+                    if call_hash != &request.call_hash || decision.is_some() {
+                        return Err("tool approval decision is duplicated or tampered".into());
+                    }
+                    decision = Some(*value);
+                }
+            }
+        }
+        found = Some(decision.ok_or_else(|| {
+            "Plan tool approval is still undecided; decide it before resuming".to_string()
+        })?);
+    }
+    found.ok_or_else(|| "V4 approval resume has no pending Plan tool approval".into())
+}
+
 #[tauri::command]
 pub async fn agent_v4_decide_tool_approval(
     app: AppHandle,
@@ -1583,11 +1779,6 @@ pub async fn agent_v4_decide_tool_approval(
     request: DecideToolApprovalV4Request,
 ) -> Result<(), String> {
     let record = load_record(&state.repository, request.run_id).await?;
-    let spec = record.spec.ok_or("V4 run has no frozen execution spec")?;
-    let spec_hash = spec
-        .spec_hash
-        .clone()
-        .ok_or("V4 run has no frozen spec hash")?;
     let events = state
         .repository
         .agent_events_v4(request.run_id)
@@ -1602,31 +1793,91 @@ pub async fn agent_v4_decide_tool_approval(
         _ => None,
     });
     let approval = approval.ok_or("tool approval request was not found")?;
-    approval
-        .validate(request.run_id, &spec_hash)
-        .map_err(|error| error.to_string())?;
     if approval.call_hash != request.call_hash {
         return Err("tool approval call hash mismatch".into());
     }
-    if events.iter().any(|event| {
-        matches!(&event.event, AgentEventKindV4::ToolApprovalDecided { approval_id, .. } if approval_id == &request.approval_id)
-    }) {
-        return Err("tool approval request was already decided".into());
-    }
-    let store = RepositoryEventStoreV4 {
-        repository: state.repository.clone(),
-        app,
+    let event = if let Some(spec) = record.spec {
+        let spec_hash = spec
+            .spec_hash
+            .clone()
+            .ok_or("V4 run has no frozen spec hash")?;
+        if approval.mode != omicsops_protocol::RunModeV4::Execute || approval.scope_hash.is_some() {
+            return Err("Execute approval request has an unexpected Plan binding".into());
+        }
+        approval
+            .validate(request.run_id, &spec_hash)
+            .map_err(|error| error.to_string())?;
+        state
+            .repository
+            .decide_tool_approval_v4(
+                record.project_id,
+                record.conversation_id,
+                request.run_id,
+                &request.approval_id,
+                &request.call_hash,
+                request.decision,
+                &spec_hash,
+                omicsops_protocol::RunModeV4::Execute,
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?
+    } else {
+        let latest = state
+            .repository
+            .latest_proposed_plan_revision_v4(record.project_id, record.conversation_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("V4 run has no active plan revision")?;
+        let consistent_phase = (record.status == "planning"
+            && latest.status == PlanRevisionStatusV4::Generating)
+            || (record.status == "waiting_for_approval"
+                && latest.status == PlanRevisionStatusV4::Revising);
+        if latest.run_id != request.run_id || !consistent_phase {
+            return Err(
+                "Plan approval does not belong to the current planning revision phase".into(),
+            );
+        }
+        let scope = PlanApprovalScopeV4 {
+            project_id: record.project_id,
+            conversation_id: record.conversation_id,
+            run_id: request.run_id,
+            revision_id: latest.id,
+            revision: latest.revision,
+        };
+        let scope_hash = scope.hash();
+        if approval.mode != omicsops_protocol::RunModeV4::Plan
+            || approval.scope_hash.as_deref() != Some(scope_hash.as_str())
+            || approval.effect != ToolEffectV4::ReadOnly
+            || approval.call.tool_id != "use_mcp_tool"
+        {
+            return Err("Plan approval request has an invalid current revision binding".into());
+        }
+        approval
+            .validate_with_scope(
+                request.run_id,
+                &scope_hash,
+                omicsops_protocol::RunModeV4::Plan,
+            )
+            .map_err(|error| error.to_string())?;
+        state
+            .repository
+            .decide_tool_approval_v4(
+                record.project_id,
+                record.conversation_id,
+                request.run_id,
+                &request.approval_id,
+                &request.call_hash,
+                request.decision,
+                &scope_hash,
+                omicsops_protocol::RunModeV4::Plan,
+                Some(&scope_hash),
+            )
+            .await
+            .map_err(|error| error.to_string())?
     };
-    append_next(
-        &store,
-        request.run_id,
-        AgentEventKindV4::ToolApprovalDecided {
-            approval_id: request.approval_id,
-            call_hash: request.call_hash,
-            decision: request.decision,
-        },
-    )
-    .await
+    app.emit(AGENT_V4_EVENT_CHANNEL, &event)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -2041,19 +2292,33 @@ fn register_active_run_guard(
 async fn wait_for_active_run_to_yield(
     active_runs: &Arc<std::sync::Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
     run_id: Uuid,
-) -> Result<bool, String> {
-    const POLL_ATTEMPTS: usize = 100;
-    for _ in 0..POLL_ATTEMPTS {
+) -> Result<(), String> {
+    wait_for_active_run_to_yield_with(
+        active_runs,
+        run_id,
+        100,
+        std::time::Duration::from_millis(20),
+    )
+    .await
+}
+
+async fn wait_for_active_run_to_yield_with(
+    active_runs: &Arc<std::sync::Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
+    run_id: Uuid,
+    poll_attempts: usize,
+    poll_delay: std::time::Duration,
+) -> Result<(), String> {
+    for _ in 0..poll_attempts {
         let is_active = active_runs
             .lock()
             .map_err(|_| "active run registry unavailable".to_string())?
             .contains_key(&run_id);
         if !is_active {
-            return Ok(true);
+            return Ok(());
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(poll_delay).await;
     }
-    Ok(false)
+    Err("V4 run is still active after the resume wait timeout; no resume was started".into())
 }
 
 // Keeps V4 composition independent from Tauri internals; concrete credentials are resolved before spawning.
@@ -2911,6 +3176,10 @@ impl DesktopToolExecutorV4 {
                         .unwrap_or("MCP tool")
                         .into(),
                     schema_sha256: schema_digest(&input_schema),
+                    tool_catalog_sha256: profile.tool_catalog_sha256.clone().unwrap_or_default(),
+                    read_only_hint: tool.get("annotations").and_then(Value::as_object).and_then(
+                        |annotations| annotations.get("readOnlyHint").and_then(Value::as_bool),
+                    ),
                     input_schema,
                     configured: true,
                     enabled: profile.enabled,
@@ -2929,36 +3198,171 @@ impl DesktopToolExecutorV4 {
             .agent_events_v4(self.run_id)
             .await
             .map_err(|error| error.to_string())?;
-        run_has_approved_tool_call(&events, call)
+        let record = load_record(&self.repository, self.run_id).await?;
+        let Some(spec_hash) = record
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.spec_hash.as_deref())
+        else {
+            return Ok(false);
+        };
+        run_has_approved_tool_call(
+            &events,
+            call,
+            omicsops_protocol::RunModeV4::Execute,
+            Some(spec_hash),
+            None,
+            self.run_id,
+        )
+    }
+
+    async fn run_approved_plan_tool_call(&self, call: &ToolCallV4) -> Result<bool, String> {
+        let record = load_record(&self.repository, self.run_id).await?;
+        let latest = self
+            .repository
+            .latest_proposed_plan_revision_v4(record.project_id, record.conversation_id)
+            .await;
+        let latest = match latest {
+            Ok(Some(latest)) if latest.run_id == self.run_id => latest,
+            Ok(_) => return Ok(false),
+            Err(error) => return Err(error.to_string()),
+        };
+        let phase_ok = (record.status == "planning"
+            && latest.status == PlanRevisionStatusV4::Generating)
+            || (record.status == "waiting_for_approval"
+                && latest.status == PlanRevisionStatusV4::Revising);
+        if !phase_ok {
+            return Ok(false);
+        }
+        let scope = PlanApprovalScopeV4 {
+            project_id: record.project_id,
+            conversation_id: latest.conversation_id,
+            run_id: self.run_id,
+            revision_id: latest.id,
+            revision: latest.revision,
+        };
+        let scope_hash = scope.hash();
+        let events = self
+            .repository
+            .agent_events_v4(self.run_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        run_has_approved_tool_call(
+            &events,
+            call,
+            omicsops_protocol::RunModeV4::Plan,
+            Some(scope_hash.as_str()),
+            Some(ToolEffectV4::ReadOnly),
+            self.run_id,
+        )
     }
 }
 
-fn run_has_approved_tool_call(events: &[AgentEventV4], call: &ToolCallV4) -> Result<bool, String> {
+fn run_has_approved_tool_call(
+    events: &[AgentEventV4],
+    call: &ToolCallV4,
+    expected_mode: omicsops_protocol::RunModeV4,
+    expected_binding_hash: Option<&str>,
+    expected_effect: Option<ToolEffectV4>,
+    run_id: Uuid,
+) -> Result<bool, String> {
     let call_hash = call.canonical_hash().map_err(|error| error.to_string())?;
     let request = events.iter().rev().find_map(|event| match &event.event {
         AgentEventKindV4::ToolApprovalRequested { request }
-            if request.call_hash == call_hash && request.call == *call =>
+            if request.call_hash == call_hash
+                && request.call == *call
+                && request.mode == expected_mode
+                && request.scope_hash.as_deref()
+                    == if expected_mode == omicsops_protocol::RunModeV4::Plan {
+                        expected_binding_hash
+                    } else {
+                        None
+                    }
+                && expected_effect.is_none_or(|effect| request.effect == effect) =>
         {
             Some(request)
         }
         _ => None,
     });
-    Ok(request.is_some_and(|request| {
-        events.iter().any(|event| {
-            matches!(
-                &event.event,
-                AgentEventKindV4::ToolApprovalDecided {
-                    approval_id,
-                    call_hash: decided_hash,
-                    decision: ToolApprovalDecisionV4::Approved,
-                } if approval_id == &request.approval_id && decided_hash == &request.call_hash
-            )
-        })
-    }))
+    let Some(request) = request else {
+        return Ok(false);
+    };
+    let binding = expected_binding_hash.ok_or("approval is missing its binding hash")?;
+    if expected_mode == omicsops_protocol::RunModeV4::Plan {
+        request
+            .validate_with_scope(run_id, binding, omicsops_protocol::RunModeV4::Plan)
+            .map_err(|error| error.to_string())?;
+    } else {
+        request
+            .validate(run_id, binding)
+            .map_err(|error| error.to_string())?;
+    }
+    let mut decision = None;
+    for event in events {
+        if let AgentEventKindV4::ToolApprovalDecided {
+            approval_id,
+            call_hash: decided_hash,
+            decision: value,
+        } = &event.event
+        {
+            if approval_id == &request.approval_id {
+                if decided_hash != &request.call_hash || decision.is_some() {
+                    return Err("tool approval decision is duplicated or tampered".into());
+                }
+                decision = Some(*value);
+            }
+        }
+    }
+    Ok(decision == Some(ToolApprovalDecisionV4::Approved))
 }
-#[async_trait]
-impl ToolExecutorV4 for DesktopToolExecutorV4 {
-    async fn execute(&self, call: &ToolCallV4) -> Result<ToolOutcomeV4, String> {
+impl DesktopToolExecutorV4 {
+    async fn authorize_plan_target(
+        &self,
+        call: &ToolCallV4,
+    ) -> Result<PlanToolAuthorizationV4, String> {
+        if call.tool_id != "use_mcp_tool" {
+            return Err(format!(
+                "tool {} is not a dynamic Plan-mode target",
+                call.tool_id
+            ));
+        }
+        let server_id = required(&call.arguments, "server_id")?
+            .parse::<Uuid>()
+            .map_err(|_| "server_id must be a UUID")?;
+        let tool = required(&call.arguments, "tool")?;
+        let expected_catalog = required(&call.arguments, "catalog_sha256")?;
+        let expected_schema = required(&call.arguments, "schema_sha256")?;
+        let indexed = self
+            .mcp_tool_index()
+            .await?
+            .into_iter()
+            .find(|entry| entry.server_id == server_id && entry.tool_name == tool)
+            .ok_or("MCP tool is not currently indexed")?;
+        let run_approved = self.run_approved_plan_tool_call(call).await?;
+        match authorize_mcp_read_only_target(
+            &indexed,
+            expected_catalog,
+            expected_schema,
+            run_approved,
+        ) {
+            Ok(()) => Ok(PlanToolAuthorizationV4::Allowed {
+                effect: ToolEffectV4::ReadOnly,
+            }),
+            Err(KnowledgeErrorV4::McpToolNotApproved) if !run_approved => {
+                Ok(PlanToolAuthorizationV4::RequiresApproval {
+                    effect: ToolEffectV4::ReadOnly,
+                    reason: "The third-party readOnlyHint is an unverified hint trusted by the user, not a host guarantee; approve this exact MCP read-only call only if you trust the configured server and arguments.".into(),
+                })
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    async fn execute_inner(
+        &self,
+        call: &ToolCallV4,
+        require_read_only_hint: bool,
+    ) -> Result<ToolOutcomeV4, String> {
         let (content, data, provenance) = match call.tool_id.as_str() {
             "project.list" => {
                 let path = call
@@ -3066,9 +3470,9 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                         && !hit.tool.tool_approved
                 });
                 let guidance = if needs_run_approval {
-                    "A matching MCP tool is configured and launch-approved but not persistently tool-approved. Call use_mcp_tool with its exact server_id, tool, schema_sha256, and arguments; the Host will request explicit schema-bound approval for this run. Do not replace literature MCP access with ad-hoc runtime HTTP code."
+                    "A matching MCP tool is configured and launch-approved but not persistently tool-approved. Call use_mcp_tool with its exact server_id, tool, catalog_sha256, schema_sha256, and arguments; the Host will request explicit schema+catalog-bound approval for this run. The third-party readOnlyHint is an unverified hint trusted by the user, not a Host guarantee. Do not replace literature MCP access with ad-hoc runtime HTTP code."
                 } else {
-                    "Call use_mcp_tool with the selected tool's exact server_id, tool, schema_sha256, and arguments."
+                    "Call use_mcp_tool with the selected tool's exact server_id, tool, catalog_sha256, schema_sha256, and arguments. The third-party readOnlyHint is an unverified hint trusted by the user, not a Host guarantee."
                 };
                 let payload = json!({"tools":hits,"guidance":guidance});
                 (
@@ -3089,11 +3493,39 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                     .into_iter()
                     .find(|entry| entry.server_id == server_id && entry.tool_name == tool)
                     .ok_or("MCP tool is not currently indexed")?;
-                let schema_bound_run_approved = self.run_approved_tool_call(call).await?;
+                // Plan calls must carry the search snapshot explicitly. The
+                // historical Execute path may omit catalog_sha256; in that
+                // case bind it to the currently indexed profile snapshot.
+                let expected_catalog = call
+                    .arguments
+                    .get("catalog_sha256")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(ToOwned::to_owned)
+                    .or_else(|| {
+                        (!require_read_only_hint).then(|| indexed.tool_catalog_sha256.clone())
+                    })
+                    .ok_or_else(|| "catalog_sha256 is required for Plan MCP calls".to_string())?;
+                let schema_bound_run_approved = if require_read_only_hint {
+                    self.run_approved_plan_tool_call(call).await?
+                } else {
+                    self.run_approved_tool_call(call).await?
+                };
                 if !indexed.tool_approved && schema_bound_run_approved {
                     indexed.tool_approved = true;
                 }
-                authorize_mcp_use(&indexed, expected_schema).map_err(|error| error.to_string())?;
+                if require_read_only_hint {
+                    authorize_mcp_read_only_target(
+                        &indexed,
+                        &expected_catalog,
+                        expected_schema,
+                        schema_bound_run_approved,
+                    )
+                    .map_err(|error| error.to_string())?;
+                } else {
+                    authorize_mcp_use(&indexed, &expected_catalog, expected_schema)
+                        .map_err(|error| error.to_string())?;
+                }
                 let result = invoke_configured_mcp_tool_v4(
                     &self.repository,
                     &self.mcp_sessions,
@@ -3105,7 +3537,9 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                         .get("arguments")
                         .cloned()
                         .unwrap_or_else(|| json!({})),
+                    expected_catalog,
                     expected_schema.into(),
+                    require_read_only_hint,
                     schema_bound_run_approved,
                 )
                 .await?;
@@ -3115,6 +3549,7 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                     json!({
                         "server_id":server_id,
                         "tool":tool,
+                        "catalog_sha256":indexed.tool_catalog_sha256,
                         "schema_sha256":indexed.schema_sha256,
                         "audit_id":result.audit_id,
                         "result":value
@@ -3289,6 +3724,24 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
             data,
             provenance,
         })
+    }
+}
+
+#[async_trait]
+impl ToolExecutorV4 for DesktopToolExecutorV4 {
+    async fn execute(&self, call: &ToolCallV4) -> Result<ToolOutcomeV4, String> {
+        self.execute_inner(call, false).await
+    }
+
+    async fn authorize_plan_call(
+        &self,
+        call: &ToolCallV4,
+    ) -> Result<PlanToolAuthorizationV4, String> {
+        self.authorize_plan_target(call).await
+    }
+
+    async fn execute_plan(&self, call: &ToolCallV4) -> Result<ToolOutcomeV4, String> {
+        self.execute_inner(call, true).await
     }
 
     async fn interrupt(&self, run_id: Uuid) -> Result<(), String> {
@@ -4242,7 +4695,9 @@ mod tests {
     use super::*;
     use omicsops_adapters::{llm::ProviderProtocol, ssh::SshAuthentication};
     use omicsops_core::domain::{AuthenticationMethod, ConnectionProfile};
-    use omicsops_protocol::{RunModeV4, ToolApprovalRequestV4, ToolDescriptorV4, ToolEffectV4};
+    use omicsops_protocol::{
+        RunModeV4, ToolApprovalDecisionV4, ToolApprovalRequestV4, ToolDescriptorV4, ToolEffectV4,
+    };
     use url::Url;
 
     #[test]
@@ -4280,8 +4735,158 @@ mod tests {
             remove_active_run(&releasing_runs, run_id, &token);
         });
 
-        assert!(wait_for_active_run_to_yield(&runs, run_id).await.unwrap());
+        wait_for_active_run_to_yield(&runs, run_id).await.unwrap();
         assert!(!runs.lock().unwrap().contains_key(&run_id));
+    }
+
+    #[tokio::test]
+    async fn resume_wait_timeout_is_an_error_and_keeps_the_active_slot() {
+        let runs = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let run_id = Uuid::new_v4();
+        let token = Arc::new(AtomicBool::new(false));
+        assert!(register_active_run(&runs, run_id, token).unwrap());
+
+        let error = wait_for_active_run_to_yield_with(
+            &runs,
+            run_id,
+            1,
+            std::time::Duration::from_millis(0),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("resume wait timeout"));
+        assert!(runs.lock().unwrap().contains_key(&run_id));
+    }
+
+    fn plan_approval_event_fixture(
+        decision: Option<ToolApprovalDecisionV4>,
+        duplicate: bool,
+    ) -> (PlanApprovalScopeV4, ToolCallV4, Vec<AgentEventV4>) {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let scope = PlanApprovalScopeV4 {
+            project_id,
+            conversation_id,
+            run_id,
+            revision_id: Uuid::new_v4(),
+            revision: 1,
+        };
+        let call = ToolCallV4 {
+            call_id: "plan-approval".into(),
+            tool_id: "use_mcp_tool".into(),
+            arguments: json!({
+                "server_id": Uuid::new_v4(),
+                "tool": "search",
+                "catalog_sha256": "catalog",
+                "schema_sha256": "schema",
+                "arguments": {"query":"fixture"}
+            }),
+        };
+        let scope_hash = scope.hash();
+        let request = ToolApprovalRequestV4::new_with_scope(
+            run_id,
+            &scope_hash,
+            call.clone(),
+            ToolEffectV4::ReadOnly,
+            "fixture approval",
+        )
+        .unwrap();
+        let first = AgentEventV4::first(
+            run_id,
+            project_id,
+            conversation_id,
+            Utc::now(),
+            AgentEventKindV4::RunCreated {
+                mode: RunModeV4::Plan,
+            },
+        );
+        let requested = AgentEventV4::next(
+            &first,
+            Utc::now(),
+            AgentEventKindV4::ToolRequested { call: call.clone() },
+        );
+        let approval = AgentEventV4::next(
+            &requested,
+            Utc::now(),
+            AgentEventKindV4::ToolApprovalRequested {
+                request: request.clone(),
+            },
+        );
+        let mut events = vec![first, requested, approval];
+        if let Some(decision) = decision {
+            let decided = AgentEventV4::next(
+                events.last().unwrap(),
+                Utc::now(),
+                AgentEventKindV4::ToolApprovalDecided {
+                    approval_id: request.approval_id.clone(),
+                    call_hash: request.call_hash.clone(),
+                    decision,
+                },
+            );
+            events.push(decided);
+            if duplicate {
+                events.push(AgentEventV4::next(
+                    events.last().unwrap(),
+                    Utc::now(),
+                    AgentEventKindV4::ToolApprovalDecided {
+                        approval_id: request.approval_id,
+                        call_hash: request.call_hash,
+                        decision,
+                    },
+                ));
+            }
+        }
+        (scope, call, events)
+    }
+
+    #[test]
+    fn plan_approval_resume_decision_requires_one_current_valid_decision() {
+        let (scope, _call, events) = plan_approval_event_fixture(None, false);
+        let undecided = plan_approval_resume_decision(&events, scope).unwrap_err();
+        assert!(undecided.contains("undecided"));
+
+        let (scope, _call, events) =
+            plan_approval_event_fixture(Some(ToolApprovalDecisionV4::Approved), false);
+        assert_eq!(
+            plan_approval_resume_decision(&events, scope).unwrap(),
+            ToolApprovalDecisionV4::Approved
+        );
+        let (scope, _call, events) =
+            plan_approval_event_fixture(Some(ToolApprovalDecisionV4::Denied), false);
+        assert_eq!(
+            plan_approval_resume_decision(&events, scope).unwrap(),
+            ToolApprovalDecisionV4::Denied
+        );
+
+        let (scope, _call, events) =
+            plan_approval_event_fixture(Some(ToolApprovalDecisionV4::Approved), true);
+        let duplicate = plan_approval_resume_decision(&events, scope).unwrap_err();
+        assert!(duplicate.contains("duplicated") || duplicate.contains("tampered"));
+
+        let (scope, call, mut events) =
+            plan_approval_event_fixture(Some(ToolApprovalDecisionV4::Approved), false);
+        events.push(AgentEventV4::next(
+            events.last().unwrap(),
+            Utc::now(),
+            AgentEventKindV4::ToolDispatchStarted {
+                call_id: call.call_id,
+                tool_id: call.tool_id,
+                effect: ToolEffectV4::ReadOnly,
+                idempotency_key: "already-dispatched".into(),
+            },
+        ));
+        let dispatched = plan_approval_resume_decision(&events, scope).unwrap_err();
+        assert!(dispatched.contains("no pending") || dispatched.contains("current"));
+
+        let (mut old_scope, _call, events) =
+            plan_approval_event_fixture(Some(ToolApprovalDecisionV4::Approved), false);
+        old_scope.revision_id = Uuid::new_v4();
+        let old = plan_approval_resume_decision(&events, old_scope).unwrap_err();
+        assert!(old.contains("no pending") || old.contains("current"));
+
+        // Keep the first fixture call live in this test so its scope/call
+        // construction is also checked by the helper's exact-call predicate.
     }
 
     #[test]
@@ -4346,6 +4951,7 @@ mod tests {
             arguments: json!({
                 "server_id":Uuid::new_v4(),
                 "tool":"pubmed_search",
+                "catalog_sha256":"catalog",
                 "schema_sha256":"schema",
                 "arguments":{"query":"HCC single-cell"}
             }),
@@ -4367,7 +4973,17 @@ mod tests {
                 request: request.clone(),
             },
         );
-        assert!(!run_has_approved_tool_call(&[first.clone()], &call).unwrap());
+        assert!(
+            !run_has_approved_tool_call(
+                &[first.clone()],
+                &call,
+                RunModeV4::Execute,
+                Some("frozen-spec"),
+                None,
+                run_id,
+            )
+            .unwrap()
+        );
         let approved = AgentEventV4::next(
             &first,
             Utc::now(),
@@ -4378,11 +4994,99 @@ mod tests {
             },
         );
         let events = [first, approved];
-        assert!(run_has_approved_tool_call(&events, &call).unwrap());
+        assert!(
+            run_has_approved_tool_call(
+                &events,
+                &call,
+                RunModeV4::Execute,
+                Some("frozen-spec"),
+                None,
+                run_id,
+            )
+            .unwrap()
+        );
 
         let mut changed = call.clone();
         changed.arguments["arguments"]["query"] = json!("different query");
-        assert!(!run_has_approved_tool_call(&events, &changed).unwrap());
+        assert!(
+            !run_has_approved_tool_call(
+                &events,
+                &changed,
+                RunModeV4::Execute,
+                Some("frozen-spec"),
+                None,
+                run_id,
+            )
+            .unwrap()
+        );
+
+        let plan_scope = PlanApprovalScopeV4 {
+            project_id: Uuid::new_v4(),
+            conversation_id: Uuid::new_v4(),
+            run_id,
+            revision_id: Uuid::new_v4(),
+            revision: 1,
+        };
+        let plan_scope_hash = plan_scope.hash();
+        let plan_request = ToolApprovalRequestV4::new_with_scope(
+            run_id,
+            &plan_scope_hash,
+            call.clone(),
+            ToolEffectV4::ReadOnly,
+            "plan read-only approval",
+        )
+        .unwrap();
+        let plan_first = AgentEventV4::first(
+            run_id,
+            plan_scope.project_id,
+            plan_scope.conversation_id,
+            Utc::now(),
+            AgentEventKindV4::ToolApprovalRequested {
+                request: plan_request.clone(),
+            },
+        );
+        let plan_decided = AgentEventV4::next(
+            &plan_first,
+            Utc::now(),
+            AgentEventKindV4::ToolApprovalDecided {
+                approval_id: plan_request.approval_id,
+                call_hash: plan_request.call_hash,
+                decision: ToolApprovalDecisionV4::Approved,
+            },
+        );
+        assert!(
+            run_has_approved_tool_call(
+                &[plan_first.clone(), plan_decided.clone()],
+                &call,
+                RunModeV4::Plan,
+                Some(&plan_scope_hash),
+                Some(ToolEffectV4::ReadOnly),
+                run_id,
+            )
+            .unwrap()
+        );
+        assert!(
+            !run_has_approved_tool_call(
+                &[plan_first.clone(), plan_decided.clone()],
+                &call,
+                RunModeV4::Plan,
+                Some("old-plan-scope"),
+                Some(ToolEffectV4::ReadOnly),
+                run_id,
+            )
+            .unwrap()
+        );
+        assert!(
+            !run_has_approved_tool_call(
+                &[plan_first, plan_decided],
+                &call,
+                RunModeV4::Execute,
+                Some(&plan_scope_hash),
+                None,
+                run_id,
+            )
+            .unwrap()
+        );
     }
 
     #[test]

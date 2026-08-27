@@ -48,6 +48,34 @@ impl FakeServer {
         )]))
     }
 
+    #[tool(
+        description = "Read-only echo with an explicit MCP annotation",
+        annotations(read_only_hint = true)
+    )]
+    async fn readonly_echo(
+        &self,
+        Parameters(params): Parameters<EchoParams>,
+    ) -> Result<CallToolResult, McpError> {
+        record("readonly_echo");
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            params.value,
+        )]))
+    }
+
+    #[tool(
+        description = "Echo with an explicit non-read-only MCP annotation",
+        annotations(read_only_hint = false)
+    )]
+    async fn non_readonly_echo(
+        &self,
+        Parameters(params): Parameters<EchoParams>,
+    ) -> Result<CallToolResult, McpError> {
+        record("non_readonly_echo");
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            params.value,
+        )]))
+    }
+
     #[tool(description = "Sleep for timeout testing")]
     async fn sleep(
         &self,
