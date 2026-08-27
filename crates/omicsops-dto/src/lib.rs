@@ -3,6 +3,7 @@
 //! This crate intentionally has no desktop, UI, database, or async runtime
 //! dependencies so it remains usable from native and `wasm32` consumers.
 
+use chrono::{DateTime, Utc};
 use omicsops_protocol::{ComputeSelectionV4, ExecutionPlanV4};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -17,6 +18,80 @@ pub enum SessionAgentModeV4 {
     /// Plan-first mode, where execution requires plan approval.
     Plan,
 }
+
+/// Durable lifecycle of one immutable proposed-plan revision.
+///
+/// The plan content, hash, and revision number never change after insertion.
+/// Status and feedback are lifecycle metadata used to make the latest
+/// revision approvable without rewriting an older proposal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanRevisionStatusV4 {
+    Generating,
+    Revising,
+    Pending,
+    Approved,
+    Superseded,
+    Cancelled,
+}
+
+impl PlanRevisionStatusV4 {
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Generating | Self::Revising | Self::Pending)
+    }
+}
+
+/// A persisted, content-addressed plan revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ProposedPlanRevisionV4 {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub conversation_id: Uuid,
+    pub run_id: Uuid,
+    pub revision: u64,
+    pub plan: ExecutionPlanV4,
+    pub markdown: String,
+    pub plan_hash: String,
+    pub status: PlanRevisionStatusV4,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Backward/forward-compatible aliases used by the native command boundary.
+pub type PlanRevisionStatus = PlanRevisionStatusV4;
+pub type ProposedPlanRevision = ProposedPlanRevisionV4;
+
+/// Request body for `agent_v4_request_plan_revision`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RequestPlanRevisionV4 {
+    pub run_id: Uuid,
+    pub plan_hash: String,
+    pub feedback: String,
+}
+
+pub type AgentV4RequestPlanRevisionRequest = RequestPlanRevisionV4;
+pub type RequestPlanRevisionRequestV4 = RequestPlanRevisionV4;
+pub type PlanRevisionRequestV4 = RequestPlanRevisionV4;
+
+/// Response returned after feedback is durably attached to the current
+/// revision. A subsequent planning pass creates the next immutable revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RequestPlanRevisionResponseV4 {
+    pub run_id: Uuid,
+    pub revision: u64,
+    pub plan_hash: String,
+    pub status: PlanRevisionStatusV4,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<String>,
+}
+
+pub type AgentV4RequestPlanRevisionResponse = RequestPlanRevisionResponseV4;
+pub type AgentV4RequestPlanRevisionResponseV4 = RequestPlanRevisionResponseV4;
 
 /// Request shape shared by mode readers even though the Tauri command keeps
 /// its historical two-argument boundary.

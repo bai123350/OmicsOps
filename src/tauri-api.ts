@@ -12,6 +12,8 @@ import type {
   GetConversationAgentModeResponseV4,
   SetConversationAgentModeRequestV4,
   SetConversationAgentModeResponseV4,
+  AgentV4RequestPlanRevisionRequest,
+  RequestPlanRevisionResponseV4,
   ComputeSelectionV4,
   ComputeBackendAvailabilityV4,
   WorkspaceConversation,
@@ -381,8 +383,12 @@ export async function agentV4StartDirect(request: { project_id: string; conversa
   return invoke("agent_v4_start_direct", { request });
 }
 
-export async function agentV4ApprovePlan(runId: string, approvalHash: string): Promise<RunSummaryV4> {
-  return invoke("agent_v4_approve_plan", { request: { run_id: runId, approval_hash: approvalHash } });
+export async function agentV4ApprovePlan(runId: string, approvalHash: string, revision?: number): Promise<RunSummaryV4> {
+  return invoke("agent_v4_approve_plan", { request: { run_id: runId, approval_hash: approvalHash, ...(revision === undefined ? {} : { revision }) } });
+}
+
+export async function agentV4RequestPlanRevision(request: AgentV4RequestPlanRevisionRequest): Promise<RequestPlanRevisionResponseV4> {
+  return invoke("agent_v4_request_plan_revision", { request });
 }
 
 export async function agentV4Resume(runId: string): Promise<void> { await invoke("agent_v4_resume", { runId }); }

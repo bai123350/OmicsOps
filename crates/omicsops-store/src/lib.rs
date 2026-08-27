@@ -17,9 +17,10 @@ use omicsops_core::{
         SkillPackage, SyncEntry,
     },
 };
-use omicsops_dto::SessionAgentModeV4;
+use omicsops_dto::{PlanRevisionStatusV4, ProposedPlanRevisionV4, SessionAgentModeV4};
 use omicsops_protocol::{
-    AgentEventV4, ContextArchiveV4, ContextCheckpointV4, deserialize_event_chain_v4,
+    AgentEventKindV4, AgentEventV4, ComputeSelectionV4, ContextArchiveV4, ContextCheckpointV4,
+    ExecutionPlanV4, RunModeV4, RunSpecV4, deserialize_event_chain_v4,
 };
 use omicsops_science::ScientificStateV4;
 use serde::{Serialize, de::DeserializeOwned};
@@ -27,7 +28,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{
     Row, Sqlite, SqlitePool, Transaction,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePoolOptions},
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -36,6 +37,32 @@ const SCHEMA_VERSION: u32 = 4;
 const INIT_SQL: &str = include_str!("../migrations/init.sql");
 const SETTINGS_GLOBAL_SCOPE: &str = "global";
 const CONVERSATION_AGENT_MODE_SETTING_PREFIX: &str = "conversation_agent_mode:";
+const PROPOSED_PLAN_TRIGGER_SQL: &str = r#"
+CREATE TRIGGER trg_proposed_plans_immutable_content
+BEFORE UPDATE OF status,id,project_id,frame_id,revision,plan_hash,plan_json,markdown,run_id,created_at
+ON proposed_plans
+WHEN NOT (
+    NEW.id IS OLD.id
+    AND NEW.project_id IS OLD.project_id
+    AND NEW.frame_id IS OLD.frame_id
+    AND NEW.revision IS OLD.revision
+    AND NEW.plan_hash IS OLD.plan_hash
+    AND NEW.plan_json IS OLD.plan_json
+    AND NEW.markdown IS OLD.markdown
+    AND NEW.run_id IS OLD.run_id
+    AND NEW.created_at IS OLD.created_at
+    AND (
+        NEW.status IS OLD.status
+        OR (OLD.status = 'generating' AND NEW.status IN ('revising','cancelled','superseded'))
+        OR (OLD.status = 'revising' AND NEW.status IN ('cancelled','superseded'))
+        OR (OLD.status = 'pending' AND NEW.status IN ('approved','revising','cancelled','superseded'))
+        OR (OLD.status = 'approved' AND NEW.status = 'superseded')
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'proposed plan revision content is immutable');
+END
+"#;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -57,6 +84,66 @@ pub enum StoreError {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MigrationOptions {
     pub fail_after_rows: Option<usize>,
+}
+
+/// Optional deterministic failure injection for the plan approval transaction.
+/// It is intentionally public so Store integration tests can prove that no
+/// partial approval, mode change, or event is visible after a rollback.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ApprovalOptionsV4 {
+    pub fail_after_step: Option<u8>,
+}
+
+/// Optional deterministic failure injection for plan-revision request tests.
+/// The fault is raised after lifecycle metadata is changed but before the
+/// request event is inserted, proving that both writes share one transaction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlanRevisionRequestOptionsV4 {
+    pub fail_after_step: Option<u8>,
+}
+
+/// Fields that are known only after the planning model returns. They are
+/// persisted by the same transaction that materializes the generating row so
+/// no later whole-run snapshot can roll them back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanRevisionFinalizeOptionsV4 {
+    pub approval_hash: Option<String>,
+    pub compute_selection: Option<ComputeSelectionV4>,
+}
+
+/// The durable result of requesting changes to a plan revision. The event is
+/// returned for post-commit Tauri broadcasting; it is inserted by the same
+/// Store transaction as the feedback/status transition.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanRevisionRequestResultV4 {
+    pub revision: ProposedPlanRevisionV4,
+    pub event: AgentEventV4,
+}
+
+/// The durable result of an atomic plan approval. The returned events are
+/// emitted by the Tauri adapter only after the transaction commits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanApprovalResultV4 {
+    pub run_id: Uuid,
+    pub project_id: Uuid,
+    pub conversation_id: Uuid,
+    pub revision: u64,
+    pub plan_hash: String,
+    pub approval_hash: Option<String>,
+    pub spec_hash: Option<String>,
+    pub mode: SessionAgentModeV4,
+    pub events: Vec<AgentEventV4>,
+}
+
+/// The durable result of cancelling a pending/revising plan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanCancellationResultV4 {
+    pub run_id: Uuid,
+    pub project_id: Uuid,
+    pub conversation_id: Uuid,
+    pub revision: u64,
+    pub mode: SessionAgentModeV4,
+    pub events: Vec<AgentEventV4>,
 }
 
 #[derive(Clone)]
@@ -324,7 +411,25 @@ impl Store {
         mode: SessionAgentModeV4,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
-        ensure_conversation_owner_executor(&mut tx, project_id, conversation_id).await?;
+        ensure_conversation_owner_executor(&mut *tx, project_id, conversation_id).await?;
+        if mode == SessionAgentModeV4::Agent {
+            let locked: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM proposed_plans
+                    WHERE project_id=?1 AND frame_id=?2
+                      AND status IN ('generating','revising','pending')
+                )",
+            )
+            .bind(project_id.to_string())
+            .bind(conversation_id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+            if locked != 0 {
+                return Err(StoreError::InvalidInput(
+                    "conversation is locked by an active plan; approve, request changes, or cancel it first".into(),
+                ));
+            }
+        }
         let key = conversation_agent_mode_setting_key(conversation_id);
         sqlx::query(
             "INSERT INTO settings (scope,key,value_json,updated_at)
@@ -438,9 +543,93 @@ impl Store {
             message.created_at,
         )
         .await?;
+        ensure_conversation_unlocked_executor(
+            &mut *tx,
+            message.project_id,
+            message.conversation_id,
+        )
+        .await?;
         insert_message(&mut tx, message).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Atomically persist a submitted user message and, when it is the first
+    /// user message in the conversation, update the conversation title.
+    ///
+    /// The lock predicate is evaluated inside the same `BEGIN IMMEDIATE`
+    /// transaction as both writes. This prevents a plan revision from winning
+    /// between a title preflight and the message insert, which would otherwise
+    /// leave a title-only mutation behind after the message is rejected.
+    pub async fn save_message_with_first_title(
+        &self,
+        message: &Message,
+        title: &str,
+    ) -> Result<Option<Conversation>, StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        ensure_frame(
+            &mut tx,
+            message.project_id,
+            message.conversation_id,
+            message.created_at,
+        )
+        .await?;
+        ensure_conversation_unlocked_executor(
+            &mut *tx,
+            message.project_id,
+            message.conversation_id,
+        )
+        .await?;
+
+        let has_user_message: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM messages
+                WHERE frame_id=?1 AND role='user'
+            )",
+        )
+        .bind(message.conversation_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let updated_conversation = if has_user_message == 0 {
+            let row = sqlx::query(
+                "SELECT frame_id,project_id,title,status,model_profile_id,created_at,updated_at
+                 FROM conversation_records
+                 WHERE frame_id=?1 AND project_id=?2",
+            )
+            .bind(message.conversation_id.to_string())
+            .bind(message.project_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| StoreError::InvalidInput("conversation not found".into()))?;
+            let mut conversation = conversation_from_row(row)?;
+            conversation.title = title.to_owned();
+            conversation.updated_at = message.created_at;
+            sqlx::query(
+                "UPDATE conversation_records
+                 SET title=?1,updated_at=?2
+                 WHERE frame_id=?3 AND project_id=?4",
+            )
+            .bind(&conversation.title)
+            .bind(timestamp(conversation.updated_at))
+            .bind(message.conversation_id.to_string())
+            .bind(message.project_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("UPDATE frames SET updated_at=?1 WHERE id=?2 AND project_id=?3")
+                .bind(timestamp(conversation.updated_at))
+                .bind(message.conversation_id.to_string())
+                .bind(message.project_id.to_string())
+                .execute(&mut *tx)
+                .await?;
+            Some(conversation)
+        } else {
+            None
+        };
+
+        insert_message(&mut tx, message).await?;
+        tx.commit().await?;
+        Ok(updated_conversation)
     }
 
     pub async fn messages_for_conversation(
@@ -660,20 +849,63 @@ impl Store {
         status: &str,
         value: &Value,
     ) -> Result<(), StoreError> {
-        sqlx::query(
+        // This is the ordinary public persistence seam. Lifecycle methods
+        // write their run row inside their own transition transaction; this
+        // seam must never be able to overwrite a generating/revising/pending
+        // plan (including with a stale whole-row snapshot).
+        let mut tx = self.pool.begin().await?;
+        let existing_owner =
+            sqlx::query("SELECT project_id,conversation_id FROM agent_runs_v4 WHERE run_id=?1")
+                .bind(run_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some(existing_owner) = existing_owner {
+            let owner_matches = existing_owner.try_get::<String, _>(0)? == project_id.to_string()
+                && existing_owner.try_get::<String, _>(1)? == conversation_id.to_string();
+            if !owner_matches {
+                return Err(StoreError::InvalidInput(
+                    "agent run owner/context mismatch: it already belongs to a different project or conversation".into(),
+                ));
+            }
+        }
+        ensure_conversation_unlocked_executor(&mut *tx, project_id, conversation_id).await?;
+        let saved = sqlx::query(
             "INSERT INTO agent_runs_v4 (run_id,project_id,conversation_id,status,value_json)
              VALUES (?1,?2,?3,?4,?5)
-             ON CONFLICT(run_id) DO UPDATE SET project_id=excluded.project_id,
-             conversation_id=excluded.conversation_id,status=excluded.status,value_json=excluded.value_json",
+             ON CONFLICT(run_id) DO UPDATE SET status=excluded.status,value_json=excluded.value_json
+             WHERE agent_runs_v4.project_id=excluded.project_id
+               AND agent_runs_v4.conversation_id=excluded.conversation_id",
         )
         .bind(run_id.to_string())
         .bind(project_id.to_string())
         .bind(conversation_id.to_string())
         .bind(status)
         .bind(serde_json::to_string(value)?)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if saved.rows_affected() != 1 {
+            return Err(StoreError::InvalidInput(
+                "agent run owner/context mismatch: it already belongs to a different project or conversation".into(),
+            ));
+        }
+        tx.commit().await?;
         Ok(())
+    }
+
+    /// Persist a newly started ordinary/direct run only when the conversation
+    /// is currently unlocked. The ownership and lock predicate are checked in
+    /// the same transaction as the write, so a Tauri preflight cannot race a
+    /// generating plan revision.
+    pub async fn save_agent_run_v4_if_unlocked(
+        &self,
+        run_id: Uuid,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        status: &str,
+        value: &Value,
+    ) -> Result<(), StoreError> {
+        self.save_agent_run_v4(run_id, project_id, conversation_id, status, value)
+            .await
     }
 
     pub async fn agent_run_v4(&self, run_id: Uuid) -> Result<Option<Value>, StoreError> {
@@ -683,6 +915,1737 @@ impl Store {
             .await?;
         row.map(|row| Ok(serde_json::from_str(row.try_get::<String, _>(0)?.as_str())?))
             .transpose()
+    }
+
+    /// Atomically create a planning run, reserve its generating revision, and
+    /// acquire the conversation lock before any model call is made. This is
+    /// the write-path seam used by the Tauri planning command; its lock check
+    /// is not merely a preflight performed by the adapter.
+    pub async fn start_plan_run_v4(
+        &self,
+        run_id: Uuid,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        status: &str,
+        value: &Value,
+        objective: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ProposedPlanRevisionV4, StoreError> {
+        let objective = objective.trim();
+        if objective.is_empty() {
+            return Err(StoreError::InvalidInput(
+                "plan generation objective cannot be empty".into(),
+            ));
+        }
+        let timestamp = timestamp(now);
+        let stored_now = from_timestamp(timestamp, "plan revision timestamp")?;
+        let mut connection = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let result: Result<ProposedPlanRevisionV4, StoreError> = async {
+            let owns_conversation: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM conversation_records
+                    WHERE frame_id=?1 AND project_id=?2
+                )",
+            )
+            .bind(conversation_id.to_string())
+            .bind(project_id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+            if owns_conversation == 0 {
+                return Err(StoreError::InvalidInput(format!(
+                    "conversation {conversation_id} does not belong to project {project_id}"
+                )));
+            }
+            let active: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM proposed_plans
+                    WHERE project_id=?1 AND frame_id=?2
+                      AND status IN ('generating','revising','pending')
+                )",
+            )
+            .bind(project_id.to_string())
+            .bind(conversation_id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+            if active != 0 {
+                return Err(StoreError::InvalidInput(
+                    "conversation already has an active plan generation or proposal".into(),
+                ));
+            }
+            let existing_run: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM agent_runs_v4 WHERE run_id=?1)",
+            )
+            .bind(run_id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+            if existing_run != 0 {
+                return Err(StoreError::InvalidInput(
+                    "planning run id already exists and cannot be reused".into(),
+                ));
+            }
+            sqlx::query(
+                "INSERT INTO agent_runs_v4 (run_id,project_id,conversation_id,status,value_json)
+                 VALUES (?1,?2,?3,?4,?5)",
+            )
+            .bind(run_id.to_string())
+            .bind(project_id.to_string())
+            .bind(conversation_id.to_string())
+            .bind(status)
+            .bind(serde_json::to_string(value)?)
+            .execute(&mut *connection)
+            .await?;
+            let next_revision: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(revision),0)+1 FROM proposed_plans WHERE frame_id=?1",
+            )
+            .bind(conversation_id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+            let revision = u64::try_from(next_revision)
+                .map_err(|_| StoreError::InvalidInput("invalid next plan revision".into()))?;
+            let seed_plan = generation_seed_plan(objective, revision);
+            let plan_hash = seed_plan
+                .canonical_hash()
+                .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO proposed_plans
+                 (id,project_id,frame_id,revision,plan_hash,status,plan_json,markdown,feedback,run_id,created_at,updated_at)
+                 VALUES (?1,?2,?3,?4,?5,'generating',?6,'',NULL,?7,?8,?8)",
+            )
+            .bind(id.to_string())
+            .bind(project_id.to_string())
+            .bind(conversation_id.to_string())
+            .bind(next_revision)
+            .bind(&plan_hash)
+            .bind(serde_json::to_string(&seed_plan)?)
+            .bind(run_id.to_string())
+            .bind(timestamp)
+            .execute(&mut *connection)
+            .await?;
+            sqlx::query(
+                "INSERT INTO settings (scope,key,value_json,updated_at)
+                 VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(scope,key) DO UPDATE SET value_json=excluded.value_json,
+                 updated_at=excluded.updated_at",
+            )
+            .bind(SETTINGS_GLOBAL_SCOPE)
+            .bind(conversation_agent_mode_setting_key(conversation_id))
+            .bind(serde_json::to_string(&SessionAgentModeV4::Plan)?)
+            .bind(timestamp)
+            .execute(&mut *connection)
+            .await?;
+            let mut stored_value = value.clone();
+            if let Some(object) = stored_value.as_object_mut() {
+                object.insert("status".into(), Value::String("planning".into()));
+                object.insert("plan_revision".into(), Value::from(revision));
+            }
+            sqlx::query(
+                "UPDATE agent_runs_v4 SET status='planning',value_json=?,updated_at=? WHERE run_id=?3",
+            )
+            .bind(serde_json::to_string(&stored_value)?)
+            .bind(timestamp)
+            .bind(run_id.to_string())
+            .execute(&mut *connection)
+            .await?;
+            Ok(ProposedPlanRevisionV4 {
+                id,
+                project_id,
+                conversation_id,
+                run_id,
+                revision,
+                plan: seed_plan,
+                markdown: String::new(),
+                plan_hash,
+                status: PlanRevisionStatusV4::Generating,
+                feedback: None,
+                created_at: stored_now,
+                updated_at: stored_now,
+            })
+        }
+        .await;
+        match result {
+            Ok(value) => {
+                connection.commit().await?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = connection.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Atomically acquire the conversation's plan-generation lock and reserve
+    /// the first immutable revision number. `BEGIN IMMEDIATE` serializes two
+    /// concurrent planners before either can observe the no-active-lock
+    /// predicate; a uniqueness violation is not used as synchronization.
+    pub async fn acquire_plan_revision_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        objective: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ProposedPlanRevisionV4, StoreError> {
+        self.acquire_plan_revision_generation_v4(
+            project_id,
+            conversation_id,
+            run_id,
+            objective,
+            now,
+            false,
+        )
+        .await
+    }
+
+    /// Atomically acquire the next revision after a user requested changes.
+    /// Only a matching latest `revising` revision may be resumed; pending,
+    /// approved, superseded, or cancelled plans cannot be revived.
+    pub async fn acquire_plan_revision_resume_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        objective: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ProposedPlanRevisionV4, StoreError> {
+        self.acquire_plan_revision_generation_v4(
+            project_id,
+            conversation_id,
+            run_id,
+            objective,
+            now,
+            true,
+        )
+        .await
+    }
+
+    async fn acquire_plan_revision_generation_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        objective: &str,
+        now: DateTime<Utc>,
+        resume: bool,
+    ) -> Result<ProposedPlanRevisionV4, StoreError> {
+        let objective = objective.trim();
+        if objective.is_empty() {
+            return Err(StoreError::InvalidInput(
+                "plan generation objective cannot be empty".into(),
+            ));
+        }
+        let timestamp = timestamp(now);
+        let stored_now = from_timestamp(timestamp, "plan revision timestamp")?;
+        let mut connection = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let result: Result<ProposedPlanRevisionV4, StoreError> = async {
+            let owns_conversation: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM conversation_records
+                    WHERE frame_id=?1 AND project_id=?2
+                )",
+            )
+            .bind(conversation_id.to_string())
+            .bind(project_id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+            if owns_conversation == 0 {
+                return Err(StoreError::InvalidInput(format!(
+                    "conversation {conversation_id} does not belong to project {project_id}"
+                )));
+            }
+            let owns_run: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM agent_runs_v4
+                    WHERE run_id=?1 AND project_id=?2 AND conversation_id=?3
+                )",
+            )
+            .bind(run_id.to_string())
+            .bind(project_id.to_string())
+            .bind(conversation_id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+            if owns_run == 0 {
+                return Err(StoreError::InvalidInput(format!(
+                    "run {run_id} does not belong to conversation {conversation_id} in project {project_id}"
+                )));
+            }
+            let run_status: String =
+                sqlx::query_scalar("SELECT status FROM agent_runs_v4 WHERE run_id=?1")
+                    .bind(run_id.to_string())
+                    .fetch_one(&mut *connection)
+                    .await?;
+            if matches!(
+                run_status.as_str(),
+                "completed" | "cancelled" | "failed" | "needs_attention"
+            ) {
+                return Err(StoreError::InvalidInput(
+                    "terminal run cannot acquire a plan revision".into(),
+                ));
+            }
+
+            let latest = sqlx::query(
+                "SELECT revision,run_id,status FROM proposed_plans
+                 WHERE project_id=?1 AND frame_id=?2
+                 ORDER BY revision DESC,id DESC LIMIT 1",
+            )
+            .bind(project_id.to_string())
+            .bind(conversation_id.to_string())
+            .fetch_optional(&mut *connection)
+            .await?;
+            if resume {
+                let Some(latest) = latest else {
+                    return Err(StoreError::InvalidInput(
+                        "only a latest revising plan can be resumed".into(),
+                    ));
+                };
+                let latest_run = latest.try_get::<Option<String>, _>(1)?;
+                let latest_status = latest.try_get::<String, _>(2)?;
+                if latest_run.as_deref() != Some(run_id.to_string().as_str())
+                    || latest_status != "revising"
+                {
+                    return Err(StoreError::InvalidInput(
+                        "only the latest revising plan can be resumed".into(),
+                    ));
+                }
+            } else {
+                let active: i64 = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM proposed_plans
+                        WHERE project_id=?1 AND frame_id=?2
+                          AND status IN ('generating','revising','pending')
+                    )",
+                )
+                .bind(project_id.to_string())
+                .bind(conversation_id.to_string())
+                .fetch_one(&mut *connection)
+                .await?;
+                if active != 0 {
+                    return Err(StoreError::InvalidInput(
+                        "conversation already has an active plan generation or proposal".into(),
+                    ));
+                }
+            }
+
+            let next_revision: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(revision),0)+1 FROM proposed_plans WHERE frame_id=?1",
+            )
+            .bind(conversation_id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+            let revision = u64::try_from(next_revision)
+                .map_err(|_| StoreError::InvalidInput("invalid next plan revision".into()))?;
+            let seed_plan = generation_seed_plan(objective, revision);
+            let plan_hash = seed_plan
+                .canonical_hash()
+                .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+            let plan_json = serde_json::to_string(&seed_plan)?;
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO proposed_plans
+                 (id,project_id,frame_id,revision,plan_hash,status,plan_json,markdown,feedback,run_id,created_at,updated_at)
+                 VALUES (?1,?2,?3,?4,?5,'generating',?6,'',NULL,?7,?8,?8)",
+            )
+            .bind(id.to_string())
+            .bind(project_id.to_string())
+            .bind(conversation_id.to_string())
+            .bind(next_revision)
+            .bind(&plan_hash)
+            .bind(plan_json)
+            .bind(run_id.to_string())
+            .bind(timestamp)
+            .execute(&mut *connection)
+            .await?;
+            sqlx::query(
+                "INSERT INTO settings (scope,key,value_json,updated_at)
+                 VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(scope,key) DO UPDATE SET value_json=excluded.value_json,
+                 updated_at=excluded.updated_at",
+            )
+            .bind(SETTINGS_GLOBAL_SCOPE)
+            .bind(conversation_agent_mode_setting_key(conversation_id))
+            .bind(serde_json::to_string(&SessionAgentModeV4::Plan)?)
+            .bind(timestamp)
+            .execute(&mut *connection)
+            .await?;
+
+            let value_json: String = sqlx::query_scalar(
+                "SELECT value_json FROM agent_runs_v4 WHERE run_id=?1",
+            )
+            .bind(run_id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+            let mut value: Value = serde_json::from_str(&value_json)?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert("status".into(), Value::String("planning".into()));
+                object.insert("plan_revision".into(), Value::from(revision));
+            }
+            sqlx::query(
+                "UPDATE agent_runs_v4 SET status='planning',value_json=?,updated_at=? WHERE run_id=?3",
+            )
+            .bind(serde_json::to_string(&value)?)
+            .bind(timestamp)
+            .bind(run_id.to_string())
+            .execute(&mut *connection)
+            .await?;
+            Ok(ProposedPlanRevisionV4 {
+                id,
+                project_id,
+                conversation_id,
+                run_id,
+                revision,
+                plan: seed_plan,
+                markdown: String::new(),
+                plan_hash,
+                status: PlanRevisionStatusV4::Generating,
+                feedback: None,
+                created_at: stored_now,
+                updated_at: stored_now,
+            })
+        }
+        .await;
+        match result {
+            Ok(value) => {
+                connection.commit().await?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = connection.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Finalize the reserved generating row in place. The database trigger
+    /// permits exactly this generating -> pending content materialization;
+    /// every later lifecycle update leaves identity/content/hash immutable.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finalize_plan_revision_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        revision: u64,
+        plan: ExecutionPlanV4,
+        markdown: String,
+        plan_hash: String,
+        now: DateTime<Utc>,
+    ) -> Result<ProposedPlanRevisionV4, StoreError> {
+        self.finalize_plan_revision_v4_with_options(
+            project_id,
+            conversation_id,
+            run_id,
+            revision,
+            plan,
+            markdown,
+            plan_hash,
+            now,
+            PlanRevisionFinalizeOptionsV4::default(),
+        )
+        .await
+    }
+
+    /// Finalize a generating revision and atomically persist the run metadata
+    /// derived from that same model result. Any failure attempts a terminal
+    /// cancellation through the Store before returning the original error;
+    /// cleanup failures are retained in a combined diagnostic.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finalize_plan_revision_v4_with_options(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        revision: u64,
+        plan: ExecutionPlanV4,
+        markdown: String,
+        plan_hash: String,
+        now: DateTime<Utc>,
+        options: PlanRevisionFinalizeOptionsV4,
+    ) -> Result<ProposedPlanRevisionV4, StoreError> {
+        let result = Self::finalize_plan_revision_v4_inner(
+            self.pool.clone(),
+            project_id,
+            conversation_id,
+            run_id,
+            revision,
+            plan,
+            markdown,
+            plan_hash,
+            now,
+            options,
+        )
+        .await;
+        let error = match result {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let cleanup_feedback = format!("plan finalization failed: {error}");
+        match self
+            .terminate_plan_generation_v4(
+                project_id,
+                conversation_id,
+                run_id,
+                revision,
+                PlanRevisionStatusV4::Cancelled,
+                Some(&cleanup_feedback),
+            )
+            .await
+        {
+            Ok(_) => Err(error),
+            Err(cleanup_error) => Err(StoreError::InvalidInput(format!(
+                "{error}; cleanup failed: {cleanup_error}"
+            ))),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_plan_revision_v4_inner(
+        pool: SqlitePool,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        revision: u64,
+        plan: ExecutionPlanV4,
+        markdown: String,
+        plan_hash: String,
+        now: DateTime<Utc>,
+        options: PlanRevisionFinalizeOptionsV4,
+    ) -> Result<ProposedPlanRevisionV4, StoreError> {
+        validate_plan_revision_input(
+            project_id,
+            conversation_id,
+            run_id,
+            revision,
+            &plan,
+            &plan_hash,
+            PlanRevisionStatusV4::Pending,
+        )?;
+        let actual_hash = plan
+            .canonical_hash()
+            .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+        if actual_hash != plan_hash {
+            return Err(StoreError::InvalidInput(
+                "proposed plan hash does not match the structured plan".into(),
+            ));
+        }
+        let timestamp = timestamp(now);
+        let stored_now = from_timestamp(timestamp, "plan revision timestamp")?;
+        let mut connection = pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await?;
+        let result = finalize_plan_revision_v4_in_connection(
+            &mut *connection,
+            project_id,
+            conversation_id,
+            run_id,
+            revision,
+            plan,
+            markdown,
+            plan_hash,
+            timestamp,
+            stored_now,
+            options,
+        )
+        .await;
+        match result {
+            Ok(value) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Mark a still-generating revision as revising (for an input pause) or
+    /// cancelled (for a failed/cancelled generation), releasing the lock when
+    /// the terminal cancellation path is used.
+    pub async fn terminate_plan_generation_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        revision: u64,
+        status: PlanRevisionStatusV4,
+        feedback: Option<&str>,
+    ) -> Result<ProposedPlanRevisionV4, StoreError> {
+        if !matches!(
+            status,
+            PlanRevisionStatusV4::Revising | PlanRevisionStatusV4::Cancelled
+        ) {
+            return Err(StoreError::InvalidInput(
+                "plan generation can only terminate as revising or cancelled".into(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        ensure_conversation_owner_executor(&mut *tx, project_id, conversation_id).await?;
+        ensure_run_owner_executor(&mut *tx, project_id, conversation_id, run_id).await?;
+        let row = sqlx::query(
+            "SELECT id,project_id,frame_id,run_id,revision,plan_json,markdown,plan_hash,status,feedback,created_at,updated_at
+             FROM proposed_plans WHERE project_id=?1 AND frame_id=?2 AND run_id=?3 AND revision=?4",
+        )
+        .bind(project_id.to_string())
+        .bind(conversation_id.to_string())
+        .bind(run_id.to_string())
+        .bind(i64::try_from(revision).map_err(|_| {
+            StoreError::InvalidInput("plan revision exceeds SQLite integer range".into())
+        })?)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| StoreError::InvalidInput("plan generation revision was not found".into()))?;
+        let current = proposed_plan_revision_from_row(row)?;
+        if current.status != PlanRevisionStatusV4::Generating {
+            return Err(StoreError::InvalidInput(
+                "plan generation is no longer active".into(),
+            ));
+        }
+        let now = Utc::now();
+        let stored_now = from_timestamp(timestamp(now), "plan revision timestamp")?;
+        let terminated = sqlx::query(
+            "UPDATE proposed_plans SET status=?1,feedback=?2,updated_at=?3 WHERE id=?4 AND status='generating'",
+        )
+        .bind(enum_string(&status)?)
+        .bind(feedback)
+        .bind(timestamp(stored_now))
+        .bind(current.id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        if terminated.rows_affected() != 1 {
+            return Err(StoreError::InvalidInput(
+                "plan generation changed before it could be terminated".into(),
+            ));
+        }
+        set_agent_run_status_in_tx(
+            &mut *tx,
+            run_id,
+            if status == PlanRevisionStatusV4::Cancelled {
+                "cancelled"
+            } else {
+                "waiting_for_input"
+            },
+        )
+        .await?;
+        if status == PlanRevisionStatusV4::Cancelled {
+            let existing = load_agent_events_in_tx(&mut *tx, run_id).await?;
+            if let Some(terminal) = existing.iter().find(|event| is_terminal_event(event)) {
+                if !matches!(&terminal.event, AgentEventKindV4::RunCancelled) {
+                    return Err(StoreError::InvalidInput(
+                        "plan generation run already has a different terminal event".into(),
+                    ));
+                }
+            } else {
+                let event = if let Some(previous) = existing.last() {
+                    AgentEventV4::next(previous, now, AgentEventKindV4::RunCancelled)
+                } else {
+                    AgentEventV4::first(
+                        run_id,
+                        project_id,
+                        conversation_id,
+                        now,
+                        AgentEventKindV4::RunCancelled,
+                    )
+                };
+                insert_agent_event_in_tx(&mut *tx, &event).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(ProposedPlanRevisionV4 {
+            status,
+            feedback: feedback.map(ToOwned::to_owned),
+            updated_at: stored_now,
+            ..current
+        })
+    }
+
+    /// Insert one immutable proposed-plan revision.
+    ///
+    /// The revision, plan JSON, Markdown, and content hash are never updated
+    /// in place. Lifecycle metadata is changed only by the explicit
+    /// request/approve/cancel transitions below.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_proposed_plan_revision_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        revision: u64,
+        plan: ExecutionPlanV4,
+        markdown: String,
+        plan_hash: String,
+        status: PlanRevisionStatusV4,
+        feedback: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<ProposedPlanRevisionV4, StoreError> {
+        validate_plan_revision_input(
+            project_id,
+            conversation_id,
+            run_id,
+            revision,
+            &plan,
+            &plan_hash,
+            status,
+        )?;
+        let actual_hash = plan
+            .canonical_hash()
+            .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+        if actual_hash != plan_hash {
+            return Err(StoreError::InvalidInput(
+                "proposed plan hash does not match the structured plan".into(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        ensure_conversation_owner_executor(&mut *tx, project_id, conversation_id).await?;
+        ensure_run_owner_executor(&mut *tx, project_id, conversation_id, run_id).await?;
+        let run_status: String =
+            sqlx::query_scalar("SELECT status FROM agent_runs_v4 WHERE run_id=?1")
+                .bind(run_id.to_string())
+                .fetch_one(&mut *tx)
+                .await?;
+        if matches!(
+            run_status.as_str(),
+            "completed" | "cancelled" | "failed" | "needs_attention"
+        ) {
+            return Err(StoreError::InvalidInput(
+                "cannot create a plan revision for a terminal run".into(),
+            ));
+        }
+        let active = sqlx::query(
+            "SELECT run_id,status FROM proposed_plans
+             WHERE project_id=?1 AND frame_id=?2
+               AND status IN ('generating','revising','pending')
+             ORDER BY revision DESC,id DESC LIMIT 1",
+        )
+        .bind(project_id.to_string())
+        .bind(conversation_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(active) = active {
+            let active_run = active.try_get::<Option<String>, _>(0)?;
+            let active_status = active.try_get::<String, _>(1)?;
+            let allowed_materialization = status == PlanRevisionStatusV4::Pending
+                && active_run.as_deref() == Some(run_id.to_string().as_str())
+                && active_status == "revising";
+            if !allowed_materialization {
+                return Err(StoreError::InvalidInput(
+                    "conversation already has an active plan revision".into(),
+                ));
+            }
+        }
+        let plan_json = serde_json::to_string(&plan)?;
+        let status_string = enum_string(&status)?;
+        let timestamp = timestamp(now);
+        let stored_now = from_timestamp(timestamp, "plan revision timestamp")?;
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO proposed_plans
+             (id,project_id,frame_id,revision,plan_hash,status,plan_json,markdown,feedback,run_id,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        )
+        .bind(id.to_string())
+        .bind(project_id.to_string())
+        .bind(conversation_id.to_string())
+        .bind(i64::try_from(revision).map_err(|_| {
+            StoreError::InvalidInput("plan revision exceeds SQLite integer range".into())
+        })?)
+        .bind(&plan_hash)
+        .bind(status_string)
+        .bind(plan_json)
+        .bind(&markdown)
+        .bind(feedback.as_deref())
+        .bind(run_id.to_string())
+        .bind(timestamp)
+        .bind(timestamp)
+        .execute(&mut *tx)
+        .await?;
+        if status.is_active() {
+            upsert_conversation_mode_in_tx(
+                &mut *tx,
+                conversation_id,
+                SessionAgentModeV4::Plan,
+                stored_now,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(ProposedPlanRevisionV4 {
+            id,
+            project_id,
+            conversation_id,
+            run_id,
+            revision,
+            plan,
+            markdown,
+            plan_hash,
+            status,
+            feedback,
+            created_at: stored_now,
+            updated_at: stored_now,
+        })
+    }
+
+    /// Materialize revision one for a pre-revision V4 run that already has a
+    /// plan/hash in its legacy run record. This compatibility seam is
+    /// intentionally separate from `create_next_*`, which requires a latest
+    /// `revising` revision and is therefore not valid for this migration path.
+    pub async fn create_legacy_approval_plan_revision_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        plan: ExecutionPlanV4,
+        markdown: String,
+        plan_hash: String,
+        now: DateTime<Utc>,
+    ) -> Result<ProposedPlanRevisionV4, StoreError> {
+        if self
+            .latest_proposed_plan_revision_v4(project_id, conversation_id)
+            .await?
+            .is_some()
+        {
+            return Err(StoreError::InvalidInput(
+                "legacy approval revision can only be created when no proposal exists".into(),
+            ));
+        }
+        self.create_proposed_plan_revision_v4(
+            project_id,
+            conversation_id,
+            run_id,
+            1,
+            plan,
+            markdown,
+            plan_hash,
+            PlanRevisionStatusV4::Pending,
+            None,
+            now,
+        )
+        .await
+    }
+
+    /// Insert the next revision number for a conversation. The current
+    /// revision is left intact; a caller may use this after a revision request
+    /// has put the conversation into `revising`.
+    pub async fn create_next_proposed_plan_revision_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        plan: ExecutionPlanV4,
+        markdown: String,
+        plan_hash: String,
+        status: PlanRevisionStatusV4,
+        feedback: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<ProposedPlanRevisionV4, StoreError> {
+        validate_plan_revision_input(
+            project_id,
+            conversation_id,
+            run_id,
+            1,
+            &plan,
+            &plan_hash,
+            status,
+        )?;
+        let actual_hash = plan
+            .canonical_hash()
+            .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+        if actual_hash != plan_hash {
+            return Err(StoreError::InvalidInput(
+                "proposed plan hash does not match the structured plan".into(),
+            ));
+        }
+        let timestamp = timestamp(now);
+        let stored_now = from_timestamp(timestamp, "plan revision timestamp")?;
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await?;
+        let result: Result<ProposedPlanRevisionV4, StoreError> = async {
+            let owns_conversation: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM conversation_records
+                    WHERE frame_id=?1 AND project_id=?2
+                )",
+            )
+            .bind(conversation_id.to_string())
+            .bind(project_id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+            if owns_conversation == 0 {
+                return Err(StoreError::InvalidInput(
+                    "proposed plan context is not owned by the project".into(),
+                ));
+            }
+            let owns_run: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM agent_runs_v4
+                    WHERE run_id=?1 AND project_id=?2 AND conversation_id=?3
+                )",
+            )
+            .bind(run_id.to_string())
+            .bind(project_id.to_string())
+            .bind(conversation_id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+            if owns_run == 0 {
+                return Err(StoreError::InvalidInput(
+                    "proposed plan run does not belong to the requested context".into(),
+                ));
+            }
+            let run_status: String = sqlx::query_scalar(
+                "SELECT status FROM agent_runs_v4 WHERE run_id=?1",
+            )
+            .bind(run_id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+            if matches!(
+                run_status.as_str(),
+                "completed" | "cancelled" | "failed" | "needs_attention"
+            ) {
+                return Err(StoreError::InvalidInput(
+                    "cannot create a plan revision for a terminal run".into(),
+                ));
+            }
+            if status != PlanRevisionStatusV4::Pending {
+                return Err(StoreError::InvalidInput(
+                    "low-level next plan revisions must be pending materializations".into(),
+                ));
+            }
+            let latest = sqlx::query(
+                "SELECT run_id,status FROM proposed_plans
+                 WHERE project_id=?1 AND frame_id=?2
+                 ORDER BY revision DESC,id DESC LIMIT 1",
+            )
+            .bind(project_id.to_string())
+            .bind(conversation_id.to_string())
+            .fetch_optional(&mut *connection)
+            .await?;
+            let latest = latest.ok_or_else(|| {
+                StoreError::InvalidInput(
+                    "next plan revision requires the latest matching revising plan".into(),
+                )
+            })?;
+            let latest_run = latest.try_get::<Option<String>, _>(0)?;
+            let latest_status = latest.try_get::<String, _>(1)?;
+            if latest_run.as_deref() != Some(run_id.to_string().as_str())
+                || latest_status != "revising"
+            {
+                return Err(StoreError::InvalidInput(
+                    "next plan revision requires the latest matching revising plan".into(),
+                ));
+            }
+            let next_revision: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(revision),0)+1 FROM proposed_plans WHERE frame_id=?1",
+            )
+            .bind(conversation_id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+            let revision = u64::try_from(next_revision)
+                .map_err(|_| StoreError::InvalidInput("invalid next plan revision".into()))?;
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO proposed_plans
+                 (id,project_id,frame_id,revision,plan_hash,status,plan_json,markdown,feedback,run_id,created_at,updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)",
+            )
+            .bind(id.to_string())
+            .bind(project_id.to_string())
+            .bind(conversation_id.to_string())
+            .bind(next_revision)
+            .bind(&plan_hash)
+            .bind(enum_string(&status)?)
+            .bind(serde_json::to_string(&plan)?)
+            .bind(&markdown)
+            .bind(feedback.as_deref())
+            .bind(run_id.to_string())
+            .bind(timestamp)
+            .execute(&mut *connection)
+            .await?;
+            if status.is_active() {
+                sqlx::query(
+                    "INSERT INTO settings (scope,key,value_json,updated_at)
+                     VALUES (?1,?2,?3,?4)
+                     ON CONFLICT(scope,key) DO UPDATE SET value_json=excluded.value_json,
+                     updated_at=excluded.updated_at",
+                )
+                .bind(SETTINGS_GLOBAL_SCOPE)
+                .bind(conversation_agent_mode_setting_key(conversation_id))
+                .bind(serde_json::to_string(&SessionAgentModeV4::Plan)?)
+                .bind(timestamp)
+                .execute(&mut *connection)
+                .await?;
+            }
+            Ok(ProposedPlanRevisionV4 {
+                id,
+                project_id,
+                conversation_id,
+                run_id,
+                revision,
+                plan,
+                markdown,
+                plan_hash,
+                status,
+                feedback,
+                created_at: stored_now,
+                updated_at: stored_now,
+            })
+        }
+        .await;
+        match result {
+            Ok(value) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Compatibility spelling for Store consumers that do not include the
+    /// protocol version in their repository method names.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn save_proposed_plan_revision_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        revision: u64,
+        plan: ExecutionPlanV4,
+        markdown: String,
+        plan_hash: String,
+        status: PlanRevisionStatusV4,
+        feedback: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<ProposedPlanRevisionV4, StoreError> {
+        self.create_proposed_plan_revision_v4(
+            project_id,
+            conversation_id,
+            run_id,
+            revision,
+            plan,
+            markdown,
+            plan_hash,
+            status,
+            feedback,
+            now,
+        )
+        .await
+    }
+
+    pub async fn proposed_plan_revision_v4(
+        &self,
+        revision_id: Uuid,
+    ) -> Result<Option<ProposedPlanRevisionV4>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id,project_id,frame_id,run_id,revision,plan_json,markdown,plan_hash,status,feedback,created_at,updated_at
+             FROM proposed_plans WHERE id=?1",
+        )
+        .bind(revision_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(proposed_plan_revision_from_row).transpose()
+    }
+
+    pub async fn proposed_plan_revisions_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+    ) -> Result<Vec<ProposedPlanRevisionV4>, StoreError> {
+        self.ensure_conversation_owner(project_id, conversation_id)
+            .await?;
+        let rows = sqlx::query(
+            "SELECT id,project_id,frame_id,run_id,revision,plan_json,markdown,plan_hash,status,feedback,created_at,updated_at
+             FROM proposed_plans WHERE project_id=?1 AND frame_id=?2 ORDER BY revision,id",
+        )
+        .bind(project_id.to_string())
+        .bind(conversation_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(proposed_plan_revision_from_row)
+            .collect()
+    }
+
+    pub async fn list_proposed_plan_revisions_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+    ) -> Result<Vec<ProposedPlanRevisionV4>, StoreError> {
+        self.proposed_plan_revisions_v4(project_id, conversation_id)
+            .await
+    }
+
+    pub async fn latest_proposed_plan_revision_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+    ) -> Result<Option<ProposedPlanRevisionV4>, StoreError> {
+        self.ensure_conversation_owner(project_id, conversation_id)
+            .await?;
+        let row = sqlx::query(
+            "SELECT id,project_id,frame_id,run_id,revision,plan_json,markdown,plan_hash,status,feedback,created_at,updated_at
+             FROM proposed_plans WHERE project_id=?1 AND frame_id=?2 ORDER BY revision DESC,id DESC LIMIT 1",
+        )
+        .bind(project_id.to_string())
+        .bind(conversation_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(proposed_plan_revision_from_row).transpose()
+    }
+
+    pub async fn latest_plan_revision_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+    ) -> Result<Option<ProposedPlanRevisionV4>, StoreError> {
+        self.latest_proposed_plan_revision_v4(project_id, conversation_id)
+            .await
+    }
+
+    pub async fn latest_pending_plan_revision_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+    ) -> Result<Option<ProposedPlanRevisionV4>, StoreError> {
+        self.ensure_conversation_owner(project_id, conversation_id)
+            .await?;
+        let row = sqlx::query(
+            "SELECT id,project_id,frame_id,run_id,revision,plan_json,markdown,plan_hash,status,feedback,created_at,updated_at
+             FROM proposed_plans
+             WHERE project_id=?1 AND frame_id=?2 AND status='pending'
+             ORDER BY revision DESC,id DESC LIMIT 1",
+        )
+        .bind(project_id.to_string())
+        .bind(conversation_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(proposed_plan_revision_from_row).transpose()
+    }
+
+    /// Lifecycle transitions must go through the transaction APIs. This
+    /// method deliberately rejects all direct updates so plan content and
+    /// hashes cannot be rewritten by a generic persistence caller.
+    pub async fn update_proposed_plan_revision_v4(
+        &self,
+        _revision_id: Uuid,
+        _markdown: String,
+        _status: PlanRevisionStatusV4,
+        _feedback: Option<String>,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::InvalidInput(
+            "proposed plan revisions are immutable; use a lifecycle transition".into(),
+        ))
+    }
+
+    /// Record feedback against the latest revision and move that revision to
+    /// `revising`. The plan JSON/hash/revision remain unchanged. The next
+    /// planner result is inserted as a new immutable revision.
+    pub async fn request_plan_revision_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        plan_hash: &str,
+        feedback: &str,
+    ) -> Result<ProposedPlanRevisionV4, StoreError> {
+        self.request_plan_revision_v4_with_event(
+            project_id,
+            conversation_id,
+            run_id,
+            plan_hash,
+            feedback,
+        )
+        .await
+        .map(|result| result.revision)
+    }
+
+    /// Request changes and return the event committed alongside the
+    /// lifecycle transition. Tauri broadcasts this event only after this
+    /// method returns successfully.
+    pub async fn request_plan_revision_v4_with_event(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        plan_hash: &str,
+        feedback: &str,
+    ) -> Result<PlanRevisionRequestResultV4, StoreError> {
+        self.request_plan_revision_v4_with_options(
+            project_id,
+            conversation_id,
+            run_id,
+            plan_hash,
+            feedback,
+            PlanRevisionRequestOptionsV4::default(),
+        )
+        .await
+    }
+
+    pub async fn request_plan_revision_v4_with_options(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        plan_hash: &str,
+        feedback: &str,
+        options: PlanRevisionRequestOptionsV4,
+    ) -> Result<PlanRevisionRequestResultV4, StoreError> {
+        let feedback = feedback.trim();
+        if feedback.is_empty() {
+            return Err(StoreError::InvalidInput(
+                "plan revision feedback cannot be empty".into(),
+            ));
+        }
+        let mut connection = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let result: Result<PlanRevisionRequestResultV4, StoreError> = async {
+            ensure_conversation_owner_executor(&mut *connection, project_id, conversation_id)
+                .await?;
+            ensure_run_owner_executor(&mut *connection, project_id, conversation_id, run_id).await?;
+            let run_status: String =
+                sqlx::query_scalar("SELECT status FROM agent_runs_v4 WHERE run_id=?1")
+                    .bind(run_id.to_string())
+                    .fetch_one(&mut *connection)
+                    .await?;
+            if matches!(
+                run_status.as_str(),
+                "completed" | "cancelled" | "failed" | "needs_attention"
+            ) {
+                return Err(StoreError::InvalidInput(
+                    "terminal run cannot request a plan revision".into(),
+                ));
+            }
+            let row = sqlx::query(
+                "SELECT id,project_id,frame_id,run_id,revision,plan_json,markdown,plan_hash,status,feedback,created_at,updated_at
+                 FROM proposed_plans WHERE project_id=?1 AND frame_id=?2
+                 ORDER BY revision DESC,id DESC LIMIT 1",
+            )
+            .bind(project_id.to_string())
+            .bind(conversation_id.to_string())
+            .fetch_optional(&mut *connection)
+            .await?
+            .ok_or_else(|| StoreError::InvalidInput("no proposed plan revision exists".into()))?;
+            let current = proposed_plan_revision_from_row(row)?;
+            if current.run_id != run_id {
+                return Err(StoreError::InvalidInput(
+                    "plan revision does not belong to the requested run".into(),
+                ));
+            }
+            if current.plan_hash != plan_hash {
+                return Err(StoreError::InvalidInput(
+                    "plan revision hash does not match the latest revision".into(),
+                ));
+            }
+            if current.status != PlanRevisionStatusV4::Pending {
+                return Err(StoreError::InvalidInput(
+                    "plan revision is no longer pending; only one concurrent request may transition it".into(),
+                ));
+            }
+            let now = Utc::now();
+            let stored_now = from_timestamp(timestamp(now), "plan revision timestamp")?;
+            let updated = sqlx::query(
+                "UPDATE proposed_plans SET status='revising',feedback=?1,updated_at=?2
+                 WHERE id=?3 AND status='pending'",
+            )
+            .bind(feedback)
+            .bind(timestamp(stored_now))
+            .bind(current.id.to_string())
+            .execute(&mut *connection)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Err(StoreError::InvalidInput(
+                    "plan revision changed before feedback could be recorded".into(),
+                ));
+            }
+            set_agent_run_status_in_tx(&mut *connection, run_id, "planning").await?;
+            maybe_fail_plan_request(options, 1)?;
+            let existing = load_agent_events_in_tx(&mut *connection, run_id).await?;
+            let event = if let Some(previous) = existing.last() {
+                AgentEventV4::next(
+                    previous,
+                    now,
+                    AgentEventKindV4::PlanRevisionRequested {
+                        plan_hash: plan_hash.to_owned(),
+                        feedback: feedback.to_owned(),
+                    },
+                )
+            } else {
+                AgentEventV4::first(
+                    run_id,
+                    project_id,
+                    conversation_id,
+                    now,
+                    AgentEventKindV4::PlanRevisionRequested {
+                        plan_hash: plan_hash.to_owned(),
+                        feedback: feedback.to_owned(),
+                    },
+                )
+            };
+            insert_agent_event_in_tx(&mut *connection, &event).await?;
+            Ok(PlanRevisionRequestResultV4 {
+                revision: ProposedPlanRevisionV4 {
+                    status: PlanRevisionStatusV4::Revising,
+                    feedback: Some(feedback.to_owned()),
+                    updated_at: stored_now,
+                    ..current
+                },
+                event,
+            })
+        }
+        .await;
+        match result {
+            Ok(value) => {
+                connection.commit().await?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = connection.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Return whether this exact conversation has an active plan revision.
+    /// The project ownership check prevents a project from observing another
+    /// project's lock by guessing a conversation id.
+    pub async fn conversation_plan_lock_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+    ) -> Result<bool, StoreError> {
+        self.ensure_conversation_owner(project_id, conversation_id)
+            .await?;
+        let locked: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM proposed_plans
+                WHERE project_id=?1 AND frame_id=?2
+                  AND status IN ('generating','revising','pending')
+            )",
+        )
+        .bind(project_id.to_string())
+        .bind(conversation_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(locked != 0)
+    }
+
+    pub async fn is_conversation_locked_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+    ) -> Result<bool, StoreError> {
+        self.conversation_plan_lock_v4(project_id, conversation_id)
+            .await
+    }
+
+    pub async fn conversation_is_locked_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+    ) -> Result<bool, StoreError> {
+        self.conversation_plan_lock_v4(project_id, conversation_id)
+            .await
+    }
+
+    /// Guard ordinary direct/planning sends. Explicit plan actions call their
+    /// own transition methods and are therefore allowed while this guard is
+    /// active.
+    pub async fn ensure_conversation_unlocked_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+    ) -> Result<(), StoreError> {
+        if self
+            .conversation_plan_lock_v4(project_id, conversation_id)
+            .await?
+        {
+            return Err(StoreError::InvalidInput(
+                "conversation is locked by an active plan; approve, request changes, or cancel it first".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn ensure_plan_action_allowed_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+    ) -> Result<(), StoreError> {
+        self.ensure_conversation_owner(project_id, conversation_id)
+            .await
+    }
+
+    /// Atomically approve the latest pending revision, freeze the execution
+    /// specification, append approval/mode events, switch the conversation to
+    /// Agent mode, and persist the running record. The caller must not spawn
+    /// execution until this method returns successfully.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn approve_plan_revision_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        revision: u64,
+        plan_hash: &str,
+        spec: &RunSpecV4,
+        run_value: &Value,
+    ) -> Result<PlanApprovalResultV4, StoreError> {
+        self.approve_plan_revision_v4_with_options(
+            project_id,
+            conversation_id,
+            run_id,
+            revision,
+            plan_hash,
+            spec,
+            run_value,
+            ApprovalOptionsV4::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn approve_plan_revision_v4_with_options(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        revision: u64,
+        plan_hash: &str,
+        spec: &RunSpecV4,
+        run_value: &Value,
+        options: ApprovalOptionsV4,
+    ) -> Result<PlanApprovalResultV4, StoreError> {
+        validate_approval_inputs(project_id, conversation_id, run_id, spec, run_value)?;
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await?;
+        let result = approve_plan_revision_v4_in_connection(
+            &mut *connection,
+            project_id,
+            conversation_id,
+            run_id,
+            revision,
+            plan_hash,
+            spec,
+            run_value,
+            options,
+        )
+        .await;
+        match result {
+            Ok(value) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Compatibility approval for a pre-revision run. Revision one is
+    /// materialized and approved in the same `BEGIN IMMEDIATE` transaction so
+    /// an invalid plan/spec/hash or a concurrent state change cannot leave a
+    /// pending proposal behind.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn approve_legacy_plan_revision_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        plan: ExecutionPlanV4,
+        markdown: String,
+        plan_hash: &str,
+        spec: &RunSpecV4,
+        run_value: &Value,
+    ) -> Result<PlanApprovalResultV4, StoreError> {
+        self.approve_legacy_plan_revision_v4_with_options(
+            project_id,
+            conversation_id,
+            run_id,
+            plan,
+            markdown,
+            plan_hash,
+            spec,
+            run_value,
+            ApprovalOptionsV4::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn approve_legacy_plan_revision_v4_with_options(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        plan: ExecutionPlanV4,
+        markdown: String,
+        plan_hash: &str,
+        spec: &RunSpecV4,
+        run_value: &Value,
+        options: ApprovalOptionsV4,
+    ) -> Result<PlanApprovalResultV4, StoreError> {
+        validate_approval_inputs(project_id, conversation_id, run_id, spec, run_value)?;
+        let actual_hash = plan
+            .canonical_hash()
+            .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+        if actual_hash != plan_hash || spec.plan != plan || spec.approved_plan_hash != plan_hash {
+            return Err(StoreError::InvalidInput(
+                "legacy plan hash does not match the frozen plan".into(),
+            ));
+        }
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await?;
+        let result: Result<PlanApprovalResultV4, StoreError> = async {
+            ensure_conversation_owner_executor(&mut *connection, project_id, conversation_id)
+                .await?;
+            ensure_run_owner_executor(&mut *connection, project_id, conversation_id, run_id)
+                .await?;
+            ensure_run_awaiting_approval(&mut *connection, run_id).await?;
+            let proposal_exists: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM proposed_plans
+                    WHERE project_id=?1 AND frame_id=?2
+                )",
+            )
+            .bind(project_id.to_string())
+            .bind(conversation_id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+            if proposal_exists != 0 {
+                return Err(StoreError::InvalidInput(
+                    "legacy approval requires no existing plan revision".into(),
+                ));
+            }
+            let stored_value = load_agent_run_value_in_tx(&mut *connection, run_id).await?;
+            let stored_plan = stored_value.get("plan").cloned().ok_or_else(|| {
+                StoreError::InvalidInput("legacy run is missing its persisted plan".into())
+            })?;
+            let stored_plan: ExecutionPlanV4 =
+                serde_json::from_value(stored_plan).map_err(|error| {
+                    StoreError::InvalidInput(format!(
+                        "legacy run has invalid persisted plan: {error}"
+                    ))
+                })?;
+            let stored_hash = stored_value
+                .get("plan_hash")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    StoreError::InvalidInput("legacy run is missing its plan hash".into())
+                })?;
+            if stored_plan != plan || stored_hash != plan_hash {
+                return Err(StoreError::InvalidInput(
+                    "legacy plan does not match the persisted run plan".into(),
+                ));
+            }
+            insert_proposed_plan_revision_in_connection(
+                &mut *connection,
+                project_id,
+                conversation_id,
+                run_id,
+                1,
+                plan,
+                markdown,
+                plan_hash,
+                PlanRevisionStatusV4::Pending,
+                None,
+                Utc::now(),
+            )
+            .await?;
+            approve_plan_revision_v4_in_connection(
+                &mut *connection,
+                project_id,
+                conversation_id,
+                run_id,
+                1,
+                plan_hash,
+                spec,
+                run_value,
+                options,
+            )
+            .await
+        }
+        .await;
+        match result {
+            Ok(value) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Cancel an active planning revision. The conversation remains in Plan
+    /// mode and becomes available for ordinary sends after commit.
+    pub async fn cancel_plan_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<PlanCancellationResultV4, StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        ensure_conversation_owner_executor(&mut *tx, project_id, conversation_id).await?;
+        ensure_run_owner_executor(&mut *tx, project_id, conversation_id, run_id).await?;
+        let rows = sqlx::query(
+            "SELECT id,project_id,frame_id,run_id,revision,plan_json,markdown,plan_hash,status,feedback,created_at,updated_at
+             FROM proposed_plans WHERE project_id=?1 AND frame_id=?2 AND run_id=?3
+               AND status IN ('generating','revising','pending')
+             ORDER BY revision DESC,id DESC",
+        )
+        .bind(project_id.to_string())
+        .bind(conversation_id.to_string())
+        .bind(run_id.to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        let current = rows
+            .into_iter()
+            .next()
+            .map(proposed_plan_revision_from_row)
+            .transpose()?;
+        let now = Utc::now();
+        if current.is_none() {
+            let latest = sqlx::query(
+                "SELECT revision,status FROM proposed_plans
+                 WHERE project_id=?1 AND frame_id=?2 AND run_id=?3
+                 ORDER BY revision DESC,id DESC LIMIT 1",
+            )
+            .bind(project_id.to_string())
+            .bind(conversation_id.to_string())
+            .bind(run_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(latest) = latest else {
+                return Err(StoreError::InvalidInput(
+                    "no active plan revision to cancel".into(),
+                ));
+            };
+            let latest_revision = u64::try_from(latest.try_get::<i64, _>(0)?)
+                .map_err(|_| StoreError::InvalidInput("invalid plan revision".into()))?;
+            let latest_status = latest.try_get::<String, _>(1)?;
+            let run_status: String =
+                sqlx::query_scalar("SELECT status FROM agent_runs_v4 WHERE run_id=?1")
+                    .bind(run_id.to_string())
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let existing = load_agent_events_in_tx(&mut *tx, run_id).await?;
+            if run_status == "cancelled"
+                && latest_status == "cancelled"
+                && existing
+                    .iter()
+                    .any(|event| matches!(event.event, AgentEventKindV4::RunCancelled))
+            {
+                upsert_conversation_mode_in_tx(
+                    &mut *tx,
+                    conversation_id,
+                    SessionAgentModeV4::Plan,
+                    now,
+                )
+                .await?;
+                tx.commit().await?;
+                return Ok(PlanCancellationResultV4 {
+                    run_id,
+                    project_id,
+                    conversation_id,
+                    revision: latest_revision,
+                    mode: SessionAgentModeV4::Plan,
+                    events: vec![],
+                });
+            }
+            return Err(StoreError::InvalidInput(
+                "no active plan revision to cancel".into(),
+            ));
+        }
+        let current = current.expect("checked above");
+        let cancelled = sqlx::query(
+            "UPDATE proposed_plans SET status='cancelled',updated_at=?1
+             WHERE project_id=?2 AND frame_id=?3 AND run_id=?4
+               AND status IN ('generating','revising','pending')",
+        )
+        .bind(timestamp(now))
+        .bind(project_id.to_string())
+        .bind(conversation_id.to_string())
+        .bind(run_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        if cancelled.rows_affected() == 0 {
+            return Err(StoreError::InvalidInput(
+                "plan changed before cancellation could be committed".into(),
+            ));
+        }
+        let mut persisted_value = load_agent_run_value_in_tx(&mut *tx, run_id).await?;
+        if let Some(object) = persisted_value.as_object_mut() {
+            object.insert("status".into(), Value::String("cancelled".into()));
+            object.insert("session_mode".into(), Value::String("plan".into()));
+        }
+        sqlx::query(
+            "UPDATE agent_runs_v4 SET status='cancelled',value_json=?,updated_at=? WHERE run_id=?3",
+        )
+        .bind(serde_json::to_string(&persisted_value)?)
+        .bind(timestamp(now))
+        .bind(run_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        let existing = load_agent_events_in_tx(&mut *tx, run_id).await?;
+        let event = if existing.iter().any(is_terminal_event) {
+            if existing
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::RunCancelled))
+            {
+                None
+            } else {
+                return Err(StoreError::InvalidInput(
+                    "V4 run event chain is already terminal".into(),
+                ));
+            }
+        } else if let Some(previous) = existing.last() {
+            Some(AgentEventV4::next(
+                previous,
+                now,
+                AgentEventKindV4::RunCancelled,
+            ))
+        } else {
+            Some(AgentEventV4::first(
+                run_id,
+                project_id,
+                conversation_id,
+                now,
+                AgentEventKindV4::RunCancelled,
+            ))
+        };
+        if let Some(event) = &event {
+            insert_agent_event_in_tx(&mut *tx, event).await?;
+        }
+        upsert_conversation_mode_in_tx(&mut *tx, conversation_id, SessionAgentModeV4::Plan, now)
+            .await?;
+        tx.commit().await?;
+        Ok(PlanCancellationResultV4 {
+            run_id,
+            project_id,
+            conversation_id,
+            revision: current.revision,
+            mode: SessionAgentModeV4::Plan,
+            events: event.into_iter().collect(),
+        })
+    }
+
+    pub async fn cancel_proposed_plan_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<PlanCancellationResultV4, StoreError> {
+        self.cancel_plan_v4(project_id, conversation_id, run_id)
+            .await
     }
 
     pub async fn agent_runs_for_context_v4(
@@ -718,7 +2681,7 @@ impl Store {
             .verify()
             .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
         let mut tx = self.pool.begin().await?;
-        ensure_event_context(&mut tx, event).await?;
+        ensure_event_context_tx(&mut tx, event).await?;
         let serialized =
             sqlx::query("SELECT value_json FROM agent_events_v4 WHERE run_id=?1 ORDER BY sequence")
                 .bind(event.run_id.to_string())
@@ -747,6 +2710,12 @@ impl Store {
             };
             tx.commit().await?;
             return Ok(message);
+        }
+
+        if existing.iter().any(is_terminal_event) {
+            return Err(StoreError::InvalidInput(
+                "V4 run event chain is terminal; no events may be appended".into(),
+            ));
         }
 
         let chain_continues = existing.last().map_or_else(
@@ -1156,6 +3125,12 @@ async fn initialize(
         rename_legacy_tables(&mut tx).await?;
     }
     sqlx::raw_sql(INIT_SQL).execute(&mut *tx).await?;
+    repair_proposed_plans_schema(&mut tx).await?;
+    // `CREATE TRIGGER IF NOT EXISTS` intentionally does not replace a
+    // pre-release v4 trigger. Re-install this security boundary on every
+    // open, including fresh, existing, and repeated opens, so old trigger
+    // bodies cannot leave plan materialization or immutable content exposed.
+    repair_proposed_plan_trigger(&mut tx).await?;
     if version < SCHEMA_VERSION {
         migrate_legacy_rows(&mut tx, options).await?;
     }
@@ -1165,6 +3140,151 @@ async fn initialize(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+async fn repair_proposed_plan_trigger(tx: &mut Transaction<'_, Sqlite>) -> Result<(), StoreError> {
+    sqlx::query("DROP TRIGGER IF EXISTS trg_proposed_plans_immutable_content")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(PROPOSED_PLAN_TRIGGER_SQL)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn repair_proposed_plans_schema(tx: &mut Transaction<'_, Sqlite>) -> Result<(), StoreError> {
+    let columns = sqlx::query("PRAGMA table_info(proposed_plans)")
+        .fetch_all(&mut **tx)
+        .await?;
+    let run_id_required = columns.iter().any(|row| {
+        row.try_get::<String, _>(1)
+            .is_ok_and(|name| name == "run_id")
+            && row.try_get::<i64, _>(3).is_ok_and(|not_null| not_null != 0)
+    });
+    let run_id_foreign_key = sqlx::query("PRAGMA foreign_key_list(proposed_plans)")
+        .fetch_all(&mut **tx)
+        .await?
+        .iter()
+        .any(|row| {
+            row.try_get::<String, _>(2)
+                .is_ok_and(|table| table == "agent_runs_v4")
+                && row
+                    .try_get::<String, _>(3)
+                    .is_ok_and(|column| column == "run_id")
+                && row
+                    .try_get::<String, _>(4)
+                    .is_ok_and(|column| column == "run_id")
+        });
+    if run_id_required && run_id_foreign_key {
+        validate_proposed_plan_run_owners(tx).await?;
+        return Ok(());
+    }
+
+    let null_run_ids: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM proposed_plans WHERE run_id IS NULL")
+            .fetch_one(&mut **tx)
+            .await?;
+    if null_run_ids != 0 {
+        return Err(StoreError::Migration(
+            "proposed_plans contains NULL run_id values and cannot be upgraded safely".into(),
+        ));
+    }
+    let orphaned_or_mismatched_runs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM proposed_plans p
+         LEFT JOIN agent_runs_v4 r
+           ON r.run_id=p.run_id AND r.project_id=p.project_id AND r.conversation_id=p.frame_id
+         WHERE r.run_id IS NULL",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if orphaned_or_mismatched_runs != 0 {
+        return Err(StoreError::Migration(
+            "proposed_plans contains orphaned or mismatched run owners".into(),
+        ));
+    }
+
+    sqlx::query("DROP TRIGGER IF EXISTS trg_proposed_plans_immutable_content")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DROP TABLE IF EXISTS proposed_plans_v4_repair")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE proposed_plans_v4_repair (
+            id TEXT PRIMARY KEY CHECK (length(trim(id)) > 0),
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            frame_id TEXT NOT NULL REFERENCES frames(id) ON DELETE CASCADE,
+            revision INTEGER NOT NULL CHECK (revision > 0),
+            plan_hash TEXT NOT NULL CHECK (length(trim(plan_hash)) > 0),
+            status TEXT NOT NULL CHECK (length(trim(status)) > 0),
+            plan_json TEXT NOT NULL,
+            markdown TEXT NOT NULL DEFAULT '',
+            feedback TEXT,
+            run_id TEXT NOT NULL REFERENCES agent_runs_v4(run_id) ON DELETE CASCADE,
+            created_at INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            UNIQUE (frame_id, revision),
+            UNIQUE (frame_id, plan_hash)
+        )",
+    )
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO proposed_plans_v4_repair
+         (id,project_id,frame_id,revision,plan_hash,status,plan_json,markdown,feedback,run_id,created_at,updated_at)
+         SELECT id,project_id,frame_id,revision,plan_hash,status,plan_json,markdown,feedback,run_id,created_at,updated_at
+         FROM proposed_plans",
+    )
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DROP TABLE proposed_plans")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("ALTER TABLE proposed_plans_v4_repair RENAME TO proposed_plans")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_proposed_plans_context_revision
+         ON proposed_plans(project_id, frame_id, revision DESC, id DESC)",
+    )
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_proposed_plans_active
+         ON proposed_plans(project_id, frame_id, status, revision DESC)",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn validate_proposed_plan_run_owners(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> Result<(), StoreError> {
+    let null_run_ids: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM proposed_plans WHERE run_id IS NULL")
+            .fetch_one(&mut **tx)
+            .await?;
+    if null_run_ids != 0 {
+        return Err(StoreError::Migration(
+            "proposed_plans contains NULL run_id values and cannot be upgraded safely".into(),
+        ));
+    }
+    let orphaned_or_mismatched_runs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM proposed_plans p
+         LEFT JOIN agent_runs_v4 r ON r.run_id=p.run_id
+         WHERE r.run_id IS NULL
+            OR r.project_id <> p.project_id
+            OR r.conversation_id <> p.frame_id",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if orphaned_or_mismatched_runs != 0 {
+        return Err(StoreError::Migration(
+            "proposed_plans contains orphaned or mismatched run owners".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -1669,6 +3789,7 @@ async fn validate_before_commit(tx: &mut Transaction<'_, Sqlite>) -> Result<(), 
     validate_conversation_ownership(tx).await?;
     validate_message_ownership(tx).await?;
     validate_agent_runs(tx).await?;
+    validate_proposed_plan_run_owners(tx).await?;
     validate_agent_events(tx).await?;
     validate_scientific_states(tx).await?;
     Ok(())
@@ -2193,6 +4314,56 @@ async fn insert_message(
 }
 
 async fn ensure_event_context(
+    tx: &mut SqliteConnection,
+    event: &AgentEventV4,
+) -> Result<(), StoreError> {
+    let project_id = event.project_id.to_string();
+    let conversation_id = event.conversation_id.to_string();
+    let owns_conversation: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM conversation_records WHERE frame_id=?1 AND project_id=?2)",
+    )
+    .bind(&conversation_id)
+    .bind(&project_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if owns_conversation == 0 {
+        return Err(StoreError::InvalidInput(format!(
+            "event {} references unknown project or conversation: {project_id}/{conversation_id}",
+            event.run_id
+        )));
+    }
+
+    let run_id = event.run_id.to_string();
+    let existing =
+        sqlx::query("SELECT project_id,conversation_id FROM agent_runs_v4 WHERE run_id=?1")
+            .bind(&run_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if let Some(row) = existing {
+        let stored_project = row.try_get::<String, _>(0)?;
+        let stored_conversation = row.try_get::<String, _>(1)?;
+        if stored_project != project_id || stored_conversation != conversation_id {
+            return Err(StoreError::InvalidInput(format!(
+                "event {} does not match its persisted run context",
+                event.run_id
+            )));
+        }
+    } else {
+        sqlx::query(
+            "INSERT INTO agent_runs_v4
+             (run_id,project_id,conversation_id,status,value_json)
+             VALUES (?1,?2,?3,'event_only','{}')",
+        )
+        .bind(&run_id)
+        .bind(&project_id)
+        .bind(&conversation_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn ensure_event_context_tx(
     tx: &mut Transaction<'_, Sqlite>,
     event: &AgentEventV4,
 ) -> Result<(), StoreError> {
@@ -2288,8 +4459,172 @@ fn parse_conversation_agent_mode(value: &str) -> Result<SessionAgentModeV4, Stor
         })
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn finalize_plan_revision_v4_in_connection(
+    connection: &mut SqliteConnection,
+    project_id: Uuid,
+    conversation_id: Uuid,
+    run_id: Uuid,
+    revision: u64,
+    plan: ExecutionPlanV4,
+    markdown: String,
+    plan_hash: String,
+    timestamp: i64,
+    stored_now: chrono::DateTime<Utc>,
+    options: PlanRevisionFinalizeOptionsV4,
+) -> Result<ProposedPlanRevisionV4, StoreError> {
+    let owns_conversation: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM conversation_records
+            WHERE frame_id=?1 AND project_id=?2
+        )",
+    )
+    .bind(conversation_id.to_string())
+    .bind(project_id.to_string())
+    .fetch_one(&mut *connection)
+    .await?;
+    if owns_conversation == 0 {
+        return Err(StoreError::InvalidInput(
+            "plan generation context is not owned by the project".into(),
+        ));
+    }
+    let owns_run: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM agent_runs_v4
+            WHERE run_id=?1 AND project_id=?2 AND conversation_id=?3
+        )",
+    )
+    .bind(run_id.to_string())
+    .bind(project_id.to_string())
+    .bind(conversation_id.to_string())
+    .fetch_one(&mut *connection)
+    .await?;
+    if owns_run == 0 {
+        return Err(StoreError::InvalidInput(
+            "plan generation run does not belong to the requested context".into(),
+        ));
+    }
+    let run_status: String = sqlx::query_scalar("SELECT status FROM agent_runs_v4 WHERE run_id=?1")
+        .bind(run_id.to_string())
+        .fetch_one(&mut *connection)
+        .await?;
+    if matches!(
+        run_status.as_str(),
+        "completed" | "cancelled" | "failed" | "needs_attention"
+    ) {
+        return Err(StoreError::InvalidInput(
+            "plan generation run is already terminal".into(),
+        ));
+    }
+    let serialized =
+        sqlx::query("SELECT value_json FROM agent_events_v4 WHERE run_id=?1 ORDER BY sequence")
+            .bind(run_id.to_string())
+            .fetch_all(&mut *connection)
+            .await?
+            .into_iter()
+            .map(|row| row.try_get::<String, _>(0))
+            .collect::<Result<Vec<_>, _>>()?;
+    let existing_events = deserialize_event_chain_v4(&serialized)
+        .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+    if existing_events.iter().any(is_terminal_event) {
+        return Err(StoreError::InvalidInput(
+            "plan generation run already has a terminal event".into(),
+        ));
+    }
+    let row = sqlx::query(
+        "SELECT id,project_id,frame_id,run_id,revision,plan_json,markdown,plan_hash,status,feedback,created_at,updated_at
+         FROM proposed_plans WHERE project_id=?1 AND frame_id=?2 AND run_id=?3 AND revision=?4",
+    )
+    .bind(project_id.to_string())
+    .bind(conversation_id.to_string())
+    .bind(run_id.to_string())
+    .bind(i64::try_from(revision).map_err(|_| {
+        StoreError::InvalidInput("plan revision exceeds SQLite integer range".into())
+    })?)
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or_else(|| StoreError::InvalidInput("generating plan revision was not found".into()))?;
+    let current = proposed_plan_revision_from_row(row)?;
+    if current.status != PlanRevisionStatusV4::Generating {
+        return Err(StoreError::InvalidInput(
+            "plan revision is no longer generating and cannot be finalized".into(),
+        ));
+    }
+    // Materialization is the sole operation that intentionally replaces plan
+    // content. The trigger is repaired before each open and recreated before
+    // this transaction commits, so a pre-release trigger cannot broaden this
+    // Store-owned authority.
+    sqlx::query("DROP TRIGGER IF EXISTS trg_proposed_plans_immutable_content")
+        .execute(&mut *connection)
+        .await?;
+    let finalized = sqlx::query(
+        "UPDATE proposed_plans
+         SET plan_hash=?1,plan_json=?2,markdown=?3,status='pending',updated_at=?4
+         WHERE id=?5 AND status='generating'",
+    )
+    .bind(&plan_hash)
+    .bind(serde_json::to_string(&plan)?)
+    .bind(&markdown)
+    .bind(timestamp)
+    .bind(current.id.to_string())
+    .execute(&mut *connection)
+    .await?;
+    if finalized.rows_affected() != 1 {
+        return Err(StoreError::InvalidInput(
+            "plan generation changed before it could be finalized".into(),
+        ));
+    }
+    sqlx::query(PROPOSED_PLAN_TRIGGER_SQL)
+        .execute(&mut *connection)
+        .await?;
+
+    let value_json: String =
+        sqlx::query_scalar("SELECT value_json FROM agent_runs_v4 WHERE run_id=?1")
+            .bind(run_id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+    let mut value: Value = serde_json::from_str(&value_json)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("status".into(), Value::String("awaiting_approval".into()));
+        object.insert("plan".into(), serde_json::to_value(&plan)?);
+        object.insert("plan_hash".into(), Value::String(plan_hash.clone()));
+        object.insert("plan_revision".into(), Value::from(revision));
+        if let Some(approval_hash) = &options.approval_hash {
+            object.insert("approval_hash".into(), Value::String(approval_hash.clone()));
+        }
+        if let Some(compute_selection) = &options.compute_selection {
+            object.insert(
+                "compute_selection".into(),
+                serde_json::to_value(compute_selection)?,
+            );
+        }
+    }
+    sqlx::query(
+        "UPDATE agent_runs_v4 SET status='awaiting_approval',value_json=?,updated_at=? WHERE run_id=?3",
+    )
+    .bind(serde_json::to_string(&value)?)
+    .bind(timestamp)
+    .bind(run_id.to_string())
+    .execute(&mut *connection)
+    .await?;
+    Ok(ProposedPlanRevisionV4 {
+        id: current.id,
+        project_id,
+        conversation_id,
+        run_id,
+        revision,
+        plan,
+        markdown,
+        plan_hash,
+        status: PlanRevisionStatusV4::Pending,
+        feedback: current.feedback,
+        created_at: current.created_at,
+        updated_at: stored_now,
+    })
+}
+
 async fn ensure_conversation_owner_executor(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut SqliteConnection,
     project_id: Uuid,
     conversation_id: Uuid,
 ) -> Result<(), StoreError> {
@@ -2301,7 +4636,7 @@ async fn ensure_conversation_owner_executor(
     )
     .bind(conversation_id.to_string())
     .bind(project_id.to_string())
-    .fetch_one(&mut **tx)
+    .fetch_one(&mut *tx)
     .await?;
     if owns == 0 {
         return Err(StoreError::InvalidInput(format!(
@@ -2309,6 +4644,579 @@ async fn ensure_conversation_owner_executor(
         )));
     }
     Ok(())
+}
+
+async fn ensure_conversation_unlocked_executor(
+    tx: &mut SqliteConnection,
+    project_id: Uuid,
+    conversation_id: Uuid,
+) -> Result<(), StoreError> {
+    ensure_conversation_owner_executor(&mut *tx, project_id, conversation_id).await?;
+    let locked: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM proposed_plans
+            WHERE project_id=?1 AND frame_id=?2
+              AND status IN ('generating','revising','pending')
+        )",
+    )
+    .bind(project_id.to_string())
+    .bind(conversation_id.to_string())
+    .fetch_one(&mut *tx)
+    .await?;
+    if locked != 0 {
+        return Err(StoreError::InvalidInput(
+            "conversation is locked by an active plan; approve, request changes, or cancel it first".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_plan_revision_input(
+    project_id: Uuid,
+    conversation_id: Uuid,
+    run_id: Uuid,
+    revision: u64,
+    plan: &ExecutionPlanV4,
+    plan_hash: &str,
+    status: PlanRevisionStatusV4,
+) -> Result<(), StoreError> {
+    let _ = (project_id, conversation_id, run_id);
+    if revision == 0 {
+        return Err(StoreError::InvalidInput(
+            "plan revision must be greater than zero".into(),
+        ));
+    }
+    if plan_hash.trim().is_empty() {
+        return Err(StoreError::InvalidInput(
+            "proposed plan hash cannot be empty".into(),
+        ));
+    }
+    if !status.is_active()
+        && !matches!(
+            status,
+            PlanRevisionStatusV4::Approved
+                | PlanRevisionStatusV4::Superseded
+                | PlanRevisionStatusV4::Cancelled
+        )
+    {
+        return Err(StoreError::InvalidInput(
+            "unknown plan revision status".into(),
+        ));
+    }
+    plan.validate()
+        .map_err(|error| StoreError::InvalidInput(error.to_string()))
+}
+
+async fn ensure_run_owner_executor(
+    tx: &mut SqliteConnection,
+    project_id: Uuid,
+    conversation_id: Uuid,
+    run_id: Uuid,
+) -> Result<(), StoreError> {
+    let owns: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM agent_runs_v4
+            WHERE run_id=?1 AND project_id=?2 AND conversation_id=?3
+        )",
+    )
+    .bind(run_id.to_string())
+    .bind(project_id.to_string())
+    .bind(conversation_id.to_string())
+    .fetch_one(&mut *tx)
+    .await?;
+    if owns == 0 {
+        return Err(StoreError::InvalidInput(format!(
+            "run {run_id} does not belong to conversation {conversation_id} in project {project_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_approval_inputs(
+    project_id: Uuid,
+    conversation_id: Uuid,
+    run_id: Uuid,
+    spec: &RunSpecV4,
+    run_value: &Value,
+) -> Result<(), StoreError> {
+    if spec.run_id != run_id
+        || spec.project_id != project_id
+        || spec.conversation_id != conversation_id
+    {
+        return Err(StoreError::InvalidInput(
+            "frozen specification does not belong to the requested run context".into(),
+        ));
+    }
+    spec.validate_integrity()
+        .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+    if !run_value.is_object() {
+        return Err(StoreError::InvalidInput(
+            "approved run value must be a JSON object".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_run_awaiting_approval(
+    tx: &mut SqliteConnection,
+    run_id: Uuid,
+) -> Result<(), StoreError> {
+    let status =
+        sqlx::query_scalar::<_, String>("SELECT status FROM agent_runs_v4 WHERE run_id=?1")
+            .bind(run_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| StoreError::InvalidInput("run was not found".into()))?;
+    if status != "awaiting_approval" {
+        if matches!(
+            status.as_str(),
+            "completed" | "cancelled" | "failed" | "needs_attention"
+        ) {
+            return Err(StoreError::InvalidInput(
+                "terminal run cannot be approved; run is not awaiting approval".into(),
+            ));
+        }
+        return Err(StoreError::InvalidInput(format!(
+            "run must be awaiting approval, but is {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_proposed_plan_revision_in_connection(
+    tx: &mut SqliteConnection,
+    project_id: Uuid,
+    conversation_id: Uuid,
+    run_id: Uuid,
+    revision: u64,
+    plan: ExecutionPlanV4,
+    markdown: String,
+    plan_hash: &str,
+    status: PlanRevisionStatusV4,
+    feedback: Option<String>,
+    now: DateTime<Utc>,
+) -> Result<ProposedPlanRevisionV4, StoreError> {
+    validate_plan_revision_input(
+        project_id,
+        conversation_id,
+        run_id,
+        revision,
+        &plan,
+        plan_hash,
+        status,
+    )?;
+    let actual_hash = plan
+        .canonical_hash()
+        .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+    if actual_hash != plan_hash {
+        return Err(StoreError::InvalidInput(
+            "proposed plan hash does not match the structured plan".into(),
+        ));
+    }
+    let timestamp = timestamp(now);
+    let stored_now = from_timestamp(timestamp, "plan revision timestamp")?;
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO proposed_plans
+         (id,project_id,frame_id,revision,plan_hash,status,plan_json,markdown,feedback,run_id,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+    )
+    .bind(id.to_string())
+    .bind(project_id.to_string())
+    .bind(conversation_id.to_string())
+    .bind(i64::try_from(revision).map_err(|_| {
+        StoreError::InvalidInput("plan revision exceeds SQLite integer range".into())
+    })?)
+    .bind(plan_hash)
+    .bind(enum_string(&status)?)
+    .bind(serde_json::to_string(&plan)?)
+    .bind(&markdown)
+    .bind(feedback.as_deref())
+    .bind(run_id.to_string())
+    .bind(timestamp)
+    .bind(timestamp)
+    .execute(&mut *tx)
+    .await?;
+    if status.is_active() {
+        upsert_conversation_mode_in_tx(
+            &mut *tx,
+            conversation_id,
+            SessionAgentModeV4::Plan,
+            stored_now,
+        )
+        .await?;
+    }
+    Ok(ProposedPlanRevisionV4 {
+        id,
+        project_id,
+        conversation_id,
+        run_id,
+        revision,
+        plan,
+        markdown,
+        plan_hash: plan_hash.to_owned(),
+        status,
+        feedback,
+        created_at: stored_now,
+        updated_at: stored_now,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn approve_plan_revision_v4_in_connection(
+    tx: &mut SqliteConnection,
+    project_id: Uuid,
+    conversation_id: Uuid,
+    run_id: Uuid,
+    revision: u64,
+    plan_hash: &str,
+    spec: &RunSpecV4,
+    run_value: &Value,
+    options: ApprovalOptionsV4,
+) -> Result<PlanApprovalResultV4, StoreError> {
+    ensure_conversation_owner_executor(&mut *tx, project_id, conversation_id).await?;
+    ensure_run_owner_executor(&mut *tx, project_id, conversation_id, run_id).await?;
+    ensure_run_awaiting_approval(&mut *tx, run_id).await?;
+    let row = sqlx::query(
+        "SELECT id,project_id,frame_id,run_id,revision,plan_json,markdown,plan_hash,status,feedback,created_at,updated_at
+         FROM proposed_plans WHERE project_id=?1 AND frame_id=?2
+         ORDER BY revision DESC,id DESC LIMIT 1",
+    )
+    .bind(project_id.to_string())
+    .bind(conversation_id.to_string())
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| StoreError::InvalidInput("no proposed plan revision exists".into()))?;
+    let current = proposed_plan_revision_from_row(row)?;
+    if current.revision != revision {
+        return Err(StoreError::InvalidInput(
+            "only the latest plan revision can be approved".into(),
+        ));
+    }
+    if current.status != PlanRevisionStatusV4::Pending {
+        return Err(StoreError::InvalidInput(
+            "only a pending plan revision can be approved".into(),
+        ));
+    }
+    if current.run_id != run_id || current.plan_hash != plan_hash {
+        return Err(StoreError::InvalidInput(
+            "plan revision ownership or hash does not match the approval".into(),
+        ));
+    }
+    if spec.approved_plan_hash != plan_hash {
+        return Err(StoreError::InvalidInput(
+            "frozen specification plan hash does not match the requested revision".into(),
+        ));
+    }
+    if current.plan != spec.plan {
+        return Err(StoreError::InvalidInput(
+            "frozen specification plan does not match the pending revision".into(),
+        ));
+    }
+
+    let mut persisted_value = run_value.clone();
+    let object = persisted_value.as_object_mut().ok_or_else(|| {
+        StoreError::InvalidInput("approved run value must be a JSON object".into())
+    })?;
+    object.insert("status".into(), Value::String("running".into()));
+    object.insert("spec".into(), serde_json::to_value(spec)?);
+    object.insert("plan_revision".into(), Value::from(revision));
+    object.insert("session_mode".into(), Value::String("agent".into()));
+    let now = Utc::now();
+    let updated = sqlx::query(
+        "UPDATE proposed_plans SET status='approved',updated_at=?1 WHERE id=?2 AND status='pending'",
+    )
+    .bind(timestamp(now))
+    .bind(current.id.to_string())
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(StoreError::InvalidInput(
+            "plan revision changed before approval could be committed".into(),
+        ));
+    }
+    // A newer revision supersedes all older active proposals. Their immutable
+    // plan content remains available for audit/replay, while the approved
+    // latest revision is the sole source of the lock state.
+    sqlx::query(
+        "UPDATE proposed_plans SET status='superseded',updated_at=?1
+         WHERE project_id=?2 AND frame_id=?3 AND revision<?4
+           AND status IN ('generating','revising','pending')",
+    )
+    .bind(timestamp(now))
+    .bind(project_id.to_string())
+    .bind(conversation_id.to_string())
+    .bind(i64::try_from(revision).map_err(|_| {
+        StoreError::InvalidInput("plan revision exceeds SQLite integer range".into())
+    })?)
+    .execute(&mut *tx)
+    .await?;
+    maybe_fail_approval(options, 1)?;
+    let updated_run = sqlx::query(
+        "UPDATE agent_runs_v4 SET status='running',value_json=?,updated_at=? WHERE run_id=?3",
+    )
+    .bind(serde_json::to_string(&persisted_value)?)
+    .bind(timestamp(now))
+    .bind(run_id.to_string())
+    .execute(&mut *tx)
+    .await?;
+    if updated_run.rows_affected() != 1 {
+        return Err(StoreError::InvalidInput(
+            "run changed before approval could be committed".into(),
+        ));
+    }
+    maybe_fail_approval(options, 2)?;
+
+    let mut events = load_agent_events_in_tx(&mut *tx, run_id).await?;
+    let mut appended = Vec::new();
+    let approval = if let Some(previous) = events.last() {
+        AgentEventV4::next(
+            previous,
+            now,
+            AgentEventKindV4::PlanApproved {
+                plan_hash: plan_hash.to_owned(),
+            },
+        )
+    } else {
+        AgentEventV4::first(
+            run_id,
+            project_id,
+            conversation_id,
+            now,
+            AgentEventKindV4::PlanApproved {
+                plan_hash: plan_hash.to_owned(),
+            },
+        )
+    };
+    insert_agent_event_in_tx(&mut *tx, &approval).await?;
+    events.push(approval.clone());
+    appended.push(approval);
+    let frozen = AgentEventV4::next(
+        events.last().expect("approval event was appended"),
+        now,
+        AgentEventKindV4::RunSpecFrozen {
+            approval_hash: spec.approval_hash.clone().unwrap_or_default(),
+            spec_hash: spec.spec_hash.clone().unwrap_or_default(),
+        },
+    );
+    insert_agent_event_in_tx(&mut *tx, &frozen).await?;
+    events.push(frozen.clone());
+    appended.push(frozen);
+    let mode = AgentEventV4::next(
+        events.last().expect("frozen event was appended"),
+        now,
+        AgentEventKindV4::ModeChanged {
+            mode: RunModeV4::Execute,
+        },
+    );
+    insert_agent_event_in_tx(&mut *tx, &mode).await?;
+    appended.push(mode);
+    maybe_fail_approval(options, 3)?;
+    upsert_conversation_mode_in_tx(&mut *tx, conversation_id, SessionAgentModeV4::Agent, now)
+        .await?;
+    maybe_fail_approval(options, 4)?;
+    Ok(PlanApprovalResultV4 {
+        run_id,
+        project_id,
+        conversation_id,
+        revision,
+        plan_hash: plan_hash.to_owned(),
+        approval_hash: spec.approval_hash.clone(),
+        spec_hash: spec.spec_hash.clone(),
+        mode: SessionAgentModeV4::Agent,
+        events: appended,
+    })
+}
+
+fn proposed_plan_revision_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<ProposedPlanRevisionV4, StoreError> {
+    let id = parse_uuid(row.try_get::<String, _>(0)?, "proposed plan revision id")?;
+    let project_id = parse_uuid(row.try_get::<String, _>(1)?, "proposed plan project id")?;
+    let conversation_id = parse_uuid(
+        row.try_get::<String, _>(2)?,
+        "proposed plan conversation id",
+    )?;
+    let run_id = parse_uuid(
+        row.try_get::<Option<String>, _>(3)?.ok_or_else(|| {
+            StoreError::InvalidInput(format!("proposed plan revision {id} has no run id"))
+        })?,
+        "proposed plan run id",
+    )?;
+    let revision = u64::try_from(row.try_get::<i64, _>(4)?).map_err(|_| {
+        StoreError::InvalidInput(format!(
+            "proposed plan revision {id} is outside the supported range"
+        ))
+    })?;
+    let plan_json = row.try_get::<String, _>(5)?;
+    let plan = serde_json::from_str::<ExecutionPlanV4>(&plan_json).map_err(|error| {
+        StoreError::InvalidInput(format!(
+            "proposed plan revision {id} has invalid plan JSON: {error}"
+        ))
+    })?;
+    let plan_hash = row.try_get::<String, _>(7)?;
+    let status = parse_json_enum(
+        row.try_get::<String, _>(8)?.as_str(),
+        "plan revision status",
+    )?;
+    Ok(ProposedPlanRevisionV4 {
+        id,
+        project_id,
+        conversation_id,
+        run_id,
+        revision,
+        plan,
+        markdown: row.try_get(6)?,
+        plan_hash,
+        status,
+        feedback: row.try_get(9)?,
+        created_at: from_timestamp(row.try_get(10)?, "plan revision created_at")?,
+        updated_at: from_timestamp(row.try_get(11)?, "plan revision updated_at")?,
+    })
+}
+
+async fn load_agent_run_value_in_tx(
+    tx: &mut SqliteConnection,
+    run_id: Uuid,
+) -> Result<Value, StoreError> {
+    let value: String = sqlx::query_scalar("SELECT value_json FROM agent_runs_v4 WHERE run_id=?1")
+        .bind(run_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+    Ok(serde_json::from_str(&value)?)
+}
+
+async fn set_agent_run_status_in_tx(
+    tx: &mut SqliteConnection,
+    run_id: Uuid,
+    status: &str,
+) -> Result<(), StoreError> {
+    let mut value = load_agent_run_value_in_tx(&mut *tx, run_id).await?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("status".into(), Value::String(status.into()));
+    }
+    sqlx::query("UPDATE agent_runs_v4 SET status=?1,value_json=?2,updated_at=?3 WHERE run_id=?4")
+        .bind(status)
+        .bind(serde_json::to_string(&value)?)
+        .bind(timestamp(Utc::now()))
+        .bind(run_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    Ok(())
+}
+
+async fn upsert_conversation_mode_in_tx(
+    tx: &mut SqliteConnection,
+    conversation_id: Uuid,
+    mode: SessionAgentModeV4,
+    now: DateTime<Utc>,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO settings (scope,key,value_json,updated_at)
+         VALUES (?1,?2,?3,?4)
+         ON CONFLICT(scope,key) DO UPDATE SET value_json=excluded.value_json,
+         updated_at=excluded.updated_at",
+    )
+    .bind(SETTINGS_GLOBAL_SCOPE)
+    .bind(conversation_agent_mode_setting_key(conversation_id))
+    .bind(serde_json::to_string(&mode)?)
+    .bind(timestamp(now))
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
+}
+
+async fn load_agent_events_in_tx(
+    tx: &mut SqliteConnection,
+    run_id: Uuid,
+) -> Result<Vec<AgentEventV4>, StoreError> {
+    let rows =
+        sqlx::query("SELECT value_json FROM agent_events_v4 WHERE run_id=?1 ORDER BY sequence")
+            .bind(run_id.to_string())
+            .fetch_all(&mut *tx)
+            .await?;
+    let serialized = rows
+        .into_iter()
+        .map(|row| row.try_get::<String, _>(0))
+        .collect::<Result<Vec<_>, _>>()?;
+    deserialize_event_chain_v4(&serialized)
+        .map_err(|error| StoreError::InvalidInput(error.to_string()))
+}
+
+fn is_terminal_event(event: &AgentEventV4) -> bool {
+    matches!(
+        event.event,
+        AgentEventKindV4::RunCompleted
+            | AgentEventKindV4::RunFailed { .. }
+            | AgentEventKindV4::RunNeedsAttention { .. }
+            | AgentEventKindV4::RunCancelled
+    )
+}
+
+async fn insert_agent_event_in_tx(
+    tx: &mut SqliteConnection,
+    event: &AgentEventV4,
+) -> Result<(), StoreError> {
+    event
+        .verify()
+        .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+    ensure_event_context(&mut *tx, event).await?;
+    let existing = load_agent_events_in_tx(&mut *tx, event.run_id).await?;
+    if existing.iter().any(is_terminal_event) {
+        return Err(StoreError::InvalidInput(
+            "V4 run event chain is terminal; no events may be appended".into(),
+        ));
+    }
+    let sequence = i64::try_from(event.sequence)
+        .map_err(|_| StoreError::InvalidInput("event sequence exceeds SQLite range".into()))?;
+    sqlx::query(
+        "INSERT INTO agent_events_v4
+         (run_id,project_id,conversation_id,sequence,previous_hash,event_hash,value_json,occurred_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+    )
+    .bind(event.run_id.to_string())
+    .bind(event.project_id.to_string())
+    .bind(event.conversation_id.to_string())
+    .bind(sequence)
+    .bind(&event.previous_hash)
+    .bind(&event.event_hash)
+    .bind(serde_json::to_string(event)?)
+    .bind(timestamp(event.occurred_at))
+        .execute(&mut *tx)
+    .await?;
+    Ok(())
+}
+
+fn maybe_fail_approval(options: ApprovalOptionsV4, step: u8) -> Result<(), StoreError> {
+    if options.fail_after_step == Some(step) {
+        return Err(StoreError::Migration(format!(
+            "injected plan approval failure after step {step}"
+        )));
+    }
+    Ok(())
+}
+
+fn maybe_fail_plan_request(
+    options: PlanRevisionRequestOptionsV4,
+    step: u8,
+) -> Result<(), StoreError> {
+    if options.fail_after_step == Some(step) {
+        return Err(StoreError::Migration(format!(
+            "injected plan revision request failure after step {step}"
+        )));
+    }
+    Ok(())
+}
+
+fn generation_seed_plan(objective: &str, revision: u64) -> ExecutionPlanV4 {
+    ExecutionPlanV4 {
+        schema_version: 4,
+        objective: objective.to_owned(),
+        steps: vec![format!("Generate immutable plan revision {revision}")],
+        completion_criteria: vec!["A schema-valid plan is returned".into()],
+        requested_capabilities: Default::default(),
+    }
 }
 
 fn conversation_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Conversation, StoreError> {

@@ -799,6 +799,13 @@ pub enum AgentEventKindV4 {
     PlanApproved {
         plan_hash: String,
     },
+    /// A user requested changes to the currently pending plan. This additive
+    /// event keeps older event JSON readable while making feedback replayable.
+    #[serde(alias = "plan_revision_request")]
+    PlanRevisionRequested {
+        plan_hash: String,
+        feedback: String,
+    },
     RunSpecFrozen {
         approval_hash: String,
         spec_hash: String,
@@ -927,13 +934,26 @@ impl AgentEventV4 {
         value
     }
     fn calculate_hash(&self) -> String {
-        let envelope = serde_json::json!({"schema_version":self.schema_version,"run_id":self.run_id,"project_id":self.project_id,"conversation_id":self.conversation_id,"sequence":self.sequence,"occurred_at":self.occurred_at,"previous_hash":self.previous_hash,"event":self.event});
+        self.calculate_hash_for_event(
+            &serde_json::to_value(&self.event).expect("serializable V4 event"),
+        )
+    }
+    fn calculate_hash_for_event(&self, event: &serde_json::Value) -> String {
+        let envelope = serde_json::json!({"schema_version":self.schema_version,"run_id":self.run_id,"project_id":self.project_id,"conversation_id":self.conversation_id,"sequence":self.sequence,"occurred_at":self.occurred_at,"previous_hash":self.previous_hash,"event":event});
         hex::encode(Sha256::digest(
             serde_json::to_vec(&envelope).expect("serializable V4 event"),
         ))
     }
     pub fn verify(&self) -> Result<(), ProtocolErrorV4> {
-        if self.event_hash == self.calculate_hash() {
+        let legacy_revision_request_hash =
+            matches!(&self.event, AgentEventKindV4::PlanRevisionRequested { .. }).then(|| {
+                let mut event = serde_json::to_value(&self.event).expect("serializable V4 event");
+                event["kind"] = serde_json::Value::String("plan_revision_request".into());
+                self.calculate_hash_for_event(&event)
+            });
+        if self.event_hash == self.calculate_hash()
+            || legacy_revision_request_hash.as_deref() == Some(self.event_hash.as_str())
+        {
             Ok(())
         } else {
             Err(ProtocolErrorV4::EventHashMismatch)
@@ -951,7 +971,32 @@ pub fn validate_event_chain_v4(events: &[AgentEventV4]) -> Result<(), ProtocolEr
             return Err(ProtocolErrorV4::BrokenEventChain);
         }
     }
+    validate_terminal_position_v4(events)?;
     Ok(())
+}
+
+fn validate_terminal_position_v4(events: &[AgentEventV4]) -> Result<(), ProtocolErrorV4> {
+    for (index, event) in events.iter().enumerate() {
+        if is_terminal_event_kind_v4(&event.event)
+            && (index + 1 != events.len()
+                || events[..index]
+                    .iter()
+                    .any(|previous| is_terminal_event_kind_v4(&previous.event)))
+        {
+            return Err(ProtocolErrorV4::BrokenEventChain);
+        }
+    }
+    Ok(())
+}
+
+fn is_terminal_event_kind_v4(event: &AgentEventKindV4) -> bool {
+    matches!(
+        event,
+        AgentEventKindV4::RunCompleted
+            | AgentEventKindV4::RunFailed { .. }
+            | AgentEventKindV4::RunNeedsAttention { .. }
+            | AgentEventKindV4::RunCancelled
+    )
 }
 
 /// Validate durable events against their original JSON representation before
@@ -962,9 +1007,10 @@ pub fn deserialize_event_chain_v4(
     serialized: &[String],
 ) -> Result<Vec<AgentEventV4>, ProtocolErrorV4> {
     let mut events: Vec<AgentEventV4> = Vec::with_capacity(serialized.len());
-    for (index, serialized) in serialized.iter().enumerate() {
-        let value: serde_json::Value =
-            serde_json::from_str(serialized).map_err(|_| ProtocolErrorV4::InvalidEventEncoding)?;
+    let serialized_len = serialized.len();
+    for (index, serialized_event) in serialized.iter().enumerate() {
+        let value: serde_json::Value = serde_json::from_str(serialized_event)
+            .map_err(|_| ProtocolErrorV4::InvalidEventEncoding)?;
         let stored_hash = value
             .get("event_hash")
             .and_then(serde_json::Value::as_str)
@@ -996,6 +1042,13 @@ pub fn deserialize_event_chain_v4(
         if event.sequence != index as u64 + 1
             || (index == 0 && !event.previous_hash.is_empty())
             || (index > 0 && event.previous_hash != events[index - 1].event_hash)
+        {
+            return Err(ProtocolErrorV4::BrokenEventChain);
+        }
+        if events
+            .iter()
+            .any(|previous| is_terminal_event_kind_v4(&previous.event))
+            || (is_terminal_event_kind_v4(&event.event) && index + 1 != serialized_len)
         {
             return Err(ProtocolErrorV4::BrokenEventChain);
         }
@@ -1113,6 +1166,42 @@ mod tests {
         let mut tampered = second;
         tampered.previous_hash = "bad".into();
         assert!(validate_event_chain_v4(&[first, tampered]).is_err());
+    }
+
+    #[test]
+    fn terminal_event_cannot_appear_before_the_end_of_a_valid_hash_chain() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let first = AgentEventV4::first(
+            run_id,
+            project_id,
+            conversation_id,
+            Utc::now(),
+            AgentEventKindV4::RunCreated {
+                mode: RunModeV4::Plan,
+            },
+        );
+        let terminal = AgentEventV4::next(&first, Utc::now(), AgentEventKindV4::RunCancelled);
+        let after = AgentEventV4::next(
+            &terminal,
+            Utc::now(),
+            AgentEventKindV4::ModelText {
+                text: "post-terminal".into(),
+            },
+        );
+        let serialized = [&first, &terminal, &after]
+            .into_iter()
+            .map(|event| serde_json::to_string(event).unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            deserialize_event_chain_v4(&serialized),
+            Err(ProtocolErrorV4::BrokenEventChain)
+        ));
+        assert!(matches!(
+            validate_event_chain_v4(&[first, terminal, after]),
+            Err(ProtocolErrorV4::BrokenEventChain)
+        ));
     }
 
     fn local_selection() -> ComputeSelectionV4 {

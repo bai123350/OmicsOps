@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use thiserror::Error;
@@ -277,6 +280,28 @@ impl AgentCoreV4<'_> {
         conversation_id: Uuid,
         objective: &str,
     ) -> Result<ExecutionPlanV4, AgentCoreErrorV4> {
+        let cancelled = AtomicBool::new(false);
+        self.plan_with_cancellation(
+            run_id,
+            project_id,
+            conversation_id,
+            objective,
+            Arc::new(cancelled),
+        )
+        .await
+    }
+
+    pub async fn plan_with_cancellation(
+        &self,
+        run_id: Uuid,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        objective: &str,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<ExecutionPlanV4, AgentCoreErrorV4> {
+        if self.stop_if_cancelled(run_id, &cancelled).await? {
+            return Err(AgentCoreErrorV4::Cancelled);
+        }
         if self
             .events
             .load(run_id)
@@ -296,6 +321,9 @@ impl AgentCoreV4<'_> {
             .await?;
         }
         for _ in 0..16 {
+            if self.stop_if_cancelled(run_id, &cancelled).await? {
+                return Err(AgentCoreErrorV4::Cancelled);
+            }
             let prior = self
                 .events
                 .load(run_id)
@@ -321,16 +349,22 @@ impl AgentCoreV4<'_> {
                     },
                     AgentLimitsV4::default().max_model_retries,
                     AgentLimitsV4::default().model_attempt_timeout,
-                    None,
+                    Some(&cancelled),
                 )
                 .await?;
             for call in turn.tool_calls {
+                if self.stop_if_cancelled(run_id, &cancelled).await? {
+                    return Err(AgentCoreErrorV4::Cancelled);
+                }
                 self.push(
                     run_id,
                     AgentEventKindV4::ToolRequested { call: call.clone() },
                 )
                 .await?;
                 if call.tool_id == "agent.propose_plan" {
+                    if self.stop_if_cancelled(run_id, &cancelled).await? {
+                        return Err(AgentCoreErrorV4::Cancelled);
+                    }
                     let plan: ExecutionPlanV4 = serde_json::from_value(call.arguments)
                         .map_err(|e| AgentCoreErrorV4::InvalidArguments(e.to_string()))?;
                     let plan_hash = plan
@@ -347,6 +381,9 @@ impl AgentCoreV4<'_> {
                     return Ok(plan);
                 }
                 if call.tool_id == "agent.request_input" {
+                    if self.stop_if_cancelled(run_id, &cancelled).await? {
+                        return Err(AgentCoreErrorV4::Cancelled);
+                    }
                     let question = call
                         .arguments
                         .get("question")
@@ -365,16 +402,44 @@ impl AgentCoreV4<'_> {
                     .await?;
                     return Err(AgentCoreErrorV4::WaitingForInput);
                 }
+                if self.stop_if_cancelled(run_id, &cancelled).await? {
+                    return Err(AgentCoreErrorV4::Cancelled);
+                }
                 let outcome = self
                     .tools
                     .execute(RunModeV4::Plan, call)
                     .await
                     .map_err(AgentCoreErrorV4::Tool)?;
+                if self.stop_if_cancelled(run_id, &cancelled).await? {
+                    return Err(AgentCoreErrorV4::Cancelled);
+                }
                 self.push(run_id, AgentEventKindV4::ToolFinished { outcome })
                     .await?;
             }
         }
         Err(AgentCoreErrorV4::MissingPlan)
+    }
+
+    async fn stop_if_cancelled(
+        &self,
+        run_id: Uuid,
+        cancelled: &AtomicBool,
+    ) -> Result<bool, AgentCoreErrorV4> {
+        let events = self
+            .events
+            .load(run_id)
+            .await
+            .map_err(AgentCoreErrorV4::Store)?;
+        let already_terminal = events
+            .iter()
+            .any(|event| is_terminal_event_v4(&event.event));
+        if !cancelled.load(Ordering::SeqCst) && !already_terminal {
+            return Ok(false);
+        }
+        if !already_terminal {
+            self.push(run_id, AgentEventKindV4::RunCancelled).await?;
+        }
+        Ok(true)
     }
 
     pub async fn approve(&self, spec: &RunSpecV4) -> Result<(), AgentCoreErrorV4> {
@@ -1248,8 +1313,9 @@ impl AgentCoreV4<'_> {
                     }
                     _ = tokio::time::sleep(Duration::from_millis(50)), if cancelled.is_some() => {
                         if cancelled.is_some_and(|token| token.load(Ordering::SeqCst)) {
-                            self.push(run_id, AgentEventKindV4::RunCancelled)
-                                .await?;
+                            if let Some(token) = cancelled {
+                                self.stop_if_cancelled(run_id, token).await?;
+                            }
                             return Err(AgentCoreErrorV4::Cancelled);
                         }
                     }
@@ -1307,7 +1373,9 @@ impl AgentCoreV4<'_> {
         let mut attempt = 0_u8;
         loop {
             if cancelled.is_some_and(|token| token.load(Ordering::SeqCst)) {
-                self.push(run_id, AgentEventKindV4::RunCancelled).await?;
+                if let Some(token) = cancelled {
+                    self.stop_if_cancelled(run_id, token).await?;
+                }
                 return Err(AgentCoreErrorV4::Cancelled);
             }
             let review = tokio::time::timeout(attempt_timeout, self.model.review(request.clone()))
@@ -2089,6 +2157,16 @@ fn validate_delegation_graph_v4(
     Ok(nodes)
 }
 
+fn is_terminal_event_v4(event: &AgentEventKindV4) -> bool {
+    matches!(
+        event,
+        AgentEventKindV4::RunCompleted
+            | AgentEventKindV4::RunFailed { .. }
+            | AgentEventKindV4::RunNeedsAttention { .. }
+            | AgentEventKindV4::RunCancelled
+    )
+}
+
 pub fn build_scientific_bridge_v4(
     spec: &RunSpecV4,
     state: &ScientificStateV4,
@@ -2705,6 +2783,32 @@ mod tests {
 
     struct ScriptedModel(Mutex<Vec<ModelTurnV4>>);
 
+    struct BlockingPlanningModel {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        plan: ExecutionPlanV4,
+    }
+
+    #[async_trait]
+    impl ModelPortV4 for BlockingPlanningModel {
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![ToolCallV4 {
+                    call_id: "proposal-after-cancel".into(),
+                    tool_id: "agent.propose_plan".into(),
+                    arguments: serde_json::to_value(&self.plan).unwrap(),
+                }],
+            })
+        }
+    }
+
     struct CharacterStreamingModel;
 
     #[async_trait]
@@ -2940,6 +3044,111 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|e| matches!(e.event, AgentEventKindV4::PlanProposed { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn planning_cancellation_does_not_persist_a_post_terminal_proposal() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let store = MemoryStore::default();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let model = BlockingPlanningModel {
+            entered: entered.clone(),
+            release: release.clone(),
+            plan: ExecutionPlanV4 {
+                schema_version: 4,
+                objective: "cancelled plan".into(),
+                steps: vec!["would run".into()],
+                completion_criteria: vec!["would verify".into()],
+                requested_capabilities: BTreeSet::new(),
+            },
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let mut planning = Box::pin(core.plan_with_cancellation(
+            run_id,
+            project_id,
+            conversation_id,
+            "cancelled plan",
+            cancelled.clone(),
+        ));
+        tokio::select! {
+            result = &mut planning => panic!("planning completed before cancellation: {result:?}"),
+            _ = entered.notified() => {
+                cancelled.store(true, Ordering::SeqCst);
+                release.notify_one();
+            }
+        }
+        let error = planning.await.unwrap_err();
+        assert!(matches!(error, AgentCoreErrorV4::Cancelled));
+        let events = store.load_direct(run_id).unwrap();
+        assert!(matches!(
+            events.last().map(|event| &event.event),
+            Some(AgentEventKindV4::RunCancelled)
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::PlanProposed { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_does_not_append_another_terminal_event_when_terminal_is_not_last() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let store = MemoryStore::default();
+        let first = AgentEventV4::first(
+            run_id,
+            project_id,
+            conversation_id,
+            Utc::now(),
+            AgentEventKindV4::RunCreated {
+                mode: RunModeV4::Plan,
+            },
+        );
+        let terminal = AgentEventV4::next(&first, Utc::now(), AgentEventKindV4::RunCancelled);
+        let after = AgentEventV4::next(
+            &terminal,
+            Utc::now(),
+            AgentEventKindV4::ModelText {
+                text: "post-terminal".into(),
+            },
+        );
+        for event in [&first, &terminal, &after] {
+            store.append_direct(event).unwrap();
+        }
+        let core = AgentCoreV4 {
+            model: &BlockingPlanningModel {
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+                plan: ExecutionPlanV4 {
+                    schema_version: 4,
+                    objective: "unreachable".into(),
+                    steps: vec!["unreachable".into()],
+                    completion_criteria: vec!["unreachable".into()],
+                    requested_capabilities: BTreeSet::new(),
+                },
+            },
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let cancelled = AtomicBool::new(true);
+        let result = core.stop_if_cancelled(run_id, &cancelled).await;
+        assert!(matches!(result, Ok(true)));
+        assert_eq!(
+            store.load_direct(run_id).unwrap(),
+            vec![first, terminal, after]
         );
     }
 

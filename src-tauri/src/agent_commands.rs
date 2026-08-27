@@ -32,43 +32,6 @@ pub fn conversation_title_from_first_message(markdown: &str) -> String {
     markdown.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-async fn title_conversation_from_first_message(
-    app: &AppHandle,
-    repository: &Store,
-    message: &Message,
-) -> Result<(), String> {
-    if repository
-        .messages_for_conversation(message.conversation_id)
-        .await
-        .map_err(|error| error.to_string())?
-        .iter()
-        .any(|stored| stored.role == MessageRole::User)
-    {
-        return Ok(());
-    }
-    let mut conversation = repository
-        .conversations_for_project(message.project_id)
-        .await
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .find(|conversation| conversation.id == message.conversation_id)
-        .ok_or_else(|| "conversation not found".to_string())?;
-    conversation.title = conversation_title_from_first_message(&message.markdown);
-    conversation.updated_at = message.created_at;
-    repository
-        .save_conversation(&conversation)
-        .await
-        .map_err(|error| error.to_string())?;
-    app.emit(
-        "conversation-updated",
-        ConversationUpdatedEvent {
-            project_id: message.project_id,
-            conversation,
-        },
-    )
-    .map_err(|error| error.to_string())
-}
-
 pub fn user_message_from_request(
     request: SubmitMessageRequest,
     id: Uuid,
@@ -87,6 +50,19 @@ pub fn user_message_from_request(
         markdown,
         now,
     ))
+}
+
+/// Persist the command's message and first-message title as one Store
+/// transaction. The command uses this seam before emitting any UI event.
+pub(crate) async fn persist_submitted_message(
+    repository: &Store,
+    message: &Message,
+) -> Result<Option<Conversation>, String> {
+    let title = conversation_title_from_first_message(&message.markdown);
+    repository
+        .save_message_with_first_title(message, &title)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -108,12 +84,16 @@ pub async fn submit_message(
     request: SubmitMessageRequest,
 ) -> Result<Message, String> {
     let message = user_message_from_request(request, Uuid::new_v4(), Utc::now())?;
-    title_conversation_from_first_message(&app, &state.repository, &message).await?;
-    state
-        .repository
-        .save_message(&message)
-        .await
+    if let Some(conversation) = persist_submitted_message(&state.repository, &message).await? {
+        app.emit(
+            "conversation-updated",
+            ConversationUpdatedEvent {
+                project_id: message.project_id,
+                conversation,
+            },
+        )
         .map_err(|error| error.to_string())?;
+    }
     app.emit(
         "conversation-event",
         ConversationEvent {

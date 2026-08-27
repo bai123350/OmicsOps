@@ -174,6 +174,34 @@ export interface SetConversationAgentModeRequestV4 extends GetConversationAgentM
 
 export interface SetConversationAgentModeResponseV4 extends SetConversationAgentModeRequestV4 {}
 
+export type PlanRevisionStatusV4 = "generating" | "revising" | "pending" | "approved" | "superseded" | "cancelled";
+export interface ProposedPlanRevisionV4 {
+  id: string;
+  project_id: string;
+  conversation_id: string;
+  run_id: string;
+  revision: number;
+  plan: ExecutionPlanV4;
+  markdown: string;
+  plan_hash: string;
+  status: PlanRevisionStatusV4;
+  feedback?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+export interface AgentV4RequestPlanRevisionRequest {
+  run_id: string;
+  plan_hash: string;
+  feedback: string;
+}
+export interface RequestPlanRevisionResponseV4 {
+  run_id: string;
+  revision: number;
+  plan_hash: string;
+  status: PlanRevisionStatusV4;
+  feedback?: string | null;
+}
+
 export interface ToolCallV4 { call_id: string; tool_id: string; arguments: Record<string, unknown> }
 export interface ToolOutcomeV4 { call_id: string; tool_id: string; succeeded: boolean; model_content: string; data: unknown; provenance: string[] }
 export type ToolEffectV4 = "read_only" | "mutating" | "runtime" | "network" | "delegation";
@@ -198,6 +226,7 @@ export type AgentEventKindV4 =
   | { kind: "tool_dispatch_resolved"; call_id: string; resolution: "side_effect_observed" | "side_effect_not_observed" | "compensated"; evidence: string }
   | { kind: "plan_proposed"; plan: ExecutionPlanV4; plan_hash: string }
   | { kind: "plan_approved"; plan_hash: string }
+  | { kind: "plan_revision_requested"; plan_hash: string; feedback: string }
   | { kind: "run_spec_frozen"; approval_hash: string; spec_hash: string }
   | { kind: "mode_changed"; mode: "plan" | "execute" }
   | { kind: "input_requested"; question_id: string; question: string }

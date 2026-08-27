@@ -3255,6 +3255,7 @@ dependencies = [
 name = "omicsops-dto"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "omicsops-protocol",
  "serde",
  "serde_json",

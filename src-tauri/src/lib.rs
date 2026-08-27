@@ -11,6 +11,8 @@ pub mod inspection;
 pub mod kernel_commands;
 pub mod model_commands;
 pub mod p1_commands;
+#[cfg(test)]
+mod plan_revision_tests;
 pub mod pubmed_mcp;
 pub mod research_commands;
 pub mod skill_commands;
@@ -93,6 +95,7 @@ pub fn run() {
             agent_v4::agent_v4_start_direct,
             agent_v4::agent_v4_compute_backends,
             agent_v4::agent_v4_approve_plan,
+            agent_v4::agent_v4_request_plan_revision,
             agent_v4::agent_v4_resume,
             agent_v4::agent_v4_cancel,
             agent_v4::agent_v4_answer,

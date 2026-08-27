@@ -32,6 +32,10 @@ use omicsops_core::{
     project::{require_remote_descendant, shell_quote},
     workspace::Project,
 };
+pub use omicsops_dto::{
+    AgentV4RequestPlanRevisionRequest, PlanRevisionStatusV4, ProposedPlanRevisionV4,
+    RequestPlanRevisionResponseV4,
+};
 use omicsops_knowledge::{
     McpToolIndexV4, MemoryDocumentV4, SkillDocumentV4, authorize_mcp_use, freeze_skill,
     markdown_sections, schema_digest, search_mcp_tools, search_memory, search_skills,
@@ -53,7 +57,9 @@ use omicsops_science::{
     AnalysisDeclarationV4, AnalysisStatusV4, DatasetStageV4, EvidenceDeclarationV4,
     RuntimeIdentityV4, ScientificStateV4, VerifiedArtifactFactV4, VerifiedDatasetFactV4,
 };
-use omicsops_store::Store;
+use omicsops_store::{
+    PlanApprovalResultV4, PlanCancellationResultV4, PlanRevisionFinalizeOptionsV4, Store,
+};
 use omicsops_tools::{ToolExecutorV4, ToolRegistryV4, builtin_tool_definitions_v4};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -74,6 +80,77 @@ static PROJECT_SIDE_EFFECT_LOCKS_V4: OnceLock<std::sync::Mutex<HashMap<Uuid, Wea
     OnceLock::new();
 static SCIENTIFIC_STATE_LOCKS_V4: OnceLock<std::sync::Mutex<HashMap<Uuid, Weak<Mutex<()>>>>> =
     OnceLock::new();
+
+/// Guard ordinary Agent/Plan starts against an active proposal in the same
+/// conversation. Explicit approve/request/cancel commands intentionally do
+/// not call this helper and remain available while the conversation is locked.
+pub async fn ensure_v4_start_allowed(
+    repository: &Store,
+    project_id: Uuid,
+    conversation_id: Uuid,
+) -> Result<(), String> {
+    repository
+        .ensure_conversation_unlocked_v4(project_id, conversation_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Validate the only resumable plan-generation state. Terminal runs are
+/// rejected before looking at legacy `spec == None` records, and a pending
+/// proposal can never be silently regenerated into a newer revision.
+pub async fn ensure_v4_resume_allowed(
+    repository: &Store,
+    run_id: Uuid,
+) -> Result<ProposedPlanRevisionV4, String> {
+    let record = load_record(repository, run_id).await?;
+    if matches!(
+        record.status.as_str(),
+        "completed" | "cancelled" | "failed" | "needs_attention"
+    ) {
+        return Err("V4 run is terminal and cannot be resumed".into());
+    }
+    let latest = repository
+        .latest_proposed_plan_revision_v4(record.project_id, record.conversation_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "V4 run has no revising plan revision to resume".to_string())?;
+    if latest.run_id != run_id {
+        return Err("latest plan revision belongs to a different V4 run".into());
+    }
+    if latest.status == PlanRevisionStatusV4::Pending {
+        return Err(
+            "pending plan revision must be approved, revised, or cancelled before resume".into(),
+        );
+    }
+    if latest.status == PlanRevisionStatusV4::Cancelled {
+        return Err("cancelled plan revision cannot be resumed".into());
+    }
+    if latest.status != PlanRevisionStatusV4::Revising {
+        return Err("only the latest revising plan revision can be resumed".into());
+    }
+    Ok(latest)
+}
+
+/// Reserve the next generating revision for a request-change resume. Keeping
+/// this service seam separate from the Tauri `State` makes the command-level
+/// transition deterministic and testable without a live window.
+pub async fn begin_v4_plan_resume(
+    repository: &Store,
+    run_id: Uuid,
+) -> Result<ProposedPlanRevisionV4, String> {
+    let record = load_record(repository, run_id).await?;
+    ensure_v4_resume_allowed(repository, run_id).await?;
+    repository
+        .acquire_plan_revision_resume_v4(
+            record.project_id,
+            record.conversation_id,
+            record.run_id,
+            &record.objective,
+            Utc::now(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
 
 fn project_side_effect_lock_v4(project_id: Uuid) -> Arc<Mutex<()>> {
     let locks = PROJECT_SIDE_EFFECT_LOCKS_V4.get_or_init(Default::default);
@@ -113,6 +190,8 @@ pub struct ApprovePlanV4Request {
     pub approval_hash: Option<String>,
     #[serde(default)]
     pub plan_hash: Option<String>,
+    #[serde(default)]
+    pub revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +248,8 @@ struct RunRecordV4 {
     compute_selection: Option<ComputeSelectionV4>,
     #[serde(default)]
     approval_hash: Option<String>,
+    #[serde(default)]
+    plan_revision: Option<u64>,
     spec: Option<RunSpecV4>,
 }
 
@@ -316,18 +397,15 @@ pub async fn agent_v4_start_planning(
     if request.objective.trim().is_empty() {
         return Err("V4 objective is empty".into());
     }
-    let project = workspace_project(&state.repository, request.project_id).await?;
-    validate_compute_selection(&state, &project, &request.compute_selection).await?;
-    let (model, tools) = compose(
-        &state,
-        &project,
-        &request.compute_selection,
-        request.model_profile_id,
-        Uuid::new_v4(),
-        None,
+    ensure_v4_start_allowed(
+        &state.repository,
+        request.project_id,
+        request.conversation_id,
     )
     .await?;
-    let run_id = tools.run_id();
+    let project = workspace_project(&state.repository, request.project_id).await?;
+    validate_compute_selection(&state, &project, &request.compute_selection).await?;
+    let run_id = Uuid::new_v4();
     let mut record = RunRecordV4 {
         run_id,
         project_id: request.project_id,
@@ -339,9 +417,82 @@ pub async fn agent_v4_start_planning(
         plan_hash: None,
         compute_selection: Some(request.compute_selection.clone()),
         approval_hash: None,
+        plan_revision: None,
         spec: None,
     };
-    save_record(&state.repository, &record).await?;
+    let generation = state
+        .repository
+        .start_plan_run_v4(
+            record.run_id,
+            record.project_id,
+            record.conversation_id,
+            &record.status,
+            &serde_json::to_value(&record).map_err(|error| error.to_string())?,
+            &record.objective,
+            Utc::now(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    record.plan_revision = Some(generation.revision);
+    let planning_cancelled = Arc::new(AtomicBool::new(false));
+    let _planning_guard =
+        match register_active_run_guard(&state.active_runs, run_id, planning_cancelled.clone()) {
+            Ok(Some(guard)) => guard,
+            Ok(None) => {
+                let message = "V4 planning run is already active";
+                return Err(terminate_plan_generation_with_diagnostics(
+                    &state.repository,
+                    record.project_id,
+                    record.conversation_id,
+                    record.run_id,
+                    generation.revision,
+                    PlanRevisionStatusV4::Cancelled,
+                    message,
+                )
+                .await);
+            }
+            Err(error) => {
+                return Err(terminate_plan_generation_with_diagnostics(
+                    &state.repository,
+                    record.project_id,
+                    record.conversation_id,
+                    record.run_id,
+                    generation.revision,
+                    PlanRevisionStatusV4::Cancelled,
+                    &error,
+                )
+                .await);
+            }
+        };
+    if planning_cancelled.load(Ordering::SeqCst)
+        || !plan_generation_is_active(&state.repository, generation.id).await?
+    {
+        return Err("V4 planning was cancelled".into());
+    }
+    let (model, tools) = match compose(
+        &state,
+        &project,
+        &request.compute_selection,
+        request.model_profile_id,
+        run_id,
+        None,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(terminate_plan_generation_with_diagnostics(
+                &state.repository,
+                record.project_id,
+                record.conversation_id,
+                record.run_id,
+                generation.revision,
+                PlanRevisionStatusV4::Cancelled,
+                &error,
+            )
+            .await);
+        }
+    };
     let event_store = RepositoryEventStoreV4 {
         repository: state.repository.clone(),
         app: app.clone(),
@@ -357,55 +508,148 @@ pub async fn agent_v4_start_planning(
         events: &event_store,
         science: Some(&science_store),
     };
-    let plan = match core
-        .plan(
+    let plan_result = core
+        .plan_with_cancellation(
             run_id,
             request.project_id,
             request.conversation_id,
             &request.objective,
+            planning_cancelled.clone(),
         )
-        .await
-    {
+        .await;
+    if !plan_generation_is_active(&state.repository, generation.id).await? {
+        return Err("V4 planning was cancelled".into());
+    }
+    let plan = match plan_result {
         Ok(plan) => plan,
         Err(AgentCoreErrorV4::WaitingForInput) => {
-            record.status = "waiting_for_input".into();
-            save_record(&state.repository, &record).await?;
+            state
+                .repository
+                .terminate_plan_generation_v4(
+                    request.project_id,
+                    request.conversation_id,
+                    run_id,
+                    generation.revision,
+                    PlanRevisionStatusV4::Revising,
+                    Some("planning is waiting for user input"),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
             return Ok(RunSummaryV4 {
                 run_id,
-                status: record.status,
+                status: "waiting_for_input".into(),
                 plan: None,
                 plan_hash: None,
                 compute_selection: Some(request.compute_selection),
                 approval_hash: None,
-                plan_revision: None,
+                plan_revision: Some(generation.revision),
                 session_mode: Some(SessionAgentModeV4::Plan),
             });
         }
-        Err(error) => return Err(error.to_string()),
+        Err(error) => {
+            let message = error.to_string();
+            return Err(terminate_plan_generation_with_diagnostics(
+                &state.repository,
+                request.project_id,
+                request.conversation_id,
+                run_id,
+                generation.revision,
+                PlanRevisionStatusV4::Cancelled,
+                &message,
+            )
+            .await);
+        }
     };
-    let hash = plan.canonical_hash().map_err(|error| error.to_string())?;
-    let approval_hash = RunSpecV4::approval_hash_for(
+    let hash = match plan.canonical_hash() {
+        Ok(hash) => hash,
+        Err(error) => {
+            let message = error.to_string();
+            return Err(terminate_plan_generation_with_diagnostics(
+                &state.repository,
+                record.project_id,
+                record.conversation_id,
+                record.run_id,
+                generation.revision,
+                PlanRevisionStatusV4::Cancelled,
+                &message,
+            )
+            .await);
+        }
+    };
+    if planning_cancelled.load(Ordering::SeqCst) {
+        let message = "V4 planning was cancelled";
+        return Err(terminate_plan_generation_with_diagnostics(
+            &state.repository,
+            record.project_id,
+            record.conversation_id,
+            record.run_id,
+            generation.revision,
+            PlanRevisionStatusV4::Cancelled,
+            message,
+        )
+        .await);
+    }
+    let approval_hash = match RunSpecV4::approval_hash_for(
         run_id,
         request.project_id,
         request.conversation_id,
         request.model_profile_id,
         &plan,
         &request.compute_selection,
-    )
-    .map_err(|error| error.to_string())?;
-    record.status = "awaiting_approval".into();
-    record.plan = Some(plan.clone());
-    record.plan_hash = Some(hash.clone());
-    record.approval_hash = Some(approval_hash.clone());
-    save_record(&state.repository, &record).await?;
+    ) {
+        Ok(hash) => hash,
+        Err(error) => {
+            let message = error.to_string();
+            return Err(terminate_plan_generation_with_diagnostics(
+                &state.repository,
+                record.project_id,
+                record.conversation_id,
+                record.run_id,
+                generation.revision,
+                PlanRevisionStatusV4::Cancelled,
+                &message,
+            )
+            .await);
+        }
+    };
+    let revision = state
+        .repository
+        .finalize_plan_revision_v4_with_options(
+            request.project_id,
+            request.conversation_id,
+            run_id,
+            generation.revision,
+            plan.clone(),
+            plan_markdown(&plan),
+            hash.clone(),
+            Utc::now(),
+            PlanRevisionFinalizeOptionsV4 {
+                approval_hash: Some(approval_hash.clone()),
+                compute_selection: Some(request.compute_selection.clone()),
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if planning_cancelled.load(Ordering::SeqCst) {
+        let cancellation = state
+            .repository
+            .cancel_plan_v4(record.project_id, record.conversation_id, record.run_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        for event in &cancellation.events {
+            app.emit(AGENT_V4_EVENT_CHANNEL, event)
+                .map_err(|error| error.to_string())?;
+        }
+        return Err("V4 planning was cancelled".into());
+    }
     Ok(RunSummaryV4 {
         run_id,
-        status: record.status,
+        status: "awaiting_approval".into(),
         plan: Some(plan),
         plan_hash: Some(hash),
         compute_selection: Some(request.compute_selection),
         approval_hash: Some(approval_hash),
-        plan_revision: None,
+        plan_revision: Some(revision.revision),
         session_mode: Some(SessionAgentModeV4::Plan),
     })
 }
@@ -419,6 +663,12 @@ pub async fn agent_v4_start_direct(
     if request.objective.trim().is_empty() {
         return Err("V4 direct objective is empty".into());
     }
+    ensure_v4_start_allowed(
+        &state.repository,
+        request.project_id,
+        request.conversation_id,
+    )
+    .await?;
     let project = workspace_project(&state.repository, request.project_id).await?;
     validate_compute_selection(&state, &project, &request.compute_selection).await?;
     let (_model, tools) = compose(
@@ -477,9 +727,20 @@ pub async fn agent_v4_start_direct(
         plan_hash: Some(spec.approved_plan_hash.clone()),
         compute_selection: Some(request.compute_selection.clone()),
         approval_hash: Some(approval_hash.clone()),
+        plan_revision: None,
         spec: Some(spec.clone()),
     };
-    save_record(&state.repository, &record).await?;
+    state
+        .repository
+        .save_agent_run_v4_if_unlocked(
+            record.run_id,
+            record.project_id,
+            record.conversation_id,
+            &record.status,
+            &serde_json::to_value(&record).map_err(|error| error.to_string())?,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
     let store = RepositoryEventStoreV4 {
         repository: state.repository.clone(),
         app: app.clone(),
@@ -540,105 +801,352 @@ fn direct_execution_plan(
     }
 }
 
-#[tauri::command]
-pub async fn agent_v4_approve_plan(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    request: ApprovePlanV4Request,
-) -> Result<RunSummaryV4, String> {
-    let mut record = load_record(&state.repository, request.run_id).await?;
-    if record.status != "awaiting_approval" {
-        return Err("V4 run is not awaiting approval".into());
+fn plan_markdown(plan: &ExecutionPlanV4) -> String {
+    let steps = plan
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| format!("{}. {}", index + 1, step))
+        .collect::<Vec<_>>();
+    let criteria = plan
+        .completion_criteria
+        .iter()
+        .map(|criterion| format!("- {criterion}"))
+        .collect::<Vec<_>>();
+    format!(
+        "# Execution plan\n\n{}\n\n## Steps\n{}\n\n## Completion criteria\n{}",
+        plan.objective,
+        steps.join("\n"),
+        criteria.join("\n")
+    )
+}
+
+/// The mutation-before-spawn portion of plan approval. It performs all
+/// request/hash checks before calling Store, and uses the Store legacy seam
+/// when the run predates a persisted proposal. That seam materializes and
+/// approves revision one in one transaction.
+#[derive(Debug)]
+pub(crate) struct PlanApprovalServiceResult {
+    pub plan: ExecutionPlanV4,
+    pub plan_hash: String,
+    pub revision: u64,
+    pub selection: ComputeSelectionV4,
+    pub expected_approval: String,
+    pub spec: RunSpecV4,
+    pub approval: PlanApprovalResultV4,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PlanApprovalRunContext {
+    pub project_id: Uuid,
+    pub conversation_id: Uuid,
+    pub run_id: Uuid,
+    pub model_profile_id: Uuid,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn approve_plan_revision_for_command(
+    repository: &Store,
+    context: PlanApprovalRunContext,
+    record_plan_hash: Option<&str>,
+    record_plan: ExecutionPlanV4,
+    selection: ComputeSelectionV4,
+    request: &ApprovePlanV4Request,
+    run_value: &Value,
+) -> Result<PlanApprovalServiceResult, String> {
+    let PlanApprovalRunContext {
+        project_id,
+        conversation_id,
+        run_id,
+        model_profile_id,
+    } = context;
+    if request.run_id != run_id {
+        return Err("approval request run does not match the persisted run".into());
     }
-    let plan = record
-        .plan
-        .clone()
-        .ok_or_else(|| "V4 plan is missing".to_string())?;
-    let project = workspace_project(&state.repository, record.project_id).await?;
-    let legacy = record.compute_selection.is_none();
-    let selection = match record.compute_selection.clone() {
-        Some(selection) => selection,
-        None => legacy_ssh_selection(&project)?,
+    let latest = repository
+        .latest_proposed_plan_revision_v4(project_id, conversation_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let legacy = latest.is_none();
+    let (plan, plan_hash, revision) = match latest {
+        Some(latest) => {
+            if latest.run_id != run_id || latest.plan != record_plan {
+                return Err("latest plan revision does not match the V4 run".into());
+            }
+            let revision = request.revision.unwrap_or(latest.revision);
+            if revision != latest.revision {
+                return Err("only the latest plan revision can be approved".into());
+            }
+            (latest.plan, latest.plan_hash, latest.revision)
+        }
+        None => {
+            let plan_hash = record_plan_hash
+                .ok_or_else(|| "V4 plan hash is missing".to_string())?
+                .to_owned();
+            let actual_hash = record_plan
+                .canonical_hash()
+                .map_err(|error| error.to_string())?;
+            if actual_hash != plan_hash {
+                return Err("V4 plan hash does not match the frozen plan".into());
+            }
+            if request.revision.is_some_and(|revision| revision != 1) {
+                return Err("only the latest plan revision can be approved".into());
+            }
+            (record_plan, plan_hash, 1)
+        }
     };
-    validate_compute_selection(&state, &project, &selection).await?;
     let expected_approval = RunSpecV4::approval_hash_for(
-        record.run_id,
-        record.project_id,
-        record.conversation_id,
-        record.model_profile_id,
+        run_id,
+        project_id,
+        conversation_id,
+        model_profile_id,
         &plan,
         &selection,
     )
     .map_err(|error| error.to_string())?;
-    let supplied = request
-        .approval_hash
-        .as_deref()
-        .or(request.plan_hash.as_deref());
-    let accepted = if legacy {
-        supplied == Some(expected_approval.as_str()) || supplied == record.plan_hash.as_deref()
-    } else {
-        supplied == Some(expected_approval.as_str())
+    let accepted = match (
+        request.approval_hash.as_deref(),
+        request.plan_hash.as_deref(),
+    ) {
+        (Some(value), _) => value == expected_approval || (legacy && value == plan_hash),
+        (None, Some(value)) => value == plan_hash || value == expected_approval,
+        (None, None) => false,
     };
     if !accepted {
         return Err("V4 approval hash does not match the frozen plan and compute selection".into());
     }
     let spec = RunSpecV4::freeze_with_compute(
-        record.run_id,
-        record.project_id,
-        record.conversation_id,
-        record.model_profile_id,
+        run_id,
+        project_id,
+        conversation_id,
+        model_profile_id,
         plan.clone(),
         selection.clone(),
         &expected_approval,
         Utc::now(),
     )
     .map_err(|error| error.to_string())?;
-    let store = RepositoryEventStoreV4 {
-        repository: state.repository.clone(),
-        app: app.clone(),
+    let mut persisted_run_value = run_value.clone();
+    let object = persisted_run_value
+        .as_object_mut()
+        .ok_or_else(|| "approved run value must be a JSON object".to_string())?;
+    object.insert(
+        "plan".into(),
+        serde_json::to_value(&plan).map_err(|error| error.to_string())?,
+    );
+    object.insert("plan_hash".into(), Value::String(plan_hash.clone()));
+    object.insert(
+        "compute_selection".into(),
+        serde_json::to_value(&selection).map_err(|error| error.to_string())?,
+    );
+    object.insert(
+        "approval_hash".into(),
+        Value::String(expected_approval.clone()),
+    );
+    object.insert("plan_revision".into(), Value::from(revision));
+    let approval = if legacy {
+        repository
+            .approve_legacy_plan_revision_v4(
+                project_id,
+                conversation_id,
+                run_id,
+                plan.clone(),
+                plan_markdown(&plan),
+                &plan_hash,
+                &spec,
+                &persisted_run_value,
+            )
+            .await
+    } else {
+        repository
+            .approve_plan_revision_v4(
+                project_id,
+                conversation_id,
+                run_id,
+                revision,
+                &plan_hash,
+                &spec,
+                &persisted_run_value,
+            )
+            .await
+    }
+    .map_err(|error| error.to_string())?;
+    Ok(PlanApprovalServiceResult {
+        plan,
+        plan_hash,
+        revision,
+        selection,
+        expected_approval,
+        spec,
+        approval,
+    })
+}
+
+pub(crate) async fn plan_generation_is_active(
+    repository: &Store,
+    revision_id: Uuid,
+) -> Result<bool, String> {
+    Ok(repository
+        .proposed_plan_revision_v4(revision_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .is_some_and(|revision| revision.status == PlanRevisionStatusV4::Generating))
+}
+
+/// Cancel planning durably before returning from the command. Execution runs
+/// only receive the in-memory cancellation token; planning runs additionally
+/// transition their revision/run/event/mode state through Store atomically.
+pub(crate) async fn cancel_active_run_for_command(
+    repository: &Store,
+    run_id: Uuid,
+    active_token: Option<Arc<AtomicBool>>,
+) -> Result<Option<PlanCancellationResultV4>, String> {
+    let record = load_record(repository, run_id).await?;
+    let revisions = repository
+        .proposed_plan_revisions_v4(record.project_id, record.conversation_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let planning = revisions.iter().any(|revision| {
+        revision.run_id == run_id
+            && (revision.status.is_active()
+                || (revision.status == PlanRevisionStatusV4::Cancelled
+                    && record.status == "cancelled"))
+    });
+    if planning {
+        if let Some(token) = &active_token {
+            token.store(true, Ordering::SeqCst);
+        }
+        return repository
+            .cancel_plan_v4(record.project_id, record.conversation_id, run_id)
+            .await
+            .map(Some)
+            .map_err(|error| error.to_string());
+    }
+    if let Some(token) = active_token {
+        token.store(true, Ordering::SeqCst);
+        return Ok(None);
+    }
+    Err("V4 run is not active".into())
+}
+
+#[tauri::command]
+pub async fn agent_v4_approve_plan(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: ApprovePlanV4Request,
+) -> Result<RunSummaryV4, String> {
+    let record = load_record(&state.repository, request.run_id).await?;
+    if record.status != "awaiting_approval" {
+        return Err("V4 run is not awaiting approval".into());
+    }
+    let record_plan = record
+        .plan
+        .clone()
+        .ok_or_else(|| "V4 plan is missing".to_string())?;
+    let project = workspace_project(&state.repository, record.project_id).await?;
+    let selection = match record.compute_selection.clone() {
+        Some(selection) => selection,
+        None => legacy_ssh_selection(&project)?,
     };
-    append_next(
-        &store,
-        record.run_id,
-        AgentEventKindV4::PlanApproved {
-            plan_hash: spec.approved_plan_hash.clone(),
+    validate_compute_selection(&state, &project, &selection).await?;
+    let run_value = serde_json::to_value(&record).map_err(|error| error.to_string())?;
+    let approved = approve_plan_revision_for_command(
+        &state.repository,
+        PlanApprovalRunContext {
+            project_id: record.project_id,
+            conversation_id: record.conversation_id,
+            run_id: record.run_id,
+            model_profile_id: record.model_profile_id,
         },
+        record.plan_hash.as_deref(),
+        record_plan,
+        selection,
+        &request,
+        &run_value,
     )
     .await?;
-    append_next(
-        &store,
-        record.run_id,
-        AgentEventKindV4::RunSpecFrozen {
-            approval_hash: expected_approval.clone(),
-            spec_hash: spec.spec_hash.clone().expect("new V4 spec hash"),
-        },
-    )
-    .await?;
-    append_next(
-        &store,
-        record.run_id,
-        AgentEventKindV4::ModeChanged {
-            mode: omicsops_protocol::RunModeV4::Execute,
-        },
-    )
-    .await?;
+    let mut record = record;
     record.status = "running".into();
-    record.compute_selection = Some(selection.clone());
-    record.approval_hash = Some(expected_approval.clone());
-    record.spec = Some(spec.clone());
-    save_record(&state.repository, &record).await?;
-    let approved_plan_hash = spec.approved_plan_hash.clone();
-    spawn_execution(app, &state, record.clone(), spec).await?;
+    record.plan = Some(approved.plan.clone());
+    record.plan_hash = Some(approved.plan_hash.clone());
+    record.compute_selection = Some(approved.selection.clone());
+    record.approval_hash = Some(approved.expected_approval.clone());
+    record.spec = Some(approved.spec.clone());
+    record.plan_revision = Some(approved.revision);
+    // The Store transaction has committed before any event is emitted or
+    // execution is spawned. A UI reconnect therefore observes a coherent
+    // approval/mode/spec state even if the process exits here.
+    if let Some(error) = broadcast_events_best_effort(&approved.approval.events, |event| {
+        app.emit(AGENT_V4_EVENT_CHANNEL, event)
+            .map_err(|error| error.to_string())
+    }) {
+        eprintln!("failed to broadcast committed V4 approval event: {error}");
+    }
+    let approved_plan_hash = approved.spec.approved_plan_hash.clone();
+    spawn_execution(app, &state, record.clone(), approved.spec.clone()).await?;
     Ok(RunSummaryV4 {
         run_id: record.run_id,
         status: "running".into(),
-        plan: Some(plan),
+        plan: Some(approved.plan),
         plan_hash: Some(approved_plan_hash),
-        compute_selection: Some(selection),
-        approval_hash: Some(expected_approval),
-        plan_revision: None,
+        compute_selection: Some(approved.selection),
+        approval_hash: Some(approved.expected_approval),
+        plan_revision: Some(approved.revision),
         session_mode: Some(SessionAgentModeV4::Agent),
     })
+}
+
+/// Shared command helper used by the native boundary and deterministic
+/// contract tests. It resolves project/conversation ownership from the run,
+/// so callers cannot submit feedback for another project's conversation.
+pub async fn request_plan_revision_response(
+    repository: &Store,
+    request: &AgentV4RequestPlanRevisionRequest,
+) -> Result<RequestPlanRevisionResponseV4, String> {
+    request_plan_revision_committed(repository, request)
+        .await
+        .map(|(response, _event)| response)
+}
+
+/// Store feedback and its hash-chained event atomically. The event is handed
+/// to the Tauri command for post-commit broadcast only.
+pub async fn request_plan_revision_committed(
+    repository: &Store,
+    request: &AgentV4RequestPlanRevisionRequest,
+) -> Result<(RequestPlanRevisionResponseV4, AgentEventV4), String> {
+    let record = load_record(repository, request.run_id).await?;
+    let result = repository
+        .request_plan_revision_v4_with_event(
+            record.project_id,
+            record.conversation_id,
+            record.run_id,
+            &request.plan_hash,
+            &request.feedback,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((
+        RequestPlanRevisionResponseV4 {
+            run_id: result.revision.run_id,
+            revision: result.revision.revision,
+            plan_hash: result.revision.plan_hash,
+            status: result.revision.status,
+            feedback: result.revision.feedback,
+        },
+        result.event,
+    ))
+}
+
+#[tauri::command]
+pub async fn agent_v4_request_plan_revision(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: AgentV4RequestPlanRevisionRequest,
+) -> Result<RequestPlanRevisionResponseV4, String> {
+    let (response, event) = request_plan_revision_committed(&state.repository, &request).await?;
+    app.emit(AGENT_V4_EVENT_CHANNEL, &event)
+        .map_err(|error| error.to_string())?;
+    Ok(response)
 }
 
 #[tauri::command]
@@ -655,14 +1163,63 @@ pub async fn agent_v4_resume(
         return Ok(());
     }
     let mut record = load_record(&state.repository, run_id).await?;
-    let Some(mut spec) = record.spec.clone() else {
+    if matches!(
+        record.status.as_str(),
+        "completed" | "cancelled" | "failed" | "needs_attention"
+    ) {
+        return Err("V4 run is terminal".into());
+    }
+    if record.spec.is_none() {
+        // Reject pending/cancelled/replayed plan runs before any legacy
+        // compute-selection fallback or model composition can obscure the
+        // request -> revising -> resume contract.
+        ensure_v4_resume_allowed(&state.repository, run_id).await?;
         let project = workspace_project(&state.repository, record.project_id).await?;
         let selection = record
             .compute_selection
             .clone()
             .unwrap_or(legacy_ssh_selection(&project)?);
         validate_compute_selection(&state, &project, &selection).await?;
-        let (model, tools) = compose(
+        let generation = begin_v4_plan_resume(&state.repository, run_id).await?;
+        let planning_cancelled = Arc::new(AtomicBool::new(false));
+        let _planning_guard = match register_active_run_guard(
+            &state.active_runs,
+            record.run_id,
+            planning_cancelled.clone(),
+        ) {
+            Ok(Some(guard)) => guard,
+            Ok(None) => {
+                let message = "V4 planning run is already active";
+                return Err(terminate_plan_generation_with_diagnostics(
+                    &state.repository,
+                    record.project_id,
+                    record.conversation_id,
+                    record.run_id,
+                    generation.revision,
+                    PlanRevisionStatusV4::Cancelled,
+                    message,
+                )
+                .await);
+            }
+            Err(error) => {
+                return Err(terminate_plan_generation_with_diagnostics(
+                    &state.repository,
+                    record.project_id,
+                    record.conversation_id,
+                    record.run_id,
+                    generation.revision,
+                    PlanRevisionStatusV4::Cancelled,
+                    &error,
+                )
+                .await);
+            }
+        };
+        if planning_cancelled.load(Ordering::SeqCst)
+            || !plan_generation_is_active(&state.repository, generation.id).await?
+        {
+            return Err("V4 planning was cancelled".into());
+        }
+        let (model, tools) = match compose(
             &state,
             &project,
             &selection,
@@ -670,7 +1227,22 @@ pub async fn agent_v4_resume(
             record.run_id,
             None,
         )
-        .await?;
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(terminate_plan_generation_with_diagnostics(
+                    &state.repository,
+                    record.project_id,
+                    record.conversation_id,
+                    record.run_id,
+                    generation.revision,
+                    PlanRevisionStatusV4::Cancelled,
+                    &error,
+                )
+                .await);
+            }
+        };
         let store = RepositoryEventStoreV4 {
             repository: state.repository.clone(),
             app: app.clone(),
@@ -686,43 +1258,137 @@ pub async fn agent_v4_resume(
             events: &store,
             science: Some(&science_store),
         };
-        match core
-            .plan(
+        let plan_result = core
+            .plan_with_cancellation(
                 record.run_id,
                 record.project_id,
                 record.conversation_id,
                 &record.objective,
+                planning_cancelled.clone(),
             )
-            .await
-        {
+            .await;
+        if !plan_generation_is_active(&state.repository, generation.id).await? {
+            return Err("V4 planning was cancelled".into());
+        }
+        match plan_result {
             Ok(plan) => {
-                let mut updated = record;
-                let hash = plan.canonical_hash().map_err(|e| e.to_string())?;
-                updated.status = "awaiting_approval".into();
-                updated.plan = Some(plan);
-                updated.plan_hash = Some(hash);
-                updated.compute_selection = Some(selection.clone());
-                updated.approval_hash = Some(
-                    RunSpecV4::approval_hash_for(
-                        updated.run_id,
-                        updated.project_id,
-                        updated.conversation_id,
-                        updated.model_profile_id,
-                        updated.plan.as_ref().expect("plan was set"),
-                        &selection,
+                let hash = match plan.canonical_hash() {
+                    Ok(hash) => hash,
+                    Err(error) => {
+                        let message = error.to_string();
+                        return Err(terminate_plan_generation_with_diagnostics(
+                            &state.repository,
+                            record.project_id,
+                            record.conversation_id,
+                            record.run_id,
+                            generation.revision,
+                            PlanRevisionStatusV4::Cancelled,
+                            &message,
+                        )
+                        .await);
+                    }
+                };
+                if planning_cancelled.load(Ordering::SeqCst) {
+                    let message = "V4 planning was cancelled";
+                    return Err(terminate_plan_generation_with_diagnostics(
+                        &state.repository,
+                        record.project_id,
+                        record.conversation_id,
+                        record.run_id,
+                        generation.revision,
+                        PlanRevisionStatusV4::Cancelled,
+                        message,
                     )
-                    .map_err(|error| error.to_string())?,
-                );
-                save_record(&state.repository, &updated).await?;
+                    .await);
+                }
+                let approval_hash = match RunSpecV4::approval_hash_for(
+                    record.run_id,
+                    record.project_id,
+                    record.conversation_id,
+                    record.model_profile_id,
+                    &plan,
+                    &selection,
+                ) {
+                    Ok(hash) => hash,
+                    Err(error) => {
+                        let message = error.to_string();
+                        return Err(terminate_plan_generation_with_diagnostics(
+                            &state.repository,
+                            record.project_id,
+                            record.conversation_id,
+                            record.run_id,
+                            generation.revision,
+                            PlanRevisionStatusV4::Cancelled,
+                            &message,
+                        )
+                        .await);
+                    }
+                };
+                let _revision = state
+                    .repository
+                    .finalize_plan_revision_v4_with_options(
+                        record.project_id,
+                        record.conversation_id,
+                        record.run_id,
+                        generation.revision,
+                        plan.clone(),
+                        plan_markdown(&plan),
+                        hash.clone(),
+                        Utc::now(),
+                        PlanRevisionFinalizeOptionsV4 {
+                            approval_hash: Some(approval_hash),
+                            compute_selection: Some(selection.clone()),
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if planning_cancelled.load(Ordering::SeqCst) {
+                    let cancellation = state
+                        .repository
+                        .cancel_plan_v4(record.project_id, record.conversation_id, record.run_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    for event in &cancellation.events {
+                        app.emit(AGENT_V4_EVENT_CHANNEL, event)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    return Err("V4 planning was cancelled".into());
+                }
                 return Ok(());
             }
-            Err(AgentCoreErrorV4::WaitingForInput) => return Ok(()),
-            Err(error) => return Err(error.to_string()),
+            Err(AgentCoreErrorV4::WaitingForInput) => {
+                state
+                    .repository
+                    .terminate_plan_generation_v4(
+                        record.project_id,
+                        record.conversation_id,
+                        record.run_id,
+                        generation.revision,
+                        PlanRevisionStatusV4::Revising,
+                        Some("planning is waiting for user input"),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                return Ok(());
+            }
+            Err(error) => {
+                let message = error.to_string();
+                return Err(terminate_plan_generation_with_diagnostics(
+                    &state.repository,
+                    record.project_id,
+                    record.conversation_id,
+                    record.run_id,
+                    generation.revision,
+                    PlanRevisionStatusV4::Cancelled,
+                    &message,
+                )
+                .await);
+            }
         }
-    };
-    if matches!(record.status.as_str(), "completed" | "cancelled") {
-        return Err("V4 run is terminal".into());
     }
+    let Some(mut spec) = record.spec.clone() else {
+        return Err("V4 run has no frozen specification or resumable plan revision".into());
+    };
     if spec.compute_selection.is_none() {
         let project = workspace_project(&state.repository, record.project_id).await?;
         let selection = legacy_ssh_selection(&project)?;
@@ -826,15 +1492,27 @@ fn recoverable_system_environment_ensure(
 }
 
 #[tauri::command]
-pub fn agent_v4_cancel(state: State<'_, AppState>, run_id: Uuid) -> Result<(), String> {
-    let active = state
+pub async fn agent_v4_cancel(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    run_id: Uuid,
+) -> Result<(), String> {
+    let active_token = state
         .active_runs
         .lock()
-        .map_err(|_| "active run registry unavailable".to_string())?;
-    active
+        .map_err(|_| "active run registry unavailable".to_string())?
         .get(&run_id)
-        .ok_or_else(|| "V4 run is not active".to_string())?
-        .store(true, Ordering::SeqCst);
+        .cloned();
+    if let Some(cancellation) =
+        cancel_active_run_for_command(&state.repository, run_id, active_token).await?
+    {
+        if let Some(error) = broadcast_events_best_effort(&cancellation.events, |event| {
+            app.emit(AGENT_V4_EVENT_CHANNEL, event)
+                .map_err(|error| error.to_string())
+        }) {
+            eprintln!("failed to broadcast committed V4 cancellation event: {error}");
+        }
+    }
     Ok(())
 }
 
@@ -1260,6 +1938,46 @@ async fn append_terminal_event(
     Err(last_error.unwrap_or_else(|| "failed to persist terminal V4 event".into()))
 }
 
+async fn terminate_plan_generation_with_diagnostics(
+    repository: &Store,
+    project_id: Uuid,
+    conversation_id: Uuid,
+    run_id: Uuid,
+    revision: u64,
+    status: PlanRevisionStatusV4,
+    message: &str,
+) -> String {
+    match repository
+        .terminate_plan_generation_v4(
+            project_id,
+            conversation_id,
+            run_id,
+            revision,
+            status,
+            Some(message),
+        )
+        .await
+    {
+        Ok(_) => message.to_owned(),
+        Err(cleanup) => format!("{message}; cleanup failed: {cleanup}"),
+    }
+}
+
+fn broadcast_events_best_effort<F>(events: &[AgentEventV4], mut emit: F) -> Option<String>
+where
+    F: FnMut(&AgentEventV4) -> Result<(), String>,
+{
+    let mut first_error = None;
+    for event in events {
+        if let Err(error) = emit(event) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    first_error
+}
+
 fn register_active_run(
     active_runs: &Arc<std::sync::Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
     run_id: Uuid,
@@ -1291,6 +2009,33 @@ fn remove_active_run(
     {
         active.remove(&run_id);
     }
+}
+
+struct ActiveRunGuard {
+    active_runs: Arc<std::sync::Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
+    run_id: Uuid,
+    token: Arc<AtomicBool>,
+}
+
+impl Drop for ActiveRunGuard {
+    fn drop(&mut self) {
+        remove_active_run(&self.active_runs, self.run_id, &self.token);
+    }
+}
+
+fn register_active_run_guard(
+    active_runs: &Arc<std::sync::Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
+    run_id: Uuid,
+    token: Arc<AtomicBool>,
+) -> Result<Option<ActiveRunGuard>, String> {
+    if !register_active_run(active_runs, run_id, token.clone())? {
+        return Ok(None);
+    }
+    Ok(Some(ActiveRunGuard {
+        active_runs: active_runs.clone(),
+        run_id,
+        token,
+    }))
 }
 
 async fn wait_for_active_run_to_yield(
@@ -3556,6 +4301,7 @@ mod tests {
             plan_hash: None,
             compute_selection: None,
             approval_hash: None,
+            plan_revision: None,
             spec: None,
         };
         let recent = vec![AgentEventV4::first(
@@ -4433,5 +5179,25 @@ mod tests {
         assert!(rendered.find("base-live-rule") < rendered.find("override-live-rule"));
         assert!(rendered.contains("HIGHER PRIORITY"));
         assert!(!rendered.contains("SKILL.md contents"));
+    }
+
+    #[test]
+    fn approval_event_broadcast_failure_is_best_effort() {
+        let event = AgentEventV4::first(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Utc::now(),
+            AgentEventKindV4::PlanApproved {
+                plan_hash: "hash".into(),
+            },
+        );
+        let mut attempts = 0;
+        let error = broadcast_events_best_effort(std::slice::from_ref(&event), |_event| {
+            attempts += 1;
+            Err("emit failed".into())
+        });
+        assert_eq!(attempts, 1);
+        assert_eq!(error.as_deref(), Some("emit failed"));
     }
 }

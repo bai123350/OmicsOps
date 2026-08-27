@@ -190,12 +190,41 @@ CREATE TABLE IF NOT EXISTS proposed_plans (
     plan_json TEXT NOT NULL,
     markdown TEXT NOT NULL DEFAULT '',
     feedback TEXT,
-    run_id TEXT,
+    run_id TEXT NOT NULL REFERENCES agent_runs_v4(run_id) ON DELETE CASCADE,
     created_at INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL DEFAULT 0,
     UNIQUE (frame_id, revision),
     UNIQUE (frame_id, plan_hash)
 );
+
+-- Plan content is append-only. Lifecycle metadata (status, feedback, and
+-- updated_at) is intentionally mutable through Store transactions, while a
+-- direct SQL caller cannot rewrite the identity, revision, hash, structured
+-- plan, Markdown, owner, run, or creation timestamp of an existing proposal.
+CREATE TRIGGER IF NOT EXISTS trg_proposed_plans_immutable_content
+BEFORE UPDATE OF status,id,project_id,frame_id,revision,plan_hash,plan_json,markdown,run_id,created_at
+ON proposed_plans
+WHEN NOT (
+    NEW.id IS OLD.id
+    AND NEW.project_id IS OLD.project_id
+    AND NEW.frame_id IS OLD.frame_id
+    AND NEW.revision IS OLD.revision
+    AND NEW.plan_hash IS OLD.plan_hash
+    AND NEW.plan_json IS OLD.plan_json
+    AND NEW.markdown IS OLD.markdown
+    AND NEW.run_id IS OLD.run_id
+    AND NEW.created_at IS OLD.created_at
+    AND (
+        NEW.status IS OLD.status
+        OR (OLD.status = 'generating' AND NEW.status IN ('revising','cancelled','superseded'))
+        OR (OLD.status = 'revising' AND NEW.status IN ('cancelled','superseded'))
+        OR (OLD.status = 'pending' AND NEW.status IN ('approved','revising','cancelled','superseded'))
+        OR (OLD.status = 'approved' AND NEW.status = 'superseded')
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'proposed plan revision content is immutable');
+END;
 
 CREATE TABLE IF NOT EXISTS codex_turn_configs (
     frame_id TEXT PRIMARY KEY REFERENCES frames(id) ON DELETE CASCADE,
@@ -877,6 +906,10 @@ CREATE INDEX IF NOT EXISTS idx_agent_runs_context
     ON agent_runs_v4(project_id, conversation_id, run_id);
 CREATE INDEX IF NOT EXISTS idx_agent_events_context
     ON agent_events_v4(project_id, conversation_id, run_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_proposed_plans_context_revision
+    ON proposed_plans(project_id, frame_id, revision DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_proposed_plans_active
+    ON proposed_plans(project_id, frame_id, status, revision DESC);
 CREATE INDEX IF NOT EXISTS idx_scientific_datasets_project
     ON scientific_datasets_v4(project_id, id);
 CREATE INDEX IF NOT EXISTS idx_notebook_project_updated
