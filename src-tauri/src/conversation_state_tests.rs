@@ -192,11 +192,7 @@ async fn command_helper_keeps_a_historical_plan_separate_from_a_later_direct_run
         .unwrap();
     fixture
         .store
-        .cancel_plan_v4(
-            fixture.project.id,
-            fixture.conversation.id,
-            plan_run_id,
-        )
+        .cancel_plan_v4(fixture.project.id, fixture.conversation.id, plan_run_id)
         .await
         .unwrap();
     fixture
@@ -243,7 +239,10 @@ async fn command_helper_keeps_a_historical_plan_separate_from_a_later_direct_run
     assert!(!state.locked);
     let latest_revision = state.latest_plan_revision.unwrap();
     assert_eq!(latest_revision.id, historical.id);
-    assert_eq!(latest_revision.status, omicsops_dto::PlanRevisionStatusV4::Cancelled);
+    assert_eq!(
+        latest_revision.status,
+        omicsops_dto::PlanRevisionStatusV4::Cancelled
+    );
     let summary = state.latest_run.unwrap();
     assert_eq!(summary.run_id, direct_run_id);
     assert_eq!(summary.status, "running");
