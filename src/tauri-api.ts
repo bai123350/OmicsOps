@@ -9,6 +9,7 @@ import type {
   ServerInspection,
   AgentRunEventV4,
   RunSummaryV4,
+  ConversationAgentStateV4,
   GetConversationAgentModeResponseV4,
   SetConversationAgentModeRequestV4,
   SetConversationAgentModeResponseV4,
@@ -96,6 +97,29 @@ export async function setConversationAgentMode(
 ): Promise<SetConversationAgentModeResponseV4> {
   if (!isTauri()) return request;
   return invoke("set_conversation_agent_mode", { request });
+}
+
+/**
+ * Read the complete durable Agent/Plan state for one conversation.
+ *
+ * Browser tests use the same shape as the native command so hydration and
+ * reconnect behavior can be exercised without a Tauri host.
+ */
+export async function agentV4ConversationState(
+  projectId: string,
+  conversationId: string,
+): Promise<ConversationAgentStateV4> {
+  if (!isTauri()) {
+    return {
+      project_id: projectId,
+      conversation_id: conversationId,
+      mode: "agent",
+      locked: false,
+      latest_plan_revision: null,
+      latest_run: null,
+    };
+  }
+  return invoke("agent_v4_conversation_state", { projectId, conversationId });
 }
 
 export async function listMessages(conversationId: string): Promise<WorkspaceMessage[]> {

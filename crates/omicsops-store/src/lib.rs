@@ -147,6 +147,21 @@ pub struct PlanCancellationResultV4 {
     pub events: Vec<AgentEventV4>,
 }
 
+/// A coherent, read-only view of one conversation's durable Agent state.
+///
+/// `latest_run_json` deliberately remains untyped at the Store boundary. The
+/// desktop command owns the Agent V4 run record contract and turns this value
+/// into the shared `RunSummaryV4` DTO after validating its context.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConversationAgentStateSnapshotV4 {
+    pub project_id: Uuid,
+    pub conversation_id: Uuid,
+    pub mode: SessionAgentModeV4,
+    pub locked: bool,
+    pub latest_plan_revision: Option<ProposedPlanRevisionV4>,
+    pub latest_run_json: Option<Value>,
+}
+
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
@@ -373,6 +388,134 @@ impl Store {
         insert_conversation(&mut tx, conversation).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Read all durable Agent state for a conversation from one SQLite
+    /// snapshot. The transaction is intentionally read-only: ownership,
+    /// mode, lock, latest revision, and latest run are never observed across
+    /// separate pool connections or separate transactions.
+    pub async fn conversation_agent_state_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+    ) -> Result<ConversationAgentStateSnapshotV4, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let project_id_string = project_id.to_string();
+        let conversation_id_string = conversation_id.to_string();
+
+        let owns_conversation: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM conversation_records
+                WHERE frame_id=?1 AND project_id=?2
+            )",
+        )
+        .bind(&conversation_id_string)
+        .bind(&project_id_string)
+        .fetch_one(&mut *tx)
+        .await?;
+        if owns_conversation == 0 {
+            return Err(StoreError::InvalidInput(format!(
+                "conversation {conversation_id} does not belong to project {project_id}"
+            )));
+        }
+
+        let mode_value = sqlx::query_scalar::<_, String>(
+            "SELECT value_json FROM settings WHERE scope=?1 AND key=?2",
+        )
+        .bind(SETTINGS_GLOBAL_SCOPE)
+        .bind(conversation_agent_mode_setting_key(conversation_id))
+        .fetch_optional(&mut *tx)
+        .await?;
+        let mode = mode_value
+            .as_deref()
+            .map(parse_conversation_agent_mode)
+            .transpose()?
+            .unwrap_or_default();
+
+        let locked: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM proposed_plans
+                WHERE project_id=?1 AND frame_id=?2
+                  AND status IN ('generating','revising','pending')
+            )",
+        )
+        .bind(&project_id_string)
+        .bind(&conversation_id_string)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let latest_plan_revision = sqlx::query(
+            "SELECT id,project_id,frame_id,run_id,revision,plan_json,markdown,plan_hash,status,feedback,created_at,updated_at
+             FROM proposed_plans
+             WHERE project_id=?1 AND frame_id=?2
+             ORDER BY revision DESC,id DESC LIMIT 1",
+        )
+        .bind(&project_id_string)
+        .bind(&conversation_id_string)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(proposed_plan_revision_from_row)
+        .transpose()?;
+
+        if locked != 0 {
+            if mode != SessionAgentModeV4::Plan {
+                return Err(StoreError::InvalidInput(
+                    "conversation has an active plan lock but is not in Plan mode".into(),
+                ));
+            }
+            if !latest_plan_revision
+                .as_ref()
+                .is_some_and(|revision| revision.status.is_active())
+            {
+                return Err(StoreError::InvalidInput(
+                    "conversation active plan lock has no active latest revision".into(),
+                ));
+            }
+        }
+
+        // Run timestamps are optional on legacy rows and may remain zero;
+        // rowid preserves the insertion-order meaning used by the existing
+        // conversation run listing API.
+        let latest_run = sqlx::query(
+            "SELECT run_id,status,value_json
+             FROM agent_runs_v4
+             WHERE project_id=?1 AND conversation_id=?2
+             ORDER BY rowid DESC LIMIT 1",
+        )
+        .bind(&project_id_string)
+        .bind(&conversation_id_string)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let latest_run_json = if let Some(row) = latest_run {
+            let run_id = row.try_get::<String, _>(0)?;
+            let status = row.try_get::<String, _>(1)?;
+            let serialized = row.try_get::<String, _>(2)?;
+            let value: Value = serde_json::from_str(&serialized).map_err(|error| {
+                StoreError::InvalidInput(format!(
+                    "latest Agent V4 run {run_id} has invalid JSON: {error}"
+                ))
+            })?;
+            validate_latest_agent_run_json(
+                &value,
+                &run_id,
+                &project_id_string,
+                &conversation_id_string,
+                &status,
+            )?;
+            Some(value)
+        } else {
+            None
+        };
+
+        tx.commit().await?;
+        Ok(ConversationAgentStateSnapshotV4 {
+            project_id,
+            conversation_id,
+            mode,
+            locked: locked != 0,
+            latest_plan_revision,
+            latest_run_json,
+        })
     }
 
     /// Read the durable Agent/Plan mode for a conversation.
@@ -4855,6 +4998,40 @@ fn project_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Project, StoreError>
 
 fn conversation_agent_mode_setting_key(conversation_id: Uuid) -> String {
     format!("{CONVERSATION_AGENT_MODE_SETTING_PREFIX}{conversation_id}")
+}
+
+fn validate_latest_agent_run_json(
+    value: &Value,
+    run_id: &str,
+    project_id: &str,
+    conversation_id: &str,
+    status: &str,
+) -> Result<(), StoreError> {
+    let Some(object) = value.as_object() else {
+        return Err(StoreError::InvalidInput(format!(
+            "latest Agent V4 run {run_id} must be a JSON object"
+        )));
+    };
+    for (key, expected) in [
+        ("run_id", run_id),
+        ("project_id", project_id),
+        ("conversation_id", conversation_id),
+        ("status", status),
+    ] {
+        if let Some(actual) = object.get(key) {
+            let Some(actual) = actual.as_str() else {
+                return Err(StoreError::InvalidInput(format!(
+                    "latest Agent V4 run {run_id} has a non-string {key}"
+                )));
+            };
+            if actual != expected {
+                return Err(StoreError::InvalidInput(format!(
+                    "latest Agent V4 run {run_id} has inconsistent {key}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_conversation_agent_mode(value: &str) -> Result<SessionAgentModeV4, StoreError> {

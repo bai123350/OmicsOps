@@ -229,6 +229,7 @@ describe("WorkspaceShell", () => {
     expect(screen.getByText(/等待工具审批 · 0 个步骤/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "终止运行" })).not.toBeInTheDocument();
     expect(screen.getByRole("region", { name: "工具审批" })).toHaveTextContent("runtime.execute");
+    expect(screen.getByRole("region", { name: "工具审批" })).toHaveTextContent("首次代码执行需要批准");
     fireEvent.click(screen.getByRole("button", { name: "批准并继续" }));
     expect(decide).toHaveBeenCalledWith("run-approval", "approval-1", "c".repeat(64), "approved");
   });
@@ -371,6 +372,45 @@ describe("WorkspaceShell", () => {
     expect(resume).toBeDisabled();
     releaseResume();
     await waitFor(() => expect(screen.getByRole("button", { name: "继续运行" })).toBeEnabled());
+  });
+
+  it("locks a pending Plan conversation even before execution starts", () => {
+    const plan = { schema_version: 4 as const, objective: "审核 QC", steps: ["检查输入"], completion_criteria: ["报告完成"], requested_capabilities: [] };
+    const revision = { id: "revision-pending", project_id: project.id, conversation_id: "conversation-1", run_id: "run-pending", revision: 4, plan, markdown: "# 审核 QC", plan_hash: "plan-hash", status: "pending" as const, feedback: null, created_at: "2026-08-20T00:00:00Z", updated_at: "2026-08-20T00:00:00Z" };
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={vi.fn()}
+      agentMode="plan" conversationLocked latestPlanRevision={revision}
+      v4Plan={{ run_id: revision.run_id, status: "awaiting_approval", plan, plan_hash: revision.plan_hash, compute_selection: null, approval_hash: "approval", plan_revision: 4, session_mode: "plan" }}
+      onApprovePlan={vi.fn()} onRequestPlanRevision={vi.fn()} onCancelRun={vi.fn()} />);
+
+    expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "批准并运行" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "请求修改" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "取消计划" })).toBeEnabled();
+  });
+
+  it("submits revision feedback once and disables every competing plan action", async () => {
+    let release!: () => void;
+    const requestRevision = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
+    const plan = { schema_version: 4 as const, objective: "修改 QC", steps: ["检查输入"], completion_criteria: ["报告完成"], requested_capabilities: [] };
+    const revision = { id: "revision-feedback", project_id: project.id, conversation_id: "conversation-1", run_id: "run-feedback", revision: 5, plan, markdown: "# 修改 QC", plan_hash: "plan-hash", status: "pending" as const, feedback: null, created_at: "2026-08-20T00:00:00Z", updated_at: "2026-08-20T00:00:00Z" };
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined}
+      agentMode="plan" conversationLocked latestPlanRevision={revision}
+      v4Plan={{ run_id: revision.run_id, status: "awaiting_approval", plan, plan_hash: revision.plan_hash, compute_selection: null, approval_hash: "approval", plan_revision: 5, session_mode: "plan" }}
+      onApprovePlan={vi.fn()} onRequestPlanRevision={requestRevision} onCancelRun={vi.fn()} />);
+    const feedback = screen.getByRole("textbox", { name: "计划修改意见" });
+    fireEvent.change(feedback, { target: { value: "补充批次效应检查" } });
+    const request = screen.getByRole("button", { name: "请求修改" });
+    fireEvent.click(request);
+    fireEvent.click(request);
+
+    expect(requestRevision).toHaveBeenCalledTimes(1);
+    expect(requestRevision).toHaveBeenCalledWith("补充批次效应检查");
+    expect(screen.getByRole("button", { name: "批准并运行" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "取消计划" })).toBeDisabled();
+    release();
+    await waitFor(() => expect(feedback).toHaveValue(""));
+    expect(screen.getByRole("button", { name: "批准并运行" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "取消计划" })).toBeEnabled();
   });
 
   it("guards answer and uncertain-dispatch recovery actions while preserving their controls during a run", async () => {

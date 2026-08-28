@@ -206,6 +206,17 @@
 .plan-panel > footer small { color: #98a2b3; overflow-wrap: anywhere; }
 .plan-panel > footer button, .plan-panel-errors button { border: 0; border-radius: 8px; background: #254fca; color: white; padding: 8px 10px; }
 .plan-panel > footer button:disabled { opacity: .55; }
+.plan-action-row { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.plan-cancel-button { border: 1px solid #d92d20 !important; background: white !important; color: #b42318 !important; }
+.plan-revision-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 9px 10px; border: 1px solid #d6def6; border-radius: 9px; background: #f8faff; color: #475467; font-size: 10px; }
+.plan-revision-meta span { padding: 2px 6px; border-radius: 99px; background: #edf2ff; color: #315bd4; }
+.plan-revision-meta code { margin-left: auto; color: #667085; font-size: 9px; }
+.plan-revision-form { display: grid; gap: 7px; padding: 11px; border: 1px solid #b9cafc; border-radius: 10px; background: #f8faff; }
+.plan-revision-form label { color: #475467; font-size: 10px; font-weight: 700; }
+.plan-revision-form textarea { min-height: 72px; resize: vertical; border: 1px solid #d0d5dd; border-radius: 7px; padding: 8px; font: inherit; font-size: 11px; }
+.plan-revision-form textarea:disabled { background: #f2f4f7; }
+.plan-revision-form button { justify-self: end; border: 1px solid #315bd4; border-radius: 7px; background: #315bd4; color: white; padding: 7px 10px; font-size: 10px; font-weight: 700; }
+.plan-revision-form button:disabled { cursor: not-allowed; opacity: .55; }
 .plan-panel-empty { min-height: 260px; padding: 36px 22px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px; text-align: center; color: #667085; }
 .plan-panel-empty p { margin: 0; font-size: 10px; line-height: 1.5; }
 .plan-question { padding: 10px; border: 1px solid #f0c36a; border-radius: 9px; background: #fffaeb; }

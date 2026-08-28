@@ -20,12 +20,13 @@ use crate::agent_commands::persist_submitted_message;
 use crate::agent_v4::{
     ApprovePlanV4Request, PlanApprovalRunContext, approve_plan_revision_for_command,
     begin_v4_plan_resume, cancel_active_run_for_command, ensure_v4_resume_allowed,
-    ensure_v4_start_allowed, plan_generation_is_active, request_plan_revision_response,
+    ensure_v4_start_allowed, plan_generation_is_active, request_plan_revision_command_response,
+    request_plan_revision_response,
 };
 use crate::conversation_mode::set_conversation_agent_mode_response;
 
 #[tokio::test]
-async fn revision_request_command_helper_preserves_wire_contract_and_ownership() {
+async fn revision_request_command_emit_failure_does_not_hide_commit_or_block_resume() {
     let store = Store::open_in_memory().await.unwrap();
     let project = Project::new(
         Uuid::new_v4(),
@@ -88,25 +89,45 @@ async fn revision_request_command_helper_preserves_wire_contract_and_ownership()
         )
         .await
         .unwrap();
-    let response = request_plan_revision_response(
+    let mut emit_attempts = 0;
+    let response = request_plan_revision_command_response(
         &store,
         &AgentV4RequestPlanRevisionRequest {
             run_id,
             plan_hash: revision.plan_hash.clone(),
             feedback: "add a control".into(),
         },
+        |_event| {
+            emit_attempts += 1;
+            Err("emit failed".into())
+        },
     )
     .await
     .unwrap();
+    assert_eq!(emit_attempts, 1);
     assert_eq!(response.revision, 1);
     assert_eq!(response.status, PlanRevisionStatusV4::Revising);
     assert_eq!(
         serde_json::to_value(response).unwrap()["plan_hash"],
         revision.plan_hash
     );
+    assert_eq!(
+        store.agent_run_v4(run_id).await.unwrap().unwrap()["status"],
+        "planning"
+    );
+    let latest = store
+        .latest_proposed_plan_revision_v4(project.id, conversation.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.status, PlanRevisionStatusV4::Revising);
+    assert_eq!(latest.feedback.as_deref(), Some("add a control"));
     let events = store.agent_events_v4(run_id).await.unwrap();
     assert_eq!(events.len(), 1);
     events[0].verify().unwrap();
+    let generating = begin_v4_plan_resume(&store, run_id).await.unwrap();
+    assert_eq!(generating.revision, 2);
+    assert_eq!(generating.status, PlanRevisionStatusV4::Generating);
 }
 
 #[tokio::test]
@@ -352,7 +373,7 @@ async fn manual_agent_mode_switch_is_rejected_while_plan_revision_is_locked() {
 }
 
 #[tokio::test]
-async fn request_then_resume_service_creates_revision_two() {
+async fn request_then_resume_service_accepts_planning_status_and_creates_revision_two() {
     let store = Store::open_in_memory().await.unwrap();
     let project = Project::new(
         Uuid::new_v4(),
@@ -421,6 +442,10 @@ async fn request_then_resume_service_creates_revision_two() {
     )
     .await
     .unwrap();
+    assert_eq!(
+        store.agent_run_v4(run_id).await.unwrap().unwrap()["status"],
+        "planning"
+    );
     let generating = begin_v4_plan_resume(&store, run_id).await.unwrap();
     assert_eq!(generating.revision, 2);
     assert_eq!(generating.status, PlanRevisionStatusV4::Generating);

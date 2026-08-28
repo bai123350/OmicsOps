@@ -4,6 +4,8 @@ pub mod commands;
 pub mod conversation_mode;
 #[cfg(test)]
 mod conversation_mode_tests;
+#[cfg(test)]
+mod conversation_state_tests;
 pub mod dto;
 #[cfg(test)]
 mod dto_contract_tests;
@@ -94,6 +96,7 @@ pub fn run() {
             agent_v4::agent_v4_start_planning,
             agent_v4::agent_v4_start_direct,
             agent_v4::agent_v4_compute_backends,
+            agent_v4::agent_v4_conversation_state,
             agent_v4::agent_v4_approve_plan,
             agent_v4::agent_v4_request_plan_revision,
             agent_v4::agent_v4_resume,

@@ -1,5 +1,5 @@
 use crate::dto::{
-    GetConversationAgentModeResponseV4, RunSummaryV4, SessionAgentModeV4,
+    ConversationAgentStateV4, GetConversationAgentModeResponseV4, RunSummaryV4, SessionAgentModeV4,
     SetConversationAgentModeRequestV4,
 };
 use serde_json::json;
@@ -65,4 +65,39 @@ fn old_run_summary_json_deserializes_with_new_optional_fields_absent() {
     assert_eq!(summary.run_id, run_id);
     assert_eq!(summary.plan_revision, None);
     assert_eq!(summary.session_mode, None);
+}
+
+#[test]
+fn conversation_agent_state_contract_is_snake_case_and_backward_compatible() {
+    let project_id = Uuid::from_u128(3);
+    let conversation_id = Uuid::from_u128(4);
+    let response = ConversationAgentStateV4 {
+        project_id,
+        conversation_id,
+        mode: SessionAgentModeV4::Plan,
+        locked: true,
+        latest_plan_revision: None,
+        latest_run: None,
+    };
+    assert_eq!(
+        serde_json::to_value(response).unwrap(),
+        json!({
+            "project_id": project_id,
+            "conversation_id": conversation_id,
+            "mode": "plan",
+            "locked": true,
+            "latest_plan_revision": null,
+            "latest_run": null
+        })
+    );
+
+    let legacy: ConversationAgentStateV4 = serde_json::from_value(json!({
+        "project_id": project_id,
+        "conversation_id": conversation_id,
+        "mode": "agent",
+        "locked": false
+    }))
+    .unwrap();
+    assert_eq!(legacy.latest_plan_revision, None);
+    assert_eq!(legacy.latest_run, None);
 }

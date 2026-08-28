@@ -149,6 +149,23 @@ pub struct RunSummaryV4 {
     pub session_mode: Option<SessionAgentModeV4>,
 }
 
+/// Atomically hydrated conversation-scoped Agent/Plan state.
+///
+/// The optional fields use defaults so a consumer can safely deserialize an
+/// older response that predates durable plan revisions or Agent runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ConversationAgentStateV4 {
+    pub project_id: Uuid,
+    pub conversation_id: Uuid,
+    pub mode: SessionAgentModeV4,
+    pub locked: bool,
+    #[serde(default)]
+    pub latest_plan_revision: Option<ProposedPlanRevisionV4>,
+    #[serde(default)]
+    pub latest_run: Option<RunSummaryV4>,
+}
+
 // Keep aliases for the two common naming orders used by existing OmicsOps
 // request/response types. They are type aliases, so they cannot diverge on
 // the wire and remain source-compatible for boundary consumers.
@@ -198,5 +215,40 @@ mod tests {
         .unwrap();
         assert_eq!(summary.plan_revision, None);
         assert_eq!(summary.session_mode, None);
+    }
+
+    #[test]
+    fn conversation_agent_state_uses_snake_case_and_old_optional_defaults() {
+        let project_id = Uuid::from_u128(3);
+        let conversation_id = Uuid::from_u128(4);
+        let state = ConversationAgentStateV4 {
+            project_id,
+            conversation_id,
+            mode: SessionAgentModeV4::Plan,
+            locked: true,
+            latest_plan_revision: None,
+            latest_run: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&state).unwrap(),
+            json!({
+                "project_id": project_id,
+                "conversation_id": conversation_id,
+                "mode": "plan",
+                "locked": true,
+                "latest_plan_revision": null,
+                "latest_run": null
+            })
+        );
+
+        let legacy: ConversationAgentStateV4 = serde_json::from_value(json!({
+            "project_id": project_id,
+            "conversation_id": conversation_id,
+            "mode": "agent",
+            "locked": false
+        }))
+        .unwrap();
+        assert_eq!(legacy.latest_plan_revision, None);
+        assert_eq!(legacy.latest_run, None);
     }
 }

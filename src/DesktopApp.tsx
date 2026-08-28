@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import * as api from "./tauri-api";
-import type { AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendAvailabilityV4, ComputeSelectionV4, ConnectionProfile, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, ProjectArtifact, RemoteFileEntry, RunSummaryV4, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
+import type { AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendAvailabilityV4, ComputeSelectionV4, ConnectionProfile, ConversationAgentStateV4, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, ProjectArtifact, ProposedPlanRevisionV4, RemoteFileEntry, RunSummaryV4, SessionAgentModeV4, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
 import { WorkspaceShell } from "./features/workspace/WorkspaceShell";
 import type { Locale } from "./features/workspace/copy";
@@ -14,6 +14,8 @@ export default function DesktopApp() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [conversations, setConversations] = useState<WorkspaceConversation[]>([]);
   const [conversation, setConversation] = useState<WorkspaceConversation | null>(null);
+  const [conversationMode, setConversationMode] = useState<SessionAgentModeV4>("agent");
+  const [conversationState, setConversationState] = useState<ConversationAgentStateV4 | null>(null);
   const [messageSequence, setMessageSequence] = useState(1);
   const [messages, setMessages] = useState<WorkspaceMessage[]>([]);
   const [agentBusy, setAgentBusy] = useState(false);
@@ -51,6 +53,15 @@ export default function DesktopApp() {
   const [syncEntries, setSyncEntries] = useState<SyncEntry[]>([]);
   const runActionGuards = useRef(new Set<string>());
   const runPollingNotice = useRef("");
+  // Every asynchronous conversation read/action captures both this token and
+  // the ids below. A late response from a previous session must never hydrate
+  // the currently selected conversation.
+  const conversationRequestToken = useRef(0);
+  const conversationSnapshotRequestSequence = useRef(0);
+  const conversationModeRequestSequence = useRef(0);
+  const projectRequestToken = useRef(0);
+  const currentConversationIdentity = useRef<{ projectId: string | null; conversationId: string | null }>({ projectId: null, conversationId: null });
+  currentConversationIdentity.current = { projectId: selected?.id ?? null, conversationId: conversation?.id ?? null };
 
   function reportRunPollingFailure(error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
@@ -65,6 +76,99 @@ export default function DesktopApp() {
     setAgentNotice((current) => current === recovered ? "" : current);
   }
 
+  function isCurrentConversation(projectId: string, conversationId: string, token: number) {
+    const identity = currentConversationIdentity.current;
+    return token === conversationRequestToken.current
+      && identity.projectId === projectId
+      && identity.conversationId === conversationId;
+  }
+
+  function isCurrentConversationIdentity(projectId: string, conversationId: string) {
+    const identity = currentConversationIdentity.current;
+    return identity.projectId === projectId && identity.conversationId === conversationId;
+  }
+
+  function captureConversationAction() {
+    const projectId = selected?.id;
+    const conversationId = conversation?.id;
+    if (!projectId || !conversationId) return null;
+    return { projectId, conversationId, token: conversationRequestToken.current };
+  }
+
+  function isCurrentConversationAction(action: { projectId: string; conversationId: string; token: number }) {
+    return isCurrentConversation(action.projectId, action.conversationId, action.token);
+  }
+
+  function isCurrentConversationProject(projectId: string, token: number) {
+    return token === projectRequestToken.current
+      && (currentConversationIdentity.current.projectId === projectId || selected?.id === projectId);
+  }
+
+  function applyConversationState(snapshot: ConversationAgentStateV4) {
+    const revision = snapshot.latest_plan_revision;
+    const run = snapshot.latest_run;
+    // A conversation can retain older cancelled/superseded revisions while a
+    // later direct run is active. Only use revision fields to fill a run when
+    // both records identify the same run; otherwise the durable run remains
+    // authoritative and the old plan must not leak into the UI.
+    const revisionForRun = run && revision?.run_id === run.run_id ? revision : null;
+    const summary = run
+      ? {
+          ...run,
+          plan: run.plan ?? revisionForRun?.plan ?? null,
+          plan_hash: run.plan_hash ?? revisionForRun?.plan_hash ?? null,
+          plan_revision: run.plan_revision ?? revisionForRun?.revision ?? null,
+          session_mode: run.session_mode ?? snapshot.mode,
+        }
+      : revision
+        ? {
+            run_id: revision.run_id,
+            status: revision.status,
+            plan: revision.plan,
+            plan_hash: revision.plan_hash,
+            compute_selection: null,
+            approval_hash: null,
+            plan_revision: revision.revision,
+            session_mode: snapshot.mode,
+          }
+        : null;
+    setConversationState(snapshot);
+    setConversationMode(snapshot.mode);
+    setV4Plan(summary);
+    const effectiveRevision = run ? revisionForRun : revision;
+    setPlanApproved(effectiveRevision?.status === "approved" || summary?.status === "approved");
+
+    const active = Boolean(
+      run
+      && !isTerminalRunStatus(run.status)
+      && (snapshot.locked || !revisionForRun || revisionForRun.status === "approved" || run.status === "running"),
+    );
+    setRunId(active ? run!.run_id : null);
+    setRunStartedAt(active ? new Date().toISOString() : null);
+  }
+
+  async function refreshConversationState(
+    projectId = selected?.id,
+    conversationId = conversation?.id,
+    token = conversationRequestToken.current,
+    preserveTransient = false,
+  ) {
+    if (!projectId || !conversationId) return null;
+    const requestSequence = ++conversationSnapshotRequestSequence.current;
+    const snapshot = await api.agentV4ConversationState(projectId, conversationId);
+    if (!isCurrentConversation(projectId, conversationId, token)
+      || requestSequence !== conversationSnapshotRequestSequence.current) return null;
+    // The browser fallback and a freshly-created native run may briefly
+    // return an empty durable snapshot. Keep the optimistic run/plan and mode
+    // until a non-empty snapshot arrives. A later ordinary refresh remains
+    // authoritative and will clear the transient state if nothing was saved.
+    if (preserveTransient && !snapshot.latest_run && !snapshot.latest_plan_revision) {
+      return snapshot;
+    }
+    applyConversationState(snapshot);
+    return snapshot;
+  }
+
   useEffect(() => {
     Promise.all([api.listProjects(), api.listModelProfiles(), api.listSkillPackages(), api.listMcpServers(), api.listConnections()]).then(([items, profiles, skills, servers, savedConnections]) => {
       setProjects(items); setSelected(items[0] ?? null);
@@ -75,17 +179,14 @@ export default function DesktopApp() {
     }).finally(() => setLoading(false));
   }, []);
   useEffect(() => {
+    const token = ++projectRequestToken.current;
     let disposed = false;
     if (!selected) { setConversations([]); setConversation(null); return () => { disposed = true; }; }
     api.listConversations(selected.id).then(async (items) => {
       const active = items[0] ?? await api.createConversation(selected.id);
-      if (disposed) return;
+      if (disposed || !isCurrentConversationProject(selected.id, token)) return;
       setConversations(items.length ? items : [active]);
       setConversation(active);
-      const storedMessages = await api.listMessages(active.id);
-      setMessages(storedMessages);
-      setMessageSequence((storedMessages.at(-1)?.sequence ?? 0) + 1);
-      setLastGoal([...storedMessages].reverse().find((message) => message.role === "user")?.markdown ?? "");
     }).catch((error) => { if (!disposed) setAgentNotice(error instanceof Error ? error.message : String(error)); });
     return () => { disposed = true; };
   }, [selected?.id]);
@@ -143,39 +244,82 @@ export default function DesktopApp() {
       .catch((error) => setKernelNotice(error instanceof Error ? error.message : String(error)));
   }, [selected?.id]);
   useEffect(() => {
+    const projectId = selected?.id;
+    const conversationId = conversation?.id;
+    const token = ++conversationRequestToken.current;
+    const snapshotRequestSequence = ++conversationSnapshotRequestSequence.current;
+    const modeRequestSequence = conversationModeRequestSequence.current;
     let disposed = false;
+    setConversationState(null);
+    setConversationMode("agent");
     setAgentRunEventsV4([]);
+    setV4Plan(null);
+    setPlanApproved(false);
     setRunId(null);
     setRunStartedAt(null);
     setRunStopping(false);
-    if (!selected || !conversation) return () => { disposed = true; };
-    api.agentV4EventsForConversation(selected.id, conversation.id)
-      .then((eventsV4) => {
-        if (disposed) return;
+    if (!projectId || !conversationId || conversation?.project_id !== projectId) return () => { disposed = true; };
+
+    Promise.all([
+      api.listMessages(conversationId),
+      api.agentV4ConversationState(projectId, conversationId),
+      api.agentV4EventsForConversation(projectId, conversationId),
+    ])
+      .then(([storedMessages, snapshot, eventsV4]) => {
+        if (disposed || !isCurrentConversation(projectId, conversationId, token)) return;
         clearRecoveredRunPollingFailure();
-        setAgentRunEventsV4(mergeAgentRunEventsV4([], eventsV4));
-        const latest = eventsV4.map((event) => ({ runId: event.run_id, timestamp: event.occurred_at })).sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime()).at(-1);
+        setMessages(storedMessages);
+        setMessageSequence((storedMessages.at(-1)?.sequence ?? 0) + 1);
+        setLastGoal([...storedMessages].reverse().find((message) => message.role === "user")?.markdown ?? "");
+        // A mode write can complete while this initial read is in flight.
+        // Keep the independently loaded messages/events, but do not let the
+        // older snapshot roll back that explicit mode transition. The mode
+        // action performs its own authoritative snapshot refresh.
+        if (snapshotRequestSequence === conversationSnapshotRequestSequence.current
+          && modeRequestSequence === conversationModeRequestSequence.current) {
+          applyConversationState(snapshot);
+        }
+        // Keep events delivered while hydration was in flight. Replacing the
+        // list here would erase a newer live event (and the snapshot refresh
+        // it triggered), while merging still hydrates an otherwise empty UI.
+        setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, eventsV4));
+        const latest = eventsV4
+          .map((event) => ({ runId: event.run_id, timestamp: event.occurred_at }))
+          .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime())
+          .at(-1);
         const latestRunEventsV4 = latest ? eventsV4.filter((event) => event.run_id === latest.runId) : [];
-        setRunId(latest && !latestRunEventsV4.some(isTerminalAgentEventV4) ? latest.runId : null);
-        setRunStartedAt(latest && !latestRunEventsV4.some(isTerminalAgentEventV4) ? (latestAgentRunEventV4(latestRunEventsV4)?.occurred_at ?? latest.timestamp) : null);
+        // Events can be absent from a test/native reconnect while the durable
+        // snapshot still contains a planning run. Prefer the snapshot in that
+        // case; event history only narrows a run when it proves termination.
+        if (snapshotRequestSequence === conversationSnapshotRequestSequence.current
+          && latest && !latestRunEventsV4.some(isTerminalAgentEventV4)) {
+          setRunId(latest.runId);
+          setRunStartedAt(latestAgentRunEventV4(latestRunEventsV4)?.occurred_at ?? latest.timestamp);
+        }
       })
       .catch((error) => {
-        if (!disposed) reportRunPollingFailure(error);
+        if (!disposed && isCurrentConversation(projectId ?? "", conversationId ?? "", token)) reportRunPollingFailure(error);
       });
     return () => { disposed = true; };
   }, [selected?.id, conversation?.id]);
   useEffect(() => {
     let disposed = false;
     const unlisten: Array<() => void> = [];
+    const subscriptionProjectId = selected?.id;
+    const subscriptionConversationId = conversation?.id;
     api.onConversationEvent((event) => {
-      if (event.conversation_id !== conversation?.id) return;
+      if (disposed || !subscriptionProjectId || !subscriptionConversationId
+        || event.project_id !== subscriptionProjectId
+        || event.conversation_id !== subscriptionConversationId
+        || !isCurrentConversationIdentity(subscriptionProjectId, subscriptionConversationId)) return;
       setMessages((current) => current.some((message) => message.id === event.message.id) ? current : [...current, event.message]);
       setMessageSequence((value) => Math.max(value, event.message.sequence + 1));
     }).then((fn) => disposed ? fn() : unlisten.push(fn)).catch((error) => {
       if (!disposed) setAgentNotice(subscriptionError("conversation", error));
     });
     api.onConversationUpdated((event) => {
-      if (event.project_id !== selected?.id) return;
+      if (disposed || !subscriptionProjectId || event.project_id !== subscriptionProjectId
+        || currentConversationIdentity.current.projectId !== subscriptionProjectId) return;
       setConversations((current) => [event.conversation, ...current.filter((item) => item.id !== event.conversation.id)]);
       setConversation((current) => current?.id === event.conversation.id ? event.conversation : current);
     }).then((fn) => disposed ? fn() : unlisten.push(fn)).catch((error) => {
@@ -194,7 +338,11 @@ export default function DesktopApp() {
       if (!disposed) setAgentNotice(subscriptionError("sync", error));
     });
     api.onAgentV4Event((event) => {
-      if (event.project_id !== selected?.id || event.conversation_id !== conversation?.id) return;
+      if (disposed || !subscriptionProjectId || !subscriptionConversationId
+        || event.project_id !== subscriptionProjectId
+        || event.conversation_id !== subscriptionConversationId
+        || !isCurrentConversationIdentity(subscriptionProjectId, subscriptionConversationId)) return;
+      const eventToken = conversationRequestToken.current;
       if (isTerminalAgentEventV4(event)) {
         setRunStopping(false);
         setRunStartedAt(null);
@@ -205,6 +353,12 @@ export default function DesktopApp() {
         setRunStartedAt((current) => current ?? event.occurred_at);
       }
       setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, [event]));
+      if (eventChangesConversationState(event.event.kind)) {
+        // Event rendering above remains immediate. Snapshot reconciliation is
+        // best-effort and deliberately cannot replace the primary event
+        // error/notice when the read fails.
+        void refreshConversationState(event.project_id, event.conversation_id, eventToken).catch(() => undefined);
+      }
     }).then((fn) => disposed ? fn() : unlisten.push(fn)).catch((error) => {
       if (!disposed) setAgentNotice(subscriptionError("Agent V4", error));
     });
@@ -303,7 +457,7 @@ export default function DesktopApp() {
   }
   function resetConversationWork() {
     setMessages([]); setMessageSequence(1); setAgentBusy(false); setAgentNotice("");
-    setLastGoal(""); setV4Plan(null); setPlanApproved(false); setRunId(null); setRunStartedAt(null); setRunStopping(false); setAgentRunEventsV4([]);
+    setLastGoal(""); setConversationMode("agent"); setConversationState(null); setV4Plan(null); setPlanApproved(false); setRunId(null); setRunStartedAt(null); setRunStopping(false); setAgentRunEventsV4([]);
   }
 
   function currentComputeSelection(): ComputeSelectionV4 {
@@ -323,38 +477,54 @@ export default function DesktopApp() {
     };
   }
 
-  async function startV4Planning(goal: string) {
+  async function startV4Planning(goal: string, token = ++conversationRequestToken.current) {
     if (!selected || !conversation || !activeModel) throw new Error(locale === "zh-CN" ? "请先选择会话和模型。" : "Select a conversation and model first.");
+    const projectId = selected.id;
+    const conversationId = conversation.id;
     const summary = await api.agentV4StartPlanning({
-      project_id: selected.id,
-      conversation_id: conversation.id,
+      project_id: projectId,
+      conversation_id: conversationId,
       model_profile_id: activeModel.id,
       objective: goal,
       compute_selection: currentComputeSelection(),
     });
+    if (!isCurrentConversation(projectId, conversationId, token)) return summary;
     setV4Plan(summary);
     setRunId(summary.run_id);
     setRunStartedAt(new Date().toISOString());
     setPlanApproved(false);
     const events = await api.agentV4Events(summary.run_id);
+    if (!isCurrentConversation(projectId, conversationId, token)) return summary;
     setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
+    // Reconcile the planning result with the durable conversation snapshot.
+    // A temporary read failure must not turn a successfully-created run into
+    // a failed send or overwrite the local plan with an empty fallback.
+    try {
+      await refreshConversationState(projectId, conversationId, token, true);
+    } catch {
+      // The run summary/events above are still authoritative for this turn.
+    }
     return summary;
   }
 
-  async function startV4Direct(goal: string) {
+  async function startV4Direct(goal: string, token = ++conversationRequestToken.current) {
     if (!selected || !conversation || !activeModel) throw new Error(locale === "zh-CN" ? "请先选择会话和模型。" : "Select a conversation and model first.");
+    const projectId = selected.id;
+    const conversationId = conversation.id;
     const summary = await api.agentV4StartDirect({
-      project_id: selected.id,
-      conversation_id: conversation.id,
+      project_id: projectId,
+      conversation_id: conversationId,
       model_profile_id: activeModel.id,
       objective: goal,
       compute_selection: currentComputeSelection(),
     });
+    if (!isCurrentConversation(projectId, conversationId, token)) return summary;
     setV4Plan(summary);
     setRunId(summary.run_id);
     setRunStartedAt(new Date().toISOString());
     setPlanApproved(false);
     const events = await api.agentV4Events(summary.run_id);
+    if (!isCurrentConversation(projectId, conversationId, token)) return summary;
     setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
     return summary;
   }
@@ -362,16 +532,9 @@ export default function DesktopApp() {
   async function selectConversation(conversationId: string) {
     const next = conversations.find((item) => item.id === conversationId);
     if (!next || next.id === conversation?.id) return;
+    ++conversationRequestToken.current;
     resetConversationWork();
     setConversation(next);
-    try {
-      const storedMessages = await api.listMessages(next.id);
-      setMessages(storedMessages);
-      setMessageSequence((storedMessages.at(-1)?.sequence ?? 0) + 1);
-      setLastGoal([...storedMessages].reverse().find((message) => message.role === "user")?.markdown ?? "");
-    } catch (error) {
-      setAgentNotice(error instanceof Error ? error.message : String(error));
-    }
   }
 
   async function newConversation() {
@@ -380,6 +543,7 @@ export default function DesktopApp() {
     try {
       const created = await api.createConversation(selected.id);
       setConversations((current) => [created, ...current]);
+      ++conversationRequestToken.current;
       resetConversationWork();
       setConversation(created);
     } catch (error) {
@@ -388,7 +552,7 @@ export default function DesktopApp() {
   }
 
   async function deleteConversation(conversationId: string) {
-    if (!selected || agentBusy || (conversation?.id === conversationId && runId)) return;
+    if (!selected || agentBusy || (conversation?.id === conversationId && (runId || conversationLocked))) return;
     setAgentNotice("");
     try {
       await api.deleteConversation(selected.id, conversationId);
@@ -399,14 +563,9 @@ export default function DesktopApp() {
       }
       const next = remaining[0] ?? await api.createConversation(selected.id);
       setConversations(remaining.length > 0 ? remaining : [next]);
+      ++conversationRequestToken.current;
       resetConversationWork();
       setConversation(next);
-      if (remaining.length > 0) {
-        const storedMessages = await api.listMessages(next.id);
-        setMessages(storedMessages);
-        setMessageSequence((storedMessages.at(-1)?.sequence ?? 0) + 1);
-        setLastGoal([...storedMessages].reverse().find((message) => message.role === "user")?.markdown ?? "");
-      }
     } catch (error) {
       setAgentNotice(error instanceof Error ? error.message : String(error));
     }
@@ -419,84 +578,288 @@ export default function DesktopApp() {
     ? latestAgentRunEventV4(agentRunEventsV4.filter((event) => event.run_id === runId))?.occurred_at ?? runStartedAt
     : null;
   const currentRunEventsV4 = runId ? agentRunEventsV4.filter((event) => event.run_id === runId) : [];
-  const currentRunAwaitsPlanApproval = v4Plan?.status === "awaiting_approval"
+  const latestRun = conversationState?.latest_run ?? v4Plan;
+  const snapshotPlanRevision = conversationState?.latest_plan_revision ?? null;
+  // Do not render a revision belonging to another run (for example a
+  // cancelled planning run retained in the conversation history) alongside a
+  // later direct run. A revision can supplement a run only when its run id
+  // matches; with no run, it remains the current plan draft.
+  const latestPlanRevision = snapshotPlanRevision && (!latestRun || snapshotPlanRevision.run_id === latestRun.run_id)
+    ? snapshotPlanRevision
+    : null;
+  const currentRunAwaitsPlanApproval = isActivePlanRevisionStatus(latestPlanRevision?.status)
+    || conversationState?.locked === true
+    || ["planning", "generating", "revising", "pending", "awaiting_approval", "waiting_for_approval"].includes(latestRun?.status ?? "")
+    || v4Plan?.status === "awaiting_approval"
     || (currentRunEventsV4.some((event) => event.event.kind === "plan_proposed")
       && !currentRunEventsV4.some((event) => event.event.kind === "mode_changed" && event.event.mode === "execute"));
+  const conversationLocked = Boolean(
+    conversationState?.locked
+    || isActivePlanRevisionStatus(latestPlanRevision?.status)
+    || planLoading
+    || currentRunAwaitsPlanApproval,
+  );
+  const activePlanRunId = runId ?? latestPlanRevision?.run_id ?? latestRun?.run_id ?? v4Plan?.run_id ?? null;
+
+  async function changeConversationMode(nextMode: SessionAgentModeV4) {
+    if (!selected || !conversation || nextMode === conversationMode) return;
+    const projectId = selected.id;
+    const conversationId = conversation.id;
+    const actionKey = `mode:${projectId}:${conversationId}`;
+    if (runActionGuards.current.has(actionKey)) return;
+    if (!isCurrentConversation(projectId, conversationId, conversationRequestToken.current)) return;
+    if (conversationLocked) {
+      setAgentNotice(locale === "zh-CN" ? "当前计划正在处理中，请先批准、请求修改或取消计划。" : "The current plan is still active. Approve, request changes, or cancel it first.");
+      return;
+    }
+    // Invalidate only older mode/snapshot reads. Conversation identity uses a
+    // separate token so an in-flight hydration may still deliver messages and
+    // events for this same conversation.
+    const modeRequestToken = conversationRequestToken.current;
+    const modeRequestSequence = ++conversationModeRequestSequence.current;
+    ++conversationSnapshotRequestSequence.current;
+    runActionGuards.current.add(actionKey);
+    const previousMode = conversationMode;
+    setConversationMode(nextMode);
+    setConversationState((current) => current ? { ...current, mode: nextMode } : current);
+    setAgentNotice("");
+    try {
+      const response = await api.setConversationAgentMode({ project_id: projectId, conversation_id: conversationId, mode: nextMode });
+      if (!isCurrentConversation(projectId, conversationId, modeRequestToken)
+        || modeRequestSequence !== conversationModeRequestSequence.current) return;
+      setConversationMode(response.mode);
+      setConversationState((current) => current ? { ...current, mode: response.mode } : current);
+      try { await refreshConversationState(projectId, conversationId, modeRequestToken); } catch { /* the persisted response remains authoritative for mode */ }
+    } catch (error) {
+      if (!isCurrentConversation(projectId, conversationId, modeRequestToken)
+        || modeRequestSequence !== conversationModeRequestSequence.current) return;
+      setConversationMode(previousMode);
+      setConversationState((current) => current ? { ...current, mode: previousMode } : current);
+      setAgentNotice(error instanceof Error ? error.message : String(error));
+      try { await refreshConversationState(projectId, conversationId, modeRequestToken); } catch { /* retain the rollback and original write error */ }
+    } finally {
+      runActionGuards.current.delete(actionKey);
+    }
+  }
+
+  async function requestPlanRevision(feedback: string) {
+    if (!selected || !conversation) return;
+    const revision = latestPlanRevision;
+    const targetRunId = revision?.run_id ?? v4Plan?.run_id ?? conversationState?.latest_run?.run_id;
+    const targetPlanHash = revision?.plan_hash ?? v4Plan?.plan_hash;
+    if (!targetRunId || !targetPlanHash || !feedback.trim()) return;
+    if (revision && revision.status !== "pending") {
+      setAgentNotice(locale === "zh-CN" ? "只能对最新的待审批计划请求修改。" : "Changes can only be requested for the latest pending plan.");
+      return;
+    }
+    const projectId = selected.id;
+    const conversationId = conversation.id;
+    const token = conversationRequestToken.current;
+    const revisionKey = revision?.revision ?? v4Plan?.plan_revision ?? "legacy";
+    const actionKey = `request-revision:${targetRunId}:${revisionKey}`;
+    if (runActionGuards.current.has(actionKey)) return;
+    runActionGuards.current.add(actionKey);
+    setAgentNotice("");
+    try {
+      await api.agentV4RequestPlanRevision({ run_id: targetRunId, plan_hash: targetPlanHash, feedback: feedback.trim() });
+      // A request-change transition is one logical resume. Do not route this
+      // through the old "regenerate" callback, which created a second run.
+      await api.agentV4Resume(targetRunId);
+      await refreshConversationState(projectId, conversationId, token);
+    } catch (error) {
+      if (isCurrentConversation(projectId, conversationId, token)) setAgentNotice(error instanceof Error ? error.message : String(error));
+      try { await refreshConversationState(projectId, conversationId, token); } catch { /* preserve the original action error */ }
+    } finally {
+      runActionGuards.current.delete(actionKey);
+    }
+  }
+
+  async function approvePlan() {
+    const revision = latestPlanRevision;
+    if (revision && revision.status !== "pending") {
+      setAgentNotice(locale === "zh-CN" ? "只能批准最新的待审批计划。" : "Only the latest pending plan can be approved.");
+      try { await refreshConversationState(); } catch { /* keep the current plan visible */ }
+      return;
+    }
+    if (!v4Plan?.run_id || !v4Plan.approval_hash) return;
+    const projectId = selected?.id;
+    const conversationId = conversation?.id;
+    const token = conversationRequestToken.current;
+    const revisionNumber = revision?.revision ?? v4Plan.plan_revision ?? undefined;
+    const actionKey = `approve:${v4Plan.run_id}:${revisionNumber ?? "legacy"}`;
+    if (runActionGuards.current.has(actionKey)) return;
+    runActionGuards.current.add(actionKey);
+    setAgentNotice("");
+    try {
+      const approved = revisionNumber === undefined
+        ? await api.agentV4ApprovePlan(v4Plan.run_id, v4Plan.approval_hash)
+        : await api.agentV4ApprovePlan(v4Plan.run_id, v4Plan.approval_hash, revisionNumber);
+      if (projectId && conversationId && !isCurrentConversation(projectId, conversationId, token)) return;
+      setV4Plan(approved);
+      setRunId(approved.run_id);
+      setRunStartedAt(new Date().toISOString());
+      setPlanApproved(true);
+      setConversationMode("agent");
+      setConversationState((current) => current ? {
+        ...current,
+        mode: "agent",
+        locked: false,
+        latest_plan_revision: current.latest_plan_revision ? { ...current.latest_plan_revision, status: "approved" } : current.latest_plan_revision,
+        latest_run: { ...approved, session_mode: "agent" },
+      } : current);
+      const events = await api.agentV4Events(approved.run_id);
+      if (!projectId || !conversationId || isCurrentConversation(projectId, conversationId, token)) {
+        setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
+      }
+    } catch (error) {
+      if (!projectId || !conversationId || isCurrentConversation(projectId, conversationId, token)) {
+        setAgentNotice(error instanceof Error ? error.message : String(error));
+        try { await refreshConversationState(projectId, conversationId, token); } catch { /* leave Plan/lock state intact */ }
+      }
+    } finally {
+      runActionGuards.current.delete(actionKey);
+    }
+  }
+
+  async function cancelRun() {
+    const targetRunId = runId ?? latestPlanRevision?.run_id ?? conversationState?.latest_run?.run_id ?? v4Plan?.run_id;
+    if (!targetRunId) return;
+    const projectId = selected?.id;
+    const conversationId = conversation?.id;
+    const token = conversationRequestToken.current;
+    const keepPlanMode = conversationMode === "plan" || conversationLocked || isActivePlanRevisionStatus(latestPlanRevision?.status);
+    const actionKey = `cancel:${targetRunId}:${token}`;
+    if (runActionGuards.current.has(actionKey)) return;
+    runActionGuards.current.add(actionKey);
+    setRunStopping(true);
+    setAgentNotice("");
+    let cancelObservedTerminal = false;
+    try {
+      await api.agentV4Cancel(targetRunId);
+      const events = await api.agentV4Events(targetRunId);
+      if (!projectId || !conversationId || isCurrentConversation(projectId, conversationId, token)) {
+        const runEvents = events.filter((event) => event.run_id === targetRunId);
+        setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, runEvents));
+        if (runEvents.some(isTerminalAgentEventV4)) {
+          cancelObservedTerminal = true;
+          setRunStartedAt(null);
+          setRunId((current) => current === targetRunId ? null : current);
+        }
+      }
+    } catch (error) {
+      if (!projectId || !conversationId || isCurrentConversation(projectId, conversationId, token)) setAgentNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      try {
+        const snapshot = await refreshConversationState(projectId, conversationId, token);
+        if (snapshot && keepPlanMode && isCurrentConversation(projectId!, conversationId!, token)) setConversationMode("plan");
+        // Legacy/browser mocks may not expose a post-cancel run snapshot. Keep
+        // the local direct-run controls until the persisted terminal event is
+        // observed, while real snapshots remain authoritative.
+        if (snapshot && !keepPlanMode && !cancelObservedTerminal && !snapshot.latest_run && !snapshot.latest_plan_revision) {
+          setRunId(targetRunId);
+          setRunStartedAt((current) => current ?? new Date().toISOString());
+        }
+      } catch (error) {
+        if ((!projectId || !conversationId || isCurrentConversation(projectId, conversationId, token)) && !agentNotice) setAgentNotice(error instanceof Error ? error.message : String(error));
+        if (keepPlanMode && (!projectId || !conversationId || isCurrentConversation(projectId, conversationId, token))) setConversationMode("plan");
+      }
+      runActionGuards.current.delete(actionKey);
+      if (!projectId || !conversationId || isCurrentConversation(projectId, conversationId, token)) setRunStopping(false);
+    }
+  }
+  const currentConversationAction = captureConversationAction();
   return <><WorkspaceShell
     project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template }}
     locale={locale} onLocaleChange={setLocale} onOpenSettings={() => setSettingsOpen(true)} onBackToProjects={() => setSelected(null)}
     conversations={conversations} activeConversationId={conversation?.id} onSelectConversation={selectConversation} onNewConversation={newConversation} onDeleteConversation={deleteConversation}
     messages={messages} agentBusy={agentBusy} agentNotice={agentNotice} modelLabel={activeModel?.label}
-    v4Plan={v4Plan} planLoading={planLoading} planApproved={planApproved} canStartRun={false} runStarted={Boolean(runId && !currentRunAwaitsPlanApproval)} activeRunId={runId} activeRunLastActivityAt={activeRunLastActivityAt} agentRunEventsV4={agentRunEventsV4}
+    agentMode={conversationMode} conversationLocked={conversationLocked} onAgentModeChange={changeConversationMode}
+    latestPlanRevision={latestPlanRevision} v4Plan={v4Plan} planLoading={planLoading} planApproved={planApproved} canStartRun={false} runStarted={Boolean(runId && !currentRunAwaitsPlanApproval)} activeRunId={runId} activeRunLastActivityAt={activeRunLastActivityAt} agentRunEventsV4={agentRunEventsV4}
     computeBackends={computeBackends} computeBackendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} approvalPolicy={approvalPolicy} computeEnvironment={computeEnvironment} computeBusy={computeBusy}
     onComputeBackendChange={setComputeBackendId} onContainerImageChange={setContainerImage} onAutonomyModeChange={setAutonomyMode} onApprovalPolicyChange={setApprovalPolicy} onComputeEnvironmentChange={setComputeEnvironment}
     onAnswerAgentQuestionV4={async (answerRunId, questionId, answer) => {
-      const actionKey = `answer:${answerRunId}:${questionId}`;
+      const action = currentConversationAction;
+      if (!action || !isCurrentConversationAction(action)) return;
+      const actionKey = `answer:${action.token}:${answerRunId}:${questionId}`;
       if (runActionGuards.current.has(actionKey)) return;
       runActionGuards.current.add(actionKey);
       setAgentNotice("");
       try {
         await api.agentV4Answer(answerRunId, questionId, answer);
         await api.agentV4Resume(answerRunId);
+        if (!isCurrentConversationAction(action)) return;
         setRunId(answerRunId);
         setRunStartedAt((current) => current ?? new Date().toISOString());
         const events = await api.agentV4Events(answerRunId);
+        if (!isCurrentConversationAction(action)) return;
         setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
       } catch (error) {
-        setAgentNotice(error instanceof Error ? error.message : String(error));
+        if (isCurrentConversationAction(action)) setAgentNotice(error instanceof Error ? error.message : String(error));
       } finally {
         runActionGuards.current.delete(actionKey);
       }
     }}
     onDecideToolApprovalV4={async (approvalRunId, approvalId, callHash, decision) => {
-      const actionKey = `approval:${approvalRunId}:${approvalId}`;
+      const action = currentConversationAction;
+      if (!action || !isCurrentConversationAction(action)) return;
+      const actionKey = `approval:${action.token}:${approvalRunId}:${approvalId}`;
       if (runActionGuards.current.has(actionKey)) return;
       runActionGuards.current.add(actionKey);
       setAgentNotice("");
       try {
         await api.agentV4DecideToolApproval(approvalRunId, approvalId, callHash, decision);
         await api.agentV4Resume(approvalRunId);
+        if (!isCurrentConversationAction(action)) return;
         setRunId(approvalRunId);
         setRunStartedAt((current) => current ?? new Date().toISOString());
         const events = await api.agentV4Events(approvalRunId);
+        if (!isCurrentConversationAction(action)) return;
         setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
       } catch (error) {
-        setAgentNotice(error instanceof Error ? error.message : String(error));
+        if (isCurrentConversationAction(action)) setAgentNotice(error instanceof Error ? error.message : String(error));
       } finally {
         runActionGuards.current.delete(actionKey);
       }
     }}
     onResolveUncertainV4={async (uncertainRunId, callId, resolution, evidence) => {
-      const actionKey = `uncertain:${uncertainRunId}:${callId}`;
+      const action = currentConversationAction;
+      if (!action || !isCurrentConversationAction(action)) return;
+      const actionKey = `uncertain:${action.token}:${uncertainRunId}:${callId}`;
       if (runActionGuards.current.has(actionKey)) return;
       runActionGuards.current.add(actionKey);
       setAgentNotice("");
       try {
         await api.agentV4ResolveUncertain(uncertainRunId, callId, resolution, evidence);
         await api.agentV4Resume(uncertainRunId);
+        if (!isCurrentConversationAction(action)) return;
         setRunId(uncertainRunId);
         setRunStartedAt((current) => current ?? new Date().toISOString());
         const events = await api.agentV4Events(uncertainRunId);
+        if (!isCurrentConversationAction(action)) return;
         setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
       } catch (error) {
-        setAgentNotice(error instanceof Error ? error.message : String(error));
+        if (isCurrentConversationAction(action)) setAgentNotice(error instanceof Error ? error.message : String(error));
       } finally {
         runActionGuards.current.delete(actionKey);
       }
     }}
     onResumeAgentRunV4={async (resumeRunId) => {
-      const actionKey = `resume:${resumeRunId}`;
+      const action = currentConversationAction;
+      if (!action || !isCurrentConversationAction(action)) return;
+      const actionKey = `resume:${action.token}:${resumeRunId}`;
       if (runActionGuards.current.has(actionKey)) return;
       runActionGuards.current.add(actionKey);
       setAgentNotice("");
       try {
         await api.agentV4Resume(resumeRunId);
+        if (!isCurrentConversationAction(action)) return;
         setRunId(resumeRunId);
         setRunStartedAt((current) => current ?? new Date().toISOString());
         const events = await api.agentV4Events(resumeRunId);
+        if (!isCurrentConversationAction(action)) return;
         setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
       } catch (error) {
-        setAgentNotice(error instanceof Error ? error.message : String(error));
+        if (isCurrentConversationAction(action)) setAgentNotice(error instanceof Error ? error.message : String(error));
       } finally {
         runActionGuards.current.delete(actionKey);
       }
@@ -519,83 +882,50 @@ export default function DesktopApp() {
     onPreviewImage={selected.connection_id && selected.remote_root ? (relativePath) => api.previewProjectImage(selected.id, relativePath) : undefined}
     onSend={async (markdown, mode) => {
       if (!conversation || !activeModel) { setSettingsOpen(true); return false; }
+      if (conversationLocked) return false;
+      const projectId = selected.id;
+      const conversationId = conversation.id;
+      // The send is a newer conversation transition than any reconnect read
+      // that may still be in flight.
+      ++conversationRequestToken.current;
+      const token = conversationRequestToken.current;
       setLastGoal(markdown); setV4Plan(null); setPlanApproved(false); setRunId(null); setRunStartedAt(null); setAgentBusy(true); setAgentNotice("");
       if (mode === "plan") {
         setPlanLoading(true);
         try {
-          const message = await api.submitMessage({ project_id: selected.id, conversation_id: conversation.id, markdown, sequence: messageSequence });
+          const message = await api.submitMessage({ project_id: projectId, conversation_id: conversationId, markdown, sequence: messageSequence });
+          if (!isCurrentConversation(projectId, conversationId, token)) return false;
           setMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message]);
           setMessageSequence((value) => Math.max(value, message.sequence + 1));
-          await startV4Planning(markdown);
-          return true;
+          await startV4Planning(markdown, token);
+          return isCurrentConversation(projectId, conversationId, token);
         } catch (error) {
-          setAgentNotice(error instanceof Error ? error.message : String(error));
+          if (isCurrentConversation(projectId, conversationId, token)) setAgentNotice(error instanceof Error ? error.message : String(error));
           return false;
         } finally {
-          setPlanLoading(false);
-          setAgentBusy(false);
+          if (isCurrentConversation(projectId, conversationId, token)) {
+            setPlanLoading(false);
+            setAgentBusy(false);
+          }
         }
       }
       try {
-        const message = await api.submitMessage({ project_id: selected.id, conversation_id: conversation.id, markdown, sequence: messageSequence });
+        const message = await api.submitMessage({ project_id: projectId, conversation_id: conversationId, markdown, sequence: messageSequence });
+        if (!isCurrentConversation(projectId, conversationId, token)) return false;
         setMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message]);
         setMessageSequence((value) => Math.max(value, message.sequence + 1));
-        await startV4Direct(markdown);
-        return true;
+        await startV4Direct(markdown, token);
+        return isCurrentConversation(projectId, conversationId, token);
       } catch (error) {
-        setAgentNotice(error instanceof Error ? error.message : String(error));
+        if (isCurrentConversation(projectId, conversationId, token)) setAgentNotice(error instanceof Error ? error.message : String(error));
         return false;
-      } finally { setAgentBusy(false); }
-    }}
-    onRequestPlan={async () => {
-      if (!activeModel || !lastGoal) { if (!activeModel) setSettingsOpen(true); return; }
-      setPlanLoading(true); setAgentNotice("");
-      try { await startV4Planning(lastGoal); }
-      catch (error) { setAgentNotice(error instanceof Error ? error.message : String(error)); }
-      finally { setPlanLoading(false); }
-    }}
-    onApprovePlan={async () => {
-      if (!v4Plan?.approval_hash) return;
-      const actionKey = `approve:${v4Plan.run_id}`;
-      if (runActionGuards.current.has(actionKey)) return;
-      runActionGuards.current.add(actionKey);
-      setAgentNotice("");
-      try {
-        const approved = await api.agentV4ApprovePlan(v4Plan.run_id, v4Plan.approval_hash);
-        setV4Plan(approved);
-        setRunId(approved.run_id);
-        setRunStartedAt(new Date().toISOString());
-        setPlanApproved(true);
-        const events = await api.agentV4Events(approved.run_id);
-        setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, events));
-      } catch (error) {
-        setAgentNotice(error instanceof Error ? error.message : String(error));
       } finally {
-        runActionGuards.current.delete(actionKey);
+        if (isCurrentConversation(projectId, conversationId, token)) setAgentBusy(false);
       }
     }}
-    onCancelRun={runId ? async () => {
-      const targetRunId = runId;
-      setRunStopping(true);
-      setAgentNotice("");
-      try {
-        await api.agentV4Cancel(targetRunId);
-        const events = await api.agentV4Events(targetRunId);
-        const runEvents = events.filter((event) => event.run_id === targetRunId);
-        setAgentRunEventsV4((current) => mergeAgentRunEventsV4(current, runEvents));
-        if (runEvents.some(isTerminalAgentEventV4)) {
-          setRunStartedAt(null);
-          setRunId((current) => current === targetRunId ? null : current);
-        }
-      } catch (error) {
-        setAgentNotice(error instanceof Error ? error.message : String(error));
-      } finally {
-        // Cancellation is asynchronous in the host. The reconciliation loop
-        // will clear the run when the terminal event is persisted; this
-        // fallback keeps the control usable if that event is delayed/lost.
-        setRunStopping(false);
-      }
-    } : undefined}
+    onApprovePlan={approvePlan}
+    onRequestPlanRevision={requestPlanRevision}
+    onCancelRun={activePlanRunId ? cancelRun : undefined}
   />{settings}</>;
 }
 function mergeAgentRunEventsV4(current: AgentRunEventV4[], incoming: AgentRunEventV4[]) {
@@ -615,4 +945,24 @@ function subscriptionError(channel: string, error: unknown) {
 
 function isTerminalAgentEventV4(event: AgentRunEventV4) {
   return event.event.kind === "run_completed" || event.event.kind === "run_failed" || event.event.kind === "run_cancelled" || event.event.kind === "run_needs_attention";
+}
+
+function eventChangesConversationState(kind: AgentRunEventV4["event"]["kind"]) {
+  return kind === "run_created"
+    || kind === "plan_proposed"
+    || kind === "plan_approved"
+    || kind === "plan_revision_requested"
+    || kind === "mode_changed"
+    || kind === "run_completed"
+    || kind === "run_failed"
+    || kind === "run_cancelled"
+    || kind === "run_needs_attention";
+}
+
+function isActivePlanRevisionStatus(status: ProposedPlanRevisionV4["status"] | undefined) {
+  return status === "generating" || status === "revising" || status === "pending";
+}
+
+function isTerminalRunStatus(status: string) {
+  return status === "completed" || status === "cancelled" || status === "failed" || status === "needs_attention";
 }

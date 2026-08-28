@@ -7,7 +7,7 @@ import {
   Search, Send, Settings, Shield, ShieldAlert, ShieldCheck, Sparkles, Square, Trash2, X,
 } from "lucide-react";
 import { copy, type Locale } from "./copy";
-import type { AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendAvailabilityV4, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, MemoryFact, NotebookEntry, ProjectArtifact, ProjectImagePreview, RunSummaryV4, SyncEntry, WorkspaceConversation } from "../../types";
+import type { AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendAvailabilityV4, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, MemoryFact, NotebookEntry, ProposedPlanRevisionV4, ProjectArtifact, ProjectImagePreview, RunSummaryV4, SessionAgentModeV4, SyncEntry, WorkspaceConversation } from "../../types";
 import { RemoteFileTree } from "./RemoteFileTree";
 import { KernelPanel } from "./KernelPanel";
 import { V4PlanPanel } from "./V4PlanPanel";
@@ -44,7 +44,15 @@ interface Props {
   agentNotice?: string;
   agentRetryNotice?: string;
   modelLabel?: string;
+  /** Durable conversation mode owned by DesktopApp. */
+  agentMode?: SessionAgentModeV4;
+  onAgentModeChange?: (mode: SessionAgentModeV4) => Promise<void> | void;
+  /** Snapshot-derived lock for the active conversation only. */
+  conversationLocked?: boolean;
+  /** Mutually excludes approve/request-changes/cancel plan actions. */
+  planActionBusy?: boolean;
   v4Plan?: RunSummaryV4 | null;
+  latestPlanRevision?: ProposedPlanRevisionV4 | null;
   computeBackends?: ComputeBackendAvailabilityV4[];
   computeBackendId?: string;
   containerImage?: string;
@@ -60,6 +68,7 @@ interface Props {
   planLoading?: boolean;
   planApproved?: boolean;
   onRequestPlan?: () => Promise<void> | void;
+  onRequestPlanRevision?: (feedback: string) => Promise<void> | void;
   onApprovePlan?: () => Promise<void> | void;
   onStartRun?: () => Promise<void> | void;
   onCancelRun?: () => Promise<void> | void;
@@ -103,13 +112,13 @@ interface Props {
 type ContextTab = "files" | "plan" | "preview" | "notebook" | "explore" | "runs";
 const AGENT_STALL_THRESHOLD_MS = 90_000;
 
-export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, conversations = [], activeConversationId, onSelectConversation, onNewConversation, onDeleteConversation, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, v4Plan, computeBackends = [], computeBackendId = "", containerImage = "", autonomyMode = "supervised", approvalPolicy = "risk_based", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onApprovalPolicyChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, activeRunLastActivityAt, agentRunEventsV4 = [], onAnswerAgentQuestionV4, onDecideToolApprovalV4, onResolveUncertainV4, onResumeAgentRunV4, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
+export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, conversations = [], activeConversationId, onSelectConversation, onNewConversation, onDeleteConversation, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, agentMode, onAgentModeChange, conversationLocked = false, planActionBusy = false, v4Plan, latestPlanRevision, computeBackends = [], computeBackendId = "", containerImage = "", autonomyMode = "supervised", approvalPolicy = "risk_based", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onApprovalPolicyChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onRequestPlanRevision, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, activeRunLastActivityAt, agentRunEventsV4 = [], onAnswerAgentQuestionV4, onDecideToolApprovalV4, onResolveUncertainV4, onResumeAgentRunV4, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
   const t = copy[locale];
   const zh = locale === "zh-CN";
   const [tab, setTab] = useState<ContextTab>("files");
   const [expanded, setExpanded] = useState(false);
   const [draft, setDraft] = useState("");
-  const [planModeEnabled, setPlanModeEnabled] = useState(false);
+  const [localMode, setLocalMode] = useState<SessionAgentModeV4>("agent");
   const [planSessionActive, setPlanSessionActive] = useState(false);
   const [composerMenuOpen, setComposerMenuOpen] = useState(false);
   const [computeMenuOpen, setComputeMenuOpen] = useState(false);
@@ -118,6 +127,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const [approved, setApproved] = useState(false);
   const [sendBusy, setSendBusy] = useState(false);
   const sendBusyRef = useRef(false);
+  const sendGenerationRef = useRef(0);
   const [approvePlanBusy, setApprovePlanBusy] = useState(false);
   const approvePlanBusyRef = useRef(false);
   const [selectedImagePath, setSelectedImagePath] = useState("");
@@ -126,6 +136,11 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const [previewError, setPreviewError] = useState("");
   const [deletingConversationId, setDeletingConversationId] = useState<string | null>(null);
   const messageStreamRef = useRef<HTMLElement>(null);
+  const effectivePlanActionBusy = Boolean(planActionBusy || approvePlanBusy || runStopping);
+  const controlledMode = agentMode !== undefined;
+  const effectiveMode = agentMode ?? localMode;
+  const planModeEnabled = effectiveMode === "plan";
+  const modeLocked = conversationLocked || planLoading || runStarted;
   const imageFiles = (remoteFiles ?? []).filter((entry) => !entry.directory && isPreviewImage(entry.relative_path));
   const preview = <ArtifactPreview title={t.overview} locale={locale} images={imageFiles} selectedPath={selectedImagePath} preview={imagePreview} busy={previewBusy} error={previewError} onSelect={setSelectedImagePath} onLoad={loadImagePreview} />;
   const effectiveActiveRunId = activeRunId ?? (runStarted ? agentRunEventsV4.at(-1)?.run_id ?? null : null);
@@ -142,7 +157,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const runStalled = runActive && Number.isFinite(lastActivityMs) && watchdogNow - lastActivityMs > AGENT_STALL_THRESHOLD_MS;
   // A paused run still owns the conversation sequence. Keep the composer
   // locked while approval/input cards remain usable inside the run trace.
-  const composerDisabled = sendBusy || agentBusy || (runStarted && !runFinished);
+  const composerDisabled = sendBusy || agentBusy || conversationLocked || (runStarted && !runFinished);
   const activeConversation = conversations.find((item) => item.id === activeConversationId);
   const conversationTitle = activeConversation?.title || (zh ? "新会话" : "New conversation");
   const historicalAgentRunEventsV4 = effectiveActiveRunId
@@ -153,11 +168,16 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const selectedBackend = computeBackends.find((item) => item.descriptor.backend_id === computeBackendId);
   const computeReady = Boolean(selectedBackend?.selectable);
   const selectedBackendIsContainer = selectedBackend?.descriptor.isolation === "container";
-  const showPlanPanel = planModeEnabled || planSessionActive || planLoading || Boolean(v4Plan?.plan);
+  const showPlanPanel = planModeEnabled || planLoading || (!controlledMode && (planSessionActive || Boolean(v4Plan?.plan)));
   const executeStart = activeRunEventsV4.findIndex((event) => event.event.kind === "mode_changed" && event.event.mode === "execute");
   const visibleActiveRunEventsV4 = v4Plan?.plan && executeStart >= 0 ? activeRunEventsV4.slice(executeStart) : v4Plan?.plan ? [] : activeRunEventsV4;
 
-  useEffect(() => { setPlanModeEnabled(false); setPlanSessionActive(false); }, [activeConversationId]);
+  useEffect(() => { if (!controlledMode) setLocalMode("agent"); setPlanSessionActive(false); }, [activeConversationId, controlledMode]);
+  useEffect(() => {
+    sendGenerationRef.current += 1;
+    sendBusyRef.current = false;
+    setSendBusy(false);
+  }, [activeConversationId]);
   useEffect(() => { if (showPlanPanel) setTab("plan"); }, [showPlanPanel]);
   useEffect(() => {
     if (!runActive || !activeRunLastActivityAt) {
@@ -198,9 +218,19 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     }
   }
 
+  function chooseMode(nextMode: SessionAgentModeV4) {
+    if (modeLocked) return;
+    if (controlledMode) {
+      void onAgentModeChange?.(nextMode);
+      return;
+    }
+    setLocalMode(nextMode);
+  }
+
   async function send() {
     const message = draft.trim();
     if (!message || composerDisabled || sendBusyRef.current) return;
+    const sendGeneration = sendGenerationRef.current;
     sendBusyRef.current = true;
     setSendBusy(true);
     setDraft("");
@@ -209,14 +239,15 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
         const mode = planModeEnabled ? "plan" : "chat";
         setPlanSessionActive(mode === "plan");
         const accepted = await onSend(message, mode);
-        if (accepted === false) setDraft((current) => current || message);
-        else if (planModeEnabled) setPlanModeEnabled(false);
+        if (accepted === false && sendGeneration === sendGenerationRef.current) setDraft((current) => current || message);
       } else {
         setSentMessages((current) => [...current, message]);
       }
     } finally {
-      sendBusyRef.current = false;
-      setSendBusy(false);
+      if (sendGeneration === sendGenerationRef.current) {
+        sendBusyRef.current = false;
+        setSendBusy(false);
+      }
     }
   }
 
@@ -252,7 +283,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
       <button className="rail-home" onClick={onBackToProjects} aria-label={zh ? "返回项目主页" : "Back to project home"}><ArrowLeft size={15} />{zh ? "返回项目主页" : "Project home"}</button>
       <button className="rail-search"><Search size={15} />{zh ? "搜索项目" : "Search projects"}</button>
       <div className="rail-section"><span>{zh ? "项目" : "Projects"}</span><button className="project-row active"><span className="project-glyph"><Database size={16} /></span><span><strong>{project.name}</strong><small>{t.status}</small></span><ChevronRight size={14} /></button></div>
-      <div className="rail-section sessions"><span>{zh ? "会话" : "Sessions"}</span><div className="session-list">{conversations.map((item) => { const title = item.title || (zh ? "新会话" : "New conversation"); const active = item.id === activeConversationId; const deleteDisabled = deletingConversationId !== null || (active && (agentBusy || runActive)); return <div className={`session-entry ${active ? "active" : ""}`} key={item.id}><button className="session-row" aria-current={active ? "page" : undefined} onClick={() => void onSelectConversation?.(item.id)}><Sparkles size={15} /><span title={item.title}>{title}</span></button><button className="session-delete" aria-label={zh ? `删除会话：${title}` : `Delete conversation: ${title}`} title={zh ? "删除会话" : "Delete conversation"} disabled={deleteDisabled || !onDeleteConversation} onClick={() => void deleteConversation(item)}><Trash2 size={14} /></button></div>; })}</div><button className="new-session" disabled={agentBusy} onClick={() => void onNewConversation?.()}><MessageSquarePlus size={15} />{t.newConversation}</button></div>
+      <div className="rail-section sessions"><span>{zh ? "会话" : "Sessions"}</span><div className="session-list">{conversations.map((item) => { const title = item.title || (zh ? "新会话" : "New conversation"); const active = item.id === activeConversationId; const deleteDisabled = deletingConversationId !== null || (active && (agentBusy || runActive || conversationLocked)); return <div className={`session-entry ${active ? "active" : ""}`} key={item.id}><button className="session-row" aria-current={active ? "page" : undefined} onClick={() => void onSelectConversation?.(item.id)}><Sparkles size={15} /><span title={item.title}>{title}</span></button><button className="session-delete" aria-label={zh ? `删除会话：${title}` : `Delete conversation: ${title}`} title={zh ? "删除会话" : "Delete conversation"} disabled={deleteDisabled || !onDeleteConversation} onClick={() => void deleteConversation(item)}><Trash2 size={14} /></button></div>; })}</div><button className="new-session" disabled={agentBusy} onClick={() => void onNewConversation?.()}><MessageSquarePlus size={15} />{t.newConversation}</button></div>
       <div className="rail-footer"><button onClick={() => onLocaleChange(zh ? "en-US" : "zh-CN")}><Languages size={16} />{zh ? "English" : "简体中文"}</button><button onClick={onOpenSettings}><Settings size={16} />{t.settings}</button></div>
     </nav>
 
@@ -282,7 +313,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
         <div className={`composer-input ${planModeEnabled ? "is-plan-mode" : ""}`}>
           <textarea aria-label={t.composer} placeholder={planModeEnabled ? (zh ? "描述需要规划和执行的任务" : "Describe the task to plan and execute") : t.composer} value={draft} disabled={composerDisabled} onChange={(event) => setDraft(event.target.value)} />
           <div>
-            <div className="composer-menu-anchor"><button className="composer-tool" aria-label={zh ? "添加上下文或选择模式" : "Add context or choose mode"} aria-expanded={composerMenuOpen} onClick={() => { setComposerMenuOpen((open) => !open); setPermissionMenuOpen(false); setComputeMenuOpen(false); }}><Plus size={17} /></button>{composerMenuOpen && <div className="composer-add-menu" role="menu"><button role="menuitem" disabled={!onUploadFiles} onClick={() => { setComposerMenuOpen(false); void onUploadFiles?.(); }}><Folder size={16} /><span><b>{zh ? "添加文件" : "Add files"}</b><small>{zh ? "选择项目输入文件" : "Select project input files"}</small></span></button><button role="menuitem" className={planModeEnabled ? "active" : ""} onClick={() => { setPlanModeEnabled(!planModeEnabled); setComposerMenuOpen(false); }}><Activity size={16} /><span><b>{zh ? "Plan 模式" : "Plan mode"}</b><small>{zh ? "先规划并在右侧审核，再批准执行" : "Plan first, review on the right, then approve execution"}</small></span>{planModeEnabled && <Check size={15} />}</button></div>}</div>
+            <div className="composer-menu-anchor"><button className="composer-tool" aria-label={zh ? "添加上下文或选择模式" : "Add context or choose mode"} aria-expanded={composerMenuOpen} onClick={() => { setComposerMenuOpen((open) => !open); setPermissionMenuOpen(false); setComputeMenuOpen(false); }}><Plus size={17} /></button>{composerMenuOpen && <div className="composer-add-menu" role="menu"><button role="menuitem" disabled={!onUploadFiles} onClick={() => { setComposerMenuOpen(false); void onUploadFiles?.(); }}><Folder size={16} /><span><b>{zh ? "添加文件" : "Add files"}</b><small>{zh ? "选择项目输入文件" : "Select project input files"}</small></span></button><button role="menuitem" disabled={modeLocked} className={planModeEnabled ? "active" : ""} onClick={() => { chooseMode(planModeEnabled ? "agent" : "plan"); setComposerMenuOpen(false); }}><Activity size={16} /><span><b>{zh ? "Plan 模式" : "Plan mode"}</b><small>{modeLocked ? (zh ? "当前计划处理中，暂不可切换" : "Mode switching is locked by the active plan") : (zh ? "先规划并在右侧审核，再批准执行" : "Plan first, review on the right, then approve execution")}</small></span>{planModeEnabled && <Check size={15} />}</button></div>}</div>
             <div className="composer-menu-anchor permission-anchor">
               <button className="composer-policy-button" aria-label={zh ? "Agent 权限" : "Agent permissions"} aria-expanded={permissionMenuOpen} onClick={() => { setPermissionMenuOpen((open) => !open); setComposerMenuOpen(false); setComputeMenuOpen(false); }}><Shield size={15} />{approvalPolicy === "request_approval" ? (zh ? "请求批准" : "Ask approval") : approvalPolicy === "full_access" ? (zh ? "完全访问" : "Full access") : (zh ? "帮我批准" : "Risk based")}<ChevronRight size={13} /></button>
               {permissionMenuOpen && <div className="permission-menu" role="menu" aria-label={zh ? "Agent 权限选项" : "Agent permission options"}>
@@ -296,7 +327,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
               <button className="composer-policy-button" aria-label={zh ? "选择计算后端" : "Choose compute backend"} aria-expanded={computeMenuOpen} onClick={() => { setComputeMenuOpen((open) => !open); setComposerMenuOpen(false); setPermissionMenuOpen(false); }}><Database size={15} />{selectedBackend?.descriptor.kind.toUpperCase() ?? (zh ? "选择后端" : "Backend")}<ChevronRight size={13} /></button>
               {computeMenuOpen && <div className="composer-compute-menu"><ComputeBackendSelector locale={locale} backends={computeBackends} backendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} environment={computeEnvironment} busy={computeBusy} onBackendChange={onComputeBackendChange} onImageChange={onContainerImageChange} onAutonomyChange={onAutonomyModeChange} onEnvironmentChange={onComputeEnvironmentChange} /></div>}
             </div>
-            {planModeEnabled && <button className="composer-mode-chip" onClick={() => setPlanModeEnabled(false)}><Activity size={14} />Plan<X size={13} /></button>}
+            {planModeEnabled && <button className="composer-mode-chip" disabled={modeLocked} onClick={() => chooseMode("agent")}><Activity size={14} />Plan<X size={13} /></button>}
             <button className="send-button" disabled={composerDisabled || planLoading || !draft.trim() || Boolean(onSend && !computeReady)} onClick={send}><Send size={16} />{composerDisabled || planLoading ? (planModeEnabled ? (zh ? "规划中…" : "Planning…") : (zh ? "执行中…" : "Running…")) : t.send}</button>
           </div>
         </div>
@@ -306,7 +337,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
 
     <aside className="context-pane" aria-label={t.context}>
       <div className="context-tabs" role="tablist">{(["files", "plan", "preview", "notebook", "explore", "runs"] as ContextTab[]).map((id) => <button key={id} role="tab" aria-selected={tab === id} onClick={() => setTab(id)}>{id === "files" ? t.files : id === "plan" ? (zh ? "Plan" : "Plan") : id === "preview" ? t.preview : id === "notebook" ? t.notebook : id === "explore" ? t.explore : t.runs}</button>)}</div>
-      <div className="context-content">{tab === "files" && <RemoteFileTree locale={locale} remoteFiles={remoteFiles} busy={filesBusy} notice={fileNotice} onUpload={onUploadFiles} onRefresh={onRefreshFiles} onDownload={onDownloadFile} syncEntries={syncEntries} onPauseSync={onPauseSync} onCancelSync={onCancelSync} onRetrySync={onRetrySync} />}{tab === "plan" && <V4PlanPanel locale={locale} active={showPlanPanel} planLoading={planLoading} v4Plan={v4Plan} planApproved={planApproved || approved || approvePlanBusy} runStarted={runStarted} events={activeRunEventsV4} onApprove={approvePlan} onRegenerate={onRequestPlan} />}{tab === "preview" && <><div className="context-toolbar"><span>{t.overview}</span><button aria-label={t.expand} onClick={() => setExpanded(true)}><Expand size={16} /></button></div>{preview}</>}{tab === "notebook" && <Notebook locale={locale} entries={notebookEntries} artifacts={projectArtifacts} facts={memoryFacts} onSearch={onSearchMemory} onExport={onExportNotebook} />}{tab === "explore" && <KernelPanel locale={locale} sessions={kernelSessions} events={kernelEvents} busy={kernelBusy} notice={kernelNotice} onStart={onStartKernel} onExecute={onExecuteKernel} onInterrupt={onInterruptKernel} onStop={onStopKernel} onPromote={onPromoteKernelCell} />}{tab === "runs" && <RunSummary locale={locale} />}</div>
+      <div className="context-content">{tab === "files" && <RemoteFileTree locale={locale} remoteFiles={remoteFiles} busy={filesBusy} notice={fileNotice} onUpload={onUploadFiles} onRefresh={onRefreshFiles} onDownload={onDownloadFile} syncEntries={syncEntries} onPauseSync={onPauseSync} onCancelSync={onCancelSync} onRetrySync={onRetrySync} />}{tab === "plan" && <V4PlanPanel locale={locale} active={showPlanPanel} planLoading={planLoading} v4Plan={v4Plan} latestPlanRevision={latestPlanRevision} conversationLocked={conversationLocked} planActionBusy={effectivePlanActionBusy} planApproved={planApproved || approved || approvePlanBusy} runStarted={runStarted} events={activeRunEventsV4} onApprove={approvePlan} onRequestPlanRevision={onRequestPlanRevision} onCancel={onCancelRun} />}{tab === "preview" && <><div className="context-toolbar"><span>{t.overview}</span><button aria-label={t.expand} onClick={() => setExpanded(true)}><Expand size={16} /></button></div>{preview}</>}{tab === "notebook" && <Notebook locale={locale} entries={notebookEntries} artifacts={projectArtifacts} facts={memoryFacts} onSearch={onSearchMemory} onExport={onExportNotebook} />}{tab === "explore" && <KernelPanel locale={locale} sessions={kernelSessions} events={kernelEvents} busy={kernelBusy} notice={kernelNotice} onStart={onStartKernel} onExecute={onExecuteKernel} onInterrupt={onInterruptKernel} onStop={onStopKernel} onPromote={onPromoteKernelCell} />}{tab === "runs" && <RunSummary locale={locale} />}</div>
     </aside>
     {expanded && <div className="preview-overlay" role="dialog" aria-modal="true" aria-label={t.artifactPreview}><header><div><small>{project.name}</small><h2>{t.overview}</h2></div><button aria-label="Close" onClick={() => setExpanded(false)}><X /></button></header>{preview}</div>}
   </div>;

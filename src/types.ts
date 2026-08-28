@@ -202,6 +202,22 @@ export interface RequestPlanRevisionResponseV4 {
   feedback?: string | null;
 }
 
+/**
+ * Durable, conversation-scoped Agent V4 snapshot.
+ *
+ * The snapshot is the UI hydration boundary: mode and lock state are read
+ * together with the latest plan revision/run so a reconnect cannot briefly
+ * expose a stale local mode or an unlocked pending plan.
+ */
+export interface ConversationAgentStateV4 {
+  project_id: string;
+  conversation_id: string;
+  mode: SessionAgentModeV4;
+  locked: boolean;
+  latest_plan_revision: ProposedPlanRevisionV4 | null;
+  latest_run: RunSummaryV4 | null;
+}
+
 export interface ToolCallV4 { call_id: string; tool_id: string; arguments: Record<string, unknown> }
 export interface ToolOutcomeV4 { call_id: string; tool_id: string; succeeded: boolean; model_content: string; data: unknown; provenance: string[] }
 export type ToolEffectV4 = "read_only" | "mutating" | "runtime" | "network" | "delegation";

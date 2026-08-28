@@ -72,7 +72,7 @@ use uuid::Uuid;
 use crate::commands::{
     AppState, authentication_for_profile, find_profile, require_trusted_host, unified_model_client,
 };
-pub use crate::dto::{RunSummaryV4, SessionAgentModeV4};
+pub use crate::dto::{ConversationAgentStateV4, RunSummaryV4, SessionAgentModeV4};
 use crate::p1_commands::{
     McpServerProfile, MemorySearchRequest, invoke_configured_mcp_tool_v4, memory_facts,
 };
@@ -141,6 +141,7 @@ pub async fn begin_v4_plan_resume(
 ) -> Result<ProposedPlanRevisionV4, String> {
     let record = load_record(repository, run_id).await?;
     ensure_v4_resume_allowed(repository, run_id).await?;
+    ensure_v4_request_resume_status(&record.status)?;
     repository
         .acquire_plan_revision_resume_v4(
             record.project_id,
@@ -251,6 +252,7 @@ struct RunRecordV4 {
     approval_hash: Option<String>,
     #[serde(default)]
     plan_revision: Option<u64>,
+    #[serde(default)]
     spec: Option<RunSpecV4>,
 }
 
@@ -1183,16 +1185,36 @@ pub async fn request_plan_revision_committed(
     ))
 }
 
+/// Complete the request-changes command boundary. The Store transaction is
+/// committed before the event is handed to the UI, so an emit failure must
+/// not turn a durable revision request into a command failure or strand the
+/// conversation lock.
+pub(crate) async fn request_plan_revision_command_response<F>(
+    repository: &Store,
+    request: &AgentV4RequestPlanRevisionRequest,
+    emit: F,
+) -> Result<RequestPlanRevisionResponseV4, String>
+where
+    F: FnMut(&AgentEventV4) -> Result<(), String>,
+{
+    let (response, event) = request_plan_revision_committed(repository, request).await?;
+    if let Some(error) = broadcast_events_best_effort(std::slice::from_ref(&event), emit) {
+        eprintln!("failed to broadcast committed V4 plan revision request event: {error}");
+    }
+    Ok(response)
+}
+
 #[tauri::command]
 pub async fn agent_v4_request_plan_revision(
     app: AppHandle,
     state: State<'_, AppState>,
     request: AgentV4RequestPlanRevisionRequest,
 ) -> Result<RequestPlanRevisionResponseV4, String> {
-    let (response, event) = request_plan_revision_committed(&state.repository, &request).await?;
-    app.emit(AGENT_V4_EVENT_CHANNEL, &event)
-        .map_err(|error| error.to_string())?;
-    Ok(response)
+    request_plan_revision_command_response(&state.repository, &request, |event| {
+        app.emit(AGENT_V4_EVENT_CHANNEL, event)
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1233,10 +1255,8 @@ pub async fn agent_v4_resume(
                 revision: latest.revision,
             };
             plan_approval_resume_decision(&events, scope)?;
-        } else if record.status != "waiting_for_input" {
-            return Err(
-                "only a waiting-for-input or waiting-for-approval Plan run can be resumed".into(),
-            );
+        } else {
+            ensure_v4_request_resume_status(&record.status)?;
         }
         let project = workspace_project(&state.repository, record.project_id).await?;
         let selection = record
@@ -1574,6 +1594,14 @@ pub async fn agent_v4_resume(
         .await?;
     }
     spawn_execution(app, &state, record, spec).await
+}
+
+fn ensure_v4_request_resume_status(status: &str) -> Result<(), String> {
+    if matches!(status, "waiting_for_input" | "planning") {
+        Ok(())
+    } else {
+        Err("only a waiting-for-input or request-changes planning Plan run can be resumed".into())
+    }
 }
 
 fn recoverable_system_environment_ensure(
@@ -1934,6 +1962,96 @@ pub async fn agent_v4_events(
         .agent_events_v4(run_id)
         .await
         .map_err(|error| error.to_string())
+}
+
+/// Read one conversation's durable Agent state without requiring a live
+/// Tauri runtime. The Store supplies all source rows from one SQLite
+/// transaction; this adapter validates and types the persisted run JSON at
+/// the command boundary.
+pub async fn conversation_state_response(
+    repository: &Store,
+    project_id: Uuid,
+    conversation_id: Uuid,
+) -> Result<ConversationAgentStateV4, String> {
+    let snapshot = repository
+        .conversation_agent_state_v4(project_id, conversation_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if snapshot.locked && snapshot.mode != SessionAgentModeV4::Plan {
+        return Err("conversation has an active plan lock but is not in Plan mode".into());
+    }
+
+    let latest_run = snapshot
+        .latest_run_json
+        .map(|value| {
+            let record: RunRecordV4 = serde_json::from_value(value)
+                .map_err(|error| format!("latest Agent V4 run has invalid record JSON: {error}"))?;
+            if record.run_id == Uuid::nil() {
+                return Err("latest Agent V4 run has an invalid run id".into());
+            }
+            if record.project_id != project_id || record.conversation_id != conversation_id {
+                return Err(
+                    "latest Agent V4 run does not belong to the requested conversation".into(),
+                );
+            }
+            run_summary_from_record(
+                &record,
+                snapshot.mode,
+                snapshot.latest_plan_revision.as_ref(),
+            )
+        })
+        .transpose()?;
+
+    if snapshot.latest_plan_revision.is_some() && latest_run.is_none() {
+        return Err("latest plan revision has no corresponding Agent V4 run".into());
+    }
+
+    Ok(ConversationAgentStateV4 {
+        project_id: snapshot.project_id,
+        conversation_id: snapshot.conversation_id,
+        mode: snapshot.mode,
+        locked: snapshot.locked,
+        latest_plan_revision: snapshot.latest_plan_revision,
+        latest_run,
+    })
+}
+
+fn run_summary_from_record(
+    record: &RunRecordV4,
+    mode: SessionAgentModeV4,
+    latest_plan_revision: Option<&ProposedPlanRevisionV4>,
+) -> Result<RunSummaryV4, String> {
+    let matching_revision =
+        latest_plan_revision.filter(|revision| revision.run_id == record.run_id);
+    if let (Some(record_revision), Some(revision)) = (record.plan_revision, matching_revision) {
+        if record_revision != revision.revision {
+            return Err(
+                "latest Agent V4 run plan revision does not match the latest plan revision".into(),
+            );
+        }
+    }
+    let plan_revision = matching_revision
+        .map(|revision| revision.revision)
+        .or(record.plan_revision);
+    Ok(RunSummaryV4 {
+        run_id: record.run_id,
+        status: record.status.clone(),
+        plan: record.plan.clone(),
+        plan_hash: record.plan_hash.clone(),
+        compute_selection: record.compute_selection.clone(),
+        approval_hash: record.approval_hash.clone(),
+        plan_revision,
+        session_mode: Some(mode),
+    })
+}
+
+#[tauri::command]
+pub async fn agent_v4_conversation_state(
+    state: State<'_, AppState>,
+    project_id: Uuid,
+    conversation_id: Uuid,
+) -> Result<ConversationAgentStateV4, String> {
+    conversation_state_response(&state.repository, project_id, conversation_id).await
 }
 
 #[tauri::command]
