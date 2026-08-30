@@ -145,6 +145,90 @@ fn v3_fixture_with_sync(
     (project, conversation, messages, entry)
 }
 
+fn v3_fixture_with_agent_events_without_occurred_at(
+    path: &Path,
+) -> (Project, Conversation, Vec<AgentEventV4>) {
+    let (project, conversation, _) = v3_fixture(path, false);
+    let run_id = Uuid::new_v4();
+    let first = AgentEventV4::first(
+        run_id,
+        project.id,
+        conversation.id,
+        Utc::now(),
+        AgentEventKindV4::RunCreated {
+            mode: RunModeV4::Plan,
+        },
+    );
+    let second = AgentEventV4::next(
+        &first,
+        Utc::now(),
+        AgentEventKindV4::ModelText {
+            text: "legacy event".into(),
+        },
+    );
+    let events = vec![first, second];
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE agent_runs_v4 (
+                run_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                value_json TEXT NOT NULL
+            );
+            CREATE TABLE agent_events_v4 (
+                run_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                previous_hash TEXT NOT NULL,
+                event_hash TEXT NOT NULL UNIQUE,
+                value_json TEXT NOT NULL,
+                PRIMARY KEY(run_id, sequence)
+            );
+            CREATE TABLE notebook_entries (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                value_json TEXT NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO agent_runs_v4
+             (run_id,project_id,conversation_id,status,value_json)
+             VALUES (?1,?2,?3,'planning','{}')",
+            params![
+                run_id.to_string(),
+                project.id.to_string(),
+                conversation.id.to_string(),
+            ],
+        )
+        .unwrap();
+    for event in &events {
+        connection
+            .execute(
+                "INSERT INTO agent_events_v4
+                 (run_id,project_id,conversation_id,sequence,previous_hash,event_hash,value_json)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    event.run_id.to_string(),
+                    event.project_id.to_string(),
+                    event.conversation_id.to_string(),
+                    event.sequence,
+                    event.previous_hash,
+                    event.event_hash,
+                    serde_json::to_string(event).unwrap(),
+                ],
+            )
+            .unwrap();
+    }
+    (project, conversation, events)
+}
+
 #[test]
 fn schema_is_clean_room_and_not_reference_ordered() {
     let sql = include_str!("../migrations/init.sql");
@@ -875,6 +959,103 @@ async fn zero_occurred_at_is_rejected_even_when_json_is_valid() {
         text.contains("occurred") || text.contains("durable"),
         "{text}"
     );
+}
+
+#[tokio::test]
+async fn v3_agent_events_without_occurred_at_are_backfilled_and_reopen_idempotently() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("legacy-agent-events.sqlite3");
+    let (_, _, events) = v3_fixture_with_agent_events_without_occurred_at(&path);
+
+    let store = Store::open(&path).await.unwrap();
+    assert_eq!(store.schema_version().await.unwrap(), 4);
+    assert_eq!(
+        store.agent_events_v4(events[0].run_id).await.unwrap(),
+        events
+    );
+    let stored_times = sqlx::query_scalar::<_, i64>(
+        "SELECT occurred_at FROM agent_events_v4 WHERE run_id=?1 ORDER BY sequence",
+    )
+    .bind(events[0].run_id.to_string())
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        stored_times,
+        events
+            .iter()
+            .map(|event| event.occurred_at.timestamp_millis())
+            .collect::<Vec<_>>()
+    );
+    for column in ["created_at", "updated_at"] {
+        assert!(table_has_column(store.pool(), "agent_runs_v4", column).await);
+    }
+    drop(store);
+
+    let reopened = Store::open(&path).await.unwrap();
+    assert_eq!(
+        reopened.agent_events_v4(events[0].run_id).await.unwrap(),
+        events
+    );
+    assert_eq!(backup_names(directory.path()).len(), 1);
+}
+
+#[tokio::test]
+async fn malformed_v3_agent_event_rolls_back_timestamp_and_index_extensions() {
+    let directory = tempdir().unwrap();
+    let path = directory
+        .path()
+        .join("malformed-legacy-agent-event.sqlite3");
+    let (_, _, events) = v3_fixture_with_agent_events_without_occurred_at(&path);
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE agent_events_v4 SET value_json='{not-json' WHERE run_id=?1 AND sequence=1",
+            [events[0].run_id.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match Store::open(&path).await {
+        Ok(_) => panic!("malformed legacy Agent event unexpectedly migrated"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("backfilling occurred_at"));
+
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    for (table, column) in [
+        ("agent_events_v4", "occurred_at"),
+        ("agent_runs_v4", "updated_at"),
+        ("notebook_entries", "updated_at"),
+    ] {
+        assert_eq!(
+            connection
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name='{column}'"
+                    ),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "failed migration left {table}.{column} behind"
+        );
+    }
+}
+
+async fn table_has_column(pool: &sqlx::SqlitePool, table: &str, column: &str) -> bool {
+    let rows = sqlx::query(&format!("PRAGMA table_info(\"{table}\")"))
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    rows.iter().any(|row| row.get::<String, _>(1) == column)
 }
 
 #[tokio::test]

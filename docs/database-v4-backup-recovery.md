@@ -18,6 +18,8 @@ omicsops.db.pre-store-v4.<timestamp>-<id>.bak
 
 迁移在一个事务中执行。ID/计数/顺序、外键、SQLite 完整性、event hash chain 或扩展数据验证失败时，事务回滚，应用拒绝启动和写入。升级前 `.bak` 保留不变。
 
+旧版 `agent_events_v4` 可能只在 `value_json` 中保存事件时间而没有独立的 `occurred_at` 列。v4 迁移会先从每条事件的 JSON 信封回填毫秒时间，再核对持久列、事件内容和 hash chain；不会用 `0` 或当前时间替代历史时间。旧 notebook、Agent run、context archive 和 scientific state 的兼容列也会在相关索引创建前补齐。任何 JSON、归属或 hash 不一致仍会使整个事务回滚。
+
 先保存完整错误信息和失败库的只读副本；不要反复覆盖文件，也不要用 SQLite 工具手工删除约束或事件。可在报告中提供脱敏后的错误和 schema version，但不要提供凭据、真实服务器输出或未经脱敏的科研数据。
 
 ## 从 pre-store-v4 备份恢复

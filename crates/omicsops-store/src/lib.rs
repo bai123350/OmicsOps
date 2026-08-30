@@ -3832,6 +3832,11 @@ async fn initialize(
     if version < SCHEMA_VERSION {
         rename_legacy_tables(&mut tx).await?;
     }
+    // Existing v3/pre-release-v4 extension tables must receive additive
+    // columns before INIT_SQL creates indexes that reference those columns.
+    // This also backfills the legacy Agent V4 event timestamp while its exact
+    // JSON envelope and hash chain are still available for later validation.
+    ensure_schema_extensions(&mut tx).await?;
     sqlx::raw_sql(INIT_SQL).execute(&mut *tx).await?;
     repair_proposed_plans_schema(&mut tx).await?;
     // `CREATE TRIGGER IF NOT EXISTS` intentionally does not replace a
@@ -3842,7 +3847,6 @@ async fn initialize(
     if version < SCHEMA_VERSION {
         migrate_legacy_rows(&mut tx, options).await?;
     }
-    ensure_schema_extensions(&mut tx).await?;
     validate_before_commit(&mut tx).await?;
     sqlx::query("PRAGMA user_version = 4")
         .execute(&mut *tx)
@@ -4012,6 +4016,8 @@ async fn ensure_schema_extensions(tx: &mut Transaction<'_, Sqlite>) -> Result<()
     // These additive columns make opening a pre-release v4 database safe when
     // it already contains the table but predates the final compatibility
     // projection. Every operation is idempotent and remains transactional.
+    let backfill_agent_event_occurred_at = table_exists(tx, "agent_events_v4").await?
+        && !table_has_column(tx, "agent_events_v4", "occurred_at").await?;
     for (table, column, definition) in [
         ("messages", "project_id", "TEXT"),
         ("messages", "conversation_id", "TEXT"),
@@ -4035,6 +4041,18 @@ async fn ensure_schema_extensions(tx: &mut Transaction<'_, Sqlite>) -> Result<()
             "occurred_at",
             "INTEGER NOT NULL DEFAULT 0",
         ),
+        ("agent_runs_v4", "created_at", "INTEGER NOT NULL DEFAULT 0"),
+        ("agent_runs_v4", "updated_at", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "agent_context_archives_v4",
+            "created_at",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "scientific_states_v4",
+            "updated_at",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
     ] {
         if table_exists(tx, table).await? && !table_has_column(tx, table, column).await? {
             sqlx::query(&format!(
@@ -4042,6 +4060,44 @@ async fn ensure_schema_extensions(tx: &mut Transaction<'_, Sqlite>) -> Result<()
             ))
             .execute(&mut **tx)
             .await?;
+        }
+    }
+    if backfill_agent_event_occurred_at {
+        backfill_legacy_agent_event_occurred_at(tx).await?;
+    }
+    Ok(())
+}
+
+async fn backfill_legacy_agent_event_occurred_at(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> Result<(), StoreError> {
+    let rows = sqlx::query(
+        "SELECT run_id,sequence,value_json
+         FROM agent_events_v4 ORDER BY run_id,sequence",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    for row in rows {
+        let run_id = row.try_get::<String, _>(0)?;
+        let sequence = row.try_get::<i64, _>(1)?;
+        let event: AgentEventV4 = serde_json::from_str(row.try_get::<String, _>(2)?.as_str())
+            .map_err(|error| {
+                StoreError::Migration(format!(
+                    "event {run_id}/{sequence} has invalid JSON while backfilling occurred_at: {error}"
+                ))
+            })?;
+        let updated = sqlx::query(
+            "UPDATE agent_events_v4 SET occurred_at=?1 WHERE run_id=?2 AND sequence=?3",
+        )
+        .bind(event.occurred_at.timestamp_millis())
+        .bind(&run_id)
+        .bind(sequence)
+        .execute(&mut **tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(StoreError::Migration(format!(
+                "event {run_id}/{sequence} could not be backfilled uniquely"
+            )));
         }
     }
     Ok(())
