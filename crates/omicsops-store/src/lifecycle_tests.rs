@@ -964,9 +964,51 @@ async fn failed_upgrade_rolls_back_schema_and_rows() {
 async fn injected_upgrade_failure_is_atomic() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("injected.sqlite3");
-    let (project, _, _) = v3_fixture(&path, false);
+    let (project, conversation, messages) = v3_fixture(&path, false);
 
-    assert!(Store::open_with_migration_failure(&path, 0).await.is_err());
+    let before = Connection::open(&path).unwrap();
+    let schema_before = before
+        .prepare(
+            "SELECT name,sql FROM sqlite_master
+             WHERE type='table' AND name IN ('projects','conversations','messages')
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let rows_before = [
+        before
+            .query_row(
+                "SELECT value_json FROM projects WHERE id=?1",
+                [project.id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        before
+            .query_row(
+                "SELECT value_json FROM conversations WHERE id=?1",
+                [conversation.id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        before
+            .query_row(
+                "SELECT value_json FROM messages WHERE id=?1",
+                [messages[0].id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+    ];
+    drop(before);
+
+    // The second checkpoint fails only after the first project row was copied,
+    // proving rollback covers actual DML as well as the preceding table renames
+    // and schema creation.
+    assert!(Store::open_with_migration_failure(&path, 1).await.is_err());
     let connection = Connection::open(&path).unwrap();
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -980,6 +1022,54 @@ async fn injected_upgrade_failure_is_atomic() {
         )
         .unwrap();
     assert_eq!(project_count, 1);
+    let schema_after = connection
+        .prepare(
+            "SELECT name,sql FROM sqlite_master
+             WHERE type='table' AND name IN ('projects','conversations','messages')
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(schema_after, schema_before);
+    let rows_after = [
+        connection
+            .query_row(
+                "SELECT value_json FROM projects WHERE id=?1",
+                [project.id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        connection
+            .query_row(
+                "SELECT value_json FROM conversations WHERE id=?1",
+                [conversation.id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        connection
+            .query_row(
+                "SELECT value_json FROM messages WHERE id=?1",
+                [messages[0].id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+    ];
+    assert_eq!(rows_after, rows_before);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE '%_v3_legacy'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]

@@ -165,23 +165,7 @@ async fn persist_installed(
     enabled_by_default: bool,
     category: Option<String>,
 ) -> Result<SkillPackage, String> {
-    if let Some(mut existing) = repository
-        .list_skill_packages()
-        .await
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .find(|skill| skill.sha256 == installed.sha256)
-    {
-        if category.is_some() && existing.category != category {
-            existing.category = category;
-            repository
-                .save_skill_package(&existing)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-        return Ok(existing);
-    }
-    let mut package = SkillPackage {
+    let package = SkillPackage {
         id: Uuid::new_v4(),
         name: installed.name,
         version: installed.version,
@@ -192,13 +176,9 @@ async fn persist_installed(
         category,
     };
     repository
-        .save_skill_package(&package)
+        .upsert_skill_package_by_sha(&package, enabled_by_default)
         .await
-        .map_err(|error| error.to_string())?;
-    if enabled_by_default {
-        package = set_skill_enabled_in_repository(repository, package.id, true).await?;
-    }
-    Ok(package)
+        .map_err(|error| error.to_string())
 }
 
 pub async fn agent_skill_packages(repository: &Store) -> Result<Vec<SkillPackage>, String> {
@@ -380,33 +360,78 @@ pub async fn set_skill_enabled_in_repository(
     skill_id: Uuid,
     enabled: bool,
 ) -> Result<SkillPackage, String> {
-    let mut packages = repository
-        .list_skill_packages()
+    repository
+        .set_skill_enabled_atomic(skill_id, enabled)
         .await
-        .map_err(|error| error.to_string())?;
-    let index = packages
-        .iter()
-        .position(|skill| skill.id == skill_id)
-        .ok_or_else(|| "skill package was not found".to_string())?;
-    let target_name = packages[index].name.clone();
-    if enabled {
-        for skill in packages
-            .iter_mut()
-            .filter(|skill| skill.name == target_name)
-        {
-            if skill.enabled {
-                skill.enabled = false;
-                repository
-                    .save_skill_package(skill)
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn package(id: Uuid, name: &str, sha256: &str) -> SkillPackage {
+        SkillPackage {
+            id,
+            name: name.into(),
+            version: "1.0.0".into(),
+            source_path: format!(r"C:\OmicsOps\skills\{id}"),
+            sha256: sha256.into(),
+            enabled: false,
+            capabilities: vec!["read_project_files".into()],
+            category: None,
         }
     }
-    packages[index].enabled = enabled;
-    repository
-        .save_skill_package(&packages[index])
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(packages[index].clone())
+
+    #[tokio::test]
+    async fn concurrent_same_name_enables_leave_exactly_one_winner() {
+        let store = Store::open_in_memory().await.unwrap();
+        let first = package(Uuid::new_v4(), "same-name", "sha-first");
+        let second = package(Uuid::new_v4(), "same-name", "sha-second");
+        store.save_skill_package(&first).await.unwrap();
+        store.save_skill_package(&second).await.unwrap();
+
+        let (left, right) = tokio::join!(
+            set_skill_enabled_in_repository(&store, first.id, true),
+            set_skill_enabled_in_repository(&store, second.id, true),
+        );
+        left.unwrap();
+        right.unwrap();
+        let stored = store.list_skill_packages().await.unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .filter(|skill| skill.name == "same-name" && skill.enabled)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_sha_imports_reuse_one_persisted_package() {
+        let store = Store::open_in_memory().await.unwrap();
+        let installed = InstalledSkillPackage {
+            name: "same-source".into(),
+            version: "1.0.0".into(),
+            sha256: "shared-source-sha".into(),
+            capabilities: vec!["read_project_files".into()],
+            install_path: PathBuf::from(r"C:\OmicsOps\skills\same-source"),
+        };
+
+        let (left, right) = tokio::join!(
+            persist_installed(&store, installed.clone(), false, None),
+            persist_installed(&store, installed, false, None),
+        );
+        let left = left.unwrap();
+        let right = right.unwrap();
+        assert_eq!(left.id, right.id);
+        let stored = store.list_skill_packages().await.unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .filter(|skill| skill.sha256 == "shared-source-sha")
+                .count(),
+            1
+        );
+    }
 }

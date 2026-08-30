@@ -178,3 +178,56 @@ async fn deleting_a_conversation_removes_its_persisted_mode_in_the_same_transact
             .unwrap();
     assert_eq!(after, 0);
 }
+
+#[tokio::test]
+async fn deleting_a_plan_locked_conversation_rolls_back_rows_and_mode() {
+    let (store, project, conversation, _) = fixture().await;
+    let run_id = Uuid::new_v4();
+    store
+        .start_plan_run_v4(
+            run_id,
+            project.id,
+            conversation.id,
+            "planning",
+            &json!({
+                "run_id": run_id,
+                "project_id": project.id,
+                "conversation_id": conversation.id,
+                "status": "planning"
+            }),
+            "keep this conversation locked",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+
+    let error = store
+        .delete_conversation(project.id, conversation.id)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("locked"), "{error}");
+    assert!(
+        store
+            .conversations_for_project(project.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|stored| stored.id == conversation.id)
+    );
+    assert_eq!(
+        store
+            .get_conversation_agent_mode(project.id, conversation.id)
+            .await
+            .unwrap(),
+        SessionAgentModeV4::Plan
+    );
+    assert_eq!(
+        store
+            .proposed_plan_revisions_v4(project.id, conversation.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(store.agent_run_v4(run_id).await.unwrap().is_some());
+}

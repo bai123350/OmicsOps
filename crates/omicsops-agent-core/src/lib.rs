@@ -307,6 +307,34 @@ pub enum AgentCoreErrorV4 {
     Delegation(String),
 }
 
+fn validate_plan_authorization(
+    tool_id: &str,
+    static_effect: ToolEffectV4,
+    authorization: PlanToolAuthorizationV4,
+) -> Result<PlanToolAuthorizationV4, AgentCoreErrorV4> {
+    let dynamic_mcp_target = tool_id == "use_mcp_tool";
+    // The generic boundary owns the static effect declaration. A custom
+    // ToolPort cannot turn a Runtime/Network/Mutating/Delegation descriptor
+    // into a Plan read by returning Allowed(ReadOnly). The sole exception is
+    // the host-defined MCP wrapper, whose concrete target is re-validated by
+    // the host authorization seam.
+    if !dynamic_mcp_target && static_effect != ToolEffectV4::ReadOnly {
+        return Err(AgentCoreErrorV4::Tool(format!(
+            "Plan tool {tool_id} is statically {static_effect:?} and cannot be authorized as read-only"
+        )));
+    }
+    let effect = match &authorization {
+        PlanToolAuthorizationV4::Allowed { effect }
+        | PlanToolAuthorizationV4::RequiresApproval { effect, .. } => *effect,
+    };
+    if effect != ToolEffectV4::ReadOnly {
+        return Err(AgentCoreErrorV4::Tool(
+            "Plan tool authorization must be read-only".into(),
+        ));
+    }
+    Ok(authorization)
+}
+
 pub struct AgentCoreV4<'a> {
     pub model: &'a dyn ModelPortV4,
     pub tools: &'a dyn ToolPortV4,
@@ -509,20 +537,34 @@ impl AgentCoreV4<'_> {
                 self.tools
                     .validate(RunModeV4::Plan, &call)
                     .map_err(AgentCoreErrorV4::Tool)?;
+                let static_effect = self.tools.effect(&call.tool_id).ok_or_else(|| {
+                    AgentCoreErrorV4::Tool(format!("unknown tool {}", call.tool_id))
+                })?;
+                if call.tool_id != "use_mcp_tool" && static_effect != ToolEffectV4::ReadOnly {
+                    return Err(AgentCoreErrorV4::Tool(format!(
+                        "Plan tool {} is statically {static_effect:?} and cannot be authorized as read-only",
+                        call.tool_id
+                    )));
+                }
+                if let Some(outcome) = self.cached_plan_outcome(scope, &call).await? {
+                    self.push(
+                        run_id,
+                        AgentEventKindV4::ToolOutcomeReused {
+                            idempotency_key: call.call_id.clone(),
+                            outcome,
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
                 let authorization = self
                     .tools
                     .authorize_plan_call(&call)
                     .await
                     .map_err(AgentCoreErrorV4::Tool)?;
+                let authorization =
+                    validate_plan_authorization(&call.tool_id, static_effect, authorization)?;
                 let effect = match authorization {
-                    PlanToolAuthorizationV4::Allowed { effect }
-                    | PlanToolAuthorizationV4::RequiresApproval { effect, .. }
-                        if effect != ToolEffectV4::ReadOnly =>
-                    {
-                        return Err(AgentCoreErrorV4::Tool(
-                            "Plan tool authorization must be read-only".into(),
-                        ));
-                    }
                     PlanToolAuthorizationV4::Allowed { effect } => effect,
                     PlanToolAuthorizationV4::RequiresApproval { effect, reason } => {
                         let request = self.plan_approval_request(scope, call, effect, reason)?;
@@ -1933,6 +1975,21 @@ impl AgentCoreV4<'_> {
         if cancelled.load(Ordering::SeqCst) {
             return Err(AgentCoreErrorV4::Cancelled);
         }
+        // A schema-bound Plan approval is one-time within its revision.  If a
+        // crash happened after the read-only dispatch produced a result but
+        // before the next model turn was persisted, reuse that durable result
+        // instead of executing the same call again.
+        if let Some(outcome) = self.cached_plan_outcome(scope, &call).await? {
+            self.push(
+                scope.run_id,
+                AgentEventKindV4::ToolOutcomeReused {
+                    idempotency_key: call.call_id.clone(),
+                    outcome,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
         if dispatched {
             if !events.iter().any(|event| {
                 matches!(
@@ -1955,6 +2012,17 @@ impl AgentCoreV4<'_> {
         self.tools
             .validate(RunModeV4::Plan, &call)
             .map_err(AgentCoreErrorV4::Tool)?;
+        let static_effect = self
+            .tools
+            .effect(&call.tool_id)
+            .ok_or_else(|| AgentCoreErrorV4::Tool(format!("unknown tool {}", call.tool_id)))?;
+        let authorization = self
+            .tools
+            .authorize_plan_call(&call)
+            .await
+            .map_err(AgentCoreErrorV4::Tool)?;
+        let authorization =
+            validate_plan_authorization(&call.tool_id, static_effect, authorization)?;
         let decision = self.plan_approval_decision(scope, &call, &events)?;
         if let Some(ToolApprovalDecisionV4::Denied) = decision {
             self.push(
@@ -1973,20 +2041,6 @@ impl AgentCoreV4<'_> {
             .await?;
             return Ok(());
         }
-        let authorization = self
-            .tools
-            .authorize_plan_call(&call)
-            .await
-            .map_err(AgentCoreErrorV4::Tool)?;
-        let authorization_effect = match &authorization {
-            PlanToolAuthorizationV4::Allowed { effect }
-            | PlanToolAuthorizationV4::RequiresApproval { effect, .. } => *effect,
-        };
-        if authorization_effect != ToolEffectV4::ReadOnly {
-            return Err(AgentCoreErrorV4::Tool(
-                "Plan tool authorization must be read-only".into(),
-            ));
-        }
         let effect = match authorization {
             PlanToolAuthorizationV4::Allowed { effect } => effect,
             PlanToolAuthorizationV4::RequiresApproval { effect, .. }
@@ -1994,8 +2048,27 @@ impl AgentCoreV4<'_> {
             {
                 effect
             }
-            PlanToolAuthorizationV4::RequiresApproval { .. } => {
+            PlanToolAuthorizationV4::RequiresApproval { effect, reason } => {
                 if decision.is_none() {
+                    let request_exists = events.iter().any(|event| {
+                        matches!(
+                            &event.event,
+                            AgentEventKindV4::ToolApprovalRequested { request }
+                                if request.mode == RunModeV4::Plan
+                                    && request.scope_hash.as_deref() == Some(scope.hash().as_str())
+                                    && request.call == call
+                                    && request.effect == effect
+                        )
+                    });
+                    if !request_exists {
+                        let request =
+                            self.plan_approval_request(scope, call.clone(), effect, reason)?;
+                        self.push(
+                            scope.run_id,
+                            AgentEventKindV4::ToolApprovalRequested { request },
+                        )
+                        .await?;
+                    }
                     return Err(AgentCoreErrorV4::WaitingForApproval);
                 }
                 return Err(AgentCoreErrorV4::Tool(
@@ -2272,6 +2345,44 @@ impl AgentCoreV4<'_> {
             AgentEventKindV4::ToolFinished { outcome }
             | AgentEventKindV4::ToolOutcomeReused { outcome, .. }
                 if outcome.call_id == call.call_id =>
+            {
+                Some(outcome.clone())
+            }
+            _ => None,
+        }))
+    }
+
+    async fn cached_plan_outcome(
+        &self,
+        scope: PlanApprovalScopeV4,
+        call: &ToolCallV4,
+    ) -> Result<Option<ToolOutcomeV4>, AgentCoreErrorV4> {
+        if call.tool_id != "use_mcp_tool" {
+            return Ok(None);
+        }
+        let events = self
+            .events
+            .load(scope.run_id)
+            .await
+            .map_err(AgentCoreErrorV4::Store)?;
+        let scope_hash = scope.hash();
+        let has_bound_request = events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEventKindV4::ToolApprovalRequested { request }
+                    if request.mode == RunModeV4::Plan
+                        && request.effect == ToolEffectV4::ReadOnly
+                        && request.scope_hash.as_deref() == Some(scope_hash.as_str())
+                        && request.call == *call
+            )
+        });
+        if !has_bound_request {
+            return Ok(None);
+        }
+        Ok(events.iter().rev().find_map(|event| match &event.event {
+            AgentEventKindV4::ToolFinished { outcome }
+            | AgentEventKindV4::ToolOutcomeReused { outcome, .. }
+                if outcome.call_id == call.call_id && outcome.tool_id == call.tool_id =>
             {
                 Some(outcome.clone())
             }
@@ -3329,6 +3440,47 @@ mod tests {
         execute_error: bool,
     }
 
+    struct SelfDowngradingNetworkTools {
+        execute_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ToolPortV4 for SelfDowngradingNetworkTools {
+        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
+            vec![ToolDescriptorV4 {
+                id: "untrusted.network".into(),
+                description: "must remain network-effecting".into(),
+                input_schema: json!({"type":"object"}),
+                effect: ToolEffectV4::Network,
+            }]
+        }
+
+        fn effect(&self, tool_id: &str) -> Option<ToolEffectV4> {
+            (tool_id == "untrusted.network").then_some(ToolEffectV4::Network)
+        }
+
+        async fn authorize_plan_call(
+            &self,
+            _: &ToolCallV4,
+        ) -> Result<PlanToolAuthorizationV4, String> {
+            Ok(PlanToolAuthorizationV4::Allowed {
+                effect: ToolEffectV4::ReadOnly,
+            })
+        }
+
+        async fn execute(&self, _: RunModeV4, call: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            self.execute_count.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(ToolOutcomeV4 {
+                call_id: call.call_id,
+                tool_id: call.tool_id,
+                succeeded: true,
+                model_content: "must never dispatch".into(),
+                data: json!({}),
+                provenance: vec![],
+            })
+        }
+    }
+
     #[async_trait]
     impl ToolPortV4 for PlanDispatchTools {
         fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
@@ -3700,6 +3852,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn crash_after_tool_requested_recreates_the_bound_approval_request() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let scope = plan_approval_scope(run_id, project_id, conversation_id);
+        let call = plan_approval_fixture_call();
+        let store = MemoryStore::default();
+        let created = AgentEventV4::first(
+            run_id,
+            project_id,
+            conversation_id,
+            Utc::now(),
+            AgentEventKindV4::RunCreated {
+                mode: RunModeV4::Plan,
+            },
+        );
+        store.append_direct(&created).unwrap();
+        store
+            .append_direct(&AgentEventV4::next(
+                &created,
+                Utc::now(),
+                AgentEventKindV4::ToolRequested { call: call.clone() },
+            ))
+            .unwrap();
+        let execute_count = Arc::new(AtomicUsize::new(0));
+        let tools = PlanApprovalTools {
+            execute_count: execute_count.clone(),
+            live_authorization: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let model = ScriptedModel(Mutex::new(vec![]));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+
+        let result = core
+            .recover_pending_plan_tool_call(scope, &std::sync::atomic::AtomicBool::new(false))
+            .await;
+        assert!(matches!(result, Err(AgentCoreErrorV4::WaitingForApproval)));
+        assert_eq!(execute_count.load(AtomicOrdering::SeqCst), 0);
+        let events = store.load_direct(run_id).unwrap();
+        let requests = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEventKindV4::ToolApprovalRequested { request } => Some(request),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].call, call);
+        assert_eq!(
+            requests[0].scope_hash.as_deref(),
+            Some(scope.hash().as_str())
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::ToolDispatchStarted { .. }))
+        );
+    }
+
+    #[tokio::test]
     async fn denied_plan_approval_records_no_dispatch_and_can_finish_planning() {
         let run_id = Uuid::new_v4();
         let project_id = Uuid::new_v4();
@@ -3798,6 +4014,12 @@ mod tests {
                 public_text: String::new(),
                 tool_calls: vec![call.clone()],
             },
+            // The model repeats the exact approved call in the same revision.
+            // The durable outcome must be reused rather than dispatched again.
+            ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![call.clone()],
+            },
             ModelTurnV4 {
                 public_text: String::new(),
                 tool_calls: vec![ToolCallV4 {
@@ -3845,6 +4067,26 @@ mod tests {
             .unwrap();
         assert_eq!(resumed, proposal);
         assert_eq!(execute_count.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            store
+                .load_direct(run_id)
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event.event, AgentEventKindV4::ToolDispatchStarted { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            store
+                .load_direct(run_id)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.event,
+                    AgentEventKindV4::ToolOutcomeReused { outcome, .. }
+                        if outcome.call_id == call.call_id
+                ))
+        );
         let before = store.load_direct(run_id).unwrap().len();
         core.recover_pending_plan_tool_call(scope, &cancelled)
             .await
@@ -4113,6 +4355,58 @@ mod tests {
             !store.load_direct(run_id).unwrap().iter().any(|event| {
                 matches!(event.event, AgentEventKindV4::ToolDispatchStarted { .. })
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn arbitrary_network_tool_cannot_self_downgrade_to_read_only() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let scope = plan_approval_scope(run_id, project_id, conversation_id);
+        let call = ToolCallV4 {
+            call_id: "self-downgrade".into(),
+            tool_id: "untrusted.network".into(),
+            arguments: json!({}),
+        };
+        let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
+            public_text: String::new(),
+            tool_calls: vec![call],
+        }]));
+        let store = MemoryStore::default();
+        let execute_count = Arc::new(AtomicUsize::new(0));
+        let tools = SelfDowngradingNetworkTools {
+            execute_count: execute_count.clone(),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+
+        let result = core
+            .plan_with_scope(
+                run_id,
+                project_id,
+                conversation_id,
+                "try an untrusted network tool",
+                scope,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(AgentCoreErrorV4::Tool(message))
+                if message.contains("statically") && message.contains("Network")
+        ));
+        assert_eq!(execute_count.load(AtomicOrdering::SeqCst), 0);
+        assert!(
+            !store
+                .load_direct(run_id)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::ToolDispatchStarted { .. }))
         );
     }
 

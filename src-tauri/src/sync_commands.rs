@@ -90,6 +90,12 @@ impl SyncProgressState {
     }
 }
 
+fn retain_latest_progress(entry: &mut SyncEntry, state: &SyncProgressState) {
+    entry.transferred_bytes = entry
+        .transferred_bytes
+        .max(state.latest_bytes.load(Ordering::Acquire));
+}
+
 struct SyncProgressPersistence {
     state: Arc<SyncProgressState>,
     worker: Option<JoinHandle<Result<(), String>>>,
@@ -116,14 +122,15 @@ impl SyncProgressPersistence {
         }
     }
 
-    async fn finish(mut self) -> Result<(), String> {
+    async fn finish(mut self) -> Result<u64, String> {
         self.state.closed.store(true, Ordering::Release);
         self.state.notify.notify_one();
         self.worker
             .take()
             .ok_or_else(|| "sync progress worker was already finished".to_owned())?
             .await
-            .map_err(|error| format!("sync progress worker failed: {error}"))?
+            .map_err(|error| format!("sync progress worker failed: {error}"))??;
+        Ok(self.state.latest_bytes.load(Ordering::Acquire))
     }
 }
 
@@ -314,13 +321,41 @@ async fn resume_download(
         .lock()
         .map_err(|_| "sync control lock poisoned")?
         .insert(entry.id, control.clone());
+    let progress = SyncProgressPersistence::start(state.repository.clone(), &entry);
+    let progress_state = progress.state.clone();
+    let callback_state = progress_state.clone();
+    let progress_app = app.clone();
+    let progress_entry = entry.clone();
     let outcome = session
-        .download_controlled_verified(&remote, &local, &entry.sha256, offset, control, |_| {})
+        .download_controlled_verified(
+            &remote,
+            &local,
+            &entry.sha256,
+            offset,
+            control,
+            move |bytes| {
+                let mut update = progress_entry.clone();
+                update.transferred_bytes = bytes;
+                update.updated_at = Utc::now();
+                callback_state.report(bytes);
+                let _ = progress_app.emit("artifact-event", &update);
+            },
+        )
         .await
         .map_err(|error| error.to_string());
-    match outcome {
+    let progress_result = progress.finish().await;
+    retain_latest_progress(&mut entry, &progress_state);
+    let terminal_result = match outcome {
         Ok(value) => finish_transfer(app, state, entry, value).await,
         Err(error) => fail_transfer(app, state, entry, error).await,
+    };
+    match (terminal_result, progress_result) {
+        (Ok(entry), Ok(_)) => Ok(entry),
+        (Ok(_), Err(progress_error)) => Err(progress_error),
+        (Err(terminal_error), Ok(_)) => Err(terminal_error),
+        (Err(terminal_error), Err(progress_error)) => Err(format!(
+            "{terminal_error}; sync progress persistence failed: {progress_error}"
+        )),
     }
 }
 
@@ -379,13 +414,34 @@ async fn resume_upload(
         .lock()
         .map_err(|_| "sync control lock poisoned")?
         .insert(entry.id, control.clone());
+    let progress = SyncProgressPersistence::start(state.repository.clone(), &entry);
+    let progress_state = progress.state.clone();
+    let callback_state = progress_state.clone();
+    let progress_app = app.clone();
+    let progress_entry = entry.clone();
     let outcome = session
-        .upload_file_controlled(&local, &remote, offset, control, |_| {})
+        .upload_file_controlled(&local, &remote, offset, control, move |bytes| {
+            let mut update = progress_entry.clone();
+            update.transferred_bytes = bytes;
+            update.updated_at = Utc::now();
+            callback_state.report(bytes);
+            let _ = progress_app.emit("artifact-event", &update);
+        })
         .await
         .map_err(|error| error.to_string());
-    match outcome {
+    let progress_result = progress.finish().await;
+    retain_latest_progress(&mut entry, &progress_state);
+    let terminal_result = match outcome {
         Ok(value) => finish_transfer(app, state, entry, value).await,
         Err(error) => fail_transfer(app, state, entry, error).await,
+    };
+    match (terminal_result, progress_result) {
+        (Ok(entry), Ok(_)) => Ok(entry),
+        (Ok(_), Err(progress_error)) => Err(progress_error),
+        (Err(terminal_error), Ok(_)) => Err(terminal_error),
+        (Err(terminal_error), Err(progress_error)) => Err(format!(
+            "{terminal_error}; sync progress persistence failed: {progress_error}"
+        )),
     }
 }
 
@@ -761,6 +817,7 @@ pub async fn upload_selected_files(
             .insert(entry.id, control.clone());
         let progress = SyncProgressPersistence::start(state.repository.clone(), &entry);
         let progress_state = progress.state.clone();
+        let callback_state = progress_state.clone();
         let progress_app = app.clone();
         let progress_entry = entry.clone();
         let outcome = session
@@ -768,20 +825,25 @@ pub async fn upload_selected_files(
                 let mut update = progress_entry.clone();
                 update.transferred_bytes = bytes;
                 update.updated_at = Utc::now();
-                progress_state.report(bytes);
+                callback_state.report(bytes);
                 let _ = progress_app.emit("artifact-event", &update);
             })
             .await
             .map_err(|error| error.to_string());
         let progress_result = progress.finish().await;
+        // `entry` predates the synchronous callback stream and still carries
+        // the initial offset.  Always copy the drained worker's latest value
+        // before terminal failure persistence so retry resumes from the
+        // verified partial upload rather than byte zero.
+        retain_latest_progress(&mut entry, &progress_state);
         let terminal_result = match outcome {
             Ok(value) => finish_transfer(&app, &state, entry, value).await,
             Err(error) => fail_transfer(&app, &state, entry, error).await,
         };
         let completed = match (terminal_result, progress_result) {
-            (Ok(completed), Ok(())) => completed,
+            (Ok(completed), Ok(_)) => completed,
             (Ok(_), Err(progress_error)) => return Err(progress_error),
-            (Err(terminal_error), Ok(())) => return Err(terminal_error),
+            (Err(terminal_error), Ok(_)) => return Err(terminal_error),
             (Err(terminal_error), Err(progress_error)) => {
                 return Err(format!(
                     "{terminal_error}; sync progress persistence failed: {progress_error}"
@@ -936,6 +998,7 @@ pub async fn download_project_file(
         .insert(entry.id, control.clone());
     let progress = SyncProgressPersistence::start(state.repository.clone(), &entry);
     let progress_state = progress.state.clone();
+    let callback_state = progress_state.clone();
     let progress_app = app.clone();
     let progress_entry = entry.clone();
     let outcome = session
@@ -949,21 +1012,25 @@ pub async fn download_project_file(
                 let mut update = progress_entry.clone();
                 update.transferred_bytes = bytes;
                 update.updated_at = Utc::now();
-                progress_state.report(bytes);
+                callback_state.report(bytes);
                 let _ = progress_app.emit("artifact-event", &update);
             },
         )
         .await
         .map_err(|error| error.to_string());
     let progress_result = progress.finish().await;
+    // Preserve the latest callback progress on failure; `entry` otherwise
+    // still contains the initial zero offset and would make retry restart
+    // from the beginning.
+    retain_latest_progress(&mut entry, &progress_state);
     let terminal_result = match outcome {
         Ok(value) => finish_transfer(&app, &state, entry, value).await,
         Err(error) => fail_transfer(&app, &state, entry, error).await,
     };
     entry = match (terminal_result, progress_result) {
-        (Ok(entry), Ok(())) => entry,
+        (Ok(entry), Ok(_)) => entry,
         (Ok(_), Err(progress_error)) => return Err(progress_error),
-        (Err(terminal_error), Ok(())) => return Err(terminal_error),
+        (Err(terminal_error), Ok(_)) => return Err(terminal_error),
         (Err(terminal_error), Err(progress_error)) => {
             return Err(format!(
                 "{terminal_error}; sync progress persistence failed: {progress_error}"
@@ -1129,5 +1196,51 @@ mod tests {
             .unwrap();
         assert_eq!(stored.state, SyncState::Synced);
         assert_eq!(stored.transferred_bytes, terminal.size_bytes);
+    }
+
+    async fn assert_failed_direction_retains_progress(direction: SyncDirection) {
+        let repository = Store::open_in_memory().await.unwrap();
+        let project_id = Uuid::new_v4();
+        repository
+            .save_project(&omicsops_core::workspace::Project::new(
+                project_id,
+                "sync failure progress",
+                "C:\\OmicsOps\\sync-failure-progress",
+                omicsops_core::workspace::ProjectTemplate::Blank,
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
+        let mut entry = test_sync_entry(project_id);
+        entry.direction = direction;
+        repository.save_sync_entry(&entry).await.unwrap();
+        let progress = SyncProgressPersistence::start(repository.clone(), &entry);
+        let progress_state = progress.state.clone();
+        progress_state.report(64);
+        progress.finish().await.unwrap();
+
+        retain_latest_progress(&mut entry, &progress_state);
+        entry.state = SyncState::Failed;
+        entry.error = Some("deterministic transfer failure".into());
+        repository.save_sync_entry(&entry).await.unwrap();
+        let stored = repository
+            .sync_entries_for_project(project_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == entry.id)
+            .unwrap();
+        assert_eq!(stored.state, SyncState::Failed);
+        assert_eq!(stored.transferred_bytes, 64);
+    }
+
+    #[tokio::test]
+    async fn upload_failure_retains_latest_persisted_progress() {
+        assert_failed_direction_retains_progress(SyncDirection::LocalToRemote).await;
+    }
+
+    #[tokio::test]
+    async fn download_failure_retains_latest_persisted_progress() {
+        assert_failed_direction_retains_progress(SyncDirection::RemoteToLocal).await;
     }
 }

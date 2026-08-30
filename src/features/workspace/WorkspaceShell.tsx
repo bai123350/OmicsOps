@@ -49,6 +49,8 @@ interface Props {
   onAgentModeChange?: (mode: SessionAgentModeV4) => Promise<void> | void;
   /** Snapshot-derived lock for the active conversation only. */
   conversationLocked?: boolean;
+  /** Initial conversation hydration is still restoring the durable mode/state. */
+  conversationHydrating?: boolean;
   /** Mutually excludes approve/request-changes/cancel plan actions. */
   planActionBusy?: boolean;
   v4Plan?: RunSummaryV4 | null;
@@ -112,7 +114,7 @@ interface Props {
 type ContextTab = "files" | "plan" | "preview" | "notebook" | "explore" | "runs";
 const AGENT_STALL_THRESHOLD_MS = 90_000;
 
-export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, conversations = [], activeConversationId, onSelectConversation, onNewConversation, onDeleteConversation, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, agentMode, onAgentModeChange, conversationLocked = false, planActionBusy = false, v4Plan, latestPlanRevision, computeBackends = [], computeBackendId = "", containerImage = "", autonomyMode = "supervised", approvalPolicy = "risk_based", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onApprovalPolicyChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onRequestPlanRevision, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, activeRunLastActivityAt, agentRunEventsV4 = [], onAnswerAgentQuestionV4, onDecideToolApprovalV4, onResolveUncertainV4, onResumeAgentRunV4, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
+export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, conversations = [], activeConversationId, onSelectConversation, onNewConversation, onDeleteConversation, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, agentMode, onAgentModeChange, conversationLocked = false, conversationHydrating = false, planActionBusy = false, v4Plan, latestPlanRevision, computeBackends = [], computeBackendId = "", containerImage = "", autonomyMode = "supervised", approvalPolicy = "risk_based", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onApprovalPolicyChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onRequestPlanRevision, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, activeRunLastActivityAt, agentRunEventsV4 = [], onAnswerAgentQuestionV4, onDecideToolApprovalV4, onResolveUncertainV4, onResumeAgentRunV4, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
   const t = copy[locale];
   const zh = locale === "zh-CN";
   const [tab, setTab] = useState<ContextTab>("files");
@@ -140,7 +142,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const controlledMode = agentMode !== undefined;
   const effectiveMode = agentMode ?? localMode;
   const planModeEnabled = effectiveMode === "plan";
-  const modeLocked = conversationLocked || planLoading || runStarted;
+  const modeLocked = conversationHydrating || conversationLocked || planLoading || runStarted;
   const imageFiles = (remoteFiles ?? []).filter((entry) => !entry.directory && isPreviewImage(entry.relative_path));
   const preview = <ArtifactPreview title={t.overview} locale={locale} images={imageFiles} selectedPath={selectedImagePath} preview={imagePreview} busy={previewBusy} error={previewError} onSelect={setSelectedImagePath} onLoad={loadImagePreview} />;
   const effectiveActiveRunId = activeRunId ?? (runStarted ? agentRunEventsV4.at(-1)?.run_id ?? null : null);
@@ -157,7 +159,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const runStalled = runActive && Number.isFinite(lastActivityMs) && watchdogNow - lastActivityMs > AGENT_STALL_THRESHOLD_MS;
   // A paused run still owns the conversation sequence. Keep the composer
   // locked while approval/input cards remain usable inside the run trace.
-  const composerDisabled = sendBusy || agentBusy || conversationLocked || (runStarted && !runFinished);
+  const composerDisabled = conversationHydrating || sendBusy || agentBusy || conversationLocked || (runStarted && !runFinished);
   const activeConversation = conversations.find((item) => item.id === activeConversationId);
   const conversationTitle = activeConversation?.title || (zh ? "新会话" : "New conversation");
   const historicalAgentRunEventsV4 = effectiveActiveRunId
@@ -283,7 +285,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
       <button className="rail-home" onClick={onBackToProjects} aria-label={zh ? "返回项目主页" : "Back to project home"}><ArrowLeft size={15} />{zh ? "返回项目主页" : "Project home"}</button>
       <button className="rail-search"><Search size={15} />{zh ? "搜索项目" : "Search projects"}</button>
       <div className="rail-section"><span>{zh ? "项目" : "Projects"}</span><button className="project-row active"><span className="project-glyph"><Database size={16} /></span><span><strong>{project.name}</strong><small>{t.status}</small></span><ChevronRight size={14} /></button></div>
-      <div className="rail-section sessions"><span>{zh ? "会话" : "Sessions"}</span><div className="session-list">{conversations.map((item) => { const title = item.title || (zh ? "新会话" : "New conversation"); const active = item.id === activeConversationId; const deleteDisabled = deletingConversationId !== null || (active && (agentBusy || runActive || conversationLocked)); return <div className={`session-entry ${active ? "active" : ""}`} key={item.id}><button className="session-row" aria-current={active ? "page" : undefined} onClick={() => void onSelectConversation?.(item.id)}><Sparkles size={15} /><span title={item.title}>{title}</span></button><button className="session-delete" aria-label={zh ? `删除会话：${title}` : `Delete conversation: ${title}`} title={zh ? "删除会话" : "Delete conversation"} disabled={deleteDisabled || !onDeleteConversation} onClick={() => void deleteConversation(item)}><Trash2 size={14} /></button></div>; })}</div><button className="new-session" disabled={agentBusy} onClick={() => void onNewConversation?.()}><MessageSquarePlus size={15} />{t.newConversation}</button></div>
+      <div className="rail-section sessions"><span>{zh ? "会话" : "Sessions"}</span><div className="session-list">{conversations.map((item) => { const title = item.title || (zh ? "新会话" : "New conversation"); const active = item.id === activeConversationId; const deleteDisabled = deletingConversationId !== null || conversationHydrating || conversationLocked || (active && (agentBusy || runActive)); return <div className={`session-entry ${active ? "active" : ""}`} key={item.id}><button className="session-row" aria-current={active ? "page" : undefined} onClick={() => void onSelectConversation?.(item.id)}><Sparkles size={15} /><span title={item.title}>{title}</span></button><button className="session-delete" aria-label={zh ? `删除会话：${title}` : `Delete conversation: ${title}`} title={zh ? "删除会话" : "Delete conversation"} disabled={deleteDisabled || !onDeleteConversation} onClick={() => void deleteConversation(item)}><Trash2 size={14} /></button></div>; })}</div><button className="new-session" disabled={conversationHydrating || agentBusy || conversationLocked} onClick={() => void onNewConversation?.()}><MessageSquarePlus size={15} />{t.newConversation}</button></div>
       <div className="rail-footer"><button onClick={() => onLocaleChange(zh ? "en-US" : "zh-CN")}><Languages size={16} />{zh ? "English" : "简体中文"}</button><button onClick={onOpenSettings}><Settings size={16} />{t.settings}</button></div>
     </nav>
 
@@ -331,7 +333,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
             <button className="send-button" disabled={composerDisabled || planLoading || !draft.trim() || Boolean(onSend && !computeReady)} onClick={send}><Send size={16} />{composerDisabled || planLoading ? (planModeEnabled ? (zh ? "规划中…" : "Planning…") : (zh ? "执行中…" : "Running…")) : t.send}</button>
           </div>
         </div>
-        <small>{planModeEnabled ? (zh ? "Plan 模式：计划显示在右侧，批准后才执行" : "Plan mode: review the plan on the right before execution") : computeReady ? (zh ? `Agent 模式：${selectedBackend?.descriptor.kind.toUpperCase()} · ${approvalPolicy === "request_approval" ? "请求批准" : approvalPolicy === "full_access" ? "完全访问" : "风险审批"}` : `Agent mode: ${selectedBackend?.descriptor.kind.toUpperCase()} · ${approvalPolicy}`) : onSend ? (zh ? "请选择一个可用的计算后端" : "Choose an available compute backend") : modelLabel ? `${zh ? "当前模型" : "Model"}: ${modelLabel}` : ""}</small>
+        <small>{conversationHydrating ? (zh ? "正在恢复会话模式和运行状态…" : "Restoring conversation mode and run state…") : planModeEnabled ? (zh ? "Plan 模式：计划显示在右侧，批准后才执行" : "Plan mode: review the plan on the right before execution") : computeReady ? (zh ? `Agent 模式：${selectedBackend?.descriptor.kind.toUpperCase()} · ${approvalPolicy === "request_approval" ? "请求批准" : approvalPolicy === "full_access" ? "完全访问" : "风险审批"}` : `Agent mode: ${selectedBackend?.descriptor.kind.toUpperCase()} · ${approvalPolicy}`) : onSend ? (zh ? "请选择一个可用的计算后端" : "Choose an available compute backend") : modelLabel ? `${zh ? "当前模型" : "Model"}: ${modelLabel}` : ""}</small>
       </footer>
     </main>
 

@@ -684,9 +684,11 @@ pub async fn agent_v4_start_planning(
             .cancel_plan_v4(record.project_id, record.conversation_id, record.run_id)
             .await
             .map_err(|error| error.to_string())?;
-        for event in &cancellation.events {
+        if let Some(error) = broadcast_events_best_effort(&cancellation.events, |event| {
             app.emit(AGENT_V4_EVENT_CHANNEL, event)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())
+        }) {
+            eprintln!("failed to broadcast committed V4 cancellation event: {error}");
         }
         return Err("V4 planning was cancelled".into());
     }
@@ -1077,6 +1079,25 @@ pub(crate) async fn cancel_active_run_for_command(
     Err("V4 run is not active".into())
 }
 
+pub(crate) async fn cancel_active_run_command_response<F>(
+    repository: &Store,
+    run_id: Uuid,
+    active_token: Option<Arc<AtomicBool>>,
+    emit: F,
+) -> Result<(), String>
+where
+    F: FnMut(&AgentEventV4) -> Result<(), String>,
+{
+    if let Some(cancellation) =
+        cancel_active_run_for_command(repository, run_id, active_token).await?
+    {
+        if let Some(error) = broadcast_events_best_effort(&cancellation.events, emit) {
+            eprintln!("failed to broadcast committed V4 cancellation event: {error}");
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn agent_v4_approve_plan(
     app: AppHandle,
@@ -1456,9 +1477,13 @@ pub async fn agent_v4_resume(
                         .cancel_plan_v4(record.project_id, record.conversation_id, record.run_id)
                         .await
                         .map_err(|error| error.to_string())?;
-                    for event in &cancellation.events {
-                        app.emit(AGENT_V4_EVENT_CHANNEL, event)
-                            .map_err(|error| error.to_string())?;
+                    if let Some(error) =
+                        broadcast_events_best_effort(&cancellation.events, |event| {
+                            app.emit(AGENT_V4_EVENT_CHANNEL, event)
+                                .map_err(|error| error.to_string())
+                        })
+                    {
+                        eprintln!("failed to broadcast committed V4 cancellation event: {error}");
                     }
                     return Err("V4 planning was cancelled".into());
                 }
@@ -1646,17 +1671,11 @@ pub async fn agent_v4_cancel(
         .map_err(|_| "active run registry unavailable".to_string())?
         .get(&run_id)
         .cloned();
-    if let Some(cancellation) =
-        cancel_active_run_for_command(&state.repository, run_id, active_token).await?
-    {
-        if let Some(error) = broadcast_events_best_effort(&cancellation.events, |event| {
-            app.emit(AGENT_V4_EVENT_CHANNEL, event)
-                .map_err(|error| error.to_string())
-        }) {
-            eprintln!("failed to broadcast committed V4 cancellation event: {error}");
-        }
-    }
-    Ok(())
+    cancel_active_run_command_response(&state.repository, run_id, active_token, |event| {
+        app.emit(AGENT_V4_EVENT_CHANNEL, event)
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -4095,20 +4114,23 @@ impl EventStoreV4 for RepositoryEventStoreV4 {
             .append_agent_event_v4_with_conversation(event)
             .await
             .map_err(|e| e.to_string())?;
-        self.app
-            .emit(AGENT_V4_EVENT_CHANNEL, event)
-            .map_err(|e| e.to_string())?;
+        // Persistence is the source of truth. A closed/stale Tauri listener
+        // must not make the agent retry a committed event or report a command
+        // failure; the next reconciliation/hydration reads it from Store.
+        if let Err(error) = self.app.emit(AGENT_V4_EVENT_CHANNEL, event) {
+            eprintln!("failed to broadcast committed V4 event: {error}");
+        }
         if let Some(message) = message {
-            self.app
-                .emit(
-                    "conversation-event",
-                    crate::agent_commands::ConversationEvent {
-                        project_id: message.project_id,
-                        conversation_id: message.conversation_id,
-                        message,
-                    },
-                )
-                .map_err(|e| e.to_string())?;
+            if let Err(error) = self.app.emit(
+                "conversation-event",
+                crate::agent_commands::ConversationEvent {
+                    project_id: message.project_id,
+                    conversation_id: message.conversation_id,
+                    message,
+                },
+            ) {
+                eprintln!("failed to broadcast committed conversation event: {error}");
+            }
         }
         Ok(())
     }

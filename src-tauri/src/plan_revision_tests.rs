@@ -19,9 +19,9 @@ use uuid::Uuid;
 use crate::agent_commands::persist_submitted_message;
 use crate::agent_v4::{
     ApprovePlanV4Request, PlanApprovalRunContext, approve_plan_revision_for_command,
-    begin_v4_plan_resume, cancel_active_run_for_command, ensure_v4_resume_allowed,
-    ensure_v4_start_allowed, plan_generation_is_active, request_plan_revision_command_response,
-    request_plan_revision_response,
+    begin_v4_plan_resume, cancel_active_run_command_response, cancel_active_run_for_command,
+    ensure_v4_resume_allowed, ensure_v4_start_allowed, plan_generation_is_active,
+    request_plan_revision_command_response, request_plan_revision_response,
 };
 use crate::conversation_mode::set_conversation_agent_mode_response;
 
@@ -128,6 +128,87 @@ async fn revision_request_command_emit_failure_does_not_hide_commit_or_block_res
     let generating = begin_v4_plan_resume(&store, run_id).await.unwrap();
     assert_eq!(generating.revision, 2);
     assert_eq!(generating.status, PlanRevisionStatusV4::Generating);
+}
+
+#[tokio::test]
+async fn cancellation_emit_failure_does_not_hide_the_durable_commit() {
+    let store = Store::open_in_memory().await.unwrap();
+    let project = Project::new(
+        Uuid::new_v4(),
+        "cancel emit project",
+        r"C:\data\cancel-emit",
+        ProjectTemplate::Blank,
+        Utc::now(),
+    );
+    store.save_project(&project).await.unwrap();
+    let conversation = Conversation::new(
+        Uuid::new_v4(),
+        project.id,
+        "cancel emit conversation",
+        Utc::now(),
+    );
+    store.save_conversation(&conversation).await.unwrap();
+    let run_id = Uuid::new_v4();
+    store
+        .start_plan_run_v4(
+            run_id,
+            project.id,
+            conversation.id,
+            "planning",
+            &json!({
+                "run_id": run_id,
+                "project_id": project.id,
+                "conversation_id": conversation.id,
+                "model_profile_id": Uuid::new_v4(),
+                "objective": "cancel after commit",
+                "status": "planning",
+                "plan": null,
+                "plan_hash": null,
+                "compute_selection": null,
+                "approval_hash": null,
+                "plan_revision": null,
+                "spec": null
+            }),
+            "cancel after commit",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let mut attempts = 0;
+    cancel_active_run_command_response(&store, run_id, None, |_event| {
+        attempts += 1;
+        Err("listener closed".into())
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(attempts, 1);
+    assert_eq!(
+        store.agent_run_v4(run_id).await.unwrap().unwrap()["status"],
+        "cancelled"
+    );
+    assert_eq!(
+        store
+            .latest_proposed_plan_revision_v4(project.id, conversation.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        PlanRevisionStatusV4::Cancelled
+    );
+    assert_eq!(
+        store
+            .get_conversation_agent_mode(project.id, conversation.id)
+            .await
+            .unwrap(),
+        SessionAgentModeV4::Plan
+    );
+    assert!(
+        !store
+            .is_conversation_locked_v4(project.id, conversation.id)
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]

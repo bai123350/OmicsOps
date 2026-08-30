@@ -1,6 +1,6 @@
 use chrono::Utc;
 use omicsops_core::workspace::{Conversation, Message, MessageRole, Project, ProjectTemplate};
-use omicsops_dto::{PlanRevisionStatusV4, ProposedPlanRevisionV4};
+use omicsops_dto::{PlanRevisionStatusV4, ProposedPlanRevisionV4, SessionAgentModeV4};
 use omicsops_protocol::{
     AgentEventKindV4, AgentEventV4, ExecutionPlanV4, PlanApprovalScopeV4, RunModeV4, RunSpecV4,
     ToolApprovalDecisionV4, ToolApprovalRequestV4, ToolCallV4, ToolEffectV4,
@@ -607,6 +607,270 @@ async fn cancel_keeps_plan_mode_and_unlocks_conversation() {
     );
 }
 
+async fn insert_stale_active_revision(
+    fixture: &Fixture,
+    run_id: Uuid,
+    revision: u64,
+    status: &str,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let stale_plan = plan("stale active revision");
+    sqlx::query(
+        "INSERT INTO proposed_plans
+         (id,project_id,frame_id,revision,plan_hash,status,plan_json,markdown,feedback,run_id,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL,?9,?10,?10)",
+    )
+    .bind(id.to_string())
+    .bind(fixture.project.id.to_string())
+    .bind(fixture.conversation.id.to_string())
+    .bind(i64::try_from(revision).unwrap())
+    .bind(stale_plan.canonical_hash().unwrap())
+    .bind(status)
+    .bind(serde_json::to_string(&stale_plan).unwrap())
+    .bind("# stale active revision")
+    .bind(run_id.to_string())
+    .bind(Utc::now().timestamp_millis())
+    .execute(fixture.store.pool())
+    .await
+    .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn approving_newest_revision_supersedes_stale_active_rows_and_unlocks() {
+    let fixture = fixture().await;
+    let run_id = Uuid::new_v4();
+    save_run(&fixture, run_id).await;
+    let latest = save_revision(
+        &fixture,
+        run_id,
+        2,
+        &plan("newest approval"),
+        PlanRevisionStatusV4::Pending,
+    )
+    .await;
+    let stale_id = insert_stale_active_revision(&fixture, run_id, 1, "revising").await;
+    assert!(
+        fixture
+            .store
+            .is_conversation_locked_v4(fixture.project.id, fixture.conversation.id)
+            .await
+            .unwrap()
+    );
+
+    let spec = minimal_spec(&fixture, run_id, &latest.plan);
+    fixture
+        .store
+        .approve_plan_revision_v4(
+            fixture.project.id,
+            fixture.conversation.id,
+            run_id,
+            latest.revision,
+            &latest.plan_hash,
+            &spec,
+            &json!({"status":"awaiting_approval"}),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fixture
+            .store
+            .proposed_plan_revision_v4(stale_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        PlanRevisionStatusV4::Superseded
+    );
+    assert!(
+        !fixture
+            .store
+            .is_conversation_locked_v4(fixture.project.id, fixture.conversation.id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .get_conversation_agent_mode(fixture.project.id, fixture.conversation.id)
+            .await
+            .unwrap(),
+        SessionAgentModeV4::Agent
+    );
+}
+
+#[tokio::test]
+async fn cancelling_newest_revision_supersedes_stale_active_rows_and_unlocks() {
+    let fixture = fixture().await;
+    let run_id = Uuid::new_v4();
+    let stale_run_id = Uuid::new_v4();
+    save_run(&fixture, run_id).await;
+    save_run(&fixture, stale_run_id).await;
+    let latest = save_revision(
+        &fixture,
+        run_id,
+        2,
+        &plan("newest cancellation"),
+        PlanRevisionStatusV4::Pending,
+    )
+    .await;
+    let stale_id = insert_stale_active_revision(&fixture, stale_run_id, 1, "generating").await;
+
+    fixture
+        .store
+        .cancel_plan_v4(fixture.project.id, fixture.conversation.id, run_id)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fixture
+            .store
+            .proposed_plan_revision_v4(latest.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        PlanRevisionStatusV4::Cancelled
+    );
+    assert_eq!(
+        fixture
+            .store
+            .proposed_plan_revision_v4(stale_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        PlanRevisionStatusV4::Superseded
+    );
+    assert!(
+        !fixture
+            .store
+            .is_conversation_locked_v4(fixture.project.id, fixture.conversation.id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .get_conversation_agent_mode(fixture.project.id, fixture.conversation.id)
+            .await
+            .unwrap(),
+        SessionAgentModeV4::Plan
+    );
+}
+
+#[tokio::test]
+async fn non_object_run_json_cannot_partially_finalize_or_cancel_a_plan() {
+    let fixture = fixture().await;
+    let rejected_run = Uuid::new_v4();
+    let start_error = fixture
+        .store
+        .start_plan_run_v4(
+            rejected_run,
+            fixture.project.id,
+            fixture.conversation.id,
+            "planning",
+            &json!("not an object"),
+            "reject malformed run JSON",
+            Utc::now(),
+        )
+        .await
+        .unwrap_err();
+    assert!(start_error.to_string().contains("object"), "{start_error}");
+    assert!(
+        fixture
+            .store
+            .agent_run_v4(rejected_run)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let run_id = Uuid::new_v4();
+    let generation = fixture
+        .store
+        .start_plan_run_v4(
+            run_id,
+            fixture.project.id,
+            fixture.conversation.id,
+            "planning",
+            &json!({
+                "run_id": run_id,
+                "project_id": fixture.project.id,
+                "conversation_id": fixture.conversation.id,
+                "status": "planning"
+            }),
+            "corrupt after start",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_runs_v4 SET value_json=?1 WHERE run_id=?2")
+        .bind(json!("corrupted run JSON").to_string())
+        .bind(run_id.to_string())
+        .execute(fixture.store.pool())
+        .await
+        .unwrap();
+    let proposal = plan("must not finalize");
+    let finalize_error = fixture
+        .store
+        .finalize_plan_revision_v4(
+            fixture.project.id,
+            fixture.conversation.id,
+            run_id,
+            generation.revision,
+            proposal.clone(),
+            "# must not finalize".into(),
+            proposal.canonical_hash().unwrap(),
+            Utc::now(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        finalize_error.to_string().contains("object"),
+        "{finalize_error}"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .proposed_plan_revision_v4(generation.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        PlanRevisionStatusV4::Generating
+    );
+    assert_eq!(
+        fixture.store.agent_run_v4(run_id).await.unwrap().unwrap(),
+        json!("corrupted run JSON")
+    );
+
+    let cancel_error = fixture
+        .store
+        .cancel_plan_v4(fixture.project.id, fixture.conversation.id, run_id)
+        .await
+        .unwrap_err();
+    assert!(
+        cancel_error.to_string().contains("object"),
+        "{cancel_error}"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .proposed_plan_revision_v4(generation.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        PlanRevisionStatusV4::Generating
+    );
+    assert_eq!(
+        fixture.store.agent_run_v4(run_id).await.unwrap().unwrap(),
+        json!("corrupted run JSON")
+    );
+}
+
 #[tokio::test]
 async fn revisions_survive_store_restart_without_rewriting_the_history() {
     let directory = tempfile::tempdir().unwrap();
@@ -809,6 +1073,14 @@ async fn plan_start_transaction_writes_run_and_generation_lock_together() {
             .unwrap()
             .len(),
         1
+    );
+    assert!(
+        fixture
+            .store
+            .agent_run_v4(second_run)
+            .await
+            .unwrap()
+            .is_none()
     );
 }
 
@@ -1569,6 +1841,13 @@ async fn reopening_repairs_a_pre_release_immutable_trigger_and_remains_idempoten
     pool.close().await;
 
     let reopened = Store::open(&path).await.unwrap();
+    let trigger_sql: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_proposed_plans_immutable_content'",
+    )
+    .fetch_one(reopened.pool())
+    .await
+    .unwrap();
+    assert!(trigger_sql.contains("OLD.status = 'generating'"));
     let generation = reopened
         .acquire_plan_revision_v4(
             project.id,
@@ -1594,13 +1873,6 @@ async fn reopening_repairs_a_pre_release_immutable_trigger_and_remains_idempoten
         .await
         .unwrap();
     assert_eq!(finalized.status, PlanRevisionStatusV4::Pending);
-    let trigger_sql: String = sqlx::query_scalar(
-        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_proposed_plans_immutable_content'",
-    )
-    .fetch_one(reopened.pool())
-    .await
-    .unwrap();
-    assert!(trigger_sql.contains("OLD.status = 'generating'"));
     drop(reopened);
     let repeated = Store::open(&path).await.unwrap();
     assert_eq!(repeated.schema_version().await.unwrap(), 4);
@@ -1618,6 +1890,69 @@ async fn reopening_repairs_a_pre_release_immutable_trigger_and_remains_idempoten
         .await
         .unwrap();
     assert!(fk_violations.is_empty());
+}
+
+#[tokio::test]
+async fn reopening_a_pre_release_plan_table_without_run_id_fails_contextually() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("missing-plan-run-id.sqlite3");
+    let store = Store::open(&path).await.unwrap();
+    sqlx::query("DROP TRIGGER trg_proposed_plans_immutable_content")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE proposed_plans")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE proposed_plans (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            frame_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            plan_hash TEXT NOT NULL,
+            status TEXT NOT NULL,
+            plan_json TEXT NOT NULL,
+            markdown TEXT NOT NULL,
+            feedback TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    drop(store);
+
+    let error = match Store::open(&path).await {
+        Ok(_) => panic!("pre-release table without run_id unexpectedly reopened"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("proposed_plans") && message.contains("run_id"),
+        "{message}"
+    );
+    assert!(!message.contains("no such column"), "{message}");
+
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&path)
+        .create_if_missing(false);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let columns = sqlx::query("PRAGMA table_info(proposed_plans)")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(
+        !columns
+            .iter()
+            .any(|row| row.get::<String, _>(1) == "run_id")
+    );
 }
 
 #[tokio::test]

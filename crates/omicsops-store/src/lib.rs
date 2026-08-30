@@ -648,6 +648,25 @@ impl Store {
             tx.rollback().await?;
             return Ok(false);
         }
+        // Conversation deletion is a destructive ordinary mutation. Check
+        // the lifecycle lock in this same transaction so a plan cannot win
+        // between the ownership check and the deletes below.
+        let locked: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM proposed_plans
+                WHERE project_id=?1 AND frame_id=?2
+                  AND status IN ('generating','revising','pending')
+            )",
+        )
+        .bind(&project_id)
+        .bind(&conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if locked != 0 {
+            return Err(StoreError::InvalidInput(
+                "conversation is locked by an active plan; approve, request changes, or cancel it first".into(),
+            ));
+        }
         sqlx::query(
             "DELETE FROM agent_context_archives_v4 WHERE run_id IN
              (SELECT run_id FROM agent_runs_v4 WHERE project_id=?1 AND conversation_id=?2)",
@@ -931,6 +950,90 @@ impl Store {
         Ok(())
     }
 
+    /// Atomically insert a content-addressed skill package, or return the
+    /// package that won a concurrent insert of the same source SHA.  The
+    /// immediate transaction serializes writers across the desktop process;
+    /// callers never need a read-then-insert race window.
+    pub async fn upsert_skill_package_by_sha(
+        &self,
+        skill: &SkillPackage,
+        enabled_by_default: bool,
+    ) -> Result<SkillPackage, StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut packages = skill_packages_in_tx(&mut tx).await?;
+        if let Some(index) = packages
+            .iter()
+            .position(|candidate| candidate.sha256 == skill.sha256)
+        {
+            let mut existing = packages[index].clone();
+            let mut changed = false;
+            if skill.category.is_some() && existing.category != skill.category {
+                existing.category = skill.category.clone();
+                changed = true;
+            }
+            if enabled_by_default {
+                for candidate in &mut packages {
+                    if candidate.name == existing.name && candidate.enabled {
+                        candidate.enabled = false;
+                        save_skill_package_in_tx(&mut tx, candidate).await?;
+                    }
+                }
+                existing.enabled = true;
+                changed = true;
+            }
+            if changed {
+                save_skill_package_in_tx(&mut tx, &existing).await?;
+            }
+            tx.commit().await?;
+            return Ok(existing);
+        }
+
+        let mut inserted = skill.clone();
+        inserted.enabled = enabled_by_default;
+        if enabled_by_default {
+            for candidate in &mut packages {
+                if candidate.name == inserted.name && candidate.enabled {
+                    candidate.enabled = false;
+                    save_skill_package_in_tx(&mut tx, candidate).await?;
+                }
+            }
+        }
+        save_skill_package_in_tx(&mut tx, &inserted).await?;
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    /// Atomically switch the enabled version for one skill name.  Skill
+    /// packages are intentionally stored as JSON, so the transaction loads
+    /// and rewrites the small control-plane set while holding SQLite's write
+    /// lock; this keeps same-name concurrent toggles single-writer safe.
+    pub async fn set_skill_enabled_atomic(
+        &self,
+        skill_id: Uuid,
+        enabled: bool,
+    ) -> Result<SkillPackage, StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut packages = skill_packages_in_tx(&mut tx).await?;
+        let index = packages
+            .iter()
+            .position(|skill| skill.id == skill_id)
+            .ok_or_else(|| StoreError::InvalidInput("skill package was not found".into()))?;
+        let target_name = packages[index].name.clone();
+        if enabled {
+            for candidate in &mut packages {
+                if candidate.name == target_name {
+                    candidate.enabled = false;
+                    save_skill_package_in_tx(&mut tx, candidate).await?;
+                }
+            }
+        }
+        packages[index].enabled = enabled;
+        let result = packages[index].clone();
+        save_skill_package_in_tx(&mut tx, &result).await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
     pub async fn list_skill_packages(&self) -> Result<Vec<SkillPackage>, StoreError> {
         self.simple_json_rows("skill_packages").await
     }
@@ -1081,6 +1184,11 @@ impl Store {
                 "plan generation objective cannot be empty".into(),
             ));
         }
+        if !value.is_object() {
+            return Err(StoreError::InvalidInput(
+                "planning run value must be a JSON object".into(),
+            ));
+        }
         let timestamp = timestamp(now);
         let stored_now = from_timestamp(timestamp, "plan revision timestamp")?;
         let mut connection = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -1179,10 +1287,11 @@ impl Store {
             .execute(&mut *connection)
             .await?;
             let mut stored_value = value.clone();
-            if let Some(object) = stored_value.as_object_mut() {
-                object.insert("status".into(), Value::String("planning".into()));
-                object.insert("plan_revision".into(), Value::from(revision));
-            }
+            let object = stored_value.as_object_mut().ok_or_else(|| {
+                StoreError::InvalidInput("planning run value must be a JSON object".into())
+            })?;
+            object.insert("status".into(), Value::String("planning".into()));
+            object.insert("plan_revision".into(), Value::from(revision));
             sqlx::query(
                 "UPDATE agent_runs_v4 SET status='planning',value_json=?,updated_at=? WHERE run_id=?3",
             )
@@ -1631,10 +1740,13 @@ impl Store {
             .fetch_one(&mut *connection)
             .await?;
             let mut value: Value = serde_json::from_str(&value_json)?;
-            if let Some(object) = value.as_object_mut() {
-                object.insert("status".into(), Value::String("planning".into()));
-                object.insert("plan_revision".into(), Value::from(revision));
-            }
+            let object = value.as_object_mut().ok_or_else(|| {
+                StoreError::InvalidInput(
+                    "plan resume requires agent_runs_v4.value_json to be a JSON object".into(),
+                )
+            })?;
+            object.insert("status".into(), Value::String("planning".into()));
+            object.insert("plan_revision".into(), Value::from(revision));
             sqlx::query(
                 "UPDATE agent_runs_v4 SET status='planning',value_json=?,updated_at=? WHERE run_id=?3",
             )
@@ -2853,13 +2965,12 @@ impl Store {
         ensure_run_owner_executor(&mut *tx, project_id, conversation_id, run_id).await?;
         let rows = sqlx::query(
             "SELECT id,project_id,frame_id,run_id,revision,plan_json,markdown,plan_hash,status,feedback,created_at,updated_at
-             FROM proposed_plans WHERE project_id=?1 AND frame_id=?2 AND run_id=?3
+             FROM proposed_plans WHERE project_id=?1 AND frame_id=?2
                AND status IN ('generating','revising','pending')
              ORDER BY revision DESC,id DESC",
         )
         .bind(project_id.to_string())
         .bind(conversation_id.to_string())
-        .bind(run_id.to_string())
         .fetch_all(&mut *tx)
         .await?;
         let current = rows
@@ -2921,6 +3032,11 @@ impl Store {
             ));
         }
         let current = current.expect("checked above");
+        if current.run_id != run_id {
+            return Err(StoreError::InvalidInput(
+                "only the newest active plan revision can be cancelled".into(),
+            ));
+        }
         let cancelled = sqlx::query(
             "UPDATE proposed_plans SET status='cancelled',updated_at=?1
              WHERE project_id=?2 AND frame_id=?3 AND run_id=?4
@@ -2937,11 +3053,28 @@ impl Store {
                 "plan changed before cancellation could be committed".into(),
             ));
         }
+        // Cancellation of the newest revision also closes any older active
+        // rows left by a recovered/imported database. Keeping those rows
+        // active would retain the conversation lock after the run is closed.
+        sqlx::query(
+            "UPDATE proposed_plans SET status='superseded',updated_at=?1
+             WHERE project_id=?2 AND frame_id=?3 AND id<>?4
+               AND status IN ('generating','revising','pending')",
+        )
+        .bind(timestamp(now))
+        .bind(project_id.to_string())
+        .bind(conversation_id.to_string())
+        .bind(current.id.to_string())
+        .execute(&mut *tx)
+        .await?;
         let mut persisted_value = load_agent_run_value_in_tx(&mut *tx, run_id).await?;
-        if let Some(object) = persisted_value.as_object_mut() {
-            object.insert("status".into(), Value::String("cancelled".into()));
-            object.insert("session_mode".into(), Value::String("plan".into()));
-        }
+        let object = persisted_value.as_object_mut().ok_or_else(|| {
+            StoreError::InvalidInput(
+                "plan cancellation requires agent_runs_v4.value_json to be a JSON object".into(),
+            )
+        })?;
+        object.insert("status".into(), Value::String("cancelled".into()));
+        object.insert("session_mode".into(), Value::String("plan".into()));
         sqlx::query(
             "UPDATE agent_runs_v4 SET status='cancelled',value_json=?,updated_at=? WHERE run_id=?3",
         )
@@ -3596,6 +3729,32 @@ impl Store {
     }
 }
 
+async fn skill_packages_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> Result<Vec<SkillPackage>, StoreError> {
+    let rows = sqlx::query("SELECT value_json FROM skill_packages ORDER BY id")
+        .fetch_all(&mut **tx)
+        .await?;
+    rows.into_iter()
+        .map(|row| Ok(serde_json::from_str(row.try_get::<String, _>(0)?.as_str())?))
+        .collect()
+}
+
+async fn save_skill_package_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    skill: &SkillPackage,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO skill_packages (id,value_json) VALUES (?1,?2)
+         ON CONFLICT(id) DO UPDATE SET value_json=excluded.value_json",
+    )
+    .bind(skill.id.to_string())
+    .bind(serde_json::to_string(skill)?)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn read_schema_version(path: &Path) -> Result<u32, StoreError> {
     let options = SqliteConnectOptions::new()
         .filename(path)
@@ -3706,6 +3865,18 @@ async fn repair_proposed_plans_schema(tx: &mut Transaction<'_, Sqlite>) -> Resul
     let columns = sqlx::query("PRAGMA table_info(proposed_plans)")
         .fetch_all(&mut **tx)
         .await?;
+    // A few pre-release v4 databases created this table before `run_id` was
+    // added.  Return a contextual migration error before any query references
+    // that missing column; this keeps the failure deterministic and leaves the
+    // pre-release table untouched for recovery.
+    if !columns.iter().any(|row| {
+        row.try_get::<String, _>(1)
+            .is_ok_and(|name| name == "run_id")
+    }) {
+        return Err(StoreError::Migration(
+            "proposed_plans is missing the required run_id column; cannot establish plan/run ownership safely".into(),
+        ));
+    }
     let run_id_required = columns.iter().any(|row| {
         row.try_get::<String, _>(1)
             .is_ok_and(|name| name == "run_id")
@@ -5167,20 +5338,23 @@ async fn finalize_plan_revision_v4_in_connection(
             .fetch_one(&mut *connection)
             .await?;
     let mut value: Value = serde_json::from_str(&value_json)?;
-    if let Some(object) = value.as_object_mut() {
-        object.insert("status".into(), Value::String("awaiting_approval".into()));
-        object.insert("plan".into(), serde_json::to_value(&plan)?);
-        object.insert("plan_hash".into(), Value::String(plan_hash.clone()));
-        object.insert("plan_revision".into(), Value::from(revision));
-        if let Some(approval_hash) = &options.approval_hash {
-            object.insert("approval_hash".into(), Value::String(approval_hash.clone()));
-        }
-        if let Some(compute_selection) = &options.compute_selection {
-            object.insert(
-                "compute_selection".into(),
-                serde_json::to_value(compute_selection)?,
-            );
-        }
+    let object = value.as_object_mut().ok_or_else(|| {
+        StoreError::InvalidInput(
+            "plan finalization requires agent_runs_v4.value_json to be a JSON object".into(),
+        )
+    })?;
+    object.insert("status".into(), Value::String("awaiting_approval".into()));
+    object.insert("plan".into(), serde_json::to_value(&plan)?);
+    object.insert("plan_hash".into(), Value::String(plan_hash.clone()));
+    object.insert("plan_revision".into(), Value::from(revision));
+    if let Some(approval_hash) = &options.approval_hash {
+        object.insert("approval_hash".into(), Value::String(approval_hash.clone()));
+    }
+    if let Some(compute_selection) = &options.compute_selection {
+        object.insert(
+            "compute_selection".into(),
+            serde_json::to_value(compute_selection)?,
+        );
     }
     sqlx::query(
         "UPDATE agent_runs_v4 SET status='awaiting_approval',value_json=?,updated_at=? WHERE run_id=?3",
@@ -5667,7 +5841,13 @@ async fn load_agent_run_value_in_tx(
         .bind(run_id.to_string())
         .fetch_one(&mut *tx)
         .await?;
-    Ok(serde_json::from_str(&value)?)
+    let value: Value = serde_json::from_str(&value)?;
+    if !value.is_object() {
+        return Err(StoreError::InvalidInput(format!(
+            "agent run {run_id} value_json must be a JSON object"
+        )));
+    }
+    Ok(value)
 }
 
 async fn set_agent_run_status_in_tx(
@@ -5676,9 +5856,12 @@ async fn set_agent_run_status_in_tx(
     status: &str,
 ) -> Result<(), StoreError> {
     let mut value = load_agent_run_value_in_tx(&mut *tx, run_id).await?;
-    if let Some(object) = value.as_object_mut() {
-        object.insert("status".into(), Value::String(status.into()));
-    }
+    let object = value.as_object_mut().ok_or_else(|| {
+        StoreError::InvalidInput(format!(
+            "agent run {run_id} value_json must be a JSON object"
+        ))
+    })?;
+    object.insert("status".into(), Value::String(status.into()));
     sqlx::query("UPDATE agent_runs_v4 SET status=?1,value_json=?2,updated_at=?3 WHERE run_id=?4")
         .bind(status)
         .bind(serde_json::to_string(&value)?)
