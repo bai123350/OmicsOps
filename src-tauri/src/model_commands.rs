@@ -9,6 +9,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::commands::AppState;
+use crate::model_catalog_shared::exact_model_supports_vision;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveModelProfileRequest {
@@ -38,16 +39,18 @@ pub fn model_profile_from_request(
         other => return Err(format!("unsupported model provider: {other}")),
     };
     let id = request.id.unwrap_or_else(Uuid::new_v4);
+    let model = request.model.trim().to_owned();
+    let supports_vision = exact_model_supports_vision(provider, &base_url, &model);
     Ok(ModelProfile {
         id,
         label: request.label.trim().into(),
         provider,
         base_url: base_url.to_string(),
-        model: request.model.trim().into(),
+        model,
         credential_reference: (provider != ModelProviderKind::Ollama)
             .then(|| credential_account("model", id)),
         supports_tools: true,
-        supports_vision: false,
+        supports_vision,
         context_window_tokens: request.context_window_tokens,
     })
 }
@@ -150,4 +153,49 @@ async fn client_for_profile(
         credential,
     )
     .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(provider: &str, base_url: &str, model: &str) -> SaveModelProfileRequest {
+        SaveModelProfileRequest {
+            id: None,
+            label: "vision test".into(),
+            provider: provider.into(),
+            base_url: base_url.into(),
+            model: model.into(),
+            credential: None,
+            context_window_tokens: None,
+        }
+    }
+
+    #[test]
+    fn vision_capability_requires_exact_provider_host_port_and_model_id() {
+        assert!(
+            model_profile_from_request(request(
+                "open_ai_compatible",
+                "https://api.openai.com/v1",
+                "gpt-4o"
+            ))
+            .unwrap()
+            .supports_vision
+        );
+        for candidate in [
+            request("open_ai_compatible", "https://gateway.example/v1", "gpt-4o"),
+            request(
+                "open_ai_compatible",
+                "https://api.openai.com/v1",
+                "gpt-4o-custom",
+            ),
+            request("anthropic", "https://api.openai.com/v1", "gpt-4o"),
+        ] {
+            assert!(
+                !model_profile_from_request(candidate)
+                    .unwrap()
+                    .supports_vision
+            );
+        }
+    }
 }

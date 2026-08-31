@@ -13,6 +13,9 @@ use tokio::sync::{Mutex, Semaphore};
 #[async_trait]
 pub trait ToolExecutorV4: Send + Sync {
     async fn execute(&self, call: &ToolCallV4) -> Result<ToolOutcomeV4, String>;
+    fn has_persistent_authorization(&self, _call: &ToolCallV4) -> bool {
+        false
+    }
     /// Dynamic authority for the generic MCP wrapper in Plan mode. Ordinary
     /// executors do not expose Network tools to planning; the desktop
     /// executor overrides this only after checking the concrete target.
@@ -92,11 +95,16 @@ impl ToolRegistryV4 {
             .definitions
             .get(&call.tool_id)
             .ok_or_else(|| ToolRegistryErrorV4::Unknown(call.tool_id.clone()))?;
-        let planning_allowed = definition.effect == ToolEffectV4::ReadOnly
-            || matches!(
-                call.tool_id.as_str(),
-                "agent.request_input" | "agent.propose_plan" | "use_mcp_tool"
-            );
+        let direct_only = matches!(
+            call.tool_id.as_str(),
+            "agent.route_request" | "agent.record_mcp_unavailable"
+        );
+        let planning_allowed = !direct_only
+            && (definition.effect == ToolEffectV4::ReadOnly
+                || matches!(
+                    call.tool_id.as_str(),
+                    "agent.request_input" | "agent.propose_plan" | "use_mcp_tool"
+                ));
         if mode == RunModeV4::Plan && !planning_allowed {
             return Err(ToolRegistryErrorV4::PlanModeDenied(call.tool_id.clone()));
         }
@@ -114,6 +122,8 @@ impl ToolRegistryV4 {
             return Err(ToolRegistryErrorV4::CapabilityDenied(call.tool_id.clone()));
         }
         validate_required(&definition.input_schema, &call.arguments)
+            .map_err(|error| ToolRegistryErrorV4::InvalidArguments(call.tool_id.clone(), error))?;
+        validate_browser_call(call)
             .map_err(|error| ToolRegistryErrorV4::InvalidArguments(call.tool_id.clone(), error))?;
         Ok(definition)
     }
@@ -162,11 +172,14 @@ impl ToolPortV4 for ToolRegistryV4 {
             .values()
             .filter(|definition| match mode {
                 RunModeV4::Plan => {
-                    definition.effect == ToolEffectV4::ReadOnly
+                    !matches!(
+                        definition.id.as_str(),
+                        "agent.route_request" | "agent.record_mcp_unavailable"
+                    ) && (definition.effect == ToolEffectV4::ReadOnly
                         || matches!(
                             definition.id.as_str(),
                             "agent.request_input" | "agent.propose_plan" | "use_mcp_tool"
-                        )
+                        ))
                 }
                 RunModeV4::Execute => {
                     definition.id != "agent.propose_plan"
@@ -192,6 +205,10 @@ impl ToolPortV4 for ToolRegistryV4 {
         self.authorize(mode, call)
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    fn has_persistent_authorization(&self, call: &ToolCallV4) -> bool {
+        self.executor.has_persistent_authorization(call)
     }
 
     async fn authorize_plan_call(
@@ -355,6 +372,60 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
             json!({"type":"object","required":["server_id","tool","arguments","schema_sha256"],"properties":{"server_id":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"},"catalog_sha256":{"type":"string","minLength":1},"schema_sha256":{"type":"string","minLength":1}}}),
         ),
         descriptor(
+            "agent.route_request",
+            "Classify the current ordinary Agent request before any task tool is used. Research retrieval includes papers, external databases, current web evidence, and cross-source verification",
+            ToolEffectV4::ReadOnly,
+            json!({"type":"object","required":["route","reason"],"properties":{"route":{"type":"string","enum":["research_retrieval","adaptive"]},"reason":{"type":"string","minLength":1}}}),
+        ),
+        descriptor(
+            "agent.record_mcp_unavailable",
+            "Record the structured reason that no discovered professional MCP can be called for this research retrieval",
+            ToolEffectV4::ReadOnly,
+            json!({"type":"object","required":["reason","searched_query","candidate_count"],"properties":{"reason":{"type":"string","minLength":1},"searched_query":{"type":"string","minLength":1},"candidate_count":{"type":"integer","minimum":0}}}),
+        ),
+        descriptor(
+            "browser_setup",
+            "Connect or launch the authorized OmicsOps real-browser bridge. This is never available in Plan mode and Full Access cannot bypass browser authorization",
+            ToolEffectV4::Network,
+            json!({"type":"object","required":["session"],"properties":{"session":{"type":"string","enum":["shared","workspace"]},"launch_if_needed":{"type":"boolean"}}}),
+        ),
+        descriptor(
+            "web_search",
+            "Search through the user's real browser and return the results tab identity. Never sends prompts to web AI services",
+            ToolEffectV4::Network,
+            json!({"type":"object","required":["session","query","provider"],"properties":{"session":{"type":"string","enum":["shared","workspace"]},"query":{"type":"string","minLength":1},"provider":{"type":"string","enum":["google","bing","duckduckgo"]}}}),
+        ),
+        descriptor(
+            "web_open_tab",
+            "Open one HTTP(S) URL in the authorized real browser and ledger the tab to the current run",
+            ToolEffectV4::Network,
+            json!({"type":"object","required":["session","url"],"properties":{"session":{"type":"string","enum":["shared","workspace"]},"url":{"type":"string","minLength":1}}}),
+        ),
+        descriptor(
+            "web_scan",
+            "Wait for page stability and return a structured scan. Re-scan after every navigation or material page change",
+            ToolEffectV4::Network,
+            json!({"type":"object","required":["session","tab_id","target_host","page_kind"],"properties":{"session":{"type":"string","enum":["shared","workspace"]},"tab_id":{"type":"integer"},"target_host":{"type":"string","minLength":1},"page_kind":{"type":"string","enum":["search_results","source"]}}}),
+        ),
+        descriptor(
+            "web_execute_js",
+            "Execute a bounded browser operation through tabs/CDP. Script source is size-limited and web AI prompting is forbidden",
+            ToolEffectV4::Network,
+            json!({"type":"object","required":["session","tab_id","target_host","script"],"properties":{"session":{"type":"string","enum":["shared","workspace"]},"tab_id":{"type":"integer"},"target_host":{"type":"string","minLength":1},"script":{"type":"string","maxLength":16000}}}),
+        ),
+        descriptor(
+            "web_screenshot",
+            "Capture a browser tab screenshot to the project without storing image bytes in SQLite",
+            ToolEffectV4::Network,
+            json!({"type":"object","required":["session","tab_id","target_host","relative_path"],"properties":{"session":{"type":"string","enum":["shared","workspace"]},"tab_id":{"type":"integer"},"target_host":{"type":"string","minLength":1},"relative_path":{"type":"string","minLength":1}}}),
+        ),
+        descriptor(
+            "web_save_assets",
+            "Copy browser-staged downloads to project-relative regular files and record size plus SHA-256",
+            ToolEffectV4::Network,
+            json!({"type":"object","required":["session","target_host","assets"],"properties":{"session":{"type":"string","enum":["shared","workspace"]},"target_host":{"type":"string","minLength":1},"assets":{"type":"array","minItems":1,"items":{"type":"object","required":["relative_path","source_url"],"properties":{"relative_path":{"type":"string","minLength":1},"source_url":{"type":"string","minLength":1}}}}}}),
+        ),
+        descriptor(
             "agent.request_input",
             "Request user input",
             ToolEffectV4::ReadOnly,
@@ -435,6 +506,138 @@ fn descriptor(
         input_schema,
         effect,
     }
+}
+
+fn validate_browser_call(call: &ToolCallV4) -> Result<(), String> {
+    fn concrete_host(value: &str) -> Result<String, String> {
+        let host = value.trim_end_matches('.').to_ascii_lowercase();
+        if value.trim() != value
+            || host.is_empty()
+            || host.len() > 253
+            || host.contains('*')
+            || !host.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '.' | '-')
+            })
+        {
+            return Err("target_host must be a concrete host".into());
+        }
+        Ok(host)
+    }
+
+    fn safe_url(value: &str) -> Result<url::Url, String> {
+        let parsed = url::Url::parse(value).map_err(|_| "browser URL is invalid")?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err("browser URL must be credential-free HTTP(S)".into());
+        }
+        if parsed
+            .query_pairs()
+            .any(|(key, _)| sensitive_browser_query_key(&key))
+        {
+            return Err("browser URL contains a sensitive query parameter".into());
+        }
+        Ok(parsed)
+    }
+
+    match call.tool_id.as_str() {
+        "web_open_tab" => {
+            safe_url(
+                call.arguments
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .ok_or("url is required")?,
+            )?;
+        }
+        "web_scan" | "web_screenshot" => {
+            concrete_host(
+                call.arguments
+                    .get("target_host")
+                    .and_then(Value::as_str)
+                    .ok_or("target_host is required")?,
+            )?;
+        }
+        "web_execute_js" => {
+            concrete_host(
+                call.arguments
+                    .get("target_host")
+                    .and_then(Value::as_str)
+                    .ok_or("target_host is required")?,
+            )?;
+            let script = call
+                .arguments
+                .get("script")
+                .and_then(Value::as_str)
+                .ok_or("script is required")?
+                .to_ascii_lowercase();
+            if [
+                "document.cookie",
+                "localstorage",
+                "sessionstorage",
+                "indexeddb",
+                "navigator.credentials",
+                "navigator.clipboard",
+                "fetch(",
+                "xmlhttprequest",
+                "sendbeacon",
+                "websocket",
+                "eventsource",
+            ]
+            .iter()
+            .any(|forbidden| script.contains(forbidden))
+            {
+                return Err("script requests a forbidden sensitive browser API".into());
+            }
+        }
+        "web_save_assets" => {
+            let target_host = concrete_host(
+                call.arguments
+                    .get("target_host")
+                    .and_then(Value::as_str)
+                    .ok_or("target_host is required")?,
+            )?;
+            for asset in call
+                .arguments
+                .get("assets")
+                .and_then(Value::as_array)
+                .ok_or("assets are required")?
+            {
+                let parsed = safe_url(
+                    asset
+                        .get("source_url")
+                        .and_then(Value::as_str)
+                        .ok_or("asset source_url is required")?,
+                )?;
+                if parsed.host_str().map(str::to_ascii_lowercase).as_deref()
+                    != Some(target_host.as_str())
+                {
+                    return Err("asset source_url does not match target_host".into());
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn sensitive_browser_query_key(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase().replace('-', "_");
+    matches!(normalized.as_str(), "access_token" | "api_key")
+        || normalized.split('_').any(|part| {
+            matches!(
+                part,
+                "auth"
+                    | "authorization"
+                    | "code"
+                    | "key"
+                    | "password"
+                    | "secret"
+                    | "signature"
+                    | "token"
+            )
+        })
 }
 
 #[cfg(test)]
@@ -534,6 +737,8 @@ mod tests {
         assert!(planning.contains("use_skill"));
         assert!(planning.contains("search_memory"));
         assert!(planning.contains("search_mcp_tools"));
+        assert!(!planning.contains("agent.route_request"));
+        assert!(!planning.contains("agent.record_mcp_unavailable"));
         // The generic MCP wrapper remains visible so the planner can request
         // a concrete target; its Network effect is dynamically gated by the
         // host rather than being treated as a permanently read-only tool.
@@ -550,6 +755,17 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("forbidden in plan mode"));
+        let route_error = registry
+            .validate(
+                RunModeV4::Plan,
+                &ToolCallV4 {
+                    call_id: "route".into(),
+                    tool_id: "agent.route_request".into(),
+                    arguments: json!({"route":"adaptive","reason":"not a direct run"}),
+                },
+            )
+            .unwrap_err();
+        assert!(route_error.contains("forbidden in plan mode"));
         let result = registry
             .execute(
                 RunModeV4::Plan,
@@ -562,6 +778,46 @@ mod tests {
             .await
             .unwrap();
         assert!(result.succeeded);
+    }
+
+    #[test]
+    fn browser_validation_rejects_credentials_sensitive_queries_and_browser_secrets() {
+        let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap();
+        for url in [
+            "https://user:secret@example.org/paper",
+            "https://example.org/paper?token=secret",
+            "https://example.org/paper?session_token=secret",
+        ] {
+            assert!(
+                registry
+                    .validate(
+                        RunModeV4::Execute,
+                        &ToolCallV4 {
+                            call_id: "unsafe-url".into(),
+                            tool_id: "web_open_tab".into(),
+                            arguments: json!({"session":"shared","url":url}),
+                        },
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            registry
+                .validate(
+                    RunModeV4::Execute,
+                    &ToolCallV4 {
+                        call_id: "unsafe-js".into(),
+                        tool_id: "web_execute_js".into(),
+                        arguments: json!({
+                            "session":"shared",
+                            "tab_id":1,
+                            "target_host":"example.org",
+                            "script":"return document.cookie"
+                        }),
+                    },
+                )
+                .is_err()
+        );
     }
 
     #[tokio::test]

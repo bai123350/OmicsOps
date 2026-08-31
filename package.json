@@ -8,7 +8,7 @@
     "build": "tsc -b && vite build",
     "build:desktop": "tauri build --bundles nsis",
     "tauri:dev": "tauri dev --config src-tauri/tauri.dev.conf.json",
-    "test": "vitest run",
+    "test": "vitest run && node --test browser-extension/tests/*.test.js",
     "test:watch": "vitest",
     "tauri": "tauri"
   },

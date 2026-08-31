@@ -418,7 +418,15 @@ export async function agentV4RequestPlanRevision(request: AgentV4RequestPlanRevi
 export async function agentV4Resume(runId: string): Promise<void> { await invoke("agent_v4_resume", { runId }); }
 export async function agentV4Cancel(runId: string): Promise<void> { await invoke("agent_v4_cancel", { runId }); }
 export async function agentV4Answer(runId: string, questionId: string, answer: string): Promise<void> { await invoke("agent_v4_answer", { request: { run_id: runId, question_id: questionId, answer } }); }
-export async function agentV4DecideToolApproval(runId: string, approvalId: string, callHash: string, decision: "approved" | "denied"): Promise<void> { await invoke("agent_v4_decide_tool_approval", { request: { run_id: runId, approval_id: approvalId, call_hash: callHash, decision } }); }
+export async function agentV4DecideToolApproval(runId: string, approvalId: string, callHash: string, decision: "approved" | "denied", browserScope?: import("./types").BrowserApprovalScopeV4): Promise<void> { await invoke("agent_v4_decide_tool_approval", { request: { run_id: runId, approval_id: approvalId, call_hash: callHash, decision, ...(browserScope ? { browser_scope: browserScope } : {}) } }); }
+
+export async function browserGetSettings(): Promise<import("./types").BrowserSettingsResponseV4> { return invoke("browser_get_settings"); }
+export async function browserSaveSettings(config: import("./types").BrowserConfigV4): Promise<import("./types").BrowserSettingsResponseV4> { return invoke("browser_save_settings", { config }); }
+export async function browserStatus(session: import("./types").BrowserSessionKindV4): Promise<import("./types").BrowserStatusV4> { return invoke("browser_status", { session }); }
+export async function browserSetup(session: import("./types").BrowserSessionKindV4, launchIfNeeded = true): Promise<import("./types").BrowserStatusV4> { return invoke("browser_setup", { session, launchIfNeeded }); }
+export async function browserCloseRunTabs(session: import("./types").BrowserSessionKindV4, runId: string): Promise<void> { await invoke("browser_close_run_tabs", { session, runId }); }
+export async function browserListAuthorizations(): Promise<import("./types").BrowserAuthorizationV4[]> { return invoke("browser_list_authorizations"); }
+export async function browserRevokeAuthorization(id: string): Promise<boolean> { return invoke("browser_revoke_authorization", { id }); }
 export async function agentV4ResolveUncertain(runId: string, callId: string, resolution: "side_effect_observed" | "side_effect_not_observed" | "compensated", evidence: string): Promise<void> { await invoke("agent_v4_resolve_uncertain", { request: { run_id: runId, call_id: callId, resolution, evidence } }); }
 export async function agentV4Events(runId: string): Promise<AgentRunEventV4[]> { return isTauri() ? invoke("agent_v4_events", { runId }) : []; }
 export async function agentV4EventsForConversation(projectId: string, conversationId: string): Promise<AgentRunEventV4[]> {

@@ -2989,6 +2989,43 @@ async fn terminal_middle_valid_hash_chain_is_rejected_on_load() {
 }
 
 #[tokio::test]
+async fn one_browser_cleanup_prompt_can_be_appended_after_terminal() {
+    let fixture = fixture().await;
+    let run_id = Uuid::new_v4();
+    save_run(&fixture, run_id).await;
+    let first = AgentEventV4::first(
+        run_id,
+        fixture.project.id,
+        fixture.conversation.id,
+        Utc::now(),
+        AgentEventKindV4::RunCreated {
+            mode: RunModeV4::Execute,
+        },
+    );
+    fixture.store.append_agent_event_v4(&first).await.unwrap();
+    let terminal = AgentEventV4::next(&first, Utc::now(), AgentEventKindV4::RunCancelled);
+    fixture
+        .store
+        .append_agent_event_v4(&terminal)
+        .await
+        .unwrap();
+    let cleanup = AgentEventV4::next(
+        &terminal,
+        Utc::now(),
+        AgentEventKindV4::BrowserTabCleanupRequired {
+            sessions: vec![omicsops_protocol::BrowserSessionKindV4::Shared],
+            tabs: vec![],
+            message: "confirm cleanup".into(),
+        },
+    );
+    fixture.store.append_agent_event_v4(&cleanup).await.unwrap();
+    assert_eq!(
+        fixture.store.agent_events_v4(run_id).await.unwrap().len(),
+        3
+    );
+}
+
+#[tokio::test]
 async fn resume_acquire_requires_revising_latest_revision_and_allocates_revision_two() {
     let fixture = fixture().await;
     let run_id = Uuid::new_v4();

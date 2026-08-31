@@ -1,5 +1,6 @@
 pub mod agent_commands;
 pub mod agent_v4;
+pub mod browser_commands;
 pub mod commands;
 pub mod conversation_mode;
 #[cfg(test)]
@@ -11,6 +12,7 @@ pub mod dto;
 mod dto_contract_tests;
 pub mod inspection;
 pub mod kernel_commands;
+mod model_catalog_shared;
 pub mod model_commands;
 pub mod p1_commands;
 #[cfg(test)]
@@ -56,6 +58,21 @@ pub fn run() {
             } else {
                 development_skills_root
             };
+            let packaged_browser_extension = app
+                .path()
+                .resource_dir()
+                .map_err(|error| error.to_string())?
+                .join("browser-extension");
+            let development_browser_extension = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("browser-extension");
+            let browser_extension_root = if packaged_browser_extension.is_dir() {
+                packaged_browser_extension
+            } else {
+                development_browser_extension
+            };
+            let browser =
+                omicsops_browser::BrowserRuntime::new(data_dir.clone(), browser_extension_root);
             let repository = tauri::async_runtime::block_on(async {
                 let repository = Store::open(data_dir.join("omicsops.db"))
                     .await
@@ -66,6 +83,18 @@ pub fn run() {
                     &bundled_skills_root,
                 )
                 .await?;
+                if let Some(value) = repository
+                    .browser_settings()
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    let config: omicsops_browser::BrowserConfig =
+                        serde_json::from_value(value).map_err(|error| error.to_string())?;
+                    browser
+                        .set_config(config)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
                 kernel_commands::mark_orphaned_kernels_interrupted(&repository).await?;
                 sync_commands::mark_orphaned_sync_transfers_failed(&repository).await?;
                 Ok::<_, String>(repository)
@@ -81,6 +110,7 @@ pub fn run() {
                 active_kernels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 project_kernel_queues: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 sync_controls: Arc::new(Mutex::new(HashMap::new())),
+                browser,
             });
             Ok(())
         })
@@ -106,6 +136,13 @@ pub fn run() {
             agent_v4::agent_v4_resolve_uncertain,
             agent_v4::agent_v4_events,
             agent_v4::agent_v4_events_for_conversation,
+            browser_commands::browser_get_settings,
+            browser_commands::browser_save_settings,
+            browser_commands::browser_status,
+            browser_commands::browser_setup,
+            browser_commands::browser_close_run_tabs,
+            browser_commands::browser_list_authorizations,
+            browser_commands::browser_revoke_authorization,
             p1_commands::search_agent_memory,
             p1_commands::list_notebook_entries,
             p1_commands::list_project_artifacts,

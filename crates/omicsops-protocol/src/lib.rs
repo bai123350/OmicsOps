@@ -130,6 +130,18 @@ impl ExecutionPlanV4 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RunExecutionKindV4 {
+    #[default]
+    ApprovedPlan,
+    OrdinaryAgent,
+}
+
+fn is_approved_plan_execution(value: &RunExecutionKindV4) -> bool {
+    *value == RunExecutionKindV4::ApprovedPlan
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RunSpecV4 {
     pub schema_version: u8,
@@ -140,6 +152,8 @@ pub struct RunSpecV4 {
     pub model_profile_id: Uuid,
     pub plan: ExecutionPlanV4,
     pub approved_plan_hash: String,
+    #[serde(default, skip_serializing_if = "is_approved_plan_execution")]
+    pub execution_kind: RunExecutionKindV4,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compute_selection: Option<ComputeSelectionV4>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,6 +186,7 @@ impl RunSpecV4 {
             model_profile_id,
             plan,
             approved_plan_hash: actual,
+            execution_kind: RunExecutionKindV4::ApprovedPlan,
             compute_selection: None,
             approval_hash: None,
             spec_hash: None,
@@ -235,6 +250,7 @@ impl RunSpecV4 {
             model_profile_id,
             plan,
             approved_plan_hash: plan_hash,
+            execution_kind: RunExecutionKindV4::ApprovedPlan,
             compute_selection: Some(selection),
             approval_hash: Some(expected),
             spec_hash: None,
@@ -244,8 +260,33 @@ impl RunSpecV4 {
         Ok(spec)
     }
 
+    pub fn freeze_ordinary_agent_with_compute(
+        run_id: Uuid,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        model_profile_id: Uuid,
+        plan: ExecutionPlanV4,
+        selection: ComputeSelectionV4,
+        approved_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Self, ProtocolErrorV4> {
+        let mut spec = Self::freeze_with_compute(
+            run_id,
+            project_id,
+            conversation_id,
+            model_profile_id,
+            plan,
+            selection,
+            approved_hash,
+            now,
+        )?;
+        spec.execution_kind = RunExecutionKindV4::OrdinaryAgent;
+        spec.spec_hash = Some(spec.calculate_spec_hash()?);
+        Ok(spec)
+    }
+
     pub fn calculate_spec_hash(&self) -> Result<String, ProtocolErrorV4> {
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "schema_version": self.schema_version,
             "runtime_id": self.runtime_id,
             "run_id": self.run_id,
@@ -258,6 +299,9 @@ impl RunSpecV4 {
             "approval_hash": self.approval_hash,
             "created_at": self.created_at,
         });
+        if self.execution_kind == RunExecutionKindV4::OrdinaryAgent {
+            value["execution_kind"] = serde_json::json!(self.execution_kind);
+        }
         Ok(hex::encode(Sha256::digest(
             serde_json::to_vec(&value).map_err(|_| ProtocolErrorV4::InvalidComputeSelection)?,
         )))
@@ -297,6 +341,87 @@ pub enum ToolEffectV4 {
     Runtime,
     Network,
     Delegation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRequestRouteV4 {
+    ResearchRetrieval,
+    Adaptive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserSessionKindV4 {
+    Shared,
+    Workspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserApprovalScopeV4 {
+    Once,
+    Conversation,
+    Project,
+    Global,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BrowserApprovalBindingV4 {
+    pub capability: String,
+    pub target_host: String,
+    pub session: BrowserSessionKindV4,
+    pub protocol_version: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BrowserAuthorizationV4 {
+    pub id: String,
+    pub scope: BrowserApprovalScopeV4,
+    pub binding: BrowserApprovalBindingV4,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<Uuid>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BrowserTabSummaryV4 {
+    pub session: BrowserSessionKindV4,
+    pub tab_id: u64,
+    pub run_id: Option<Uuid>,
+    pub title: String,
+    pub origin: String,
+    pub created_by_run: bool,
+}
+
+impl BrowserAuthorizationV4 {
+    pub fn validate(&self) -> Result<(), ProtocolErrorV4> {
+        let context_valid = match self.scope {
+            BrowserApprovalScopeV4::Once => {
+                self.project_id.is_some() && self.conversation_id.is_some()
+            }
+            BrowserApprovalScopeV4::Conversation => {
+                self.project_id.is_some() && self.conversation_id.is_some()
+            }
+            BrowserApprovalScopeV4::Project => {
+                self.project_id.is_some() && self.conversation_id.is_none()
+            }
+            BrowserApprovalScopeV4::Global => {
+                self.project_id.is_none() && self.conversation_id.is_none()
+            }
+        };
+        if self.id.trim().is_empty()
+            || self.binding.capability.trim().is_empty()
+            || self.binding.target_host.trim().is_empty()
+            || self.binding.protocol_version == 0
+            || !context_valid
+        {
+            return Err(ProtocolErrorV4::InvalidToolApproval);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -882,6 +1007,24 @@ pub enum AgentEventKindV4 {
         call_hash: String,
         decision: ToolApprovalDecisionV4,
     },
+    RequestRouted {
+        route: AgentRequestRouteV4,
+    },
+    BrowserConnectionRequired {
+        session: BrowserSessionKindV4,
+        protocol_version: u16,
+        message: String,
+    },
+    BrowserHumanInterventionRequired {
+        session: BrowserSessionKindV4,
+        reason: String,
+        message: String,
+    },
+    BrowserTabCleanupRequired {
+        sessions: Vec<BrowserSessionKindV4>,
+        tabs: Vec<BrowserTabSummaryV4>,
+        message: String,
+    },
     ToolDispatchStarted {
         call_id: String,
         tool_id: String,
@@ -1088,14 +1231,24 @@ pub fn validate_event_chain_v4(events: &[AgentEventV4]) -> Result<(), ProtocolEr
 }
 
 fn validate_terminal_position_v4(events: &[AgentEventV4]) -> Result<(), ProtocolErrorV4> {
-    for (index, event) in events.iter().enumerate() {
-        if is_terminal_event_kind_v4(&event.event)
-            && (index + 1 != events.len()
-                || events[..index]
-                    .iter()
-                    .any(|previous| is_terminal_event_kind_v4(&previous.event)))
-        {
-            return Err(ProtocolErrorV4::BrokenEventChain);
+    let mut terminal_seen = false;
+    let mut cleanup_seen = false;
+    for event in events {
+        if is_terminal_event_kind_v4(&event.event) {
+            if terminal_seen {
+                return Err(ProtocolErrorV4::BrokenEventChain);
+            }
+            terminal_seen = true;
+        } else if terminal_seen {
+            if cleanup_seen
+                || !matches!(
+                    event.event,
+                    AgentEventKindV4::BrowserTabCleanupRequired { .. }
+                )
+            {
+                return Err(ProtocolErrorV4::BrokenEventChain);
+            }
+            cleanup_seen = true;
         }
     }
     Ok(())
@@ -1119,7 +1272,6 @@ pub fn deserialize_event_chain_v4(
     serialized: &[String],
 ) -> Result<Vec<AgentEventV4>, ProtocolErrorV4> {
     let mut events: Vec<AgentEventV4> = Vec::with_capacity(serialized.len());
-    let serialized_len = serialized.len();
     for (index, serialized_event) in serialized.iter().enumerate() {
         let value: serde_json::Value = serde_json::from_str(serialized_event)
             .map_err(|_| ProtocolErrorV4::InvalidEventEncoding)?;
@@ -1157,15 +1309,9 @@ pub fn deserialize_event_chain_v4(
         {
             return Err(ProtocolErrorV4::BrokenEventChain);
         }
-        if events
-            .iter()
-            .any(|previous| is_terminal_event_kind_v4(&previous.event))
-            || (is_terminal_event_kind_v4(&event.event) && index + 1 != serialized_len)
-        {
-            return Err(ProtocolErrorV4::BrokenEventChain);
-        }
         events.push(event);
     }
+    validate_terminal_position_v4(&events)?;
     Ok(events)
 }
 
@@ -1316,6 +1462,35 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn one_browser_cleanup_prompt_may_follow_a_terminal_event() {
+        let first = AgentEventV4::first(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Utc::now(),
+            AgentEventKindV4::RunCreated {
+                mode: RunModeV4::Execute,
+            },
+        );
+        let terminal = AgentEventV4::next(&first, Utc::now(), AgentEventKindV4::RunCancelled);
+        let cleanup = AgentEventV4::next(
+            &terminal,
+            Utc::now(),
+            AgentEventKindV4::BrowserTabCleanupRequired {
+                sessions: vec![BrowserSessionKindV4::Shared],
+                tabs: vec![],
+                message: "confirm cleanup".into(),
+            },
+        );
+        let serialized = [&first, &terminal, &cleanup]
+            .into_iter()
+            .map(|event| serde_json::to_string(event).unwrap())
+            .collect::<Vec<_>>();
+        assert!(deserialize_event_chain_v4(&serialized).is_ok());
+        assert!(validate_event_chain_v4(&[first, terminal, cleanup]).is_ok());
+    }
+
     fn local_selection() -> ComputeSelectionV4 {
         ComputeSelectionV4 {
             schema_version: 4,
@@ -1377,6 +1552,101 @@ mod tests {
         let mut network = spec.clone();
         network.compute_selection.as_mut().unwrap().network_policy = NetworkPolicyV4::None;
         assert!(network.validate_integrity().is_err());
+    }
+
+    #[test]
+    fn ordinary_agent_execution_kind_is_serialized_and_tamper_evident() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let model_profile_id = Uuid::new_v4();
+        let plan = ExecutionPlanV4 {
+            schema_version: 4,
+            objective: "ordinary agent request".into(),
+            steps: vec!["route and execute adaptively".into()],
+            completion_criteria: vec!["host requirements satisfied".into()],
+            requested_capabilities: BTreeSet::new(),
+        };
+        let selection = local_selection();
+        let approval = RunSpecV4::approval_hash_for(
+            run_id,
+            project_id,
+            conversation_id,
+            model_profile_id,
+            &plan,
+            &selection,
+        )
+        .unwrap();
+        let spec = RunSpecV4::freeze_ordinary_agent_with_compute(
+            run_id,
+            project_id,
+            conversation_id,
+            model_profile_id,
+            plan,
+            selection,
+            &approval,
+            Utc::now(),
+        )
+        .unwrap();
+
+        assert_eq!(spec.execution_kind, RunExecutionKindV4::OrdinaryAgent);
+        assert_eq!(
+            serde_json::to_value(&spec).unwrap()["execution_kind"],
+            serde_json::json!("ordinary_agent")
+        );
+        assert!(spec.validate_integrity().is_ok());
+
+        let mut tampered = spec;
+        tampered.execution_kind = RunExecutionKindV4::ApprovedPlan;
+        assert_eq!(
+            tampered.validate_integrity(),
+            Err(ProtocolErrorV4::SpecHashMismatch)
+        );
+    }
+
+    #[test]
+    fn approved_plan_execution_kind_keeps_legacy_serialization_shape() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let model_profile_id = Uuid::new_v4();
+        let plan = ExecutionPlanV4 {
+            schema_version: 4,
+            objective: "approved plan".into(),
+            steps: vec!["execute frozen step".into()],
+            completion_criteria: vec!["verified".into()],
+            requested_capabilities: BTreeSet::new(),
+        };
+        let selection = local_selection();
+        let approval = RunSpecV4::approval_hash_for(
+            run_id,
+            project_id,
+            conversation_id,
+            model_profile_id,
+            &plan,
+            &selection,
+        )
+        .unwrap();
+        let spec = RunSpecV4::freeze_with_compute(
+            run_id,
+            project_id,
+            conversation_id,
+            model_profile_id,
+            plan,
+            selection,
+            &approval,
+            Utc::now(),
+        )
+        .unwrap();
+
+        assert_eq!(spec.execution_kind, RunExecutionKindV4::ApprovedPlan);
+        assert!(
+            serde_json::to_value(&spec)
+                .unwrap()
+                .get("execution_kind")
+                .is_none()
+        );
+        assert!(spec.validate_integrity().is_ok());
     }
 
     #[test]

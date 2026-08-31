@@ -19,7 +19,38 @@ pub type AgentResult<T> = Result<T, AgentError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelMessage {
     pub role: String,
-    pub content: String,
+    pub content: ModelMessageContent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ModelMessageContent {
+    Text(String),
+    Parts(Vec<ModelContentPart>),
+}
+
+impl From<String> for ModelMessageContent {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<&str> for ModelMessageContent {
+    fn from(value: &str) -> Self {
+        Self::Text(value.into())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ModelContentPart {
+    Text {
+        text: String,
+    },
+    Image {
+        media_type: String,
+        data_base64: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -19,9 +19,10 @@ use omicsops_core::{
 };
 use omicsops_dto::{PlanRevisionStatusV4, ProposedPlanRevisionV4, SessionAgentModeV4};
 use omicsops_protocol::{
-    AgentEventKindV4, AgentEventV4, ComputeSelectionV4, ContextArchiveV4, ContextCheckpointV4,
-    ExecutionPlanV4, PlanApprovalScopeV4, RunModeV4, RunSpecV4, ToolApprovalDecisionV4,
-    ToolApprovalRequestV4, ToolEffectV4, deserialize_event_chain_v4,
+    AgentEventKindV4, AgentEventV4, BrowserApprovalBindingV4, BrowserApprovalScopeV4,
+    BrowserAuthorizationV4, BrowserSessionKindV4, ComputeSelectionV4, ContextArchiveV4,
+    ContextCheckpointV4, ExecutionPlanV4, PlanApprovalScopeV4, RunModeV4, RunSpecV4,
+    ToolApprovalDecisionV4, ToolApprovalRequestV4, ToolEffectV4, deserialize_event_chain_v4,
 };
 use omicsops_science::ScientificStateV4;
 use serde::{Serialize, de::DeserializeOwned};
@@ -589,6 +590,196 @@ impl Store {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn browser_settings(&self) -> Result<Option<Value>, StoreError> {
+        let value = sqlx::query_scalar::<_, String>(
+            "SELECT value_json FROM settings WHERE scope='global' AND key='browser_v1'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        value
+            .map(|value| serde_json::from_str(&value).map_err(StoreError::from))
+            .transpose()
+    }
+
+    pub async fn save_browser_settings(&self, value: &Value) -> Result<(), StoreError> {
+        if !value.is_object() {
+            return Err(StoreError::InvalidInput(
+                "browser settings must be a JSON object".into(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO settings(scope,key,value_json,updated_at)
+             VALUES('global','browser_v1',?1,?2)
+             ON CONFLICT(scope,key) DO UPDATE SET
+               value_json=excluded.value_json,updated_at=excluded.updated_at",
+        )
+        .bind(serde_json::to_string(value)?)
+        .bind(timestamp(Utc::now()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn save_browser_authorization_v4(
+        &self,
+        authorization: &BrowserAuthorizationV4,
+    ) -> Result<(), StoreError> {
+        authorization
+            .validate()
+            .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+        if let (Some(project_id), Some(conversation_id)) =
+            (authorization.project_id, authorization.conversation_id)
+        {
+            self.ensure_conversation_owner(project_id, conversation_id)
+                .await?;
+        } else if let Some(project_id) = authorization.project_id {
+            let exists: i64 =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1)")
+                    .bind(project_id.to_string())
+                    .fetch_one(&self.pool)
+                    .await?;
+            if exists == 0 {
+                return Err(StoreError::InvalidInput(
+                    "browser authorization project does not exist".into(),
+                ));
+            }
+        }
+        let scope = match authorization.scope {
+            BrowserApprovalScopeV4::Once => "once",
+            BrowserApprovalScopeV4::Conversation => "conversation",
+            BrowserApprovalScopeV4::Project => "project",
+            BrowserApprovalScopeV4::Global => "global",
+        };
+        let session = match authorization.binding.session {
+            BrowserSessionKindV4::Shared => "shared",
+            BrowserSessionKindV4::Workspace => "workspace",
+        };
+        sqlx::query(
+            "INSERT INTO browser_authorizations_v4
+             (id,scope,capability,target_host,session,protocol_version,project_id,conversation_id,value_json,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(&authorization.id)
+        .bind(scope)
+        .bind(&authorization.binding.capability)
+        .bind(&authorization.binding.target_host)
+        .bind(session)
+        .bind(i64::from(authorization.binding.protocol_version))
+        .bind(authorization.project_id.map(|value| value.to_string()))
+        .bind(authorization.conversation_id.map(|value| value.to_string()))
+        .bind(serde_json::to_string(authorization)?)
+        .bind(authorization.created_at_ms)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_browser_authorizations_v4(
+        &self,
+    ) -> Result<Vec<BrowserAuthorizationV4>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT value_json FROM browser_authorizations_v4 ORDER BY created_at DESC,id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let value = row.try_get::<String, _>(0)?;
+                let authorization: BrowserAuthorizationV4 = serde_json::from_str(&value)?;
+                authorization
+                    .validate()
+                    .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+                Ok(authorization)
+            })
+            .collect()
+    }
+
+    pub async fn revoke_browser_authorization_v4(&self, id: &str) -> Result<bool, StoreError> {
+        if id.trim().is_empty() {
+            return Err(StoreError::InvalidInput(
+                "browser authorization id is empty".into(),
+            ));
+        }
+        Ok(
+            sqlx::query("DELETE FROM browser_authorizations_v4 WHERE id=?1")
+                .bind(id)
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+                != 0,
+        )
+    }
+
+    /// Check the binding immediately before browser dispatch. A once grant is
+    /// consumed in the same transaction, so duplicate calls cannot replay it.
+    pub async fn consume_browser_authorization_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        binding: &BrowserApprovalBindingV4,
+    ) -> Result<bool, StoreError> {
+        self.ensure_conversation_owner(project_id, conversation_id)
+            .await?;
+        let session = match binding.session {
+            BrowserSessionKindV4::Shared => "shared",
+            BrowserSessionKindV4::Workspace => "workspace",
+        };
+        // Serialize matching and consumption so two runs cannot both observe
+        // the same one-shot grant before either deletes it.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let project_id_text = project_id.to_string();
+        let conversation_id_text = conversation_id.to_string();
+        let rows = sqlx::query(
+            "SELECT id,scope,project_id,conversation_id
+             FROM browser_authorizations_v4
+             WHERE capability=?1 AND target_host=?2 AND session=?3 AND protocol_version=?4
+             ORDER BY CASE scope WHEN 'once' THEN 0 WHEN 'conversation' THEN 1 WHEN 'project' THEN 2 ELSE 3 END,
+                      created_at DESC,id",
+        )
+        .bind(&binding.capability)
+        .bind(&binding.target_host)
+        .bind(session)
+        .bind(i64::from(binding.protocol_version))
+        .fetch_all(&mut *tx)
+        .await?;
+        for row in rows {
+            let id = row.try_get::<String, _>(0)?;
+            let scope = row.try_get::<String, _>(1)?;
+            let row_project = row.try_get::<Option<String>, _>(2)?;
+            let row_conversation = row.try_get::<Option<String>, _>(3)?;
+            let matches = match scope.as_str() {
+                "once" | "conversation" => {
+                    row_project.as_deref() == Some(project_id_text.as_str())
+                        && row_conversation.as_deref() == Some(conversation_id_text.as_str())
+                }
+                "project" => {
+                    row_project.as_deref() == Some(project_id_text.as_str())
+                        && row_conversation.is_none()
+                }
+                "global" => row_project.is_none() && row_conversation.is_none(),
+                _ => false,
+            };
+            if !matches {
+                continue;
+            }
+            if scope == "once" {
+                let deleted = sqlx::query("DELETE FROM browser_authorizations_v4 WHERE id=?1")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+                if deleted != 1 {
+                    continue;
+                }
+            }
+            tx.commit().await?;
+            return Ok(true);
+        }
+        tx.commit().await?;
+        Ok(false)
     }
 
     async fn ensure_conversation_owner(
@@ -3200,7 +3391,9 @@ impl Store {
             return Ok(message);
         }
 
-        if existing.iter().any(is_terminal_event) {
+        if existing.iter().any(is_terminal_event)
+            && !post_terminal_browser_cleanup_allowed(&existing, event)
+        {
             return Err(StoreError::InvalidInput(
                 "V4 run event chain is terminal; no events may be appended".into(),
             ));
@@ -3268,10 +3461,95 @@ impl Store {
         expected_mode: RunModeV4,
         expected_scope_hash: Option<&str>,
     ) -> Result<AgentEventV4, StoreError> {
+        self.decide_tool_approval_v4_inner(
+            project_id,
+            conversation_id,
+            run_id,
+            approval_id,
+            call_hash,
+            decision,
+            binding_hash,
+            expected_mode,
+            expected_scope_hash,
+            None,
+        )
+        .await
+    }
+
+    /// Atomically persist an approved browser grant with its exact approval
+    /// decision. A caller can never observe a committed decision whose
+    /// requested durable browser scope was silently lost.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn decide_tool_approval_v4_with_browser_authorization(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        approval_id: &str,
+        call_hash: &str,
+        decision: ToolApprovalDecisionV4,
+        binding_hash: &str,
+        authorization: &BrowserAuthorizationV4,
+    ) -> Result<AgentEventV4, StoreError> {
+        self.decide_tool_approval_v4_inner(
+            project_id,
+            conversation_id,
+            run_id,
+            approval_id,
+            call_hash,
+            decision,
+            binding_hash,
+            RunModeV4::Execute,
+            None,
+            Some(authorization),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn decide_tool_approval_v4_inner(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+        approval_id: &str,
+        call_hash: &str,
+        decision: ToolApprovalDecisionV4,
+        binding_hash: &str,
+        expected_mode: RunModeV4,
+        expected_scope_hash: Option<&str>,
+        browser_authorization: Option<&BrowserAuthorizationV4>,
+    ) -> Result<AgentEventV4, StoreError> {
         if approval_id.trim().is_empty() || call_hash.trim().is_empty() {
             return Err(StoreError::InvalidInput(
                 "tool approval decision identifiers cannot be empty".into(),
             ));
+        }
+        if let Some(authorization) = browser_authorization {
+            authorization
+                .validate()
+                .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+            let context_matches = match authorization.scope {
+                BrowserApprovalScopeV4::Once | BrowserApprovalScopeV4::Conversation => {
+                    authorization.project_id == Some(project_id)
+                        && authorization.conversation_id == Some(conversation_id)
+                }
+                BrowserApprovalScopeV4::Project => {
+                    authorization.project_id == Some(project_id)
+                        && authorization.conversation_id.is_none()
+                }
+                BrowserApprovalScopeV4::Global => {
+                    authorization.project_id.is_none() && authorization.conversation_id.is_none()
+                }
+            };
+            if decision != ToolApprovalDecisionV4::Approved
+                || expected_mode != RunModeV4::Execute
+                || !context_matches
+            {
+                return Err(StoreError::InvalidInput(
+                    "browser authorization does not match the approved Execute context".into(),
+                ));
+            }
         }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result: Result<AgentEventV4, StoreError> = async {
@@ -3415,6 +3693,72 @@ impl Store {
                 return Err(StoreError::InvalidInput(
                     "tool approval request was already decided".into(),
                 ));
+            }
+            if let Some(authorization) = browser_authorization {
+                if decision != ToolApprovalDecisionV4::Approved {
+                    return Err(StoreError::InvalidInput(
+                        "browser authorization requires an approved tool decision".into(),
+                    ));
+                }
+                authorization
+                    .validate()
+                    .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+                let context_matches = match authorization.scope {
+                    BrowserApprovalScopeV4::Once | BrowserApprovalScopeV4::Conversation => {
+                        authorization.project_id == Some(project_id)
+                            && authorization.conversation_id == Some(conversation_id)
+                    }
+                    BrowserApprovalScopeV4::Project => {
+                        authorization.project_id == Some(project_id)
+                            && authorization.conversation_id.is_none()
+                    }
+                    BrowserApprovalScopeV4::Global => {
+                        authorization.project_id.is_none()
+                            && authorization.conversation_id.is_none()
+                    }
+                };
+                if !context_matches {
+                    return Err(StoreError::InvalidInput(
+                        "browser authorization scope does not match the approved run context"
+                            .into(),
+                    ));
+                }
+                if request.call.tool_id != authorization.binding.capability
+                    || !(request.call.tool_id == "browser_setup"
+                        || request.call.tool_id.starts_with("web_"))
+                {
+                    return Err(StoreError::InvalidInput(
+                        "browser authorization capability does not match the approved call".into(),
+                    ));
+                }
+                let scope = match authorization.scope {
+                    BrowserApprovalScopeV4::Once => "once",
+                    BrowserApprovalScopeV4::Conversation => "conversation",
+                    BrowserApprovalScopeV4::Project => "project",
+                    BrowserApprovalScopeV4::Global => "global",
+                };
+                let session = match authorization.binding.session {
+                    BrowserSessionKindV4::Shared => "shared",
+                    BrowserSessionKindV4::Workspace => "workspace",
+                };
+                sqlx::query(
+                    "INSERT INTO browser_authorizations_v4
+                     (id,scope,capability,target_host,session,protocol_version,project_id,conversation_id,value_json,created_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                     ON CONFLICT(id) DO NOTHING",
+                )
+                .bind(&authorization.id)
+                .bind(scope)
+                .bind(&authorization.binding.capability)
+                .bind(&authorization.binding.target_host)
+                .bind(session)
+                .bind(i64::from(authorization.binding.protocol_version))
+                .bind(authorization.project_id.map(|value| value.to_string()))
+                .bind(authorization.conversation_id.map(|value| value.to_string()))
+                .bind(serde_json::to_string(authorization)?)
+                .bind(authorization.created_at_ms)
+                .execute(&mut *tx)
+                .await?;
             }
             let previous = existing.last().ok_or_else(|| {
                 StoreError::InvalidInput("V4 run has no event chain".into())
@@ -6076,6 +6420,18 @@ fn is_terminal_event(event: &AgentEventV4) -> bool {
     )
 }
 
+fn post_terminal_browser_cleanup_allowed(existing: &[AgentEventV4], event: &AgentEventV4) -> bool {
+    matches!(
+        event.event,
+        AgentEventKindV4::BrowserTabCleanupRequired { .. }
+    ) && !existing.iter().any(|candidate| {
+        matches!(
+            candidate.event,
+            AgentEventKindV4::BrowserTabCleanupRequired { .. }
+        )
+    })
+}
+
 async fn insert_agent_event_in_tx(
     tx: &mut SqliteConnection,
     event: &AgentEventV4,
@@ -6085,7 +6441,9 @@ async fn insert_agent_event_in_tx(
         .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
     ensure_event_context(&mut *tx, event).await?;
     let existing = load_agent_events_in_tx(&mut *tx, event.run_id).await?;
-    if existing.iter().any(is_terminal_event) {
+    if existing.iter().any(is_terminal_event)
+        && !post_terminal_browser_cleanup_allowed(&existing, event)
+    {
         return Err(StoreError::InvalidInput(
             "V4 run event chain is terminal; no events may be appended".into(),
         ));

@@ -35,6 +35,7 @@ pub struct AppState {
     pub active_kernels: crate::kernel_commands::ActiveKernelMap,
     pub project_kernel_queues: Arc<tokio::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Semaphore>>>>,
     pub sync_controls: Arc<Mutex<HashMap<Uuid, Arc<AtomicU8>>>>,
+    pub browser: omicsops_browser::BrowserRuntime,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

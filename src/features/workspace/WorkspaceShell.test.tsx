@@ -234,6 +234,56 @@ describe("WorkspaceShell", () => {
     expect(decide).toHaveBeenCalledWith("run-approval", "approval-1", "c".repeat(64), "approved");
   });
 
+  it("binds browser approval scope and resumes the same run after a successful browser call", () => {
+    const decide = vi.fn();
+    const resume = vi.fn();
+    const base = { schema_version: 4 as const, run_id: "run-browser", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
+    const request = { approval_id: "approval-browser", call: { call_id: "call-browser", tool_id: "web_open_tab", arguments: { session: "workspace", url: "https://example.org/paper" } }, effect: "network" as const, reason: "需要访问独立来源", call_hash: "d".repeat(64) };
+    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-browser" onDecideToolApprovalV4={decide} onResumeAgentRunV4={resume} agentRunEventsV4={[
+      { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "tool_approval_requested" as const, request } },
+    ]} />);
+    fireEvent.change(screen.getByRole("combobox", { name: "浏览器授权范围" }), { target: { value: "project" } });
+    fireEvent.click(screen.getByRole("button", { name: "批准并继续" }));
+    expect(decide).toHaveBeenCalledWith("run-browser", "approval-browser", "d".repeat(64), "approved", "project");
+
+    const disconnected = [
+      { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "browser_connection_required" as const, session: "workspace" as const, protocol_version: 1, message: "connect the extension" } },
+    ];
+    rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-browser" onResumeAgentRunV4={resume} agentRunEventsV4={disconnected} />);
+    expect(screen.getByText(/等待连接浏览器 · 0 个步骤/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "已连接，继续" }));
+    expect(resume).toHaveBeenCalledWith("run-browser");
+
+    rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-browser" onResumeAgentRunV4={resume} agentRunEventsV4={[...disconnected,
+      { ...base, sequence: 3, occurred_at: "2026-08-17T00:00:02Z", event: { kind: "tool_finished" as const, outcome: { call_id: "call-search", tool_id: "web_search", succeeded: true, model_content: "searched", data: { tab_id: 10 }, provenance: [] } } },
+    ]} />);
+    expect(screen.getByText(/运行中 · 1 个步骤/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "已连接，继续" })).not.toBeInTheDocument();
+  });
+
+  it("keeps a terminal status when a tab-cleanup prompt follows it", () => {
+    const closeTabs = vi.fn();
+    const base = { schema_version: 4 as const, run_id: "run-cleanup", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-cleanup" onCloseBrowserRunTabsV4={closeTabs} agentRunEventsV4={[
+      { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "run_completed" as const } },
+      { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "browser_tab_cleanup_required" as const, sessions: ["workspace" as const], tabs: [{ session: "workspace" as const, tab_id: 10, run_id: "run-cleanup", title: "Paper", origin: "https://example.org", created_by_run: true }], message: "close run tabs" } },
+    ]} />);
+    expect(screen.getByText(/已完成 · 0 个步骤/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "关闭本轮标签" }));
+    expect(closeTabs).toHaveBeenCalledWith("run-cleanup", ["workspace"]);
+  });
+
+  it("pauses the same run for CAPTCHA intervention without claiming it was solved", () => {
+    const resume = vi.fn();
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-captcha" onResumeAgentRunV4={resume} agentRunEventsV4={[{
+      schema_version: 4, run_id: "run-captcha", project_id: project.id, conversation_id: "conversation-1", sequence: 1, occurred_at: "2026-08-17T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "browser_human_intervention_required", session: "workspace", reason: "captcha_detected", message: "CAPTCHA detected" },
+    }]} />);
+    expect(screen.getByText(/等待人工处理浏览器 · 0 个步骤/)).toBeInTheDocument();
+    expect(screen.getByText(/不会自动求解 CAPTCHA/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "已人工处理，继续" }));
+    expect(resume).toHaveBeenCalledWith("run-captcha");
+  });
+
   it("requires evidence before resolving an uncertain V4 dispatch", () => {
     const resolve = vi.fn();
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-uncertain" onResolveUncertainV4={resolve} agentRunEventsV4={[{

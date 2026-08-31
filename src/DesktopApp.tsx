@@ -954,7 +954,7 @@ export default function DesktopApp() {
         runActionGuards.current.delete(actionKey);
       }
     }}
-    onDecideToolApprovalV4={async (approvalRunId, approvalId, callHash, decision) => {
+    onDecideToolApprovalV4={async (approvalRunId, approvalId, callHash, decision, browserScope) => {
       const action = currentConversationAction;
       if (!action || !isCurrentConversationAction(action)) return;
       const actionKey = `approval:${action.token}:${approvalRunId}:${approvalId}`;
@@ -962,7 +962,7 @@ export default function DesktopApp() {
       runActionGuards.current.add(actionKey);
       setAgentNotice("");
       try {
-        await api.agentV4DecideToolApproval(approvalRunId, approvalId, callHash, decision);
+        await api.agentV4DecideToolApproval(approvalRunId, approvalId, callHash, decision, browserScope);
         await api.agentV4Resume(approvalRunId);
         if (!isCurrentConversationAction(action)) return;
         setRunId(approvalRunId);
@@ -974,6 +974,15 @@ export default function DesktopApp() {
         if (isCurrentConversationAction(action)) setAgentNotice(error instanceof Error ? error.message : String(error));
       } finally {
         runActionGuards.current.delete(actionKey);
+      }
+    }}
+    onCloseBrowserRunTabsV4={async (browserRunId, sessions) => {
+      setAgentNotice("");
+      try {
+        await Promise.all([...new Set(sessions)].map((session) => api.browserCloseRunTabs(session, browserRunId)));
+      } catch (error) {
+        setAgentNotice(error instanceof Error ? error.message : String(error));
+        throw error;
       }
     }}
     onResolveUncertainV4={async (uncertainRunId, callId, resolution, evidence) => {

@@ -4,6 +4,10 @@
 //! dependencies so it remains usable from native and `wasm32` consumers.
 
 use chrono::{DateTime, Utc};
+pub use omicsops_protocol::{
+    AgentRequestRouteV4, BrowserApprovalBindingV4, BrowserApprovalScopeV4, BrowserAuthorizationV4,
+    BrowserSessionKindV4, BrowserTabSummaryV4,
+};
 use omicsops_protocol::{ComputeSelectionV4, ExecutionPlanV4};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

@@ -3,7 +3,7 @@ use omicsops_adapters::llm::{
     build_provider_request_with_tools, parse_provider_tool_response_for_request,
 };
 use omicsops_agent::{
-    ModelMessage,
+    ModelContentPart, ModelMessage, ModelMessageContent,
     provider::{Provider, ProviderRequest, ProviderStreamEvent, ProviderToolSpec},
 };
 use serde_json::json;
@@ -30,6 +30,52 @@ fn request() -> ProviderRequest {
         ],
         require_strict_json_fallback: true,
     }
+}
+
+#[test]
+fn multimodal_messages_are_serialized_for_each_provider_protocol() {
+    let mut request = request();
+    request.messages = vec![ModelMessage {
+        role: "user".into(),
+        content: ModelMessageContent::Parts(vec![
+            ModelContentPart::Text {
+                text: "inspect screenshot".into(),
+            },
+            ModelContentPart::Image {
+                media_type: "image/png".into(),
+                data_base64: "aW1hZ2U=".into(),
+            },
+        ]),
+    }];
+    let openai = build_provider_request_with_tools(
+        ProviderProtocol::OpenAiCompatible,
+        Url::parse("https://example.test").unwrap(),
+        "vision-exact-id",
+        &request,
+    )
+    .unwrap();
+    assert_eq!(
+        openai.body["messages"][1]["content"][1]["type"],
+        "image_url"
+    );
+
+    let anthropic = build_provider_request_with_tools(
+        ProviderProtocol::Anthropic,
+        Url::parse("https://example.test").unwrap(),
+        "vision-exact-id",
+        &request,
+    )
+    .unwrap();
+    assert_eq!(anthropic.body["messages"][0]["content"][1]["type"], "image");
+
+    let ollama = build_provider_request_with_tools(
+        ProviderProtocol::Ollama,
+        Url::parse("http://localhost:11434").unwrap(),
+        "vision-exact-id",
+        &request,
+    )
+    .unwrap();
+    assert_eq!(ollama.body["messages"][1]["images"][0], "aW1hZ2U=");
 }
 
 #[test]

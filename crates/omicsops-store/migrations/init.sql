@@ -846,6 +846,19 @@ CREATE TABLE IF NOT EXISTS agent_context_archives_v4 (
     created_at INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS browser_authorizations_v4 (
+    id TEXT PRIMARY KEY CHECK (length(trim(id)) > 0),
+    scope TEXT NOT NULL CHECK (scope IN ('once','conversation','project','global')),
+    capability TEXT NOT NULL CHECK (length(trim(capability)) > 0),
+    target_host TEXT NOT NULL CHECK (length(trim(target_host)) > 0),
+    session TEXT NOT NULL CHECK (session IN ('shared','workspace')),
+    protocol_version INTEGER NOT NULL CHECK (protocol_version > 0),
+    project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+    conversation_id TEXT REFERENCES conversation_records(frame_id) ON DELETE CASCADE,
+    value_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS scientific_states_v4 (
     project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
     revision INTEGER NOT NULL CHECK (revision >= 0),
@@ -906,6 +919,8 @@ CREATE INDEX IF NOT EXISTS idx_agent_runs_context
     ON agent_runs_v4(project_id, conversation_id, run_id);
 CREATE INDEX IF NOT EXISTS idx_agent_events_context
     ON agent_events_v4(project_id, conversation_id, run_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_browser_authorizations_binding
+    ON browser_authorizations_v4(capability, target_host, session, protocol_version, scope);
 CREATE INDEX IF NOT EXISTS idx_proposed_plans_context_revision
     ON proposed_plans(project_id, frame_id, revision DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_proposed_plans_active

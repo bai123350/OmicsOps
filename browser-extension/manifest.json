@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "OmicsOps Browser Bridge",
+  "version": "0.1.0",
+  "description": "A local-only browser bridge for explicit OmicsOps research actions.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvtp/HskdX8XD6BA0cZX57uWHKy21v7oGBf6IS1o/vvVNefE6fqOvbQE49kamsJEMhFbmO2gkHv83YeY4JuY6OHcj6ysq/YPFYyRvXfN9co5M+LNvZplK5S1z/sNdcDBS2Tau65+r9W+X7QEUp4kdKcp+iVBBUiGmGEfdXxY3da3evBLoEL5af4s+J2DYX5Bfihl5sDkV27O6bKALeDdVlZLBKRmh8mlbxupF7LiIfOMoXGdlTblkbT+628Yg8JCEOBkR+WJ1Cwi6noiNm7VUHWoUc9TiZ2q+jaSW4QcTspfnPvnvx/t4B3Tv0MZI68ecmj+u2GX9hLlRhVob+Ij5OwIDAQAB",
+  "minimum_chrome_version": "109",
+  "permissions": [
+    "tabs",
+    "scripting",
+    "downloads",
+    "debugger",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "OmicsOps Browser Bridge"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "content-script.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src ws://127.0.0.1:18775 ws://127.0.0.1:18776"
+  }
+}

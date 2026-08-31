@@ -25,7 +25,22 @@
     "active": true,
     "targets": ["nsis", "msi"],
     "resources": {
-      "../skills/single-cell/": "skills/single-cell/"
+      "../skills/single-cell/": "skills/single-cell/",
+      "../browser-extension/asset-stager.js": "browser-extension/asset-stager.js",
+      "../browser-extension/chrome-api.js": "browser-extension/chrome-api.js",
+      "../browser-extension/command-router.js": "browser-extension/command-router.js",
+      "../browser-extension/content-script.js": "browser-extension/content-script.js",
+      "../browser-extension/execute-js-policy.js": "browser-extension/execute-js-policy.js",
+      "../browser-extension/manifest.json": "browser-extension/manifest.json",
+      "../browser-extension/protocol.js": "browser-extension/protocol.js",
+      "../browser-extension/README.md": "browser-extension/README.md",
+      "../browser-extension/search.js": "browser-extension/search.js",
+      "../browser-extension/service-worker.js": "browser-extension/service-worker.js",
+      "../browser-extension/session.html": "browser-extension/session.html",
+      "../browser-extension/session.js": "browser-extension/session.js",
+      "../browser-extension/tab-ledger.js": "browser-extension/tab-ledger.js",
+      "../browser-extension/url-policy.js": "browser-extension/url-policy.js",
+      "../browser-extension/websocket-client.js": "browser-extension/websocket-client.js"
     },
     "icon": []
   }

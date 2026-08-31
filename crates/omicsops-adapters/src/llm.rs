@@ -3,7 +3,7 @@ use futures_util::StreamExt;
 use omicsops_agent::provider::{
     Provider, ProviderRequest as ProviderModelRequest, ProviderStreamEvent,
 };
-use omicsops_agent::{AgentError, AgentResult};
+use omicsops_agent::{AgentError, AgentResult, ModelContentPart, ModelMessageContent};
 use schemars::{JsonSchema, schema_for};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -113,8 +113,8 @@ pub fn build_provider_request_with_tools(
     let messages = request
         .messages
         .iter()
-        .map(|message| json!({"role": message.role, "content": message.content}))
-        .collect::<Vec<_>>();
+        .map(|message| provider_message(protocol, &message.role, &message.content))
+        .collect::<AdapterResult<Vec<_>>>()?;
     let tool_aliases = provider_tool_aliases(request);
     let openai_tools = request
         .tools
@@ -184,6 +184,57 @@ pub fn build_provider_request_with_tools(
             }),
             requires_credential: false,
         }),
+    }
+}
+
+fn provider_message(
+    protocol: ProviderProtocol,
+    role: &str,
+    content: &ModelMessageContent,
+) -> AdapterResult<Value> {
+    let ModelMessageContent::Parts(parts) = content else {
+        let ModelMessageContent::Text(text) = content else {
+            unreachable!()
+        };
+        return Ok(json!({"role":role,"content":text}));
+    };
+    let mut text = String::new();
+    let mut images = Vec::new();
+    for part in parts {
+        match part {
+            ModelContentPart::Text { text: value } => text.push_str(value),
+            ModelContentPart::Image {
+                media_type,
+                data_base64,
+            } => images.push((media_type, data_base64)),
+        }
+    }
+    match protocol {
+        ProviderProtocol::OpenAiCompatible => Ok(json!({
+            "role":role,
+            "content":parts.iter().map(|part| match part {
+                ModelContentPart::Text { text } => json!({"type":"text","text":text}),
+                ModelContentPart::Image { media_type, data_base64 } => json!({
+                    "type":"image_url",
+                    "image_url":{"url":format!("data:{media_type};base64,{data_base64}")}
+                }),
+            }).collect::<Vec<_>>()
+        })),
+        ProviderProtocol::Anthropic => Ok(json!({
+            "role":role,
+            "content":parts.iter().map(|part| match part {
+                ModelContentPart::Text { text } => json!({"type":"text","text":text}),
+                ModelContentPart::Image { media_type, data_base64 } => json!({
+                    "type":"image",
+                    "source":{"type":"base64","media_type":media_type,"data":data_base64}
+                }),
+            }).collect::<Vec<_>>()
+        })),
+        ProviderProtocol::Ollama => Ok(json!({
+            "role":role,
+            "content":text,
+            "images":images.into_iter().map(|(_, data)| data).collect::<Vec<_>>()
+        })),
     }
 }
 

@@ -1,8 +1,9 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Bot, CheckCircle2, Cloud, FolderOpen, KeyRound, Layers3, LoaderCircle, Monitor, Server, ShieldCheck, Wrench, X, XCircle } from "lucide-react";
+import { Bot, CheckCircle2, Cloud, FolderOpen, Globe2, KeyRound, Layers3, LoaderCircle, Monitor, Server, ShieldCheck, Wrench, X, XCircle } from "lucide-react";
 import type { ConnectionProfile, ConnectionTestResult, McpEnvBinding, McpServerProfile, ModelProbeResult, ModelProfile, SkillPackage, WorkspaceProject } from "../../types";
 import type { Locale } from "../workspace/copy";
+import { BrowserSettings, useWindowEscapeLayer } from "./BrowserSettings";
 import "./settings.css";
 import "./model-form.css";
 import "./remote-form.css";
@@ -47,11 +48,12 @@ export function SettingsPanel({ locale, onClose, modelProfiles = [], onSaveModel
   const zh = locale === "zh-CN";
   const [form, setForm] = useState<FormState | null>(null);
   const [saving, setSaving] = useState(false);
-  const [section, setSection] = useState<"models" | "remote" | "skills">("models");
+  const [section, setSection] = useState<"models" | "remote" | "skills" | "browser">("models");
   const [skillsBusy, setSkillsBusy] = useState(false);
   const [skillError, setSkillError] = useState("");
   const [modelTests, setModelTests] = useState<Record<string, { state: "testing" | "success" | "error"; result?: ModelProbeResult; message?: string }>>({});
   const [modelChoices, setModelChoices] = useState<Record<string, string[]>>({});
+  useWindowEscapeLayer(true, onClose);
   const configure = (provider: ModelProfile["provider"]) => setForm({ ...defaults[provider] });
 
   async function saveProvider() {
@@ -102,7 +104,7 @@ export function SettingsPanel({ locale, onClose, modelProfiles = [], onSaveModel
   return <div className="settings-backdrop"><section className="settings-panel" role="dialog" aria-modal="true" aria-label={zh ? "工作台设置" : "Workspace settings"}>
     <header><div><small>OmicsOps Desktop</small><h2>{zh ? "工作台设置" : "Workspace settings"}</h2></div><button aria-label="Close" onClick={onClose}><X size={19} /></button></header>
     <div className="settings-layout">
-      <nav><button className={section === "models" ? "active" : ""} onClick={() => setSection("models")}><Bot size={16} />{zh ? "模型提供方" : "Model providers"}</button><button className={section === "remote" ? "active" : ""} onClick={() => setSection("remote")}><Server size={16} />{zh ? "远端计算" : "Remote compute"}</button><button className={section === "skills" ? "active" : ""} onClick={() => setSection("skills")}><Wrench size={16} />{zh ? "技能与 MCP" : "Skills and MCP"}</button><button><ShieldCheck size={16} />{zh ? "隐私与权限" : "Privacy and permissions"}</button></nav>
+      <nav><button className={section === "models" ? "active" : ""} onClick={() => setSection("models")}><Bot size={16} />{zh ? "模型提供方" : "Model providers"}</button><button className={section === "remote" ? "active" : ""} onClick={() => setSection("remote")}><Server size={16} />{zh ? "远端计算" : "Remote compute"}</button><button className={section === "skills" ? "active" : ""} onClick={() => setSection("skills")}><Wrench size={16} />{zh ? "技能与 MCP" : "Skills and MCP"}</button><button className={section === "browser" ? "active" : ""} onClick={() => setSection("browser")}><Globe2 size={16} />{zh ? "浏览器" : "Browser"}</button><button><ShieldCheck size={16} />{zh ? "隐私与权限" : "Privacy and permissions"}</button></nav>
       {section === "models" ? <main><div className="settings-heading"><h3>{zh ? "模型提供方" : "Model providers"}</h3><p>{zh ? "密钥保存在 Windows Credential Manager，项目只记录引用。" : "Keys stay in Windows Credential Manager; projects store references only."}</p></div>
         <div className="provider-grid">
           <Provider icon={Cloud} name="Anthropic" detail="Messages API · tool use" configured={modelProfiles.some((profile) => profile.provider === "anthropic")} onConfigure={() => configure("anthropic")} />
@@ -120,7 +122,7 @@ export function SettingsPanel({ locale, onClose, modelProfiles = [], onSaveModel
         </section>}
         {modelProfiles.length > 0 && <div className="configured-models">{modelProfiles.map((profile) => { const probe = modelTests[profile.id]; const choices = modelChoices[profile.id] ?? []; return <div key={profile.id}><span><b>{profile.label}</b><small>{profile.model} · {profile.provider}</small></span><button onClick={() => setForm({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model: profile.model, credential: "" })}>{zh ? "编辑" : "Edit"}</button><button disabled={!onListModels} onClick={() => void discoverModels(profile.id)}>{zh ? "可用模型" : "Models"}</button><button disabled={probe?.state === "testing" || !onProbeModel} onClick={() => void testModel(profile.id)}>{probe?.state === "testing" ? <><LoaderCircle className="spin" size={13} />{zh ? "测试中" : "Testing"}</> : (zh ? "测试" : "Test")}</button>{choices.length > 0 && <div className="model-choices"><small>{zh ? "网关当前可用，点击后保存：" : "Available now; click to edit:"}</small>{choices.map((model) => <button key={model} onClick={() => setForm({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model, credential: "" })}>{model}</button>)}</div>}{probe?.state === "success" && probe.result && <div className="model-probe-result success" role="status"><CheckCircle2 size={15} /><span><b>{zh ? "连接成功" : "Connection succeeded"}</b><small>{probe.result.model} · {probe.result.latency_ms} ms · {probe.result.endpoint}</small><code>{probe.result.response_preview}</code></span></div>}{probe?.state === "error" && <div className="model-probe-result error" role="alert"><XCircle size={15} /><span><b>{zh ? "测试失败" : "Test failed"}</b><small>{probe.message}</small></span></div>}</div>; })}</div>}
         <div className="settings-note"><ShieldCheck size={18} /><span><b>{zh ? "默认无遥测" : "Telemetry off by default"}</b><small>{zh ? "诊断包仅在主动导出时生成，并经过凭据脱敏。" : "Diagnostic bundles are generated only on export and redact credentials."}</small></span></div>
-      </main> : section === "remote" ? <RemoteSettings locale={locale} connections={connections} selectedProject={selectedProject} onSave={onSaveConnection} onTest={onTestConnection} onConfirm={onConfirmHostKey} onBind={onBindProjectRemote} /> : <SkillsAndMcpSettings locale={locale} skillPackages={skillPackages} skillsBusy={skillsBusy} skillError={skillError} onImportSkill={onImportSkill ? importSkill : undefined} onSetSkillEnabled={onSetSkillEnabled} mcpServers={mcpServers} selectedProject={selectedProject} onSaveMcpServer={onSaveMcpServer} onInspectMcpServer={onInspectMcpServer} onSetMcpServerEnabled={onSetMcpServerEnabled} onSetMcpLaunchApproval={onSetMcpLaunchApproval} onSetMcpToolApproval={onSetMcpToolApproval} onAddPubMedMcp={onAddPubMedMcp} />}
+      </main> : section === "remote" ? <RemoteSettings locale={locale} connections={connections} selectedProject={selectedProject} onSave={onSaveConnection} onTest={onTestConnection} onConfirm={onConfirmHostKey} onBind={onBindProjectRemote} /> : section === "skills" ? <SkillsAndMcpSettings locale={locale} skillPackages={skillPackages} skillsBusy={skillsBusy} skillError={skillError} onImportSkill={onImportSkill ? importSkill : undefined} onSetSkillEnabled={onSetSkillEnabled} mcpServers={mcpServers} selectedProject={selectedProject} onSaveMcpServer={onSaveMcpServer} onInspectMcpServer={onInspectMcpServer} onSetMcpServerEnabled={onSetMcpServerEnabled} onSetMcpLaunchApproval={onSetMcpLaunchApproval} onSetMcpToolApproval={onSetMcpToolApproval} onAddPubMedMcp={onAddPubMedMcp} /> : <BrowserSettings locale={locale} />}
     </div>
   </section></div>;
 }

@@ -1,4 +1,5 @@
 use crate::dto::{
+    BrowserApprovalBindingV4, BrowserApprovalScopeV4, BrowserAuthorizationV4, BrowserSessionKindV4,
     ConversationAgentStateV4, GetConversationAgentModeResponseV4, RunSummaryV4, SessionAgentModeV4,
     SetConversationAgentModeRequestV4,
 };
@@ -100,4 +101,32 @@ fn conversation_agent_state_contract_is_snake_case_and_backward_compatible() {
     .unwrap();
     assert_eq!(legacy.latest_plan_revision, None);
     assert_eq!(legacy.latest_run, None);
+}
+
+#[test]
+fn browser_authorization_contract_binds_scope_host_session_and_protocol() {
+    let value = json!({
+        "id":"grant",
+        "scope":"project",
+        "binding":{
+            "capability":"web_scan",
+            "target_host":"browser-session",
+            "session":"workspace",
+            "protocol_version":1
+        },
+        "project_id":Uuid::from_u128(7),
+        "created_at_ms":1
+    });
+    let grant: BrowserAuthorizationV4 = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(grant.scope, BrowserApprovalScopeV4::Project);
+    assert_eq!(
+        grant.binding,
+        BrowserApprovalBindingV4 {
+            capability: "web_scan".into(),
+            target_host: "browser-session".into(),
+            session: BrowserSessionKindV4::Workspace,
+            protocol_version: 1,
+        }
+    );
+    assert_eq!(serde_json::to_value(grant).unwrap(), value);
 }

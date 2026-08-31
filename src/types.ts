@@ -222,6 +222,14 @@ export interface ToolCallV4 { call_id: string; tool_id: string; arguments: Recor
 export interface ToolOutcomeV4 { call_id: string; tool_id: string; succeeded: boolean; model_content: string; data: unknown; provenance: string[] }
 export type ToolEffectV4 = "read_only" | "mutating" | "runtime" | "network" | "delegation";
 export interface ToolApprovalRequestV4 { approval_id: string; call: ToolCallV4; effect: ToolEffectV4; reason: string; call_hash: string }
+export type BrowserSessionKindV4 = "shared" | "workspace";
+export type BrowserApprovalScopeV4 = "once" | "conversation" | "project" | "global";
+export interface BrowserApprovalBindingV4 { capability: string; target_host: string; session: BrowserSessionKindV4; protocol_version: number }
+export interface BrowserAuthorizationV4 { id: string; scope: BrowserApprovalScopeV4; binding: BrowserApprovalBindingV4; project_id?: string; conversation_id?: string; created_at_ms: number }
+export interface BrowserConfigV4 { auto_launch: boolean; auto_close_turn_tabs: boolean; browser_path: string | null; default_search_provider: "default" | "google" | "bing" | "duckduckgo"; disabled_domains: string[]; preferred_domains: string[] }
+export interface BrowserStatusV4 { session: BrowserSessionKindV4; port: number; listening: boolean; connected: boolean; protocol_version: number; extension_id: string; capabilities: string[]; tab_summaries: BrowserTabSummaryV4[] }
+export interface BrowserTabSummaryV4 { session: BrowserSessionKindV4; tab_id: number; run_id?: string | null; title: string; origin: string; created_by_run: boolean }
+export interface BrowserSettingsResponseV4 { config: BrowserConfigV4; shared: BrowserStatusV4; workspace: BrowserStatusV4; extension_path: string }
 export interface CompletionProposalV4 {
   schema_version: number;
   summary: string;
@@ -235,6 +243,10 @@ export type AgentEventKindV4 =
   | { kind: "tool_requested"; call: ToolCallV4 }
   | { kind: "tool_approval_requested"; request: ToolApprovalRequestV4 }
   | { kind: "tool_approval_decided"; approval_id: string; call_hash: string; decision: "approved" | "denied" }
+  | { kind: "request_routed"; route: "research_retrieval" | "adaptive" }
+  | { kind: "browser_connection_required"; session: BrowserSessionKindV4; protocol_version: number; message: string }
+  | { kind: "browser_human_intervention_required"; session: BrowserSessionKindV4; reason: string; message: string }
+  | { kind: "browser_tab_cleanup_required"; sessions: BrowserSessionKindV4[]; tabs: BrowserTabSummaryV4[]; message: string }
   | { kind: "tool_dispatch_started"; call_id: string; tool_id: string; effect: string; idempotency_key: string }
   | { kind: "tool_finished"; outcome: ToolOutcomeV4 }
   | { kind: "tool_outcome_reused"; idempotency_key: string; outcome: ToolOutcomeV4 }
