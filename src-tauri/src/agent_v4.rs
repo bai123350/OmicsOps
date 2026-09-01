@@ -43,6 +43,7 @@ use omicsops_knowledge::{
     schema_digest, search_mcp_tools, search_memory, search_skills,
 };
 use omicsops_mcp::McpSessionManager;
+use omicsops_process::background_command;
 use omicsops_protocol::{
     AgentEventKindV4, AgentEventV4, AgentRequestRouteV4, ApprovalPolicyV4, AutonomyModeV4,
     BrowserApprovalBindingV4, BrowserApprovalScopeV4, BrowserAuthorizationV4, BrowserSessionKindV4,
@@ -69,7 +70,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Digest;
 use tauri::{AppHandle, Emitter, State};
-use tokio::{process::Command, sync::Mutex};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::commands::{
@@ -3353,7 +3354,7 @@ impl RuntimeEnvironmentPortV4 for ContainerEnvironmentPortV4 {
             return Err("container environment is frozen in the image".into());
         }
         let (executable, flag, code) = software_version_program(language, &requirements)?;
-        let output = Command::new(&self.program)
+        let output = background_command(&self.program)
             .args([
                 "run",
                 "--rm",
@@ -5047,7 +5048,7 @@ fn legacy_ssh_selection(project: &Project) -> Result<ComputeSelectionV4, String>
 }
 
 async fn program_available(program: &str) -> bool {
-    Command::new(program)
+    background_command(program)
         .arg("--version")
         .kill_on_drop(true)
         .output()
@@ -5059,7 +5060,7 @@ async fn inspect_container_image(program: &str, image: &str) -> (Option<String>,
     if image.trim().is_empty() || image.chars().any(char::is_whitespace) {
         return (None, Some("container image reference is invalid".into()));
     }
-    match Command::new(program)
+    match background_command(program)
         .args(container_image_inspect_args(image))
         .kill_on_drop(true)
         .output()
@@ -5254,7 +5255,7 @@ async fn software_versions_from_command(
     requirements: Vec<String>,
 ) -> Result<BTreeMap<String, String>, String> {
     let (program, flag, code) = software_version_program(language, &requirements)?;
-    let output = Command::new(program)
+    let output = background_command(program)
         .args([flag, &code])
         .output()
         .await

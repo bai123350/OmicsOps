@@ -3203,6 +3203,7 @@ dependencies = [
  "base64 0.22.1",
  "futures-util",
  "hex",
+ "omicsops-process",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3247,6 +3248,7 @@ dependencies = [
  "omicsops-dto",
  "omicsops-knowledge",
  "omicsops-mcp",
+ "omicsops-process",
  "omicsops-protocol",
  "omicsops-runtime",
  "omicsops-science",
@@ -3300,6 +3302,7 @@ name = "omicsops-mcp"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "omicsops-process",
  "rmcp",
  "schemars 1.2.2",
  "serde",
@@ -3309,6 +3312,13 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "omicsops-process"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]
@@ -3331,6 +3341,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "hex",
+ "omicsops-process",
  "omicsops-protocol",
  "serde_json",
  "sha2 0.10.9",

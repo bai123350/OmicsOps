@@ -14,6 +14,7 @@ required-features = ["test-fixtures"]
 
 [dependencies]
 hex.workspace = true
+omicsops-process = { path = "../omicsops-process" }
 rmcp.workspace = true
 schemars.workspace = true
 serde.workspace = true

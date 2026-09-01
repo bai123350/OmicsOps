@@ -27,6 +27,7 @@ omicsops-store = { path = "../crates/omicsops-store" }
 omicsops-knowledge = { path = "../crates/omicsops-knowledge" }
 omicsops-mcp = { path = "../crates/omicsops-mcp" }
 omicsops-browser = { path = "../crates/omicsops-browser" }
+omicsops-process = { path = "../crates/omicsops-process" }
 omicsops-tools = { path = "../crates/omicsops-tools" }
 reqwest.workspace = true
 rmcp.workspace = true

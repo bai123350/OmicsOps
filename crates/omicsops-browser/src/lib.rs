@@ -13,6 +13,7 @@ use std::{
 
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
+use omicsops_process::background_command;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -20,7 +21,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    process::{Child, Command},
+    process::Child,
     sync::{Mutex, mpsc, oneshot},
 };
 use tokio_tungstenite::{
@@ -726,7 +727,7 @@ impl BrowserRuntime {
         }
         let config = self.config().await;
         let executable = discover_browser(config.browser_path.as_deref())?;
-        let mut command = Command::new(executable);
+        let mut command = background_command(executable);
         command
             .arg("--no-first-run")
             .arg("--no-default-browser-check")

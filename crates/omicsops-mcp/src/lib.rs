@@ -16,6 +16,7 @@ use std::{
     time::Duration,
 };
 
+use omicsops_process::background_command;
 use rmcp::{
     ClientHandler, ServiceExt,
     model::{CallToolRequestParams, ClientInfo},
@@ -28,7 +29,6 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
-    process::Command,
     sync::{Mutex, OwnedMutexGuard, RwLock},
 };
 use uuid::Uuid;
@@ -562,7 +562,7 @@ impl McpSessionManager {
     async fn connect(&self, config: &McpServerConfig) -> Result<Arc<McpSession>, McpRuntimeError> {
         let stale = Arc::new(AtomicBool::new(false));
         let stderr_tail = Arc::new(Mutex::new(String::new()));
-        let mut command = Command::new(&config.command);
+        let mut command = background_command(&config.command);
         command.args(&config.args);
         if let Some(cwd) = config.cwd.as_deref() {
             command.current_dir(cwd);
