@@ -7,7 +7,7 @@ import {
   Search, Send, Settings, Shield, ShieldAlert, ShieldCheck, Sparkles, Square, Trash2, X,
 } from "lucide-react";
 import { copy, type Locale } from "./copy";
-import type { AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, BrowserApprovalScopeV4, ComputeBackendAvailabilityV4, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, MemoryFact, NotebookEntry, ProposedPlanRevisionV4, ProjectArtifact, ProjectImagePreview, RunSummaryV4, SessionAgentModeV4, SyncEntry, WorkspaceConversation } from "../../types";
+import type { AgentRunEventV4, AgentV4Phase, AgentV4Task, AgentV4TaskShape, ApprovalPolicyV4, AutonomyModeV4, BrowserApprovalScopeV4, ComputeBackendAvailabilityV4, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, MemoryFact, NotebookEntry, ProposedPlanRevisionV4, ProjectArtifact, ProjectImagePreview, RunSummaryV4, SessionAgentModeV4, SyncEntry, WorkspaceConversation } from "../../types";
 import { RemoteFileTree } from "./RemoteFileTree";
 import { KernelPanel } from "./KernelPanel";
 import { V4PlanPanel } from "./V4PlanPanel";
@@ -365,6 +365,9 @@ function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncer
   const progress = entries.filter(({ modelText }) => modelText !== undefined && modelText.trim());
   const technicalEntries = entries.filter(({ event, modelText }) => modelText === undefined && !isToolTrajectoryEvent(event) && !isHiddenTrajectoryEvent(event));
   const tools = mergeV4ToolCalls(events);
+  const guided = buildGuidedV4Overview(events);
+  const batchedCallIds = new Set(guided?.batches.flatMap((batch) => batch.callIds) ?? []);
+  const unbatchedTools = tools.filter((tool) => !batchedCallIds.has(tool.callId));
   const latest = events.at(-1);
   const terminal = effectiveTerminalAgentEventV4(events);
   const completionPending = !terminal && Boolean(latest && (
@@ -390,16 +393,17 @@ function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncer
     }
   }
   return <>
+    {guided && <GuidedV4Overview locale={locale} overview={guided} terminal={terminal} historical={historical} />}
     {progress.map(({ event, lastEvent, modelText }) => <article aria-label={zh ? "模型输出" : "Model output"} className="message assistant-message agent-work-update agent-public-progress" key={`${event.run_id}-${event.sequence}`}>
       <div className="assistant-avatar"><Bot size={17} /></div>
-      <div><div className="agent-work-heading"><strong>{zh ? "进度" : "Progress"}</strong><small>{new Date(lastEvent.occurred_at).toLocaleTimeString()}</small></div><MarkdownContent markdown={modelText ?? ""} /></div>
+      <div><div className="agent-work-heading"><strong>{guided ? (zh ? "思考摘要" : "Thought summary") : (zh ? "进度" : "Progress")}</strong>{guided && <span className="v4-public-summary-label">{zh ? "公开摘要" : "Public summary"}</span>}<small>{new Date(lastEvent.occurred_at).toLocaleTimeString()}</small></div><MarkdownContent markdown={modelText ?? ""} /></div>
     </article>)}
     {completionPending && <div className="agent-completion-pending" role="status"><span className="agent-working"><i />{zh ? "正在核验最终结果…" : "Verifying the final result…"}</span></div>}
     <details className={`agent-run-fold agent-v4-run ${historical ? "" : "is-active"}`} open={shouldExpand}>
     <summary><span className="agent-run-fold-title"><span><b>{zh ? "执行过程" : "Process"}</b><small>{terminal ? (zh ? "工具调用与验证记录" : "Tool calls and verification") : (zh ? "Agent 正在处理任务" : "Agent is working")}</small></span><ChevronRight size={15} /></span><span>{status} · {tools.length} {zh ? "个步骤" : tools.length === 1 ? "step" : "steps"}</span></summary>
     <div className="agent-run-fold-body">
-      {tools.length > 0 && <section className="v4-tool-traces" aria-label={zh ? "工具调用详情" : "Tool call details"}>
-        {tools.map((tool) => <details className="v4-tool-trace" key={tool.callId}>
+      {unbatchedTools.length > 0 && <section className="v4-tool-traces" aria-label={zh ? "工具调用详情" : "Tool call details"}>
+        {unbatchedTools.map((tool) => <details className="v4-tool-trace" key={tool.callId}>
           <summary className="v4-tool-trace-heading"><ChevronRight size={13} /><strong>{toolDisplayLabel(tool.toolId, zh)}</strong>{tool.subject && <span className="v4-tool-subject">{tool.subject}</span>}<span className={`v4-tool-status ${tool.status}`}>{toolStatusLabel(tool.status, zh)}</span></summary>
           <div className="v4-tool-trace-body">
             <small>{tool.toolId} · #{tool.firstSequence}–#{tool.lastSequence}</small>
@@ -408,7 +412,7 @@ function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncer
           </div>
         </details>)}
       </section>}
-      {technicalEntries.map(({ event, lastEvent }) => <article className="message assistant-message agent-work-update" key={`${event.run_id}-${event.sequence}`}>
+      {technicalEntries.map(({ event, lastEvent }) => <article className={`message assistant-message agent-work-update ${event.event.kind === "input_requested" ? "v4-input-decision-entry" : ""}`} key={`${event.run_id}-${event.sequence}`}>
         <div className="assistant-avatar"><Bot size={17} /></div>
         <div><div className="agent-work-heading"><strong>{v4EventLabel(event, zh)}</strong><small>{lastEvent.sequence === event.sequence ? `#${event.sequence}` : `#${event.sequence}–#${lastEvent.sequence}`} · {new Date(lastEvent.occurred_at).toLocaleTimeString()}</small></div>
           {v4EventContent(event, zh) && <MarkdownContent markdown={v4EventContent(event, zh)} />}
@@ -431,6 +435,210 @@ function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncer
     </details>
   </>;
 }
+const GUIDED_V4_PHASES: AgentV4Phase[] = ["routing", "discovery", "clarification", "organizing", "executing", "verifying"];
+type GuidedTaskList = { revision: number; changeSummary: string; tasks: AgentV4Task[] };
+type GuidedCycle = { cycleId: number; startedAt?: string; finishedAt?: string };
+type GuidedToolBatch = {
+  batchId: number;
+  cycleId: number;
+  phase: AgentV4Phase;
+  toolNames: string[];
+  callIds: string[];
+  startedAt?: string;
+  finishedAt?: string;
+  startedSequence?: number;
+  finishedSequence?: number;
+  durationMs?: number;
+  succeeded?: number;
+  failed?: number;
+};
+type GuidedV4OverviewData = {
+  taskShape?: AgentV4TaskShape;
+  taskShapeSource?: "model" | "host";
+  taskShapeReason?: string;
+  currentPhase: AgentV4Phase;
+  taskList?: GuidedTaskList;
+  cycles: Map<number, GuidedCycle>;
+  batches: GuidedToolBatch[];
+};
+
+function buildGuidedV4Overview(events: AgentRunEventV4[]): GuidedV4OverviewData | null {
+  const ordered = [...events].sort((left, right) => left.sequence - right.sequence);
+  const hasGuidedEvent = ordered.some(({ event }) => event.kind === "task_shape_selected"
+    || event.kind === "phase_changed"
+    || event.kind === "cycle_started"
+    || event.kind === "cycle_finished"
+    || event.kind === "task_list_updated"
+    || event.kind === "tool_batch_started"
+    || event.kind === "tool_batch_finished");
+  if (!hasGuidedEvent) return null;
+
+  let taskShape: AgentV4TaskShape | undefined;
+  let taskShapeSource: "model" | "host" | undefined;
+  let taskShapeReason: string | undefined;
+  let currentPhase: AgentV4Phase | undefined;
+  let explicitPhaseSeen = false;
+  let taskList: GuidedTaskList | undefined;
+  const cycles = new Map<number, GuidedCycle>();
+  const batches = new Map<number, GuidedToolBatch>();
+
+  for (const item of ordered) {
+    const event = item.event;
+    if (event.kind === "task_shape_selected") {
+      taskShape = event.task_shape;
+      taskShapeSource = event.source;
+      taskShapeReason = event.reason;
+    } else if (event.kind === "phase_changed") {
+      currentPhase = event.phase;
+      explicitPhaseSeen = true;
+    } else if (event.kind === "cycle_started" || event.kind === "cycle_finished") {
+      const cycle = cycles.get(event.cycle_id) ?? { cycleId: event.cycle_id };
+      if (event.kind === "cycle_started") cycle.startedAt = item.occurred_at;
+      else cycle.finishedAt = item.occurred_at;
+      cycles.set(event.cycle_id, cycle);
+    } else if (event.kind === "task_list_updated") {
+      taskList = { revision: event.revision, changeSummary: event.change_summary ?? "", tasks: event.tasks };
+      if (!explicitPhaseSeen) currentPhase = "organizing";
+    } else if (event.kind === "tool_batch_started" || event.kind === "tool_batch_finished") {
+      const visibleBatch = visibleToolBatchEntries(event.tool_names, event.call_ids);
+      if (visibleBatch === null) {
+        batches.delete(event.batch_id);
+        continue;
+      }
+      const batch = batches.get(event.batch_id) ?? {
+        batchId: event.batch_id,
+        cycleId: event.cycle_id,
+        phase: event.phase,
+        toolNames: [],
+        callIds: [],
+      };
+      batch.cycleId = event.cycle_id;
+      batch.phase = event.phase;
+      batch.toolNames = visibleBatch.toolNames;
+      batch.callIds = visibleBatch.callIds;
+      if (event.kind === "tool_batch_started") {
+        batch.startedAt = item.occurred_at;
+        batch.startedSequence = item.sequence;
+      } else {
+        batch.finishedAt = item.occurred_at;
+        batch.finishedSequence = item.sequence;
+        batch.durationMs = event.duration_ms ?? elapsedMilliseconds(batch.startedAt, item.occurred_at);
+        batch.succeeded = event.succeeded;
+        batch.failed = event.failed;
+      }
+      batches.set(event.batch_id, batch);
+      if (!explicitPhaseSeen) currentPhase = event.phase;
+    }
+  }
+
+  return {
+    taskShape,
+    taskShapeSource,
+    taskShapeReason,
+    currentPhase: currentPhase ?? inferGuidedV4Phase(ordered),
+    taskList,
+    cycles,
+    batches: [...batches.values()].sort((left, right) => (left.startedSequence ?? left.finishedSequence ?? 0) - (right.startedSequence ?? right.finishedSequence ?? 0)),
+  };
+}
+
+function visibleToolBatchEntries(toolNames: string[], callIds: string[]) {
+  if (toolNames.length === 0) return { toolNames: [], callIds };
+  const visibleIndexes = toolNames
+    .map((toolName, index) => ({ toolName, index }))
+    .filter(({ toolName }) => toolName === "agent.update_tasks" || !isInternalAgentTool(toolName));
+  if (visibleIndexes.length === 0) return null;
+  return {
+    toolNames: visibleIndexes.map(({ toolName }) => toolName),
+    callIds: visibleIndexes.map(({ index }) => callIds[index]).filter((callId): callId is string => Boolean(callId)),
+  };
+}
+
+function inferGuidedV4Phase(events: AgentRunEventV4[]): AgentV4Phase {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index].event;
+    if (event.kind === "deterministic_verification_finished" || event.kind === "reviewer_finished" || event.kind === "completion_proposed" || event.kind === "run_completed") return "verifying";
+    if (event.kind === "input_requested") return "clarification";
+    if (event.kind === "tool_batch_started" || event.kind === "tool_batch_finished" || event.kind === "tool_requested" || event.kind === "tool_dispatch_started" || event.kind === "tool_finished") return "executing";
+    if (event.kind === "task_list_updated") return "organizing";
+    if (event.kind === "request_routed") return "routing";
+  }
+  return "routing";
+}
+
+function elapsedMilliseconds(startedAt: string | undefined, finishedAt: string) {
+  if (!startedAt) return undefined;
+  const started = Date.parse(startedAt);
+  const finished = Date.parse(finishedAt);
+  return Number.isFinite(started) && Number.isFinite(finished) && finished >= started ? finished - started : undefined;
+}
+
+function GuidedV4Overview({ locale, overview, terminal, historical }: { locale: Locale; overview: GuidedV4OverviewData; terminal?: AgentRunEventV4; historical: boolean }) {
+  const zh = locale === "zh-CN";
+  const currentIndex = Math.max(0, GUIDED_V4_PHASES.indexOf(overview.currentPhase));
+  const completedRun = terminal?.event.kind === "run_completed";
+  const failedRun = terminal?.event.kind === "run_failed";
+  const isFastPath = overview.taskShape === "fast";
+  const shapeLabel = overview.taskShape === "fast" ? (zh ? "快速路径" : "Fast path") : overview.taskShape === "multi_step" ? (zh ? "多步骤路径" : "Multi-step path") : (zh ? "引导轨迹" : "Guided trajectory");
+  return <section className={`v4-guided-overview ${isFastPath ? "is-fast" : ""} ${historical ? "is-historical" : ""}`} aria-label={zh ? "Agent 阶段轨迹" : "Agent guided trajectory"}>
+    <header className="v4-guided-heading"><div><strong>{zh ? "Agent 轨迹" : "Agent trajectory"}</strong><small>{shapeLabel}</small>{overview.taskShapeSource && <small>{zh ? "来源" : "source"}: {overview.taskShapeSource}</small>}</div>{overview.taskShape && <span className="v4-task-shape">{overview.taskShape}</span>}</header>
+    {overview.taskShapeReason && <p className="v4-task-shape-reason">{overview.taskShapeReason}</p>}
+    <ol className="v4-phase-list">
+      {GUIDED_V4_PHASES.map((phase, index) => {
+        const state = index < currentIndex || completedRun ? "completed" : index === currentIndex ? (failedRun ? "failed" : "active") : "pending";
+        return <li className={`v4-phase-item ${state}`} data-phase={phase} key={phase} aria-current={index === currentIndex ? "step" : undefined}><span className="v4-phase-dot" /><b>{phase}</b><small>{phaseStateLabel(state, zh)}</small></li>;
+      })}
+    </ol>
+    {isFastPath && <small className="v4-fast-path-note">{zh ? "快速路径：紧凑轨迹。" : "Fast path: compact trajectory."}</small>}
+    {overview.taskList && !isFastPath && overview.taskList.tasks.length > 0 && <V4TaskList locale={locale} taskList={overview.taskList} />}
+    {overview.batches.length > 0 && <section className="v4-tool-batches" aria-label={zh ? "工具批次" : "Tool batches"}>{overview.batches.map((batch) => <V4ToolBatch locale={locale} batch={batch} cycle={overview.cycles.get(batch.cycleId)} key={batch.batchId} />)}</section>}
+  </section>;
+}
+
+function V4TaskList({ locale, taskList }: { locale: Locale; taskList: GuidedTaskList }) {
+  const zh = locale === "zh-CN";
+  const statuses: AgentV4Task["status"][] = ["pending", "in_progress", "completed", "blocked"];
+  const counts: Record<AgentV4Task["status"], number> = { pending: 0, in_progress: 0, completed: 0, blocked: 0 };
+  taskList.tasks.forEach((task) => { counts[task.status] += 1; });
+  return <section className="v4-task-list" aria-label={zh ? "任务列表" : "Task list"} aria-readonly="true">
+    <header><b>{zh ? "任务列表" : "Task list"}</b><span>revision {taskList.revision}</span></header>
+    {taskList.changeSummary && <p>{taskList.changeSummary}</p>}
+    <div className="v4-task-counts" aria-label={statuses.map((status) => `${status} ${counts[status]}`).join(", ")}>
+      {statuses.map((status) => <span data-status={status} key={status}><b>{counts[status]}</b><small>{status} · {taskStatusLabel(status, zh)}</small></span>)}
+    </div>
+    <ul>{taskList.tasks.map((task) => <li className={`v4-task-row ${task.status}`} data-task-id={task.id} key={task.id}><span className="v4-task-status-dot" /><div><b>{task.title}</b><small>{task.status} · {taskStatusLabel(task.status, zh)}</small>{task.status === "blocked" && task.blocked_reason && <em>{task.blocked_reason}</em>}</div></li>)}</ul>
+  </section>;
+}
+
+function V4ToolBatch({ locale, batch, cycle }: { locale: Locale; batch: GuidedToolBatch; cycle?: GuidedCycle }) {
+  const zh = locale === "zh-CN";
+  const steps = Math.max(batch.callIds.length, batch.toolNames.length);
+  const finished = batch.finishedSequence !== undefined;
+  const duration = batch.durationMs === undefined ? "" : ` · ${zh ? "耗时" : "duration"} ${formatDuration(batch.durationMs)}`;
+  const summary = finished
+    ? `${zh ? "已运行" : "Ran"} ${steps} ${zh ? "步" : steps === 1 ? "step" : "steps"}${duration}`
+    : `${zh ? "执行中" : "Running"} ${steps} ${zh ? "步" : steps === 1 ? "step" : "steps"}`;
+  const hasFailure = typeof batch.failed === "number" && batch.failed > 0;
+  const status = !finished ? "running" : hasFailure ? "failed" : "succeeded";
+  return <details className={`v4-tool-batch ${status}`}>
+    <summary className="v4-tool-batch-heading"><span><b>{zh ? "阶段" : "stage"} · {batch.phase}</b><small>cycle {cycle?.cycleId ?? batch.cycleId}</small></span><strong>{summary}</strong></summary>
+    <div className="v4-tool-batch-body"><small>{zh ? "工具" : "Tools"}: {batch.toolNames.length ? batch.toolNames.map((toolName) => toolDisplayLabel(toolName, zh)).join(" · ") : (zh ? "未提供工具名称" : "No tool names provided")}</small>{batch.callIds.length > 0 && <small>{zh ? "调用" : "Calls"}: {batch.callIds.join(" · ")}</small>}{(batch.succeeded !== undefined || batch.failed !== undefined) && <small>{zh ? "结果" : "Outcome"}: {batch.succeeded !== undefined ? `${zh ? "成功" : "succeeded"} ${formatMetric(batch.succeeded)}` : ""}{batch.succeeded !== undefined && batch.failed !== undefined ? " · " : ""}{batch.failed !== undefined ? `${zh ? "失败" : "failed"} ${formatMetric(batch.failed)}` : ""}</small>}</div>
+  </details>;
+}
+
+function phaseStateLabel(state: "pending" | "active" | "completed" | "failed", zh: boolean) {
+  return state === "completed" ? (zh ? "已完成" : "Completed") : state === "failed" ? (zh ? "失败" : "Failed") : state === "active" ? (zh ? "进行中" : "Active") : (zh ? "待处理" : "Pending");
+}
+function taskStatusLabel(status: AgentV4Task["status"], zh: boolean) {
+  return status === "pending" ? (zh ? "待处理" : "Pending") : status === "in_progress" ? (zh ? "进行中" : "In progress") : status === "completed" ? (zh ? "已完成" : "Completed") : (zh ? "已阻塞" : "Blocked");
+}
+function formatMetric(value: number) { return String(value); }
+function formatDuration(milliseconds: number) {
+  if (milliseconds < 1_000) return `${Math.max(0, Math.round(milliseconds))} ms`;
+  if (milliseconds < 60_000) return `${(milliseconds / 1_000).toFixed(milliseconds % 1_000 === 0 ? 0 : 1)}s`;
+  return `${Math.floor(milliseconds / 60_000)}m ${Math.round((milliseconds % 60_000) / 1_000)}s`;
+}
+
 function V4ApprovalCard({ locale, request, onDecide }: { locale: Locale; request: Extract<AgentRunEventV4["event"], { kind: "tool_approval_requested" }>['request']; onDecide: (decision: "approved" | "denied", browserScope?: BrowserApprovalScopeV4) => Promise<void> | void }) {
   const zh = locale === "zh-CN";
   const [busy, setBusy] = useState(false);
@@ -542,7 +750,7 @@ function mergeV4ToolCalls(events: AgentRunEventV4[]): MergedV4ToolCall[] {
   return [...byCall.values()];
 }
 function isInternalAgentTool(toolId: string) {
-  return toolId === "agent.complete" || toolId === "agent.request_input" || toolId === "agent.propose_plan";
+  return toolId === "agent.complete" || toolId === "agent.request_input" || toolId === "agent.propose_plan" || toolId === "agent.update_tasks" || toolId === "agent.route" || toolId === "agent.route_request";
 }
 function toolSubject(args?: Record<string, unknown>) {
   if (!args) return undefined;
@@ -562,6 +770,7 @@ function toolDisplayLabel(toolId: string, zh: boolean) {
     "runtime.python": ["运行 Python", "Run Python"],
     "runtime.r": ["运行 R", "Run R"],
     "agent.delegate": ["执行子任务", "Run delegated task"],
+    "agent.update_tasks": ["更新任务列表", "Update task list"],
   };
   const label = labels[toolId];
   return label ? label[zh ? 0 : 1] : toolId;
@@ -582,7 +791,22 @@ function isToolTrajectoryEvent(event: AgentRunEventV4) {
   return event.event.kind === "tool_requested" || event.event.kind === "tool_dispatch_started" || event.event.kind === "tool_finished" || event.event.kind === "tool_outcome_reused";
 }
 function isHiddenTrajectoryEvent(event: AgentRunEventV4) {
-  return event.event.kind === "run_spec_frozen" || event.event.kind === "completion_proposal_submitted" || event.event.kind === "deterministic_verification_finished" || event.event.kind === "reviewer_finished" || event.event.kind === "reviewer_correction_requested";
+  return event.event.kind === "run_spec_frozen"
+    || event.event.kind === "request_routed"
+    || event.event.kind === "task_shape_selected"
+    || event.event.kind === "phase_changed"
+    || event.event.kind === "cycle_started"
+    || event.event.kind === "cycle_finished"
+    || event.event.kind === "task_list_updated"
+    || event.event.kind === "tool_batch_started"
+    || event.event.kind === "tool_batch_finished"
+    || event.event.kind === "completion_proposed"
+    || event.event.kind === "completion_proposal_submitted"
+    || event.event.kind === "deterministic_verification_finished"
+    || event.event.kind === "reviewer_finished"
+    || event.event.kind === "reviewer_correction_requested"
+    || event.event.kind === "run_completed"
+    || event.event.kind === "run_cancelled";
 }
 function V4AnswerForm({ locale, onSubmit }: { locale: Locale; onSubmit: (answer: string) => Promise<void> | void }) {
   const [answer, setAnswer] = useState("");

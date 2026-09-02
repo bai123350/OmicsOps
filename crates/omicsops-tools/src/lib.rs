@@ -97,7 +97,7 @@ impl ToolRegistryV4 {
             .ok_or_else(|| ToolRegistryErrorV4::Unknown(call.tool_id.clone()))?;
         let direct_only = matches!(
             call.tool_id.as_str(),
-            "agent.route_request" | "agent.record_mcp_unavailable"
+            "agent.route_request" | "agent.record_mcp_unavailable" | "agent.update_tasks"
         );
         let planning_allowed = !direct_only
             && (definition.effect == ToolEffectV4::ReadOnly
@@ -174,7 +174,7 @@ impl ToolPortV4 for ToolRegistryV4 {
                 RunModeV4::Plan => {
                     !matches!(
                         definition.id.as_str(),
-                        "agent.route_request" | "agent.record_mcp_unavailable"
+                        "agent.route_request" | "agent.record_mcp_unavailable" | "agent.update_tasks"
                     ) && (definition.effect == ToolEffectV4::ReadOnly
                         || matches!(
                             definition.id.as_str(),
@@ -373,9 +373,9 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "agent.route_request",
-            "Classify the current ordinary Agent request before any task tool is used. Research retrieval includes papers, external databases, current web evidence, and cross-source verification",
+            "Classify the current ordinary Agent request and its task shape before any task tool is used. Research retrieval includes papers, external databases, current web evidence, and cross-source verification",
             ToolEffectV4::ReadOnly,
-            json!({"type":"object","required":["route","reason"],"properties":{"route":{"type":"string","enum":["research_retrieval","adaptive"]},"reason":{"type":"string","minLength":1}}}),
+            json!({"type":"object","required":["route","task_shape","reason"],"properties":{"route":{"type":"string","enum":["research_retrieval","adaptive"]},"task_shape":{"type":"string","enum":["fast","multi_step"]},"reason":{"type":"string","minLength":1}}}),
         ),
         descriptor(
             "agent.record_mcp_unavailable",
@@ -426,10 +426,16 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
             json!({"type":"object","required":["session","target_host","assets"],"properties":{"session":{"type":"string","enum":["shared","workspace"]},"target_host":{"type":"string","minLength":1},"assets":{"type":"array","minItems":1,"items":{"type":"object","required":["relative_path","source_url"],"properties":{"relative_path":{"type":"string","minLength":1},"source_url":{"type":"string","minLength":1}}}}}}),
         ),
         descriptor(
+            "agent.update_tasks",
+            "Create or revise the Host-persisted read-only task list for an ordinary multi-step Agent run. This is a coordinator, not an approved Plan",
+            ToolEffectV4::ReadOnly,
+            json!({"type":"object","required":["schema_version","expected_revision","change_summary","tasks"],"properties":{"schema_version":{"type":"integer","const":4},"expected_revision":{"type":"integer","minimum":0},"change_summary":{"type":"string","minLength":1},"tasks":{"type":"array","minItems":2,"maxItems":12,"items":{"type":"object","required":["id","title","status"],"properties":{"id":{"type":"string","minLength":1,"maxLength":64},"title":{"type":"string","minLength":1,"maxLength":240},"status":{"type":"string","enum":["pending","in_progress","completed","blocked"]},"blocked_reason":{"type":"string","minLength":1,"maxLength":500}}}}}}),
+        ),
+        descriptor(
             "agent.request_input",
             "Request user input",
             ToolEffectV4::ReadOnly,
-            json!({"type":"object","required":["question"],"properties":{"question":{"type":"string"}}}),
+            json!({"type":"object","required":["question"],"properties":{"question":{"type":"string"},"reason":{"type":"string","enum":["scope","decision","missing_data","blocker"],"default":"decision"}}}),
         ),
         descriptor(
             "agent.propose_plan",
@@ -739,6 +745,7 @@ mod tests {
         assert!(planning.contains("search_mcp_tools"));
         assert!(!planning.contains("agent.route_request"));
         assert!(!planning.contains("agent.record_mcp_unavailable"));
+        assert!(!planning.contains("agent.update_tasks"));
         // The generic MCP wrapper remains visible so the planner can request
         // a concrete target; its Network effect is dynamically gated by the
         // host rather than being treated as a permanently read-only tool.
@@ -761,7 +768,7 @@ mod tests {
                 &ToolCallV4 {
                     call_id: "route".into(),
                     tool_id: "agent.route_request".into(),
-                    arguments: json!({"route":"adaptive","reason":"not a direct run"}),
+                    arguments: json!({"route":"adaptive","task_shape":"fast","reason":"not a direct run"}),
                 },
             )
             .unwrap_err();
@@ -778,6 +785,46 @@ mod tests {
             .await
             .unwrap();
         assert!(result.succeeded);
+    }
+
+    #[test]
+    fn ordinary_task_coordinator_is_schema_bounded_and_direct_run_scoped() {
+        let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop))
+            .unwrap()
+            .with_execute_capabilities(BTreeSet::from(["agent.update_tasks".into()]));
+        let valid = ToolCallV4 {
+            call_id: "tasks-1".into(),
+            tool_id: "agent.update_tasks".into(),
+            arguments: json!({
+                "schema_version":4,
+                "expected_revision":0,
+                "change_summary":"initial breakdown",
+                "tasks":[
+                    {"id":"discover","title":"Discover context","status":"completed"},
+                    {"id":"execute","title":"Execute work","status":"in_progress"}
+                ]
+            }),
+        };
+        assert!(registry.validate(RunModeV4::Execute, &valid).is_ok());
+        let mut invalid = valid;
+        invalid.arguments["tasks"] = json!([
+            {"id":"discover","title":"Discover context"},
+            {"id":"execute","title":"Execute work","status":"pending"}
+        ]);
+        assert!(registry.validate(RunModeV4::Execute, &invalid).is_err());
+    }
+
+    #[test]
+    fn ordinary_route_requires_an_explicit_task_shape() {
+        let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap();
+        let mut call = ToolCallV4 {
+            call_id: "route".into(),
+            tool_id: "agent.route_request".into(),
+            arguments: json!({"route":"adaptive","reason":"bounded request"}),
+        };
+        assert!(registry.validate(RunModeV4::Execute, &call).is_err());
+        call.arguments["task_shape"] = json!("fast");
+        assert!(registry.validate(RunModeV4::Execute, &call).is_ok());
     }
 
     #[test]

@@ -1068,6 +1068,11 @@ async fn archiving_an_unknown_run_is_rejected_without_writing_a_row() {
         unresolved_errors: vec![],
         recent_steps: vec![],
         scientific_state: serde_json::json!({}),
+        task_shape: None,
+        phase: None,
+        task_revision: None,
+        tasks: vec![],
+        cycle_id: None,
     };
 
     let error = store
@@ -1467,6 +1472,11 @@ async fn v4_context_columns_must_match_checkpoint_and_transcript() -> Result<(),
         unresolved_errors: vec![],
         recent_steps: vec!["inspect".into()],
         scientific_state: serde_json::json!({"path":"/Users/研究者/context data"}),
+        task_shape: None,
+        phase: None,
+        task_revision: None,
+        tasks: vec![],
+        cycle_id: None,
     };
     let transcript = "[ { \"sequence\": 7 } ]";
     let archive = store
@@ -1534,6 +1544,11 @@ async fn v4_context_archive_owner_is_validated_on_reopen() -> Result<(), StoreEr
         unresolved_errors: vec![],
         recent_steps: vec![],
         scientific_state: serde_json::json!({}),
+        task_shape: None,
+        phase: None,
+        task_revision: None,
+        tasks: vec![],
+        cycle_id: None,
     };
     let archive = store
         .archive_agent_context_v4(run_id, "[]", &checkpoint)
