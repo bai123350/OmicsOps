@@ -1,0 +1,9 @@
+[package]
+name = "omicsops-process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+

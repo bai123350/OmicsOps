@@ -236,6 +236,15 @@ export interface CompletionProposalV4 {
   answer_markdown: string;
   criteria: Array<{ criterion: string; evidence: Array<Record<string, unknown>> }>;
 }
+export type AgentV4Phase = "routing" | "discovery" | "clarification" | "organizing" | "executing" | "verifying";
+export type AgentV4TaskShape = "fast" | "multi_step";
+export type AgentV4TaskStatus = "pending" | "in_progress" | "completed" | "blocked";
+export interface AgentV4Task {
+  id: string;
+  title: string;
+  status: AgentV4TaskStatus;
+  blocked_reason?: string | null;
+}
 export type AgentEventKindV4 =
   | { kind: "run_created"; mode: "plan" | "execute" }
   | { kind: "model_text"; text: string }
@@ -257,10 +266,17 @@ export type AgentEventKindV4 =
   | { kind: "plan_revision_requested"; plan_hash: string; feedback: string }
   | { kind: "run_spec_frozen"; approval_hash: string; spec_hash: string }
   | { kind: "mode_changed"; mode: "plan" | "execute" }
-  | { kind: "input_requested"; question_id: string; question: string }
+  | { kind: "task_shape_selected"; task_shape: AgentV4TaskShape; source: "model" | "host"; reason: string }
+  | { kind: "phase_changed"; phase: AgentV4Phase }
+  | { kind: "cycle_started"; cycle_id: number }
+  | { kind: "cycle_finished"; cycle_id: number }
+  | { kind: "task_list_updated"; revision: number; change_summary: string; tasks: AgentV4Task[] }
+  | { kind: "tool_batch_started"; batch_id: number; cycle_id: number; phase: AgentV4Phase; tool_names: string[]; call_ids: string[] }
+  | { kind: "tool_batch_finished"; batch_id: number; cycle_id: number; phase: AgentV4Phase; tool_names: string[]; call_ids: string[]; duration_ms: number; succeeded: number; failed: number }
+  | { kind: "input_requested"; question_id: string; question: string; reason?: "scope" | "decision" | "missing_data" | "blocker" }
   | { kind: "user_input_answered"; question_id: string; answer: string }
   | { kind: "context_archived"; archive: { archive_id: string; through_sequence: number; size_bytes: number; sha256: string } }
-  | { kind: "context_checkpointed"; checkpoint: { schema_version: 4; through_sequence: number; completion_criteria: string[]; unresolved_errors: string[]; recent_steps: string[]; scientific_state: unknown } }
+  | { kind: "context_checkpointed"; checkpoint: { schema_version: 4; through_sequence: number; completion_criteria: string[]; unresolved_errors: string[]; recent_steps: string[]; scientific_state: unknown; task_shape?: AgentV4TaskShape | null; phase?: AgentV4Phase | null; task_revision?: number | null; tasks?: AgentV4Task[]; cycle_id?: number | null } }
   | { kind: "scientific_state_changed"; revision: number; state_sha256: string; changes: string[] }
   | { kind: "completion_proposed" | "run_completed" | "run_cancelled" }
   | { kind: "completion_proposal_submitted"; proposal: CompletionProposalV4 }

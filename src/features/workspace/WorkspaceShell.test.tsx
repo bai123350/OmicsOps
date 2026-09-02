@@ -11,6 +11,70 @@ const project = {
 };
 
 describe("WorkspaceShell", () => {
+  it("renders the guided six-phase trajectory, public thought summaries, and a read-only task snapshot", () => {
+    const base = { schema_version: 4 as const, run_id: "run-guided", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
+    const events = [
+      { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: Object.assign({ kind: "model_text" as const, text: "公开摘要：先检查输入。" }, { raw_reasoning: "private reasoning must never render" }) },
+      { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "task_shape_selected" as const, task_shape: "multi_step" as const, source: "host" as const, reason: "needs verification" } },
+      { ...base, sequence: 3, occurred_at: "2026-08-17T00:00:02Z", event: { kind: "phase_changed" as const, phase: "organizing" as const } },
+      { ...base, sequence: 4, occurred_at: "2026-08-17T00:00:03Z", event: { kind: "task_list_updated" as const, revision: 2, change_summary: "分解为可验证步骤", tasks: [
+        { id: "task-1", title: "检查输入矩阵", status: "completed" as const },
+        { id: "task-2", title: "评估批次效应", status: "in_progress" as const },
+        { id: "task-3", title: "等待参考注释", status: "blocked" as const, blocked_reason: "缺少注释文件" },
+      ] } },
+      { ...base, sequence: 5, occurred_at: "2026-08-17T00:00:04Z", event: { kind: "tool_requested" as const, call: { call_id: "update-1", tool_id: "agent.update_tasks", arguments: { tasks: ["private task payload"] } } } },
+      { ...base, sequence: 6, occurred_at: "2026-08-17T00:00:05Z", event: { kind: "tool_requested" as const, call: { call_id: "route-1", tool_id: "agent.route_request", arguments: { route: "adaptive" } } } },
+      { ...base, sequence: 7, occurred_at: "2026-08-17T00:00:06Z", event: { kind: "tool_batch_started" as const, batch_id: 2, cycle_id: 1, phase: "organizing" as const, tool_names: ["agent.update_tasks"], call_ids: ["update-1"] } },
+      { ...base, sequence: 8, occurred_at: "2026-08-17T00:00:07Z", event: { kind: "tool_batch_finished" as const, batch_id: 2, cycle_id: 1, phase: "organizing" as const, tool_names: ["agent.update_tasks"], call_ids: ["update-1"], duration_ms: 0, succeeded: 1, failed: 0 } },
+    ];
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-guided" agentRunEventsV4={events} />);
+
+    const overview = screen.getByRole("region", { name: "Agent 阶段轨迹" });
+    for (const phase of ["routing", "discovery", "clarification", "organizing", "executing", "verifying"]) expect(screen.getByText(phase, { exact: true })).toBeInTheDocument();
+    expect(screen.getByText("思考摘要")).toBeInTheDocument();
+    expect(screen.getByText("公开摘要")).toBeInTheDocument();
+    expect(screen.queryByText("private reasoning must never render")).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "任务列表" })).toHaveTextContent("revision 2");
+    expect(overview).toHaveTextContent("分解为可验证步骤");
+    expect(overview).toHaveTextContent("缺少注释文件");
+    expect(screen.queryByText("agent.update_tasks")).not.toBeInTheDocument();
+    expect(screen.queryByText("agent.route_request")).not.toBeInTheDocument();
+    expect(screen.getByText(/更新任务列表/)).toBeInTheDocument();
+  });
+
+  it("summarizes tool batches by phase and model cycle while keeping input decisions in the same run", () => {
+    const onAnswer = vi.fn();
+    const base = { schema_version: 4 as const, run_id: "run-batch", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} runStarted activeRunId="run-batch" onAnswerAgentQuestionV4={onAnswer} agentRunEventsV4={[
+      { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "task_shape_selected" as const, task_shape: "multi_step" as const, source: "model" as const, reason: "requires verification" } },
+      { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "cycle_started" as const, cycle_id: 3 } },
+      { ...base, sequence: 3, occurred_at: "2026-08-17T00:00:02Z", event: { kind: "tool_batch_started" as const, batch_id: 8, cycle_id: 3, phase: "executing" as const, tool_names: ["project.read", "runtime.execute"], call_ids: ["call-1", "call-2"] } },
+      { ...base, sequence: 4, occurred_at: "2026-08-17T00:00:03Z", event: { kind: "tool_batch_finished" as const, batch_id: 8, cycle_id: 3, phase: "executing" as const, tool_names: ["project.read", "runtime.execute"], call_ids: ["call-1", "call-2"], duration_ms: 1200, succeeded: 2, failed: 0 } },
+      { ...base, sequence: 5, occurred_at: "2026-08-17T00:00:04Z", event: { kind: "input_requested" as const, question_id: "species", question: "Which species?" } },
+    ]} />);
+
+    expect(screen.getByText("Ran 2 steps · duration 1.2s")).toBeInTheDocument();
+    expect(screen.getByText("executing", { exact: true })).toBeInTheDocument();
+    expect(screen.getByText("cycle 3")).toBeInTheDocument();
+    expect(screen.getByText("Which species?")).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: "Answer V4 question" }), { target: { value: "human" } });
+    fireEvent.click(screen.getByRole("button", { name: "Answer and resume" }));
+    expect(onAnswer).toHaveBeenCalledWith("run-batch", "species", "human");
+  });
+
+  it("keeps fast-path runs compact and omits an empty task panel", () => {
+    const base = { schema_version: 4 as const, run_id: "run-fast", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} runStarted activeRunId="run-fast" agentRunEventsV4={[
+      { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "task_shape_selected" as const, task_shape: "fast" as const, source: "host" as const, reason: "one bounded operation" } },
+      { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "task_list_updated" as const, revision: 1, change_summary: "no tasks needed", tasks: [] } },
+    ]} />);
+
+    const overview = screen.getByRole("region", { name: "Agent guided trajectory" });
+    expect(overview).toHaveClass("is-fast");
+    expect(screen.getByText("Fast path")).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Task list" })).not.toBeInTheDocument();
+  });
+
   it("renders the V4 hash-chained trajectory", () => {
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-v4" agentRunEventsV4={[{
       schema_version: 4, run_id: "run-v4", project_id: project.id, conversation_id: "conversation-1", sequence: 1,

@@ -6,6 +6,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use omicsops_process::{background_command, configure_background_command};
 use omicsops_protocol::{
     ComputeBackendDescriptorV4, ComputeBackendKindV4, ExecutionContextKeyV4, IsolationStrengthV4,
     KernelLanguageV4, OutputCaptureV4, RuntimeArtifactV4, RuntimeResultV4,
@@ -74,12 +75,12 @@ impl KernelBackendV4 for LocalKernelBackendV4 {
         let driver = write_driver(&self.project_root, key.language, session_id).await?;
         let mut command = match key.language {
             KernelLanguageV4::Python => {
-                let mut command = Command::new(&self.python_program);
+                let mut command = background_command(&self.python_program);
                 command.arg("-u");
                 command
             }
             KernelLanguageV4::R => {
-                let mut command = Command::new(&self.r_program);
+                let mut command = background_command(&self.r_program);
                 command.arg("--vanilla");
                 command
             }
@@ -242,7 +243,7 @@ impl KernelBackendV4 for ContainerKernelBackendV4 {
             .to_string_lossy()
             .replace('\\', "/");
         let container_name = format!("omicsops-v4-{session_id}");
-        let mut command = Command::new(&self.engine_program);
+        let mut command = background_command(&self.engine_program);
         command.args(self.container_arguments(key, &relative_driver, session_id, &container_name));
         launch_process(
             command,
@@ -405,7 +406,7 @@ impl KernelProcessV4 for ProcessKernelV4 {
             let _ = handle.child.wait().await;
         }
         if let Some((engine, name)) = &self.container_cleanup {
-            let _ = Command::new(engine)
+            let _ = background_command(engine)
                 .arg("rm")
                 .arg("-f")
                 .arg(name)
@@ -426,6 +427,9 @@ async fn launch_process(
     backend: &str,
     container_cleanup: Option<(String, String)>,
 ) -> Result<Arc<dyn KernelProcessV4>, String> {
+    // Keep the spawn boundary defensive even if a future backend constructs
+    // its command without using `background_command`.
+    configure_background_command(&mut command);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -654,7 +658,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_python_kernel_preserves_namespace_and_process_identity() {
-        if Command::new("python")
+        if background_command("python")
             .arg("--version")
             .output()
             .await

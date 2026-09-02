@@ -148,6 +148,11 @@ async fn v4_context_archive_is_durable_and_hash_addressed() {
         unresolved_errors: vec!["one error".into()],
         recent_steps: vec!["inspect".into()],
         scientific_state: json!({}),
+        task_shape: None,
+        phase: None,
+        task_revision: None,
+        tasks: vec![],
+        cycle_id: None,
     };
     let archive = store
         .archive_agent_context_v4(run_id, transcript, &checkpoint)

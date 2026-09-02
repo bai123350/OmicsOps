@@ -155,3 +155,46 @@ fn streaming_decoder_preserves_utf8_split_across_network_chunks() {
         ProviderStreamEvent::TextDelta { text } if text == "我会检索肝癌文献。"
     )));
 }
+
+#[test]
+fn provider_reasoning_fields_are_never_mapped_to_public_text() {
+    let fixtures = [
+        (
+            ProviderProtocol::OpenAiCompatible,
+            json!({"choices":[{"message":{"content":"public update","reasoning_content":"private chain"}}]}),
+        ),
+        (
+            ProviderProtocol::Anthropic,
+            json!({"content":[
+                {"type":"thinking","thinking":"private chain"},
+                {"type":"text","text":"public update"}
+            ]}),
+        ),
+        (
+            ProviderProtocol::Ollama,
+            json!({"message":{"content":"public update","thinking":"private chain"}}),
+        ),
+    ];
+    for (protocol, fixture) in fixtures {
+        let events =
+            parse_provider_tool_response_for_request(protocol, &fixture, &request()).unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderStreamEvent::TextDelta { text } if text == "public update"
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            ProviderStreamEvent::TextDelta { text } if text.contains("private chain")
+        )));
+    }
+
+    let mut decoder = ProviderToolStreamDecoder::new(ProviderProtocol::OpenAiCompatible);
+    let events = decoder
+        .push(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private chain\"}}]}\n\n")
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ProviderStreamEvent::TextDelta { .. }))
+    );
+}

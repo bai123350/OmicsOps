@@ -350,6 +350,67 @@ pub enum AgentRequestRouteV4 {
     Adaptive,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTaskShapeV4 {
+    Fast,
+    MultiStep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTaskShapeSourceV4 {
+    Model,
+    Host,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPhaseV4 {
+    Routing,
+    Discovery,
+    Clarification,
+    Organizing,
+    Executing,
+    Verifying,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTaskStatusV4 {
+    Pending,
+    InProgress,
+    Completed,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentTaskV4 {
+    pub id: String,
+    pub title: String,
+    pub status: AgentTaskStatusV4,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentTaskListUpdateV4 {
+    pub schema_version: u8,
+    pub expected_revision: u64,
+    pub change_summary: String,
+    pub tasks: Vec<AgentTaskV4>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentInputReasonV4 {
+    Scope,
+    #[default]
+    Decision,
+    MissingData,
+    Blocker,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserSessionKindV4 {
@@ -839,6 +900,16 @@ pub struct ContextCheckpointV4 {
     pub unresolved_errors: Vec<String>,
     pub recent_steps: Vec<String>,
     pub scientific_state: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_shape: Option<AgentTaskShapeV4>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<AgentPhaseV4>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<AgentTaskV4>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1010,6 +1081,42 @@ pub enum AgentEventKindV4 {
     RequestRouted {
         route: AgentRequestRouteV4,
     },
+    TaskShapeSelected {
+        task_shape: AgentTaskShapeV4,
+        source: AgentTaskShapeSourceV4,
+        reason: String,
+    },
+    PhaseChanged {
+        phase: AgentPhaseV4,
+    },
+    CycleStarted {
+        cycle_id: u64,
+    },
+    CycleFinished {
+        cycle_id: u64,
+    },
+    TaskListUpdated {
+        revision: u64,
+        change_summary: String,
+        tasks: Vec<AgentTaskV4>,
+    },
+    ToolBatchStarted {
+        batch_id: u64,
+        cycle_id: u64,
+        phase: AgentPhaseV4,
+        tool_names: Vec<String>,
+        call_ids: Vec<String>,
+    },
+    ToolBatchFinished {
+        batch_id: u64,
+        cycle_id: u64,
+        phase: AgentPhaseV4,
+        tool_names: Vec<String>,
+        call_ids: Vec<String>,
+        duration_ms: u64,
+        succeeded: u32,
+        failed: u32,
+    },
     BrowserConnectionRequired {
         session: BrowserSessionKindV4,
         protocol_version: u16,
@@ -1071,6 +1178,8 @@ pub enum AgentEventKindV4 {
     InputRequested {
         question_id: String,
         question: String,
+        #[serde(default)]
+        reason: AgentInputReasonV4,
     },
     UserInputAnswered {
         question_id: String,
@@ -1352,6 +1461,88 @@ mod tests {
         }))
         .expect("legacy completion proposal remains readable");
         assert!(proposal.answer_markdown.is_empty());
+    }
+
+    #[test]
+    fn legacy_input_and_checkpoint_json_receive_guided_loop_defaults() {
+        let input: AgentEventKindV4 = serde_json::from_value(serde_json::json!({
+            "kind": "input_requested",
+            "question_id": "legacy-question",
+            "question": "Continue?"
+        }))
+        .unwrap();
+        assert!(matches!(
+            input,
+            AgentEventKindV4::InputRequested {
+                reason: AgentInputReasonV4::Decision,
+                ..
+            }
+        ));
+
+        let checkpoint: ContextCheckpointV4 = serde_json::from_value(serde_json::json!({
+            "schema_version": 4,
+            "through_sequence": 3,
+            "completion_criteria": [],
+            "unresolved_errors": [],
+            "recent_steps": [],
+            "scientific_state": {}
+        }))
+        .unwrap();
+        assert_eq!(checkpoint.task_shape, None);
+        assert_eq!(checkpoint.phase, None);
+        assert_eq!(checkpoint.task_revision, None);
+        assert!(checkpoint.tasks.is_empty());
+        assert_eq!(checkpoint.cycle_id, None);
+    }
+
+    #[test]
+    fn guided_loop_events_round_trip_in_the_hash_chain() {
+        let first = AgentEventV4::first(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Utc::now(),
+            AgentEventKindV4::RunCreated {
+                mode: RunModeV4::Execute,
+            },
+        );
+        let shape = AgentEventV4::next(
+            &first,
+            Utc::now(),
+            AgentEventKindV4::TaskShapeSelected {
+                task_shape: AgentTaskShapeV4::MultiStep,
+                source: AgentTaskShapeSourceV4::Model,
+                reason: "requires several verified steps".into(),
+            },
+        );
+        let tasks = AgentEventV4::next(
+            &shape,
+            Utc::now(),
+            AgentEventKindV4::TaskListUpdated {
+                revision: 1,
+                change_summary: "initial work breakdown".into(),
+                tasks: vec![
+                    AgentTaskV4 {
+                        id: "discover".into(),
+                        title: "Discover context".into(),
+                        status: AgentTaskStatusV4::Completed,
+                        blocked_reason: None,
+                    },
+                    AgentTaskV4 {
+                        id: "execute".into(),
+                        title: "Execute request".into(),
+                        status: AgentTaskStatusV4::InProgress,
+                        blocked_reason: None,
+                    },
+                ],
+            },
+        );
+        let encoded = [&first, &shape, &tasks]
+            .into_iter()
+            .map(|event| serde_json::to_string(event).unwrap())
+            .collect::<Vec<_>>();
+        let decoded = deserialize_event_chain_v4(&encoded).unwrap();
+        assert_eq!(decoded, vec![first, shape, tasks]);
     }
 
     #[test]

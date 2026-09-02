@@ -7,6 +7,7 @@ use omicsops_core::workspace::{
 };
 use omicsops_knowledge::{McpToolIndexV4, authorize_mcp_read_only_target, schema_digest};
 use omicsops_mcp::{McpEnvBinding, McpServerConfig, McpSessionManager};
+use omicsops_process::background_command;
 use omicsops_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -14,7 +15,7 @@ use sha2::{Digest, Sha256};
 use tauri::State;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, Command},
+    process::Child,
 };
 use uuid::Uuid;
 
@@ -946,7 +947,7 @@ async fn run_mcp_session(
     call_tool: bool,
     audit_id: Uuid,
 ) -> Result<McpResult, String> {
-    let mut child = Command::new(&request.command)
+    let mut child = background_command(&request.command)
         .args(&request.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
