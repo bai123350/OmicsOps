@@ -7,11 +7,11 @@ use omicsops_protocol::{
     AgentTaskV4, ApprovalPolicyV4, BrowserSessionKindV4, CompletionEvidenceRefV4,
     CompletionProposalV4, ComputeBackendKindV4, ContextArchiveV4, ContextCheckpointV4,
     DelegatedTaskNodeV4, DelegationGraphOutcomeV4, DelegationGraphV4, DelegationIsolationV4,
-    DelegationNodeOutcomeV4, DelegationNodeStatusV4, DeterministicVerificationV4,
-    ExecutionPlanV4, ExternalExecutorOutcomeV4, ExternalExecutorTaskV4, ModelFailureV4,
-    ReviewerReportV4, RunExecutionKindV4, RunModeV4, RunSpecV4, ScientificBridgeV4,
-    ToolApprovalDecisionV4, ToolApprovalRequestV4, ToolCallV4, ToolDescriptorV4, ToolEffectV4,
-    ToolOutcomeV4, VerificationFindingV4, VerificationSeverityV4,
+    DelegationNodeOutcomeV4, DelegationNodeStatusV4, DeterministicVerificationV4, ExecutionPlanV4,
+    ExternalExecutorOutcomeV4, ExternalExecutorTaskV4, ModelFailureV4, ReviewerReportV4,
+    RunExecutionKindV4, RunModeV4, RunSpecV4, ScientificBridgeV4, ToolApprovalDecisionV4,
+    ToolApprovalRequestV4, ToolCallV4, ToolDescriptorV4, ToolEffectV4, ToolOutcomeV4,
+    VerificationFindingV4, VerificationSeverityV4,
 };
 use omicsops_science::{AnalysisStatusV4, EvidenceSourceV4, ScientificStateV4};
 use serde::{Deserialize, Serialize};
@@ -787,11 +787,8 @@ impl AgentCoreV4<'_> {
             let guided_cycle = spec.execution_kind == RunExecutionKindV4::OrdinaryAgent
                 && guided_loop_enabled(&current_events);
             if guided_cycle {
-                self.push(
-                    spec.run_id,
-                    AgentEventKindV4::CycleStarted { cycle_id },
-                )
-                .await?;
+                self.push(spec.run_id, AgentEventKindV4::CycleStarted { cycle_id })
+                    .await?;
             }
             let turn = self
                 .model_turn(
@@ -811,11 +808,8 @@ impl AgentCoreV4<'_> {
                 )
                 .await?;
             if guided_cycle {
-                self.push(
-                    spec.run_id,
-                    AgentEventKindV4::CycleFinished { cycle_id },
-                )
-                .await?;
+                self.push(spec.run_id, AgentEventKindV4::CycleFinished { cycle_id })
+                    .await?;
             }
             let mut ordinary = Vec::new();
             let mut completion_proposal = None;
@@ -882,8 +876,7 @@ impl AgentCoreV4<'_> {
                             },
                         )
                         .await?;
-                        self.set_phase(spec.run_id, AgentPhaseV4::Discovery)
-                            .await?;
+                        self.set_phase(spec.run_id, AgentPhaseV4::Discovery).await?;
                         workflow_events = self
                             .events
                             .load(spec.run_id)
@@ -891,13 +884,12 @@ impl AgentCoreV4<'_> {
                             .map_err(AgentCoreErrorV4::Store)?;
                     }
                 }
-                let workflow_rejection =
-                    (spec.execution_kind == RunExecutionKindV4::OrdinaryAgent)
-                        .then(|| {
-                            guided_loop_rejection(&workflow_events, &call)
-                                .or_else(|| research_workflow_rejection(&workflow_events, &call))
-                        })
-                        .flatten();
+                let workflow_rejection = (spec.execution_kind == RunExecutionKindV4::OrdinaryAgent)
+                    .then(|| {
+                        guided_loop_rejection(&workflow_events, &call)
+                            .or_else(|| research_workflow_rejection(&workflow_events, &call))
+                    })
+                    .flatten();
                 if let Some(message) = workflow_rejection {
                     self.push(
                         spec.run_id,
@@ -1197,7 +1189,10 @@ impl AgentCoreV4<'_> {
             for call in ordinary {
                 if let Some(outcome) = self.cached_outcome(spec.run_id, &call).await? {
                     let reused_route = if call.tool_id == "agent.route_request" {
-                        Some(route_and_shape_from_outcome(&outcome).map_err(AgentCoreErrorV4::Tool)?)
+                        Some(
+                            route_and_shape_from_outcome(&outcome)
+                                .map_err(AgentCoreErrorV4::Tool)?,
+                        )
                     } else {
                         None
                     };
@@ -1619,8 +1614,7 @@ impl AgentCoreV4<'_> {
             }
             if let Some(proposal) = completion_proposal {
                 if guided_cycle {
-                    self.set_phase(spec.run_id, AgentPhaseV4::Verifying)
-                        .await?;
+                    self.set_phase(spec.run_id, AgentPhaseV4::Verifying).await?;
                 }
                 self.push(spec.run_id, AgentEventKindV4::CompletionProposed)
                     .await?;
@@ -3100,11 +3094,7 @@ impl AgentCoreV4<'_> {
             .await
     }
 
-    async fn set_phase(
-        &self,
-        run_id: Uuid,
-        phase: AgentPhaseV4,
-    ) -> Result<(), AgentCoreErrorV4> {
+    async fn set_phase(&self, run_id: Uuid, phase: AgentPhaseV4) -> Result<(), AgentCoreErrorV4> {
         let events = self
             .events
             .load(run_id)
@@ -3798,16 +3788,15 @@ fn next_batch_id(events: &[AgentEventV4]) -> u64 {
 }
 
 fn phase_for_calls(calls: &[ToolCallV4]) -> AgentPhaseV4 {
-    if calls.iter().any(|call| call.tool_id == "agent.route_request") {
+    if calls
+        .iter()
+        .any(|call| call.tool_id == "agent.route_request")
+    {
         AgentPhaseV4::Routing
     } else if calls.iter().all(|call| {
         matches!(
             call.tool_id.as_str(),
-            "search_mcp_tools"
-                | "project.list"
-                | "search_memory"
-                | "search_skills"
-                | "use_skill"
+            "search_mcp_tools" | "project.list" | "search_memory" | "search_skills" | "use_skill"
         )
     }) {
         AgentPhaseV4::Discovery
@@ -3890,8 +3879,7 @@ fn guided_loop_rejection(events: &[AgentEventV4], call: &ToolCallV4) -> Option<S
     }
     if route == AgentRequestRouteV4::Adaptive && is_browser_tool_id(&call.tool_id) {
         return Some(
-            "real-browser retrieval is reserved for Host-classified research_retrieval runs"
-                .into(),
+            "real-browser retrieval is reserved for Host-classified research_retrieval runs".into(),
         );
     }
     // Runs created before guided-loop events existed retain the legacy fast
@@ -3944,7 +3932,9 @@ fn guided_loop_rejection(events: &[AgentEventV4], call: &ToolCallV4) -> Option<S
     let (skill_search_index, skill_search_outcome) = skill_search.expect("checked above");
     let skill_candidates = skill_candidate_ids(&skill_search_outcome.data);
     if call.tool_id == "use_skill" && !skill_call_matches_candidates(call, &skill_candidates) {
-        return Some("use_skill must select a skill_id from the latest search_skills result".into());
+        return Some(
+            "use_skill must select a skill_id from the latest search_skills result".into(),
+        );
     }
     let skill_loaded = skill_candidates.is_empty()
         || successful_tool_outcomes_indexed(events, "use_skill").any(|(index, outcome)| {
@@ -4003,10 +3993,9 @@ fn validate_task_list_update(
     for task in &update.tasks {
         let id_valid = !task.id.is_empty()
             && task.id.len() <= 64
-            && task
-                .id
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'));
+            && task.id.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+            });
         if !id_valid || !ids.insert(task.id.as_str()) {
             return Err(format!("task id {} is invalid or duplicated", task.id));
         }
@@ -4042,9 +4031,11 @@ fn validate_task_list_update(
             .iter()
             .filter(|task| task.status == AgentTaskStatusV4::Completed)
         {
-            if !update.tasks.iter().any(|task| {
-                task.id == completed.id && task.status == AgentTaskStatusV4::Completed
-            }) {
+            if !update
+                .tasks
+                .iter()
+                .any(|task| task.id == completed.id && task.status == AgentTaskStatusV4::Completed)
+            {
                 return Err(format!(
                     "completed task {} cannot be removed or regressed",
                     completed.id
@@ -6721,9 +6712,11 @@ mod tests {
             .position(|event| matches!(event.event, AgentEventKindV4::CompletionProposed))
             .unwrap();
         assert!(task_index < completion_index);
-        assert!(events
-            .iter()
-            .any(|event| matches!(event.event, AgentEventKindV4::RunCompleted)));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::RunCompleted))
+        );
         assert!(!events.iter().any(|event| matches!(
             &event.event,
             AgentEventKindV4::ToolDispatchStarted { tool_id, .. } if tool_id == "agent.update_tasks"
@@ -6821,11 +6814,7 @@ mod tests {
             events: &store,
             science: None,
         }
-        .recover_interrupted_dispatches(
-            &spec,
-            AgentLimitsV4::default(),
-            &AtomicBool::new(false),
-        )
+        .recover_interrupted_dispatches(&spec, AgentLimitsV4::default(), &AtomicBool::new(false))
         .await
         .unwrap();
         let events = store.load_direct(run_id).unwrap();
@@ -6907,24 +6896,28 @@ mod tests {
             events: &store,
             science: None,
         }
-        .recover_interrupted_dispatches(
-            &spec,
-            AgentLimitsV4::default(),
-            &AtomicBool::new(false),
-        )
+        .recover_interrupted_dispatches(&spec, AgentLimitsV4::default(), &AtomicBool::new(false))
         .await
         .unwrap();
         let events = store.load_direct(run_id).unwrap();
         let batch_finished = events
             .iter()
-            .position(|event| matches!(event.event, AgentEventKindV4::ToolBatchFinished { batch_id: 1, .. }))
+            .position(|event| {
+                matches!(
+                    event.event,
+                    AgentEventKindV4::ToolBatchFinished { batch_id: 1, .. }
+                )
+            })
             .unwrap();
         let routed = events
             .iter()
             .position(|event| matches!(event.event, AgentEventKindV4::RequestRouted { .. }))
             .unwrap();
         assert!(batch_finished < routed);
-        assert_eq!(latest_task_shape(&events), Some(AgentTaskShapeV4::MultiStep));
+        assert_eq!(
+            latest_task_shape(&events),
+            Some(AgentTaskShapeV4::MultiStep)
+        );
         assert_eq!(latest_phase(&events), Some(AgentPhaseV4::Discovery));
     }
 
@@ -8679,7 +8672,9 @@ mod tests {
             },
         );
         events.push(first_requested);
-        assert!(guided_loop_promotion_reason(&events, &first, Some(ToolEffectV4::ReadOnly)).is_none());
+        assert!(
+            guided_loop_promotion_reason(&events, &first, Some(ToolEffectV4::ReadOnly)).is_none()
+        );
 
         let second = workflow_call("artifact.verify");
         let second_requested = AgentEventV4::next(
@@ -8698,9 +8693,13 @@ mod tests {
 
         let runtime = workflow_call("runtime.execute");
         assert!(
-            guided_loop_promotion_reason(&guided_events(AgentRequestRouteV4::Adaptive, AgentTaskShapeV4::Fast), &runtime, Some(ToolEffectV4::Runtime))
-                .unwrap()
-                .contains("high-cost")
+            guided_loop_promotion_reason(
+                &guided_events(AgentRequestRouteV4::Adaptive, AgentTaskShapeV4::Fast),
+                &runtime,
+                Some(ToolEffectV4::Runtime)
+            )
+            .unwrap()
+            .contains("high-cost")
         );
     }
 
@@ -8726,8 +8725,7 @@ mod tests {
 
     #[test]
     fn multi_step_discovery_tasks_and_completion_are_host_gated_from_events() {
-        let mut events =
-            guided_events(AgentRequestRouteV4::Adaptive, AgentTaskShapeV4::MultiStep);
+        let mut events = guided_events(AgentRequestRouteV4::Adaptive, AgentTaskShapeV4::MultiStep);
         assert!(
             guided_loop_rejection(&events, &workflow_call("browser_setup"))
                 .unwrap()
@@ -8735,11 +8733,33 @@ mod tests {
         );
         let mut scope = workflow_call("agent.request_input");
         scope.arguments = json!({"question":"Which scope?","reason":"scope"});
-        assert!(guided_loop_rejection(&events, &scope).unwrap().contains("discovery"));
+        assert!(
+            guided_loop_rejection(&events, &scope)
+                .unwrap()
+                .contains("discovery")
+        );
 
-        guided_success(&mut events, "root", "project.list", json!({"path":""}), json!([]));
-        guided_success(&mut events, "memory", "search_memory", json!({"query":"x"}), json!([]));
-        guided_success(&mut events, "skills", "search_skills", json!({"query":"x"}), json!([]));
+        guided_success(
+            &mut events,
+            "root",
+            "project.list",
+            json!({"path":""}),
+            json!([]),
+        );
+        guided_success(
+            &mut events,
+            "memory",
+            "search_memory",
+            json!({"query":"x"}),
+            json!([]),
+        );
+        guided_success(
+            &mut events,
+            "skills",
+            "search_skills",
+            json!({"query":"x"}),
+            json!([]),
+        );
         assert!(guided_loop_rejection(&events, &scope).is_none());
         assert!(
             guided_loop_rejection(&events, &workflow_call("project.read"))
@@ -8799,8 +8819,7 @@ mod tests {
 
     #[test]
     fn task_list_revision_and_completed_task_invariants_survive_replay() {
-        let mut events =
-            guided_events(AgentRequestRouteV4::Adaptive, AgentTaskShapeV4::MultiStep);
+        let mut events = guided_events(AgentRequestRouteV4::Adaptive, AgentTaskShapeV4::MultiStep);
         let first_tasks = vec![
             test_task("done", AgentTaskStatusV4::Completed),
             test_task("next", AgentTaskStatusV4::Pending),
@@ -8824,7 +8843,11 @@ mod tests {
                 test_task("next", AgentTaskStatusV4::Pending),
             ],
         };
-        assert!(validate_task_list_update(&events, &stale).unwrap_err().contains("revision 3"));
+        assert!(
+            validate_task_list_update(&events, &stale)
+                .unwrap_err()
+                .contains("revision 3")
+        );
         let regressed = AgentTaskListUpdateV4 {
             expected_revision: 3,
             change_summary: "bad regression".into(),
@@ -8834,7 +8857,11 @@ mod tests {
             ],
             ..stale
         };
-        assert!(validate_task_list_update(&events, &regressed).unwrap_err().contains("cannot be removed or regressed"));
+        assert!(
+            validate_task_list_update(&events, &regressed)
+                .unwrap_err()
+                .contains("cannot be removed or regressed")
+        );
 
         let mut overlong_blocker = test_task("next", AgentTaskStatusV4::Blocked);
         overlong_blocker.blocked_reason = Some("x".repeat(501));
@@ -8847,9 +8874,11 @@ mod tests {
                 overlong_blocker,
             ],
         };
-        assert!(validate_task_list_update(&events, &invalid_blocker)
-            .unwrap_err()
-            .contains("1..=500"));
+        assert!(
+            validate_task_list_update(&events, &invalid_blocker)
+                .unwrap_err()
+                .contains("1..=500")
+        );
     }
 
     #[test]

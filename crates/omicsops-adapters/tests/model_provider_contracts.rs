@@ -176,8 +176,8 @@ fn provider_reasoning_fields_are_never_mapped_to_public_text() {
         ),
     ];
     for (protocol, fixture) in fixtures {
-        let events = parse_provider_tool_response_for_request(protocol, &fixture, &request())
-            .unwrap();
+        let events =
+            parse_provider_tool_response_for_request(protocol, &fixture, &request()).unwrap();
         assert!(events.iter().any(|event| matches!(
             event,
             ProviderStreamEvent::TextDelta { text } if text == "public update"
@@ -192,8 +192,9 @@ fn provider_reasoning_fields_are_never_mapped_to_public_text() {
     let events = decoder
         .push(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private chain\"}}]}\n\n")
         .unwrap();
-    assert!(!events.iter().any(|event| matches!(
-        event,
-        ProviderStreamEvent::TextDelta { .. }
-    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ProviderStreamEvent::TextDelta { .. }))
+    );
 }

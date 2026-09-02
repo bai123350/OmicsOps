@@ -4061,7 +4061,9 @@ impl DesktopToolExecutorV4 {
                     requested_shape
                 };
                 (
-                    format!("Host request route frozen as {route_name} with {task_shape} shape: {reason}"),
+                    format!(
+                        "Host request route frozen as {route_name} with {task_shape} shape: {reason}"
+                    ),
                     json!({"route":route_name,"task_shape":task_shape,"reason":reason,"host_classified":self.forced_route.is_some(),"host_promoted":requested_shape != task_shape}),
                     vec!["host-request-router-v4".into()],
                 )

@@ -174,7 +174,9 @@ impl ToolPortV4 for ToolRegistryV4 {
                 RunModeV4::Plan => {
                     !matches!(
                         definition.id.as_str(),
-                        "agent.route_request" | "agent.record_mcp_unavailable" | "agent.update_tasks"
+                        "agent.route_request"
+                            | "agent.record_mcp_unavailable"
+                            | "agent.update_tasks"
                     ) && (definition.effect == ToolEffectV4::ReadOnly
                         || matches!(
                             definition.id.as_str(),
