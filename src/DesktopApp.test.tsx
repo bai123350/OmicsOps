@@ -61,13 +61,14 @@ function setupConversationStateHarness() {
 }
 
 describe("DesktopApp", () => {
-  it("shows actual model IDs in the composer and picker instead of provider profile labels", async () => {
+  it("loads all models from the current API and saves the selected model before allowing sends", async () => {
     const { stateSpy } = setupConversationStateHarness();
     stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
-    vi.mocked(api.listModelProfiles).mockResolvedValue([
-      { ...stateModel, label: "OpenAI-compatible", model: "research-model-a" },
-      { ...stateModel, id: "model-second", label: "Another gateway", model: "research-model-b" },
-    ]);
+    const profile = { ...stateModel, label: "OpenAI-compatible", model: "research-model-a" };
+    vi.mocked(api.listModelProfiles).mockResolvedValue([profile]);
+    const listModels = vi.spyOn(api, "listModelProfileModels").mockResolvedValue(["research-model-a", "research-model-b"]);
+    const saved = deferred<Awaited<ReturnType<typeof api.saveModelProfile>>>();
+    const save = vi.spyOn(api, "saveModelProfile").mockReturnValue(saved.promise);
     render(<DesktopApp />);
 
     await screen.findByText(/Agent 模式：LOCAL/);
@@ -75,10 +76,29 @@ describe("DesktopApp", () => {
     await waitFor(() => expect(selector).toBeEnabled());
     expect(selector).toHaveTextContent("research-model-a");
     fireEvent.click(selector);
-    expect(screen.getByRole("menuitemradio", { name: "research-model-a" })).toHaveAttribute("aria-checked", "true");
-    expect(screen.queryByText("OpenAI-compatible")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("menuitemradio", { name: "research-model-b" }));
-    expect(selector).toHaveTextContent("research-model-b");
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: "research-model-b" }));
+    expect(listModels).toHaveBeenCalledWith(profile.id);
+    expect(save).toHaveBeenCalledWith({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model: "research-model-b" });
+    expect(selector).toHaveTextContent("research-model-a");
+    expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toBeDisabled();
+    await act(async () => saved.resolve({ ...profile, model: "research-model-b" }));
+    await waitFor(() => expect(selector).toHaveTextContent("research-model-b"));
+    expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toBeEnabled();
+  });
+  it("keeps the current model and unlocks the composer when saving an API model fails", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    vi.spyOn(api, "listModelProfileModels").mockResolvedValue([stateModel.model, "other-api-model"]);
+    vi.spyOn(api, "saveModelProfile").mockRejectedValue(new Error("sensitive transport detail"));
+    render(<DesktopApp />);
+    await screen.findByText(/Agent 模式：LOCAL/);
+    const selector = screen.getByRole("button", { name: "选择模型" });
+    fireEvent.click(selector);
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: "other-api-model" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("模型切换失败");
+    expect(selector).toHaveTextContent(stateModel.model);
+    expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toBeEnabled();
+    expect(screen.queryByText("sensitive transport detail")).not.toBeInTheDocument();
   });
   it("opens the local-first project library when no project exists", async () => {
     vi.spyOn(api, "listProjects").mockResolvedValue([]);

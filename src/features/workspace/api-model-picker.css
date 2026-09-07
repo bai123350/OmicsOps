@@ -1,0 +1,12 @@
+.model-menu.api-model-menu { width: min(360px, calc(100vw - 60px)); max-height: min(560px, 65vh); display: flex; flex-direction: column; gap: 8px; padding: 12px; }
+.api-model-provider { display: flex; align-items: center; gap: 10px; color: #65736d; font-size: 11px; }
+.api-model-provider select { flex: 1; min-width: 0; padding: 7px; border: 1px solid #dde3de; border-radius: 8px; background: #fff; color: #384a42; }
+.api-model-search { display: flex; gap: 6px; }
+.api-model-search input { min-width: 0; flex: 1; border: 1px solid #dde3de; border-radius: 8px; padding: 9px; font: inherit; font-size: 12px; }
+.model-menu .api-model-search button { width: 34px; flex: 0 0 34px; justify-content: center; padding: 6px; }
+.api-model-options { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.api-model-options button span { min-width: 0; overflow-wrap: anywhere; }
+.api-model-options svg { flex-shrink: 0; }
+.api-model-menu p { margin: 0; padding: 4px 6px; font-size: 11px; line-height: 1.5; color: #64756c; }
+.api-model-menu p[role=alert] { color: #a04834; }
+.model-menu .api-model-manage { border-top: 1px solid #e7ebe7; border-radius: 0; flex-shrink: 0; }

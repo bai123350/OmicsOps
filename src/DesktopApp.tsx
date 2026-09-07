@@ -3,6 +3,7 @@ import * as api from "./tauri-api";
 import type { AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendAvailabilityV4, ComputeSelectionV4, ConnectionProfile, ConversationAgentStateV4, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, ProjectArtifact, ProposedPlanRevisionV4, RemoteFileEntry, RunSummaryV4, SessionAgentModeV4, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
 import { WorkspaceShell } from "./features/workspace/WorkspaceShell";
+import { ApiModelPicker } from "./features/workspace/ApiModelPicker";
 import type { Locale } from "./features/workspace/copy";
 import { SettingsPanel } from "./features/settings/SettingsPanel";
 
@@ -23,6 +24,8 @@ export default function DesktopApp() {
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>([]);
   const [settingsSection, setSettingsSection] = useState<"models" | "remote" | "skills">("models");
   const [activeModelProfileId, setActiveModelProfileId] = useState<string | null>(null);
+  const [modelSelectionBusy, setModelSelectionBusy] = useState(false);
+  const modelSelectionInFlight = useRef(false);
   const [lastGoal, setLastGoal] = useState("");
   const [v4Plan, setV4Plan] = useState<RunSummaryV4 | null>(null);
   const [computeBackends, setComputeBackends] = useState<ComputeBackendAvailabilityV4[]>([]);
@@ -929,7 +932,19 @@ export default function DesktopApp() {
     locale={locale} onLocaleChange={setLocale} onOpenSettings={(section = "models") => { setSettingsSection(section); setSettingsOpen(true); }} onBackToProjects={() => setSelected(null)}
     conversations={conversations} activeConversationId={conversation?.id} onSelectConversation={selectConversation} onNewConversation={newConversation} onDeleteConversation={deleteConversation}
     messages={messages} agentBusy={agentBusy} agentNotice={agentNotice} modelLabel={activeModel?.model}
-    modelOptions={modelProfiles.map((profile) => ({ id: profile.id, label: profile.model }))} modelId={activeModelProfileId ?? undefined} onModelChange={setActiveModelProfileId}
+    composerBusy={modelSelectionBusy}
+    modelPicker={<ApiModelPicker zh={locale === "zh-CN"} profiles={modelProfiles} activeProfileId={activeModelProfileId} disabled={agentBusy || conversationLocked || conversationHydrating || modelSelectionBusy || planLoading} onProfileChange={(id) => { if (!modelSelectionInFlight.current) setActiveModelProfileId(id); }} onManage={() => { setSettingsSection("models"); setSettingsOpen(true); }} onModelSelect={async (profile, model) => {
+      if (modelSelectionInFlight.current || conversationLocked || conversationHydrating || agentBusy || profile.id !== activeModelProfileId) throw new Error("Model selection is currently locked");
+      modelSelectionInFlight.current = true;
+      setModelSelectionBusy(true);
+      try {
+        const updated = await api.saveModelProfile({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model });
+        setModelProfiles((current) => current.map((item) => item.id === updated.id ? updated : item));
+      } finally {
+        modelSelectionInFlight.current = false;
+        setModelSelectionBusy(false);
+      }
+    }} />}
     agentMode={conversationMode} conversationLocked={conversationLocked} conversationHydrating={conversationHydrating} onAgentModeChange={changeConversationMode}
     latestPlanRevision={latestPlanRevision} v4Plan={v4Plan} planLoading={planLoading} planApproved={planApproved} canStartRun={false} runStarted={Boolean(runId && !currentRunAwaitsPlanApproval)} activeRunId={runId} activeRunLastActivityAt={activeRunLastActivityAt} agentRunEventsV4={agentRunEventsV4}
     computeBackends={computeBackends} computeBackendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} approvalPolicy={approvalPolicy} computeEnvironment={computeEnvironment} computeBusy={computeBusy}
@@ -1048,7 +1063,7 @@ export default function DesktopApp() {
     onPreviewImage={selected.connection_id && selected.remote_root ? (relativePath) => api.previewProjectImage(selected.id, relativePath) : undefined}
     onSend={async (markdown, mode) => {
       if (!conversation || !activeModel) { setSettingsOpen(true); return false; }
-      if (conversationHydratingRef.current || conversationLocked) return false;
+      if (conversationHydratingRef.current || conversationLocked || modelSelectionInFlight.current) return false;
       const projectId = selected.id;
       const conversationId = conversation.id;
       // The send is a newer conversation transition than any reconnect read
