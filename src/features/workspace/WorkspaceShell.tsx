@@ -157,6 +157,8 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const [previewBusy, setPreviewBusy] = useState(false);
   const [previewError, setPreviewError] = useState("");
   const [deletingConversationId, setDeletingConversationId] = useState<string | null>(null);
+  const [followingLatest, setFollowingLatest] = useState(true);
+  const followingLatestRef = useRef(true);
   const messageStreamRef = useRef<HTMLElement>(null);
   const effectivePlanActionBusy = Boolean(planActionBusy || approvePlanBusy || runStopping);
   const controlledMode = agentMode !== undefined;
@@ -207,6 +209,8 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     sendGenerationRef.current += 1;
     sendBusyRef.current = false;
     setSendBusy(false);
+    followingLatestRef.current = true;
+    setFollowingLatest(true);
   }, [activeConversationId]);
   useEffect(() => { if (showPlanPanel) setTab("plan"); }, [showPlanPanel]);
   useEffect(() => {
@@ -220,12 +224,12 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
 
   useEffect(() => {
     const stream = messageStreamRef.current;
-    if (!stream) return;
+    if (!stream || !followingLatestRef.current) return;
     const frame = requestAnimationFrame(() => {
-      stream.scrollTop = stream.scrollHeight;
+      if (followingLatestRef.current) stream.scrollTop = stream.scrollHeight;
     });
     return () => cancelAnimationFrame(frame);
-  }, [messages.length, streamingAssistant, agentBusy, agentNotice, planLoading, runStarted, latestAgentRunEventV4?.run_id, latestAgentRunEventV4?.sequence]);
+  }, [activeConversationId, messages.length, streamingAssistant, agentBusy, agentNotice, planLoading, runStarted, latestAgentRunEventV4?.run_id, latestAgentRunEventV4?.sequence]);
 
   useEffect(() => {
     if (selectedImagePath && imageFiles.some((entry) => entry.relative_path === selectedImagePath)) return;
@@ -319,7 +323,12 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
 
     <main className="conversation-pane" aria-label={t.research}>
       <header className="conversation-header"><div><small>{project.name}</small><h1>{conversationTitle}</h1></div><span className="live-status"><i />{t.status}</span></header>
-      <section className="message-stream" aria-live="polite" ref={messageStreamRef}>
+      <section className="message-stream" aria-live="polite" ref={messageStreamRef} onScroll={(event) => {
+        const stream = event.currentTarget;
+        const following = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 64;
+        followingLatestRef.current = following;
+        setFollowingLatest(following);
+      }}>
         {!onSend && <article className="message user-message"><MarkdownContent markdown={zh ? "比较两批 PBMC，检查批次效应并生成可复现的分析报告。" : "Compare two PBMC batches, assess batch effects, and generate a reproducible report."} /></article>}
         {messages.length === 0 && <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><MarkdownContent markdown={zh ? "描述你的研究目标。我会先核对数据与假设，并在任何正式执行前展示计划供你审批。" : "Describe your research goal. I will first check the data and assumptions, then show a plan for approval before any formal execution."} /></div></article>}
         {sentMessages.map((message, index) => <article className="message user-message" key={`${index}-${message}`}><MarkdownContent markdown={message} /></article>)}
@@ -338,6 +347,12 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
         {runStalled && <div className="agent-retry-notice" role="status"><span>{zh ? "超过 90 秒未收到新的 Agent 事件，任务可能卡住；仍可终止运行。" : "No new Agent event has arrived for 90 seconds; the run may be stuck. You can still stop it."}</span></div>}
         {runActive && onCancelRun && <div className="agent-run-controls" role="region" aria-label={zh ? "远程 Agent 运行控制" : "Remote agent run controls"}><div><span className="agent-working"><i />{runStopping ? (zh ? "正在终止当前操作…" : "Stopping current operation…") : (zh ? "远程 Agent 正在运行" : "Remote agent is running")}</span><small>{zh ? "将中断模型请求、当前 SSH 命令及后续操作" : "Stops the model request, current SSH command, and all subsequent actions"}</small></div><button className="stop-agent-button" disabled={runStopping} onClick={() => void onCancelRun()}><Square size={14} fill="currentColor" />{runStopping ? (zh ? "终止中…" : "Stopping…") : (zh ? "终止运行" : "Stop run")}</button></div>}
         {!onSend && <article className="task-card"><div className="task-icon"><Activity size={18} /></div><div className="task-body"><div><strong>{t.task}</strong><span>65%</span></div><p>{zh ? "远端 Linux · 8 CPU · 32 GiB · 低风险" : "Remote Linux · 8 CPU · 32 GiB · low risk"}</p><div className="task-progress"><i /></div><div className="task-actions"><button>{zh ? "查看日志" : "View logs"}</button><button>{zh ? "查看计划" : "View plan"}</button></div></div></article>}
+      {!followingLatest && <button className="back-to-latest" onClick={() => {
+        const stream = messageStreamRef.current;
+        if (stream) stream.scrollTop = stream.scrollHeight;
+        followingLatestRef.current = true;
+        setFollowingLatest(true);
+      }}>↓ {zh ? "回到最新" : "Back to latest"}</button>}
       </section>
       <footer className="composer">
         <div className="composer-runtime-bar">
@@ -416,8 +431,6 @@ function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncer
   const technicalEntries = entries.filter(({ event, modelText }) => modelText === undefined && !isToolTrajectoryEvent(event) && !isHiddenTrajectoryEvent(event));
   const tools = mergeV4ToolCalls(events);
   const guided = buildGuidedV4Overview(events);
-  const batchedCallIds = new Set(guided?.batches.flatMap((batch) => batch.callIds) ?? []);
-  const unbatchedTools = tools.filter((tool) => !batchedCallIds.has(tool.callId));
   const latest = events.at(-1);
   const terminal = effectiveTerminalAgentEventV4(events);
   const completionPending = !terminal && Boolean(latest && (
@@ -430,7 +443,7 @@ function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncer
   const pauseReason = getV4PauseReason(events);
   const status = terminal?.event.kind === "run_completed" ? (zh ? "已完成" : "Completed") : terminal?.event.kind === "run_cancelled" ? (zh ? "已终止" : "Cancelled") : terminal?.event.kind === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention") : terminal?.event.kind === "run_failed" ? (zh ? "失败" : "Failed") : pauseReason === "approval" ? (zh ? "等待工具审批" : "Waiting for approval") : pauseReason === "input" ? (zh ? "等待回答" : "Waiting for input") : pauseReason === "browser_connection" ? (zh ? "等待连接浏览器" : "Waiting for browser") : pauseReason === "browser_human" ? (zh ? "等待人工处理浏览器" : "Waiting for browser intervention") : pauseReason === "uncertain" ? (zh ? "等待副作用核验" : "Waiting for verification") : (zh ? "运行中" : "Running");
   const failed = terminal?.event.kind === "run_failed";
-  const shouldExpand = !historical && (Boolean(pauseReason) || terminal?.event.kind === "run_failed" || terminal?.event.kind === "run_needs_attention");
+  const shouldExpand = !historical && (!terminal || Boolean(pauseReason) || terminal?.event.kind === "run_failed" || terminal?.event.kind === "run_needs_attention");
   async function resumeRun() {
     if (!onResume || !events[0] || resumeBusyRef.current) return;
     resumeBusyRef.current = true;
@@ -443,26 +456,23 @@ function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncer
     }
   }
   return <>
-    {guided && <GuidedV4Overview locale={locale} overview={guided} terminal={terminal} historical={historical} />}
-    {progress.map(({ event, lastEvent, modelText }) => <article aria-label={zh ? "模型输出" : "Model output"} className="message assistant-message agent-work-update agent-public-progress" key={`${event.run_id}-${event.sequence}`}>
-      <div className="assistant-avatar"><Bot size={17} /></div>
-      <div><div className="agent-work-heading"><strong>{guided ? (zh ? "思考摘要" : "Thought summary") : (zh ? "进度" : "Progress")}</strong>{guided && <span className="v4-public-summary-label">{zh ? "公开摘要" : "Public summary"}</span>}<small>{new Date(lastEvent.occurred_at).toLocaleTimeString()}</small></div><MarkdownContent markdown={modelText ?? ""} /></div>
-    </article>)}
     {completionPending && <div className="agent-completion-pending" role="status"><span className="agent-working"><i />{zh ? "正在核验最终结果…" : "Verifying the final result…"}</span></div>}
     <details className={`agent-run-fold agent-v4-run ${historical ? "" : "is-active"}`} open={shouldExpand}>
-    <summary><span className="agent-run-fold-title"><span><b>{zh ? "执行过程" : "Process"}</b><small>{terminal ? (zh ? "工具调用与验证记录" : "Tool calls and verification") : (zh ? "Agent 正在处理任务" : "Agent is working")}</small></span><ChevronRight size={15} /></span><span>{status} · {tools.length} {zh ? "个步骤" : tools.length === 1 ? "step" : "steps"}</span></summary>
+    <summary><span className="agent-run-fold-title"><span><b>{zh ? "执行过程" : terminal ? "Processed" : "Processing"}</b><small>{terminal ? (zh ? "工具调用与验证记录" : "Tool calls and verification") : (zh ? "Agent 正在处理任务" : "Agent is working")}</small></span><ChevronRight size={15} /></span><span>{status} · {tools.length} {zh ? "个步骤" : tools.length === 1 ? "step" : "steps"}{eventDuration(events[0]?.occurred_at, (terminal ?? latest)?.occurred_at) && ` · ${eventDuration(events[0]?.occurred_at, (terminal ?? latest)?.occurred_at)}`}</span></summary>
     <div className="agent-run-fold-body">
-      {unbatchedTools.length > 0 && <section className="v4-tool-traces" aria-label={zh ? "工具调用详情" : "Tool call details"}>
-        {unbatchedTools.map((tool) => <details className="v4-tool-trace" key={tool.callId}>
-          <summary className="v4-tool-trace-heading"><ChevronRight size={13} /><strong>{toolDisplayLabel(tool.toolId, zh)}</strong>{tool.subject && <span className="v4-tool-subject">{tool.subject}</span>}<span className={`v4-tool-status ${tool.status}`}>{toolStatusLabel(tool.status, zh)}</span></summary>
+      <section className="v4-process-timeline" aria-label={zh ? "工具调用详情" : "Tool call details"}>
+      {[
+        ...progress.map(({ event, modelText }) => ({ sequence: event.sequence, node: <article aria-label={zh ? "模型输出" : "Model output"} className="v4-progress-row" key={`progress-${event.sequence}`}><span aria-hidden="true">–</span><strong>{zh ? "进度" : "PROGRESS"}</strong><MarkdownContent markdown={modelText ?? ""} /></article> })),
+        ...events.filter(({ event }) => event.kind === "cycle_started").map((event) => ({ sequence: event.sequence, node: <div className="v4-thinking-row" key={`thinking-${event.sequence}`}><span aria-hidden="true">○</span><strong>{zh ? "思考中" : "THINKING"}</strong></div> })),
+        ...tools.map((tool) => ({ sequence: tool.firstSequence, node: <details className="v4-tool-trace" key={tool.callId}>
+          <summary className="v4-tool-trace-heading"><span className={`v4-tool-mark ${tool.status}`} aria-label={toolStatusLabel(tool.status, zh)}>{tool.status === "failed" ? "×" : tool.status === "succeeded" || tool.status === "reused" ? "✓" : "○"}</span><strong title={toolDisplayLabel(tool.toolId, zh)}>{compactToolLabel(tool.toolId)}</strong>{tool.subject && <span className="v4-tool-subject" title={tool.subject}>{tool.subject}</span>}<span className={`v4-tool-status ${tool.status}`}>{toolStatusLabel(tool.status, zh)}</span><small className="v4-tool-metrics">{toolMetrics(tool, zh)}</small><ChevronRight size={13} /></summary>
           <div className="v4-tool-trace-body">
             <small>{tool.toolId} · #{tool.firstSequence}–#{tool.lastSequence}</small>
             {tool.argumentsPreview && <><b>{zh ? "输入" : "Input"}</b><code>{tool.argumentsPreview}</code></>}
-            {tool.outcome && <><b>{zh ? "结果" : "Result"}</b><MarkdownContent markdown={limitText(tool.outcome, 800)} /></>}
+            {tool.outcome !== undefined && <><b>{zh ? "结果" : "Result"}</b><pre>{tool.outcome}</pre></>}
           </div>
-        </details>)}
-      </section>}
-      {technicalEntries.map(({ event, lastEvent }) => <article className={`message assistant-message agent-work-update ${event.event.kind === "input_requested" ? "v4-input-decision-entry" : ""}`} key={`${event.run_id}-${event.sequence}`}>
+        </details> })),
+        ...technicalEntries.map(({ event, lastEvent }) => ({ sequence: event.sequence, node: <article className={`message assistant-message agent-work-update ${event.event.kind === "input_requested" ? "v4-input-decision-entry" : ""}`} key={`${event.run_id}-${event.sequence}`}>
         <div className="assistant-avatar"><Bot size={17} /></div>
         <div><div className="agent-work-heading"><strong>{v4EventLabel(event, zh)}</strong><small>{lastEvent.sequence === event.sequence ? `#${event.sequence}` : `#${event.sequence}–#${lastEvent.sequence}`} · {new Date(lastEvent.occurred_at).toLocaleTimeString()}</small></div>
           {v4EventContent(event, zh) && <MarkdownContent markdown={v4EventContent(event, zh)} />}
@@ -477,7 +487,10 @@ function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncer
           {event.event.kind === "tool_dispatch_uncertain" && onResolveUncertain && !isV4UncertainResolved(events, event.event.call_id) && <V4UncertainCard locale={locale} onResolve={(resolution, evidence) => onResolveUncertain(event.run_id, event.event.kind === "tool_dispatch_uncertain" ? event.event.call_id : "", resolution, evidence)} />}
           {event.event.kind === "browser_tab_cleanup_required" && onCloseBrowserTabs && <BrowserTabCleanupCard locale={locale} tabs={event.event.tabs} onClose={() => onCloseBrowserTabs(event.run_id, event.event.kind === "browser_tab_cleanup_required" ? event.event.sessions : [])} />}
         </div>
-      </article>)}
+      </article> })),
+      ].sort((a, b) => a.sequence - b.sequence).map(({ node }) => node)}
+      </section>
+      {guided && <details className="v4-process-context"><summary>{zh ? "任务与阶段详情" : "Task and phase details"}</summary><GuidedV4Overview locale={locale} overview={guided} terminal={terminal} historical={historical} /></details>}
       {failed && onResume && <div className="v4-resume-run"><span>{zh ? "修正运行条件后可从已验证事件链继续。" : "Resume from the verified event chain after fixing the runtime condition."}</span><button disabled={resumeBusy} onClick={() => void resumeRun()}>{resumeBusy ? (zh ? "恢复中…" : "Resuming…") : (zh ? "继续运行" : "Resume run")}</button></div>}
       {pauseReason === "browser_connection" && onResume && <div className="v4-resume-run"><span>{zh ? "请在设置 → Browser 安装或启用 OmicsOps 扩展并连接相应会话，然后原地继续此任务。" : "Open Settings → Browser, install or enable the OmicsOps extension, connect the requested session, then resume this same task."}</span><button disabled={resumeBusy} onClick={() => void resumeRun()}>{resumeBusy ? (zh ? "恢复中…" : "Resuming…") : (zh ? "已连接，继续" : "Connected, resume")}</button></div>}
       {pauseReason === "browser_human" && onResume && <div className="v4-resume-run"><span>{zh ? "请在真实浏览器中完成人机验证或其他人工步骤；OmicsOps 不会自动求解 CAPTCHA。处理完成后原地继续。" : "Complete the CAPTCHA or other manual step in the real browser. OmicsOps never solves CAPTCHA automatically; resume this same run when finished."}</span><button disabled={resumeBusy} onClick={() => void resumeRun()}>{resumeBusy ? (zh ? "恢复中…" : "Resuming…") : (zh ? "已人工处理，继续" : "Handled, resume")}</button></div>}
@@ -769,6 +782,8 @@ type MergedV4ToolCall = {
   firstSequence: number;
   lastSequence: number;
   outcome?: string;
+  startedAt?: string;
+  finishedAt?: string;
   subject?: string;
   status: "requested" | "running" | "succeeded" | "failed" | "reused";
 };
@@ -787,7 +802,7 @@ function mergeV4ToolCalls(events: AgentRunEventV4[]): MergedV4ToolCall[] {
       current.argumentsPreview = limitText(JSON.stringify(redactToolArguments(args)), 500);
       current.subject = toolSubject(args);
     }
-    if (outcome) current.outcome = outcome;
+    if (outcome !== undefined) current.outcome = outcome;
     if (status) current.status = status;
   };
   for (const item of events) {
@@ -797,6 +812,16 @@ function mergeV4ToolCalls(events: AgentRunEventV4[]): MergedV4ToolCall[] {
     else if (event.kind === "tool_finished") update(event.outcome.call_id, item.sequence, event.outcome.tool_id, undefined, event.outcome.succeeded ? "succeeded" : "failed", event.outcome.model_content);
     else if (event.kind === "tool_outcome_reused") update(event.outcome.call_id, item.sequence, event.outcome.tool_id, undefined, "reused", event.outcome.model_content);
   }
+  for (const item of events) {
+    const event = item.event;
+    if (event.kind === "tool_requested" || event.kind === "tool_dispatch_started") {
+      const tool = byCall.get(event.kind === "tool_requested" ? event.call.call_id : event.call_id);
+      if (tool && (event.kind === "tool_dispatch_started" || !tool.startedAt)) tool.startedAt = item.occurred_at;
+    } else if (event.kind === "tool_finished") {
+      const tool = byCall.get(event.outcome.call_id);
+      if (tool) tool.finishedAt = item.occurred_at;
+    }
+  }
   return [...byCall.values()];
 }
 function isInternalAgentTool(toolId: string) {
@@ -804,11 +829,25 @@ function isInternalAgentTool(toolId: string) {
 }
 function toolSubject(args?: Record<string, unknown>) {
   if (!args) return undefined;
-  for (const key of ["path", "relative_path", "artifact_id", "query"]) {
+  for (const key of ["path", "file_path", "relative_path", "command", "cmd", "skill_name", "name", "artifact_id", "query"]) {
     const value = args[key];
-    if (typeof value === "string" && value.trim()) return limitText(value.trim(), 90);
+    if (typeof value === "string" && value.trim()) return value.trim();
   }
   return undefined;
+}
+function compactToolLabel(toolId: string) {
+  const labels: Record<string, string> = { "project.read": "read", "project.write": "write", "project.edit": "edit", "project.list": "list", "use_skill": "SKILL", "runtime.execute": "execute", "runtime.python": "python", "runtime.r": "R", "agent.delegate": "agent" };
+  return labels[toolId] ?? toolId;
+}
+function eventDuration(start?: string, end?: string) {
+  if (!start || !end) return "";
+  const duration = Date.parse(end) - Date.parse(start);
+  return Number.isFinite(duration) && duration >= 0 ? `${Number((duration / 1000).toFixed(1))}s` : "";
+}
+function toolMetrics(tool: MergedV4ToolCall, zh: boolean) {
+  const duration = tool.status === "reused" ? "" : eventDuration(tool.startedAt, tool.finishedAt);
+  const lines = tool.outcome === undefined ? undefined : tool.outcome === "" ? 0 : tool.outcome.replace(/\r?\n$/, "").split(/\r?\n/).length;
+  return [duration, lines === undefined ? "" : `${lines} ${zh ? "行" : lines === 1 ? "line" : "lines"}`].filter(Boolean).join(" · ");
 }
 function toolDisplayLabel(toolId: string, zh: boolean) {
   const labels: Record<string, [string, string]> = {

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { WorkspaceShell } from "./WorkspaceShell";
@@ -11,6 +11,45 @@ const project = {
 };
 
 describe("WorkspaceShell", () => {
+  it("interleaves progress and individual read, write, edit calls even inside a batch", () => {
+    const base = { schema_version: 4 as const, run_id: "run-compact", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
+    const longOutput = `${"a".repeat(900)}\r\nlast line\r\n`;
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} runStarted activeRunId={base.run_id} agentRunEventsV4={[
+      { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "cycle_started", cycle_id: 1 } },
+      { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "model_text", text: "Inspect the file first." } },
+      { ...base, sequence: 3, occurred_at: "2026-08-17T00:00:02Z", event: { kind: "tool_batch_started", batch_id: 1, cycle_id: 1, phase: "executing", tool_names: ["project.read", "write", "edit"], call_ids: ["r", "w", "e"] } },
+      { ...base, sequence: 4, occurred_at: "2026-08-17T00:00:03Z", event: { kind: "tool_requested", call: { call_id: "r", tool_id: "project.read", arguments: { path: "C:\\data\\input.txt" } } } },
+      { ...base, sequence: 5, occurred_at: "2026-08-17T00:00:04Z", event: { kind: "tool_finished", outcome: { call_id: "r", tool_id: "project.read", succeeded: true, model_content: longOutput, data: null, provenance: [] } } },
+      { ...base, sequence: 6, occurred_at: "2026-08-17T00:00:05Z", event: { kind: "model_text", text: "Now save and revise." } },
+      { ...base, sequence: 7, occurred_at: "2026-08-17T00:00:06Z", event: { kind: "tool_requested", call: { call_id: "w", tool_id: "write", arguments: { file_path: "/Users/research/output.txt" } } } },
+      { ...base, sequence: 8, occurred_at: "2026-08-17T00:00:07Z", event: { kind: "tool_requested", call: { call_id: "e", tool_id: "edit", arguments: { path: "C:\\data\\output.txt" } } } },
+    ]} />);
+    const timeline = screen.getByRole("region", { name: "Tool call details" });
+    expect(Array.from(timeline.children).map((row) => row.querySelector("strong")?.textContent)).toEqual(["THINKING", "PROGRESS", "read", "PROGRESS", "write", "edit"]);
+    const read = within(timeline).getByText("read").closest("details")!;
+    expect(read).not.toHaveAttribute("open");
+    expect(read.querySelector("summary")).toHaveTextContent("1s · 2 lines");
+    fireEvent.click(read.querySelector("summary")!);
+    expect(read).toHaveAttribute("open");
+    expect(read.querySelector("pre")?.textContent).toBe(longOutput);
+    expect(within(timeline).getByText("/Users/research/output.txt")).toBeInTheDocument();
+  });
+
+  it("preserves reading position on new output and returns to the latest on demand", async () => {
+    const props = { project, locale: "en-US" as const, onLocaleChange: () => undefined, onSend: vi.fn() };
+    const { container, rerender } = render(<WorkspaceShell {...props} streamingAssistant="First" />);
+    const stream = container.querySelector(".message-stream") as HTMLElement;
+    Object.defineProperties(stream, { scrollHeight: { configurable: true, value: 1200 }, clientHeight: { configurable: true, value: 400 } });
+    stream.scrollTop = 100;
+    fireEvent.scroll(stream);
+    rerender(<WorkspaceShell {...props} streamingAssistant="First and second" />);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(stream.scrollTop).toBe(100);
+    fireEvent.click(screen.getByRole("button", { name: /Back to latest/ }));
+    expect(stream.scrollTop).toBe(1200);
+    expect(screen.queryByRole("button", { name: /Back to latest/ })).not.toBeInTheDocument();
+  });
+
   it("renders the guided six-phase trajectory, public thought summaries, and a read-only task snapshot", () => {
     const base = { schema_version: 4 as const, run_id: "run-guided", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
     const events = [
@@ -31,8 +70,7 @@ describe("WorkspaceShell", () => {
 
     const overview = screen.getByRole("region", { name: "Agent 阶段轨迹" });
     for (const phase of ["routing", "discovery", "clarification", "organizing", "executing", "verifying"]) expect(screen.getByText(phase, { exact: true })).toBeInTheDocument();
-    expect(screen.getByText("思考摘要")).toBeInTheDocument();
-    expect(screen.getByText("公开摘要")).toBeInTheDocument();
+    expect(screen.getByText("进度", { exact: true })).toBeInTheDocument();
     expect(screen.queryByText("private reasoning must never render")).not.toBeInTheDocument();
     expect(screen.getByRole("region", { name: "任务列表" })).toHaveTextContent("revision 2");
     expect(overview).toHaveTextContent("分解为可验证步骤");
@@ -370,13 +408,13 @@ describe("WorkspaceShell", () => {
     expect(screen.getByRole("cell", { name: "CD3D" })).toBeInTheDocument();
   });
 
-  it("keeps technical trajectory collapsed and omits persistence placeholder text", () => {
+  it("opens the active trajectory while omitting persistence placeholder text", () => {
     const base = { schema_version: 4 as const, run_id: "run-technical", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
     render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-technical" onLocaleChange={() => undefined} agentRunEventsV4={[
       { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "run_spec_frozen" as const, approval_hash: "a", spec_hash: "b" } },
       { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "tool_dispatch_started" as const, call_id: "call-1", tool_id: "runtime.execute", effect: "runtime", idempotency_key: "key" } },
     ]} />);
-    expect(screen.getByText("执行过程").closest("details")).not.toHaveAttribute("open");
+    expect(screen.getByText("执行过程").closest("details")).toHaveAttribute("open");
     expect(screen.queryByText(/状态已写入可验证事件链/)).not.toBeInTheDocument();
   });
 
@@ -398,7 +436,7 @@ describe("WorkspaceShell", () => {
       { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "tool_finished" as const, outcome: { call_id: "read-1", tool_id: "project.read", succeeded: true, model_content: "large internal report", data: null, provenance: [] } } },
     ]} />);
     fireEvent.click(screen.getByText("执行过程"));
-    const step = screen.getByText("读取项目文件").closest("details");
+    const step = screen.getByTitle("读取项目文件").closest("details");
     expect(step).not.toHaveAttribute("open");
     expect(step).toHaveTextContent("results/audit.md");
     expect(screen.getByText(/运行中 · 1 个步骤/)).toBeInTheDocument();
