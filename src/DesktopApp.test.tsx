@@ -61,6 +61,45 @@ function setupConversationStateHarness() {
 }
 
 describe("DesktopApp", () => {
+  it("loads all models from the current API and saves the selected model before allowing sends", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    const profile = { ...stateModel, label: "OpenAI-compatible", model: "research-model-a" };
+    vi.mocked(api.listModelProfiles).mockResolvedValue([profile]);
+    const listModels = vi.spyOn(api, "listModelProfileModels").mockResolvedValue(["research-model-a", "research-model-b"]);
+    const saved = deferred<Awaited<ReturnType<typeof api.saveModelProfile>>>();
+    const save = vi.spyOn(api, "saveModelProfile").mockReturnValue(saved.promise);
+    render(<DesktopApp />);
+
+    await screen.findByText(/Agent 模式：LOCAL/);
+    const selector = await screen.findByRole("button", { name: "选择模型" });
+    await waitFor(() => expect(selector).toBeEnabled());
+    expect(selector).toHaveTextContent("research-model-a");
+    fireEvent.click(selector);
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: "research-model-b" }));
+    expect(listModels).toHaveBeenCalledWith(profile.id);
+    expect(save).toHaveBeenCalledWith({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model: "research-model-b" });
+    expect(selector).toHaveTextContent("research-model-a");
+    expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toBeDisabled();
+    await act(async () => saved.resolve({ ...profile, model: "research-model-b" }));
+    await waitFor(() => expect(selector).toHaveTextContent("research-model-b"));
+    expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toBeEnabled();
+  });
+  it("keeps the current model and unlocks the composer when saving an API model fails", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    vi.spyOn(api, "listModelProfileModels").mockResolvedValue([stateModel.model, "other-api-model"]);
+    vi.spyOn(api, "saveModelProfile").mockRejectedValue(new Error("sensitive transport detail"));
+    render(<DesktopApp />);
+    await screen.findByText(/Agent 模式：LOCAL/);
+    const selector = screen.getByRole("button", { name: "选择模型" });
+    fireEvent.click(selector);
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: "other-api-model" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("模型切换失败");
+    expect(selector).toHaveTextContent(stateModel.model);
+    expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toBeEnabled();
+    expect(screen.queryByText("sensitive transport detail")).not.toBeInTheDocument();
+  });
   it("opens the local-first project library when no project exists", async () => {
     vi.spyOn(api, "listProjects").mockResolvedValue([]);
     render(<DesktopApp />);
@@ -191,7 +230,7 @@ describe("DesktopApp", () => {
     }
   });
 
-  it("starts planning from the plus-menu Plan mode and continues execution after approval", async () => {
+  it("starts planning from the Agent controls Plan mode and continues execution after approval", async () => {
     const project = { id: "project-1", name: "PBMC 图谱", description: "", local_root: "E:/Science/pbmc", remote_root: null, connection_id: null, template: "single_cell_rna_seq" as const, status: "running" as const, ollama_only: false, created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" };
     const conversation = { id: "conversation-1", project_id: project.id, title: "分析任务", status: "idle" as const, model_profile_id: "model-1", created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" };
     const model = { id: "model-1", label: "Test model", provider: "ollama" as const, base_url: "http://localhost:11434", model: "test", credential_reference: null, supports_tools: true, supports_vision: false };
@@ -224,8 +263,8 @@ describe("DesktopApp", () => {
     render(<DesktopApp />);
     await screen.findByRole("main", { name: "科研对话" });
     await screen.findByText(/Agent 模式：LOCAL/);
-    fireEvent.click(screen.getByRole("button", { name: "添加上下文或选择模式" }));
-    fireEvent.click(screen.getByRole("menuitem", { name: /Plan 模式/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Agent 权限" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "先做计划" }));
     fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
     await screen.findByRole("region", { name: "V4 计算后端" });
     await screen.findByRole("radio", { name: /LOCAL/ }, { timeout: 3000 });
@@ -279,8 +318,8 @@ describe("DesktopApp", () => {
 
     render(<DesktopApp />);
     await screen.findByRole("heading", { name: "Agent 会话" });
-    fireEvent.click(screen.getByRole("button", { name: "添加上下文或选择模式" }));
-    const planMode = screen.getByRole("menuitem", { name: /Plan 模式/ });
+    fireEvent.click(screen.getByRole("button", { name: "Agent 权限" }));
+    const planMode = screen.getByRole("menuitemcheckbox", { name: "先做计划" });
     expect(planMode).toBeDisabled();
     fireEvent.click(planMode);
     expect(setConversationAgentMode).not.toHaveBeenCalled();
@@ -538,8 +577,8 @@ describe("DesktopApp", () => {
 
     render(<DesktopApp />);
     await screen.findByText(/Agent 模式：LOCAL/);
-    fireEvent.click(screen.getByRole("button", { name: "添加上下文或选择模式" }));
-    fireEvent.click(screen.getByRole("menuitem", { name: /Plan 模式/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Agent 权限" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "先做计划" }));
 
     expect(await screen.findByText("mode write failed")).toBeInTheDocument();
     expect(await screen.findByText(/Agent 模式：LOCAL/)).toBeInTheDocument();

@@ -192,7 +192,7 @@ describe("WorkspaceShell", () => {
     expect(onApprovalPolicyChange).toHaveBeenCalledWith("full_access");
     expect(onAutonomyModeChange).toHaveBeenCalledWith("full_auto");
   });
-  it("keeps ordinary questions in chat until the user explicitly selects Plan mode from the plus menu", async () => {
+  it("keeps ordinary questions in chat until the user explicitly selects Plan mode from Agent controls", async () => {
     const onSend = vi.fn().mockResolvedValue(true);
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={onSend}
       computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
@@ -202,8 +202,8 @@ describe("WorkspaceShell", () => {
     await waitFor(() => expect(onSend).toHaveBeenCalledWith("这个文件是什么格式？", "chat"));
     expect(screen.queryByRole("region", { name: "V4 计算后端" })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "添加上下文或选择模式" }));
-    fireEvent.click(screen.getByRole("menuitem", { name: /Plan 模式/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Agent 权限" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "先做计划" }));
     fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
     expect(screen.getByRole("region", { name: "V4 计算后端" })).toBeInTheDocument();
     fireEvent.change(screen.getByRole("textbox", { name: /描述研究目标/ }), { target: { value: "执行完整 QC" } });
