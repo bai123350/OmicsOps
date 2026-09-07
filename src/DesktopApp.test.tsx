@@ -61,6 +61,25 @@ function setupConversationStateHarness() {
 }
 
 describe("DesktopApp", () => {
+  it("shows actual model IDs in the composer and picker instead of provider profile labels", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    vi.mocked(api.listModelProfiles).mockResolvedValue([
+      { ...stateModel, label: "OpenAI-compatible", model: "research-model-a" },
+      { ...stateModel, id: "model-second", label: "Another gateway", model: "research-model-b" },
+    ]);
+    render(<DesktopApp />);
+
+    await screen.findByText(/Agent 模式：LOCAL/);
+    const selector = await screen.findByRole("button", { name: "选择模型" });
+    await waitFor(() => expect(selector).toBeEnabled());
+    expect(selector).toHaveTextContent("research-model-a");
+    fireEvent.click(selector);
+    expect(screen.getByRole("menuitemradio", { name: "research-model-a" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.queryByText("OpenAI-compatible")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "research-model-b" }));
+    expect(selector).toHaveTextContent("research-model-b");
+  });
   it("opens the local-first project library when no project exists", async () => {
     vi.spyOn(api, "listProjects").mockResolvedValue([]);
     render(<DesktopApp />);

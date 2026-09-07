@@ -928,8 +928,8 @@ export default function DesktopApp() {
     project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template }}
     locale={locale} onLocaleChange={setLocale} onOpenSettings={(section = "models") => { setSettingsSection(section); setSettingsOpen(true); }} onBackToProjects={() => setSelected(null)}
     conversations={conversations} activeConversationId={conversation?.id} onSelectConversation={selectConversation} onNewConversation={newConversation} onDeleteConversation={deleteConversation}
-    messages={messages} agentBusy={agentBusy} agentNotice={agentNotice} modelLabel={activeModel?.label}
-    modelOptions={modelProfiles.map((profile) => ({ id: profile.id, label: profile.label }))} modelId={activeModelProfileId ?? undefined} onModelChange={setActiveModelProfileId}
+    messages={messages} agentBusy={agentBusy} agentNotice={agentNotice} modelLabel={activeModel?.model}
+    modelOptions={modelProfiles.map((profile) => ({ id: profile.id, label: profile.model }))} modelId={activeModelProfileId ?? undefined} onModelChange={setActiveModelProfileId}
     agentMode={conversationMode} conversationLocked={conversationLocked} conversationHydrating={conversationHydrating} onAgentModeChange={changeConversationMode}
     latestPlanRevision={latestPlanRevision} v4Plan={v4Plan} planLoading={planLoading} planApproved={planApproved} canStartRun={false} runStarted={Boolean(runId && !currentRunAwaitsPlanApproval)} activeRunId={runId} activeRunLastActivityAt={activeRunLastActivityAt} agentRunEventsV4={agentRunEventsV4}
     computeBackends={computeBackends} computeBackendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} approvalPolicy={approvalPolicy} computeEnvironment={computeEnvironment} computeBusy={computeBusy}
