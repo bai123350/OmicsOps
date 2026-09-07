@@ -11,6 +11,31 @@ const project = {
 };
 
 describe("WorkspaceShell", () => {
+  it("switches the composer arrow to a stop square and restores it after cancellation", () => {
+    const cancel = vi.fn();
+    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, onCancelRun: cancel };
+    const { rerender, container } = render(<WorkspaceShell {...props} />);
+    expect(container.querySelector(".send-button .lucide-arrow-up")).toBeInTheDocument();
+    rerender(<WorkspaceShell {...props} runStarted activeRunId="run-stop" composerBusy />);
+    const stop = screen.getByRole("button", { name: "终止运行" });
+    expect(stop.closest(".composer")).toBeInTheDocument();
+    expect(stop.querySelector(".lucide-square")).toBeInTheDocument();
+    expect(stop).toBeEnabled();
+    expect(screen.queryByRole("region", { name: "远程 Agent 运行控制" })).not.toBeInTheDocument();
+    fireEvent.click(stop);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    rerender(<WorkspaceShell {...props} runStarted activeRunId="run-stop" runStopping />);
+    const stopping = screen.getByRole("button", { name: "终止中…" });
+    expect(stopping).toBeDisabled();
+    fireEvent.click(stopping);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    rerender(<WorkspaceShell {...props} runStarted activeRunId="run-stop" agentRunEventsV4={[{
+      schema_version: 4, run_id: "run-stop", project_id: project.id, conversation_id: "c", sequence: 1, occurred_at: "2026-09-08T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "run_cancelled" },
+    }]} />);
+    expect(screen.queryByRole("button", { name: "终止运行" })).not.toBeInTheDocument();
+    expect(container.querySelector(".send-button .lucide-arrow-up")).toBeInTheDocument();
+  });
+
   it("interleaves progress and individual read, write, edit calls even inside a batch", () => {
     const base = { schema_version: 4 as const, run_id: "run-compact", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
     const longOutput = `${"a".repeat(900)}\r\nlast line\r\n`;

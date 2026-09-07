@@ -452,30 +452,6 @@
   font-weight: 700;
 }
 
-.agent-run-controls {
-  position: sticky;
-  bottom: 4px;
-  z-index: 4;
-  width: min(100%, 700px);
-  align-self: center;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 10px 12px;
-  border: 1px solid #f0b7b2;
-  border-radius: 10px;
-  background: rgba(255, 250, 249, 0.97);
-  box-shadow: 0 10px 28px rgba(83, 26, 20, 0.12);
-  backdrop-filter: blur(10px);
-}
-
-.agent-run-controls > div { display: grid; gap: 3px; }
-.agent-run-controls .agent-working { margin-top: 0; color: #7a271a; }
-.agent-run-controls .agent-working i { background: #f04438; box-shadow: 0 0 0 4px rgba(240, 68, 56, 0.12); }
-.agent-run-controls small { color: #7a5b57; font-size: 9px; }
-.stop-agent-button { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; padding: 7px 10px; border: 1px solid #d92d20; border-radius: 7px; background: #d92d20; color: white; font-size: 10px; font-weight: 700; }
-.stop-agent-button:disabled { cursor: wait; opacity: .6; }
 .v4-approval-card,
 .v4-uncertain-card {
   display: grid;

@@ -2,9 +2,9 @@ import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
-  Activity, ArrowLeft, Bot, Check, ChevronRight, ClipboardList, Database, Expand, FileBarChart, FileText,
+  Activity, ArrowLeft, ArrowUp, Bot, Check, ChevronRight, ClipboardList, Database, Expand, FileBarChart, FileText,
   FlaskConical, Folder, Hand, Languages, MessageSquarePlus, NotebookPen, Plus,
-  Search, Send, Settings, Shield, ShieldAlert, ShieldCheck, Sparkles, Square, Trash2, X, Orbit, Monitor, ChevronDown, Gauge, Zap,
+  Search, Settings, Shield, ShieldAlert, ShieldCheck, Sparkles, Square, Trash2, X, Orbit, Monitor, ChevronDown, Gauge, Zap,
 } from "lucide-react";
 import { copy, type Locale } from "./copy";
 import type { AgentRunEventV4, AgentV4Phase, AgentV4Task, AgentV4TaskShape, ApprovalPolicyV4, AutonomyModeV4, BrowserApprovalScopeV4, ComputeBackendAvailabilityV4, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, MemoryFact, NotebookEntry, ProposedPlanRevisionV4, ProjectArtifact, ProjectImagePreview, RunSummaryV4, SessionAgentModeV4, SyncEntry, WorkspaceConversation } from "../../types";
@@ -176,12 +176,15 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const runFinished = Boolean(effectiveTerminalAgentEventV4(activeRunEventsV4));
   const runPaused = getV4PauseReason(activeRunEventsV4) !== null;
   const runActive = runStarted && !runFinished && !runPaused;
+  const showStopButton = Boolean(onCancelRun && (runActive || runStopping));
+  const stopLabel = runStopping ? (zh ? "终止中…" : "Stopping…") : (zh ? "终止运行" : "Stop run");
   const [watchdogNow, setWatchdogNow] = useState(() => Date.now());
   const lastActivityMs = activeRunLastActivityAt ? Date.parse(activeRunLastActivityAt) : Number.NaN;
   const runStalled = runActive && Number.isFinite(lastActivityMs) && watchdogNow - lastActivityMs > AGENT_STALL_THRESHOLD_MS;
   // A paused run still owns the conversation sequence. Keep the composer
   // locked while approval/input cards remain usable inside the run trace.
   const composerDisabled = composerBusy || conversationHydrating || sendBusy || agentBusy || conversationLocked || (runStarted && !runFinished);
+  const sendLabel = composerDisabled || planLoading ? (planModeEnabled ? (zh ? "规划中…" : "Planning…") : (zh ? "执行中…" : "Running…")) : t.send;
   const activeConversation = conversations.find((item) => item.id === activeConversationId);
   const conversationTitle = activeConversation?.title || (zh ? "新会话" : "New conversation");
   const historicalAgentRunEventsV4 = effectiveActiveRunId
@@ -345,7 +348,6 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
         {visibleActiveRunEventsV4.length > 0 && <V4RunTrace locale={locale} events={visibleActiveRunEventsV4} onAnswer={onAnswerAgentQuestionV4} onDecideApproval={onDecideToolApprovalV4} onResolveUncertain={onResolveUncertainV4} onResume={onResumeAgentRunV4} onCloseBrowserTabs={onCloseBrowserRunTabsV4} />}
         {runStarted && agentRunEventsV4.length === 0 && <article className="message assistant-message agent-pending" role="status"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><p>{zh ? "V4 运行正在启动…" : "Starting the V4 run…"}</p></div></article>}
         {runStalled && <div className="agent-retry-notice" role="status"><span>{zh ? "超过 90 秒未收到新的 Agent 事件，任务可能卡住；仍可终止运行。" : "No new Agent event has arrived for 90 seconds; the run may be stuck. You can still stop it."}</span></div>}
-        {runActive && onCancelRun && <div className="agent-run-controls" role="region" aria-label={zh ? "远程 Agent 运行控制" : "Remote agent run controls"}><div><span className="agent-working"><i />{runStopping ? (zh ? "正在终止当前操作…" : "Stopping current operation…") : (zh ? "远程 Agent 正在运行" : "Remote agent is running")}</span><small>{zh ? "将中断模型请求、当前 SSH 命令及后续操作" : "Stops the model request, current SSH command, and all subsequent actions"}</small></div><button className="stop-agent-button" disabled={runStopping} onClick={() => void onCancelRun()}><Square size={14} fill="currentColor" />{runStopping ? (zh ? "终止中…" : "Stopping…") : (zh ? "终止运行" : "Stop run")}</button></div>}
         {!onSend && <article className="task-card"><div className="task-icon"><Activity size={18} /></div><div className="task-body"><div><strong>{t.task}</strong><span>65%</span></div><p>{zh ? "远端 Linux · 8 CPU · 32 GiB · 低风险" : "Remote Linux · 8 CPU · 32 GiB · low risk"}</p><div className="task-progress"><i /></div><div className="task-actions"><button>{zh ? "查看日志" : "View logs"}</button><button>{zh ? "查看计划" : "View plan"}</button></div></div></article>}
       {!followingLatest && <button className="back-to-latest" onClick={() => {
         const stream = messageStreamRef.current;
@@ -387,7 +389,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
             <button className={`composer-tool ${planModeEnabled ? "" : "is-active"}`} disabled={modeLocked} aria-label={zh ? "直接执行模式" : "Direct execution mode"} aria-pressed={!planModeEnabled} title={zh ? "直接执行 / 先做计划" : "Execute directly / Plan first"} onClick={() => chooseMode(planModeEnabled ? "agent" : "plan")}><Zap size={20} /></button>
             {modelPicker ? <div onClickCapture={closeComposerMenus}>{modelPicker}</div> : <div className="composer-menu-anchor model-anchor"><button className="composer-model" disabled={composerDisabled} aria-label={zh ? "选择模型" : "Choose model"} aria-expanded={modelMenuOpen} onClick={() => { const next = !modelMenuOpen; closeComposerMenus(); setModelMenuOpen(next); }}><span>{modelLabel || (zh ? "选择模型" : "Choose model")}</span><ChevronDown size={12} /></button>{modelMenuOpen && <div className="model-menu" role="menu">{modelOptions.map((model) => <button role="menuitemradio" aria-checked={model.id === modelId} key={model.id} disabled={!onModelChange} onClick={() => { onModelChange?.(model.id); setModelMenuOpen(false); }}>{model.label}{model.id === modelId && <Check size={14} />}</button>)}<button role="menuitem" disabled={!onOpenSettings} onClick={() => { setModelMenuOpen(false); onOpenSettings?.(); }}>{zh ? "管理模型" : "Manage models"}<Settings size={14} /></button></div>}</div>}
             <div className="composer-send-group">
-            <button className="send-button" disabled={composerDisabled || planLoading || !draft.trim() || Boolean(onSend && !computeReady)} onClick={send}><Send size={16} />{composerDisabled || planLoading ? (planModeEnabled ? (zh ? "规划中…" : "Planning…") : (zh ? "执行中…" : "Running…")) : t.send}</button>
+            <button className={`send-button ${showStopButton ? "is-stop" : ""}`} aria-label={showStopButton ? stopLabel : sendLabel} title={showStopButton ? stopLabel : sendLabel} aria-busy={showStopButton && runStopping} disabled={showStopButton ? runStopping : composerDisabled || planLoading || !draft.trim() || Boolean(onSend && !computeReady)} onClick={showStopButton ? () => { void onCancelRun?.(); } : send}>{showStopButton ? <Square size={16} fill="currentColor" /> : <ArrowUp size={21} />}</button>
             <div className="composer-menu-anchor"><button className="send-options" aria-label={zh ? "发送选项" : "Send options"} aria-expanded={sendMenuOpen} onClick={() => { const next = !sendMenuOpen; closeComposerMenus(); setSendMenuOpen(next); }}><ChevronDown size={17} /></button>{sendMenuOpen && <div className="model-menu send-menu" role="menu">{(["agent", "plan"] as const).map((mode) => <button key={mode} role="menuitemradio" aria-checked={effectiveMode === mode} disabled={modeLocked} onClick={() => { chooseMode(mode); setSendMenuOpen(false); }}>{mode === "plan" ? (zh ? "先做计划" : "Plan first") : (zh ? "直接执行" : "Execute directly")}{effectiveMode === mode && <Check size={14} />}</button>)}</div>}</div>
             </div>
             </div>

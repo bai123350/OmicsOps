@@ -275,7 +275,8 @@ describe("DesktopApp", () => {
     fireEvent.click(await screen.findByRole("button", { name: "批准并运行" }));
     await waitFor(() => expect(approvePlan).toHaveBeenCalledWith("run-v4", "approval-hash", 1));
     expect(await screen.findByText(/Agent 模式：LOCAL/)).toBeInTheDocument();
-    expect(screen.getByRole("region", { name: "远程 Agent 运行控制" })).toHaveTextContent("远程 Agent 正在运行");
+    expect(screen.getByRole("button", { name: "终止运行" })).toBeEnabled();
+    expect(screen.queryByRole("region", { name: "远程 Agent 运行控制" })).not.toBeInTheDocument();
   });
 
   it("hydrates conversation-scoped Agent and Plan modes when switching sessions", async () => {
