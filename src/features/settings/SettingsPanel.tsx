@@ -15,6 +15,7 @@ type SaveMcpServerRequest = { id?: string; name: string; command: string; args: 
 
 interface Props {
   locale: Locale;
+  initialSection?: "models" | "remote" | "skills" | "browser";
   onClose: () => void;
   modelProfiles?: ModelProfile[];
   onSaveModel?: (request: SaveModelRequest) => Promise<void>;
@@ -44,11 +45,11 @@ const defaults: Record<ModelProfile["provider"], FormState> = {
   ollama: { provider: "ollama", label: "Ollama", base_url: "http://127.0.0.1:11434/", model: "", credential: "" },
 };
 
-export function SettingsPanel({ locale, onClose, modelProfiles = [], onSaveModel, onProbeModel, onListModels, skillPackages = [], onImportSkill, onSetSkillEnabled, mcpServers = [], onSaveMcpServer, onInspectMcpServer, onSetMcpServerEnabled, onSetMcpLaunchApproval, onSetMcpToolApproval, onAddPubMedMcp, connections = [], selectedProject, onSaveConnection, onTestConnection, onConfirmHostKey, onBindProjectRemote }: Props) {
+export function SettingsPanel({ locale, initialSection = "models", onClose, modelProfiles = [], onSaveModel, onProbeModel, onListModels, skillPackages = [], onImportSkill, onSetSkillEnabled, mcpServers = [], onSaveMcpServer, onInspectMcpServer, onSetMcpServerEnabled, onSetMcpLaunchApproval, onSetMcpToolApproval, onAddPubMedMcp, connections = [], selectedProject, onSaveConnection, onTestConnection, onConfirmHostKey, onBindProjectRemote }: Props) {
   const zh = locale === "zh-CN";
   const [form, setForm] = useState<FormState | null>(null);
   const [saving, setSaving] = useState(false);
-  const [section, setSection] = useState<"models" | "remote" | "skills" | "browser">("models");
+  const [section, setSection] = useState<"models" | "remote" | "skills" | "browser">(initialSection);
   const [skillsBusy, setSkillsBusy] = useState(false);
   const [skillError, setSkillError] = useState("");
   const [modelTests, setModelTests] = useState<Record<string, { state: "testing" | "success" | "error"; result?: ModelProbeResult; message?: string }>>({});

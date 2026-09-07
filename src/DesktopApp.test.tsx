@@ -191,7 +191,7 @@ describe("DesktopApp", () => {
     }
   });
 
-  it("starts planning from the plus-menu Plan mode and continues execution after approval", async () => {
+  it("starts planning from the Agent controls Plan mode and continues execution after approval", async () => {
     const project = { id: "project-1", name: "PBMC 图谱", description: "", local_root: "E:/Science/pbmc", remote_root: null, connection_id: null, template: "single_cell_rna_seq" as const, status: "running" as const, ollama_only: false, created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" };
     const conversation = { id: "conversation-1", project_id: project.id, title: "分析任务", status: "idle" as const, model_profile_id: "model-1", created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" };
     const model = { id: "model-1", label: "Test model", provider: "ollama" as const, base_url: "http://localhost:11434", model: "test", credential_reference: null, supports_tools: true, supports_vision: false };
@@ -224,8 +224,8 @@ describe("DesktopApp", () => {
     render(<DesktopApp />);
     await screen.findByRole("main", { name: "科研对话" });
     await screen.findByText(/Agent 模式：LOCAL/);
-    fireEvent.click(screen.getByRole("button", { name: "添加上下文或选择模式" }));
-    fireEvent.click(screen.getByRole("menuitem", { name: /Plan 模式/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Agent 权限" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "先做计划" }));
     fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
     await screen.findByRole("region", { name: "V4 计算后端" });
     await screen.findByRole("radio", { name: /LOCAL/ }, { timeout: 3000 });
@@ -279,8 +279,8 @@ describe("DesktopApp", () => {
 
     render(<DesktopApp />);
     await screen.findByRole("heading", { name: "Agent 会话" });
-    fireEvent.click(screen.getByRole("button", { name: "添加上下文或选择模式" }));
-    const planMode = screen.getByRole("menuitem", { name: /Plan 模式/ });
+    fireEvent.click(screen.getByRole("button", { name: "Agent 权限" }));
+    const planMode = screen.getByRole("menuitemcheckbox", { name: "先做计划" });
     expect(planMode).toBeDisabled();
     fireEvent.click(planMode);
     expect(setConversationAgentMode).not.toHaveBeenCalled();
@@ -538,8 +538,8 @@ describe("DesktopApp", () => {
 
     render(<DesktopApp />);
     await screen.findByText(/Agent 模式：LOCAL/);
-    fireEvent.click(screen.getByRole("button", { name: "添加上下文或选择模式" }));
-    fireEvent.click(screen.getByRole("menuitem", { name: /Plan 模式/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Agent 权限" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "先做计划" }));
 
     expect(await screen.findByText("mode write failed")).toBeInTheDocument();
     expect(await screen.findByText(/Agent 模式：LOCAL/)).toBeInTheDocument();

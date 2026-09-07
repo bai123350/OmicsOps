@@ -3,6 +3,11 @@ import { describe, expect, it, vi } from "vitest";
 import { SettingsPanel } from "./SettingsPanel";
 
 describe("SettingsPanel model providers", () => {
+  it("opens directly on Skills when launched from the composer", () => {
+    render(<SettingsPanel locale="en-US" initialSection="skills" onClose={() => undefined} />);
+    expect(screen.getByRole("button", { name: "Skills and MCP" })).toHaveClass("active");
+    expect(screen.getByText("Research Skills")).toBeInTheDocument();
+  });
   it("collects provider configuration without rendering stored credentials", async () => {
     const onSaveModel = vi.fn().mockResolvedValue(undefined);
     render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[]} onSaveModel={onSaveModel} />);
