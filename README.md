@@ -92,6 +92,7 @@ Running ordinary Agent tasks accept short follow-up guidance through the inline
 **Run guidance** panel. Each run accepts up to 16 messages of 2048 UTF-8 bytes each.
 “Received” means durably stored; “Applied” means added to the model context, not
 that the requested work has finished. Guidance interrupts a pending model request
-and is applied at the next model boundary. Dispatched tools finish their batch
-first. Retries reuse the message ID, and pending input survives restart. Guidance
+and is applied at the next model boundary. Pending read-only tools yield;
+completed results are retained. Dispatched side-effecting tools finish their
+batch first. Retries reuse the message ID, and pending input survives restart. Guidance
 cannot modify an approved plan or expand execution permissions.

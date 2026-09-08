@@ -124,7 +124,7 @@ real acceptance host.
 After the deterministic tests, start an ordinary Agent run and submit guidance
 while its model request is waiting. Confirm one received record becomes applied,
 the same run continues, and Stop remains available. Repeat during a tool batch:
-the batch finishes before guidance is applied. Restart after acceptance and
+pending reads yield with a recoverable interruption while completed results remain visible; side-effecting operations finish before guidance is applied. Restart after acceptance and
 resume the original run; confirm the guidance appears once. Retry an uncertain
 submission without editing its text, switch conversations during submission, and
 verify no duplicate or cross-run guidance appears. Approved plans must not expose
