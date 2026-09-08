@@ -49,7 +49,7 @@ not be reported as passed.
 ## Agent Runtime V4 stage-2 acceptance
 
 Stage 2 adds typed provider retry handling, model/tool cancellation, bounded
-tool-call and iteration budgets, repeated-signature termination, four-way
+tool-call and iteration budgets, repeated-call/result termination, four-way
 read-only concurrency, per-project side-effect serialization, archive-first
 context compaction, and crash recovery that never automatically repeats a
 dispatched side effect whose outcome is missing.
@@ -59,6 +59,38 @@ checking remote state, record the conclusion with
 `agent_v4_resolve_uncertain` (call id, resolution and non-empty evidence), then
 call `agent_v4_resume`. The resolution is hash-chained and the original side
 effect is never replayed automatically.
+
+The Wisp-inspired loop increment additionally checks the complete provider
+request before dispatch and after compaction, permits one smaller-request retry
+on explicit provider context overflow, and rejects truncated or unterminated
+responses. Runs with `agent.read_tool_result` can page original results by
+run-scoped sequence/hash while the model sees bounded projections. The progress
+guard compares completed outcomes (closed batches when present), preserving
+changing job state as progress. These paths have deterministic fake-provider and
+temporary-store tests; they still require separate live model acceptance.
+
+For a manual smoke test, use a disposable project with a synthetic large text
+result. Confirm its shortened model view can be paged back exactly; a reference
+from another run must fail. Lower the test profile's context window and confirm
+the original run enters needs-attention without tool dispatch after unsuccessful
+compaction. Restore the real window, resume the same run, and confirm prior
+outcomes remain available. Exercise normal text, a long answer that reaches the
+output cap, and a provider disconnect. On both Windows and macOS, confirm no
+unexpected local shell window or unrelated process cleanup occurs. Record actual
+commands, provider model IDs, run IDs and results separately from unit tests.
+
+For read-only delegation, create two disposable model profiles and select the
+child in the main profile's **Read-only subagent model** setting. Start a new
+ordinary Agent run and check its frozen child binding. Change the main profile's
+selection, then resume: the existing run must retain its binding. Changing the
+bound child's exact model or endpoint must block resume until restored. An
+approved plan must retain its original behavior. With synthetic evidence, check
+large-result failure retains the full trace, repeated recovery reuses successful
+nodes and consumes the run's remaining delegation allowance, and cancellation
+ends a pending child model/read wait. In settings, press Escape immediately after
+opening the model form: only the form closes; the next Escape closes settings.
+Run these checks on Windows and macOS and record results explicitly. They have
+not been executed against real models as part of the deterministic tests.
 
 Every Python/R cell writes complete stdout and stderr under
 `.omicsops/runs/<run-id>/outputs/`. Events and model context contain only a

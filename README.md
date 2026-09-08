@@ -6,6 +6,50 @@ bioinformatics workflows on a remote Linux server over SSH.
 The Rust control plane owns credentials, approvals, policy enforcement, task
 state, SSH, and audit records. Analysis data stays on the remote server.
 
+Desktop V4 model requests are checked against the selected profile's context
+window before sending, including system instructions, tool schemas and provider
+formatting. Unset windows retain the existing 32,768-token fallback. The initial
+budget uses conservative UTF-8 byte estimation, reserves 4,096 output tokens and
+1,024 safety tokens, and explicitly caps the provider's output request. These are
+request allowances, not inferred model capabilities. The current catalog does
+not supply maximum output limits or model-specific image costs.
+
+Execution archives and checkpoints oversized context once, then checks again.
+If it still does not fit, the run needs attention and retains its evidence; it
+does not silently discard the plan or send the oversized request. Requests with
+actual image parts currently stop with an unknown-image-cost error. Non-vision
+profiles continue to receive the existing textual image notice. A provider's
+explicit context-overflow error permits one archive-first retry with a smaller
+context; a second overflow stops the run. Estimation is not an exact tokenizer.
+
+Runs with the `agent.read_tool_result` capability receive bounded model views of
+large tool results. The original stays in the event store and can be paged by
+run-scoped sequence/hash references. This tool is unavailable in Plan mode;
+existing approved capabilities remain enforced. Repeated completed calls are
+compared with their results, so changing job state counts as progress. Unchanged
+repeated observations stop the run for attention. Truncated responses and streams
+without a terminal provider event never dispatch partial tool calls.
+
+Read-only subagents receive their objective, explicit dependency results and
+required output schema. Each child request is capped at 64 KiB (or the smaller
+parent context limit), including tool schemas; submissions are capped at 8 KiB.
+Oversized evidence fails the node with its original tool outcomes retained.
+Model attempts and read-only tool waits have deadlines and observe cancellation.
+The parent receives conclusions and call counts, with run-scoped references for
+the complete delegation trace. Recovery reuses successful nodes only for an
+identical graph and successful dependencies. Delegation reserves at most 32 model
+turns and 64 tool calls per run; restarting an incomplete graph reserves its full
+declared budget again, so recovery cannot reset that allowance.
+
+In a model profile's settings, **Read-only subagent model** selects another saved
+profile for newly created ordinary Agent runs. The child profile ID and exact
+execution-configuration hash are frozen into the run. A missing or changed child
+configuration prevents execution/resume; restore it or start a new run. Existing
+runs and approved plans retain their previous model behavior. Profile labels and
+credential rotation do not change the execution hash; credentials remain in the
+keyring. Reasoning-effort overrides and automatic main-model routing are not yet
+supported; selecting a profile does not imply a `max` effort setting.
+
 ## Development
 
 Prerequisites:
