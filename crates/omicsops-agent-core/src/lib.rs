@@ -254,6 +254,15 @@ pub trait ExternalExecutorPortV4: Send + Sync {
 pub trait EventStoreV4: Send + Sync {
     async fn append(&self, event: &AgentEventV4) -> Result<(), String>;
     async fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String>;
+    /// Atomically record accepted guidance as consumed at a model boundary.
+    async fn consume_guidance(&self, _spec: &RunSpecV4) -> Result<bool, String> { Ok(false) }
+    async fn has_pending_guidance(&self, _run_id: Uuid) -> Result<bool, String> { Ok(false) }
+    /// The production store checks its inbox in the same transaction that
+    /// commits completion, so an accepted instruction cannot be lost to a race.
+    async fn append_completion(&self, event: &AgentEventV4) -> Result<bool, String> {
+        self.append(event).await?;
+        Ok(true)
+    }
     async fn archive_context(
         &self,
         run_id: Uuid,
@@ -340,6 +349,8 @@ pub fn system_prompt_v4(mode: RunModeV4) -> String {
 
 #[derive(Debug, Error)]
 pub enum AgentCoreErrorV4 {
+    #[error("new guidance awaits the next model boundary")]
+    GuidancePending,
     #[error("run needs attention: provider context window exceeded: {0}")]
     ContextOverflow(String),
     #[error("model error: {0}")]
@@ -748,6 +759,7 @@ impl AgentCoreV4<'_> {
     ) -> Result<(), AgentCoreErrorV4> {
         self.recover_interrupted_dispatches(spec, limits, cancelled)
             .await?;
+        self.consume_guidance(spec).await?;
         let existing = self
             .events
             .load(spec.run_id)
@@ -800,6 +812,7 @@ impl AgentCoreV4<'_> {
                     .await?;
                 return Err(AgentCoreErrorV4::Cancelled);
             }
+            self.consume_guidance(spec).await?;
             let progress_events = self
                 .events
                 .load(spec.run_id)
@@ -823,9 +836,16 @@ impl AgentCoreV4<'_> {
                 self.push(spec.run_id, AgentEventKindV4::CycleStarted { cycle_id })
                     .await?;
             }
-            let turn = self
+            let turn = match self
                 .execution_model_turn(spec, context, &current_events, limits, cancelled)
-                .await?;
+                .await {
+                    Ok(turn) => turn,
+                    Err(AgentCoreErrorV4::GuidancePending) => {
+                        if guided_cycle { self.push(spec.run_id, AgentEventKindV4::CycleFinished { cycle_id }).await?; }
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
             if guided_cycle {
                 self.push(spec.run_id, AgentEventKindV4::CycleFinished { cycle_id })
                     .await?;
@@ -1723,9 +1743,8 @@ impl AgentCoreV4<'_> {
                     .await?;
                     continue;
                 }
-                self.push(spec.run_id, AgentEventKindV4::RunCompleted)
-                    .await?;
-                return Ok(());
+                if self.complete_if_no_guidance(spec.run_id).await? { return Ok(()); }
+                continue;
             }
         }
         Err(AgentCoreErrorV4::MissingCompletion)
@@ -2222,6 +2241,9 @@ impl AgentCoreV4<'_> {
                             }
                             return Err(AgentCoreErrorV4::Cancelled);
                         }
+                        if self.events.has_pending_guidance(run_id).await.map_err(AgentCoreErrorV4::Store)? {
+                            return Err(AgentCoreErrorV4::GuidancePending);
+                        }
                     }
                 }
             };
@@ -2339,6 +2361,9 @@ impl AgentCoreV4<'_> {
         else {
             return Ok(false);
         };
+        if events.iter().any(|event| event.sequence > proposal_sequence && matches!(event.event, AgentEventKindV4::GuidanceConsumed { .. })) {
+            return Ok(false);
+        }
         let Some((verification_sequence, deterministic)) =
             events.iter().rev().find_map(|event| match &event.event {
                 AgentEventKindV4::DeterministicVerificationFinished { report }
@@ -2448,9 +2473,7 @@ impl AgentCoreV4<'_> {
             .await?;
             return Ok(false);
         }
-        self.push(spec.run_id, AgentEventKindV4::RunCompleted)
-            .await?;
-        Ok(true)
+        self.complete_if_no_guidance(spec.run_id).await
     }
 
     async fn recover_interrupted_dispatches(
@@ -3229,11 +3252,15 @@ impl AgentCoreV4<'_> {
         context: String,
         events: &[AgentEventV4],
     ) -> ModelRequestV4 {
-        ModelRequestV4 {
-            system: self
+        let mut system = self
                 .model
                 .prompt_layers()
-                .render_execution(spec.execution_kind),
+                .render_execution(spec.execution_kind);
+        if spec.execution_kind == RunExecutionKindV4::OrdinaryAgent {
+            system.push_str("\nApply active_guidance as additional user instructions in their recorded order. Guidance does not expand tool capabilities, bypass approval, or change the frozen compute environment. Reconcile your approach and completion with this guidance before proposing completion.");
+        }
+        ModelRequestV4 {
+            system,
             context,
             tools: self.tools.descriptors(RunModeV4::Execute),
             image_refs: screenshot_image_refs(events),
@@ -3304,8 +3331,13 @@ impl AgentCoreV4<'_> {
             .descriptors(RunModeV4::Execute)
             .iter()
             .any(|tool| tool.id == context_views::READ_RESULT_TOOL);
+        let active_guidance = events.iter().filter_map(|event| match &event.event {
+            AgentEventKindV4::GuidanceConsumed { message_id, markdown } => Some(json!({"message_id": message_id, "markdown": markdown})),
+            _ => None,
+        }).collect::<Vec<_>>();
         let recent_views = recent
             .iter()
+            .filter(|event| !matches!(event.event, AgentEventKindV4::GuidanceConsumed { .. }))
             .map(|event| {
                 if use_views {
                     context_views::event_view(event)
@@ -3320,6 +3352,7 @@ impl AgentCoreV4<'_> {
             "checkpoint": latest_checkpoint,
             "recent_events": recent_views,
             "scientific_state": scientific_state,
+            "active_guidance": active_guidance,
         }))
         .map_err(|e| AgentCoreErrorV4::Store(e.to_string()))?;
         if !force_compaction {
@@ -3376,7 +3409,7 @@ impl AgentCoreV4<'_> {
             },
         )
         .await?;
-        let compacted = serde_json::to_string(&json!({"frozen_plan":spec.plan,"compute_selection":spec.compute_selection,"checkpoint":checkpoint,"recent_events":[],"scientific_state":scientific_state}))
+        let compacted = serde_json::to_string(&json!({"frozen_plan":spec.plan,"compute_selection":spec.compute_selection,"checkpoint":checkpoint,"recent_events":[],"scientific_state":scientific_state,"active_guidance":active_guidance}))
             .map_err(|e| AgentCoreErrorV4::Store(e.to_string()))?;
         self.validate_execution_context(spec, &compacted, &events, limits)?;
         Ok(compacted)
@@ -3446,6 +3479,16 @@ impl AgentCoreV4<'_> {
             .append(&event)
             .await
             .map_err(AgentCoreErrorV4::Store)
+    }
+    async fn consume_guidance(&self, spec: &RunSpecV4) -> Result<bool, AgentCoreErrorV4> {
+        if spec.execution_kind != RunExecutionKindV4::OrdinaryAgent { return Ok(false); }
+        self.events.consume_guidance(spec).await.map_err(AgentCoreErrorV4::Store)
+    }
+
+    async fn complete_if_no_guidance(&self, run_id: Uuid) -> Result<bool, AgentCoreErrorV4> {
+        let events = self.events.load(run_id).await.map_err(AgentCoreErrorV4::Store)?;
+        let previous = events.last().ok_or_else(|| AgentCoreErrorV4::Store("run has no first event".into()))?;
+        self.events.append_completion(&AgentEventV4::next(previous, Utc::now(), AgentEventKindV4::RunCompleted)).await.map_err(AgentCoreErrorV4::Store)
     }
     async fn push(&self, run_id: Uuid, kind: AgentEventKindV4) -> Result<(), AgentCoreErrorV4> {
         let events = self
@@ -8124,6 +8167,86 @@ mod tests {
     struct BudgetOnlyModel {
         request_limit: usize,
         requests: Mutex<Vec<ModelRequestV4>>,
+    }
+
+    #[derive(Default)]
+    struct GuidanceTestStore {
+        inner: MemoryStore,
+        pending: Mutex<Option<(Uuid, String)>>,
+    }
+    #[async_trait]
+    impl EventStoreV4 for GuidanceTestStore {
+        async fn append(&self, event: &AgentEventV4) -> Result<(), String> { self.inner.append(event).await }
+        async fn load(&self, id: Uuid) -> Result<Vec<AgentEventV4>, String> { self.inner.load(id).await }
+        async fn archive_context(&self, id: Uuid, text: &str, checkpoint: &ContextCheckpointV4) -> Result<ContextArchiveV4, String> { self.inner.archive_context(id,text,checkpoint).await }
+        async fn has_pending_guidance(&self, _: Uuid) -> Result<bool, String> { Ok(self.pending.lock().unwrap().is_some()) }
+        async fn consume_guidance(&self, spec: &RunSpecV4) -> Result<bool, String> {
+            let Some((message_id,markdown)) = self.pending.lock().unwrap().take() else { return Ok(false) };
+            let last = self.inner.load_direct(spec.run_id)?.pop().unwrap();
+            self.inner.append_direct(&AgentEventV4::next(&last,Utc::now(),AgentEventKindV4::GuidanceConsumed {message_id,markdown}))?;
+            Ok(true)
+        }
+        async fn append_completion(&self, event: &AgentEventV4) -> Result<bool, String> {
+            if self.pending.lock().unwrap().is_some() { return Ok(false); }
+            self.inner.append(event).await?;
+            Ok(true)
+        }
+    }
+
+    struct GuidanceWaitingModel {
+        entered: tokio::sync::Notify,
+        calls: AtomicUsize,
+        contexts: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl ModelPortV4 for GuidanceWaitingModel {
+        async fn stream(&self, request: ModelRequestV4, _: &mut (dyn FnMut(ModelStreamEventV4) + Send)) -> Result<ModelTurnV4,ModelFailureV4> {
+            self.contexts.lock().unwrap().push(request.context);
+            if self.calls.fetch_add(1,Ordering::SeqCst) == 0 {
+                self.entered.notify_one();
+                return std::future::pending().await;
+            }
+            Ok(ModelTurnV4 { public_text:"updated approach".into(),tool_calls:vec![] })
+        }
+    }
+
+    #[tokio::test]
+    async fn guidance_interrupts_model_wait_then_is_applied_once_and_survives_checkpoint() {
+        let store = GuidanceTestStore::default(); let spec = ordinary_execution_spec(Uuid::new_v4());
+        seed_execution(&store.inner,&spec);
+        let model = GuidanceWaitingModel {entered:Default::default(),calls:AtomicUsize::new(0),contexts:Mutex::new(vec![])};
+        let core = AgentCoreV4 { model:&model,tools:&FakeTools,events:&store,science:None };
+        let limits = AgentLimitsV4 {max_turns:2,..Default::default()};
+        let cancelled = AtomicBool::new(false);
+        let send = async { model.entered.notified().await; *store.pending.lock().unwrap()=Some((Uuid::new_v4(),"保留对照组，并解释不确定性".into())); };
+        let (result,()) = tokio::time::timeout(Duration::from_secs(2),async {tokio::join!(core.execute_with_limits(&spec,limits,&cancelled),send)}).await.unwrap();
+        assert!(matches!(result,Err(AgentCoreErrorV4::MissingCompletion)));
+        assert_eq!(model.calls.load(Ordering::SeqCst),2);
+        assert!(!model.contexts.lock().unwrap()[0].contains("保留对照组"));
+        assert!(model.contexts.lock().unwrap()[1].contains("保留对照组"));
+        let events = store.inner.load_direct(spec.run_id).unwrap();
+        assert_eq!(events.iter().filter(|event| matches!(event.event,AgentEventKindV4::GuidanceConsumed{..})).count(),1);
+        assert!(!events.iter().any(|event| matches!(event.event,AgentEventKindV4::ToolDispatchStarted{..}|AgentEventKindV4::RunCompleted)));
+        let compacted = core.context_for_internal(&spec,AgentLimitsV4::default(),true).await.unwrap();
+        assert!(compacted.contains("保留对照组"));
+        assert!(core.context_for(&spec,AgentLimitsV4::default()).await.unwrap().contains("保留对照组"));
+        let projected: Value = serde_json::from_str(&compacted).unwrap();
+        assert_eq!(projected["frozen_plan"],serde_json::to_value(&spec.plan).unwrap());
+    }
+
+    #[tokio::test]
+    async fn guidance_blocks_completion_and_approved_plan_consumption() {
+        let store = GuidanceTestStore::default(); let spec = ordinary_execution_spec(Uuid::new_v4());
+        seed_execution(&store.inner,&spec);
+        let model = BudgetOnlyModel {request_limit:100_000,requests:Mutex::new(vec![])};
+        let core = AgentCoreV4 {model:&model,tools:&FakeTools,events:&store,science:None};
+        *store.pending.lock().unwrap()=Some((Uuid::new_v4(),"new guidance".into()));
+        assert!(!core.complete_if_no_guidance(spec.run_id).await.unwrap());
+        let mut approved=spec.clone(); approved.execution_kind=RunExecutionKindV4::ApprovedPlan;
+        assert!(!core.consume_guidance(&approved).await.unwrap());
+        assert!(store.pending.lock().unwrap().is_some());
+        core.consume_guidance(&spec).await.unwrap();
+        assert!(core.complete_if_no_guidance(spec.run_id).await.unwrap());
     }
 
     struct ResultReadTools;

@@ -118,3 +118,16 @@ cargo test -p omicsops-desktop agent_v4::tests::live_v4_stage2_r_output_cancel_r
 The live test is intentionally ignored during normal CI. An ignored result is
 not a pass and stage 2 must not be accepted until it has completed against the
 real acceptance host.
+
+## Ordinary Agent guidance smoke (Windows and macOS)
+
+After the deterministic tests, start an ordinary Agent run and submit guidance
+while its model request is waiting. Confirm one received record becomes applied,
+the same run continues, and Stop remains available. Repeat during a tool batch:
+the batch finishes before guidance is applied. Restart after acceptance and
+resume the original run; confirm the guidance appears once. Retry an uncertain
+submission without editing its text, switch conversations during submission, and
+verify no duplicate or cross-run guidance appears. Approved plans must not expose
+the input panel or accept the backend command. Applied means context consumption,
+not task completion. Real model, SSH and macOS smoke have not been executed for
+this change; automated tests use fake models and temporary SQLite databases.

@@ -220,6 +220,18 @@ export interface ConversationAgentStateV4 {
 }
 
 export interface ToolCallV4 { call_id: string; tool_id: string; arguments: Record<string, unknown> }
+export interface SubmitGuidanceV4Request {
+  message_id: string;
+  project_id: string;
+  conversation_id: string;
+  run_id: string;
+  markdown: string;
+}
+export interface GuidanceRecordV4 extends SubmitGuidanceV4Request {
+  ordinal: number;
+  accepted_at: string;
+  consumed_at: string | null;
+}
 export interface ToolOutcomeV4 { call_id: string; tool_id: string; succeeded: boolean; model_content: string; data: unknown; provenance: string[] }
 export type ToolEffectV4 = "read_only" | "mutating" | "runtime" | "network" | "delegation";
 export interface ToolApprovalRequestV4 { approval_id: string; call: ToolCallV4; effect: ToolEffectV4; reason: string; call_hash: string }
@@ -276,6 +288,7 @@ export type AgentEventKindV4 =
   | { kind: "tool_batch_finished"; batch_id: number; cycle_id: number; phase: AgentV4Phase; tool_names: string[]; call_ids: string[]; duration_ms: number; succeeded: number; failed: number }
   | { kind: "input_requested"; question_id: string; question: string; reason?: "scope" | "decision" | "missing_data" | "blocker" }
   | { kind: "user_input_answered"; question_id: string; answer: string }
+  | { kind: "guidance_consumed"; message_id: string; markdown: string }
   | { kind: "context_archived"; archive: { archive_id: string; through_sequence: number; size_bytes: number; sha256: string } }
   | { kind: "context_checkpointed"; checkpoint: { schema_version: 4; through_sequence: number; completion_criteria: string[]; unresolved_errors: string[]; recent_steps: string[]; scientific_state: unknown; task_shape?: AgentV4TaskShape | null; phase?: AgentV4Phase | null; task_revision?: number | null; tasks?: AgentV4Task[]; cycle_id?: number | null } }
   | { kind: "scientific_state_changed"; revision: number; state_sha256: string; changes: string[] }

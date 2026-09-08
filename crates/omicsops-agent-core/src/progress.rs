@@ -47,6 +47,7 @@ pub(crate) fn stalled(events: &[AgentEventV4], repetitions: u32) -> bool {
     for event in events {
         let next = match &event.event {
             AgentEventKindV4::UserInputAnswered { .. }
+            | AgentEventKindV4::GuidanceConsumed { .. }
             | AgentEventKindV4::ScientificStateChanged { .. } => {
                 window.clear();
                 None

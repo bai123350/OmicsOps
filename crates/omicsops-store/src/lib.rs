@@ -36,6 +36,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const SCHEMA_VERSION: u32 = 4;
+mod guidance;
 const INIT_SQL: &str = include_str!("../migrations/init.sql");
 const SETTINGS_GLOBAL_SCOPE: &str = "global";
 const CONVERSATION_AGENT_MODE_SETTING_PREFIX: &str = "conversation_agent_mode:";
@@ -68,6 +69,8 @@ END
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("accepted guidance is pending")]
+    GuidancePending,
     #[error("database failed: {0}")]
     Database(#[from] sqlx::Error),
     #[error("I/O failed: {0}")]
@@ -1342,8 +1345,16 @@ impl Store {
         status: &str,
         value: &Value,
     ) -> Result<(), StoreError> {
-        self.save_agent_run_v4(run_id, project_id, conversation_id, status, value)
-            .await
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        ensure_conversation_unlocked_executor(&mut tx, project_id, conversation_id).await?;
+        let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs_v4 WHERE project_id=?1 AND conversation_id=?2 AND status IN ('running','waiting_for_input','waiting_for_approval','awaiting_approval')")
+            .bind(project_id.to_string()).bind(conversation_id.to_string()).fetch_one(&mut *tx).await?;
+        if active > 0 { return Err(StoreError::InvalidInput("conversation already has an active run; guide or resume it instead".into())); }
+        sqlx::query("INSERT INTO agent_runs_v4(run_id,project_id,conversation_id,status,value_json) VALUES (?1,?2,?3,?4,?5)")
+            .bind(run_id.to_string()).bind(project_id.to_string()).bind(conversation_id.to_string()).bind(status).bind(serde_json::to_string(value)?)
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn agent_run_v4(&self, run_id: Uuid) -> Result<Option<Value>, StoreError> {
@@ -1413,6 +1424,18 @@ impl Store {
             if active != 0 {
                 return Err(StoreError::InvalidInput(
                     "conversation already has an active plan generation or proposal".into(),
+                ));
+            }
+            let active_run: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_runs_v4 WHERE conversation_id=?1
+                 AND status IN ('running','waiting_for_input','waiting_for_approval','awaiting_approval')",
+            )
+            .bind(conversation_id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+            if active_run != 0 {
+                return Err(StoreError::InvalidInput(
+                    "conversation already has an active run".into(),
                 ));
             }
             let existing_run: i64 = sqlx::query_scalar(
@@ -3359,7 +3382,7 @@ impl Store {
         event
             .verify()
             .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         ensure_event_context_tx(&mut tx, event).await?;
         let serialized =
             sqlx::query("SELECT value_json FROM agent_events_v4 WHERE run_id=?1 ORDER BY sequence")
@@ -3391,6 +3414,10 @@ impl Store {
             return Ok(message);
         }
 
+        if is_run_completed(event) && sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_guidance_v4 WHERE run_id=?1 AND consumed_at IS NULL")
+            .bind(event.run_id.to_string()).fetch_one(&mut *tx).await? > 0 {
+            return Err(StoreError::GuidancePending);
+        }
         if existing.iter().any(is_terminal_event)
             && !post_terminal_browser_cleanup_allowed(&existing, event)
         {

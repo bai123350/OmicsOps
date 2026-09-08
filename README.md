@@ -87,3 +87,11 @@ The V2 control plane uses versioned tool contracts, canonical plan approvals,
 append-only hash-chained events, verified checkpoints, process-group recovery,
 and auditable run bundles. See `acceptance/README.md` for the pinned PBMC and
 bulk RNA-seq acceptance procedure.
+
+Running ordinary Agent tasks accept short follow-up guidance through the inline
+**Run guidance** panel. Each run accepts up to 16 messages of 2048 UTF-8 bytes each.
+“Received” means durably stored; “Applied” means added to the model context, not
+that the requested work has finished. Guidance interrupts a pending model request
+and is applied at the next model boundary. Dispatched tools finish their batch
+first. Retries reuse the message ID, and pending input survives restart. Guidance
+cannot modify an approved plan or expand execution permissions.

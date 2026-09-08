@@ -12,6 +12,27 @@ use omicsops_protocol::{ComputeSelectionV4, ExecutionPlanV4};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitGuidanceV4Request {
+    pub message_id: Uuid,
+    pub project_id: Uuid,
+    pub conversation_id: Uuid,
+    pub run_id: Uuid,
+    pub markdown: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuidanceRecordV4 {
+    pub message_id: Uuid,
+    pub project_id: Uuid,
+    pub conversation_id: Uuid,
+    pub run_id: Uuid,
+    pub ordinal: u64,
+    pub markdown: String,
+    pub accepted_at: DateTime<Utc>,
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveModelProfileRequest {
     pub id: Option<Uuid>,

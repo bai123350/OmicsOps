@@ -1,6 +1,6 @@
 # wisp-inspired Agent Loop 实施计划
 
-日期：2026-09-08。状态：已实现前三个切片的执行保护及切片 4 的有界委派/冻结角色 profile；设计见 [设计文档](../specs/2026-09-08-wisp-inspired-agent-loop.md)。完整规格目录/准确图片成本、推理档位配置和切片 5–6 待实施，不能将六步计划整体标为完成。
+日期：2026-09-08。状态：已实现前三个切片的执行保护及切片 4 的有界委派/冻结角色 profile；设计见 [设计文档](../specs/2026-09-08-wisp-inspired-agent-loop.md)。切片 5 已接入持久化指导与模型等待切入；完整规格目录/准确图片成本、推理档位配置、只读工具等待切入和切片 6 待实施，不能将六步计划整体标为完成。
 
 ## 切片 1：完整请求预算
 
@@ -38,7 +38,9 @@ Settings 可将主 profile 绑定到另一个已保存的只读子 profile；新
 
 ## 切片 5：运行中指导与单 driver
 
-在实际 `agent_v4.rs` / `agent_commands.rs`、protocol、store 和 DTO 中接入 durable accepted/consumed 契约。测试重复发送、双 driver 争用、消费前后崩溃、指导打断只读等待、已派发副作用保持 uncertain、approved_plan 不被改写。UI 展示真实消费状态；新增覆盖层测试 Escape。
+已实现独立 SQLite 收件箱及 GuidanceConsumed 事件。接收不抢占事件序号；driver 在模型边界以同一事务消费并写事件。每 run 最多 16 条，每条最多 2048 UTF-8 字节，重送 message_id 幂等且校验项目/会话/run/内容。消费事件在 checkpoint 后仍完整进入 active_guidance，不修改 frozen spec 或 approved_plan。RunCompleted 与未消费收件箱在同一事务互斥，旧完成提案不能越过新指导。普通/计划启动在事务内争用同一会话；恢复复用原 run 的 driver 槽位。
+
+UI 使用内联面板，区分已接收和已应用，失败保留原文并复用请求 ID；切换 run 丢弃迟到响应。已应用仅表示持久化进入模型上下文，不表示指导要求已完成。模型等待可被指导打断；已派发工具等待其 batch 结束，不丢弃结果或伪造副作用取消。只读工具等待切入仍待实施，无新增覆盖层。
 
 ## 切片 6：结构化等待的闭环
 
@@ -110,3 +112,17 @@ Settings 可将主 profile 绑定到另一个已保存的只读子 profile；新
 - `c08afcd`：桌面预算接入、冻结子模型 profile、设置界面和 DTO。
 
 设计、README 与验收步骤另作文档提交。未推送远端，未发布或分发安装包。前面各阶段的“未提交”描述是当时交付状态。
+
+## 切片 5 当前增量的实现验证
+
+2026-09-08，Windows 工作树：
+
+- `cargo test -p omicsops-store --test guidance`：7 项通过，覆盖幂等、作用域、限额、重开、故障回滚、消费/完成及普通/计划启动竞争。
+- `cargo test -p omicsops-agent-core guidance --lib`：2 项通过，覆盖模型等待切入、消费一次、checkpoint、完成保护及 approved_plan 隔离。
+- `cargo test --workspace`：通过，exit 0；真实环境 ignored 测试未执行。
+- `npm test`：116 项前端测试、22 项扩展测试通过，其中新增指导面板 4 项。
+- `npm run build`（桌面 beforeBuildCommand）：通过，保留 Vite 大 chunk 提示。
+- `npm run build:desktop`：通过，Windows release/NSIS 构建成功，仅用于验证，未分发。
+- `cargo fmt --all -- --check` 初次发现偏差，已运行 `cargo fmt --all`，复查通过；格式修改单独提交。
+
+没有依赖锁变化。新增收件箱表由现有幂等迁移加载；未引入凭据字段、远端同步或新审批路径。旧程序无法识别 GuidanceConsumed 事件时不可跳过事件恢复。真实模型、SSH、Windows 桌面交互和 macOS smoke 未执行。工具等待即时切入、结构化计算等待、完整模型规格/图片预算与推理档位仍待后续增量。

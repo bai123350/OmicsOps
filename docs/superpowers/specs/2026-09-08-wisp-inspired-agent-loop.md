@@ -108,7 +108,7 @@ Settings 新增可选只读子 profile 绑定。ordinary run 创建时把 profil
 
 ## 8. 运行中指导与持久化
 
-后续独立切片增加 guidance 的 accepted/consumed 事件或等价持久化记录：包含 message_id、run_id、顺序和预期版本。客户端重送同一 message_id 幂等；只能在模型边界或已关闭工具 batch 后消费。收到指导可打断只读等待，但不能伪造取消已派发副作用。
+当前实现使用独立 agent_guidance_v4 表保存 accepted/consumed 状态，包含 message_id、run_id、顺序和时间；消费时校验完整冻结 spec。客户端重送同一 message_id 幂等；只能在模型边界或已关闭工具 batch 后消费，消费记录与 GuidanceConsumed 事件在同一事务提交。每 run 最多 16 条、每条 2048 UTF-8 字节；仅运行中的 ordinary Agent 可接收新指导。收到指导可打断模型等待；只读工具等待切入尚未实现，已派发工具先收口，不伪造副作用取消。完成事务拒绝未消费指导；checkpoint 保留已消费指导的上下文。
 
 排队新任务与指导当前 run 分开；每个会话只有一个 driver，槽位获取与队列操作原子协调。关闭窗口、重启、消费前崩溃都能恢复未消费输入。指导不得悄悄改 frozen approved plan；超出授权范围保持现有修改/审批路径。
 
