@@ -12,6 +12,30 @@ use omicsops_protocol::{ComputeSelectionV4, ExecutionPlanV4};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaveModelProfileRequest {
+    pub id: Option<Uuid>,
+    pub label: String,
+    pub provider: String,
+    pub base_url: String,
+    pub model: String,
+    pub credential: Option<String>,
+    pub context_window_tokens: Option<u32>,
+    /// Omission preserves an existing binding; explicit null restores inheritance.
+    #[serde(
+        default,
+        deserialize_with = "explicit_nullable_uuid",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub delegated_model_profile_id: Option<Option<Uuid>>,
+}
+
+fn explicit_nullable_uuid<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<Uuid>>, D::Error> {
+    Option::<Uuid>::deserialize(deserializer).map(Some)
+}
+
 /// Conversation-scoped Agent Runtime V4 mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

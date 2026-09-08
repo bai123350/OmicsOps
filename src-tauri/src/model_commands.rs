@@ -3,7 +3,6 @@ use omicsops_adapters::{
     llm::{ModelProbeResult, ProviderProtocol, UnifiedModelClient},
 };
 use omicsops_core::workspace::{ModelProfile, ModelProviderKind};
-use serde::{Deserialize, Serialize};
 use tauri::State;
 use url::Url;
 use uuid::Uuid;
@@ -11,16 +10,7 @@ use uuid::Uuid;
 use crate::commands::AppState;
 use crate::model_catalog_shared::exact_model_supports_vision;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SaveModelProfileRequest {
-    pub id: Option<Uuid>,
-    pub label: String,
-    pub provider: String,
-    pub base_url: String,
-    pub model: String,
-    pub credential: Option<String>,
-    pub context_window_tokens: Option<u32>,
-}
+pub use omicsops_dto::SaveModelProfileRequest;
 
 pub fn model_profile_from_request(
     request: SaveModelProfileRequest,
@@ -39,6 +29,9 @@ pub fn model_profile_from_request(
         other => return Err(format!("unsupported model provider: {other}")),
     };
     let id = request.id.unwrap_or_else(Uuid::new_v4);
+    if request.delegated_model_profile_id.flatten() == Some(id) {
+        return Err("choose another delegated profile or inherit the main model".into());
+    }
     let model = request.model.trim().to_owned();
     let supports_vision = exact_model_supports_vision(provider, &base_url, &model);
     Ok(ModelProfile {
@@ -52,6 +45,7 @@ pub fn model_profile_from_request(
         supports_tools: true,
         supports_vision,
         context_window_tokens: request.context_window_tokens,
+        delegated_model_profile_id: request.delegated_model_profile_id.flatten(),
     })
 }
 
@@ -70,7 +64,35 @@ pub async fn save_model_profile(
     request: SaveModelProfileRequest,
 ) -> Result<ModelProfile, String> {
     let credential = request.credential.clone();
-    let profile = model_profile_from_request(request)?;
+    let preserve_binding = request.delegated_model_profile_id.is_none();
+    let preserve_window = request.context_window_tokens.is_none();
+    let mut profile = model_profile_from_request(request)?;
+    if preserve_binding || preserve_window {
+        if let Some(existing) = state
+            .repository
+            .get_model_profile(profile.id)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            if preserve_binding {
+                profile.delegated_model_profile_id = existing.delegated_model_profile_id;
+            }
+            if preserve_window {
+                profile.context_window_tokens = existing.context_window_tokens;
+            }
+        }
+    }
+    if let Some(child_id) = profile.delegated_model_profile_id {
+        let child = state
+            .repository
+            .get_model_profile(child_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("delegated model profile not found")?;
+        if !child.supports_tools {
+            return Err("delegated model must support tools".into());
+        }
+    }
     if let (Some(reference), Some(secret)) = (&profile.credential_reference, credential) {
         if !secret.trim().is_empty() {
             state
@@ -168,6 +190,7 @@ mod tests {
             model: model.into(),
             credential: None,
             context_window_tokens: None,
+            delegated_model_profile_id: None,
         }
     }
 

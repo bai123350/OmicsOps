@@ -3,6 +3,41 @@ import { describe, expect, it, vi } from "vitest";
 import { SettingsPanel } from "./SettingsPanel";
 
 describe("SettingsPanel model providers", () => {
+  it("saves a selected child profile, clears it explicitly, and closes only the form on Escape", async () => {
+    const child = { id: "child", label: "Reader", provider: "ollama" as const, base_url: "http://127.0.0.1:11434", model: "reader-model", credential_reference: null, supports_tools: true, supports_vision: false };
+    const main = { ...child, id: "main", label: "Main", delegated_model_profile_id: "child" };
+    const save = vi.fn().mockResolvedValue(undefined);
+    const close = vi.fn();
+    render(<SettingsPanel locale="en-US" onClose={close} modelProfiles={[main, child]} onSaveModel={save} />);
+    fireEvent.click(screen.getAllByRole("button", { name: "Edit" })[0]);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByLabelText("Read-only subagent model")).not.toBeInTheDocument();
+    expect(close).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: "Edit" })[0]);
+    expect(screen.getByLabelText("Read-only subagent model")).toHaveValue("child");
+    expect(screen.queryByRole("option", { name: /Main/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    await waitFor(() => expect(screen.queryByLabelText("Read-only subagent model")).not.toBeInTheDocument());
+    expect(save).toHaveBeenLastCalledWith(expect.objectContaining({ delegated_model_profile_id: "child" }));
+    fireEvent.click(screen.getAllByRole("button", { name: "Edit" })[0]);
+    fireEvent.change(screen.getByLabelText("Read-only subagent model"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    await waitFor(() => expect(save).toHaveBeenLastCalledWith(expect.objectContaining({ delegated_model_profile_id: null })));
+    await waitFor(() => expect(screen.queryByLabelText("Read-only subagent model")).not.toBeInTheDocument());
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a failed role selection editable without showing raw transport details", async () => {
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} onSaveModel={vi.fn().mockRejectedValue(new Error("secret transport"))} />);
+    fireEvent.click(screen.getByRole("button", { name: "Configure Ollama" }));
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "reader" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not save");
+    expect(screen.queryByText("secret transport")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Model")).toHaveValue("reader");
+  });
   it("opens directly on Skills when launched from the composer", () => {
     render(<SettingsPanel locale="en-US" initialSection="skills" onClose={() => undefined} />);
     expect(screen.getByRole("button", { name: "Skills and MCP" })).toHaveClass("active");

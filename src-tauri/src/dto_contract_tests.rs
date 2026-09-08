@@ -7,6 +7,29 @@ use serde_json::json;
 use uuid::Uuid;
 
 #[test]
+fn model_binding_request_distinguishes_omission_clear_and_selection() {
+    let base = json!({"label":"test","provider":"ollama","base_url":"http://127.0.0.1:11434","model":"exact-test"});
+    let missing: crate::model_commands::SaveModelProfileRequest =
+        serde_json::from_value(base.clone()).unwrap();
+    assert_eq!(missing.delegated_model_profile_id, None);
+    assert!(
+        serde_json::to_value(&missing)
+            .unwrap()
+            .get("delegated_model_profile_id")
+            .is_none()
+    );
+    for choice in [None, Some(Uuid::new_v4())] {
+        let mut value = base.clone();
+        value["delegated_model_profile_id"] = json!(choice);
+        let dto: crate::dto::SaveModelProfileRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(dto.delegated_model_profile_id, Some(choice));
+        let backend: crate::model_commands::SaveModelProfileRequest =
+            serde_json::from_value(serde_json::to_value(dto).unwrap()).unwrap();
+        assert_eq!(backend.delegated_model_profile_id, Some(choice));
+    }
+}
+
+#[test]
 fn session_mode_serializes_as_lowercase_wire_values() {
     assert_eq!(
         serde_json::to_value(SessionAgentModeV4::Agent).unwrap(),

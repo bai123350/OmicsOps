@@ -8,7 +8,7 @@ import "./settings.css";
 import "./model-form.css";
 import "./remote-form.css";
 
-type SaveModelRequest = { id?: string; label: string; provider: ModelProfile["provider"]; base_url: string; model: string; credential?: string };
+type SaveModelRequest = { id?: string; label: string; provider: ModelProfile["provider"]; base_url: string; model: string; credential?: string; delegated_model_profile_id?: string | null };
 type FormState = SaveModelRequest & { credential: string };
 type McpEnvFormBinding = McpEnvBinding & { mode: "literal" | "credential" };
 type SaveMcpServerRequest = { id?: string; name: string; command: string; args: string[]; cwd?: string | null; timeout_secs?: number | null; env_bindings?: McpEnvBinding[] };
@@ -49,20 +49,25 @@ export function SettingsPanel({ locale, initialSection = "models", onClose, mode
   const zh = locale === "zh-CN";
   const [form, setForm] = useState<FormState | null>(null);
   const [saving, setSaving] = useState(false);
+  const [modelSaveError, setModelSaveError] = useState("");
   const [section, setSection] = useState<"models" | "remote" | "skills" | "browser">(initialSection);
   const [skillsBusy, setSkillsBusy] = useState(false);
   const [skillError, setSkillError] = useState("");
   const [modelTests, setModelTests] = useState<Record<string, { state: "testing" | "success" | "error"; result?: ModelProbeResult; message?: string }>>({});
   const [modelChoices, setModelChoices] = useState<Record<string, string[]>>({});
   useWindowEscapeLayer(true, onClose);
+  useWindowEscapeLayer(form !== null, () => setForm(null));
   const configure = (provider: ModelProfile["provider"]) => setForm({ ...defaults[provider] });
 
   async function saveProvider() {
     if (!form || !onSaveModel) return;
     setSaving(true);
+    setModelSaveError("");
     try {
       await onSaveModel({ ...form, credential: form.provider === "ollama" ? undefined : form.credential });
       setForm(null);
+    } catch {
+      setModelSaveError(zh ? "保存失败，请检查模型配置后重试。" : "Could not save. Check the model configuration and retry.");
     } finally {
       setSaving(false);
     }
@@ -118,10 +123,16 @@ export function SettingsPanel({ locale, initialSection = "models", onClose, mode
             <label>{zh ? "模型" : "Model"}<input aria-label="Model" value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })} /></label>
             <label className="wide">Base URL<input aria-label="Base URL" value={form.base_url} onChange={(event) => setForm({ ...form, base_url: event.target.value })} /></label>
             {form.provider !== "ollama" && <label className="wide">API key<input aria-label="API key" type="password" autoComplete="new-password" value={form.credential} onChange={(event) => setForm({ ...form, credential: event.target.value })} /></label>}
+            <label className="wide">{zh ? "只读子 Agent 模型" : "Read-only subagent model"}<select aria-label="Read-only subagent model" value={form.delegated_model_profile_id ?? ""} onChange={(event) => setForm({ ...form, delegated_model_profile_id: event.target.value || null })}>
+              <option value="">{zh ? "沿用主模型" : "Inherit main model"}</option>
+              {modelProfiles.filter((profile) => profile.id !== form.id && profile.supports_tools).map((profile) => <option key={profile.id} value={profile.id}>{profile.label} · {profile.model}</option>)}
+              {form.delegated_model_profile_id && !modelProfiles.some((profile) => profile.id === form.delegated_model_profile_id && profile.supports_tools) && <option value={form.delegated_model_profile_id}>{zh ? "配置不可用，请重新选择" : "Profile unavailable; select again"}</option>}
+            </select><small>{zh ? "用于新建普通 Agent 任务的只读委派；运行中任务保留原配置。" : "Used for read-only delegation in new ordinary Agent runs; existing runs keep their configuration."}</small></label>
           </div>
+          {modelSaveError && <p role="alert">{modelSaveError}</p>}
           <div className="model-form-actions"><button onClick={() => setForm(null)}>{zh ? "取消" : "Cancel"}</button><button className="primary" disabled={saving || !form.label.trim() || !form.model.trim()} onClick={saveProvider}>{zh ? "保存提供方" : "Save provider"}</button></div>
         </section>}
-        {modelProfiles.length > 0 && <div className="configured-models">{modelProfiles.map((profile) => { const probe = modelTests[profile.id]; const choices = modelChoices[profile.id] ?? []; return <div key={profile.id}><span><b>{profile.label}</b><small>{profile.model} · {profile.provider}</small></span><button onClick={() => setForm({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model: profile.model, credential: "" })}>{zh ? "编辑" : "Edit"}</button><button disabled={!onListModels} onClick={() => void discoverModels(profile.id)}>{zh ? "可用模型" : "Models"}</button><button disabled={probe?.state === "testing" || !onProbeModel} onClick={() => void testModel(profile.id)}>{probe?.state === "testing" ? <><LoaderCircle className="spin" size={13} />{zh ? "测试中" : "Testing"}</> : (zh ? "测试" : "Test")}</button>{choices.length > 0 && <div className="model-choices"><small>{zh ? "网关当前可用，点击后保存：" : "Available now; click to edit:"}</small>{choices.map((model) => <button key={model} onClick={() => setForm({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model, credential: "" })}>{model}</button>)}</div>}{probe?.state === "success" && probe.result && <div className="model-probe-result success" role="status"><CheckCircle2 size={15} /><span><b>{zh ? "连接成功" : "Connection succeeded"}</b><small>{probe.result.model} · {probe.result.latency_ms} ms · {probe.result.endpoint}</small><code>{probe.result.response_preview}</code></span></div>}{probe?.state === "error" && <div className="model-probe-result error" role="alert"><XCircle size={15} /><span><b>{zh ? "测试失败" : "Test failed"}</b><small>{probe.message}</small></span></div>}</div>; })}</div>}
+        {modelProfiles.length > 0 && <div className="configured-models">{modelProfiles.map((profile) => { const probe = modelTests[profile.id]; const choices = modelChoices[profile.id] ?? []; return <div key={profile.id}><span><b>{profile.label}</b><small>{profile.model} · {profile.provider}</small></span><button onClick={() => setForm({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model: profile.model, credential: "", delegated_model_profile_id: profile.delegated_model_profile_id ?? null })}>{zh ? "编辑" : "Edit"}</button><button disabled={!onListModels} onClick={() => void discoverModels(profile.id)}>{zh ? "可用模型" : "Models"}</button><button disabled={probe?.state === "testing" || !onProbeModel} onClick={() => void testModel(profile.id)}>{probe?.state === "testing" ? <><LoaderCircle className="spin" size={13} />{zh ? "测试中" : "Testing"}</> : (zh ? "测试" : "Test")}</button>{choices.length > 0 && <div className="model-choices"><small>{zh ? "网关当前可用，点击后保存：" : "Available now; click to edit:"}</small>{choices.map((model) => <button key={model} onClick={() => setForm({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model, credential: "", delegated_model_profile_id: profile.delegated_model_profile_id ?? null })}>{model}</button>)}</div>}{probe?.state === "success" && probe.result && <div className="model-probe-result success" role="status"><CheckCircle2 size={15} /><span><b>{zh ? "连接成功" : "Connection succeeded"}</b><small>{probe.result.model} · {probe.result.latency_ms} ms · {probe.result.endpoint}</small><code>{probe.result.response_preview}</code></span></div>}{probe?.state === "error" && <div className="model-probe-result error" role="alert"><XCircle size={15} /><span><b>{zh ? "测试失败" : "Test failed"}</b><small>{probe.message}</small></span></div>}</div>; })}</div>}
         <div className="settings-note"><ShieldCheck size={18} /><span><b>{zh ? "默认无遥测" : "Telemetry off by default"}</b><small>{zh ? "诊断包仅在主动导出时生成，并经过凭据脱敏。" : "Diagnostic bundles are generated only on export and redact credentials."}</small></span></div>
       </main> : section === "remote" ? <RemoteSettings locale={locale} connections={connections} selectedProject={selectedProject} onSave={onSaveConnection} onTest={onTestConnection} onConfirm={onConfirmHostKey} onBind={onBindProjectRemote} /> : section === "skills" ? <SkillsAndMcpSettings locale={locale} skillPackages={skillPackages} skillsBusy={skillsBusy} skillError={skillError} onImportSkill={onImportSkill ? importSkill : undefined} onSetSkillEnabled={onSetSkillEnabled} mcpServers={mcpServers} selectedProject={selectedProject} onSaveMcpServer={onSaveMcpServer} onInspectMcpServer={onInspectMcpServer} onSetMcpServerEnabled={onSetMcpServerEnabled} onSetMcpLaunchApproval={onSetMcpLaunchApproval} onSetMcpToolApproval={onSetMcpToolApproval} onAddPubMedMcp={onAddPubMedMcp} /> : <BrowserSettings locale={locale} />}
     </div>

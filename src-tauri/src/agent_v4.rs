@@ -15,7 +15,7 @@ use chrono::Utc;
 use omicsops_adapters::{
     credentials::SystemCredentialVault,
     kernel::{kernel_driver, validate_capture_paths, validate_kernel_code},
-    llm::UnifiedModelClient,
+    llm::{RequestBudget, UnifiedModelClient},
     ssh::{SshJsonlProcess, SshSession},
 };
 use omicsops_agent::provider::{
@@ -487,6 +487,7 @@ pub async fn agent_v4_start_planning(
         request.conversation_id,
         None,
         None,
+        None,
     )
     .await
     {
@@ -738,6 +739,7 @@ pub async fn agent_v4_start_direct(
         request.conversation_id,
         None,
         None,
+        None,
     )
     .await?;
     let run_id = tools.run_id();
@@ -765,7 +767,7 @@ pub async fn agent_v4_start_direct(
         &request.compute_selection,
     )
     .map_err(|error| error.to_string())?;
-    let spec = RunSpecV4::freeze_ordinary_agent_with_compute(
+    let mut spec = RunSpecV4::freeze_ordinary_agent_with_compute(
         run_id,
         request.project_id,
         request.conversation_id,
@@ -776,6 +778,12 @@ pub async fn agent_v4_start_direct(
         Utc::now(),
     )
     .map_err(|error| error.to_string())?;
+    spec.delegated_model =
+        freeze_delegated_model(&state.repository, request.model_profile_id).await?;
+    spec.spec_hash = Some(
+        spec.calculate_spec_hash()
+            .map_err(|error| error.to_string())?,
+    );
     let record = RunRecordV4 {
         run_id,
         project_id: request.project_id,
@@ -1433,6 +1441,7 @@ pub async fn agent_v4_resume(
             record.model_profile_id,
             record.run_id,
             record.conversation_id,
+            None,
             None,
             None,
         )
@@ -2346,6 +2355,7 @@ async fn spawn_execution(
         spec.conversation_id,
         Some(&spec.plan.requested_capabilities),
         forced_route,
+        spec.delegated_model.as_ref(),
     )
     .await?;
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -2681,6 +2691,48 @@ impl ComposedToolsV4 {
     }
 }
 
+async fn freeze_delegated_model(
+    repository: &Store,
+    main_id: Uuid,
+) -> Result<Option<omicsops_protocol::DelegatedModelBindingV4>, String> {
+    let main = repository
+        .get_model_profile(main_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or("model profile not found")?;
+    let Some(child_id) = main.delegated_model_profile_id else {
+        return Ok(None);
+    };
+    let child = repository
+        .get_model_profile(child_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or("configured delegated model profile not found")?;
+    if child_id == main_id || !child.supports_tools {
+        return Err("delegated model must be a separate tool-capable profile".into());
+    }
+    Ok(Some(omicsops_protocol::DelegatedModelBindingV4 {
+        profile_id: child.id,
+        configuration_hash: child.execution_configuration_hash(),
+    }))
+}
+
+fn validate_delegated_profile(
+    profile: &omicsops_core::workspace::ModelProfile,
+    binding: &omicsops_protocol::DelegatedModelBindingV4,
+) -> Result<(), String> {
+    if !profile.supports_tools
+        || profile.id != binding.profile_id
+        || profile.execution_configuration_hash() != binding.configuration_hash
+    {
+        return Err(
+            "frozen delegated model configuration changed; restore the profile or start a new run"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 async fn compose(
     state: &AppState,
     project: &Project,
@@ -2690,6 +2742,7 @@ async fn compose(
     conversation_id: Uuid,
     execute_capabilities: Option<&BTreeSet<String>>,
     forced_route: Option<AgentRequestRouteV4>,
+    delegated_binding: Option<&omicsops_protocol::DelegatedModelBindingV4>,
 ) -> Result<(Arc<DesktopModelPortV4>, ComposedToolsV4), String> {
     let (filesystem, environment_port, backend): (
         Arc<dyn ProjectFilesystemPortV4>,
@@ -2830,12 +2883,47 @@ async fn compose(
     } else {
         registry
     };
+    let delegated = if let Some(binding) = delegated_binding {
+        let child = state
+            .repository
+            .get_model_profile(binding.profile_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("frozen delegated model profile not found")?;
+        validate_delegated_profile(&child, binding)?;
+        Some((
+            binding.clone(),
+            Box::new(DesktopModelPortV4 {
+                client: crate::commands::unified_model_client_for_profile(state, &child)?
+                    .with_request_budget(RequestBudget {
+                        context_window_tokens: child.effective_context_window_tokens(),
+                        reserved_output_tokens: 4096,
+                        safety_margin_tokens: 1024,
+                    }),
+                prompt: prompt.clone(),
+                project_root: PathBuf::from(&project.local_root),
+                supports_vision: child.supports_vision,
+                delegated: None,
+            }),
+        ))
+    } else {
+        None
+    };
     Ok((
         Arc::new(DesktopModelPortV4 {
-            client: unified_model_client(state, model_profile_id).await?,
+            client: unified_model_client(state, model_profile_id)
+                .await?
+                .with_request_budget(RequestBudget {
+                    context_window_tokens: model_profile.effective_context_window_tokens(),
+                    // This is a requested output allowance, not an inferred
+                    // maximum capability of an unknown model.
+                    reserved_output_tokens: 4096,
+                    safety_margin_tokens: 1024,
+                }),
             prompt,
             project_root: PathBuf::from(&project.local_root),
             supports_vision: model_profile.supports_vision,
+            delegated,
         }),
         ComposedToolsV4 {
             run_id,
@@ -2849,18 +2937,17 @@ struct DesktopModelPortV4 {
     prompt: PromptLayersV4,
     project_root: PathBuf,
     supports_vision: bool,
+    delegated: Option<(
+        omicsops_protocol::DelegatedModelBindingV4,
+        Box<DesktopModelPortV4>,
+    )>,
 }
-#[async_trait]
-impl ModelPortV4 for DesktopModelPortV4 {
-    fn prompt_layers(&self) -> PromptLayersV4 {
-        self.prompt.clone()
-    }
-
-    async fn stream(
+impl DesktopModelPortV4 {
+    fn prepare_request(
         &self,
         request: ModelRequestV4,
-        on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
-    ) -> Result<ModelTurnV4, ModelFailureV4> {
+        load_images: bool,
+    ) -> Result<ProviderRequest, ModelFailureV4> {
         let tools = request
             .tools
             .into_iter()
@@ -2879,7 +2966,13 @@ impl ModelPortV4 for DesktopModelPortV4 {
         } else {
             let mut parts = vec![omicsops_agent::ModelContentPart::Text { text: context }];
             for image in &request.image_refs {
-                let bytes = verified_model_image(&self.project_root, image)?;
+                let bytes = if load_images {
+                    verified_model_image(&self.project_root, image)?
+                } else {
+                    // Preserve the image part for budget validation without
+                    // accessing disk. Unknown image cost must not become zero.
+                    Vec::new()
+                };
                 parts.push(omicsops_agent::ModelContentPart::Image {
                     media_type: image.media_type.clone(),
                     data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
@@ -2887,56 +2980,93 @@ impl ModelPortV4 for DesktopModelPortV4 {
             }
             omicsops_agent::ModelMessageContent::Parts(parts)
         };
+        Ok(ProviderRequest {
+            system: request.system,
+            messages: vec![omicsops_agent::ModelMessage {
+                role: "user".into(),
+                content,
+            }],
+            tools,
+            require_strict_json_fallback: true,
+        })
+    }
+}
+
+#[async_trait]
+impl ModelPortV4 for DesktopModelPortV4 {
+    fn delegated_model(
+        &self,
+        binding: Option<&omicsops_protocol::DelegatedModelBindingV4>,
+    ) -> Result<Option<&dyn ModelPortV4>, ModelFailureV4> {
+        match (binding, &self.delegated) {
+            (None, _) => Ok(None),
+            (Some(expected), Some((actual, model))) if expected == actual => {
+                Ok(Some(model.as_ref()))
+            }
+            _ => Err(ModelFailureV4::permanent(
+                ModelErrorClassV4::InvalidRequest,
+                "frozen delegated model binding is unavailable or changed",
+            )),
+        }
+    }
+    fn prompt_layers(&self) -> PromptLayersV4 {
+        self.prompt.clone()
+    }
+
+    fn validate_request(&self, request: &ModelRequestV4) -> Result<(), ModelFailureV4> {
+        let provider_request = self.prepare_request(request.clone(), false)?;
+        self.client
+            .validate_request(&provider_request)
+            .map_err(|error| {
+                ModelFailureV4::permanent(ModelErrorClassV4::InvalidRequest, error.to_string())
+            })
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequestV4,
+        on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+    ) -> Result<ModelTurnV4, ModelFailureV4> {
+        self.validate_request(&request)?;
+        let provider_request = self.prepare_request(request, true)?;
         let mut text = String::new();
         let mut calls = ProviderToolCallAccumulator::default();
         let mut provider_error = None;
         let mut accumulator_error = None;
         self.client
-            .stream_with_provider(
-                ProviderRequest {
-                    system: request.system,
-                    messages: vec![omicsops_agent::ModelMessage {
-                        role: "user".into(),
-                        content,
-                    }],
-                    tools,
-                    require_strict_json_fallback: true,
-                },
-                |event| match event {
-                    ProviderStreamEvent::TextDelta { text: delta } => {
-                        text.push_str(&delta);
-                        on_event(ModelStreamEventV4::TextDelta(delta));
+            .stream_with_provider(provider_request, |event| match event {
+                ProviderStreamEvent::TextDelta { text: delta } => {
+                    text.push_str(&delta);
+                    on_event(ModelStreamEventV4::TextDelta(delta));
+                }
+                ProviderStreamEvent::Retrying {
+                    attempt,
+                    delay_ms,
+                    message,
+                } => on_event(ModelStreamEventV4::ProviderRetrying {
+                    attempt,
+                    delay_ms,
+                    message,
+                }),
+                ProviderStreamEvent::Error { code, message, .. } => {
+                    provider_error = Some(classify_model_failure(&format!("{code}: {message}")));
+                }
+                other if accumulator_error.is_none() => {
+                    if let Err(error) = calls.push(&other) {
+                        accumulator_error = Some(ModelFailureV4::permanent(
+                            ModelErrorClassV4::InvalidResponse,
+                            error.to_string(),
+                        ));
                     }
-                    ProviderStreamEvent::Retrying {
-                        attempt,
-                        delay_ms,
-                        message,
-                    } => on_event(ModelStreamEventV4::ProviderRetrying {
-                        attempt,
-                        delay_ms,
-                        message,
-                    }),
-                    ProviderStreamEvent::Error { code, message, .. } => {
-                        provider_error =
-                            Some(classify_model_failure(&format!("{code}: {message}")));
-                    }
-                    other if accumulator_error.is_none() => {
-                        if let Err(error) = calls.push(&other) {
-                            accumulator_error = Some(ModelFailureV4::permanent(
-                                ModelErrorClassV4::InvalidResponse,
-                                error.to_string(),
-                            ));
-                        }
-                    }
-                    _ => {}
-                },
-            )
+                }
+                _ => {}
+            })
             .await
             .map_err(|error| classify_model_failure(&error.to_string()))?;
         if let Some(error) = provider_error.or(accumulator_error) {
             return Err(error);
         }
-        let tool_calls = calls
+        let tool_calls: Vec<ToolCallV4> = calls
             .finish()
             .map_err(|error| {
                 ModelFailureV4::permanent(ModelErrorClassV4::InvalidResponse, error.to_string())
@@ -2948,6 +3078,12 @@ impl ModelPortV4 for DesktopModelPortV4 {
                 arguments: call.arguments,
             })
             .collect();
+        if text.trim().is_empty() && tool_calls.is_empty() {
+            return Err(ModelFailureV4::permanent(
+                ModelErrorClassV4::InvalidResponse,
+                "empty_model_response: no public text or tools; prior run evidence is retained",
+            ));
+        }
         Ok(ModelTurnV4 {
             public_text: text,
             tool_calls,
@@ -3052,7 +3188,9 @@ fn verified_model_image(
 
 fn classify_model_failure(message: &str) -> ModelFailureV4 {
     let lower = message.to_ascii_lowercase();
-    if lower.contains("429") || lower.contains("rate limit") {
+    if lower.contains("context_length_exceeded") || lower.contains("context_window_exceeded") {
+        ModelFailureV4::permanent(ModelErrorClassV4::ContextOverflow, message)
+    } else if lower.contains("429") || lower.contains("rate limit") {
         ModelFailureV4::transient(ModelErrorClassV4::RateLimited, message)
     } else if ["500", "502", "503", "504"]
         .iter()
@@ -5449,6 +5587,148 @@ mod tests {
     };
     use url::Url;
 
+    fn budget_test_model(supports_vision: bool, window: u32) -> DesktopModelPortV4 {
+        DesktopModelPortV4 {
+            client: UnifiedModelClient::new(
+                Uuid::new_v4(),
+                ProviderProtocol::Ollama,
+                Url::parse("http://127.0.0.1:1").unwrap(),
+                "test-model",
+                None,
+            )
+            .unwrap()
+            .with_request_budget(RequestBudget {
+                context_window_tokens: window,
+                reserved_output_tokens: 100,
+                safety_margin_tokens: 10,
+            }),
+            prompt: PromptLayersV4::default(),
+            project_root: PathBuf::from("nonexistent-budget-test-root"),
+            supports_vision,
+            delegated: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_profile_freezes_exact_configuration_and_missing_profiles_fail() {
+        let repository = Store::open_in_memory().await.unwrap();
+        let mut main: omicsops_core::workspace::ModelProfile = serde_json::from_value(json!({
+            "id":Uuid::new_v4(),"label":"main","provider":"ollama","base_url":"http://127.0.0.1:11434",
+            "model":"main-exact","credential_reference":null,"supports_tools":true,"supports_vision":false,
+        })).unwrap();
+        repository.save_model_profile(&main).await.unwrap();
+        assert_eq!(
+            freeze_delegated_model(&repository, main.id).await.unwrap(),
+            None
+        );
+        let mut child = main.clone();
+        child.id = Uuid::new_v4();
+        child.model = "child-exact".into();
+        main.delegated_model_profile_id = Some(child.id);
+        repository.save_model_profile(&main).await.unwrap();
+        assert!(
+            freeze_delegated_model(&repository, main.id)
+                .await
+                .unwrap_err()
+                .contains("not found")
+        );
+        repository.save_model_profile(&child).await.unwrap();
+        let binding = freeze_delegated_model(&repository, main.id)
+            .await
+            .unwrap()
+            .unwrap();
+        validate_delegated_profile(&child, &binding).unwrap();
+        child.label = "renamed".into();
+        child.credential_reference = Some("safe-keyring-reference".into());
+        validate_delegated_profile(&child, &binding).unwrap();
+        child.model = "child-exact-sibling".into();
+        assert!(validate_delegated_profile(&child, &binding).is_err());
+        child.model = "child-exact".into();
+        child.base_url = "http://127.0.0.1:11435".into();
+        assert!(validate_delegated_profile(&child, &binding).is_err());
+        let mut parent_port = budget_test_model(false, 100_000);
+        assert!(parent_port.delegated_model(Some(&binding)).is_err());
+        parent_port.delegated = Some((binding.clone(), Box::new(budget_test_model(false, 500))));
+        let child_port = parent_port
+            .delegated_model(Some(&binding))
+            .unwrap()
+            .unwrap();
+        let request = ModelRequestV4 {
+            system: "system".into(),
+            context: "large".repeat(500),
+            tools: vec![],
+            image_refs: vec![],
+        };
+        assert!(child_port.validate_request(&request).is_err());
+        assert!(parent_port.validate_request(&request).is_ok());
+        assert!(parent_port.delegated_model(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn desktop_preflight_counts_the_actual_nonvision_notice_and_tools() {
+        let model = budget_test_model(false, 100_000);
+        let request = ModelRequestV4 {
+            system: "system".into(),
+            context: "user context".into(),
+            tools: vec![ToolDescriptorV4 {
+                id: "read".into(),
+                description: "description".into(),
+                input_schema: json!({"type":"object"}),
+                effect: ToolEffectV4::ReadOnly,
+            }],
+            image_refs: vec![ModelImageRefV4 {
+                relative_path: "missing.png".into(),
+                media_type: "image/png".into(),
+                size_bytes: 1,
+                sha256: "unused".into(),
+            }],
+        };
+        let preview = model.prepare_request(request.clone(), false).unwrap();
+        let actual = model.prepare_request(request.clone(), true).unwrap();
+        assert_eq!(preview, actual);
+        assert_eq!(preview.tools.len(), 1);
+        assert!(
+            serde_json::to_string(&preview)
+                .unwrap()
+                .contains("HOST IMAGE NOTICE")
+        );
+        model.validate_request(&request).unwrap();
+    }
+
+    #[test]
+    fn provider_overflow_codes_are_distinct_from_generic_invalid_requests() {
+        for message in ["400: context_length_exceeded", "context_window_exceeded"] {
+            let failure = classify_model_failure(message);
+            assert_eq!(failure.class, ModelErrorClassV4::ContextOverflow);
+            assert!(!failure.retryable);
+        }
+        assert_eq!(
+            classify_model_failure("400 invalid tool schema").class,
+            ModelErrorClassV4::InvalidRequest
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_budget_rejects_unknown_images_before_disk_or_network_access() {
+        let model = budget_test_model(true, 100_000);
+        let request = ModelRequestV4 {
+            system: "system".into(),
+            context: "context".into(),
+            tools: vec![],
+            image_refs: vec![ModelImageRefV4 {
+                relative_path: "missing.png".into(),
+                media_type: "image/png".into(),
+                size_bytes: 1,
+                sha256: "unused".into(),
+            }],
+        };
+        let preflight = model.validate_request(&request).unwrap_err();
+        assert!(preflight.message.to_ascii_lowercase().contains("image"));
+        let actual = model.stream(request, &mut |_| {}).await.unwrap_err();
+        assert_eq!(actual, preflight);
+        assert!(!actual.retryable);
+    }
+
     #[test]
     fn host_route_classifier_forces_research_only_for_external_evidence_signals() {
         for objective in [
@@ -6265,6 +6545,7 @@ mod tests {
             prompt: PromptLayersV4::default(),
             project_root: std::env::current_dir().unwrap(),
             supports_vision: false,
+            delegated: None,
         };
         let mut streamed = String::new();
         let turn = model

@@ -248,9 +248,26 @@ pub struct ModelProfile {
     pub supports_vision: bool,
     #[serde(default)]
     pub context_window_tokens: Option<u32>,
+    /// Optional profile for read-only delegation in newly created ordinary runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated_model_profile_id: Option<Uuid>,
 }
 
 impl ModelProfile {
+    pub fn execution_configuration_hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+        // Credentials and labels do not belong in the execution identity.
+        let value = serde_json::json!({
+            "profile_id": self.id, "provider": self.provider, "base_url": self.base_url,
+            "model": self.model, "supports_tools": self.supports_tools,
+            "supports_vision": self.supports_vision,
+            "context_window_tokens": self.effective_context_window_tokens(),
+        });
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(&value).expect("serializable profile"),
+        ))
+    }
+
     pub fn effective_context_window_tokens(&self) -> u32 {
         self.context_window_tokens.unwrap_or(32_768)
     }
