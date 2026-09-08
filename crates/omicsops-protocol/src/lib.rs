@@ -67,6 +67,7 @@ pub enum RunStatusV4 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelErrorClassV4 {
+    ContextOverflow,
     RateLimited,
     Server,
     Timeout,
@@ -143,6 +144,12 @@ fn is_approved_plan_execution(value: &RunExecutionKindV4) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DelegatedModelBindingV4 {
+    pub profile_id: Uuid,
+    pub configuration_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RunSpecV4 {
     pub schema_version: u8,
     pub runtime_id: String,
@@ -150,6 +157,8 @@ pub struct RunSpecV4 {
     pub project_id: Uuid,
     pub conversation_id: Uuid,
     pub model_profile_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated_model: Option<DelegatedModelBindingV4>,
     pub plan: ExecutionPlanV4,
     pub approved_plan_hash: String,
     #[serde(default, skip_serializing_if = "is_approved_plan_execution")]
@@ -185,6 +194,7 @@ impl RunSpecV4 {
             conversation_id,
             model_profile_id,
             plan,
+            delegated_model: None,
             approved_plan_hash: actual,
             execution_kind: RunExecutionKindV4::ApprovedPlan,
             compute_selection: None,
@@ -250,6 +260,7 @@ impl RunSpecV4 {
             model_profile_id,
             plan,
             approved_plan_hash: plan_hash,
+            delegated_model: None,
             execution_kind: RunExecutionKindV4::ApprovedPlan,
             compute_selection: Some(selection),
             approval_hash: Some(expected),
@@ -302,12 +313,27 @@ impl RunSpecV4 {
         if self.execution_kind == RunExecutionKindV4::OrdinaryAgent {
             value["execution_kind"] = serde_json::json!(self.execution_kind);
         }
+        if let Some(binding) = &self.delegated_model {
+            value["delegated_model"] = serde_json::json!(binding);
+        }
         Ok(hex::encode(Sha256::digest(
             serde_json::to_vec(&value).map_err(|_| ProtocolErrorV4::InvalidComputeSelection)?,
         )))
     }
 
     pub fn validate_integrity(&self) -> Result<(), ProtocolErrorV4> {
+        if let Some(binding) = &self.delegated_model {
+            if self.execution_kind != RunExecutionKindV4::OrdinaryAgent
+                || self.compute_selection.is_none()
+                || binding.configuration_hash.len() != 64
+                || !binding
+                    .configuration_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(ProtocolErrorV4::SpecHashMismatch);
+            }
+        }
         if self.plan.canonical_hash()? != self.approved_plan_hash {
             return Err(ProtocolErrorV4::PlanHashMismatch);
         }
@@ -1838,6 +1864,45 @@ mod tests {
                 .is_none()
         );
         assert!(spec.validate_integrity().is_ok());
+        assert!(
+            serde_json::to_value(&spec)
+                .unwrap()
+                .get("delegated_model")
+                .is_none()
+        );
+        let legacy: RunSpecV4 =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(
+            legacy.calculate_spec_hash().unwrap(),
+            spec.calculate_spec_hash().unwrap()
+        );
+        let mut ordinary = spec.clone();
+        ordinary.execution_kind = RunExecutionKindV4::OrdinaryAgent;
+        ordinary.delegated_model = Some(DelegatedModelBindingV4 {
+            profile_id: Uuid::new_v4(),
+            configuration_hash: "a".repeat(64),
+        });
+        ordinary.spec_hash = Some(ordinary.calculate_spec_hash().unwrap());
+        ordinary.validate_integrity().unwrap();
+        let roundtrip: RunSpecV4 =
+            serde_json::from_value(serde_json::to_value(&ordinary).unwrap()).unwrap();
+        roundtrip.validate_integrity().unwrap();
+        ordinary
+            .delegated_model
+            .as_mut()
+            .unwrap()
+            .configuration_hash = "b".repeat(64);
+        assert_eq!(
+            ordinary.validate_integrity(),
+            Err(ProtocolErrorV4::SpecHashMismatch)
+        );
+        ordinary.spec_hash = Some(ordinary.calculate_spec_hash().unwrap());
+        ordinary.execution_kind = RunExecutionKindV4::ApprovedPlan;
+        ordinary.spec_hash = Some(ordinary.calculate_spec_hash().unwrap());
+        assert_eq!(
+            ordinary.validate_integrity(),
+            Err(ProtocolErrorV4::SpecHashMismatch)
+        );
     }
 
     #[test]

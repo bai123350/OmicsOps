@@ -97,7 +97,10 @@ impl ToolRegistryV4 {
             .ok_or_else(|| ToolRegistryErrorV4::Unknown(call.tool_id.clone()))?;
         let direct_only = matches!(
             call.tool_id.as_str(),
-            "agent.route_request" | "agent.record_mcp_unavailable" | "agent.update_tasks"
+            "agent.route_request"
+                | "agent.record_mcp_unavailable"
+                | "agent.update_tasks"
+                | "agent.read_tool_result"
         );
         let planning_allowed = !direct_only
             && (definition.effect == ToolEffectV4::ReadOnly
@@ -177,6 +180,7 @@ impl ToolPortV4 for ToolRegistryV4 {
                         "agent.route_request"
                             | "agent.record_mcp_unavailable"
                             | "agent.update_tasks"
+                            | "agent.read_tool_result"
                     ) && (definition.effect == ToolEffectV4::ReadOnly
                         || matches!(
                             definition.id.as_str(),
@@ -378,6 +382,16 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
             "Classify the current ordinary Agent request and its task shape before any task tool is used. Research retrieval includes papers, external databases, current web evidence, and cross-source verification",
             ToolEffectV4::ReadOnly,
             json!({"type":"object","required":["route","task_shape","reason"],"properties":{"route":{"type":"string","enum":["research_retrieval","adaptive"]},"task_shape":{"type":"string","enum":["fast","multi_step"]},"reason":{"type":"string","minLength":1}}}),
+        ),
+        descriptor(
+            "agent.read_tool_result",
+            "Read a bounded page of an original tool outcome or delegation trace from this run using its result_reference. Delegation traces use field data. Offsets and limits are UTF-8 bytes; use next_offset for the next page. Cannot read other runs or arbitrary files.",
+            ToolEffectV4::ReadOnly,
+            json!({"type":"object","required":["sequence","event_hash","field","offset","limit"],"properties":{
+                "sequence":{"type":"integer","minimum":0},"event_hash":{"type":"string","minLength":1},
+                "field":{"type":"string","enum":["model_content","data"]},
+                "offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":4,"maximum":8192}
+            }}),
         ),
         descriptor(
             "agent.record_mcp_unavailable",
@@ -748,6 +762,7 @@ mod tests {
         assert!(!planning.contains("agent.route_request"));
         assert!(!planning.contains("agent.record_mcp_unavailable"));
         assert!(!planning.contains("agent.update_tasks"));
+        assert!(!planning.contains("agent.read_tool_result"));
         // The generic MCP wrapper remains visible so the planner can request
         // a concrete target; its Network effect is dynamically gated by the
         // host rather than being treated as a permanently read-only tool.
