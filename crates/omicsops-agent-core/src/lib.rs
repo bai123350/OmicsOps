@@ -8409,8 +8409,12 @@ mod tests {
 
     #[async_trait]
     impl ToolPortV4 for GuidanceReadTools {
-        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> { vec![] }
-        fn effect(&self, _: &str) -> Option<ToolEffectV4> { Some(self.effect) }
+        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
+            vec![]
+        }
+        fn effect(&self, _: &str) -> Option<ToolEffectV4> {
+            Some(self.effect)
+        }
         async fn execute(&self, _: RunModeV4, call: ToolCallV4) -> Result<ToolOutcomeV4, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if call.call_id == "waiting" {
@@ -8429,11 +8433,20 @@ mod tests {
     }
 
     fn guidance_read_tools(effect: ToolEffectV4) -> GuidanceReadTools {
-        GuidanceReadTools { effect, entered: Default::default(), release: Default::default(), calls: AtomicUsize::new(0) }
+        GuidanceReadTools {
+            effect,
+            entered: Default::default(),
+            release: Default::default(),
+            calls: AtomicUsize::new(0),
+        }
     }
 
     fn guidance_read_call(id: &str) -> ToolCallV4 {
-        ToolCallV4 { call_id: id.into(), tool_id: "read.fixture".into(), arguments: json!({}) }
+        ToolCallV4 {
+            call_id: id.into(),
+            tool_id: "read.fixture".into(),
+            arguments: json!({}),
+        }
     }
 
     #[tokio::test]
@@ -8443,21 +8456,45 @@ mod tests {
         seed_execution(&store.inner, &spec);
         let tools = guidance_read_tools(ToolEffectV4::ReadOnly);
         let model = ScriptedModel(Mutex::new(vec![]));
-        let core = AgentCoreV4 { model: &model, tools: &tools, events: &store, science: None };
-        let calls = [guidance_read_call("finished"), guidance_read_call("waiting")];
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        let calls = [
+            guidance_read_call("finished"),
+            guidance_read_call("waiting"),
+        ];
         for call in &calls {
-            core.push(spec.run_id, AgentEventKindV4::ToolDispatchStarted {
-                call_id: call.call_id.clone(), tool_id: call.tool_id.clone(),
-                effect: ToolEffectV4::ReadOnly, idempotency_key: call.call_id.clone(),
-            }).await.unwrap();
+            core.push(
+                spec.run_id,
+                AgentEventKindV4::ToolDispatchStarted {
+                    call_id: call.call_id.clone(),
+                    tool_id: call.tool_id.clone(),
+                    effect: ToolEffectV4::ReadOnly,
+                    idempotency_key: call.call_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
         }
         let send = async {
             tools.entered.notified().await;
             *store.pending.lock().unwrap() = Some((Uuid::new_v4(), "change approach".into()));
         };
         let (results, ()) = tokio::time::timeout(Duration::from_secs(2), async {
-            tokio::join!(join_all(calls.iter().map(|call| core.execute_with_guidance(&spec, call))), send)
-        }).await.unwrap();
+            tokio::join!(
+                join_all(
+                    calls
+                        .iter()
+                        .map(|call| core.execute_with_guidance(&spec, call))
+                ),
+                send
+            )
+        })
+        .await
+        .unwrap();
         let first = results[0].as_ref().unwrap();
         assert!(first.succeeded);
         assert_eq!(first.data["value"], 42);
@@ -8470,22 +8507,48 @@ mod tests {
         // The batch owner must persist outcomes before the next boundary consumes input.
         assert!(store.has_pending_guidance(spec.run_id).await.unwrap());
         for result in results {
-            core.push(spec.run_id, AgentEventKindV4::ToolFinished { outcome: result.unwrap() }).await.unwrap();
+            core.push(
+                spec.run_id,
+                AgentEventKindV4::ToolFinished {
+                    outcome: result.unwrap(),
+                },
+            )
+            .await
+            .unwrap();
         }
         core.consume_guidance(&spec).await.unwrap();
-        core.recover_interrupted_dispatches(&spec, AgentLimitsV4::default(), &AtomicBool::new(false)).await.unwrap();
+        core.recover_interrupted_dispatches(
+            &spec,
+            AgentLimitsV4::default(),
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
         assert_eq!(tools.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
     async fn guidance_does_not_discard_side_effects_or_approved_plan_reads() {
-        for effect in [ToolEffectV4::ReadOnly, ToolEffectV4::Mutating, ToolEffectV4::Runtime, ToolEffectV4::Network, ToolEffectV4::Delegation] {
+        for effect in [
+            ToolEffectV4::ReadOnly,
+            ToolEffectV4::Mutating,
+            ToolEffectV4::Runtime,
+            ToolEffectV4::Network,
+            ToolEffectV4::Delegation,
+        ] {
             let store = GuidanceTestStore::default();
             let mut spec = ordinary_execution_spec(Uuid::new_v4());
-            if effect == ToolEffectV4::ReadOnly { spec.execution_kind = RunExecutionKindV4::ApprovedPlan; }
+            if effect == ToolEffectV4::ReadOnly {
+                spec.execution_kind = RunExecutionKindV4::ApprovedPlan;
+            }
             let tools = guidance_read_tools(effect);
             let model = ScriptedModel(Mutex::new(vec![]));
-            let core = AgentCoreV4 { model: &model, tools: &tools, events: &store, science: None };
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &tools,
+                events: &store,
+                science: None,
+            };
             let call = guidance_read_call("waiting");
             let execution = core.execute_with_guidance(&spec, &call);
             tokio::pin!(execution);
@@ -8497,9 +8560,16 @@ mod tests {
                 _ = &mut execution => panic!("tool finished without release"),
                 _ = send => {}
             }
-            assert!(tokio::time::timeout(Duration::from_millis(120), &mut execution).await.is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(120), &mut execution)
+                    .await
+                    .is_err()
+            );
             tools.release.notify_one();
-            let outcome = tokio::time::timeout(Duration::from_secs(1), execution).await.unwrap().unwrap();
+            let outcome = tokio::time::timeout(Duration::from_secs(1), execution)
+                .await
+                .unwrap()
+                .unwrap();
             assert!(outcome.succeeded);
             assert_eq!(outcome.provenance, ["actual-evidence"]);
             assert_eq!(tools.calls.load(Ordering::SeqCst), 1);
