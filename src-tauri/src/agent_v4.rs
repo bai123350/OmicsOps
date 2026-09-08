@@ -4858,8 +4858,16 @@ pub async fn agent_v4_submit_guidance(
     state: State<'_, AppState>,
     request: omicsops_dto::SubmitGuidanceV4Request,
 ) -> Result<omicsops_dto::GuidanceRecordV4, String> {
-    let record = state.repository.accept_guidance_v4(&request).await.map_err(|error| error.to_string())?;
-    let active = state.active_runs.lock().map_err(|_| "active run registry unavailable")?.contains_key(&request.run_id);
+    let record = state
+        .repository
+        .accept_guidance_v4(&request)
+        .await
+        .map_err(|error| error.to_string())?;
+    let active = state
+        .active_runs
+        .lock()
+        .map_err(|_| "active run registry unavailable")?
+        .contains_key(&request.run_id);
     if !active && record.consumed_at.is_none() {
         // A restart can leave a durable running record without a live driver.
         // Resume uses the same idempotent active slot as explicit UI resumes.
@@ -4872,9 +4880,16 @@ pub async fn agent_v4_submit_guidance(
 
 #[tauri::command]
 pub async fn agent_v4_list_guidance(
-    state: State<'_, AppState>, project_id: Uuid, conversation_id: Uuid, run_id: Uuid,
+    state: State<'_, AppState>,
+    project_id: Uuid,
+    conversation_id: Uuid,
+    run_id: Uuid,
 ) -> Result<Vec<omicsops_dto::GuidanceRecordV4>, String> {
-    state.repository.list_guidance_v4(project_id, conversation_id, run_id).await.map_err(|error| error.to_string())
+    state
+        .repository
+        .list_guidance_v4(project_id, conversation_id, run_id)
+        .await
+        .map_err(|error| error.to_string())
 }
 impl RepositoryEventStoreV4 {
     fn publish(&self, event: &AgentEventV4, message: Option<omicsops_core::workspace::Message>) {
@@ -4901,24 +4916,44 @@ impl RepositoryEventStoreV4 {
 #[async_trait]
 impl EventStoreV4 for RepositoryEventStoreV4 {
     async fn append(&self, event: &AgentEventV4) -> Result<(), String> {
-        let message = self.repository.append_agent_event_v4_with_conversation(event).await.map_err(|error| error.to_string())?;
+        let message = self
+            .repository
+            .append_agent_event_v4_with_conversation(event)
+            .await
+            .map_err(|error| error.to_string())?;
         self.publish(event, message);
         Ok(())
     }
     async fn append_completion(&self, event: &AgentEventV4) -> Result<bool, String> {
-        match self.repository.append_agent_event_v4_with_conversation(event).await {
-            Ok(message) => { self.publish(event, message); Ok(true) }
+        match self
+            .repository
+            .append_agent_event_v4_with_conversation(event)
+            .await
+        {
+            Ok(message) => {
+                self.publish(event, message);
+                Ok(true)
+            }
             Err(omicsops_store::StoreError::GuidancePending) => Ok(false),
             Err(error) => Err(error.to_string()),
         }
     }
     async fn consume_guidance(&self, spec: &RunSpecV4) -> Result<bool, String> {
-        let events = self.repository.consume_guidance_v4(spec).await.map_err(|error| error.to_string())?;
-        for event in &events { self.publish(event, None); }
+        let events = self
+            .repository
+            .consume_guidance_v4(spec)
+            .await
+            .map_err(|error| error.to_string())?;
+        for event in &events {
+            self.publish(event, None);
+        }
         Ok(!events.is_empty())
     }
     async fn has_pending_guidance(&self, run_id: Uuid) -> Result<bool, String> {
-        self.repository.has_pending_guidance_v4(run_id).await.map_err(|error| error.to_string())
+        self.repository
+            .has_pending_guidance_v4(run_id)
+            .await
+            .map_err(|error| error.to_string())
     }
     async fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String> {
         self.repository
