@@ -182,6 +182,25 @@ impl Store {
         call_id: &str,
         request_sha256: &str,
     ) -> Result<(RuntimeJobV4, bool), StoreError> {
+        self.reserve_runtime_job_with_remote_root_v4(context, call_id, request_sha256, None, None).await
+    }
+
+    pub async fn remote_runtime_jobs_v4(
+        &self, project_id: Uuid, backend_id: &str, root: &str, job_id: Option<Uuid>, host_key: &str,
+    ) -> Result<Vec<RuntimeJobV4>, StoreError> {
+        let rows: Vec<String> = sqlx::query_scalar("SELECT j.value_json FROM runtime_jobs_v4 j JOIN agent_runs_v4 r ON r.run_id=j.run_id WHERE r.project_id=?1 AND json_extract(j.value_json,'$.context.backend_id')=?2 AND json_extract(j.value_json,'$.remote_root')=?3 AND (?4 IS NULL OR j.job_id=?4) AND json_extract(j.value_json,'$.remote_host_key')=?5 ORDER BY j.rowid DESC LIMIT 100")
+            .bind(project_id.to_string()).bind(backend_id).bind(root).bind(job_id.map(|id| id.to_string())).bind(host_key)
+            .fetch_all(&self.pool).await?;
+        rows.into_iter().map(|row| serde_json::from_str(&row).map_err(StoreError::from)).collect()
+    }
+
+    pub async fn reserve_runtime_job_with_remote_root_v4(
+        &self, context: &ExecutionContextKeyV4, call_id: &str, request_sha256: &str,
+        remote_root: Option<&str>, remote_host_key: Option<&str>,
+    ) -> Result<(RuntimeJobV4, bool), StoreError> {
+        if remote_root.is_some() != remote_host_key.is_some() || remote_host_key.is_some_and(|key| key.trim().is_empty()) || remote_root.is_some_and(|root| !root.starts_with('/') || root == "/" || !context.backend_id.starts_with("ssh:")) {
+            return Err(StoreError::InvalidInput("detached jobs require an absolute SSH root".into()));
+        }
         if call_id.trim().is_empty()
             || call_id.len() > 256
             || request_sha256.len() != 64
@@ -232,7 +251,7 @@ impl Store {
         .await?;
         if let Some(previous) = previous {
             let job: RuntimeJobV4 = serde_json::from_str(&previous)?;
-            if job.context != *context || job.request_sha256 != request_sha256 {
+            if job.context != *context || job.request_sha256 != request_sha256 || job.remote_root.as_deref() != remote_root || job.remote_host_key.as_deref() != remote_host_key {
                 return Err(StoreError::InvalidInput(
                     "runtime job identity already binds another request".into(),
                 ));
@@ -249,6 +268,7 @@ impl Store {
             })
             .is_some_and(|call| {
                 call.tool_id == "runtime.execute"
+                    && (call.arguments.get("background").and_then(Value::as_bool).unwrap_or(false) == remote_root.is_some())
                     && call.canonical_hash().ok().as_deref() == Some(request_sha256)
                     && call.arguments.get("language")
                         == Some(&serde_json::to_value(context.language).unwrap_or(Value::Null))
@@ -277,6 +297,8 @@ impl Store {
             call_id: call_id.into(),
             request_sha256: request_sha256.into(),
             state: RuntimeJobStateV4::Reserved,
+            remote_root: remote_root.map(str::to_owned),
+            remote_host_key: remote_host_key.map(str::to_owned),
             session_id: None,
             result_request_id: None,
             result_sha256: None,
@@ -458,6 +480,7 @@ pub(super) async fn observe_runtime_event(
     sqlx::query(
         "UPDATE runtime_jobs_v4 SET value_json=json_set(value_json,'$.state','unknown')
         WHERE run_id=?1 AND (?2 IS NULL OR call_id=?2)
+        AND json_extract(value_json,'$.remote_root') IS NULL
         AND json_extract(value_json,'$.state') IN ('reserved','running')",
     )
     .bind(event.run_id.to_string())

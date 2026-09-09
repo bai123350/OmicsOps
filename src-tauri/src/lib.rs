@@ -20,6 +20,7 @@ mod plan_revision_tests;
 pub mod pubmed_mcp;
 pub mod research_commands;
 mod runtime_jobs_v4;
+mod remote_jobs_v4;
 pub mod skill_commands;
 pub mod sync_commands;
 pub mod workspace_commands;

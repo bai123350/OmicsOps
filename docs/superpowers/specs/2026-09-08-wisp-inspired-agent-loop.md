@@ -182,3 +182,14 @@ Settings 编辑模型新增默认未选中的目录刷新选项，经共享 DTO 
 内置适配器的 Usage.provider_json 不再复制原始 usage 对象或 Ollama 整段响应。三个协议共用数值白名单，保留已识别的非负整数计数；OpenAI-compatible 保留明确上报的 reasoning/cache 等 token 明细，未知字段、字符串、负数、浮点和对象值舍弃。明细缺失保持缺失，不根据 token 数推断生效推理档位。字段参考 [OpenAI SDK usage 定义](https://github.com/openai/openai-python/blob/main/src/openai/types/completion_usage.py)。
 
 流式分片与非流式回退采用同一清洗路径。保持旧顶层 input/output 计数、正数事件触发及 Anthropic 部分更新语义；没有将增量和累计值直接相加。无协议字段、数据库迁移或网络依赖变化，不回写历史数据。本增量是用量审计前置边界，尚未实现 V4 用量持久化/汇总、生效档位报告、图像计费或远端任务重连。
+
+
+## 2026-09-09：脱离连接的远端作业与重连查询
+
+`runtime.execute(background=true)` 新增 SSH Linux 单次后台作业路径，保留原 Runtime effect/审批，Plan 不得提交。原交互内核语义不变。Store 在已记录 dispatch 下预留 job，并在远端启动前保存 Running 身份；`RuntimeJobV4` 增加默认省略的 remote_root/remote_host_key，冻结原项目、run、请求 hash、SSH backend、真实主机指纹和已解析 root。旧 JSON 往返不变，无 SQL 表迁移。
+
+远端 Python 3 controller 使用唯一目录和独立 session 的 worker。重复身份仅查询，不重启；启动确认丢失也不重复派发。worker 用独立 Python/R 进程执行，使用 system 或已存在的项目 Micromamba 环境，完整输出留远端，hash/限长摘要与终态回执通过原子替换发布。禁止 control directory symlink 越界；输出/产物在 Host 校验身份、路径和摘要格式之后记录。远端同账号执行代码仍属于 process isolation，不能将回执当成针对恶意远端的可信证明。
+
+新增 ReadOnly `runtime.remote_job_status`：无 job_id 列出当前项目/backend/root/主机指纹最近 100 个记录（列表不是存活探测）；有 job_id 用新连接读取原身份的状态/结果，独立于原会话/run 是否已结束。PID 与 Linux start time 匹配才能报告 running；没有进程/回执、启动中或不确定状态均 unknown。终态并发 CAS 收敛、已记录回执不可被不同结果覆盖。查询不携带代码、不启动进程，不使用拉长 shell timeout 模拟后台任务。
+
+停止 Agent 不停止后台作业，取消/失败事件不再将独立后台记录强制改为 unknown。尚不包含专用作业面板、后台自动轮询/通知、取消后台作业、SLURM 适配、旧交互内核接回或远端重启后恢复执行。此版本允许用户在同项目的新会话通过 Agent 列出/查询作业；完成后台提交不等于计算已完成。真实主机验收与 deterministic 测试分开记录。

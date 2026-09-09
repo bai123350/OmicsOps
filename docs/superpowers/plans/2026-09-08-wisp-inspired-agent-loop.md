@@ -238,3 +238,16 @@ Settings 编辑模型新增默认未选中的目录刷新选项，经共享 DTO 
 流式分片与非流式回退采用同一清洗路径。保持旧顶层 input/output 计数、正数事件触发及 Anthropic 部分更新语义；没有将增量和累计值直接相加。无协议字段、数据库迁移或网络依赖变化，不回写历史数据。本增量是用量审计前置边界，尚未实现 V4 用量持久化/汇总、生效档位报告、图像计费或远端任务重连。
 
 本增量最终验证（2026-09-09）：`cargo test -p omicsops-adapters usage_metadata_tests` 3 项通过，覆盖三个协议的流式分片/非流式元数据清洗、非法数值、明细缺失与显式零、Anthropic 部分更新。首次流式夹具缺少结束标记失败，补齐标记后通过，未放宽不完整流拒绝。`cargo test --workspace`、`npm test`（123 前端/22 扩展）、`npm run build` 均通过；格式初查偏差经 `cargo fmt --all` 修复，复查及 diff 检查通过，纯格式单独提交。保留既有 Vite 大 chunk/Windows linker 提示。未改桌面组合或打包，本轮未执行 `npm run build:desktop`；真实模型、SSH、macOS 验收未执行，未推送或分发构建产物。
+
+
+## 2026-09-09：脱离连接的远端作业与重连查询
+
+`runtime.execute(background=true)` 新增 SSH Linux 单次后台作业路径，保留原 Runtime effect/审批，Plan 不得提交。原交互内核语义不变。Store 在已记录 dispatch 下预留 job，并在远端启动前保存 Running 身份；`RuntimeJobV4` 增加默认省略的 remote_root/remote_host_key，冻结原项目、run、请求 hash、SSH backend、真实主机指纹和已解析 root。旧 JSON 往返不变，无 SQL 表迁移。
+
+远端 Python 3 controller 使用唯一目录和独立 session 的 worker。重复身份仅查询，不重启；启动确认丢失也不重复派发。worker 用独立 Python/R 进程执行，使用 system 或已存在的项目 Micromamba 环境，完整输出留远端，hash/限长摘要与终态回执通过原子替换发布。禁止 control directory symlink 越界；输出/产物在 Host 校验身份、路径和摘要格式之后记录。远端同账号执行代码仍属于 process isolation，不能将回执当成针对恶意远端的可信证明。
+
+新增 ReadOnly `runtime.remote_job_status`：无 job_id 列出当前项目/backend/root/主机指纹最近 100 个记录（列表不是存活探测）；有 job_id 用新连接读取原身份的状态/结果，独立于原会话/run 是否已结束。PID 与 Linux start time 匹配才能报告 running；没有进程/回执、启动中或不确定状态均 unknown。终态并发 CAS 收敛、已记录回执不可被不同结果覆盖。查询不携带代码、不启动进程，不使用拉长 shell timeout 模拟后台任务。
+
+停止 Agent 不停止后台作业，取消/失败事件不再将独立后台记录强制改为 unknown。尚不包含专用作业面板、后台自动轮询/通知、取消后台作业、SLURM 适配、旧交互内核接回或远端重启后恢复执行。此版本允许用户在同项目的新会话通过 Agent 列出/查询作业；完成后台提交不等于计算已完成。真实主机验收与 deterministic 测试分开记录。
+
+本增量最终验证（2026-09-09）：桌面远端作业近邻 2 项通过、真实 SSH 验收 1 项被忽略；Python bridge 5 项通过（全部 scripts 共 7 项），覆盖脱离会话启动参数、重复/部分提交不重启、进程消失、全新 controller 读回执、输出截断/产物、篡改和 control path 越界。开发检查中修复 ToolOutcome 字段名及 Python 文件大小取值错误后复测通过。`cargo test --workspace`（含工具权限与旧 Job JSON 兼容测试）、`npm test`（123 前端/22 扩展）、`npm run build`、`npm run build:desktop` 均通过。格式初查偏差经 `cargo fmt --all` 修复，复查及 diff 检查通过，纯格式单独提交。保留既有 Vite 大 chunk/Windows linker 提示，无依赖或 SQL 迁移变化。真实 SSH 所需环境变量均未配置，未执行 live 验收；macOS、真实 R/Micromamba 和桌面交互 smoke 也未执行。未推送、发布或分发构建产物。

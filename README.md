@@ -126,7 +126,8 @@ jobs as unknown, not as confirmed remote cancellation. Completed output remains
 in the existing tool events and archives; the job ledger stores only metadata and
 a result digest. In-process workers now support event-driven waiting and rereading
 results without rerunning computation. Dropping a waiter does not cancel its worker.
-Automatic reconnection across application restarts is not yet implemented.
+Interactive kernel reconnection across application restarts is not implemented.
+For detached one-shot SSH jobs, use the background execution path below.
 
 A bounded, temporary runtime-result receipt now bridges the gap between recording
 job completion and committing its tool event. Recovery verifies the original
@@ -182,3 +183,31 @@ unknown fields and invalid counter values are excluded in both streaming and
 non-streaming responses. Existing top-level token counts and partial-event
 semantics are unchanged. This does not add V4 usage persistence, aggregate partial
 updates, or rewrite historical records.
+
+
+Detached SSH jobs can be reconnected after the app or SSH connection closes.
+Ask the Agent to run a standalone job in the background (`runtime.execute` with
+`background: true`). It returns a durable job ID. In a later conversation in the
+same project, ask to list or reconnect remote jobs: `runtime.remote_job_status`
+with no arguments lists up to 100 recent jobs, and `job_id` reads the original
+job's current state/result. A query never submits code again. A lost submission
+acknowledgement or missing/dead process returns unknown, not permission to retry.
+
+Jobs bind project, original run/request, SSH backend, pinned host-key fingerprint
+and resolved remote root. Code runs in a fresh Python/R process, outside the
+interactive kernel; it does not inherit variables. The selected system or existing
+Micromamba environment is used. The Linux SSH host needs Python 3 and must allow
+detached process groups. Windows/macOS clients use the same SSH path; local and
+container background jobs are rejected. Code is limited to 16 KiB, captures to
+128 paths / 16 KiB. Inline `analysis` declarations are not supported for detached
+jobs; inspect completion and register verified results separately.
+
+Full stdout/stderr stay under the remote project's `.omicsops/remote-jobs`; bounded
+excerpts, checksums and result metadata can be read on reconnect. Completion
+receipts are atomically published remotely and validated before local persistence.
+Stopping the Agent or cancelling its run does **not** cancel detached computation.
+There is no automatic polling, dedicated job panel or job-cancellation command in
+this increment. Existing interactive jobs cannot be converted retroactively, and
+server reboot/process loss without a receipt remains unknown. Reconnection does
+not reopen or rewrite a terminal Agent run. Live SSH acceptance is documented in
+`acceptance/README.md`; deterministic tests are not a real-host acceptance claim.

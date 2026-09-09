@@ -2843,6 +2843,7 @@ async fn compose(
     let model_profile =
         load_frozen_main_profile(&state.repository, model_profile_id, main_configuration_hash)
             .await?;
+    let mut remote_jobs = None;
     let (filesystem, environment_port, backend): (
         Arc<dyn ProjectFilesystemPortV4>,
         Arc<dyn RuntimeEnvironmentPortV4>,
@@ -2874,6 +2875,7 @@ async fn compose(
                 .as_deref()
                 .ok_or("project has no remote root")?;
             let root = resolve_root(&session, configured_root).await?;
+            remote_jobs = Some((session.clone(), root.clone()));
             (
                 Arc::new(SshProjectFilesystemV4 {
                     session: session.clone(),
@@ -2967,6 +2969,7 @@ async fn compose(
                 .map_err(|error| error.to_string())?,
         )),
         forced_route,
+        remote_jobs,
     });
     let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), executor)
         .map_err(|error| error.to_string())?
@@ -3706,6 +3709,7 @@ struct DesktopToolExecutorV4 {
     local_project_root: PathBuf,
     browser_authorizations: Arc<std::sync::Mutex<Vec<BrowserAuthorizationV4>>>,
     forced_route: Option<AgentRequestRouteV4>,
+    remote_jobs: Option<(Arc<SshSession>, String)>,
 }
 
 impl DesktopToolExecutorV4 {
@@ -4524,6 +4528,12 @@ impl DesktopToolExecutorV4 {
                 validate_kernel_code(&code).map_err(|e| e.to_string())?;
                 validate_capture_paths(&captures).map_err(|e| e.to_string())?;
                 let key = self.key(language, environment)?;
+                if call.arguments.get("background").map(|value| value.as_bool().ok_or("background must be boolean")).transpose()?.unwrap_or(false) {
+                    validate_environment_name(environment)?;
+                    let (session, root) = self.remote_jobs.as_ref().ok_or("background jobs require an SSH Linux backend")?;
+                    let data = crate::remote_jobs_v4::submit(&self.repository, &crate::remote_jobs_v4::SshTransport { session: session.clone() }, root, &key, call).await?;
+                    return Ok(ToolOutcomeV4 { call_id: call.call_id.clone(), tool_id: call.tool_id.clone(), succeeded: true, model_content: serde_json::to_string(&data).map_err(|e| e.to_string())?, data, provenance: vec![] });
+                }
                 let (running, mut result) = crate::runtime_jobs_v4::execute_reserved(
                     &self.repository,
                     &self.runtime,
@@ -4560,6 +4570,12 @@ impl DesktopToolExecutorV4 {
                     .await
                     .map_err(|error| error.to_string())?;
                 return crate::runtime_jobs_v4::outcome(call, &running, &result);
+            }
+            "runtime.remote_job_status" => {
+                let (session, root) = self.remote_jobs.as_ref().ok_or("remote jobs require an SSH Linux backend")?;
+                let job_id = call.arguments.get("job_id").map(|value| value.as_str().ok_or("invalid job id").and_then(|id| Uuid::parse_str(id).map_err(|_| "invalid job id"))).transpose()?;
+                let data = crate::remote_jobs_v4::query(&self.repository, &crate::remote_jobs_v4::SshTransport { session: session.clone() }, self.project_id, &self.backend_id, root, job_id).await?;
+                (serde_json::to_string(&data).map_err(|e| e.to_string())?, data, vec![])
             }
             "runtime.environment.ensure" => {
                 let language = parse_language(required(&call.arguments, "language")?)?;
@@ -7056,6 +7072,7 @@ mod tests {
             local_project_root: std::env::temp_dir(),
             browser_authorizations: Arc::new(std::sync::Mutex::new(Vec::new())),
             forced_route: None,
+            remote_jobs: None,
         };
         executor
             .execute(&ToolCallV4 {
@@ -7167,6 +7184,7 @@ mod tests {
             local_project_root: std::env::temp_dir(),
             browser_authorizations: Arc::new(std::sync::Mutex::new(Vec::new())),
             forced_route: None,
+            remote_jobs: None,
         };
         let local_state = tempfile::tempdir().unwrap();
         let repository = Store::open(local_state.path().join("stage3.sqlite"))

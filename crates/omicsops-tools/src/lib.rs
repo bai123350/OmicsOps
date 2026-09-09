@@ -469,9 +469,15 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "runtime.execute",
-            "Execute code in a persistent run-scoped kernel",
+            "Execute code in a persistent kernel, or background=true for a detached one-shot SSH job. Background jobs survive disconnects and Agent Stop; they do not share kernel variables. Query runtime.remote_job_status after restart. Never resubmit to reconnect.",
             ToolEffectV4::Runtime,
-            json!({"type":"object","required":["language","code"],"properties":{"language":{"type":"string"},"environment":{"type":"string","default":"system"},"code":{"type":"string"},"capture_paths":{"type":"array"},"analysis":{"type":"object","required":["analysis_type","input_dataset_ids","sample_ids","method","parameters"],"properties":{"analysis_type":{"type":"string"},"input_dataset_ids":{"type":"array"},"sample_ids":{"type":"array"},"method":{"type":"string"},"parameters":{"type":"object"},"software_requirements":{"type":"array"},"database_versions":{"type":"object"},"random_seed":{"type":["integer","null"]}}}}}),
+            json!({"type":"object","required":["language","code"],"properties":{"language":{"type":"string"},"environment":{"type":"string","default":"system"},"code":{"type":"string"},"background":{"type":"boolean","default":false},"capture_paths":{"type":"array"},"analysis":{"type":"object","required":["analysis_type","input_dataset_ids","sample_ids","method","parameters"],"properties":{"analysis_type":{"type":"string"},"input_dataset_ids":{"type":"array"},"sample_ids":{"type":"array"},"method":{"type":"string"},"parameters":{"type":"object"},"software_requirements":{"type":"array"},"database_versions":{"type":"object"},"random_seed":{"type":["integer","null"]}}}}}),
+        ),
+        descriptor(
+            "runtime.remote_job_status",
+            "Reconnect to a detached SSH job without executing code. Omit job_id to list up to 100 recent jobs in this project and SSH root; supply job_id to read current status/result. Running or unknown is not completion.",
+            ToolEffectV4::ReadOnly,
+            json!({"type":"object","properties":{"job_id":{"type":"string","format":"uuid"}}}),
         ),
         descriptor(
             "science.register_dataset",
@@ -753,6 +759,18 @@ mod tests {
             assert!(error.contains("forbidden in plan mode"), "{error}");
             assert_eq!(executor.dispatches.load(Ordering::SeqCst), 0);
         }
+    }
+
+    #[test]
+    fn detached_jobs_keep_runtime_authority_while_status_is_read_only() {
+        let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap();
+        let submit = ToolCallV4 { call_id: "background".into(), tool_id: "runtime.execute".into(), arguments: json!({"language":"python","code":"print(42)","background":true}) };
+        assert!(registry.validate(RunModeV4::Plan, &submit).is_err());
+        let query = ToolCallV4 { call_id: "observe".into(), tool_id: "runtime.remote_job_status".into(), arguments: json!({}) };
+        registry.validate(RunModeV4::Plan, &query).unwrap();
+        assert_eq!(registry.descriptors(RunModeV4::Execute).iter().find(|d| d.id == query.tool_id).unwrap().effect, ToolEffectV4::ReadOnly);
+        let denied = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap().with_execute_capabilities(BTreeSet::new());
+        assert!(denied.validate(RunModeV4::Execute, &submit).is_err());
     }
 
     #[tokio::test]

@@ -205,3 +205,36 @@ the editor available for retry, and Escape immediately closes only the editor.
 Check a changed capability/budget refuses frozen-run resume; an unchanged
 effective configuration must retain its fingerprint. No real API key or network is needed for saving
 these configurations; live model inference is a separate opt-in acceptance test.
+
+
+## Detached remote job reconnection (opt-in Linux SSH)
+
+The deterministic tests reopen a temporary SQLite store, use a fresh mocked
+transport and Python subprocess stubs, and verify no resubmission. Run them with:
+
+```text
+cargo test -p omicsops-desktop --lib remote_job
+python -B -m unittest discover -s scripts -p "test_remote_job_bridge.py"
+```
+
+Real acceptance requires the existing `OMICSOPS_LIVE_SSH_HOST`, `_PORT` (optional),
+`_USER`, `_PASSWORD`, `_FINGERPRINT` variables plus
+`OMICSOPS_LIVE_REMOTE_JOB_ROOT`, an existing empty disposable absolute directory.
+It needs a low-privilege Linux host with Python 3 and detached process support;
+no model/API key is used. The test rejects a nonempty directory, submits a job
+that exclusively creates a counter then sleeps, explicitly disconnects SSH,
+reopens the local store, reconnects and verifies a single execution and completion.
+It leaves remote output in that disposable root for inspection.
+
+```text
+cargo test -p omicsops-desktop --lib remote_jobs_v4::tests::live_remote_job_survives_disconnect_and_store_reopen -- --ignored --exact
+```
+
+This test is ignored by default. Do not describe it as passed unless explicitly
+executed with the disposable environment. Manual desktop smoke: submit a background
+job, close the app before completion, reopen the same project/SSH binding, ask the
+Agent to list remote jobs and reconnect to its ID. Verify finished output and that
+no new execution occurred. Changing project, backend, root or trusted host key must
+refuse the old identity. Do not resubmit to recover an unknown job. Agent Stop and
+run cancellation do not cancel detached computation. R/Micromamba require separate
+live environment acceptance; Windows/macOS client tests do not imply those passed.
