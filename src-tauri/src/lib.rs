@@ -132,6 +132,7 @@ pub fn run() {
             agent_v4::agent_v4_request_plan_revision,
             agent_v4::agent_v4_resume,
             agent_v4::agent_v4_cancel,
+            agent_v4::agent_v4_cancel_runtime_recovery,
             agent_v4::agent_v4_answer,
             agent_v4::agent_v4_submit_guidance,
             agent_v4::agent_v4_list_guidance,

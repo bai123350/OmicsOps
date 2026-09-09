@@ -442,3 +442,5 @@ export async function onAgentV4Event(callback: (event: AgentRunEventV4) => void)
   if (!isTauri()) return () => undefined;
   return listen<AgentRunEventV4>("agent-v4-event", ({ payload }) => callback(payload));
 }
+
+export async function agentV4CancelRuntimeRecovery(runId: string): Promise<void> { await invoke("agent_v4_cancel_runtime_recovery", { runId }); }

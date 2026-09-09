@@ -11,14 +11,43 @@ const project = {
 };
 
 describe("WorkspaceShell", () => {
+  it("cancels saved recovery exclusively and hides actions after cancellation", async () => {
+    let release: (() => void) | undefined;
+    const cancel = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
+    const resume = vi.fn();
+    const event = { schema_version: 4 as const, run_id: "receipt-run", project_id: project.id, conversation_id: "c", sequence: 1, occurred_at: "2026-09-09T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "runtime_recovery_available" as const, call_ids: ["cell"] } };
+    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: event.run_id, onResumeAgentRunV4: resume, onCancelRuntimeRecoveryV4: cancel };
+    const { rerender } = render(<WorkspaceShell {...props} agentRunEventsV4={[event]} />);
+    fireEvent.click(screen.getByRole("button", { name: "取消此运行" }));
+    fireEvent.click(screen.getByRole("button", { name: "取消中…" }));
+    fireEvent.click(screen.getByRole("button", { name: "恢复已保存结果" }));
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(cancel).toHaveBeenCalledWith(event.run_id);
+    expect(resume).not.toHaveBeenCalled();
+    release?.();
+    await waitFor(() => expect(screen.getByRole("button", { name: "取消此运行" })).toBeEnabled());
+    rerender(<WorkspaceShell {...props} agentRunEventsV4={[event, { ...event, sequence: 2, event: { kind: "run_cancelled" } }]} />);
+    expect(screen.queryByRole("button", { name: "取消此运行" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "恢复已保存结果" })).not.toBeInTheDocument();
+  });
+  it("keeps a rejected recovery cancellation retryable without transport details", async () => {
+    const cancel = vi.fn().mockRejectedValue(new Error("private transport"));
+    const event = { schema_version: 4 as const, run_id: "receipt-run", project_id: project.id, conversation_id: "c", sequence: 1, occurred_at: "2026-09-09T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "runtime_recovery_available" as const, call_ids: ["cell"] } };
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} agentRunEventsV4={[event]} onCancelRuntimeRecoveryV4={cancel} />);
+    fireEvent.click(screen.getByRole("button", { name: "取消此运行" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("取消失败");
+    expect(screen.getByRole("button", { name: "取消此运行" })).toBeEnabled();
+    expect(screen.queryByText("private transport")).not.toBeInTheDocument();
+  });
   it("resumes durable computation receipts once and hides the action after results are recorded", async () => {
     let finish: (() => void) | undefined;
     const resume = vi.fn(() => new Promise<void>((resolve) => { finish = resolve; }));
     const event = { schema_version: 4 as const, run_id: "receipt-run", project_id: project.id, conversation_id: "c", sequence: 1, occurred_at: "2026-09-09T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "runtime_recovery_available" as const, call_ids: ["cell"] } };
-    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: event.run_id, onResumeAgentRunV4: resume };
+    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: event.run_id, onResumeAgentRunV4: resume, onCancelRuntimeRecoveryV4: vi.fn() };
     const { rerender } = render(<WorkspaceShell {...props} agentRunEventsV4={[event]} />);
     fireEvent.click(screen.getByRole("button", { name: "恢复已保存结果" }));
     expect(screen.getByRole("button", { name: "恢复中…" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "取消此运行" })).toBeDisabled();
     expect(resume).toHaveBeenCalledTimes(1);
     expect(resume).toHaveBeenCalledWith(event.run_id);
     finish?.();

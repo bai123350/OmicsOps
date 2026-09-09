@@ -175,3 +175,11 @@ the original settings and resume the same run. Profile labels and keyring secret
 rotation may change without invalidating the fingerprint. Old runs lacking the
 field retain legacy behavior. This manual desktop/model smoke remains unexecuted;
 deterministic protocol and temporary-database tests verify the binding logic.
+
+Saved-result cancellation smoke (Windows/macOS): when a run offers Resume saved
+results, click Cancel this run. Both actions should be disabled during submission;
+completion should show Cancelled and remove both actions. A failed submission
+remains retryable. Verify the original job and receipt remain auditable, and no
+kernel/model is started by cancellation. A delayed resume must not overwrite the
+cancelled state. Deterministic store/UI/desktop tests cover these transitions;
+manual desktop, real-model and SSH cancellation smoke have not been executed.

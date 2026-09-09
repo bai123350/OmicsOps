@@ -1025,6 +1025,23 @@ export default function DesktopApp() {
         runActionGuards.current.delete(actionKey);
       }
     }}
+    onCancelRuntimeRecoveryV4={async (cancelRunId) => {
+      const action = currentConversationAction;
+      if (!action || !isCurrentConversationAction(action)) return;
+      const actionKey = `resume:${action.token}:${cancelRunId}`;
+      if (runActionGuards.current.has(actionKey)) return;
+      runActionGuards.current.add(actionKey);
+      setAgentNotice("");
+      try {
+        await api.agentV4CancelRuntimeRecovery(cancelRunId);
+        if (!isCurrentConversationAction(action)) return;
+        const events = await api.agentV4Events(cancelRunId);
+        if (isCurrentConversationAction(action)) mergeAgentRunEvents(events);
+      } catch (error) {
+        if (isCurrentConversationAction(action)) setAgentNotice(error instanceof Error ? error.message : String(error));
+        throw error;
+      } finally { runActionGuards.current.delete(actionKey); }
+    }}
     onResumeAgentRunV4={async (resumeRunId) => {
       const action = currentConversationAction;
       if (!action || !isCurrentConversationAction(action)) return;

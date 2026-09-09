@@ -147,3 +147,9 @@ ModelProfile JSON 新增可空 reasoning_effort，无表迁移或凭据字段。
 compose 在建立 SSH/解释器资源前读取并验证主 profile；后续凭据引用、模型请求、视觉标志和预算都从同一拥有的快照构建，不再二次加载 profile。恢复发现执行配置不符时拒绝，提示恢复原设置或创建新运行；不自动降档、替换 profile 或重写已冻结规格。label 和凭据引用不进入指纹，允许重命名及 keyring 密钥轮换；子模型绑定由独立冻结字段控制。该增量覆盖主模型配置重现性，不确认服务端实际 effort，也不实现远端任务重连。
 
 没有新表、凭据存储或 UI 覆盖层；Windows/macOS 共用相同验证路径。旧程序计算不含新字段的 spec_hash 会失败，不能让旧版本跳过完整性检查恢复新规格。
+
+## 2026-09-09 增量：取消待恢复运行
+
+新增 agent_v4_cancel_runtime_recovery 命令，复用 run_id 参数及已有事件契约。桌面先取得现有 driver 槽位，活动执行/恢复检查占用时拒绝该请求。Store 在 BEGIN IMMEDIATE 中仅允许 waiting_for_input 且最后事件为 RuntimeRecoveryAvailable 的运行转为 cancelled；RunCancelled 和两份 status（列/JSON）同事务写入。已完成的同一次取消返回原事件，其他暂停、已继续执行或其他终态不被覆盖。job 元数据及回执保留审计，不启动解释器、不生成 ToolFinished、不将结果视作已通过科学核验。
+
+界面内联提供“取消此运行”，与恢复共用点击锁和 DesktopApp 的会话/run 操作锁；提交失败可重试，RunCancelled 收口后隐藏两项动作。恢复在取得 driver 槽位后重新检查取消事件，以处理 compose 等待期间取消已提交的竞态，失败时释放槽位；不改变原有失败运行的兼容恢复。Windows/macOS 使用同一路径，无覆盖层、额外审批、数据库迁移或凭据字段变化。真实远端运行中的中断/重连和其他暂停类型取消不属于此增量。

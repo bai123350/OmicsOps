@@ -136,3 +136,10 @@ settings or start a new run; renaming a profile or rotating its keyring credenti
 does not invalidate it. The client and request budget use the same loaded profile
 snapshot. Legacy runs without the fingerprint and approved-plan runs retain their
 existing behavior; no historical configuration is invented or backfilled.
+
+A run paused at **Resume saved results** can now be ended with **Cancel this run**.
+Cancellation records its terminal event and status atomically, retains the saved
+receipts/job identities for audit, and does not launch computation or validate the
+results. Resume and cancel are mutually exclusive while an action is submitting;
+a delayed resume cannot overwrite a committed cancellation. This action applies
+only to saved-result recovery, not other pauses or live remote jobs.

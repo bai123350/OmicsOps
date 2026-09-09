@@ -195,3 +195,9 @@ core/tools/desktop 增加只恢复不执行的 recover_result 接口；按原请
 协议测试覆盖省略兼容、往返、指纹替换/删除、非法摘要、缺失 compute selection 及错误执行模式；桌面临时数据库测试覆盖配置修改拒绝、恢复设置后通过、旧规格加载与已读取快照稳定。完整模型目录、生效档位审计、主循环以外指导切入和运行中远端重连仍未全部完成。
 
 本增量最终验证（2026-09-09）：`cargo test -p omicsops-protocol --lib` 15 项、桌面主模型恢复近邻测试 1 项通过；`cargo test --workspace`、`npm test`（118 前端/22 扩展）、`npm run build`、`npm run build:desktop` 均通过。Rust 测试结束后顺序执行构建，无 dist 清理竞争。格式初查偏差经 `cargo fmt --all` 修复，复查和 diff 检查通过；纯格式单独提交。保留既有 Vite 大 chunk/Windows linker 提示，无依赖或数据库迁移变化。未执行真实模型、SSH、macOS 或桌面交互 smoke，未推送、发布或分发构建产物。
+
+## 2026-09-09：取消待恢复运行
+
+完成 Store 原子取消/精确幂等重试、独立 Tauri 命令、内联按钮和恢复/取消互斥。保留回执及 job 身份，拒绝覆盖其他终态或普通输入暂停。执行启动在槽位内复查取消，阻止延迟恢复写回旧状态。测试覆盖事务故障回滚、并发重复取消、状态列/JSON一致、回执保留、其他状态拒绝、延迟启动拒绝、界面提交互斥/失败重试/终态收口。仍不提供运行中远端任务重连或普通暂停运行通用取消。
+
+本增量最终验证（2026-09-09）：存储取消近邻 2 项、桌面延迟恢复近邻 1 项、WorkspaceShell 近邻 42 项通过；`cargo test --workspace`、`npm test`（120 前端/22 扩展）、`npm run build`、`npm run build:desktop` 均通过。格式初查偏差经 `cargo fmt --all` 修复，复查及 diff 检查通过，纯格式单独提交。保留既有 Vite 大 chunk/Windows linker 提示；无依赖或迁移变化。真实模型、SSH、macOS 和桌面交互 smoke 未执行；未推送、发布或分发构建产物。
