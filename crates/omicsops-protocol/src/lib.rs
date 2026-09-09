@@ -1903,7 +1903,12 @@ mod tests {
             legacy.calculate_spec_hash().unwrap(),
             spec.calculate_spec_hash().unwrap()
         );
-        assert!(serde_json::to_value(&spec).unwrap().get("model_configuration_hash").is_none());
+        assert!(
+            serde_json::to_value(&spec)
+                .unwrap()
+                .get("model_configuration_hash")
+                .is_none()
+        );
         let mut bound_main = spec.clone();
         bound_main.execution_kind = RunExecutionKindV4::OrdinaryAgent;
         bound_main.model_configuration_hash = Some("c".repeat(64));
@@ -1911,27 +1916,42 @@ mod tests {
         bound_main.validate_integrity().unwrap();
         let encoded = serde_json::to_value(&bound_main).unwrap();
         let roundtrip: RunSpecV4 = serde_json::from_value(encoded).unwrap();
-        assert_eq!(roundtrip.model_configuration_hash, bound_main.model_configuration_hash);
+        assert_eq!(
+            roundtrip.model_configuration_hash,
+            bound_main.model_configuration_hash
+        );
         roundtrip.validate_integrity().unwrap();
         for hash in [None, Some("d".repeat(64))] {
             let mut changed = bound_main.clone();
             changed.model_configuration_hash = hash;
-            assert_eq!(changed.validate_integrity(), Err(ProtocolErrorV4::SpecHashMismatch));
+            assert_eq!(
+                changed.validate_integrity(),
+                Err(ProtocolErrorV4::SpecHashMismatch)
+            );
         }
         for hash in ["".to_owned(), "z".repeat(64), "a".repeat(63)] {
             let mut invalid = bound_main.clone();
             invalid.model_configuration_hash = Some(hash);
             invalid.spec_hash = Some(invalid.calculate_spec_hash().unwrap());
-            assert_eq!(invalid.validate_integrity(), Err(ProtocolErrorV4::SpecHashMismatch));
+            assert_eq!(
+                invalid.validate_integrity(),
+                Err(ProtocolErrorV4::SpecHashMismatch)
+            );
         }
         let mut approved = bound_main.clone();
         approved.execution_kind = RunExecutionKindV4::ApprovedPlan;
         approved.spec_hash = Some(approved.calculate_spec_hash().unwrap());
-        assert_eq!(approved.validate_integrity(), Err(ProtocolErrorV4::SpecHashMismatch));
+        assert_eq!(
+            approved.validate_integrity(),
+            Err(ProtocolErrorV4::SpecHashMismatch)
+        );
         let mut no_compute = bound_main.clone();
         no_compute.compute_selection = None;
         no_compute.spec_hash = Some(no_compute.calculate_spec_hash().unwrap());
-        assert_eq!(no_compute.validate_integrity(), Err(ProtocolErrorV4::SpecHashMismatch));
+        assert_eq!(
+            no_compute.validate_integrity(),
+            Err(ProtocolErrorV4::SpecHashMismatch)
+        );
         let mut ordinary = spec.clone();
         ordinary.execution_kind = RunExecutionKindV4::OrdinaryAgent;
         ordinary.delegated_model = Some(DelegatedModelBindingV4 {

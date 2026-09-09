@@ -73,9 +73,7 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::commands::{
-    AppState, authentication_for_profile, find_profile, require_trusted_host,
-};
+use crate::commands::{AppState, authentication_for_profile, find_profile, require_trusted_host};
 pub use crate::dto::{ConversationAgentStateV4, RunSummaryV4, SessionAgentModeV4};
 use crate::p1_commands::{
     McpServerProfile, MemorySearchRequest, invoke_configured_mcp_tool_v4, memory_facts,
@@ -780,7 +778,8 @@ pub async fn agent_v4_start_direct(
         Utc::now(),
     )
     .map_err(|error| error.to_string())?;
-    let main_profile = load_frozen_main_profile(&state.repository, request.model_profile_id, None).await?;
+    let main_profile =
+        load_frozen_main_profile(&state.repository, request.model_profile_id, None).await?;
     spec.model_configuration_hash = Some(main_profile.execution_configuration_hash());
     spec.delegated_model = freeze_delegated_model(&state.repository, &main_profile).await?;
     spec.spec_hash = Some(
@@ -2736,10 +2735,16 @@ async fn load_frozen_main_profile(
     profile_id: Uuid,
     expected_hash: Option<&str>,
 ) -> Result<omicsops_core::workspace::ModelProfile, String> {
-    let profile = repository.get_model_profile(profile_id).await
-        .map_err(|error| error.to_string())?.ok_or("main model profile not found")?;
+    let profile = repository
+        .get_model_profile(profile_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or("main model profile not found")?;
     if expected_hash.is_some_and(|hash| profile.execution_configuration_hash() != hash) {
-        return Err("frozen main model configuration changed; restore the profile or start a new run".into());
+        return Err(
+            "frozen main model configuration changed; restore the profile or start a new run"
+                .into(),
+        );
     }
     Ok(profile)
 }
@@ -2795,7 +2800,9 @@ async fn compose(
 ) -> Result<(Arc<DesktopModelPortV4>, ComposedToolsV4), String> {
     // Validate before opening SSH or runtime resources, then construct the
     // client and budget from this same owned snapshot without reloading it.
-    let model_profile = load_frozen_main_profile(&state.repository, model_profile_id, main_configuration_hash).await?;
+    let model_profile =
+        load_frozen_main_profile(&state.repository, model_profile_id, main_configuration_hash)
+            .await?;
     let (filesystem, environment_port, backend): (
         Arc<dyn ProjectFilesystemPortV4>,
         Arc<dyn RuntimeEnvironmentPortV4>,
@@ -5746,20 +5753,32 @@ mod tests {
             "reasoning_effort":"max"
         })).unwrap();
         let hash = profile.execution_configuration_hash();
-        assert!(load_frozen_main_profile(&repository, profile.id, Some(&hash)).await.is_err());
+        assert!(
+            load_frozen_main_profile(&repository, profile.id, Some(&hash))
+                .await
+                .is_err()
+        );
         repository.save_model_profile(&profile).await.unwrap();
-        let snapshot = load_frozen_main_profile(&repository, profile.id, Some(&hash)).await.unwrap();
+        let snapshot = load_frozen_main_profile(&repository, profile.id, Some(&hash))
+            .await
+            .unwrap();
         let mut renamed = profile.clone();
         renamed.label = "renamed".into();
         renamed.credential_reference = Some("test-keyring-reference".into());
         repository.save_model_profile(&renamed).await.unwrap();
-        load_frozen_main_profile(&repository, profile.id, Some(&hash)).await.unwrap();
-        for field in ["model", "host", "provider", "context", "vision", "tools", "effort"] {
+        load_frozen_main_profile(&repository, profile.id, Some(&hash))
+            .await
+            .unwrap();
+        for field in [
+            "model", "host", "provider", "context", "vision", "tools", "effort",
+        ] {
             let mut changed = profile.clone();
             match field {
                 "model" => changed.model.push_str("-sibling"),
                 "host" => changed.base_url = "https://other.example/v1".into(),
-                "provider" => changed.provider = omicsops_core::workspace::ModelProviderKind::Anthropic,
+                "provider" => {
+                    changed.provider = omicsops_core::workspace::ModelProviderKind::Anthropic
+                }
                 "context" => changed.context_window_tokens = Some(64000),
                 "vision" => changed.supports_vision = true,
                 "tools" => changed.supports_tools = false,
@@ -5767,13 +5786,29 @@ mod tests {
                 _ => unreachable!(),
             }
             repository.save_model_profile(&changed).await.unwrap();
-            assert!(load_frozen_main_profile(&repository, profile.id, Some(&hash)).await.unwrap_err().contains("frozen main model configuration changed"), "{field}");
+            assert!(
+                load_frozen_main_profile(&repository, profile.id, Some(&hash))
+                    .await
+                    .unwrap_err()
+                    .contains("frozen main model configuration changed"),
+                "{field}"
+            );
             // Old specs intentionally retain legacy profile loading behavior.
-            assert_eq!(load_frozen_main_profile(&repository, profile.id, None).await.unwrap(), changed);
+            assert_eq!(
+                load_frozen_main_profile(&repository, profile.id, None)
+                    .await
+                    .unwrap(),
+                changed
+            );
         }
         assert_eq!(snapshot, profile);
         repository.save_model_profile(&profile).await.unwrap();
-        assert_eq!(load_frozen_main_profile(&repository, profile.id, Some(&hash)).await.unwrap(), profile);
+        assert_eq!(
+            load_frozen_main_profile(&repository, profile.id, Some(&hash))
+                .await
+                .unwrap(),
+            profile
+        );
     }
 
     #[tokio::test]
