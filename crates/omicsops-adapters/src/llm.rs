@@ -659,7 +659,100 @@ fn usage_from_value(protocol: ProviderProtocol, value: &Value) -> Option<(u64, u
             usage.get("eval_count").and_then(Value::as_u64).unwrap_or(0),
         ),
     };
-    (input > 0 || output > 0).then(|| (input, output, usage.clone()))
+    (input > 0 || output > 0).then(|| (input, output, safe_usage_metadata(protocol, usage)))
+}
+
+/// Usage is audit metadata, never a copy of the provider response. Keep a
+/// bounded set of numeric counters, including explicitly reported reasoning
+/// tokens; these counters do not establish an effective reasoning effort.
+fn safe_usage_metadata(protocol: ProviderProtocol, usage: &Value) -> Value {
+    fn counters(value: &Value, keys: &[&str]) -> serde_json::Map<String, Value> {
+        keys.iter().filter_map(|key| {
+            value.get(*key).and_then(Value::as_u64).map(|count| ((*key).to_owned(), json!(count)))
+        }).collect()
+    }
+    let keys: &[&str] = match protocol {
+        ProviderProtocol::OpenAiCompatible => &["prompt_tokens", "completion_tokens", "total_tokens"],
+        ProviderProtocol::Anthropic => &["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"],
+        ProviderProtocol::Ollama => &["prompt_eval_count", "eval_count"],
+    };
+    let mut safe = counters(usage, keys);
+    if protocol == ProviderProtocol::OpenAiCompatible {
+        for (name, keys) in [
+            ("prompt_tokens_details", &["cached_tokens", "audio_tokens"][..]),
+            ("completion_tokens_details", &["reasoning_tokens", "audio_tokens", "accepted_prediction_tokens", "rejected_prediction_tokens"][..]),
+        ] {
+            if let Some(details) = usage.get(name) {
+                let details = counters(details, keys);
+                if !details.is_empty() { safe.insert(name.into(), Value::Object(details)); }
+            }
+        }
+    }
+    Value::Object(safe)
+}
+
+#[cfg(test)]
+mod usage_metadata_tests {
+    use super::*;
+
+    fn only_usage(events: &[ProviderStreamEvent]) -> (u64, u64, Value) {
+        let usage: Vec<_> = events.iter().filter_map(|event| match event {
+            ProviderStreamEvent::Usage { input_tokens, output_tokens, provider_json } => Some((*input_tokens, *output_tokens, provider_json.clone())),
+            _ => None,
+        }).collect();
+        assert_eq!(usage.len(), 1);
+        usage[0].clone()
+    }
+
+    #[test]
+    fn stream_and_non_streaming_usage_exclude_provider_payloads() {
+        for (protocol, response, expected) in [
+            (ProviderProtocol::OpenAiCompatible,
+             json!({"choices":[{"message":{"content":"answer"},"delta":{"content":"answer"}}],"usage":{"prompt_tokens":12,"completion_tokens":8,"total_tokens":20,"private":"sentinel","completion_tokens_details":{"reasoning_tokens":3,"private":"sentinel"},"prompt_tokens_details":{"cached_tokens":0,"private":"sentinel"}}}),
+             json!({"prompt_tokens":12,"completion_tokens":8,"total_tokens":20,"completion_tokens_details":{"reasoning_tokens":3},"prompt_tokens_details":{"cached_tokens":0}})),
+            (ProviderProtocol::Anthropic,
+             json!({"type":"message_delta","content":[{"type":"text","text":"answer"}],"usage":{"input_tokens":12,"output_tokens":8,"cache_read_input_tokens":4,"private":"sentinel"}}),
+             json!({"input_tokens":12,"output_tokens":8,"cache_read_input_tokens":4})),
+            (ProviderProtocol::Ollama,
+             json!({"message":{"content":"sentinel answer","thinking":"sentinel"},"done":true,"prompt_eval_count":12,"eval_count":8,"context":[999],"private":"sentinel"}),
+             json!({"prompt_eval_count":12,"eval_count":8})),
+        ] {
+            let parsed = parse_provider_tool_response(protocol, &response).unwrap();
+            assert_eq!(only_usage(&parsed), (12, 8, expected.clone()));
+            let wire = match protocol {
+                ProviderProtocol::Ollama => format!("{response}\n"),
+                ProviderProtocol::OpenAiCompatible => format!("data: {response}\n\ndata: [DONE]\n\n"),
+                ProviderProtocol::Anthropic => format!("data: {response}\n\ndata: {{\"type\":\"message_stop\"}}\n\n"),
+            };
+            let mut decoder = ProviderToolStreamDecoder::new(protocol);
+            let mut events = Vec::new();
+            for chunk in wire.as_bytes().chunks(7) { events.extend(decoder.push(chunk).unwrap()); }
+            events.extend(decoder.finish().unwrap());
+            let usage = only_usage(&events);
+            assert_eq!(usage, (12, 8, expected));
+            assert!(!usage.2.to_string().contains("sentinel"));
+        }
+    }
+
+    #[test]
+    fn rejects_non_integer_metadata_and_preserves_explicit_zero_details() {
+        let value = json!({"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":"secret","completion_tokens_details":{"reasoning_tokens":0,"audio_tokens":-1,"accepted_prediction_tokens":1.5,"rejected_prediction_tokens":{"secret":true}},"prompt_tokens_details":"secret"}});
+        let (_, _, safe) = usage_from_value(ProviderProtocol::OpenAiCompatible, &value).unwrap();
+        assert_eq!(safe, json!({"prompt_tokens":4,"completion_tokens":2,"completion_tokens_details":{"reasoning_tokens":0}}));
+        for invalid in [Value::Null, json!("secret"), json!({"prompt_tokens":-1,"completion_tokens":"secret"})] {
+            assert!(usage_from_value(ProviderProtocol::OpenAiCompatible, &json!({"usage":invalid})).is_none());
+        }
+        let (_, _, missing) = usage_from_value(ProviderProtocol::OpenAiCompatible, &json!({"usage":{"prompt_tokens":1}})).unwrap();
+        assert!(missing.get("completion_tokens_details").is_none());
+    }
+
+    #[test]
+    fn anthropic_message_start_and_partial_updates_stay_separate() {
+        let initial = json!({"message":{"usage":{"input_tokens":10,"output_tokens":1,"private":"sentinel"}}});
+        let delta = json!({"usage":{"output_tokens":7,"private":"sentinel"}});
+        assert_eq!(usage_from_value(ProviderProtocol::Anthropic, &initial).unwrap(), (10,1,json!({"input_tokens":10,"output_tokens":1})));
+        assert_eq!(usage_from_value(ProviderProtocol::Anthropic, &delta).unwrap(), (0,7,json!({"output_tokens":7})));
+    }
 }
 
 #[derive(Debug, Clone)]

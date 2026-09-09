@@ -175,3 +175,10 @@ Settings 显示已保存的目录上限。显式 effort 按已公布能力验证
 Settings 编辑模型新增默认未选中的目录刷新选项，经共享 DTO `refresh_catalog`（省略为 false）传递。普通编辑继续保留旧快照；显式刷新采用当前精确目录条目、工具/视觉能力和 context 额度。API 显式传入的窗口仍须通过上限校验。保留同身份的请求 effort 与子模型绑定，不自动降低 effort；未知条目或不兼容 effort 在写入凭据/数据库之前拒绝。失败可在原编辑器重试，关闭后重新编辑不保留刷新意图；沿用窗口 Escape 栈。
 
 刷新不修改已冻结 RunSpec 或运行中内存客户端。实际能力/预算变化仍由已有 profile hash 阻止旧运行恢复；同配置重复刷新保持 hash。无网络请求、依赖或 SQL 迁移变化。其他供应商、价格、图像计费、生效档位审计及远端任务重连仍待开发。
+
+
+## 2026-09-09：收紧供应商用量审计边界
+
+内置适配器的 Usage.provider_json 不再复制原始 usage 对象或 Ollama 整段响应。三个协议共用数值白名单，保留已识别的非负整数计数；OpenAI-compatible 保留明确上报的 reasoning/cache 等 token 明细，未知字段、字符串、负数、浮点和对象值舍弃。明细缺失保持缺失，不根据 token 数推断生效推理档位。字段参考 [OpenAI SDK usage 定义](https://github.com/openai/openai-python/blob/main/src/openai/types/completion_usage.py)。
+
+流式分片与非流式回退采用同一清洗路径。保持旧顶层 input/output 计数、正数事件触发及 Anthropic 部分更新语义；没有将增量和累计值直接相加。无协议字段、数据库迁移或网络依赖变化，不回写历史数据。本增量是用量审计前置边界，尚未实现 V4 用量持久化/汇总、生效档位报告、图像计费或远端任务重连。

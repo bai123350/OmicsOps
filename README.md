@@ -173,3 +173,12 @@ and downstream nodes are blocked. Children observe the inbox but leave its
 consumption to the parent after the graph settles. This does not set the global
 Stop token, interrupt compute jobs, refund delegation budgets, or change
 approved-plan delegation behavior.
+
+Built-in provider usage events retain only allowlisted non-negative integer
+counters. OpenAI-compatible events may include reported reasoning/cache token
+details; these do not certify an effective reasoning effort. Missing details remain
+absent. Ollama usage no longer copies the response body, messages or context IDs;
+unknown fields and invalid counter values are excluded in both streaming and
+non-streaming responses. Existing top-level token counts and partial-event
+semantics are unchanged. This does not add V4 usage persistence, aggregate partial
+updates, or rewrite historical records.

@@ -229,3 +229,12 @@ Settings 编辑模型新增默认未选中的目录刷新选项，经共享 DTO 
 刷新不修改已冻结 RunSpec 或运行中内存客户端。实际能力/预算变化仍由已有 profile hash 阻止旧运行恢复；同配置重复刷新保持 hash。无网络请求、依赖或 SQL 迁移变化。其他供应商、价格、图像计费、生效档位审计及远端任务重连仍待开发。
 
 本增量最终验证（2026-09-09）：桌面 refresh 近邻 4 项、Settings 近邻 16 项通过；`cargo test --workspace`、`npm test`（123 前端/22 扩展）、`npm run build`、`npm run build:desktop` 均通过。覆盖共享 DTO 省略/显式值、旧快照保留、显式刷新与重复刷新指纹、窗口覆盖、未知端点拒绝、effort 重验、UI 失败重试及 Escape 层级。格式初查偏差经 `cargo fmt --all` 修复，复查和 diff 检查通过，纯格式单独提交。保留既有 Vite 大 chunk/Windows linker 提示；真实模型、SSH、macOS 和桌面交互 smoke 未执行。未推送、发布或分发构建产物。
+
+
+## 2026-09-09：收紧供应商用量审计边界
+
+内置适配器的 Usage.provider_json 不再复制原始 usage 对象或 Ollama 整段响应。三个协议共用数值白名单，保留已识别的非负整数计数；OpenAI-compatible 保留明确上报的 reasoning/cache 等 token 明细，未知字段、字符串、负数、浮点和对象值舍弃。明细缺失保持缺失，不根据 token 数推断生效推理档位。字段参考 [OpenAI SDK usage 定义](https://github.com/openai/openai-python/blob/main/src/openai/types/completion_usage.py)。
+
+流式分片与非流式回退采用同一清洗路径。保持旧顶层 input/output 计数、正数事件触发及 Anthropic 部分更新语义；没有将增量和累计值直接相加。无协议字段、数据库迁移或网络依赖变化，不回写历史数据。本增量是用量审计前置边界，尚未实现 V4 用量持久化/汇总、生效档位报告、图像计费或远端任务重连。
+
+本增量最终验证（2026-09-09）：`cargo test -p omicsops-adapters usage_metadata_tests` 3 项通过，覆盖三个协议的流式分片/非流式元数据清洗、非法数值、明细缺失与显式零、Anthropic 部分更新。首次流式夹具缺少结束标记失败，补齐标记后通过，未放宽不完整流拒绝。`cargo test --workspace`、`npm test`（123 前端/22 扩展）、`npm run build` 均通过；格式初查偏差经 `cargo fmt --all` 修复，复查及 diff 检查通过，纯格式单独提交。保留既有 Vite 大 chunk/Windows linker 提示。未改桌面组合或打包，本轮未执行 `npm run build:desktop`；真实模型、SSH、macOS 验收未执行，未推送或分发构建产物。
