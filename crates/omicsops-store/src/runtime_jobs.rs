@@ -185,13 +185,18 @@ impl Store {
             next.result_request_id = Some(result.request_id);
             next.result_sha256 = Some(hex::encode(Sha256::digest(serde_json::to_vec(result)?)));
         }
+        let receipt = result.map(serde_json::to_string).transpose()?;
+        if receipt.as_ref().is_some_and(|value| value.len() > 1024 * 1024) {
+            return Err(StoreError::InvalidInput("runtime result receipt exceeds 1 MiB".into()));
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let changed = sqlx::query(
             "UPDATE runtime_jobs_v4 SET value_json=?1 WHERE job_id=?2 AND value_json=?3",
         )
         .bind(serde_json::to_string(&next)?)
         .bind(previous.job_id.to_string())
         .bind(serde_json::to_string(previous)?)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if changed != 1 {
@@ -199,7 +204,32 @@ impl Store {
                 "runtime job changed concurrently".into(),
             ));
         }
+        if let Some(receipt) = receipt {
+            sqlx::query("INSERT INTO runtime_job_results_v4(job_id,result_json) VALUES (?1,?2)")
+                .bind(next.job_id.to_string()).bind(receipt).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
         Ok(next)
+    }
+
+    pub async fn recover_runtime_result_v4(&self, context: &ExecutionContextKeyV4, call: &omicsops_protocol::ToolCallV4) -> Result<Option<(RuntimeJobV4, RuntimeResultV4)>, StoreError> {
+        let Some(job) = self.runtime_job_v4(context, &call.call_id).await? else { return Ok(None); };
+        if call.tool_id != "runtime.execute" || call.canonical_hash().map_err(|error| StoreError::InvalidInput(error.to_string()))? != job.request_sha256 {
+            return Err(StoreError::InvalidInput("runtime receipt request mismatch".into()));
+        }
+        if !matches!(job.state, RuntimeJobStateV4::Succeeded | RuntimeJobStateV4::Failed) { return Ok(None); }
+        let serialized: Option<String> = sqlx::query_scalar("SELECT result_json FROM runtime_job_results_v4 WHERE job_id=?1")
+            .bind(job.job_id.to_string()).fetch_optional(&self.pool).await?;
+        let Some(serialized) = serialized else { return Ok(None); };
+        if serialized.len() > 1024 * 1024 || Some(hex::encode(Sha256::digest(serialized.as_bytes()))) != job.result_sha256 {
+            return Err(StoreError::InvalidInput("runtime receipt digest mismatch".into()));
+        }
+        let result: RuntimeResultV4 = serde_json::from_str(&serialized)?;
+        if Some(result.session_id) != job.session_id || Some(result.request_id) != job.result_request_id
+            || result.succeeded != (job.state == RuntimeJobStateV4::Succeeded) {
+            return Err(StoreError::InvalidInput("runtime receipt identity mismatch".into()));
+        }
+        Ok(Some((job, result)))
     }
 }
 
@@ -207,6 +237,10 @@ pub(super) async fn observe_runtime_event(
     tx: &mut SqliteConnection,
     event: &AgentEventV4,
 ) -> Result<(), StoreError> {
+    if let AgentEventKindV4::ToolFinished { outcome } = &event.event {
+        sqlx::query("DELETE FROM runtime_job_results_v4 WHERE job_id IN (SELECT job_id FROM runtime_jobs_v4 WHERE run_id=?1 AND call_id=?2)")
+            .bind(event.run_id.to_string()).bind(&outcome.call_id).execute(&mut *tx).await?;
+    }
     let call_id = match &event.event {
         AgentEventKindV4::ToolDispatchUncertain { call_id, .. } => Some(call_id.as_str()),
         AgentEventKindV4::RunCancelled | AgentEventKindV4::RunFailed { .. } => None,

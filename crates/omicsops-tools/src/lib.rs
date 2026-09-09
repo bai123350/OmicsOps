@@ -13,6 +13,7 @@ use tokio::sync::{Mutex, Semaphore};
 #[async_trait]
 pub trait ToolExecutorV4: Send + Sync {
     async fn execute(&self, call: &ToolCallV4) -> Result<ToolOutcomeV4, String>;
+    async fn recover_result(&self, _call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> { Ok(None) }
     fn has_persistent_authorization(&self, _call: &ToolCallV4) -> bool {
         false
     }
@@ -170,6 +171,10 @@ impl ToolRegistryV4 {
 
 #[async_trait]
 impl ToolPortV4 for ToolRegistryV4 {
+    async fn recover_result(&self, call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
+        self.authorize(RunModeV4::Execute, call).map_err(|error| error.to_string())?;
+        self.executor.recover_result(call).await
+    }
     fn descriptors(&self, mode: RunModeV4) -> Vec<ToolDescriptorV4> {
         self.definitions
             .values()

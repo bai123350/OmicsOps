@@ -163,3 +163,11 @@ UI 使用内联面板，区分已接收和已应用，失败保留原文并复�
 注册表最多保留 128 条（包括未释放的终态）。正在运行的条目不能释放；桌面在读取终态后释放条目，既有等待 handle 仍能读取共享结果。管理器销毁会结束其 worker；这不是跨应用重启的后台守护进程。该等待只覆盖持有同一管理器期间，尚未增加 UI 暂停后自动重新挂接、远端状态/产物重连或独立 start/status/wait 模型工具，也未放宽 uncertain dispatch 自动恢复。
 
 本增量实际验证（2026-09-09）：`cargo test -p omicsops-runtime jobs --lib` 4 项通过；`cargo test --workspace` 通过；`npm test` 通过（116 项前端、22 项扩展）；`npm run build` 与 `npm run build:desktop` 通过，保留既有 Vite 大 chunk/Windows linker 信息提示。`cargo fmt --all -- --check` 初次发现格式偏差，运行 `cargo fmt --all` 后复查通过，格式单独提交；`git diff --check` 通过。无依赖变更，无构建产物分发。真实模型、SSH、macOS 和桌面交互 smoke 未执行。
+
+## 切片 6：完成结果回执与恢复接口
+
+2026-09-09，新增临时 runtime_job_results_v4 回执表，与 succeeded/failed 元数据原子提交，单条最多 1 MiB。内容沿用现有 RuntimeResultV4（输出片段、捕获引用、产物引用、版本信息），不增加代码、凭据配置或完整科研数据字段；该表只弥补 ToolFinished 提交前的窗口，工具事件提交与回执删除同事务完成，元数据表仍仅含摘要。旧任务无回执时保持不确定路径。
+
+core/tools/desktop 增加只恢复不执行的 recover_result 接口；按原请求 hash、context、会话、结果 request_id 和结果 SHA-256 校验，恢复后经过现有科学状态处理与最终证据验证。恢复只记录一次 ToolFinished；明确的 ToolDispatchUncertain 不自动核销，缺失/损坏回执不重跑。不会重开终态运行。桌面过期运行识别和恢复按钮接入仍待紧随其后的增量。
+
+实际验证：`cargo test --workspace`、`npm test`（116 前端/22 扩展）、`npm run build`、`npm run build:desktop` 均通过。包括 core 回执恢复测试、8 项 runtime job 存储测试、模拟解释器结果重建测试。覆盖重开、摘要篡改、请求不匹配、写入/删除回执故障原子性和大小限制。fmt 复查通过，格式单独提交。未执行真实模型、SSH、macOS/桌面交互验收，未分发构建产物。

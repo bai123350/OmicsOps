@@ -4467,41 +4467,7 @@ impl DesktopToolExecutorV4 {
                     )
                     .await
                     .map_err(|error| error.to_string())?;
-                let content = format!(
-                    "session={} process={} request={}\nstdout ({} bytes, sha256={}):\n{}\nstderr ({} bytes, sha256={}):\n{}",
-                    result.session_id,
-                    result.process_identity,
-                    result.request_id,
-                    result
-                        .stdout_capture
-                        .as_ref()
-                        .map_or(0, |capture| capture.total_bytes),
-                    result
-                        .stdout_capture
-                        .as_ref()
-                        .map_or("", |capture| capture.sha256.as_str()),
-                    result.stdout,
-                    result
-                        .stderr_capture
-                        .as_ref()
-                        .map_or(0, |capture| capture.total_bytes),
-                    result
-                        .stderr_capture
-                        .as_ref()
-                        .map_or("", |capture| capture.sha256.as_str()),
-                    result.stderr
-                );
-                return Ok(ToolOutcomeV4 {
-                    call_id: call.call_id.clone(),
-                    tool_id: call.tool_id.clone(),
-                    succeeded: result.succeeded,
-                    model_content: content,
-                    data: serde_json::to_value(&result).map_err(|e| e.to_string())?,
-                    provenance: vec![
-                        format!("kernel-session:{}", result.session_id),
-                        format!("runtime-job:{}", running.job_id),
-                    ],
-                });
+                return crate::runtime_jobs_v4::outcome(call, &running, &result);
             }
             "runtime.environment.ensure" => {
                 let language = parse_language(required(&call.arguments, "language")?)?;
@@ -4608,6 +4574,14 @@ impl DesktopToolExecutorV4 {
 
 #[async_trait]
 impl ToolExecutorV4 for DesktopToolExecutorV4 {
+    async fn recover_result(&self, call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
+        if call.tool_id != "runtime.execute" { return Ok(None); }
+        let language = parse_language(required(&call.arguments, "language")?)?;
+        let environment = call.arguments.get("environment").and_then(Value::as_str).unwrap_or("system");
+        let key = self.key(language, environment)?;
+        self.repository.recover_runtime_result_v4(&key, call).await.map_err(|error| error.to_string())?
+            .map(|(job, result)| crate::runtime_jobs_v4::outcome(call, &job, &result)).transpose()
+    }
     async fn execute(&self, call: &ToolCallV4) -> Result<ToolOutcomeV4, String> {
         self.execute_inner(call, false).await
     }

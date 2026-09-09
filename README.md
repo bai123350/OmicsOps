@@ -105,3 +105,9 @@ in the existing tool events and archives; the job ledger stores only metadata an
 a result digest. In-process workers now support event-driven waiting and rereading
 results without rerunning computation. Dropping a waiter does not cancel its worker.
 Automatic reconnection across application restarts is not yet implemented.
+
+A bounded, temporary runtime-result receipt now bridges the gap between recording
+job completion and committing its tool event. Recovery verifies the original
+request, session and result digest and never executes the cell again. The receipt
+is removed atomically with the tool event. Explicitly uncertain dispatches retain
+the existing reconciliation requirement; terminal runs are not reopened.
