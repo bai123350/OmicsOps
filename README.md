@@ -111,3 +111,10 @@ job completion and committing its tool event. Recovery verifies the original
 request, session and result digest and never executes the cell again. The receipt
 is removed atomically with the tool event. Explicitly uncertain dispatches retain
 the existing reconciliation requirement; terminal runs are not reopened.
+
+When an inactive run exceeds the existing stale-run threshold, the desktop now
+checks for verified receipts for every unfinished dispatched operation. If all
+are available, it preserves the run and offers **Resume saved results** instead
+of marking it failed. Resuming follows the original run and frozen configuration.
+Missing receipts, explicitly uncertain dispatches and terminal runs retain their
+existing handling; this does not reconnect to a still-running remote process.

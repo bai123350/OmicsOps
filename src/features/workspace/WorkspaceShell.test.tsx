@@ -11,6 +11,21 @@ const project = {
 };
 
 describe("WorkspaceShell", () => {
+  it("resumes durable computation receipts once and hides the action after results are recorded", async () => {
+    let finish: (() => void) | undefined;
+    const resume = vi.fn(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const event = { schema_version: 4 as const, run_id: "receipt-run", project_id: project.id, conversation_id: "c", sequence: 1, occurred_at: "2026-09-09T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "runtime_recovery_available" as const, call_ids: ["cell"] } };
+    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: event.run_id, onResumeAgentRunV4: resume };
+    const { rerender } = render(<WorkspaceShell {...props} agentRunEventsV4={[event]} />);
+    fireEvent.click(screen.getByRole("button", { name: "恢复已保存结果" }));
+    expect(screen.getByRole("button", { name: "恢复中…" })).toBeDisabled();
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(resume).toHaveBeenCalledWith(event.run_id);
+    finish?.();
+    await waitFor(() => expect(screen.getByRole("button", { name: "恢复已保存结果" })).toBeEnabled());
+    rerender(<WorkspaceShell {...props} agentRunEventsV4={[event, { ...event, sequence: 2, event: { kind: "tool_finished", outcome: { call_id: "cell", tool_id: "runtime.execute", succeeded: true, model_content: "result", data: {}, provenance: [] } } }]} />);
+    expect(screen.queryByRole("button", { name: "恢复已保存结果" })).not.toBeInTheDocument();
+  });
   it("switches the composer arrow to a stop square and restores it after cancellation", () => {
     const cancel = vi.fn();
     const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, onCancelRun: cancel };

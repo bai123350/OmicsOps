@@ -149,3 +149,11 @@ runtime cell still returns its original output/artifact references and Stop wake
 its wait promptly. Deterministic tests simulate a waiter timeout, reattachment to
 the same manager, repeated reads, worker failure and capacity exhaustion. A waiter
 reattachment is not an application-restart or SSH-reconnection acceptance test.
+
+For saved-result recovery, the desktop should offer “Resume saved results” when
+all unfinished dispatches have verified receipts and the inactive run reaches the
+existing stale threshold. Confirm the original run continues, the action cannot
+be submitted twice while busy, and the prompt disappears after tool results are
+recorded. A missing receipt or explicitly uncertain dispatch must not expose this
+shortcut. The exact interruption window is covered by deterministic receipt/store
+fixtures; real desktop restart and remote-host smoke have not been executed.

@@ -289,6 +289,7 @@ export type AgentEventKindV4 =
   | { kind: "input_requested"; question_id: string; question: string; reason?: "scope" | "decision" | "missing_data" | "blocker" }
   | { kind: "user_input_answered"; question_id: string; answer: string }
   | { kind: "guidance_consumed"; message_id: string; markdown: string }
+  | { kind: "runtime_recovery_available"; call_ids: string[] }
   | { kind: "context_archived"; archive: { archive_id: string; through_sequence: number; size_bytes: number; sha256: string } }
   | { kind: "context_checkpointed"; checkpoint: { schema_version: 4; through_sequence: number; completion_criteria: string[]; unresolved_errors: string[]; recent_steps: string[]; scientific_state: unknown; task_shape?: AgentV4TaskShape | null; phase?: AgentV4Phase | null; task_revision?: number | null; tasks?: AgentV4Task[]; cycle_id?: number | null } }
   | { kind: "scientific_state_changed"; revision: number; state_sha256: string; changes: string[] }

@@ -171,3 +171,11 @@ UI 使用内联面板，区分已接收和已应用，失败保留原文并复�
 core/tools/desktop 增加只恢复不执行的 recover_result 接口；按原请求 hash、context、会话、结果 request_id 和结果 SHA-256 校验，恢复后经过现有科学状态处理与最终证据验证。恢复只记录一次 ToolFinished；明确的 ToolDispatchUncertain 不自动核销，缺失/损坏回执不重跑。不会重开终态运行。桌面过期运行识别和恢复按钮接入仍待紧随其后的增量。
 
 实际验证：`cargo test --workspace`、`npm test`（116 前端/22 扩展）、`npm run build`、`npm run build:desktop` 均通过。包括 core 回执恢复测试、8 项 runtime job 存储测试、模拟解释器结果重建测试。覆盖重开、摘要篡改、请求不匹配、写入/删除回执故障原子性和大小限制。fmt 复查通过，格式单独提交。未执行真实模型、SSH、macOS/桌面交互验收，未分发构建产物。
+
+## 切片 6：桌面恢复入口
+
+2026-09-09，桌面在原有两分钟过期运行检查中先取得单 driver 槽位并重新读取状态，防止与恢复启动或另一次检查竞争。仅当所有未完成派发都为 runtime.execute 且完整、匹配、终态回执可验证时，Store 才原子追加 RuntimeRecoveryAvailable 并将运行置为 waiting_for_input。明确不确定、其他副作用、缺失回执或终态均不被自动提升；没有创建新 run、重开终态或启动解释器。
+
+内联轨迹显示“结果待恢复”与“恢复已保存结果”。使用既有 resume 命令，按钮在提交时禁用，同一 call 的 ToolFinished 收口后提示消失。没有新增覆盖层。新事件是加法协议变更，旧程序无法理解时不得跳过恢复。10 项 runtime job 存储测试包含原子暂停、并发只提示一次、故障回滚、不完整/未知拒绝；WorkspaceShell 测试覆盖恢复按钮与结果收口。
+
+桌面入口增量最终验证（2026-09-09）：`cargo test --workspace` 通过；`npm test` 通过（117 项前端、22 项扩展）；`npm run build`、`npm run build:desktop` 通过，保留现有大 chunk/linker 提示。`cargo fmt --all -- --check` 初次偏差经 `cargo fmt --all` 修复后通过，格式单独提交；`git diff --check` 通过。无依赖变化；真实模型、SSH、macOS 和桌面交互验收未执行；未推送或分发安装包。

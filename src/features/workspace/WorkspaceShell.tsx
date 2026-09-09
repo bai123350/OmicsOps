@@ -447,7 +447,7 @@ function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncer
     || (latest.event.kind === "tool_requested" && latest.event.call.tool_id === "agent.complete")
   ));
   const pauseReason = getV4PauseReason(events);
-  const status = terminal?.event.kind === "run_completed" ? (zh ? "已完成" : "Completed") : terminal?.event.kind === "run_cancelled" ? (zh ? "已终止" : "Cancelled") : terminal?.event.kind === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention") : terminal?.event.kind === "run_failed" ? (zh ? "失败" : "Failed") : pauseReason === "approval" ? (zh ? "等待工具审批" : "Waiting for approval") : pauseReason === "input" ? (zh ? "等待回答" : "Waiting for input") : pauseReason === "browser_connection" ? (zh ? "等待连接浏览器" : "Waiting for browser") : pauseReason === "browser_human" ? (zh ? "等待人工处理浏览器" : "Waiting for browser intervention") : pauseReason === "uncertain" ? (zh ? "等待副作用核验" : "Waiting for verification") : (zh ? "运行中" : "Running");
+  const status = terminal?.event.kind === "run_completed" ? (zh ? "已完成" : "Completed") : terminal?.event.kind === "run_cancelled" ? (zh ? "已终止" : "Cancelled") : terminal?.event.kind === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention") : terminal?.event.kind === "run_failed" ? (zh ? "失败" : "Failed") : pauseReason === "approval" ? (zh ? "等待工具审批" : "Waiting for approval") : pauseReason === "input" ? (zh ? "等待回答" : "Waiting for input") : pauseReason === "browser_connection" ? (zh ? "等待连接浏览器" : "Waiting for browser") : pauseReason === "browser_human" ? (zh ? "等待人工处理浏览器" : "Waiting for browser intervention") : pauseReason === "runtime_recovery" ? (zh ? "结果待恢复" : "Results ready to resume") : pauseReason === "uncertain" ? (zh ? "等待副作用核验" : "Waiting for verification") : (zh ? "运行中" : "Running");
   const failed = terminal?.event.kind === "run_failed";
   const shouldExpand = !historical && (!terminal || Boolean(pauseReason) || terminal?.event.kind === "run_failed" || terminal?.event.kind === "run_needs_attention");
   async function resumeRun() {
@@ -497,6 +497,7 @@ function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncer
       ].sort((a, b) => a.sequence - b.sequence).map(({ node }) => node)}
       </section>
       {guided && <details className="v4-process-context"><summary>{zh ? "任务与阶段详情" : "Task and phase details"}</summary><GuidedV4Overview locale={locale} overview={guided} terminal={terminal} historical={historical} /></details>}
+      {pauseReason === "runtime_recovery" && onResume && <div className="v4-resume-run"><span>{zh ? "计算结果已保存，可继续核验。" : "Saved computation results are ready for verification."}</span><button disabled={resumeBusy} onClick={() => void resumeRun()}>{resumeBusy ? (zh ? "恢复中…" : "Resuming…") : (zh ? "恢复已保存结果" : "Resume saved results")}</button></div>}
       {failed && onResume && <div className="v4-resume-run"><span>{zh ? "修正运行条件后可从已验证事件链继续。" : "Resume from the verified event chain after fixing the runtime condition."}</span><button disabled={resumeBusy} onClick={() => void resumeRun()}>{resumeBusy ? (zh ? "恢复中…" : "Resuming…") : (zh ? "继续运行" : "Resume run")}</button></div>}
       {pauseReason === "browser_connection" && onResume && <div className="v4-resume-run"><span>{zh ? "请在设置 → Browser 安装或启用 OmicsOps 扩展并连接相应会话，然后原地继续此任务。" : "Open Settings → Browser, install or enable the OmicsOps extension, connect the requested session, then resume this same task."}</span><button disabled={resumeBusy} onClick={() => void resumeRun()}>{resumeBusy ? (zh ? "恢复中…" : "Resuming…") : (zh ? "已连接，继续" : "Connected, resume")}</button></div>}
       {pauseReason === "browser_human" && onResume && <div className="v4-resume-run"><span>{zh ? "请在真实浏览器中完成人机验证或其他人工步骤；OmicsOps 不会自动求解 CAPTCHA。处理完成后原地继续。" : "Complete the CAPTCHA or other manual step in the real browser. OmicsOps never solves CAPTCHA automatically; resume this same run when finished."}</span><button disabled={resumeBusy} onClick={() => void resumeRun()}>{resumeBusy ? (zh ? "恢复中…" : "Resuming…") : (zh ? "已人工处理，继续" : "Handled, resume")}</button></div>}
@@ -940,9 +941,10 @@ function effectiveTerminalAgentEventV4(events: AgentRunEventV4[]): AgentRunEvent
   return undefined;
 }
 
-function getV4PauseReason(events: AgentRunEventV4[]): "approval" | "input" | "browser_connection" | "browser_human" | "uncertain" | null {
+function getV4PauseReason(events: AgentRunEventV4[]): "approval" | "input" | "browser_connection" | "browser_human" | "uncertain" | "runtime_recovery" | null {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index].event;
+    if (event.kind === "runtime_recovery_available") return event.call_ids.some((id) => !events.slice(index + 1).some((item) => item.event.kind === "tool_finished" && item.event.outcome.call_id === id)) ? "runtime_recovery" : null;
     if (event.kind === "tool_approval_requested") return isV4ApprovalDecided(events, event.request.approval_id) ? null : "approval";
     if (event.kind === "input_requested") return isV4QuestionAnswered(events, event.question_id) ? null : "input";
     if (event.kind === "browser_connection_required") return "browser_connection";
