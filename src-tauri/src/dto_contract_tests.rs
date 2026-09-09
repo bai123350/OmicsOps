@@ -9,12 +9,15 @@ use uuid::Uuid;
 #[test]
 fn catalog_refresh_is_explicit_and_round_trips_through_shared_dto() {
     let mut value = json!({"label":"test","provider":"open_ai_compatible","base_url":"https://api.openai.com/v1","model":"gpt-4o"});
-    let legacy: crate::dto::SaveModelProfileRequest = serde_json::from_value(value.clone()).unwrap();
+    let legacy: crate::dto::SaveModelProfileRequest =
+        serde_json::from_value(value.clone()).unwrap();
     assert!(!legacy.refresh_catalog);
     for refresh in [false, true] {
         value["refresh_catalog"] = json!(refresh);
-        let dto: crate::dto::SaveModelProfileRequest = serde_json::from_value(value.clone()).unwrap();
-        let backend: crate::model_commands::SaveModelProfileRequest = serde_json::from_value(serde_json::to_value(dto).unwrap()).unwrap();
+        let dto: crate::dto::SaveModelProfileRequest =
+            serde_json::from_value(value.clone()).unwrap();
+        let backend: crate::model_commands::SaveModelProfileRequest =
+            serde_json::from_value(serde_json::to_value(dto).unwrap()).unwrap();
         assert_eq!(backend.refresh_catalog, refresh);
     }
     value["refresh_catalog"] = json!("true");

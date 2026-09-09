@@ -294,7 +294,11 @@ mod tests {
 
     #[test]
     fn explicit_refresh_adopts_snapshot_and_preserves_effort_and_binding() {
-        let mut input = request("open_ai_compatible", "https://api.openai.com/v1", "gpt-5.6-luna");
+        let mut input = request(
+            "open_ai_compatible",
+            "https://api.openai.com/v1",
+            "gpt-5.6-luna",
+        );
         let mut saved = model_profile_from_request(input.clone()).unwrap();
         saved.catalog_capabilities = None;
         saved.context_window_tokens = Some(32000);
@@ -310,11 +314,17 @@ mod tests {
         assert!(refreshed.catalog_capabilities.is_some());
         assert_eq!(refreshed.context_window_tokens, Some(1050000));
         assert_eq!(refreshed.reasoning_effort, saved.reasoning_effort);
-        assert_eq!(refreshed.delegated_model_profile_id, saved.delegated_model_profile_id);
+        assert_eq!(
+            refreshed.delegated_model_profile_id,
+            saved.delegated_model_profile_id
+        );
         assert_ne!(refreshed.execution_configuration_hash(), old_hash);
         let mut repeated = model_profile_from_request(input.clone()).unwrap();
         merge_existing_profile(&mut repeated, Some(&refreshed), true, true, true, true);
-        assert_eq!(repeated.execution_configuration_hash(), refreshed.execution_configuration_hash());
+        assert_eq!(
+            repeated.execution_configuration_hash(),
+            refreshed.execution_configuration_hash()
+        );
         input.context_window_tokens = Some(64000);
         let mut custom = model_profile_from_request(input).unwrap();
         merge_existing_profile(&mut custom, Some(&saved), true, false, true, true);
