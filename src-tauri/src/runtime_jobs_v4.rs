@@ -65,7 +65,9 @@ pub(crate) async fn execute_reserved(
         .await
         .map_err(|error| error.to_string())?;
     let execution = async {
-        let handle = runtime.start_job(key, running.job_id, session.session_id(), code, captures).await?;
+        let handle = runtime
+            .start_job(key, running.job_id, session.session_id(), code, captures)
+            .await?;
         let outcome = handle.wait().await;
         runtime.release_job(key, running.job_id)?;
         outcome.map(|result| (*result).clone())
