@@ -8,7 +8,7 @@ import "./settings.css";
 import "./model-form.css";
 import "./remote-form.css";
 
-type SaveModelRequest = { id?: string; label: string; provider: ModelProfile["provider"]; base_url: string; model: string; credential?: string; reasoning_effort?: ModelProfile["reasoning_effort"]; delegated_model_profile_id?: string | null };
+type SaveModelRequest = { id?: string; label: string; provider: ModelProfile["provider"]; base_url: string; model: string; credential?: string; refresh_catalog?: boolean; reasoning_effort?: ModelProfile["reasoning_effort"]; delegated_model_profile_id?: string | null };
 type FormState = SaveModelRequest & { credential: string };
 type McpEnvFormBinding = McpEnvBinding & { mode: "literal" | "credential" };
 type SaveMcpServerRequest = { id?: string; name: string; command: string; args: string[]; cwd?: string | null; timeout_secs?: number | null; env_bindings?: McpEnvBinding[] };
@@ -127,6 +127,7 @@ export function SettingsPanel({ locale, initialSection = "models", onClose, mode
               <option value="">{zh ? "服务端默认" : "Provider default"}</option>
               {["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"].map((effort) => <option key={effort} value={effort}>{effort}</option>)}
             </select><small>{zh ? "按所选值发送，不自动降档。测试可检查请求是否被接受，不能确认实际生效档位。" : "Sent as selected, with no automatic downgrade. Test checks request acceptance, not the effective effort."}</small></label>}
+            {form.id && <label className="wide"><span><input type="checkbox" aria-label="Refresh catalog capabilities" checked={form.refresh_catalog ?? false} onChange={(event) => setForm({ ...form, refresh_catalog: event.target.checked })} />{zh ? "保存时采用当前目录能力" : "Adopt current catalog capabilities on save"}</span><small>{zh ? "更新能力快照并使用目录上下文额度。保留请求推理档位；能力或预算变化可能使旧运行无法恢复。目录未收录的模型无法刷新。" : "Updates the capability snapshot and uses the catalog context allowance. Keeps requested effort; capability or budget changes may prevent old runs from resuming. Requires an exact catalog entry."}</small></label>}
             <label className="wide">{zh ? "只读子 Agent 模型" : "Read-only subagent model"}<select aria-label="Read-only subagent model" value={form.delegated_model_profile_id ?? ""} onChange={(event) => setForm({ ...form, delegated_model_profile_id: event.target.value || null })}>
               <option value="">{zh ? "沿用主模型" : "Inherit main model"}</option>
               {modelProfiles.filter((profile) => profile.id !== form.id && profile.supports_tools).map((profile) => <option key={profile.id} value={profile.id}>{profile.label} · {profile.model}</option>)}

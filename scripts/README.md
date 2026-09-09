@@ -20,7 +20,8 @@ cargo test -p omicsops-desktop --lib model_
 
 Review the generated diff and the source checksum before committing. The importer
 itself, builds, tests and application startup do not access models.dev. Existing
-profiles keep their snapshots; recreate a profile to intentionally adopt new data.
+profiles keep their snapshots; explicitly select the catalog refresh option when
+editing in Settings to adopt new data. Recreating a profile also adopts it.
 API host matching follows the application's provider contract; model IDs are
 case sensitive and gateway prefixes are significant. A model listing is capability
 metadata, not proof that an account can access that model.

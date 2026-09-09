@@ -199,6 +199,9 @@ models.dev context/output limits. Edit only its label and confirm the frozen
 capabilities remain unchanged. An unknown gateway or longer sibling ID must not
 inherit the official entry. Explicit unsupported reasoning effort or a context
 above the catalog limit must be rejected before credentials are written. A legacy
-profile must retain its original context/vision/tools on edit. Recreate a profile
-to adopt a newer bundled catalog. No real API key or network is needed for saving
+profile must retain its original context/vision/tools on edit. Select the catalog refresh option when editing to adopt the bundled catalog.
+Confirm the option is unchecked after reopening the editor, failed refreshes keep
+the editor available for retry, and Escape immediately closes only the editor.
+Check a changed capability/budget refuses frozen-run resume; an unchanged
+effective configuration must retain its fingerprint. No real API key or network is needed for saving
 these configurations; live model inference is a separate opt-in acceptance test.

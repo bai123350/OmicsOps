@@ -135,7 +135,7 @@ export async function listModelProfiles(): Promise<ModelProfile[]> {
   return isTauri() ? invoke("list_model_profiles") : [];
 }
 
-export async function saveModelProfile(request: { id?: string; label: string; provider: ModelProfile["provider"]; base_url: string; model: string; credential?: string; reasoning_effort?: ModelProfile["reasoning_effort"]; delegated_model_profile_id?: string | null }): Promise<ModelProfile> {
+export async function saveModelProfile(request: { id?: string; label: string; provider: ModelProfile["provider"]; base_url: string; model: string; credential?: string; refresh_catalog?: boolean; reasoning_effort?: ModelProfile["reasoning_effort"]; delegated_model_profile_id?: string | null }): Promise<ModelProfile> {
   if (!isTauri()) return { id: request.id ?? crypto.randomUUID(), label: request.label, provider: request.provider, base_url: request.base_url, model: request.model, credential_reference: request.provider === "ollama" ? null : "model/demo", supports_tools: true, supports_vision: false };
   return invoke("save_model_profile", { request });
 }

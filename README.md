@@ -26,7 +26,13 @@ its saved capabilities, including legacy profiles without a snapshot; creating a
 profile or changing provider/base URL/model adopts the bundled catalog. A known
 catalog rejects context overrides above its limit and unsupported explicit
 reasoning efforts. Missing effort lists do not certify an effective effort.
-Settings shows saved catalog limits. Runtime fingerprints bind effective budgets,
+Settings shows saved catalog limits. When editing, explicitly select “Adopt current
+catalog capabilities on save” to refresh the snapshot and reset the context to the
+bundled limit (an API caller may supply a lower explicit window). Requested effort
+and child binding are retained and revalidated. Unknown entries fail without
+saving. The option starts unchecked on each edit. Changed capabilities or budgets
+can invalidate existing runs' frozen profile bindings; current in-memory clients
+keep their loaded snapshot. Runtime fingerprints bind effective budgets,
 not catalog source metadata. Updating the app does not rewrite existing profiles.
 Catalog generation is offline and documented in `scripts/README.md`.
 

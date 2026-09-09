@@ -7,6 +7,21 @@ use serde_json::json;
 use uuid::Uuid;
 
 #[test]
+fn catalog_refresh_is_explicit_and_round_trips_through_shared_dto() {
+    let mut value = json!({"label":"test","provider":"open_ai_compatible","base_url":"https://api.openai.com/v1","model":"gpt-4o"});
+    let legacy: crate::dto::SaveModelProfileRequest = serde_json::from_value(value.clone()).unwrap();
+    assert!(!legacy.refresh_catalog);
+    for refresh in [false, true] {
+        value["refresh_catalog"] = json!(refresh);
+        let dto: crate::dto::SaveModelProfileRequest = serde_json::from_value(value.clone()).unwrap();
+        let backend: crate::model_commands::SaveModelProfileRequest = serde_json::from_value(serde_json::to_value(dto).unwrap()).unwrap();
+        assert_eq!(backend.refresh_catalog, refresh);
+    }
+    value["refresh_catalog"] = json!("true");
+    assert!(serde_json::from_value::<crate::dto::SaveModelProfileRequest>(value).is_err());
+}
+
+#[test]
 fn model_binding_request_distinguishes_omission_clear_and_selection() {
     let base = json!({"label":"test","provider":"ollama","base_url":"http://127.0.0.1:11434","model":"exact-test"});
     let missing: crate::model_commands::SaveModelProfileRequest =

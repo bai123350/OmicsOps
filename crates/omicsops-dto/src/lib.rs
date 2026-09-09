@@ -42,6 +42,9 @@ pub struct SaveModelProfileRequest {
     pub model: String,
     pub credential: Option<String>,
     pub context_window_tokens: Option<u32>,
+    /// Explicitly adopt the bundled catalog; ordinary edits preserve saved capabilities.
+    #[serde(default)]
+    pub refresh_catalog: bool,
     /// Omission preserves the saved request; null restores provider defaults.
     #[serde(
         default,

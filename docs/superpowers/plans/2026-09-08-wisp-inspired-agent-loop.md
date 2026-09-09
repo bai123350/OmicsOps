@@ -220,3 +220,12 @@ core/tools/desktop 增加只恢复不执行的 recover_result 接口；按原请
 Settings 显示已保存的目录上限。显式 effort 按已公布能力验证，缺失列表不推断实际生效档位。仍待实现其他供应商、价格、图像精确计费、生效档位审计及运行中远端重连。
 
 本增量最终验证（2026-09-09）：`cargo test -p omicsops-desktop --lib model_` 11 项通过、1 项真实环境测试被忽略；Settings 近邻 14 项、离线导入 2 项通过，同源目录逐字节重建一致。`cargo test --workspace`、`npm test`（121 前端/22 扩展）、`npm run build`、`npm run build:desktop` 均通过。Rust 检查后顺序构建，无 dist 清理竞争；格式初查偏差经 `cargo fmt --all` 修复，复查及 diff 检查通过，纯格式单独提交。保持已有 Vite 大 chunk/Windows linker 提示，无依赖或 SQL 迁移变化。真实模型/SSH、macOS 和桌面交互 smoke 未执行；未推送、发布或分发构建产物。只读兼容审查使用 Luna/max。
+
+
+## 2026-09-09：显式刷新目录能力
+
+Settings 编辑模型新增默认未选中的目录刷新选项，经共享 DTO `refresh_catalog`（省略为 false）传递。普通编辑继续保留旧快照；显式刷新采用当前精确目录条目、工具/视觉能力和 context 额度。API 显式传入的窗口仍须通过上限校验。保留同身份的请求 effort 与子模型绑定，不自动降低 effort；未知条目或不兼容 effort 在写入凭据/数据库之前拒绝。失败可在原编辑器重试，关闭后重新编辑不保留刷新意图；沿用窗口 Escape 栈。
+
+刷新不修改已冻结 RunSpec 或运行中内存客户端。实际能力/预算变化仍由已有 profile hash 阻止旧运行恢复；同配置重复刷新保持 hash。无网络请求、依赖或 SQL 迁移变化。其他供应商、价格、图像计费、生效档位审计及远端任务重连仍待开发。
+
+本增量最终验证（2026-09-09）：桌面 refresh 近邻 4 项、Settings 近邻 16 项通过；`cargo test --workspace`、`npm test`（123 前端/22 扩展）、`npm run build`、`npm run build:desktop` 均通过。覆盖共享 DTO 省略/显式值、旧快照保留、显式刷新与重复刷新指纹、窗口覆盖、未知端点拒绝、effort 重验、UI 失败重试及 Escape 层级。格式初查偏差经 `cargo fmt --all` 修复，复查和 diff 检查通过，纯格式单独提交。保留既有 Vite 大 chunk/Windows linker 提示；真实模型、SSH、macOS 和桌面交互 smoke 未执行。未推送、发布或分发构建产物。

@@ -37,6 +37,9 @@ pub fn model_profile_from_request(
     omicsops_core::workspace::validate_reasoning_effort(provider, reasoning_effort.as_deref())?;
     let supports_vision = exact_model_supports_vision(provider, &base_url, &model);
     let catalog = exact_model_capabilities(provider, &base_url, &model);
+    if request.refresh_catalog && catalog.is_none() {
+        return Err("no exact entry in the bundled catalog for this model endpoint".into());
+    }
     Ok(ModelProfile {
         id,
         label: request.label.trim().into(),
@@ -63,6 +66,7 @@ fn merge_existing_profile(
     preserve_binding: bool,
     preserve_window: bool,
     preserve_effort: bool,
+    refresh_catalog: bool,
 ) {
     let Some(existing) = existing else {
         return;
@@ -74,11 +78,13 @@ fn merge_existing_profile(
         && profile.model == existing.model
         && Url::parse(&profile.base_url).ok() == Url::parse(&existing.base_url).ok();
     if same_identity {
-        profile.catalog_capabilities = existing.catalog_capabilities.clone();
-        profile.supports_tools = existing.supports_tools;
-        profile.supports_vision = existing.supports_vision;
-        if preserve_window {
-            profile.context_window_tokens = existing.context_window_tokens;
+        if !refresh_catalog {
+            profile.catalog_capabilities = existing.catalog_capabilities.clone();
+            profile.supports_tools = existing.supports_tools;
+            profile.supports_vision = existing.supports_vision;
+            if preserve_window {
+                profile.context_window_tokens = existing.context_window_tokens;
+            }
         }
         if preserve_effort {
             profile.reasoning_effort = existing.reasoning_effort.clone();
@@ -129,6 +135,7 @@ pub async fn save_model_profile(
     state: State<'_, AppState>,
     request: SaveModelProfileRequest,
 ) -> Result<ModelProfile, String> {
+    let refresh_catalog = request.refresh_catalog;
     let credential = request.credential.clone();
     let preserve_binding = request.delegated_model_profile_id.is_none();
     let preserve_window = request.context_window_tokens.is_none();
@@ -145,6 +152,7 @@ pub async fn save_model_profile(
         preserve_binding,
         preserve_window,
         preserve_effort,
+        refresh_catalog,
     );
     validate_profile_capabilities(&profile)?;
     if let Some(child_id) = profile.delegated_model_profile_id {
@@ -278,9 +286,58 @@ mod tests {
             model: model.into(),
             credential: None,
             context_window_tokens: None,
+            refresh_catalog: false,
             reasoning_effort: None,
             delegated_model_profile_id: None,
         }
+    }
+
+    #[test]
+    fn explicit_refresh_adopts_snapshot_and_preserves_effort_and_binding() {
+        let mut input = request("open_ai_compatible", "https://api.openai.com/v1", "gpt-5.6-luna");
+        let mut saved = model_profile_from_request(input.clone()).unwrap();
+        saved.catalog_capabilities = None;
+        saved.context_window_tokens = Some(32000);
+        saved.supports_vision = false;
+        saved.reasoning_effort = Some("max".into());
+        saved.delegated_model_profile_id = Some(Uuid::new_v4());
+        let old_hash = saved.execution_configuration_hash();
+        input.id = Some(saved.id);
+        input.refresh_catalog = true;
+        let mut refreshed = model_profile_from_request(input.clone()).unwrap();
+        merge_existing_profile(&mut refreshed, Some(&saved), true, true, true, true);
+        validate_profile_capabilities(&refreshed).unwrap();
+        assert!(refreshed.catalog_capabilities.is_some());
+        assert_eq!(refreshed.context_window_tokens, Some(1050000));
+        assert_eq!(refreshed.reasoning_effort, saved.reasoning_effort);
+        assert_eq!(refreshed.delegated_model_profile_id, saved.delegated_model_profile_id);
+        assert_ne!(refreshed.execution_configuration_hash(), old_hash);
+        let mut repeated = model_profile_from_request(input.clone()).unwrap();
+        merge_existing_profile(&mut repeated, Some(&refreshed), true, true, true, true);
+        assert_eq!(repeated.execution_configuration_hash(), refreshed.execution_configuration_hash());
+        input.context_window_tokens = Some(64000);
+        let mut custom = model_profile_from_request(input).unwrap();
+        merge_existing_profile(&mut custom, Some(&saved), true, false, true, true);
+        assert_eq!(custom.context_window_tokens, Some(64000));
+    }
+
+    #[test]
+    fn refresh_rejects_unknown_endpoints_and_revalidates_saved_effort() {
+        let mut unknown = request("open_ai_compatible", "https://gateway.example/v1", "gpt-4o");
+        unknown.refresh_catalog = true;
+        assert!(model_profile_from_request(unknown).is_err());
+        let mut input = request("open_ai_compatible", "https://api.openai.com/v1", "gpt-4o");
+        let mut legacy = model_profile_from_request(input.clone()).unwrap();
+        legacy.catalog_capabilities = None;
+        legacy.reasoning_effort = Some("max".into());
+        input.refresh_catalog = true;
+        let mut refreshed = model_profile_from_request(input).unwrap();
+        merge_existing_profile(&mut refreshed, Some(&legacy), true, true, true, true);
+        assert!(validate_profile_capabilities(&refreshed).is_err());
+        refreshed.reasoning_effort = None;
+        assert!(validate_profile_capabilities(&refreshed).is_ok());
+        assert!(legacy.catalog_capabilities.is_none());
+        assert_eq!(legacy.reasoning_effort.as_deref(), Some("max"));
     }
 
     #[test]
@@ -370,7 +427,7 @@ mod tests {
         .unwrap();
         edited.id = old.id;
         edited.label = "Renamed".into();
-        merge_existing_profile(&mut edited, Some(&old), true, true, true);
+        merge_existing_profile(&mut edited, Some(&old), true, true, true, false);
         assert_eq!(edited.execution_configuration_hash(), hash);
         assert!(edited.catalog_capabilities.is_none());
         assert_eq!(edited.effective_context_window_tokens(), 32768);
@@ -382,7 +439,7 @@ mod tests {
         ))
         .unwrap();
         replacement.id = old.id;
-        merge_existing_profile(&mut replacement, Some(&old), true, true, true);
+        merge_existing_profile(&mut replacement, Some(&old), true, true, true, false);
         assert!(replacement.catalog_capabilities.is_some());
         assert_ne!(replacement.execution_configuration_hash(), hash);
     }
@@ -410,7 +467,7 @@ mod tests {
         ))
         .unwrap();
         edited.id = saved.id;
-        merge_existing_profile(&mut edited, Some(&saved), true, true, true);
+        merge_existing_profile(&mut edited, Some(&saved), true, true, true, false);
         assert_eq!(edited.catalog_capabilities, saved.catalog_capabilities);
         assert_eq!(
             edited.execution_configuration_hash(),
