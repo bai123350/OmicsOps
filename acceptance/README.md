@@ -131,3 +131,15 @@ verify no duplicate or cross-run guidance appears. Approved plans must not expos
 the input panel or accept the backend command. Applied means context consumption,
 not task completion. Real model, SSH and macOS smoke have not been executed for
 this change; automated tests use fake models and temporary SQLite databases.
+
+## Runtime job identity smoke (Windows/macOS/SSH)
+
+Use only the existing disposable acceptance environment. Execute a small synthetic
+Python or R cell, verify its result retains the kernel-session reference and adds
+a runtime-job reference. During another cell, stop the Agent or disconnect the
+backend and resume the original run: verify the original dispatch requires
+reconciliation and does not automatically execute again. An unknown record is
+not proof that a remote process stopped. Check that normal subsequent cells with
+new call IDs still share the intended interpreter session. These manual scenarios
+have not been executed for this increment; deterministic tests use temporary SQLite
+and a fake interpreter, without API keys or a real SSH host.

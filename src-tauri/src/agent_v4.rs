@@ -4432,7 +4432,9 @@ impl DesktopToolExecutorV4 {
                 validate_kernel_code(&code).map_err(|e| e.to_string())?;
                 validate_capture_paths(&captures).map_err(|e| e.to_string())?;
                 let key = self.key(language, environment)?;
-                let mut result = self.runtime.execute(&key, code, captures).await?;
+                let (running, mut result) = crate::runtime_jobs_v4::execute_reserved(
+                    &self.repository, &self.runtime, &key, &call, code, captures,
+                ).await?;
                 result.software_versions = self
                     .software_versions(
                         language,
@@ -4446,6 +4448,9 @@ impl DesktopToolExecutorV4 {
                             .filter_map(Value::as_str),
                     )
                     .await;
+                self.repository.advance_runtime_job_v4(&running,
+                    if result.succeeded { omicsops_protocol::RuntimeJobStateV4::Succeeded } else { omicsops_protocol::RuntimeJobStateV4::Failed },
+                    None, Some(&result)).await.map_err(|error| error.to_string())?;
                 let content = format!(
                     "session={} process={} request={}\nstdout ({} bytes, sha256={}):\n{}\nstderr ({} bytes, sha256={}):\n{}",
                     result.session_id,
@@ -4476,7 +4481,7 @@ impl DesktopToolExecutorV4 {
                     succeeded: result.succeeded,
                     model_content: content,
                     data: serde_json::to_value(&result).map_err(|e| e.to_string())?,
-                    provenance: vec![format!("kernel-session:{}", result.session_id)],
+                    provenance: vec![format!("kernel-session:{}", result.session_id), format!("runtime-job:{}", running.job_id)],
                 });
             }
             "runtime.environment.ensure" => {

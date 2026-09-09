@@ -44,7 +44,7 @@ UI 使用内联面板，区分已接收和已应用，失败保留原文并复�
 
 ## 切片 6：结构化等待的闭环
 
-前置调查：当前 KernelProcessV4::execute 仍为等待最终结果的同步异步调用，session_id 是解释器会话而非可恢复的计算任务句柄。下一增量须先定义持久化计算任务 ID、启动幂等及 running/unknown/terminal 状态，再接入等待与恢复；不能把会话 ID 当作任务 ID，也不新建通用 shell 长超时。fake backend 覆盖启动成功、运行中、断线未知、完成产物、取消未确认；等待期间不重复启动任务，也不以固定频率调用模型。真实 SSH/GPU 等另行一次性验收。
+前置调查：当前 KernelProcessV4::execute 仍为等待最终结果的同步异步调用，session_id 是解释器会话而非可恢复的计算任务句柄。已补充独立任务 ID、持久化启动占用和 reserved/running/unknown/succeeded/failed 状态；下一增量接入后台等待与恢复；不能把会话 ID 当作任务 ID，也不新建通用 shell 长超时。fake backend 覆盖启动成功、运行中、断线未知、完成产物、取消未确认；等待期间不重复启动任务，也不以固定频率调用模型。真实 SSH/GPU 等另行一次性验收。
 
 ## 每个切片的验证和回滚
 
@@ -132,3 +132,24 @@ UI 使用内联面板，区分已接收和已应用，失败保留原文并复�
 主执行循环按单个工具 future 检查指导收件箱：仅 ordinary Agent 的 ReadOnly 等待可提前返回 guidance_interrupted；join_all 保留已完成结果，主循环按既有 ToolFinished 路径收口后消费指导。网络、runtime、写入和委派操作不丢弃 future；已批准计划不受影响。停止等待不等于终止底层远端操作，指导不会触发全 run 的 runtime interrupt。此能力尚未扩展到委派子循环。
 
 2026-09-08 实际验证：`cargo test --workspace` 通过（core 80 项，真实环境 ignored 未执行）；`npm test` 通过（116 项前端、22 项扩展）；`npm run build` 通过（已有大 chunk 提示）；`cargo fmt --all` 后格式复查通过，格式独立提交。新增测试覆盖已完成读取证据保留、未完成读取切入、消费与恢复不重放、所有副作用分类与 approved_plan 等待真实结果。`npm run build:desktop` 未执行，本次未改桌面组合/配置/打包；真实模型、SSH 和 Windows/macOS 交互 smoke 未执行。
+
+## 切片 6：持久化计算任务基础
+
+2026-09-09，新增 RuntimeJobV4 与 runtime_jobs_v4 表。job_id 区分单次调用与可复用 session_id；同 run/call_id 只有一次初始启动资格，项目、执行上下文、冻结 compute selection、已记录请求 hash 和未解决派发均须匹配。已有记录（包括未知、失败或成功）不会重新授予启动资格，旧已完成/不确定派发也不能借缺失任务记录重放。
+
+桌面 runtime.execute 在启动解释器前持久化 reserved，取得会话后记录 running，收到结果并补齐软件版本后记录 succeeded/failed 及结果 request_id/SHA-256。任务表不复制代码、stdout/stderr、进程字符串、凭据或产物内容；原始 ToolFinished/归档仍负责证据，provenance 增加 runtime-job 引用。表由现有幂等迁移创建，无依赖变更。
+
+运行失败、取消及 ToolDispatchUncertain 与未完成任务转 unknown 在同一事件事务提交；并发状态更新使用 CAS，迟到完成不能覆盖 unknown。reserved/running 只反映最后持久化阶段，不证明远端仍存活；崩溃恢复沿用原 uncertain dispatch 核验流程。任务摘要成功不等于 Agent 完成，也不能取代完整工具证据。
+
+本增量不启动后台 worker、不添加模型轮询、不重跑未知计算，不宣称自动重连已完成。后台 start/status/wait、可验证的远端终态与产物重新挂接、取消确认、等待 UI，以及子委派等待切入仍待后续开发。Windows/macOS/SSH 使用各自现有 RuntimeManager 后端，无新增 Unix-only 命令。
+
+本增量实际验证（2026-09-09）：
+
+- `cargo test -p omicsops-store --test runtime_jobs` 初次 5 项通过，新增事务故障测试后在完整工作区测试中共 6 项通过。
+- `cargo test -p omicsops-desktop runtime_jobs_v4 --lib` 通过，模拟成功/断线、并发重复请求、重建管理器均只启动一次。
+- `cargo test --workspace` 通过，真实环境 ignored 未执行。
+- `npm test` 通过：116 项前端测试、22 项扩展测试。
+- `npm run build` 和 `npm run build:desktop` 通过；已有 Vite 大 chunk 与 Windows linker 信息提示，未发布或分发构建产物。
+- `cargo fmt --all -- --check` 初次发现偏差，执行 `cargo fmt --all` 后复查通过；纯格式修改单独提交。`git diff --check` 通过。
+
+未执行真实模型、SSH、Windows/macOS 交互 smoke。以上验证不代表后台计算等待/重连端到端完成。

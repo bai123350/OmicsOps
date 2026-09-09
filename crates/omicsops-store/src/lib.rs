@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 const SCHEMA_VERSION: u32 = 4;
 mod guidance;
+mod runtime_jobs;
 const INIT_SQL: &str = include_str!("../migrations/init.sql");
 const SETTINGS_GLOBAL_SCOPE: &str = "global";
 const CONVERSATION_AGENT_MODE_SETTING_PREFIX: &str = "conversation_agent_mode:";
@@ -3471,6 +3472,7 @@ impl Store {
         } else {
             None
         };
+        runtime_jobs::observe_runtime_event(&mut tx, event).await?;
         tx.commit().await?;
         Ok(message)
     }
@@ -6503,6 +6505,7 @@ async fn insert_agent_event_in_tx(
     .bind(timestamp(event.occurred_at))
         .execute(&mut *tx)
     .await?;
+    runtime_jobs::observe_runtime_event(tx, event).await?;
     Ok(())
 }
 

@@ -823,6 +823,14 @@ CREATE TABLE IF NOT EXISTS agent_runs_v4 (
     updated_at INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS runtime_jobs_v4 (
+    job_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES agent_runs_v4(run_id) ON DELETE CASCADE,
+    call_id TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    UNIQUE(run_id, call_id)
+);
+
 CREATE TABLE IF NOT EXISTS agent_guidance_v4 (
     message_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES agent_runs_v4(run_id) ON DELETE CASCADE,

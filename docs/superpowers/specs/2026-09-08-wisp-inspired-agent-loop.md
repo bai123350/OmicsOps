@@ -114,6 +114,8 @@ Settings 新增可选只读子 profile 绑定。ordinary run 创建时把 profil
 
 新增协议字段采用可选/default，旧事件可读取，迁移幂等。新增事件要同步更新归约、hash/sequence 校验、store、checkpoint、DTO 和 UI 投影，不能仅在前端显示一个不可恢复的状态。本文不预先指定新 SQL 表，以免重复现有事件存储。
 
+计算任务基础现已使用独立 runtime_jobs_v4 元数据表：每 run/call_id 的持久化启动占用绑定请求 hash 和执行上下文，任务 ID 区别于解释器会话 ID；事件事务将取消或不确定派发转为 unknown，恢复不自动重跑。结果只存 request_id 与摘要，证据仍沿用 ToolFinished/归档。后台等待、远端状态查询与自动恢复仍未实施。
+
 ## 9. 平台、界面与安全
 
 Windows 使用现有无控制台后台进程策略和 Windows 路径处理；macOS 使用原生路径/进程策略。SSH/WSL 通过对应 ExecutionContext 执行，不能假设本地有 bash、nohup 或 kill。run-owned 资源清理不得影响用户其他计算或浏览器窗口。

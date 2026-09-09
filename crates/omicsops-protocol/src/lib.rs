@@ -8,6 +8,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod runtime_job;
+pub use runtime_job::*;
+
 pub const AGENT_RUNTIME_V4: &str = "omicsops.agent-runtime@4.0.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

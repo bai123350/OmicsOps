@@ -96,3 +96,11 @@ and is applied at the next model boundary. Pending read-only tools yield;
 completed results are retained. Dispatched side-effecting tools finish their
 batch first. Retries reuse the message ID, and pending input survives restart. Guidance
 cannot modify an approved plan or expand execution permissions.
+
+Runtime invocations now have a durable job identity separate from the interpreter
+session. Repeating the same recorded invocation cannot launch a second computation,
+including after an uncertain connection failure. Cancellation records unfinished
+jobs as unknown, not as confirmed remote cancellation. Completed output remains
+in the existing tool events and archives; the job ledger stores only metadata and
+a result digest. Background job waiting and automatic reconnection are not yet
+implemented.
