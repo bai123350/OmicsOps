@@ -1,6 +1,6 @@
 # wisp-inspired Agent Loop 实施计划
 
-日期：2026-09-08。状态：已实现前三个切片的执行保护及切片 4 的有界委派/冻结角色 profile；设计见 [设计文档](../specs/2026-09-08-wisp-inspired-agent-loop.md)。切片 5 已接入持久化指导与模型等待切入；完整规格目录/准确图片成本、推理档位配置和切片 6 待实施，不能将六步计划整体标为完成。
+日期：2026-09-08。状态：已实现前三个切片的执行保护及切片 4 的有界委派/冻结角色 profile；设计见 [设计文档](../specs/2026-09-08-wisp-inspired-agent-loop.md)。切片 5 已接入持久化指导及模型/主循环只读工具等待切入；切片 6 已有后台 worker、完成结果回执和桌面恢复入口。OpenAI-compatible 显式推理档位请求已接通；完整规格目录/准确图片成本、生效档位审计、运行中远端任务重连仍待实施，不能将六步计划整体标为完成。
 
 ## 切片 1：完整请求预算
 
@@ -179,3 +179,11 @@ core/tools/desktop 增加只恢复不执行的 recover_result 接口；按原请
 内联轨迹显示“结果待恢复”与“恢复已保存结果”。使用既有 resume 命令，按钮在提交时禁用，同一 call 的 ToolFinished 收口后提示消失。没有新增覆盖层。新事件是加法协议变更，旧程序无法理解时不得跳过恢复。10 项 runtime job 存储测试包含原子暂停、并发只提示一次、故障回滚、不完整/未知拒绝；WorkspaceShell 测试覆盖恢复按钮与结果收口。
 
 桌面入口增量最终验证（2026-09-09）：`cargo test --workspace` 通过；`npm test` 通过（117 项前端、22 项扩展）；`npm run build`、`npm run build:desktop` 通过，保留现有大 chunk/linker 提示。`cargo fmt --all -- --check` 初次偏差经 `cargo fmt --all` 修复后通过，格式单独提交；`git diff --check` 通过。无依赖变化；真实模型、SSH、macOS 和桌面交互验收未执行；未推送或分发安装包。
+
+## 2026-09-09：显式推理档位配置
+
+已接通设置编辑、共享 DTO 三态保存、ModelProfile JSON 持久化、主/子独立客户端与 probe/正式请求。显式 effort 进入冻结子模型哈希，旧空值哈希兼容。未实现完整能力目录/实际档位回报或简单任务自动路由；用户仍需保存精确服务型号的 profile 并配置子模型绑定。本轮不增加任何型号能力猜测。
+
+确定性覆盖：档位隔离、省略/清空、非法协议和值、请求预算包含档位、probe 输出预算优先、存储重读和冻结哈希变更；设置测试覆盖保存/清空后子模型配置保持独立。
+
+实际验证：适配器近邻测试 3 项、设置近邻测试 13 项通过；最终 `cargo test --workspace`、`npm test`（118 前端/22 扩展）、`npm run build`、`npm run build:desktop` 均通过。首次工作区检查与 Web 构建并行时，Tauri 读取 dist/index.html 遇到 Vite 清理窗口而失败；Web 完成后顺序重跑工作区检查通过。格式初查失败，执行 `cargo fmt --all` 后复查通过，纯格式单独提交；diff 检查通过。保留既有 Vite chunk/linker 提示，无依赖变化，未推送或分发安装包。真实模型/SSH/macOS 和桌面交互验收未执行，服务端实际 effort 未验证。

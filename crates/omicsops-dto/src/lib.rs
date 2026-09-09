@@ -42,6 +42,9 @@ pub struct SaveModelProfileRequest {
     pub model: String,
     pub credential: Option<String>,
     pub context_window_tokens: Option<u32>,
+    /// Omission preserves the saved request; null restores provider defaults.
+    #[serde(default, deserialize_with = "explicit_nullable_string", skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<Option<String>>,
     /// Omission preserves an existing binding; explicit null restores inheritance.
     #[serde(
         default,
@@ -49,6 +52,10 @@ pub struct SaveModelProfileRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub delegated_model_profile_id: Option<Option<Uuid>>,
+}
+
+fn explicit_nullable_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 fn explicit_nullable_uuid<'de, D: serde::Deserializer<'de>>(

@@ -118,3 +118,13 @@ are available, it preserves the run and offers **Resume saved results** instead
 of marking it failed. Resuming follows the original run and frozen configuration.
 Missing receipts, explicitly uncertain dispatches and terminal runs retain their
 existing handling; this does not reconnect to a still-running remote process.
+
+OpenAI-compatible model settings now expose **Requested reasoning effort**. Save
+an explicit wire value (including `max`) or choose **Provider default** to omit
+it. Each saved profile, including a bound read-only child, uses its own setting;
+changing a frozen child's effort requires a new run. Older callers that omit
+this setting preserve it, while explicit null clears it. Test sends the same
+effort with a 4096-token output allowance unless a request budget overrides it.
+Acceptance of a request does not prove the service used that effort. There is no
+automatic downgrade, model-family capability inference or automatic Luna route;
+the full capability catalog and effective-effort reporting remain pending.

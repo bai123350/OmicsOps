@@ -102,6 +102,7 @@ export interface ModelProfile {
   supports_tools: boolean;
   supports_vision: boolean;
   context_window_tokens?: number | null;
+  reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | null;
   delegated_model_profile_id?: string | null;
 }
 

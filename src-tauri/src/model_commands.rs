@@ -33,6 +33,8 @@ pub fn model_profile_from_request(
         return Err("choose another delegated profile or inherit the main model".into());
     }
     let model = request.model.trim().to_owned();
+    let reasoning_effort = request.reasoning_effort.flatten();
+    omicsops_core::workspace::validate_reasoning_effort(provider, reasoning_effort.as_deref())?;
     let supports_vision = exact_model_supports_vision(provider, &base_url, &model);
     Ok(ModelProfile {
         id,
@@ -45,6 +47,7 @@ pub fn model_profile_from_request(
         supports_tools: true,
         supports_vision,
         context_window_tokens: request.context_window_tokens,
+        reasoning_effort,
         delegated_model_profile_id: request.delegated_model_profile_id.flatten(),
     })
 }
@@ -66,8 +69,9 @@ pub async fn save_model_profile(
     let credential = request.credential.clone();
     let preserve_binding = request.delegated_model_profile_id.is_none();
     let preserve_window = request.context_window_tokens.is_none();
+    let preserve_effort = request.reasoning_effort.is_none();
     let mut profile = model_profile_from_request(request)?;
-    if preserve_binding || preserve_window {
+    if preserve_binding || preserve_window || preserve_effort {
         if let Some(existing) = state
             .repository
             .get_model_profile(profile.id)
@@ -80,8 +84,12 @@ pub async fn save_model_profile(
             if preserve_window {
                 profile.context_window_tokens = existing.context_window_tokens;
             }
+            if preserve_effort {
+                profile.reasoning_effort = existing.reasoning_effort;
+            }
         }
     }
+    omicsops_core::workspace::validate_reasoning_effort(profile.provider, profile.reasoning_effort.as_deref())?;
     if let Some(child_id) = profile.delegated_model_profile_id {
         let child = state
             .repository
@@ -174,6 +182,7 @@ async fn client_for_profile(
         profile.model,
         credential,
     )
+    .and_then(|client| client.with_reasoning_effort(profile.reasoning_effort))
     .map_err(|error| error.to_string())
 }
 
@@ -190,7 +199,17 @@ mod tests {
             model: model.into(),
             credential: None,
             context_window_tokens: None,
+            reasoning_effort: None,
             delegated_model_profile_id: None,
+        }
+    }
+
+    #[test]
+    fn effort_validation_rejects_protocol_mismatch_and_invalid_values() {
+        for (provider, effort) in [("anthropic", "max"), ("ollama", "max"), ("open_ai_compatible", "MAX")] {
+            let mut input = request(provider, "https://gateway.example/v1", "exact-model");
+            input.reasoning_effort = Some(Some(effort.into()));
+            assert!(model_profile_from_request(input).is_err());
         }
     }
 

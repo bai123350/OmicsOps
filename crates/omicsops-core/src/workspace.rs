@@ -248,6 +248,9 @@ pub struct ModelProfile {
     pub supports_vision: bool,
     #[serde(default)]
     pub context_window_tokens: Option<u32>,
+    /// Explicit OpenAI-compatible wire request; not a capability declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// Optional profile for read-only delegation in newly created ordinary runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegated_model_profile_id: Option<Uuid>,
@@ -257,12 +260,16 @@ impl ModelProfile {
     pub fn execution_configuration_hash(&self) -> String {
         use sha2::{Digest, Sha256};
         // Credentials and labels do not belong in the execution identity.
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "profile_id": self.id, "provider": self.provider, "base_url": self.base_url,
             "model": self.model, "supports_tools": self.supports_tools,
             "supports_vision": self.supports_vision,
             "context_window_tokens": self.effective_context_window_tokens(),
         });
+        // Preserve hashes of legacy profiles that never requested an effort.
+        if let Some(effort) = &self.reasoning_effort {
+            value["reasoning_effort"] = serde_json::json!(effort);
+        }
         hex::encode(Sha256::digest(
             serde_json::to_vec(&value).expect("serializable profile"),
         ))
@@ -271,6 +278,17 @@ impl ModelProfile {
     pub fn effective_context_window_tokens(&self) -> u32 {
         self.context_window_tokens.unwrap_or(32_768)
     }
+}
+
+pub fn validate_reasoning_effort(provider: ModelProviderKind, effort: Option<&str>) -> Result<(), &'static str> {
+    let Some(effort) = effort else { return Ok(()); };
+    if provider != ModelProviderKind::OpenAiCompatible {
+        return Err("explicit reasoning effort currently requires an OpenAI-compatible provider");
+    }
+    if !matches!(effort, "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra") {
+        return Err("unsupported reasoning effort value");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

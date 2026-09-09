@@ -3,6 +3,26 @@ import { describe, expect, it, vi } from "vitest";
 import { SettingsPanel } from "./SettingsPanel";
 
 describe("SettingsPanel model providers", () => {
+  it("edits and explicitly clears requested effort without changing the child binding", async () => {
+    const profile = { id: "main", label: "Main", provider: "open_ai_compatible" as const, base_url: "https://gateway.example/v1", model: "exact-model", credential_reference: null, supports_tools: true, supports_vision: false, reasoning_effort: "max" as const, delegated_model_profile_id: "child" };
+    const child = { ...profile, id: "child", label: "Reader", reasoning_effort: "low" as const, delegated_model_profile_id: null };
+    const save = vi.fn().mockResolvedValue(undefined);
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[profile, child]} onSaveModel={save} />);
+    fireEvent.click(screen.getAllByRole("button", { name: "Edit" })[0]);
+    expect(screen.getByLabelText("Requested reasoning effort")).toHaveValue("max");
+    fireEvent.change(screen.getByLabelText("Requested reasoning effort"), { target: { value: "high" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    await waitFor(() => expect(screen.queryByLabelText("Requested reasoning effort")).not.toBeInTheDocument());
+    expect(save).toHaveBeenLastCalledWith(expect.objectContaining({ id: "main", reasoning_effort: "high", delegated_model_profile_id: "child" }));
+    fireEvent.click(screen.getAllByRole("button", { name: "Edit" })[0]);
+    fireEvent.change(screen.getByLabelText("Requested reasoning effort"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    await waitFor(() => expect(screen.queryByLabelText("Requested reasoning effort")).not.toBeInTheDocument());
+    expect(save).toHaveBeenLastCalledWith(expect.objectContaining({ reasoning_effort: null }));
+    fireEvent.click(screen.getAllByRole("button", { name: "Edit" })[1]);
+    expect(screen.getByLabelText("Requested reasoning effort")).toHaveValue("low");
+  });
+
   it("saves a selected child profile, clears it explicitly, and closes only the form on Escape", async () => {
     const child = { id: "child", label: "Reader", provider: "ollama" as const, base_url: "http://127.0.0.1:11434", model: "reader-model", credential_reference: null, supports_tools: true, supports_vision: false };
     const main = { ...child, id: "main", label: "Main", delegated_model_profile_id: "child" };

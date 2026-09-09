@@ -1003,6 +1003,7 @@ pub struct UnifiedModelClient {
     model: String,
     credential: Option<String>,
     request_budget: Option<RequestBudget>,
+    reasoning_effort: Option<String>,
     http: reqwest::Client,
 }
 
@@ -1043,6 +1044,7 @@ impl UnifiedModelClient {
             model: model.into(),
             credential,
             request_budget: None,
+            reasoning_effort: None,
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
                 .timeout(MODEL_REQUEST_TIMEOUT)
@@ -1063,17 +1065,40 @@ impl UnifiedModelClient {
         self.request_budget
     }
 
+    /// Send an explicit wire value unchanged. This does not assert that a
+    /// particular model or gateway supports it, nor silently downgrade it.
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> AdapterResult<Self> {
+        use omicsops_core::workspace::{ModelProviderKind, validate_reasoning_effort};
+        let provider = match self.protocol {
+            ProviderProtocol::OpenAiCompatible => ModelProviderKind::OpenAiCompatible,
+            ProviderProtocol::Anthropic => ModelProviderKind::Anthropic,
+            ProviderProtocol::Ollama => ModelProviderKind::Ollama,
+        };
+        validate_reasoning_effort(provider, effort.as_deref())
+            .map_err(|error| AdapterError::Llm(error.into()))?;
+        self.reasoning_effort = effort;
+        Ok(self)
+    }
+
+    fn apply_reasoning_effort(&self, body: &mut Value) {
+        if let Some(effort) = &self.reasoning_effort {
+            body["reasoning_effort"] = json!(effort);
+        }
+    }
+
     fn build_provider_request(
         &self,
         request: &ProviderModelRequest,
     ) -> AdapterResult<ProviderRequest> {
-        build_provider_request_with_optional_budget(
+        let mut built = build_provider_request_with_optional_budget(
             self.protocol,
             self.base_url.clone(),
             &self.model,
             request,
             self.request_budget,
-        )
+        )?;
+        self.apply_reasoning_effort(&mut built.body);
+        Ok(built)
     }
 
     /// Validate the complete provider-shaped request before any network I/O.
@@ -1213,8 +1238,7 @@ impl UnifiedModelClient {
         Ok(())
     }
 
-    pub async fn probe(&self) -> AdapterResult<ModelProbeResult> {
-        let endpoint = provider_endpoint(self.protocol, self.base_url.clone())?;
+    fn probe_body(&self) -> AdapterResult<Value> {
         let mut body = match self.protocol {
             ProviderProtocol::OpenAiCompatible => json!({
                 "model": self.model,
@@ -1234,6 +1258,16 @@ impl UnifiedModelClient {
                 "messages": [{"role":"user", "content":"Reply with OK."}]
             }),
         };
+        self.apply_reasoning_effort(&mut body);
+        if self.reasoning_effort.is_some() {
+            // Reasoning consumes output tokens too; the legacy 16-token
+            // connection probe cannot exercise an explicit reasoning request.
+            body["max_tokens"] = json!(4096);
+            if is_official_openai_endpoint(&self.base_url) {
+                body.as_object_mut().unwrap().remove("max_tokens");
+                body["max_completion_tokens"] = json!(4096);
+            }
+        }
         if let Some(budget) = self.request_budget {
             match self.protocol {
                 ProviderProtocol::OpenAiCompatible
@@ -1251,6 +1285,12 @@ impl UnifiedModelClient {
             }
             budget.validate_provider_json(&body)?;
         }
+        Ok(body)
+    }
+
+    pub async fn probe(&self) -> AdapterResult<ModelProbeResult> {
+        let endpoint = provider_endpoint(self.protocol, self.base_url.clone())?;
+        let body = self.probe_body()?;
         let mut builder = self.http.post(endpoint.clone()).json(&body);
         match self.protocol {
             ProviderProtocol::Anthropic => {
@@ -1283,6 +1323,7 @@ impl UnifiedModelClient {
         let value: Value = serde_json::from_str(&text).map_err(|error| {
             AdapterError::Llm(format!("{} returned invalid JSON: {error}", endpoint))
         })?;
+        validate_response_end(self.protocol, &value)?;
         let response_text = match self.protocol {
             ProviderProtocol::OpenAiCompatible => value
                 .pointer("/choices/0/message/content")
@@ -1548,5 +1589,67 @@ impl OpenAiCompatibleClient {
                 "model returned an invalid capability probe".into(),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod reasoning_effort_tests {
+    use super::*;
+
+    fn client(model: &str) -> UnifiedModelClient {
+        UnifiedModelClient::new(Uuid::new_v4(), ProviderProtocol::OpenAiCompatible,
+            Url::parse("https://api.openai.com/v1").unwrap(), model, Some("test-only".into())).unwrap()
+    }
+
+    fn request() -> ProviderModelRequest {
+        ProviderModelRequest { system: "test".into(), messages: vec![], tools: vec![], require_strict_json_fallback: false }
+    }
+
+    #[test]
+    fn explicit_effort_is_isolated_and_survives_probe_and_fallback_shapes() {
+        let main = client("main").with_reasoning_effort(Some("low".into())).unwrap();
+        let child = client("child").with_reasoning_effort(Some("max".into())).unwrap();
+        for (client, expected) in [(&main, "low"), (&child, "max")] {
+            let built = client.build_provider_request(&request()).unwrap();
+            assert_eq!(built.body["reasoning_effort"], expected);
+            let mut fallback = built.body.clone();
+            fallback["stream"] = json!(false);
+            assert_eq!(fallback["reasoning_effort"], expected);
+            let probe = client.probe_body().unwrap();
+            assert_eq!(probe["reasoning_effort"], expected);
+            assert_eq!(probe["max_completion_tokens"], 4096);
+            assert!(probe.get("max_tokens").is_none());
+        }
+        let inherited = client("legacy");
+        assert!(inherited.build_provider_request(&request()).unwrap().body.get("reasoning_effort").is_none());
+        assert!(inherited.probe_body().unwrap().get("reasoning_effort").is_none());
+        let reset = child.with_reasoning_effort(None).unwrap();
+        assert!(reset.build_provider_request(&request()).unwrap().body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_values_and_other_protocols_without_network() {
+        for value in ["", "MAX", " max", "arbitrary"] {
+            assert!(client("exact").with_reasoning_effort(Some(value.into())).is_err());
+        }
+        for protocol in [ProviderProtocol::Anthropic, ProviderProtocol::Ollama] {
+            let client = UnifiedModelClient::new(Uuid::new_v4(), protocol, Url::parse("http://127.0.0.1:1").unwrap(), "exact", Some("test-only".into())).unwrap();
+            assert!(client.with_reasoning_effort(Some("max".into())).is_err());
+        }
+    }
+
+    #[test]
+    fn budget_includes_effort_and_probe_uses_the_same_output_reservation() {
+        let plain = client("exact").with_request_budget(RequestBudget { context_window_tokens: 10000, reserved_output_tokens: 1, safety_margin_tokens: 0 });
+        let bytes = serde_json::to_vec(&plain.build_provider_request(&request()).unwrap().body).unwrap().len() as u32;
+        let budget = RequestBudget { context_window_tokens: bytes + 1, reserved_output_tokens: 1, safety_margin_tokens: 0 };
+        let plain = plain.with_request_budget(budget);
+        plain.validate_request(&request()).unwrap();
+        let configured = plain.with_reasoning_effort(Some("max".into())).unwrap().with_request_budget(budget);
+        assert!(configured.validate_request(&request()).unwrap_err().to_string().contains("request budget:"));
+        let configured = configured.with_request_budget(RequestBudget { context_window_tokens: 10000, reserved_output_tokens: 100, safety_margin_tokens: 1 });
+        let probe = configured.probe_body().unwrap();
+        assert_eq!(probe["max_completion_tokens"], 100);
+        assert_eq!(probe["reasoning_effort"], "max");
     }
 }

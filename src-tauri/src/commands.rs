@@ -375,5 +375,6 @@ pub(crate) fn unified_model_client_for_profile(
         profile.model.clone(),
         credential,
     )
+    .and_then(|client| client.with_reasoning_effort(profile.reasoning_effort.clone()))
     .map_err(|error| error.to_string())
 }

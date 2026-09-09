@@ -5756,6 +5756,13 @@ mod tests {
             .unwrap()
             .unwrap();
         validate_delegated_profile(&child, &binding).unwrap();
+        let legacy_hash = child.execution_configuration_hash();
+        child.reasoning_effort = Some("max".into());
+        assert!(validate_delegated_profile(&child, &binding).is_err());
+        repository.save_model_profile(&child).await.unwrap();
+        assert_eq!(repository.get_model_profile(child.id).await.unwrap().unwrap().reasoning_effort.as_deref(), Some("max"));
+        child.reasoning_effort = None;
+        assert_eq!(child.execution_configuration_hash(), legacy_hash);
         child.label = "renamed".into();
         child.credential_reference = Some("safe-keyring-reference".into());
         validate_delegated_profile(&child, &binding).unwrap();

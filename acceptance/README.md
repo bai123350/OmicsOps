@@ -157,3 +157,13 @@ be submitted twice while busy, and the prompt disappears after tool results are
 recorded. A missing receipt or explicitly uncertain dispatch must not expose this
 shortcut. The exact interruption window is covered by deterministic receipt/store
 fixtures; real desktop restart and remote-host smoke have not been executed.
+
+For reasoning-effort smoke on Windows/macOS, edit an OpenAI-compatible profile,
+select a documented effort for its exact service/model, save and reopen it; clear
+it with Provider default. Edit a bound child independently and check the parent
+selection remains intact. Test now sends the selected effort and allows 4096
+output tokens (or the configured request budget). A passing connection probe
+shows request acceptance only, not confirmed effective effort. Verify a frozen
+child rejects changed effort on resume. Real model/gateway smoke has not been
+executed; do not interpret deterministic request-shape tests as Luna/max service
+acceptance. Anthropic/Ollama effort mapping and catalog-driven choices are pending.

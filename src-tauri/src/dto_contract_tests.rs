@@ -153,3 +153,19 @@ fn browser_authorization_contract_binds_scope_host_session_and_protocol() {
     );
     assert_eq!(serde_json::to_value(grant).unwrap(), value);
 }
+
+#[test]
+fn reasoning_effort_request_distinguishes_omission_clear_and_value() {
+    let base = json!({"label":"test","provider":"open_ai_compatible","base_url":"https://gateway.example/v1","model":"exact-test"});
+    let missing: crate::dto::SaveModelProfileRequest = serde_json::from_value(base.clone()).unwrap();
+    assert_eq!(missing.reasoning_effort, None);
+    assert!(serde_json::to_value(missing).unwrap().get("reasoning_effort").is_none());
+    for value in [None, Some("max".to_string()), Some("none".to_string())] {
+        let mut payload = base.clone();
+        payload["reasoning_effort"] = json!(value);
+        let dto: crate::dto::SaveModelProfileRequest = serde_json::from_value(payload).unwrap();
+        let backend: crate::model_commands::SaveModelProfileRequest = serde_json::from_value(serde_json::to_value(dto).unwrap()).unwrap();
+        assert_eq!(backend.reasoning_effort, Some(value.clone()));
+        assert_eq!(crate::model_commands::model_profile_from_request(backend).unwrap().reasoning_effort, value);
+    }
+}
