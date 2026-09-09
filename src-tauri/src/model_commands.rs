@@ -89,7 +89,10 @@ pub async fn save_model_profile(
             }
         }
     }
-    omicsops_core::workspace::validate_reasoning_effort(profile.provider, profile.reasoning_effort.as_deref())?;
+    omicsops_core::workspace::validate_reasoning_effort(
+        profile.provider,
+        profile.reasoning_effort.as_deref(),
+    )?;
     if let Some(child_id) = profile.delegated_model_profile_id {
         let child = state
             .repository
@@ -206,7 +209,11 @@ mod tests {
 
     #[test]
     fn effort_validation_rejects_protocol_mismatch_and_invalid_values() {
-        for (provider, effort) in [("anthropic", "max"), ("ollama", "max"), ("open_ai_compatible", "MAX")] {
+        for (provider, effort) in [
+            ("anthropic", "max"),
+            ("ollama", "max"),
+            ("open_ai_compatible", "MAX"),
+        ] {
             let mut input = request(provider, "https://gateway.example/v1", "exact-model");
             input.reasoning_effort = Some(Some(effort.into()));
             assert!(model_profile_from_request(input).is_err());

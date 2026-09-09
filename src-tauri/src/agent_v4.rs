@@ -5760,7 +5760,16 @@ mod tests {
         child.reasoning_effort = Some("max".into());
         assert!(validate_delegated_profile(&child, &binding).is_err());
         repository.save_model_profile(&child).await.unwrap();
-        assert_eq!(repository.get_model_profile(child.id).await.unwrap().unwrap().reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(
+            repository
+                .get_model_profile(child.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .reasoning_effort
+                .as_deref(),
+            Some("max")
+        );
         child.reasoning_effort = None;
         assert_eq!(child.execution_configuration_hash(), legacy_hash);
         child.label = "renamed".into();

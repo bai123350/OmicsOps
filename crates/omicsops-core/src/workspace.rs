@@ -280,12 +280,20 @@ impl ModelProfile {
     }
 }
 
-pub fn validate_reasoning_effort(provider: ModelProviderKind, effort: Option<&str>) -> Result<(), &'static str> {
-    let Some(effort) = effort else { return Ok(()); };
+pub fn validate_reasoning_effort(
+    provider: ModelProviderKind,
+    effort: Option<&str>,
+) -> Result<(), &'static str> {
+    let Some(effort) = effort else {
+        return Ok(());
+    };
     if provider != ModelProviderKind::OpenAiCompatible {
         return Err("explicit reasoning effort currently requires an OpenAI-compatible provider");
     }
-    if !matches!(effort, "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra") {
+    if !matches!(
+        effort,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+    ) {
         return Err("unsupported reasoning effort value");
     }
     Ok(())

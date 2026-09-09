@@ -1597,18 +1597,33 @@ mod reasoning_effort_tests {
     use super::*;
 
     fn client(model: &str) -> UnifiedModelClient {
-        UnifiedModelClient::new(Uuid::new_v4(), ProviderProtocol::OpenAiCompatible,
-            Url::parse("https://api.openai.com/v1").unwrap(), model, Some("test-only".into())).unwrap()
+        UnifiedModelClient::new(
+            Uuid::new_v4(),
+            ProviderProtocol::OpenAiCompatible,
+            Url::parse("https://api.openai.com/v1").unwrap(),
+            model,
+            Some("test-only".into()),
+        )
+        .unwrap()
     }
 
     fn request() -> ProviderModelRequest {
-        ProviderModelRequest { system: "test".into(), messages: vec![], tools: vec![], require_strict_json_fallback: false }
+        ProviderModelRequest {
+            system: "test".into(),
+            messages: vec![],
+            tools: vec![],
+            require_strict_json_fallback: false,
+        }
     }
 
     #[test]
     fn explicit_effort_is_isolated_and_survives_probe_and_fallback_shapes() {
-        let main = client("main").with_reasoning_effort(Some("low".into())).unwrap();
-        let child = client("child").with_reasoning_effort(Some("max".into())).unwrap();
+        let main = client("main")
+            .with_reasoning_effort(Some("low".into()))
+            .unwrap();
+        let child = client("child")
+            .with_reasoning_effort(Some("max".into()))
+            .unwrap();
         for (client, expected) in [(&main, "low"), (&child, "max")] {
             let built = client.build_provider_request(&request()).unwrap();
             assert_eq!(built.body["reasoning_effort"], expected);
@@ -1621,33 +1636,87 @@ mod reasoning_effort_tests {
             assert!(probe.get("max_tokens").is_none());
         }
         let inherited = client("legacy");
-        assert!(inherited.build_provider_request(&request()).unwrap().body.get("reasoning_effort").is_none());
-        assert!(inherited.probe_body().unwrap().get("reasoning_effort").is_none());
+        assert!(
+            inherited
+                .build_provider_request(&request())
+                .unwrap()
+                .body
+                .get("reasoning_effort")
+                .is_none()
+        );
+        assert!(
+            inherited
+                .probe_body()
+                .unwrap()
+                .get("reasoning_effort")
+                .is_none()
+        );
         let reset = child.with_reasoning_effort(None).unwrap();
-        assert!(reset.build_provider_request(&request()).unwrap().body.get("reasoning_effort").is_none());
+        assert!(
+            reset
+                .build_provider_request(&request())
+                .unwrap()
+                .body
+                .get("reasoning_effort")
+                .is_none()
+        );
     }
 
     #[test]
     fn rejects_unknown_values_and_other_protocols_without_network() {
         for value in ["", "MAX", " max", "arbitrary"] {
-            assert!(client("exact").with_reasoning_effort(Some(value.into())).is_err());
+            assert!(
+                client("exact")
+                    .with_reasoning_effort(Some(value.into()))
+                    .is_err()
+            );
         }
         for protocol in [ProviderProtocol::Anthropic, ProviderProtocol::Ollama] {
-            let client = UnifiedModelClient::new(Uuid::new_v4(), protocol, Url::parse("http://127.0.0.1:1").unwrap(), "exact", Some("test-only".into())).unwrap();
+            let client = UnifiedModelClient::new(
+                Uuid::new_v4(),
+                protocol,
+                Url::parse("http://127.0.0.1:1").unwrap(),
+                "exact",
+                Some("test-only".into()),
+            )
+            .unwrap();
             assert!(client.with_reasoning_effort(Some("max".into())).is_err());
         }
     }
 
     #[test]
     fn budget_includes_effort_and_probe_uses_the_same_output_reservation() {
-        let plain = client("exact").with_request_budget(RequestBudget { context_window_tokens: 10000, reserved_output_tokens: 1, safety_margin_tokens: 0 });
-        let bytes = serde_json::to_vec(&plain.build_provider_request(&request()).unwrap().body).unwrap().len() as u32;
-        let budget = RequestBudget { context_window_tokens: bytes + 1, reserved_output_tokens: 1, safety_margin_tokens: 0 };
+        let plain = client("exact").with_request_budget(RequestBudget {
+            context_window_tokens: 10000,
+            reserved_output_tokens: 1,
+            safety_margin_tokens: 0,
+        });
+        let bytes = serde_json::to_vec(&plain.build_provider_request(&request()).unwrap().body)
+            .unwrap()
+            .len() as u32;
+        let budget = RequestBudget {
+            context_window_tokens: bytes + 1,
+            reserved_output_tokens: 1,
+            safety_margin_tokens: 0,
+        };
         let plain = plain.with_request_budget(budget);
         plain.validate_request(&request()).unwrap();
-        let configured = plain.with_reasoning_effort(Some("max".into())).unwrap().with_request_budget(budget);
-        assert!(configured.validate_request(&request()).unwrap_err().to_string().contains("request budget:"));
-        let configured = configured.with_request_budget(RequestBudget { context_window_tokens: 10000, reserved_output_tokens: 100, safety_margin_tokens: 1 });
+        let configured = plain
+            .with_reasoning_effort(Some("max".into()))
+            .unwrap()
+            .with_request_budget(budget);
+        assert!(
+            configured
+                .validate_request(&request())
+                .unwrap_err()
+                .to_string()
+                .contains("request budget:")
+        );
+        let configured = configured.with_request_budget(RequestBudget {
+            context_window_tokens: 10000,
+            reserved_output_tokens: 100,
+            safety_margin_tokens: 1,
+        });
         let probe = configured.probe_body().unwrap();
         assert_eq!(probe["max_completion_tokens"], 100);
         assert_eq!(probe["reasoning_effort"], "max");
