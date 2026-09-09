@@ -294,14 +294,20 @@ impl ModelProfile {
 
     pub fn effective_context_window_tokens(&self) -> u32 {
         let requested = self.context_window_tokens.unwrap_or(32_768);
-        self.catalog_capabilities.as_ref().map_or(requested, |caps| {
-            // Conservatively reserve output even when a separate input limit exists.
-            requested.min(caps.context_limit).min(caps.input_limit.unwrap_or(u32::MAX))
-        })
+        self.catalog_capabilities
+            .as_ref()
+            .map_or(requested, |caps| {
+                // Conservatively reserve output even when a separate input limit exists.
+                requested
+                    .min(caps.context_limit)
+                    .min(caps.input_limit.unwrap_or(u32::MAX))
+            })
     }
 
     pub fn effective_output_tokens(&self) -> u32 {
-        self.catalog_capabilities.as_ref().map_or(4096, |caps| caps.output_limit.min(4096))
+        self.catalog_capabilities
+            .as_ref()
+            .map_or(4096, |caps| caps.output_limit.min(4096))
     }
 }
 
