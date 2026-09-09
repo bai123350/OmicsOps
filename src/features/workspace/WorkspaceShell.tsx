@@ -2,9 +2,9 @@ import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
-  Activity, ArrowLeft, Bot, Check, ChevronRight, ClipboardList, Database, Expand, FileBarChart, FileText,
+  Activity, ArrowLeft, ArrowUp, Bot, Check, ChevronRight, ClipboardList, Database, Expand, FileBarChart, FileText,
   FlaskConical, Folder, Hand, Languages, MessageSquarePlus, NotebookPen, Plus,
-  Search, Send, Settings, Shield, ShieldAlert, ShieldCheck, Sparkles, Square, Trash2, X, Orbit, Monitor, ChevronDown, Gauge, Zap,
+  Search, Settings, Shield, ShieldAlert, ShieldCheck, Sparkles, Square, Trash2, X, Orbit, Monitor, ChevronDown, Gauge, Zap,
 } from "lucide-react";
 import { copy, type Locale } from "./copy";
 import type { AgentRunEventV4, AgentV4Phase, AgentV4Task, AgentV4TaskShape, ApprovalPolicyV4, AutonomyModeV4, BrowserApprovalScopeV4, ComputeBackendAvailabilityV4, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, MemoryFact, NotebookEntry, ProposedPlanRevisionV4, ProjectArtifact, ProjectImagePreview, RunSummaryV4, SessionAgentModeV4, SyncEntry, WorkspaceConversation } from "../../types";
@@ -14,6 +14,7 @@ import { ComposeActions } from "./ComposeActions";
 import { RuntimeDialog } from "./RuntimeDialog";
 import { useWindowEscapeLayer } from "../settings/BrowserSettings";
 import { V4PlanPanel } from "./V4PlanPanel";
+import { GuidancePanel } from "./GuidancePanel";
 import "./workspace.css";
 import "./approval.css";
 import "./file-actions.css";
@@ -89,9 +90,11 @@ interface Props {
   activeRunId?: string | null;
   activeRunLastActivityAt?: string | null;
   agentRunEventsV4?: AgentRunEventV4[];
+  guidanceAvailable?: boolean;
   onAnswerAgentQuestionV4?: (runId: string, questionId: string, answer: string) => Promise<void> | void;
   onDecideToolApprovalV4?: (runId: string, approvalId: string, callHash: string, decision: "approved" | "denied", browserScope?: BrowserApprovalScopeV4) => Promise<void> | void;
   onResolveUncertainV4?: (runId: string, callId: string, resolution: "side_effect_observed" | "side_effect_not_observed" | "compensated", evidence: string) => Promise<void> | void;
+  onCancelRuntimeRecoveryV4?: (runId: string) => Promise<void> | void;
   onResumeAgentRunV4?: (runId: string) => Promise<void> | void;
   onCloseBrowserRunTabsV4?: (runId: string, sessions: Array<"shared" | "workspace">) => Promise<void> | void;
   remoteFiles?: import("../../types").RemoteFileEntry[];
@@ -124,7 +127,7 @@ interface Props {
 type ContextTab = "files" | "plan" | "preview" | "notebook" | "explore" | "runs";
 const AGENT_STALL_THRESHOLD_MS = 90_000;
 
-export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, conversations = [], activeConversationId, onSelectConversation, onNewConversation, onDeleteConversation, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, modelPicker, composerBusy = false, modelOptions = [], modelId, onModelChange, agentMode, onAgentModeChange, conversationLocked = false, conversationHydrating = false, planActionBusy = false, v4Plan, latestPlanRevision, computeBackends = [], computeBackendId = "", containerImage = "", autonomyMode = "supervised", approvalPolicy = "risk_based", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onApprovalPolicyChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onRequestPlanRevision, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, activeRunLastActivityAt, agentRunEventsV4 = [], onAnswerAgentQuestionV4, onDecideToolApprovalV4, onResolveUncertainV4, onResumeAgentRunV4, onCloseBrowserRunTabsV4, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
+export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, conversations = [], activeConversationId, onSelectConversation, onNewConversation, onDeleteConversation, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, modelPicker, composerBusy = false, modelOptions = [], modelId, onModelChange, agentMode, onAgentModeChange, conversationLocked = false, conversationHydrating = false, planActionBusy = false, v4Plan, latestPlanRevision, computeBackends = [], computeBackendId = "", containerImage = "", autonomyMode = "supervised", approvalPolicy = "risk_based", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onApprovalPolicyChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onRequestPlanRevision, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, activeRunLastActivityAt, agentRunEventsV4 = [], guidanceAvailable = false, onAnswerAgentQuestionV4, onDecideToolApprovalV4, onResolveUncertainV4, onResumeAgentRunV4, onCancelRuntimeRecoveryV4, onCloseBrowserRunTabsV4, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
   const t = copy[locale];
   const zh = locale === "zh-CN";
   const [tab, setTab] = useState<ContextTab>("files");
@@ -157,6 +160,8 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const [previewBusy, setPreviewBusy] = useState(false);
   const [previewError, setPreviewError] = useState("");
   const [deletingConversationId, setDeletingConversationId] = useState<string | null>(null);
+  const [followingLatest, setFollowingLatest] = useState(true);
+  const followingLatestRef = useRef(true);
   const messageStreamRef = useRef<HTMLElement>(null);
   const effectivePlanActionBusy = Boolean(planActionBusy || approvePlanBusy || runStopping);
   const controlledMode = agentMode !== undefined;
@@ -174,12 +179,15 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const runFinished = Boolean(effectiveTerminalAgentEventV4(activeRunEventsV4));
   const runPaused = getV4PauseReason(activeRunEventsV4) !== null;
   const runActive = runStarted && !runFinished && !runPaused;
+  const showStopButton = Boolean(onCancelRun && (runActive || runStopping));
+  const stopLabel = runStopping ? (zh ? "终止中…" : "Stopping…") : (zh ? "终止运行" : "Stop run");
   const [watchdogNow, setWatchdogNow] = useState(() => Date.now());
   const lastActivityMs = activeRunLastActivityAt ? Date.parse(activeRunLastActivityAt) : Number.NaN;
   const runStalled = runActive && Number.isFinite(lastActivityMs) && watchdogNow - lastActivityMs > AGENT_STALL_THRESHOLD_MS;
   // A paused run still owns the conversation sequence. Keep the composer
   // locked while approval/input cards remain usable inside the run trace.
   const composerDisabled = composerBusy || conversationHydrating || sendBusy || agentBusy || conversationLocked || (runStarted && !runFinished);
+  const sendLabel = composerDisabled || planLoading ? (planModeEnabled ? (zh ? "规划中…" : "Planning…") : (zh ? "执行中…" : "Running…")) : t.send;
   const activeConversation = conversations.find((item) => item.id === activeConversationId);
   const conversationTitle = activeConversation?.title || (zh ? "新会话" : "New conversation");
   const historicalAgentRunEventsV4 = effectiveActiveRunId
@@ -207,6 +215,8 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     sendGenerationRef.current += 1;
     sendBusyRef.current = false;
     setSendBusy(false);
+    followingLatestRef.current = true;
+    setFollowingLatest(true);
   }, [activeConversationId]);
   useEffect(() => { if (showPlanPanel) setTab("plan"); }, [showPlanPanel]);
   useEffect(() => {
@@ -220,12 +230,12 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
 
   useEffect(() => {
     const stream = messageStreamRef.current;
-    if (!stream) return;
+    if (!stream || !followingLatestRef.current) return;
     const frame = requestAnimationFrame(() => {
-      stream.scrollTop = stream.scrollHeight;
+      if (followingLatestRef.current) stream.scrollTop = stream.scrollHeight;
     });
     return () => cancelAnimationFrame(frame);
-  }, [messages.length, streamingAssistant, agentBusy, agentNotice, planLoading, runStarted, latestAgentRunEventV4?.run_id, latestAgentRunEventV4?.sequence]);
+  }, [activeConversationId, messages.length, streamingAssistant, agentBusy, agentNotice, planLoading, runStarted, latestAgentRunEventV4?.run_id, latestAgentRunEventV4?.sequence]);
 
   useEffect(() => {
     if (selectedImagePath && imageFiles.some((entry) => entry.relative_path === selectedImagePath)) return;
@@ -319,27 +329,39 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
 
     <main className="conversation-pane" aria-label={t.research}>
       <header className="conversation-header"><div><small>{project.name}</small><h1>{conversationTitle}</h1></div><span className="live-status"><i />{t.status}</span></header>
-      <section className="message-stream" aria-live="polite" ref={messageStreamRef}>
+      <section className="message-stream" aria-live="polite" ref={messageStreamRef} onScroll={(event) => {
+        const stream = event.currentTarget;
+        const following = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 64;
+        followingLatestRef.current = following;
+        setFollowingLatest(following);
+      }}>
         {!onSend && <article className="message user-message"><MarkdownContent markdown={zh ? "比较两批 PBMC，检查批次效应并生成可复现的分析报告。" : "Compare two PBMC batches, assess batch effects, and generate a reproducible report."} /></article>}
         {messages.length === 0 && <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><MarkdownContent markdown={zh ? "描述你的研究目标。我会先核对数据与假设，并在任何正式执行前展示计划供你审批。" : "Describe your research goal. I will first check the data and assumptions, then show a plan for approval before any formal execution."} /></div></article>}
         {sentMessages.map((message, index) => <article className="message user-message" key={`${index}-${message}`}><MarkdownContent markdown={message} /></article>)}
         {messages.map((message) => <Fragment key={message.id}>
           {message.role === "user" ? <article className="message user-message"><MarkdownContent markdown={message.markdown} /></article> : message.role === "assistant" ? <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><MarkdownContent markdown={message.markdown} /></div></article> : null}
-          {runTimelineV4.afterMessage.get(message.id)?.map((run) => <V4RunTrace locale={locale} events={run.events} onAnswer={onAnswerAgentQuestionV4} onDecideApproval={onDecideToolApprovalV4} onResolveUncertain={onResolveUncertainV4} onResume={onResumeAgentRunV4} onCloseBrowserTabs={onCloseBrowserRunTabsV4} historical key={run.runId} />)}
+          {runTimelineV4.afterMessage.get(message.id)?.map((run) => <V4RunTrace locale={locale} events={run.events} onAnswer={onAnswerAgentQuestionV4} onDecideApproval={onDecideToolApprovalV4} onResolveUncertain={onResolveUncertainV4} onResume={onResumeAgentRunV4} onCancelRecovery={onCancelRuntimeRecoveryV4} onCloseBrowserTabs={onCloseBrowserRunTabsV4} historical key={run.runId} />)}
         </Fragment>)}
         {streamingAssistant && <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent · {zh ? "生成中" : "streaming"}</strong><MarkdownContent markdown={streamingAssistant} /></div></article>}
         {agentBusy && !streamingAssistant && <article className="message assistant-message agent-pending" role="status"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><p>{zh ? "正在等待模型响应…" : "Waiting for the model…"}</p></div></article>}
         {agentRetryNotice && <div className="agent-retry-notice" role="status"><span className="agent-working"><i />{agentRetryNotice}</span></div>}
         {agentNotice && <div className="agent-notice" role="alert"><strong>{zh ? "对话未完成" : "Conversation did not complete"}</strong><span>{agentNotice}</span></div>}
         {v4Plan?.plan && !runStarted && <article className="message assistant-message plan-ready-message"><div className="assistant-avatar"><ClipboardList size={17} /></div><div><strong>OmicsOps Agent</strong><p>{zh ? "计划已生成，请在右侧 Plan 面板审核并决定是否运行。" : "The plan is ready. Review it in the Plan panel and decide whether to run it."}</p></div></article>}
-        {runTimelineV4.unanchored.map((run) => <V4RunTrace locale={locale} events={run.events} onAnswer={onAnswerAgentQuestionV4} onDecideApproval={onDecideToolApprovalV4} onResolveUncertain={onResolveUncertainV4} onResume={onResumeAgentRunV4} onCloseBrowserTabs={onCloseBrowserRunTabsV4} historical key={run.runId} />)}
-        {visibleActiveRunEventsV4.length > 0 && <V4RunTrace locale={locale} events={visibleActiveRunEventsV4} onAnswer={onAnswerAgentQuestionV4} onDecideApproval={onDecideToolApprovalV4} onResolveUncertain={onResolveUncertainV4} onResume={onResumeAgentRunV4} onCloseBrowserTabs={onCloseBrowserRunTabsV4} />}
+        {runTimelineV4.unanchored.map((run) => <V4RunTrace locale={locale} events={run.events} onAnswer={onAnswerAgentQuestionV4} onDecideApproval={onDecideToolApprovalV4} onResolveUncertain={onResolveUncertainV4} onResume={onResumeAgentRunV4} onCancelRecovery={onCancelRuntimeRecoveryV4} onCloseBrowserTabs={onCloseBrowserRunTabsV4} historical key={run.runId} />)}
+        {visibleActiveRunEventsV4.length > 0 && <V4RunTrace locale={locale} events={visibleActiveRunEventsV4} onAnswer={onAnswerAgentQuestionV4} onDecideApproval={onDecideToolApprovalV4} onResolveUncertain={onResolveUncertainV4} onResume={onResumeAgentRunV4} onCancelRecovery={onCancelRuntimeRecoveryV4} onCloseBrowserTabs={onCloseBrowserRunTabsV4} />}
         {runStarted && agentRunEventsV4.length === 0 && <article className="message assistant-message agent-pending" role="status"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><p>{zh ? "V4 运行正在启动…" : "Starting the V4 run…"}</p></div></article>}
         {runStalled && <div className="agent-retry-notice" role="status"><span>{zh ? "超过 90 秒未收到新的 Agent 事件，任务可能卡住；仍可终止运行。" : "No new Agent event has arrived for 90 seconds; the run may be stuck. You can still stop it."}</span></div>}
-        {runActive && onCancelRun && <div className="agent-run-controls" role="region" aria-label={zh ? "远程 Agent 运行控制" : "Remote agent run controls"}><div><span className="agent-working"><i />{runStopping ? (zh ? "正在终止当前操作…" : "Stopping current operation…") : (zh ? "远程 Agent 正在运行" : "Remote agent is running")}</span><small>{zh ? "将中断模型请求、当前 SSH 命令及后续操作" : "Stops the model request, current SSH command, and all subsequent actions"}</small></div><button className="stop-agent-button" disabled={runStopping} onClick={() => void onCancelRun()}><Square size={14} fill="currentColor" />{runStopping ? (zh ? "终止中…" : "Stopping…") : (zh ? "终止运行" : "Stop run")}</button></div>}
         {!onSend && <article className="task-card"><div className="task-icon"><Activity size={18} /></div><div className="task-body"><div><strong>{t.task}</strong><span>65%</span></div><p>{zh ? "远端 Linux · 8 CPU · 32 GiB · 低风险" : "Remote Linux · 8 CPU · 32 GiB · low risk"}</p><div className="task-progress"><i /></div><div className="task-actions"><button>{zh ? "查看日志" : "View logs"}</button><button>{zh ? "查看计划" : "View plan"}</button></div></div></article>}
+        {guidanceAvailable && activeConversationId && (activeRunId || v4Plan?.run_id) && <GuidancePanel key={activeRunId ?? v4Plan?.run_id} runId={(activeRunId ?? v4Plan?.run_id)!} projectId={project.id} conversationId={activeConversationId} locale={locale} enabled={runActive && !runStopping && !conversationLocked} />}
+      {!followingLatest && <button className="back-to-latest" onClick={() => {
+        const stream = messageStreamRef.current;
+        if (stream) stream.scrollTop = stream.scrollHeight;
+        followingLatestRef.current = true;
+        setFollowingLatest(true);
+      }}>↓ {zh ? "回到最新" : "Back to latest"}</button>}
       </section>
       <footer className="composer">
+
         <div className="composer-runtime-bar">
           <div className="composer-menu-anchor compute-anchor">
             <button className="runtime-host" aria-label={zh ? "选择计算后端" : "Choose compute backend"} aria-expanded={computeMenuOpen} onClick={() => { const next = !computeMenuOpen; closeComposerMenus(); setComputeMenuOpen(next); }}><Monitor size={17} /><b>{backendLabel}</b><ChevronDown size={13} /></button>
@@ -372,7 +394,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
             <button className={`composer-tool ${planModeEnabled ? "" : "is-active"}`} disabled={modeLocked} aria-label={zh ? "直接执行模式" : "Direct execution mode"} aria-pressed={!planModeEnabled} title={zh ? "直接执行 / 先做计划" : "Execute directly / Plan first"} onClick={() => chooseMode(planModeEnabled ? "agent" : "plan")}><Zap size={20} /></button>
             {modelPicker ? <div onClickCapture={closeComposerMenus}>{modelPicker}</div> : <div className="composer-menu-anchor model-anchor"><button className="composer-model" disabled={composerDisabled} aria-label={zh ? "选择模型" : "Choose model"} aria-expanded={modelMenuOpen} onClick={() => { const next = !modelMenuOpen; closeComposerMenus(); setModelMenuOpen(next); }}><span>{modelLabel || (zh ? "选择模型" : "Choose model")}</span><ChevronDown size={12} /></button>{modelMenuOpen && <div className="model-menu" role="menu">{modelOptions.map((model) => <button role="menuitemradio" aria-checked={model.id === modelId} key={model.id} disabled={!onModelChange} onClick={() => { onModelChange?.(model.id); setModelMenuOpen(false); }}>{model.label}{model.id === modelId && <Check size={14} />}</button>)}<button role="menuitem" disabled={!onOpenSettings} onClick={() => { setModelMenuOpen(false); onOpenSettings?.(); }}>{zh ? "管理模型" : "Manage models"}<Settings size={14} /></button></div>}</div>}
             <div className="composer-send-group">
-            <button className="send-button" disabled={composerDisabled || planLoading || !draft.trim() || Boolean(onSend && !computeReady)} onClick={send}><Send size={16} />{composerDisabled || planLoading ? (planModeEnabled ? (zh ? "规划中…" : "Planning…") : (zh ? "执行中…" : "Running…")) : t.send}</button>
+            <button className={`send-button ${showStopButton ? "is-stop" : ""}`} aria-label={showStopButton ? stopLabel : sendLabel} title={showStopButton ? stopLabel : sendLabel} aria-busy={showStopButton && runStopping} disabled={showStopButton ? runStopping : composerDisabled || planLoading || !draft.trim() || Boolean(onSend && !computeReady)} onClick={showStopButton ? () => { void onCancelRun?.(); } : send}>{showStopButton ? <Square size={16} fill="currentColor" /> : <ArrowUp size={21} />}</button>
             <div className="composer-menu-anchor"><button className="send-options" aria-label={zh ? "发送选项" : "Send options"} aria-expanded={sendMenuOpen} onClick={() => { const next = !sendMenuOpen; closeComposerMenus(); setSendMenuOpen(next); }}><ChevronDown size={17} /></button>{sendMenuOpen && <div className="model-menu send-menu" role="menu">{(["agent", "plan"] as const).map((mode) => <button key={mode} role="menuitemradio" aria-checked={effectiveMode === mode} disabled={modeLocked} onClick={() => { chooseMode(mode); setSendMenuOpen(false); }}>{mode === "plan" ? (zh ? "先做计划" : "Plan first") : (zh ? "直接执行" : "Execute directly")}{effectiveMode === mode && <Check size={14} />}</button>)}</div>}</div>
             </div>
             </div>
@@ -407,17 +429,17 @@ function PermissionOption({ icon, active, danger = false, disabled = false, titl
   return <button role="menuitemradio" aria-checked={active} disabled={disabled} className={`${active ? "active" : ""} ${danger ? "danger" : ""}`} onClick={onClick}><span className="permission-icon">{icon}</span><span><b>{title}</b><small>{description}</small></span>{active && <Check size={15} />}</button>;
 }
 function FileTree({ locale }: { locale: Locale }) { const zh = locale === "zh-CN"; return <div className="file-tree"><div className="context-heading"><b>{zh ? "项目文件" : "Project files"}</b><small>{zh ? "选择性同步" : "Selective sync"}</small></div><div className="tree-folder"><Folder size={15} />data <span>{zh ? "远端" : "remote"}</span></div><div className="tree-folder"><Folder size={15} />analysis</div><div className="tree-file"><FileBarChart size={15} />umap.png <em>1.2 MB</em></div><div className="tree-file"><FileText size={15} />markers.csv <em>84 KB</em></div><div className="tree-file"><NotebookPen size={15} />report.md <em>12 KB</em></div></div>; }
-function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncertain, onResume, onCloseBrowserTabs, historical = false }: { locale: Locale; events: AgentRunEventV4[]; onAnswer?: (runId: string, questionId: string, answer: string) => Promise<void> | void; onDecideApproval?: (runId: string, approvalId: string, callHash: string, decision: "approved" | "denied", browserScope?: BrowserApprovalScopeV4) => Promise<void> | void; onResolveUncertain?: (runId: string, callId: string, resolution: "side_effect_observed" | "side_effect_not_observed" | "compensated", evidence: string) => Promise<void> | void; onResume?: (runId: string) => Promise<void> | void; onCloseBrowserTabs?: (runId: string, sessions: Array<"shared" | "workspace">) => Promise<void> | void; historical?: boolean }) {
+function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncertain, onResume, onCancelRecovery, onCloseBrowserTabs, historical = false }: { locale: Locale; events: AgentRunEventV4[]; onAnswer?: (runId: string, questionId: string, answer: string) => Promise<void> | void; onDecideApproval?: (runId: string, approvalId: string, callHash: string, decision: "approved" | "denied", browserScope?: BrowserApprovalScopeV4) => Promise<void> | void; onResolveUncertain?: (runId: string, callId: string, resolution: "side_effect_observed" | "side_effect_not_observed" | "compensated", evidence: string) => Promise<void> | void; onResume?: (runId: string) => Promise<void> | void; onCancelRecovery?: (runId: string) => Promise<void> | void; onCloseBrowserTabs?: (runId: string, sessions: Array<"shared" | "workspace">) => Promise<void> | void; historical?: boolean }) {
   const zh = locale === "zh-CN";
   const [resumeBusy, setResumeBusy] = useState(false);
   const resumeBusyRef = useRef(false);
+  const [cancelRecoveryBusy, setCancelRecoveryBusy] = useState(false);
+  const [recoveryError, setRecoveryError] = useState("");
   const entries = coalesceV4ModelText(events);
   const progress = entries.filter(({ modelText }) => modelText !== undefined && modelText.trim());
   const technicalEntries = entries.filter(({ event, modelText }) => modelText === undefined && !isToolTrajectoryEvent(event) && !isHiddenTrajectoryEvent(event));
   const tools = mergeV4ToolCalls(events);
   const guided = buildGuidedV4Overview(events);
-  const batchedCallIds = new Set(guided?.batches.flatMap((batch) => batch.callIds) ?? []);
-  const unbatchedTools = tools.filter((tool) => !batchedCallIds.has(tool.callId));
   const latest = events.at(-1);
   const terminal = effectiveTerminalAgentEventV4(events);
   const completionPending = !terminal && Boolean(latest && (
@@ -428,13 +450,14 @@ function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncer
     || (latest.event.kind === "tool_requested" && latest.event.call.tool_id === "agent.complete")
   ));
   const pauseReason = getV4PauseReason(events);
-  const status = terminal?.event.kind === "run_completed" ? (zh ? "已完成" : "Completed") : terminal?.event.kind === "run_cancelled" ? (zh ? "已终止" : "Cancelled") : terminal?.event.kind === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention") : terminal?.event.kind === "run_failed" ? (zh ? "失败" : "Failed") : pauseReason === "approval" ? (zh ? "等待工具审批" : "Waiting for approval") : pauseReason === "input" ? (zh ? "等待回答" : "Waiting for input") : pauseReason === "browser_connection" ? (zh ? "等待连接浏览器" : "Waiting for browser") : pauseReason === "browser_human" ? (zh ? "等待人工处理浏览器" : "Waiting for browser intervention") : pauseReason === "uncertain" ? (zh ? "等待副作用核验" : "Waiting for verification") : (zh ? "运行中" : "Running");
+  const status = terminal?.event.kind === "run_completed" ? (zh ? "已完成" : "Completed") : terminal?.event.kind === "run_cancelled" ? (zh ? "已终止" : "Cancelled") : terminal?.event.kind === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention") : terminal?.event.kind === "run_failed" ? (zh ? "失败" : "Failed") : pauseReason === "approval" ? (zh ? "等待工具审批" : "Waiting for approval") : pauseReason === "input" ? (zh ? "等待回答" : "Waiting for input") : pauseReason === "browser_connection" ? (zh ? "等待连接浏览器" : "Waiting for browser") : pauseReason === "browser_human" ? (zh ? "等待人工处理浏览器" : "Waiting for browser intervention") : pauseReason === "runtime_recovery" ? (zh ? "结果待恢复" : "Results ready to resume") : pauseReason === "uncertain" ? (zh ? "等待副作用核验" : "Waiting for verification") : (zh ? "运行中" : "Running");
   const failed = terminal?.event.kind === "run_failed";
-  const shouldExpand = !historical && (Boolean(pauseReason) || terminal?.event.kind === "run_failed" || terminal?.event.kind === "run_needs_attention");
+  const shouldExpand = !historical && (!terminal || Boolean(pauseReason) || terminal?.event.kind === "run_failed" || terminal?.event.kind === "run_needs_attention");
   async function resumeRun() {
     if (!onResume || !events[0] || resumeBusyRef.current) return;
     resumeBusyRef.current = true;
     setResumeBusy(true);
+    setRecoveryError("");
     try {
       await onResume(events[0].run_id);
     } finally {
@@ -442,27 +465,34 @@ function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncer
       setResumeBusy(false);
     }
   }
+  async function cancelRecovery() {
+    if (!onCancelRecovery || !events[0] || resumeBusyRef.current) return;
+    resumeBusyRef.current = true;
+    setResumeBusy(true);
+    setCancelRecoveryBusy(true);
+    setRecoveryError("");
+    try { await onCancelRecovery(events[0].run_id); }
+    catch { setRecoveryError(zh ? "取消失败，请重试。" : "Cancellation failed. Retry."); }
+    finally { resumeBusyRef.current = false; setResumeBusy(false); setCancelRecoveryBusy(false); }
+  }
   return <>
-    {guided && <GuidedV4Overview locale={locale} overview={guided} terminal={terminal} historical={historical} />}
-    {progress.map(({ event, lastEvent, modelText }) => <article aria-label={zh ? "模型输出" : "Model output"} className="message assistant-message agent-work-update agent-public-progress" key={`${event.run_id}-${event.sequence}`}>
-      <div className="assistant-avatar"><Bot size={17} /></div>
-      <div><div className="agent-work-heading"><strong>{guided ? (zh ? "思考摘要" : "Thought summary") : (zh ? "进度" : "Progress")}</strong>{guided && <span className="v4-public-summary-label">{zh ? "公开摘要" : "Public summary"}</span>}<small>{new Date(lastEvent.occurred_at).toLocaleTimeString()}</small></div><MarkdownContent markdown={modelText ?? ""} /></div>
-    </article>)}
     {completionPending && <div className="agent-completion-pending" role="status"><span className="agent-working"><i />{zh ? "正在核验最终结果…" : "Verifying the final result…"}</span></div>}
     <details className={`agent-run-fold agent-v4-run ${historical ? "" : "is-active"}`} open={shouldExpand}>
-    <summary><span className="agent-run-fold-title"><span><b>{zh ? "执行过程" : "Process"}</b><small>{terminal ? (zh ? "工具调用与验证记录" : "Tool calls and verification") : (zh ? "Agent 正在处理任务" : "Agent is working")}</small></span><ChevronRight size={15} /></span><span>{status} · {tools.length} {zh ? "个步骤" : tools.length === 1 ? "step" : "steps"}</span></summary>
+    <summary><span className="agent-run-fold-title"><span><b>{zh ? "执行过程" : terminal ? "Processed" : "Processing"}</b><small>{terminal ? (zh ? "工具调用与验证记录" : "Tool calls and verification") : (zh ? "Agent 正在处理任务" : "Agent is working")}</small></span><ChevronRight size={15} /></span><span>{status} · {tools.length} {zh ? "个步骤" : tools.length === 1 ? "step" : "steps"}{eventDuration(events[0]?.occurred_at, (terminal ?? latest)?.occurred_at) && ` · ${eventDuration(events[0]?.occurred_at, (terminal ?? latest)?.occurred_at)}`}</span></summary>
     <div className="agent-run-fold-body">
-      {unbatchedTools.length > 0 && <section className="v4-tool-traces" aria-label={zh ? "工具调用详情" : "Tool call details"}>
-        {unbatchedTools.map((tool) => <details className="v4-tool-trace" key={tool.callId}>
-          <summary className="v4-tool-trace-heading"><ChevronRight size={13} /><strong>{toolDisplayLabel(tool.toolId, zh)}</strong>{tool.subject && <span className="v4-tool-subject">{tool.subject}</span>}<span className={`v4-tool-status ${tool.status}`}>{toolStatusLabel(tool.status, zh)}</span></summary>
+      <section className="v4-process-timeline" aria-label={zh ? "工具调用详情" : "Tool call details"}>
+      {[
+        ...progress.map(({ event, modelText }) => ({ sequence: event.sequence, node: <article aria-label={zh ? "模型输出" : "Model output"} className="v4-progress-row" key={`progress-${event.sequence}`}><span aria-hidden="true">–</span><strong>{zh ? "进度" : "PROGRESS"}</strong><MarkdownContent markdown={modelText ?? ""} /></article> })),
+        ...events.filter(({ event }) => event.kind === "cycle_started").map((event) => ({ sequence: event.sequence, node: <div className="v4-thinking-row" key={`thinking-${event.sequence}`}><span aria-hidden="true">○</span><strong>{zh ? "思考中" : "THINKING"}</strong></div> })),
+        ...tools.map((tool) => ({ sequence: tool.firstSequence, node: <details className="v4-tool-trace" key={tool.callId}>
+          <summary className="v4-tool-trace-heading"><span className={`v4-tool-mark ${tool.status}`} aria-label={toolStatusLabel(tool.status, zh)}>{tool.status === "failed" ? "×" : tool.status === "succeeded" || tool.status === "reused" ? "✓" : "○"}</span><strong title={toolDisplayLabel(tool.toolId, zh)}>{compactToolLabel(tool.toolId)}</strong>{tool.subject && <span className="v4-tool-subject" title={tool.subject}>{tool.subject}</span>}<span className={`v4-tool-status ${tool.status}`}>{toolStatusLabel(tool.status, zh)}</span><small className="v4-tool-metrics">{toolMetrics(tool, zh)}</small><ChevronRight size={13} /></summary>
           <div className="v4-tool-trace-body">
             <small>{tool.toolId} · #{tool.firstSequence}–#{tool.lastSequence}</small>
             {tool.argumentsPreview && <><b>{zh ? "输入" : "Input"}</b><code>{tool.argumentsPreview}</code></>}
-            {tool.outcome && <><b>{zh ? "结果" : "Result"}</b><MarkdownContent markdown={limitText(tool.outcome, 800)} /></>}
+            {tool.outcome !== undefined && <><b>{zh ? "结果" : "Result"}</b><pre>{tool.outcome}</pre></>}
           </div>
-        </details>)}
-      </section>}
-      {technicalEntries.map(({ event, lastEvent }) => <article className={`message assistant-message agent-work-update ${event.event.kind === "input_requested" ? "v4-input-decision-entry" : ""}`} key={`${event.run_id}-${event.sequence}`}>
+        </details> })),
+        ...technicalEntries.map(({ event, lastEvent }) => ({ sequence: event.sequence, node: <article className={`message assistant-message agent-work-update ${event.event.kind === "input_requested" ? "v4-input-decision-entry" : ""}`} key={`${event.run_id}-${event.sequence}`}>
         <div className="assistant-avatar"><Bot size={17} /></div>
         <div><div className="agent-work-heading"><strong>{v4EventLabel(event, zh)}</strong><small>{lastEvent.sequence === event.sequence ? `#${event.sequence}` : `#${event.sequence}–#${lastEvent.sequence}`} · {new Date(lastEvent.occurred_at).toLocaleTimeString()}</small></div>
           {v4EventContent(event, zh) && <MarkdownContent markdown={v4EventContent(event, zh)} />}
@@ -477,7 +507,11 @@ function V4RunTrace({ locale, events, onAnswer, onDecideApproval, onResolveUncer
           {event.event.kind === "tool_dispatch_uncertain" && onResolveUncertain && !isV4UncertainResolved(events, event.event.call_id) && <V4UncertainCard locale={locale} onResolve={(resolution, evidence) => onResolveUncertain(event.run_id, event.event.kind === "tool_dispatch_uncertain" ? event.event.call_id : "", resolution, evidence)} />}
           {event.event.kind === "browser_tab_cleanup_required" && onCloseBrowserTabs && <BrowserTabCleanupCard locale={locale} tabs={event.event.tabs} onClose={() => onCloseBrowserTabs(event.run_id, event.event.kind === "browser_tab_cleanup_required" ? event.event.sessions : [])} />}
         </div>
-      </article>)}
+      </article> })),
+      ].sort((a, b) => a.sequence - b.sequence).map(({ node }) => node)}
+      </section>
+      {guided && <details className="v4-process-context"><summary>{zh ? "任务与阶段详情" : "Task and phase details"}</summary><GuidedV4Overview locale={locale} overview={guided} terminal={terminal} historical={historical} /></details>}
+      {!terminal && pauseReason === "runtime_recovery" && (onResume || onCancelRecovery) && <div className="v4-resume-run"><span>{zh ? "计算结果已保存，可继续核验。" : "Saved computation results are ready for verification."}</span>{onResume && <button disabled={resumeBusy} onClick={() => void resumeRun()}>{resumeBusy && !cancelRecoveryBusy ? (zh ? "恢复中…" : "Resuming…") : (zh ? "恢复已保存结果" : "Resume saved results")}</button>}{onCancelRecovery && <button disabled={resumeBusy} onClick={() => void cancelRecovery()}>{cancelRecoveryBusy ? (zh ? "取消中…" : "Cancelling…") : (zh ? "取消此运行" : "Cancel this run")}</button>}{recoveryError && <span role="alert">{recoveryError}</span>}</div>}
       {failed && onResume && <div className="v4-resume-run"><span>{zh ? "修正运行条件后可从已验证事件链继续。" : "Resume from the verified event chain after fixing the runtime condition."}</span><button disabled={resumeBusy} onClick={() => void resumeRun()}>{resumeBusy ? (zh ? "恢复中…" : "Resuming…") : (zh ? "继续运行" : "Resume run")}</button></div>}
       {pauseReason === "browser_connection" && onResume && <div className="v4-resume-run"><span>{zh ? "请在设置 → Browser 安装或启用 OmicsOps 扩展并连接相应会话，然后原地继续此任务。" : "Open Settings → Browser, install or enable the OmicsOps extension, connect the requested session, then resume this same task."}</span><button disabled={resumeBusy} onClick={() => void resumeRun()}>{resumeBusy ? (zh ? "恢复中…" : "Resuming…") : (zh ? "已连接，继续" : "Connected, resume")}</button></div>}
       {pauseReason === "browser_human" && onResume && <div className="v4-resume-run"><span>{zh ? "请在真实浏览器中完成人机验证或其他人工步骤；OmicsOps 不会自动求解 CAPTCHA。处理完成后原地继续。" : "Complete the CAPTCHA or other manual step in the real browser. OmicsOps never solves CAPTCHA automatically; resume this same run when finished."}</span><button disabled={resumeBusy} onClick={() => void resumeRun()}>{resumeBusy ? (zh ? "恢复中…" : "Resuming…") : (zh ? "已人工处理，继续" : "Handled, resume")}</button></div>}
@@ -769,6 +803,8 @@ type MergedV4ToolCall = {
   firstSequence: number;
   lastSequence: number;
   outcome?: string;
+  startedAt?: string;
+  finishedAt?: string;
   subject?: string;
   status: "requested" | "running" | "succeeded" | "failed" | "reused";
 };
@@ -787,7 +823,7 @@ function mergeV4ToolCalls(events: AgentRunEventV4[]): MergedV4ToolCall[] {
       current.argumentsPreview = limitText(JSON.stringify(redactToolArguments(args)), 500);
       current.subject = toolSubject(args);
     }
-    if (outcome) current.outcome = outcome;
+    if (outcome !== undefined) current.outcome = outcome;
     if (status) current.status = status;
   };
   for (const item of events) {
@@ -797,6 +833,16 @@ function mergeV4ToolCalls(events: AgentRunEventV4[]): MergedV4ToolCall[] {
     else if (event.kind === "tool_finished") update(event.outcome.call_id, item.sequence, event.outcome.tool_id, undefined, event.outcome.succeeded ? "succeeded" : "failed", event.outcome.model_content);
     else if (event.kind === "tool_outcome_reused") update(event.outcome.call_id, item.sequence, event.outcome.tool_id, undefined, "reused", event.outcome.model_content);
   }
+  for (const item of events) {
+    const event = item.event;
+    if (event.kind === "tool_requested" || event.kind === "tool_dispatch_started") {
+      const tool = byCall.get(event.kind === "tool_requested" ? event.call.call_id : event.call_id);
+      if (tool && (event.kind === "tool_dispatch_started" || !tool.startedAt)) tool.startedAt = item.occurred_at;
+    } else if (event.kind === "tool_finished") {
+      const tool = byCall.get(event.outcome.call_id);
+      if (tool) tool.finishedAt = item.occurred_at;
+    }
+  }
   return [...byCall.values()];
 }
 function isInternalAgentTool(toolId: string) {
@@ -804,11 +850,25 @@ function isInternalAgentTool(toolId: string) {
 }
 function toolSubject(args?: Record<string, unknown>) {
   if (!args) return undefined;
-  for (const key of ["path", "relative_path", "artifact_id", "query"]) {
+  for (const key of ["path", "file_path", "relative_path", "command", "cmd", "skill_name", "name", "artifact_id", "query"]) {
     const value = args[key];
-    if (typeof value === "string" && value.trim()) return limitText(value.trim(), 90);
+    if (typeof value === "string" && value.trim()) return value.trim();
   }
   return undefined;
+}
+function compactToolLabel(toolId: string) {
+  const labels: Record<string, string> = { "project.read": "read", "project.write": "write", "project.edit": "edit", "project.list": "list", "use_skill": "SKILL", "runtime.execute": "execute", "runtime.python": "python", "runtime.r": "R", "agent.delegate": "agent" };
+  return labels[toolId] ?? toolId;
+}
+function eventDuration(start?: string, end?: string) {
+  if (!start || !end) return "";
+  const duration = Date.parse(end) - Date.parse(start);
+  return Number.isFinite(duration) && duration >= 0 ? `${Number((duration / 1000).toFixed(1))}s` : "";
+}
+function toolMetrics(tool: MergedV4ToolCall, zh: boolean) {
+  const duration = tool.status === "reused" ? "" : eventDuration(tool.startedAt, tool.finishedAt);
+  const lines = tool.outcome === undefined ? undefined : tool.outcome === "" ? 0 : tool.outcome.replace(/\r?\n$/, "").split(/\r?\n/).length;
+  return [duration, lines === undefined ? "" : `${lines} ${zh ? "行" : lines === 1 ? "line" : "lines"}`].filter(Boolean).join(" · ");
 }
 function toolDisplayLabel(toolId: string, zh: boolean) {
   const labels: Record<string, [string, string]> = {
@@ -895,9 +955,10 @@ function effectiveTerminalAgentEventV4(events: AgentRunEventV4[]): AgentRunEvent
   return undefined;
 }
 
-function getV4PauseReason(events: AgentRunEventV4[]): "approval" | "input" | "browser_connection" | "browser_human" | "uncertain" | null {
+function getV4PauseReason(events: AgentRunEventV4[]): "approval" | "input" | "browser_connection" | "browser_human" | "uncertain" | "runtime_recovery" | null {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index].event;
+    if (event.kind === "runtime_recovery_available") return event.call_ids.some((id) => !events.slice(index + 1).some((item) => item.event.kind === "tool_finished" && item.event.outcome.call_id === id)) ? "runtime_recovery" : null;
     if (event.kind === "tool_approval_requested") return isV4ApprovalDecided(events, event.request.approval_id) ? null : "approval";
     if (event.kind === "input_requested") return isV4QuestionAnswered(events, event.question_id) ? null : "input";
     if (event.kind === "browser_connection_required") return "browser_connection";

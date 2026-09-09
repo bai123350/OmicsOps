@@ -823,6 +823,29 @@ CREATE TABLE IF NOT EXISTS agent_runs_v4 (
     updated_at INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS runtime_jobs_v4 (
+    job_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES agent_runs_v4(run_id) ON DELETE CASCADE,
+    call_id TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    UNIQUE(run_id, call_id)
+);
+
+CREATE TABLE IF NOT EXISTS runtime_job_results_v4 (
+    job_id TEXT PRIMARY KEY REFERENCES runtime_jobs_v4(job_id) ON DELETE CASCADE,
+    result_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_guidance_v4 (
+    message_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES agent_runs_v4(run_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK(ordinal > 0),
+    markdown TEXT NOT NULL,
+    accepted_at INTEGER NOT NULL,
+    consumed_at INTEGER,
+    UNIQUE(run_id, ordinal)
+);
+
 CREATE TABLE IF NOT EXISTS agent_events_v4 (
     run_id TEXT NOT NULL REFERENCES agent_runs_v4(run_id) ON DELETE CASCADE,
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,

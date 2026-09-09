@@ -47,6 +47,8 @@ pub enum ProviderStreamEvent {
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+        /// Built-in adapters retain only allowlisted numeric usage counters here,
+        /// never raw response bodies. Reasoning tokens are not an effort report.
         #[serde(default)]
         provider_json: Value,
     },

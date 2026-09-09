@@ -13,6 +13,9 @@ use tokio::sync::{Mutex, Semaphore};
 #[async_trait]
 pub trait ToolExecutorV4: Send + Sync {
     async fn execute(&self, call: &ToolCallV4) -> Result<ToolOutcomeV4, String>;
+    async fn recover_result(&self, _call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
+        Ok(None)
+    }
     fn has_persistent_authorization(&self, _call: &ToolCallV4) -> bool {
         false
     }
@@ -97,7 +100,10 @@ impl ToolRegistryV4 {
             .ok_or_else(|| ToolRegistryErrorV4::Unknown(call.tool_id.clone()))?;
         let direct_only = matches!(
             call.tool_id.as_str(),
-            "agent.route_request" | "agent.record_mcp_unavailable" | "agent.update_tasks"
+            "agent.route_request"
+                | "agent.record_mcp_unavailable"
+                | "agent.update_tasks"
+                | "agent.read_tool_result"
         );
         let planning_allowed = !direct_only
             && (definition.effect == ToolEffectV4::ReadOnly
@@ -167,6 +173,11 @@ impl ToolRegistryV4 {
 
 #[async_trait]
 impl ToolPortV4 for ToolRegistryV4 {
+    async fn recover_result(&self, call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
+        self.authorize(RunModeV4::Execute, call)
+            .map_err(|error| error.to_string())?;
+        self.executor.recover_result(call).await
+    }
     fn descriptors(&self, mode: RunModeV4) -> Vec<ToolDescriptorV4> {
         self.definitions
             .values()
@@ -177,6 +188,7 @@ impl ToolPortV4 for ToolRegistryV4 {
                         "agent.route_request"
                             | "agent.record_mcp_unavailable"
                             | "agent.update_tasks"
+                            | "agent.read_tool_result"
                     ) && (definition.effect == ToolEffectV4::ReadOnly
                         || matches!(
                             definition.id.as_str(),
@@ -380,6 +392,16 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
             json!({"type":"object","required":["route","task_shape","reason"],"properties":{"route":{"type":"string","enum":["research_retrieval","adaptive"]},"task_shape":{"type":"string","enum":["fast","multi_step"]},"reason":{"type":"string","minLength":1}}}),
         ),
         descriptor(
+            "agent.read_tool_result",
+            "Read a bounded page of an original tool outcome or delegation trace from this run using its result_reference. Delegation traces use field data. Offsets and limits are UTF-8 bytes; use next_offset for the next page. Cannot read other runs or arbitrary files.",
+            ToolEffectV4::ReadOnly,
+            json!({"type":"object","required":["sequence","event_hash","field","offset","limit"],"properties":{
+                "sequence":{"type":"integer","minimum":0},"event_hash":{"type":"string","minLength":1},
+                "field":{"type":"string","enum":["model_content","data"]},
+                "offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":4,"maximum":8192}
+            }}),
+        ),
+        descriptor(
             "agent.record_mcp_unavailable",
             "Record the structured reason that no discovered professional MCP can be called for this research retrieval",
             ToolEffectV4::ReadOnly,
@@ -447,9 +469,15 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "runtime.execute",
-            "Execute code in a persistent run-scoped kernel",
+            "Execute code in a persistent kernel, or background=true for a detached one-shot SSH job. Background jobs survive disconnects and Agent Stop; they do not share kernel variables. Query runtime.remote_job_status after restart. Never resubmit to reconnect.",
             ToolEffectV4::Runtime,
-            json!({"type":"object","required":["language","code"],"properties":{"language":{"type":"string"},"environment":{"type":"string","default":"system"},"code":{"type":"string"},"capture_paths":{"type":"array"},"analysis":{"type":"object","required":["analysis_type","input_dataset_ids","sample_ids","method","parameters"],"properties":{"analysis_type":{"type":"string"},"input_dataset_ids":{"type":"array"},"sample_ids":{"type":"array"},"method":{"type":"string"},"parameters":{"type":"object"},"software_requirements":{"type":"array"},"database_versions":{"type":"object"},"random_seed":{"type":["integer","null"]}}}}}),
+            json!({"type":"object","required":["language","code"],"properties":{"language":{"type":"string"},"environment":{"type":"string","default":"system"},"code":{"type":"string"},"background":{"type":"boolean","default":false},"capture_paths":{"type":"array"},"analysis":{"type":"object","required":["analysis_type","input_dataset_ids","sample_ids","method","parameters"],"properties":{"analysis_type":{"type":"string"},"input_dataset_ids":{"type":"array"},"sample_ids":{"type":"array"},"method":{"type":"string"},"parameters":{"type":"object"},"software_requirements":{"type":"array"},"database_versions":{"type":"object"},"random_seed":{"type":["integer","null"]}}}}}),
+        ),
+        descriptor(
+            "runtime.remote_job_status",
+            "Reconnect to a detached SSH job without executing code. Omit job_id to list up to 100 recent jobs in this project and SSH root; supply job_id to read current status/result. Running or unknown is not completion.",
+            ToolEffectV4::ReadOnly,
+            json!({"type":"object","properties":{"job_id":{"type":"string","format":"uuid"}}}),
         ),
         descriptor(
             "science.register_dataset",
@@ -733,6 +761,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn detached_jobs_keep_runtime_authority_while_status_is_read_only() {
+        let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap();
+        let submit = ToolCallV4 {
+            call_id: "background".into(),
+            tool_id: "runtime.execute".into(),
+            arguments: json!({"language":"python","code":"print(42)","background":true}),
+        };
+        assert!(registry.validate(RunModeV4::Plan, &submit).is_err());
+        let query = ToolCallV4 {
+            call_id: "observe".into(),
+            tool_id: "runtime.remote_job_status".into(),
+            arguments: json!({}),
+        };
+        registry.validate(RunModeV4::Plan, &query).unwrap();
+        assert_eq!(
+            registry
+                .descriptors(RunModeV4::Execute)
+                .iter()
+                .find(|d| d.id == query.tool_id)
+                .unwrap()
+                .effect,
+            ToolEffectV4::ReadOnly
+        );
+        let denied = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop))
+            .unwrap()
+            .with_execute_capabilities(BTreeSet::new());
+        assert!(denied.validate(RunModeV4::Execute, &submit).is_err());
+    }
+
     #[tokio::test]
     async fn plan_mode_hard_denies_runtime() {
         let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap();
@@ -748,6 +806,7 @@ mod tests {
         assert!(!planning.contains("agent.route_request"));
         assert!(!planning.contains("agent.record_mcp_unavailable"));
         assert!(!planning.contains("agent.update_tasks"));
+        assert!(!planning.contains("agent.read_tool_result"));
         // The generic MCP wrapper remains visible so the planner can request
         // a concrete target; its Network effect is dynamically gated by the
         // host rather than being treated as a permanently read-only tool.

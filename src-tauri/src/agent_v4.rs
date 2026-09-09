@@ -15,7 +15,7 @@ use chrono::Utc;
 use omicsops_adapters::{
     credentials::SystemCredentialVault,
     kernel::{kernel_driver, validate_capture_paths, validate_kernel_code},
-    llm::UnifiedModelClient,
+    llm::{RequestBudget, UnifiedModelClient},
     ssh::{SshJsonlProcess, SshSession},
 };
 use omicsops_agent::provider::{
@@ -73,9 +73,7 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::commands::{
-    AppState, authentication_for_profile, find_profile, require_trusted_host, unified_model_client,
-};
+use crate::commands::{AppState, authentication_for_profile, find_profile, require_trusted_host};
 pub use crate::dto::{ConversationAgentStateV4, RunSummaryV4, SessionAgentModeV4};
 use crate::p1_commands::{
     McpServerProfile, MemorySearchRequest, invoke_configured_mcp_tool_v4, memory_facts,
@@ -487,6 +485,8 @@ pub async fn agent_v4_start_planning(
         request.conversation_id,
         None,
         None,
+        None,
+        None,
     )
     .await
     {
@@ -738,6 +738,8 @@ pub async fn agent_v4_start_direct(
         request.conversation_id,
         None,
         None,
+        None,
+        None,
     )
     .await?;
     let run_id = tools.run_id();
@@ -765,7 +767,7 @@ pub async fn agent_v4_start_direct(
         &request.compute_selection,
     )
     .map_err(|error| error.to_string())?;
-    let spec = RunSpecV4::freeze_ordinary_agent_with_compute(
+    let mut spec = RunSpecV4::freeze_ordinary_agent_with_compute(
         run_id,
         request.project_id,
         request.conversation_id,
@@ -776,6 +778,14 @@ pub async fn agent_v4_start_direct(
         Utc::now(),
     )
     .map_err(|error| error.to_string())?;
+    let main_profile =
+        load_frozen_main_profile(&state.repository, request.model_profile_id, None).await?;
+    spec.model_configuration_hash = Some(main_profile.execution_configuration_hash());
+    spec.delegated_model = freeze_delegated_model(&state.repository, &main_profile).await?;
+    spec.spec_hash = Some(
+        spec.calculate_spec_hash()
+            .map_err(|error| error.to_string())?,
+    );
     let record = RunRecordV4 {
         run_id,
         project_id: request.project_id,
@@ -1435,6 +1445,8 @@ pub async fn agent_v4_resume(
             record.conversation_id,
             None,
             None,
+            None,
+            None,
         )
         .await
         {
@@ -1765,6 +1777,25 @@ pub async fn agent_v4_cancel(
             .map_err(|error| error.to_string())
     })
     .await
+}
+
+#[tauri::command]
+pub async fn agent_v4_cancel_runtime_recovery(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    run_id: Uuid,
+) -> Result<(), String> {
+    let _guard =
+        register_active_run_guard(&state.active_runs, run_id, Arc::new(AtomicBool::new(false)))?
+            .ok_or("run is busy; retry cancellation after the current action finishes")?;
+    let event = state
+        .repository
+        .cancel_runtime_recovery_v4(run_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    // A closed listener cannot turn a committed cancellation into a failed one.
+    let _ = app.emit(AGENT_V4_EVENT_CHANNEL, event);
+    Ok(())
 }
 
 #[tauri::command]
@@ -2265,6 +2296,41 @@ async fn reconcile_run_terminal_event(
         .map_err(|_| "active run registry unavailable".to_string())?
         .contains_key(&run_id);
     let terminal = missing_terminal_event(&record, &events, active, Utc::now());
+    let _recovery_guard = if terminal.is_some() && record.status == "running" && !active {
+        let Some(guard) = register_active_run_guard(
+            &state.active_runs,
+            run_id,
+            Arc::new(AtomicBool::new(false)),
+        )?
+        else {
+            return Ok(());
+        };
+        record = load_record(&state.repository, run_id).await?;
+        let current = state
+            .repository
+            .agent_events_v4(run_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if record.status != "running"
+            || has_terminal_event(&current)
+            || missing_terminal_event(&record, &current, false, Utc::now()).is_none()
+        {
+            return Ok(());
+        }
+        if let Some(event) = state
+            .repository
+            .prepare_runtime_recovery_v4(run_id)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            // Persistence is authoritative; UI hydration also reads this event.
+            let _ = app.emit(AGENT_V4_EVENT_CHANNEL, event);
+            return Ok(());
+        }
+        Some(guard)
+    } else {
+        None
+    };
     if terminal.is_some() && matches!(record.status.as_str(), "completed" | "running") {
         record.status = "failed".into();
     }
@@ -2346,6 +2412,8 @@ async fn spawn_execution(
         spec.conversation_id,
         Some(&spec.plan.requested_capabilities),
         forced_route,
+        spec.delegated_model.as_ref(),
+        spec.model_configuration_hash.as_deref(),
     )
     .await?;
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -2354,6 +2422,13 @@ async fn spawn_execution(
         // must not replace the cancellation token of the execution already
         // running for this run ID.
         return Ok(());
+    }
+    // Cancellation may have committed while compose was awaiting resources.
+    // Recheck under ownership so a delayed resume cannot overwrite its status.
+    let recheck = reject_cancelled_execution(&state.repository, spec.run_id).await;
+    if let Err(error) = recheck {
+        remove_active_run(&state.active_runs, spec.run_id, &cancelled);
+        return Err(error);
     }
     let repository = state.repository.clone();
     let active = state.active_runs.clone();
@@ -2504,6 +2579,20 @@ async fn spawn_execution(
         let _ = save_record(&repository, &record).await;
         remove_active_run(&active, spec.run_id, &cancelled);
     });
+    Ok(())
+}
+
+async fn reject_cancelled_execution(repository: &Store, run_id: Uuid) -> Result<(), String> {
+    let events = repository
+        .agent_events_v4(run_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if events
+        .iter()
+        .any(|event| matches!(event.event, AgentEventKindV4::RunCancelled))
+    {
+        return Err("cancelled runs cannot be resumed".into());
+    }
     Ok(())
 }
 
@@ -2681,6 +2770,62 @@ impl ComposedToolsV4 {
     }
 }
 
+async fn load_frozen_main_profile(
+    repository: &Store,
+    profile_id: Uuid,
+    expected_hash: Option<&str>,
+) -> Result<omicsops_core::workspace::ModelProfile, String> {
+    let profile = repository
+        .get_model_profile(profile_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or("main model profile not found")?;
+    if expected_hash.is_some_and(|hash| profile.execution_configuration_hash() != hash) {
+        return Err(
+            "frozen main model configuration changed; restore the profile or start a new run"
+                .into(),
+        );
+    }
+    Ok(profile)
+}
+
+async fn freeze_delegated_model(
+    repository: &Store,
+    main: &omicsops_core::workspace::ModelProfile,
+) -> Result<Option<omicsops_protocol::DelegatedModelBindingV4>, String> {
+    let Some(child_id) = main.delegated_model_profile_id else {
+        return Ok(None);
+    };
+    let child = repository
+        .get_model_profile(child_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or("configured delegated model profile not found")?;
+    if child_id == main.id || !child.supports_tools {
+        return Err("delegated model must be a separate tool-capable profile".into());
+    }
+    Ok(Some(omicsops_protocol::DelegatedModelBindingV4 {
+        profile_id: child.id,
+        configuration_hash: child.execution_configuration_hash(),
+    }))
+}
+
+fn validate_delegated_profile(
+    profile: &omicsops_core::workspace::ModelProfile,
+    binding: &omicsops_protocol::DelegatedModelBindingV4,
+) -> Result<(), String> {
+    if !profile.supports_tools
+        || profile.id != binding.profile_id
+        || profile.execution_configuration_hash() != binding.configuration_hash
+    {
+        return Err(
+            "frozen delegated model configuration changed; restore the profile or start a new run"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 async fn compose(
     state: &AppState,
     project: &Project,
@@ -2690,7 +2835,15 @@ async fn compose(
     conversation_id: Uuid,
     execute_capabilities: Option<&BTreeSet<String>>,
     forced_route: Option<AgentRequestRouteV4>,
+    delegated_binding: Option<&omicsops_protocol::DelegatedModelBindingV4>,
+    main_configuration_hash: Option<&str>,
 ) -> Result<(Arc<DesktopModelPortV4>, ComposedToolsV4), String> {
+    // Validate before opening SSH or runtime resources, then construct the
+    // client and budget from this same owned snapshot without reloading it.
+    let model_profile =
+        load_frozen_main_profile(&state.repository, model_profile_id, main_configuration_hash)
+            .await?;
+    let mut remote_jobs = None;
     let (filesystem, environment_port, backend): (
         Arc<dyn ProjectFilesystemPortV4>,
         Arc<dyn RuntimeEnvironmentPortV4>,
@@ -2722,6 +2875,7 @@ async fn compose(
                 .as_deref()
                 .ok_or("project has no remote root")?;
             let root = resolve_root(&session, configured_root).await?;
+            remote_jobs = Some((session.clone(), root.clone()));
             (
                 Arc::new(SshProjectFilesystemV4 {
                     session: session.clone(),
@@ -2793,12 +2947,6 @@ async fn compose(
         selection.network_policy
     ));
     let runtime = Arc::new(RuntimeManagerV4::new(backend));
-    let model_profile = state
-        .repository
-        .get_model_profile(model_profile_id)
-        .await
-        .map_err(|error| error.to_string())?
-        .ok_or("model profile not found")?;
     let executor = Arc::new(DesktopToolExecutorV4 {
         repository: state.repository.clone(),
         mcp_sessions: state.mcp_sessions.clone(),
@@ -2821,6 +2969,7 @@ async fn compose(
                 .map_err(|error| error.to_string())?,
         )),
         forced_route,
+        remote_jobs,
     });
     let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), executor)
         .map_err(|error| error.to_string())?
@@ -2830,12 +2979,46 @@ async fn compose(
     } else {
         registry
     };
+    let delegated = if let Some(binding) = delegated_binding {
+        let child = state
+            .repository
+            .get_model_profile(binding.profile_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("frozen delegated model profile not found")?;
+        validate_delegated_profile(&child, binding)?;
+        Some((
+            binding.clone(),
+            Box::new(DesktopModelPortV4 {
+                client: crate::commands::unified_model_client_for_profile(state, &child)?
+                    .with_request_budget(RequestBudget {
+                        context_window_tokens: child.effective_context_window_tokens(),
+                        reserved_output_tokens: child.effective_output_tokens(),
+                        safety_margin_tokens: 1024,
+                    }),
+                prompt: prompt.clone(),
+                project_root: PathBuf::from(&project.local_root),
+                supports_vision: child.supports_vision,
+                delegated: None,
+            }),
+        ))
+    } else {
+        None
+    };
     Ok((
         Arc::new(DesktopModelPortV4 {
-            client: unified_model_client(state, model_profile_id).await?,
+            client: crate::commands::unified_model_client_for_profile(state, &model_profile)?
+                .with_request_budget(RequestBudget {
+                    context_window_tokens: model_profile.effective_context_window_tokens(),
+                    // This is a requested output allowance, not an inferred
+                    // maximum capability of an unknown model.
+                    reserved_output_tokens: model_profile.effective_output_tokens(),
+                    safety_margin_tokens: 1024,
+                }),
             prompt,
             project_root: PathBuf::from(&project.local_root),
             supports_vision: model_profile.supports_vision,
+            delegated,
         }),
         ComposedToolsV4 {
             run_id,
@@ -2849,18 +3032,17 @@ struct DesktopModelPortV4 {
     prompt: PromptLayersV4,
     project_root: PathBuf,
     supports_vision: bool,
+    delegated: Option<(
+        omicsops_protocol::DelegatedModelBindingV4,
+        Box<DesktopModelPortV4>,
+    )>,
 }
-#[async_trait]
-impl ModelPortV4 for DesktopModelPortV4 {
-    fn prompt_layers(&self) -> PromptLayersV4 {
-        self.prompt.clone()
-    }
-
-    async fn stream(
+impl DesktopModelPortV4 {
+    fn prepare_request(
         &self,
         request: ModelRequestV4,
-        on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
-    ) -> Result<ModelTurnV4, ModelFailureV4> {
+        load_images: bool,
+    ) -> Result<ProviderRequest, ModelFailureV4> {
         let tools = request
             .tools
             .into_iter()
@@ -2879,7 +3061,13 @@ impl ModelPortV4 for DesktopModelPortV4 {
         } else {
             let mut parts = vec![omicsops_agent::ModelContentPart::Text { text: context }];
             for image in &request.image_refs {
-                let bytes = verified_model_image(&self.project_root, image)?;
+                let bytes = if load_images {
+                    verified_model_image(&self.project_root, image)?
+                } else {
+                    // Preserve the image part for budget validation without
+                    // accessing disk. Unknown image cost must not become zero.
+                    Vec::new()
+                };
                 parts.push(omicsops_agent::ModelContentPart::Image {
                     media_type: image.media_type.clone(),
                     data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
@@ -2887,56 +3075,93 @@ impl ModelPortV4 for DesktopModelPortV4 {
             }
             omicsops_agent::ModelMessageContent::Parts(parts)
         };
+        Ok(ProviderRequest {
+            system: request.system,
+            messages: vec![omicsops_agent::ModelMessage {
+                role: "user".into(),
+                content,
+            }],
+            tools,
+            require_strict_json_fallback: true,
+        })
+    }
+}
+
+#[async_trait]
+impl ModelPortV4 for DesktopModelPortV4 {
+    fn delegated_model(
+        &self,
+        binding: Option<&omicsops_protocol::DelegatedModelBindingV4>,
+    ) -> Result<Option<&dyn ModelPortV4>, ModelFailureV4> {
+        match (binding, &self.delegated) {
+            (None, _) => Ok(None),
+            (Some(expected), Some((actual, model))) if expected == actual => {
+                Ok(Some(model.as_ref()))
+            }
+            _ => Err(ModelFailureV4::permanent(
+                ModelErrorClassV4::InvalidRequest,
+                "frozen delegated model binding is unavailable or changed",
+            )),
+        }
+    }
+    fn prompt_layers(&self) -> PromptLayersV4 {
+        self.prompt.clone()
+    }
+
+    fn validate_request(&self, request: &ModelRequestV4) -> Result<(), ModelFailureV4> {
+        let provider_request = self.prepare_request(request.clone(), false)?;
+        self.client
+            .validate_request(&provider_request)
+            .map_err(|error| {
+                ModelFailureV4::permanent(ModelErrorClassV4::InvalidRequest, error.to_string())
+            })
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequestV4,
+        on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+    ) -> Result<ModelTurnV4, ModelFailureV4> {
+        self.validate_request(&request)?;
+        let provider_request = self.prepare_request(request, true)?;
         let mut text = String::new();
         let mut calls = ProviderToolCallAccumulator::default();
         let mut provider_error = None;
         let mut accumulator_error = None;
         self.client
-            .stream_with_provider(
-                ProviderRequest {
-                    system: request.system,
-                    messages: vec![omicsops_agent::ModelMessage {
-                        role: "user".into(),
-                        content,
-                    }],
-                    tools,
-                    require_strict_json_fallback: true,
-                },
-                |event| match event {
-                    ProviderStreamEvent::TextDelta { text: delta } => {
-                        text.push_str(&delta);
-                        on_event(ModelStreamEventV4::TextDelta(delta));
+            .stream_with_provider(provider_request, |event| match event {
+                ProviderStreamEvent::TextDelta { text: delta } => {
+                    text.push_str(&delta);
+                    on_event(ModelStreamEventV4::TextDelta(delta));
+                }
+                ProviderStreamEvent::Retrying {
+                    attempt,
+                    delay_ms,
+                    message,
+                } => on_event(ModelStreamEventV4::ProviderRetrying {
+                    attempt,
+                    delay_ms,
+                    message,
+                }),
+                ProviderStreamEvent::Error { code, message, .. } => {
+                    provider_error = Some(classify_model_failure(&format!("{code}: {message}")));
+                }
+                other if accumulator_error.is_none() => {
+                    if let Err(error) = calls.push(&other) {
+                        accumulator_error = Some(ModelFailureV4::permanent(
+                            ModelErrorClassV4::InvalidResponse,
+                            error.to_string(),
+                        ));
                     }
-                    ProviderStreamEvent::Retrying {
-                        attempt,
-                        delay_ms,
-                        message,
-                    } => on_event(ModelStreamEventV4::ProviderRetrying {
-                        attempt,
-                        delay_ms,
-                        message,
-                    }),
-                    ProviderStreamEvent::Error { code, message, .. } => {
-                        provider_error =
-                            Some(classify_model_failure(&format!("{code}: {message}")));
-                    }
-                    other if accumulator_error.is_none() => {
-                        if let Err(error) = calls.push(&other) {
-                            accumulator_error = Some(ModelFailureV4::permanent(
-                                ModelErrorClassV4::InvalidResponse,
-                                error.to_string(),
-                            ));
-                        }
-                    }
-                    _ => {}
-                },
-            )
+                }
+                _ => {}
+            })
             .await
             .map_err(|error| classify_model_failure(&error.to_string()))?;
         if let Some(error) = provider_error.or(accumulator_error) {
             return Err(error);
         }
-        let tool_calls = calls
+        let tool_calls: Vec<ToolCallV4> = calls
             .finish()
             .map_err(|error| {
                 ModelFailureV4::permanent(ModelErrorClassV4::InvalidResponse, error.to_string())
@@ -2948,6 +3173,12 @@ impl ModelPortV4 for DesktopModelPortV4 {
                 arguments: call.arguments,
             })
             .collect();
+        if text.trim().is_empty() && tool_calls.is_empty() {
+            return Err(ModelFailureV4::permanent(
+                ModelErrorClassV4::InvalidResponse,
+                "empty_model_response: no public text or tools; prior run evidence is retained",
+            ));
+        }
         Ok(ModelTurnV4 {
             public_text: text,
             tool_calls,
@@ -3052,7 +3283,9 @@ fn verified_model_image(
 
 fn classify_model_failure(message: &str) -> ModelFailureV4 {
     let lower = message.to_ascii_lowercase();
-    if lower.contains("429") || lower.contains("rate limit") {
+    if lower.contains("context_length_exceeded") || lower.contains("context_window_exceeded") {
+        ModelFailureV4::permanent(ModelErrorClassV4::ContextOverflow, message)
+    } else if lower.contains("429") || lower.contains("rate limit") {
         ModelFailureV4::transient(ModelErrorClassV4::RateLimited, message)
     } else if ["500", "502", "503", "504"]
         .iter()
@@ -3476,6 +3709,7 @@ struct DesktopToolExecutorV4 {
     local_project_root: PathBuf,
     browser_authorizations: Arc<std::sync::Mutex<Vec<BrowserAuthorizationV4>>>,
     forced_route: Option<AgentRequestRouteV4>,
+    remote_jobs: Option<(Arc<SshSession>, String)>,
 }
 
 impl DesktopToolExecutorV4 {
@@ -4294,7 +4528,46 @@ impl DesktopToolExecutorV4 {
                 validate_kernel_code(&code).map_err(|e| e.to_string())?;
                 validate_capture_paths(&captures).map_err(|e| e.to_string())?;
                 let key = self.key(language, environment)?;
-                let mut result = self.runtime.execute(&key, code, captures).await?;
+                if call
+                    .arguments
+                    .get("background")
+                    .map(|value| value.as_bool().ok_or("background must be boolean"))
+                    .transpose()?
+                    .unwrap_or(false)
+                {
+                    validate_environment_name(environment)?;
+                    let (session, root) = self
+                        .remote_jobs
+                        .as_ref()
+                        .ok_or("background jobs require an SSH Linux backend")?;
+                    let data = crate::remote_jobs_v4::submit(
+                        &self.repository,
+                        &crate::remote_jobs_v4::SshTransport {
+                            session: session.clone(),
+                        },
+                        root,
+                        &key,
+                        call,
+                    )
+                    .await?;
+                    return Ok(ToolOutcomeV4 {
+                        call_id: call.call_id.clone(),
+                        tool_id: call.tool_id.clone(),
+                        succeeded: true,
+                        model_content: serde_json::to_string(&data).map_err(|e| e.to_string())?,
+                        data,
+                        provenance: vec![],
+                    });
+                }
+                let (running, mut result) = crate::runtime_jobs_v4::execute_reserved(
+                    &self.repository,
+                    &self.runtime,
+                    &key,
+                    &call,
+                    code,
+                    captures,
+                )
+                .await?;
                 result.software_versions = self
                     .software_versions(
                         language,
@@ -4308,38 +4581,52 @@ impl DesktopToolExecutorV4 {
                             .filter_map(Value::as_str),
                     )
                     .await;
-                let content = format!(
-                    "session={} process={} request={}\nstdout ({} bytes, sha256={}):\n{}\nstderr ({} bytes, sha256={}):\n{}",
-                    result.session_id,
-                    result.process_identity,
-                    result.request_id,
-                    result
-                        .stdout_capture
-                        .as_ref()
-                        .map_or(0, |capture| capture.total_bytes),
-                    result
-                        .stdout_capture
-                        .as_ref()
-                        .map_or("", |capture| capture.sha256.as_str()),
-                    result.stdout,
-                    result
-                        .stderr_capture
-                        .as_ref()
-                        .map_or(0, |capture| capture.total_bytes),
-                    result
-                        .stderr_capture
-                        .as_ref()
-                        .map_or("", |capture| capture.sha256.as_str()),
-                    result.stderr
-                );
-                return Ok(ToolOutcomeV4 {
-                    call_id: call.call_id.clone(),
-                    tool_id: call.tool_id.clone(),
-                    succeeded: result.succeeded,
-                    model_content: content,
-                    data: serde_json::to_value(&result).map_err(|e| e.to_string())?,
-                    provenance: vec![format!("kernel-session:{}", result.session_id)],
-                });
+                self.repository
+                    .advance_runtime_job_v4(
+                        &running,
+                        if result.succeeded {
+                            omicsops_protocol::RuntimeJobStateV4::Succeeded
+                        } else {
+                            omicsops_protocol::RuntimeJobStateV4::Failed
+                        },
+                        None,
+                        Some(&result),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                return crate::runtime_jobs_v4::outcome(call, &running, &result);
+            }
+            "runtime.remote_job_status" => {
+                let (session, root) = self
+                    .remote_jobs
+                    .as_ref()
+                    .ok_or("remote jobs require an SSH Linux backend")?;
+                let job_id = call
+                    .arguments
+                    .get("job_id")
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .ok_or("invalid job id")
+                            .and_then(|id| Uuid::parse_str(id).map_err(|_| "invalid job id"))
+                    })
+                    .transpose()?;
+                let data = crate::remote_jobs_v4::query(
+                    &self.repository,
+                    &crate::remote_jobs_v4::SshTransport {
+                        session: session.clone(),
+                    },
+                    self.project_id,
+                    &self.backend_id,
+                    root,
+                    job_id,
+                )
+                .await?;
+                (
+                    serde_json::to_string(&data).map_err(|e| e.to_string())?,
+                    data,
+                    vec![],
+                )
             }
             "runtime.environment.ensure" => {
                 let language = parse_language(required(&call.arguments, "language")?)?;
@@ -4446,6 +4733,24 @@ impl DesktopToolExecutorV4 {
 
 #[async_trait]
 impl ToolExecutorV4 for DesktopToolExecutorV4 {
+    async fn recover_result(&self, call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
+        if call.tool_id != "runtime.execute" {
+            return Ok(None);
+        }
+        let language = parse_language(required(&call.arguments, "language")?)?;
+        let environment = call
+            .arguments
+            .get("environment")
+            .and_then(Value::as_str)
+            .unwrap_or("system");
+        let key = self.key(language, environment)?;
+        self.repository
+            .recover_runtime_result_v4(&key, call)
+            .await
+            .map_err(|error| error.to_string())?
+            .map(|(job, result)| crate::runtime_jobs_v4::outcome(call, &job, &result))
+            .transpose()
+    }
     async fn execute(&self, call: &ToolCallV4) -> Result<ToolOutcomeV4, String> {
         self.execute_inner(call, false).await
     }
@@ -4714,14 +5019,47 @@ struct RepositoryEventStoreV4 {
     repository: Store,
     app: AppHandle,
 }
-#[async_trait]
-impl EventStoreV4 for RepositoryEventStoreV4 {
-    async fn append(&self, event: &AgentEventV4) -> Result<(), String> {
-        let message = self
-            .repository
-            .append_agent_event_v4_with_conversation(event)
-            .await
-            .map_err(|e| e.to_string())?;
+#[tauri::command]
+pub async fn agent_v4_submit_guidance(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: omicsops_dto::SubmitGuidanceV4Request,
+) -> Result<omicsops_dto::GuidanceRecordV4, String> {
+    let record = state
+        .repository
+        .accept_guidance_v4(&request)
+        .await
+        .map_err(|error| error.to_string())?;
+    let active = state
+        .active_runs
+        .lock()
+        .map_err(|_| "active run registry unavailable")?
+        .contains_key(&request.run_id);
+    if !active && record.consumed_at.is_none() {
+        // A restart can leave a durable running record without a live driver.
+        // Resume uses the same idempotent active slot as explicit UI resumes.
+        if let Err(error) = agent_v4_resume(app, state, request.run_id).await {
+            eprintln!("accepted guidance retained; automatic resume failed: {error}");
+        }
+    }
+    Ok(record)
+}
+
+#[tauri::command]
+pub async fn agent_v4_list_guidance(
+    state: State<'_, AppState>,
+    project_id: Uuid,
+    conversation_id: Uuid,
+    run_id: Uuid,
+) -> Result<Vec<omicsops_dto::GuidanceRecordV4>, String> {
+    state
+        .repository
+        .list_guidance_v4(project_id, conversation_id, run_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+impl RepositoryEventStoreV4 {
+    fn publish(&self, event: &AgentEventV4, message: Option<omicsops_core::workspace::Message>) {
         // Persistence is the source of truth. A closed/stale Tauri listener
         // must not make the agent retry a committed event or report a command
         // failure; the next reconciliation/hydration reads it from Store.
@@ -4740,7 +5078,49 @@ impl EventStoreV4 for RepositoryEventStoreV4 {
                 eprintln!("failed to broadcast committed conversation event: {error}");
             }
         }
+    }
+}
+#[async_trait]
+impl EventStoreV4 for RepositoryEventStoreV4 {
+    async fn append(&self, event: &AgentEventV4) -> Result<(), String> {
+        let message = self
+            .repository
+            .append_agent_event_v4_with_conversation(event)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.publish(event, message);
         Ok(())
+    }
+    async fn append_completion(&self, event: &AgentEventV4) -> Result<bool, String> {
+        match self
+            .repository
+            .append_agent_event_v4_with_conversation(event)
+            .await
+        {
+            Ok(message) => {
+                self.publish(event, message);
+                Ok(true)
+            }
+            Err(omicsops_store::StoreError::GuidancePending) => Ok(false),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+    async fn consume_guidance(&self, spec: &RunSpecV4) -> Result<bool, String> {
+        let events = self
+            .repository
+            .consume_guidance_v4(spec)
+            .await
+            .map_err(|error| error.to_string())?;
+        for event in &events {
+            self.publish(event, None);
+        }
+        Ok(!events.is_empty())
+    }
+    async fn has_pending_guidance(&self, run_id: Uuid) -> Result<bool, String> {
+        self.repository
+            .has_pending_guidance_v4(run_id)
+            .await
+            .map_err(|error| error.to_string())
     }
     async fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String> {
         self.repository
@@ -5448,6 +5828,308 @@ mod tests {
         ToolDescriptorV4, ToolEffectV4,
     };
     use url::Url;
+
+    fn budget_test_model(supports_vision: bool, window: u32) -> DesktopModelPortV4 {
+        DesktopModelPortV4 {
+            client: UnifiedModelClient::new(
+                Uuid::new_v4(),
+                ProviderProtocol::Ollama,
+                Url::parse("http://127.0.0.1:1").unwrap(),
+                "test-model",
+                None,
+            )
+            .unwrap()
+            .with_request_budget(RequestBudget {
+                context_window_tokens: window,
+                reserved_output_tokens: 100,
+                safety_margin_tokens: 10,
+            }),
+            prompt: PromptLayersV4::default(),
+            project_root: PathBuf::from("nonexistent-budget-test-root"),
+            supports_vision,
+            delegated: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_recovery_cancel_rejects_a_delayed_execution_start() {
+        let repository = Store::open_in_memory().await.unwrap();
+        let project = Project::new(
+            Uuid::new_v4(),
+            "test",
+            "synthetic",
+            omicsops_core::workspace::ProjectTemplate::Blank,
+            Utc::now(),
+        );
+        repository.save_project(&project).await.unwrap();
+        let conversation = omicsops_core::workspace::Conversation::new(
+            Uuid::new_v4(),
+            project.id,
+            "test",
+            Utc::now(),
+        );
+        repository.save_conversation(&conversation).await.unwrap();
+        let run_id = Uuid::new_v4();
+        repository
+            .save_agent_run_v4(
+                run_id,
+                project.id,
+                conversation.id,
+                "waiting_for_input",
+                &json!({"status":"waiting_for_input"}),
+            )
+            .await
+            .unwrap();
+        let first = AgentEventV4::first(
+            run_id,
+            project.id,
+            conversation.id,
+            Utc::now(),
+            AgentEventKindV4::RunCreated {
+                mode: omicsops_protocol::RunModeV4::Execute,
+            },
+        );
+        repository.append_agent_event_v4(&first).await.unwrap();
+        repository
+            .append_agent_event_v4(&AgentEventV4::next(
+                &first,
+                Utc::now(),
+                AgentEventKindV4::RuntimeRecoveryAvailable {
+                    call_ids: vec!["cell".into()],
+                },
+            ))
+            .await
+            .unwrap();
+        reject_cancelled_execution(&repository, run_id)
+            .await
+            .unwrap();
+        let registry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let guard = register_active_run_guard(&registry, run_id, Arc::new(AtomicBool::new(false)))
+            .unwrap()
+            .unwrap();
+        assert!(!register_active_run(&registry, run_id, Arc::new(AtomicBool::new(false))).unwrap());
+        repository.cancel_runtime_recovery_v4(run_id).await.unwrap();
+        drop(guard);
+        let delayed =
+            register_active_run_guard(&registry, run_id, Arc::new(AtomicBool::new(false)))
+                .unwrap()
+                .unwrap();
+        assert!(
+            reject_cancelled_execution(&repository, run_id)
+                .await
+                .unwrap_err()
+                .contains("cannot be resumed")
+        );
+        drop(delayed);
+        assert!(registry.lock().unwrap().is_empty());
+        assert_eq!(
+            repository.agent_run_v4(run_id).await.unwrap().unwrap()["status"],
+            "cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn main_profile_restore_checks_execution_settings_and_retains_one_snapshot() {
+        let repository = Store::open_in_memory().await.unwrap();
+        let profile: omicsops_core::workspace::ModelProfile = serde_json::from_value(json!({
+            "id":Uuid::new_v4(),"label":"main","provider":"open_ai_compatible","base_url":"https://gateway.example/v1",
+            "model":"exact-model","credential_reference":null,"supports_tools":true,"supports_vision":false,
+            "reasoning_effort":"max"
+        })).unwrap();
+        let hash = profile.execution_configuration_hash();
+        assert!(
+            load_frozen_main_profile(&repository, profile.id, Some(&hash))
+                .await
+                .is_err()
+        );
+        repository.save_model_profile(&profile).await.unwrap();
+        let snapshot = load_frozen_main_profile(&repository, profile.id, Some(&hash))
+            .await
+            .unwrap();
+        let mut renamed = profile.clone();
+        renamed.label = "renamed".into();
+        renamed.credential_reference = Some("test-keyring-reference".into());
+        repository.save_model_profile(&renamed).await.unwrap();
+        load_frozen_main_profile(&repository, profile.id, Some(&hash))
+            .await
+            .unwrap();
+        for field in [
+            "model", "host", "provider", "context", "vision", "tools", "effort",
+        ] {
+            let mut changed = profile.clone();
+            match field {
+                "model" => changed.model.push_str("-sibling"),
+                "host" => changed.base_url = "https://other.example/v1".into(),
+                "provider" => {
+                    changed.provider = omicsops_core::workspace::ModelProviderKind::Anthropic
+                }
+                "context" => changed.context_window_tokens = Some(64000),
+                "vision" => changed.supports_vision = true,
+                "tools" => changed.supports_tools = false,
+                "effort" => changed.reasoning_effort = Some("low".into()),
+                _ => unreachable!(),
+            }
+            repository.save_model_profile(&changed).await.unwrap();
+            assert!(
+                load_frozen_main_profile(&repository, profile.id, Some(&hash))
+                    .await
+                    .unwrap_err()
+                    .contains("frozen main model configuration changed"),
+                "{field}"
+            );
+            // Old specs intentionally retain legacy profile loading behavior.
+            assert_eq!(
+                load_frozen_main_profile(&repository, profile.id, None)
+                    .await
+                    .unwrap(),
+                changed
+            );
+        }
+        assert_eq!(snapshot, profile);
+        repository.save_model_profile(&profile).await.unwrap();
+        assert_eq!(
+            load_frozen_main_profile(&repository, profile.id, Some(&hash))
+                .await
+                .unwrap(),
+            profile
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_profile_freezes_exact_configuration_and_missing_profiles_fail() {
+        let repository = Store::open_in_memory().await.unwrap();
+        let mut main: omicsops_core::workspace::ModelProfile = serde_json::from_value(json!({
+            "id":Uuid::new_v4(),"label":"main","provider":"ollama","base_url":"http://127.0.0.1:11434",
+            "model":"main-exact","credential_reference":null,"supports_tools":true,"supports_vision":false,
+        })).unwrap();
+        repository.save_model_profile(&main).await.unwrap();
+        assert_eq!(
+            freeze_delegated_model(&repository, &main).await.unwrap(),
+            None
+        );
+        let mut child = main.clone();
+        child.id = Uuid::new_v4();
+        child.model = "child-exact".into();
+        main.delegated_model_profile_id = Some(child.id);
+        repository.save_model_profile(&main).await.unwrap();
+        assert!(
+            freeze_delegated_model(&repository, &main)
+                .await
+                .unwrap_err()
+                .contains("not found")
+        );
+        repository.save_model_profile(&child).await.unwrap();
+        let binding = freeze_delegated_model(&repository, &main)
+            .await
+            .unwrap()
+            .unwrap();
+        validate_delegated_profile(&child, &binding).unwrap();
+        let legacy_hash = child.execution_configuration_hash();
+        child.reasoning_effort = Some("max".into());
+        assert!(validate_delegated_profile(&child, &binding).is_err());
+        repository.save_model_profile(&child).await.unwrap();
+        assert_eq!(
+            repository
+                .get_model_profile(child.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .reasoning_effort
+                .as_deref(),
+            Some("max")
+        );
+        child.reasoning_effort = None;
+        assert_eq!(child.execution_configuration_hash(), legacy_hash);
+        child.label = "renamed".into();
+        child.credential_reference = Some("safe-keyring-reference".into());
+        validate_delegated_profile(&child, &binding).unwrap();
+        child.model = "child-exact-sibling".into();
+        assert!(validate_delegated_profile(&child, &binding).is_err());
+        child.model = "child-exact".into();
+        child.base_url = "http://127.0.0.1:11435".into();
+        assert!(validate_delegated_profile(&child, &binding).is_err());
+        let mut parent_port = budget_test_model(false, 100_000);
+        assert!(parent_port.delegated_model(Some(&binding)).is_err());
+        parent_port.delegated = Some((binding.clone(), Box::new(budget_test_model(false, 500))));
+        let child_port = parent_port
+            .delegated_model(Some(&binding))
+            .unwrap()
+            .unwrap();
+        let request = ModelRequestV4 {
+            system: "system".into(),
+            context: "large".repeat(500),
+            tools: vec![],
+            image_refs: vec![],
+        };
+        assert!(child_port.validate_request(&request).is_err());
+        assert!(parent_port.validate_request(&request).is_ok());
+        assert!(parent_port.delegated_model(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn desktop_preflight_counts_the_actual_nonvision_notice_and_tools() {
+        let model = budget_test_model(false, 100_000);
+        let request = ModelRequestV4 {
+            system: "system".into(),
+            context: "user context".into(),
+            tools: vec![ToolDescriptorV4 {
+                id: "read".into(),
+                description: "description".into(),
+                input_schema: json!({"type":"object"}),
+                effect: ToolEffectV4::ReadOnly,
+            }],
+            image_refs: vec![ModelImageRefV4 {
+                relative_path: "missing.png".into(),
+                media_type: "image/png".into(),
+                size_bytes: 1,
+                sha256: "unused".into(),
+            }],
+        };
+        let preview = model.prepare_request(request.clone(), false).unwrap();
+        let actual = model.prepare_request(request.clone(), true).unwrap();
+        assert_eq!(preview, actual);
+        assert_eq!(preview.tools.len(), 1);
+        assert!(
+            serde_json::to_string(&preview)
+                .unwrap()
+                .contains("HOST IMAGE NOTICE")
+        );
+        model.validate_request(&request).unwrap();
+    }
+
+    #[test]
+    fn provider_overflow_codes_are_distinct_from_generic_invalid_requests() {
+        for message in ["400: context_length_exceeded", "context_window_exceeded"] {
+            let failure = classify_model_failure(message);
+            assert_eq!(failure.class, ModelErrorClassV4::ContextOverflow);
+            assert!(!failure.retryable);
+        }
+        assert_eq!(
+            classify_model_failure("400 invalid tool schema").class,
+            ModelErrorClassV4::InvalidRequest
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_budget_rejects_unknown_images_before_disk_or_network_access() {
+        let model = budget_test_model(true, 100_000);
+        let request = ModelRequestV4 {
+            system: "system".into(),
+            context: "context".into(),
+            tools: vec![],
+            image_refs: vec![ModelImageRefV4 {
+                relative_path: "missing.png".into(),
+                media_type: "image/png".into(),
+                size_bytes: 1,
+                sha256: "unused".into(),
+            }],
+        };
+        let preflight = model.validate_request(&request).unwrap_err();
+        assert!(preflight.message.to_ascii_lowercase().contains("image"));
+        let actual = model.stream(request, &mut |_| {}).await.unwrap_err();
+        assert_eq!(actual, preflight);
+        assert!(!actual.retryable);
+    }
 
     #[test]
     fn host_route_classifier_forces_research_only_for_external_evidence_signals() {
@@ -6265,6 +6947,7 @@ mod tests {
             prompt: PromptLayersV4::default(),
             project_root: std::env::current_dir().unwrap(),
             supports_vision: false,
+            delegated: None,
         };
         let mut streamed = String::new();
         let turn = model
@@ -6440,6 +7123,7 @@ mod tests {
             local_project_root: std::env::temp_dir(),
             browser_authorizations: Arc::new(std::sync::Mutex::new(Vec::new())),
             forced_route: None,
+            remote_jobs: None,
         };
         executor
             .execute(&ToolCallV4 {
@@ -6551,6 +7235,7 @@ mod tests {
             local_project_root: std::env::temp_dir(),
             browser_authorizations: Arc::new(std::sync::Mutex::new(Vec::new())),
             forced_route: None,
+            remote_jobs: None,
         };
         let local_state = tempfile::tempdir().unwrap();
         let repository = Store::open(local_state.path().join("stage3.sqlite"))

@@ -40,6 +40,47 @@ mod retry_tests {
     }
 }
 
+#[cfg(test)]
+mod budget_tests {
+    use super::{ProviderProtocol, RequestBudget, UnifiedModelClient};
+    use serde_json::json;
+    use url::Url;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn final_send_boundary_rechecks_budget_for_non_streaming_fallback_shape() {
+        let client = UnifiedModelClient::new(
+            Uuid::new_v4(),
+            ProviderProtocol::Ollama,
+            Url::parse("http://127.0.0.1:1").unwrap(),
+            "model",
+            None,
+        )
+        .unwrap()
+        .with_request_budget(RequestBudget {
+            context_window_tokens: 8,
+            reserved_output_tokens: 1,
+            safety_margin_tokens: 1,
+        });
+        let body = json!({
+            "model": "model",
+            "stream": false,
+            "messages": [{"role": "user", "content": "a request too large for this budget"}]
+        });
+        let mut events = Vec::new();
+        let error = client
+            .send_with_retry_provider(
+                &Url::parse("http://127.0.0.1:1/api/chat").unwrap(),
+                &body,
+                &mut |event| events.push(event),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("request budget:"));
+        assert!(events.is_empty());
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderProtocol {
     Anthropic,
@@ -52,6 +93,111 @@ pub struct ProviderRequest {
     pub endpoint: Url,
     pub body: Value,
     pub requires_credential: bool,
+}
+
+/// A conservative preflight budget for one complete provider request.
+///
+/// The adapter currently estimates input tokens by counting the UTF-8 bytes of
+/// the compact, serialized provider JSON. This is deliberately conservative
+/// and is not a substitute for a provider tokenizer. Image token costs are
+/// provider/model dependent, so requests containing images fail closed until a
+/// model-specific estimator is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestBudget {
+    pub context_window_tokens: u32,
+    pub reserved_output_tokens: u32,
+    pub safety_margin_tokens: u32,
+}
+
+impl RequestBudget {
+    const ERROR_PREFIX: &'static str = "request budget:";
+
+    /// Estimate the input token count for a fully shaped provider JSON body.
+    ///
+    /// This uses compact UTF-8 byte length as a conservative estimate, rather
+    /// than pretending to know the selected model's tokenizer. The complete
+    /// JSON body is measured, so system content, messages, tool schemas and
+    /// provider formatting are all included.
+    pub fn estimate_input_tokens(&self, provider_json: &Value) -> AdapterResult<u64> {
+        if contains_unknown_image(provider_json) {
+            return Err(AdapterError::Llm(format!(
+                "{} image token cost is unknown; refusing to estimate it as zero",
+                Self::ERROR_PREFIX
+            )));
+        }
+        serde_json::to_vec(provider_json)
+            .map(|json| json.len() as u64)
+            .map_err(|error| {
+                AdapterError::Llm(format!(
+                    "{} could not serialize provider JSON for conservative UTF-8 byte estimation: {error}",
+                    Self::ERROR_PREFIX
+                ))
+            })
+    }
+
+    /// Validate the complete provider JSON against this budget without doing
+    /// any network I/O. The inequality enforced is
+    /// `estimated_input + reserved_output + safety_margin <= context_window`.
+    pub fn validate_provider_json(&self, provider_json: &Value) -> AdapterResult<()> {
+        if self.context_window_tokens == 0 {
+            return Err(AdapterError::Llm(format!(
+                "{} context window must be greater than zero",
+                Self::ERROR_PREFIX
+            )));
+        }
+        if self.reserved_output_tokens == 0 {
+            return Err(AdapterError::Llm(format!(
+                "{} reserved output must be greater than zero",
+                Self::ERROR_PREFIX
+            )));
+        }
+        let estimated_input = self.estimate_input_tokens(provider_json)?;
+        let required = estimated_input
+            .saturating_add(u64::from(self.reserved_output_tokens))
+            .saturating_add(u64::from(self.safety_margin_tokens));
+        let context_window = u64::from(self.context_window_tokens);
+        if required > context_window {
+            return Err(AdapterError::Llm(format!(
+                "{} provider JSON needs {required} tokens (input estimate {estimated_input} conservative UTF-8 bytes, reserved output {}, safety margin {}), exceeding context window {context_window}; estimate is not an exact tokenizer count",
+                Self::ERROR_PREFIX,
+                self.reserved_output_tokens,
+                self.safety_margin_tokens,
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn contains_unknown_image(value: &Value) -> bool {
+    value
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| messages.iter().any(message_contains_image))
+}
+
+fn message_contains_image(message: &Value) -> bool {
+    if message
+        .get("images")
+        .and_then(Value::as_array)
+        .is_some_and(|images| !images.is_empty())
+    {
+        return true;
+    }
+    let Some(content) = message.get("content") else {
+        return false;
+    };
+    match content {
+        Value::Array(parts) => parts.iter().any(|part| {
+            part.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| matches!(kind, "image" | "image_url"))
+        }),
+        Value::Object(part) => part
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| matches!(kind, "image" | "image_url")),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -110,6 +256,29 @@ pub fn build_provider_request_with_tools(
     model: &str,
     request: &ProviderModelRequest,
 ) -> AdapterResult<ProviderRequest> {
+    build_provider_request_with_optional_budget(protocol, base_url, model, request, None)
+}
+
+/// Build a provider request while reserving the requested output allowance in
+/// the provider's native request field. This is the budget-aware counterpart
+/// to [`build_provider_request_with_tools`].
+pub fn build_provider_request_with_tools_and_budget(
+    protocol: ProviderProtocol,
+    base_url: Url,
+    model: &str,
+    request: &ProviderModelRequest,
+    budget: RequestBudget,
+) -> AdapterResult<ProviderRequest> {
+    build_provider_request_with_optional_budget(protocol, base_url, model, request, Some(budget))
+}
+
+fn build_provider_request_with_optional_budget(
+    protocol: ProviderProtocol,
+    base_url: Url,
+    model: &str,
+    request: &ProviderModelRequest,
+    budget: Option<RequestBudget>,
+) -> AdapterResult<ProviderRequest> {
     let messages = request
         .messages
         .iter()
@@ -133,9 +302,8 @@ pub fn build_provider_request_with_tools(
         .collect::<Vec<_>>();
 
     match protocol {
-        ProviderProtocol::OpenAiCompatible => Ok(ProviderRequest {
-            endpoint: provider_endpoint(protocol, base_url)?,
-            body: json!({
+        ProviderProtocol::OpenAiCompatible => {
+            let mut body = json!({
                 "model": model,
                 "stream": true,
                 "stream_options": {"include_usage": true},
@@ -143,9 +311,21 @@ pub fn build_provider_request_with_tools(
                     .chain(messages)
                     .collect::<Vec<_>>(),
                 "tools": openai_tools
-            }),
-            requires_credential: true,
-        }),
+            });
+            if let Some(budget) = budget {
+                let output_field = if is_official_openai_endpoint(&base_url) {
+                    "max_completion_tokens"
+                } else {
+                    "max_tokens"
+                };
+                body[output_field] = json!(budget.reserved_output_tokens);
+            }
+            Ok(ProviderRequest {
+                endpoint: provider_endpoint(protocol, base_url)?,
+                body,
+                requires_credential: true,
+            })
+        }
         ProviderProtocol::Anthropic => {
             let tools = request
                 .tools
@@ -159,32 +339,50 @@ pub fn build_provider_request_with_tools(
                     })
                 })
                 .collect::<Vec<_>>();
+            let mut body = json!({
+                "model": model,
+                "system": request.system,
+                "max_tokens": 4096,
+                "stream": true,
+                "messages": messages,
+                "tools": tools
+            });
+            if let Some(budget) = budget {
+                body["max_tokens"] = json!(budget.reserved_output_tokens);
+            }
             Ok(ProviderRequest {
                 endpoint: provider_endpoint(protocol, base_url)?,
-                body: json!({
-                    "model": model,
-                    "system": request.system,
-                    "max_tokens": 4096,
-                    "stream": true,
-                    "messages": messages,
-                    "tools": tools
-                }),
+                body,
                 requires_credential: true,
             })
         }
-        ProviderProtocol::Ollama => Ok(ProviderRequest {
-            endpoint: provider_endpoint(protocol, base_url)?,
-            body: json!({
+        ProviderProtocol::Ollama => {
+            let mut body = json!({
                 "model": model,
                 "stream": true,
                 "messages": std::iter::once(json!({"role":"system", "content":request.system}))
                     .chain(messages)
                     .collect::<Vec<_>>(),
                 "tools": openai_tools
-            }),
-            requires_credential: false,
-        }),
+            });
+            if let Some(budget) = budget {
+                body["options"] = json!({"num_predict": budget.reserved_output_tokens});
+            }
+            Ok(ProviderRequest {
+                endpoint: provider_endpoint(protocol, base_url)?,
+                body,
+                requires_credential: false,
+            })
+        }
     }
+}
+
+fn is_official_openai_endpoint(base_url: &Url) -> bool {
+    base_url.scheme() == "https"
+        && base_url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("api.openai.com"))
+        && base_url.port_or_known_default() == Some(443)
 }
 
 fn provider_message(
@@ -313,6 +511,7 @@ fn parse_provider_tool_response_with_aliases(
     value: &Value,
     aliases: &BTreeMap<String, String>,
 ) -> AdapterResult<Vec<ProviderStreamEvent>> {
+    validate_response_end(protocol, value)?;
     let mut events = Vec::new();
     let text = match protocol {
         ProviderProtocol::OpenAiCompatible => value.pointer("/choices/0/message/content"),
@@ -460,7 +659,168 @@ fn usage_from_value(protocol: ProviderProtocol, value: &Value) -> Option<(u64, u
             usage.get("eval_count").and_then(Value::as_u64).unwrap_or(0),
         ),
     };
-    (input > 0 || output > 0).then(|| (input, output, usage.clone()))
+    (input > 0 || output > 0).then(|| (input, output, safe_usage_metadata(protocol, usage)))
+}
+
+/// Usage is audit metadata, never a copy of the provider response. Keep a
+/// bounded set of numeric counters, including explicitly reported reasoning
+/// tokens; these counters do not establish an effective reasoning effort.
+fn safe_usage_metadata(protocol: ProviderProtocol, usage: &Value) -> Value {
+    fn counters(value: &Value, keys: &[&str]) -> serde_json::Map<String, Value> {
+        keys.iter()
+            .filter_map(|key| {
+                value
+                    .get(*key)
+                    .and_then(Value::as_u64)
+                    .map(|count| ((*key).to_owned(), json!(count)))
+            })
+            .collect()
+    }
+    let keys: &[&str] = match protocol {
+        ProviderProtocol::OpenAiCompatible => {
+            &["prompt_tokens", "completion_tokens", "total_tokens"]
+        }
+        ProviderProtocol::Anthropic => &[
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ],
+        ProviderProtocol::Ollama => &["prompt_eval_count", "eval_count"],
+    };
+    let mut safe = counters(usage, keys);
+    if protocol == ProviderProtocol::OpenAiCompatible {
+        for (name, keys) in [
+            (
+                "prompt_tokens_details",
+                &["cached_tokens", "audio_tokens"][..],
+            ),
+            (
+                "completion_tokens_details",
+                &[
+                    "reasoning_tokens",
+                    "audio_tokens",
+                    "accepted_prediction_tokens",
+                    "rejected_prediction_tokens",
+                ][..],
+            ),
+        ] {
+            if let Some(details) = usage.get(name) {
+                let details = counters(details, keys);
+                if !details.is_empty() {
+                    safe.insert(name.into(), Value::Object(details));
+                }
+            }
+        }
+    }
+    Value::Object(safe)
+}
+
+#[cfg(test)]
+mod usage_metadata_tests {
+    use super::*;
+
+    fn only_usage(events: &[ProviderStreamEvent]) -> (u64, u64, Value) {
+        let usage: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderStreamEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                    provider_json,
+                } => Some((*input_tokens, *output_tokens, provider_json.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage.len(), 1);
+        usage[0].clone()
+    }
+
+    #[test]
+    fn stream_and_non_streaming_usage_exclude_provider_payloads() {
+        for (protocol, response, expected) in [
+            (
+                ProviderProtocol::OpenAiCompatible,
+                json!({"choices":[{"message":{"content":"answer"},"delta":{"content":"answer"}}],"usage":{"prompt_tokens":12,"completion_tokens":8,"total_tokens":20,"private":"sentinel","completion_tokens_details":{"reasoning_tokens":3,"private":"sentinel"},"prompt_tokens_details":{"cached_tokens":0,"private":"sentinel"}}}),
+                json!({"prompt_tokens":12,"completion_tokens":8,"total_tokens":20,"completion_tokens_details":{"reasoning_tokens":3},"prompt_tokens_details":{"cached_tokens":0}}),
+            ),
+            (
+                ProviderProtocol::Anthropic,
+                json!({"type":"message_delta","content":[{"type":"text","text":"answer"}],"usage":{"input_tokens":12,"output_tokens":8,"cache_read_input_tokens":4,"private":"sentinel"}}),
+                json!({"input_tokens":12,"output_tokens":8,"cache_read_input_tokens":4}),
+            ),
+            (
+                ProviderProtocol::Ollama,
+                json!({"message":{"content":"sentinel answer","thinking":"sentinel"},"done":true,"prompt_eval_count":12,"eval_count":8,"context":[999],"private":"sentinel"}),
+                json!({"prompt_eval_count":12,"eval_count":8}),
+            ),
+        ] {
+            let parsed = parse_provider_tool_response(protocol, &response).unwrap();
+            assert_eq!(only_usage(&parsed), (12, 8, expected.clone()));
+            let wire = match protocol {
+                ProviderProtocol::Ollama => format!("{response}\n"),
+                ProviderProtocol::OpenAiCompatible => {
+                    format!("data: {response}\n\ndata: [DONE]\n\n")
+                }
+                ProviderProtocol::Anthropic => {
+                    format!("data: {response}\n\ndata: {{\"type\":\"message_stop\"}}\n\n")
+                }
+            };
+            let mut decoder = ProviderToolStreamDecoder::new(protocol);
+            let mut events = Vec::new();
+            for chunk in wire.as_bytes().chunks(7) {
+                events.extend(decoder.push(chunk).unwrap());
+            }
+            events.extend(decoder.finish().unwrap());
+            let usage = only_usage(&events);
+            assert_eq!(usage, (12, 8, expected));
+            assert!(!usage.2.to_string().contains("sentinel"));
+        }
+    }
+
+    #[test]
+    fn rejects_non_integer_metadata_and_preserves_explicit_zero_details() {
+        let value = json!({"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":"secret","completion_tokens_details":{"reasoning_tokens":0,"audio_tokens":-1,"accepted_prediction_tokens":1.5,"rejected_prediction_tokens":{"secret":true}},"prompt_tokens_details":"secret"}});
+        let (_, _, safe) = usage_from_value(ProviderProtocol::OpenAiCompatible, &value).unwrap();
+        assert_eq!(
+            safe,
+            json!({"prompt_tokens":4,"completion_tokens":2,"completion_tokens_details":{"reasoning_tokens":0}})
+        );
+        for invalid in [
+            Value::Null,
+            json!("secret"),
+            json!({"prompt_tokens":-1,"completion_tokens":"secret"}),
+        ] {
+            assert!(
+                usage_from_value(
+                    ProviderProtocol::OpenAiCompatible,
+                    &json!({"usage":invalid})
+                )
+                .is_none()
+            );
+        }
+        let (_, _, missing) = usage_from_value(
+            ProviderProtocol::OpenAiCompatible,
+            &json!({"usage":{"prompt_tokens":1}}),
+        )
+        .unwrap();
+        assert!(missing.get("completion_tokens_details").is_none());
+    }
+
+    #[test]
+    fn anthropic_message_start_and_partial_updates_stay_separate() {
+        let initial =
+            json!({"message":{"usage":{"input_tokens":10,"output_tokens":1,"private":"sentinel"}}});
+        let delta = json!({"usage":{"output_tokens":7,"private":"sentinel"}});
+        assert_eq!(
+            usage_from_value(ProviderProtocol::Anthropic, &initial).unwrap(),
+            (10, 1, json!({"input_tokens":10,"output_tokens":1}))
+        );
+        assert_eq!(
+            usage_from_value(ProviderProtocol::Anthropic, &delta).unwrap(),
+            (0, 7, json!({"output_tokens":7}))
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -469,6 +829,7 @@ pub struct ProviderToolStreamDecoder {
     pending: Vec<u8>,
     active_calls: BTreeMap<u32, (String, String)>,
     tool_aliases: BTreeMap<String, String>,
+    saw_completion: bool,
 }
 
 impl ProviderToolStreamDecoder {
@@ -478,6 +839,7 @@ impl ProviderToolStreamDecoder {
             pending: Vec::new(),
             active_calls: BTreeMap::new(),
             tool_aliases: BTreeMap::new(),
+            saw_completion: false,
         }
     }
 
@@ -487,6 +849,7 @@ impl ProviderToolStreamDecoder {
             pending: Vec::new(),
             active_calls: BTreeMap::new(),
             tool_aliases: provider_tool_alias_map(request),
+            saw_completion: false,
         }
     }
 
@@ -513,6 +876,7 @@ impl ProviderToolStreamDecoder {
                 continue;
             };
             if data == "[DONE]" {
+                self.saw_completion = true;
                 for (index, (call_id, _)) in &self.active_calls {
                     events.push(ProviderStreamEvent::ToolCallCompleted {
                         call_id: call_id.clone(),
@@ -523,6 +887,7 @@ impl ProviderToolStreamDecoder {
                 continue;
             }
             let value: Value = serde_json::from_str(data)?;
+            validate_response_end(self.protocol, &value)?;
             match self.protocol {
                 ProviderProtocol::OpenAiCompatible => {
                     self.push_openai(&value, &mut events)?;
@@ -535,6 +900,9 @@ impl ProviderToolStreamDecoder {
                 }
             }
         }
+        self.saw_completion |= events
+            .iter()
+            .any(|event| matches!(event, ProviderStreamEvent::Completed));
         Ok(events)
     }
 
@@ -757,11 +1125,34 @@ impl ProviderToolStreamDecoder {
     }
 
     pub fn finish(&mut self) -> AdapterResult<Vec<ProviderStreamEvent>> {
-        if self.pending.iter().all(u8::is_ascii_whitespace) {
-            return Ok(Vec::new());
+        let events = if self.pending.iter().all(u8::is_ascii_whitespace) {
+            Vec::new()
+        } else {
+            self.pending.push(b'\n');
+            self.push(&[])?
+        };
+        if !self.saw_completion {
+            return Err(AdapterError::Llm("incomplete model stream: no terminal provider event; tool calls were not dispatched".into()));
         }
-        self.pending.push(b'\n');
-        self.push(&[])
+        Ok(events)
+    }
+}
+
+fn validate_response_end(protocol: ProviderProtocol, value: &Value) -> AdapterResult<()> {
+    let reason = match protocol {
+        ProviderProtocol::OpenAiCompatible => value.pointer("/choices/0/finish_reason"),
+        ProviderProtocol::Anthropic => value
+            .get("stop_reason")
+            .or_else(|| value.pointer("/delta/stop_reason")),
+        ProviderProtocol::Ollama => value.get("done_reason"),
+    }
+    .and_then(Value::as_str);
+    match reason {
+        Some("length" | "max_tokens" | "model_context_window_exceeded") => Err(AdapterError::Llm(
+            "truncated_output: provider exhausted its output allowance; partial tool calls cannot execute".into())),
+        Some("content_filter" | "refusal") => Err(AdapterError::Llm(
+            "unsuccessful_model_response: provider did not finish the requested response".into())),
+        _ => Ok(()),
     }
 }
 
@@ -772,6 +1163,8 @@ pub struct UnifiedModelClient {
     base_url: Url,
     model: String,
     credential: Option<String>,
+    request_budget: Option<RequestBudget>,
+    reasoning_effort: Option<String>,
     http: reqwest::Client,
 }
 
@@ -811,6 +1204,8 @@ impl UnifiedModelClient {
             base_url,
             model: model.into(),
             credential,
+            request_budget: None,
+            reasoning_effort: None,
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
                 .timeout(MODEL_REQUEST_TIMEOUT)
@@ -819,12 +1214,74 @@ impl UnifiedModelClient {
         })
     }
 
+    /// Attach a preflight budget to subsequent model generation requests.
+    /// Existing callers that do not opt in retain the historical request
+    /// shape and behavior.
+    pub fn with_request_budget(mut self, budget: RequestBudget) -> Self {
+        self.request_budget = Some(budget);
+        self
+    }
+
+    pub fn request_budget(&self) -> Option<RequestBudget> {
+        self.request_budget
+    }
+
+    /// Send an explicit wire value unchanged. This does not assert that a
+    /// particular model or gateway supports it, nor silently downgrade it.
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> AdapterResult<Self> {
+        use omicsops_core::workspace::{ModelProviderKind, validate_reasoning_effort};
+        let provider = match self.protocol {
+            ProviderProtocol::OpenAiCompatible => ModelProviderKind::OpenAiCompatible,
+            ProviderProtocol::Anthropic => ModelProviderKind::Anthropic,
+            ProviderProtocol::Ollama => ModelProviderKind::Ollama,
+        };
+        validate_reasoning_effort(provider, effort.as_deref())
+            .map_err(|error| AdapterError::Llm(error.into()))?;
+        self.reasoning_effort = effort;
+        Ok(self)
+    }
+
+    fn apply_reasoning_effort(&self, body: &mut Value) {
+        if let Some(effort) = &self.reasoning_effort {
+            body["reasoning_effort"] = json!(effort);
+        }
+    }
+
+    fn build_provider_request(
+        &self,
+        request: &ProviderModelRequest,
+    ) -> AdapterResult<ProviderRequest> {
+        let mut built = build_provider_request_with_optional_budget(
+            self.protocol,
+            self.base_url.clone(),
+            &self.model,
+            request,
+            self.request_budget,
+        )?;
+        self.apply_reasoning_effort(&mut built.body);
+        Ok(built)
+    }
+
+    /// Validate the complete provider-shaped request before any network I/O.
+    pub fn validate_request(&self, request: &ProviderModelRequest) -> AdapterResult<()> {
+        let provider_request = self.build_provider_request(request)?;
+        if let Some(budget) = self.request_budget {
+            budget.validate_provider_json(&provider_request.body)?;
+        }
+        Ok(())
+    }
+
     async fn send_with_retry_provider(
         &self,
         endpoint: &Url,
         body: &Value,
         on_event: &mut impl FnMut(ProviderStreamEvent),
     ) -> AdapterResult<reqwest::Response> {
+        if let Some(budget) = self.request_budget {
+            // Keep this check at the final send boundary so retries and the
+            // non-streaming fallback cannot bypass the same preflight.
+            budget.validate_provider_json(body)?;
+        }
         let mut retries = 0_u8;
         loop {
             let result = self
@@ -872,12 +1329,10 @@ impl UnifiedModelClient {
         request: ProviderModelRequest,
         mut on_event: impl FnMut(ProviderStreamEvent),
     ) -> AdapterResult<()> {
-        let provider_request = build_provider_request_with_tools(
-            self.protocol,
-            self.base_url.clone(),
-            &self.model,
-            &request,
-        )?;
+        let provider_request = self.build_provider_request(&request)?;
+        if let Some(budget) = self.request_budget {
+            budget.validate_provider_json(&provider_request.body)?;
+        }
         let response = self
             .send_with_retry_provider(
                 &provider_request.endpoint,
@@ -944,9 +1399,8 @@ impl UnifiedModelClient {
         Ok(())
     }
 
-    pub async fn probe(&self) -> AdapterResult<ModelProbeResult> {
-        let endpoint = provider_endpoint(self.protocol, self.base_url.clone())?;
-        let body = match self.protocol {
+    fn probe_body(&self) -> AdapterResult<Value> {
+        let mut body = match self.protocol {
             ProviderProtocol::OpenAiCompatible => json!({
                 "model": self.model,
                 "stream": false,
@@ -965,6 +1419,39 @@ impl UnifiedModelClient {
                 "messages": [{"role":"user", "content":"Reply with OK."}]
             }),
         };
+        self.apply_reasoning_effort(&mut body);
+        if self.reasoning_effort.is_some() {
+            // Reasoning consumes output tokens too; the legacy 16-token
+            // connection probe cannot exercise an explicit reasoning request.
+            body["max_tokens"] = json!(4096);
+            if is_official_openai_endpoint(&self.base_url) {
+                body.as_object_mut().unwrap().remove("max_tokens");
+                body["max_completion_tokens"] = json!(4096);
+            }
+        }
+        if let Some(budget) = self.request_budget {
+            match self.protocol {
+                ProviderProtocol::OpenAiCompatible
+                    if is_official_openai_endpoint(&self.base_url) =>
+                {
+                    body.as_object_mut().unwrap().remove("max_tokens");
+                    body["max_completion_tokens"] = json!(budget.reserved_output_tokens);
+                }
+                ProviderProtocol::OpenAiCompatible | ProviderProtocol::Anthropic => {
+                    body["max_tokens"] = json!(budget.reserved_output_tokens);
+                }
+                ProviderProtocol::Ollama => {
+                    body["options"] = json!({"num_predict": budget.reserved_output_tokens});
+                }
+            }
+            budget.validate_provider_json(&body)?;
+        }
+        Ok(body)
+    }
+
+    pub async fn probe(&self) -> AdapterResult<ModelProbeResult> {
+        let endpoint = provider_endpoint(self.protocol, self.base_url.clone())?;
+        let body = self.probe_body()?;
         let mut builder = self.http.post(endpoint.clone()).json(&body);
         match self.protocol {
             ProviderProtocol::Anthropic => {
@@ -997,6 +1484,7 @@ impl UnifiedModelClient {
         let value: Value = serde_json::from_str(&text).map_err(|error| {
             AdapterError::Llm(format!("{} returned invalid JSON: {error}", endpoint))
         })?;
+        validate_response_end(self.protocol, &value)?;
         let response_text = match self.protocol {
             ProviderProtocol::OpenAiCompatible => value
                 .pointer("/choices/0/message/content")
@@ -1262,5 +1750,136 @@ impl OpenAiCompatibleClient {
                 "model returned an invalid capability probe".into(),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod reasoning_effort_tests {
+    use super::*;
+
+    fn client(model: &str) -> UnifiedModelClient {
+        UnifiedModelClient::new(
+            Uuid::new_v4(),
+            ProviderProtocol::OpenAiCompatible,
+            Url::parse("https://api.openai.com/v1").unwrap(),
+            model,
+            Some("test-only".into()),
+        )
+        .unwrap()
+    }
+
+    fn request() -> ProviderModelRequest {
+        ProviderModelRequest {
+            system: "test".into(),
+            messages: vec![],
+            tools: vec![],
+            require_strict_json_fallback: false,
+        }
+    }
+
+    #[test]
+    fn explicit_effort_is_isolated_and_survives_probe_and_fallback_shapes() {
+        let main = client("main")
+            .with_reasoning_effort(Some("low".into()))
+            .unwrap();
+        let child = client("child")
+            .with_reasoning_effort(Some("max".into()))
+            .unwrap();
+        for (client, expected) in [(&main, "low"), (&child, "max")] {
+            let built = client.build_provider_request(&request()).unwrap();
+            assert_eq!(built.body["reasoning_effort"], expected);
+            let mut fallback = built.body.clone();
+            fallback["stream"] = json!(false);
+            assert_eq!(fallback["reasoning_effort"], expected);
+            let probe = client.probe_body().unwrap();
+            assert_eq!(probe["reasoning_effort"], expected);
+            assert_eq!(probe["max_completion_tokens"], 4096);
+            assert!(probe.get("max_tokens").is_none());
+        }
+        let inherited = client("legacy");
+        assert!(
+            inherited
+                .build_provider_request(&request())
+                .unwrap()
+                .body
+                .get("reasoning_effort")
+                .is_none()
+        );
+        assert!(
+            inherited
+                .probe_body()
+                .unwrap()
+                .get("reasoning_effort")
+                .is_none()
+        );
+        let reset = child.with_reasoning_effort(None).unwrap();
+        assert!(
+            reset
+                .build_provider_request(&request())
+                .unwrap()
+                .body
+                .get("reasoning_effort")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_values_and_other_protocols_without_network() {
+        for value in ["", "MAX", " max", "arbitrary"] {
+            assert!(
+                client("exact")
+                    .with_reasoning_effort(Some(value.into()))
+                    .is_err()
+            );
+        }
+        for protocol in [ProviderProtocol::Anthropic, ProviderProtocol::Ollama] {
+            let client = UnifiedModelClient::new(
+                Uuid::new_v4(),
+                protocol,
+                Url::parse("http://127.0.0.1:1").unwrap(),
+                "exact",
+                Some("test-only".into()),
+            )
+            .unwrap();
+            assert!(client.with_reasoning_effort(Some("max".into())).is_err());
+        }
+    }
+
+    #[test]
+    fn budget_includes_effort_and_probe_uses_the_same_output_reservation() {
+        let plain = client("exact").with_request_budget(RequestBudget {
+            context_window_tokens: 10000,
+            reserved_output_tokens: 1,
+            safety_margin_tokens: 0,
+        });
+        let bytes = serde_json::to_vec(&plain.build_provider_request(&request()).unwrap().body)
+            .unwrap()
+            .len() as u32;
+        let budget = RequestBudget {
+            context_window_tokens: bytes + 1,
+            reserved_output_tokens: 1,
+            safety_margin_tokens: 0,
+        };
+        let plain = plain.with_request_budget(budget);
+        plain.validate_request(&request()).unwrap();
+        let configured = plain
+            .with_reasoning_effort(Some("max".into()))
+            .unwrap()
+            .with_request_budget(budget);
+        assert!(
+            configured
+                .validate_request(&request())
+                .unwrap_err()
+                .to_string()
+                .contains("request budget:")
+        );
+        let configured = configured.with_request_budget(RequestBudget {
+            context_window_tokens: 10000,
+            reserved_output_tokens: 100,
+            safety_margin_tokens: 1,
+        });
+        let probe = configured.probe_body().unwrap();
+        assert_eq!(probe["max_completion_tokens"], 100);
+        assert_eq!(probe["reasoning_effort"], "max");
     }
 }

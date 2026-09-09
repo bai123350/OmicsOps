@@ -337,16 +337,10 @@ pub(crate) async fn connect_profile(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn unified_model_client(
+pub(crate) fn unified_model_client_for_profile(
     state: &AppState,
-    model_profile_id: Uuid,
+    profile: &omicsops_core::workspace::ModelProfile,
 ) -> Result<UnifiedModelClient, String> {
-    let profile = state
-        .repository
-        .get_model_profile(model_profile_id)
-        .await
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "model profile not found".to_string())?;
     let credential = match &profile.credential_reference {
         Some(reference) => state
             .credentials
@@ -365,8 +359,9 @@ pub(crate) async fn unified_model_client(
         profile.id,
         protocol,
         Url::parse(&profile.base_url).map_err(|error| error.to_string())?,
-        profile.model,
+        profile.model.clone(),
         credential,
     )
+    .and_then(|client| client.with_reasoning_effort(profile.reasoning_effort.clone()))
     .map_err(|error| error.to_string())
 }

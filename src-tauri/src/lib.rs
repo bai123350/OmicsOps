@@ -18,7 +18,9 @@ pub mod p1_commands;
 #[cfg(test)]
 mod plan_revision_tests;
 pub mod pubmed_mcp;
+mod remote_jobs_v4;
 pub mod research_commands;
+mod runtime_jobs_v4;
 pub mod skill_commands;
 pub mod sync_commands;
 pub mod workspace_commands;
@@ -131,7 +133,10 @@ pub fn run() {
             agent_v4::agent_v4_request_plan_revision,
             agent_v4::agent_v4_resume,
             agent_v4::agent_v4_cancel,
+            agent_v4::agent_v4_cancel_runtime_recovery,
             agent_v4::agent_v4_answer,
+            agent_v4::agent_v4_submit_guidance,
+            agent_v4::agent_v4_list_guidance,
             agent_v4::agent_v4_decide_tool_approval,
             agent_v4::agent_v4_resolve_uncertain,
             agent_v4::agent_v4_events,

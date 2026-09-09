@@ -17,3 +17,5 @@
 .model-probe-result b,.model-probe-result small,.model-probe-result code { display: block; }.model-probe-result small { color: inherit; line-height: 1.45; }.model-probe-result code { margin-top: 4px; font-size: 9px; }
 .spin { animation: model-spin .9s linear infinite; }@keyframes model-spin { to { transform: rotate(360deg); } }
 .model-choices { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 5px; padding: 8px; background: #f8fafc; border-radius: 7px; }.model-choices > small { flex-basis: 100%; }.model-choices > button { color: #254fca; background: #edf2ff; border-color: #cddcff; font-size: 9px; }
+
+.model-form input[type="checkbox"] { display: inline-block; width: auto; margin: 0 6px 0 0; padding: 0; vertical-align: middle; }

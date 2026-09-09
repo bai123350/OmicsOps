@@ -135,7 +135,7 @@ export async function listModelProfiles(): Promise<ModelProfile[]> {
   return isTauri() ? invoke("list_model_profiles") : [];
 }
 
-export async function saveModelProfile(request: { id?: string; label: string; provider: ModelProfile["provider"]; base_url: string; model: string; credential?: string }): Promise<ModelProfile> {
+export async function saveModelProfile(request: { id?: string; label: string; provider: ModelProfile["provider"]; base_url: string; model: string; credential?: string; refresh_catalog?: boolean; reasoning_effort?: ModelProfile["reasoning_effort"]; delegated_model_profile_id?: string | null }): Promise<ModelProfile> {
   if (!isTauri()) return { id: request.id ?? crypto.randomUUID(), label: request.label, provider: request.provider, base_url: request.base_url, model: request.model, credential_reference: request.provider === "ollama" ? null : "model/demo", supports_tools: true, supports_vision: false };
   return invoke("save_model_profile", { request });
 }
@@ -429,6 +429,12 @@ export async function browserListAuthorizations(): Promise<import("./types").Bro
 export async function browserRevokeAuthorization(id: string): Promise<boolean> { return invoke("browser_revoke_authorization", { id }); }
 export async function agentV4ResolveUncertain(runId: string, callId: string, resolution: "side_effect_observed" | "side_effect_not_observed" | "compensated", evidence: string): Promise<void> { await invoke("agent_v4_resolve_uncertain", { request: { run_id: runId, call_id: callId, resolution, evidence } }); }
 export async function agentV4Events(runId: string): Promise<AgentRunEventV4[]> { return isTauri() ? invoke("agent_v4_events", { runId }) : []; }
+export async function agentV4SubmitGuidance(request: import("./types").SubmitGuidanceV4Request): Promise<import("./types").GuidanceRecordV4> {
+  return invoke("agent_v4_submit_guidance", { request });
+}
+export async function agentV4ListGuidance(projectId: string, conversationId: string, runId: string): Promise<import("./types").GuidanceRecordV4[]> {
+  return isTauri() ? invoke("agent_v4_list_guidance", { projectId, conversationId, runId }) : [];
+}
 export async function agentV4EventsForConversation(projectId: string, conversationId: string): Promise<AgentRunEventV4[]> {
   return isTauri() ? invoke("agent_v4_events_for_conversation", { projectId, conversationId }) : [];
 }
@@ -436,3 +442,5 @@ export async function onAgentV4Event(callback: (event: AgentRunEventV4) => void)
   if (!isTauri()) return () => undefined;
   return listen<AgentRunEventV4>("agent-v4-event", ({ payload }) => callback(payload));
 }
+
+export async function agentV4CancelRuntimeRecovery(runId: string): Promise<void> { await invoke("agent_v4_cancel_runtime_recovery", { runId }); }

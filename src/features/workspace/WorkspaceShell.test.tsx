@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { WorkspaceShell } from "./WorkspaceShell";
@@ -11,6 +11,114 @@ const project = {
 };
 
 describe("WorkspaceShell", () => {
+  it("cancels saved recovery exclusively and hides actions after cancellation", async () => {
+    let release: (() => void) | undefined;
+    const cancel = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
+    const resume = vi.fn();
+    const event = { schema_version: 4 as const, run_id: "receipt-run", project_id: project.id, conversation_id: "c", sequence: 1, occurred_at: "2026-09-09T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "runtime_recovery_available" as const, call_ids: ["cell"] } };
+    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: event.run_id, onResumeAgentRunV4: resume, onCancelRuntimeRecoveryV4: cancel };
+    const { rerender } = render(<WorkspaceShell {...props} agentRunEventsV4={[event]} />);
+    fireEvent.click(screen.getByRole("button", { name: "取消此运行" }));
+    fireEvent.click(screen.getByRole("button", { name: "取消中…" }));
+    fireEvent.click(screen.getByRole("button", { name: "恢复已保存结果" }));
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(cancel).toHaveBeenCalledWith(event.run_id);
+    expect(resume).not.toHaveBeenCalled();
+    release?.();
+    await waitFor(() => expect(screen.getByRole("button", { name: "取消此运行" })).toBeEnabled());
+    rerender(<WorkspaceShell {...props} agentRunEventsV4={[event, { ...event, sequence: 2, event: { kind: "run_cancelled" } }]} />);
+    expect(screen.queryByRole("button", { name: "取消此运行" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "恢复已保存结果" })).not.toBeInTheDocument();
+  });
+  it("keeps a rejected recovery cancellation retryable without transport details", async () => {
+    const cancel = vi.fn().mockRejectedValue(new Error("private transport"));
+    const event = { schema_version: 4 as const, run_id: "receipt-run", project_id: project.id, conversation_id: "c", sequence: 1, occurred_at: "2026-09-09T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "runtime_recovery_available" as const, call_ids: ["cell"] } };
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} agentRunEventsV4={[event]} onCancelRuntimeRecoveryV4={cancel} />);
+    fireEvent.click(screen.getByRole("button", { name: "取消此运行" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("取消失败");
+    expect(screen.getByRole("button", { name: "取消此运行" })).toBeEnabled();
+    expect(screen.queryByText("private transport")).not.toBeInTheDocument();
+  });
+  it("resumes durable computation receipts once and hides the action after results are recorded", async () => {
+    let finish: (() => void) | undefined;
+    const resume = vi.fn(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const event = { schema_version: 4 as const, run_id: "receipt-run", project_id: project.id, conversation_id: "c", sequence: 1, occurred_at: "2026-09-09T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "runtime_recovery_available" as const, call_ids: ["cell"] } };
+    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: event.run_id, onResumeAgentRunV4: resume, onCancelRuntimeRecoveryV4: vi.fn() };
+    const { rerender } = render(<WorkspaceShell {...props} agentRunEventsV4={[event]} />);
+    fireEvent.click(screen.getByRole("button", { name: "恢复已保存结果" }));
+    expect(screen.getByRole("button", { name: "恢复中…" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "取消此运行" })).toBeDisabled();
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(resume).toHaveBeenCalledWith(event.run_id);
+    finish?.();
+    await waitFor(() => expect(screen.getByRole("button", { name: "恢复已保存结果" })).toBeEnabled());
+    rerender(<WorkspaceShell {...props} agentRunEventsV4={[event, { ...event, sequence: 2, event: { kind: "tool_finished", outcome: { call_id: "cell", tool_id: "runtime.execute", succeeded: true, model_content: "result", data: {}, provenance: [] } } }]} />);
+    expect(screen.queryByRole("button", { name: "恢复已保存结果" })).not.toBeInTheDocument();
+  });
+  it("switches the composer arrow to a stop square and restores it after cancellation", () => {
+    const cancel = vi.fn();
+    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, onCancelRun: cancel };
+    const { rerender, container } = render(<WorkspaceShell {...props} />);
+    expect(container.querySelector(".send-button .lucide-arrow-up")).toBeInTheDocument();
+    rerender(<WorkspaceShell {...props} runStarted activeRunId="run-stop" composerBusy />);
+    const stop = screen.getByRole("button", { name: "终止运行" });
+    expect(stop.closest(".composer")).toBeInTheDocument();
+    expect(stop.querySelector(".lucide-square")).toBeInTheDocument();
+    expect(stop).toBeEnabled();
+    expect(screen.queryByRole("region", { name: "远程 Agent 运行控制" })).not.toBeInTheDocument();
+    fireEvent.click(stop);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    rerender(<WorkspaceShell {...props} runStarted activeRunId="run-stop" runStopping />);
+    const stopping = screen.getByRole("button", { name: "终止中…" });
+    expect(stopping).toBeDisabled();
+    fireEvent.click(stopping);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    rerender(<WorkspaceShell {...props} runStarted activeRunId="run-stop" agentRunEventsV4={[{
+      schema_version: 4, run_id: "run-stop", project_id: project.id, conversation_id: "c", sequence: 1, occurred_at: "2026-09-08T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "run_cancelled" },
+    }]} />);
+    expect(screen.queryByRole("button", { name: "终止运行" })).not.toBeInTheDocument();
+    expect(container.querySelector(".send-button .lucide-arrow-up")).toBeInTheDocument();
+  });
+
+  it("interleaves progress and individual read, write, edit calls even inside a batch", () => {
+    const base = { schema_version: 4 as const, run_id: "run-compact", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
+    const longOutput = `${"a".repeat(900)}\r\nlast line\r\n`;
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} runStarted activeRunId={base.run_id} agentRunEventsV4={[
+      { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "cycle_started", cycle_id: 1 } },
+      { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "model_text", text: "Inspect the file first." } },
+      { ...base, sequence: 3, occurred_at: "2026-08-17T00:00:02Z", event: { kind: "tool_batch_started", batch_id: 1, cycle_id: 1, phase: "executing", tool_names: ["project.read", "write", "edit"], call_ids: ["r", "w", "e"] } },
+      { ...base, sequence: 4, occurred_at: "2026-08-17T00:00:03Z", event: { kind: "tool_requested", call: { call_id: "r", tool_id: "project.read", arguments: { path: "C:\\data\\input.txt" } } } },
+      { ...base, sequence: 5, occurred_at: "2026-08-17T00:00:04Z", event: { kind: "tool_finished", outcome: { call_id: "r", tool_id: "project.read", succeeded: true, model_content: longOutput, data: null, provenance: [] } } },
+      { ...base, sequence: 6, occurred_at: "2026-08-17T00:00:05Z", event: { kind: "model_text", text: "Now save and revise." } },
+      { ...base, sequence: 7, occurred_at: "2026-08-17T00:00:06Z", event: { kind: "tool_requested", call: { call_id: "w", tool_id: "write", arguments: { file_path: "/Users/research/output.txt" } } } },
+      { ...base, sequence: 8, occurred_at: "2026-08-17T00:00:07Z", event: { kind: "tool_requested", call: { call_id: "e", tool_id: "edit", arguments: { path: "C:\\data\\output.txt" } } } },
+    ]} />);
+    const timeline = screen.getByRole("region", { name: "Tool call details" });
+    expect(Array.from(timeline.children).map((row) => row.querySelector("strong")?.textContent)).toEqual(["THINKING", "PROGRESS", "read", "PROGRESS", "write", "edit"]);
+    const read = within(timeline).getByText("read").closest("details")!;
+    expect(read).not.toHaveAttribute("open");
+    expect(read.querySelector("summary")).toHaveTextContent("1s · 2 lines");
+    fireEvent.click(read.querySelector("summary")!);
+    expect(read).toHaveAttribute("open");
+    expect(read.querySelector("pre")?.textContent).toBe(longOutput);
+    expect(within(timeline).getByText("/Users/research/output.txt")).toBeInTheDocument();
+  });
+
+  it("preserves reading position on new output and returns to the latest on demand", async () => {
+    const props = { project, locale: "en-US" as const, onLocaleChange: () => undefined, onSend: vi.fn() };
+    const { container, rerender } = render(<WorkspaceShell {...props} streamingAssistant="First" />);
+    const stream = container.querySelector(".message-stream") as HTMLElement;
+    Object.defineProperties(stream, { scrollHeight: { configurable: true, value: 1200 }, clientHeight: { configurable: true, value: 400 } });
+    stream.scrollTop = 100;
+    fireEvent.scroll(stream);
+    rerender(<WorkspaceShell {...props} streamingAssistant="First and second" />);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(stream.scrollTop).toBe(100);
+    fireEvent.click(screen.getByRole("button", { name: /Back to latest/ }));
+    expect(stream.scrollTop).toBe(1200);
+    expect(screen.queryByRole("button", { name: /Back to latest/ })).not.toBeInTheDocument();
+  });
+
   it("renders the guided six-phase trajectory, public thought summaries, and a read-only task snapshot", () => {
     const base = { schema_version: 4 as const, run_id: "run-guided", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
     const events = [
@@ -31,8 +139,7 @@ describe("WorkspaceShell", () => {
 
     const overview = screen.getByRole("region", { name: "Agent 阶段轨迹" });
     for (const phase of ["routing", "discovery", "clarification", "organizing", "executing", "verifying"]) expect(screen.getByText(phase, { exact: true })).toBeInTheDocument();
-    expect(screen.getByText("思考摘要")).toBeInTheDocument();
-    expect(screen.getByText("公开摘要")).toBeInTheDocument();
+    expect(screen.getByText("进度", { exact: true })).toBeInTheDocument();
     expect(screen.queryByText("private reasoning must never render")).not.toBeInTheDocument();
     expect(screen.getByRole("region", { name: "任务列表" })).toHaveTextContent("revision 2");
     expect(overview).toHaveTextContent("分解为可验证步骤");
@@ -370,13 +477,13 @@ describe("WorkspaceShell", () => {
     expect(screen.getByRole("cell", { name: "CD3D" })).toBeInTheDocument();
   });
 
-  it("keeps technical trajectory collapsed and omits persistence placeholder text", () => {
+  it("opens the active trajectory while omitting persistence placeholder text", () => {
     const base = { schema_version: 4 as const, run_id: "run-technical", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
     render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-technical" onLocaleChange={() => undefined} agentRunEventsV4={[
       { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "run_spec_frozen" as const, approval_hash: "a", spec_hash: "b" } },
       { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "tool_dispatch_started" as const, call_id: "call-1", tool_id: "runtime.execute", effect: "runtime", idempotency_key: "key" } },
     ]} />);
-    expect(screen.getByText("执行过程").closest("details")).not.toHaveAttribute("open");
+    expect(screen.getByText("执行过程").closest("details")).toHaveAttribute("open");
     expect(screen.queryByText(/状态已写入可验证事件链/)).not.toBeInTheDocument();
   });
 
@@ -398,7 +505,7 @@ describe("WorkspaceShell", () => {
       { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "tool_finished" as const, outcome: { call_id: "read-1", tool_id: "project.read", succeeded: true, model_content: "large internal report", data: null, provenance: [] } } },
     ]} />);
     fireEvent.click(screen.getByText("执行过程"));
-    const step = screen.getByText("读取项目文件").closest("details");
+    const step = screen.getByTitle("读取项目文件").closest("details");
     expect(step).not.toHaveAttribute("open");
     expect(step).toHaveTextContent("results/audit.md");
     expect(screen.getByText(/运行中 · 1 个步骤/)).toBeInTheDocument();

@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+mod context_views;
+mod progress;
 use chrono::Utc;
 use futures_util::future::join_all;
 use omicsops_protocol::{
@@ -82,8 +84,30 @@ pub enum ModelStreamEventV4 {
 
 #[async_trait]
 pub trait ModelPortV4: Send + Sync {
+    /// Resolve the already-frozen child role. An explicit binding must never
+    /// fall back silently to the main model. Review remains independent.
+    fn delegated_model(
+        &self,
+        binding: Option<&omicsops_protocol::DelegatedModelBindingV4>,
+    ) -> Result<Option<&dyn ModelPortV4>, ModelFailureV4> {
+        if binding.is_some() {
+            return Err(ModelFailureV4::permanent(
+                omicsops_protocol::ModelErrorClassV4::InvalidRequest,
+                "the frozen delegated model is not available",
+            ));
+        }
+        Ok(None)
+    }
+
     fn prompt_layers(&self) -> PromptLayersV4 {
         PromptLayersV4::default()
+    }
+
+    /// Validate the complete, provider-shaped request before dispatch. Ports
+    /// without a provider budget retain their existing behavior; production
+    /// adapters must also enforce this at their final network boundary.
+    fn validate_request(&self, _request: &ModelRequestV4) -> Result<(), ModelFailureV4> {
+        Ok(())
     }
 
     async fn stream(
@@ -198,6 +222,10 @@ pub trait ToolPortV4: Send + Sync {
         }
     }
     async fn execute(&self, mode: RunModeV4, call: ToolCallV4) -> Result<ToolOutcomeV4, String>;
+    /// Return only durable results of this exact dispatch; never execute here.
+    async fn recover_result(&self, _call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
+        Ok(None)
+    }
     async fn interrupt(&self, _run_id: Uuid) -> Result<(), String> {
         Ok(())
     }
@@ -230,6 +258,19 @@ pub trait ExternalExecutorPortV4: Send + Sync {
 pub trait EventStoreV4: Send + Sync {
     async fn append(&self, event: &AgentEventV4) -> Result<(), String>;
     async fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String>;
+    /// Atomically record accepted guidance as consumed at a model boundary.
+    async fn consume_guidance(&self, _spec: &RunSpecV4) -> Result<bool, String> {
+        Ok(false)
+    }
+    async fn has_pending_guidance(&self, _run_id: Uuid) -> Result<bool, String> {
+        Ok(false)
+    }
+    /// The production store checks its inbox in the same transaction that
+    /// commits completion, so an accepted instruction cannot be lost to a race.
+    async fn append_completion(&self, event: &AgentEventV4) -> Result<bool, String> {
+        self.append(event).await?;
+        Ok(true)
+    }
     async fn archive_context(
         &self,
         run_id: Uuid,
@@ -278,6 +319,11 @@ pub struct AgentLimitsV4 {
     pub max_delegation_depth: usize,
     pub max_delegated_turns: u8,
     pub max_delegated_tool_calls: u16,
+    pub delegated_context_max_bytes: usize,
+    pub delegated_output_max_bytes: usize,
+    pub delegated_tool_timeout: Duration,
+    pub max_delegation_total_turns: u32,
+    pub max_delegation_total_tool_calls: u32,
 }
 
 impl Default for AgentLimitsV4 {
@@ -296,6 +342,11 @@ impl Default for AgentLimitsV4 {
             max_delegation_depth: 2,
             max_delegated_turns: 4,
             max_delegated_tool_calls: 8,
+            delegated_context_max_bytes: 64 * 1024,
+            delegated_output_max_bytes: 8 * 1024,
+            delegated_tool_timeout: Duration::from_secs(60),
+            max_delegation_total_turns: 32,
+            max_delegation_total_tool_calls: 64,
         }
     }
 }
@@ -306,6 +357,10 @@ pub fn system_prompt_v4(mode: RunModeV4) -> String {
 
 #[derive(Debug, Error)]
 pub enum AgentCoreErrorV4 {
+    #[error("new guidance awaits the next model boundary")]
+    GuidancePending,
+    #[error("run needs attention: provider context window exceeded: {0}")]
+    ContextOverflow(String),
     #[error("model error: {0}")]
     Model(String),
     #[error("tool error: {0}")]
@@ -326,7 +381,7 @@ pub enum AgentCoreErrorV4 {
     WaitingForApproval,
     #[error("tool-call budget exhausted ({0})")]
     ToolBudgetExceeded(u32),
-    #[error("repeated tool-call signature detected: {0}")]
+    #[error("run needs attention: repeated tool calls and unchanged results: {0}")]
     RepeatedToolCall(String),
     #[error("side-effect dispatch is uncertain and requires verification: {0}")]
     UncertainSideEffect(String),
@@ -712,6 +767,7 @@ impl AgentCoreV4<'_> {
     ) -> Result<(), AgentCoreErrorV4> {
         self.recover_interrupted_dispatches(spec, limits, cancelled)
             .await?;
+        self.consume_guidance(spec).await?;
         let existing = self
             .events
             .load(spec.run_id)
@@ -721,8 +777,6 @@ impl AgentCoreV4<'_> {
             .iter()
             .filter(|event| matches!(event.event, AgentEventKindV4::ToolRequested { .. }))
             .count() as u32;
-        let mut last_signature = None::<String>;
-        let mut consecutive_repeats = 0_u32;
         let mut reviewer_corrections = existing
             .iter()
             .filter(|event| {
@@ -732,17 +786,6 @@ impl AgentCoreV4<'_> {
                 )
             })
             .count() as u8;
-        for event in &existing {
-            if let AgentEventKindV4::ToolRequested { call } = &event.event {
-                let signature = tool_signature(call);
-                if last_signature.as_deref() == Some(&signature) {
-                    consecutive_repeats += 1;
-                } else {
-                    last_signature = Some(signature);
-                    consecutive_repeats = 1;
-                }
-            }
-        }
         if self
             .resume_pending_review(
                 spec,
@@ -777,6 +820,17 @@ impl AgentCoreV4<'_> {
                     .await?;
                 return Err(AgentCoreErrorV4::Cancelled);
             }
+            self.consume_guidance(spec).await?;
+            let progress_events = self
+                .events
+                .load(spec.run_id)
+                .await
+                .map_err(AgentCoreErrorV4::Store)?;
+            if progress::stalled(&progress_events, limits.repeated_signature_limit) {
+                return Err(AgentCoreErrorV4::RepeatedToolCall(
+                    "completed observations did not change; revise the approach".into(),
+                ));
+            }
             let context = self.context_for(spec, limits).await?;
             let current_events = self
                 .events
@@ -790,23 +844,20 @@ impl AgentCoreV4<'_> {
                 self.push(spec.run_id, AgentEventKindV4::CycleStarted { cycle_id })
                     .await?;
             }
-            let turn = self
-                .model_turn(
-                    spec.run_id,
-                    ModelRequestV4 {
-                        system: self
-                            .model
-                            .prompt_layers()
-                            .render_execution(spec.execution_kind),
-                        context,
-                        tools: self.tools.descriptors(RunModeV4::Execute),
-                        image_refs: screenshot_image_refs(&current_events),
-                    },
-                    limits.max_model_retries,
-                    limits.model_attempt_timeout,
-                    Some(cancelled),
-                )
-                .await?;
+            let turn = match self
+                .execution_model_turn(spec, context, &current_events, limits, cancelled)
+                .await
+            {
+                Ok(turn) => turn,
+                Err(AgentCoreErrorV4::GuidancePending) => {
+                    if guided_cycle {
+                        self.push(spec.run_id, AgentEventKindV4::CycleFinished { cycle_id })
+                            .await?;
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if guided_cycle {
                 self.push(spec.run_id, AgentEventKindV4::CycleFinished { cycle_id })
                     .await?;
@@ -819,16 +870,6 @@ impl AgentCoreV4<'_> {
                 tool_call_count += 1;
                 if tool_call_count > limits.max_tool_calls {
                     return Err(AgentCoreErrorV4::ToolBudgetExceeded(limits.max_tool_calls));
-                }
-                let signature = tool_signature(&call);
-                if last_signature.as_deref() == Some(&signature) {
-                    consecutive_repeats += 1;
-                } else {
-                    last_signature = Some(signature.clone());
-                    consecutive_repeats = 1;
-                }
-                if consecutive_repeats > limits.repeated_signature_limit {
-                    return Err(AgentCoreErrorV4::RepeatedToolCall(signature));
                 }
                 if is_browser_tool_id(&call.tool_id) {
                     if let Err(message) = self.tools.validate(RunModeV4::Execute, &call) {
@@ -947,6 +988,12 @@ impl AgentCoreV4<'_> {
                         .await?;
                         return Err(AgentCoreErrorV4::WaitingForApproval);
                     }
+                }
+                if call.tool_id == context_views::READ_RESULT_TOOL {
+                    let outcome = context_views::read_outcome(spec, &workflow_events, call);
+                    self.push(spec.run_id, AgentEventKindV4::ToolFinished { outcome })
+                        .await?;
+                    continue;
                 }
                 if call.tool_id == "agent.complete" {
                     let proposal: CompletionProposalV4 =
@@ -1314,7 +1361,7 @@ impl AgentCoreV4<'_> {
                     .await?;
                 }
                 let futures = dispatch.into_iter().map(|call| async move {
-                    let result = self.tools.execute(RunModeV4::Execute, call.clone()).await;
+                    let result = self.execute_with_guidance(spec, &call).await;
                     (call, result)
                 });
                 let mut batch = Box::pin(join_all(futures));
@@ -1708,9 +1755,10 @@ impl AgentCoreV4<'_> {
                     .await?;
                     continue;
                 }
-                self.push(spec.run_id, AgentEventKindV4::RunCompleted)
-                    .await?;
-                return Ok(());
+                if self.complete_if_no_guidance(spec.run_id).await? {
+                    return Ok(());
+                }
+                continue;
             }
         }
         Err(AgentCoreErrorV4::MissingCompletion)
@@ -1724,17 +1772,119 @@ impl AgentCoreV4<'_> {
         limits: AgentLimitsV4,
         cancelled: &AtomicBool,
     ) -> Result<DelegationGraphOutcomeV4, AgentCoreErrorV4> {
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(AgentCoreErrorV4::Cancelled);
+        }
         let nodes = validate_delegation_graph_v4(&graph, spec, self.tools, limits)
             .map_err(AgentCoreErrorV4::Delegation)?;
-        self.push(
-            spec.run_id,
-            AgentEventKindV4::DelegationGraphStarted {
-                call_id: call_id.into(),
-                graph,
-            },
-        )
-        .await?;
+        let delegated_model = self
+            .model
+            .delegated_model(spec.delegated_model.as_ref())
+            .map_err(|error| AgentCoreErrorV4::NeedsAttention(error.message))?
+            .unwrap_or(self.model);
+        let history = self
+            .events
+            .load(spec.run_id)
+            .await
+            .map_err(AgentCoreErrorV4::Store)?;
         let mut outcomes = BTreeMap::<String, DelegationNodeOutcomeV4>::new();
+        let mut matching_graph_seen = false;
+        let mut reserved_turns = 0_u32;
+        let mut reserved_calls = 0_u32;
+        for event in &history {
+            if event.run_id != spec.run_id
+                || event.project_id != spec.project_id
+                || event.conversation_id != spec.conversation_id
+                || event.verify().is_err()
+            {
+                return Err(AgentCoreErrorV4::Delegation(
+                    "delegation history failed integrity or scope validation".into(),
+                ));
+            }
+            match &event.event {
+                AgentEventKindV4::DelegationGraphStarted {
+                    call_id: previous_id,
+                    graph: previous,
+                } => {
+                    for node in &previous.nodes {
+                        reserved_turns =
+                            reserved_turns.saturating_add(u32::from(node.budget.max_turns));
+                        reserved_calls =
+                            reserved_calls.saturating_add(u32::from(node.budget.max_tool_calls));
+                    }
+                    if previous_id == call_id {
+                        if previous != &graph {
+                            return Err(AgentCoreErrorV4::Delegation(
+                                "resumed delegation graph differs from its recorded input".into(),
+                            ));
+                        }
+                        matching_graph_seen = true;
+                    }
+                }
+                AgentEventKindV4::DelegationNodeFinished {
+                    call_id: previous_id,
+                    outcome,
+                } if previous_id == call_id
+                    && matching_graph_seen
+                    && outcome.status == DelegationNodeStatusV4::Succeeded =>
+                {
+                    let node = nodes.get(&outcome.node_id).ok_or_else(|| {
+                        AgentCoreErrorV4::Delegation(
+                            "stored delegation node is absent from its graph".into(),
+                        )
+                    })?;
+                    let output = outcome.output.as_ref().ok_or_else(|| {
+                        AgentCoreErrorV4::Delegation("stored successful node has no output".into())
+                    })?;
+                    validate_json_schema_subset(&node.output_schema, output, "$")
+                        .map_err(AgentCoreErrorV4::Delegation)?;
+                    outcomes.insert(node.id.clone(), outcome.clone());
+                }
+                _ => {}
+            }
+        }
+        // Reuse only nodes whose full dependency chain was also successful.
+        // This prevents an isolated stale child result from bypassing its inputs.
+        loop {
+            let stale = outcomes
+                .keys()
+                .filter(|id| {
+                    nodes[*id]
+                        .dependencies
+                        .iter()
+                        .any(|dependency| !outcomes.contains_key(dependency))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if stale.is_empty() {
+                break;
+            }
+            for id in stale {
+                outcomes.remove(&id);
+            }
+        }
+        if outcomes.len() < nodes.len() {
+            for node in &graph.nodes {
+                reserved_turns = reserved_turns.saturating_add(u32::from(node.budget.max_turns));
+                reserved_calls =
+                    reserved_calls.saturating_add(u32::from(node.budget.max_tool_calls));
+            }
+            if reserved_turns > limits.max_delegation_total_turns
+                || reserved_calls > limits.max_delegation_total_tool_calls
+            {
+                return Err(AgentCoreErrorV4::NeedsAttention(
+                    "run-wide delegation budget exhausted; completed results retained".into(),
+                ));
+            }
+            self.push(
+                spec.run_id,
+                AgentEventKindV4::DelegationGraphStarted {
+                    call_id: call_id.into(),
+                    graph,
+                },
+            )
+            .await?;
+        }
         while outcomes.len() < nodes.len() {
             if cancelled.load(Ordering::SeqCst) {
                 return Err(AgentCoreErrorV4::Cancelled);
@@ -1801,7 +1951,15 @@ impl AgentCoreV4<'_> {
                             .map(|output| (dependency.clone(), output))
                     })
                     .collect::<BTreeMap<_, _>>();
-                self.execute_delegated_node(node, dependency_outputs, cancelled)
+                self.execute_delegated_node_with_model(
+                    delegated_model,
+                    node,
+                    dependency_outputs,
+                    limits,
+                    cancelled,
+                    (spec.execution_kind == RunExecutionKindV4::OrdinaryAgent)
+                        .then_some(spec.run_id),
+                )
             });
             for outcome in join_all(futures).await {
                 self.push(
@@ -1814,6 +1972,9 @@ impl AgentCoreV4<'_> {
                 .await?;
                 outcomes.insert(outcome.node_id.clone(), outcome);
             }
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(AgentCoreErrorV4::Cancelled);
         }
         let result = DelegationGraphOutcomeV4 {
             schema_version: 4,
@@ -1830,11 +1991,33 @@ impl AgentCoreV4<'_> {
         Ok(result)
     }
 
+    #[cfg(test)]
     async fn execute_delegated_node(
         &self,
         node: &DelegatedTaskNodeV4,
         dependency_outputs: BTreeMap<String, Value>,
+        limits: AgentLimitsV4,
         cancelled: &AtomicBool,
+    ) -> DelegationNodeOutcomeV4 {
+        self.execute_delegated_node_with_model(
+            self.model,
+            node,
+            dependency_outputs,
+            limits,
+            cancelled,
+            None,
+        )
+        .await
+    }
+
+    async fn execute_delegated_node_with_model(
+        &self,
+        model: &dyn ModelPortV4,
+        node: &DelegatedTaskNodeV4,
+        dependency_outputs: BTreeMap<String, Value>,
+        limits: AgentLimitsV4,
+        cancelled: &AtomicBool,
+        guidance_run_id: Option<Uuid>,
     ) -> DelegationNodeOutcomeV4 {
         let mut tool_outcomes = Vec::new();
         let mut feedback = Vec::<String>::new();
@@ -1847,15 +2030,16 @@ impl AgentCoreV4<'_> {
                 node.capabilities.contains(&tool.id) && tool.effect == ToolEffectV4::ReadOnly
             })
             .collect::<Vec<_>>();
-        descriptors.push(delegated_result_descriptor());
+        descriptors.push(delegated_result_descriptor(&node.output_schema));
         for _ in 0..node.budget.max_turns {
-            if cancelled.load(Ordering::SeqCst) {
-                return failed_delegation_node(node, "delegated task was cancelled", tool_outcomes);
+            if let Some(reason) = self.delegated_stop_reason(cancelled, guidance_run_id).await {
+                return failed_delegation_node(node, reason, tool_outcomes);
             }
             let context = json!({
                 "node_id": node.id,
                 "objective": node.objective,
                 "dependency_results": dependency_outputs,
+                "output_schema": node.output_schema,
                 "validation_feedback": feedback,
             });
             let request = ModelRequestV4 {
@@ -1864,29 +2048,47 @@ impl AgentCoreV4<'_> {
                 tools: descriptors.clone(),
                 image_refs: vec![],
             };
+            // Bound all child input, including schema and tool descriptions. Do
+            // not silently discard evidence or alter the required output schema.
+            if serde_json::to_vec(&request)
+                .expect("serializable request")
+                .len()
+                > limits
+                    .delegated_context_max_bytes
+                    .min(limits.context_max_bytes)
+            {
+                return failed_delegation_node(
+                    node,
+                    "delegated context budget exhausted; narrow the objective or dependencies",
+                    tool_outcomes,
+                );
+            }
             let mut ignore = |_| {};
-            let mut pending = Box::pin(self.model.stream(request, &mut ignore));
+            if let Err(error) = model.validate_request(&request) {
+                return failed_delegation_node(node, error.message, tool_outcomes);
+            }
+            let mut pending = Box::pin(model.stream(request, &mut ignore));
+            let deadline = tokio::time::sleep(limits.model_attempt_timeout);
+            tokio::pin!(deadline);
             let model_result = loop {
                 tokio::select! {
-                    result = &mut pending => break Some(result),
+                    _ = &mut deadline => break Ok(Err(ModelFailureV4::permanent(
+                        omicsops_protocol::ModelErrorClassV4::Timeout,
+                        "delegated model attempt timed out",
+                    ))),
+                    result = &mut pending => break Ok(result),
                     _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                        if cancelled.load(Ordering::SeqCst) {
-                            break None;
+                        if let Some(reason) = self.delegated_stop_reason(cancelled, guidance_run_id).await {
+                            break Err(reason);
                         }
                     }
                 }
             };
             drop(pending);
             let turn = match model_result {
-                None => {
-                    return failed_delegation_node(
-                        node,
-                        "delegated task was cancelled",
-                        tool_outcomes,
-                    );
-                }
-                Some(Ok(turn)) => turn,
-                Some(Err(error)) => {
+                Err(reason) => return failed_delegation_node(node, reason, tool_outcomes),
+                Ok(Ok(turn)) => turn,
+                Ok(Err(error)) => {
                     return failed_delegation_node(
                         node,
                         format!("delegated model failed: {}", error.message),
@@ -1895,8 +2097,19 @@ impl AgentCoreV4<'_> {
                 }
             };
             for call in turn.tool_calls {
+                if let Some(reason) = self.delegated_stop_reason(cancelled, guidance_run_id).await {
+                    return failed_delegation_node(node, reason, tool_outcomes);
+                }
                 if call.tool_id == "agent.submit_delegated_result" {
                     let output = call.arguments.get("output").cloned().unwrap_or(Value::Null);
+                    if serde_json::to_vec(&output)
+                        .expect("serializable output")
+                        .len()
+                        > limits.delegated_output_max_bytes
+                    {
+                        feedback.push("output budget exceeded; submit a concise result with evidence references".into());
+                        continue;
+                    }
                     match validate_json_schema_subset(&node.output_schema, &output, "$") {
                         Ok(()) => {
                             return DelegationNodeOutcomeV4 {
@@ -1923,6 +2136,7 @@ impl AgentCoreV4<'_> {
                 }
                 let allowed = node.capabilities.contains(&call.tool_id)
                     && self.tools.effect(&call.tool_id) == Some(ToolEffectV4::ReadOnly);
+                let mut stop_after_tool = None;
                 let outcome = if !allowed {
                     ToolOutcomeV4 {
                         call_id: call.call_id,
@@ -1943,23 +2157,42 @@ impl AgentCoreV4<'_> {
                         provenance: vec![],
                     }
                 } else {
-                    match self.tools.execute(RunModeV4::Execute, call.clone()).await {
+                    let execution = self.tools.execute(RunModeV4::Execute, call.clone());
+                    tokio::pin!(execution);
+                    let deadline = tokio::time::sleep(limits.delegated_tool_timeout);
+                    tokio::pin!(deadline);
+                    let result = loop {
+                        tokio::select! {
+                            result = &mut execution => break result,
+                            _ = &mut deadline => break Err("delegated read-only tool timed out".into()),
+                            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                                if let Some(reason) = self.delegated_stop_reason(cancelled, guidance_run_id).await {
+                                    stop_after_tool = Some(reason);
+                                    break Err(reason.into());
+                                }
+                            }
+                        }
+                    };
+                    match result {
                         Ok(outcome) => outcome,
                         Err(error) => ToolOutcomeV4 {
                             call_id: call.call_id,
                             tool_id: call.tool_id,
                             succeeded: false,
+                            data: json!({"error_kind": if error.starts_with("guidance_interrupted:") { "guidance_interrupted" } else { "delegation_tool" }}),
                             model_content: error,
-                            data: json!({"error_kind":"delegation_tool"}),
                             provenance: vec![],
                         },
                     }
                 };
-                feedback.push(format!(
-                    "tool {}: {}",
-                    outcome.tool_id, outcome.model_content
-                ));
+                feedback.push(serde_json::to_string(&outcome).expect("serializable tool result"));
                 tool_outcomes.push(outcome);
+                if let Some(reason) = stop_after_tool {
+                    return failed_delegation_node(node, reason, tool_outcomes);
+                }
+                if let Some(reason) = self.delegated_stop_reason(cancelled, guidance_run_id).await {
+                    return failed_delegation_node(node, reason, tool_outcomes);
+                }
             }
         }
         failed_delegation_node(
@@ -1972,6 +2205,26 @@ impl AgentCoreV4<'_> {
         )
     }
 
+    // Children only observe the inbox. The parent driver consumes it after
+    // preserving the graph results, so event sequence ownership stays singular.
+    async fn delegated_stop_reason(
+        &self,
+        cancelled: &AtomicBool,
+        run_id: Option<Uuid>,
+    ) -> Option<&'static str> {
+        if cancelled.load(Ordering::SeqCst) {
+            return Some("delegated task was cancelled");
+        }
+        let run_id = run_id?;
+        match self.events.has_pending_guidance(run_id).await {
+            Ok(false) => None,
+            Ok(true) => Some("guidance_interrupted: delegated task yielded to new user guidance"),
+            Err(_) => {
+                Some("delegated guidance inbox unavailable; task stopped without further requests")
+            }
+        }
+    }
+
     async fn model_turn(
         &self,
         run_id: Uuid,
@@ -1980,6 +2233,9 @@ impl AgentCoreV4<'_> {
         attempt_timeout: Duration,
         cancelled: Option<&AtomicBool>,
     ) -> Result<ModelTurnV4, AgentCoreErrorV4> {
+        self.model
+            .validate_request(&request)
+            .map_err(|error| AgentCoreErrorV4::NeedsAttention(error.message))?;
         let mut attempt = 0_u8;
         loop {
             let mut callback_events = Vec::new();
@@ -2021,6 +2277,9 @@ impl AgentCoreV4<'_> {
                             }
                             return Err(AgentCoreErrorV4::Cancelled);
                         }
+                        if self.events.has_pending_guidance(run_id).await.map_err(AgentCoreErrorV4::Store)? {
+                            return Err(AgentCoreErrorV4::GuidancePending);
+                        }
                     }
                 }
             };
@@ -2059,6 +2318,11 @@ impl AgentCoreV4<'_> {
                     )
                     .await?;
                     tokio::time::sleep(Duration::from_millis(25 * u64::from(attempt))).await;
+                }
+                Err(error)
+                    if error.class == omicsops_protocol::ModelErrorClassV4::ContextOverflow =>
+                {
+                    return Err(AgentCoreErrorV4::ContextOverflow(error.message));
                 }
                 Err(error) => return Err(AgentCoreErrorV4::Model(error.message)),
             }
@@ -2115,6 +2379,38 @@ impl AgentCoreV4<'_> {
         }
     }
 
+    /// Only discard a pending read, never a side-effecting operation. Each
+    /// future owns its result so join_all retains reads that already finished.
+    async fn execute_with_guidance(
+        &self,
+        spec: &RunSpecV4,
+        call: &ToolCallV4,
+    ) -> Result<ToolOutcomeV4, String> {
+        let execution = self.tools.execute(RunModeV4::Execute, call.clone());
+        tokio::pin!(execution);
+        let can_yield = spec.execution_kind == RunExecutionKindV4::OrdinaryAgent
+            && self.tools.effect(&call.tool_id) == Some(ToolEffectV4::ReadOnly);
+        loop {
+            tokio::select! {
+                // Prefer an available result over a simultaneous guidance tick.
+                biased;
+                result = &mut execution => return result,
+                _ = tokio::time::sleep(Duration::from_millis(50)), if can_yield => {
+                    if self.events.has_pending_guidance(spec.run_id).await? {
+                        return Ok(ToolOutcomeV4 {
+                            call_id: call.call_id.clone(),
+                            tool_id: call.tool_id.clone(),
+                            succeeded: false,
+                            model_content: "Read wait ended for new user guidance; no result was obtained. Reconsider this read after applying the guidance.".into(),
+                            data: json!({"error_kind":"guidance_interrupted", "recoverable":true}),
+                            provenance: vec![],
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     async fn resume_pending_review(
         &self,
         spec: &RunSpecV4,
@@ -2133,6 +2429,12 @@ impl AgentCoreV4<'_> {
         else {
             return Ok(false);
         };
+        if events.iter().any(|event| {
+            event.sequence > proposal_sequence
+                && matches!(event.event, AgentEventKindV4::GuidanceConsumed { .. })
+        }) {
+            return Ok(false);
+        }
         let Some((verification_sequence, deterministic)) =
             events.iter().rev().find_map(|event| match &event.event {
                 AgentEventKindV4::DeterministicVerificationFinished { report }
@@ -2242,9 +2544,7 @@ impl AgentCoreV4<'_> {
             .await?;
             return Ok(false);
         }
-        self.push(spec.run_id, AgentEventKindV4::RunCompleted)
-            .await?;
-        Ok(true)
+        self.complete_if_no_guidance(spec.run_id).await
     }
 
     async fn recover_interrupted_dispatches(
@@ -2317,6 +2617,48 @@ impl AgentCoreV4<'_> {
                 .effect(&call.tool_id)
                 .ok_or_else(|| AgentCoreErrorV4::Tool(format!("unknown tool {}", call.tool_id)))?;
             if dispatched && effect != ToolEffectV4::ReadOnly {
+                if cancelled.load(Ordering::SeqCst) {
+                    return Err(AgentCoreErrorV4::Cancelled);
+                }
+                self.tools
+                    .validate(RunModeV4::Execute, &call)
+                    .map_err(AgentCoreErrorV4::Tool)?;
+                // Once explicitly classified uncertain, retain the existing
+                // human reconciliation path rather than resolve it implicitly.
+                let recovered = if events.iter().any(|event| matches!(&event.event,
+                    AgentEventKindV4::ToolDispatchUncertain { call_id, .. } if call_id == &call.call_id)) {
+                    None
+                } else {
+                    self.tools.recover_result(&call).await.map_err(AgentCoreErrorV4::Tool)?
+                };
+                if cancelled.load(Ordering::SeqCst) {
+                    return Err(AgentCoreErrorV4::Cancelled);
+                }
+                if let Some(mut outcome) = recovered {
+                    if outcome.call_id != call.call_id || outcome.tool_id != call.tool_id {
+                        return Err(AgentCoreErrorV4::Tool(
+                            "recovered result belongs to another dispatch".into(),
+                        ));
+                    }
+                    let update = if outcome.succeeded {
+                        Some(self.science_after_tool(spec, &call, &outcome).await)
+                    } else {
+                        None
+                    };
+                    if let Some(Err(error)) = &update {
+                        outcome.succeeded = false;
+                        outcome.model_content =
+                            format!("host rejected recovered scientific result: {error}");
+                        outcome.data = json!({"error_kind":"scientific_validation"});
+                        outcome.provenance.clear();
+                    }
+                    self.push(run_id, AgentEventKindV4::ToolFinished { outcome })
+                        .await?;
+                    if let Some(Ok(update)) = update {
+                        self.record_scientific_update(run_id, update).await?;
+                    }
+                    continue;
+                }
                 if !events.iter().any(|event| {
                     matches!(&event.event, AgentEventKindV4::ToolDispatchUncertain { call_id, .. } if call_id == &call.call_id)
                 }) {
@@ -2386,6 +2728,12 @@ impl AgentCoreV4<'_> {
                     },
                 )
                 .await?;
+                continue;
+            }
+            if call.tool_id == context_views::READ_RESULT_TOOL {
+                let outcome = context_views::read_outcome(spec, &events, call);
+                self.push(run_id, AgentEventKindV4::ToolFinished { outcome })
+                    .await?;
                 continue;
             }
             if call.tool_id == "agent.delegate" {
@@ -2954,10 +3302,116 @@ impl AgentCoreV4<'_> {
         }))
     }
 
+    async fn execution_model_turn(
+        &self,
+        spec: &RunSpecV4,
+        context: String,
+        events: &[AgentEventV4],
+        limits: AgentLimitsV4,
+        cancelled: &AtomicBool,
+    ) -> Result<ModelTurnV4, AgentCoreErrorV4> {
+        let first = self
+            .model_turn(
+                spec.run_id,
+                self.execution_request(spec, context.clone(), events),
+                limits.max_model_retries,
+                limits.model_attempt_timeout,
+                Some(cancelled),
+            )
+            .await;
+        if !matches!(first, Err(AgentCoreErrorV4::ContextOverflow(_))) {
+            return first;
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(AgentCoreErrorV4::Cancelled);
+        }
+        // A provider-confirmed overflow gets one archive-first recovery with
+        // no recent narrative tail. Frozen state and evidence are never erased.
+        let compacted = self
+            .context_for_internal(
+                spec,
+                AgentLimitsV4 {
+                    checkpoint_recent_events: 0,
+                    ..limits
+                },
+                true,
+            )
+            .await?;
+        if compacted.len() >= context.len() {
+            return first;
+        }
+        self.push(
+            spec.run_id,
+            AgentEventKindV4::ModelRetrying {
+                attempt: 1,
+                class: omicsops_protocol::ModelErrorClassV4::ContextOverflow,
+                message: "retrying once after archive-first context compaction".into(),
+            },
+        )
+        .await?;
+        self.model_turn(
+            spec.run_id,
+            self.execution_request(spec, compacted, events),
+            0,
+            limits.model_attempt_timeout,
+            Some(cancelled),
+        )
+        .await
+    }
+
+    fn execution_request(
+        &self,
+        spec: &RunSpecV4,
+        context: String,
+        events: &[AgentEventV4],
+    ) -> ModelRequestV4 {
+        let mut system = self
+            .model
+            .prompt_layers()
+            .render_execution(spec.execution_kind);
+        if spec.execution_kind == RunExecutionKindV4::OrdinaryAgent {
+            system.push_str("\nApply active_guidance as additional user instructions in their recorded order. Guidance does not expand tool capabilities, bypass approval, or change the frozen compute environment. Reconcile your approach and completion with this guidance before proposing completion.");
+        }
+        ModelRequestV4 {
+            system,
+            context,
+            tools: self.tools.descriptors(RunModeV4::Execute),
+            image_refs: screenshot_image_refs(events),
+        }
+    }
+
+    fn validate_execution_context(
+        &self,
+        spec: &RunSpecV4,
+        context: &str,
+        events: &[AgentEventV4],
+        limits: AgentLimitsV4,
+    ) -> Result<(), AgentCoreErrorV4> {
+        if context.len() > limits.context_max_bytes {
+            return Err(AgentCoreErrorV4::NeedsAttention(format!(
+                "model context exceeds byte budget ({} > {}); original run and evidence retained",
+                context.len(),
+                limits.context_max_bytes
+            )));
+        }
+        self.model
+            .validate_request(&self.execution_request(spec, context.to_owned(), events))
+            .map_err(|error| AgentCoreErrorV4::NeedsAttention(error.message))
+    }
+
     async fn context_for(
         &self,
         spec: &RunSpecV4,
         limits: AgentLimitsV4,
+    ) -> Result<String, AgentCoreErrorV4> {
+        self.context_for_internal(spec, limits, false).await
+    }
+
+    async fn context_for_internal(
+        &self,
+        spec: &RunSpecV4,
+        limits: AgentLimitsV4,
+        force_compaction: bool,
     ) -> Result<String, AgentCoreErrorV4> {
         let events = self
             .events
@@ -2973,31 +3427,93 @@ impl AgentCoreV4<'_> {
             events
                 .iter()
                 .filter(|event| event.sequence > checkpoint.through_sequence)
+                .filter(|event| {
+                    !matches!(
+                        event.event,
+                        AgentEventKindV4::ContextArchived { .. }
+                            | AgentEventKindV4::ContextCheckpointed { .. }
+                    )
+                })
                 .cloned()
                 .collect::<Vec<_>>()
         } else {
             events.clone()
         };
+        let use_views = self
+            .tools
+            .descriptors(RunModeV4::Execute)
+            .iter()
+            .any(|tool| tool.id == context_views::READ_RESULT_TOOL);
+        let active_guidance = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEventKindV4::GuidanceConsumed {
+                    message_id,
+                    markdown,
+                } => Some(json!({"message_id": message_id, "markdown": markdown})),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let recent_views = recent
+            .iter()
+            .filter(|event| !matches!(event.event, AgentEventKindV4::GuidanceConsumed { .. }))
+            .map(|event| {
+                if use_views {
+                    context_views::event_view(event)
+                } else {
+                    serde_json::to_value(event).expect("serializable event")
+                }
+            })
+            .collect::<Vec<_>>();
         let candidate = serde_json::to_string(&json!({
             "frozen_plan": spec.plan,
             "compute_selection": spec.compute_selection,
             "checkpoint": latest_checkpoint,
-            "recent_events": recent,
+            "recent_events": recent_views,
             "scientific_state": scientific_state,
+            "active_guidance": active_guidance,
         }))
         .map_err(|e| AgentCoreErrorV4::Store(e.to_string()))?;
-        if candidate.len() <= limits.context_max_bytes {
-            return Ok(candidate);
+        if !force_compaction {
+            match self.validate_execution_context(spec, &candidate, &events, limits) {
+                Ok(()) => return Ok(candidate),
+                Err(error) if latest_checkpoint.is_some() && recent.is_empty() => {
+                    return Err(error);
+                }
+                Err(_) => {}
+            }
         }
         let transcript =
             serde_json::to_string(&events).map_err(|e| AgentCoreErrorV4::Store(e.to_string()))?;
-        let checkpoint = build_checkpoint(
+        let mut checkpoint = build_checkpoint(
             spec,
             &events,
             limits.checkpoint_recent_events,
             serde_json::to_value(&scientific_state)
                 .map_err(|error| AgentCoreErrorV4::Science(error.to_string()))?,
         );
+        if use_views {
+            checkpoint.recent_steps = events
+                .iter()
+                .rev()
+                .filter(|event| {
+                    matches!(
+                        event.event,
+                        AgentEventKindV4::ToolFinished { .. }
+                            | AgentEventKindV4::ToolOutcomeReused { .. }
+                            | AgentEventKindV4::DelegationNodeFinished { .. }
+                            | AgentEventKindV4::DelegationGraphFinished { .. }
+                            | AgentEventKindV4::ModelText { .. }
+                            | AgentEventKindV4::UserInputAnswered { .. }
+                    )
+                })
+                .take(limits.checkpoint_recent_events)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|event| context_views::event_view(event).to_string())
+                .collect();
+        }
         let archive = self
             .events
             .archive_context(spec.run_id, &transcript, &checkpoint)
@@ -3012,8 +3528,10 @@ impl AgentCoreV4<'_> {
             },
         )
         .await?;
-        serde_json::to_string(&json!({"frozen_plan":spec.plan,"compute_selection":spec.compute_selection,"checkpoint":checkpoint,"recent_events":[],"scientific_state":scientific_state}))
-            .map_err(|e| AgentCoreErrorV4::Store(e.to_string()))
+        let compacted = serde_json::to_string(&json!({"frozen_plan":spec.plan,"compute_selection":spec.compute_selection,"checkpoint":checkpoint,"recent_events":[],"scientific_state":scientific_state,"active_guidance":active_guidance}))
+            .map_err(|e| AgentCoreErrorV4::Store(e.to_string()))?;
+        self.validate_execution_context(spec, &compacted, &events, limits)?;
+        Ok(compacted)
     }
 
     async fn scientific_snapshot(
@@ -3078,6 +3596,34 @@ impl AgentCoreV4<'_> {
     async fn record(&self, event: AgentEventV4) -> Result<(), AgentCoreErrorV4> {
         self.events
             .append(&event)
+            .await
+            .map_err(AgentCoreErrorV4::Store)
+    }
+    async fn consume_guidance(&self, spec: &RunSpecV4) -> Result<bool, AgentCoreErrorV4> {
+        if spec.execution_kind != RunExecutionKindV4::OrdinaryAgent {
+            return Ok(false);
+        }
+        self.events
+            .consume_guidance(spec)
+            .await
+            .map_err(AgentCoreErrorV4::Store)
+    }
+
+    async fn complete_if_no_guidance(&self, run_id: Uuid) -> Result<bool, AgentCoreErrorV4> {
+        let events = self
+            .events
+            .load(run_id)
+            .await
+            .map_err(AgentCoreErrorV4::Store)?;
+        let previous = events
+            .last()
+            .ok_or_else(|| AgentCoreErrorV4::Store("run has no first event".into()))?;
+        self.events
+            .append_completion(&AgentEventV4::next(
+                previous,
+                Utc::now(),
+                AgentEventKindV4::RunCompleted,
+            ))
             .await
             .map_err(AgentCoreErrorV4::Store)
     }
@@ -3441,14 +3987,14 @@ fn delegation_depth(
     Ok(depth)
 }
 
-fn delegated_result_descriptor() -> ToolDescriptorV4 {
+fn delegated_result_descriptor(output_schema: &Value) -> ToolDescriptorV4 {
     ToolDescriptorV4 {
         id: "agent.submit_delegated_result".into(),
         description: "Submit the delegated node JSON output".into(),
         input_schema: json!({
             "type":"object",
             "required":["output"],
-            "properties":{"output":{}}
+            "properties":{"output":output_schema}
         }),
         effect: ToolEffectV4::ReadOnly,
     }
@@ -3536,14 +4082,6 @@ fn validate_json_schema_subset(schema: &Value, value: &Value, path: &str) -> Res
         }
     }
     Ok(())
-}
-
-fn tool_signature(call: &ToolCallV4) -> String {
-    format!(
-        "{}:{}",
-        call.tool_id,
-        serde_json::to_string(&call.arguments).unwrap_or_else(|_| "<invalid>".into())
-    )
 }
 
 fn approval_reason(effect: ToolEffectV4) -> &'static str {
@@ -3806,6 +4344,9 @@ fn phase_for_calls(calls: &[ToolCallV4]) -> AgentPhaseV4 {
 }
 
 fn is_task_tool(tool_id: &str) -> bool {
+    if tool_id == context_views::READ_RESULT_TOOL {
+        return false;
+    }
     !matches!(
         tool_id,
         "agent.route_request"
@@ -3876,6 +4417,9 @@ fn guided_loop_rejection(events: &[AgentEventV4], call: &ToolCallV4) -> Option<S
     };
     if call.tool_id == "agent.route_request" {
         return Some("the request route is already frozen for this run".into());
+    }
+    if call.tool_id == context_views::READ_RESULT_TOOL {
+        return None;
     }
     if route == AgentRequestRouteV4::Adaptive && is_browser_tool_id(&call.tool_id) {
         return Some(
@@ -4070,6 +4614,9 @@ fn research_workflow_rejection(events: &[AgentEventV4], call: &ToolCallV4) -> Op
     };
     if call.tool_id == "agent.route_request" {
         return Some("the request route is already frozen for this run".into());
+    }
+    if call.tool_id == context_views::READ_RESULT_TOOL {
+        return None;
     }
     if route == AgentRequestRouteV4::Adaptive {
         return None;
@@ -7418,6 +7965,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn progress_guard_waits_for_batch_close_and_resets_on_user_input() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = ScriptedModel(Mutex::new(vec![]));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        for batch_id in 1..=2 {
+            let call_ids = vec![format!("a-{batch_id}"), format!("b-{batch_id}")];
+            for (index, id) in call_ids.iter().enumerate() {
+                core.push(
+                    spec.run_id,
+                    AgentEventKindV4::ToolRequested {
+                        call: ToolCallV4 {
+                            call_id: id.clone(),
+                            tool_id: "monitor".into(),
+                            arguments: json!({"job":index}),
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            core.push(
+                spec.run_id,
+                AgentEventKindV4::ToolBatchStarted {
+                    batch_id,
+                    cycle_id: batch_id,
+                    phase: AgentPhaseV4::Executing,
+                    tool_names: vec!["monitor".into(); 2],
+                    call_ids: call_ids.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            for id in call_ids.iter().rev() {
+                core.push(
+                    spec.run_id,
+                    AgentEventKindV4::ToolFinished {
+                        outcome: ToolOutcomeV4 {
+                            call_id: id.clone(),
+                            tool_id: "monitor".into(),
+                            succeeded: true,
+                            model_content: "running".into(),
+                            data: json!({"state":"running"}),
+                            provenance: vec![],
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            assert!(!progress::stalled(&store.events.lock().unwrap(), 2));
+            core.push(
+                spec.run_id,
+                AgentEventKindV4::ToolBatchFinished {
+                    batch_id,
+                    cycle_id: batch_id,
+                    phase: AgentPhaseV4::Executing,
+                    tool_names: vec!["monitor".into(); 2],
+                    call_ids,
+                    duration_ms: batch_id,
+                    succeeded: 2,
+                    failed: 0,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        assert!(progress::stalled(&store.events.lock().unwrap(), 2));
+        core.push(
+            spec.run_id,
+            AgentEventKindV4::UserInputAnswered {
+                question_id: "q".into(),
+                answer: "use a different job".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!progress::stalled(&store.events.lock().unwrap(), 2));
+    }
+
+    #[tokio::test]
     async fn cancellation_interrupts_an_active_tool() {
         let run_id = Uuid::new_v4();
         let spec = execution_spec(run_id);
@@ -7651,7 +8285,7 @@ mod tests {
             .context_for(
                 &spec,
                 AgentLimitsV4 {
-                    context_max_bytes: 256,
+                    context_max_bytes: 6_000,
                     checkpoint_recent_events: 4,
                     ..AgentLimitsV4::default()
                 },
@@ -7665,6 +8299,854 @@ mod tests {
             store.events.lock().unwrap().last().unwrap().event,
             AgentEventKindV4::ContextCheckpointed { .. }
         ));
+    }
+
+    struct BudgetOnlyModel {
+        request_limit: usize,
+        requests: Mutex<Vec<ModelRequestV4>>,
+    }
+
+    #[derive(Default)]
+    struct GuidanceTestStore {
+        inner: MemoryStore,
+        pending: Mutex<Option<(Uuid, String)>>,
+        fail_next_poll: AtomicBool,
+    }
+    #[async_trait]
+    impl EventStoreV4 for GuidanceTestStore {
+        async fn append(&self, event: &AgentEventV4) -> Result<(), String> {
+            self.inner.append(event).await
+        }
+        async fn load(&self, id: Uuid) -> Result<Vec<AgentEventV4>, String> {
+            self.inner.load(id).await
+        }
+        async fn archive_context(
+            &self,
+            id: Uuid,
+            text: &str,
+            checkpoint: &ContextCheckpointV4,
+        ) -> Result<ContextArchiveV4, String> {
+            self.inner.archive_context(id, text, checkpoint).await
+        }
+        async fn has_pending_guidance(&self, _: Uuid) -> Result<bool, String> {
+            if self.fail_next_poll.swap(false, Ordering::SeqCst) {
+                return Err("synthetic inbox failure".into());
+            }
+            Ok(self.pending.lock().unwrap().is_some())
+        }
+        async fn consume_guidance(&self, spec: &RunSpecV4) -> Result<bool, String> {
+            let Some((message_id, markdown)) = self.pending.lock().unwrap().take() else {
+                return Ok(false);
+            };
+            let last = self.inner.load_direct(spec.run_id)?.pop().unwrap();
+            self.inner.append_direct(&AgentEventV4::next(
+                &last,
+                Utc::now(),
+                AgentEventKindV4::GuidanceConsumed {
+                    message_id,
+                    markdown,
+                },
+            ))?;
+            Ok(true)
+        }
+        async fn append_completion(&self, event: &AgentEventV4) -> Result<bool, String> {
+            if self.pending.lock().unwrap().is_some() {
+                return Ok(false);
+            }
+            self.inner.append(event).await?;
+            Ok(true)
+        }
+    }
+
+    struct GuidanceWaitingModel {
+        entered: tokio::sync::Notify,
+        calls: AtomicUsize,
+        contexts: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl ModelPortV4 for GuidanceWaitingModel {
+        async fn stream(
+            &self,
+            request: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            self.contexts.lock().unwrap().push(request.context);
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.entered.notify_one();
+                return std::future::pending().await;
+            }
+            Ok(ModelTurnV4 {
+                public_text: "updated approach".into(),
+                tool_calls: vec![],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn guidance_interrupts_model_wait_then_is_applied_once_and_survives_checkpoint() {
+        let store = GuidanceTestStore::default();
+        let spec = ordinary_execution_spec(Uuid::new_v4());
+        seed_execution(&store.inner, &spec);
+        let model = GuidanceWaitingModel {
+            entered: Default::default(),
+            calls: AtomicUsize::new(0),
+            contexts: Mutex::new(vec![]),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let limits = AgentLimitsV4 {
+            max_turns: 2,
+            ..Default::default()
+        };
+        let cancelled = AtomicBool::new(false);
+        let send = async {
+            model.entered.notified().await;
+            *store.pending.lock().unwrap() =
+                Some((Uuid::new_v4(), "保留对照组，并解释不确定性".into()));
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(core.execute_with_limits(&spec, limits, &cancelled), send)
+        })
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(AgentCoreErrorV4::MissingCompletion)));
+        assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+        assert!(!model.contexts.lock().unwrap()[0].contains("保留对照组"));
+        assert!(model.contexts.lock().unwrap()[1].contains("保留对照组"));
+        let events = store.inner.load_direct(spec.run_id).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, AgentEventKindV4::GuidanceConsumed { .. }))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event.event,
+            AgentEventKindV4::ToolDispatchStarted { .. } | AgentEventKindV4::RunCompleted
+        )));
+        let compacted = core
+            .context_for_internal(&spec, AgentLimitsV4::default(), true)
+            .await
+            .unwrap();
+        assert!(compacted.contains("保留对照组"));
+        assert!(
+            core.context_for(&spec, AgentLimitsV4::default())
+                .await
+                .unwrap()
+                .contains("保留对照组")
+        );
+        let projected: Value = serde_json::from_str(&compacted).unwrap();
+        assert_eq!(
+            projected["frozen_plan"],
+            serde_json::to_value(&spec.plan).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn guidance_blocks_completion_and_approved_plan_consumption() {
+        let store = GuidanceTestStore::default();
+        let spec = ordinary_execution_spec(Uuid::new_v4());
+        seed_execution(&store.inner, &spec);
+        let model = BudgetOnlyModel {
+            request_limit: 100_000,
+            requests: Mutex::new(vec![]),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        *store.pending.lock().unwrap() = Some((Uuid::new_v4(), "new guidance".into()));
+        assert!(!core.complete_if_no_guidance(spec.run_id).await.unwrap());
+        let mut approved = spec.clone();
+        approved.execution_kind = RunExecutionKindV4::ApprovedPlan;
+        assert!(!core.consume_guidance(&approved).await.unwrap());
+        assert!(store.pending.lock().unwrap().is_some());
+        core.consume_guidance(&spec).await.unwrap();
+        assert!(core.complete_if_no_guidance(spec.run_id).await.unwrap());
+    }
+
+    struct GuidanceReadTools {
+        effect: ToolEffectV4,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ToolPortV4 for GuidanceReadTools {
+        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
+            vec![]
+        }
+        fn effect(&self, _: &str) -> Option<ToolEffectV4> {
+            Some(self.effect)
+        }
+        async fn execute(&self, _: RunModeV4, call: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if call.call_id == "waiting" {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(ToolOutcomeV4 {
+                call_id: call.call_id,
+                tool_id: call.tool_id,
+                succeeded: true,
+                model_content: "actual result".into(),
+                data: json!({"value":42}),
+                provenance: vec!["actual-evidence".into()],
+            })
+        }
+    }
+
+    fn guidance_read_tools(effect: ToolEffectV4) -> GuidanceReadTools {
+        GuidanceReadTools {
+            effect,
+            entered: Default::default(),
+            release: Default::default(),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn guidance_read_call(id: &str) -> ToolCallV4 {
+        ToolCallV4 {
+            call_id: id.into(),
+            tool_id: "read.fixture".into(),
+            arguments: json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn guidance_ends_pending_read_but_retains_completed_batch_result() {
+        let store = GuidanceTestStore::default();
+        let spec = ordinary_execution_spec(Uuid::new_v4());
+        seed_execution(&store.inner, &spec);
+        let tools = guidance_read_tools(ToolEffectV4::ReadOnly);
+        let model = ScriptedModel(Mutex::new(vec![]));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        let calls = [
+            guidance_read_call("finished"),
+            guidance_read_call("waiting"),
+        ];
+        for call in &calls {
+            core.push(
+                spec.run_id,
+                AgentEventKindV4::ToolDispatchStarted {
+                    call_id: call.call_id.clone(),
+                    tool_id: call.tool_id.clone(),
+                    effect: ToolEffectV4::ReadOnly,
+                    idempotency_key: call.call_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let send = async {
+            tools.entered.notified().await;
+            *store.pending.lock().unwrap() = Some((Uuid::new_v4(), "change approach".into()));
+        };
+        let (results, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                join_all(
+                    calls
+                        .iter()
+                        .map(|call| core.execute_with_guidance(&spec, call))
+                ),
+                send
+            )
+        })
+        .await
+        .unwrap();
+        let first = results[0].as_ref().unwrap();
+        assert!(first.succeeded);
+        assert_eq!(first.data["value"], 42);
+        assert_eq!(first.provenance, ["actual-evidence"]);
+        let pending = results[1].as_ref().unwrap();
+        assert!(!pending.succeeded);
+        assert_eq!(pending.data["error_kind"], "guidance_interrupted");
+        assert!(pending.provenance.is_empty());
+        assert_eq!(tools.calls.load(Ordering::SeqCst), 2);
+        // The batch owner must persist outcomes before the next boundary consumes input.
+        assert!(store.has_pending_guidance(spec.run_id).await.unwrap());
+        for result in results {
+            core.push(
+                spec.run_id,
+                AgentEventKindV4::ToolFinished {
+                    outcome: result.unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        core.consume_guidance(&spec).await.unwrap();
+        core.recover_interrupted_dispatches(
+            &spec,
+            AgentLimitsV4::default(),
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tools.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn guidance_does_not_discard_side_effects_or_approved_plan_reads() {
+        for effect in [
+            ToolEffectV4::ReadOnly,
+            ToolEffectV4::Mutating,
+            ToolEffectV4::Runtime,
+            ToolEffectV4::Network,
+            ToolEffectV4::Delegation,
+        ] {
+            let store = GuidanceTestStore::default();
+            let mut spec = ordinary_execution_spec(Uuid::new_v4());
+            if effect == ToolEffectV4::ReadOnly {
+                spec.execution_kind = RunExecutionKindV4::ApprovedPlan;
+            }
+            let tools = guidance_read_tools(effect);
+            let model = ScriptedModel(Mutex::new(vec![]));
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &tools,
+                events: &store,
+                science: None,
+            };
+            let call = guidance_read_call("waiting");
+            let execution = core.execute_with_guidance(&spec, &call);
+            tokio::pin!(execution);
+            let send = async {
+                tools.entered.notified().await;
+                *store.pending.lock().unwrap() = Some((Uuid::new_v4(), "change approach".into()));
+            };
+            tokio::select! {
+                _ = &mut execution => panic!("tool finished without release"),
+                _ = send => {}
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(120), &mut execution)
+                    .await
+                    .is_err()
+            );
+            tools.release.notify_one();
+            let outcome = tokio::time::timeout(Duration::from_secs(1), execution)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(outcome.succeeded);
+            assert_eq!(outcome.provenance, ["actual-evidence"]);
+            assert_eq!(tools.calls.load(Ordering::SeqCst), 1);
+            assert!(store.has_pending_guidance(spec.run_id).await.unwrap());
+        }
+    }
+
+    struct ReceiptTools {
+        available: bool,
+        recoveries: AtomicUsize,
+    }
+    #[async_trait]
+    impl ToolPortV4 for ReceiptTools {
+        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
+            vec![]
+        }
+        fn effect(&self, _: &str) -> Option<ToolEffectV4> {
+            Some(ToolEffectV4::Runtime)
+        }
+        async fn execute(&self, _: RunModeV4, _: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            panic!("recovery must not execute")
+        }
+        async fn recover_result(&self, call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
+            self.recoveries.fetch_add(1, Ordering::SeqCst);
+            Ok(self.available.then(|| ToolOutcomeV4 {
+                call_id: call.call_id.clone(),
+                tool_id: call.tool_id.clone(),
+                succeeded: true,
+                model_content: "recovered".into(),
+                data: json!({}),
+                provenance: vec!["verified-receipt".into()],
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_receipt_recovers_once_without_execution_and_keeps_explicit_uncertainty() {
+        for (available, uncertain) in [(true, false), (false, false), (true, true)] {
+            let store = MemoryStore::default();
+            let spec = execution_spec(Uuid::new_v4());
+            seed_execution(&store, &spec);
+            let call = ToolCallV4 {
+                call_id: "receipt".into(),
+                tool_id: "runtime.execute".into(),
+                arguments: json!({"language":"python","code":"print(42)"}),
+            };
+            append_test_event(
+                &store,
+                spec.run_id,
+                AgentEventKindV4::ToolRequested { call: call.clone() },
+            );
+            append_test_event(
+                &store,
+                spec.run_id,
+                AgentEventKindV4::ToolDispatchStarted {
+                    call_id: call.call_id.clone(),
+                    tool_id: call.tool_id.clone(),
+                    effect: ToolEffectV4::Runtime,
+                    idempotency_key: call.call_id.clone(),
+                },
+            );
+            if uncertain {
+                append_test_event(
+                    &store,
+                    spec.run_id,
+                    AgentEventKindV4::ToolDispatchUncertain {
+                        call_id: call.call_id.clone(),
+                        tool_id: call.tool_id.clone(),
+                    },
+                );
+            }
+            let tools = ReceiptTools {
+                available,
+                recoveries: AtomicUsize::new(0),
+            };
+            let model = ScriptedModel(Mutex::new(vec![]));
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &tools,
+                events: &store,
+                science: None,
+            };
+            let result = core
+                .recover_interrupted_dispatches(
+                    &spec,
+                    AgentLimitsV4::default(),
+                    &AtomicBool::new(false),
+                )
+                .await;
+            if available && !uncertain {
+                result.unwrap();
+                core.recover_interrupted_dispatches(
+                    &spec,
+                    AgentLimitsV4::default(),
+                    &AtomicBool::new(false),
+                )
+                .await
+                .unwrap();
+                assert_eq!(tools.recoveries.load(Ordering::SeqCst), 1);
+                assert_eq!(store.load_direct(spec.run_id).unwrap().iter().filter(|event| matches!(&event.event, AgentEventKindV4::ToolFinished { outcome } if outcome.call_id == call.call_id)).count(), 1);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(AgentCoreErrorV4::UncertainSideEffect(_))
+                ));
+                assert_eq!(
+                    tools.recoveries.load(Ordering::SeqCst),
+                    usize::from(!uncertain)
+                );
+            }
+        }
+    }
+
+    struct ResultReadTools;
+    #[async_trait]
+    impl ToolPortV4 for ResultReadTools {
+        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
+            vec![ToolDescriptorV4 {
+                id: context_views::READ_RESULT_TOOL.into(),
+                description: "read stored result".into(),
+                input_schema: json!({"type":"object"}),
+                effect: ToolEffectV4::ReadOnly,
+            }]
+        }
+        fn effect(&self, _: &str) -> Option<ToolEffectV4> {
+            Some(ToolEffectV4::ReadOnly)
+        }
+        fn validate(&self, _: RunModeV4, _: &ToolCallV4) -> Result<(), String> {
+            Ok(())
+        }
+        async fn execute(&self, _: RunModeV4, _: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            panic!("stored result reads must stay inside the Host")
+        }
+    }
+
+    #[tokio::test]
+    async fn result_projection_is_bounded_and_paged_original_is_run_and_hash_scoped() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let previous = store.events.lock().unwrap().last().unwrap().clone();
+        let original = "数据🧬".repeat(10_000);
+        let event = AgentEventV4::next(
+            &previous,
+            Utc::now(),
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: "large-result".into(),
+                    tool_id: "project.read".into(),
+                    succeeded: true,
+                    model_content: original.clone(),
+                    data: json!({"payload":original}),
+                    provenance: vec![],
+                },
+            },
+        );
+        store.append_direct(&event).unwrap();
+        let model = ScriptedModel(Mutex::new(vec![]));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: None,
+        };
+        for _ in 0..2 {
+            let context = core
+                .context_for(&spec, AgentLimitsV4::default())
+                .await
+                .unwrap();
+            assert!(context.len() < 25_000);
+            assert!(context.contains("result_reference"));
+            assert!(context.contains(&event.event_hash));
+        }
+        assert_eq!(store.events.lock().unwrap().last().unwrap(), &event);
+        assert!(store.archives.lock().unwrap().is_empty());
+        let mut call = ToolCallV4 {
+            call_id: "read-page".into(),
+            tool_id: context_views::READ_RESULT_TOOL.into(),
+            arguments: json!({"sequence":event.sequence,"event_hash":event.event_hash,
+                "field":"model_content","offset":0,"limit":8192}),
+        };
+        let mut restored = String::new();
+        loop {
+            let page = context_views::read_result(&spec, &[event.clone()], &call).unwrap();
+            restored.push_str(page["content"].as_str().unwrap());
+            let Some(offset) = page["next_offset"].as_u64() else {
+                break;
+            };
+            call.arguments["offset"] = json!(offset);
+        }
+        assert_eq!(restored, original);
+        let mut foreign = spec.clone();
+        foreign.run_id = Uuid::new_v4();
+        assert!(context_views::read_result(&foreign, &[event.clone()], &call).is_err());
+        call.arguments["event_hash"] = json!("changed");
+        assert!(context_views::read_result(&spec, &[event.clone()], &call).is_err());
+        call.arguments["event_hash"] = json!(event.event_hash);
+        call.arguments["offset"] = json!(1);
+        assert!(context_views::read_result(&spec, &[event.clone()], &call).is_err());
+        call.arguments["offset"] = json!(0);
+        call.arguments["limit"] = json!(8193);
+        assert!(context_views::read_result(&spec, &[event.clone()], &call).is_err());
+        call.arguments["limit"] = json!(8192);
+        let previous = store.events.lock().unwrap().last().unwrap().clone();
+        store
+            .append_direct(&AgentEventV4::next(
+                &previous,
+                Utc::now(),
+                AgentEventKindV4::ToolRequested { call: call.clone() },
+            ))
+            .unwrap();
+        core.recover_interrupted_dispatches(
+            &spec,
+            AgentLimitsV4::default(),
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        assert!(store.events.lock().unwrap().iter().any(|event| matches!(&event.event,
+            AgentEventKindV4::ToolFinished { outcome } if outcome.call_id == call.call_id && outcome.succeeded)));
+    }
+
+    struct OverflowModel {
+        always_overflow: bool,
+        requests: Mutex<Vec<ModelRequestV4>>,
+    }
+
+    #[async_trait]
+    impl ModelPortV4 for OverflowModel {
+        async fn stream(
+            &self,
+            request: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request);
+            if requests.len() == 1 || self.always_overflow {
+                Err(ModelFailureV4::permanent(
+                    omicsops_protocol::ModelErrorClassV4::ContextOverflow,
+                    "context_length_exceeded",
+                ))
+            } else {
+                Ok(ModelTurnV4 {
+                    public_text: "recovered".into(),
+                    tool_calls: vec![],
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_overflow_recovers_once_in_the_same_run_without_tool_replay() {
+        for always_overflow in [false, true] {
+            let spec = execution_spec(Uuid::new_v4());
+            let store = MemoryStore::default();
+            seed_execution(&store, &spec);
+            let previous = store.events.lock().unwrap().last().unwrap().clone();
+            store
+                .append_direct(&AgentEventV4::next(
+                    &previous,
+                    Utc::now(),
+                    AgentEventKindV4::ModelText {
+                        text: "archived research details ".repeat(2_000),
+                    },
+                ))
+                .unwrap();
+            let model = OverflowModel {
+                always_overflow,
+                requests: Mutex::new(vec![]),
+            };
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &FakeTools,
+                events: &store,
+                science: None,
+            };
+            let limits = AgentLimitsV4::default();
+            let context = core.context_for(&spec, limits).await.unwrap();
+            let events = store.events.lock().unwrap().clone();
+            let outcome = core
+                .execution_model_turn(&spec, context, &events, limits, &AtomicBool::new(false))
+                .await;
+            if always_overflow {
+                assert!(matches!(outcome, Err(AgentCoreErrorV4::ContextOverflow(_))));
+            } else {
+                assert_eq!(outcome.unwrap().public_text, "recovered");
+            }
+            let requests = model.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests[1].context.len() < requests[0].context.len());
+            assert!(requests[1].context.contains(&spec.plan.objective));
+            assert_eq!(store.archives.lock().unwrap().len(), 1);
+            let events = store.events.lock().unwrap();
+            assert!(events.iter().all(|event| event.run_id == spec.run_id));
+            assert!(!events.iter().any(|event| matches!(
+                event.event,
+                AgentEventKindV4::ToolDispatchStarted { .. }
+                    | AgentEventKindV4::RunCompleted { .. }
+            )));
+        }
+    }
+
+    #[async_trait]
+    impl ModelPortV4 for BudgetOnlyModel {
+        fn validate_request(&self, request: &ModelRequestV4) -> Result<(), ModelFailureV4> {
+            self.requests.lock().unwrap().push(request.clone());
+            let bytes = serde_json::to_vec(request).unwrap().len();
+            if bytes > self.request_limit {
+                Err(ModelFailureV4::permanent(
+                    omicsops_protocol::ModelErrorClassV4::InvalidRequest,
+                    "complete model request exceeds budget",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            panic!("budget-rejected requests must never reach the model")
+        }
+    }
+
+    #[tokio::test]
+    async fn full_request_budget_compacts_even_when_context_bytes_fit() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        for _ in 0..20 {
+            let previous = store.events.lock().unwrap().last().unwrap().clone();
+            store
+                .append_direct(&AgentEventV4::next(
+                    &previous,
+                    Utc::now(),
+                    AgentEventKindV4::ModelText {
+                        text: "科学数据".repeat(200),
+                    },
+                ))
+                .unwrap();
+        }
+        let model = BudgetOnlyModel {
+            request_limit: 30_000,
+            requests: Mutex::new(vec![]),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let context = core
+            .context_for(
+                &spec,
+                AgentLimitsV4 {
+                    checkpoint_recent_events: 1,
+                    ..AgentLimitsV4::default()
+                },
+            )
+            .await
+            .unwrap();
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[0].system.is_empty());
+        assert!(!requests[0].tools.is_empty());
+        assert!(requests[0].context.len() < AgentLimitsV4::default().context_max_bytes);
+        assert!(requests[1].context.len() < requests[0].context.len());
+        assert_eq!(requests[1].context, context);
+        assert_eq!(store.archives.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unshrinkable_request_stops_without_dispatch_or_duplicate_compaction() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let original = store.events.lock().unwrap().clone();
+        let model = BudgetOnlyModel {
+            request_limit: 1,
+            requests: Mutex::new(vec![]),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                core.context_for(&spec, AgentLimitsV4::default()).await,
+                Err(AgentCoreErrorV4::NeedsAttention(_))
+            ));
+        }
+        assert_eq!(store.archives.lock().unwrap().len(), 1);
+        let events = store.events.lock().unwrap();
+        assert_eq!(&events[..original.len()], original.as_slice());
+        assert!(events.iter().all(|event| event.run_id == spec.run_id));
+        assert!(!events.iter().any(|event| matches!(
+            event.event,
+            AgentEventKindV4::RunCompleted { .. } | AgentEventKindV4::ToolDispatchStarted { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn compacted_context_must_still_respect_byte_limit() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = ScriptedModel(Mutex::new(vec![]));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        assert!(matches!(
+            core.context_for(
+                &spec,
+                AgentLimitsV4 {
+                    context_max_bytes: 1,
+                    ..AgentLimitsV4::default()
+                }
+            )
+            .await,
+            Err(AgentCoreErrorV4::NeedsAttention(_))
+        ));
+        assert_eq!(store.archives.lock().unwrap().len(), 1);
+    }
+
+    struct ArchiveFailureStore(MemoryStore);
+
+    #[async_trait]
+    impl EventStoreV4 for ArchiveFailureStore {
+        async fn append(&self, event: &AgentEventV4) -> Result<(), String> {
+            self.0.append(event).await
+        }
+        async fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String> {
+            self.0.load(run_id).await
+        }
+        async fn archive_context(
+            &self,
+            _: Uuid,
+            _: &str,
+            _: &ContextCheckpointV4,
+        ) -> Result<ContextArchiveV4, String> {
+            Err("archive unavailable".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_compaction_archive_failure_keeps_original_event_chain() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = ArchiveFailureStore(MemoryStore::default());
+        seed_execution(&store.0, &spec);
+        let original = store.0.events.lock().unwrap().clone();
+        let model = BudgetOnlyModel {
+            request_limit: 1,
+            requests: Mutex::new(vec![]),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        assert!(matches!(
+            core.context_for(&spec, AgentLimitsV4::default()).await,
+            Err(AgentCoreErrorV4::Store(_))
+        ));
+        assert_eq!(*store.0.events.lock().unwrap(), original);
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn planning_model_boundary_rejects_budget_without_retry_or_network() {
+        let model = BudgetOnlyModel {
+            request_limit: 1,
+            requests: Mutex::new(vec![]),
+        };
+        let store = MemoryStore::default();
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let result = core
+            .model_turn(
+                Uuid::new_v4(),
+                ModelRequestV4 {
+                    system: "plan".into(),
+                    context: "目标".into(),
+                    tools: vec![],
+                    image_refs: vec![],
+                },
+                3,
+                Duration::from_secs(1),
+                None,
+            )
+            .await;
+        assert!(matches!(result, Err(AgentCoreErrorV4::NeedsAttention(_))));
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+        assert!(store.events.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -8151,6 +9633,438 @@ mod tests {
         attempts: Mutex<HashMap<String, usize>>,
     }
 
+    struct DelegationBoundaryModel {
+        requests: Mutex<Vec<ModelRequestV4>>,
+        turns: Mutex<std::collections::VecDeque<ModelTurnV4>>,
+    }
+
+    #[async_trait]
+    impl ModelPortV4 for DelegationBoundaryModel {
+        async fn stream(
+            &self,
+            request: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            self.requests.lock().unwrap().push(request);
+            let turn = self.turns.lock().unwrap().pop_front();
+            match turn {
+                Some(turn) => Ok(turn),
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    fn delegated_submission(output: Value) -> ModelTurnV4 {
+        ModelTurnV4 {
+            public_text: String::new(),
+            tool_calls: vec![ToolCallV4 {
+                call_id: "submit".into(),
+                tool_id: "agent.submit_delegated_result".into(),
+                arguments: json!({"output": output}),
+            }],
+        }
+    }
+
+    struct BoundDelegationModel {
+        binding: omicsops_protocol::DelegatedModelBindingV4,
+        child: DelegationBoundaryModel,
+    }
+
+    #[async_trait]
+    impl ModelPortV4 for BoundDelegationModel {
+        fn delegated_model(
+            &self,
+            binding: Option<&omicsops_protocol::DelegatedModelBindingV4>,
+        ) -> Result<Option<&dyn ModelPortV4>, ModelFailureV4> {
+            match binding {
+                Some(binding) if binding == &self.binding => Ok(Some(&self.child)),
+                None => Ok(None),
+                _ => Err(ModelFailureV4::permanent(
+                    omicsops_protocol::ModelErrorClassV4::InvalidRequest,
+                    "missing role profile",
+                )),
+            }
+        }
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            panic!("explicit child binding must not dispatch to the parent")
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_resolves_frozen_role_and_never_falls_back_on_missing_binding() {
+        let mut spec = ordinary_execution_spec(Uuid::new_v4());
+        let binding = omicsops_protocol::DelegatedModelBindingV4 {
+            profile_id: Uuid::new_v4(),
+            configuration_hash: "a".repeat(64),
+        };
+        spec.delegated_model = Some(binding.clone());
+        spec.spec_hash = Some(spec.calculate_spec_hash().unwrap());
+        spec.validate_integrity().unwrap();
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = BoundDelegationModel {
+            binding,
+            child: DelegationBoundaryModel {
+                requests: Mutex::new(vec![]),
+                turns: Mutex::new(std::collections::VecDeque::from([delegated_submission(
+                    json!({"value":"child result"}),
+                )])),
+            },
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let graph = DelegationGraphV4 {
+            schema_version: 4,
+            nodes: vec![delegated_node("child", vec![], 1)],
+        };
+        let result = core
+            .execute_delegation_graph(
+                &spec,
+                "role",
+                graph.clone(),
+                AgentLimitsV4::default(),
+                &AtomicBool::new(false),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.nodes["child"].output.as_ref().unwrap()["value"],
+            "child result"
+        );
+        assert_eq!(model.child.requests.lock().unwrap().len(), 1);
+        spec.delegated_model.as_mut().unwrap().profile_id = Uuid::new_v4();
+        assert!(spec.validate_integrity().is_err());
+        let before = store.events.lock().unwrap().len();
+        assert!(matches!(
+            core.execute_delegation_graph(
+                &spec,
+                "missing",
+                graph.clone(),
+                AgentLimitsV4::default(),
+                &AtomicBool::new(false)
+            )
+            .await,
+            Err(AgentCoreErrorV4::NeedsAttention(_))
+        ));
+        assert_eq!(store.events.lock().unwrap().len(), before);
+        let legacy_port = AgentCoreV4 {
+            model: &model.child,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        assert!(matches!(
+            legacy_port
+                .execute_delegation_graph(
+                    &spec,
+                    "missing",
+                    graph,
+                    AgentLimitsV4::default(),
+                    &AtomicBool::new(false)
+                )
+                .await,
+            Err(AgentCoreErrorV4::NeedsAttention(_))
+        ));
+        assert_eq!(model.child.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delegation_enforces_input_and_output_bytes_and_supplies_schema() {
+        let store = MemoryStore::default();
+        let model = DelegationBoundaryModel {
+            requests: Mutex::new(vec![]),
+            turns: Mutex::new(std::collections::VecDeque::from([
+                delegated_submission(json!({"value":"测".repeat(3000)})),
+                delegated_submission(json!({"value":"concise evidence reference"})),
+            ])),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let node = delegated_node("bounded", vec![], 2);
+        let limits = AgentLimitsV4::default();
+        let cancelled = AtomicBool::new(false);
+        let outcome = core
+            .execute_delegated_node(
+                &node,
+                BTreeMap::from([("large".into(), json!("测".repeat(30_000)))]),
+                limits,
+                &cancelled,
+            )
+            .await;
+        assert_eq!(outcome.status, DelegationNodeStatusV4::Failed);
+        assert!(outcome.error.unwrap().contains("context budget"));
+        assert!(model.requests.lock().unwrap().is_empty());
+
+        let outcome = core
+            .execute_delegated_node(&node, BTreeMap::new(), limits, &cancelled)
+            .await;
+        assert_eq!(outcome.status, DelegationNodeStatusV4::Succeeded);
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let context: Value = serde_json::from_str(&requests[0].context).unwrap();
+        assert_eq!(context["output_schema"], node.output_schema);
+        assert_eq!(
+            requests[0].tools.last().unwrap().input_schema["properties"]["output"],
+            node.output_schema
+        );
+        assert!(requests[1].context.contains("output budget exceeded"));
+        assert!(!requests[1].context.contains(&"测".repeat(100)));
+    }
+
+    #[tokio::test]
+    async fn delegation_model_deadline_and_pre_cancel_do_not_hang_or_dispatch() {
+        let store = MemoryStore::default();
+        let model = DelegationBoundaryModel {
+            requests: Mutex::new(vec![]),
+            turns: Mutex::new(Default::default()),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let node = delegated_node("waiting", vec![], 1);
+        let limits = AgentLimitsV4 {
+            model_attempt_timeout: Duration::from_millis(5),
+            ..Default::default()
+        };
+        let outcome = core
+            .execute_delegated_node(&node, BTreeMap::new(), limits, &AtomicBool::new(true))
+            .await;
+        assert!(outcome.error.unwrap().contains("cancelled"));
+        assert!(model.requests.lock().unwrap().is_empty());
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            core.execute_delegated_node(&node, BTreeMap::new(), limits, &AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.status, DelegationNodeStatusV4::Failed);
+        assert!(outcome.error.unwrap().contains("timed out"));
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+    }
+
+    struct DelegationReadTools {
+        payload: String,
+        hang: bool,
+    }
+
+    #[async_trait]
+    impl ToolPortV4 for DelegationReadTools {
+        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
+            vec![ToolDescriptorV4 {
+                id: "read".into(),
+                description: "read synthetic evidence".into(),
+                input_schema: json!({"type":"object"}),
+                effect: ToolEffectV4::ReadOnly,
+            }]
+        }
+        fn effect(&self, id: &str) -> Option<ToolEffectV4> {
+            (id == "read").then_some(ToolEffectV4::ReadOnly)
+        }
+        fn validate(&self, _: RunModeV4, _: &ToolCallV4) -> Result<(), String> {
+            Ok(())
+        }
+        async fn execute(&self, _: RunModeV4, call: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            if self.hang {
+                return std::future::pending().await;
+            }
+            Ok(ToolOutcomeV4 {
+                call_id: call.call_id,
+                tool_id: call.tool_id,
+                succeeded: true,
+                model_content: "evidence in data".into(),
+                data: json!({"payload":self.payload}),
+                provenance: vec![],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_bounds_tool_feedback_preserves_original_and_times_out_reads() {
+        for hang in [false, true] {
+            let store = MemoryStore::default();
+            let tools = DelegationReadTools {
+                payload: "测".repeat(30_000),
+                hang,
+            };
+            let model = DelegationBoundaryModel {
+                requests: Mutex::new(vec![]),
+                turns: Mutex::new(std::collections::VecDeque::from([
+                    ModelTurnV4 {
+                        public_text: String::new(),
+                        tool_calls: vec![ToolCallV4 {
+                            call_id: "read-evidence".into(),
+                            tool_id: "read".into(),
+                            arguments: json!({}),
+                        }],
+                    },
+                    delegated_submission(json!({"value":"handled error"})),
+                ])),
+            };
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &tools,
+                events: &store,
+                science: None,
+            };
+            let mut node = delegated_node("reader", vec![], 2);
+            node.capabilities.insert("read".into());
+            node.isolation = DelegationIsolationV4::ReadOnlyProject;
+            node.budget.max_tool_calls = 1;
+            let limits = AgentLimitsV4 {
+                delegated_tool_timeout: Duration::from_millis(5),
+                ..Default::default()
+            };
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(1),
+                core.execute_delegated_node(
+                    &node,
+                    BTreeMap::new(),
+                    limits,
+                    &AtomicBool::new(false),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome.tool_outcomes.len(), 1);
+            if hang {
+                assert!(!outcome.tool_outcomes[0].succeeded);
+                assert!(outcome.tool_outcomes[0].model_content.contains("timed out"));
+                assert_eq!(model.requests.lock().unwrap().len(), 2);
+            } else {
+                assert_eq!(outcome.status, DelegationNodeStatusV4::Failed);
+                assert!(outcome.error.unwrap().contains("context budget"));
+                assert_eq!(outcome.tool_outcomes[0].data["payload"], tools.payload);
+                assert_eq!(model.requests.lock().unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_parent_views_omit_trace_but_pages_restore_all_evidence() {
+        let spec = delegation_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let node = DelegationNodeOutcomeV4 {
+            node_id: "reader".into(),
+            status: DelegationNodeStatusV4::Succeeded,
+            output: Some(json!({"value":"verified conclusion"})),
+            error: None,
+            tool_outcomes: vec![ToolOutcomeV4 {
+                call_id: "evidence".into(),
+                tool_id: "read".into(),
+                succeeded: true,
+                model_content: "测".repeat(30_000),
+                data: json!({"original":true}),
+                provenance: vec![],
+            }],
+        };
+        let graph = DelegationGraphOutcomeV4 {
+            schema_version: 4,
+            nodes: BTreeMap::from([(node.node_id.clone(), node.clone())]),
+        };
+        for kind in [
+            AgentEventKindV4::DelegationNodeFinished {
+                call_id: "delegate".into(),
+                outcome: node.clone(),
+            },
+            AgentEventKindV4::DelegationGraphFinished {
+                call_id: "delegate".into(),
+                outcome: graph.clone(),
+            },
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: "delegate".into(),
+                    tool_id: "agent.delegate".into(),
+                    succeeded: true,
+                    model_content: serde_json::to_string(&graph).unwrap(),
+                    data: serde_json::to_value(&graph).unwrap(),
+                    provenance: vec![],
+                },
+            },
+        ] {
+            let previous = store.events.lock().unwrap().last().unwrap().clone();
+            let event = AgentEventV4::next(&previous, Utc::now(), kind);
+            store.append_direct(&event).unwrap();
+            let original = event.clone();
+            let view = context_views::event_view(&event);
+            assert!(view.to_string().len() < 2_000);
+            assert!(view.to_string().contains("verified conclusion"));
+            assert!(view.to_string().contains("tool_call_count"));
+            let mut call = ToolCallV4 {
+                call_id: "page".into(),
+                tool_id: context_views::READ_RESULT_TOOL.into(),
+                arguments: json!({"sequence":event.sequence,"event_hash":event.event_hash,"field":"data","offset":0,"limit":8192}),
+            };
+            let mut restored = String::new();
+            loop {
+                let page = context_views::read_result(&spec, &[event.clone()], &call).unwrap();
+                restored.push_str(page["content"].as_str().unwrap());
+                let Some(offset) = page["next_offset"].as_u64() else {
+                    break;
+                };
+                call.arguments["offset"] = json!(offset);
+            }
+            let restored: Value = serde_json::from_str(&restored).unwrap();
+            let restored_node = restored
+                .get("nodes")
+                .map(|nodes| &nodes["reader"])
+                .unwrap_or(&restored);
+            assert_eq!(
+                restored_node["tool_outcomes"][0]["model_content"],
+                node.tool_outcomes[0].model_content
+            );
+            assert_eq!(event, original);
+            let mut foreign = spec.clone();
+            foreign.run_id = Uuid::new_v4();
+            assert!(context_views::read_result(&foreign, &[event.clone()], &call).is_err());
+            call.arguments["event_hash"] = json!("wrong");
+            assert!(context_views::read_result(&spec, &[event], &call).is_err());
+        }
+        let model = BudgetOnlyModel {
+            request_limit: 40_000,
+            requests: Mutex::new(vec![]),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: None,
+        };
+        let limits = AgentLimitsV4 {
+            context_max_bytes: 20_000,
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let context = core.context_for(&spec, limits).await.unwrap();
+            assert!(context.len() < 20_000);
+            assert!(context.contains("verified conclusion"));
+            assert!(!context.contains(&"测".repeat(100)));
+        }
+        let context = core
+            .context_for_internal(&spec, limits, true)
+            .await
+            .unwrap();
+        assert!(context.contains("verified conclusion"));
+        assert!(context.contains("result_reference"));
+        assert!(!context.contains(&"测".repeat(100)));
+        assert!(core.context_for(&spec, limits).await.unwrap().len() < 20_000);
+    }
+
     #[async_trait]
     impl ModelPortV4 for DelegationModel {
         async fn stream(
@@ -8294,6 +10208,411 @@ mod tests {
             outcome.nodes["independent"].status,
             DelegationNodeStatusV4::Succeeded
         );
+    }
+
+    #[tokio::test]
+    async fn delegation_resume_reuses_success_and_accumulates_reservations_across_graphs() {
+        let spec = delegation_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = DelegationModel {
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+            attempts: Mutex::new(HashMap::new()),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let graph = DelegationGraphV4 {
+            schema_version: 4,
+            nodes: vec![
+                delegated_node("ok", vec![], 1),
+                delegated_node("retry", vec![], 1),
+            ],
+        };
+        let limits = AgentLimitsV4 {
+            max_delegation_total_turns: 4,
+            ..Default::default()
+        };
+        let cancelled = AtomicBool::new(false);
+        let first = core
+            .execute_delegation_graph(&spec, "same-call", graph.clone(), limits, &cancelled)
+            .await
+            .unwrap();
+        assert_eq!(first.nodes["retry"].status, DelegationNodeStatusV4::Failed);
+        let second = core
+            .execute_delegation_graph(&spec, "same-call", graph.clone(), limits, &cancelled)
+            .await
+            .unwrap();
+        assert!(
+            second
+                .nodes
+                .values()
+                .all(|node| node.status == DelegationNodeStatusV4::Succeeded)
+        );
+        assert_eq!(model.attempts.lock().unwrap()["ok"], 1);
+        assert_eq!(model.attempts.lock().unwrap()["retry"], 2);
+        let restored = core
+            .execute_delegation_graph(&spec, "same-call", graph.clone(), limits, &cancelled)
+            .await
+            .unwrap();
+        assert_eq!(restored, second);
+        assert_eq!(model.attempts.lock().unwrap()["ok"], 1);
+        assert_eq!(model.attempts.lock().unwrap()["retry"], 2);
+        let before = store.events.lock().unwrap().len();
+        assert!(matches!(
+            core.execute_delegation_graph(&spec, "new-call", graph.clone(), limits, &cancelled)
+                .await,
+            Err(AgentCoreErrorV4::NeedsAttention(_))
+        ));
+        let mut changed = graph;
+        changed.nodes[0].objective = "changed objective".into();
+        assert!(matches!(
+            core.execute_delegation_graph(&spec, "same-call", changed, limits, &cancelled)
+                .await,
+            Err(AgentCoreErrorV4::Delegation(_))
+        ));
+        assert_eq!(store.events.lock().unwrap().len(), before);
+    }
+
+    struct GuidedChildModel {
+        entered: Arc<tokio::sync::Notify>,
+        wait_on_tool: bool,
+        requests: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl ModelPortV4 for GuidedChildModel {
+        async fn stream(
+            &self,
+            request: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            let context: Value = serde_json::from_str(&request.context).unwrap();
+            let id = context["node_id"].as_str().unwrap().to_owned();
+            self.requests.lock().unwrap().push(id.clone());
+            assert!(context.get("active_guidance").is_none());
+            match id.as_str() {
+                "done" => Ok(delegated_submission(json!({"value":"completed evidence"}))),
+                "wait" if self.wait_on_tool => Ok(ModelTurnV4 {
+                    public_text: String::new(),
+                    tool_calls: ["fast", "slow"]
+                        .into_iter()
+                        .map(|id| ToolCallV4 {
+                            call_id: id.into(),
+                            tool_id: "read".into(),
+                            arguments: json!({}),
+                        })
+                        .collect(),
+                }),
+                "wait" => {
+                    self.entered.notify_one();
+                    std::future::pending().await
+                }
+                _ => panic!("downstream work must not start after guidance"),
+            }
+        }
+    }
+    struct GuidedChildTools(Arc<tokio::sync::Notify>);
+    #[async_trait]
+    impl ToolPortV4 for GuidedChildTools {
+        fn descriptors(&self, mode: RunModeV4) -> Vec<ToolDescriptorV4> {
+            DelegationReadTools {
+                payload: String::new(),
+                hang: false,
+            }
+            .descriptors(mode)
+        }
+        fn effect(&self, id: &str) -> Option<ToolEffectV4> {
+            (id == "read").then_some(ToolEffectV4::ReadOnly)
+        }
+        fn validate(&self, _: RunModeV4, _: &ToolCallV4) -> Result<(), String> {
+            Ok(())
+        }
+        async fn execute(
+            &self,
+            mode: RunModeV4,
+            call: ToolCallV4,
+        ) -> Result<ToolOutcomeV4, String> {
+            if call.call_id == "slow" {
+                self.0.notify_one();
+                return std::future::pending().await;
+            }
+            DelegationReadTools {
+                payload: "completed tool evidence".into(),
+                hang: false,
+            }
+            .execute(mode, call)
+            .await
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_guidance_yields_waits_retains_evidence_and_leaves_consumption_to_parent() {
+        for wait_on_tool in [false, true] {
+            let store = GuidanceTestStore::default();
+            let mut spec = delegation_spec(Uuid::new_v4());
+            spec.execution_kind = RunExecutionKindV4::OrdinaryAgent;
+            spec.plan.requested_capabilities.insert("read".into());
+            spec.approved_plan_hash = spec.plan.canonical_hash().unwrap();
+            store
+                .append(&AgentEventV4::first(
+                    spec.run_id,
+                    spec.project_id,
+                    spec.conversation_id,
+                    Utc::now(),
+                    AgentEventKindV4::RunCreated {
+                        mode: RunModeV4::Execute,
+                    },
+                ))
+                .await
+                .unwrap();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let model = GuidedChildModel {
+                entered: entered.clone(),
+                wait_on_tool,
+                requests: Mutex::new(vec![]),
+            };
+            let tools = GuidedChildTools(entered.clone());
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &tools,
+                events: &store,
+                science: None,
+            };
+            let mut waiting = delegated_node("wait", vec![], 2);
+            waiting.isolation = DelegationIsolationV4::ReadOnlyProject;
+            waiting.capabilities.insert("read".into());
+            waiting.budget.max_tool_calls = 2;
+            let graph = DelegationGraphV4 {
+                schema_version: 4,
+                nodes: vec![
+                    delegated_node("done", vec![], 1),
+                    waiting,
+                    delegated_node("downstream", vec!["wait"], 1),
+                ],
+            };
+            let cancelled = AtomicBool::new(false);
+            validate_delegation_graph_v4(&graph, &spec, &tools, AgentLimitsV4::default()).unwrap();
+            let guidance = async {
+                entered.notified().await;
+                *store.pending.lock().unwrap() = Some((Uuid::new_v4(), "change direction".into()));
+            };
+            let (outcome, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(
+                    core.execute_delegation_graph(
+                        &spec,
+                        "graph",
+                        graph,
+                        AgentLimitsV4::default(),
+                        &cancelled
+                    ),
+                    guidance
+                )
+            })
+            .await
+            .unwrap();
+            let outcome = outcome.unwrap();
+            assert_eq!(
+                outcome.nodes["done"].status,
+                DelegationNodeStatusV4::Succeeded
+            );
+            assert_eq!(
+                outcome.nodes["done"].output,
+                Some(json!({"value":"completed evidence"}))
+            );
+            assert_eq!(outcome.nodes["wait"].status, DelegationNodeStatusV4::Failed);
+            assert!(
+                outcome.nodes["wait"]
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("guidance_interrupted:")
+            );
+            assert_eq!(
+                outcome.nodes["downstream"].status,
+                DelegationNodeStatusV4::Blocked
+            );
+            if wait_on_tool {
+                let reads = &outcome.nodes["wait"].tool_outcomes;
+                assert_eq!(reads.len(), 2);
+                assert!(reads[0].succeeded);
+                assert_eq!(reads[0].data["payload"], "completed tool evidence");
+                assert!(!reads[1].succeeded);
+                assert_eq!(reads[1].data["error_kind"], "guidance_interrupted");
+                assert!(reads[1].provenance.is_empty());
+            }
+            assert_eq!(*model.requests.lock().unwrap(), vec!["done", "wait"]);
+            assert!(!cancelled.load(Ordering::SeqCst));
+            assert!(store.has_pending_guidance(spec.run_id).await.unwrap());
+            let history = store.load(spec.run_id).await.unwrap();
+            assert!(matches!(
+                history.last().unwrap().event,
+                AgentEventKindV4::DelegationGraphFinished { .. }
+            ));
+            assert!(
+                !history
+                    .iter()
+                    .any(|event| matches!(event.event, AgentEventKindV4::GuidanceConsumed { .. }))
+            );
+            assert!(core.consume_guidance(&spec).await.unwrap());
+            assert!(!core.consume_guidance(&spec).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_inbox_failure_stops_read_wait_even_if_next_poll_recovers() {
+        let store = GuidanceTestStore::default();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let model = GuidedChildModel {
+            entered: entered.clone(),
+            wait_on_tool: true,
+            requests: Mutex::new(vec![]),
+        };
+        let tools = GuidedChildTools(entered.clone());
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        let mut node = delegated_node("wait", vec![], 2);
+        node.capabilities.insert("read".into());
+        node.budget.max_tool_calls = 2;
+        let cancelled = AtomicBool::new(false);
+        let fail_inbox = async {
+            entered.notified().await;
+            store.fail_next_poll.store(true, Ordering::SeqCst);
+        };
+        let (outcome, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                core.execute_delegated_node_with_model(
+                    &model,
+                    &node,
+                    BTreeMap::new(),
+                    AgentLimitsV4::default(),
+                    &cancelled,
+                    Some(Uuid::new_v4())
+                ),
+                fail_inbox
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(outcome.status, DelegationNodeStatusV4::Failed);
+        assert!(outcome.error.unwrap().contains("inbox unavailable"));
+        assert_eq!(outcome.tool_outcomes.len(), 2);
+        assert!(outcome.tool_outcomes[0].succeeded);
+        assert!(!outcome.tool_outcomes[1].succeeded);
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+        assert!(!store.has_pending_guidance(Uuid::new_v4()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn approved_delegation_does_not_consume_or_yield_to_guidance() {
+        let store = GuidanceTestStore::default();
+        *store.pending.lock().unwrap() = Some((Uuid::new_v4(), "ordinary guidance".into()));
+        let spec = delegation_spec(Uuid::new_v4());
+        store
+            .append(&AgentEventV4::first(
+                spec.run_id,
+                spec.project_id,
+                spec.conversation_id,
+                Utc::now(),
+                AgentEventKindV4::RunCreated {
+                    mode: RunModeV4::Execute,
+                },
+            ))
+            .await
+            .unwrap();
+        let model = DelegationBoundaryModel {
+            requests: Mutex::new(vec![]),
+            turns: Mutex::new(std::collections::VecDeque::from([delegated_submission(
+                json!({"value":"approved result"}),
+            )])),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let graph = DelegationGraphV4 {
+            schema_version: 4,
+            nodes: vec![delegated_node("approved", vec![], 1)],
+        };
+        let result = core
+            .execute_delegation_graph(
+                &spec,
+                "approved-graph",
+                graph,
+                AgentLimitsV4::default(),
+                &AtomicBool::new(false),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.nodes["approved"].status,
+            DelegationNodeStatusV4::Succeeded
+        );
+        assert!(store.has_pending_guidance(spec.run_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delegation_cancellation_interrupts_pending_models_and_read_only_tools() {
+        for waiting_on_tool in [false, true] {
+            let store = MemoryStore::default();
+            let tools = DelegationReadTools {
+                payload: String::new(),
+                hang: true,
+            };
+            let turns = if waiting_on_tool {
+                std::collections::VecDeque::from([ModelTurnV4 {
+                    public_text: String::new(),
+                    tool_calls: vec![ToolCallV4 {
+                        call_id: "read".into(),
+                        tool_id: "read".into(),
+                        arguments: json!({}),
+                    }],
+                }])
+            } else {
+                Default::default()
+            };
+            let model = DelegationBoundaryModel {
+                requests: Mutex::new(vec![]),
+                turns: Mutex::new(turns),
+            };
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &tools,
+                events: &store,
+                science: None,
+            };
+            let mut node = delegated_node("cancel", vec![], 2);
+            node.capabilities.insert("read".into());
+            node.budget.max_tool_calls = 1;
+            let cancelled = AtomicBool::new(false);
+            let execution = core.execute_delegated_node(
+                &node,
+                BTreeMap::new(),
+                AgentLimitsV4::default(),
+                &cancelled,
+            );
+            let cancellation = async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                cancelled.store(true, Ordering::SeqCst);
+            };
+            let (outcome, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(execution, cancellation)
+            })
+            .await
+            .unwrap();
+            assert_eq!(outcome.status, DelegationNodeStatusV4::Failed);
+            assert!(outcome.error.unwrap().contains("cancelled"));
+            assert_eq!(model.requests.lock().unwrap().len(), 1);
+        }
     }
 
     struct DelegationTools;

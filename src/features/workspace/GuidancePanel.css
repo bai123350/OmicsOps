@@ -1,0 +1,13 @@
+.guidance-panel { display: flex; flex-direction: column; gap: 10px; padding: 16px; border: 1px solid #d7e0dc; border-radius: 8px; background: #fff; }
+.guidance-panel > small { color: #66756f; line-height: 1.5; }
+.guidance-form { display: flex; flex-direction: column; gap: 8px; }
+.guidance-form textarea { box-sizing: border-box; width: 100%; resize: vertical; min-height: 76px; padding: 10px; border: 1px solid #c8d4d0; border-radius: 6px; color: #17201e; background: #fbfcfb; line-height: 1.5; }
+.guidance-form textarea:focus-visible { outline: 2px solid #249f7e; outline-offset: 2px; }
+.guidance-form-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.guidance-submit { border: 0; border-radius: 6px; padding: 9px 13px; color: #fff; background: #147e63; font-size: 12px; }
+.guidance-submit:disabled { opacity: .5; cursor: not-allowed; }
+.guidance-panel [role="alert"] { margin: 0; color: #9f3636; font-size: 12px; }
+.guidance-records ol { display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.guidance-records li { padding: 10px; border: 1px solid #e4e9e7; border-radius: 6px; background: #fbfcfb; }
+.guidance-records small { color: #66756f; }
+.guidance-records p { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.5; }

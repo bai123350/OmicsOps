@@ -947,6 +947,7 @@ export default function DesktopApp() {
     }} />}
     agentMode={conversationMode} conversationLocked={conversationLocked} conversationHydrating={conversationHydrating} onAgentModeChange={changeConversationMode}
     latestPlanRevision={latestPlanRevision} v4Plan={v4Plan} planLoading={planLoading} planApproved={planApproved} canStartRun={false} runStarted={Boolean(runId && !currentRunAwaitsPlanApproval)} activeRunId={runId} activeRunLastActivityAt={activeRunLastActivityAt} agentRunEventsV4={agentRunEventsV4}
+    guidanceAvailable={v4Plan?.session_mode === "agent" && !planApproved && latestPlanRevision?.run_id !== v4Plan?.run_id}
     computeBackends={computeBackends} computeBackendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} approvalPolicy={approvalPolicy} computeEnvironment={computeEnvironment} computeBusy={computeBusy}
     onComputeBackendChange={setComputeBackendId} onContainerImageChange={setContainerImage} onAutonomyModeChange={setAutonomyMode} onApprovalPolicyChange={setApprovalPolicy} onComputeEnvironmentChange={setComputeEnvironment}
     onAnswerAgentQuestionV4={async (answerRunId, questionId, answer) => {
@@ -1023,6 +1024,23 @@ export default function DesktopApp() {
       } finally {
         runActionGuards.current.delete(actionKey);
       }
+    }}
+    onCancelRuntimeRecoveryV4={async (cancelRunId) => {
+      const action = currentConversationAction;
+      if (!action || !isCurrentConversationAction(action)) return;
+      const actionKey = `resume:${action.token}:${cancelRunId}`;
+      if (runActionGuards.current.has(actionKey)) return;
+      runActionGuards.current.add(actionKey);
+      setAgentNotice("");
+      try {
+        await api.agentV4CancelRuntimeRecovery(cancelRunId);
+        if (!isCurrentConversationAction(action)) return;
+        const events = await api.agentV4Events(cancelRunId);
+        if (isCurrentConversationAction(action)) mergeAgentRunEvents(events);
+      } catch (error) {
+        if (isCurrentConversationAction(action)) setAgentNotice(error instanceof Error ? error.message : String(error));
+        throw error;
+      } finally { runActionGuards.current.delete(actionKey); }
     }}
     onResumeAgentRunV4={async (resumeRunId) => {
       const action = currentConversationAction;

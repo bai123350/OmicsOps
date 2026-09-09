@@ -3,6 +3,104 @@ import { describe, expect, it, vi } from "vitest";
 import { SettingsPanel } from "./SettingsPanel";
 
 describe("SettingsPanel model providers", () => {
+  it("refreshes only when explicitly selected and resets selection when editing again", async () => {
+    const profile = { id: "known", label: "Known", provider: "open_ai_compatible" as const, base_url: "https://api.openai.com/v1", model: "gpt-4o", credential_reference: null, supports_tools: true, supports_vision: true };
+    const save = vi.fn().mockResolvedValue(undefined);
+    const close = vi.fn();
+    render(<SettingsPanel locale="en-US" onClose={close} modelProfiles={[profile]} onSaveModel={save} />);
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByLabelText("Refresh catalog capabilities")).not.toBeChecked();
+    fireEvent.click(screen.getByLabelText("Refresh catalog capabilities"));
+    expect(screen.getByText(/may prevent old runs from resuming/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    await waitFor(() => expect(save).toHaveBeenCalledWith(expect.objectContaining({ refresh_catalog: true })));
+    await waitFor(() => expect(screen.queryByLabelText("Refresh catalog capabilities")).not.toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByLabelText("Refresh catalog capabilities")).not.toBeChecked();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByLabelText("Refresh catalog capabilities")).not.toBeInTheDocument();
+    expect(close).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("keeps refresh intent available for retry after a failed save", async () => {
+    const profile = { id: "unknown", label: "Unknown", provider: "open_ai_compatible" as const, base_url: "https://gateway.example/v1", model: "exact", credential_reference: null, supports_tools: true, supports_vision: false };
+    const save = vi.fn().mockRejectedValueOnce(new Error("private diagnostic")).mockResolvedValue(undefined);
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[profile]} onSaveModel={save} />);
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.click(screen.getByLabelText("Refresh catalog capabilities"));
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not save");
+    expect(screen.getByLabelText("Refresh catalog capabilities")).toBeChecked();
+    expect(screen.queryByText("private diagnostic")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("Refresh catalog capabilities"));
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    await waitFor(() => expect(save).toHaveBeenLastCalledWith(expect.objectContaining({ refresh_catalog: false })));
+  });
+
+  it("shows saved catalog limits without inventing metadata for legacy profiles", () => {
+    const legacy = { id: "legacy", label: "Legacy", provider: "open_ai_compatible" as const, base_url: "https://gateway.example/v1", model: "exact-model", credential_reference: null, supports_tools: true, supports_vision: false };
+    const known = { ...legacy, id: "known", label: "Known", catalog_capabilities: { source_provider: "openai", source_sha256: "a".repeat(64), context_limit: 128000, input_limit: null, output_limit: 16384, reasoning: false, reasoning_efforts: null } };
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[legacy, known]} />);
+    expect(screen.getAllByText(/Catalog snapshot/)).toHaveLength(1);
+    expect(screen.getByText(/Catalog snapshot/)).toHaveTextContent("Context limit 128000 · Output limit 16384");
+  });
+
+  it("edits and explicitly clears requested effort without changing the child binding", async () => {
+    const profile = { id: "main", label: "Main", provider: "open_ai_compatible" as const, base_url: "https://gateway.example/v1", model: "exact-model", credential_reference: null, supports_tools: true, supports_vision: false, reasoning_effort: "max" as const, delegated_model_profile_id: "child" };
+    const child = { ...profile, id: "child", label: "Reader", reasoning_effort: "low" as const, delegated_model_profile_id: null };
+    const save = vi.fn().mockResolvedValue(undefined);
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[profile, child]} onSaveModel={save} />);
+    fireEvent.click(screen.getAllByRole("button", { name: "Edit" })[0]);
+    expect(screen.getByLabelText("Requested reasoning effort")).toHaveValue("max");
+    fireEvent.change(screen.getByLabelText("Requested reasoning effort"), { target: { value: "high" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    await waitFor(() => expect(screen.queryByLabelText("Requested reasoning effort")).not.toBeInTheDocument());
+    expect(save).toHaveBeenLastCalledWith(expect.objectContaining({ id: "main", reasoning_effort: "high", delegated_model_profile_id: "child" }));
+    fireEvent.click(screen.getAllByRole("button", { name: "Edit" })[0]);
+    fireEvent.change(screen.getByLabelText("Requested reasoning effort"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    await waitFor(() => expect(screen.queryByLabelText("Requested reasoning effort")).not.toBeInTheDocument());
+    expect(save).toHaveBeenLastCalledWith(expect.objectContaining({ reasoning_effort: null }));
+    fireEvent.click(screen.getAllByRole("button", { name: "Edit" })[1]);
+    expect(screen.getByLabelText("Requested reasoning effort")).toHaveValue("low");
+  });
+
+  it("saves a selected child profile, clears it explicitly, and closes only the form on Escape", async () => {
+    const child = { id: "child", label: "Reader", provider: "ollama" as const, base_url: "http://127.0.0.1:11434", model: "reader-model", credential_reference: null, supports_tools: true, supports_vision: false };
+    const main = { ...child, id: "main", label: "Main", delegated_model_profile_id: "child" };
+    const save = vi.fn().mockResolvedValue(undefined);
+    const close = vi.fn();
+    render(<SettingsPanel locale="en-US" onClose={close} modelProfiles={[main, child]} onSaveModel={save} />);
+    fireEvent.click(screen.getAllByRole("button", { name: "Edit" })[0]);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByLabelText("Read-only subagent model")).not.toBeInTheDocument();
+    expect(close).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: "Edit" })[0]);
+    expect(screen.getByLabelText("Read-only subagent model")).toHaveValue("child");
+    expect(screen.queryByRole("option", { name: /Main/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    await waitFor(() => expect(screen.queryByLabelText("Read-only subagent model")).not.toBeInTheDocument());
+    expect(save).toHaveBeenLastCalledWith(expect.objectContaining({ delegated_model_profile_id: "child" }));
+    fireEvent.click(screen.getAllByRole("button", { name: "Edit" })[0]);
+    fireEvent.change(screen.getByLabelText("Read-only subagent model"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    await waitFor(() => expect(save).toHaveBeenLastCalledWith(expect.objectContaining({ delegated_model_profile_id: null })));
+    await waitFor(() => expect(screen.queryByLabelText("Read-only subagent model")).not.toBeInTheDocument());
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a failed role selection editable without showing raw transport details", async () => {
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} onSaveModel={vi.fn().mockRejectedValue(new Error("secret transport"))} />);
+    fireEvent.click(screen.getByRole("button", { name: "Configure Ollama" }));
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "reader" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not save");
+    expect(screen.queryByText("secret transport")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Model")).toHaveValue("reader");
+  });
   it("opens directly on Skills when launched from the composer", () => {
     render(<SettingsPanel locale="en-US" initialSection="skills" onClose={() => undefined} />);
     expect(screen.getByRole("button", { name: "Skills and MCP" })).toHaveClass("active");
