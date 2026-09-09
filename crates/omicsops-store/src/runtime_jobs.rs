@@ -6,28 +6,52 @@ use omicsops_protocol::{ExecutionContextKeyV4, RuntimeJobStateV4, RuntimeJobV4, 
 impl Store {
     /// End a paused saved-result recovery, under the desktop's driver slot.
     /// Receipts and job identities remain available for audit; nothing executes.
-    pub async fn cancel_runtime_recovery_v4(&self, run_id: Uuid) -> Result<AgentEventV4, StoreError> {
+    pub async fn cancel_runtime_recovery_v4(
+        &self,
+        run_id: Uuid,
+    ) -> Result<AgentEventV4, StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query("SELECT status,value_json FROM agent_runs_v4 WHERE run_id=?1")
-            .bind(run_id.to_string()).fetch_optional(&mut *tx).await?
+            .bind(run_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
             .ok_or_else(|| StoreError::InvalidInput("run not found".into()))?;
         let status: String = row.try_get(0)?;
         let events = load_agent_events_in_tx(&mut tx, run_id).await?;
-        let previous = events.last().ok_or_else(|| StoreError::InvalidInput("run events missing".into()))?;
-        if status == "cancelled" && matches!(previous.event, AgentEventKindV4::RunCancelled)
-            && events.iter().rev().nth(1).is_some_and(|event| matches!(event.event, AgentEventKindV4::RuntimeRecoveryAvailable { .. })) {
+        let previous = events
+            .last()
+            .ok_or_else(|| StoreError::InvalidInput("run events missing".into()))?;
+        if status == "cancelled"
+            && matches!(previous.event, AgentEventKindV4::RunCancelled)
+            && events.iter().rev().nth(1).is_some_and(|event| {
+                matches!(
+                    event.event,
+                    AgentEventKindV4::RuntimeRecoveryAvailable { .. }
+                )
+            })
+        {
             return Ok(previous.clone());
         }
-        if status != "waiting_for_input" || events.iter().any(is_terminal_event)
-            || !matches!(previous.event, AgentEventKindV4::RuntimeRecoveryAvailable { .. }) {
-            return Err(StoreError::InvalidInput("run is not waiting for saved-result recovery".into()));
+        if status != "waiting_for_input"
+            || events.iter().any(is_terminal_event)
+            || !matches!(
+                previous.event,
+                AgentEventKindV4::RuntimeRecoveryAvailable { .. }
+            )
+        {
+            return Err(StoreError::InvalidInput(
+                "run is not waiting for saved-result recovery".into(),
+            ));
         }
         let event = AgentEventV4::next(previous, Utc::now(), AgentEventKindV4::RunCancelled);
         insert_agent_event_in_tx(&mut tx, &event).await?;
         let mut value: Value = serde_json::from_str(&row.try_get::<String, _>(1)?)?;
         value["status"] = Value::String("cancelled".into());
         sqlx::query("UPDATE agent_runs_v4 SET status='cancelled',value_json=?1 WHERE run_id=?2")
-            .bind(serde_json::to_string(&value)?).bind(run_id.to_string()).execute(&mut *tx).await?;
+            .bind(serde_json::to_string(&value)?)
+            .bind(run_id.to_string())
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(event)
     }

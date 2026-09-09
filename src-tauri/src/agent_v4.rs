@@ -1785,9 +1785,13 @@ pub async fn agent_v4_cancel_runtime_recovery(
     state: State<'_, AppState>,
     run_id: Uuid,
 ) -> Result<(), String> {
-    let _guard = register_active_run_guard(&state.active_runs, run_id, Arc::new(AtomicBool::new(false)))?
-        .ok_or("run is busy; retry cancellation after the current action finishes")?;
-    let event = state.repository.cancel_runtime_recovery_v4(run_id).await
+    let _guard =
+        register_active_run_guard(&state.active_runs, run_id, Arc::new(AtomicBool::new(false)))?
+            .ok_or("run is busy; retry cancellation after the current action finishes")?;
+    let event = state
+        .repository
+        .cancel_runtime_recovery_v4(run_id)
+        .await
         .map_err(|error| error.to_string())?;
     // A closed listener cannot turn a committed cancellation into a failed one.
     let _ = app.emit(AGENT_V4_EVENT_CHANNEL, event);
@@ -2579,8 +2583,14 @@ async fn spawn_execution(
 }
 
 async fn reject_cancelled_execution(repository: &Store, run_id: Uuid) -> Result<(), String> {
-    let events = repository.agent_events_v4(run_id).await.map_err(|error| error.to_string())?;
-    if events.iter().any(|event| matches!(event.event, AgentEventKindV4::RunCancelled)) {
+    let events = repository
+        .agent_events_v4(run_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if events
+        .iter()
+        .any(|event| matches!(event.event, AgentEventKindV4::RunCancelled))
+    {
         return Err("cancelled runs cannot be resumed".into());
     }
     Ok(())
@@ -5777,26 +5787,78 @@ mod tests {
     #[tokio::test]
     async fn committed_recovery_cancel_rejects_a_delayed_execution_start() {
         let repository = Store::open_in_memory().await.unwrap();
-        let project = Project::new(Uuid::new_v4(), "test", "synthetic", omicsops_core::workspace::ProjectTemplate::Blank, Utc::now());
+        let project = Project::new(
+            Uuid::new_v4(),
+            "test",
+            "synthetic",
+            omicsops_core::workspace::ProjectTemplate::Blank,
+            Utc::now(),
+        );
         repository.save_project(&project).await.unwrap();
-        let conversation = omicsops_core::workspace::Conversation::new(Uuid::new_v4(), project.id, "test", Utc::now());
+        let conversation = omicsops_core::workspace::Conversation::new(
+            Uuid::new_v4(),
+            project.id,
+            "test",
+            Utc::now(),
+        );
         repository.save_conversation(&conversation).await.unwrap();
         let run_id = Uuid::new_v4();
-        repository.save_agent_run_v4(run_id, project.id, conversation.id, "waiting_for_input", &json!({"status":"waiting_for_input"})).await.unwrap();
-        let first = AgentEventV4::first(run_id, project.id, conversation.id, Utc::now(), AgentEventKindV4::RunCreated { mode: omicsops_protocol::RunModeV4::Execute });
+        repository
+            .save_agent_run_v4(
+                run_id,
+                project.id,
+                conversation.id,
+                "waiting_for_input",
+                &json!({"status":"waiting_for_input"}),
+            )
+            .await
+            .unwrap();
+        let first = AgentEventV4::first(
+            run_id,
+            project.id,
+            conversation.id,
+            Utc::now(),
+            AgentEventKindV4::RunCreated {
+                mode: omicsops_protocol::RunModeV4::Execute,
+            },
+        );
         repository.append_agent_event_v4(&first).await.unwrap();
-        repository.append_agent_event_v4(&AgentEventV4::next(&first, Utc::now(), AgentEventKindV4::RuntimeRecoveryAvailable { call_ids: vec!["cell".into()] })).await.unwrap();
-        reject_cancelled_execution(&repository, run_id).await.unwrap();
+        repository
+            .append_agent_event_v4(&AgentEventV4::next(
+                &first,
+                Utc::now(),
+                AgentEventKindV4::RuntimeRecoveryAvailable {
+                    call_ids: vec!["cell".into()],
+                },
+            ))
+            .await
+            .unwrap();
+        reject_cancelled_execution(&repository, run_id)
+            .await
+            .unwrap();
         let registry = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let guard = register_active_run_guard(&registry, run_id, Arc::new(AtomicBool::new(false))).unwrap().unwrap();
+        let guard = register_active_run_guard(&registry, run_id, Arc::new(AtomicBool::new(false)))
+            .unwrap()
+            .unwrap();
         assert!(!register_active_run(&registry, run_id, Arc::new(AtomicBool::new(false))).unwrap());
         repository.cancel_runtime_recovery_v4(run_id).await.unwrap();
         drop(guard);
-        let delayed = register_active_run_guard(&registry, run_id, Arc::new(AtomicBool::new(false))).unwrap().unwrap();
-        assert!(reject_cancelled_execution(&repository, run_id).await.unwrap_err().contains("cannot be resumed"));
+        let delayed =
+            register_active_run_guard(&registry, run_id, Arc::new(AtomicBool::new(false)))
+                .unwrap()
+                .unwrap();
+        assert!(
+            reject_cancelled_execution(&repository, run_id)
+                .await
+                .unwrap_err()
+                .contains("cannot be resumed")
+        );
         drop(delayed);
         assert!(registry.lock().unwrap().is_empty());
-        assert_eq!(repository.agent_run_v4(run_id).await.unwrap().unwrap()["status"], "cancelled");
+        assert_eq!(
+            repository.agent_run_v4(run_id).await.unwrap().unwrap()["status"],
+            "cancelled"
+        );
     }
 
     #[tokio::test]

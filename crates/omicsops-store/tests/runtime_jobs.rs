@@ -645,11 +645,29 @@ async fn incomplete_or_uncertain_dispatches_do_not_receive_recovery_offer() {
 
 async fn ready_recovery(store: &Store) -> (ExecutionContextKeyV4, ToolCallV4) {
     let (key, call) = fixture(store).await;
-    let (reserved, _) = store.reserve_runtime_job_v4(&key, &call.call_id, &call.canonical_hash().unwrap()).await.unwrap();
+    let (reserved, _) = store
+        .reserve_runtime_job_v4(&key, &call.call_id, &call.canonical_hash().unwrap())
+        .await
+        .unwrap();
     let session = Uuid::new_v4();
-    let running = store.advance_runtime_job_v4(&reserved, RuntimeJobStateV4::Running, Some(session), None).await.unwrap();
-    store.advance_runtime_job_v4(&running, RuntimeJobStateV4::Succeeded, None, Some(&result(session, true))).await.unwrap();
-    store.prepare_runtime_recovery_v4(key.run_id).await.unwrap().unwrap();
+    let running = store
+        .advance_runtime_job_v4(&reserved, RuntimeJobStateV4::Running, Some(session), None)
+        .await
+        .unwrap();
+    store
+        .advance_runtime_job_v4(
+            &running,
+            RuntimeJobStateV4::Succeeded,
+            None,
+            Some(&result(session, true)),
+        )
+        .await
+        .unwrap();
+    store
+        .prepare_runtime_recovery_v4(key.run_id)
+        .await
+        .unwrap()
+        .unwrap();
     (key, call)
 }
 
@@ -661,36 +679,94 @@ async fn recovery_cancellation_is_atomic_idempotent_and_preserves_receipts() {
     sqlx::query("CREATE TRIGGER reject_cancel BEFORE UPDATE ON agent_runs_v4 BEGIN SELECT RAISE(ABORT,'synthetic failure'); END").execute(store.pool()).await.unwrap();
     assert!(store.cancel_runtime_recovery_v4(key.run_id).await.is_err());
     assert_eq!(store.agent_events_v4(key.run_id).await.unwrap(), before);
-    assert_eq!(store.agent_run_v4(key.run_id).await.unwrap().unwrap()["status"], "waiting_for_input");
-    sqlx::query("DROP TRIGGER reject_cancel").execute(store.pool()).await.unwrap();
-    let (a,b) = tokio::join!(store.cancel_runtime_recovery_v4(key.run_id), store.cancel_runtime_recovery_v4(key.run_id));
+    assert_eq!(
+        store.agent_run_v4(key.run_id).await.unwrap().unwrap()["status"],
+        "waiting_for_input"
+    );
+    sqlx::query("DROP TRIGGER reject_cancel")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let (a, b) = tokio::join!(
+        store.cancel_runtime_recovery_v4(key.run_id),
+        store.cancel_runtime_recovery_v4(key.run_id)
+    );
     assert_eq!(a.unwrap(), b.unwrap());
     let events = store.agent_events_v4(key.run_id).await.unwrap();
     assert_eq!(events.len(), before.len() + 1);
-    assert!(matches!(events.last().unwrap().event, AgentEventKindV4::RunCancelled));
-    let row: (String, String) = sqlx::query_as("SELECT status,value_json FROM agent_runs_v4 WHERE run_id=?1").bind(key.run_id.to_string()).fetch_one(store.pool()).await.unwrap();
+    assert!(matches!(
+        events.last().unwrap().event,
+        AgentEventKindV4::RunCancelled
+    ));
+    let row: (String, String) =
+        sqlx::query_as("SELECT status,value_json FROM agent_runs_v4 WHERE run_id=?1")
+            .bind(key.run_id.to_string())
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
     assert_eq!(row.0, "cancelled");
-    assert_eq!(serde_json::from_str::<serde_json::Value>(&row.1).unwrap()["status"], "cancelled");
-    assert!(store.recover_runtime_result_v4(&key, &call).await.unwrap().is_some());
-    assert!(!store.reserve_runtime_job_v4(&key, &call.call_id, &call.canonical_hash().unwrap()).await.unwrap().1);
-    assert!(store.prepare_runtime_recovery_v4(key.run_id).await.unwrap().is_none());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&row.1).unwrap()["status"],
+        "cancelled"
+    );
+    assert!(
+        store
+            .recover_runtime_result_v4(&key, &call)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        !store
+            .reserve_runtime_job_v4(&key, &call.call_id, &call.canonical_hash().unwrap())
+            .await
+            .unwrap()
+            .1
+    );
+    assert!(
+        store
+            .prepare_runtime_recovery_v4(key.run_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
 async fn recovery_cancellation_rejects_other_pause_and_terminal_states() {
     let store = Store::open_in_memory().await.unwrap();
-    assert!(store.cancel_runtime_recovery_v4(Uuid::new_v4()).await.is_err());
+    assert!(
+        store
+            .cancel_runtime_recovery_v4(Uuid::new_v4())
+            .await
+            .is_err()
+    );
     let (key, _) = fixture(&store).await;
     assert!(store.cancel_runtime_recovery_v4(key.run_id).await.is_err());
-    sqlx::query("UPDATE agent_runs_v4 SET status='waiting_for_input' WHERE run_id=?1").bind(key.run_id.to_string()).execute(store.pool()).await.unwrap();
+    sqlx::query("UPDATE agent_runs_v4 SET status='waiting_for_input' WHERE run_id=?1")
+        .bind(key.run_id.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
     assert!(store.cancel_runtime_recovery_v4(key.run_id).await.is_err());
     for resumed in [false, true] {
         let store = Store::open_in_memory().await.unwrap();
         let (key, _) = ready_recovery(&store).await;
         if resumed {
-            sqlx::query("UPDATE agent_runs_v4 SET status='running' WHERE run_id=?1").bind(key.run_id.to_string()).execute(store.pool()).await.unwrap();
+            sqlx::query("UPDATE agent_runs_v4 SET status='running' WHERE run_id=?1")
+                .bind(key.run_id.to_string())
+                .execute(store.pool())
+                .await
+                .unwrap();
         } else {
-            append(&store, key.run_id, AgentEventKindV4::RunFailed { message: "synthetic terminal".into() }).await;
+            append(
+                &store,
+                key.run_id,
+                AgentEventKindV4::RunFailed {
+                    message: "synthetic terminal".into(),
+                },
+            )
+            .await;
         }
         let before = store.agent_events_v4(key.run_id).await.unwrap();
         assert!(store.cancel_runtime_recovery_v4(key.run_id).await.is_err());
