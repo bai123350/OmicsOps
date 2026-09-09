@@ -764,12 +764,30 @@ mod tests {
     #[test]
     fn detached_jobs_keep_runtime_authority_while_status_is_read_only() {
         let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap();
-        let submit = ToolCallV4 { call_id: "background".into(), tool_id: "runtime.execute".into(), arguments: json!({"language":"python","code":"print(42)","background":true}) };
+        let submit = ToolCallV4 {
+            call_id: "background".into(),
+            tool_id: "runtime.execute".into(),
+            arguments: json!({"language":"python","code":"print(42)","background":true}),
+        };
         assert!(registry.validate(RunModeV4::Plan, &submit).is_err());
-        let query = ToolCallV4 { call_id: "observe".into(), tool_id: "runtime.remote_job_status".into(), arguments: json!({}) };
+        let query = ToolCallV4 {
+            call_id: "observe".into(),
+            tool_id: "runtime.remote_job_status".into(),
+            arguments: json!({}),
+        };
         registry.validate(RunModeV4::Plan, &query).unwrap();
-        assert_eq!(registry.descriptors(RunModeV4::Execute).iter().find(|d| d.id == query.tool_id).unwrap().effect, ToolEffectV4::ReadOnly);
-        let denied = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap().with_execute_capabilities(BTreeSet::new());
+        assert_eq!(
+            registry
+                .descriptors(RunModeV4::Execute)
+                .iter()
+                .find(|d| d.id == query.tool_id)
+                .unwrap()
+                .effect,
+            ToolEffectV4::ReadOnly
+        );
+        let denied = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop))
+            .unwrap()
+            .with_execute_capabilities(BTreeSet::new());
         assert!(denied.validate(RunModeV4::Execute, &submit).is_err());
     }
 

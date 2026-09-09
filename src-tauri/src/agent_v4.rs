@@ -4528,11 +4528,36 @@ impl DesktopToolExecutorV4 {
                 validate_kernel_code(&code).map_err(|e| e.to_string())?;
                 validate_capture_paths(&captures).map_err(|e| e.to_string())?;
                 let key = self.key(language, environment)?;
-                if call.arguments.get("background").map(|value| value.as_bool().ok_or("background must be boolean")).transpose()?.unwrap_or(false) {
+                if call
+                    .arguments
+                    .get("background")
+                    .map(|value| value.as_bool().ok_or("background must be boolean"))
+                    .transpose()?
+                    .unwrap_or(false)
+                {
                     validate_environment_name(environment)?;
-                    let (session, root) = self.remote_jobs.as_ref().ok_or("background jobs require an SSH Linux backend")?;
-                    let data = crate::remote_jobs_v4::submit(&self.repository, &crate::remote_jobs_v4::SshTransport { session: session.clone() }, root, &key, call).await?;
-                    return Ok(ToolOutcomeV4 { call_id: call.call_id.clone(), tool_id: call.tool_id.clone(), succeeded: true, model_content: serde_json::to_string(&data).map_err(|e| e.to_string())?, data, provenance: vec![] });
+                    let (session, root) = self
+                        .remote_jobs
+                        .as_ref()
+                        .ok_or("background jobs require an SSH Linux backend")?;
+                    let data = crate::remote_jobs_v4::submit(
+                        &self.repository,
+                        &crate::remote_jobs_v4::SshTransport {
+                            session: session.clone(),
+                        },
+                        root,
+                        &key,
+                        call,
+                    )
+                    .await?;
+                    return Ok(ToolOutcomeV4 {
+                        call_id: call.call_id.clone(),
+                        tool_id: call.tool_id.clone(),
+                        succeeded: true,
+                        model_content: serde_json::to_string(&data).map_err(|e| e.to_string())?,
+                        data,
+                        provenance: vec![],
+                    });
                 }
                 let (running, mut result) = crate::runtime_jobs_v4::execute_reserved(
                     &self.repository,
@@ -4572,10 +4597,36 @@ impl DesktopToolExecutorV4 {
                 return crate::runtime_jobs_v4::outcome(call, &running, &result);
             }
             "runtime.remote_job_status" => {
-                let (session, root) = self.remote_jobs.as_ref().ok_or("remote jobs require an SSH Linux backend")?;
-                let job_id = call.arguments.get("job_id").map(|value| value.as_str().ok_or("invalid job id").and_then(|id| Uuid::parse_str(id).map_err(|_| "invalid job id"))).transpose()?;
-                let data = crate::remote_jobs_v4::query(&self.repository, &crate::remote_jobs_v4::SshTransport { session: session.clone() }, self.project_id, &self.backend_id, root, job_id).await?;
-                (serde_json::to_string(&data).map_err(|e| e.to_string())?, data, vec![])
+                let (session, root) = self
+                    .remote_jobs
+                    .as_ref()
+                    .ok_or("remote jobs require an SSH Linux backend")?;
+                let job_id = call
+                    .arguments
+                    .get("job_id")
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .ok_or("invalid job id")
+                            .and_then(|id| Uuid::parse_str(id).map_err(|_| "invalid job id"))
+                    })
+                    .transpose()?;
+                let data = crate::remote_jobs_v4::query(
+                    &self.repository,
+                    &crate::remote_jobs_v4::SshTransport {
+                        session: session.clone(),
+                    },
+                    self.project_id,
+                    &self.backend_id,
+                    root,
+                    job_id,
+                )
+                .await?;
+                (
+                    serde_json::to_string(&data).map_err(|e| e.to_string())?,
+                    data,
+                    vec![],
+                )
             }
             "runtime.environment.ensure" => {
                 let language = parse_language(required(&call.arguments, "language")?)?;

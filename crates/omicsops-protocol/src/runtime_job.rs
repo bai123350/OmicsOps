@@ -37,6 +37,6 @@ mod tests {
         let value = serde_json::json!({"job_id":Uuid::nil(),"context":{"project_id":Uuid::nil(),"run_id":Uuid::nil(),"backend_id":"local","language":"python","environment":"system"},"call_id":"legacy","request_sha256":"a".repeat(64),"state":"running","session_id":null,"result_request_id":null,"result_sha256":null});
         let job: RuntimeJobV4 = serde_json::from_value(value.clone()).unwrap();
         assert!(job.remote_root.is_none() && job.remote_host_key.is_none());
-        assert_eq!(serde_json::to_value(job).unwrap(),value);
+        assert_eq!(serde_json::to_value(job).unwrap(), value);
     }
 }
