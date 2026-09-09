@@ -128,3 +128,11 @@ effort with a 4096-token output allowance unless a request budget overrides it.
 Acceptance of a request does not prove the service used that effort. There is no
 automatic downgrade, model-family capability inference or automatic Luna route;
 the full capability catalog and effective-effort reporting remain pending.
+
+New ordinary runs also freeze the main model's execution configuration. Resuming
+with a changed model ID, endpoint, provider, reasoning effort, capability flags
+or context window fails before opening execution resources. Restore the original
+settings or start a new run; renaming a profile or rotating its keyring credential
+does not invalidate it. The client and request budget use the same loaded profile
+snapshot. Legacy runs without the fingerprint and approved-plan runs retain their
+existing behavior; no historical configuration is invented or backfilled.

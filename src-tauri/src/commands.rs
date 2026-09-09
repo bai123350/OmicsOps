@@ -337,19 +337,6 @@ pub(crate) async fn connect_profile(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn unified_model_client(
-    state: &AppState,
-    model_profile_id: Uuid,
-) -> Result<UnifiedModelClient, String> {
-    let profile = state
-        .repository
-        .get_model_profile(model_profile_id)
-        .await
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "model profile not found".to_string())?;
-    unified_model_client_for_profile(state, &profile)
-}
-
 pub(crate) fn unified_model_client_for_profile(
     state: &AppState,
     profile: &omicsops_core::workspace::ModelProfile,

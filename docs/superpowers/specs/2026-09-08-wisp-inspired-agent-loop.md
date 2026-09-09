@@ -139,3 +139,11 @@ ModelProfile JSON 新增可空 reasoning_effort，无表迁移或凭据字段。
 统一客户端对常规模型、独立子模型、结构化调用、重试和非流式 fallback 保留同一 reasoning_effort，完整预算覆盖该字段。probe 同样发送，显式档位默认预留 4096 输出 token（沿用已有运行请求额度，非模型上限），已有 RequestBudget 优先，并拒绝明确的截断/拒答响应。wire 字段参考 [OpenAI Chat API](https://developers.openai.com/api/reference/resources/chat)；可选字符串不代表所选精确模型支持这些档位。
 
 显式值加入子模型 execution_configuration_hash，未设置时不改变旧哈希。角色仍按既有冻结绑定验证；主模型沿用既有 profile 加载语义，不新增跨恢复的主模型配置快照。Windows/macOS 使用同一设置与适配器路径，无覆盖层/审批/隔离/数据驻留变化。完整 models.dev 精确能力目录、requested/effective/capability source 审计，以及自动简单任务模型路由仍待实施。
+
+## 2026-09-09 增量：主模型配置冻结
+
+在显式档位增量基础上，新建 ordinary run 的 RunSpecV4 增加可空 model_configuration_hash，使用 ModelProfile.execution_configuration_hash。与子模型绑定从同一主 profile 快照冻结，字段纳入 spec_hash 和已有 RunSpecFrozen 事件锚点。省略字段时保持旧序列化/哈希；只允许 ordinary 且有 compute selection 的规格携带 64 位十六进制指纹，不回填旧运行，不改变 approved-plan 审批绑定。
+
+compose 在建立 SSH/解释器资源前读取并验证主 profile；后续凭据引用、模型请求、视觉标志和预算都从同一拥有的快照构建，不再二次加载 profile。恢复发现执行配置不符时拒绝，提示恢复原设置或创建新运行；不自动降档、替换 profile 或重写已冻结规格。label 和凭据引用不进入指纹，允许重命名及 keyring 密钥轮换；子模型绑定由独立冻结字段控制。该增量覆盖主模型配置重现性，不确认服务端实际 effort，也不实现远端任务重连。
+
+没有新表、凭据存储或 UI 覆盖层；Windows/macOS 共用相同验证路径。旧程序计算不含新字段的 spec_hash 会失败，不能让旧版本跳过完整性检查恢复新规格。

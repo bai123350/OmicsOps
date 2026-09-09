@@ -167,3 +167,11 @@ shows request acceptance only, not confirmed effective effort. Verify a frozen
 child rejects changed effort on resume. Real model/gateway smoke has not been
 executed; do not interpret deterministic request-shape tests as Luna/max service
 acceptance. Anthropic/Ollama effort mapping and catalog-driven choices are pending.
+
+For main-model freeze smoke on Windows/macOS, pause a new ordinary run, edit the
+main profile's effort/model/endpoint, and attempt resume: it must report a frozen
+configuration mismatch without continuing the model or opening a kernel. Restore
+the original settings and resume the same run. Profile labels and keyring secret
+rotation may change without invalidating the fingerprint. Old runs lacking the
+field retain legacy behavior. This manual desktop/model smoke remains unexecuted;
+deterministic protocol and temporary-database tests verify the binding logic.

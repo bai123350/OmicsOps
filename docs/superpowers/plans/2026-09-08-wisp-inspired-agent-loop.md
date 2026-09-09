@@ -187,3 +187,11 @@ core/tools/desktop 增加只恢复不执行的 recover_result 接口；按原请
 确定性覆盖：档位隔离、省略/清空、非法协议和值、请求预算包含档位、probe 输出预算优先、存储重读和冻结哈希变更；设置测试覆盖保存/清空后子模型配置保持独立。
 
 实际验证：适配器近邻测试 3 项、设置近邻测试 13 项通过；最终 `cargo test --workspace`、`npm test`（118 前端/22 扩展）、`npm run build`、`npm run build:desktop` 均通过。首次工作区检查与 Web 构建并行时，Tauri 读取 dist/index.html 遇到 Vite 清理窗口而失败；Web 完成后顺序重跑工作区检查通过。格式初查失败，执行 `cargo fmt --all` 后复查通过，纯格式单独提交；diff 检查通过。保留既有 Vite chunk/linker 提示，无依赖变化，未推送或分发安装包。真实模型/SSH/macOS 和桌面交互验收未执行，服务端实际 effort 未验证。
+
+## 2026-09-09：主模型配置冻结与恢复检查
+
+完成新 ordinary RunSpec 主模型指纹、完整性验证与事件锚定；主/子角色从同一主 profile 快照选取。恢复检查型号、主机、协议、上下文额度、能力标志和请求 effort 的变化；允许 label/凭据引用变化。客户端与预算从验证后的同一个 profile 构建，删除已无调用者的二次查询构造器。旧无指纹规格保留原路径，approved-plan 不纳入本增量。
+
+协议测试覆盖省略兼容、往返、指纹替换/删除、非法摘要、缺失 compute selection 及错误执行模式；桌面临时数据库测试覆盖配置修改拒绝、恢复设置后通过、旧规格加载与已读取快照稳定。完整模型目录、生效档位审计、主循环以外指导切入和运行中远端重连仍未全部完成。
+
+本增量最终验证（2026-09-09）：`cargo test -p omicsops-protocol --lib` 15 项、桌面主模型恢复近邻测试 1 项通过；`cargo test --workspace`、`npm test`（118 前端/22 扩展）、`npm run build`、`npm run build:desktop` 均通过。Rust 测试结束后顺序执行构建，无 dist 清理竞争。格式初查偏差经 `cargo fmt --all` 修复，复查和 diff 检查通过；纯格式单独提交。保留既有 Vite 大 chunk/Windows linker 提示，无依赖或数据库迁移变化。未执行真实模型、SSH、macOS 或桌面交互 smoke，未推送、发布或分发构建产物。

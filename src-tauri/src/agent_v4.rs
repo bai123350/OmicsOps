@@ -74,7 +74,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::commands::{
-    AppState, authentication_for_profile, find_profile, require_trusted_host, unified_model_client,
+    AppState, authentication_for_profile, find_profile, require_trusted_host,
 };
 pub use crate::dto::{ConversationAgentStateV4, RunSummaryV4, SessionAgentModeV4};
 use crate::p1_commands::{
@@ -488,6 +488,7 @@ pub async fn agent_v4_start_planning(
         None,
         None,
         None,
+        None,
     )
     .await
     {
@@ -740,6 +741,7 @@ pub async fn agent_v4_start_direct(
         None,
         None,
         None,
+        None,
     )
     .await?;
     let run_id = tools.run_id();
@@ -778,8 +780,9 @@ pub async fn agent_v4_start_direct(
         Utc::now(),
     )
     .map_err(|error| error.to_string())?;
-    spec.delegated_model =
-        freeze_delegated_model(&state.repository, request.model_profile_id).await?;
+    let main_profile = load_frozen_main_profile(&state.repository, request.model_profile_id, None).await?;
+    spec.model_configuration_hash = Some(main_profile.execution_configuration_hash());
+    spec.delegated_model = freeze_delegated_model(&state.repository, &main_profile).await?;
     spec.spec_hash = Some(
         spec.calculate_spec_hash()
             .map_err(|error| error.to_string())?,
@@ -1441,6 +1444,7 @@ pub async fn agent_v4_resume(
             record.model_profile_id,
             record.run_id,
             record.conversation_id,
+            None,
             None,
             None,
             None,
@@ -2391,6 +2395,7 @@ async fn spawn_execution(
         Some(&spec.plan.requested_capabilities),
         forced_route,
         spec.delegated_model.as_ref(),
+        spec.model_configuration_hash.as_deref(),
     )
     .await?;
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -2726,15 +2731,23 @@ impl ComposedToolsV4 {
     }
 }
 
+async fn load_frozen_main_profile(
+    repository: &Store,
+    profile_id: Uuid,
+    expected_hash: Option<&str>,
+) -> Result<omicsops_core::workspace::ModelProfile, String> {
+    let profile = repository.get_model_profile(profile_id).await
+        .map_err(|error| error.to_string())?.ok_or("main model profile not found")?;
+    if expected_hash.is_some_and(|hash| profile.execution_configuration_hash() != hash) {
+        return Err("frozen main model configuration changed; restore the profile or start a new run".into());
+    }
+    Ok(profile)
+}
+
 async fn freeze_delegated_model(
     repository: &Store,
-    main_id: Uuid,
+    main: &omicsops_core::workspace::ModelProfile,
 ) -> Result<Option<omicsops_protocol::DelegatedModelBindingV4>, String> {
-    let main = repository
-        .get_model_profile(main_id)
-        .await
-        .map_err(|error| error.to_string())?
-        .ok_or("model profile not found")?;
     let Some(child_id) = main.delegated_model_profile_id else {
         return Ok(None);
     };
@@ -2743,7 +2756,7 @@ async fn freeze_delegated_model(
         .await
         .map_err(|error| error.to_string())?
         .ok_or("configured delegated model profile not found")?;
-    if child_id == main_id || !child.supports_tools {
+    if child_id == main.id || !child.supports_tools {
         return Err("delegated model must be a separate tool-capable profile".into());
     }
     Ok(Some(omicsops_protocol::DelegatedModelBindingV4 {
@@ -2778,7 +2791,11 @@ async fn compose(
     execute_capabilities: Option<&BTreeSet<String>>,
     forced_route: Option<AgentRequestRouteV4>,
     delegated_binding: Option<&omicsops_protocol::DelegatedModelBindingV4>,
+    main_configuration_hash: Option<&str>,
 ) -> Result<(Arc<DesktopModelPortV4>, ComposedToolsV4), String> {
+    // Validate before opening SSH or runtime resources, then construct the
+    // client and budget from this same owned snapshot without reloading it.
+    let model_profile = load_frozen_main_profile(&state.repository, model_profile_id, main_configuration_hash).await?;
     let (filesystem, environment_port, backend): (
         Arc<dyn ProjectFilesystemPortV4>,
         Arc<dyn RuntimeEnvironmentPortV4>,
@@ -2881,12 +2898,6 @@ async fn compose(
         selection.network_policy
     ));
     let runtime = Arc::new(RuntimeManagerV4::new(backend));
-    let model_profile = state
-        .repository
-        .get_model_profile(model_profile_id)
-        .await
-        .map_err(|error| error.to_string())?
-        .ok_or("model profile not found")?;
     let executor = Arc::new(DesktopToolExecutorV4 {
         repository: state.repository.clone(),
         mcp_sessions: state.mcp_sessions.clone(),
@@ -2946,8 +2957,7 @@ async fn compose(
     };
     Ok((
         Arc::new(DesktopModelPortV4 {
-            client: unified_model_client(state, model_profile_id)
-                .await?
+            client: crate::commands::unified_model_client_for_profile(state, &model_profile)?
                 .with_request_budget(RequestBudget {
                     context_window_tokens: model_profile.effective_context_window_tokens(),
                     // This is a requested output allowance, not an inferred
@@ -5728,6 +5738,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn main_profile_restore_checks_execution_settings_and_retains_one_snapshot() {
+        let repository = Store::open_in_memory().await.unwrap();
+        let profile: omicsops_core::workspace::ModelProfile = serde_json::from_value(json!({
+            "id":Uuid::new_v4(),"label":"main","provider":"open_ai_compatible","base_url":"https://gateway.example/v1",
+            "model":"exact-model","credential_reference":null,"supports_tools":true,"supports_vision":false,
+            "reasoning_effort":"max"
+        })).unwrap();
+        let hash = profile.execution_configuration_hash();
+        assert!(load_frozen_main_profile(&repository, profile.id, Some(&hash)).await.is_err());
+        repository.save_model_profile(&profile).await.unwrap();
+        let snapshot = load_frozen_main_profile(&repository, profile.id, Some(&hash)).await.unwrap();
+        let mut renamed = profile.clone();
+        renamed.label = "renamed".into();
+        renamed.credential_reference = Some("test-keyring-reference".into());
+        repository.save_model_profile(&renamed).await.unwrap();
+        load_frozen_main_profile(&repository, profile.id, Some(&hash)).await.unwrap();
+        for field in ["model", "host", "provider", "context", "vision", "tools", "effort"] {
+            let mut changed = profile.clone();
+            match field {
+                "model" => changed.model.push_str("-sibling"),
+                "host" => changed.base_url = "https://other.example/v1".into(),
+                "provider" => changed.provider = omicsops_core::workspace::ModelProviderKind::Anthropic,
+                "context" => changed.context_window_tokens = Some(64000),
+                "vision" => changed.supports_vision = true,
+                "tools" => changed.supports_tools = false,
+                "effort" => changed.reasoning_effort = Some("low".into()),
+                _ => unreachable!(),
+            }
+            repository.save_model_profile(&changed).await.unwrap();
+            assert!(load_frozen_main_profile(&repository, profile.id, Some(&hash)).await.unwrap_err().contains("frozen main model configuration changed"), "{field}");
+            // Old specs intentionally retain legacy profile loading behavior.
+            assert_eq!(load_frozen_main_profile(&repository, profile.id, None).await.unwrap(), changed);
+        }
+        assert_eq!(snapshot, profile);
+        repository.save_model_profile(&profile).await.unwrap();
+        assert_eq!(load_frozen_main_profile(&repository, profile.id, Some(&hash)).await.unwrap(), profile);
+    }
+
+    #[tokio::test]
     async fn delegated_profile_freezes_exact_configuration_and_missing_profiles_fail() {
         let repository = Store::open_in_memory().await.unwrap();
         let mut main: omicsops_core::workspace::ModelProfile = serde_json::from_value(json!({
@@ -5736,7 +5785,7 @@ mod tests {
         })).unwrap();
         repository.save_model_profile(&main).await.unwrap();
         assert_eq!(
-            freeze_delegated_model(&repository, main.id).await.unwrap(),
+            freeze_delegated_model(&repository, &main).await.unwrap(),
             None
         );
         let mut child = main.clone();
@@ -5745,13 +5794,13 @@ mod tests {
         main.delegated_model_profile_id = Some(child.id);
         repository.save_model_profile(&main).await.unwrap();
         assert!(
-            freeze_delegated_model(&repository, main.id)
+            freeze_delegated_model(&repository, &main)
                 .await
                 .unwrap_err()
                 .contains("not found")
         );
         repository.save_model_profile(&child).await.unwrap();
-        let binding = freeze_delegated_model(&repository, main.id)
+        let binding = freeze_delegated_model(&repository, &main)
             .await
             .unwrap()
             .unwrap();
