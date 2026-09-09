@@ -223,7 +223,9 @@ pub trait ToolPortV4: Send + Sync {
     }
     async fn execute(&self, mode: RunModeV4, call: ToolCallV4) -> Result<ToolOutcomeV4, String>;
     /// Return only durable results of this exact dispatch; never execute here.
-    async fn recover_result(&self, _call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> { Ok(None) }
+    async fn recover_result(&self, _call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
+        Ok(None)
+    }
     async fn interrupt(&self, _run_id: Uuid) -> Result<(), String> {
         Ok(())
     }
@@ -2593,8 +2595,12 @@ impl AgentCoreV4<'_> {
                 .effect(&call.tool_id)
                 .ok_or_else(|| AgentCoreErrorV4::Tool(format!("unknown tool {}", call.tool_id)))?;
             if dispatched && effect != ToolEffectV4::ReadOnly {
-                if cancelled.load(Ordering::SeqCst) { return Err(AgentCoreErrorV4::Cancelled); }
-                self.tools.validate(RunModeV4::Execute, &call).map_err(AgentCoreErrorV4::Tool)?;
+                if cancelled.load(Ordering::SeqCst) {
+                    return Err(AgentCoreErrorV4::Cancelled);
+                }
+                self.tools
+                    .validate(RunModeV4::Execute, &call)
+                    .map_err(AgentCoreErrorV4::Tool)?;
                 // Once explicitly classified uncertain, retain the existing
                 // human reconciliation path rather than resolve it implicitly.
                 let recovered = if events.iter().any(|event| matches!(&event.event,
@@ -2603,20 +2609,32 @@ impl AgentCoreV4<'_> {
                 } else {
                     self.tools.recover_result(&call).await.map_err(AgentCoreErrorV4::Tool)?
                 };
-                if cancelled.load(Ordering::SeqCst) { return Err(AgentCoreErrorV4::Cancelled); }
+                if cancelled.load(Ordering::SeqCst) {
+                    return Err(AgentCoreErrorV4::Cancelled);
+                }
                 if let Some(mut outcome) = recovered {
                     if outcome.call_id != call.call_id || outcome.tool_id != call.tool_id {
-                        return Err(AgentCoreErrorV4::Tool("recovered result belongs to another dispatch".into()));
+                        return Err(AgentCoreErrorV4::Tool(
+                            "recovered result belongs to another dispatch".into(),
+                        ));
                     }
-                    let update = if outcome.succeeded { Some(self.science_after_tool(spec, &call, &outcome).await) } else { None };
+                    let update = if outcome.succeeded {
+                        Some(self.science_after_tool(spec, &call, &outcome).await)
+                    } else {
+                        None
+                    };
                     if let Some(Err(error)) = &update {
                         outcome.succeeded = false;
-                        outcome.model_content = format!("host rejected recovered scientific result: {error}");
+                        outcome.model_content =
+                            format!("host rejected recovered scientific result: {error}");
                         outcome.data = json!({"error_kind":"scientific_validation"});
                         outcome.provenance.clear();
                     }
-                    self.push(run_id, AgentEventKindV4::ToolFinished { outcome }).await?;
-                    if let Some(Ok(update)) = update { self.record_scientific_update(run_id, update).await?; }
+                    self.push(run_id, AgentEventKindV4::ToolFinished { outcome })
+                        .await?;
+                    if let Some(Ok(update)) = update {
+                        self.record_scientific_update(run_id, update).await?;
+                    }
                     continue;
                 }
                 if !events.iter().any(|event| {
@@ -8605,40 +8623,108 @@ mod tests {
         }
     }
 
-    struct ReceiptTools { available: bool, recoveries: AtomicUsize }
+    struct ReceiptTools {
+        available: bool,
+        recoveries: AtomicUsize,
+    }
     #[async_trait]
     impl ToolPortV4 for ReceiptTools {
-        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> { vec![] }
-        fn effect(&self, _: &str) -> Option<ToolEffectV4> { Some(ToolEffectV4::Runtime) }
-        async fn execute(&self, _: RunModeV4, _: ToolCallV4) -> Result<ToolOutcomeV4, String> { panic!("recovery must not execute") }
+        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
+            vec![]
+        }
+        fn effect(&self, _: &str) -> Option<ToolEffectV4> {
+            Some(ToolEffectV4::Runtime)
+        }
+        async fn execute(&self, _: RunModeV4, _: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            panic!("recovery must not execute")
+        }
         async fn recover_result(&self, call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
             self.recoveries.fetch_add(1, Ordering::SeqCst);
-            Ok(self.available.then(|| ToolOutcomeV4 { call_id: call.call_id.clone(), tool_id: call.tool_id.clone(), succeeded: true, model_content: "recovered".into(), data: json!({}), provenance: vec!["verified-receipt".into()] }))
+            Ok(self.available.then(|| ToolOutcomeV4 {
+                call_id: call.call_id.clone(),
+                tool_id: call.tool_id.clone(),
+                succeeded: true,
+                model_content: "recovered".into(),
+                data: json!({}),
+                provenance: vec!["verified-receipt".into()],
+            }))
         }
     }
 
     #[tokio::test]
     async fn durable_receipt_recovers_once_without_execution_and_keeps_explicit_uncertainty() {
-        for (available, uncertain) in [(true,false),(false,false),(true,true)] {
+        for (available, uncertain) in [(true, false), (false, false), (true, true)] {
             let store = MemoryStore::default();
             let spec = execution_spec(Uuid::new_v4());
             seed_execution(&store, &spec);
-            let call = ToolCallV4 { call_id: "receipt".into(), tool_id: "runtime.execute".into(), arguments: json!({"language":"python","code":"print(42)"}) };
-            append_test_event(&store, spec.run_id, AgentEventKindV4::ToolRequested { call: call.clone() });
-            append_test_event(&store, spec.run_id, AgentEventKindV4::ToolDispatchStarted { call_id: call.call_id.clone(), tool_id: call.tool_id.clone(), effect: ToolEffectV4::Runtime, idempotency_key: call.call_id.clone() });
-            if uncertain { append_test_event(&store, spec.run_id, AgentEventKindV4::ToolDispatchUncertain { call_id: call.call_id.clone(), tool_id: call.tool_id.clone() }); }
-            let tools = ReceiptTools { available, recoveries: AtomicUsize::new(0) };
+            let call = ToolCallV4 {
+                call_id: "receipt".into(),
+                tool_id: "runtime.execute".into(),
+                arguments: json!({"language":"python","code":"print(42)"}),
+            };
+            append_test_event(
+                &store,
+                spec.run_id,
+                AgentEventKindV4::ToolRequested { call: call.clone() },
+            );
+            append_test_event(
+                &store,
+                spec.run_id,
+                AgentEventKindV4::ToolDispatchStarted {
+                    call_id: call.call_id.clone(),
+                    tool_id: call.tool_id.clone(),
+                    effect: ToolEffectV4::Runtime,
+                    idempotency_key: call.call_id.clone(),
+                },
+            );
+            if uncertain {
+                append_test_event(
+                    &store,
+                    spec.run_id,
+                    AgentEventKindV4::ToolDispatchUncertain {
+                        call_id: call.call_id.clone(),
+                        tool_id: call.tool_id.clone(),
+                    },
+                );
+            }
+            let tools = ReceiptTools {
+                available,
+                recoveries: AtomicUsize::new(0),
+            };
             let model = ScriptedModel(Mutex::new(vec![]));
-            let core = AgentCoreV4 { model: &model, tools: &tools, events: &store, science: None };
-            let result = core.recover_interrupted_dispatches(&spec, AgentLimitsV4::default(), &AtomicBool::new(false)).await;
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &tools,
+                events: &store,
+                science: None,
+            };
+            let result = core
+                .recover_interrupted_dispatches(
+                    &spec,
+                    AgentLimitsV4::default(),
+                    &AtomicBool::new(false),
+                )
+                .await;
             if available && !uncertain {
                 result.unwrap();
-                core.recover_interrupted_dispatches(&spec, AgentLimitsV4::default(), &AtomicBool::new(false)).await.unwrap();
+                core.recover_interrupted_dispatches(
+                    &spec,
+                    AgentLimitsV4::default(),
+                    &AtomicBool::new(false),
+                )
+                .await
+                .unwrap();
                 assert_eq!(tools.recoveries.load(Ordering::SeqCst), 1);
                 assert_eq!(store.load_direct(spec.run_id).unwrap().iter().filter(|event| matches!(&event.event, AgentEventKindV4::ToolFinished { outcome } if outcome.call_id == call.call_id)).count(), 1);
             } else {
-                assert!(matches!(result, Err(AgentCoreErrorV4::UncertainSideEffect(_))));
-                assert_eq!(tools.recoveries.load(Ordering::SeqCst), usize::from(!uncertain));
+                assert!(matches!(
+                    result,
+                    Err(AgentCoreErrorV4::UncertainSideEffect(_))
+                ));
+                assert_eq!(
+                    tools.recoveries.load(Ordering::SeqCst),
+                    usize::from(!uncertain)
+                );
             }
         }
     }

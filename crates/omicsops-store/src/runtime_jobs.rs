@@ -186,8 +186,13 @@ impl Store {
             next.result_sha256 = Some(hex::encode(Sha256::digest(serde_json::to_vec(result)?)));
         }
         let receipt = result.map(serde_json::to_string).transpose()?;
-        if receipt.as_ref().is_some_and(|value| value.len() > 1024 * 1024) {
-            return Err(StoreError::InvalidInput("runtime result receipt exceeds 1 MiB".into()));
+        if receipt
+            .as_ref()
+            .is_some_and(|value| value.len() > 1024 * 1024)
+        {
+            return Err(StoreError::InvalidInput(
+                "runtime result receipt exceeds 1 MiB".into(),
+            ));
         }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let changed = sqlx::query(
@@ -206,28 +211,62 @@ impl Store {
         }
         if let Some(receipt) = receipt {
             sqlx::query("INSERT INTO runtime_job_results_v4(job_id,result_json) VALUES (?1,?2)")
-                .bind(next.job_id.to_string()).bind(receipt).execute(&mut *tx).await?;
+                .bind(next.job_id.to_string())
+                .bind(receipt)
+                .execute(&mut *tx)
+                .await?;
         }
         tx.commit().await?;
         Ok(next)
     }
 
-    pub async fn recover_runtime_result_v4(&self, context: &ExecutionContextKeyV4, call: &omicsops_protocol::ToolCallV4) -> Result<Option<(RuntimeJobV4, RuntimeResultV4)>, StoreError> {
-        let Some(job) = self.runtime_job_v4(context, &call.call_id).await? else { return Ok(None); };
-        if call.tool_id != "runtime.execute" || call.canonical_hash().map_err(|error| StoreError::InvalidInput(error.to_string()))? != job.request_sha256 {
-            return Err(StoreError::InvalidInput("runtime receipt request mismatch".into()));
+    pub async fn recover_runtime_result_v4(
+        &self,
+        context: &ExecutionContextKeyV4,
+        call: &omicsops_protocol::ToolCallV4,
+    ) -> Result<Option<(RuntimeJobV4, RuntimeResultV4)>, StoreError> {
+        let Some(job) = self.runtime_job_v4(context, &call.call_id).await? else {
+            return Ok(None);
+        };
+        if call.tool_id != "runtime.execute"
+            || call
+                .canonical_hash()
+                .map_err(|error| StoreError::InvalidInput(error.to_string()))?
+                != job.request_sha256
+        {
+            return Err(StoreError::InvalidInput(
+                "runtime receipt request mismatch".into(),
+            ));
         }
-        if !matches!(job.state, RuntimeJobStateV4::Succeeded | RuntimeJobStateV4::Failed) { return Ok(None); }
-        let serialized: Option<String> = sqlx::query_scalar("SELECT result_json FROM runtime_job_results_v4 WHERE job_id=?1")
-            .bind(job.job_id.to_string()).fetch_optional(&self.pool).await?;
-        let Some(serialized) = serialized else { return Ok(None); };
-        if serialized.len() > 1024 * 1024 || Some(hex::encode(Sha256::digest(serialized.as_bytes()))) != job.result_sha256 {
-            return Err(StoreError::InvalidInput("runtime receipt digest mismatch".into()));
+        if !matches!(
+            job.state,
+            RuntimeJobStateV4::Succeeded | RuntimeJobStateV4::Failed
+        ) {
+            return Ok(None);
+        }
+        let serialized: Option<String> =
+            sqlx::query_scalar("SELECT result_json FROM runtime_job_results_v4 WHERE job_id=?1")
+                .bind(job.job_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some(serialized) = serialized else {
+            return Ok(None);
+        };
+        if serialized.len() > 1024 * 1024
+            || Some(hex::encode(Sha256::digest(serialized.as_bytes()))) != job.result_sha256
+        {
+            return Err(StoreError::InvalidInput(
+                "runtime receipt digest mismatch".into(),
+            ));
         }
         let result: RuntimeResultV4 = serde_json::from_str(&serialized)?;
-        if Some(result.session_id) != job.session_id || Some(result.request_id) != job.result_request_id
-            || result.succeeded != (job.state == RuntimeJobStateV4::Succeeded) {
-            return Err(StoreError::InvalidInput("runtime receipt identity mismatch".into()));
+        if Some(result.session_id) != job.session_id
+            || Some(result.request_id) != job.result_request_id
+            || result.succeeded != (job.state == RuntimeJobStateV4::Succeeded)
+        {
+            return Err(StoreError::InvalidInput(
+                "runtime receipt identity mismatch".into(),
+            ));
         }
         Ok(Some((job, result)))
     }

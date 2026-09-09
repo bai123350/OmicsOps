@@ -4575,12 +4575,22 @@ impl DesktopToolExecutorV4 {
 #[async_trait]
 impl ToolExecutorV4 for DesktopToolExecutorV4 {
     async fn recover_result(&self, call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
-        if call.tool_id != "runtime.execute" { return Ok(None); }
+        if call.tool_id != "runtime.execute" {
+            return Ok(None);
+        }
         let language = parse_language(required(&call.arguments, "language")?)?;
-        let environment = call.arguments.get("environment").and_then(Value::as_str).unwrap_or("system");
+        let environment = call
+            .arguments
+            .get("environment")
+            .and_then(Value::as_str)
+            .unwrap_or("system");
         let key = self.key(language, environment)?;
-        self.repository.recover_runtime_result_v4(&key, call).await.map_err(|error| error.to_string())?
-            .map(|(job, result)| crate::runtime_jobs_v4::outcome(call, &job, &result)).transpose()
+        self.repository
+            .recover_runtime_result_v4(&key, call)
+            .await
+            .map_err(|error| error.to_string())?
+            .map(|(job, result)| crate::runtime_jobs_v4::outcome(call, &job, &result))
+            .transpose()
     }
     async fn execute(&self, call: &ToolCallV4) -> Result<ToolOutcomeV4, String> {
         self.execute_inner(call, false).await

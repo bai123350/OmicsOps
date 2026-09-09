@@ -290,9 +290,24 @@ mod tests {
             if !fail {
                 let (running, result) = a.as_ref().or(b.as_ref()).unwrap();
                 let expected = outcome(&call, running, result).unwrap();
-                store.advance_runtime_job_v4(running, RuntimeJobStateV4::Succeeded, None, Some(result)).await.unwrap();
-                let (restored_job, restored_result) = store.recover_runtime_result_v4(&key, &call).await.unwrap().unwrap();
-                assert_eq!(outcome(&call, &restored_job, &restored_result).unwrap(), expected);
+                store
+                    .advance_runtime_job_v4(
+                        running,
+                        RuntimeJobStateV4::Succeeded,
+                        None,
+                        Some(result),
+                    )
+                    .await
+                    .unwrap();
+                let (restored_job, restored_result) = store
+                    .recover_runtime_result_v4(&key, &call)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    outcome(&call, &restored_job, &restored_result).unwrap(),
+                    expected
+                );
                 assert_eq!(process.calls.load(Ordering::SeqCst), 1);
             }
             // A new manager represents loss of the local interpreter registry.
@@ -307,41 +322,44 @@ mod tests {
     }
 }
 
-pub(crate) fn outcome(call: &ToolCallV4, running: &RuntimeJobV4, result: &RuntimeResultV4) -> Result<omicsops_protocol::ToolOutcomeV4, String> {
-                let content = format!(
-                    "session={} process={} request={}\nstdout ({} bytes, sha256={}):\n{}\nstderr ({} bytes, sha256={}):\n{}",
-                    result.session_id,
-                    result.process_identity,
-                    result.request_id,
-                    result
-                        .stdout_capture
-                        .as_ref()
-                        .map_or(0, |capture| capture.total_bytes),
-                    result
-                        .stdout_capture
-                        .as_ref()
-                        .map_or("", |capture| capture.sha256.as_str()),
-                    result.stdout,
-                    result
-                        .stderr_capture
-                        .as_ref()
-                        .map_or(0, |capture| capture.total_bytes),
-                    result
-                        .stderr_capture
-                        .as_ref()
-                        .map_or("", |capture| capture.sha256.as_str()),
-                    result.stderr
-                );
-                return Ok(omicsops_protocol::ToolOutcomeV4 {
-                    call_id: call.call_id.clone(),
-                    tool_id: call.tool_id.clone(),
-                    succeeded: result.succeeded,
-                    model_content: content,
-                    data: serde_json::to_value(&result).map_err(|e| e.to_string())?,
-                    provenance: vec![
-                        format!("kernel-session:{}", result.session_id),
-                        format!("runtime-job:{}", running.job_id),
-                    ],
-                });
+pub(crate) fn outcome(
+    call: &ToolCallV4,
+    running: &RuntimeJobV4,
+    result: &RuntimeResultV4,
+) -> Result<omicsops_protocol::ToolOutcomeV4, String> {
+    let content = format!(
+        "session={} process={} request={}\nstdout ({} bytes, sha256={}):\n{}\nstderr ({} bytes, sha256={}):\n{}",
+        result.session_id,
+        result.process_identity,
+        result.request_id,
+        result
+            .stdout_capture
+            .as_ref()
+            .map_or(0, |capture| capture.total_bytes),
+        result
+            .stdout_capture
+            .as_ref()
+            .map_or("", |capture| capture.sha256.as_str()),
+        result.stdout,
+        result
+            .stderr_capture
+            .as_ref()
+            .map_or(0, |capture| capture.total_bytes),
+        result
+            .stderr_capture
+            .as_ref()
+            .map_or("", |capture| capture.sha256.as_str()),
+        result.stderr
+    );
+    return Ok(omicsops_protocol::ToolOutcomeV4 {
+        call_id: call.call_id.clone(),
+        tool_id: call.tool_id.clone(),
+        succeeded: result.succeeded,
+        model_content: content,
+        data: serde_json::to_value(&result).map_err(|e| e.to_string())?,
+        provenance: vec![
+            format!("kernel-session:{}", result.session_id),
+            format!("runtime-job:{}", running.job_id),
+        ],
+    });
 }
-

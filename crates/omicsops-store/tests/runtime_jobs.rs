@@ -389,45 +389,142 @@ async fn result_receipt_survives_reopen_is_verified_and_retires_with_tool_event(
     let path = temp.path().join("receipts.sqlite");
     let store = Store::open(&path).await.unwrap();
     let (key, call) = fixture(&store).await;
-    let (reserved, _) = store.reserve_runtime_job_v4(&key, &call.call_id, &call.canonical_hash().unwrap()).await.unwrap();
+    let (reserved, _) = store
+        .reserve_runtime_job_v4(&key, &call.call_id, &call.canonical_hash().unwrap())
+        .await
+        .unwrap();
     let session = Uuid::new_v4();
-    let running = store.advance_runtime_job_v4(&reserved, RuntimeJobStateV4::Running, Some(session), None).await.unwrap();
+    let running = store
+        .advance_runtime_job_v4(&reserved, RuntimeJobStateV4::Running, Some(session), None)
+        .await
+        .unwrap();
     let output = result(session, true);
-    store.advance_runtime_job_v4(&running, RuntimeJobStateV4::Succeeded, None, Some(&output)).await.unwrap();
+    store
+        .advance_runtime_job_v4(&running, RuntimeJobStateV4::Succeeded, None, Some(&output))
+        .await
+        .unwrap();
     store.pool().close().await;
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.recover_runtime_result_v4(&key, &call).await.unwrap().unwrap().1, output);
+    assert_eq!(
+        store
+            .recover_runtime_result_v4(&key, &call)
+            .await
+            .unwrap()
+            .unwrap()
+            .1,
+        output
+    );
     let mut changed = call.clone();
     changed.arguments["code"] = json!("different");
-    assert!(store.recover_runtime_result_v4(&key, &changed).await.is_err());
-    let original: String = sqlx::query_scalar("SELECT result_json FROM runtime_job_results_v4").fetch_one(store.pool()).await.unwrap();
-    sqlx::query("UPDATE runtime_job_results_v4 SET result_json='{}'").execute(store.pool()).await.unwrap();
+    assert!(
+        store
+            .recover_runtime_result_v4(&key, &changed)
+            .await
+            .is_err()
+    );
+    let original: String = sqlx::query_scalar("SELECT result_json FROM runtime_job_results_v4")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE runtime_job_results_v4 SET result_json='{}'")
+        .execute(store.pool())
+        .await
+        .unwrap();
     assert!(store.recover_runtime_result_v4(&key, &call).await.is_err());
-    sqlx::query("UPDATE runtime_job_results_v4 SET result_json=?1").bind(original).execute(store.pool()).await.unwrap();
-    let previous = store.agent_events_v4(key.run_id).await.unwrap().pop().unwrap();
-    let event = AgentEventV4::next(&previous, Utc::now(), AgentEventKindV4::ToolFinished { outcome: ToolOutcomeV4 { call_id: call.call_id.clone(), tool_id: call.tool_id.clone(), succeeded: true, model_content: "42".into(), data: serde_json::to_value(&output).unwrap(), provenance: vec![] } });
+    sqlx::query("UPDATE runtime_job_results_v4 SET result_json=?1")
+        .bind(original)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let previous = store
+        .agent_events_v4(key.run_id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let event = AgentEventV4::next(
+        &previous,
+        Utc::now(),
+        AgentEventKindV4::ToolFinished {
+            outcome: ToolOutcomeV4 {
+                call_id: call.call_id.clone(),
+                tool_id: call.tool_id.clone(),
+                succeeded: true,
+                model_content: "42".into(),
+                data: serde_json::to_value(&output).unwrap(),
+                provenance: vec![],
+            },
+        },
+    );
     sqlx::query("CREATE TRIGGER reject_receipt_delete BEFORE DELETE ON runtime_job_results_v4 BEGIN SELECT RAISE(ABORT,'synthetic deletion failure'); END").execute(store.pool()).await.unwrap();
     assert!(store.append_agent_event_v4(&event).await.is_err());
-    assert!(store.recover_runtime_result_v4(&key, &call).await.unwrap().is_some());
-    assert_eq!(store.agent_events_v4(key.run_id).await.unwrap().last(), Some(&previous));
-    sqlx::query("DROP TRIGGER reject_receipt_delete").execute(store.pool()).await.unwrap();
+    assert!(
+        store
+            .recover_runtime_result_v4(&key, &call)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        store.agent_events_v4(key.run_id).await.unwrap().last(),
+        Some(&previous)
+    );
+    sqlx::query("DROP TRIGGER reject_receipt_delete")
+        .execute(store.pool())
+        .await
+        .unwrap();
     store.append_agent_event_v4(&event).await.unwrap();
-    assert!(store.recover_runtime_result_v4(&key, &call).await.unwrap().is_none());
+    assert!(
+        store
+            .recover_runtime_result_v4(&key, &call)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
 async fn receipt_failure_and_size_limit_never_commit_terminal_metadata() {
     let store = Store::open_in_memory().await.unwrap();
     let (key, call) = fixture(&store).await;
-    let (reserved, _) = store.reserve_runtime_job_v4(&key, &call.call_id, &call.canonical_hash().unwrap()).await.unwrap();
+    let (reserved, _) = store
+        .reserve_runtime_job_v4(&key, &call.call_id, &call.canonical_hash().unwrap())
+        .await
+        .unwrap();
     let session = Uuid::new_v4();
-    let running = store.advance_runtime_job_v4(&reserved, RuntimeJobStateV4::Running, Some(session), None).await.unwrap();
+    let running = store
+        .advance_runtime_job_v4(&reserved, RuntimeJobStateV4::Running, Some(session), None)
+        .await
+        .unwrap();
     let mut output = result(session, true);
     output.stdout = "x".repeat(1024 * 1024);
-    assert!(store.advance_runtime_job_v4(&running, RuntimeJobStateV4::Succeeded, None, Some(&output)).await.is_err());
+    assert!(
+        store
+            .advance_runtime_job_v4(&running, RuntimeJobStateV4::Succeeded, None, Some(&output))
+            .await
+            .is_err()
+    );
     output.stdout = "small".into();
     sqlx::query("CREATE TRIGGER reject_receipt BEFORE INSERT ON runtime_job_results_v4 BEGIN SELECT RAISE(ABORT,'synthetic failure'); END").execute(store.pool()).await.unwrap();
-    assert!(store.advance_runtime_job_v4(&running, RuntimeJobStateV4::Succeeded, None, Some(&output)).await.is_err());
-    assert_eq!(store.runtime_job_v4(&key, &call.call_id).await.unwrap().unwrap(), running);
-    assert!(store.recover_runtime_result_v4(&key, &call).await.unwrap().is_none());
+    assert!(
+        store
+            .advance_runtime_job_v4(&running, RuntimeJobStateV4::Succeeded, None, Some(&output))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .runtime_job_v4(&key, &call.call_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        running
+    );
+    assert!(
+        store
+            .recover_runtime_result_v4(&key, &call)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
