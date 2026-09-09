@@ -183,3 +183,10 @@ remains retryable. Verify the original job and receipt remain auditable, and no
 kernel/model is started by cancellation. A delayed resume must not overwrite the
 cancelled state. Deterministic store/UI/desktop tests cover these transitions;
 manual desktop, real-model and SSH cancellation smoke have not been executed.
+
+For child guidance smoke on Windows/macOS, send guidance while an ordinary
+read-only delegation is waiting for a child response or read. Completed evidence
+should remain visible; pending child work should fail with guidance interruption,
+its dependents should not run, and the parent should apply the guidance once and
+replan. This is not a compute-job interrupt. Deterministic tests use pending
+futures and notifications; real-model/SSH/manual desktop smoke remains unexecuted.

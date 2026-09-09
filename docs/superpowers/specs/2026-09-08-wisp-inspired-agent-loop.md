@@ -153,3 +153,9 @@ compose 在建立 SSH/解释器资源前读取并验证主 profile；后续凭�
 新增 agent_v4_cancel_runtime_recovery 命令，复用 run_id 参数及已有事件契约。桌面先取得现有 driver 槽位，活动执行/恢复检查占用时拒绝该请求。Store 在 BEGIN IMMEDIATE 中仅允许 waiting_for_input 且最后事件为 RuntimeRecoveryAvailable 的运行转为 cancelled；RunCancelled 和两份 status（列/JSON）同事务写入。已完成的同一次取消返回原事件，其他暂停、已继续执行或其他终态不被覆盖。job 元数据及回执保留审计，不启动解释器、不生成 ToolFinished、不将结果视作已通过科学核验。
 
 界面内联提供“取消此运行”，与恢复共用点击锁和 DesktopApp 的会话/run 操作锁；提交失败可重试，RunCancelled 收口后隐藏两项动作。恢复在取得 driver 槽位后重新检查取消事件，以处理 compose 等待期间取消已提交的竞态，失败时释放槽位；不改变原有失败运行的兼容恢复。Windows/macOS 使用同一路径，无覆盖层、额外审批、数据库迁移或凭据字段变化。真实远端运行中的中断/重连和其他暂停类型取消不属于此增量。
+
+## 2026-09-09 增量：子 Agent 指导等待切入
+
+ordinary graph 的节点接收父 run_id，仅用于检查持久化指导收件箱。开始新模型轮次、派发/接收工具结果时检查；模型/只读工具等待沿用 50 ms 取消检查间隔观察指导。发现 pending 时未完成节点返回 Failed，挂起读取保留 guidance_interrupted 失败 outcome、空 provenance；既有成功节点及该节点已完成的工具结果保留，失败依赖节点为 Blocked。收件箱错误也停止节点，保留其失败原因，即便下一次查询恢复也不会继续旧请求。
+
+节点不消费指导、不追加事件、不更改全局 cancelled；父调度器在 join 收口后仍按原顺序持久化 NodeFinished/GraphFinished/ToolFinished，主循环随后按原事务消费 GuidanceConsumed 并重新决策。预算预留不退款、工具能力不扩张，approved-plan 节点不观察 ordinary 指导。无新协议字段、数据库迁移、UI 覆盖层、凭据或远端驻留变化；Windows/macOS 共用 core 实现。此行为放弃本地等待，不宣称远端服务已经停止执行，不影响 runtime 副作用工具等待策略。

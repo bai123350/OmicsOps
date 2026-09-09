@@ -143,3 +143,11 @@ receipts/job identities for audit, and does not launch computation or validate t
 results. Resume and cancel are mutually exclusive while an action is submitting;
 a delayed resume cannot overwrite a committed cancellation. This action applies
 only to saved-result recovery, not other pauses or live remote jobs.
+
+In-run guidance now also yields pending child-model and delegated read-only tool
+waits in ordinary runs. Completed nodes and reads remain in the graph trace;
+interrupted reads carry a failed guidance_interrupted result without evidence,
+and downstream nodes are blocked. Children observe the inbox but leave its
+consumption to the parent after the graph settles. This does not set the global
+Stop token, interrupt compute jobs, refund delegation budgets, or change
+approved-plan delegation behavior.

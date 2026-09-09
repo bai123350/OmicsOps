@@ -1957,6 +1957,7 @@ impl AgentCoreV4<'_> {
                     dependency_outputs,
                     limits,
                     cancelled,
+                    (spec.execution_kind == RunExecutionKindV4::OrdinaryAgent).then_some(spec.run_id),
                 )
             });
             for outcome in join_all(futures).await {
@@ -2003,6 +2004,7 @@ impl AgentCoreV4<'_> {
             dependency_outputs,
             limits,
             cancelled,
+            None,
         )
         .await
     }
@@ -2014,6 +2016,7 @@ impl AgentCoreV4<'_> {
         dependency_outputs: BTreeMap<String, Value>,
         limits: AgentLimitsV4,
         cancelled: &AtomicBool,
+        guidance_run_id: Option<Uuid>,
     ) -> DelegationNodeOutcomeV4 {
         let mut tool_outcomes = Vec::new();
         let mut feedback = Vec::<String>::new();
@@ -2028,8 +2031,8 @@ impl AgentCoreV4<'_> {
             .collect::<Vec<_>>();
         descriptors.push(delegated_result_descriptor(&node.output_schema));
         for _ in 0..node.budget.max_turns {
-            if cancelled.load(Ordering::SeqCst) {
-                return failed_delegation_node(node, "delegated task was cancelled", tool_outcomes);
+            if let Some(reason) = self.delegated_stop_reason(cancelled, guidance_run_id).await {
+                return failed_delegation_node(node, reason, tool_outcomes);
             }
             let context = json!({
                 "node_id": node.id,
@@ -2068,29 +2071,23 @@ impl AgentCoreV4<'_> {
             tokio::pin!(deadline);
             let model_result = loop {
                 tokio::select! {
-                    _ = &mut deadline => break Some(Err(ModelFailureV4::permanent(
+                    _ = &mut deadline => break Ok(Err(ModelFailureV4::permanent(
                         omicsops_protocol::ModelErrorClassV4::Timeout,
                         "delegated model attempt timed out",
                     ))),
-                    result = &mut pending => break Some(result),
+                    result = &mut pending => break Ok(result),
                     _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                        if cancelled.load(Ordering::SeqCst) {
-                            break None;
+                        if let Some(reason) = self.delegated_stop_reason(cancelled, guidance_run_id).await {
+                            break Err(reason);
                         }
                     }
                 }
             };
             drop(pending);
             let turn = match model_result {
-                None => {
-                    return failed_delegation_node(
-                        node,
-                        "delegated task was cancelled",
-                        tool_outcomes,
-                    );
-                }
-                Some(Ok(turn)) => turn,
-                Some(Err(error)) => {
+                Err(reason) => return failed_delegation_node(node, reason, tool_outcomes),
+                Ok(Ok(turn)) => turn,
+                Ok(Err(error)) => {
                     return failed_delegation_node(
                         node,
                         format!("delegated model failed: {}", error.message),
@@ -2099,12 +2096,8 @@ impl AgentCoreV4<'_> {
                 }
             };
             for call in turn.tool_calls {
-                if cancelled.load(Ordering::SeqCst) {
-                    return failed_delegation_node(
-                        node,
-                        "delegated task was cancelled",
-                        tool_outcomes,
-                    );
+                if let Some(reason) = self.delegated_stop_reason(cancelled, guidance_run_id).await {
+                    return failed_delegation_node(node, reason, tool_outcomes);
                 }
                 if call.tool_id == "agent.submit_delegated_result" {
                     let output = call.arguments.get("output").cloned().unwrap_or(Value::Null);
@@ -2142,6 +2135,7 @@ impl AgentCoreV4<'_> {
                 }
                 let allowed = node.capabilities.contains(&call.tool_id)
                     && self.tools.effect(&call.tool_id) == Some(ToolEffectV4::ReadOnly);
+                let mut stop_after_tool = None;
                 let outcome = if !allowed {
                     ToolOutcomeV4 {
                         call_id: call.call_id,
@@ -2171,8 +2165,9 @@ impl AgentCoreV4<'_> {
                             result = &mut execution => break result,
                             _ = &mut deadline => break Err("delegated read-only tool timed out".into()),
                             _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                                if cancelled.load(Ordering::SeqCst) {
-                                    break Err("delegated task was cancelled".into());
+                                if let Some(reason) = self.delegated_stop_reason(cancelled, guidance_run_id).await {
+                                    stop_after_tool = Some(reason);
+                                    break Err(reason.into());
                                 }
                             }
                         }
@@ -2183,14 +2178,20 @@ impl AgentCoreV4<'_> {
                             call_id: call.call_id,
                             tool_id: call.tool_id,
                             succeeded: false,
+                            data: json!({"error_kind": if error.starts_with("guidance_interrupted:") { "guidance_interrupted" } else { "delegation_tool" }}),
                             model_content: error,
-                            data: json!({"error_kind":"delegation_tool"}),
                             provenance: vec![],
                         },
                     }
                 };
                 feedback.push(serde_json::to_string(&outcome).expect("serializable tool result"));
                 tool_outcomes.push(outcome);
+                if let Some(reason) = stop_after_tool {
+                    return failed_delegation_node(node, reason, tool_outcomes);
+                }
+                if let Some(reason) = self.delegated_stop_reason(cancelled, guidance_run_id).await {
+                    return failed_delegation_node(node, reason, tool_outcomes);
+                }
             }
         }
         failed_delegation_node(
@@ -2201,6 +2202,18 @@ impl AgentCoreV4<'_> {
                 .unwrap_or_else(|| "delegated node did not submit a result".into()),
             tool_outcomes,
         )
+    }
+
+    // Children only observe the inbox. The parent driver consumes it after
+    // preserving the graph results, so event sequence ownership stays singular.
+    async fn delegated_stop_reason(&self, cancelled: &AtomicBool, run_id: Option<Uuid>) -> Option<&'static str> {
+        if cancelled.load(Ordering::SeqCst) { return Some("delegated task was cancelled"); }
+        let run_id = run_id?;
+        match self.events.has_pending_guidance(run_id).await {
+            Ok(false) => None,
+            Ok(true) => Some("guidance_interrupted: delegated task yielded to new user guidance"),
+            Err(_) => Some("delegated guidance inbox unavailable; task stopped without further requests"),
+        }
     }
 
     async fn model_turn(
@@ -8288,6 +8301,7 @@ mod tests {
     struct GuidanceTestStore {
         inner: MemoryStore,
         pending: Mutex<Option<(Uuid, String)>>,
+        fail_next_poll: AtomicBool,
     }
     #[async_trait]
     impl EventStoreV4 for GuidanceTestStore {
@@ -8306,6 +8320,7 @@ mod tests {
             self.inner.archive_context(id, text, checkpoint).await
         }
         async fn has_pending_guidance(&self, _: Uuid) -> Result<bool, String> {
+            if self.fail_next_poll.swap(false, Ordering::SeqCst) { return Err("synthetic inbox failure".into()); }
             Ok(self.pending.lock().unwrap().is_some())
         }
         async fn consume_guidance(&self, spec: &RunSpecV4) -> Result<bool, String> {
@@ -10250,6 +10265,129 @@ mod tests {
             Err(AgentCoreErrorV4::Delegation(_))
         ));
         assert_eq!(store.events.lock().unwrap().len(), before);
+    }
+
+    struct GuidedChildModel {
+        entered: Arc<tokio::sync::Notify>,
+        wait_on_tool: bool,
+        requests: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl ModelPortV4 for GuidedChildModel {
+        async fn stream(&self, request: ModelRequestV4, _: &mut (dyn FnMut(ModelStreamEventV4) + Send)) -> Result<ModelTurnV4, ModelFailureV4> {
+            let context: Value = serde_json::from_str(&request.context).unwrap();
+            let id = context["node_id"].as_str().unwrap().to_owned();
+            self.requests.lock().unwrap().push(id.clone());
+            assert!(context.get("active_guidance").is_none());
+            match id.as_str() {
+                "done" => Ok(delegated_submission(json!({"value":"completed evidence"}))),
+                "wait" if self.wait_on_tool => Ok(ModelTurnV4 { public_text: String::new(), tool_calls: ["fast", "slow"].into_iter().map(|id| ToolCallV4 { call_id: id.into(), tool_id: "read".into(), arguments: json!({}) }).collect() }),
+                "wait" => { self.entered.notify_one(); std::future::pending().await }
+                _ => panic!("downstream work must not start after guidance"),
+            }
+        }
+    }
+    struct GuidedChildTools(Arc<tokio::sync::Notify>);
+    #[async_trait]
+    impl ToolPortV4 for GuidedChildTools {
+        fn descriptors(&self, mode: RunModeV4) -> Vec<ToolDescriptorV4> { DelegationReadTools { payload: String::new(), hang: false }.descriptors(mode) }
+        fn effect(&self, id: &str) -> Option<ToolEffectV4> { (id == "read").then_some(ToolEffectV4::ReadOnly) }
+        fn validate(&self, _: RunModeV4, _: &ToolCallV4) -> Result<(), String> { Ok(()) }
+        async fn execute(&self, mode: RunModeV4, call: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            if call.call_id == "slow" { self.0.notify_one(); return std::future::pending().await; }
+            DelegationReadTools { payload: "completed tool evidence".into(), hang: false }.execute(mode, call).await
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_guidance_yields_waits_retains_evidence_and_leaves_consumption_to_parent() {
+        for wait_on_tool in [false, true] {
+            let store = GuidanceTestStore::default();
+            let mut spec = delegation_spec(Uuid::new_v4());
+            spec.execution_kind = RunExecutionKindV4::OrdinaryAgent;
+            spec.plan.requested_capabilities.insert("read".into());
+            spec.approved_plan_hash = spec.plan.canonical_hash().unwrap();
+            store.append(&AgentEventV4::first(spec.run_id, spec.project_id, spec.conversation_id, Utc::now(), AgentEventKindV4::RunCreated { mode: RunModeV4::Execute })).await.unwrap();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let model = GuidedChildModel { entered: entered.clone(), wait_on_tool, requests: Mutex::new(vec![]) };
+            let tools = GuidedChildTools(entered.clone());
+            let core = AgentCoreV4 { model: &model, tools: &tools, events: &store, science: None };
+            let mut waiting = delegated_node("wait", vec![], 2);
+            waiting.isolation = DelegationIsolationV4::ReadOnlyProject;
+            waiting.capabilities.insert("read".into());
+            waiting.budget.max_tool_calls = 2;
+            let graph = DelegationGraphV4 { schema_version: 4, nodes: vec![delegated_node("done", vec![], 1), waiting, delegated_node("downstream", vec!["wait"], 1)] };
+            let cancelled = AtomicBool::new(false);
+            validate_delegation_graph_v4(&graph, &spec, &tools, AgentLimitsV4::default()).unwrap();
+            let guidance = async {
+                entered.notified().await;
+                *store.pending.lock().unwrap() = Some((Uuid::new_v4(), "change direction".into()));
+            };
+            let (outcome, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(core.execute_delegation_graph(&spec, "graph", graph, AgentLimitsV4::default(), &cancelled), guidance)
+            }).await.unwrap();
+            let outcome = outcome.unwrap();
+            assert_eq!(outcome.nodes["done"].status, DelegationNodeStatusV4::Succeeded);
+            assert_eq!(outcome.nodes["done"].output, Some(json!({"value":"completed evidence"})));
+            assert_eq!(outcome.nodes["wait"].status, DelegationNodeStatusV4::Failed);
+            assert!(outcome.nodes["wait"].error.as_deref().unwrap().starts_with("guidance_interrupted:"));
+            assert_eq!(outcome.nodes["downstream"].status, DelegationNodeStatusV4::Blocked);
+            if wait_on_tool {
+                let reads = &outcome.nodes["wait"].tool_outcomes;
+                assert_eq!(reads.len(), 2);
+                assert!(reads[0].succeeded);
+                assert_eq!(reads[0].data["payload"], "completed tool evidence");
+                assert!(!reads[1].succeeded);
+                assert_eq!(reads[1].data["error_kind"], "guidance_interrupted");
+                assert!(reads[1].provenance.is_empty());
+            }
+            assert_eq!(*model.requests.lock().unwrap(), vec!["done", "wait"]);
+            assert!(!cancelled.load(Ordering::SeqCst));
+            assert!(store.has_pending_guidance(spec.run_id).await.unwrap());
+            let history = store.load(spec.run_id).await.unwrap();
+            assert!(matches!(history.last().unwrap().event, AgentEventKindV4::DelegationGraphFinished { .. }));
+            assert!(!history.iter().any(|event| matches!(event.event, AgentEventKindV4::GuidanceConsumed { .. })));
+            assert!(core.consume_guidance(&spec).await.unwrap());
+            assert!(!core.consume_guidance(&spec).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_inbox_failure_stops_read_wait_even_if_next_poll_recovers() {
+        let store = GuidanceTestStore::default();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let model = GuidedChildModel { entered: entered.clone(), wait_on_tool: true, requests: Mutex::new(vec![]) };
+        let tools = GuidedChildTools(entered.clone());
+        let core = AgentCoreV4 { model: &model, tools: &tools, events: &store, science: None };
+        let mut node = delegated_node("wait", vec![], 2);
+        node.capabilities.insert("read".into());
+        node.budget.max_tool_calls = 2;
+        let cancelled = AtomicBool::new(false);
+        let fail_inbox = async { entered.notified().await; store.fail_next_poll.store(true, Ordering::SeqCst); };
+        let (outcome, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(core.execute_delegated_node_with_model(&model, &node, BTreeMap::new(), AgentLimitsV4::default(), &cancelled, Some(Uuid::new_v4())), fail_inbox)
+        }).await.unwrap();
+        assert_eq!(outcome.status, DelegationNodeStatusV4::Failed);
+        assert!(outcome.error.unwrap().contains("inbox unavailable"));
+        assert_eq!(outcome.tool_outcomes.len(), 2);
+        assert!(outcome.tool_outcomes[0].succeeded);
+        assert!(!outcome.tool_outcomes[1].succeeded);
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+        assert!(!store.has_pending_guidance(Uuid::new_v4()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn approved_delegation_does_not_consume_or_yield_to_guidance() {
+        let store = GuidanceTestStore::default();
+        *store.pending.lock().unwrap() = Some((Uuid::new_v4(), "ordinary guidance".into()));
+        let spec = delegation_spec(Uuid::new_v4());
+        store.append(&AgentEventV4::first(spec.run_id, spec.project_id, spec.conversation_id, Utc::now(), AgentEventKindV4::RunCreated { mode: RunModeV4::Execute })).await.unwrap();
+        let model = DelegationBoundaryModel { requests: Mutex::new(vec![]), turns: Mutex::new(std::collections::VecDeque::from([delegated_submission(json!({"value":"approved result"}))])) };
+        let core = AgentCoreV4 { model: &model, tools: &FakeTools, events: &store, science: None };
+        let graph = DelegationGraphV4 { schema_version: 4, nodes: vec![delegated_node("approved", vec![], 1)] };
+        let result = core.execute_delegation_graph(&spec, "approved-graph", graph, AgentLimitsV4::default(), &AtomicBool::new(false)).await.unwrap();
+        assert_eq!(result.nodes["approved"].status, DelegationNodeStatusV4::Succeeded);
+        assert!(store.has_pending_guidance(spec.run_id).await.unwrap());
     }
 
     #[tokio::test]

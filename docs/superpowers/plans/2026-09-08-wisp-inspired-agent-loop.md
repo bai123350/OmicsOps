@@ -40,7 +40,7 @@ Settings 可将主 profile 绑定到另一个已保存的只读子 profile；新
 
 已实现独立 SQLite 收件箱及 GuidanceConsumed 事件。接收不抢占事件序号；driver 在模型边界以同一事务消费并写事件。每 run 最多 16 条，每条最多 2048 UTF-8 字节，重送 message_id 幂等且校验项目/会话/run/内容。消费事件在 checkpoint 后仍完整进入 active_guidance，不修改 frozen spec 或 approved_plan。RunCompleted 与未消费收件箱在同一事务互斥，旧完成提案不能越过新指导。普通/计划启动在事务内争用同一会话；恢复复用原 run 的 driver 槽位。
 
-UI 使用内联面板，区分已接收和已应用，失败保留原文并复用请求 ID；切换 run 丢弃迟到响应。已应用仅表示持久化进入模型上下文，不表示指导要求已完成。模型等待及主循环未完成的 ReadOnly 工具等待可被指导打断。已完成的工具结果保留；中断的读取记录 guidance_interrupted 可恢复失败，不伪造证据。副作用工具仍等待 batch 收口；不调用 runtime 全局 interrupt，不宣称远端操作已取消。approved_plan 不受影响，无新增覆盖层。
+UI 使用内联面板，区分已接收和已应用，失败保留原文并复用请求 ID；切换 run 丢弃迟到响应。已应用仅表示持久化进入模型上下文，不表示指导要求已完成。模型等待及主循环未完成的 ReadOnly 工具等待可被指导打断；最新增量也覆盖 ordinary 子模型/只读工具等待。已完成的工具结果保留；中断的读取记录 guidance_interrupted 可恢复失败，不伪造证据。副作用工具仍等待 batch 收口；不调用 runtime 全局 interrupt，不宣称远端操作已取消。approved_plan 不受影响，无新增覆盖层。
 
 ## 切片 6：结构化等待的闭环
 
@@ -201,3 +201,11 @@ core/tools/desktop 增加只恢复不执行的 recover_result 接口；按原请
 完成 Store 原子取消/精确幂等重试、独立 Tauri 命令、内联按钮和恢复/取消互斥。保留回执及 job 身份，拒绝覆盖其他终态或普通输入暂停。执行启动在槽位内复查取消，阻止延迟恢复写回旧状态。测试覆盖事务故障回滚、并发重复取消、状态列/JSON一致、回执保留、其他状态拒绝、延迟启动拒绝、界面提交互斥/失败重试/终态收口。仍不提供运行中远端任务重连或普通暂停运行通用取消。
 
 本增量最终验证（2026-09-09）：存储取消近邻 2 项、桌面延迟恢复近邻 1 项、WorkspaceShell 近邻 42 项通过；`cargo test --workspace`、`npm test`（120 前端/22 扩展）、`npm run build`、`npm run build:desktop` 均通过。格式初查偏差经 `cargo fmt --all` 修复，复查及 diff 检查通过，纯格式单独提交。保留既有 Vite 大 chunk/Windows linker 提示；无依赖或迁移变化。真实模型、SSH、macOS 和桌面交互 smoke 未执行；未推送、发布或分发构建产物。
+
+## 2026-09-09：子 Agent 指导切入
+
+补齐 ordinary 子模型/只读工具等待的指导检查。成功节点、已完成读取和中断读取的失败 trace 均保留；依赖失败节点不继续执行。节点只读收件箱，由主循环消费指导，预算预留及 cancelled 标志不变。收件箱错误停止当前节点，不在后续查询恢复时重新启动旧请求。
+
+测试使用 Notify 和 pending future，覆盖模型等待/工具等待、成功 sibling、同节点已完成读取、下游阻断、父消费一次、approved-plan 不受影响以及收件箱一次失败。首次图测试误将读取能力赋予 EvidenceOnly 夹具被拒绝，修正为 ReadOnlyProject 后通过；没有放宽隔离规则。
+
+本增量最终验证（2026-09-09）：Agent Core 近邻全库 84 项通过；`cargo test --workspace`、`npm test`（120 前端/22 扩展）、`npm run build`、`npm run build:desktop` 均通过。新增测试覆盖 ordinary 指导切入、approved-plan 兼容及收件箱失败。格式初查偏差经 `cargo fmt --all` 修复，复查与 diff 检查通过，纯格式单独提交。保留既有 Vite 大 chunk/Windows linker 提示；无依赖、协议字段或迁移变化。真实模型、SSH、macOS 和桌面交互验收未执行，未推送或分发构建产物。
