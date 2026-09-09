@@ -2275,17 +2275,40 @@ async fn reconcile_run_terminal_event(
         .contains_key(&run_id);
     let terminal = missing_terminal_event(&record, &events, active, Utc::now());
     let _recovery_guard = if terminal.is_some() && record.status == "running" && !active {
-        let Some(guard) = register_active_run_guard(&state.active_runs, run_id, Arc::new(AtomicBool::new(false)))? else { return Ok(()); };
+        let Some(guard) = register_active_run_guard(
+            &state.active_runs,
+            run_id,
+            Arc::new(AtomicBool::new(false)),
+        )?
+        else {
+            return Ok(());
+        };
         record = load_record(&state.repository, run_id).await?;
-        let current = state.repository.agent_events_v4(run_id).await.map_err(|error| error.to_string())?;
-        if record.status != "running" || has_terminal_event(&current) || missing_terminal_event(&record, &current, false, Utc::now()).is_none() { return Ok(()); }
-        if let Some(event) = state.repository.prepare_runtime_recovery_v4(run_id).await.map_err(|error| error.to_string())? {
+        let current = state
+            .repository
+            .agent_events_v4(run_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if record.status != "running"
+            || has_terminal_event(&current)
+            || missing_terminal_event(&record, &current, false, Utc::now()).is_none()
+        {
+            return Ok(());
+        }
+        if let Some(event) = state
+            .repository
+            .prepare_runtime_recovery_v4(run_id)
+            .await
+            .map_err(|error| error.to_string())?
+        {
             // Persistence is authoritative; UI hydration also reads this event.
             let _ = app.emit(AGENT_V4_EVENT_CHANNEL, event);
             return Ok(());
         }
         Some(guard)
-    } else { None };
+    } else {
+        None
+    };
     if terminal.is_some() && matches!(record.status.as_str(), "completed" | "running") {
         record.status = "failed".into();
     }

@@ -7,56 +7,118 @@ impl Store {
     /// Called only after the desktop has acquired the inactive driver's slot.
     /// Preserve an interrupted run when every outstanding dispatched operation
     /// has a verified terminal receipt. Unknown side effects are never promoted.
-    pub async fn prepare_runtime_recovery_v4(&self, run_id: Uuid) -> Result<Option<AgentEventV4>, StoreError> {
+    pub async fn prepare_runtime_recovery_v4(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Option<AgentEventV4>, StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query("SELECT status,value_json FROM agent_runs_v4 WHERE run_id=?1")
-            .bind(run_id.to_string()).fetch_optional(&mut *tx).await?;
-        let Some(row) = row else { return Ok(None); };
-        if row.try_get::<String,_>(0)? != "running" { return Ok(None); }
-        let mut value: Value = serde_json::from_str(&row.try_get::<String,_>(1)?)?;
-        let Some(spec_value) = value.get("spec").filter(|spec| !spec.is_null()) else { return Ok(None); };
+            .bind(run_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        if row.try_get::<String, _>(0)? != "running" {
+            return Ok(None);
+        }
+        let mut value: Value = serde_json::from_str(&row.try_get::<String, _>(1)?)?;
+        let Some(spec_value) = value.get("spec").filter(|spec| !spec.is_null()) else {
+            return Ok(None);
+        };
         let spec: RunSpecV4 = serde_json::from_value(spec_value.clone())?;
-        spec.validate_integrity().map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+        spec.validate_integrity()
+            .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
         let events = load_agent_events_in_tx(&mut tx, run_id).await?;
-        if events.iter().any(is_terminal_event) || spec.run_id != run_id { return Ok(None); }
+        if events.iter().any(is_terminal_event) || spec.run_id != run_id {
+            return Ok(None);
+        }
         let mut requested = BTreeMap::new();
         let mut pending = BTreeMap::new();
         for event in &events {
             match &event.event {
-                AgentEventKindV4::ToolRequested { call } => { requested.insert(call.call_id.clone(), call.clone()); }
-                AgentEventKindV4::ToolDispatchStarted { call_id, tool_id, .. } => { pending.insert(call_id.clone(), tool_id.clone()); }
-                AgentEventKindV4::ToolFinished { outcome } | AgentEventKindV4::ToolOutcomeReused { outcome, .. } => { pending.remove(&outcome.call_id); }
-                AgentEventKindV4::ToolDispatchResolved { call_id, .. } => { pending.remove(call_id); }
+                AgentEventKindV4::ToolRequested { call } => {
+                    requested.insert(call.call_id.clone(), call.clone());
+                }
+                AgentEventKindV4::ToolDispatchStarted {
+                    call_id, tool_id, ..
+                } => {
+                    pending.insert(call_id.clone(), tool_id.clone());
+                }
+                AgentEventKindV4::ToolFinished { outcome }
+                | AgentEventKindV4::ToolOutcomeReused { outcome, .. } => {
+                    pending.remove(&outcome.call_id);
+                }
+                AgentEventKindV4::ToolDispatchResolved { call_id, .. } => {
+                    pending.remove(call_id);
+                }
                 AgentEventKindV4::ToolDispatchUncertain { .. } => return Ok(None),
                 _ => {}
             }
         }
-        if pending.is_empty() { return Ok(None); }
+        if pending.is_empty() {
+            return Ok(None);
+        }
         for (call_id, tool_id) in &pending {
-            if tool_id != "runtime.execute" { return Ok(None); }
-            let Some(call) = requested.get(call_id) else { return Ok(None); };
+            if tool_id != "runtime.execute" {
+                return Ok(None);
+            }
+            let Some(call) = requested.get(call_id) else {
+                return Ok(None);
+            };
             let row = sqlx::query("SELECT j.value_json,r.result_json FROM runtime_jobs_v4 j JOIN runtime_job_results_v4 r ON j.job_id=r.job_id WHERE j.run_id=?1 AND j.call_id=?2")
                 .bind(run_id.to_string()).bind(call_id).fetch_optional(&mut *tx).await?;
-            let Some(row) = row else { return Ok(None); };
-            let job: RuntimeJobV4 = serde_json::from_str(&row.try_get::<String,_>(0)?)?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            let job: RuntimeJobV4 = serde_json::from_str(&row.try_get::<String, _>(0)?)?;
             let serialized: String = row.try_get(1)?;
-            if job.context.project_id != spec.project_id || job.context.run_id != run_id || job.call_id != *call_id
-                || !matches!(job.state, RuntimeJobStateV4::Succeeded | RuntimeJobStateV4::Failed)
+            if job.context.project_id != spec.project_id
+                || job.context.run_id != run_id
+                || job.call_id != *call_id
+                || !matches!(
+                    job.state,
+                    RuntimeJobStateV4::Succeeded | RuntimeJobStateV4::Failed
+                )
                 || call.canonical_hash().ok().as_deref() != Some(job.request_sha256.as_str())
-                || serialized.len() > 1024 * 1024 || Some(hex::encode(Sha256::digest(serialized.as_bytes()))) != job.result_sha256 {
+                || serialized.len() > 1024 * 1024
+                || Some(hex::encode(Sha256::digest(serialized.as_bytes()))) != job.result_sha256
+            {
                 return Ok(None);
             }
             let result: RuntimeResultV4 = serde_json::from_str(&serialized)?;
-            if Some(result.session_id) != job.session_id || Some(result.request_id) != job.result_request_id
-                || result.succeeded != (job.state == RuntimeJobStateV4::Succeeded) { return Ok(None); }
-            if spec.compute_selection.as_ref().is_some_and(|selection| selection.backend_id != job.context.backend_id || selection.environment != job.context.environment) { return Ok(None); }
+            if Some(result.session_id) != job.session_id
+                || Some(result.request_id) != job.result_request_id
+                || result.succeeded != (job.state == RuntimeJobStateV4::Succeeded)
+            {
+                return Ok(None);
+            }
+            if spec.compute_selection.as_ref().is_some_and(|selection| {
+                selection.backend_id != job.context.backend_id
+                    || selection.environment != job.context.environment
+            }) {
+                return Ok(None);
+            }
         }
-        let Some(previous) = events.last() else { return Ok(None); };
-        let event = AgentEventV4::next(previous, Utc::now(), AgentEventKindV4::RuntimeRecoveryAvailable { call_ids: pending.into_keys().collect() });
+        let Some(previous) = events.last() else {
+            return Ok(None);
+        };
+        let event = AgentEventV4::next(
+            previous,
+            Utc::now(),
+            AgentEventKindV4::RuntimeRecoveryAvailable {
+                call_ids: pending.into_keys().collect(),
+            },
+        );
         insert_agent_event_in_tx(&mut tx, &event).await?;
         value["status"] = Value::String("waiting_for_input".into());
-        sqlx::query("UPDATE agent_runs_v4 SET status='waiting_for_input',value_json=?1 WHERE run_id=?2")
-            .bind(serde_json::to_string(&value)?).bind(run_id.to_string()).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE agent_runs_v4 SET status='waiting_for_input',value_json=?1 WHERE run_id=?2",
+        )
+        .bind(serde_json::to_string(&value)?)
+        .bind(run_id.to_string())
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(Some(event))
     }

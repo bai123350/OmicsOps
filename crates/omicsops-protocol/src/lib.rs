@@ -1085,7 +1085,9 @@ impl ReviewerReportV4 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentEventKindV4 {
-    RuntimeRecoveryAvailable { call_ids: Vec<String> },
+    RuntimeRecoveryAvailable {
+        call_ids: Vec<String>,
+    },
     GuidanceConsumed {
         message_id: Uuid,
         markdown: String,

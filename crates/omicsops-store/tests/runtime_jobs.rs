@@ -533,35 +533,112 @@ async fn receipt_failure_and_size_limit_never_commit_terminal_metadata() {
 async fn recovery_offer_is_atomic_and_idempotent_and_requires_all_receipts() {
     let store = Store::open_in_memory().await.unwrap();
     let (key, call) = fixture(&store).await;
-    assert!(store.prepare_runtime_recovery_v4(key.run_id).await.unwrap().is_none());
-    let (reserved, _) = store.reserve_runtime_job_v4(&key, &call.call_id, &call.canonical_hash().unwrap()).await.unwrap();
+    assert!(
+        store
+            .prepare_runtime_recovery_v4(key.run_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let (reserved, _) = store
+        .reserve_runtime_job_v4(&key, &call.call_id, &call.canonical_hash().unwrap())
+        .await
+        .unwrap();
     let session = Uuid::new_v4();
-    let running = store.advance_runtime_job_v4(&reserved, RuntimeJobStateV4::Running, Some(session), None).await.unwrap();
-    store.advance_runtime_job_v4(&running, RuntimeJobStateV4::Succeeded, None, Some(&result(session,true))).await.unwrap();
-    let previous = store.agent_events_v4(key.run_id).await.unwrap().pop().unwrap();
+    let running = store
+        .advance_runtime_job_v4(&reserved, RuntimeJobStateV4::Running, Some(session), None)
+        .await
+        .unwrap();
+    store
+        .advance_runtime_job_v4(
+            &running,
+            RuntimeJobStateV4::Succeeded,
+            None,
+            Some(&result(session, true)),
+        )
+        .await
+        .unwrap();
+    let previous = store
+        .agent_events_v4(key.run_id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
     sqlx::query("CREATE TRIGGER reject_recovery_offer BEFORE UPDATE ON agent_runs_v4 BEGIN SELECT RAISE(ABORT,'synthetic failure'); END").execute(store.pool()).await.unwrap();
     assert!(store.prepare_runtime_recovery_v4(key.run_id).await.is_err());
-    assert_eq!(store.agent_events_v4(key.run_id).await.unwrap().last(), Some(&previous));
-    sqlx::query("DROP TRIGGER reject_recovery_offer").execute(store.pool()).await.unwrap();
-    let (a,b) = tokio::join!(store.prepare_runtime_recovery_v4(key.run_id), store.prepare_runtime_recovery_v4(key.run_id));
-    let (a,b) = (a.unwrap(),b.unwrap());
-    assert_ne!(a.is_some(),b.is_some());
+    assert_eq!(
+        store.agent_events_v4(key.run_id).await.unwrap().last(),
+        Some(&previous)
+    );
+    sqlx::query("DROP TRIGGER reject_recovery_offer")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let (a, b) = tokio::join!(
+        store.prepare_runtime_recovery_v4(key.run_id),
+        store.prepare_runtime_recovery_v4(key.run_id)
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_ne!(a.is_some(), b.is_some());
     let event = a.or(b).unwrap();
-    assert!(matches!(event.event, AgentEventKindV4::RuntimeRecoveryAvailable { call_ids } if call_ids == vec![call.call_id]));
-    let status: String = sqlx::query_scalar("SELECT status FROM agent_runs_v4 WHERE run_id=?1").bind(key.run_id.to_string()).fetch_one(store.pool()).await.unwrap();
+    assert!(
+        matches!(event.event, AgentEventKindV4::RuntimeRecoveryAvailable { call_ids } if call_ids == vec![call.call_id])
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM agent_runs_v4 WHERE run_id=?1")
+        .bind(key.run_id.to_string())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
     assert_eq!(status, "waiting_for_input");
 }
 
 #[tokio::test]
 async fn incomplete_or_uncertain_dispatches_do_not_receive_recovery_offer() {
-    for uncertain in [false,true] {
+    for uncertain in [false, true] {
         let store = Store::open_in_memory().await.unwrap();
         let (key, call) = fixture(&store).await;
-        let (reserved, _) = store.reserve_runtime_job_v4(&key, &call.call_id, &call.canonical_hash().unwrap()).await.unwrap();
+        let (reserved, _) = store
+            .reserve_runtime_job_v4(&key, &call.call_id, &call.canonical_hash().unwrap())
+            .await
+            .unwrap();
         let session = Uuid::new_v4();
-        let running = store.advance_runtime_job_v4(&reserved, RuntimeJobStateV4::Running, Some(session), None).await.unwrap();
-        store.advance_runtime_job_v4(&running, RuntimeJobStateV4::Succeeded, None, Some(&result(session,true))).await.unwrap();
-        append(&store, key.run_id, if uncertain { AgentEventKindV4::ToolDispatchUncertain { call_id: call.call_id, tool_id: call.tool_id } } else { AgentEventKindV4::ToolDispatchStarted { call_id: "other".into(), tool_id: "mutate".into(), effect: ToolEffectV4::Mutating, idempotency_key: "other".into() } }).await;
-        assert!(store.prepare_runtime_recovery_v4(key.run_id).await.unwrap().is_none());
+        let running = store
+            .advance_runtime_job_v4(&reserved, RuntimeJobStateV4::Running, Some(session), None)
+            .await
+            .unwrap();
+        store
+            .advance_runtime_job_v4(
+                &running,
+                RuntimeJobStateV4::Succeeded,
+                None,
+                Some(&result(session, true)),
+            )
+            .await
+            .unwrap();
+        append(
+            &store,
+            key.run_id,
+            if uncertain {
+                AgentEventKindV4::ToolDispatchUncertain {
+                    call_id: call.call_id,
+                    tool_id: call.tool_id,
+                }
+            } else {
+                AgentEventKindV4::ToolDispatchStarted {
+                    call_id: "other".into(),
+                    tool_id: "mutate".into(),
+                    effect: ToolEffectV4::Mutating,
+                    idempotency_key: "other".into(),
+                }
+            },
+        )
+        .await;
+        assert!(
+            store
+                .prepare_runtime_recovery_v4(key.run_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
