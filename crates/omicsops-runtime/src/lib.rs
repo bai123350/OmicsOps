@@ -1,4 +1,6 @@
 mod process_backend;
+mod jobs;
+pub use jobs::RuntimeJobHandleV4;
 
 pub use process_backend::{ContainerKernelBackendV4, LocalKernelBackendV4};
 
@@ -92,6 +94,7 @@ impl ComputeBackendRegistryV4 {
 pub struct RuntimeManagerV4 {
     backend: Arc<dyn KernelBackendV4>,
     sessions: Mutex<HashMap<ExecutionContextKeyV4, Arc<dyn KernelProcessV4>>>,
+    jobs: std::sync::Mutex<jobs::Jobs>,
 }
 
 impl RuntimeManagerV4 {
@@ -99,6 +102,7 @@ impl RuntimeManagerV4 {
         Self {
             backend,
             sessions: Mutex::new(HashMap::new()),
+            jobs: Default::default(),
         }
     }
 
@@ -128,8 +132,28 @@ impl RuntimeManagerV4 {
         self.acquire(key).await?.execute(code, capture_paths).await
     }
 
+    /// Requires a durable launch reservation and the already acquired session.
+    pub async fn start_job(&self, key: &ExecutionContextKeyV4, job_id: Uuid, session_id: Uuid, code: String, captures: Vec<String>) -> Result<RuntimeJobHandleV4, String> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(key).filter(|session| session.session_id() == session_id)
+            .ok_or_else(|| "runtime job session is no longer available".to_owned())?;
+        self.jobs.lock().map_err(|_| "runtime worker registry unavailable")?.start(key, job_id, session.clone(), code, captures)
+    }
+
+    pub fn job(&self, key: &ExecutionContextKeyV4, job_id: Uuid) -> Result<Option<RuntimeJobHandleV4>, String> {
+        self.jobs.lock().map_err(|_| "runtime worker registry unavailable")?.get(key, job_id)
+    }
+
+    pub fn release_job(&self, key: &ExecutionContextKeyV4, job_id: Uuid) -> Result<(), String> {
+        self.jobs.lock().map_err(|_| "runtime worker registry unavailable")?.release(key, job_id)
+    }
+
     pub async fn interrupt(&self, key: &ExecutionContextKeyV4) -> Result<(), String> {
-        let session = self.sessions.lock().await.remove(key);
+        let session = {
+            let mut sessions = self.sessions.lock().await;
+            self.jobs.lock().map_err(|_| "runtime worker registry unavailable")?.interrupt(key);
+            sessions.remove(key)
+        };
         if let Some(session) = session {
             session.interrupt().await?;
         }
@@ -152,8 +176,12 @@ impl RuntimeManagerV4 {
                 .filter(|key| key.run_id == run_id)
                 .cloned()
                 .collect::<Vec<_>>();
+            let mut jobs = self.jobs.lock().map_err(|_| "runtime worker registry unavailable")?;
             keys.into_iter()
-                .filter_map(|key| guard.remove(&key))
+                .filter_map(|key| {
+                    jobs.interrupt(&key);
+                    guard.remove(&key)
+                })
                 .collect::<Vec<_>>()
         };
         for session in sessions {

@@ -153,3 +153,13 @@ UI 使用内联面板，区分已接收和已应用，失败保留原文并复�
 - `cargo fmt --all -- --check` 初次发现偏差，执行 `cargo fmt --all` 后复查通过；纯格式修改单独提交。`git diff --check` 通过。
 
 未执行真实模型、SSH、Windows/macOS 交互 smoke。以上验证不代表后台计算等待/重连端到端完成。
+
+## 切片 6：进程内后台 worker 与等待
+
+2026-09-09，RuntimeManager 增加以 job_id 和完整 context 绑定的后台 worker 注册表；请求指纹绑定会话 ID、代码和 capture_paths，相同 job_id 的冲突请求拒绝。启动权限仍由 Store 的持久化占用控制，释放内存记录不提供新的启动权限。
+
+桌面 runtime.execute 已通过 start_job/wait 执行已占用的调用。等待使用 watch 通知，不轮询模型；多个等待者共享同一 Arc 结果与产物引用。丢弃等待 future 不取消 worker，同一管理器可按 context/job_id 重新取得 handle。显式 interrupt/rebuild/interrupt_run 将相应等待者唤醒为未知并沿用现有内核中断；底层是否已停止仍不得伪造确认。worker panic/abort 同样收口为未知，迟到成功不能覆盖已记录的中断结果。
+
+注册表最多保留 128 条（包括未释放的终态）。正在运行的条目不能释放；桌面在读取终态后释放条目，既有等待 handle 仍能读取共享结果。管理器销毁会结束其 worker；这不是跨应用重启的后台守护进程。该等待只覆盖持有同一管理器期间，尚未增加 UI 暂停后自动重新挂接、远端状态/产物重连或独立 start/status/wait 模型工具，也未放宽 uncertain dispatch 自动恢复。
+
+本增量实际验证（2026-09-09）：`cargo test -p omicsops-runtime jobs --lib` 4 项通过；`cargo test --workspace` 通过；`npm test` 通过（116 项前端、22 项扩展）；`npm run build` 与 `npm run build:desktop` 通过，保留既有 Vite 大 chunk/Windows linker 信息提示。`cargo fmt --all -- --check` 初次发现格式偏差，运行 `cargo fmt --all` 后复查通过，格式单独提交；`git diff --check` 通过。无依赖变更，无构建产物分发。真实模型、SSH、macOS 和桌面交互 smoke 未执行。

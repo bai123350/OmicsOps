@@ -143,3 +143,9 @@ not proof that a remote process stopped. Check that normal subsequent cells with
 new call IDs still share the intended interpreter session. These manual scenarios
 have not been executed for this increment; deterministic tests use temporary SQLite
 and a fake interpreter, without API keys or a real SSH host.
+
+The in-process worker increment additionally requires checking that an ordinary
+runtime cell still returns its original output/artifact references and Stop wakes
+its wait promptly. Deterministic tests simulate a waiter timeout, reattachment to
+the same manager, repeated reads, worker failure and capacity exhaustion. A waiter
+reattachment is not an application-restart or SSH-reconnection acceptance test.

@@ -102,5 +102,6 @@ session. Repeating the same recorded invocation cannot launch a second computati
 including after an uncertain connection failure. Cancellation records unfinished
 jobs as unknown, not as confirmed remote cancellation. Completed output remains
 in the existing tool events and archives; the job ledger stores only metadata and
-a result digest. Background job waiting and automatic reconnection are not yet
-implemented.
+a result digest. In-process workers now support event-driven waiting and rereading
+results without rerunning computation. Dropping a waiter does not cancel its worker.
+Automatic reconnection across application restarts is not yet implemented.
