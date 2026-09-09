@@ -2990,7 +2990,7 @@ async fn compose(
                 client: crate::commands::unified_model_client_for_profile(state, &child)?
                     .with_request_budget(RequestBudget {
                         context_window_tokens: child.effective_context_window_tokens(),
-                        reserved_output_tokens: 4096,
+                        reserved_output_tokens: child.effective_output_tokens(),
                         safety_margin_tokens: 1024,
                     }),
                 prompt: prompt.clone(),
@@ -3009,7 +3009,7 @@ async fn compose(
                     context_window_tokens: model_profile.effective_context_window_tokens(),
                     // This is a requested output allowance, not an inferred
                     // maximum capability of an unknown model.
-                    reserved_output_tokens: 4096,
+                    reserved_output_tokens: model_profile.effective_output_tokens(),
                     safety_margin_tokens: 1024,
                 }),
             prompt,

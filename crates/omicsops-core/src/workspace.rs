@@ -236,6 +236,18 @@ pub enum ModelProviderKind {
     Ollama,
 }
 
+/// Catalog data captured when a profile is created; never refreshed implicitly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ModelCatalogCapabilities {
+    pub source_provider: String,
+    pub source_sha256: String,
+    pub context_limit: u32,
+    pub input_limit: Option<u32>,
+    pub output_limit: u32,
+    pub reasoning: bool,
+    pub reasoning_efforts: Option<Vec<String>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelProfile {
     pub id: Uuid,
@@ -248,6 +260,8 @@ pub struct ModelProfile {
     pub supports_vision: bool,
     #[serde(default)]
     pub context_window_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_capabilities: Option<ModelCatalogCapabilities>,
     /// Explicit OpenAI-compatible wire request; not a capability declaration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
@@ -270,13 +284,24 @@ impl ModelProfile {
         if let Some(effort) = &self.reasoning_effort {
             value["reasoning_effort"] = serde_json::json!(effort);
         }
+        if self.effective_output_tokens() != 4096 {
+            value["reserved_output_tokens"] = serde_json::json!(self.effective_output_tokens());
+        }
         hex::encode(Sha256::digest(
             serde_json::to_vec(&value).expect("serializable profile"),
         ))
     }
 
     pub fn effective_context_window_tokens(&self) -> u32 {
-        self.context_window_tokens.unwrap_or(32_768)
+        let requested = self.context_window_tokens.unwrap_or(32_768);
+        self.catalog_capabilities.as_ref().map_or(requested, |caps| {
+            // Conservatively reserve output even when a separate input limit exists.
+            requested.min(caps.context_limit).min(caps.input_limit.unwrap_or(u32::MAX))
+        })
+    }
+
+    pub fn effective_output_tokens(&self) -> u32 {
+        self.catalog_capabilities.as_ref().map_or(4096, |caps| caps.output_limit.min(4096))
     }
 }
 

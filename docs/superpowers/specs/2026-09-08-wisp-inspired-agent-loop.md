@@ -159,3 +159,12 @@ compose 在建立 SSH/解释器资源前读取并验证主 profile；后续凭�
 ordinary graph 的节点接收父 run_id，仅用于检查持久化指导收件箱。开始新模型轮次、派发/接收工具结果时检查；模型/只读工具等待沿用 50 ms 取消检查间隔观察指导。发现 pending 时未完成节点返回 Failed，挂起读取保留 guidance_interrupted 失败 outcome、空 provenance；既有成功节点及该节点已完成的工具结果保留，失败依赖节点为 Blocked。收件箱错误也停止节点，保留其失败原因，即便下一次查询恢复也不会继续旧请求。
 
 节点不消费指导、不追加事件、不更改全局 cancelled；父调度器在 join 收口后仍按原顺序持久化 NodeFinished/GraphFinished/ToolFinished，主循环随后按原事务消费 GuidanceConsumed 并重新决策。预算预留不退款、工具能力不扩张，approved-plan 节点不观察 ordinary 指导。无新协议字段、数据库迁移、UI 覆盖层、凭据或远端驻留变化；Windows/macOS 共用 core 实现。此行为放弃本地等待，不宣称远端服务已经停止执行，不影响 runtime 副作用工具等待策略。
+
+
+## 2026-09-09：持久化 models.dev 能力快照
+
+新建或更换模型身份时，从编译目录按协议、HTTPS host/port 和完整 model ID 精确匹配，保存上下文/输入/输出上限、工具/视觉能力及已公布的推理档位。当前覆盖八个明确支持的供应商端点；OpenRouter 保留完整供应商前缀，不使用家族、前缀或未知网关推断。目录带源 SHA-256，离线导入，不在构建、测试或应用启动时联网。
+
+同一身份的编辑保留旧 snapshot 和能力标志，legacy 无 snapshot 保留 32768/4096 回退。改 provider/base URL/model 采用新目录，省略的旧窗口/effort 不移植到新模型。显式窗口不能超过目录 context；单独 input limit 保守约束预算，输出请求 min(4096, output limit)。实际输出额度改变进入 profile hash，源校验和等审计信息不进入；主模型与子模型均使用持久快照，无旧 run/spec 回填或 SQL schema 迁移。
+
+Settings 显示已保存的目录上限。显式 effort 按已公布能力验证，缺失列表不推断实际生效档位。仍待实现其他供应商、价格、图像精确计费、生效档位审计及运行中远端重连。

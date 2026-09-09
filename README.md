@@ -9,10 +9,26 @@ state, SSH, and audit records. Analysis data stays on the remote server.
 Desktop V4 model requests are checked against the selected profile's context
 window before sending, including system instructions, tool schemas and provider
 formatting. Unset windows retain the existing 32,768-token fallback. The initial
-budget uses conservative UTF-8 byte estimation, reserves 4,096 output tokens and
-1,024 safety tokens, and explicitly caps the provider's output request. These are
-request allowances, not inferred model capabilities. The current catalog does
-not supply maximum output limits or model-specific image costs.
+budget uses conservative UTF-8 byte estimation and 1,024 safety tokens. New known
+model profiles capture a compiled models.dev snapshot: context/input/output
+limits, tool/vision support and published reasoning efforts. Requests reserve at
+most 4,096 output tokens, capped by the saved catalog output limit. Separate input
+limits conservatively cap the context budget too. Model-specific image costs
+remain unknown.
+
+The bundled catalog covers OpenAI, Anthropic, DeepSeek, Alibaba (international
+and China), MiniMax (international and China), and OpenRouter text-output models.
+Matching requires the exact protocol, HTTPS API host/port and full model ID;
+OpenRouter IDs retain their provider prefix. Unknown gateways retain the existing
+32,768 context / 4,096 output fallback and no inferred vision support. Existing
+Ollama visual entries remain supported. Editing the same profile identity keeps
+its saved capabilities, including legacy profiles without a snapshot; creating a
+profile or changing provider/base URL/model adopts the bundled catalog. A known
+catalog rejects context overrides above its limit and unsupported explicit
+reasoning efforts. Missing effort lists do not certify an effective effort.
+Settings shows saved catalog limits. Runtime fingerprints bind effective budgets,
+not catalog source metadata. Updating the app does not rewrite existing profiles.
+Catalog generation is offline and documented in `scripts/README.md`.
 
 Execution archives and checkpoints oversized context once, then checks again.
 If it still does not fit, the run needs attention and retains its evidence; it
@@ -127,7 +143,7 @@ this setting preserve it, while explicit null clears it. Test sends the same
 effort with a 4096-token output allowance unless a request budget overrides it.
 Acceptance of a request does not prove the service used that effort. There is no
 automatic downgrade, model-family capability inference or automatic Luna route;
-the full capability catalog and effective-effort reporting remain pending.
+additional catalog providers, pricing and effective-effort reporting remain pending.
 
 New ordinary runs also freeze the main model's execution configuration. Resuming
 with a changed model ID, endpoint, provider, reasoning effort, capability flags

@@ -190,3 +190,15 @@ should remain visible; pending child work should fail with guidance interruption
 its dependents should not run, and the parent should apply the guidance once and
 replan. This is not a compute-job interrupt. Deterministic tests use pending
 futures and notifications; real-model/SSH/manual desktop smoke remains unexecuted.
+
+
+### Compiled catalog snapshot smoke (Windows/macOS; manual, not yet executed)
+
+Create a known official model profile and confirm Settings shows its saved
+models.dev context/output limits. Edit only its label and confirm the frozen
+capabilities remain unchanged. An unknown gateway or longer sibling ID must not
+inherit the official entry. Explicit unsupported reasoning effort or a context
+above the catalog limit must be rejected before credentials are written. A legacy
+profile must retain its original context/vision/tools on edit. Recreate a profile
+to adopt a newer bundled catalog. No real API key or network is needed for saving
+these configurations; live model inference is a separate opt-in acceptance test.

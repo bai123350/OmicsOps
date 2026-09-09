@@ -3,6 +3,14 @@ import { describe, expect, it, vi } from "vitest";
 import { SettingsPanel } from "./SettingsPanel";
 
 describe("SettingsPanel model providers", () => {
+  it("shows saved catalog limits without inventing metadata for legacy profiles", () => {
+    const legacy = { id: "legacy", label: "Legacy", provider: "open_ai_compatible" as const, base_url: "https://gateway.example/v1", model: "exact-model", credential_reference: null, supports_tools: true, supports_vision: false };
+    const known = { ...legacy, id: "known", label: "Known", catalog_capabilities: { source_provider: "openai", source_sha256: "a".repeat(64), context_limit: 128000, input_limit: null, output_limit: 16384, reasoning: false, reasoning_efforts: null } };
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[legacy, known]} />);
+    expect(screen.getAllByText(/Catalog snapshot/)).toHaveLength(1);
+    expect(screen.getByText(/Catalog snapshot/)).toHaveTextContent("Context limit 128000 · Output limit 16384");
+  });
+
   it("edits and explicitly clears requested effort without changing the child binding", async () => {
     const profile = { id: "main", label: "Main", provider: "open_ai_compatible" as const, base_url: "https://gateway.example/v1", model: "exact-model", credential_reference: null, supports_tools: true, supports_vision: false, reasoning_effort: "max" as const, delegated_model_profile_id: "child" };
     const child = { ...profile, id: "child", label: "Reader", reasoning_effort: "low" as const, delegated_model_profile_id: null };

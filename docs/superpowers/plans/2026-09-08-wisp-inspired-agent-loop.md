@@ -209,3 +209,14 @@ core/tools/desktop 增加只恢复不执行的 recover_result 接口；按原请
 测试使用 Notify 和 pending future，覆盖模型等待/工具等待、成功 sibling、同节点已完成读取、下游阻断、父消费一次、approved-plan 不受影响以及收件箱一次失败。首次图测试误将读取能力赋予 EvidenceOnly 夹具被拒绝，修正为 ReadOnlyProject 后通过；没有放宽隔离规则。
 
 本增量最终验证（2026-09-09）：Agent Core 近邻全库 84 项通过；`cargo test --workspace`、`npm test`（120 前端/22 扩展）、`npm run build`、`npm run build:desktop` 均通过。新增测试覆盖 ordinary 指导切入、approved-plan 兼容及收件箱失败。格式初查偏差经 `cargo fmt --all` 修复，复查与 diff 检查通过，纯格式单独提交。保留既有 Vite 大 chunk/Windows linker 提示；无依赖、协议字段或迁移变化。真实模型、SSH、macOS 和桌面交互验收未执行，未推送或分发构建产物。
+
+
+## 2026-09-09：持久化 models.dev 能力快照
+
+新建或更换模型身份时，从编译目录按协议、HTTPS host/port 和完整 model ID 精确匹配，保存上下文/输入/输出上限、工具/视觉能力及已公布的推理档位。当前覆盖八个明确支持的供应商端点；OpenRouter 保留完整供应商前缀，不使用家族、前缀或未知网关推断。目录带源 SHA-256，离线导入，不在构建、测试或应用启动时联网。
+
+同一身份的编辑保留旧 snapshot 和能力标志，legacy 无 snapshot 保留 32768/4096 回退。改 provider/base URL/model 采用新目录，省略的旧窗口/effort 不移植到新模型。显式窗口不能超过目录 context；单独 input limit 保守约束预算，输出请求 min(4096, output limit)。实际输出额度改变进入 profile hash，源校验和等审计信息不进入；主模型与子模型均使用持久快照，无旧 run/spec 回填或 SQL schema 迁移。
+
+Settings 显示已保存的目录上限。显式 effort 按已公布能力验证，缺失列表不推断实际生效档位。仍待实现其他供应商、价格、图像精确计费、生效档位审计及运行中远端重连。
+
+本增量最终验证（2026-09-09）：`cargo test -p omicsops-desktop --lib model_` 11 项通过、1 项真实环境测试被忽略；Settings 近邻 14 项、离线导入 2 项通过，同源目录逐字节重建一致。`cargo test --workspace`、`npm test`（121 前端/22 扩展）、`npm run build`、`npm run build:desktop` 均通过。Rust 检查后顺序构建，无 dist 清理竞争；格式初查偏差经 `cargo fmt --all` 修复，复查及 diff 检查通过，纯格式单独提交。保持已有 Vite 大 chunk/Windows linker 提示，无依赖或 SQL 迁移变化。真实模型/SSH、macOS 和桌面交互 smoke 未执行；未推送、发布或分发构建产物。只读兼容审查使用 Luna/max。

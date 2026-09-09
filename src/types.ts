@@ -102,6 +102,15 @@ export interface ModelProfile {
   supports_tools: boolean;
   supports_vision: boolean;
   context_window_tokens?: number | null;
+  catalog_capabilities?: {
+    source_provider: string;
+    source_sha256: string;
+    context_limit: number;
+    input_limit: number | null;
+    output_limit: number;
+    reasoning: boolean;
+    reasoning_efforts: string[] | null;
+  } | null;
   reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | null;
   delegated_model_profile_id?: string | null;
 }

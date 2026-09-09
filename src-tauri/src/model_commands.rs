@@ -1,6 +1,6 @@
 use omicsops_adapters::{
     credentials::{CredentialVault, credential_account},
-    llm::{ModelProbeResult, ProviderProtocol, UnifiedModelClient},
+    llm::{ModelProbeResult, ProviderProtocol, RequestBudget, UnifiedModelClient},
 };
 use omicsops_core::workspace::{ModelProfile, ModelProviderKind};
 use tauri::State;
@@ -8,7 +8,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::commands::AppState;
-use crate::model_catalog_shared::exact_model_supports_vision;
+use crate::model_catalog_shared::{exact_model_capabilities, exact_model_supports_vision};
 
 pub use omicsops_dto::SaveModelProfileRequest;
 
@@ -36,6 +36,7 @@ pub fn model_profile_from_request(
     let reasoning_effort = request.reasoning_effort.flatten();
     omicsops_core::workspace::validate_reasoning_effort(provider, reasoning_effort.as_deref())?;
     let supports_vision = exact_model_supports_vision(provider, &base_url, &model);
+    let catalog = exact_model_capabilities(provider, &base_url, &model);
     Ok(ModelProfile {
         id,
         label: request.label.trim().into(),
@@ -44,12 +45,47 @@ pub fn model_profile_from_request(
         model,
         credential_reference: (provider != ModelProviderKind::Ollama)
             .then(|| credential_account("model", id)),
-        supports_tools: true,
+        supports_tools: catalog.map_or(true, |row| row.supports_tools),
         supports_vision,
-        context_window_tokens: request.context_window_tokens,
+        context_window_tokens: request.context_window_tokens.or_else(|| catalog.map(|row| row.capabilities.context_limit)),
+        catalog_capabilities: catalog.map(|row| row.capabilities.clone()),
         reasoning_effort,
         delegated_model_profile_id: request.delegated_model_profile_id.flatten(),
     })
+}
+
+/// A catalog update must never mutate the runtime contract of an existing profile.
+fn merge_existing_profile(
+    profile: &mut ModelProfile, existing: Option<&ModelProfile>,
+    preserve_binding: bool, preserve_window: bool, preserve_effort: bool,
+) {
+    let Some(existing) = existing else { return; };
+    if preserve_binding { profile.delegated_model_profile_id = existing.delegated_model_profile_id; }
+    let same_identity = profile.provider == existing.provider && profile.model == existing.model
+        && Url::parse(&profile.base_url).ok() == Url::parse(&existing.base_url).ok();
+    if same_identity {
+        profile.catalog_capabilities = existing.catalog_capabilities.clone();
+        profile.supports_tools = existing.supports_tools;
+        profile.supports_vision = existing.supports_vision;
+        if preserve_window { profile.context_window_tokens = existing.context_window_tokens; }
+        if preserve_effort { profile.reasoning_effort = existing.reasoning_effort.clone(); }
+    }
+}
+
+fn validate_profile_capabilities(profile: &ModelProfile) -> Result<(), String> {
+    omicsops_core::workspace::validate_reasoning_effort(profile.provider, profile.reasoning_effort.as_deref())?;
+    if profile.context_window_tokens == Some(0) { return Err("context window must be positive".into()); }
+    if let Some(caps) = &profile.catalog_capabilities {
+        if profile.context_window_tokens.is_some_and(|window| window > caps.context_limit) {
+            return Err("context window exceeds the model catalog limit".into());
+        }
+        if let Some(effort) = &profile.reasoning_effort {
+            if !caps.reasoning || caps.reasoning_efforts.as_ref().is_some_and(|values| !values.contains(effort)) {
+                return Err("reasoning effort is not supported by this model catalog entry".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -71,28 +107,9 @@ pub async fn save_model_profile(
     let preserve_window = request.context_window_tokens.is_none();
     let preserve_effort = request.reasoning_effort.is_none();
     let mut profile = model_profile_from_request(request)?;
-    if preserve_binding || preserve_window || preserve_effort {
-        if let Some(existing) = state
-            .repository
-            .get_model_profile(profile.id)
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            if preserve_binding {
-                profile.delegated_model_profile_id = existing.delegated_model_profile_id;
-            }
-            if preserve_window {
-                profile.context_window_tokens = existing.context_window_tokens;
-            }
-            if preserve_effort {
-                profile.reasoning_effort = existing.reasoning_effort;
-            }
-        }
-    }
-    omicsops_core::workspace::validate_reasoning_effort(
-        profile.provider,
-        profile.reasoning_effort.as_deref(),
-    )?;
+    let existing = state.repository.get_model_profile(profile.id).await.map_err(|error| error.to_string())?;
+    merge_existing_profile(&mut profile, existing.as_ref(), preserve_binding, preserve_window, preserve_effort);
+    validate_profile_capabilities(&profile)?;
     if let Some(child_id) = profile.delegated_model_profile_id {
         let child = state
             .repository
@@ -156,6 +173,14 @@ pub async fn list_model_profile_models(
         .map_err(|error| error.to_string())
 }
 
+fn catalog_probe_budget(profile: &ModelProfile) -> Option<RequestBudget> {
+    profile.catalog_capabilities.as_ref().map(|caps| RequestBudget {
+        context_window_tokens: profile.effective_context_window_tokens(),
+        reserved_output_tokens: caps.output_limit.min(if profile.reasoning_effort.is_some() { 4096 } else { 16 }),
+        safety_margin_tokens: 1024,
+    })
+}
+
 async fn client_for_profile(
     state: &AppState,
     profile_id: Uuid,
@@ -178,6 +203,7 @@ async fn client_for_profile(
         ModelProviderKind::OpenAiCompatible => ProviderProtocol::OpenAiCompatible,
         ModelProviderKind::Ollama => ProviderProtocol::Ollama,
     };
+    let budget = catalog_probe_budget(&profile);
     UnifiedModelClient::new(
         profile.id,
         protocol,
@@ -186,6 +212,7 @@ async fn client_for_profile(
         credential,
     )
     .and_then(|client| client.with_reasoning_effort(profile.reasoning_effort))
+    .map(|client| match budget { Some(budget) => client.with_request_budget(budget), None => client })
     .map_err(|error| error.to_string())
 }
 
@@ -205,6 +232,82 @@ mod tests {
             reasoning_effort: None,
             delegated_model_profile_id: None,
         }
+    }
+
+    #[test]
+    fn probes_cap_output_without_increasing_plain_probe_allowance() {
+        let mut profile = model_profile_from_request(request("open_ai_compatible", "https://api.openai.com/v1", "gpt-5.6-luna")).unwrap();
+        assert_eq!(catalog_probe_budget(&profile).unwrap().reserved_output_tokens, 16);
+        profile.reasoning_effort = Some("max".into());
+        assert_eq!(catalog_probe_budget(&profile).unwrap().reserved_output_tokens, 4096);
+        profile.catalog_capabilities.as_mut().unwrap().output_limit = 2048;
+        assert_eq!(catalog_probe_budget(&profile).unwrap().reserved_output_tokens, 2048);
+        profile.catalog_capabilities = None;
+        assert!(catalog_probe_budget(&profile).is_none());
+    }
+
+    #[test]
+    fn catalog_snapshot_defaults_and_explicit_constraints() {
+        let mut profile = model_profile_from_request(request("open_ai_compatible", "https://api.openai.com/v1", "gpt-4o")).unwrap();
+        assert_eq!(profile.context_window_tokens, Some(128000));
+        assert_eq!(profile.catalog_capabilities.as_ref().unwrap().output_limit, 16384);
+        assert!(profile.supports_tools && profile.supports_vision);
+        assert!(validate_profile_capabilities(&profile).is_ok());
+        profile.context_window_tokens = Some(128001);
+        assert!(validate_profile_capabilities(&profile).is_err());
+        profile.context_window_tokens = Some(0);
+        assert!(validate_profile_capabilities(&profile).is_err());
+        profile.context_window_tokens = Some(64000);
+        profile.reasoning_effort = Some("max".into());
+        assert!(validate_profile_capabilities(&profile).is_err());
+        let mut luna = model_profile_from_request(request("open_ai_compatible", "https://api.openai.com/v1", "gpt-5.6-luna")).unwrap();
+        luna.reasoning_effort = Some("max".into());
+        assert!(validate_profile_capabilities(&luna).is_ok());
+        luna.reasoning_effort = Some("ultra".into());
+        assert!(validate_profile_capabilities(&luna).is_err());
+    }
+
+    #[test]
+    fn editing_preserves_legacy_contract_but_changing_identity_gets_new_snapshot() {
+        let mut old = model_profile_from_request(request("open_ai_compatible", "https://api.openai.com/v1", "gpt-4o")).unwrap();
+        old.catalog_capabilities = None;
+        old.context_window_tokens = None;
+        old.supports_tools = false;
+        old.supports_vision = false;
+        let hash = old.execution_configuration_hash();
+        let mut edited = model_profile_from_request(request("open_ai_compatible", "https://api.openai.com/v1", "gpt-4o")).unwrap();
+        edited.id = old.id;
+        edited.label = "Renamed".into();
+        merge_existing_profile(&mut edited, Some(&old), true, true, true);
+        assert_eq!(edited.execution_configuration_hash(), hash);
+        assert!(edited.catalog_capabilities.is_none());
+        assert_eq!(edited.effective_context_window_tokens(), 32768);
+        assert_eq!(edited.effective_output_tokens(), 4096);
+        let mut replacement = model_profile_from_request(request("open_ai_compatible", "https://api.openai.com/v1", "gpt-5.6-luna")).unwrap();
+        replacement.id = old.id;
+        merge_existing_profile(&mut replacement, Some(&old), true, true, true);
+        assert!(replacement.catalog_capabilities.is_some());
+        assert_ne!(replacement.execution_configuration_hash(), hash);
+    }
+
+    #[test]
+    fn catalog_refresh_cannot_replace_saved_snapshot_and_budget_changes_are_hashed() {
+        let mut saved = model_profile_from_request(request("open_ai_compatible", "https://api.openai.com/v1", "gpt-4o")).unwrap();
+        let original_hash = saved.execution_configuration_hash();
+        saved.catalog_capabilities.as_mut().unwrap().source_sha256 = "f".repeat(64);
+        assert_eq!(saved.execution_configuration_hash(), original_hash);
+        saved.catalog_capabilities.as_mut().unwrap().output_limit = 2048;
+        assert_eq!(saved.effective_output_tokens(), 2048);
+        assert_ne!(saved.execution_configuration_hash(), original_hash);
+        saved.catalog_capabilities.as_mut().unwrap().input_limit = Some(32000);
+        assert_eq!(saved.effective_context_window_tokens(), 32000);
+        let mut edited = model_profile_from_request(request("open_ai_compatible", "https://api.openai.com/v1", "gpt-4o")).unwrap();
+        edited.id = saved.id;
+        merge_existing_profile(&mut edited, Some(&saved), true, true, true);
+        assert_eq!(edited.catalog_capabilities, saved.catalog_capabilities);
+        assert_eq!(edited.execution_configuration_hash(), saved.execution_configuration_hash());
+        let decoded: ModelProfile = serde_json::from_value(serde_json::to_value(&saved).unwrap()).unwrap();
+        assert_eq!(decoded, saved);
     }
 
     #[test]
