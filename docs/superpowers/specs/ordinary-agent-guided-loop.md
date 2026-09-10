@@ -1,5 +1,9 @@
 # OmicsOps 普通 Agent Guided Loop 设计
 
+> 2026-09-10 更新：固定 discovery、强制任务清单和 MCP/浏览器顺序已由
+> [普通 Agent 自适应循环](../specs/2026-09-10-adaptive-ordinary-agent.md) 取代。
+> 本文其他授权、证据、预算与恢复边界继续保留。
+
 > 日期：2026-09-02
 > 状态：普通 Agent 的实现设计基线；真实模型、浏览器、跨平台安装和生产验收仍需按验收清单单独记录。
 

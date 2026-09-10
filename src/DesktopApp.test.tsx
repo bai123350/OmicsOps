@@ -61,6 +61,24 @@ function setupConversationStateHarness() {
 }
 
 describe("DesktopApp", () => {
+  it("restores a locked ordinary tool approval as execution, not a Plan", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    const runId = "ordinary-tool-approval";
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId, {
+      locked: true,
+      latest_run: { ...stateRun(runId, "waiting_for_approval", null, null, null), session_mode: "agent" },
+    }));
+    vi.mocked(api.agentV4EventsForConversation).mockResolvedValue([
+      agentEvent("conversation-agent", runId, 1, { kind: "run_created", mode: "execute" }),
+      agentEvent("conversation-agent", runId, 2, { kind: "model_text", text: "正在等待文献工具授权。" }),
+    ]);
+    render(<DesktopApp />);
+    expect(await screen.findByText("正在等待文献工具授权。")).toBeVisible();
+    expect(screen.queryByText(/计划已生成/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "批准并运行" })).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toBeDisabled();
+  });
+
   it("loads all models from the current API and saves the selected model before allowing sends", async () => {
     const { stateSpy } = setupConversationStateHarness();
     stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));

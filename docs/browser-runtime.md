@@ -22,44 +22,16 @@ Plan 阶段不启动真实浏览器，浏览器工具也不因 Plan 或批准动
 本页的研究检索门控只适用于普通 Agent；不要把 Plan 的只读批准或批准后的
 计划执行描述成浏览器检索授权。
 
-## 2. Host 编排顺序
+## 2. 按需浏览器调用
 
-普通 Agent 先成功调用 `agent.route_request`。只有路由为
-`research_retrieval` 时，Host 才启用下列固定阶段；`adaptive` 路由沿用现有
-执行路径，不套用本页的浏览器顺序。
+2026-09-10 起，普通 Agent 不再要求 route、MCP、Skill、浏览器固定先后顺序，
+也不因已有专业 MCP 结果而强制再跑浏览器。参见
+[自适应循环设计](superpowers/specs/2026-09-10-adaptive-ordinary-agent.md)。
 
-完整顺序是：
-
-`MCP → skill/use_skill → 专业 MCP 或结构化不可用 → 真实浏览器搜索 → 结果页扫描 →（有结果时）独立落地页扫描 → 综合`
-
-在事件层，对应的成功工具顺序为：
-
-1. `search_mcp_tools`：查询已启用的专业 MCP 来源、工具和 schema。
-2. `search_skills`：搜索适用的 Skill。若返回至少一个匹配，必须成功调用
-   `use_skill` 加载至少一个匹配的 `SKILL.md`；无匹配时不凭空调用 Skill。
-3. `use_mcp_tool` **或** `agent.record_mcp_unavailable`：前者调用一个已发现、
-   已启用且允许启动的专业 MCP；后者必须写入具体的 `reason`、
-   `searched_query`（可选 `candidate_count`），说明为什么当前没有可调用的
-   结构化专业来源。不能以 ad-hoc `runtime.execute` 或未审计 HTTP 代码代替。
-4. `browser_setup`：连接（或按设置启动）已授权的真实浏览器 session。
-5. `web_search`：在真实浏览器中搜索，并记录结果 tab。
-6. `web_scan` 且 `page_kind = "search_results"`：等待页面稳定后扫描搜索结果。
-7. 若结果扫描明确返回 `result_count = 0`，这是有效的浏览器观察，可直接进入
-   综合；如果缺少该字段、字段不是数值零或结果数大于零，必须
-   `web_open_tab` 至少一个独立的 HTTP(S) 落地页，再调用
-   `web_scan` 且 `page_kind = "source"`。这一步不能用搜索结果页自身冒充。
-8. Host 汇合 MCP、Skill 和浏览器结果，标注来源、时间、限制和不确定性，
-   然后才允许 `agent.complete`。
-
-Host 每个阶段都按事件链判断是否已经完成。只有同一 run 中持久化的、
-`ToolFinished.succeeded = true` 或 `ToolOutcomeReused` 的成功结果才推进阶段；
-`ToolRequested`、`ToolDispatchStarted`、超时、失败结果、拒绝结果或模型口头
-声称成功都不推进。阶段中的工具调用可以失败并在同一 run 内修正参数或改变
-方法，但不能跳过阶段、交换顺序或用一次失败调用作为成功证据。
-
-每次导航、重定向、点击导致的页面变化或其他 material page change 后，都必须
-等待稳定并重新 `web_scan`。Skill 的文字是方法指导而不是事实证据；事实必须
-来自工具返回并在综合答案中可定位。
+模型可按任务选择专业来源、网页搜索或直接打开已知 URL。浏览器必须已连接且
+获得宿主授权；导航或页面变化后，先等待稳定并 web_scan 再依赖页面内容。
+来源应可定位，Skill 是方法指导，失败、派发和模型文字不能充当成功证据。
+这些能力选择不改变下述目标、连接、权限、下载、恢复与隔离边界。
 
 ## 3. Host 与 Tauri 接口
 

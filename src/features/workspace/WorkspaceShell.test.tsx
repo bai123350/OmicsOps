@@ -11,6 +11,28 @@ const project = {
 };
 
 describe("WorkspaceShell", () => {
+  it.each(["running", "waiting_for_approval", "needs_attention", "cancelled", "completed"])("does not present an ordinary %s contract as a Plan or hide its trace", (status) => {
+    const plan = { schema_version: 4 as const, objective: "internal ordinary contract", steps: ["internal step"], completion_criteria: ["evidence"], requested_capabilities: [] };
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} agentMode="agent"
+      activeRunId="ordinary" runStarted={status === "running" || status === "waiting_for_approval"}
+      v4Plan={{ run_id: "ordinary", status, plan, plan_hash: "internal", compute_selection: null, approval_hash: "internal", session_mode: "agent" }}
+      agentRunEventsV4={[{ schema_version: 4, run_id: "ordinary", project_id: project.id, conversation_id: "c", sequence: 1, occurred_at: "2026-09-10T00:00:00Z", previous_hash: "", event_hash: "h", event: { kind: "model_text", text: "正在核对文献记录。" } }]} />);
+    expect(screen.queryByText(/计划已生成/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "批准并运行" })).not.toBeInTheDocument();
+    expect(screen.queryByText("internal ordinary contract")).not.toBeInTheDocument();
+    expect(screen.getByText("正在核对文献记录。")).toBeVisible();
+  });
+
+  it("shows the ready card only for a pending approval plan", () => {
+    const plan = { schema_version: 4 as const, objective: "用户请求的计划", steps: ["检查"], completion_criteria: ["核验"], requested_capabilities: [] };
+    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, agentMode: "plan" as const };
+    const summary = { run_id: "plan-run", status: "awaiting_approval", plan, plan_hash: "h", compute_selection: null, approval_hash: "a", session_mode: "plan" as const };
+    const { rerender } = render(<WorkspaceShell {...props} v4Plan={summary} />);
+    expect(screen.getByText(/计划已生成/)).toBeVisible();
+    rerender(<WorkspaceShell {...props} v4Plan={{ ...summary, status: "cancelled" }} />);
+    expect(screen.queryByText(/计划已生成/)).not.toBeInTheDocument();
+  });
+
   it.each(["zh-CN", "en-US"] as const)("keeps bookkeeping out of the conversation and explains attention in %s", (locale) => {
     const base = { schema_version: 4 as const, run_id: "run-attention", project_id: project.id, conversation_id: "conversation-1", occurred_at: "2026-09-10T00:00:00Z", previous_hash: "", event_hash: "hash" };
     render(<WorkspaceShell project={project} locale={locale} onLocaleChange={() => undefined} agentRunEventsV4={[

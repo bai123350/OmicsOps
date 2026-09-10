@@ -1,5 +1,7 @@
 # 浏览器与普通 Agent 验收清单
 
+> 2026-09-10：下文历史固定发现顺序用例由[自适应循环验收](superpowers/specs/2026-09-10-adaptive-ordinary-agent.md)取代；连接、权限与恢复验收仍适用。真实验收状态未因设计更新而改变。
+
 > 状态：实现验证记录；截至 2026-09-01，下面的确定性测试与 Windows NSIS
 > 构建已执行并通过，但没有执行真实浏览器握手、扩展安装、Windows/macOS 手工
 > smoke 或 ignored live test。任何空白项都是“未执行”，不是通过。ignored test

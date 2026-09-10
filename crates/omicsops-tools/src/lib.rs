@@ -387,7 +387,7 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "agent.route_request",
-            "Classify the current ordinary Agent request and its task shape before any task tool is used. Research retrieval includes papers, external databases, current web evidence, and cross-source verification",
+            "Optionally record the ordinary Agent request category and task shape for progress metadata. This is not required before tools and does not grant permissions",
             ToolEffectV4::ReadOnly,
             json!({"type":"object","required":["route","task_shape","reason"],"properties":{"route":{"type":"string","enum":["research_retrieval","adaptive"]},"task_shape":{"type":"string","enum":["fast","multi_step"]},"reason":{"type":"string","minLength":1}}}),
         ),

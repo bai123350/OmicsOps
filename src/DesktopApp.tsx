@@ -746,8 +746,8 @@ export default function DesktopApp() {
     ? snapshotPlanRevision
     : null;
   const currentRunAwaitsPlanApproval = isActivePlanRevisionStatus(latestPlanRevision?.status)
-    || conversationState?.locked === true
-    || ["planning", "generating", "revising", "pending", "awaiting_approval", "waiting_for_approval"].includes(latestRun?.status ?? "")
+    || ["planning", "generating", "revising", "pending", "awaiting_approval"].includes(latestRun?.status ?? "")
+    || (latestRun?.status === "waiting_for_approval" && latestRun.session_mode === "plan" && latestPlanRevision?.status !== "approved")
     || v4Plan?.status === "awaiting_approval"
     || (currentRunEventsV4.some((event) => event.event.kind === "plan_proposed")
       && !currentRunEventsV4.some((event) => event.event.kind === "mode_changed" && event.event.mode === "execute"));
