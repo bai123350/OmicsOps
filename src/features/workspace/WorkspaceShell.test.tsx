@@ -11,6 +11,45 @@ const project = {
 };
 
 describe("WorkspaceShell", () => {
+  it.each(["zh-CN", "en-US"] as const)("keeps bookkeeping out of the conversation and explains attention in %s", (locale) => {
+    const base = { schema_version: 4 as const, run_id: "run-attention", project_id: project.id, conversation_id: "conversation-1", occurred_at: "2026-09-10T00:00:00Z", previous_hash: "", event_hash: "hash" };
+    render(<WorkspaceShell project={project} locale={locale} onLocaleChange={() => undefined} agentRunEventsV4={[
+      { ...base, sequence: 1, event: { kind: "run_created", mode: "execute" } },
+      { ...base, sequence: 2, event: { kind: "context_archived", archive: { archive_id: "private-archive", through_sequence: 1, size_bytes: 100, sha256: "hash" } } },
+      { ...base, sequence: 3, event: { kind: "context_checkpointed", checkpoint: { schema_version: 4, through_sequence: 2, completion_criteria: [], unresolved_errors: [], recent_steps: [], scientific_state: {} } } },
+      { ...base, sequence: 4, event: { kind: "run_needs_attention", message: "请配置可用的文献检索工具。" } },
+    ]} />);
+    const timeline = screen.getByRole("region", { name: locale === "zh-CN" ? "工具调用详情" : "Tool call details" });
+    expect(timeline).toHaveTextContent(locale === "zh-CN" ? "需要处理" : "Needs attention");
+    expect(within(timeline).getByText("请配置可用的文献检索工具。")).toBeVisible();
+    expect(timeline).not.toHaveTextContent(/context_archived|context_checkpointed|run_needs_attention|run_created/);
+    expect(screen.getByText("context_archived")).not.toBeVisible();
+    expect(screen.queryByText("private-archive")).not.toBeInTheDocument();
+    const diagnostics = screen.getByText(locale === "zh-CN" ? "诊断记录" : "Diagnostic records").closest("details")!;
+    const recordFold = diagnostics.parentElement!.closest("details")!;
+    recordFold.open = true;
+    diagnostics.open = true;
+    expect(screen.getByText("context_archived")).toBeVisible();
+  });
+
+  it("keeps completed model output and the final answer visible with run details collapsed", () => {
+    const base = { schema_version: 4 as const, run_id: "run-visible", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined}
+      messages={[
+        { id: "request", role: "user", markdown: "检查数据", created_at: "2026-09-10T00:00:00Z" },
+        { id: "answer", role: "assistant", markdown: "已检查 **3 个样本**。", created_at: "2026-09-10T00:00:05Z" },
+      ]}
+      agentRunEventsV4={[
+        { ...base, sequence: 1, occurred_at: "2026-09-10T00:00:01Z", event: { kind: "run_created", mode: "execute" } },
+        { ...base, sequence: 2, occurred_at: "2026-09-10T00:00:02Z", event: { kind: "model_text", text: "正在核对样本。" } },
+        { ...base, sequence: 3, occurred_at: "2026-09-10T00:00:03Z", event: { kind: "run_completed" } },
+      ]} />);
+    expect(screen.getByText("执行过程").closest("details")).not.toHaveAttribute("open");
+    expect(screen.getByRole("article", { name: "模型输出" })).toBeVisible();
+    expect(screen.getByText("3 个样本")).toBeVisible();
+    expect(screen.getByText("正在核对样本。").compareDocumentPosition(screen.getByText("3 个样本")) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("cancels saved recovery exclusively and hides actions after cancellation", async () => {
     let release: (() => void) | undefined;
     const cancel = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
@@ -94,7 +133,8 @@ describe("WorkspaceShell", () => {
       { ...base, sequence: 8, occurred_at: "2026-08-17T00:00:07Z", event: { kind: "tool_requested", call: { call_id: "e", tool_id: "edit", arguments: { path: "C:\\data\\output.txt" } } } },
     ]} />);
     const timeline = screen.getByRole("region", { name: "Tool call details" });
-    expect(Array.from(timeline.children).map((row) => row.querySelector("strong")?.textContent)).toEqual(["THINKING", "PROGRESS", "read", "PROGRESS", "write", "edit"]);
+    expect(Array.from(timeline.children).map((row) => row.querySelector("strong")?.textContent ?? row.textContent)).toEqual(["Inspect the file first.", "read", "Now save and revise.", "write", "edit"]);
+    expect(timeline.closest("details")).toBeNull();
     const read = within(timeline).getByText("read").closest("details")!;
     expect(read).not.toHaveAttribute("open");
     expect(read.querySelector("summary")).toHaveTextContent("1s · 2 lines");
@@ -139,7 +179,7 @@ describe("WorkspaceShell", () => {
 
     const overview = screen.getByRole("region", { name: "Agent 阶段轨迹" });
     for (const phase of ["routing", "discovery", "clarification", "organizing", "executing", "verifying"]) expect(screen.getByText(phase, { exact: true })).toBeInTheDocument();
-    expect(screen.getByText("进度", { exact: true })).toBeInTheDocument();
+    expect(screen.queryByText("进度", { exact: true })).not.toBeInTheDocument();
     expect(screen.queryByText("private reasoning must never render")).not.toBeInTheDocument();
     expect(screen.getByRole("region", { name: "任务列表" })).toHaveTextContent("revision 2");
     expect(overview).toHaveTextContent("分解为可验证步骤");
@@ -189,7 +229,8 @@ describe("WorkspaceShell", () => {
     }]} />);
     expect(screen.getByText("执行过程")).toBeInTheDocument();
     expect(screen.getByText("Agent 正在处理任务")).toBeInTheDocument();
-    expect(screen.getByText("规划启动")).toBeInTheDocument();
+    expect(screen.queryByText("规划启动")).not.toBeInTheDocument();
+    expect(screen.getByText("run_created").closest("details")).not.toHaveAttribute("open");
   });
   it("warns when an active run has been silent for 90 seconds without hiding stop", () => {
     const onCancel = vi.fn();
