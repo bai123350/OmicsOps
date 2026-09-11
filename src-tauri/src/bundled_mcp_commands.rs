@@ -46,6 +46,18 @@ fn preset_server_id(preset_id: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+/// Register missing builtins before the Agent/UI reads the persisted MCP index.
+/// Catalog discovery is local and does not grant process or tool execution.
+pub async fn install_bundled_mcp_servers(
+    repository: &Store,
+    executable: &Path,
+) -> Result<(), String> {
+    for preset in list_bundled_mcp_presets() {
+        register_preset(repository, &preset.id, executable).await?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn add_bundled_mcp_server(
     state: State<'_, AppState>,
@@ -75,10 +87,22 @@ async fn register_preset(
         .await
         .map_err(|error| error.to_string())?;
     // Re-adding a configured preset must not reset credentials, edits or grants.
-    if let Some(existing) = existing {
+    if let Some(mut existing) = existing {
+        // Upgrade old declarations without changing user enablement or custom commands.
+        if existing.tools.is_empty()
+            && existing.command == executable.to_string_lossy()
+            && existing.args == ["--omicsops-bio-mcp", preset_id]
+        {
+            populate_compiled_catalog(&mut existing, preset_id)?;
+            existing.approved_tools.clear();
+            repository
+                .put_json("mcp_server", &id.to_string(), &existing)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         return Ok(existing);
     }
-    let profile = mcp_profile_from_request(
+    let mut profile = mcp_profile_from_request(
         SaveMcpServerRequest {
             id: Some(id),
             name: preset.name,
@@ -91,6 +115,8 @@ async fn register_preset(
         None,
         Utc::now(),
     )?;
+    profile.enabled = true;
+    populate_compiled_catalog(&mut profile, preset_id)?;
     repository
         .put_json("mcp_server", &id.to_string(), &profile)
         .await
@@ -98,9 +124,62 @@ async fn register_preset(
     Ok(profile)
 }
 
+fn populate_compiled_catalog(
+    profile: &mut McpServerProfile,
+    preset_id: &str,
+) -> Result<(), String> {
+    profile.tools = crate::bio_mcp::bundled_tools(preset_id)
+        .into_iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    profile.tool_catalog_sha256 = Some(omicsops_mcp::catalog_digest(&profile.tools));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_installs_all_domains_and_preserves_user_choices_on_restart() {
+        let store = Store::open_in_memory().await.unwrap();
+        let exe = Path::new(r"C:\OmicsOps\app.exe");
+        install_bundled_mcp_servers(&store, exe).await.unwrap();
+        let profiles = store
+            .list_json::<McpServerProfile>("mcp_server")
+            .await
+            .unwrap();
+        assert_eq!(profiles.len(), 23);
+        for profile in &profiles {
+            assert!(profile.enabled);
+            assert!(!profile.tools.is_empty());
+            assert_eq!(
+                profile.tool_catalog_sha256.as_deref(),
+                Some(omicsops_mcp::catalog_digest(&profile.tools).as_str())
+            );
+            assert!(!profile.launch_approved);
+            assert!(profile.approved_tools.is_empty());
+            assert!(profile.last_inspected_at.is_none());
+        }
+        let mut disabled = profiles[0].clone();
+        disabled.enabled = false;
+        store
+            .put_json("mcp_server", &disabled.id.to_string(), &disabled)
+            .await
+            .unwrap();
+        install_bundled_mcp_servers(&store, exe).await.unwrap();
+        let again = store
+            .list_json::<McpServerProfile>("mcp_server")
+            .await
+            .unwrap();
+        assert_eq!(again.len(), 23);
+        let saved = again.iter().find(|p| p.id == disabled.id).unwrap();
+        assert_eq!(
+            serde_json::to_value(saved).unwrap(),
+            serde_json::to_value(disabled).unwrap()
+        );
+    }
 
     #[test]
     fn preset_catalog_covers_every_compiled_tool_exactly_once() {
@@ -121,16 +200,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adding_a_preset_only_registers_an_unapproved_disabled_declaration() {
+    async fn adding_a_preset_registers_discoverable_tools_without_execution_grants() {
         let store = Store::open_in_memory().await.unwrap();
         let profile = register_preset(&store, "omics-archives", Path::new(r"C:\OmicsOps\app.exe"))
             .await
             .unwrap();
         assert_eq!(profile.args, ["--omicsops-bio-mcp", "omics-archives"]);
-        assert!(!profile.enabled);
+        assert!(profile.enabled);
         assert!(!profile.launch_approved);
         assert!(profile.approved_tools.is_empty());
-        assert!(profile.tools.is_empty());
+        assert_eq!(
+            profile.tools.len(),
+            list_bundled_mcp_presets()
+                .into_iter()
+                .find(|p| p.id == "omics-archives")
+                .unwrap()
+                .tool_count
+        );
+        assert!(
+            profile
+                .tools
+                .iter()
+                .all(|tool| tool["name"].is_string() && tool["inputSchema"].is_object())
+        );
         assert!(profile.env_bindings.is_empty());
         assert!(profile.last_inspected_at.is_none());
     }
@@ -166,6 +258,26 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_empty_catalog_is_backfilled_without_reenabling_server() {
+        let store = Store::open_in_memory().await.unwrap();
+        let exe = Path::new(r"C:\OmicsOps\app.exe");
+        let mut old = register_preset(&store, "pubmed", exe).await.unwrap();
+        old.enabled = false;
+        old.tools.clear();
+        old.tool_catalog_sha256 = None;
+        store
+            .put_json("mcp_server", &old.id.to_string(), &old)
+            .await
+            .unwrap();
+        install_bundled_mcp_servers(&store, exe).await.unwrap();
+        let updated = register_preset(&store, "pubmed", exe).await.unwrap();
+        assert!(!updated.enabled);
+        assert!(!updated.launch_approved);
+        assert!(!updated.tools.is_empty());
+        assert!(updated.tool_catalog_sha256.is_some());
     }
 
     #[tokio::test]

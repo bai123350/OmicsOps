@@ -105,6 +105,11 @@ pub fn run() {
                 };
                 skill_commands::install_bundled_skills(&repository, &skills_root, &wisp_root)
                     .await?;
+                bundled_mcp_commands::install_bundled_mcp_servers(
+                    &repository,
+                    &std::env::current_exe().map_err(|error| error.to_string())?,
+                )
+                .await?;
                 if let Some(value) = repository
                     .browser_settings()
                     .await

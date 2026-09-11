@@ -25,9 +25,13 @@ Adapt only the upstream host-specific schema/tool layer.
 
 Expose each domain via `--omicsops-bio-mcp <domain>` using the packaged desktop
 executable and the existing project-isolated stdio MCP runtime. A backend-derived
-catalog provides descriptions and real tool counts to Settings. Adding a preset
-is idempotent and registers a disabled, unapproved profile; only explicit
-inspection/enablement/tool approval permits execution. Existing native PubMed
+catalog provides descriptions and real tool counts to Settings. Startup registers
+all missing presets idempotently as enabled, discoverable, unapproved profiles.
+Tool schemas and catalog hashes come from the same compiled catalog as stdio;
+registration does not launch a process or contact a service. Existing user choices
+are preserved. Empty legacy builtin catalogs are backfilled only when their
+command matches the current executable and domain arguments. Inspection and
+execution approvals remain required. Existing native PubMed
 profiles remain available. Domain filtering must apply to discovery AND calls.
 Malformed input/unknown tools must not contact external services. Preserve
 structured scientific results; failures must remain MCP error results.
@@ -53,3 +57,9 @@ resources, DTO serialization and UI error/retry. Run `cargo test --workspace`,
 `npm test`, `npm run build`, and `npm run build:desktop`. No real SSH, API keys or
 public services are automatic test prerequisites. Record ignored/live acceptance
 separately from deterministic results.
+
+Startup-import regression verification: the discoverability assertion failed
+before the fix and passed afterwards. Full workspace tests: 740 passed, 11
+ignored; frontend: 179 passed; extension: 22 passed. Production Web and Windows
+desktop builds passed. No live database/model/SSH calls or installed-app UI
+acceptance were performed for this fix.

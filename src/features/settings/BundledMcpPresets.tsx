@@ -34,7 +34,7 @@ export function BundledMcpPresets({ zh, busy, runAction, onListBundledMcpPresets
   const filtered = presets.filter((preset) => [preset.id, preset.name, preset.description, preset.description_zh].some((value) => value.toLowerCase().includes(query)));
   const selected = filtered.find((preset) => preset.id === selectedId);
   return <section className="mcp-preset" aria-label={zh ? "内置科学 MCP" : "Bundled scientific MCP"}>
-    <div><b>{zh ? "内置科学 MCP" : "Bundled scientific MCP"}</b><small>{zh ? "来自 wisp-science 的科学数据库工具。添加后需检查、启用和逐工具授权；调用会向对应数据库发送查询。" : "Scientific database tools from wisp-science. After adding, inspect, enable, and approve individual tools. Calls send queries to the selected database."}</small></div>
+    <div><b>{zh ? "内置科学 MCP" : "Bundled scientific MCP"}</b><small>{zh ? "来自 wisp-science 的科学数据库工具。启动时自动导入；调用前需检查并授权；调用会向对应数据库发送查询。" : "Scientific database tools from wisp-science. Imported automatically at startup; inspect and approve before calling. Calls send queries to the selected database."}</small></div>
     {loading && <small>{zh ? "正在加载目录…" : "Loading catalog…"}</small>}
     {error && <div role="alert">{error}<button disabled={loading} onClick={() => setRevision((current) => current + 1)}>{zh ? "重试加载目录" : "Retry catalog"}</button></div>}
     <div className="mcp-preset-grid">

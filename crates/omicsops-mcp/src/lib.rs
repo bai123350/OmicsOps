@@ -691,7 +691,8 @@ fn schema_digest(value: &Value) -> String {
     ))
 }
 
-fn catalog_digest(tools: &[Value]) -> String {
+/// Stable catalog identity shared by compiled catalogs and live inspection.
+pub fn catalog_digest(tools: &[Value]) -> String {
     let mut tools = tools.to_vec();
     tools.sort_by(|left, right| {
         left.get("name")

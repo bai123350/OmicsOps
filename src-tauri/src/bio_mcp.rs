@@ -30,6 +30,42 @@ pub struct BioMcpServer {
     secrets: Vec<String>,
 }
 
+/// The same compiled catalog is used for discovery and stdio responses.
+pub(crate) fn bundled_tools(domain: &str) -> Vec<Tool> {
+    catalog()
+        .into_iter()
+        .filter(|(slug, _)| *slug == domain)
+        .map(|(_, schema)| {
+            let function = schema.function;
+            let mut annotations = ToolAnnotations::default();
+            // Submission creates a remote job and must stay approval-sensitive.
+            annotations.read_only_hint = Some(!matches!(
+                function.name.as_str(),
+                "search_sequence"
+                    | "zinc_search_by_id"
+                    | "zinc_search_by_supplier"
+                    | "zinc_get_3d"
+                    | "zinc_random_sample"
+            ));
+            annotations.destructive_hint = Some(false);
+            annotations.open_world_hint = Some(true);
+            let mut tool = Tool::new(
+                function.name,
+                function.description,
+                Arc::new(
+                    function
+                        .parameters
+                        .as_object()
+                        .expect("bundled tool schema is an object")
+                        .clone(),
+                ),
+            );
+            tool.annotations = Some(annotations);
+            tool
+        })
+        .collect()
+}
+
 impl BioMcpServer {
     pub fn new(domain: &str, credentials: &[(String, String)]) -> Result<Self, String> {
         if domain_metadata(domain).is_none() {
@@ -42,38 +78,7 @@ impl BioMcpServer {
             })
             .cloned()
             .collect();
-        let tools = catalog()
-            .into_iter()
-            .filter(|(slug, _)| *slug == domain)
-            .map(|(_, schema)| {
-                let function = schema.function;
-                let mut annotations = ToolAnnotations::default();
-                // Submission creates a remote job and must stay approval-sensitive.
-                annotations.read_only_hint = Some(!matches!(
-                    function.name.as_str(),
-                    "search_sequence"
-                        | "zinc_search_by_id"
-                        | "zinc_search_by_supplier"
-                        | "zinc_get_3d"
-                        | "zinc_random_sample"
-                ));
-                annotations.destructive_hint = Some(false);
-                annotations.open_world_hint = Some(true);
-                let mut tool = Tool::new(
-                    function.name,
-                    function.description,
-                    Arc::new(
-                        function
-                            .parameters
-                            .as_object()
-                            .expect("bundled tool schema is an object")
-                            .clone(),
-                    ),
-                );
-                tool.annotations = Some(annotations);
-                tool
-            })
-            .collect();
+        let tools = bundled_tools(domain);
         let client = NativeBio::new(&credentials)
             .map_err(|_| "could not initialize bundled scientific HTTP client".to_string())?;
         Ok(Self {
