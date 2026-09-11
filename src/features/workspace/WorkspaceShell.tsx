@@ -522,8 +522,6 @@ function V4RunTrace({ locale, events, previewText, onAnswer, onDecideApproval, o
   const pauseReason = getV4PauseReason(events);
   const legacyMcpFailure = (!terminal || terminal.event.kind === "run_needs_attention" || terminal.event.kind === "run_failed") && events.some(({ event }) => event.kind === "tool_dispatch_uncertain" && event.tool_id === "use_mcp_tool" && !isV4UncertainResolved(events, event.call_id));
   const status = legacyMcpFailure ? (zh ? "失败" : "Failed") : terminal?.event.kind === "run_completed" ? (zh ? "已完成" : "Completed") : terminal?.event.kind === "run_cancelled" ? (zh ? "已终止" : "Cancelled") : terminal?.event.kind === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention") : terminal?.event.kind === "run_failed" ? (zh ? "失败" : "Failed") : pauseReason === "approval" ? (zh ? "等待工具审批" : "Waiting for approval") : pauseReason === "input" ? (zh ? "等待回答" : "Waiting for input") : pauseReason === "browser_connection" ? (zh ? "等待连接浏览器" : "Waiting for browser") : pauseReason === "browser_human" ? (zh ? "等待人工处理浏览器" : "Waiting for browser intervention") : pauseReason === "runtime_recovery" ? (zh ? "结果待恢复" : "Results ready to resume") : pauseReason === "uncertain" ? (zh ? "等待副作用核验" : "Waiting for verification") : (zh ? "运行中" : "Running");
-  const failed = terminal?.event.kind === "run_failed"
-    || (terminal?.event.kind === "run_needs_attention" && terminal.event.message.includes("model context exceeds byte budget"));
   const shouldExpand = !historical && (!terminal || Boolean(pauseReason) || terminal?.event.kind === "run_failed" || terminal?.event.kind === "run_needs_attention");
   async function resumeRun() {
     if (!onResume || !events[0] || resumeBusyRef.current) return;
@@ -589,7 +587,6 @@ function V4RunTrace({ locale, events, previewText, onAnswer, onDecideApproval, o
       </article>))}
 
       {!terminal && pauseReason === "runtime_recovery" && (onResume || onCancelRecovery) && <div className="v4-resume-run"><span>{zh ? "计算结果已保存，可继续核验。" : "Saved computation results are ready for verification."}</span>{onResume && <button disabled={resumeBusy} onClick={() => void resumeRun()}>{resumeBusy && !cancelRecoveryBusy ? (zh ? "恢复中…" : "Resuming…") : (zh ? "恢复已保存结果" : "Resume saved results")}</button>}{onCancelRecovery && <button disabled={resumeBusy} onClick={() => void cancelRecovery()}>{cancelRecoveryBusy ? (zh ? "取消中…" : "Cancelling…") : (zh ? "取消此运行" : "Cancel this run")}</button>}{recoveryError && <span role="alert">{recoveryError}</span>}</div>}
-      {failed && onResume && <div className="v4-resume-run"><span>{zh ? "修正运行条件后可从已验证事件链继续。" : "Resume from the verified event chain after fixing the runtime condition."}</span><button disabled={resumeBusy} onClick={() => void resumeRun()}>{resumeBusy ? (zh ? "恢复中…" : "Resuming…") : (zh ? "继续运行" : "Resume run")}</button></div>}
       {pauseReason === "browser_connection" && onResume && <div className="v4-resume-run"><span>{zh ? "请在设置 → Browser 安装或启用 OmicsOps 扩展并连接相应会话，然后原地继续此任务。" : "Open Settings → Browser, install or enable the OmicsOps extension, connect the requested session, then resume this same task."}</span><button disabled={resumeBusy} onClick={() => void resumeRun()}>{resumeBusy ? (zh ? "恢复中…" : "Resuming…") : (zh ? "已连接，继续" : "Connected, resume")}</button></div>}
       {pauseReason === "browser_human" && onResume && <div className="v4-resume-run"><span>{zh ? "请在真实浏览器中完成人机验证或其他人工步骤；OmicsOps 不会自动求解 CAPTCHA。处理完成后原地继续。" : "Complete the CAPTCHA or other manual step in the real browser. OmicsOps never solves CAPTCHA automatically; resume this same run when finished."}</span><button disabled={resumeBusy} onClick={() => void resumeRun()}>{resumeBusy ? (zh ? "恢复中…" : "Resuming…") : (zh ? "已人工处理，继续" : "Handled, resume")}</button></div>}
 
@@ -693,14 +690,14 @@ function mergeV4ToolCalls(events: AgentRunEventV4[]): MergedV4ToolCall[] {
     if (isInternalAgentTool(toolId)) return;
     const current = byCall.get(callId);
     if (!current) {
-      byCall.set(callId, { callId, toolId, argumentsPreview: args ? JSON.stringify(redactToolArguments(args), null, 2) : "", firstSequence: sequence, lastSequence: sequence, outcome, subject: toolSubject(args), status: status ?? "requested" });
+      byCall.set(callId, { callId, toolId, argumentsPreview: args ? JSON.stringify(redactToolArguments(args), null, 2) : "", firstSequence: sequence, lastSequence: sequence, outcome, subject: toolSubject(args ? redactToolArguments(args) : undefined), status: status ?? "requested" });
       return;
     }
     current.lastSequence = Math.max(current.lastSequence, sequence);
     if (toolId) current.toolId = toolId;
     if (args) {
       current.argumentsPreview = JSON.stringify(redactToolArguments(args), null, 2);
-      current.subject = toolSubject(args);
+      current.subject = toolSubject(redactToolArguments(args));
     }
     if (outcome !== undefined) current.outcome = outcome;
     if (status) current.status = status;
@@ -734,8 +731,15 @@ function formatToolOutput(content: string) {
 function isInternalAgentTool(toolId: string) {
   return toolId === "agent.complete" || toolId === "agent.request_input" || toolId === "agent.propose_plan" || toolId === "agent.update_tasks" || toolId === "agent.route" || toolId === "agent.route_request";
 }
-function toolSubject(args?: Record<string, unknown>) {
-  if (!args) return undefined;
+function toolSubject(value: unknown): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const args = value as Record<string, unknown>;
+  if (typeof args.tool === "string" && args.tool.trim()) {
+    const nested = args.arguments;
+    const query = nested && typeof nested === "object" && !Array.isArray(nested)
+      ? toolSubject(nested) : undefined;
+    return query ? `${args.tool.trim()} · ${query}` : args.tool.trim();
+  }
   for (const key of ["path", "file_path", "relative_path", "command", "cmd", "skill_name", "skill_id", "name", "artifact_id", "query"]) {
     const value = args[key];
     if (typeof value === "string" && value.trim()) return value.trim();

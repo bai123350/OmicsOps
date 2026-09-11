@@ -321,7 +321,7 @@ describe("WorkspaceShell", () => {
     fireEvent.click(screen.getByText("执行过程"));
     expect(screen.getByRole("article", { name: "模型输出" })).toHaveTextContent("矩阵检查完成。");
   });
-  it("offers to resume a failed V4 run and treats later events as running", () => {
+  it("hides the failed-run resume banner and treats later events as running", () => {
     const onResume = vi.fn();
     const base = { schema_version: 4 as const, run_id: "run-recover", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
     const failed = [
@@ -331,8 +331,8 @@ describe("WorkspaceShell", () => {
     const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} agentRunEventsV4={failed} onResumeAgentRunV4={onResume} />);
 
     fireEvent.click(screen.getByText("执行过程"));
-    fireEvent.click(screen.getByRole("button", { name: "继续运行" }));
-    expect(onResume).toHaveBeenCalledWith("run-recover");
+    expect(screen.queryByRole("button", { name: "继续运行" })).not.toBeInTheDocument();
+    expect(screen.queryByText("修正运行条件后可从已验证事件链继续。")).not.toBeInTheDocument();
 
     rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-recover" agentRunEventsV4={[...failed,
       { ...base, sequence: 3, occurred_at: "2026-08-17T00:00:03Z", event: { kind: "tool_dispatch_resolved" as const, call_id: "call-1", resolution: "side_effect_not_observed" as const, evidence: "immutable system ensure" } },
@@ -561,13 +561,33 @@ describe("WorkspaceShell", () => {
     expect(resolve).toHaveBeenCalledWith("run-uncertain", "call-1", "side_effect_not_observed", "远端输出文件不存在");
   });
 
-  it("offers resume for a context byte-budget pause", () => {
+  it("shows the actual MCP tool and query in the trace summary", () => {
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} agentRunEventsV4={[{
+      schema_version: 4, run_id: "mcp", project_id: project.id, conversation_id: "conversation-1", sequence: 1, occurred_at: "2026-08-17T00:00:00Z", previous_hash: "", event_hash: "hash",
+      event: { kind: "tool_requested", call: { call_id: "search", tool_id: "use_mcp_tool", arguments: { server_id: "server", tool: "pubmed_search", arguments: { query: "Hi-C 3D genome" } } } },
+    }]} />);
+    const summary = document.querySelector(".v4-tool-trace-heading");
+    expect(summary).toHaveTextContent("pubmed_search");
+    expect(summary).toHaveTextContent("Hi-C 3D genome");
+  });
+
+  it("shows the iteration-limit status summary without a completion claim or resume banner", () => {
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onResumeAgentRunV4={vi.fn()} agentRunEventsV4={[{
+      schema_version: 4, run_id: "limit", project_id: project.id, conversation_id: "conversation-1", sequence: 1, occurred_at: "2026-08-17T00:00:00Z", previous_hash: "", event_hash: "hash",
+      event: { kind: "run_needs_attention", message: "max_iterations (100). 已获得文献列表，全文核验尚未完成。" },
+    }]} />);
+    expect(screen.getByText(/全文核验尚未完成/)).toBeInTheDocument();
+    expect(screen.getByText(/需要处理 · 0 个步骤/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "继续运行" })).not.toBeInTheDocument();
+  });
+
+  it("keeps context budget diagnostics without a resume banner", () => {
     const resume = vi.fn();
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-context" onResumeAgentRunV4={resume} agentRunEventsV4={[{
       schema_version: 4, run_id: "run-context", project_id: project.id, conversation_id: "conversation-1", sequence: 1, occurred_at: "2026-08-17T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "run_needs_attention", message: "run needs attention: model context exceeds byte budget (268851 > 262144); original run and evidence retained" },
     }]} />);
-    fireEvent.click(screen.getByRole("button", { name: "继续运行" }));
-    expect(resume).toHaveBeenCalledWith("run-context");
+    expect(screen.queryByRole("button", { name: "继续运行" })).not.toBeInTheDocument();
+    expect(screen.getByText(/model context exceeds byte budget/)).toBeInTheDocument();
   });
 
   it("shows legacy MCP uncertainty as failure without a side-effect form", () => {
@@ -697,15 +717,15 @@ describe("WorkspaceShell", () => {
     let releaseResume!: () => void;
     const onResume = vi.fn(() => new Promise<void>((resolve) => { releaseResume = resolve; }));
     const base = { schema_version: 4 as const, run_id: "run-resume-guard", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
-    const failed = [{ ...base, sequence: 1, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "run_created" as const, mode: "execute" as const } }, { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:02Z", event: { kind: "run_failed" as const, message: "temporary failure" } }];
+    const failed = [{ ...base, sequence: 1, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "run_created" as const, mode: "execute" as const } }, { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:02Z", event: { kind: "browser_connection_required" as const, session: "workspace" as const, protocol_version: 1, message: "connect the extension" } }];
     rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} agentRunEventsV4={failed} onResumeAgentRunV4={onResume} />);
-    const resume = screen.getByRole("button", { name: "继续运行" });
+    const resume = screen.getByRole("button", { name: "已连接，继续" });
     fireEvent.click(resume);
     fireEvent.click(resume);
     expect(onResume).toHaveBeenCalledTimes(1);
     expect(resume).toBeDisabled();
     releaseResume();
-    await waitFor(() => expect(screen.getByRole("button", { name: "继续运行" })).toBeEnabled());
+    await waitFor(() => expect(screen.getByRole("button", { name: "已连接，继续" })).toBeEnabled());
   });
 
   it("locks a pending Plan conversation even before execution starts", () => {

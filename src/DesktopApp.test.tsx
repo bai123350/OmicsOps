@@ -564,7 +564,7 @@ describe("DesktopApp", () => {
   it("ignores a late resume callback after switching sessions", async () => {
     const { stateSpy } = setupConversationStateHarness();
     stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
-    const failed = agentEvent("conversation-agent", "resume-run", 1, { kind: "run_failed", message: "旧会话运行失败" });
+    const failed = agentEvent("conversation-agent", "resume-run", 1, { kind: "browser_connection_required", session: "workspace", protocol_version: 1, message: "connect the extension" });
     const staleResult = agentEvent("conversation-agent", "resume-run", 2, { kind: "model_text", text: "旧会话恢复后的输出" });
     vi.spyOn(api, "agentV4EventsForConversation").mockImplementation(async (_projectId, conversationId) => conversationId === "conversation-agent" ? [failed] : []);
     const resumeDeferred = deferred<void>();
@@ -573,7 +573,7 @@ describe("DesktopApp", () => {
     const events = vi.spyOn(api, "agentV4Events").mockImplementation(async () => returnStaleEvents ? [staleResult] : []);
 
     render(<DesktopApp />);
-    fireEvent.click(await screen.findByRole("button", { name: "继续运行" }));
+    fireEvent.click(await screen.findByRole("button", { name: "已连接，继续" }));
     fireEvent.click(screen.getByRole("button", { name: "Plan 会话" }));
     await screen.findByRole("heading", { name: "Plan 会话" });
 
