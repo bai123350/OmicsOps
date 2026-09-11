@@ -12,6 +12,40 @@ use omicsops_protocol::{ComputeSelectionV4, ExecutionPlanV4};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Main Agent model iterations. Zero disables the iteration limit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentIterationSettingsV4 {
+    pub max_iterations: u32,
+    #[serde(default)]
+    pub auto_continue: bool,
+    #[serde(default = "default_auto_continue_limit")]
+    pub auto_continue_limit: u32,
+    #[serde(default = "default_session_enabled")]
+    pub auto_compact: bool,
+    #[serde(default = "default_session_enabled")]
+    pub follow_up_questions: bool,
+}
+
+fn default_auto_continue_limit() -> u32 {
+    10
+}
+fn default_session_enabled() -> bool {
+    true
+}
+
+impl Default for AgentIterationSettingsV4 {
+    fn default() -> Self {
+        Self {
+            max_iterations: 100,
+            auto_continue: false,
+            auto_continue_limit: default_auto_continue_limit(),
+            auto_compact: true,
+            follow_up_questions: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GetConversationCapabilitiesV4Request {

@@ -1,4 +1,5 @@
 pub mod agent_commands;
+pub mod agent_settings;
 pub mod agent_v4;
 pub mod bio_mcp;
 pub mod browser_commands;
@@ -168,6 +169,8 @@ pub fn run() {
             agent_v4::agent_v4_events,
             agent_v4::agent_v4_events_for_conversation,
             browser_commands::browser_get_settings,
+            agent_settings::agent_get_iteration_settings,
+            agent_settings::agent_save_iteration_settings,
             browser_commands::browser_save_settings,
             browser_commands::browser_status,
             browser_commands::browser_setup,

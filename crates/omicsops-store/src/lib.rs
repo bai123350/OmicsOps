@@ -596,6 +596,34 @@ impl Store {
         Ok(())
     }
 
+    pub async fn agent_iteration_settings(&self) -> Result<Option<Value>, StoreError> {
+        let value = sqlx::query_scalar::<_, String>(
+            "SELECT value_json FROM settings WHERE scope='global' AND key='agent_iterations_v1'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        value
+            .map(|value| serde_json::from_str(&value).map_err(StoreError::from))
+            .transpose()
+    }
+
+    pub async fn save_agent_iteration_settings(&self, value: &Value) -> Result<(), StoreError> {
+        serde_json::from_value::<omicsops_dto::AgentIterationSettingsV4>(value.clone()).map_err(
+            |error| StoreError::InvalidInput(format!("invalid session settings: {error}")),
+        )?;
+        sqlx::query(
+            "INSERT INTO settings(scope,key,value_json,updated_at)
+             VALUES('global','agent_iterations_v1',?1,?2)
+             ON CONFLICT(scope,key) DO UPDATE SET
+               value_json=excluded.value_json,updated_at=excluded.updated_at",
+        )
+        .bind(serde_json::to_string(value)?)
+        .bind(timestamp(Utc::now()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn browser_settings(&self) -> Result<Option<Value>, StoreError> {
         let value = sqlx::query_scalar::<_, String>(
             "SELECT value_json FROM settings WHERE scope='global' AND key='browser_v1'",

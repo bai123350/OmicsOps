@@ -2403,6 +2403,17 @@ async fn spawn_execution(
     } else {
         validate_compute_selection(state, &project, &selection).await?;
     }
+    let limits = if spec.execution_kind == RunExecutionKindV4::OrdinaryAgent {
+        let settings = crate::agent_settings::load_iteration_settings(&state.repository).await?;
+        AgentLimitsV4 {
+            auto_continue: settings.auto_continue,
+            auto_continue_limit: settings.auto_continue_limit,
+            auto_compact: settings.auto_compact,
+            ..AgentLimitsV4::ordinary(settings.max_iterations)
+        }
+    } else {
+        AgentLimitsV4::default()
+    };
     let forced_route = (spec.execution_kind == RunExecutionKindV4::OrdinaryAgent)
         .then(|| classify_direct_request(&record.objective));
     let (model, tools) = compose(
@@ -2453,7 +2464,7 @@ async fn spawn_execution(
                 events: &store,
                 science: Some(&science_store),
             }
-            .execute_with_limits(&spec, AgentLimitsV4::default(), &cancelled)
+            .execute_with_limits(&spec, limits, &cancelled)
             .await
             .map_err(|error| error.to_string())
         }

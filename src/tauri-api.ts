@@ -463,3 +463,10 @@ export async function onAgentV4TextPreview(callback: (event: import("./types").A
   if (!isTauri()) return () => {};
   return listen<import("./types").AgentTextPreviewV4>("agent-v4-text-preview", ({ payload }) => callback(payload));
 }
+export async function agentGetIterationSettings(): Promise<import("./types").AgentIterationSettingsV4> {
+  return invoke("agent_get_iteration_settings");
+}
+
+export async function agentSaveIterationSettings(settings: import("./types").AgentIterationSettingsV4): Promise<import("./types").AgentIterationSettingsV4> {
+  return invoke("agent_save_iteration_settings", { settings });
+}

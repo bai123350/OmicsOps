@@ -7,6 +7,27 @@ use serde_json::json;
 use uuid::Uuid;
 
 #[test]
+fn agent_iteration_settings_use_shared_validated_snake_case_contract() {
+    use crate::dto::AgentIterationSettingsV4;
+    assert_eq!(
+        serde_json::to_value(AgentIterationSettingsV4::default()).unwrap(),
+        json!({"max_iterations":100,"auto_continue":false,"auto_continue_limit":10,"auto_compact":true,"follow_up_questions":true})
+    );
+    let unlimited: AgentIterationSettingsV4 =
+        serde_json::from_value(json!({"max_iterations":0})).unwrap();
+    assert_eq!(unlimited.max_iterations, 0);
+    for invalid in [
+        json!({}),
+        json!({"max_iterations":-1}),
+        json!({"max_iterations":1.5}),
+        json!({"max_iterations":4294967296_u64}),
+        json!({"max_iterations":100,"extra":true}),
+    ] {
+        assert!(serde_json::from_value::<AgentIterationSettingsV4>(invalid).is_err());
+    }
+}
+
+#[test]
 fn conversation_capabilities_use_shared_snake_case_contract() {
     let project_id = Uuid::new_v4();
     let conversation_id = Uuid::new_v4();
@@ -258,5 +279,25 @@ fn streaming_preview_contract_clears_without_creating_an_audit_event() {
             serde_json::from_value::<omicsops_dto::AgentTextPreviewV4>(value).unwrap(),
             dto
         );
+    }
+}
+
+#[test]
+fn session_settings_defaults_preserve_legacy_records_and_validate_new_fields() {
+    use crate::dto::AgentIterationSettingsV4;
+    let legacy: AgentIterationSettingsV4 =
+        serde_json::from_value(json!({"max_iterations":25})).unwrap();
+    let value = serde_json::to_value(legacy).unwrap();
+    assert_eq!(
+        value,
+        json!({"max_iterations":25,"auto_continue":false,"auto_continue_limit":10,"auto_compact":true,"follow_up_questions":true})
+    );
+    for invalid in [
+        json!({"max_iterations":100,"auto_continue":1}),
+        json!({"max_iterations":100,"auto_continue_limit":-1}),
+        json!({"max_iterations":100,"auto_compact":"true"}),
+        json!({"max_iterations":100,"follow_up_questions":null}),
+    ] {
+        assert!(serde_json::from_value::<AgentIterationSettingsV4>(invalid).is_err());
     }
 }

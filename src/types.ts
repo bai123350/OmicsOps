@@ -507,3 +507,10 @@ export interface ConversationCapabilitiesV4 {
   mcp_servers: Array<{ id: string; name: string; enabled: boolean; tool_count: number }>;
   memory_count: number;
 }
+export interface AgentIterationSettingsV4 {
+  max_iterations: number;
+  auto_continue: boolean;
+  auto_continue_limit: number;
+  auto_compact: boolean;
+  follow_up_questions: boolean;
+}
