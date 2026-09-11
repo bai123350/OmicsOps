@@ -1,213 +1,134 @@
 # OmicsOps
 
-OmicsOps is a Windows-first Tauri desktop agent that plans and runs
-bioinformatics workflows on a remote Linux server over SSH.
+OmicsOps 是面向科研与生物信息学的 Windows-first Tauri 桌面 Agent。以对话为主要入口，连接本地或 SSH 远程 Python/R 环境，结合文献检索、可复用 Skills 和 MCP 工具，在项目上下文中推进分析、核验结果并保留科研证据。
 
-The Rust control plane owns credentials, approvals, policy enforcement, task
-state, SSH, and audit records. Analysis data stays on the remote server.
+产品目标是让研究者从一个科研问题出发，在同一项目中组织数据、计算、图表、文献与结论。以下能力和限制以当前实现为准；完整论文工作区、统一科研对象模型等长期目标不代表已全部实现。
 
-Desktop V4 model requests are checked against the selected profile's context
-window before sending, including system instructions, tool schemas and provider
-formatting. Unset windows retain the existing 32,768-token fallback. The initial
-budget uses conservative UTF-8 byte estimation and 1,024 safety tokens. New known
-model profiles capture a compiled models.dev snapshot: context/input/output
-limits, tool/vision support and published reasoning efforts. Requests reserve at
-most 4,096 output tokens, capped by the saved catalog output limit. Separate input
-limits conservatively cap the context budget too. Model-specific image costs
-remain unknown.
+## 核心能力
 
-The bundled catalog covers OpenAI, Anthropic, DeepSeek, Alibaba (international
-and China), MiniMax (international and China), and OpenRouter text-output models.
-Matching requires the exact protocol, HTTPS API host/port and full model ID;
-OpenRouter IDs retain their provider prefix. Unknown gateways retain the existing
-32,768 context / 4,096 output fallback and no inferred vision support. Existing
-Ollama visual entries remain supported. Editing the same profile identity keeps
-its saved capabilities, including legacy profiles without a snapshot; creating a
-profile or changing provider/base URL/model adopts the bundled catalog. A known
-catalog rejects context overrides above its limit and unsupported explicit
-reasoning efforts. Missing effort lists do not certify an effective effort.
-Settings shows saved catalog limits. When editing, explicitly select “Adopt current
-catalog capabilities on save” to refresh the snapshot and reset the context to the
-bundled limit (an API caller may supply a lower explicit window). Requested effort
-and child binding are retained and revalidated. Unknown entries fail without
-saving. The option starts unchecked on each edit. Changed capabilities or budgets
-can invalidate existing runs' frozen profile bindings; current in-memory clients
-keep their loaded snapshot. Runtime fingerprints bind effective budgets,
-not catalog source metadata. Updating the app does not rewrite existing profiles.
-Catalog generation is offline and documented in `scripts/README.md`.
+| 能力 | 当前支持 |
+| --- | --- |
+| 对话式分析 | 默认 Agent 模式直接启动任务；需要先审阅方案时可切换 Plan 模式。多步骤任务维护阶段和任务清单，普通运行可接收追加指导。 |
+| 本地与远程计算 | 使用本地系统 Python/R，或项目绑定的 SSH 主机及远端环境；持久解释器会话支持连续执行代码。独立 SSH 后台作业支持之后查询和重连。 |
+| 文献调研 | 检索 PubMed、Europe PMC、Crossref，保留检索来源与文献标识；内置 PubMed MCP 提供检索和记录读取。 |
+| Skills 与 MCP | 捆绑科学工作流 Skills，支持技能发现、导入和启停；按需加载指令，配置 stdio MCP server 扩展工具。技能本身不等于已安装科研依赖。 |
+| 项目与证据 | 组织会话、分析记录和产物；运行通过事件、工具结果、检查点和恢复记录保留执行依据。 |
+| 模型配置 | 使用保存的模型配置连接模型服务，配置上下文与请求推理档位，并为新建普通运行绑定独立的只读子 Agent 模型。 |
 
-Execution archives and checkpoints oversized context once, then checks again.
-If it still does not fit, the run needs attention and retains its evidence; it
-does not silently discard the plan or send the oversized request. Requests with
-actual image parts currently stop with an unknown-image-cost error. Non-vision
-profiles continue to receive the existing textual image notice. A provider's
-explicit context-overflow error permits one archive-first retry with a smaller
-context; a second overflow stops the run. Estimation is not an exact tokenizer.
+Rust 控制层负责凭据、审批、权限检查、执行状态、SSH 和审计。Skills、MCP 和子 Agent 都遵循当前运行的能力与审批边界；加载技能或收到模型建议不会自动扩大权限。
 
-Runs with the `agent.read_tool_result` capability receive bounded model views of
-large tool results. The original stays in the event store and can be paged by
-run-scoped sequence/hash references. This tool is unavailable in Plan mode;
-existing approved capabilities remain enforced. Repeated completed calls are
-compared with their results, so changing job state counts as progress. Unchanged
-repeated observations stop the run for attention. Truncated responses and streams
-without a terminal provider event never dispatch partial tool calls.
+执行契约包含版本化工具协议、与计划内容绑定的审批、只追加的哈希链事件、可验证检查点、进程组恢复记录及可审计运行包。它们用于追踪实际执行过程，不能把模型生成的方案或解释直接当作已完成的科研结果。
 
-Read-only subagents receive their objective, explicit dependency results and
-required output schema. Each child request is capped at 64 KiB (or the smaller
-parent context limit), including tool schemas; submissions are capped at 8 KiB.
-Oversized evidence fails the node with its original tool outcomes retained.
-Model attempts and read-only tool waits have deadlines and observe cancellation.
-The parent receives conclusions and call counts, with run-scoped references for
-the complete delegation trace. Recovery reuses successful nodes only for an
-identical graph and successful dependencies. Delegation reserves at most 32 model
-turns and 64 tool calls per run; restarting an incomplete graph reserves its full
-declared budget again, so recovery cannot reset that allowance.
+## 对话使用流程
 
-In a model profile's settings, **Read-only subagent model** selects another saved
-profile for newly created ordinary Agent runs. The child profile ID and exact
-execution-configuration hash are frozen into the run. A missing or changed child
-configuration prevents execution/resume; restore it or start a new run. Existing
-runs and approved plans retain their previous model behavior. Profile labels and
-credential rotation do not change the execution hash; credentials remain in the
-keyring. Reasoning-effort overrides and automatic main-model routing are not yet
-supported; selecting a profile does not imply a `max` effort setting.
+1. **建立项目和模型配置**：选择项目目录，在设置中保存可用的模型服务配置。
+2. **选择计算环境**：在输入区选择 Local 或已配置、信任并绑定到项目的 SSH 主机，检查 Python/R 探测状态。
+3. **说明科研目标与输入**：提供数据位置、分组、希望回答的问题和预期产物。Agent 检查环境与数据，必要时澄清问题；也可先用 Plan 模式审阅方案。
+4. **执行并调整分析**：按运行中的提示处理审批或缺失信息；普通 Agent 运行可以通过 Run guidance 追加简短指导。
+5. **核验并保存结果**：检查数据质量、统计假设、图表和引用，把分析产物与执行证据留在项目中。模型生成的解释需要与实际工具结果和文献相核对。
 
-## Development
+下面是使用示例，不是已完成的分析或真实环境验收结果。请替换为项目中实际存在的数据和环境。
 
-Prerequisites:
+**本地分析示例**
 
-- Rust stable
-- Node.js 22 or newer
-- Windows WebView2
+> 使用本地 Python 检查项目中的单细胞数据。先确认文件格式和依赖，再检查细胞及基因质控指标，解释过滤阈值的依据，保存质控图和分析记录。
+
+**远程分析示例**
+
+> 使用项目绑定的 SSH 主机和已准备好的 R 环境分析远端表达矩阵。先检查样本分组与依赖，再进行差异分析和可视化，保存结果表、图和参数；大型输入留在远端。
+
+**文献调研示例**
+
+> 检索与这组差异基因相关的研究，给出可核验的文献标识或链接，区分支持与冲突证据，并说明哪些结论仍需进一步实验验证。
+
+## 环境要求与数据位置
+
+- **本地 Python/R**：当前 Local 后端仅使用 `system` 环境，通过应用进程的 PATH 查找 `python` 和 `Rscript`。Windows 和 macOS 均需预先安装所用解释器及依赖；界面探测成功仅说明发现解释器，不保证科研包齐全。当前运行时面板不提供解释器路径编辑或内存变量检查。
+- **远程 Python/R**：先配置 SSH、完成主机密钥信任并绑定项目。可选择远端 `system` 或项目 Micromamba 环境名；Python/R 及科研包必须在远端可用。独立后台作业要求 Linux SSH 主机具备 Python 3 并允许分离进程组。
+- **模型与文献服务**：需配置可用模型；在线文献检索和外部 MCP 需要相应服务连接。本文不承诺所有功能可离线使用。
+- **平台**：以 Windows 为主要开发和验证平台。Windows 启动解释器和 MCP 等控制台子进程时使用后台进程策略；macOS 不设置 Windows 创建标志。下方打包命令面向 Windows NSIS，不代表已有 macOS 发布包。
+
+本地分析在本地项目中执行，SSH 分析的输入和完整计算输出可留在远端。发送给模型的对话、代码、工具结果片段，以及发给文献服务或 MCP 的查询和参数，仍会按配置的服务与授权范围传输。选择远程计算不等于所有内容都不会离开服务器。
+
+凭据使用现有操作系统 keyring 路径；Windows 使用 Credential Manager。API key、密码和 SSH 私钥内容不得进入 SQLite、模型上下文、事件、日志或导出包。大型科学数据不默认同步，应优先保留远程引用、校验和与元数据。
+
+## 当前限制与运行契约
+
+### 模型配置、能力与推理档位
+
+新建模型配置或改变供应商、API 地址、模型 ID 时，会采用编译内置的 models.dev 能力快照，包含已知的上下文、输入和输出上限、工具/视觉能力与已公布的推理档位。目录覆盖 OpenAI、Anthropic、DeepSeek、Alibaba（国际/中国）、MiniMax（国际/中国）及 OpenRouter 的文本输出模型。
+
+匹配要求精确协议、HTTPS API 主机/端口和完整模型 ID；OpenRouter 保留供应商前缀。不用型号家族、前缀或未知网关推断能力。未知网关沿用 32,768 上下文、4,096 输出回退，不推断视觉支持；既有 Ollama 视觉条目仍受支持。
+
+同一身份的配置编辑保留已保存能力，包括没有快照的旧配置。设置中的 **Adopt current catalog capabilities on save** 默认不勾选；显式勾选才采用当前目录并重置上下文上限，API 调用方可指定更低的合法窗口。未知条目或不兼容推理档位会在保存前报错，子模型绑定和请求档位保留并重新校验。应用升级不会自动重写旧配置，已加载的运行客户端继续使用原快照。
+
+OpenAI-compatible 配置提供 **Requested reasoning effort**：选择明确值（包括 `max`）或 **Provider default**，后者省略请求字段。主模型和绑定子模型各自使用自己的设置；旧调用方省略字段时保留原值，显式 null 清除。模型测试使用同样档位及 4,096 token 输出额度，除非请求预算覆盖。服务接受请求或报告 reasoning token 都不能证明实际采用了所请求档位；没有公布档位列表也不代表某档位受支持。系统不会自动降档，也没有自动 Luna 路由。
+
+新建普通运行冻结主模型执行配置，以及绑定子模型的配置 ID 和精确执行配置哈希。恢复前若模型 ID、端点、供应商、推理档位、能力或上下文预算改变，须恢复原设置或开始新运行；配置重命名和 keyring 凭据轮换不会改变执行哈希。目录来源元数据不进入运行指纹，实际能力与预算变化会影响指纹。既有运行和已批准计划保留各自兼容行为，不回填虚构的历史配置。
+
+### 上下文、工具结果与用量
+
+桌面 V4 在发送前检查完整模型请求，包含系统指令、工具 schema 和供应商格式。使用保守 UTF-8 字节估计与 1,024 安全 token；未设置窗口沿用 32,768 回退，输出预留最多 4,096 并受目录输出上限约束，独立输入上限也会限制预算。这不是精确 tokenizer。实际图片成本尚未知：包含真实图片部分的请求会停止并提示未知成本；非视觉配置继续接收文字图片提示。
+
+上下文过大时先归档并创建检查点，再检查一次；仍超限则暂停并保留证据，不静默丢弃计划。供应商明确报告上下文溢出时，只允许一次归档后以更小上下文重试；第二次溢出停止运行。被截断的响应或缺少终止事件的流不会派发不完整工具调用。
+
+获得 `agent.read_tool_result` 能力的运行可接收有界的大工具结果视图，原始结果保留在事件存储中，并可通过运行范围内的序号/哈希引用分页读取。此工具在 Plan 模式不可用。无进展检测同时比较调用和结果，作业状态变化算作进展；重复且不变的观察会让运行暂停等待处理。
+
+供应商用量事件只保留白名单中的非负整数计数。OpenAI-compatible 可保留服务报告的 reasoning/cache 明细，缺失字段保持缺失；Ollama 不复制响应正文、消息或上下文 ID。当前未新增 V4 用量持久化、部分用量聚合或历史记录重写。更多目录供应商、价格展示、准确图片成本和实际推理档位报告仍待完善；目录离线生成方式见 [scripts/README.md](scripts/README.md)。
+
+### 只读子 Agent 与运行指导
+
+只读子 Agent 接收目标、显式依赖结果和输出 schema，在独立请求中处理任务。请求含工具 schema，最多 64 KiB 或更小的父级上下文限制；提交结果最多 8 KiB。证据超限会使节点失败并保留原工具结果。模型尝试和只读工具等待均有期限并响应取消；父 Agent 接收结论、调用统计和完整委派轨迹的运行内引用。
+
+恢复只复用相同任务图及成功依赖下的成功节点。每个运行最多预留 32 个委派模型轮次、64 次工具调用；重启未完成图会再次预留完整声明预算，不能借恢复重置额度。设置中的 **Read-only subagent model** 只绑定新建普通 Agent 运行，不自动更改已有运行或批准计划，也不隐含 `max` 档位。
+
+普通运行的 **Run guidance** 最多接收 16 条消息，每条 2,048 UTF-8 字节。“Received”表示已持久化，“Applied”表示已加入模型上下文，均不表示任务已完成。指导会中断挂起的模型等待，并在下一个模型边界应用；只读工具等待让出，已完成结果保留，已派发的副作用工具先完成当前批次。重试复用消息 ID，未消费指导可跨重启保留，不能修改已批准计划或扩大执行权限。
+
+子模型和委派只读等待也会响应普通运行的指导；完成节点和读取保留，受中断读取记录 `guidance_interrupted` 失败且不生成证据，其下游节点阻塞。子 Agent 观察收件箱但由父级消费。这不会设置全局 Stop、打断计算作业、退还委派预算或改变已批准计划行为。
+
+### 交互式运行、保存结果恢复与后台作业
+
+运行时调用有独立于解释器会话的持久作业身份。同一已记录调用不会因重试或不确定连接错误重复启动计算。取消把尚未确定状态的作业记为 unknown，不宣称远端已取消。完整结果保留在工具事件和归档中，作业账本仅存元数据与摘要；进程内 worker 支持等待和重读结果，放弃等待不会取消 worker。**交互式内核尚不支持跨应用重启重连。**
+
+临时结果回执连接“作业完成”和“工具事件提交”：恢复验证原请求、会话和结果摘要，不重新执行代码，回执随工具事件在同一事务中移除。明确不确定的派发仍需核对，终态运行不会重开。非活动运行达到既有过期阈值时，只有全部未完成派发都有可验证回执，才提供 **Resume saved results**；缺失回执或不确定派发保持原处理。这是读取保存结果，不是重连仍在运行的远端进程。
+
+**Cancel this run** 可结束等待保存结果恢复的运行，原子记录取消状态与事件，保留回执和作业身份以供审计，不启动计算或验证结果。恢复与取消提交互斥，延迟恢复不能覆盖已提交取消；此操作不适用于其他暂停或远端存活作业。
+
+独立 SSH 后台作业可在应用或 SSH 连接关闭后查询：让 Agent 使用 `runtime.execute` 的 `background: true`，返回持久 job ID。在同一项目的后续对话调用 `runtime.remote_job_status`，无参数列出最多 100 个近期作业，传 `job_id` 查询原作业状态/结果。查询不重新提交代码；丢失提交确认、进程死亡或缺少完成回执都可能返回 unknown，不代表可安全重试。
+
+后台作业绑定项目、原运行/请求、SSH 后端、固定主机密钥指纹和解析后的远端根目录。Python/R 在全新进程中使用所选 system 或既有 Micromamba 环境，不继承交互变量。Windows/macOS 客户端使用同一路径；当前拒绝 Local 和容器后台作业。代码最多 16 KiB，捕获最多 128 个路径且声明不超过 16 KiB；不支持内联 `analysis` 声明，应检查完成后另行注册验证过的结果。
+
+完整 stdout/stderr 留在远端项目的 `.omicsops/remote-jobs` 中；重连可读取有界片段、校验和与结果元数据，远端完成回执原子发布并在本地持久化前验证。**停止 Agent 或取消运行不会取消独立后台计算。** 当前没有自动轮询、专门作业面板或后台作业取消命令；不能把既有交互作业转换成后台作业，服务器重启或进程丢失且无回执时仍为 unknown。重连不会重开或改写终态 Agent 运行。
+
+## 开发与构建
+
+开发需要 Rust stable、Node.js 22 或更新版本；Windows 还需 WebView2 和 Rust/Tauri 所需的系统构建工具。解释器及科研依赖按所选计算环境另外准备。
 
 ```powershell
-npm install
+npm ci
 cargo test --workspace
 npm test
+npm run build
 npm run tauri:dev
 ```
 
-## Production build
-
-Build the Windows application and NSIS installer with:
+构建 Windows 应用和 NSIS 安装包：
 
 ```powershell
 npm run build:desktop
 ```
 
-The standalone production executable is written to
-`target/release/omicsops-desktop.exe`, and the installer is written under
-`target/release/bundle/nsis/`. Do not distribute `target/debug/omicsops-desktop.exe`:
-the default Tauri configuration embeds `dist` and never points at localhost.
-The Vite development URL is isolated in `src-tauri/tauri.dev.conf.json` and is
-used only by `npm run tauri:dev`.
+生产程序输出到 `target/release/omicsops-desktop.exe`，安装包位于 `target/release/bundle/nsis/`。不要分发 `target/debug/omicsops-desktop.exe`；默认 Tauri 配置嵌入 `dist`，不指向 localhost。Vite 开发地址仅由 `src-tauri/tauri.dev.conf.json` 提供，并通过 `npm run tauri:dev` 使用。
 
-See `docs/superpowers/specs/2026-07-29-omicsops-agent-design.md` for the
-approved design.
+确定性测试不需要真实 SSH、GPU、WSL 或 API key。真实模型、SSH、R、Micromamba 和 PBMC 等验收需另按验收文档，在一次性环境中显式执行对应 ignored 测试。测试通过或构建成功不等于真实科研流程端到端验收。仓库尚无正式发布流程，不自动创建 tag、GitHub Release 或分发安装包。
 
-The V2 control plane uses versioned tool contracts, canonical plan approvals,
-append-only hash-chained events, verified checkpoints, process-group recovery,
-and auditable run bundles. See `acceptance/README.md` for the pinned PBMC and
-bulk RNA-seq acceptance procedure.
+## 参考文档
 
-Running ordinary Agent tasks accept short follow-up guidance through the inline
-**Run guidance** panel. Each run accepts up to 16 messages of 2048 UTF-8 bytes each.
-“Received” means durably stored; “Applied” means added to the model context, not
-that the requested work has finished. Guidance interrupts a pending model request
-and is applied at the next model boundary. Pending read-only tools yield;
-completed results are retained. Dispatched side-effecting tools finish their
-batch first. Retries reuse the message ID, and pending input survives restart. Guidance
-cannot modify an approved plan or expand execution permissions.
-
-Runtime invocations now have a durable job identity separate from the interpreter
-session. Repeating the same recorded invocation cannot launch a second computation,
-including after an uncertain connection failure. Cancellation records unfinished
-jobs as unknown, not as confirmed remote cancellation. Completed output remains
-in the existing tool events and archives; the job ledger stores only metadata and
-a result digest. In-process workers now support event-driven waiting and rereading
-results without rerunning computation. Dropping a waiter does not cancel its worker.
-Interactive kernel reconnection across application restarts is not implemented.
-For detached one-shot SSH jobs, use the background execution path below.
-
-A bounded, temporary runtime-result receipt now bridges the gap between recording
-job completion and committing its tool event. Recovery verifies the original
-request, session and result digest and never executes the cell again. The receipt
-is removed atomically with the tool event. Explicitly uncertain dispatches retain
-the existing reconciliation requirement; terminal runs are not reopened.
-
-When an inactive run exceeds the existing stale-run threshold, the desktop now
-checks for verified receipts for every unfinished dispatched operation. If all
-are available, it preserves the run and offers **Resume saved results** instead
-of marking it failed. Resuming follows the original run and frozen configuration.
-Missing receipts, explicitly uncertain dispatches and terminal runs retain their
-existing handling; this does not reconnect to a still-running remote process.
-
-OpenAI-compatible model settings now expose **Requested reasoning effort**. Save
-an explicit wire value (including `max`) or choose **Provider default** to omit
-it. Each saved profile, including a bound read-only child, uses its own setting;
-changing a frozen child's effort requires a new run. Older callers that omit
-this setting preserve it, while explicit null clears it. Test sends the same
-effort with a 4096-token output allowance unless a request budget overrides it.
-Acceptance of a request does not prove the service used that effort. There is no
-automatic downgrade, model-family capability inference or automatic Luna route;
-additional catalog providers, pricing and effective-effort reporting remain pending.
-
-New ordinary runs also freeze the main model's execution configuration. Resuming
-with a changed model ID, endpoint, provider, reasoning effort, capability flags
-or context window fails before opening execution resources. Restore the original
-settings or start a new run; renaming a profile or rotating its keyring credential
-does not invalidate it. The client and request budget use the same loaded profile
-snapshot. Legacy runs without the fingerprint and approved-plan runs retain their
-existing behavior; no historical configuration is invented or backfilled.
-
-A run paused at **Resume saved results** can now be ended with **Cancel this run**.
-Cancellation records its terminal event and status atomically, retains the saved
-receipts/job identities for audit, and does not launch computation or validate the
-results. Resume and cancel are mutually exclusive while an action is submitting;
-a delayed resume cannot overwrite a committed cancellation. This action applies
-only to saved-result recovery, not other pauses or live remote jobs.
-
-In-run guidance now also yields pending child-model and delegated read-only tool
-waits in ordinary runs. Completed nodes and reads remain in the graph trace;
-interrupted reads carry a failed guidance_interrupted result without evidence,
-and downstream nodes are blocked. Children observe the inbox but leave its
-consumption to the parent after the graph settles. This does not set the global
-Stop token, interrupt compute jobs, refund delegation budgets, or change
-approved-plan delegation behavior.
-
-Built-in provider usage events retain only allowlisted non-negative integer
-counters. OpenAI-compatible events may include reported reasoning/cache token
-details; these do not certify an effective reasoning effort. Missing details remain
-absent. Ollama usage no longer copies the response body, messages or context IDs;
-unknown fields and invalid counter values are excluded in both streaming and
-non-streaming responses. Existing top-level token counts and partial-event
-semantics are unchanged. This does not add V4 usage persistence, aggregate partial
-updates, or rewrite historical records.
-
-
-Detached SSH jobs can be reconnected after the app or SSH connection closes.
-Ask the Agent to run a standalone job in the background (`runtime.execute` with
-`background: true`). It returns a durable job ID. In a later conversation in the
-same project, ask to list or reconnect remote jobs: `runtime.remote_job_status`
-with no arguments lists up to 100 recent jobs, and `job_id` reads the original
-job's current state/result. A query never submits code again. A lost submission
-acknowledgement or missing/dead process returns unknown, not permission to retry.
-
-Jobs bind project, original run/request, SSH backend, pinned host-key fingerprint
-and resolved remote root. Code runs in a fresh Python/R process, outside the
-interactive kernel; it does not inherit variables. The selected system or existing
-Micromamba environment is used. The Linux SSH host needs Python 3 and must allow
-detached process groups. Windows/macOS clients use the same SSH path; local and
-container background jobs are rejected. Code is limited to 16 KiB, captures to
-128 paths / 16 KiB. Inline `analysis` declarations are not supported for detached
-jobs; inspect completion and register verified results separately.
-
-Full stdout/stderr stay under the remote project's `.omicsops/remote-jobs`; bounded
-excerpts, checksums and result metadata can be read on reconnect. Completion
-receipts are atomically published remotely and validated before local persistence.
-Stopping the Agent or cancelling its run does **not** cancel detached computation.
-There is no automatic polling, dedicated job panel or job-cancellation command in
-this increment. Existing interactive jobs cannot be converted retroactively, and
-server reboot/process loss without a receipt remains unknown. Reconnection does
-not reopen or rewrite a terminal Agent run. Live SSH acceptance is documented in
-`acceptance/README.md`; deterministic tests are not a real-host acceptance claim.
+- [开发约定与仓库职责](AGENTS.md)
+- [Agent / Plan 模式与环境选择](docs/agent-modes.md)
+- [普通 Agent Guided Loop](docs/superpowers/specs/ordinary-agent-guided-loop.md)
+- [V4 Agent Harness 设计](docs/superpowers/specs/2026-08-16-agent-harness-v3-design.md)
+- [Wisp 参考 Agent Loop 设计及后续增量](docs/superpowers/specs/2026-09-08-wisp-inspired-agent-loop.md)
+- [最初批准设计（历史背景）](docs/superpowers/specs/2026-07-29-omicsops-agent-design.md)
+- [真实环境验收流程](acceptance/README.md)
+- [Wisp Science](https://github.com/xuzhougeng/wisp-science)：科研工作流与产品表达的参考，OmicsOps 的实际支持范围以上文及本仓库实现为准。

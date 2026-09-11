@@ -29,6 +29,16 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
+struct ModelTextPreviewGuard<'a> {
+    store: &'a dyn EventStoreV4,
+    run_id: Uuid,
+}
+impl Drop for ModelTextPreviewGuard<'_> {
+    fn drop(&mut self) {
+        self.store.preview_model_text(self.run_id, None);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelRequestV4 {
     pub system: String,
@@ -193,9 +203,19 @@ pub trait ToolPortV4: Send + Sync {
     fn validate(&self, _mode: RunModeV4, _call: &ToolCallV4) -> Result<(), String> {
         Ok(())
     }
+    /// Host-only, read-only preparation after authorization, before scientific
+    /// state or dispatch is recorded. Returning an outcome defers the call;
+    /// implementations must never execute the requested operation here.
+    async fn prepare_call(&self, _call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
+        Ok(None)
+    }
     /// Host-owned durable authorization. Implementations must bind this to
     /// the exact capability, target host, session, and protocol version.
     fn has_persistent_authorization(&self, _call: &ToolCallV4) -> bool {
+        false
+    }
+    /// Host-verified approval of the concrete read-only target, never a model hint.
+    async fn risk_based_target_approved(&self, _call: &ToolCallV4) -> bool {
         false
     }
     /// Authorize one Plan-mode call after the caller has supplied its
@@ -256,6 +276,8 @@ pub trait ExternalExecutorPortV4: Send + Sync {
 
 #[async_trait]
 pub trait EventStoreV4: Send + Sync {
+    /// Ephemeral public text preview; never part of the audit/evidence chain.
+    fn preview_model_text(&self, _run_id: Uuid, _text: Option<&str>) {}
     async fn append(&self, event: &AgentEventV4) -> Result<(), String>;
     async fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String>;
     /// Atomically record accepted guidance as consumed at a model boundary.
@@ -998,7 +1020,10 @@ impl AgentCoreV4<'_> {
                         .await?;
                         continue;
                     }
-                    if self.tool_requires_approval(spec, &call, effect, &existing)? {
+                    if self
+                        .tool_requires_approval(spec, &call, effect, &existing)
+                        .await?
+                    {
                         let request = self.approval_request(spec, call, effect)?;
                         self.push(
                             spec.run_id,
@@ -1308,6 +1333,14 @@ impl AgentCoreV4<'_> {
                     )
                     .await?;
                 } else {
+                    if let Some(outcome) = self
+                        .prepare_tool_call(&call, cancelled, Duration::from_secs(30))
+                        .await?
+                    {
+                        self.push(spec.run_id, AgentEventKindV4::ToolFinished { outcome })
+                            .await?;
+                        continue;
+                    }
                     match self.science_before_tool(spec, &call).await {
                         Ok(()) => dispatch.push(call),
                         Err(message) if recoverable_scientific_declaration_error(&message) => {
@@ -2259,7 +2292,7 @@ impl AgentCoreV4<'_> {
     async fn model_turn(
         &self,
         run_id: Uuid,
-        request: ModelRequestV4,
+        mut request: ModelRequestV4,
         max_retries: u8,
         attempt_timeout: Duration,
         cancelled: Option<&AtomicBool>,
@@ -2268,13 +2301,25 @@ impl AgentCoreV4<'_> {
             .validate_request(&request)
             .map_err(|error| AgentCoreErrorV4::NeedsAttention(error.message))?;
         let mut attempt = 0_u8;
+        let mut truncated_retry = false;
         loop {
             let mut callback_events = Vec::new();
             let mut streamed_text = String::new();
+            let _preview = ModelTextPreviewGuard {
+                store: self.events,
+                run_id,
+            };
+            let mut last_preview = None::<Instant>;
             let mut on_event = |event| {
                 let kind = match event {
                     ModelStreamEventV4::TextDelta(text) => {
                         streamed_text.push_str(&text);
+                        if last_preview
+                            .is_none_or(|last| last.elapsed() >= Duration::from_millis(40))
+                        {
+                            self.events.preview_model_text(run_id, Some(&streamed_text));
+                            last_preview = Some(Instant::now());
+                        }
                         return;
                     }
                     ModelStreamEventV4::ProviderRetrying {
@@ -2336,6 +2381,17 @@ impl AgentCoreV4<'_> {
                         .await?;
                     }
                     return Ok(turn);
+                }
+                Err(error) if error.message.contains("truncated_output:") && !truncated_retry => {
+                    truncated_retry = true;
+                    request.system.push_str("\nThe previous model response exceeded its output allowance and was discarded. No tool calls from that response executed. Continue from the existing evidence with at most ONE complete tool call, minimal arguments, and a brief public update in the user's language. Do not repeat discovery already completed. Split large writes into smaller operations.");
+                    self.model
+                        .validate_request(&request)
+                        .map_err(|error| AgentCoreErrorV4::NeedsAttention(error.message))?;
+                    self.push(run_id, AgentEventKindV4::ModelRetrying {
+                        attempt: 1, class: error.class,
+                        message: "Output was truncated; retrying once with a single concise tool call. No partial call was dispatched.".into(),
+                    }).await?;
                 }
                 Err(error) if error.retryable && attempt < max_retries => {
                     attempt += 1;
@@ -2707,7 +2763,19 @@ impl AgentCoreV4<'_> {
             if cancelled.load(Ordering::SeqCst) {
                 return Err(AgentCoreErrorV4::Cancelled);
             }
-            if self.tool_requires_approval(spec, &call, effect, &events)? {
+            if let Err(message) = self.tools.validate(RunModeV4::Execute, &call) {
+                self.push(run_id, AgentEventKindV4::ToolFinished { outcome: ToolOutcomeV4 {
+                    call_id: call.call_id, tool_id: call.tool_id, succeeded: false,
+                    model_content: format!("Host rejected the pending tool before approval or dispatch: {message}"),
+                    data: json!({"error_kind":"validation","recoverable":true,"operation_dispatched":false}),
+                    provenance: vec![],
+                }}).await?;
+                continue;
+            }
+            if self
+                .tool_requires_approval(spec, &call, effect, &events)
+                .await?
+            {
                 match self.approval_decision(spec, &call, effect, &events)? {
                     Some(ToolApprovalDecisionV4::Approved) => {}
                     Some(ToolApprovalDecisionV4::Denied) => {
@@ -2794,6 +2862,14 @@ impl AgentCoreV4<'_> {
                     },
                 )
                 .await?;
+                continue;
+            }
+            if let Some(outcome) = self
+                .prepare_tool_call(&call, cancelled, Duration::from_secs(30))
+                .await?
+            {
+                self.push(run_id, AgentEventKindV4::ToolFinished { outcome })
+                    .await?;
                 continue;
             }
             if let Err(message) = self.science_before_tool(spec, &call).await {
@@ -3209,7 +3285,7 @@ impl AgentCoreV4<'_> {
         Ok(decision)
     }
 
-    fn tool_requires_approval(
+    async fn tool_requires_approval(
         &self,
         spec: &RunSpecV4,
         call: &ToolCallV4,
@@ -3232,6 +3308,9 @@ impl AgentCoreV4<'_> {
             ApprovalPolicyV4::FullAccess => Ok(false),
             ApprovalPolicyV4::RequestApproval => Ok(true),
             ApprovalPolicyV4::RiskBased => {
+                if self.tools.risk_based_target_approved(call).await {
+                    return Ok(false);
+                }
                 if call.tool_id == "runtime.execute"
                     && matches!(
                         selection.backend_kind,
@@ -3595,6 +3674,43 @@ impl AgentCoreV4<'_> {
             .await?;
         }
         Ok(())
+    }
+
+    async fn prepare_tool_call(
+        &self,
+        call: &ToolCallV4,
+        cancelled: &AtomicBool,
+        timeout: Duration,
+    ) -> Result<Option<ToolOutcomeV4>, AgentCoreErrorV4> {
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(AgentCoreErrorV4::Cancelled);
+        }
+        let pending = tokio::time::timeout(timeout, self.tools.prepare_call(call));
+        tokio::pin!(pending);
+        loop {
+            tokio::select! {
+                result = &mut pending => {
+                    let outcome = match result {
+                        Ok(Ok(outcome)) => outcome,
+                        Ok(Err(_)) | Err(_) => Some(ToolOutcomeV4 {
+                            call_id: call.call_id.clone(), tool_id: call.tool_id.clone(), succeeded: false,
+                            model_content: "Host resource preparation failed or timed out. The operation was not dispatched; retry or continue with independent tools.".into(),
+                            data: json!({"error_kind":"resource_preparation","recoverable":true,"operation_dispatched":false}),
+                            provenance: vec![],
+                        }),
+                    };
+                    if outcome.as_ref().is_some_and(|outcome| outcome.call_id != call.call_id
+                        || outcome.tool_id != call.tool_id || outcome.succeeded
+                        || outcome.data.get("operation_dispatched") != Some(&Value::Bool(false))) {
+                        return Err(AgentCoreErrorV4::Tool("invalid host preparation outcome".into()));
+                    }
+                    return Ok(outcome);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                    if cancelled.load(Ordering::SeqCst) { return Err(AgentCoreErrorV4::Cancelled); }
+                }
+            }
+        }
     }
 
     async fn science_before_tool(&self, spec: &RunSpecV4, call: &ToolCallV4) -> Result<(), String> {
@@ -4957,6 +5073,10 @@ mod tests {
     struct FakeTools;
     #[async_trait]
     impl ToolPortV4 for FakeTools {
+        async fn risk_based_target_approved(&self, call: &ToolCallV4) -> bool {
+            call.tool_id == "use_mcp_tool"
+                && call.arguments.get("fixture_approved") == Some(&json!(true))
+        }
         fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
             vec![ToolDescriptorV4 {
                 id: "project.list".into(),
@@ -5223,6 +5343,7 @@ mod tests {
     }
     #[derive(Default)]
     struct MemoryStore {
+        previews: Mutex<Vec<Option<String>>>,
         events: Mutex<Vec<AgentEventV4>>,
         archives: Mutex<Vec<String>>,
     }
@@ -5245,6 +5366,9 @@ mod tests {
     }
     #[async_trait]
     impl EventStoreV4 for MemoryStore {
+        fn preview_model_text(&self, _: Uuid, text: Option<&str>) {
+            self.previews.lock().unwrap().push(text.map(str::to_owned));
+        }
         async fn append(&self, event: &AgentEventV4) -> Result<(), String> {
             self.append_direct(event)
         }
@@ -6382,8 +6506,8 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn approval_policy_matrix_requires_the_expected_tool_decisions() {
+    #[tokio::test]
+    async fn approval_policy_matrix_requires_the_expected_tool_decisions() {
         let store = MemoryStore::default();
         let model = ScriptedModel(Mutex::new(vec![]));
         let core = AgentCoreV4 {
@@ -6404,11 +6528,13 @@ mod tests {
         );
         assert!(
             core.tool_requires_approval(&request, &call, ToolEffectV4::Runtime, &[])
+                .await
                 .unwrap()
         );
         assert!(
             !core
                 .tool_requires_approval(&request, &call, ToolEffectV4::ReadOnly, &[])
+                .await
                 .unwrap()
         );
         let risk = supervised_execution_spec(
@@ -6418,10 +6544,28 @@ mod tests {
         );
         assert!(
             core.tool_requires_approval(&risk, &call, ToolEffectV4::Runtime, &[])
+                .await
                 .unwrap()
         );
         assert!(
             core.tool_requires_approval(&risk, &call, ToolEffectV4::Network, &[])
+                .await
+                .unwrap()
+        );
+        let approved_mcp = ToolCallV4 {
+            call_id: "mcp".into(),
+            tool_id: "use_mcp_tool".into(),
+            arguments: json!({"fixture_approved":true}),
+        };
+        assert!(
+            !core
+                .tool_requires_approval(&risk, &approved_mcp, ToolEffectV4::Network, &[])
+                .await
+                .unwrap()
+        );
+        assert!(
+            core.tool_requires_approval(&request, &approved_mcp, ToolEffectV4::Network, &[])
+                .await
                 .unwrap()
         );
         let mut full_access = risk;
@@ -6437,6 +6581,7 @@ mod tests {
         };
         assert!(
             core.tool_requires_approval(&full_access, &browser_call, ToolEffectV4::Network, &[],)
+                .await
                 .unwrap(),
             "compute Full Access must not bypass host browser authorization"
         );
@@ -10447,6 +10592,176 @@ mod tests {
         }
     }
 
+    struct PreparingTools {
+        attempts: AtomicUsize,
+        network: bool,
+        hang: bool,
+    }
+    #[async_trait]
+    impl ToolPortV4 for PreparingTools {
+        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
+            vec![]
+        }
+        fn effect(&self, _: &str) -> Option<ToolEffectV4> {
+            Some(if self.network {
+                ToolEffectV4::Network
+            } else {
+                ToolEffectV4::ReadOnly
+            })
+        }
+        async fn prepare_call(&self, call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
+            self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.hang {
+                std::future::pending::<()>().await;
+            }
+            Ok(Some(ToolOutcomeV4 {
+                call_id: call.call_id.clone(),
+                tool_id: call.tool_id.clone(),
+                succeeded: false,
+                model_content: "remote context loaded; operation deferred".into(),
+                data: json!({"error_kind":"project_context_loaded","recoverable":true,"operation_dispatched":false}),
+                provenance: vec![],
+            }))
+        }
+        async fn execute(&self, _: RunModeV4, _: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            panic!("deferred operation must not dispatch")
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_preparation_deferral_precedes_science_and_dispatch_on_start_and_resume() {
+        for resume in [false, true] {
+            let spec = ordinary_execution_spec(Uuid::new_v4());
+            let store = MemoryStore::default();
+            seed_execution(&store, &spec);
+            let call = ToolCallV4 {
+                call_id: "lazy-read".into(),
+                tool_id: "project.read".into(),
+                arguments: json!({"path":"data.csv"}),
+            };
+            let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
+                public_text: "inspect data".into(),
+                tool_calls: vec![call.clone()],
+            }]));
+            let tools = PreparingTools {
+                attempts: AtomicUsize::new(0),
+                network: false,
+                hang: false,
+            };
+            let science = RecordingScience(AtomicUsize::new(0));
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &tools,
+                events: &store,
+                science: Some(&science),
+            };
+            if resume {
+                append_test_event(
+                    &store,
+                    spec.run_id,
+                    AgentEventKindV4::ToolRequested { call },
+                );
+                core.recover_interrupted_dispatches(
+                    &spec,
+                    AgentLimitsV4::default(),
+                    &AtomicBool::new(false),
+                )
+                .await
+                .unwrap();
+            } else {
+                assert!(matches!(
+                    core.execute(&spec, 1).await,
+                    Err(AgentCoreErrorV4::MissingCompletion)
+                ));
+            }
+            assert_eq!(tools.attempts.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(science.0.load(AtomicOrdering::SeqCst), 0);
+            let events = store.load_direct(spec.run_id).unwrap();
+            assert!(events.iter().any(|event| matches!(&event.event, AgentEventKindV4::ToolFinished { outcome } if outcome.data["operation_dispatched"] == false)));
+            assert!(!events.iter().any(|event| matches!(
+                event.event,
+                AgentEventKindV4::ToolDispatchStarted { .. }
+                    | AgentEventKindV4::ToolDispatchUncertain { .. }
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_preparation_waits_for_authorization() {
+        let spec = ordinary_execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
+            public_text: "query".into(),
+            tool_calls: vec![ToolCallV4 {
+                call_id: "approval".into(),
+                tool_id: "use_mcp_tool".into(),
+                arguments: json!({}),
+            }],
+        }]));
+        let tools = PreparingTools {
+            attempts: AtomicUsize::new(0),
+            network: true,
+            hang: false,
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        assert!(matches!(
+            core.execute(&spec, 1).await,
+            Err(AgentCoreErrorV4::WaitingForApproval)
+        ));
+        assert_eq!(tools.attempts.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn resource_preparation_timeout_and_cancellation_do_not_dispatch() {
+        let store = MemoryStore::default();
+        let model = ScriptedModel(Mutex::new(vec![]));
+        let tools = PreparingTools {
+            attempts: AtomicUsize::new(0),
+            network: false,
+            hang: true,
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        let call = ToolCallV4 {
+            call_id: "wait".into(),
+            tool_id: "project.read".into(),
+            arguments: json!({}),
+        };
+        let cancelled = AtomicBool::new(false);
+        let result = core
+            .prepare_tool_call(&call, &cancelled, Duration::from_millis(5))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.data["operation_dispatched"], false);
+        let cancel = async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            cancelled.store(true, Ordering::SeqCst);
+        };
+        let (result, ()) = tokio::join!(
+            core.prepare_tool_call(&call, &cancelled, Duration::from_secs(5)),
+            cancel
+        );
+        assert!(matches!(result, Err(AgentCoreErrorV4::Cancelled)));
+        assert_eq!(tools.attempts.load(AtomicOrdering::SeqCst), 2);
+        assert!(matches!(
+            core.prepare_tool_call(&call, &cancelled, Duration::from_secs(5))
+                .await,
+            Err(AgentCoreErrorV4::Cancelled)
+        ));
+        assert_eq!(tools.attempts.load(AtomicOrdering::SeqCst), 2);
+    }
+
     struct AdaptiveRetrievalTools {
         approved: bool,
     }
@@ -10892,5 +11207,94 @@ mod tests {
         let mut listing = workflow_call("project.list");
         listing.arguments = json!({"path":"."});
         assert!(guided_loop_rejection(&events, &listing).is_none());
+    }
+    struct TruncatedModel {
+        attempts: AtomicUsize,
+        always_fail: bool,
+    }
+    #[async_trait]
+    impl ModelPortV4 for TruncatedModel {
+        async fn stream(
+            &self,
+            request: ModelRequestV4,
+            on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            let attempt = self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            if attempt == 0 || self.always_fail {
+                on_event(ModelStreamEventV4::TextDelta(
+                    "discard partial response".into(),
+                ));
+                return Err(ModelFailureV4::permanent(
+                    omicsops_protocol::ModelErrorClassV4::InvalidResponse,
+                    "truncated_output: output allowance",
+                ));
+            }
+            assert!(request.system.contains("at most ONE complete tool call"));
+            assert_eq!(request.context, "verified evidence");
+            Ok(ModelTurnV4 {
+                public_text: "Recovered".into(),
+                tool_calls: vec![],
+            })
+        }
+    }
+    #[tokio::test]
+    async fn truncated_turn_retries_once_without_committing_partial_output() {
+        for always_fail in [false, true] {
+            let model = TruncatedModel {
+                attempts: AtomicUsize::new(0),
+                always_fail,
+            };
+            let store = MemoryStore::default();
+            let run_id = Uuid::new_v4();
+            store
+                .append_direct(&AgentEventV4::first(
+                    run_id,
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    Utc::now(),
+                    AgentEventKindV4::RunCreated {
+                        mode: RunModeV4::Execute,
+                    },
+                ))
+                .unwrap();
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &FakeTools,
+                events: &store,
+                science: None,
+            };
+            let result = core
+                .model_turn(
+                    run_id,
+                    ModelRequestV4 {
+                        system: "system".into(),
+                        context: "verified evidence".into(),
+                        tools: vec![],
+                        image_refs: vec![],
+                    },
+                    3,
+                    Duration::from_secs(1),
+                    None,
+                )
+                .await;
+            assert_eq!(result.is_err(), always_fail);
+            let previews = store.previews.lock().unwrap();
+            assert!(
+                previews
+                    .iter()
+                    .any(|text| text.as_deref() == Some("discard partial response"))
+            );
+            assert_eq!(previews.last(), Some(&None));
+            assert_eq!(model.attempts.load(AtomicOrdering::SeqCst), 2);
+            let events = store.events.lock().unwrap();
+            assert!(!events.iter().any(|event| matches!(&event.event, AgentEventKindV4::ModelText { text } if text.contains("discard partial"))));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event.event, AgentEventKindV4::ModelRetrying { .. }))
+                    .count(),
+                1
+            );
+        }
     }
 }

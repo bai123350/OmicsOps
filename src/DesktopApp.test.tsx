@@ -855,3 +855,23 @@ describe("DesktopApp", () => {
     expect(screen.queryByText("旧项目同步泄漏.txt")).not.toBeInTheDocument();
   });
 });
+
+it("streams public preview only for the current conversation and clears on commit", async () => {
+  // Covered through the app subscription, not just the presentation component.
+  const { stateSpy } = setupConversationStateHarness();
+  stateSpy.mockResolvedValue(stateSnapshot("conversation-agent", { latest_run: { ...stateRun("live-run", "running", null, null, null), session_mode: "agent" } }));
+  let emit!: Parameters<typeof api.onAgentV4Event>[0];
+  let preview!: Parameters<typeof api.onAgentV4TextPreview>[0];
+  vi.spyOn(api, "onAgentV4Event").mockImplementation(async (cb) => { emit = cb; return () => undefined; });
+  vi.spyOn(api, "onAgentV4TextPreview").mockImplementation(async (cb) => { preview = cb; return () => undefined; });
+  render(<DesktopApp />);
+  await screen.findByRole("heading", { name: "Agent 会话" });
+  await waitFor(() => expect(preview).toBeDefined());
+  await act(async () => emit(agentEvent("conversation-agent", "live-run", 1, { kind: "run_created", mode: "execute" })));
+  await act(async () => preview({ run_id: "wrong-run", text: "foreign preview" }));
+  expect(screen.queryByText("foreign preview")).not.toBeInTheDocument();
+  await act(async () => preview({ run_id: "live-run", text: "Live progress" }));
+  expect(screen.getByRole("article", { name: "模型实时输出" })).toHaveTextContent("Live progress");
+  await act(async () => emit(agentEvent("conversation-agent", "live-run", 2, { kind: "model_text", text: "Live progress" })));
+  expect(screen.getAllByText("Live progress")).toHaveLength(1);
+});

@@ -262,9 +262,33 @@ impl PubMedClient {
         if let Some(email) = self.config.email.as_deref() {
             url.query_pairs_mut().append_pair("email", email);
         }
-        if let Some(api_key) = self.config.api_key.as_deref() {
+        if let Some(api_key) = self.config.api_key.as_deref().and_then(usable_ncbi_api_key) {
             url.query_pairs_mut().append_pair("api_key", api_key);
         }
+    }
+}
+
+// Optional keys copied from configuration templates must not become literal URL values.
+fn usable_ncbi_api_key(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let upper = value.to_ascii_uppercase();
+    if value.is_empty()
+        || value.starts_with("${")
+        || value.starts_with("%")
+        || value.starts_with('<')
+        || matches!(
+            upper.as_str(),
+            "YOUR_API_KEY"
+                | "YOUR_NCBI_API_KEY"
+                | "NCBI_API_KEY"
+                | "API_KEY"
+                | "REPLACE_ME"
+                | "CHANGEME"
+        )
+    {
+        None
+    } else {
+        Some(value)
     }
 }
 
@@ -927,5 +951,30 @@ mod tests {
         assert!(matches!(result[1], PubMedRecordStatus::Duplicate));
         assert!(matches!(result[2], PubMedRecordStatus::Missing));
         assert!(matches!(result[3], PubMedRecordStatus::NoAbstract));
+    }
+    #[test]
+    fn placeholder_keys_are_omitted_from_requests() {
+        for key in [
+            "",
+            "${NCBI_API_KEY}",
+            "%NCBI_API_KEY%",
+            "YOUR_API_KEY",
+            "your_ncbi_api_key",
+            "<api-key>",
+        ] {
+            let client = PubMedClient::new(PubMedClientConfig {
+                api_key: Some(key.into()),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(
+                !client
+                    .fetch_url(&["123".into()])
+                    .unwrap()
+                    .query_pairs()
+                    .any(|(name, _)| name == "api_key")
+            );
+        }
+        assert_eq!(usable_ncbi_api_key(" actual-key "), Some("actual-key"));
     }
 }

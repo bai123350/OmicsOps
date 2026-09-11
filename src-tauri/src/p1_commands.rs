@@ -1445,7 +1445,7 @@ pub(crate) async fn invoke_configured_mcp_tool_v4(
         "approved": true,
         "approval_scope": if persistently_approved { "persistent" } else { "run_schema_bound" },
         "attempts": 1,
-        "succeeded": true,
+        "succeeded": invocation.result.get("isError").and_then(Value::as_bool) != Some(true),
         "catalog_sha256": invocation.tool_catalog_sha256,
         "schema_sha256": expected_schema_sha256,
         "timestamp": Utc::now(),

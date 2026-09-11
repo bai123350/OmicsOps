@@ -490,3 +490,5 @@ export interface FormalStepProposal {
   code: string;
   code_sha256: string;
 }
+
+export interface AgentTextPreviewV4 { run_id: string; text: string | null }

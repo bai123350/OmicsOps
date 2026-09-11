@@ -6,7 +6,8 @@
 
 保留 V4 基础，把普通 Agent 从固定发现流程改为目标驱动的模型—工具—结果循环。
 本设计取代 ordinary-agent-guided-loop.md 中固定 discovery、强制任务清单与
-MCP/浏览器顺序要求。复杂 Workflow、ACP、计算资源延迟初始化不属于本次切片。
+MCP/浏览器顺序要求。复杂 Workflow、ACP、计算资源延迟初始化不属于第一阶段切片。
+第二阶段按需资源初始化见 [设计](2026-09-10-lazy-agent-execution-resources.md)。
 
 ## 行为
 

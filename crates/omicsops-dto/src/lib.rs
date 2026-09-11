@@ -12,6 +12,13 @@ use omicsops_protocol::{ComputeSelectionV4, ExecutionPlanV4};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Transient public output snapshot. None clears an unfinished preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTextPreviewV4 {
+    pub run_id: Uuid,
+    pub text: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmitGuidanceV4Request {
     pub message_id: Uuid,

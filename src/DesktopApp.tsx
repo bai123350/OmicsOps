@@ -40,6 +40,7 @@ export default function DesktopApp() {
   const [runId, setRunId] = useState<string | null>(null);
   const [runStartedAt, setRunStartedAt] = useState<string | null>(null);
   const [runStopping, setRunStopping] = useState(false);
+  const [agentTextPreview, setAgentTextPreview] = useState<import("./types").AgentTextPreviewV4 | null>(null);
   const [agentRunEventsV4, setAgentRunEventsV4] = useState<AgentRunEventV4[]>([]);
   const [conversationHydrating, setConversationHydrating] = useState(false);
   const [remoteFiles, setRemoteFiles] = useState<RemoteFileEntry[]>([]);
@@ -474,11 +475,21 @@ export default function DesktopApp() {
     }).then((fn) => disposed ? fn() : unlisten.push(fn)).catch((error) => {
       if (!disposed && isCurrentSubscriptionProject()) setAgentNotice(subscriptionError("sync", error));
     });
+    setAgentTextPreview(null);
+    api.onAgentV4TextPreview((preview) => {
+      if (!isCurrentSubscriptionProject() || !subscriptionProjectId || !subscriptionConversationId
+        || !isCurrentConversationIdentity(subscriptionProjectId, subscriptionConversationId)
+        || !agentRunEventsRef.current.some((event) => event.run_id === preview.run_id && event.project_id === subscriptionProjectId && event.conversation_id === subscriptionConversationId)) return;
+      setAgentTextPreview(preview.text === null ? null : preview);
+    }).then((fn) => disposed ? fn() : unlisten.push(fn)).catch((error) => {
+      if (!disposed) setAgentNotice(subscriptionError("Agent streaming", error));
+    });
     api.onAgentV4Event((event) => {
       if (!isCurrentSubscriptionProject() || !subscriptionConversationId
         || event.project_id !== subscriptionProjectId
         || event.conversation_id !== subscriptionConversationId
         || !isCurrentConversationIdentity(subscriptionProjectId, subscriptionConversationId)) return;
+      if (event.event.kind === "model_text" || isTerminalAgentEventV4(event)) setAgentTextPreview(null);
       agentEventGeneration.current += 1;
       const eventToken = conversationRequestToken.current;
       if (isTerminalAgentEventV4(event)) {
@@ -608,7 +619,7 @@ export default function DesktopApp() {
 
   function currentComputeSelection(): ComputeSelectionV4 {
     const backend = computeBackends.find((item) => item.descriptor.backend_id === computeBackendId);
-    if (!backend?.selectable) throw new Error(locale === "zh-CN" ? "请选择一个可用的 V4 计算后端。" : "Select an available V4 compute backend.");
+    if (!backend?.selectable) throw new Error(locale === "zh-CN" ? "请选择一个有效的 V4 计算配置。" : "Select a valid V4 compute configuration.");
     const container = backend.descriptor.kind === "docker" || backend.descriptor.kind === "podman";
     if (container && !backend.resolved_image_id) throw new Error(locale === "zh-CN" ? "容器镜像尚未在本机验证。" : "The container image has not been verified locally.");
     return {
@@ -946,7 +957,7 @@ export default function DesktopApp() {
       }
     }} />}
     agentMode={conversationMode} conversationLocked={conversationLocked} conversationHydrating={conversationHydrating} onAgentModeChange={changeConversationMode}
-    latestPlanRevision={latestPlanRevision} v4Plan={v4Plan} planLoading={planLoading} planApproved={planApproved} canStartRun={false} runStarted={Boolean(runId && !currentRunAwaitsPlanApproval)} activeRunId={runId} activeRunLastActivityAt={activeRunLastActivityAt} agentRunEventsV4={agentRunEventsV4}
+    latestPlanRevision={latestPlanRevision} v4Plan={v4Plan} planLoading={planLoading} planApproved={planApproved} canStartRun={false} runStarted={Boolean(runId && !currentRunAwaitsPlanApproval)} activeRunId={runId} activeRunLastActivityAt={activeRunLastActivityAt} agentRunEventsV4={agentRunEventsV4} agentTextPreview={agentTextPreview}
     guidanceAvailable={v4Plan?.session_mode === "agent" && !planApproved && latestPlanRevision?.run_id !== v4Plan?.run_id}
     computeBackends={computeBackends} computeBackendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} approvalPolicy={approvalPolicy} computeEnvironment={computeEnvironment} computeBusy={computeBusy}
     onComputeBackendChange={setComputeBackendId} onContainerImageChange={setContainerImage} onAutonomyModeChange={setAutonomyMode} onApprovalPolicyChange={setApprovalPolicy} onComputeEnvironmentChange={setComputeEnvironment}

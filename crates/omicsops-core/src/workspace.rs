@@ -305,9 +305,15 @@ impl ModelProfile {
     }
 
     pub fn effective_output_tokens(&self) -> u32 {
-        self.catalog_capabilities
-            .as_ref()
-            .map_or(4096, |caps| caps.output_limit.min(4096))
+        self.catalog_capabilities.as_ref().map_or(4096, |caps| {
+            // Reasoning and tool arguments share the provider output allowance.
+            // Only exact catalog capabilities permit a larger reservation.
+            let requested = if caps.reasoning { 16_384 } else { 4096 };
+            caps.output_limit
+                .min(requested)
+                .min(self.effective_context_window_tokens() / 2)
+                .max(1)
+        })
     }
 }
 
@@ -378,5 +384,37 @@ pub fn conflict_sibling_path(relative_path: &str, version: u32) -> String {
         format!("{relative_path}.conflict-{version}")
     } else {
         format!("{stem}.conflict-{version}.{extension}")
+    }
+}
+
+#[cfg(test)]
+mod output_budget_tests {
+    use super::*;
+    #[test]
+    fn reasoning_output_reservation_uses_only_catalog_limits() {
+        let mut profile: ModelProfile = serde_json::from_value(serde_json::json!({
+            "id":Uuid::new_v4(), "label":"test", "provider":"open_ai_compatible",
+            "base_url":"https://gateway.example/v1", "model":"unknown", "credential_reference":null,
+            "supports_tools":true,"supports_vision":false
+        }))
+        .unwrap();
+        assert_eq!(profile.effective_output_tokens(), 4096);
+        let legacy_hash = profile.execution_configuration_hash();
+        profile.catalog_capabilities = Some(ModelCatalogCapabilities {
+            source_provider: "fixture".into(),
+            source_sha256: "fixture".into(),
+            context_limit: 131072,
+            input_limit: None,
+            output_limit: 32768,
+            reasoning: true,
+            reasoning_efforts: None,
+        });
+        assert_eq!(profile.effective_output_tokens(), 16384);
+        assert_ne!(profile.execution_configuration_hash(), legacy_hash);
+        profile.catalog_capabilities.as_mut().unwrap().output_limit = 2048;
+        assert_eq!(profile.effective_output_tokens(), 2048);
+        profile.catalog_capabilities.as_mut().unwrap().output_limit = 32768;
+        profile.catalog_capabilities.as_mut().unwrap().reasoning = false;
+        assert_eq!(profile.effective_output_tokens(), 4096);
     }
 }

@@ -12,11 +12,19 @@ use tokio::sync::{Mutex, Semaphore};
 
 #[async_trait]
 pub trait ToolExecutorV4: Send + Sync {
+    /// Read-only host preparation; never dispatch the requested operation.
+    async fn prepare_call(&self, _call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
+        Ok(None)
+    }
+
     async fn execute(&self, call: &ToolCallV4) -> Result<ToolOutcomeV4, String>;
     async fn recover_result(&self, _call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
         Ok(None)
     }
     fn has_persistent_authorization(&self, _call: &ToolCallV4) -> bool {
+        false
+    }
+    async fn risk_based_target_approved(&self, _call: &ToolCallV4) -> bool {
         false
     }
     /// Dynamic authority for the generic MCP wrapper in Plan mode. Ordinary
@@ -55,6 +63,7 @@ pub struct ToolRegistryV4 {
     definitions: BTreeMap<String, ToolDescriptorV4>,
     executor: Arc<dyn ToolExecutorV4>,
     execute_capabilities: Option<BTreeSet<String>>,
+    disabled_tools: BTreeSet<String>,
     read_slots: Semaphore,
     side_effect_lock: Arc<Mutex<()>>,
 }
@@ -74,6 +83,7 @@ impl ToolRegistryV4 {
             definitions: mapped,
             executor,
             execute_capabilities: None,
+            disabled_tools: BTreeSet::new(),
             read_slots: Semaphore::new(4),
             side_effect_lock: Arc::new(Mutex::new(())),
         })
@@ -81,6 +91,11 @@ impl ToolRegistryV4 {
 
     pub fn with_execute_capabilities(mut self, capabilities: BTreeSet<String>) -> Self {
         self.execute_capabilities = Some(capabilities);
+        self
+    }
+
+    pub fn with_disabled_tools(mut self, tools: BTreeSet<String>) -> Self {
+        self.disabled_tools = tools;
         self
     }
 
@@ -94,6 +109,9 @@ impl ToolRegistryV4 {
         mode: RunModeV4,
         call: &ToolCallV4,
     ) -> Result<&ToolDescriptorV4, ToolRegistryErrorV4> {
+        if self.disabled_tools.contains(&call.tool_id) {
+            return Err(ToolRegistryErrorV4::CapabilityDenied(call.tool_id.clone()));
+        }
         let definition = self
             .definitions
             .get(&call.tool_id)
@@ -181,6 +199,7 @@ impl ToolPortV4 for ToolRegistryV4 {
     fn descriptors(&self, mode: RunModeV4) -> Vec<ToolDescriptorV4> {
         self.definitions
             .values()
+            .filter(|definition| !self.disabled_tools.contains(&definition.id))
             .filter(|definition| match mode {
                 RunModeV4::Plan => {
                     !matches!(
@@ -221,8 +240,17 @@ impl ToolPortV4 for ToolRegistryV4 {
             .map_err(|error| error.to_string())
     }
 
+    async fn prepare_call(&self, call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
+        self.validate(RunModeV4::Execute, call)?;
+        self.executor.prepare_call(call).await
+    }
+
     fn has_persistent_authorization(&self, call: &ToolCallV4) -> bool {
         self.executor.has_persistent_authorization(call)
+    }
+    async fn risk_based_target_approved(&self, call: &ToolCallV4) -> bool {
+        self.validate(RunModeV4::Execute, call).is_ok()
+            && self.executor.risk_based_target_approved(call).await
     }
 
     async fn authorize_plan_call(
@@ -1208,5 +1236,30 @@ mod tests {
             task.await.unwrap();
         }
         assert_eq!(probe.maximum.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn disabled_tools_are_hidden_and_cannot_dispatch_even_when_approved() {
+        let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop))
+            .unwrap()
+            .with_disabled_tools(
+                ["browser_setup".into(), "web_search".into()]
+                    .into_iter()
+                    .collect(),
+            );
+        for mode in [RunModeV4::Plan, RunModeV4::Execute] {
+            assert!(
+                !registry
+                    .descriptors(mode)
+                    .iter()
+                    .any(|tool| tool.id == "browser_setup" || tool.id == "web_search")
+            );
+            let call = ToolCallV4 {
+                call_id: "old-call".into(),
+                tool_id: "browser_setup".into(),
+                arguments: json!({"session":"shared"}),
+            };
+            assert!(registry.validate(mode, &call).is_err());
+            assert!(registry.execute(mode, call).await.is_err());
+        }
     }
 }

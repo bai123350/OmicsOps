@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use chrono::Utc;
 use omicsops_adapters::{
-    credentials::SystemCredentialVault,
+    credentials::{CredentialVault, SystemCredentialVault},
     kernel::{kernel_driver, validate_capture_paths, validate_kernel_code},
     llm::{RequestBudget, UnifiedModelClient},
     ssh::{SshJsonlProcess, SshSession},
@@ -73,7 +73,7 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::commands::{AppState, authentication_for_profile, find_profile, require_trusted_host};
+use crate::commands::{AppState, find_profile, require_trusted_host};
 pub use crate::dto::{ConversationAgentStateV4, RunSummaryV4, SessionAgentModeV4};
 use crate::p1_commands::{
     McpServerProfile, MemorySearchRequest, invoke_configured_mcp_tool_v4, memory_facts,
@@ -266,101 +266,19 @@ pub async fn agent_v4_compute_backends(
     request: ComputeBackendsV4Request,
 ) -> Result<Vec<ComputeBackendAvailabilityV4>, String> {
     let project = workspace_project(&state.repository, request.project_id).await?;
-    let mut backends = Vec::new();
-
-    let local_root = std::fs::canonicalize(&project.local_root);
-    let python = program_available("python").await;
-    let r = program_available("Rscript").await;
-    let local_reason = local_root
-        .as_ref()
-        .err()
-        .map(|error| format!("local project root is unavailable: {error}"));
-    backends.push(ComputeBackendAvailabilityV4 {
-        descriptor: ComputeBackendDescriptorV4 {
-            schema_version: 4,
-            backend_id: "local".into(),
-            kind: ComputeBackendKindV4::Local,
-            isolation: IsolationStrengthV4::Process,
-            available: local_root.is_ok() && (python || r),
-            supports_python: python,
-            supports_r: r,
-            supports_network_policy: false,
-        },
-        selectable: local_root.is_ok() && (python || r),
-        reason: local_reason
-            .or_else(|| (!python && !r).then(|| "Python and R were not found".into())),
-        python_status: if python { "available" } else { "unavailable" }.into(),
-        r_status: if r { "available" } else { "unavailable" }.into(),
-        resolved_image_id: None,
-    });
-
-    if let (Some(connection_id), Some(remote_root)) = (project.connection_id, &project.remote_root)
-    {
-        let profile = find_profile(&state.repository, connection_id).await?;
-        let trusted = profile.host_key_fingerprint.is_some();
-        let mut ssh_python = false;
-        let mut ssh_r = false;
-        let mut reason = (!trusted).then(|| "SSH host key is not trusted".to_string());
-        if trusted {
-            let authentication = authentication_for_profile(&state, &profile)?;
-            match SshSession::connect(&profile, authentication).await {
-                Ok(session) => match resolve_root(&session, remote_root).await {
-                    Ok(_) => {
-                        if let Ok(output) = session
-                            .execute_checked("printf 'python='; command -v python >/dev/null && printf yes || printf no; printf '\\nr='; command -v Rscript >/dev/null && printf yes || printf no")
-                            .await
-                        {
-                            ssh_python = output.stdout.contains("python=yes");
-                            ssh_r = output.stdout.contains("r=yes");
-                        }
-                    }
-                    Err(error) => reason = Some(error),
-                },
-                Err(error) => reason = Some(error.to_string()),
-            }
-        }
-        let available = reason.is_none() && (ssh_python || ssh_r);
-        backends.push(ComputeBackendAvailabilityV4 {
-            descriptor: ComputeBackendDescriptorV4 {
-                schema_version: 4,
-                backend_id: format!("ssh:{connection_id}"),
-                kind: ComputeBackendKindV4::Ssh,
-                isolation: IsolationStrengthV4::Process,
-                available,
-                supports_python: ssh_python,
-                supports_r: ssh_r,
-                supports_network_policy: false,
-            },
-            selectable: available,
-            reason: reason
-                .or_else(|| (!available).then(|| "Python and R were not found on SSH".into())),
-            python_status: if ssh_python {
-                "available"
-            } else {
-                "unavailable"
-            }
-            .into(),
-            r_status: if ssh_r { "available" } else { "unavailable" }.into(),
-            resolved_image_id: None,
-        });
-    }
+    let mut backends = configured_process_backends(&state.repository, &project).await?;
 
     for (program, kind) in [
         ("docker", ComputeBackendKindV4::Docker),
         ("podman", ComputeBackendKindV4::Podman),
     ] {
-        let engine = program_available(program).await;
-        let (image_id, image_error) = if engine {
-            match request
-                .container_image
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-            {
-                Some(image) => inspect_container_image(program, image).await,
-                None => (None, Some("enter an existing local container image".into())),
-            }
-        } else {
-            (None, Some(format!("{program} engine was not found")))
+        let (image_id, image_error) = match request
+            .container_image
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            Some(image) => inspect_container_image(program, image).await,
+            None => (None, Some("enter an existing local container image".into())),
         };
         let backend_id = program.to_string();
         let selectable = image_id.is_some();
@@ -393,6 +311,70 @@ pub async fn agent_v4_compute_backends(
         });
     }
     Ok(backends)
+}
+
+// Catalog listing checks configuration only. Interpreter status is deliberately
+// unverified; choosing a backend is not evidence that a workflow can run.
+async fn configured_process_backends(
+    repository: &Store,
+    project: &Project,
+) -> Result<Vec<ComputeBackendAvailabilityV4>, String> {
+    let root_valid = std::fs::canonicalize(&project.local_root).is_ok();
+    let mut entries = vec![configured_process_backend(
+        "local".into(),
+        ComputeBackendKindV4::Local,
+        root_valid,
+        (!root_valid).then(|| "local project root is unavailable".into()),
+    )];
+    if let (Some(connection_id), Some(remote_root)) = (project.connection_id, &project.remote_root)
+    {
+        let profile = find_profile(repository, connection_id).await;
+        let trusted = profile
+            .as_ref()
+            .is_ok_and(|profile| profile.host_key_fingerprint.is_some());
+        let configured = root_valid && trusted && !remote_root.trim().is_empty();
+        let reason = if !root_valid {
+            Some("local project root is unavailable".into())
+        } else if !trusted {
+            Some("SSH connection is missing or its host key is not trusted".into())
+        } else if remote_root.trim().is_empty() {
+            Some("remote project root is missing".into())
+        } else {
+            None
+        };
+        entries.push(configured_process_backend(
+            format!("ssh:{connection_id}"),
+            ComputeBackendKindV4::Ssh,
+            configured,
+            reason,
+        ));
+    }
+    Ok(entries)
+}
+
+fn configured_process_backend(
+    backend_id: String,
+    kind: ComputeBackendKindV4,
+    selectable: bool,
+    reason: Option<String>,
+) -> ComputeBackendAvailabilityV4 {
+    ComputeBackendAvailabilityV4 {
+        descriptor: ComputeBackendDescriptorV4 {
+            schema_version: 4,
+            backend_id,
+            kind,
+            isolation: IsolationStrengthV4::Process,
+            available: false,
+            supports_python: true,
+            supports_r: true,
+            supports_network_policy: false,
+        },
+        selectable,
+        reason,
+        python_status: "unverified".into(),
+        r_status: "unverified".into(),
+        resolved_image_id: None,
+    }
 }
 
 #[tauri::command]
@@ -487,6 +469,7 @@ pub async fn agent_v4_start_planning(
         None,
         None,
         None,
+        false,
     )
     .await
     {
@@ -728,7 +711,7 @@ pub async fn agent_v4_start_direct(
     )
     .await?;
     let project = workspace_project(&state.repository, request.project_id).await?;
-    validate_compute_selection(&state, &project, &request.compute_selection).await?;
+    validate_compute_binding(&state.repository, &project, &request.compute_selection).await?;
     let (_model, tools) = compose(
         &state,
         &project,
@@ -740,6 +723,7 @@ pub async fn agent_v4_start_direct(
         None,
         None,
         None,
+        true,
     )
     .await?;
     let run_id = tools.run_id();
@@ -1446,6 +1430,7 @@ pub async fn agent_v4_resume(
             None,
             None,
             None,
+            false,
         )
         .await
         {
@@ -2413,7 +2398,11 @@ async fn spawn_execution(
         .clone()
         .ok_or("V4 execution spec is missing a compute selection")?;
     let project = workspace_project(&state.repository, spec.project_id).await?;
-    validate_compute_selection(state, &project, &selection).await?;
+    if spec.execution_kind == RunExecutionKindV4::OrdinaryAgent {
+        validate_compute_binding(&state.repository, &project, &selection).await?;
+    } else {
+        validate_compute_selection(state, &project, &selection).await?;
+    }
     let forced_route = (spec.execution_kind == RunExecutionKindV4::OrdinaryAgent)
         .then(|| classify_direct_request(&record.objective));
     let (model, tools) = compose(
@@ -2427,6 +2416,7 @@ async fn spawn_execution(
         forced_route,
         spec.delegated_model.as_ref(),
         spec.model_configuration_hash.as_deref(),
+        spec.execution_kind == RunExecutionKindV4::OrdinaryAgent,
     )
     .await?;
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -2839,6 +2829,224 @@ fn validate_delegated_profile(
     Ok(())
 }
 
+struct ExecutionResourcesV4 {
+    filesystem: Arc<dyn ProjectFilesystemPortV4>,
+    environment_port: Arc<dyn RuntimeEnvironmentPortV4>,
+    runtime: Arc<RuntimeManagerV4>,
+    remote_jobs: Option<(Arc<SshSession>, String)>,
+    prompt: PromptLayersV4,
+}
+
+#[async_trait]
+trait ExecutionResourceFactoryV4: Send + Sync {
+    async fn initialize(&self) -> Result<ExecutionResourcesV4, String>;
+}
+
+struct DesktopResourceFactoryV4 {
+    repository: Store,
+    credentials: SystemCredentialVault,
+    project: Project,
+    selection: ComputeSelectionV4,
+}
+
+#[async_trait]
+impl ExecutionResourceFactoryV4 for DesktopResourceFactoryV4 {
+    async fn initialize(&self) -> Result<ExecutionResourcesV4, String> {
+        let project = &self.project;
+        let selection = &self.selection;
+        let current = workspace_project(&self.repository, project.id).await?;
+        if current.local_root != project.local_root
+            || current.remote_root != project.remote_root
+            || current.connection_id != project.connection_id
+        {
+            return Err("project execution binding changed; start a new run".into());
+        }
+        let mut remote_jobs = None;
+        let (filesystem, environment_port, backend): (
+            Arc<dyn ProjectFilesystemPortV4>,
+            Arc<dyn RuntimeEnvironmentPortV4>,
+            Arc<dyn KernelBackendV4>,
+        ) = match selection.backend_kind {
+            ComputeBackendKindV4::Ssh => {
+                let connection_id = project
+                    .connection_id
+                    .ok_or("project has no remote connection")?;
+                if selection.backend_id != format!("ssh:{connection_id}") {
+                    return Err("frozen SSH backend does not match the project binding".into());
+                }
+                let profile = find_profile(&self.repository, connection_id).await?;
+                require_trusted_host(&profile)?;
+                let secret = self
+                    .credentials
+                    .get(&profile.authentication_reference)
+                    .map_err(|error| error.to_string())?
+                    .ok_or("SSH credential is missing")?;
+                let auth =
+                    crate::commands::parse_authentication_secret(profile.authentication, &secret)?;
+                let session = Arc::new(
+                    SshSession::connect(&profile, auth)
+                        .await
+                        .map_err(|error| error.to_string())?,
+                );
+                let configured_root = project
+                    .remote_root
+                    .as_deref()
+                    .ok_or("project has no remote root")?;
+                let root = resolve_root(&session, configured_root).await?;
+                remote_jobs = Some((session.clone(), root.clone()));
+                (
+                    Arc::new(SshProjectFilesystemV4 {
+                        session: session.clone(),
+                        root: root.clone(),
+                    }),
+                    Arc::new(SshEnvironmentPortV4 {
+                        session: session.clone(),
+                        root: root.clone(),
+                    }),
+                    Arc::new(SshKernelBackendV4 {
+                        session,
+                        root,
+                        project_id: project.id,
+                        backend_id: selection.backend_id.clone(),
+                    }),
+                )
+            }
+            ComputeBackendKindV4::Local => {
+                let filesystem = Arc::new(LocalProjectFilesystemV4::new(&project.local_root)?);
+                let backend = Arc::new(LocalKernelBackendV4::new(&project.local_root)?);
+                (filesystem, Arc::new(LocalEnvironmentPortV4), backend)
+            }
+            ComputeBackendKindV4::Docker | ComputeBackendKindV4::Podman => {
+                validate_container_selection(selection).await?;
+                let image = selection
+                    .container_image
+                    .as_ref()
+                    .ok_or("container image is missing")?;
+                let filesystem = Arc::new(LocalProjectFilesystemV4::new(&project.local_root)?);
+                let backend: Arc<dyn KernelBackendV4> = match selection.backend_kind {
+                    ComputeBackendKindV4::Docker => Arc::new(ContainerKernelBackendV4::docker(
+                        &project.local_root,
+                        &image.image_id,
+                    )?),
+                    ComputeBackendKindV4::Podman => Arc::new(ContainerKernelBackendV4::podman(
+                        &project.local_root,
+                        &image.image_id,
+                    )?),
+                    _ => unreachable!(),
+                };
+                (
+                    filesystem,
+                    Arc::new(ContainerEnvironmentPortV4 {
+                        program: match selection.backend_kind {
+                            ComputeBackendKindV4::Docker => "docker".into(),
+                            ComputeBackendKindV4::Podman => "podman".into(),
+                            _ => unreachable!(),
+                        },
+                        image_id: image.image_id.clone(),
+                    }),
+                    backend,
+                )
+            }
+        };
+        let descriptor = backend.descriptor();
+        if descriptor.backend_id != selection.backend_id
+            || descriptor.kind != selection.backend_kind
+            || !descriptor.permits(selection.autonomy_mode)
+        {
+            return Err(
+                "frozen compute selection does not match the runtime backend descriptor".into(),
+            );
+        }
+        let mut prompt = filesystem.prompt_layers(&selection.backend_id).await?;
+        prompt.environment.push_str(&format!(
+        "; frozen_environment={}; autonomy={:?}; approval_policy={:?}; network_policy={:?}; every runtime call must use the frozen environment; filesystem access does not verify interpreters or scientific dependencies",
+        selection.environment,
+        selection.autonomy_mode,
+        selection.approval_policy,
+        selection.network_policy
+    ));
+        let runtime = Arc::new(RuntimeManagerV4::new(backend));
+
+        Ok(ExecutionResourcesV4 {
+            filesystem,
+            environment_port,
+            runtime,
+            remote_jobs,
+            prompt,
+        })
+    }
+}
+
+/// Only successful initialization is cached. No computation is dispatched here.
+struct ExecutionResourcesSlotV4 {
+    factory: Arc<dyn ExecutionResourceFactoryV4>,
+    ready: tokio::sync::OnceCell<ExecutionResourcesV4>,
+    remote_context: bool,
+    context_observed: AtomicBool,
+}
+
+impl ExecutionResourcesSlotV4 {
+    async fn initialize(&self) -> Result<&ExecutionResourcesV4, String> {
+        self.ready
+            .get_or_try_init(|| self.factory.initialize())
+            .await
+    }
+    fn get(&self) -> Result<&ExecutionResourcesV4, String> {
+        self.ready
+            .get()
+            .ok_or_else(|| "execution resources have not been initialized".into())
+    }
+    fn prompt(&self) -> Option<PromptLayersV4> {
+        let ready = self.ready.get()?;
+        Some(ready.prompt.clone())
+    }
+    fn request_contains_context(&self, system: &str) -> bool {
+        self.ready.get().is_some_and(|ready| {
+            system.contains(&ready.prompt.environment)
+                && system.contains(&ready.prompt.project_rules)
+        })
+    }
+    async fn before_call(&self, call: &ToolCallV4) -> Option<ToolOutcomeV4> {
+        if !requires_execution_resources(&call.tool_id) {
+            return None;
+        }
+        let (kind, message) = match self.initialize().await {
+            Err(_) => (
+                "execution_resources_unavailable",
+                "The selected execution backend could not be initialized. The requested operation was not dispatched. Check the selected backend connection, trusted host, credentials, project root or container image, then retry; independent research tools remain available.",
+            ),
+            Ok(_) if self.remote_context && !self.context_observed.load(Ordering::Acquire) => (
+                "project_context_loaded",
+                "Remote project rules have been loaded for the next model turn. The requested operation was not dispatched. Review the updated project context, then issue the operation again if appropriate.",
+            ),
+            Ok(_) => return None,
+        };
+        Some(ToolOutcomeV4 {
+            call_id: call.call_id.clone(),
+            tool_id: call.tool_id.clone(),
+            succeeded: false,
+            model_content: message.into(),
+            data: json!({"error_kind":kind,"recoverable":true,"operation_dispatched":false}),
+            provenance: vec![],
+        })
+    }
+}
+
+fn requires_execution_resources(tool: &str) -> bool {
+    matches!(
+        tool,
+        "project.list"
+            | "project.read"
+            | "runtime.execute"
+            | "runtime.remote_job_status"
+            | "runtime.environment.ensure"
+            | "runtime.rebuild"
+            | "runtime.interrupt"
+            | "science.register_dataset"
+            | "artifact.verify"
+    )
+}
+
 async fn compose(
     state: &AppState,
     project: &Project,
@@ -2850,128 +3058,50 @@ async fn compose(
     forced_route: Option<AgentRequestRouteV4>,
     delegated_binding: Option<&omicsops_protocol::DelegatedModelBindingV4>,
     main_configuration_hash: Option<&str>,
+    lazy_compute: bool,
 ) -> Result<(Arc<DesktopModelPortV4>, ComposedToolsV4), String> {
     // Validate before opening SSH or runtime resources, then construct the
     // client and budget from this same owned snapshot without reloading it.
     let model_profile =
         load_frozen_main_profile(&state.repository, model_profile_id, main_configuration_hash)
             .await?;
-    let mut remote_jobs = None;
-    let (filesystem, environment_port, backend): (
-        Arc<dyn ProjectFilesystemPortV4>,
-        Arc<dyn RuntimeEnvironmentPortV4>,
-        Arc<dyn KernelBackendV4>,
-    ) = match selection.backend_kind {
-        ComputeBackendKindV4::Ssh => {
-            let connection_id = project
-                .connection_id
-                .ok_or("project has no remote connection")?;
-            if selection.backend_id != format!("ssh:{connection_id}") {
-                return Err("frozen SSH backend does not match the project binding".into());
-            }
-            let profile = find_profile(&state.repository, connection_id).await?;
-            require_trusted_host(&profile)?;
-            let auth = authentication_for_profile(state, &profile)?;
-            let session = Arc::new(
-                SshSession::connect(&profile, auth)
-                    .await
-                    .map_err(|error| error.to_string())?,
-            );
-            session
-                .execute_checked(
-                    "if command -v python >/dev/null || command -v Rscript >/dev/null; then :; else printf 'SSH V4 backend requires Python or R\\n' >&2; exit 69; fi",
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            let configured_root = project
-                .remote_root
-                .as_deref()
-                .ok_or("project has no remote root")?;
-            let root = resolve_root(&session, configured_root).await?;
-            remote_jobs = Some((session.clone(), root.clone()));
-            (
-                Arc::new(SshProjectFilesystemV4 {
-                    session: session.clone(),
-                    root: root.clone(),
-                }),
-                Arc::new(SshEnvironmentPortV4 {
-                    session: session.clone(),
-                    root: root.clone(),
-                }),
-                Arc::new(SshKernelBackendV4 {
-                    session,
-                    root,
-                    project_id: project.id,
-                    backend_id: selection.backend_id.clone(),
-                }),
-            )
-        }
-        ComputeBackendKindV4::Local => {
-            let filesystem = Arc::new(LocalProjectFilesystemV4::new(&project.local_root)?);
-            let backend = Arc::new(LocalKernelBackendV4::new(&project.local_root)?);
-            (filesystem, Arc::new(LocalEnvironmentPortV4), backend)
-        }
-        ComputeBackendKindV4::Docker | ComputeBackendKindV4::Podman => {
-            let image = selection
-                .container_image
-                .as_ref()
-                .ok_or("container image is missing")?;
-            let filesystem = Arc::new(LocalProjectFilesystemV4::new(&project.local_root)?);
-            let backend: Arc<dyn KernelBackendV4> = match selection.backend_kind {
-                ComputeBackendKindV4::Docker => Arc::new(ContainerKernelBackendV4::docker(
-                    &project.local_root,
-                    &image.image_id,
-                )?),
-                ComputeBackendKindV4::Podman => Arc::new(ContainerKernelBackendV4::podman(
-                    &project.local_root,
-                    &image.image_id,
-                )?),
-                _ => unreachable!(),
-            };
-            (
-                filesystem,
-                Arc::new(ContainerEnvironmentPortV4 {
-                    program: match selection.backend_kind {
-                        ComputeBackendKindV4::Docker => "docker".into(),
-                        ComputeBackendKindV4::Podman => "podman".into(),
-                        _ => unreachable!(),
-                    },
-                    image_id: image.image_id.clone(),
-                }),
-                backend,
-            )
-        }
-    };
-    let descriptor = backend.descriptor();
-    if descriptor.backend_id != selection.backend_id
-        || descriptor.kind != selection.backend_kind
-        || !descriptor.permits(selection.autonomy_mode)
-    {
-        return Err(
-            "frozen compute selection does not match the runtime backend descriptor".into(),
+    let resources = Arc::new(ExecutionResourcesSlotV4 {
+        factory: Arc::new(DesktopResourceFactoryV4 {
+            repository: state.repository.clone(),
+            credentials: state.credentials,
+            project: project.clone(),
+            selection: selection.clone(),
+        }),
+        ready: tokio::sync::OnceCell::new(),
+        remote_context: lazy_compute && selection.backend_kind == ComputeBackendKindV4::Ssh,
+        context_observed: AtomicBool::new(false),
+    });
+    let prompt = if lazy_compute {
+        let mut prompt = LocalProjectFilesystemV4::new(&project.local_root)?
+            .prompt_layers(&selection.backend_id)
+            .await?;
+        prompt.environment = format!(
+            "Selected backend={}; frozen_environment={}; autonomy={:?}; approval_policy={:?}; network_policy={:?}. Execution resources and interpreters have not been checked. Research and knowledge tools do not require compute initialization. Project file and runtime tools use the selected backend, never a local fallback. SSH project rules are loaded before the first remote operation; a context-loaded result requires a new model turn before retry. Every runtime call must use the frozen environment.",
+            selection.backend_id,
+            selection.environment,
+            selection.autonomy_mode,
+            selection.approval_policy,
+            selection.network_policy
         );
-    }
-    let mut prompt = filesystem.prompt_layers(&selection.backend_id).await?;
-    prompt.environment.push_str(&format!(
-        "; frozen_environment={}; autonomy={:?}; approval_policy={:?}; network_policy={:?}; every runtime call must use the frozen environment",
-        selection.environment,
-        selection.autonomy_mode,
-        selection.approval_policy,
-        selection.network_policy
-    ));
-    let runtime = Arc::new(RuntimeManagerV4::new(backend));
+        prompt
+    } else {
+        resources.initialize().await?.prompt.clone()
+    };
     let executor = Arc::new(DesktopToolExecutorV4 {
         repository: state.repository.clone(),
         mcp_sessions: state.mcp_sessions.clone(),
         credentials: state.credentials,
-        filesystem,
-        environment_port,
+        resources: resources.clone(),
         selection: selection.clone(),
         project_id: project.id,
         run_id,
         conversation_id,
         backend_id: selection.backend_id.clone(),
-        runtime,
         browser: state.browser.clone(),
         local_project_root: PathBuf::from(&project.local_root),
         browser_authorizations: Arc::new(std::sync::Mutex::new(
@@ -2982,10 +3112,15 @@ async fn compose(
                 .map_err(|error| error.to_string())?,
         )),
         forced_route,
-        remote_jobs,
     });
+    let disabled_browser_tools = builtin_tool_definitions_v4()
+        .into_iter()
+        .filter(|tool| tool.id == "browser_setup" || tool.id.starts_with("web_"))
+        .map(|tool| tool.id)
+        .collect();
     let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), executor)
         .map_err(|error| error.to_string())?
+        .with_disabled_tools(disabled_browser_tools)
         .with_side_effect_lock(project_side_effect_lock_v4(project.id));
     let registry = if let Some(capabilities) = execute_capabilities {
         registry.with_execute_capabilities(capabilities.clone())
@@ -3010,6 +3145,7 @@ async fn compose(
                         safety_margin_tokens: 1024,
                     }),
                 prompt: prompt.clone(),
+                resources: Some(resources.clone()),
                 project_root: PathBuf::from(&project.local_root),
                 supports_vision: child.supports_vision,
                 delegated: None,
@@ -3029,6 +3165,7 @@ async fn compose(
                     safety_margin_tokens: 1024,
                 }),
             prompt,
+            resources: Some(resources.clone()),
             project_root: PathBuf::from(&project.local_root),
             supports_vision: model_profile.supports_vision,
             delegated,
@@ -3043,6 +3180,7 @@ async fn compose(
 struct DesktopModelPortV4 {
     client: UnifiedModelClient,
     prompt: PromptLayersV4,
+    resources: Option<Arc<ExecutionResourcesSlotV4>>,
     project_root: PathBuf,
     supports_vision: bool,
     delegated: Option<(
@@ -3089,7 +3227,10 @@ impl DesktopModelPortV4 {
             omicsops_agent::ModelMessageContent::Parts(parts)
         };
         Ok(ProviderRequest {
-            system: request.system,
+            system: format!(
+                "{}\nHost capability update: Agent browser tools are temporarily disabled. Do not call browser_setup or web_* or propose browser fallback. Use configured MCP literature tools; if unavailable, report the specific configuration problem. Write public progress and final answers in the user's language.",
+                request.system
+            ),
             messages: vec![omicsops_agent::ModelMessage {
                 role: "user".into(),
                 content,
@@ -3118,7 +3259,10 @@ impl ModelPortV4 for DesktopModelPortV4 {
         }
     }
     fn prompt_layers(&self) -> PromptLayersV4 {
-        self.prompt.clone()
+        self.resources
+            .as_ref()
+            .and_then(|slot| slot.prompt())
+            .unwrap_or_else(|| self.prompt.clone())
     }
 
     fn validate_request(&self, request: &ModelRequestV4) -> Result<(), ModelFailureV4> {
@@ -3136,6 +3280,10 @@ impl ModelPortV4 for DesktopModelPortV4 {
         on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
     ) -> Result<ModelTurnV4, ModelFailureV4> {
         self.validate_request(&request)?;
+        let observes_context = self
+            .resources
+            .as_ref()
+            .is_some_and(|slot| slot.request_contains_context(&request.system));
         let provider_request = self.prepare_request(request, true)?;
         let mut text = String::new();
         let mut calls = ProviderToolCallAccumulator::default();
@@ -3191,6 +3339,11 @@ impl ModelPortV4 for DesktopModelPortV4 {
                 ModelErrorClassV4::InvalidResponse,
                 "empty_model_response: no public text or tools; prior run evidence is retained",
             ));
+        }
+        if observes_context {
+            if let Some(slot) = &self.resources {
+                slot.context_observed.store(true, Ordering::Release);
+            }
         }
         Ok(ModelTurnV4 {
             public_text: text,
@@ -3341,6 +3494,16 @@ trait ProjectFilesystemPortV4: Send + Sync {
 
 #[async_trait]
 trait RuntimeEnvironmentPortV4: Send + Sync {
+    /// Read-only availability probe. Containers retain their frozen image
+    /// validation; this hook must not launch containers or create environments.
+    async fn check_interpreter(
+        &self,
+        _language: KernelLanguageV4,
+        _environment: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn software_versions(
         &self,
         language: KernelLanguageV4,
@@ -3557,6 +3720,24 @@ struct LocalEnvironmentPortV4;
 
 #[async_trait]
 impl RuntimeEnvironmentPortV4 for LocalEnvironmentPortV4 {
+    async fn check_interpreter(
+        &self,
+        language: KernelLanguageV4,
+        environment: &str,
+    ) -> Result<(), String> {
+        if environment != "system" {
+            return Err("local backend only supports the system environment".into());
+        }
+        let program = match language {
+            KernelLanguageV4::Python => "python",
+            KernelLanguageV4::R => "Rscript",
+        };
+        if !program_available(program).await {
+            return Err("selected interpreter is unavailable".into());
+        }
+        Ok(())
+    }
+
     async fn software_versions(
         &self,
         language: KernelLanguageV4,
@@ -3650,6 +3831,34 @@ struct SshEnvironmentPortV4 {
 
 #[async_trait]
 impl RuntimeEnvironmentPortV4 for SshEnvironmentPortV4 {
+    async fn check_interpreter(
+        &self,
+        language: KernelLanguageV4,
+        environment: &str,
+    ) -> Result<(), String> {
+        validate_environment_name(environment)?;
+        let program = match language {
+            KernelLanguageV4::Python => "python",
+            KernelLanguageV4::R => "Rscript",
+        };
+        let command = if environment == "system" {
+            format!("command -v {program} >/dev/null")
+        } else {
+            format!(
+                "command -v micromamba >/dev/null && test -x {}",
+                shell_quote(&format!(
+                    "{}/bin/{program}",
+                    environment_path(&self.root, environment)
+                ))
+            )
+        };
+        self.session
+            .execute_checked(&command)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     async fn software_versions(
         &self,
         language: KernelLanguageV4,
@@ -3710,19 +3919,42 @@ struct DesktopToolExecutorV4 {
     repository: Store,
     mcp_sessions: McpSessionManager,
     credentials: SystemCredentialVault,
-    filesystem: Arc<dyn ProjectFilesystemPortV4>,
-    environment_port: Arc<dyn RuntimeEnvironmentPortV4>,
+    resources: Arc<ExecutionResourcesSlotV4>,
     selection: ComputeSelectionV4,
     project_id: Uuid,
     run_id: Uuid,
     conversation_id: Uuid,
     backend_id: String,
-    runtime: Arc<RuntimeManagerV4>,
     browser: omicsops_browser::BrowserRuntime,
     local_project_root: PathBuf,
     browser_authorizations: Arc<std::sync::Mutex<Vec<BrowserAuthorizationV4>>>,
     forced_route: Option<AgentRequestRouteV4>,
-    remote_jobs: Option<(Arc<SshSession>, String)>,
+}
+
+fn mcp_result_failed(data: &Value) -> bool {
+    data.get("result")
+        .and_then(|result| result.get("isError"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn approved_read_only_mcp_target(entry: &McpToolIndexV4, call: &ToolCallV4) -> bool {
+    call.tool_id == "use_mcp_tool"
+        && call.arguments.get("server_id").and_then(Value::as_str)
+            == Some(entry.server_id.to_string().as_str())
+        && call.arguments.get("tool").and_then(Value::as_str) == Some(entry.tool_name.as_str())
+        && call
+            .arguments
+            .get("catalog_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|catalog| {
+                call.arguments
+                    .get("schema_sha256")
+                    .and_then(Value::as_str)
+                    .is_some_and(|schema| {
+                        authorize_mcp_read_only_target(entry, catalog, schema, false).is_ok()
+                    })
+            })
 }
 
 impl DesktopToolExecutorV4 {
@@ -3763,7 +3995,11 @@ impl DesktopToolExecutorV4 {
             })
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        self.environment_port
+        let Ok(resources) = self.resources.get() else {
+            return BTreeMap::new();
+        };
+        resources
+            .environment_port
             .software_versions(language, environment, requirements)
             .await
             .unwrap_or_default()
@@ -4279,10 +4515,20 @@ impl DesktopToolExecutorV4 {
         require_read_only_hint: bool,
     ) -> Result<ToolOutcomeV4, String> {
         if call.tool_id == "browser_setup" || call.tool_id.starts_with("web_") {
+            // Temporarily disabled; retain the bridge implementation for later.
+            const AGENT_BROWSER_ENABLED: bool = false;
+            if !AGENT_BROWSER_ENABLED {
+                return Err(
+                    "Agent browser tools are temporarily disabled; use configured MCP tools".into(),
+                );
+            }
             if require_read_only_hint {
                 return Err("browser tools are forbidden in Plan mode".into());
             }
             return self.execute_browser_tool(call).await;
+        }
+        if let Some(outcome) = self.resources.before_call(call).await {
+            return Ok(outcome);
         }
         let (content, data, provenance) = match call.tool_id.as_str() {
             "agent.route_request" => {
@@ -4335,7 +4581,7 @@ impl DesktopToolExecutorV4 {
                     .and_then(Value::as_str)
                     .unwrap_or(".");
                 (
-                    self.filesystem.list(path).await?,
+                    self.resources.get()?.filesystem.list(path).await?,
                     json!({"path":path}),
                     vec![format!("project:{path}")],
                 )
@@ -4343,7 +4589,7 @@ impl DesktopToolExecutorV4 {
             "project.read" => {
                 let path = required(&call.arguments, "path")?;
                 (
-                    self.filesystem.read(path).await?,
+                    self.resources.get()?.filesystem.read(path).await?,
                     json!({"path":path}),
                     vec![format!("project:{path}")],
                 )
@@ -4550,6 +4796,8 @@ impl DesktopToolExecutorV4 {
                 {
                     validate_environment_name(environment)?;
                     let (session, root) = self
+                        .resources
+                        .get()?
                         .remote_jobs
                         .as_ref()
                         .ok_or("background jobs require an SSH Linux backend")?;
@@ -4574,7 +4822,7 @@ impl DesktopToolExecutorV4 {
                 }
                 let (running, mut result) = crate::runtime_jobs_v4::execute_reserved(
                     &self.repository,
-                    &self.runtime,
+                    &self.resources.get()?.runtime,
                     &key,
                     &call,
                     code,
@@ -4611,6 +4859,8 @@ impl DesktopToolExecutorV4 {
             }
             "runtime.remote_job_status" => {
                 let (session, root) = self
+                    .resources
+                    .get()?
                     .remote_jobs
                     .as_ref()
                     .ok_or("remote jobs require an SSH Linux backend")?;
@@ -4648,7 +4898,12 @@ impl DesktopToolExecutorV4 {
                 if environment != self.selection.environment {
                     return Err("environment ensure does not match the frozen selection".into());
                 }
-                let excerpt = self.environment_port.ensure(language, environment).await?;
+                let excerpt = self
+                    .resources
+                    .get()?
+                    .environment_port
+                    .ensure(language, environment)
+                    .await?;
                 (
                     excerpt,
                     json!({"environment":environment,"language":language}),
@@ -4663,7 +4918,7 @@ impl DesktopToolExecutorV4 {
                     .and_then(Value::as_str)
                     .unwrap_or("system");
                 let key = self.key(language, environment)?;
-                let session = self.runtime.rebuild(&key).await?;
+                let session = self.resources.get()?.runtime.rebuild(&key).await?;
                 (
                     format!(
                         "rebuilt kernel session={} process={}",
@@ -4682,7 +4937,7 @@ impl DesktopToolExecutorV4 {
                     .and_then(Value::as_str)
                     .unwrap_or("system");
                 let key = self.key(language, environment)?;
-                self.runtime.interrupt(&key).await?;
+                self.resources.get()?.runtime.interrupt(&key).await?;
                 (
                     format!("interrupted {language:?} kernel in {environment}"),
                     json!({"language":language,"environment":environment}),
@@ -4691,7 +4946,7 @@ impl DesktopToolExecutorV4 {
             }
             "science.register_dataset" => {
                 let path = required(&call.arguments, "path")?;
-                let verified = self.filesystem.verify_file(path).await?;
+                let verified = self.resources.get()?.filesystem.verify_file(path).await?;
                 let size = verified.size_bytes;
                 let hash = verified.sha256;
                 let data = json!({
@@ -4717,7 +4972,7 @@ impl DesktopToolExecutorV4 {
             ),
             "artifact.verify" => {
                 let path = required(&call.arguments, "path")?;
-                let verified = self.filesystem.verify_file(path).await?;
+                let verified = self.resources.get()?.filesystem.verify_file(path).await?;
                 let size = verified.size_bytes;
                 let hash = verified.sha256;
                 (
@@ -4736,7 +4991,7 @@ impl DesktopToolExecutorV4 {
         Ok(ToolOutcomeV4 {
             call_id: call.call_id.clone(),
             tool_id: call.tool_id.clone(),
-            succeeded: true,
+            succeeded: !mcp_result_failed(&data),
             model_content: content,
             data,
             provenance,
@@ -4746,6 +5001,47 @@ impl DesktopToolExecutorV4 {
 
 #[async_trait]
 impl ToolExecutorV4 for DesktopToolExecutorV4 {
+    async fn risk_based_target_approved(&self, call: &ToolCallV4) -> bool {
+        if call.tool_id != "use_mcp_tool" {
+            return false;
+        }
+        let Ok(index) = self.mcp_tool_index().await else {
+            return false;
+        };
+        index
+            .iter()
+            .any(|entry| approved_read_only_mcp_target(entry, call))
+    }
+    async fn prepare_call(&self, call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
+        if let Some(outcome) = self.resources.before_call(call).await {
+            return Ok(Some(outcome));
+        }
+        if matches!(call.tool_id.as_str(), "runtime.execute" | "runtime.rebuild") {
+            let language = parse_language(required(&call.arguments, "language")?)?;
+            let environment = call
+                .arguments
+                .get("environment")
+                .and_then(Value::as_str)
+                .unwrap_or("system");
+            self.key(language, environment)?;
+            if self
+                .resources
+                .get()?
+                .environment_port
+                .check_interpreter(language, environment)
+                .await
+                .is_err()
+            {
+                return Ok(Some(ToolOutcomeV4 {
+                    call_id: call.call_id.clone(), tool_id: call.tool_id.clone(), succeeded: false,
+                    model_content: "The selected interpreter or its execution connection is unavailable. No computation was dispatched. Inspect or prepare the selected environment before retrying; do not switch the frozen backend or environment.".into(),
+                    data: json!({"error_kind":"interpreter_unavailable","recoverable":true,"operation_dispatched":false}), provenance: vec![],
+                }));
+            }
+        }
+        Ok(None)
+    }
+
     async fn recover_result(&self, call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
         if call.tool_id != "runtime.execute" {
             return Ok(None);
@@ -4787,7 +5083,9 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
     }
 
     async fn interrupt(&self, run_id: Uuid) -> Result<(), String> {
-        self.runtime.interrupt_run(run_id).await?;
+        if let Some(resources) = self.resources.ready.get() {
+            resources.runtime.interrupt_run(run_id).await?;
+        }
         for session in [
             omicsops_browser::BrowserSessionKind::Shared,
             omicsops_browser::BrowserSessionKind::Workspace,
@@ -5095,6 +5393,15 @@ impl RepositoryEventStoreV4 {
 }
 #[async_trait]
 impl EventStoreV4 for RepositoryEventStoreV4 {
+    fn preview_model_text(&self, run_id: Uuid, text: Option<&str>) {
+        let _ = self.app.emit(
+            "agent-v4-text-preview",
+            omicsops_dto::AgentTextPreviewV4 {
+                run_id,
+                text: text.map(str::to_owned),
+            },
+        );
+    }
     async fn append(&self, event: &AgentEventV4) -> Result<(), String> {
         let message = self
             .repository
@@ -5503,50 +5810,65 @@ fn container_image_inspect_args(image: &str) -> [&str; 5] {
     ["image", "inspect", "--format", "{{.Id}}", image]
 }
 
+async fn validate_compute_binding(
+    repository: &Store,
+    project: &Project,
+    selection: &ComputeSelectionV4,
+) -> Result<(), String> {
+    selection.validate().map_err(|error| error.to_string())?;
+    std::fs::canonicalize(&project.local_root)
+        .map_err(|error| format!("local project root is unavailable: {error}"))?;
+    if selection.backend_kind == ComputeBackendKindV4::Ssh {
+        let connection_id = project
+            .connection_id
+            .ok_or("project has no remote connection")?;
+        if selection.backend_id != format!("ssh:{connection_id}") {
+            return Err("SSH selection does not match the project's trusted binding".into());
+        }
+        let profile = find_profile(repository, connection_id).await?;
+        require_trusted_host(&profile)?;
+        if project.remote_root.is_none() {
+            return Err("project has no remote root".into());
+        }
+    }
+    Ok(())
+}
+
+async fn validate_container_selection(selection: &ComputeSelectionV4) -> Result<(), String> {
+    let image = selection
+        .container_image
+        .as_ref()
+        .ok_or("container image is missing")?;
+    let program = if selection.backend_kind == ComputeBackendKindV4::Docker {
+        "docker"
+    } else {
+        "podman"
+    };
+    let (actual, error) = inspect_container_image(program, &image.reference).await;
+    if actual.as_deref() != Some(image.image_id.as_str()) {
+        return Err(error.unwrap_or_else(|| {
+            "container image tag no longer resolves to the frozen image ID".into()
+        }));
+    }
+    Ok(())
+}
+
 async fn validate_compute_selection(
     state: &AppState,
     project: &Project,
     selection: &ComputeSelectionV4,
 ) -> Result<(), String> {
-    selection.validate().map_err(|error| error.to_string())?;
+    validate_compute_binding(&state.repository, project, selection).await?;
     match selection.backend_kind {
         ComputeBackendKindV4::Local => {
-            std::fs::canonicalize(&project.local_root)
-                .map_err(|error| format!("local project root is unavailable: {error}"))?;
             if !program_available("python").await && !program_available("Rscript").await {
                 return Err("local backend requires Python or R".into());
             }
         }
-        ComputeBackendKindV4::Ssh => {
-            let connection_id = project
-                .connection_id
-                .ok_or("project has no remote connection")?;
-            if selection.backend_id != format!("ssh:{connection_id}") {
-                return Err("SSH selection does not match the project's trusted binding".into());
-            }
-            let profile = find_profile(&state.repository, connection_id).await?;
-            require_trusted_host(&profile)?;
-            if project.remote_root.is_none() {
-                return Err("project has no remote root".into());
-            }
-        }
         ComputeBackendKindV4::Docker | ComputeBackendKindV4::Podman => {
-            let image = selection
-                .container_image
-                .as_ref()
-                .ok_or("container image is missing")?;
-            let program = if selection.backend_kind == ComputeBackendKindV4::Docker {
-                "docker"
-            } else {
-                "podman"
-            };
-            let (actual, error) = inspect_container_image(program, &image.reference).await;
-            if actual.as_deref() != Some(image.image_id.as_str()) {
-                return Err(error.unwrap_or_else(|| {
-                    "container image tag no longer resolves to the frozen image ID".into()
-                }));
-            }
+            validate_container_selection(selection).await?
         }
+        ComputeBackendKindV4::Ssh => {}
     }
     Ok(())
 }
@@ -5842,6 +6164,357 @@ mod tests {
     };
     use url::Url;
 
+    struct NeverInitialize;
+    #[async_trait]
+    impl ExecutionResourceFactoryV4 for NeverInitialize {
+        async fn initialize(&self) -> Result<ExecutionResourcesV4, String> {
+            panic!("preinitialized resource fixture must not initialize again")
+        }
+    }
+    fn test_ready_resources(resources: ExecutionResourcesV4) -> Arc<ExecutionResourcesSlotV4> {
+        Arc::new(ExecutionResourcesSlotV4 {
+            factory: Arc::new(NeverInitialize),
+            ready: tokio::sync::OnceCell::new_with(Some(resources)),
+            remote_context: false,
+            context_observed: AtomicBool::new(false),
+        })
+    }
+
+    struct MockResources {
+        root: PathBuf,
+        attempts: std::sync::atomic::AtomicUsize,
+        fail_first: bool,
+    }
+    #[async_trait]
+    impl ExecutionResourceFactoryV4 for MockResources {
+        async fn initialize(&self) -> Result<ExecutionResourcesV4, String> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            if self.fail_first && attempt == 0 {
+                return Err("synthetic secret must not enter events".into());
+            }
+            let mut prompt = PromptLayersV4::default();
+            prompt.project_rules =
+                "REMOTE PROJECT RULES: use the declared reference assembly".into();
+            prompt.environment = "mock selected remote environment".into();
+            Ok(ExecutionResourcesV4 {
+                filesystem: Arc::new(LocalProjectFilesystemV4::new(self.root.to_str().unwrap())?),
+                environment_port: Arc::new(LocalEnvironmentPortV4),
+                runtime: Arc::new(RuntimeManagerV4::new(Arc::new(LocalKernelBackendV4::new(
+                    &self.root,
+                )?))),
+                remote_jobs: None,
+                prompt,
+            })
+        }
+    }
+    fn mock_resource_slot(
+        root: &std::path::Path,
+        remote: bool,
+        fail_first: bool,
+    ) -> (Arc<ExecutionResourcesSlotV4>, Arc<MockResources>) {
+        let factory = Arc::new(MockResources {
+            root: root.to_owned(),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            fail_first,
+        });
+        (
+            Arc::new(ExecutionResourcesSlotV4 {
+                factory: factory.clone(),
+                ready: tokio::sync::OnceCell::new(),
+                remote_context: remote,
+                context_observed: AtomicBool::new(false),
+            }),
+            factory,
+        )
+    }
+    fn resource_call(tool: &str) -> ToolCallV4 {
+        ToolCallV4 {
+            call_id: "resource-test".into(),
+            tool_id: tool.into(),
+            arguments: json!({"path":"."}),
+        }
+    }
+
+    #[tokio::test]
+    async fn lazy_resources_leave_research_tools_independent_of_compute() {
+        let dir = tempfile::tempdir().unwrap();
+        let (slot, factory) = mock_resource_slot(dir.path(), true, true);
+        for tool in [
+            "search_memory",
+            "search_skills",
+            "use_skill",
+            "search_mcp_tools",
+            "use_mcp_tool",
+            "browser_setup",
+            "web_search",
+            "agent.route_request",
+            "agent.complete",
+        ] {
+            assert!(
+                slot.before_call(&resource_call(tool)).await.is_none(),
+                "{tool}"
+            );
+        }
+        assert_eq!(factory.attempts.load(Ordering::SeqCst), 0);
+        assert!(slot.ready.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn lazy_resources_initialize_once_and_remote_calls_wait_for_model_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let (slot, factory) = mock_resource_slot(dir.path(), true, false);
+        let read = resource_call("project.read");
+        let execute = resource_call("runtime.execute");
+        let (first, second) = tokio::join!(slot.before_call(&read), slot.before_call(&execute));
+        for result in [first, second] {
+            let outcome = result.unwrap();
+            assert!(!outcome.succeeded);
+            assert_eq!(outcome.data["error_kind"], "project_context_loaded");
+            assert_eq!(outcome.data["operation_dispatched"], false);
+        }
+        assert_eq!(factory.attempts.load(Ordering::SeqCst), 1);
+        let prompt = slot.prompt().unwrap();
+        assert!(
+            !slot.context_observed.load(Ordering::Acquire),
+            "budget inspection must not open the gate"
+        );
+        assert!(!slot.request_contains_context("stale model prompt"));
+        assert!(slot.before_call(&execute).await.is_some());
+        assert!(
+            slot.request_contains_context(
+                &prompt.render_execution(RunExecutionKindV4::OrdinaryAgent)
+            )
+        );
+        // A successful model response to that exact context opens the gate.
+        slot.context_observed.store(true, Ordering::Release);
+        assert!(slot.before_call(&execute).await.is_none());
+        assert_eq!(factory.attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn lazy_resources_retry_known_failures_without_leaking_errors_or_falling_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (slot, factory) = mock_resource_slot(dir.path(), false, true);
+        let call = resource_call("project.list");
+        let outcome = slot.before_call(&call).await.unwrap();
+        assert_eq!(outcome.data["operation_dispatched"], false);
+        assert_eq!(
+            outcome.data["error_kind"],
+            "execution_resources_unavailable"
+        );
+        assert!(!outcome.model_content.contains("synthetic secret"));
+        assert!(slot.ready.get().is_none());
+        assert!(slot.before_call(&call).await.is_none());
+        assert_eq!(factory.attempts.load(Ordering::SeqCst), 2);
+    }
+
+    struct MissingInterpreter(std::sync::atomic::AtomicUsize);
+    #[async_trait]
+    impl RuntimeEnvironmentPortV4 for MissingInterpreter {
+        async fn check_interpreter(
+            &self,
+            language: KernelLanguageV4,
+            environment: &str,
+        ) -> Result<(), String> {
+            assert_eq!(language, KernelLanguageV4::R);
+            assert_eq!(environment, "system");
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err("missing R".into())
+        }
+        async fn software_versions(
+            &self,
+            _: KernelLanguageV4,
+            _: &str,
+            _: Vec<String>,
+        ) -> Result<BTreeMap<String, String>, String> {
+            panic!("not dispatched")
+        }
+        async fn ensure(&self, _: KernelLanguageV4, _: &str) -> Result<String, String> {
+            panic!("not dispatched")
+        }
+    }
+
+    #[tokio::test]
+    async fn lazy_interpreter_probe_is_language_specific_and_never_reserves_a_job_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, factory) = mock_resource_slot(dir.path(), false, false);
+        let mut resources = factory.initialize().await.unwrap();
+        let interpreter = Arc::new(MissingInterpreter(std::sync::atomic::AtomicUsize::new(0)));
+        resources.environment_port = interpreter.clone();
+        let executor = DesktopToolExecutorV4 {
+            repository: Store::open_in_memory().await.unwrap(),
+            mcp_sessions: McpSessionManager::new(),
+            credentials: SystemCredentialVault,
+            resources: test_ready_resources(resources),
+            selection: ComputeSelectionV4 {
+                schema_version: 4,
+                backend_id: "local".into(),
+                backend_kind: ComputeBackendKindV4::Local,
+                autonomy_mode: AutonomyModeV4::Supervised,
+                approval_policy: ApprovalPolicyV4::RiskBased,
+                environment: "system".into(),
+                network_policy: NetworkPolicyV4::HostInherited,
+                container_image: None,
+            },
+            project_id: Uuid::new_v4(),
+            run_id: Uuid::new_v4(),
+            conversation_id: Uuid::new_v4(),
+            backend_id: "local".into(),
+            browser: omicsops_browser::BrowserRuntime::new(
+                dir.path().join("browser"),
+                dir.path().join("extension"),
+            ),
+            local_project_root: dir.path().to_owned(),
+            browser_authorizations: Default::default(),
+            forced_route: None,
+        };
+        assert!(
+            executor
+                .prepare_call(&resource_call("project.list"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(interpreter.0.load(Ordering::SeqCst), 0);
+        let call = ToolCallV4 {
+            call_id: "missing-r".into(),
+            tool_id: "runtime.execute".into(),
+            arguments: json!({"language":"r","environment":"system","code":"print(1)"}),
+        };
+        let outcome = executor.prepare_call(&call).await.unwrap().unwrap();
+        assert_eq!(outcome.data["operation_dispatched"], false);
+        assert_eq!(outcome.data["error_kind"], "interpreter_unavailable");
+        assert_eq!(interpreter.0.load(Ordering::SeqCst), 1);
+        let key = executor.key(KernelLanguageV4::R, "system").unwrap();
+        assert!(
+            executor
+                .repository
+                .recover_runtime_result_v4(&key, &call)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_catalog_does_not_require_interpreters_or_ssh_credentials() {
+        let repository = Store::open_in_memory().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = Project::new(
+            Uuid::new_v4(),
+            "lazy",
+            dir.path().to_str().unwrap(),
+            omicsops_core::workspace::ProjectTemplate::Blank,
+            Utc::now(),
+        );
+        let profile = ConnectionProfile {
+            id: Uuid::new_v4(),
+            label: "offline".into(),
+            host: "192.0.2.1".into(),
+            port: 22,
+            username: "test".into(),
+            authentication: AuthenticationMethod::Password,
+            authentication_reference: "missing-test-credential".into(),
+            host_key_fingerprint: Some("SHA256:synthetic".into()),
+        };
+        repository.save_connection(&profile).await.unwrap();
+        project.connection_id = Some(profile.id);
+        project.remote_root = Some("/not-contacted".into());
+        let entries = configured_process_backends(&repository, &project)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        for entry in &entries {
+            assert!(entry.selectable);
+            assert!(!entry.descriptor.available);
+            assert_eq!(entry.python_status, "unverified");
+            assert_eq!(entry.r_status, "unverified");
+        }
+        repository.save_project(&project).await.unwrap();
+        let model_profile: omicsops_core::workspace::ModelProfile = serde_json::from_value(json!({
+            "id":Uuid::new_v4(),"label":"test","provider":"ollama","base_url":"http://127.0.0.1:1",
+            "model":"not-contacted","credential_reference":null,"supports_tools":true,"supports_vision":false
+        })).unwrap();
+        repository.save_model_profile(&model_profile).await.unwrap();
+        let state = AppState {
+            repository: repository.clone(),
+            credentials: SystemCredentialVault,
+            mcp_sessions: McpSessionManager::new(),
+            active_runs: Default::default(),
+            skills_root: dir.path().join("skills"),
+            research_last_request: Default::default(),
+            active_kernels: Default::default(),
+            project_kernel_queues: Default::default(),
+            sync_controls: Default::default(),
+            browser: omicsops_browser::BrowserRuntime::new(
+                dir.path().join("browser"),
+                dir.path().join("extension"),
+            ),
+        };
+        let selection = legacy_ssh_selection(&project).unwrap();
+        let (model, tools) = compose(
+            &state,
+            &project,
+            &selection,
+            model_profile.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(model.resources.as_ref().unwrap().ready.get().is_none());
+        assert!(
+            model
+                .prompt_layers()
+                .environment
+                .contains("have not been checked")
+        );
+        assert!(!tools.registry.descriptors(RunModeV4::Execute).is_empty());
+        let outcome = tools
+            .registry
+            .execute(
+                RunModeV4::Execute,
+                ToolCallV4 {
+                    call_id: "memory-without-ssh".into(),
+                    tool_id: "search_memory".into(),
+                    arguments: json!({"query":"liver cancer"}),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(outcome.succeeded);
+        tools.registry.interrupt(tools.run_id()).await.unwrap();
+        assert!(
+            model.resources.as_ref().unwrap().ready.get().is_none(),
+            "research and cancellation must not connect"
+        );
+        let mut selection = legacy_ssh_selection(&project).unwrap();
+        validate_compute_binding(&repository, &project, &selection)
+            .await
+            .unwrap();
+        selection.backend_id = format!("ssh:{}", Uuid::new_v4());
+        assert!(
+            validate_compute_binding(&repository, &project, &selection)
+                .await
+                .is_err()
+        );
+        let mut untrusted = profile;
+        untrusted.host_key_fingerprint = None;
+        repository.save_connection(&untrusted).await.unwrap();
+        assert!(
+            !configured_process_backends(&repository, &project)
+                .await
+                .unwrap()[1]
+                .selectable
+        );
+    }
+
     fn budget_test_model(supports_vision: bool, window: u32) -> DesktopModelPortV4 {
         DesktopModelPortV4 {
             client: UnifiedModelClient::new(
@@ -5858,6 +6531,7 @@ mod tests {
                 safety_margin_tokens: 10,
             }),
             prompt: PromptLayersV4::default(),
+            resources: None,
             project_root: PathBuf::from("nonexistent-budget-test-root"),
             supports_vision,
             delegated: None,
@@ -7025,6 +7699,7 @@ mod tests {
             )
             .unwrap(),
             prompt: PromptLayersV4::default(),
+            resources: None,
             project_root: std::env::current_dir().unwrap(),
             supports_vision: false,
             delegated: None,
@@ -7173,13 +7848,18 @@ mod tests {
             repository: Store::open_in_memory().await.unwrap(),
             mcp_sessions: McpSessionManager::new(),
             credentials: SystemCredentialVault,
-            filesystem: Arc::new(SshProjectFilesystemV4 {
-                session: session.clone(),
-                root: root.clone(),
-            }),
-            environment_port: Arc::new(SshEnvironmentPortV4 {
-                session: session.clone(),
-                root: root.clone(),
+            resources: test_ready_resources(ExecutionResourcesV4 {
+                filesystem: Arc::new(SshProjectFilesystemV4 {
+                    session: session.clone(),
+                    root: root.clone(),
+                }),
+                environment_port: Arc::new(SshEnvironmentPortV4 {
+                    session: session.clone(),
+                    root: root.clone(),
+                }),
+                runtime: runtime.clone(),
+                remote_jobs: None,
+                prompt: PromptLayersV4::default(),
             }),
             selection: ComputeSelectionV4 {
                 schema_version: 4,
@@ -7195,7 +7875,6 @@ mod tests {
             run_id,
             conversation_id: Uuid::new_v4(),
             backend_id: "ssh:live-stage2".into(),
-            runtime: runtime.clone(),
             browser: omicsops_browser::BrowserRuntime::new(
                 std::env::temp_dir().join("omicsops-live-stage2-browser"),
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../browser-extension"),
@@ -7203,7 +7882,6 @@ mod tests {
             local_project_root: std::env::temp_dir(),
             browser_authorizations: Arc::new(std::sync::Mutex::new(Vec::new())),
             forced_route: None,
-            remote_jobs: None,
         };
         executor
             .execute(&ToolCallV4 {
@@ -7285,13 +7963,18 @@ mod tests {
             repository: Store::open_in_memory().await.unwrap(),
             mcp_sessions: McpSessionManager::new(),
             credentials: SystemCredentialVault,
-            filesystem: Arc::new(SshProjectFilesystemV4 {
-                session: session.clone(),
-                root: root.clone(),
-            }),
-            environment_port: Arc::new(SshEnvironmentPortV4 {
-                session,
-                root: root.clone(),
+            resources: test_ready_resources(ExecutionResourcesV4 {
+                filesystem: Arc::new(SshProjectFilesystemV4 {
+                    session: session.clone(),
+                    root: root.clone(),
+                }),
+                environment_port: Arc::new(SshEnvironmentPortV4 {
+                    session,
+                    root: root.clone(),
+                }),
+                runtime: runtime.clone(),
+                remote_jobs: None,
+                prompt: PromptLayersV4::default(),
             }),
             selection: ComputeSelectionV4 {
                 schema_version: 4,
@@ -7307,7 +7990,6 @@ mod tests {
             run_id,
             conversation_id: Uuid::new_v4(),
             backend_id: backend_id.clone(),
-            runtime: runtime.clone(),
             browser: omicsops_browser::BrowserRuntime::new(
                 std::env::temp_dir().join("omicsops-live-stage3-browser"),
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../browser-extension"),
@@ -7315,7 +7997,6 @@ mod tests {
             local_project_root: std::env::temp_dir(),
             browser_authorizations: Arc::new(std::sync::Mutex::new(Vec::new())),
             forced_route: None,
-            remote_jobs: None,
         };
         let local_state = tempfile::tempdir().unwrap();
         let repository = Store::open(local_state.path().join("stage3.sqlite"))
@@ -7466,5 +8147,54 @@ mod tests {
         });
         assert_eq!(attempts, 1);
         assert_eq!(error.as_deref(), Some("emit failed"));
+    }
+    #[test]
+    fn risk_based_mcp_requires_live_approval_and_exact_read_only_target() {
+        let mut entry = McpToolIndexV4 {
+            server_id: Uuid::new_v4(),
+            server_name: "papers".into(),
+            tool_name: "search".into(),
+            description: "papers".into(),
+            input_schema: json!({"type":"object"}),
+            tool_catalog_sha256: "catalog".into(),
+            schema_sha256: "schema".into(),
+            read_only_hint: Some(true),
+            configured: true,
+            enabled: true,
+            launch_approved: true,
+            tool_approved: true,
+            updated_at: chrono::Utc::now(),
+        };
+        let mut call = ToolCallV4 {
+            call_id: "one".into(),
+            tool_id: "use_mcp_tool".into(),
+            arguments: json!({"server_id":entry.server_id,"tool":"search","catalog_sha256":"catalog","schema_sha256":"schema","arguments":{"query":"liver"}}),
+        };
+        assert!(approved_read_only_mcp_target(&entry, &call));
+        call.call_id = "two".into();
+        call.arguments["arguments"]["query"] = json!("spatial");
+        assert!(approved_read_only_mcp_target(&entry, &call));
+        for field in ["server_id", "tool", "catalog_sha256", "schema_sha256"] {
+            let mut stale = call.clone();
+            stale.arguments[field] = json!("changed");
+            assert!(!approved_read_only_mcp_target(&entry, &stale));
+        }
+        entry.tool_approved = false;
+        assert!(!approved_read_only_mcp_target(&entry, &call));
+        entry.tool_approved = true;
+        entry.read_only_hint = None;
+        assert!(!approved_read_only_mcp_target(&entry, &call));
+        entry.read_only_hint = Some(true);
+        entry.launch_approved = false;
+        assert!(!approved_read_only_mcp_target(&entry, &call));
+    }
+
+    #[test]
+    fn mcp_protocol_errors_are_failed_outcomes() {
+        assert!(mcp_result_failed(
+            &json!({"result":{"isError":true,"content":[{"type":"text","text":"HTTP 400"}]}})
+        ));
+        assert!(!mcp_result_failed(&json!({"result":{"isError":false}})));
+        assert!(!mcp_result_failed(&json!({"result":{"content":[]}})));
     }
 }

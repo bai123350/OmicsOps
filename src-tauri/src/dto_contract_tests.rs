@@ -199,3 +199,20 @@ fn reasoning_effort_request_distinguishes_omission_clear_and_value() {
         );
     }
 }
+
+#[test]
+fn streaming_preview_contract_clears_without_creating_an_audit_event() {
+    let run_id = Uuid::new_v4();
+    for text in [Some("public delta".to_string()), None] {
+        let dto = omicsops_dto::AgentTextPreviewV4 {
+            run_id,
+            text: text.clone(),
+        };
+        let value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(value, json!({"run_id":run_id,"text":text}));
+        assert_eq!(
+            serde_json::from_value::<omicsops_dto::AgentTextPreviewV4>(value).unwrap(),
+            dto
+        );
+    }
+}
