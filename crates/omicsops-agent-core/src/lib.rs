@@ -878,7 +878,7 @@ impl AgentCoreV4<'_> {
             )
             .await?;
         }
-        for _ in 0..limits.max_turns {
+        for turn_index in 0..limits.max_turns {
             if cancelled.load(Ordering::SeqCst) {
                 self.tools
                     .interrupt(spec.run_id)
@@ -912,8 +912,23 @@ impl AgentCoreV4<'_> {
                 self.push(spec.run_id, AgentEventKindV4::CycleStarted { cycle_id })
                     .await?;
             }
+            let finalizing = spec.execution_kind == RunExecutionKindV4::OrdinaryAgent
+                && limits.max_turns >= 8
+                && (turn_index >= limits.max_turns - 4
+                    || current_events.iter().any(|event| {
+                        matches!(&event.event,
+                        AgentEventKindV4::RunFailed { message }
+                            if message == &AgentCoreErrorV4::MissingCompletion.to_string())
+                    }));
             let turn = match self
-                .execution_model_turn(spec, context, &current_events, limits, cancelled)
+                .execution_model_turn(
+                    spec,
+                    context,
+                    &current_events,
+                    limits,
+                    cancelled,
+                    finalizing,
+                )
                 .await
             {
                 Ok(turn) => turn,
@@ -934,7 +949,14 @@ impl AgentCoreV4<'_> {
             let mut completion_proposal = None;
             let mut input_request = None;
             let mut delegation_requests = Vec::new();
-            for call in turn.tool_calls {
+            for mut call in turn.tool_calls {
+                bind_mcp_directory(&mut call, &current_events);
+                if finalizing && is_retrieval_extension(&call.tool_id) {
+                    self.push(spec.run_id, AgentEventKindV4::ToolFinished {
+                        outcome: rejected_coordinator_outcome(call, "finalization", "Search budget is reserved for finalization. Synthesize existing evidence and call agent.complete; do not request more searches."),
+                    }).await?;
+                    continue;
+                }
                 tool_call_count += 1;
                 if tool_call_count > limits.max_tool_calls {
                     return Err(AgentCoreErrorV4::ToolBudgetExceeded(limits.max_tool_calls));
@@ -1279,7 +1301,7 @@ impl AgentCoreV4<'_> {
                         .await?;
                         continue;
                     }
-                    match serde_json::from_value::<DelegationGraphV4>(call.arguments.clone()) {
+                    match parse_delegation_request(&call, spec, self.tools, limits) {
                         Ok(graph) => delegation_requests.push((call.call_id, graph)),
                         Err(error) => {
                             self.push(
@@ -2347,7 +2369,7 @@ impl AgentCoreV4<'_> {
             .validate_request(&request)
             .map_err(|error| AgentCoreErrorV4::NeedsAttention(error.message))?;
         let mut attempt = 0_u8;
-        let mut truncated_retry = false;
+        let mut output_repair_attempted = false;
         loop {
             let mut callback_events = Vec::new();
             let mut streamed_text = String::new();
@@ -2428,15 +2450,20 @@ impl AgentCoreV4<'_> {
                     }
                     return Ok(turn);
                 }
-                Err(error) if error.message.contains("truncated_output:") && !truncated_retry => {
-                    truncated_retry = true;
-                    request.system.push_str("\nThe previous model response exceeded its output allowance and was discarded. No tool calls from that response executed. Continue from the existing evidence with at most ONE complete tool call, minimal arguments, and a brief public update in the user's language. Do not repeat discovery already completed. Split large writes into smaller operations.");
+                Err(error)
+                    if error.class == omicsops_protocol::ModelErrorClassV4::InvalidResponse
+                        && (error.message.contains("truncated_output:")
+                            || error.message.contains("returned malformed JSON arguments:"))
+                        && !output_repair_attempted =>
+                {
+                    output_repair_attempted = true;
+                    request.system.push_str("\nThe previous model response was discarded because its tool arguments were malformed JSON or its output was truncated. No tool calls from that response executed. Continue from the existing evidence with at most ONE complete tool call, minimal arguments, and a brief public update in the user's language. Do not repeat discovery already completed. Split large writes into smaller operations. Generate strict JSON objects matching the tool schema; escape quotes and newlines inside strings. Do not use Markdown fences, comments, or trailing commas in arguments. For structured array items, provide objects with the required fields rather than prose strings.");
                     self.model
                         .validate_request(&request)
                         .map_err(|error| AgentCoreErrorV4::NeedsAttention(error.message))?;
                     self.push(run_id, AgentEventKindV4::ModelRetrying {
                         attempt: 1, class: error.class,
-                        message: "Output was truncated; retrying once with a single concise tool call. No partial call was dispatched.".into(),
+                        message: "Model output could not be parsed completely; retrying once with one concise tool call and strict JSON arguments. No call from the rejected response was dispatched.".into(),
                     }).await?;
                 }
                 Err(error) if error.retryable && attempt < max_retries => {
@@ -2882,8 +2909,23 @@ impl AgentCoreV4<'_> {
                 continue;
             }
             if call.tool_id == "agent.delegate" {
-                let graph: DelegationGraphV4 = serde_json::from_value(call.arguments.clone())
-                    .map_err(|error| AgentCoreErrorV4::Delegation(error.to_string()))?;
+                let graph = match parse_delegation_request(&call, spec, self.tools, limits) {
+                    Ok(graph) => graph,
+                    Err(error) => {
+                        self.push(
+                            run_id,
+                            AgentEventKindV4::ToolFinished {
+                                outcome: rejected_coordinator_outcome(
+                                    call.clone(),
+                                    "delegation_schema",
+                                    error,
+                                ),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
                 let call_id = call.call_id.clone();
                 let outcome = self
                     .execute_delegation_graph(spec, &call_id, graph, limits, cancelled)
@@ -3470,11 +3512,15 @@ impl AgentCoreV4<'_> {
         events: &[AgentEventV4],
         limits: AgentLimitsV4,
         cancelled: &AtomicBool,
+        finalizing: bool,
     ) -> Result<ModelTurnV4, AgentCoreErrorV4> {
         let first = self
             .model_turn(
                 spec.run_id,
-                self.execution_request(spec, context.clone(), events),
+                finalization_request(
+                    self.execution_request(spec, context.clone(), events),
+                    finalizing,
+                ),
                 limits.max_model_retries,
                 limits.model_attempt_timeout,
                 Some(cancelled),
@@ -3512,7 +3558,7 @@ impl AgentCoreV4<'_> {
         .await?;
         self.model_turn(
             spec.run_id,
-            self.execution_request(spec, compacted, events),
+            finalization_request(self.execution_request(spec, compacted, events), finalizing),
             0,
             limits.model_attempt_timeout,
             Some(cancelled),
@@ -3678,7 +3724,12 @@ impl AgentCoreV4<'_> {
         if !force_compaction {
             match self.validate_execution_context(spec, &candidate, &events, limits) {
                 Ok(()) => return Ok(candidate),
-                Err(error) if latest_checkpoint.is_some() && recent.is_empty() => {
+                Err(error)
+                    if latest_checkpoint
+                        .as_ref()
+                        .is_some_and(|checkpoint| checkpoint.recent_steps.is_empty())
+                        && recent.is_empty() =>
+                {
                     return Err(error);
                 }
                 Err(_) => {}
@@ -3715,6 +3766,18 @@ impl AgentCoreV4<'_> {
                 .map(|event| context_views::event_view(event).to_string())
                 .collect();
         }
+        // A fixed number of recent steps is not a byte budget: tool JSON can
+        // expand again when embedded in checkpoint strings. Fit the actual
+        // serialized request, keeping the newest steps and immutable state.
+        let (compacted, validation) = loop {
+            let compacted = serde_json::to_string(&json!({"frozen_plan":spec.plan,"compute_selection":spec.compute_selection,"checkpoint":checkpoint,"recent_events":[],"scientific_state":scientific_state,"active_guidance":active_guidance}))
+                .map_err(|e| AgentCoreErrorV4::Store(e.to_string()))?;
+            let validation = self.validate_execution_context(spec, &compacted, &events, limits);
+            if validation.is_ok() || checkpoint.recent_steps.is_empty() {
+                break (compacted, validation);
+            }
+            checkpoint.recent_steps.remove(0);
+        };
         let archive = self
             .events
             .archive_context(spec.run_id, &transcript, &checkpoint)
@@ -3729,9 +3792,7 @@ impl AgentCoreV4<'_> {
             },
         )
         .await?;
-        let compacted = serde_json::to_string(&json!({"frozen_plan":spec.plan,"compute_selection":spec.compute_selection,"checkpoint":checkpoint,"recent_events":[],"scientific_state":scientific_state,"active_guidance":active_guidance}))
-            .map_err(|e| AgentCoreErrorV4::Store(e.to_string()))?;
-        self.validate_execution_context(spec, &compacted, &events, limits)?;
+        validation?;
         Ok(compacted)
     }
 
@@ -4021,6 +4082,79 @@ fn is_browser_tool_id(tool_id: &str) -> bool {
     tool_id == "browser_setup" || tool_id.starts_with("web_")
 }
 
+fn is_retrieval_extension(tool: &str) -> bool {
+    matches!(
+        tool,
+        "use_mcp_tool"
+            | "search_mcp_tools"
+            | "search_memory"
+            | "search_skills"
+            | "use_skill"
+            | "agent.delegate"
+    )
+}
+
+fn finalization_request(mut request: ModelRequestV4, finalizing: bool) -> ModelRequestV4 {
+    if finalizing {
+        request.system.push_str("\nThe run is in its reserved finalization turns. Stop expanding the search or delegating. Use the retrieved evidence to deduplicate and synthesize the deliverable, record necessary evidence, and call agent.complete with genuine evidence references. Do not claim unsupported coverage or invent citations. If essential evidence is unavailable, use agent.request_input with reason blocker. Do not spend the remaining turns promising further searches.");
+        request
+            .tools
+            .retain(|tool| !is_retrieval_extension(&tool.id));
+    }
+    request
+}
+
+fn bind_mcp_directory(call: &mut ToolCallV4, events: &[AgentEventV4]) {
+    if call.tool_id != "use_mcp_tool" {
+        return;
+    }
+    let Some(server) = call.arguments.get("server_id").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(tool) = call.arguments.get("tool").and_then(Value::as_str) else {
+        return;
+    };
+    let entry = events
+        .iter()
+        .rev()
+        .filter_map(|event| match &event.event {
+            AgentEventKindV4::ToolFinished { outcome }
+                if outcome.tool_id == "search_mcp_tools" && outcome.succeeded =>
+            {
+                outcome.data.get("tools").and_then(Value::as_array)
+            }
+            _ => None,
+        })
+        .flatten()
+        .find(|entry| {
+            entry.get("server_id").and_then(Value::as_str) == Some(server)
+                && entry.get("tool_name").and_then(Value::as_str) == Some(tool)
+        });
+    if let Some(entry) = entry {
+        if let (Some(catalog), Some(schema)) = (
+            entry.get("tool_catalog_sha256").and_then(Value::as_str),
+            entry.get("schema_sha256").and_then(Value::as_str),
+        ) {
+            // Bind only the run's discovered snapshot, never a fresh server
+            // catalog. Runtime drift checks and approval hashing still apply.
+            call.arguments["catalog_sha256"] = json!(catalog);
+            call.arguments["schema_sha256"] = json!(schema);
+        }
+    }
+}
+
+fn parse_delegation_request(
+    call: &ToolCallV4,
+    spec: &RunSpecV4,
+    tools: &dyn ToolPortV4,
+    limits: AgentLimitsV4,
+) -> Result<DelegationGraphV4, String> {
+    let graph =
+        serde_json::from_value(call.arguments.clone()).map_err(|error| error.to_string())?;
+    validate_delegation_graph_v4(&graph, spec, tools, limits)?;
+    Ok(graph)
+}
+
 fn validate_delegation_graph_v4(
     graph: &DelegationGraphV4,
     spec: &RunSpecV4,
@@ -4058,7 +4192,7 @@ fn validate_delegation_graph_v4(
         }
         if node.isolation == DelegationIsolationV4::EvidenceOnly && !node.capabilities.is_empty() {
             return Err(format!(
-                "evidence-only delegated node {} cannot receive tools",
+                "evidence-only delegated node {} cannot receive tools: set capabilities to [] and use existing evidence. For additional retrieval, let the parent call its authorized tools; read_only_project only permits frozen read-only capabilities, not network or mutating tools",
                 node.id
             ));
         }
@@ -8684,7 +8818,14 @@ mod tests {
             let context = core.context_for(&spec, limits).await.unwrap();
             let events = store.events.lock().unwrap().clone();
             let outcome = core
-                .execution_model_turn(&spec, context, &events, limits, &AtomicBool::new(false))
+                .execution_model_turn(
+                    &spec,
+                    context,
+                    &events,
+                    limits,
+                    &AtomicBool::new(false),
+                    false,
+                )
                 .await;
             if always_overflow {
                 assert!(matches!(outcome, Err(AgentCoreErrorV4::ContextOverflow(_))));
@@ -8810,6 +8951,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_recent_checkpoint_shrinks_to_budget_and_preserves_evidence() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        for index in 0..20 {
+            let previous = store.events.lock().unwrap().last().unwrap().clone();
+            store
+                .append_direct(&AgentEventV4::next(
+                    &previous,
+                    Utc::now(),
+                    AgentEventKindV4::ModelText {
+                        text: format!("step-{index}: {}", "研究结果".repeat(1000)),
+                    },
+                ))
+                .unwrap();
+        }
+        let history = store.events.lock().unwrap().clone();
+        let checkpoint = build_checkpoint(&spec, &history, 16, json!(null));
+        store
+            .append_direct(&AgentEventV4::next(
+                history.last().unwrap(),
+                Utc::now(),
+                AgentEventKindV4::ContextCheckpointed { checkpoint },
+            ))
+            .unwrap();
+        let original = store.events.lock().unwrap().clone();
+        let model = BudgetOnlyModel {
+            request_limit: 25_000,
+            requests: Mutex::new(vec![]),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: None,
+        };
+        let limits = AgentLimitsV4 {
+            context_max_bytes: 30_000,
+            checkpoint_recent_events: 16,
+            ..AgentLimitsV4::default()
+        };
+        let context = core.context_for(&spec, limits).await.unwrap();
+        assert!(context.len() <= 30_000);
+        assert!(context.contains("step-19"));
+        let value: Value = serde_json::from_str(&context).unwrap();
+        assert_eq!(
+            value["frozen_plan"],
+            serde_json::to_value(&spec.plan).unwrap()
+        );
+        assert_eq!(
+            &store.events.lock().unwrap()[..original.len()],
+            original.as_slice()
+        );
+        assert_eq!(store.archives.lock().unwrap().len(), 1);
+        let resumed = core.context_for(&spec, limits).await.unwrap();
+        assert!(resumed.len() <= 30_000);
+        assert_eq!(store.archives.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn compacted_context_must_still_respect_byte_limit() {
         let spec = execution_spec(Uuid::new_v4());
         let store = MemoryStore::default();
@@ -8876,7 +9077,8 @@ mod tests {
             Err(AgentCoreErrorV4::Store(_))
         ));
         assert_eq!(*store.0.events.lock().unwrap(), original);
-        assert_eq!(model.requests.lock().unwrap().len(), 1);
+        // Both candidates are validated locally; no model request is dispatched.
+        assert_eq!(model.requests.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -10444,12 +10646,24 @@ mod tests {
                     }],
                 })
             } else {
+                let context: Value = serde_json::from_str(&request.context).unwrap();
+                let evidence = context["recent_events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|event| {
+                        event.pointer("/event/kind") == Some(&json!("tool_finished"))
+                            && event.pointer("/event/outcome/succeeded") == Some(&json!(true))
+                    })
+                    .unwrap();
+                let sequence = evidence["sequence"].as_u64().unwrap();
                 Ok(ModelTurnV4 {
                     public_text: String::new(),
                     tool_calls: vec![ToolCallV4 {
                         call_id: "complete".into(),
                         tool_id: "agent.complete".into(),
-                        arguments: completion_arguments(7),
+                        arguments: completion_arguments(sequence),
                     }],
                 })
             }
@@ -10491,6 +10705,64 @@ mod tests {
             events.last().unwrap().event,
             AgentEventKindV4::RunCompleted
         ));
+    }
+
+    #[tokio::test]
+    async fn resumed_invalid_delegation_returns_failure_and_parent_completes() {
+        let mut node = delegated_node("n1", vec![], 1);
+        node.isolation = DelegationIsolationV4::EvidenceOnly;
+        node.capabilities.insert("use_mcp_tool".into());
+        for arguments in [
+            json!({"schema_version":4}),
+            serde_json::to_value(DelegationGraphV4 {
+                schema_version: 4,
+                nodes: vec![node],
+            })
+            .unwrap(),
+        ] {
+            let spec = delegation_spec(Uuid::new_v4());
+            let store = MemoryStore::default();
+            seed_execution(&store, &spec);
+            let previous = store.events.lock().unwrap().last().unwrap().clone();
+            store
+                .append_direct(&AgentEventV4::next(
+                    &previous,
+                    Utc::now(),
+                    AgentEventKindV4::ToolRequested {
+                        call: ToolCallV4 {
+                            call_id: "invalid-delegation".into(),
+                            tool_id: "agent.delegate".into(),
+                            arguments,
+                        },
+                    },
+                ))
+                .unwrap();
+            AgentCoreV4 {
+                model: &MainDelegatingModel(AtomicUsize::new(0)),
+                tools: &DelegationTools,
+                events: &store,
+                science: None,
+            }
+            .execute(&spec, 3)
+            .await
+            .unwrap();
+            let events = store.events.lock().unwrap();
+            assert!(events.iter().any(|event| matches!(&event.event, AgentEventKindV4::ToolFinished { outcome } if outcome.call_id == "invalid-delegation" && !outcome.succeeded)));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        &event.event,
+                        AgentEventKindV4::DelegationGraphStarted { .. }
+                    ))
+                    .count(),
+                1
+            );
+            assert!(matches!(
+                events.last().unwrap().event,
+                AgentEventKindV4::RunCompleted
+            ));
+        }
     }
 
     #[test]
@@ -11300,6 +11572,7 @@ mod tests {
         assert!(guided_loop_rejection(&events, &listing).is_none());
     }
     struct TruncatedModel {
+        failure_message: &'static str,
         attempts: AtomicUsize,
         always_fail: bool,
     }
@@ -11317,7 +11590,7 @@ mod tests {
                 ));
                 return Err(ModelFailureV4::permanent(
                     omicsops_protocol::ModelErrorClassV4::InvalidResponse,
-                    "truncated_output: output allowance",
+                    self.failure_message,
                 ));
             }
             assert!(request.system.contains("at most ONE complete tool call"));
@@ -11329,9 +11602,21 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn truncated_turn_retries_once_without_committing_partial_output() {
-        for always_fail in [false, true] {
+    async fn malformed_or_truncated_turn_retries_once_without_committing_partial_output() {
+        for (always_fail, failure_message) in [
+            (false, "truncated_output: output allowance"),
+            (true, "truncated_output: output allowance"),
+            (
+                false,
+                "tool call c1 returned malformed JSON arguments: expected comma",
+            ),
+            (
+                true,
+                "tool call c1 returned malformed JSON arguments: expected comma",
+            ),
+        ] {
             let model = TruncatedModel {
+                failure_message,
                 attempts: AtomicUsize::new(0),
                 always_fail,
             };
@@ -11462,6 +11747,154 @@ mod tests {
         );
         assert!(request.system.contains("do not repeat search_mcp_tools"));
     }
+    struct FinishOnBudgetModel {
+        evidence: u64,
+        turns: AtomicUsize,
+    }
+    #[async_trait]
+    impl ModelPortV4 for FinishOnBudgetModel {
+        async fn stream(
+            &self,
+            request: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            let turn = self.turns.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(ModelTurnV4 {
+                public_text: format!("Working step {turn}"),
+                tool_calls: if request.system.contains("reserved finalization turns") {
+                    vec![ToolCallV4 {
+                        call_id: "complete-budget".into(),
+                        tool_id: "agent.complete".into(),
+                        arguments: completion_arguments(self.evidence),
+                    }]
+                } else {
+                    vec![]
+                },
+            })
+        }
+        async fn review(&self, _: ReviewerRequestV4) -> Result<ReviewerReportV4, ModelFailureV4> {
+            Ok(review(VerificationSeverityV4::Ok))
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_run_receives_finalization_before_exhausting_turns() {
+        for exhausted in [false, true] {
+            let mut spec = execution_spec(Uuid::new_v4());
+            spec.execution_kind = RunExecutionKindV4::OrdinaryAgent;
+            let store = MemoryStore::default();
+            let evidence = seed_success_evidence(&store, &spec);
+            if exhausted {
+                let previous = store.events.lock().unwrap().last().unwrap().clone();
+                store
+                    .append_direct(&AgentEventV4::next(
+                        &previous,
+                        Utc::now(),
+                        AgentEventKindV4::RunFailed {
+                            message: AgentCoreErrorV4::MissingCompletion.to_string(),
+                        },
+                    ))
+                    .unwrap();
+            }
+            let model = FinishOnBudgetModel {
+                evidence,
+                turns: AtomicUsize::new(0),
+            };
+            AgentCoreV4 {
+                model: &model,
+                tools: &FakeTools,
+                events: &store,
+                science: None,
+            }
+            .execute(&spec, 8)
+            .await
+            .unwrap();
+            assert_eq!(
+                model.turns.load(AtomicOrdering::SeqCst),
+                if exhausted { 1 } else { 5 }
+            );
+            assert!(matches!(
+                store.events.lock().unwrap().last().unwrap().event,
+                AgentEventKindV4::RunCompleted
+            ));
+        }
+    }
+
+    #[test]
+    fn finalization_keeps_completion_and_evidence_but_stops_more_searches() {
+        let tools = [
+            "use_mcp_tool",
+            "search_mcp_tools",
+            "agent.delegate",
+            "agent.complete",
+            "agent.read_tool_result",
+            "science.record_evidence",
+        ]
+        .into_iter()
+        .map(|id| ToolDescriptorV4 {
+            id: id.into(),
+            description: String::new(),
+            input_schema: json!({}),
+            effect: ToolEffectV4::ReadOnly,
+        })
+        .collect();
+        let request = ModelRequestV4 {
+            system: String::new(),
+            context: "existing evidence".into(),
+            tools,
+            image_refs: vec![],
+        };
+        assert_eq!(finalization_request(request.clone(), false).tools.len(), 6);
+        let final_request = finalization_request(request, true);
+        assert_eq!(
+            final_request
+                .tools
+                .iter()
+                .map(|tool| tool.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "agent.complete",
+                "agent.read_tool_result",
+                "science.record_evidence"
+            ]
+        );
+        assert!(final_request.system.contains("agent.complete"));
+        assert_eq!(final_request.context, "existing evidence");
+    }
+
+    #[test]
+    fn directory_binds_mcp_hashes_without_changing_target_or_payload() {
+        let mut call = ToolCallV4 {
+            call_id: "c".into(),
+            tool_id: "use_mcp_tool".into(),
+            arguments: json!({"server_id":"s","tool":"search","arguments":{"query":"liver"},"catalog_sha256":"model typo"}),
+        };
+        let event = AgentEventV4::first(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Utc::now(),
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: "directory".into(),
+                    tool_id: "search_mcp_tools".into(),
+                    succeeded: true,
+                    model_content: String::new(),
+                    provenance: vec![],
+                    data: json!({"tools":[{"server_id":"s","tool_name":"search","tool_catalog_sha256":"frozen-catalog","schema_sha256":"frozen-schema"}]}),
+                },
+            },
+        );
+        bind_mcp_directory(&mut call, &[event.clone()]);
+        assert_eq!(call.arguments["schema_sha256"], "frozen-schema");
+        assert_eq!(call.arguments["catalog_sha256"], "frozen-catalog");
+        assert_eq!(call.arguments["arguments"], json!({"query":"liver"}));
+        call.arguments["server_id"] = json!("unknown");
+        let original = call.clone();
+        bind_mcp_directory(&mut call, &[event]);
+        assert_eq!(call, original);
+    }
+
     #[test]
     fn mcp_business_failures_stop_after_two_and_preflight_does_not_count() {
         let mut events = vec![];

@@ -4760,7 +4760,7 @@ impl DesktopToolExecutorV4 {
                     .into_iter()
                     .filter(|entry| entry.configured && entry.enabled)
                     .collect();
-                let payload = json!({"tools":tools,"guidance":"This is the complete enabled MCP tool directory for this run. Select and filter these results; do not repeat tool discovery. This is a tool directory, not literature evidence. Copy the exact server_id, tool_name as tool, catalog and schema hashes. Retrieve actual records with use_mcp_tool. If none are suitable, report that limitation rather than repeatedly searching for unconfigured servers."});
+                let payload = json!({"tools":tools,"guidance":"This is the complete enabled MCP tool directory for this run. Select and filter these results; do not repeat tool discovery. This is a tool directory, not literature evidence. Select the exact server_id and tool_name as tool. The Host binds catalog and schema hashes from this recorded directory before approval; you may omit hashes. Retrieve actual records with use_mcp_tool. If none are suitable, report that limitation rather than repeatedly searching for unconfigured servers."});
                 (
                     serde_json::to_string(&payload).map_err(|error| error.to_string())?,
                     payload,

@@ -464,7 +464,8 @@ function V4RunTrace({ locale, events, previewText, onAnswer, onDecideApproval, o
   const pauseReason = getV4PauseReason(events);
   const legacyMcpFailure = (!terminal || terminal.event.kind === "run_needs_attention" || terminal.event.kind === "run_failed") && events.some(({ event }) => event.kind === "tool_dispatch_uncertain" && event.tool_id === "use_mcp_tool" && !isV4UncertainResolved(events, event.call_id));
   const status = legacyMcpFailure ? (zh ? "失败" : "Failed") : terminal?.event.kind === "run_completed" ? (zh ? "已完成" : "Completed") : terminal?.event.kind === "run_cancelled" ? (zh ? "已终止" : "Cancelled") : terminal?.event.kind === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention") : terminal?.event.kind === "run_failed" ? (zh ? "失败" : "Failed") : pauseReason === "approval" ? (zh ? "等待工具审批" : "Waiting for approval") : pauseReason === "input" ? (zh ? "等待回答" : "Waiting for input") : pauseReason === "browser_connection" ? (zh ? "等待连接浏览器" : "Waiting for browser") : pauseReason === "browser_human" ? (zh ? "等待人工处理浏览器" : "Waiting for browser intervention") : pauseReason === "runtime_recovery" ? (zh ? "结果待恢复" : "Results ready to resume") : pauseReason === "uncertain" ? (zh ? "等待副作用核验" : "Waiting for verification") : (zh ? "运行中" : "Running");
-  const failed = terminal?.event.kind === "run_failed";
+  const failed = terminal?.event.kind === "run_failed"
+    || (terminal?.event.kind === "run_needs_attention" && terminal.event.message.includes("model context exceeds byte budget"));
   const shouldExpand = !historical && (!terminal || Boolean(pauseReason) || terminal?.event.kind === "run_failed" || terminal?.event.kind === "run_needs_attention");
   async function resumeRun() {
     if (!onResume || !events[0] || resumeBusyRef.current) return;

@@ -413,12 +413,12 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "use_mcp_tool",
-            "Call one configured, enabled, launch-approved MCP stdio tool. A persistently approved tool is callable immediately; otherwise the Host can require explicit schema-bound approval for this run",
+            "Call one configured, enabled, launch-approved MCP stdio tool. Select the exact server_id and tool from the discovered directory; the Host binds its catalog and schema hashes before recording and approval, so you may omit hashes. A persistently approved tool is callable immediately; otherwise the Host can require explicit schema-bound approval for this run",
             ToolEffectV4::Network,
             // `catalog_sha256` is required by the dynamic Plan gate, but it
             // remains optional at the shared descriptor boundary so legacy
             // Execute calls (which predate catalog binding) stay readable.
-            json!({"type":"object","required":["server_id","tool","arguments","schema_sha256"],"properties":{"server_id":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"},"catalog_sha256":{"type":"string","minLength":1},"schema_sha256":{"type":"string","minLength":1}}}),
+            json!({"type":"object","required":["server_id","tool","arguments"],"properties":{"server_id":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"},"catalog_sha256":{"type":"string","minLength":1},"schema_sha256":{"type":"string","minLength":1}}}),
         ),
         descriptor(
             "agent.route_request",
@@ -522,9 +522,17 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "science.record_evidence",
-            "Record a claim linked to verified artifacts or literature sources",
+            "Record one concise claim linked to verified artifacts or retrieved literature. Each source must be a tagged object (kind plus source_id and citation for literature, or artifact_id for artifacts), never a prose string. Reuse identifiers from actual tool evidence.",
             ToolEffectV4::Mutating,
-            json!({"type":"object","required":["claim","sources","strength"],"properties":{"claim":{"type":"string"},"sources":{"type":"array"},"strength":{"type":"string","enum":["exploratory","supporting","strong"]},"conflicts_with":{"type":"array"}}}),
+            json!({"type":"object","required":["claim","sources","strength"],"properties":{
+                "claim":{"type":"string"},
+                "sources":{"type":"array","items":{"oneOf":[
+                    {"type":"object","required":["kind","source_id","citation"],"properties":{"kind":{"type":"string","enum":["literature"]},"source_id":{"type":"string","description":"Identifier from retrieved literature, e.g. PMID:12345 or a DOI"},"citation":{"type":"string"}}},
+                    {"type":"object","required":["kind","artifact_id"],"properties":{"kind":{"type":"string","enum":["artifact"]},"artifact_id":{"type":"string","format":"uuid"}}}
+                ]}},
+                "strength":{"type":"string","enum":["exploratory","supporting","strong"]},
+                "conflicts_with":{"type":"array","items":{"type":"string","format":"uuid"}}
+            }}),
         ),
         descriptor(
             "runtime.environment.ensure",
@@ -552,7 +560,7 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "agent.delegate",
-            "Run a bounded read-only DAG of temporary tasks. Nodes cannot expand the frozen run capabilities, write, or delegate recursively",
+            "Run a bounded read-only DAG of temporary tasks. evidence_only requires capabilities: [] and uses existing evidence only. read_only_project allows only frozen read-only capabilities; network tools such as use_mcp_tool must be called by the parent. Nodes cannot write, expand permissions, or delegate recursively",
             ToolEffectV4::Delegation,
             json!({"type":"object","required":["schema_version","nodes"],"properties":{"schema_version":{"type":"integer","const":4},"nodes":{"type":"array","maxItems":8,"items":{"type":"object","required":["id","objective","budget","capabilities","output_schema","isolation"],"properties":{"id":{"type":"string"},"objective":{"type":"string"},"dependencies":{"type":"array","items":{"type":"string"}},"budget":{"type":"object","required":["max_turns","max_tool_calls"],"properties":{"max_turns":{"type":"integer","maximum":4},"max_tool_calls":{"type":"integer","maximum":8}}},"capabilities":{"type":"array","items":{"type":"string"}},"output_schema":{"type":"object"},"isolation":{"type":"string","enum":["read_only_project","evidence_only"]}}}}}}),
         ),
@@ -714,6 +722,33 @@ fn sensitive_browser_query_key(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn evidence_sources_advertise_the_required_tagged_objects() {
+        let tool = builtin_tool_definitions_v4()
+            .into_iter()
+            .find(|tool| tool.id == "science.record_evidence")
+            .unwrap();
+        let alternatives = tool
+            .input_schema
+            .pointer("/properties/sources/items/oneOf")
+            .and_then(Value::as_array)
+            .expect("sources must describe their object variants");
+        let literature = alternatives
+            .iter()
+            .find(|item| item.pointer("/properties/kind/enum/0") == Some(&json!("literature")))
+            .unwrap();
+        assert_eq!(
+            literature["required"],
+            json!(["kind", "source_id", "citation"])
+        );
+        assert_eq!(literature["properties"]["source_id"]["type"], "string");
+        let artifact = alternatives
+            .iter()
+            .find(|item| item.pointer("/properties/kind/enum/0") == Some(&json!("artifact")))
+            .unwrap();
+        assert_eq!(artifact["required"], json!(["kind", "artifact_id"]));
+        assert_eq!(artifact["properties"]["artifact_id"]["format"], "uuid");
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct Noop;
     #[async_trait]
