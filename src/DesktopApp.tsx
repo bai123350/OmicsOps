@@ -950,6 +950,7 @@ export default function DesktopApp() {
   }
   const currentConversationAction = captureConversationAction();
   return <><WorkspaceShell
+    onSuggestFollowUps={api.agentV4SuggestFollowUps}
     capabilitySummary={capabilities.summary} capabilitiesLoading={capabilities.loading}
     capabilitiesError={capabilities.error} onRefreshCapabilities={capabilities.refresh}
     project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template }}

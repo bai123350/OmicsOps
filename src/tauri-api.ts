@@ -470,3 +470,5 @@ export async function agentGetIterationSettings(): Promise<import("./types").Age
 export async function agentSaveIterationSettings(settings: import("./types").AgentIterationSettingsV4): Promise<import("./types").AgentIterationSettingsV4> {
   return invoke("agent_save_iteration_settings", { settings });
 }
+
+export async function agentV4SuggestFollowUps(runId: string): Promise<string[]> { return isTauri() ? invoke("agent_v4_suggest_follow_up_questions", { runId }) : []; }

@@ -813,3 +813,32 @@ it("updates one live progress row then replaces it with the committed message", 
   rerender(<WorkspaceShell {...props} agentRunEventsV4={events} agentTextPreview={{ run_id: "other", text: "wrong run" }} />);
   expect(screen.queryByText("wrong run")).not.toBeInTheDocument();
 });
+
+describe("Session follow-up wiring", () => {
+  const base = { schema_version: 4 as const, run_id: "completed-session", project_id: project.id, conversation_id: "session-1", previous_hash: "", event_hash: "hash", occurred_at: "2026-09-12T00:00:01Z" };
+
+  it("shows three questions for a completed run and fills the composer without sending", async () => {
+    const questions = ["How should I validate these results?", "Which dataset should I compare next?", "Can you explain the remaining limitations?"];
+    const suggest = vi.fn().mockResolvedValue(questions);
+    const send = vi.fn();
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined}
+      activeConversationId="session-1" activeRunId={base.run_id} onSend={send} onSuggestFollowUps={suggest}
+      agentRunEventsV4={[{ ...base, sequence: 1, event: { kind: "run_completed" } }]} />);
+    const region = await screen.findByRole("region", { name: "Suggested follow-up questions" });
+    expect(within(region).getAllByRole("button")).toHaveLength(3);
+    expect(suggest).toHaveBeenCalledTimes(1);
+    expect(suggest).toHaveBeenCalledWith(base.run_id);
+    fireEvent.click(within(region).getByRole("button", { name: questions[1] }));
+    expect(screen.getByRole("textbox")).toHaveValue(questions[1]);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it.each(["run_needs_attention", "run_failed"] as const)("does not generate suggestions after %s", async (kind) => {
+    const suggest = vi.fn().mockResolvedValue(["First?", "Second?", "Third?"]);
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined}
+      activeConversationId="session-1" activeRunId={base.run_id} onSend={vi.fn()} onSuggestFollowUps={suggest}
+      agentRunEventsV4={[{ ...base, sequence: 1, event: { kind, message: "Review required" } }]} />);
+    expect(screen.queryByRole("region", { name: "Suggested follow-up questions" })).not.toBeInTheDocument();
+    expect(suggest).not.toHaveBeenCalled();
+  });
+});

@@ -14,6 +14,7 @@ mod conversation_state_tests;
 pub mod dto;
 #[cfg(test)]
 mod dto_contract_tests;
+mod follow_up_questions;
 pub mod inspection;
 pub mod kernel_commands;
 mod model_catalog_shared;
@@ -169,6 +170,7 @@ pub fn run() {
             agent_v4::agent_v4_events,
             agent_v4::agent_v4_events_for_conversation,
             browser_commands::browser_get_settings,
+            follow_up_questions::agent_v4_suggest_follow_up_questions,
             agent_settings::agent_get_iteration_settings,
             agent_settings::agent_save_iteration_settings,
             browser_commands::browser_save_settings,

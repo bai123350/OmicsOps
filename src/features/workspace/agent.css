@@ -660,3 +660,8 @@
 .v4-streaming-cursor { color: var(--accent, #009b90); animation: stream-pulse 1s step-end infinite; }
 @keyframes stream-pulse { 50% { opacity: 0; } }
 @media (prefers-reduced-motion: reduce) { .v4-streaming-cursor { animation: none; } }
+
+
+.session-follow-ups { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 0 16px; }
+.session-follow-ups button { border: 1px solid var(--border, #dfe4ea); background: white; color: inherit; border-radius: 12px; padding: 10px 14px; text-align: left; cursor: pointer; }
+.session-follow-ups button:hover { border-color: #159a90; background: #f1faf8; }
