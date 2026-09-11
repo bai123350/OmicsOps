@@ -43,6 +43,9 @@ impl FakeServer {
         Parameters(params): Parameters<EchoParams>,
     ) -> Result<CallToolResult, McpError> {
         record("echo");
+        if params.value == "reject" {
+            return Err(McpError::invalid_params("query exceeds limit", None));
+        }
         Ok(CallToolResult::success(vec![ContentBlock::text(
             params.value,
         )]))

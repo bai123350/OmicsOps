@@ -19,8 +19,8 @@ use std::{
 use omicsops_process::background_command;
 use rmcp::{
     ClientHandler, ServiceExt,
-    model::{CallToolRequestParams, ClientInfo},
-    service::{NotificationContext, Peer, RoleClient, RunningService},
+    model::{CallToolRequestParams, CallToolResult, ClientInfo, ContentBlock},
+    service::{NotificationContext, Peer, RoleClient, RunningService, ServiceError},
     transport::{ConfigureCommandExt, TokioChildProcess},
 };
 use serde::{Deserialize, Serialize};
@@ -456,6 +456,14 @@ impl McpSessionManager {
         let result = tokio::time::timeout(config.timeout(), session.peer.call_tool(params)).await;
         let result = match result {
             Ok(Ok(result)) => result,
+            // A JSON-RPC error is a completed server response, not a broken
+            // transport. Preserve the diagnostic and let the agent correct its
+            // call without killing the session or asking to verify side effects.
+            Ok(Err(ServiceError::McpError(error))) => {
+                CallToolResult::error(vec![ContentBlock::text(format!(
+                    "MCP tool failed: {error}"
+                ))])
+            }
             Ok(Err(error)) => {
                 tokio::task::yield_now().await;
                 let diagnostic = append_stderr(error.to_string(), &session.stderr_tail().await);

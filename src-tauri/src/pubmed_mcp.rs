@@ -238,16 +238,26 @@ impl PubMedClient {
     }
 
     async fn get_text(&self, url: Url) -> Result<String, PubMedClientError> {
-        self.http
-            .get(url)
+        let mut response = self
+            .http
+            .get(url.clone())
             .send()
             .await
-            .map_err(|error| PubMedClientError::Network(error.to_string()))?
+            .map_err(|error| PubMedClientError::Network(error.without_url().to_string()))?;
+        if let Some(anonymous) = anonymous_retry_url(response.status().as_u16(), &url) {
+            response = self
+                .http
+                .get(anonymous)
+                .send()
+                .await
+                .map_err(|error| PubMedClientError::Network(error.without_url().to_string()))?;
+        }
+        response
             .error_for_status()
-            .map_err(|error| PubMedClientError::Network(error.to_string()))?
+            .map_err(|error| PubMedClientError::Network(error.without_url().to_string()))?
             .text()
             .await
-            .map_err(|error| PubMedClientError::Network(error.to_string()))
+            .map_err(|error| PubMedClientError::Network(error.without_url().to_string()))
     }
 
     fn append_common_parameters(&self, url: &mut Url) {
@@ -262,9 +272,48 @@ impl PubMedClient {
         if let Some(email) = self.config.email.as_deref() {
             url.query_pairs_mut().append_pair("email", email);
         }
-        if let Some(api_key) = self.config.api_key.as_deref() {
+        if let Some(api_key) = self.config.api_key.as_deref().and_then(usable_ncbi_api_key) {
             url.query_pairs_mut().append_pair("api_key", api_key);
         }
+    }
+}
+
+// Optional keys copied from configuration templates must not become literal URL values.
+fn anonymous_retry_url(status: u16, url: &Url) -> Option<Url> {
+    if status != 400 || !url.query_pairs().any(|(key, _)| key == "api_key") {
+        return None;
+    }
+    let pairs: Vec<_> = url
+        .query_pairs()
+        .filter(|(key, _)| key != "api_key")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    let mut anonymous = url.clone();
+    anonymous.set_query(None);
+    anonymous.query_pairs_mut().extend_pairs(pairs);
+    Some(anonymous)
+}
+
+fn usable_ncbi_api_key(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let upper = value.to_ascii_uppercase();
+    if value.is_empty()
+        || value.starts_with("${")
+        || value.starts_with("%")
+        || value.starts_with('<')
+        || matches!(
+            upper.as_str(),
+            "YOUR_API_KEY"
+                | "YOUR_NCBI_API_KEY"
+                | "NCBI_API_KEY"
+                | "API_KEY"
+                | "REPLACE_ME"
+                | "CHANGEME"
+        )
+    {
+        None
+    } else {
+        Some(value)
     }
 }
 
@@ -326,7 +375,10 @@ pub struct PubMedRecordResult {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PubMedSearchParams {
-    #[schemars(description = "PubMed query, for example: single-cell RNA-seq tumor")]
+    #[schemars(
+        length(min = 1, max = 500),
+        description = "PubMed query: 1-500 printable characters, no line breaks. Keep Boolean queries concise; filter returned records locally."
+    )]
     pub query: String,
     #[schemars(description = "1-based result page; defaults to 1")]
     pub page: Option<usize>,
@@ -360,6 +412,7 @@ impl PubMedMcpServer {
 #[tool_router(server_handler)]
 impl PubMedMcpServer {
     #[tool(
+        annotations(read_only_hint = true),
         description = "Search PubMed and return paginated PMID metadata. This read-only tool does not download full text."
     )]
     async fn pubmed_search(
@@ -378,7 +431,9 @@ impl PubMedMcpServer {
                     ))
                 })
         }) {
-            return Err(McpError::invalid_params(error.to_string(), None));
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                error.to_string(),
+            )]));
         }
         let start = page.saturating_sub(1).saturating_mul(limit);
         match self.client.search(query, start, limit).await {
@@ -390,6 +445,7 @@ impl PubMedMcpServer {
     }
 
     #[tool(
+        annotations(read_only_hint = true),
         description = "Fetch PubMed abstract records by PMID using NCBI EFetch. Returns one status per requested PMID."
     )]
     async fn pubmed_fetch_records(
@@ -397,7 +453,9 @@ impl PubMedMcpServer {
         Parameters(params): Parameters<PubMedFetchParams>,
     ) -> Result<CallToolResult, McpError> {
         if let Err(error) = validate_fetch_params(&params.pmids) {
-            return Err(McpError::invalid_params(error.to_string(), None));
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                error.to_string(),
+            )]));
         }
         match self.client.fetch_records(&params.pmids).await {
             Ok(result) => json_tool_result(&result),
@@ -430,7 +488,7 @@ fn validate_fetch_params(pmids: &[String]) -> Result<(), PubMedClientError> {
 }
 
 fn validate_query(query: &str) -> Result<(), PubMedClientError> {
-    if query.is_empty() || query.len() > 500 || query.chars().any(char::is_control) {
+    if query.is_empty() || query.chars().count() > 500 || query.chars().any(char::is_control) {
         return Err(PubMedClientError::InvalidInput(
             "query must contain 1-500 printable characters".into(),
         ));
@@ -879,6 +937,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn invalid_search_returns_tool_failure_without_protocol_error() {
+        let server =
+            PubMedMcpServer::new(PubMedClient::new(PubMedClientConfig::default()).unwrap());
+        for query in ["x".repeat(603), String::new(), "a\nb".into()] {
+            let result = server
+                .pubmed_search(Parameters(PubMedSearchParams {
+                    query,
+                    page: None,
+                    limit: None,
+                }))
+                .await;
+            assert!(
+                result.is_ok(),
+                "invalid query should be a failed tool result"
+            );
+            assert_eq!(result.unwrap().is_error, Some(true));
+        }
+    }
+
+    #[test]
+    fn query_schema_and_validation_use_character_bounds() {
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(PubMedSearchParams)).unwrap();
+        assert_eq!(schema["properties"]["query"]["maxLength"], 500);
+        assert_eq!(schema["properties"]["query"]["minLength"], 1);
+        assert!(validate_query(&"肝".repeat(500)).is_ok());
+        assert!(validate_query(&"肝".repeat(501)).is_err());
+    }
+
     #[test]
     fn builds_scoped_urls_with_ncbi_metadata() {
         let client = PubMedClient::new(PubMedClientConfig {
@@ -927,5 +1014,57 @@ mod tests {
         assert!(matches!(result[1], PubMedRecordStatus::Duplicate));
         assert!(matches!(result[2], PubMedRecordStatus::Missing));
         assert!(matches!(result[3], PubMedRecordStatus::NoAbstract));
+    }
+    #[test]
+    fn placeholder_keys_are_omitted_from_requests() {
+        for key in [
+            "",
+            "${NCBI_API_KEY}",
+            "%NCBI_API_KEY%",
+            "YOUR_API_KEY",
+            "your_ncbi_api_key",
+            "<api-key>",
+        ] {
+            let client = PubMedClient::new(PubMedClientConfig {
+                api_key: Some(key.into()),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(
+                !client
+                    .fetch_url(&["123".into()])
+                    .unwrap()
+                    .query_pairs()
+                    .any(|(name, _)| name == "api_key")
+            );
+        }
+        assert_eq!(usable_ncbi_api_key(" actual-key "), Some("actual-key"));
+    }
+    #[test]
+    fn invalid_key_retry_preserves_query_and_only_runs_once() {
+        let url = Url::parse("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=liver&api_key=invalid&retmax=20").unwrap();
+        let retry = anonymous_retry_url(400, &url).unwrap();
+        assert!(!retry.query_pairs().any(|(key, _)| key == "api_key"));
+        assert!(
+            retry
+                .query_pairs()
+                .any(|(key, value)| key == "term" && value == "liver")
+        );
+        assert!(anonymous_retry_url(400, &retry).is_none());
+        for status in [200, 401, 403, 429, 500] {
+            assert!(anonymous_retry_url(status, &url).is_none());
+        }
+    }
+    #[test]
+    fn bundled_tools_advertise_read_only_annotations() {
+        let tools = PubMedMcpServer::tool_router().list_all();
+        assert_eq!(tools.len(), 2);
+        for tool in tools {
+            let value = serde_json::to_value(tool).unwrap();
+            assert_eq!(
+                value.pointer("/annotations/readOnlyHint"),
+                Some(&serde_json::json!(true))
+            );
+        }
     }
 }

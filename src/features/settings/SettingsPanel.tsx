@@ -45,6 +45,19 @@ const defaults: Record<ModelProfile["provider"], FormState> = {
   ollama: { provider: "ollama", label: "Ollama", base_url: "http://127.0.0.1:11434/", model: "", credential: "" },
 };
 
+const deepSeekDefault: FormState = { provider: "open_ai_compatible", label: "DeepSeek", base_url: "https://api.deepseek.com/v1", model: "deepseek-v4-flash", credential: "" };
+const deepSeekModels = ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4-flash-vision-exp"];
+
+function isDeepSeek(profile: Pick<ModelProfile, "provider" | "base_url">): boolean {
+  if (profile.provider !== "open_ai_compatible") return false;
+  try {
+    const url = new URL(profile.base_url);
+    return url.protocol === "https:" && url.hostname === "api.deepseek.com" && url.port === "";
+  } catch {
+    return false;
+  }
+}
+
 export function SettingsPanel({ locale, initialSection = "models", onClose, modelProfiles = [], onSaveModel, onProbeModel, onListModels, skillPackages = [], onImportSkill, onSetSkillEnabled, mcpServers = [], onSaveMcpServer, onInspectMcpServer, onSetMcpServerEnabled, onSetMcpLaunchApproval, onSetMcpToolApproval, onAddPubMedMcp, connections = [], selectedProject, onSaveConnection, onTestConnection, onConfirmHostKey, onBindProjectRemote }: Props) {
   const zh = locale === "zh-CN";
   const [form, setForm] = useState<FormState | null>(null);
@@ -115,12 +128,13 @@ export function SettingsPanel({ locale, initialSection = "models", onClose, mode
         <div className="provider-grid">
           <Provider icon={Cloud} name="Anthropic" detail="Messages API · tool use" configured={modelProfiles.some((profile) => profile.provider === "anthropic")} onConfigure={() => configure("anthropic")} />
           <Provider icon={KeyRound} name="OpenAI-compatible" detail="Chat Completions · custom Base URL" configured={modelProfiles.some((profile) => profile.provider === "open_ai_compatible")} onConfigure={() => configure("open_ai_compatible")} />
+          <Provider icon={Cloud} name="DeepSeek" detail={zh ? "官方 API · Flash / Pro" : "Official API · Flash / Pro"} configured={modelProfiles.some(isDeepSeek)} onConfigure={() => setForm({ ...deepSeekDefault })} />
           <Provider icon={Monitor} name="Ollama" detail={zh ? "本地模型 · 可设为项目强制策略" : "Local models · optional project-only policy"} configured={modelProfiles.some((profile) => profile.provider === "ollama")} onConfigure={() => configure("ollama")} />
         </div>
         {form && <section className="model-form" aria-label={zh ? "模型配置" : "Model configuration"}>
           <div className="model-form-grid">
             <label>{zh ? "配置名称" : "Profile label"}<input aria-label="Profile label" value={form.label} onChange={(event) => setForm({ ...form, label: event.target.value })} /></label>
-            <label>{zh ? "模型" : "Model"}<input aria-label="Model" value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })} /></label>
+            <label>{zh ? "模型" : "Model"}<input aria-label="Model" list={isDeepSeek(form) ? "deepseek-models" : undefined} value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })} />{isDeepSeek(form) && <><datalist id="deepseek-models">{deepSeekModels.map((model) => <option key={model} value={model} />)}</datalist><small>{zh ? "可选择预设或输入模型 ID；保存后可查询当前可用模型。" : "Choose a preset or enter a model ID; discover available models after saving."}</small></>}</label>
             <label className="wide">Base URL<input aria-label="Base URL" value={form.base_url} onChange={(event) => setForm({ ...form, base_url: event.target.value })} /></label>
             {form.provider !== "ollama" && <label className="wide">API key<input aria-label="API key" type="password" autoComplete="new-password" value={form.credential} onChange={(event) => setForm({ ...form, credential: event.target.value })} /></label>}
             {form.provider === "open_ai_compatible" && <label className="wide">{zh ? "请求推理档位" : "Requested reasoning effort"}<select aria-label="Requested reasoning effort" value={form.reasoning_effort ?? ""} onChange={(event) => setForm({ ...form, reasoning_effort: (event.target.value || null) as ModelProfile["reasoning_effort"] })}>

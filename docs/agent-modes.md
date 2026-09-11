@@ -6,6 +6,23 @@
 
 Agent 是默认模式。发送消息后会直接建立执行契约并运行，不先展示可编辑计划。执行中、等待输入或等待工具审批时，该会话的输入框和模式切换会保持锁定；其他会话不受影响。
 
+### 按需准备计算资源
+
+普通 Agent 启动与恢复只验证冻结配置，不建立 SSH 会话、不探测 Python/R，
+也不因默认列出 Docker/Podman 而启动引擎。显式填写容器镜像时仍需 inspect
+来冻结 image ID，实际使用前再次核对镜像；这不保证镜像内的解释器或科研依赖可用。
+Plan 及已批准计划仍在组合时加载选定执行上下文，不改变其批准流程。
+
+首次远端文件或计算调用先读取远端项目规则，返回“上下文已加载、操作未派发”；
+模型成功读取更新后的上下文后，才能重新发出实际操作。初始文献对话使用本地项目规则，
+远端规则在进入远端上下文时替换该规则层。规则不能扩大冻结权限或绕过逐调用审批。
+重新发起的高风险调用仍按其自身审批绑定处理，不自动继承另一条调用的批准。
+
+资源准备在审批之后、科研状态登记和正式派发之前执行，最多等待 30 秒并支持取消。
+准备失败可在后续调用重试，独立检索仍可继续；不会记录成计算已运行或不确定派发。
+已经实际派发的内核/后台作业继续遵守既有恢复与不确定状态规则。
+当前不自动重连已建立后断开的 SSH 会话；同 run 恢复会重新组合资源。
+
 ### Windows 后台进程
 
 Windows 桌面版在对话期间启动 MCP server、Python/R kernel、容器引擎探测、
@@ -25,7 +42,7 @@ Chromium 仍按浏览器设置决定是否显示正常浏览器窗口。macOS �
 
 点击 Python 或 R 打开双栏运行时面板，在两种语言之间切换。这里的“可用”仅表示发现解释器，不表示科研包齐全，也不是持久会话的运行状态。Local 使用当前系统的 `python` / `Rscript`；Windows 和 macOS 均需事先安装解释器并使应用能从 PATH 找到。SSH 使用远端解释器，可选择 `system` 或项目 Micromamba 环境名。当前面板不提供解释器路径编辑或内存变量检查。
 
-“让 Agent 准备环境”将检查版本、依赖和最小示例的请求追加到草稿，用户发送后按现有审批规则执行，不会直接安装。若后端没有任何可用解释器或 SSH 未连接，应先准备基础解释器或连接条件；不能把生成草稿视为安装或真实环境验收。
+“让 Agent 准备环境”将检查版本、依赖和最小示例的请求追加到草稿，用户发送后按现有审批规则执行，不会直接安装。纯文献、Memory、Skills 和 MCP 请求无需先连接计算后端或安装解释器。访问项目文件或计算工具时才初始化选定后端；首次计算前按本次语言检查 Local / SSH 解释器。不能把生成草稿、选择配置或通过解释器检查视为依赖安装或真实环境验收。
 
 `+` 菜单分为文件与会话操作：添加项目文件、浏览项目文件、生成会话审查草稿，以及直接打开技能管理。上传仍使用项目文件传输，不会自动把 PDF / 图片内容附入模型消息。“分享为图片”和“保存为技能”暂不可用；轨道菜单中的独立委派、自动审查、失败分析、审查模型和专家代理开关也暂不可用。记忆入口打开已有研究记录。审批策略保持原有语义，完全访问仅在可用隔离容器中开放。
 
@@ -36,7 +53,7 @@ Chromium 仍按浏览器设置决定是否显示正常浏览器窗口。macOS �
 ### 输入区手工检查
 
 1. 在 Windows 或 macOS 打开项目，检查输入区在窗口缩小时仍可见，工具栏可换行。
-2. 在已有本地解释器或可信 SSH 的项目中选择计算后端，核对 Python/R 探测状态；打开语言面板后直接按 Escape 关闭。
+2. 在有效 Local 或可信 SSH 配置中检查初始 Python/R 为“未验证”，确认普通文献请求可发送；打开语言面板后直接按 Escape 关闭。
 3. 从轨道菜单打开计算环境，连续按两次 Escape，分别关闭计算菜单和父菜单。
 4. 从 `+` 打开技能管理，再按 Escape 返回会话；选择模型及发送模式，确认下一轮使用相应配置。
 5. 点击准备环境，确认原草稿保留、追加请求且未自动发送。真实安装和 SSH 验收需另按 `acceptance/README.md` 配置一次性环境执行。
@@ -64,145 +81,26 @@ MCP 的 `readOnlyHint` 由第三方 server 自己声明，是宿主无法验证�
 
 计划操作按钮互斥。一次批准、修改或取消尚未完成时，其他计划动作会暂时禁用，避免重复请求。
 
-## 普通 Agent Guided Loop（仅 ordinary Agent）
+## 普通 Agent 自适应循环
 
-Guided Loop 是 `agent_v4_start_direct` 创建的普通 Agent Execute run 的执行
-方式。它只适用于 `RunExecutionKindV4::OrdinaryAgent`，不适用于 Plan 生成或
-批准后的计划执行。普通 Agent 的会话模式仍是 Agent；这里增加的是 run 内的
-可恢复编排状态，不是第三种会话模式。
+普通 Agent 直接围绕用户目标运行：构建上下文 → 模型选择动作 → 宿主检查权限 →
+工具执行 → 持久化结果 → 下一轮模型 → 验证与交付。具体设计见
+[自适应循环](superpowers/specs/2026-09-10-adaptive-ordinary-agent.md)。
 
-### task_shape 与状态
+`agent.route_request` 是可选元数据，不是工具前置条件。Host 仍记录
+fast/multi_step、phase、cycle 和 batch，但这些记录不限制研究步骤顺序。
+项目目录、Memory、Skills 和 MCP 按需检索；简单任务不强制建立任务清单。
+复杂任务可用 `agent.update_tasks` 维护 2–12 项动态清单，保留 revision 校验和
+完成项不回退；已有清单的项目均完成后才可以调用 `agent.complete`。
 
-普通 Agent 有两个 task shape：
+动态清单不产生 Plan 审批。普通 run 的内部执行契约保留在磁盘和冻结 spec 中，
+不作为用户待审批计划返回 UI。工具授权等待、通用会话锁定、取消或失败不得显示
+“计划已生成”；只有真正待审批的计划显示该卡片。运行轨迹与最终回答独立保留。
 
-- `fast`：面向短、边界清楚的请求。仍须先成功执行
-  `agent.route_request({route, task_shape, reason})`，但不创建多步任务清单，也不因
-  模型文字获得额外能力。
-- `multi_step`：面向需要拆解、发现资料、澄清或多轮验证的请求。Host 记录
-  阶段、模型轮次和工具批次，并在 discovery 后通过 `agent.update_tasks` 维护
-  2–12 项只读 live task list。
-
-`TaskShapeSelected` 会记录 `task_shape`、来源（模型建议或 Host）和脱敏原因。
-Host 是最终裁决者，并且只接受单调迁移：可以从 `fast` 提升为 `multi_step`，
-不能从 `multi_step` 降回 `fast`，不能迁移到 Plan，也不能用 task shape 改变
-`RunModeV4`、冻结的 capability 或审批。研究路由如果需要多步证据，必须先由
-Host 提升到 `multi_step`，不能以 `fast` 绕过研究门禁。
-
-`multi_step` 的阶段由 `PhaseChanged` 表示：`routing`、`discovery`、
-`clarification`、`organizing`、`executing`、`verifying`。阶段是同一 run 的
-可恢复游标；修复或用户澄清后可以回到后续阶段，但不得把未完成阶段标成完成。
-`CycleStarted`/`CycleFinished` 标识一次模型轮次；`ToolBatchStarted`/
-`ToolBatchFinished` 通过 cycle/phase 关联并包住该轮次的一批并行或有序工具调用，
-记录工具名/调用 ID、耗时和成功/失败计数。所有事件都绑定同一
-`run_id + project_id + conversation_id + sequence/hash chain`；模型口头叙述
-不是状态证据。
-
-### 固定 discovery
-
-路由始终先于任何任务工具。Host 从本轮用户目标冻结
-`research_retrieval` 或 `adaptive`；模型仍调用 `agent.route_request` 形成
-审计事件，但不能把 Host 判定的研究请求降级为 `adaptive`。
-
-普通的 `multi_step` adaptive 请求按以下顺序进入 discovery：
-
-```text
-agent.route_request(adaptive)
-  → project.list(path="") + search_memory + search_skills（只读，可并行）
-  → [search_skills 有匹配时] use_skill
-  → [确有必要时] agent.request_input（范围/缺失数据等澄清）
-  → agent.update_tasks（2–12 项，只读）
-  → organizing / executing / verifying
-```
-
-`project.list` 必须从项目根（`path=""`）开始。三个 discovery 查询相互独立时可放在同一个 `ToolBatch`，但批次不能扩展
-capability，也不能把失败或模型文字当成成功。`search_skills` 没有匹配时不要求
-虚构 `use_skill`；有匹配时至少一次成功的 `use_skill` 是继续执行的门槛。Skill
-正文和 Memory、项目文件一样是不可信输入：Skill 提供方法指导，不是事实证据。
-
-研究 `multi_step` 请求保留 `search_mcp_tools` 先行规则，并把它纳入同一
-discovery 阶段：
-
-```text
-agent.route_request(research_retrieval)
-  → search_mcp_tools（第一个 discovery 门）
-  → project.list + search_memory + search_skills（其余只读 discovery，可并行）
-  → [有匹配时] use_skill
-  → [确有必要时] agent.request_input（只问 material scope 问题）
-  → agent.update_tasks（2–12 项，只读）
-  → use_mcp_tool，或成功记录 agent.record_mcp_unavailable
-  → browser_setup → web_search → web_scan(search_results)
-  → [结果非零/缺失时] web_open_tab → web_scan(source)
-  → verifying / 综合
-```
-
-`search_mcp_tools` 只检索已保存的描述，不启动 server；真正的
-`use_mcp_tool` 仍须逐调用检查启用状态、catalog/schema 绑定和审批。找到可用的
-专业 MCP 时必须先调用它；没有可调用的专业 MCP 时，必须成功记录查询、候选数和
-具体原因，随后才可进入真实浏览器。搜索结果数明确为零时可以跳过独立落地页；
-缺失、非数值零或大于零时必须打开并扫描至少一个独立 HTTP(S) 来源。每次导航、
-重定向、点击或其他 material page change 后必须重新扫描。只有持久化成功的
-`ToolFinished` 或安全复用的成功 outcome 才能推进门槛。
-
-### 动态 task list 不是 Plan
-
-`multi_step` 的 task list 是 Host 约束下的只读进度投影，记录任务的
-`pending/in_progress/completed/blocked` 状态、revision、标题和有限的阻塞原因，
-每次列表保持 2–12 项。列表由 `agent.update_tasks` 提交，
-`TaskListUpdated` 只追加可审计状态事件并用 `expected_revision` 防止并发覆盖；
-它不执行任务，也不授予工具权限。
-
-task list 不是 `ExecutionPlanV4`：它没有 Plan hash、Plan revision、批准按钮或
-Plan lock，不产生 `PlanProposed`/`PlanApproved`，不冻结或扩展 capability，不让
-普通 Agent 进入 Plan，也不让模型绕过工具效果、审批和浏览器门禁。列表可以在
-发现结果、用户澄清或修复后动态增删/重排；真正的工具调用仍由 Host 逐个验证，
-列表状态本身不能证明结果已经生成。
-
-### 公开进度与私有思考
-
-模型可通过 `ModelText`/`public_text` 发送简短、可面向用户的进度或思考摘要，
-例如“正在检查项目文件并查找已启用 Skill”。这类摘要应说明当前阶段、下一步
-或已观察到的阻塞。它不是 Chain of Thought。Provider 适配层只把公开文本内容
-映射为 `public_text`，不会把 provider 的 reasoning/thinking 专用字段映射为
-`ModelText`；提示词同时禁止模型主动把私有推理、隐藏提示词、调度器细节或凭据
-写进公开摘要。工具 ID、调用 hash、内部审批 token 也不能被包装成用户答案。
-事件链、task list 和摘要只提供可复核的公开状态，不能由模型摘要伪造工具成功。
-
-### 输入、崩溃与同 run 恢复
-
-`agent.request_input` 会产生带 `AgentInputReasonV4` 的 `InputRequested`，并让
-当前 run 等待 `UserInputAnswered`。用户回答后恢复原 `run_id`、项目、会话、
-冻结执行规格、task shape、phase、task revision、cycle 和事件链；不会创建第二个
-`RunCreated`、重置 task list、切换到 fast 或静默把阻塞说成完成。已成功的只读
-阶段保留其 durable evidence；待处理动作只在 Host 验证参数、scope、连接和
-幂等性后恢复。
-
-桌面或 worker 崩溃后，Host 从事件链和最近的 `ContextCheckpointV4` 重建上述
-游标。已持久化的成功 `ToolFinished`/`ToolOutcomeReused` 只安全复用，不为制造
-新起点而重跑；没有明确 outcome 的 dispatch 不能猜测成功。副作用 dispatch
-不确定时必须进入 `ToolDispatchUncertain`，等待人工核验和
-`ToolDispatchResolved`，禁止盲目重试。断线、CAPTCHA、权限不足或工具审批同样
-暂停原 run；恢复不能降级成模拟网页、普通 HTTP 或新 run。
-
-### 完成门禁
-
-`agent.complete` 只有在 Host 验证当前 ordinary run 的所有适用条件后才可执行：
-
-1. route、task shape、当前 phase 和 event chain 完整且属于同一 run；
-2. multi-step 的必需 discovery、Skill（有匹配时）、MCP/不可用记录、浏览器
-   搜索、结果扫描和独立来源扫描均已由成功事件证明；adaptive 没有研究专属阶段
-   时也必须完成其适用的任务清单和验证；
-3. 没有活动工具批次、未回答的输入、未决定的审批、未解决的不确定 dispatch，
-   task list 的每一项都为 `completed`；存在 `pending`、`in_progress` 或
-   `blocked` 时只能等待、请求输入或进入 needs-attention；
-4. completion proposal schema、最终 Markdown、每条 completion criterion 的
-   evidence、确定性验证和既有独立 Reviewer 门禁均通过。
-
-失败、拒绝、dispatch、过期事件和模型声称不能推进门禁。浏览器阶段通过只说明
-来源已访问，不说明科研结论必然正确；最终答案必须保留证据、不确定性和限制。
-
-Guided Loop 的实现边界、事件字段和确定性/真实验收分层见
-[设计说明](superpowers/specs/ordinary-agent-guided-loop.md) 与
-[实施计划](superpowers/plans/ordinary-agent-guided-loop.md)。
+公开进度使用用户语言，说明实际工作与必要阻塞，不展示私有推理或内部调度过程。
+用户追加指导、输入、审批和恢复继续绑定同一个 run；结果不确定的副作用不得盲目重跑。
+完成仍要求真实证据、确定性检查和既有 Reviewer；计划或模型自述不等于执行结果。
+本次保留原证据 schema，没有增加无证据纯文本完成分支。
 
 ## 浏览器检索（仅普通 Agent）
 
@@ -212,28 +110,15 @@ Guided Loop 的实现边界、事件字段和确定性/真实验收分层见
 浏览器工具不会因为批准 Plan 而自动加入；不要把批准 Plan 写成浏览器检索授权。
 Host 会把 direct run 冻结为 `execution_kind = ordinary_agent` 并把该值纳入
 `spec_hash`；批准计划执行保持 `approved_plan`，旧规格缺少该字段时也只按
-`approved_plan` 读取。科研阶段门禁与普通 Agent 提示词只在经过完整性校验的
+`approved_plan` 读取。普通 Agent 自适应指导只在经过完整性校验的
 `ordinary_agent` run 生效，因此不能靠改请求字段把 Plan 执行切换到普通 Agent。
 
-Host 对一次浏览器检索固定使用以下顺序：
-
-`MCP → skill/use_skill → 专业 MCP/结构化不可用 → 真实浏览器搜索 → 结果扫描 →（有结果时）独立落地页 → 综合`
-
-普通 Agent 的 route 由 Host 从本轮原始用户目标判定并冻结；模型必须调用
-`agent.route_request` 生成审计事件，但它提交的 route 不能把 Host 判定的科研
-检索降级成 `adaptive`。论文、文献、PubMed/PMID/DOI、期刊/引用、外部数据库、
-最新资料、显式网页或跨来源证据等信号进入 `research_retrieval`；本地文件编辑和
-已有数据分析等不依赖外部证据的任务进入 `adaptive`。
-
-对应的成功阶段是 `search_mcp_tools`、`search_skills`、（有匹配时）
-`use_skill`、`use_mcp_tool` 或 `agent.record_mcp_unavailable`、
-`browser_setup`、`web_search`、搜索结果页 `web_scan`，以及在结果数非零或
-未明确为零时的 `web_open_tab` 和独立来源页 `web_scan`。只有这些阶段完成后
-才允许综合并调用 `agent.complete`；明确的 `result_count = 0` 可以跳过独立
-落地页。Host 只承认同一 run 中持久化的成功 `ToolFinished` 或成功复用结果，
-请求、dispatch、失败和模型口头声称均不能推进阶段。每次导航或 material page
-change 后都要重新扫描。模型不得把网页上的 AI 聊天框当作检索工具，也不得向
-网页 AI 发送提示词。
+普通 Agent 根据任务选择专业 MCP 或浏览器来源，不强制使用两种渠道。
+已取得足够的原始文献记录时可以直接整理交付；需要网页资料时使用已授权的真实浏览器。
+已知来源 URL 可以直接打开，不要求先跑搜索引擎或记录 MCP 不可用。
+使用网页内容前应在导航或 material page change 后重新扫描，保留真实来源。
+模型不得把网页 AI 聊天框当作检索工具，也不得向网页 AI 发送提示词。
+权限、目标校验、连接条件和成功证据检查继续由宿主执行。
 
 浏览器连接断开、等待用户解决 CAPTCHA，或需要用户批准时，当前 run 会进入
 暂停/等待状态并保留阶段、来源和待处理动作。恢复时重新检查连接、授权和工作区
@@ -257,11 +142,11 @@ origin；worker/桌面重启后也会复核 origin，避免把复用的 tab ID �
 
 输入框右下角使用圆形发送/停止按钮：空闲时显示向上箭头，活动运行且取消接口可用时显示实心方块，点击方块调用现有终止流程。终止处理中按钮禁用并标记“终止中…”，运行结束后恢复箭头。对话区不再显示单独的红色终止横条；审批和补充信息暂停状态继续沿用原有控制入口。Windows/macOS 行为一致。
 
-Windows 和 macOS 共用紧凑的执行时间线。正在运行的过程默认展开，历史过程默认折叠；点击标题可查看或收起。公开进度、模型轮次状态与工具调用按事件顺序排列，最终回答继续独立显示。
+Windows 和 macOS 共用紧凑的执行时间线。正在运行的过程默认展开，历史过程默认折叠；点击标题可查看或收起。公开进度标为 PROGRESS，与工具调用按事件顺序放在同一个可折叠区域；完成后默认收起，最终回答继续独立显示。
 
-读取、写入和编辑分别显示为 `read`、`write`、`edit`。每次调用都有独立的状态、路径或命令摘要，并可展开查看脱敏输入和工具返回的完整文本。批次内的调用也逐项显示；耗时来自已有事件时间，输出行数来自返回文本，缺失信息不显示为零。复用结果单独标记，不把复用等待算成执行耗时。“思考中”只标记模型轮次开始，不展示私有推理字段。
+读取、写入和编辑分别显示为 `read`、`write`、`edit`。每次调用都有独立的状态、路径或命令摘要，并可展开查看脱敏输入和工具返回的完整文本；JSON 以多行格式显示，行数按展示文本计算，不改写原始事件。批次内的调用也逐项显示；耗时来自已有事件时间，输出行数来自返回文本，缺失信息不显示为零。复用结果单独标记，不把复用等待算成执行耗时。技能调用带 SKILL 标记，失败工具默认展开。公开进度使用模型的公开输出，不展示或伪造私有推理字段。
 
-任务快照、阶段和批次汇总位于“任务与阶段详情”。审批、补充回答与异常恢复仍在原运行中处理。向上滚动查看历史后，新输出保留阅读位置；点击“回到最新”恢复跟随。此改动不改变工具权限、模型配置或持久化协议。
+“运行中指导”卡片和六阶段轨迹/任务快照面板已移除；协议中的相关事件继续保留。审批、补充回答与异常恢复放在过程折叠区之外，收起过程也可操作。已决定审批不重复显示正文卡片，已回答问题显示提交状态；完整事件仍可在折叠的“诊断记录”查看。向上滚动查看历史后，新输出保留阅读位置；点击“回到最新”恢复跟随。此改动不改变工具权限、模型配置或持久化协议。
 
 手工 smoke：在 Windows/macOS 中运行包含读取、写入、编辑的任务，检查三类调用及失败状态；展开长输出，收起过程并等待新事件，确认折叠状态保持；向上滚动后等待新输出，再点击“回到最新”；重新打开历史会话，检查过程与最终回答，以及审批/恢复入口。
 

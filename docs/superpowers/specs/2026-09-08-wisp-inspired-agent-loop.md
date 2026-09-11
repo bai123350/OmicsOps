@@ -1,5 +1,9 @@
 # 参考 wisp-science 的 OmicsOps Agent Loop 设计
 
+> 2026-09-10 更新：固定 discovery、强制任务清单和 MCP/浏览器顺序已由
+> [普通 Agent 自适应循环](../specs/2026-09-10-adaptive-ordinary-agent.md) 取代。
+> 本文其他授权、证据、预算与恢复边界继续保留。
+
 日期：2026-09-08。状态：用户已要求按设计开发；已实现请求预算/一次 overflow 恢复、工具结果模型视图和按结果检测无进展。模型目录/准确图片成本和切片 4–6 仍待实施。不替代现有 V4 和 ordinary guided loop 契约。
 
 ## 1. 目标和范围

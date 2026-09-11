@@ -50,6 +50,38 @@ fn advertised_schema(inspection: &omicsops_mcp::McpInspection, tool: &str) -> St
 }
 
 #[tokio::test]
+async fn rejected_parameters_return_failed_result_and_keep_session_alive() {
+    let temp = tempfile::tempdir().unwrap();
+    let counter = temp.path().join("counter.txt");
+    let manager = McpSessionManager::new();
+    let config = config(Uuid::new_v4(), &counter, 5);
+    let rejected = manager
+        .call(
+            config.clone(),
+            "echo",
+            json!({"value":"reject"}),
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        rejected.is_ok(),
+        "protocol rejection is not a transport failure: {rejected:?}"
+    );
+    let rejected = rejected.unwrap();
+    assert_eq!(rejected.result["isError"], true);
+    assert!(rejected.result.to_string().contains("-32602"));
+    let corrected = manager
+        .call(config, "echo", json!({"value":"corrected"}), None, None)
+        .await
+        .unwrap();
+    assert_ne!(corrected.result["isError"], true);
+    assert_eq!(count(&counter, "start"), 1);
+    assert_eq!(count(&counter, "echo"), 2);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
 async fn calls_reuse_one_process_and_projects_are_isolated() {
     let temp = tempfile::tempdir().unwrap();
     let counter = temp.path().join("counter.txt");

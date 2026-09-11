@@ -12,11 +12,22 @@ use tokio::sync::{Mutex, Semaphore};
 
 #[async_trait]
 pub trait ToolExecutorV4: Send + Sync {
+    /// Read-only host preparation; never dispatch the requested operation.
+    async fn prepare_call(&self, _call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
+        Ok(None)
+    }
+
     async fn execute(&self, call: &ToolCallV4) -> Result<ToolOutcomeV4, String>;
     async fn recover_result(&self, _call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
         Ok(None)
     }
     fn has_persistent_authorization(&self, _call: &ToolCallV4) -> bool {
+        false
+    }
+    async fn conversation_target_approved(&self, _call: &ToolCallV4) -> bool {
+        false
+    }
+    async fn risk_based_target_approved(&self, _call: &ToolCallV4) -> bool {
         false
     }
     /// Dynamic authority for the generic MCP wrapper in Plan mode. Ordinary
@@ -55,6 +66,7 @@ pub struct ToolRegistryV4 {
     definitions: BTreeMap<String, ToolDescriptorV4>,
     executor: Arc<dyn ToolExecutorV4>,
     execute_capabilities: Option<BTreeSet<String>>,
+    disabled_tools: BTreeSet<String>,
     read_slots: Semaphore,
     side_effect_lock: Arc<Mutex<()>>,
 }
@@ -74,6 +86,7 @@ impl ToolRegistryV4 {
             definitions: mapped,
             executor,
             execute_capabilities: None,
+            disabled_tools: BTreeSet::new(),
             read_slots: Semaphore::new(4),
             side_effect_lock: Arc::new(Mutex::new(())),
         })
@@ -81,6 +94,11 @@ impl ToolRegistryV4 {
 
     pub fn with_execute_capabilities(mut self, capabilities: BTreeSet<String>) -> Self {
         self.execute_capabilities = Some(capabilities);
+        self
+    }
+
+    pub fn with_disabled_tools(mut self, tools: BTreeSet<String>) -> Self {
+        self.disabled_tools = tools;
         self
     }
 
@@ -94,6 +112,9 @@ impl ToolRegistryV4 {
         mode: RunModeV4,
         call: &ToolCallV4,
     ) -> Result<&ToolDescriptorV4, ToolRegistryErrorV4> {
+        if self.disabled_tools.contains(&call.tool_id) {
+            return Err(ToolRegistryErrorV4::CapabilityDenied(call.tool_id.clone()));
+        }
         let definition = self
             .definitions
             .get(&call.tool_id)
@@ -181,6 +202,7 @@ impl ToolPortV4 for ToolRegistryV4 {
     fn descriptors(&self, mode: RunModeV4) -> Vec<ToolDescriptorV4> {
         self.definitions
             .values()
+            .filter(|definition| !self.disabled_tools.contains(&definition.id))
             .filter(|definition| match mode {
                 RunModeV4::Plan => {
                     !matches!(
@@ -221,8 +243,21 @@ impl ToolPortV4 for ToolRegistryV4 {
             .map_err(|error| error.to_string())
     }
 
+    async fn prepare_call(&self, call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
+        self.validate(RunModeV4::Execute, call)?;
+        self.executor.prepare_call(call).await
+    }
+
     fn has_persistent_authorization(&self, call: &ToolCallV4) -> bool {
         self.executor.has_persistent_authorization(call)
+    }
+    async fn conversation_target_approved(&self, call: &ToolCallV4) -> bool {
+        self.validate(RunModeV4::Execute, call).is_ok()
+            && self.executor.conversation_target_approved(call).await
+    }
+    async fn risk_based_target_approved(&self, call: &ToolCallV4) -> bool {
+        self.validate(RunModeV4::Execute, call).is_ok()
+            && self.executor.risk_based_target_approved(call).await
     }
 
     async fn authorize_plan_call(
@@ -378,16 +413,16 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "use_mcp_tool",
-            "Call one configured, enabled, launch-approved MCP stdio tool. A persistently approved tool is callable immediately; otherwise the Host can require explicit schema-bound approval for this run",
+            "Call one configured, enabled, launch-approved MCP stdio tool. Select the exact server_id and tool from the discovered directory; the Host binds its catalog and schema hashes before recording and approval, so you may omit hashes. A persistently approved tool is callable immediately; otherwise the Host can require explicit schema-bound approval for this run",
             ToolEffectV4::Network,
             // `catalog_sha256` is required by the dynamic Plan gate, but it
             // remains optional at the shared descriptor boundary so legacy
             // Execute calls (which predate catalog binding) stay readable.
-            json!({"type":"object","required":["server_id","tool","arguments","schema_sha256"],"properties":{"server_id":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"},"catalog_sha256":{"type":"string","minLength":1},"schema_sha256":{"type":"string","minLength":1}}}),
+            json!({"type":"object","required":["server_id","tool","arguments"],"properties":{"server_id":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"},"catalog_sha256":{"type":"string","minLength":1},"schema_sha256":{"type":"string","minLength":1}}}),
         ),
         descriptor(
             "agent.route_request",
-            "Classify the current ordinary Agent request and its task shape before any task tool is used. Research retrieval includes papers, external databases, current web evidence, and cross-source verification",
+            "Optionally record the ordinary Agent request category and task shape for progress metadata. This is not required before tools and does not grant permissions",
             ToolEffectV4::ReadOnly,
             json!({"type":"object","required":["route","task_shape","reason"],"properties":{"route":{"type":"string","enum":["research_retrieval","adaptive"]},"task_shape":{"type":"string","enum":["fast","multi_step"]},"reason":{"type":"string","minLength":1}}}),
         ),
@@ -487,9 +522,17 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "science.record_evidence",
-            "Record a claim linked to verified artifacts or literature sources",
+            "Record one concise claim linked to verified artifacts or retrieved literature. Each source must be a tagged object (kind plus source_id and citation for literature, or artifact_id for artifacts), never a prose string. Reuse identifiers from actual tool evidence.",
             ToolEffectV4::Mutating,
-            json!({"type":"object","required":["claim","sources","strength"],"properties":{"claim":{"type":"string"},"sources":{"type":"array"},"strength":{"type":"string","enum":["exploratory","supporting","strong"]},"conflicts_with":{"type":"array"}}}),
+            json!({"type":"object","required":["claim","sources","strength"],"properties":{
+                "claim":{"type":"string"},
+                "sources":{"type":"array","items":{"oneOf":[
+                    {"type":"object","required":["kind","source_id","citation"],"properties":{"kind":{"type":"string","enum":["literature"]},"source_id":{"type":"string","description":"Identifier from retrieved literature, e.g. PMID:12345 or a DOI"},"citation":{"type":"string"}}},
+                    {"type":"object","required":["kind","artifact_id"],"properties":{"kind":{"type":"string","enum":["artifact"]},"artifact_id":{"type":"string","format":"uuid"}}}
+                ]}},
+                "strength":{"type":"string","enum":["exploratory","supporting","strong"]},
+                "conflicts_with":{"type":"array","items":{"type":"string","format":"uuid"}}
+            }}),
         ),
         descriptor(
             "runtime.environment.ensure",
@@ -517,7 +560,7 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "agent.delegate",
-            "Run a bounded read-only DAG of temporary tasks. Nodes cannot expand the frozen run capabilities, write, or delegate recursively",
+            "Run a bounded read-only DAG of temporary tasks. evidence_only requires capabilities: [] and uses existing evidence only. read_only_project allows only frozen read-only capabilities; network tools such as use_mcp_tool must be called by the parent. Nodes cannot write, expand permissions, or delegate recursively",
             ToolEffectV4::Delegation,
             json!({"type":"object","required":["schema_version","nodes"],"properties":{"schema_version":{"type":"integer","const":4},"nodes":{"type":"array","maxItems":8,"items":{"type":"object","required":["id","objective","budget","capabilities","output_schema","isolation"],"properties":{"id":{"type":"string"},"objective":{"type":"string"},"dependencies":{"type":"array","items":{"type":"string"}},"budget":{"type":"object","required":["max_turns","max_tool_calls"],"properties":{"max_turns":{"type":"integer","maximum":4},"max_tool_calls":{"type":"integer","maximum":8}}},"capabilities":{"type":"array","items":{"type":"string"}},"output_schema":{"type":"object"},"isolation":{"type":"string","enum":["read_only_project","evidence_only"]}}}}}}),
         ),
@@ -679,6 +722,33 @@ fn sensitive_browser_query_key(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn evidence_sources_advertise_the_required_tagged_objects() {
+        let tool = builtin_tool_definitions_v4()
+            .into_iter()
+            .find(|tool| tool.id == "science.record_evidence")
+            .unwrap();
+        let alternatives = tool
+            .input_schema
+            .pointer("/properties/sources/items/oneOf")
+            .and_then(Value::as_array)
+            .expect("sources must describe their object variants");
+        let literature = alternatives
+            .iter()
+            .find(|item| item.pointer("/properties/kind/enum/0") == Some(&json!("literature")))
+            .unwrap();
+        assert_eq!(
+            literature["required"],
+            json!(["kind", "source_id", "citation"])
+        );
+        assert_eq!(literature["properties"]["source_id"]["type"], "string");
+        let artifact = alternatives
+            .iter()
+            .find(|item| item.pointer("/properties/kind/enum/0") == Some(&json!("artifact")))
+            .unwrap();
+        assert_eq!(artifact["required"], json!(["kind", "artifact_id"]));
+        assert_eq!(artifact["properties"]["artifact_id"]["format"], "uuid");
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct Noop;
     #[async_trait]
@@ -1208,5 +1278,30 @@ mod tests {
             task.await.unwrap();
         }
         assert_eq!(probe.maximum.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn disabled_tools_are_hidden_and_cannot_dispatch_even_when_approved() {
+        let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop))
+            .unwrap()
+            .with_disabled_tools(
+                ["browser_setup".into(), "web_search".into()]
+                    .into_iter()
+                    .collect(),
+            );
+        for mode in [RunModeV4::Plan, RunModeV4::Execute] {
+            assert!(
+                !registry
+                    .descriptors(mode)
+                    .iter()
+                    .any(|tool| tool.id == "browser_setup" || tool.id == "web_search")
+            );
+            let call = ToolCallV4 {
+                call_id: "old-call".into(),
+                tool_id: "browser_setup".into(),
+                arguments: json!({"session":"shared"}),
+            };
+            assert!(registry.validate(mode, &call).is_err());
+            assert!(registry.execute(mode, call).await.is_err());
+        }
     }
 }

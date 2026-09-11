@@ -1,8 +1,55 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { SettingsPanel } from "./SettingsPanel";
 
 describe("SettingsPanel model providers", () => {
+  it("saves the DeepSeek preset through the compatible provider and supports custom model IDs", async () => {
+    const save = vi.fn().mockResolvedValue(undefined);
+    render(<SettingsPanel locale="zh-CN" onClose={() => undefined} onSaveModel={save} />);
+    fireEvent.click(screen.getByRole("button", { name: "Configure DeepSeek" }));
+    expect(screen.getByLabelText("Profile label")).toHaveValue("DeepSeek");
+    expect(screen.getByLabelText("Base URL")).toHaveValue("https://api.deepseek.com/v1");
+    expect(screen.getByLabelText("Model")).toHaveValue("deepseek-v4-flash");
+    expect(screen.getByLabelText("Model")).toHaveAttribute("list", "deepseek-models");
+    expect(document.querySelector('#deepseek-models option[value="deepseek-v4-pro"]')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "custom-deepseek-model" } });
+    fireEvent.change(screen.getByLabelText("API key"), { target: { value: "test-only-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存提供方" }));
+    expect(save).toHaveBeenCalledWith({ provider: "open_ai_compatible", label: "DeepSeek", base_url: "https://api.deepseek.com/v1", model: "custom-deepseek-model", credential: "test-only-key" });
+    await waitFor(() => expect(screen.queryByLabelText("API key")).not.toBeInTheDocument());
+  });
+
+  it.each(["https://api.deepseek.com", "https://api.deepseek.com/v1/", "https://api.deepseek.com:443/v1"])("recognizes saved official DeepSeek profiles at %s and edits without exposing credentials", (base_url) => {
+    const profile = { id: "deepseek", label: "Lab model", provider: "open_ai_compatible" as const, base_url, model: "deepseek-v4-pro", credential_reference: "model/deepseek", supports_tools: true, supports_vision: false };
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[profile]} />);
+    const card = screen.getByRole("button", { name: "Configure DeepSeek" }).closest("article")!;
+    expect(within(card).getByText(/configured/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByLabelText("Model")).toHaveValue("deepseek-v4-pro");
+    expect(screen.getByLabelText("API key")).toHaveValue("");
+  });
+
+  it.each(["https://api.openai.com/v1", "https://api.deepseek.com.example.org/v1", "http://api.deepseek.com/v1", "https://api.deepseek.com:8443/v1", "invalid"])("does not mark DeepSeek configured for %s", (base_url) => {
+    const profile = { id: "other", label: "DeepSeek", provider: "open_ai_compatible" as const, base_url, model: "deepseek-v4-flash", credential_reference: null, supports_tools: true, supports_vision: false };
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[profile]} />);
+    const card = screen.getByRole("button", { name: "Configure DeepSeek" }).closest("article")!;
+    expect(within(card).queryByText(/configured/)).not.toBeInTheDocument();
+  });
+
+  it("closes only the DeepSeek form on immediate Escape and keeps generic defaults separate", () => {
+    const close = vi.fn();
+    render(<SettingsPanel locale="en-US" onClose={close} />);
+    fireEvent.click(screen.getByRole("button", { name: "Configure DeepSeek" }));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByLabelText("Model")).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(close).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Configure OpenAI-compatible" }));
+    expect(screen.getByLabelText("Base URL")).toHaveValue("https://api.openai.com/");
+    expect(screen.getByLabelText("Model")).toHaveValue("");
+    expect(screen.getByLabelText("Model")).not.toHaveAttribute("list");
+  });
+
   it("refreshes only when explicitly selected and resets selection when editing again", async () => {
     const profile = { id: "known", label: "Known", provider: "open_ai_compatible" as const, base_url: "https://api.openai.com/v1", model: "gpt-4o", credential_reference: null, supports_tools: true, supports_vision: true };
     const save = vi.fn().mockResolvedValue(undefined);
