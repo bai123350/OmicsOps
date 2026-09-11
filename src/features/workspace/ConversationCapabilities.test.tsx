@@ -21,7 +21,8 @@ describe("conversation capabilities", () => {
     expect(within(dialog).getByText("Literature")).toBeVisible();
     expect(within(dialog).getByText("Analysis")).toBeVisible();
     expect(within(dialog).getByText("12 tools")).toBeVisible();
-    expect(within(dialog).getByText("4 memories")).toBeVisible();
+    expect(within(dialog).getByText("4 memory files")).toBeVisible();
+    expect(within(dialog).getByText(/\.omicsops\/memory/)).toBeVisible();
     fireEvent.click(within(dialog).getByRole("button", { name: "Manage Skills and MCP" }));
     expect(screen.queryByRole("dialog", { name: "Capabilities" })).not.toBeInTheDocument();
     expect(onOpenSettings).toHaveBeenCalledWith("skills");

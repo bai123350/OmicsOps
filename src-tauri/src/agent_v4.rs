@@ -4706,6 +4706,27 @@ impl DesktopToolExecutorV4 {
                     ],
                 )
             }
+            "save_memory" => {
+                use sha2::{Digest, Sha256};
+                let path = crate::project_memory::save(
+                    &self.local_project_root,
+                    required(&call.arguments, "name")?,
+                    required(&call.arguments, "content")?,
+                )?;
+                let relative = format!(
+                    ".omicsops/memory/{}",
+                    path.file_name().unwrap().to_string_lossy()
+                );
+                let digest = hex::encode(Sha256::digest(
+                    std::fs::read(&path).map_err(|e| e.to_string())?,
+                ));
+                let payload = json!({"path":relative,"sha256":digest,"saved":true});
+                (
+                    payload.to_string(),
+                    payload,
+                    vec![format!("memory-file-sha256:{digest}")],
+                )
+            }
             "search_memory" => {
                 let query = required(&call.arguments, "query")?;
                 let dimension = call.arguments.get("dimension").and_then(Value::as_str);
@@ -6621,6 +6642,12 @@ mod tests {
                 .contains("have not been checked")
         );
         assert!(!tools.registry.descriptors(RunModeV4::Execute).is_empty());
+        let saved = tools.registry.execute(RunModeV4::Execute, ToolCallV4 {
+            call_id: "save-memory-without-ssh".into(), tool_id: "save_memory".into(),
+            arguments: json!({"name":"study.md","content":"Study liver cancer using donor-level comparisons."}),
+        }).await.unwrap();
+        assert!(saved.succeeded);
+        assert_eq!(crate::project_memory::files(dir.path()).unwrap().len(), 1);
         let outcome = tools
             .registry
             .execute(

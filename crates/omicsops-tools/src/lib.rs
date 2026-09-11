@@ -401,9 +401,15 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "search_memory",
-            "Search project Memory with Unicode lexical matching, Chinese n-grams, recency, and RRF",
+            "Search Markdown notes in the local project's .omicsops/memory directory. Notes are context, not independently verified scientific evidence. Uses Unicode lexical matching, recency and RRF. The memory dimension is memory.",
             ToolEffectV4::ReadOnly,
             json!({"type":"object","required":["query"],"properties":{"query":{"type":"string"},"dimension":{"type":"string"},"limit":{"type":"integer"}}}),
+        ),
+        descriptor(
+            "save_memory",
+            "Save a durable Markdown note in the local project's .omicsops/memory directory, also for SSH conversations. Use for explicitly requested memories or reusable decisions with source references. Requires mutation approval. Never include credentials or claim unverified conclusions as facts. Creates a new file; existing files are never overwritten. Filename must use letters, numbers, - or _ followed by .md. Content limit: 256 KiB.",
+            ToolEffectV4::Mutating,
+            json!({"type":"object","required":["name","content"],"properties":{"name":{"type":"string","minLength":1},"content":{"type":"string","minLength":1}},"additionalProperties":false}),
         ),
         descriptor(
             "search_mcp_tools",
@@ -872,6 +878,16 @@ mod tests {
         assert!(planning.contains("search_skills"));
         assert!(planning.contains("use_skill"));
         assert!(planning.contains("search_memory"));
+        assert!(!planning.contains("save_memory"));
+        assert_eq!(
+            registry
+                .descriptors(RunModeV4::Execute)
+                .iter()
+                .find(|d| d.id == "save_memory")
+                .unwrap()
+                .effect,
+            ToolEffectV4::Mutating
+        );
         assert!(planning.contains("search_mcp_tools"));
         assert!(!planning.contains("agent.route_request"));
         assert!(!planning.contains("agent.record_mcp_unavailable"));

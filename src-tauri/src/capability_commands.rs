@@ -9,7 +9,7 @@ use crate::{
         ConversationCapabilitiesV4, ConversationMcpCapabilityV4, ConversationSkillCapabilityV4,
         GetConversationCapabilitiesV4Request,
     },
-    p1_commands::{McpServerProfile, MemorySearchRequest, memory_facts},
+    p1_commands::McpServerProfile,
     skill_commands::agent_skill_packages,
 };
 
@@ -78,17 +78,13 @@ async fn conversation_capabilities(
         })
         .collect::<Vec<_>>();
     mcp_servers.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
-    let memory_count = memory_facts(
-        repository,
-        &MemorySearchRequest {
-            project_id: request.project_id,
-            conversation_id: None,
-            query: String::new(),
-            dimension: None,
-        },
-    )
-    .await?
-    .len();
+    let project = repository
+        .get_project(request.project_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "project not found".to_string())?;
+    let memory_count =
+        crate::project_memory::files(std::path::Path::new(&project.local_root))?.len();
     Ok(ConversationCapabilitiesV4 {
         project_id: request.project_id,
         conversation_id: request.conversation_id,
@@ -107,6 +103,13 @@ mod tests {
     };
     use serde_json::json;
     use uuid::Uuid;
+
+    #[test]
+    fn missing_memory_directory_is_zero_and_is_not_created() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(crate::project_memory::files(root.path()).unwrap().len(), 0);
+        assert!(!root.path().join(".omicsops").exists());
+    }
 
     async fn fixture() -> (Store, GetConversationCapabilitiesV4Request) {
         let repository = Store::open_in_memory().await.unwrap();
@@ -279,8 +282,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_matches_project_scope_and_excludes_other_projects() {
+    async fn memory_counts_project_markdown_files_instead_of_messages() {
         let (repository, request) = fixture().await;
+        let root = tempfile::tempdir().unwrap();
+        let mut project = repository
+            .get_project(request.project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        project.local_root = root.path().to_string_lossy().into_owned();
+        repository.save_project(&project).await.unwrap();
+        let memory = root.path().join(".omicsops").join("memory");
+        std::fs::create_dir_all(memory.join("nested")).unwrap();
+        for name in [
+            "2026-09-11.md",
+            "notes.md",
+            "methods.md",
+            "ignored.txt",
+            "ignored.MD",
+            "nested/ignored.md",
+        ] {
+            std::fs::write(memory.join(name), "multiple notes still count as one file").unwrap();
+        }
         let sibling = Conversation::new(Uuid::new_v4(), request.project_id, "sibling", Utc::now());
         repository.save_conversation(&sibling).await.unwrap();
         let other = Project::new(
@@ -319,7 +342,7 @@ mod tests {
         let snapshot = conversation_capabilities(&repository, &request)
             .await
             .unwrap();
-        assert_eq!(snapshot.memory_count, 2);
+        assert_eq!(snapshot.memory_count, 3);
         let sibling_snapshot = conversation_capabilities(
             &repository,
             &GetConversationCapabilitiesV4Request {

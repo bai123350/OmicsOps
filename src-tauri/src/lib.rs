@@ -20,6 +20,7 @@ pub mod model_commands;
 pub mod p1_commands;
 #[cfg(test)]
 mod plan_revision_tests;
+pub mod project_memory;
 pub mod pubmed_mcp;
 mod remote_jobs_v4;
 pub mod research_commands;

@@ -34,105 +34,51 @@ pub async fn memory_facts(
     repository: &Store,
     request: &MemorySearchRequest,
 ) -> Result<Vec<MemoryFact>, String> {
-    let query = request.query.trim().to_lowercase();
-    let mut facts = Vec::new();
-    for conversation in repository
-        .conversations_for_project(request.project_id)
+    let project = repository
+        .get_project(request.project_id)
         .await
         .map_err(|error| error.to_string())?
-    {
-        if request
-            .conversation_id
-            .is_some_and(|id| id != conversation.id)
-        {
-            continue;
-        }
-        for message in repository
-            .messages_for_conversation(conversation.id)
+        .ok_or("project not found")?;
+    if let Some(id) = request.conversation_id {
+        if !repository
+            .conversations_for_project(request.project_id)
             .await
             .map_err(|error| error.to_string())?
+            .iter()
+            .any(|c| c.id == id)
         {
-            if !matches!(message.role, omicsops_core::workspace::MessageRole::User) {
-                continue;
-            }
-            facts.push(MemoryFact {
-                id: stable_uuid(&format!("message:{}", message.id)),
-                project_id: request.project_id,
-                conversation_id: Some(conversation.id),
-                run_id: None,
-                dimension: "task".into(),
-                key: format!(
-                    "conversation:{}:message:{}",
-                    conversation.id, message.sequence
-                ),
-                value: message.markdown.clone(),
-                statement: message.markdown.clone(),
-                evidence: vec![EvidenceReference {
-                    source_kind: "message".into(),
-                    source_id: message.id.to_string(),
-                    excerpt: excerpt(&message.markdown, 320),
-                }],
-                conflicted_with: vec![],
-                created_at: message.created_at,
-            });
+            return Err("conversation does not belong to the project".into());
         }
     }
-    for artifact in repository
-        .artifacts_for_project(request.project_id)
-        .await
-        .map_err(|error| error.to_string())?
-    {
+    let query = request.query.trim().to_lowercase();
+    let mut facts = Vec::new();
+    for path in crate::project_memory::files(Path::new(&project.local_root))? {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("invalid memory filename")?;
+        let relative = format!(".omicsops/memory/{name}");
+        let content = crate::project_memory::read(&path)
+            .map_err(|error| format!("Cannot read memory file {relative}: {error}. Repair or remove this file before retrying."))?;
+        let modified = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .map_err(|e| e.to_string())?;
         facts.push(MemoryFact {
-            id: stable_uuid(&format!("artifact:{}", artifact.id)),
-            project_id: request.project_id,
+            id: stable_uuid(&format!("memory:{}:{name}", project.id)),
+            project_id: project.id,
             conversation_id: None,
-            run_id: artifact.run_id,
-            dimension: "artifact".into(),
-            key: artifact.relative_path.clone(),
-            value: artifact.sha256.clone(),
-            statement: format!(
-                "Verified artifact {} ({} bytes)",
-                artifact.relative_path, artifact.size_bytes
-            ),
-            evidence: vec![EvidenceReference {
-                source_kind: "artifact".into(),
-                source_id: artifact.id.to_string(),
-                excerpt: format!(
-                    "sha256={} media_type={}",
-                    artifact.sha256, artifact.media_type
-                ),
-            }],
-            conflicted_with: vec![],
-            created_at: artifact.created_at,
-        });
-    }
-    for entry in repository
-        .notebook_for_project(request.project_id)
-        .await
-        .map_err(|error| error.to_string())?
-    {
-        if request
-            .conversation_id
-            .is_some_and(|id| entry.conversation_id.is_some_and(|entry_id| entry_id != id))
-        {
-            continue;
-        }
-        facts.push(MemoryFact {
-            id: stable_uuid(&format!("notebook:{}", entry.id)),
-            project_id: request.project_id,
-            conversation_id: entry.conversation_id,
             run_id: None,
-            dimension: format!("{:?}", entry.kind).to_ascii_lowercase(),
-            key: entry.title.clone(),
-            value: entry.markdown.clone(),
-            statement: entry.markdown.clone(),
+            dimension: "memory".into(),
+            key: relative.clone(),
+            value: content.clone(),
+            statement: content.clone(),
             evidence: vec![EvidenceReference {
-                source_kind: "notebook".into(),
-                source_id: entry.id.to_string(),
-                excerpt: excerpt(&entry.markdown, 480),
+                source_kind: "memory_file".into(),
+                source_id: relative,
+                excerpt: excerpt(&content, 480),
             }],
             conflicted_with: vec![],
-            created_at: entry.updated_at,
+            created_at: modified.into(),
         });
     }
     mark_conflicts(&mut facts);

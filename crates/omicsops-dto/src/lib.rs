@@ -26,7 +26,7 @@ pub struct ConversationCapabilitiesV4 {
     pub conversation_id: Uuid,
     pub skills: Vec<ConversationSkillCapabilityV4>,
     pub mcp_servers: Vec<ConversationMcpCapabilityV4>,
-    /// Project-wide evidence-backed facts, matching Agent memory retrieval scope.
+    /// Markdown files directly under the local project's .omicsops/memory directory.
     pub memory_count: usize,
 }
 
