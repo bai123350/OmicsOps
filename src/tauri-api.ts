@@ -44,6 +44,11 @@ import type {
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
 
+export async function getConversationCapabilitiesV4(projectId: string, conversationId: string): Promise<import("./types").ConversationCapabilitiesV4> {
+  if (!isTauri()) return { project_id: projectId, conversation_id: conversationId, skills: [], mcp_servers: [], memory_count: 0 };
+  return invoke("get_conversation_capabilities_v4", { request: { project_id: projectId, conversation_id: conversationId } });
+}
+
 export async function listProjects(): Promise<WorkspaceProject[]> {
   return isTauri() ? invoke("list_projects") : [];
 }

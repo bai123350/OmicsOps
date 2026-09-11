@@ -10,6 +10,13 @@ afterEach(() => {
 });
 
 describe("bundled MCP API", () => {
+  it("requests capabilities for the exact project and conversation", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+    const summary = { project_id: "p", conversation_id: "c", skills: [], mcp_servers: [], memory_count: 0 };
+    vi.mocked(invoke).mockResolvedValueOnce(summary);
+    await expect(api.getConversationCapabilitiesV4("p", "c")).resolves.toEqual(summary);
+    expect(invoke).toHaveBeenCalledWith("get_conversation_capabilities_v4", { request: { project_id: "p", conversation_id: "c" } });
+  });
   it("uses the host catalog and passes only the chosen ID for registration", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
     const catalog = [{ id: "ensembl", name: "Ensembl", description: "Genome", description_zh: "基因组", tool_count: 4 }];

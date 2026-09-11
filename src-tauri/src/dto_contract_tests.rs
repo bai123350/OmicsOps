@@ -7,6 +7,31 @@ use serde_json::json;
 use uuid::Uuid;
 
 #[test]
+fn conversation_capabilities_use_shared_snake_case_contract() {
+    let project_id = Uuid::new_v4();
+    let conversation_id = Uuid::new_v4();
+    let value = json!({
+        "project_id":project_id,"conversation_id":conversation_id,
+        "skills":[{"id":Uuid::new_v4(),"name":"workflow","enabled":true}],
+        "mcp_servers":[{"id":Uuid::new_v4(),"name":"science","enabled":false,"tool_count":7}],
+        "memory_count":2
+    });
+    let snapshot: crate::dto::ConversationCapabilitiesV4 =
+        serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(snapshot).unwrap(), value);
+    let request = json!({"project_id":project_id,"conversation_id":conversation_id});
+    let parsed: crate::dto::GetConversationCapabilitiesV4Request =
+        serde_json::from_value(request.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+    assert!(
+        serde_json::from_value::<crate::dto::GetConversationCapabilitiesV4Request>(
+            json!({"project_id":project_id})
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn bundled_mcp_catalog_and_request_use_shared_snake_case_contract() {
     let value = json!({"id":"pubmed", "name":"Science · pubmed", "description":"Literature", "description_zh":"文献", "tool_count":7});
     let preset: crate::dto::BundledMcpPreset = serde_json::from_value(value.clone()).unwrap();

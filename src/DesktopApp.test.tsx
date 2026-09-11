@@ -61,6 +61,20 @@ function setupConversationStateHarness() {
 }
 
 describe("DesktopApp", () => {
+  it("refreshes shared memory counts after deleting another conversation", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    let removed = false;
+    vi.spyOn(api, "getConversationCapabilitiesV4").mockImplementation(async (project_id, conversation_id) => ({ project_id, conversation_id, skills: [], mcp_servers: [], memory_count: removed ? 1 : 3 }));
+    vi.spyOn(api, "deleteConversation").mockImplementation(async () => { removed = true; });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<DesktopApp />);
+    await screen.findByText("0 skills · 0 MCP · 3 mem");
+    await waitFor(() => expect(screen.getByRole("button", { name: "删除会话：Plan 会话" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "删除会话：Plan 会话" }));
+    await screen.findByText("0 skills · 0 MCP · 1 mem");
+    expect(screen.getByRole("heading", { name: "Agent 会话" })).toBeVisible();
+  });
   it("restores a locked ordinary tool approval as execution, not a Plan", async () => {
     const { stateSpy } = setupConversationStateHarness();
     const runId = "ordinary-tool-approval";

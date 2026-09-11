@@ -500,3 +500,10 @@ export interface FormalStepProposal {
 }
 
 export interface AgentTextPreviewV4 { run_id: string; text: string | null }
+export interface ConversationCapabilitiesV4 {
+  project_id: string;
+  conversation_id: string;
+  skills: Array<{ id: string; name: string; enabled: boolean }>;
+  mcp_servers: Array<{ id: string; name: string; enabled: boolean; tool_count: number }>;
+  memory_count: number;
+}

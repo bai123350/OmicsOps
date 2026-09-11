@@ -6,6 +6,7 @@ import { WorkspaceShell } from "./features/workspace/WorkspaceShell";
 import { ApiModelPicker } from "./features/workspace/ApiModelPicker";
 import type { Locale } from "./features/workspace/copy";
 import { SettingsPanel } from "./features/settings/SettingsPanel";
+import { useConversationCapabilities } from "./features/workspace/useConversationCapabilities";
 
 export default function DesktopApp() {
   const [projects, setProjects] = useState<WorkspaceProject[]>([]);
@@ -57,6 +58,16 @@ export default function DesktopApp() {
   const [notebookEntries, setNotebookEntries] = useState<NotebookEntry[]>([]);
   const [projectArtifacts, setProjectArtifacts] = useState<ProjectArtifact[]>([]);
   const [syncEntries, setSyncEntries] = useState<SyncEntry[]>([]);
+  const capabilities = useConversationCapabilities(
+    selected?.id ?? null,
+    conversation?.project_id === selected?.id ? conversation?.id ?? null : null,
+    JSON.stringify([
+      messages.length, agentBusy, settingsOpen, notebookEntries.length, projectArtifacts.length,
+      conversations.map(({ id }) => id),
+      skillPackages.map(({ id, name, enabled, sha256 }) => [id, name, enabled, sha256]),
+      mcpServers.map(({ id, name, enabled, updated_at }) => [id, name, enabled, updated_at]),
+    ]),
+  );
   const runActionGuards = useRef(new Set<string>());
   const runPollingNotice = useRef("");
   // Every asynchronous conversation read/action captures both this token and
@@ -939,6 +950,8 @@ export default function DesktopApp() {
   }
   const currentConversationAction = captureConversationAction();
   return <><WorkspaceShell
+    capabilitySummary={capabilities.summary} capabilitiesLoading={capabilities.loading}
+    capabilitiesError={capabilities.error} onRefreshCapabilities={capabilities.refresh}
     project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template }}
     locale={locale} onLocaleChange={setLocale} onOpenSettings={(section = "models") => { setSettingsSection(section); setSettingsOpen(true); }} onBackToProjects={() => setSelected(null)}
     conversations={conversations} activeConversationId={conversation?.id} onSelectConversation={selectConversation} onNewConversation={newConversation} onDeleteConversation={deleteConversation}

@@ -3,6 +3,7 @@ pub mod agent_v4;
 pub mod bio_mcp;
 pub mod browser_commands;
 pub mod bundled_mcp_commands;
+pub mod capability_commands;
 pub mod commands;
 pub mod conversation_mode;
 #[cfg(test)]
@@ -178,6 +179,7 @@ pub fn run() {
             p1_commands::add_pubmed_mcp_server,
             bundled_mcp_commands::list_bundled_mcp_presets,
             bundled_mcp_commands::add_bundled_mcp_server,
+            capability_commands::get_conversation_capabilities_v4,
             p1_commands::set_mcp_server_enabled,
             p1_commands::set_mcp_launch_approval,
             p1_commands::inspect_configured_mcp_server,

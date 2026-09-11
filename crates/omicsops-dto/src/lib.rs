@@ -12,6 +12,39 @@ use omicsops_protocol::{ComputeSelectionV4, ExecutionPlanV4};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GetConversationCapabilitiesV4Request {
+    pub project_id: Uuid,
+    pub conversation_id: Uuid,
+}
+
+/// Read-only availability snapshot, not a grant of execution permission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationCapabilitiesV4 {
+    pub project_id: Uuid,
+    pub conversation_id: Uuid,
+    pub skills: Vec<ConversationSkillCapabilityV4>,
+    pub mcp_servers: Vec<ConversationMcpCapabilityV4>,
+    /// Project-wide evidence-backed facts, matching Agent memory retrieval scope.
+    pub memory_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationSkillCapabilityV4 {
+    pub id: Uuid,
+    pub name: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationMcpCapabilityV4 {
+    pub id: Uuid,
+    pub name: String,
+    pub enabled: bool,
+    pub tool_count: usize,
+}
+
 /// A compiled scientific MCP domain; catalog inspection never starts a process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BundledMcpPreset {
