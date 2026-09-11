@@ -6,14 +6,14 @@ OmicsOps 是面向科研与生物信息学的 Windows-first Tauri 桌面 Agent�
 
 ## 核心能力
 
-| 能力 | 当前支持 |
-| --- | --- |
-| 对话式分析 | 默认 Agent 模式直接启动任务；需要先审阅方案时可切换 Plan 模式。多步骤任务维护阶段和任务清单，普通运行可接收追加指导。 |
+| 能力           | 当前支持                                                                                                                      |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| 对话式分析     | 默认 Agent 模式直接启动任务；需要先审阅方案时可切换 Plan 模式。多步骤任务维护阶段和任务清单，普通运行可接收追加指导。         |
 | 本地与远程计算 | 使用本地系统 Python/R，或项目绑定的 SSH 主机及远端环境；持久解释器会话支持连续执行代码。独立 SSH 后台作业支持之后查询和重连。 |
-| 文献调研 | 检索 PubMed、Europe PMC、Crossref，保留检索来源与文献标识；内置 PubMed MCP 提供检索和记录读取。 |
-| Skills 与 MCP | 捆绑科学工作流 Skills，支持技能发现、导入和启停；按需加载指令，配置 stdio MCP server 扩展工具。技能本身不等于已安装科研依赖。 |
-| 项目与证据 | 组织会话、分析记录和产物；运行通过事件、工具结果、检查点和恢复记录保留执行依据。 |
-| 模型配置 | 使用保存的模型配置连接模型服务，配置上下文与请求推理档位，并为新建普通运行绑定独立的只读子 Agent 模型。 |
+| 文献调研       | 检索 PubMed、Europe PMC、Crossref，保留检索来源与文献标识；内置 PubMed MCP 提供检索和记录读取。                               |
+| Skills 与 MCP  | 捆绑科学工作流 Skills，支持技能发现、导入和启停；按需加载指令，配置 stdio MCP server 扩展工具。技能本身不等于已安装科研依赖。 |
+| 项目与证据     | 组织会话、分析记录和产物；运行通过事件、工具结果、检查点和恢复记录保留执行依据。                                              |
+| 模型配置       | 使用保存的模型配置连接模型服务，配置上下文与请求推理档位，并为新建普通运行绑定独立的只读子 Agent 模型。                       |
 
 Rust 控制层负责凭据、审批、权限检查、执行状态、SSH 和审计。Skills、MCP 和子 Agent 都遵循当前运行的能力与审批边界；加载技能或收到模型建议不会自动扩大权限。
 
@@ -128,7 +128,6 @@ npm run build:desktop
 - [Agent / Plan 模式与环境选择](docs/agent-modes.md)
 - [普通 Agent Guided Loop](docs/superpowers/specs/ordinary-agent-guided-loop.md)
 - [V4 Agent Harness 设计](docs/superpowers/specs/2026-08-16-agent-harness-v3-design.md)
-- [Wisp 参考 Agent Loop 设计及后续增量](docs/superpowers/specs/2026-09-08-wisp-inspired-agent-loop.md)
+- [参考 Agent Loop 设计及后续增量](docs/superpowers/specs/2026-09-08-wisp-inspired-agent-loop.md)
 - [最初批准设计（历史背景）](docs/superpowers/specs/2026-07-29-omicsops-agent-design.md)
 - [真实环境验收流程](acceptance/README.md)
-- [Wisp Science](https://github.com/xuzhougeng/wisp-science)：科研工作流与产品表达的参考，OmicsOps 的实际支持范围以上文及本仓库实现为准。
