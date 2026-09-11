@@ -132,7 +132,7 @@ describe("DesktopApp", () => {
     render(<DesktopApp />);
 
     expect(await screen.findByRole("main", { name: "科研对话" })).toBeInTheDocument();
-    expect(screen.getByRole("complementary", { name: "项目上下文" })).toBeInTheDocument();
+    expect(screen.queryByRole("complementary", { name: "项目上下文" })).not.toBeInTheDocument();
   });
 
   it("starts a direct V4 agent run instead of planning after an ordinary send", async () => {
@@ -351,6 +351,7 @@ describe("DesktopApp", () => {
     releaseInitialState();
     expect(await screen.findByText("hydrated before mode switch")).toBeInTheDocument();
     expect(await screen.findByText(/Plan 模式：/)).toBeInTheDocument();
+    if (!screen.queryByRole("complementary")) fireEvent.click(screen.getByRole("button", { name: "展开侧栏" }));
     fireEvent.click(screen.getByRole("tab", { name: "Plan" }));
     expect(await screen.findByRole("heading", { name: statePlan.objective })).toBeInTheDocument();
     expect(await screen.findByText("修订 2 · 待审批")).toBeInTheDocument();
@@ -849,9 +850,13 @@ describe("DesktopApp", () => {
     const kernelEvent: KernelEvent = { project_id: projectA.id, session_id: "shared-kernel", request_id: "old-request", sequence: 1, occurred_at: "2026-08-20T00:00:00Z", event: { kind: "stdout", payload: "旧项目 kernel 泄漏" } };
     const syncEntry: SyncEntry = { id: "old-sync", project_id: projectA.id, relative_path: "旧项目同步泄漏.txt", local_relative_path: null, remote_path: null, direction: "remote_to_local", size_bytes: 10, sha256: "old", state: "failed", transferred_bytes: 4, retry_count: 1, error: "old", updated_at: "2026-08-20T00:00:00Z" };
     await act(async () => { oldKernel(kernelEvent); oldSync(syncEntry); });
-    fireEvent.click(screen.getByRole("tab", { name: "探索" }));
+    if (!screen.queryByRole("complementary")) fireEvent.click(screen.getByRole("button", { name: "展开侧栏" }));
+    if (!screen.queryByRole("menu", { name: "侧栏内容" })) fireEvent.click(screen.getByRole("button", { name: "添加侧栏标签" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Environment" }));
     expect(screen.queryByText("旧项目 kernel 泄漏")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("tab", { name: "文件" }));
+    if (!screen.queryByRole("complementary")) fireEvent.click(screen.getByRole("button", { name: "展开侧栏" }));
+    if (!screen.queryByRole("menu", { name: "侧栏内容" })) fireEvent.click(screen.getByRole("button", { name: "添加侧栏标签" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Files" }));
     expect(screen.queryByText("旧项目同步泄漏.txt")).not.toBeInTheDocument();
   });
 });

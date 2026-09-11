@@ -400,25 +400,29 @@ describe("WorkspaceShell", () => {
 
     expect(screen.getByRole("navigation", { name: "项目与会话" })).toBeInTheDocument();
     expect(screen.getByRole("main", { name: "科研对话" })).toBeInTheDocument();
-    expect(screen.getByRole("complementary", { name: "项目上下文" })).toBeInTheDocument();
+    expect(screen.queryByRole("complementary", { name: "项目上下文" })).not.toBeInTheDocument();
     expect(screen.getAllByText("PBMC 图谱")).toHaveLength(2);
     expect(screen.getByText("Scanpy 质量控制")).toBeInTheDocument();
   });
 
-  it("switches context tabs and expands artifact preview", () => {
+  it("shows an honest empty artifact catalog", () => {
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} />);
 
-    fireEvent.click(screen.getByRole("tab", { name: "预览" }));
-    expect(screen.getAllByText("UMAP 聚类概览")).toHaveLength(2);
-    fireEvent.click(screen.getByRole("button", { name: "展开预览" }));
-    expect(screen.getByRole("dialog", { name: "产物预览" })).toBeInTheDocument();
+    if (!screen.queryByRole("complementary")) fireEvent.click(screen.getByRole("button", { name: "展开侧栏" }));
+    if (!screen.queryByRole("menu", { name: "侧栏内容" })) fireEvent.click(screen.getByRole("button", { name: "添加侧栏标签" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Artifacts (0)" }));
+    expect(screen.getByText("暂无登记产物")).toBeVisible();
+    expect(screen.queryByText("UMAP 聚类概览")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "展开预览" })).not.toBeInTheDocument();
   });
 
   it("loads the selected remote image into the preview", async () => {
     const onPreviewImage = vi.fn().mockResolvedValue({ relative_path: "results/umap.png", mime_type: "image/png", size_bytes: 1024, sha256: "a".repeat(64), data_url: "data:image/png;base64,iVBORw0KGgo=" });
     render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} remoteFiles={[{ relative_path: "results/umap.png", directory: false, size_bytes: 1024, modified_unix_seconds: 0 }, { relative_path: "results/markers.csv", directory: false, size_bytes: 20, modified_unix_seconds: 0 }]} onPreviewImage={onPreviewImage} />);
 
-    fireEvent.click(screen.getByRole("tab", { name: "Preview" }));
+    if (!screen.queryByRole("complementary")) fireEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    if (!screen.queryByRole("menu", { name: "Sidebar sections" })) fireEvent.click(screen.getByRole("button", { name: "Add sidebar tab" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Artifacts (0)" }));
     expect(screen.getByRole("combobox", { name: "Select project image" })).toHaveValue("results/umap.png");
     fireEvent.click(screen.getByRole("button", { name: "Show image" }));
     expect(await screen.findByRole("img", { name: "results/umap.png" })).toHaveAttribute("src", "data:image/png;base64,iVBORw0KGgo=");
@@ -430,16 +434,17 @@ describe("WorkspaceShell", () => {
     render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} />);
 
     expect(screen.getByRole("main", { name: "Research conversation" })).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: "Lab notebook" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add sidebar tab" }));
+    expect(screen.getByRole("menuitemcheckbox", { name: "Notebook (0)" })).toBeInTheDocument();
   });
 
-  it("sends a demo research message and exposes the dedicated Plan tab", () => {
+  it("sends an ordinary message without exposing a Plan tab", () => {
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} />);
     fireEvent.change(screen.getByRole("textbox", { name: /描述研究目标/ }), { target: { value: "先检查双细胞率" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
     expect(screen.getByText("先检查双细胞率")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("tab", { name: "Plan" }));
-    expect(screen.getByText("尚未进入 Plan 模式")).toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "Plan" })).not.toBeInTheDocument();
   });
 
   it.each(["local", "ssh"] as const)("sends an ordinary research request with unverified %s compute", async (kind) => {

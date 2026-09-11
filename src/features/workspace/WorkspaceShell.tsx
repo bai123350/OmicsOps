@@ -4,7 +4,7 @@ import remarkGfm from "remark-gfm";
 import {
   Activity, ArrowLeft, ArrowUp, Bot, Check, ChevronRight, ClipboardList, Database, Expand, FileBarChart, FileText,
   FlaskConical, Folder, Hand, Languages, MessageSquarePlus, NotebookPen, Plus,
-  Search, Settings, Shield, ShieldAlert, ShieldCheck, Sparkles, Square, Trash2, X, Orbit, Monitor, ChevronDown, Gauge, Zap,
+  Search, Settings, Shield, ShieldAlert, ShieldCheck, Sparkles, Square, Trash2, X, Orbit, Monitor, ChevronDown, Gauge, Zap, PanelRight,
 } from "lucide-react";
 import { copy, type Locale } from "./copy";
 import type { AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, BrowserApprovalScopeV4, ComputeBackendAvailabilityV4, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, MemoryFact, NotebookEntry, ProposedPlanRevisionV4, ProjectArtifact, ProjectImagePreview, RunSummaryV4, SessionAgentModeV4, SyncEntry, WorkspaceConversation } from "../../types";
@@ -13,6 +13,8 @@ import { KernelPanel } from "./KernelPanel";
 import { ComposeActions } from "./ComposeActions";
 import { RuntimeDialog } from "./RuntimeDialog";
 import { useWindowEscapeLayer } from "../settings/BrowserSettings";
+import { collectNotebookCells, collectDelegatedTasks, collectProvenance, isSidebarPreviewImage } from "./sidebarData";
+import { ArtifactCatalog, CodeNotebook, DelegatedAgents, EnvironmentContexts, ProvenancePanel } from "./SidebarPanels";
 import { V4PlanPanel } from "./V4PlanPanel";
 import "./workspace.css";
 import "./approval.css";
@@ -23,6 +25,7 @@ import "./agent.css";
 import "./preview.css";
 import "./notebook.css";
 import "./composer.css";
+import "./sidebar.css";
 
 export interface WorkspaceProject {
   id: string;
@@ -124,13 +127,51 @@ interface Props {
   onRetrySync?: (id: string) => Promise<void> | void;
 }
 
-type ContextTab = "files" | "plan" | "preview" | "notebook" | "explore" | "runs";
+type ContextTab = "files" | "plan" | "artifacts" | "notebook" | "environment" | "provenance" | "agents" | "records";
+const DEFAULT_CONTEXT_TABS: ContextTab[] = ["artifacts", "agents", "files", "environment"];
 const AGENT_STALL_THRESHOLD_MS = 90_000;
 
 export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, conversations = [], activeConversationId, onSelectConversation, onNewConversation, onDeleteConversation, onSend, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, modelPicker, composerBusy = false, modelOptions = [], modelId, onModelChange, agentMode, onAgentModeChange, conversationLocked = false, conversationHydrating = false, planActionBusy = false, v4Plan, latestPlanRevision, computeBackends = [], computeBackendId = "", containerImage = "", autonomyMode = "supervised", approvalPolicy = "risk_based", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onApprovalPolicyChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onRequestPlanRevision, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, activeRunLastActivityAt, agentRunEventsV4 = [], agentTextPreview, guidanceAvailable = false, onAnswerAgentQuestionV4, onDecideToolApprovalV4, onResolveUncertainV4, onResumeAgentRunV4, onCancelRuntimeRecoveryV4, onCloseBrowserRunTabsV4, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
   const t = copy[locale];
   const zh = locale === "zh-CN";
-  const [tab, setTab] = useState<ContextTab>("files");
+  const [tab, setTab] = useState<ContextTab>("artifacts");
+  const [openTabs, setOpenTabs] = useState<ContextTab[]>(DEFAULT_CONTEXT_TABS);
+  const [draggedTab, setDraggedTab] = useState<ContextTab | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sectionMenuOpen, setSectionMenuOpen] = useState(false);
+  const sidebarEvents = agentRunEventsV4.filter((event) => event.project_id === project.id && (!activeConversationId || event.conversation_id === activeConversationId));
+  const notebookCells = collectNotebookCells(messages, sidebarEvents);
+  const delegatedTasks = collectDelegatedTasks(sidebarEvents);
+  const provenanceRows = collectProvenance(sidebarEvents);
+  const sidebarSections: Array<{ id: ContextTab | "highlights" | "side-chat"; label: string; unavailable?: string }> = [
+    { id: "artifacts", label: `Artifacts (${projectArtifacts.length})` },
+    { id: "agents", label: "Agents" },
+    { id: "notebook", label: `Notebook (${notebookCells.length})` },
+    { id: "highlights", label: "Highlights", unavailable: zh ? "需要已收藏的对话摘录；当前尚无收藏接口。" : "Requires saved conversation excerpts; the highlight API is not available." },
+    { id: "files", label: "Files" },
+    { id: "provenance", label: `Provenance (${provenanceRows.length})` },
+    { id: "environment", label: "Environment" },
+    { id: "side-chat", label: "Side chat", unavailable: zh ? "需要带证据引用的独立问答接口；当前尚未接入。" : "Requires an independent evidence-backed chat API; it is not connected." },
+  ];
+  const tabLabel = (id: ContextTab) => id === "plan" ? "Plan" : id === "records" ? (zh ? "研究记录" : "Research records") : sidebarSections.find((section) => section.id === id)!.label;
+  function openSidebarSection(id: ContextTab) {
+    setOpenTabs((current) => current.includes(id) ? current : [...current, id]);
+    setTab(id);
+    setSidebarOpen(true);
+    setSectionMenuOpen(false);
+  }
+  function closeSidebarTab(id: ContextTab) {
+    const remaining = openTabs.filter((item) => item !== id);
+    setOpenTabs(remaining);
+    if (!remaining.length) closeSidebar();
+    else if (tab === id) setTab(remaining[Math.max(0, openTabs.indexOf(id) - 1)] ?? remaining[0]);
+  }
+  function closeSidebar() {
+    setSidebarOpen(false);
+    setSectionMenuOpen(false);
+  }
+  useWindowEscapeLayer(sidebarOpen, closeSidebar);
+  useWindowEscapeLayer(sidebarOpen && sectionMenuOpen, () => setSectionMenuOpen(false));
   const [expanded, setExpanded] = useState(false);
   const [draft, setDraft] = useState("");
   const [localMode, setLocalMode] = useState<SessionAgentModeV4>("agent");
@@ -168,8 +209,11 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const effectiveMode = agentMode ?? localMode;
   const planModeEnabled = effectiveMode === "plan";
   const modeLocked = conversationHydrating || conversationLocked || planLoading || runStarted;
-  const imageFiles = (remoteFiles ?? []).filter((entry) => !entry.directory && isPreviewImage(entry.relative_path));
-  const preview = <ArtifactPreview title={t.overview} locale={locale} images={imageFiles} selectedPath={selectedImagePath} preview={imagePreview} busy={previewBusy} error={previewError} onSelect={setSelectedImagePath} onLoad={loadImagePreview} />;
+  const imageFiles = [...new Map([
+    ...(remoteFiles ?? []).filter((entry) => !entry.directory && isSidebarPreviewImage(entry.relative_path)),
+    ...projectArtifacts.filter((artifact) => /^image\//.test(artifact.media_type) && isSidebarPreviewImage(artifact.relative_path)).map((artifact) => ({ relative_path: artifact.relative_path, directory: false, size_bytes: artifact.size_bytes, modified_unix_seconds: 0 })),
+  ].map((entry) => [entry.relative_path, entry])).values()];
+  const preview = <ArtifactPreview title={t.artifactPreview} locale={locale} images={imageFiles} selectedPath={selectedImagePath} preview={imagePreview} busy={previewBusy} error={previewError} onSelect={setSelectedImagePath} onLoad={loadImagePreview} />;
   const effectiveActiveRunId = activeRunId ?? (runStarted ? agentRunEventsV4.at(-1)?.run_id ?? null : null);
   const activeRunEventsV4 = effectiveActiveRunId
     ? agentRunEventsV4
@@ -229,7 +273,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     followingLatestRef.current = true;
     setFollowingLatest(true);
   }, [activeConversationId]);
-  useEffect(() => { if (showPlanPanel) setTab("plan"); }, [showPlanPanel]);
+  useEffect(() => { if (showPlanPanel) openSidebarSection("plan"); }, [showPlanPanel]);
   useEffect(() => {
     if (!runActive || !activeRunLastActivityAt) {
       setWatchdogNow(Date.now());
@@ -253,7 +297,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     setSelectedImagePath(imageFiles[0]?.relative_path ?? "");
     setImagePreview(null);
     setPreviewError("");
-  }, [remoteFiles, selectedImagePath]);
+  }, [remoteFiles, projectArtifacts, selectedImagePath]);
 
   async function loadImagePreview() {
     if (!selectedImagePath || !onPreviewImage) return;
@@ -328,7 +372,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     }
   }
 
-  return <div className="science-shell">
+  return <div className={`science-shell ${sidebarOpen ? "sidebar-open" : "sidebar-collapsed"}`}>
     <nav className="project-rail" aria-label={t.projects}>
       <div className="science-brand"><span className="brand-orbit"><FlaskConical size={20} /></span><div><strong>OmicsOps</strong><small>Life Science Workspace</small></div></div>
       <button className="rail-home" onClick={onBackToProjects} aria-label={zh ? "返回项目主页" : "Back to project home"}><ArrowLeft size={15} />{zh ? "返回项目主页" : "Project home"}</button>
@@ -339,7 +383,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     </nav>
 
     <main className="conversation-pane" aria-label={t.research}>
-      <header className="conversation-header"><div><small>{project.name}</small><h1>{conversationTitle}</h1></div><span className="live-status"><i />{t.status}</span></header>
+      <header className="conversation-header"><div><small>{project.name}</small><h1>{conversationTitle}</h1></div><div className="workspace-header-actions">{showPlanPanel && <button className="sidebar-plan-link" onClick={() => openSidebarSection("plan")}>{zh ? "查看 Plan" : "Review Plan"}</button>}<span className="live-status"><i />{t.status}</span><button className="sidebar-toggle" aria-label={sidebarOpen ? (zh ? "收起侧栏" : "Collapse sidebar") : (zh ? "展开侧栏" : "Expand sidebar")} aria-expanded={sidebarOpen} aria-controls="workspace-sidebar" onClick={() => { if (sidebarOpen) closeSidebar(); else { if (!openTabs.length) { setOpenTabs(["artifacts"]); setTab("artifacts"); } setSidebarOpen(true); } }}><PanelRight size={19} /></button></div></header>
       <section className="message-stream" aria-live="polite" ref={messageStreamRef} onScroll={(event) => {
         const stream = event.currentTarget;
         const following = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 64;
@@ -382,7 +426,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
         <div className={`composer-input ${planModeEnabled ? "is-plan-mode" : ""}`}>
           <textarea aria-label={t.composer} placeholder={planModeEnabled ? (zh ? "描述需要规划和执行的任务" : "Describe the task to plan and execute") : t.composer} value={draft} disabled={composerDisabled} onChange={(event) => setDraft(event.target.value)} />
           <div className="composer-toolbar">
-            <div className="composer-menu-anchor"><button className="composer-tool" aria-label={zh ? "添加上下文或选择模式" : "Add context or choose mode"} aria-expanded={composerMenuOpen} onClick={() => { const next = !composerMenuOpen; closeComposerMenus(); setComposerMenuOpen(next); }}><Plus size={20} /></button>{composerMenuOpen && <ComposeActions zh={zh} onClose={() => setComposerMenuOpen(false)} onAttach={onUploadFiles ? () => { void onUploadFiles(); } : undefined} onFiles={() => setTab("files")} onReview={() => setDraft((current) => [current, zh ? "请审查当前会话中的方法、证据和结论，指出潜在问题与需要补充的验证。" : "Review the methods, evidence, and conclusions in this conversation. Identify potential issues and missing validation."].filter(Boolean).join("\n\n"))} onManageSkills={onOpenSettings ? () => onOpenSettings("skills") : undefined} />}</div>
+            <div className="composer-menu-anchor"><button className="composer-tool" aria-label={zh ? "添加上下文或选择模式" : "Add context or choose mode"} aria-expanded={composerMenuOpen} onClick={() => { const next = !composerMenuOpen; closeComposerMenus(); setComposerMenuOpen(next); }}><Plus size={20} /></button>{composerMenuOpen && <ComposeActions zh={zh} onClose={() => setComposerMenuOpen(false)} onAttach={onUploadFiles ? () => { void onUploadFiles(); } : undefined} onFiles={() => openSidebarSection("files")} onReview={() => setDraft((current) => [current, zh ? "请审查当前会话中的方法、证据和结论，指出潜在问题与需要补充的验证。" : "Review the methods, evidence, and conclusions in this conversation. Identify potential issues and missing validation."].filter(Boolean).join("\n\n"))} onManageSkills={onOpenSettings ? () => onOpenSettings("skills") : undefined} />}</div>
             <div className="composer-menu-anchor permission-anchor">
               <button className="composer-tool composer-orbit" title={zh ? "Agent 控制" : "Agent controls"} aria-label={zh ? "Agent 权限" : "Agent permissions"} aria-expanded={permissionMenuOpen} onClick={() => { const next = !permissionMenuOpen; closeComposerMenus(); setPermissionMenuOpen(next); }}><Orbit size={21} /></button>
               {permissionMenuOpen && <div className="permission-menu" role="menu" aria-label={zh ? "Agent 权限选项" : "Agent permission options"}>
@@ -394,7 +438,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
                 <div className="agent-control-divider" />
                 <button role="menuitem" className="agent-control-row" disabled><span>{zh ? "完成方式" : "Completion"}</span><small>{zh ? "会话内" : "Inline"}</small></button>
                 {[(zh ? "子任务委派" : "Delegation"), (zh ? "自动审查" : "Auto-review"), (zh ? "分析工具失败" : "Analyze tool failures"), (zh ? "审查模型" : "Reviewer model"), (zh ? "专家代理" : "Specialist")].map((label) => <button key={label} role="menuitem" className="agent-control-row" disabled><span>{label}</span><small>{zh ? "暂未支持" : "Unavailable"}</small></button>)}
-                <button role="menuitem" className="agent-control-row" onClick={() => { setTab("notebook"); setPermissionMenuOpen(false); }}><span>{zh ? "记忆与研究记录" : "Memory & notebook"}</span><ChevronRight size={14} /></button>
+                <button role="menuitem" className="agent-control-row" onClick={() => { openSidebarSection("records"); setPermissionMenuOpen(false); }}><span>{zh ? "记忆与研究记录" : "Memory & notebook"}</span><ChevronRight size={14} /></button>
                 <button role="menuitem" className="agent-control-row" onClick={() => setComputeMenuOpen(true)}><span>{zh ? "计算环境" : "Compute"}</span><span>{backendLabel}<ChevronRight size={14} /></span></button>
               </div>}
             </div>
@@ -414,17 +458,26 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
       </footer>
     </main>
 
-    <aside className="context-pane" aria-label={t.context}>
-      <div className="context-tabs" role="tablist">{(["files", "plan", "preview", "notebook", "explore", "runs"] as ContextTab[]).map((id) => <button key={id} role="tab" aria-selected={tab === id} onClick={() => setTab(id)}>{id === "files" ? t.files : id === "plan" ? (zh ? "Plan" : "Plan") : id === "preview" ? t.preview : id === "notebook" ? t.notebook : id === "explore" ? t.explore : t.runs}</button>)}</div>
-      <div className="context-content">{tab === "files" && <RemoteFileTree locale={locale} remoteFiles={remoteFiles} busy={filesBusy} notice={fileNotice} onUpload={onUploadFiles} onRefresh={onRefreshFiles} onDownload={onDownloadFile} syncEntries={syncEntries} onPauseSync={onPauseSync} onCancelSync={onCancelSync} onRetrySync={onRetrySync} />}{tab === "plan" && <V4PlanPanel locale={locale} active={showPlanPanel} planLoading={planLoading} v4Plan={visiblePlan} latestPlanRevision={latestPlanRevision} conversationLocked={conversationLocked} planActionBusy={effectivePlanActionBusy} planApproved={planApproved || approved || approvePlanBusy} runStarted={runStarted} events={activeRunEventsV4} onApprove={approvePlan} onRequestPlanRevision={onRequestPlanRevision} onCancel={onCancelRun} />}{tab === "preview" && <><div className="context-toolbar"><span>{t.overview}</span><button aria-label={t.expand} onClick={() => setExpanded(true)}><Expand size={16} /></button></div>{preview}</>}{tab === "notebook" && <Notebook locale={locale} entries={notebookEntries} artifacts={projectArtifacts} facts={memoryFacts} onSearch={onSearchMemory} onExport={onExportNotebook} />}{tab === "explore" && <KernelPanel locale={locale} sessions={kernelSessions} events={kernelEvents} busy={kernelBusy} notice={kernelNotice} onStart={onStartKernel} onExecute={onExecuteKernel} onInterrupt={onInterruptKernel} onStop={onStopKernel} onPromote={onPromoteKernelCell} />}{tab === "runs" && <RunSummary locale={locale} />}</div>
-    </aside>
+    {sidebarOpen && <aside id="workspace-sidebar" className="context-pane workspace-sidebar" aria-label={t.context}>
+      <div className="sidebar-heading">
+        <div className="sidebar-tab-scroll" role="tablist" aria-label={zh ? "已打开的侧栏标签" : "Open sidebar tabs"}>
+          {openTabs.map((id) => <div className="sidebar-tab-wrap" key={id} draggable onDragStart={() => setDraggedTab(id)} onDragEnd={() => setDraggedTab(null)} onDragOver={(event) => { if (draggedTab) event.preventDefault(); }} onDrop={(event) => { event.preventDefault(); if (draggedTab && draggedTab !== id) { const reordered = openTabs.filter((item) => item !== draggedTab); reordered.splice(openTabs.indexOf(id), 0, draggedTab); setOpenTabs(reordered); } setDraggedTab(null); }}>
+            <button id={`sidebar-tab-${id}`} role="tab" aria-controls="sidebar-tab-content" aria-selected={tab === id} tabIndex={tab === id ? 0 : -1} title={tabLabel(id)} onClick={() => { setTab(id); setSectionMenuOpen(false); }} onKeyDown={(event) => { const index = openTabs.indexOf(id); const next = event.key === "ArrowRight" ? openTabs[(index + 1) % openTabs.length] : event.key === "ArrowLeft" ? openTabs[(index + openTabs.length - 1) % openTabs.length] : event.key === "Home" ? openTabs[0] : event.key === "End" ? openTabs.at(-1) : undefined; if (next) { event.preventDefault(); setTab(next); document.getElementById(`sidebar-tab-${next}`)?.focus(); } }}>{tabLabel(id)}</button>
+            <button className="sidebar-tab-close" aria-label={zh ? `关闭标签：${tabLabel(id)}` : `Close tab: ${tabLabel(id)}`} onClick={() => closeSidebarTab(id)}><X size={12} /></button>
+          </div>)}
+        </div>
+        <button className="sidebar-tab-add" aria-label={zh ? "添加侧栏标签" : "Add sidebar tab"} aria-haspopup="menu" aria-expanded={sectionMenuOpen} onClick={() => setSectionMenuOpen((open) => !open)}><Plus size={16} /></button>
+        {sectionMenuOpen && <><button className="sidebar-menu-backdrop" aria-label={zh ? "关闭侧栏菜单" : "Close sidebar menu"} onClick={() => setSectionMenuOpen(false)} /><div className="sidebar-section-menu" role="menu" aria-label={zh ? "侧栏内容" : "Sidebar sections"}>{sidebarSections.map((section) => { const isOpen = openTabs.some((id) => id === section.id); return <button key={section.id} role="menuitemcheckbox" aria-checked={isOpen} disabled={Boolean(section.unavailable)} title={section.unavailable} onClick={() => { if (section.id !== "highlights" && section.id !== "side-chat") openSidebarSection(section.id); }}><span>{section.label}</span>{isOpen && <Check size={18} />}</button>; })}</div></>}
+      </div>
+      <div className="context-content" id="sidebar-tab-content" role="tabpanel" aria-labelledby={`sidebar-tab-${tab}`}>{tab === "files" && <RemoteFileTree locale={locale} remoteFiles={remoteFiles ?? []} busy={filesBusy} notice={fileNotice} onUpload={onUploadFiles} onRefresh={onRefreshFiles} onDownload={onDownloadFile} syncEntries={syncEntries} onPauseSync={onPauseSync} onCancelSync={onCancelSync} onRetrySync={onRetrySync} />}{tab === "plan" && <V4PlanPanel locale={locale} active={showPlanPanel} planLoading={planLoading} v4Plan={visiblePlan} latestPlanRevision={latestPlanRevision} conversationLocked={conversationLocked} planActionBusy={effectivePlanActionBusy} planApproved={planApproved || approved || approvePlanBusy} runStarted={runStarted} events={activeRunEventsV4} onApprove={approvePlan} onRequestPlanRevision={onRequestPlanRevision} onCancel={onCancelRun} />}{tab === "artifacts" && <><ArtifactCatalog artifacts={projectArtifacts} locale={locale} onSelect={(path) => { setSelectedImagePath(path); setExpanded(true); }} />{imageFiles.length > 0 && <><div className="context-toolbar"><span>{t.artifactPreview}</span><button aria-label={t.expand} onClick={() => setExpanded(true)}><Expand size={16} /></button></div>{preview}</>}</>}{tab === "notebook" && <CodeNotebook cells={notebookCells} locale={locale} />}{tab === "agents" && <DelegatedAgents tasks={delegatedTasks} locale={locale} />}{tab === "records" && <Notebook locale={locale} entries={notebookEntries} artifacts={projectArtifacts} facts={memoryFacts} onSearch={onSearchMemory} onExport={onExportNotebook} />}{tab === "environment" && <><EnvironmentContexts backends={computeBackends} selectedId={computeBackendId} environment={computeEnvironment} locale={locale} /><KernelPanel locale={locale} sessions={kernelSessions} events={kernelEvents} busy={kernelBusy} notice={kernelNotice} onStart={onStartKernel} onExecute={onExecuteKernel} onInterrupt={onInterruptKernel} onStop={onStopKernel} onPromote={onPromoteKernelCell} /></>}{tab === "provenance" && <ProvenancePanel rows={provenanceRows} locale={locale} />}</div>
+    </aside>}
     {runtimeLanguage && <RuntimeDialog zh={zh} language={runtimeLanguage} onLanguageChange={setRuntimeLanguage} backend={selectedBackend} environment={computeEnvironment} onClose={() => setRuntimeLanguage(null)} onSettings={onOpenSettings ? () => { setRuntimeLanguage(null); onOpenSettings("remote"); } : undefined} onPrepare={(language) => {
       const name = language === "python" ? "Python" : "R";
       const request = zh ? `请检查当前 ${backendLabel} 计算环境中的 ${name} 解释器和科研依赖，报告版本与缺失项，并按当前审批策略准备环境。使用项目隔离环境，避免修改系统环境；先验证最小示例再报告结果。` : `Check the ${name} interpreter and research dependencies in the current ${backendLabel} compute environment. Report versions and missing dependencies, and prepare a project-isolated environment under the current approval policy without modifying the system environment. Verify a minimal example before reporting the result.`;
       setDraft((current) => current ? `${current}\n\n${request}` : request);
       setRuntimeLanguage(null);
     }} />}
-    {expanded && <div className="preview-overlay" role="dialog" aria-modal="true" aria-label={t.artifactPreview}><header><div><small>{project.name}</small><h2>{t.overview}</h2></div><button aria-label="Close" onClick={() => setExpanded(false)}><X /></button></header>{preview}</div>}
+    {expanded && <div className="preview-overlay" role="dialog" aria-modal="true" aria-label={t.artifactPreview}><header><div><small>{project.name}</small><h2>{t.artifactPreview}</h2></div><button aria-label="Close" onClick={() => setExpanded(false)}><X /></button></header>{preview}</div>}
   </div>;
 }
 
@@ -756,7 +809,6 @@ function V4AnswerForm({ locale, onSubmit }: { locale: Locale; onSubmit: (answer:
 }
 function v4EventLabel(event: AgentRunEventV4, zh: boolean) { if (event.event.kind === "tool_dispatch_uncertain" && event.event.tool_id === "use_mcp_tool") return zh ? "工具调用失败" : "Tool call failed"; if (event.event.kind === "run_created") return event.event.mode === "execute" ? (zh ? "任务启动" : "Task started") : (zh ? "规划启动" : "Planning started"); const labels: Record<string, string> = { request_routed: zh ? "请求已分类" : "Request routed", browser_connection_required: zh ? "需要连接浏览器" : "Browser connection required", browser_human_intervention_required: zh ? "浏览器需要人工处理" : "Browser intervention required", browser_tab_cleanup_required: zh ? "浏览器标签待清理" : "Browser tabs need cleanup", plan_proposed: zh ? "计划已冻结" : "Plan frozen", plan_approved: zh ? "计划获批" : "Plan approved", mode_changed: zh ? "执行模式" : "Execution mode", tool_requested: zh ? "工具请求" : "Tool request", tool_approval_requested: zh ? "等待工具审批" : "Tool approval required", tool_approval_decided: zh ? "工具审批已决定" : "Tool approval decided", tool_dispatch_uncertain: zh ? "工具状态不确定" : "Tool dispatch uncertain", tool_dispatch_resolved: zh ? "不确定状态已核实" : "Uncertain dispatch resolved", tool_finished: zh ? "工具结果" : "Tool result", input_requested: zh ? "需要补充信息" : "Input required", user_input_answered: zh ? "用户已回答" : "User answered", completion_proposed: zh ? "完成提案" : "Completion proposed", run_completed: zh ? "运行完成" : "Run completed", run_needs_attention: zh ? "需要处理" : "Needs attention", run_failed: zh ? "运行失败" : "Run failed", run_cancelled: zh ? "运行取消" : "Run cancelled" }; return labels[event.event.kind] ?? event.event.kind; }
 function v4EventContent(event: AgentRunEventV4, zh: boolean) { if (event.event.kind === "tool_dispatch_uncertain" && event.event.tool_id === "use_mcp_tool") return zh ? "MCP 调用未正常完成，请查看失败详情。此记录不会自动重试。" : "MCP call did not complete normally. See the failure details. This call will not be retried automatically."; if (event.event.kind === "request_routed") return event.event.route === "research_retrieval" ? (zh ? "科研检索流水线" : "Research retrieval workflow") : (zh ? "自适应执行" : "Adaptive execution"); if (event.event.kind === "browser_connection_required" || event.event.kind === "browser_human_intervention_required" || event.event.kind === "browser_tab_cleanup_required") return event.event.message; if (event.event.kind === "tool_requested") return event.event.call.tool_id; if (event.event.kind === "tool_approval_requested") return `${event.event.request.call.tool_id}: ${event.event.request.reason}`; if (event.event.kind === "tool_approval_decided") return event.event.decision === "approved" ? (zh ? "用户已批准" : "Approved by user") : (zh ? "用户已拒绝" : "Denied by user"); if (event.event.kind === "tool_dispatch_uncertain") return zh ? `调用 ${event.event.tool_id} 的副作用尚未确认` : `The side effect of ${event.event.tool_id} is not yet known`; if (event.event.kind === "tool_dispatch_resolved") return event.event.evidence; if (event.event.kind === "tool_finished") return event.event.outcome.model_content; if (event.event.kind === "plan_proposed") return `${event.event.plan.steps.length} ${zh ? "个步骤" : "steps"} · SHA-256 ${event.event.plan_hash.slice(0, 12)}`; if (event.event.kind === "model_text") return event.event.text; if (event.event.kind === "input_requested") return event.event.question; if (event.event.kind === "user_input_answered") return zh ? `已提交回答：${event.event.answer}` : `Answer submitted: ${event.event.answer}`; if (event.event.kind === "run_failed" || event.event.kind === "run_needs_attention") return event.event.message; return ""; }
-function isPreviewImage(path: string) { return /\.(png|jpe?g|gif|webp|bmp)$/i.test(path); }
 function ArtifactPreview({ title, locale, images, selectedPath, preview, busy, error, onSelect, onLoad }: { title: string; locale: Locale; images: import("../../types").RemoteFileEntry[]; selectedPath: string; preview: ProjectImagePreview | null; busy: boolean; error: string; onSelect: (path: string) => void; onLoad: () => Promise<void> | void }) {
   const zh = locale === "zh-CN";
   return <div className="artifact-preview"><div className="preview-picker"><label>{zh ? "选择项目图片" : "Select project image"}<select aria-label={zh ? "选择项目图片" : "Select project image"} value={selectedPath} onChange={(event) => onSelect(event.target.value)}><option value="">{images.length ? (zh ? "请选择图片" : "Choose an image") : (zh ? "未发现图片文件" : "No image files found")}</option>{images.map((entry) => <option value={entry.relative_path} key={entry.relative_path}>{entry.relative_path}</option>)}</select></label><button disabled={!selectedPath || busy} onClick={() => void onLoad()}>{busy ? (zh ? "加载中…" : "Loading…") : (zh ? "显示图片" : "Show image")}</button></div>{error && <div className="preview-error" role="alert">{error}</div>}<div className="project-image-stage" aria-label={title}>{preview ? <img src={preview.data_url} alt={preview.relative_path} /> : <div className="preview-empty">{images.length ? (zh ? "选择图片后点击“显示图片”" : "Choose an image and click Show image") : (zh ? "项目中暂未发现 PNG、JPEG、GIF、WebP 或 BMP 图片" : "No PNG, JPEG, GIF, WebP, or BMP images were found")}</div>}</div><div className="artifact-meta"><b>{preview?.relative_path ?? title}</b>{preview && <><span>{preview.mime_type} · {formatPreviewBytes(preview.size_bytes)}</span><small>SHA-256 {preview.sha256}</small></>}</div></div>;
