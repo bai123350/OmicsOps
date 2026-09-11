@@ -40,7 +40,7 @@ pub use omicsops_dto::{
 use omicsops_knowledge::{
     KnowledgeErrorV4, McpToolIndexV4, MemoryDocumentV4, SkillDocumentV4,
     authorize_mcp_read_only_target, authorize_mcp_use, freeze_skill, markdown_sections,
-    schema_digest, search_mcp_tools, search_memory, search_skills,
+    schema_digest, search_memory, search_skills,
 };
 use omicsops_mcp::McpSessionManager;
 use omicsops_process::background_command;
@@ -3931,6 +3931,21 @@ struct DesktopToolExecutorV4 {
     forced_route: Option<AgentRequestRouteV4>,
 }
 
+fn same_mcp_conversation_target(approved: &ToolCallV4, call: &ToolCallV4) -> bool {
+    approved.tool_id == "use_mcp_tool"
+        && call.tool_id == "use_mcp_tool"
+        && ["server_id", "catalog_sha256"].iter().all(|key| {
+            approved
+                .arguments
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|value| {
+                    !value.is_empty()
+                        && call.arguments.get(*key).and_then(Value::as_str) == Some(value)
+                })
+        })
+}
+
 fn mcp_result_failed(data: &Value) -> bool {
     data.get("result")
         .and_then(|result| result.get("isError"))
@@ -3952,7 +3967,7 @@ fn approved_read_only_mcp_target(entry: &McpToolIndexV4, call: &ToolCallV4) -> b
                     .get("schema_sha256")
                     .and_then(Value::as_str)
                     .is_some_and(|schema| {
-                        authorize_mcp_read_only_target(entry, catalog, schema, false).is_ok()
+                        authorize_mcp_read_only_target(entry, catalog, schema, true).is_ok()
                     })
             })
 }
@@ -4072,6 +4087,14 @@ impl DesktopToolExecutorV4 {
             .map_err(|error| error.to_string())?;
         let mut index = Vec::new();
         for profile in profiles {
+            let profile = crate::p1_commands::refresh_bundled_pubmed_profile(
+                &self.repository,
+                &self.mcp_sessions,
+                &self.credentials,
+                self.project_id,
+                profile,
+            )
+            .await?;
             for tool in &profile.tools {
                 let Some(name) = tool.get("name").and_then(Value::as_str) else {
                     continue;
@@ -4105,6 +4128,56 @@ impl DesktopToolExecutorV4 {
             }
         }
         Ok(index)
+    }
+
+    async fn conversation_mcp_approved(&self, call: &ToolCallV4) -> Result<bool, String> {
+        if call.tool_id != "use_mcp_tool" {
+            return Ok(false);
+        }
+        let index = self.mcp_tool_index().await?;
+        if !index.iter().any(|entry| {
+            entry.enabled
+                && entry.launch_approved
+                && call.arguments.get("server_id") == Some(&json!(entry.server_id))
+                && call.arguments.get("catalog_sha256") == Some(&json!(entry.tool_catalog_sha256))
+                && call.arguments.get("tool") == Some(&json!(entry.tool_name))
+        }) {
+            return Ok(false);
+        }
+        let events = self
+            .repository
+            .agent_events_for_context_v4(self.project_id, self.conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        for event in &events {
+            let AgentEventKindV4::ToolApprovalRequested { request } = &event.event else {
+                continue;
+            };
+            if !same_mcp_conversation_target(&request.call, call) {
+                continue;
+            }
+            let record = load_record(&self.repository, event.run_id).await?;
+            let hash = record
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.spec_hash.as_deref());
+            let run_events: Vec<_> = events
+                .iter()
+                .filter(|item| item.run_id == event.run_id)
+                .cloned()
+                .collect();
+            if run_has_approved_tool_call(
+                &run_events,
+                &request.call,
+                omicsops_protocol::RunModeV4::Execute,
+                hash,
+                None,
+                event.run_id,
+            )? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn run_approved_tool_call(&self, call: &ToolCallV4) -> Result<bool, String> {
@@ -4666,25 +4739,28 @@ impl DesktopToolExecutorV4 {
                 )
             }
             "search_mcp_tools" => {
-                let query = required(&call.arguments, "query")?;
-                let limit = call
-                    .arguments
-                    .get("limit")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(8) as usize;
-                let hits = search_mcp_tools(query, &self.mcp_tool_index().await?, limit);
-                let needs_run_approval = hits.iter().any(|hit| {
-                    hit.tool.configured
-                        && hit.tool.enabled
-                        && hit.tool.launch_approved
-                        && !hit.tool.tool_approved
-                });
-                let guidance = if needs_run_approval {
-                    "A matching MCP tool is configured and launch-approved but not persistently tool-approved. Call use_mcp_tool with its exact server_id, tool, catalog_sha256, schema_sha256, and arguments; the Host will request explicit schema+catalog-bound approval for this run. The third-party readOnlyHint is an unverified hint trusted by the user, not a Host guarantee. Do not replace literature MCP access with ad-hoc runtime HTTP code."
-                } else {
-                    "Call use_mcp_tool with the selected tool's exact server_id, tool, catalog_sha256, schema_sha256, and arguments. The third-party readOnlyHint is an unverified hint trusted by the user, not a Host guarantee."
-                };
-                let payload = json!({"tools":hits,"guidance":guidance});
+                let events = self
+                    .repository
+                    .agent_events_v4(self.run_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if let Some(mut prior) = events.iter().find_map(|event| match &event.event {
+                    AgentEventKindV4::ToolFinished { outcome }
+                        if outcome.tool_id == "search_mcp_tools" && outcome.succeeded =>
+                    {
+                        Some(outcome.clone())
+                    }
+                    _ => None,
+                }) {
+                    prior.call_id = call.call_id.clone();
+                    return Ok(prior);
+                }
+                let index = self.mcp_tool_index().await?;
+                let tools: Vec<_> = index
+                    .into_iter()
+                    .filter(|entry| entry.configured && entry.enabled)
+                    .collect();
+                let payload = json!({"tools":tools,"guidance":"This is the complete enabled MCP tool directory for this run. Select and filter these results; do not repeat tool discovery. This is a tool directory, not literature evidence. Copy the exact server_id, tool_name as tool, catalog and schema hashes. Retrieve actual records with use_mcp_tool. If none are suitable, report that limitation rather than repeatedly searching for unconfigured servers."});
                 (
                     serde_json::to_string(&payload).map_err(|error| error.to_string())?,
                     payload,
@@ -4716,15 +4792,20 @@ impl DesktopToolExecutorV4 {
                         (!require_read_only_hint).then(|| indexed.tool_catalog_sha256.clone())
                     })
                     .ok_or_else(|| "catalog_sha256 is required for Plan MCP calls".to_string())?;
+                let policy_approved = !require_read_only_hint
+                    && self.selection.approval_policy == ApprovalPolicyV4::RiskBased
+                    && approved_read_only_mcp_target(&indexed, call);
                 let schema_bound_run_approved = if require_read_only_hint {
                     self.run_approved_plan_tool_call(call).await?
                 } else {
                     self.run_approved_tool_call(call).await?
+                        || policy_approved
+                        || self.conversation_mcp_approved(call).await?
                 };
                 if !indexed.tool_approved && schema_bound_run_approved {
                     indexed.tool_approved = true;
                 }
-                if require_read_only_hint {
+                if require_read_only_hint || policy_approved {
                     authorize_mcp_read_only_target(
                         &indexed,
                         &expected_catalog,
@@ -4749,7 +4830,7 @@ impl DesktopToolExecutorV4 {
                         .unwrap_or_else(|| json!({})),
                     expected_catalog,
                     expected_schema.into(),
-                    require_read_only_hint,
+                    require_read_only_hint || policy_approved,
                     schema_bound_run_approved,
                 )
                 .await?;
@@ -5001,6 +5082,10 @@ impl DesktopToolExecutorV4 {
 
 #[async_trait]
 impl ToolExecutorV4 for DesktopToolExecutorV4 {
+    async fn conversation_target_approved(&self, call: &ToolCallV4) -> bool {
+        self.conversation_mcp_approved(call).await.unwrap_or(false)
+    }
+
     async fn risk_based_target_approved(&self, call: &ToolCallV4) -> bool {
         if call.tool_id != "use_mcp_tool" {
             return false;
@@ -5008,11 +5093,76 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
         let Ok(index) = self.mcp_tool_index().await else {
             return false;
         };
-        index
-            .iter()
-            .any(|entry| approved_read_only_mcp_target(entry, call))
+        index.iter().any(|entry| {
+            let mut target = call.clone();
+            target.arguments["catalog_sha256"] = json!(entry.tool_catalog_sha256);
+            target.arguments["schema_sha256"] = json!(entry.schema_sha256);
+            approved_read_only_mcp_target(entry, &target)
+        })
     }
     async fn prepare_call(&self, call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
+        if call.tool_id == "use_mcp_tool" {
+            let events = self
+                .repository
+                .agent_events_v4(self.run_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            if call
+                .arguments
+                .get("server_id")
+                .and_then(Value::as_str)
+                .is_some_and(|server| {
+                    omicsops_agent_core::failed_mcp_servers(&events).contains(server)
+                })
+            {
+                return Ok(Some(ToolOutcomeV4 { call_id:call.call_id.clone(),tool_id:call.tool_id.clone(),succeeded:false,model_content:"This MCP server failed twice in this run. No further call was dispatched. Report the blocker or use a different available source.".into(),data:json!({"error_kind":"mcp_retry_exhausted","operation_dispatched":false}),provenance:vec![] }));
+            }
+            let index = self.mcp_tool_index().await?;
+            let target = index.iter().find(|entry| {
+                call.arguments.get("server_id").and_then(Value::as_str)
+                    == Some(entry.server_id.to_string().as_str())
+                    && call.arguments.get("tool").and_then(Value::as_str)
+                        == Some(entry.tool_name.as_str())
+            });
+            if let Some(entry) = target {
+                let mut authorized = entry.clone();
+                authorized.tool_approved = true;
+                let catalog = call
+                    .arguments
+                    .get("catalog_sha256")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let schema = call
+                    .arguments
+                    .get("schema_sha256")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if let Err(error) = authorize_mcp_use(&authorized, catalog, schema) {
+                    return Ok(Some(ToolOutcomeV4 {
+                        call_id: call.call_id.clone(),
+                        tool_id: call.tool_id.clone(),
+                        succeeded: false,
+                        model_content: format!(
+                            "MCP request rejected before dispatch: {error}. Use the exact current target metadata below; do not repeat discovery."
+                        ),
+                        data: json!({"error_kind":"mcp_preflight","operation_dispatched":false,"recoverable":true,"current_target":entry}),
+                        provenance: vec![],
+                    }));
+                }
+            } else {
+                return Ok(Some(ToolOutcomeV4 {
+                    call_id: call.call_id.clone(),
+                    tool_id: call.tool_id.clone(),
+                    succeeded: false,
+                    model_content:
+                        "MCP target is not configured. Select from the existing tool directory."
+                            .into(),
+                    data: json!({"error_kind":"mcp_preflight","operation_dispatched":false,"recoverable":true}),
+                    provenance: vec![],
+                }));
+            }
+        }
+
         if let Some(outcome) = self.resources.before_call(call).await {
             return Ok(Some(outcome));
         }
@@ -8149,7 +8299,7 @@ mod tests {
         assert_eq!(error.as_deref(), Some("emit failed"));
     }
     #[test]
-    fn risk_based_mcp_requires_live_approval_and_exact_read_only_target() {
+    fn risk_based_mcp_approves_launch_authorized_read_only_targets_without_per_tool_prompt() {
         let mut entry = McpToolIndexV4 {
             server_id: Uuid::new_v4(),
             server_name: "papers".into(),
@@ -8180,7 +8330,7 @@ mod tests {
             assert!(!approved_read_only_mcp_target(&entry, &stale));
         }
         entry.tool_approved = false;
-        assert!(!approved_read_only_mcp_target(&entry, &call));
+        assert!(approved_read_only_mcp_target(&entry, &call));
         entry.tool_approved = true;
         entry.read_only_hint = None;
         assert!(!approved_read_only_mcp_target(&entry, &call));
@@ -8196,5 +8346,25 @@ mod tests {
         ));
         assert!(!mcp_result_failed(&json!({"result":{"isError":false}})));
         assert!(!mcp_result_failed(&json!({"result":{"content":[]}})));
+    }
+    #[test]
+    fn conversation_mcp_grant_covers_changed_queries_but_not_other_catalogs() {
+        let prior = ToolCallV4 {
+            call_id: "first".into(),
+            tool_id: "use_mcp_tool".into(),
+            arguments: json!({"server_id":"server","catalog_sha256":"catalog","tool":"search","arguments":{"query":"one"}}),
+        };
+        let mut next = prior.clone();
+        next.call_id = "next".into();
+        next.arguments["tool"] = json!("fetch");
+        next.arguments["arguments"] = json!({"pmids":["123"]});
+        assert!(same_mcp_conversation_target(&prior, &next));
+        for key in ["server_id", "catalog_sha256"] {
+            let mut changed = next.clone();
+            changed.arguments[key] = json!("changed");
+            assert!(!same_mcp_conversation_target(&prior, &changed));
+        }
+        next.tool_id = "runtime.execute".into();
+        assert!(!same_mcp_conversation_target(&prior, &next));
     }
 }

@@ -1401,6 +1401,7 @@ pub(crate) async fn invoke_configured_mcp_tool_v4(
     } {
         Ok(invocation) => invocation,
         Err(error) => {
+            let undispatched = mcp_error_before_dispatch(&error);
             let error = error.to_string();
             let stale = error.contains("stale")
                 || error.contains("schema changed")
@@ -1421,6 +1422,19 @@ pub(crate) async fn invoke_configured_mcp_tool_v4(
             let _ = repository
                 .put_json("mcp_server", &profile.id.to_string(), &profile)
                 .await;
+            if undispatched {
+                let audit_id = Uuid::new_v4();
+                repository.put_json("mcp_audit", &audit_id.to_string(), &json!({"id":audit_id,"project_id":project_id,"server":profile.name,"tool":tool,"succeeded":false,"operation_dispatched":false,"error":error,"timestamp":Utc::now()})).await.map_err(|error| error.to_string())?;
+                return Ok(McpResult {
+                    server_name: profile.name,
+                    capabilities: profile.capabilities,
+                    tools: profile.tools,
+                    audit_id,
+                    result: Some(
+                        json!({"isError":true,"operation_dispatched":false,"error_kind":"mcp_preflight","content":[{"type":"text","text":error}]}),
+                    ),
+                });
+            }
             return Err(error);
         }
     };
@@ -1461,4 +1475,108 @@ pub(crate) async fn invoke_configured_mcp_tool_v4(
         result: Some(invocation.result),
         audit_id,
     })
+}
+
+fn mcp_error_before_dispatch(error: &omicsops_mcp::McpRuntimeError) -> bool {
+    use omicsops_mcp::McpRuntimeError::*;
+    matches!(
+        error,
+        SchemaChanged
+            | Stale
+            | ToolNotFound(_)
+            | InvalidArguments
+            | ReadOnlyHintMissing
+            | ReadOnlyHintNotTrue
+    )
+}
+#[cfg(test)]
+mod dispatch_boundary_tests {
+    use super::*;
+    #[test]
+    fn schema_rejection_is_not_an_uncertain_dispatch_but_transport_is() {
+        use omicsops_mcp::McpRuntimeError::*;
+        for error in [
+            SchemaChanged,
+            Stale,
+            ToolNotFound("removed".into()),
+            InvalidArguments,
+            ReadOnlyHintMissing,
+            ReadOnlyHintNotTrue,
+        ] {
+            assert!(mcp_error_before_dispatch(&error));
+        }
+        for error in [
+            Transport("disconnected".into()),
+            Timeout(30),
+            Serialization("bad response".into()),
+        ] {
+            assert!(!mcp_error_before_dispatch(&error));
+        }
+    }
+}
+
+pub(crate) async fn refresh_bundled_pubmed_profile(
+    repository: &Store,
+    sessions: &McpSessionManager,
+    credentials: &dyn CredentialVault,
+    project_id: Uuid,
+    profile: McpServerProfile,
+) -> Result<McpServerProfile, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    if !is_bundled_pubmed_profile(&profile, &executable)
+        || !profile.enabled
+        || !profile.launch_approved
+    {
+        return Ok(profile);
+    }
+    let current = executable.to_string_lossy().into_owned();
+    if profile.command == current
+        && !profile.tools.is_empty()
+        && profile.tools.iter().all(|tool| {
+            tool.pointer("/annotations/readOnlyHint")
+                .and_then(Value::as_bool)
+                == Some(true)
+        })
+    {
+        return Ok(profile);
+    }
+    let _lock = sessions.lock_server(profile.id).await;
+    let mut updated = mcp_server_profile(repository, profile.id).await?;
+    if !updated.enabled
+        || !updated.launch_approved
+        || !is_bundled_pubmed_profile(&updated, &executable)
+    {
+        return Ok(updated);
+    }
+    updated.command = current;
+    let config = resolved_mcp_config(&updated, project_id, credentials)?;
+    sessions.invalidate_server(updated.id).await;
+    let inspected = sessions
+        .inspect(config)
+        .await
+        .map_err(|error| error.to_string())?;
+    updated.tools = inspected.tools;
+    updated.capabilities = inspected.capabilities;
+    updated.tool_catalog_sha256 = Some(inspected.tool_catalog_sha256);
+    updated.catalog_generation = inspected.generation;
+    updated.approved_tools.clear();
+    updated.status = "ready".into();
+    updated.last_error = None;
+    updated.last_inspected_at = Some(Utc::now());
+    updated.updated_at = Utc::now();
+    repository
+        .put_json("mcp_server", &updated.id.to_string(), &updated)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(updated)
+}
+fn is_bundled_pubmed_profile(profile: &McpServerProfile, executable: &std::path::Path) -> bool {
+    profile.args == ["--omicsops-pubmed-mcp"]
+        && [std::path::Path::new(&profile.command), executable]
+            .iter()
+            .all(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case("omicsops-desktop.exe"))
+            })
 }

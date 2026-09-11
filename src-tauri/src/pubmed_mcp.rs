@@ -238,16 +238,26 @@ impl PubMedClient {
     }
 
     async fn get_text(&self, url: Url) -> Result<String, PubMedClientError> {
-        self.http
-            .get(url)
+        let mut response = self
+            .http
+            .get(url.clone())
             .send()
             .await
-            .map_err(|error| PubMedClientError::Network(error.to_string()))?
+            .map_err(|error| PubMedClientError::Network(error.without_url().to_string()))?;
+        if let Some(anonymous) = anonymous_retry_url(response.status().as_u16(), &url) {
+            response = self
+                .http
+                .get(anonymous)
+                .send()
+                .await
+                .map_err(|error| PubMedClientError::Network(error.without_url().to_string()))?;
+        }
+        response
             .error_for_status()
-            .map_err(|error| PubMedClientError::Network(error.to_string()))?
+            .map_err(|error| PubMedClientError::Network(error.without_url().to_string()))?
             .text()
             .await
-            .map_err(|error| PubMedClientError::Network(error.to_string()))
+            .map_err(|error| PubMedClientError::Network(error.without_url().to_string()))
     }
 
     fn append_common_parameters(&self, url: &mut Url) {
@@ -269,6 +279,21 @@ impl PubMedClient {
 }
 
 // Optional keys copied from configuration templates must not become literal URL values.
+fn anonymous_retry_url(status: u16, url: &Url) -> Option<Url> {
+    if status != 400 || !url.query_pairs().any(|(key, _)| key == "api_key") {
+        return None;
+    }
+    let pairs: Vec<_> = url
+        .query_pairs()
+        .filter(|(key, _)| key != "api_key")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    let mut anonymous = url.clone();
+    anonymous.set_query(None);
+    anonymous.query_pairs_mut().extend_pairs(pairs);
+    Some(anonymous)
+}
+
 fn usable_ncbi_api_key(value: &str) -> Option<&str> {
     let value = value.trim();
     let upper = value.to_ascii_uppercase();
@@ -384,6 +409,7 @@ impl PubMedMcpServer {
 #[tool_router(server_handler)]
 impl PubMedMcpServer {
     #[tool(
+        annotations(read_only_hint = true),
         description = "Search PubMed and return paginated PMID metadata. This read-only tool does not download full text."
     )]
     async fn pubmed_search(
@@ -414,6 +440,7 @@ impl PubMedMcpServer {
     }
 
     #[tool(
+        annotations(read_only_hint = true),
         description = "Fetch PubMed abstract records by PMID using NCBI EFetch. Returns one status per requested PMID."
     )]
     async fn pubmed_fetch_records(
@@ -976,5 +1003,32 @@ mod tests {
             );
         }
         assert_eq!(usable_ncbi_api_key(" actual-key "), Some("actual-key"));
+    }
+    #[test]
+    fn invalid_key_retry_preserves_query_and_only_runs_once() {
+        let url = Url::parse("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=liver&api_key=invalid&retmax=20").unwrap();
+        let retry = anonymous_retry_url(400, &url).unwrap();
+        assert!(!retry.query_pairs().any(|(key, _)| key == "api_key"));
+        assert!(
+            retry
+                .query_pairs()
+                .any(|(key, value)| key == "term" && value == "liver")
+        );
+        assert!(anonymous_retry_url(400, &retry).is_none());
+        for status in [200, 401, 403, 429, 500] {
+            assert!(anonymous_retry_url(status, &url).is_none());
+        }
+    }
+    #[test]
+    fn bundled_tools_advertise_read_only_annotations() {
+        let tools = PubMedMcpServer::tool_router().list_all();
+        assert_eq!(tools.len(), 2);
+        for tool in tools {
+            let value = serde_json::to_value(tool).unwrap();
+            assert_eq!(
+                value.pointer("/annotations/readOnlyHint"),
+                Some(&serde_json::json!(true))
+            );
+        }
     }
 }

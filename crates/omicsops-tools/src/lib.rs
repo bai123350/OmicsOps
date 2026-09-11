@@ -24,6 +24,9 @@ pub trait ToolExecutorV4: Send + Sync {
     fn has_persistent_authorization(&self, _call: &ToolCallV4) -> bool {
         false
     }
+    async fn conversation_target_approved(&self, _call: &ToolCallV4) -> bool {
+        false
+    }
     async fn risk_based_target_approved(&self, _call: &ToolCallV4) -> bool {
         false
     }
@@ -247,6 +250,10 @@ impl ToolPortV4 for ToolRegistryV4 {
 
     fn has_persistent_authorization(&self, call: &ToolCallV4) -> bool {
         self.executor.has_persistent_authorization(call)
+    }
+    async fn conversation_target_approved(&self, call: &ToolCallV4) -> bool {
+        self.validate(RunModeV4::Execute, call).is_ok()
+            && self.executor.conversation_target_approved(call).await
     }
     async fn risk_based_target_approved(&self, call: &ToolCallV4) -> bool {
         self.validate(RunModeV4::Execute, call).is_ok()

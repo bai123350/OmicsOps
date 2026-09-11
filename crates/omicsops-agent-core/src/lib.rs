@@ -29,6 +29,49 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
+/// Stop invoking a server after two returned business failures; preflight rejections do not count.
+pub fn failed_mcp_servers(events: &[AgentEventV4]) -> std::collections::BTreeSet<String> {
+    let mut calls = std::collections::BTreeMap::new();
+    let mut failures = std::collections::BTreeMap::<String, usize>::new();
+    for event in events {
+        match &event.event {
+            AgentEventKindV4::ToolRequested { call } if call.tool_id == "use_mcp_tool" => {
+                if let Some(server) = call
+                    .arguments
+                    .get("server_id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    calls.insert(call.call_id.clone(), server.to_owned());
+                }
+            }
+            AgentEventKindV4::ToolFinished { outcome } if outcome.tool_id == "use_mcp_tool" => {
+                if let Some(server) = calls.get(&outcome.call_id) {
+                    if outcome.succeeded {
+                        failures.remove(server);
+                    } else if outcome
+                        .data
+                        .pointer("/result/isError")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                        && outcome
+                            .data
+                            .pointer("/result/operation_dispatched")
+                            .and_then(serde_json::Value::as_bool)
+                            != Some(false)
+                    {
+                        *failures.entry(server.clone()).or_default() += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    failures
+        .into_iter()
+        .filter_map(|(server, count)| (count >= 2).then_some(server))
+        .collect()
+}
+
 struct ModelTextPreviewGuard<'a> {
     store: &'a dyn EventStoreV4,
     run_id: Uuid,
@@ -215,6 +258,9 @@ pub trait ToolPortV4: Send + Sync {
         false
     }
     /// Host-verified approval of the concrete read-only target, never a model hint.
+    async fn conversation_target_approved(&self, _call: &ToolCallV4) -> bool {
+        false
+    }
     async fn risk_based_target_approved(&self, _call: &ToolCallV4) -> bool {
         false
     }
@@ -3211,7 +3257,9 @@ impl AgentCoreV4<'_> {
             .map(Ok)
             .unwrap_or_else(|| spec.calculate_spec_hash())
             .map_err(|error| AgentCoreErrorV4::Store(error.to_string()))?;
-        let reason = if is_browser_tool_id(&call.tool_id) {
+        let reason = if call.tool_id == "use_mcp_tool" {
+            "批准后，本对话中同一 MCP 服务器、同一工具目录的后续调用将复用授权；目录或服务器授权变化后需重新确认。"
+        } else if is_browser_tool_id(&call.tool_id) {
             "This call controls the user's real browser. Choose once, conversation, project, or global authorization; the grant remains bound to the exact capability, target host, browser session, and extension protocol version. Compute Full Access never bypasses this authorization."
         } else {
             approval_reason(effect)
@@ -3300,6 +3348,9 @@ impl AgentCoreV4<'_> {
             // durable exact binding may bypass the per-call card; otherwise
             // every browser capability requires explicit host approval.
             return Ok(!self.tools.has_persistent_authorization(call));
+        }
+        if call.tool_id == "use_mcp_tool" && self.tools.conversation_target_approved(call).await {
+            return Ok(false);
         }
         let Some(selection) = &spec.compute_selection else {
             return Ok(false);
@@ -3482,10 +3533,50 @@ impl AgentCoreV4<'_> {
         if spec.execution_kind == RunExecutionKindV4::OrdinaryAgent {
             system.push_str("\nThe ordinary run plan is an internal execution contract, not a user-approved workflow. Older generated discovery steps are historical guidance, not mandatory prerequisites; preserve its objective, completion criteria, capabilities and compute binding. Apply active_guidance as additional user instructions in their recorded order. Guidance does not expand tool capabilities, bypass approval, or change the frozen compute environment. Reconcile your approach and completion with this guidance before proposing completion.");
         }
+        system.push_str("\nCall search_mcp_tools at most once: it returns the complete enabled tool directory. Filter that directory locally; additional discovery queries cannot reveal unconfigured services.");
+        let discovered = events.iter().any(|event| matches!(&event.event, AgentEventKindV4::ToolFinished { outcome } if outcome.tool_id == "search_mcp_tools" && outcome.succeeded));
+        if discovered {
+            system.push_str("\nThe MCP directory has already been discovered. Filter that result and invoke its tools; do not repeat search_mcp_tools. Use agent.read_tool_result to read the original directory if compacted. Actual paper search, pagination and fetching records are separate from tool discovery.");
+        }
+        let blocked = failed_mcp_servers(events);
+        let servers: std::collections::BTreeSet<String> = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEventKindV4::ToolFinished { outcome }
+                    if outcome.tool_id == "search_mcp_tools" =>
+                {
+                    outcome
+                        .data
+                        .get("tools")
+                        .and_then(serde_json::Value::as_array)
+                }
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|tool| {
+                tool.get("server_id")
+                    .or_else(|| tool.pointer("/tool/server_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect();
+        let all_blocked =
+            !servers.is_empty() && servers.iter().all(|server| blocked.contains(server));
+        if !blocked.is_empty() {
+            system.push_str(&format!("\nMCP servers {:?} have failed twice. Do not retry these servers in this run, repeat discovery, or guess PMIDs. Use another available source or report the blocker with existing evidence.",blocked));
+        }
         ModelRequestV4 {
             system,
             context,
-            tools: self.tools.descriptors(RunModeV4::Execute),
+            tools: self
+                .tools
+                .descriptors(RunModeV4::Execute)
+                .into_iter()
+                .filter(|tool| {
+                    (!discovered || tool.id != "search_mcp_tools")
+                        && (!all_blocked || tool.id != "use_mcp_tool")
+                })
+                .collect(),
             image_refs: screenshot_image_refs(events),
         }
     }
@@ -11295,6 +11386,117 @@ mod tests {
                     .count(),
                 1
             );
+        }
+    }
+    struct DirectoryTools;
+    #[async_trait]
+    impl ToolPortV4 for DirectoryTools {
+        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
+            ["search_mcp_tools", "use_mcp_tool", "agent.read_tool_result"]
+                .into_iter()
+                .map(|id| ToolDescriptorV4 {
+                    id: id.into(),
+                    description: id.into(),
+                    input_schema: json!({}),
+                    effect: ToolEffectV4::ReadOnly,
+                })
+                .collect()
+        }
+        fn effect(&self, _: &str) -> Option<ToolEffectV4> {
+            Some(ToolEffectV4::ReadOnly)
+        }
+        async fn execute(&self, _: RunModeV4, _: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            unreachable!()
+        }
+    }
+    #[test]
+    fn discovered_directory_removes_only_discovery_not_actual_mcp_calls() {
+        let model = ScriptedModel(Mutex::new(vec![]));
+        let store = MemoryStore::default();
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &DirectoryTools,
+            events: &store,
+            science: None,
+        };
+        let spec = supervised_execution_spec(
+            Uuid::new_v4(),
+            ApprovalPolicyV4::RiskBased,
+            ComputeBackendKindV4::Local,
+        );
+        assert!(
+            core.execution_request(&spec, String::new(), &[])
+                .tools
+                .iter()
+                .any(|tool| tool.id == "search_mcp_tools")
+        );
+        let event = AgentEventV4::first(
+            spec.run_id,
+            spec.project_id,
+            spec.conversation_id,
+            Utc::now(),
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: "catalog".into(),
+                    tool_id: "search_mcp_tools".into(),
+                    succeeded: true,
+                    model_content: "directory".into(),
+                    data: json!({}),
+                    provenance: vec![],
+                },
+            },
+        );
+        let request = core.execution_request(&spec, "directory evidence".into(), &[event]);
+        assert!(
+            !request
+                .tools
+                .iter()
+                .any(|tool| tool.id == "search_mcp_tools")
+        );
+        assert!(request.tools.iter().any(|tool| tool.id == "use_mcp_tool"));
+        assert!(
+            request
+                .tools
+                .iter()
+                .any(|tool| tool.id == "agent.read_tool_result")
+        );
+        assert!(request.system.contains("do not repeat search_mcp_tools"));
+    }
+    #[test]
+    fn mcp_business_failures_stop_after_two_and_preflight_does_not_count() {
+        let mut events = vec![];
+        for n in 0..3 {
+            let call = ToolCallV4 {
+                call_id: n.to_string(),
+                tool_id: "use_mcp_tool".into(),
+                arguments: json!({"server_id":"server"}),
+            };
+            events.push(AgentEventV4::first(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Utc::now(),
+                AgentEventKindV4::ToolRequested { call: call.clone() },
+            ));
+            events.push(AgentEventV4::next(
+                events.last().unwrap(),
+                Utc::now(),
+                AgentEventKindV4::ToolFinished {
+                    outcome: ToolOutcomeV4 {
+                        call_id: call.call_id,
+                        tool_id: call.tool_id,
+                        succeeded: false,
+                        model_content: "failure".into(),
+                        data: if n == 0 {
+                            json!({"result":{"isError":true,"operation_dispatched":false}})
+                        } else {
+                            json!({"result":{"isError":true}})
+                        },
+                        provenance: vec![],
+                    },
+                },
+            ));
+            assert_eq!(failed_mcp_servers(&events).contains("server"), n == 2);
         }
     }
 }
