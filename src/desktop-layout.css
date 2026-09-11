@@ -1,0 +1,63 @@
+/* Compact logical dimensions; Windows continues to own display/DPI scaling. */
+:root { font-size: 13px; --desktop-header-height: 52px; }
+body { min-width: 0; }
+.science-shell.sidebar-collapsed { grid-template-columns: 220px minmax(0, 1fr); }
+.science-shell.sidebar-open { grid-template-columns: 220px minmax(0, 1fr) 320px; }
+.project-rail { padding: 12px 10px; }
+.science-brand { padding: 0 6px 12px; }
+.science-brand strong { font-size: 14px; }
+.brand-orbit { width: 30px; height: 30px; border-radius: 8px; }
+.rail-section { margin-top: 14px; }
+.rail-search, .new-session { padding: 7px 9px; }
+.project-row, .session-row { padding: 7px 8px; }
+.project-glyph { width: 26px; height: 26px; }
+.conversation-header { height: var(--desktop-header-height); padding: 0 18px; }
+.conversation-header h1 { font-size: 15px; }
+.conversation-header small { font-size: 11px; }
+.workspace-header-actions { gap: 10px; }
+.message-stream { padding: 20px max(20px, 6%); }
+.composer { padding: 8px 16px 12px; }
+.composer-runtime-bar { gap: 5px; padding: 4px 6px; margin-bottom: 7px; border-radius: 10px; }
+.runtime-host { font-size: 12px; }
+.runtime-host, .runtime-pill { gap: 6px; padding: 4px 6px; }
+.composer-input { padding: 12px; border-radius: 14px; }
+.composer textarea { min-height: 52px; max-height: 180px; font-size: 13px; }
+.composer-input > .composer-toolbar { gap: 6px; margin-top: 6px; }
+.composer-tool { width: 30px; height: 30px; }
+.composer-model { height: 30px; padding: 0 10px; }
+.composer .send-button { width: 32px; height: 32px; flex-basis: 32px; }
+.send-options { height: 30px; padding: 0 7px; }
+.context-meter { padding: 4px 3px; }
+.sidebar-section-menu { width: 224px; max-height: min(320px, calc(100dvh - 112px)); }
+.sidebar-section-menu button { padding: 8px 10px; font-size: 13px; }
+.composer-add-menu, .permission-menu, .composer-compute-menu, .model-menu { border-radius: 10px; }
+.compose-actions button { padding: 7px 5px; gap: 9px; }
+.compose-action-icon { width: 28px; height: 28px; border-radius: 7px; }
+.permission-menu > button.agent-control-row { padding: 9px; }
+.library-topbar { height: var(--desktop-header-height); padding: 0 22px; }
+.library-main { max-width: 1000px; padding: 32px 28px; }
+.library-hero { margin-bottom: 28px; }
+.library-hero h1 { font-size: 28px; }
+.library-hero p { font-size: 13px; }
+.section-title { margin-top: 24px; }
+.template-card { min-height: 92px; padding: 14px; gap: 10px; }
+.template-icon { width: 34px; height: 34px; border-radius: 8px; }
+.settings-backdrop { padding: 18px; }
+.settings-panel { width: min(840px, 96vw); height: min(580px, 92vh); }
+.settings-panel > header { height: 56px; padding: 0 16px; }
+.settings-panel h2 { font-size: 17px; }
+.settings-layout { grid-template-columns: 180px minmax(0, 1fr); height: calc(100% - 56px); }
+.settings-layout > nav { padding: 10px 8px; overflow-y: auto; }
+.settings-layout > nav button { padding: 8px; }
+.settings-layout > main { padding: 18px; }
+.create-project-dialog { width: min(660px, 94vw); }
+.create-project-dialog > header { height: 56px; }
+@media (max-width: 1050px) {
+  .science-shell.sidebar-collapsed, .science-shell.sidebar-open { grid-template-columns: 200px minmax(0, 1fr); }
+  .workspace-sidebar { top: var(--desktop-header-height); width: min(320px, 100vw); }
+}
+@media (max-height: 620px) {
+  .message-stream { padding-top: 14px; padding-bottom: 14px; }
+  .session-list { max-height: 28vh; }
+  .library-main { padding-top: 24px; }
+}

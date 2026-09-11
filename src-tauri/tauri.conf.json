@@ -11,10 +11,11 @@
     "windows": [
       {
         "title": "OmicsOps",
-        "width": 1440,
-        "height": 920,
-        "minWidth": 1120,
-        "minHeight": 720
+        "width": 1100,
+        "height": 680,
+        "minWidth": 900,
+        "minHeight": 560,
+        "center": true
       }
     ],
     "security": {
