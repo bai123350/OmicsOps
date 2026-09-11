@@ -1537,6 +1537,13 @@ pub(crate) async fn refresh_bundled_pubmed_profile(
                 .and_then(Value::as_bool)
                 == Some(true)
         })
+        && profile.tools.iter().any(|tool| {
+            tool.get("name").and_then(Value::as_str) == Some("pubmed_search")
+                && tool
+                    .pointer("/inputSchema/properties/query/maxLength")
+                    .and_then(Value::as_u64)
+                    == Some(500)
+        })
     {
         return Ok(profile);
     }

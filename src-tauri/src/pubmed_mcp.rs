@@ -375,7 +375,10 @@ pub struct PubMedRecordResult {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PubMedSearchParams {
-    #[schemars(description = "PubMed query, for example: single-cell RNA-seq tumor")]
+    #[schemars(
+        length(min = 1, max = 500),
+        description = "PubMed query: 1-500 printable characters, no line breaks. Keep Boolean queries concise; filter returned records locally."
+    )]
     pub query: String,
     #[schemars(description = "1-based result page; defaults to 1")]
     pub page: Option<usize>,
@@ -428,7 +431,9 @@ impl PubMedMcpServer {
                     ))
                 })
         }) {
-            return Err(McpError::invalid_params(error.to_string(), None));
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                error.to_string(),
+            )]));
         }
         let start = page.saturating_sub(1).saturating_mul(limit);
         match self.client.search(query, start, limit).await {
@@ -448,7 +453,9 @@ impl PubMedMcpServer {
         Parameters(params): Parameters<PubMedFetchParams>,
     ) -> Result<CallToolResult, McpError> {
         if let Err(error) = validate_fetch_params(&params.pmids) {
-            return Err(McpError::invalid_params(error.to_string(), None));
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                error.to_string(),
+            )]));
         }
         match self.client.fetch_records(&params.pmids).await {
             Ok(result) => json_tool_result(&result),
@@ -481,7 +488,7 @@ fn validate_fetch_params(pmids: &[String]) -> Result<(), PubMedClientError> {
 }
 
 fn validate_query(query: &str) -> Result<(), PubMedClientError> {
-    if query.is_empty() || query.len() > 500 || query.chars().any(char::is_control) {
+    if query.is_empty() || query.chars().count() > 500 || query.chars().any(char::is_control) {
         return Err(PubMedClientError::InvalidInput(
             "query must contain 1-500 printable characters".into(),
         ));
@@ -928,6 +935,35 @@ mod tests {
                 .fetch_url(&vec!["1".into(); MAX_FETCH_RECORDS + 1])
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_search_returns_tool_failure_without_protocol_error() {
+        let server =
+            PubMedMcpServer::new(PubMedClient::new(PubMedClientConfig::default()).unwrap());
+        for query in ["x".repeat(603), String::new(), "a\nb".into()] {
+            let result = server
+                .pubmed_search(Parameters(PubMedSearchParams {
+                    query,
+                    page: None,
+                    limit: None,
+                }))
+                .await;
+            assert!(
+                result.is_ok(),
+                "invalid query should be a failed tool result"
+            );
+            assert_eq!(result.unwrap().is_error, Some(true));
+        }
+    }
+
+    #[test]
+    fn query_schema_and_validation_use_character_bounds() {
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(PubMedSearchParams)).unwrap();
+        assert_eq!(schema["properties"]["query"]["maxLength"], 500);
+        assert_eq!(schema["properties"]["query"]["minLength"], 1);
+        assert!(validate_query(&"肝".repeat(500)).is_ok());
+        assert!(validate_query(&"肝".repeat(501)).is_err());
     }
 
     #[test]

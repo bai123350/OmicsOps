@@ -556,6 +556,16 @@ describe("WorkspaceShell", () => {
     expect(resolve).toHaveBeenCalledWith("run-uncertain", "call-1", "side_effect_not_observed", "远端输出文件不存在");
   });
 
+  it("shows legacy MCP uncertainty as failure without a side-effect form", () => {
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-mcp-error" onResolveUncertainV4={vi.fn()} agentRunEventsV4={[{
+      schema_version: 4, run_id: "run-mcp-error", project_id: project.id, conversation_id: "conversation-1", sequence: 1, occurred_at: "2026-08-17T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "tool_dispatch_uncertain", call_id: "call-1", tool_id: "use_mcp_tool" },
+    }, { schema_version: 4, run_id: "run-mcp-error", project_id: project.id, conversation_id: "conversation-1", sequence: 2, occurred_at: "2026-08-17T00:00:01Z", previous_hash: "hash", event_hash: "hash2", event: { kind: "run_needs_attention", message: "MCP error: -32602: query exceeds limit" } }]} />);
+    expect(screen.queryByRole("textbox", { name: "核验证据" })).not.toBeInTheDocument();
+    expect(screen.queryByText("工具状态不确定")).not.toBeInTheDocument();
+    expect(screen.getByText("工具调用失败")).toBeInTheDocument();
+    expect(screen.getByText(/失败 · 1 个步骤/)).toBeInTheDocument();
+  });
+
   it("renders user and assistant messages as safe GFM markdown", () => {
     render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} messages={[
       { id: "user-md", role: "user", markdown: "**检查**矩阵" },
