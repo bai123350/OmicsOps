@@ -39,6 +39,7 @@ import type {
   McpResult,
   McpEnvBinding,
   McpServerProfile,
+  BundledMcpPreset,
 } from "./types";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
@@ -222,6 +223,14 @@ export async function callMcpTool(request: { project_id: string; name: string; c
 
 export async function listMcpServers(): Promise<McpServerProfile[]> {
   return isTauri() ? invoke("list_mcp_servers") : [];
+}
+
+export async function listBundledMcpPresets(): Promise<BundledMcpPreset[]> {
+  return isTauri() ? invoke("list_bundled_mcp_presets") : [];
+}
+
+export async function addBundledMcpServer(request: { preset_id: string }): Promise<McpServerProfile> {
+  return invoke("add_bundled_mcp_server", { request });
 }
 
 export interface SaveMcpServerRequest {

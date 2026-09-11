@@ -12,6 +12,22 @@ use omicsops_protocol::{ComputeSelectionV4, ExecutionPlanV4};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// A compiled scientific MCP domain; catalog inspection never starts a process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BundledMcpPreset {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub description_zh: String,
+    pub tool_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddBundledMcpServerRequest {
+    pub preset_id: String,
+}
+
 /// Transient public output snapshot. None clears an unfinished preview.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTextPreviewV4 {

@@ -452,7 +452,7 @@ fn resolved_mcp_config(
     .map_err(|error| error.to_string())
 }
 
-fn mcp_profile_from_request(
+pub(crate) fn mcp_profile_from_request(
     request: SaveMcpServerRequest,
     existing: Option<&McpServerProfile>,
     now: chrono::DateTime<Utc>,

@@ -1,6 +1,8 @@
 pub mod agent_commands;
 pub mod agent_v4;
+pub mod bio_mcp;
 pub mod browser_commands;
+pub mod bundled_mcp_commands;
 pub mod commands;
 pub mod conversation_mode;
 #[cfg(test)]
@@ -85,6 +87,23 @@ pub fn run() {
                     &bundled_skills_root,
                 )
                 .await?;
+                let packaged_wisp = app
+                    .path()
+                    .resource_dir()
+                    .map_err(|error| error.to_string())?
+                    .join("skills")
+                    .join("wisp-science");
+                let development_wisp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join("skills")
+                    .join("wisp-science");
+                let wisp_root = if packaged_wisp.is_dir() {
+                    packaged_wisp
+                } else {
+                    development_wisp
+                };
+                skill_commands::install_bundled_skills(&repository, &skills_root, &wisp_root)
+                    .await?;
                 if let Some(value) = repository
                     .browser_settings()
                     .await
@@ -157,6 +176,8 @@ pub fn run() {
             p1_commands::list_mcp_servers,
             p1_commands::save_mcp_server,
             p1_commands::add_pubmed_mcp_server,
+            bundled_mcp_commands::list_bundled_mcp_presets,
+            bundled_mcp_commands::add_bundled_mcp_server,
             p1_commands::set_mcp_server_enabled,
             p1_commands::set_mcp_launch_approval,
             p1_commands::inspect_configured_mcp_server,

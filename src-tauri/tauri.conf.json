@@ -27,6 +27,9 @@
     "targets": ["nsis", "msi"],
     "resources": {
       "../skills/single-cell/": "skills/single-cell/",
+      "../skills/wisp-science/": "skills/wisp-science/",
+      "../LICENSE": "licenses/AGPL-3.0.txt",
+      "../crates/omicsops-bio/UPSTREAM.md": "licenses/omicsops-bio-UPSTREAM.md",
       "../browser-extension/asset-stager.js": "browser-extension/asset-stager.js",
       "../browser-extension/chrome-api.js": "browser-extension/chrome-api.js",
       "../browser-extension/command-router.js": "browser-extension/command-router.js",

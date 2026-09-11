@@ -1,0 +1,666 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/xuzhougeng/wisp-science",
+  "commit": "3628a4209e494ba6fbef1095bb964782f7d2c430",
+  "retrieved_at": "2026-09-11",
+  "license": "AGPL-3.0-only, with per-file Apache-2.0 declarations",
+  "license_files": [
+    "LICENSE.upstream",
+    "Apache-2.0.upstream.txt",
+    "THIRD_PARTY_LICENSES.md"
+  ],
+  "packages": [
+    {
+      "name": "agent-infini",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "path": "agent-infini/SKILL.md",
+          "sha256": "b49aab70c3f0d96d6549ff3312e41568a13f623e7ed35248c51ea1b1bc913268"
+        }
+      ]
+    },
+    {
+      "name": "analysis-workflow",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "path": "analysis-workflow/SKILL.md",
+          "sha256": "1b6c9c1bcdb8fda80b8ecf00905e1f9915a717a7e8211338233b7769c20fe08c"
+        }
+      ]
+    },
+    {
+      "name": "audit-biomedical-paper-evidence",
+      "license": "AGPL-3.0-only (repository default)",
+      "files": [
+        {
+          "path": "audit-biomedical-paper-evidence/evals/rubric.json",
+          "sha256": "d6de2aa998cef939cb299ce177fffcef484c51a0c3bcfbff8c684e16a68db1fc"
+        },
+        {
+          "path": "audit-biomedical-paper-evidence/evals/task-cases.json",
+          "sha256": "7d767a44f76baf02e0100b4b0582a952fd9a6b57d0f67e9fe684c71be26de102"
+        },
+        {
+          "path": "audit-biomedical-paper-evidence/evals/trigger-cases.json",
+          "sha256": "b494349f976d5b3cf81ab31749ad7a0dbed4b07879eb001f15c35ba719efa015"
+        },
+        {
+          "path": "audit-biomedical-paper-evidence/references/evidence-audit-framework.md",
+          "sha256": "27c994b4326fb22f69eb3556d2d92bc629a1741492883a51506afd6f2901f909"
+        },
+        {
+          "path": "audit-biomedical-paper-evidence/references/method-audit-patterns.md",
+          "sha256": "514be408fd02731e61ff67e824ce9fc61900b22c2bc414874f2b43276362578f"
+        },
+        {
+          "path": "audit-biomedical-paper-evidence/SKILL.md",
+          "sha256": "1f9b9dd61feb6c54bb4faafa4bb6f8f8d43295927e01a3dee3bf67ccd68cd223"
+        }
+      ]
+    },
+    {
+      "name": "browser-use",
+      "license": "AGPL-3.0-only (repository default)",
+      "files": [
+        {
+          "path": "browser-use/SKILL.md",
+          "sha256": "20d3bf10dd06764d866732b5e61aba95ad91e7a5e89cb8986d71cf6f7e7dff8b"
+        }
+      ]
+    },
+    {
+      "name": "compute-env-setup",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "path": "compute-env-setup/references/envs_reference.md",
+          "sha256": "a9657c3c926cc10e6c2018f8642a0d29cdac10017dc5a00d9d7e47f34639420d"
+        },
+        {
+          "path": "compute-env-setup/SKILL.md",
+          "sha256": "a9b8d56b339cc143e2de8ed092dbc53b8da38777726e662214287d8de420ca82"
+        }
+      ]
+    },
+    {
+      "name": "custom-theme",
+      "license": "AGPL-3.0-only (repository default)",
+      "files": [
+        {
+          "path": "custom-theme/SKILL.md",
+          "sha256": "2810194aa183f599c366bb2415fb7212762d46ddc979e457ed0cd593f90d51c1"
+        }
+      ]
+    },
+    {
+      "name": "customize",
+      "license": "AGPL-3.0-only (repository default)",
+      "files": [
+        {
+          "path": "customize/SKILL.md",
+          "sha256": "a0006ccf07d205a8c1f6a86b46a039181dddefaa37a06d905f046d84cb7cb5f8"
+        }
+      ]
+    },
+    {
+      "name": "distill-concept-books",
+      "license": "AGPL-3.0-only (repository default)",
+      "files": [
+        {
+          "path": "distill-concept-books/agents/openai.yaml",
+          "sha256": "4c57a51466abb0780335a7a0f0ae0bf5218b38a9fd7eef52cc0bca4852261b36"
+        },
+        {
+          "path": "distill-concept-books/assets/templates/brief.md",
+          "sha256": "f94e7e59e8f154a7e80c7c29982a179d1999ad2d58b94330408fbff7c9028759"
+        },
+        {
+          "path": "distill-concept-books/assets/templates/candidate-SKILL.md",
+          "sha256": "3e817ac593551159d9a8d2159040a848311a05254c5b41781daaa2ae9c0f0ae3"
+        },
+        {
+          "path": "distill-concept-books/assets/templates/candidates.md",
+          "sha256": "287f381b62cf3cb43e8b111c9a2b068473b55136f7af5ab346059a9adb45786d"
+        },
+        {
+          "path": "distill-concept-books/assets/templates/capability-rules.yml",
+          "sha256": "f2fc44b01bfa841dd1db62d656fe93b32881cd353f7fbbaf8378f3fb767cf9ca"
+        },
+        {
+          "path": "distill-concept-books/assets/templates/concept-map.md",
+          "sha256": "a52f8095006be23de85afb0cb50a49bec32b7c8292e33093fe4920e6a8bc0013"
+        },
+        {
+          "path": "distill-concept-books/assets/templates/concept-map.yml",
+          "sha256": "3a2afd0172b69f342da1f40160e103bd957c6fcda940b3961792bb14613b17dc"
+        },
+        {
+          "path": "distill-concept-books/assets/templates/context-checkpoint.yml",
+          "sha256": "4cc99bdd2a3cc8dcd06e8413ed586c39350ee0ab8f8b4f9eaa4eaf6a53f8f505"
+        },
+        {
+          "path": "distill-concept-books/assets/templates/correction-overlay.yml",
+          "sha256": "3f3eda8c2e27c6ab0e27630a736da89fdbfa1a3dcd8e8eabc290c86286c57c7e"
+        },
+        {
+          "path": "distill-concept-books/assets/templates/decisions.md",
+          "sha256": "e8fc30cf6703f35c3d8b61cff7087b180fb52bd2ab2dc770569afaa61181087c"
+        },
+        {
+          "path": "distill-concept-books/assets/templates/eval-runs.yml",
+          "sha256": "ad4934971d58d6829b72070a28254959ff707f32ce6c2fc4fd14a324198124cd"
+        },
+        {
+          "path": "distill-concept-books/assets/templates/evidence-ledger.yml",
+          "sha256": "c12f344061361173b7c490cca95affe0edc05e85d76e66a73c44f082829524a6"
+        },
+        {
+          "path": "distill-concept-books/assets/templates/gate-decisions.yml",
+          "sha256": "d77dc29e2a5a7a76680679bd6a69c5f9e2fb46da6a9746629a03b2f031c3e1ab"
+        },
+        {
+          "path": "distill-concept-books/assets/templates/overview.md",
+          "sha256": "14dcdac752d9bfc46d37c9c448b08d5b6c4112bb465600ccd43e611990bee27d"
+        },
+        {
+          "path": "distill-concept-books/assets/templates/source-map.md",
+          "sha256": "8dcccdfcb9fdae090043c5fa8cd32e23bddaa477c0690449b3af2accb1309aaf"
+        },
+        {
+          "path": "distill-concept-books/assets/templates/sources.yml",
+          "sha256": "d87cafbc5861a2f2a0dc1de309bc7fad31edf03985c8c55d280f75d48eb975a4"
+        },
+        {
+          "path": "distill-concept-books/assets/templates/task-contract.yml",
+          "sha256": "ce339b850121800212c83fd9195628a9d752342d1a98382d7752cc16bb5a7139"
+        },
+        {
+          "path": "distill-concept-books/assets/templates/task-coverage.yml",
+          "sha256": "db63dadbbdb0603c6f9f4a5cbaa4d07bfa3512b409d9b8474417f117842c12bb"
+        },
+        {
+          "path": "distill-concept-books/evals/task-cases.json",
+          "sha256": "521de164913aeabfe81425981f1b54b76e387fd907aa7185dee6bf9826ff1f0f"
+        },
+        {
+          "path": "distill-concept-books/evals/trigger-cases.json",
+          "sha256": "8327b5c20057d0ac23f8aa88b450237ef8cf67a2ad382f1ed29997988e811238"
+        },
+        {
+          "path": "distill-concept-books/references/book-centered-evidence-policy.md",
+          "sha256": "1a94d83d1959d561d8ffdc33e8d014767072adf4edc35ab217e7ed5dba66f80c"
+        },
+        {
+          "path": "distill-concept-books/references/book-types-and-boundaries.md",
+          "sha256": "d60674f686eb9ee7d5be8b2bf81be05c093153e927957abdaf78d0c95fad1b3e"
+        },
+        {
+          "path": "distill-concept-books/references/candidate-splitting.md",
+          "sha256": "b67ead4d13ee25ab03a7625c0fcce41412f1822ca0e2d99758841600778152d4"
+        },
+        {
+          "path": "distill-concept-books/references/input-output-contract.md",
+          "sha256": "19d46bedffd72127138425afc6906407b98e431356b765d7da2a77f0f7d7c48c"
+        },
+        {
+          "path": "distill-concept-books/references/knowledge-model.md",
+          "sha256": "a00ee1ceca1a829d964492742d27298dbbd1e4c777486d7ad50ab498c06c440b"
+        },
+        {
+          "path": "distill-concept-books/references/rights-and-private-processing.md",
+          "sha256": "8b3f8b9cd43a9f11a65a6016fe0c635150b8d9a503e791a0a059da7ed1a8fe9f"
+        },
+        {
+          "path": "distill-concept-books/references/source-neutral-method-distillation.md",
+          "sha256": "d1b372cf4f321cc81cb90e1d41abd28a0cd18722b19b26c9622e65e9e34648fc"
+        },
+        {
+          "path": "distill-concept-books/references/source-quality-preflight.md",
+          "sha256": "cee22c1b8b74bbfd238d490e997926d21d756e6c24a7a501bb53491637a06dad"
+        },
+        {
+          "path": "distill-concept-books/references/task-contract-and-drift-control.md",
+          "sha256": "59fc8377da618ceef3bdeea3c73b4a3f4dfa2ae8a55c6b1f5cf64b1386ed508a"
+        },
+        {
+          "path": "distill-concept-books/references/validation-contract.md",
+          "sha256": "f6299bcb48bb59eab57ff0d720739f0f482dd8be77d4875adc5fea022d017964"
+        },
+        {
+          "path": "distill-concept-books/scripts/audit_candidate_disclosure.py",
+          "sha256": "94c5f402c230637f427fd56ca3209ec5c5ee97eea046c38e150ef77812b2e4fe"
+        },
+        {
+          "path": "distill-concept-books/scripts/hash_candidate_tree.py",
+          "sha256": "ebcd966eea7ef1e12a4eb8b321e578d39129775360b438794c3f1791696025c1"
+        },
+        {
+          "path": "distill-concept-books/scripts/inspect_distillation_state.py",
+          "sha256": "a295222235fe439fdf3f32b84df0afde07fac9f8f5bcffb30099a88745a07c6f"
+        },
+        {
+          "path": "distill-concept-books/scripts/normalize_docx_source.py",
+          "sha256": "8067fca39fa36791bbd69657e48416684763be59244be3e3d9f04be98d3d0a57"
+        },
+        {
+          "path": "distill-concept-books/scripts/ocr_book_source.py",
+          "sha256": "a41acbce8e3879b9207574e37ff95194f12f33f8590c328e5c63f0aaf5a4f080"
+        },
+        {
+          "path": "distill-concept-books/scripts/task_contracts.py",
+          "sha256": "a8eacd8505ee209d1015c7bcda764b0fe0e9ed3d54e518f2f1a2522e7b1280b1"
+        },
+        {
+          "path": "distill-concept-books/scripts/test_audit_candidate_disclosure.py",
+          "sha256": "f6b139121221fae6f252c1bc4e50a328b9d16b3a10355f8eab13a25a2758e02c"
+        },
+        {
+          "path": "distill-concept-books/scripts/test_hash_candidate_tree.py",
+          "sha256": "ea1a5006ba119ba49c28883a1b005d1cf713c817e739291f68c7c0c23c30846b"
+        },
+        {
+          "path": "distill-concept-books/scripts/test_inspect_distillation_state.py",
+          "sha256": "25e7c0c95588522c34d40108150bb3be52db864f6ec6a0c10dd6750da2d4f83c"
+        },
+        {
+          "path": "distill-concept-books/scripts/test_normalize_docx_source.py",
+          "sha256": "86902de7ffe66978ef09e0a623621a586c3f4a45551a4afc1e6a6f33d80327ef"
+        },
+        {
+          "path": "distill-concept-books/scripts/test_ocr_book_source.py",
+          "sha256": "0771e7c9280347d3553ce508eea1e0fbc64867623ecda7f79c09a7bc57fca2ef"
+        },
+        {
+          "path": "distill-concept-books/scripts/test_validate_distillation.py",
+          "sha256": "4f35130adf20a18d04669414a806bbb3d15f1fb21d270c0a2f2e7a3db3abf821"
+        },
+        {
+          "path": "distill-concept-books/scripts/test_verify_normalized_locators.py",
+          "sha256": "a486baf77879455960d7cc658d94deaa6d2e623948d65268a66367bc076b8cec"
+        },
+        {
+          "path": "distill-concept-books/scripts/validate_distillation.py",
+          "sha256": "3e7f527c40595ce25576b31d5a1fcb8b322f59bc741a0337022743365b485e68"
+        },
+        {
+          "path": "distill-concept-books/scripts/verify_normalized_locators.py",
+          "sha256": "623faf7bd576f553af8a392ffd9f44ef129419c0e79cff8f3603b0c74bffd94c"
+        },
+        {
+          "path": "distill-concept-books/scripts/verify_ocr_locators.py",
+          "sha256": "cd35df3483f984e52f89ff70eba9127b3468475ca54191f96b423c5a6eb6a52d"
+        },
+        {
+          "path": "distill-concept-books/SKILL.md",
+          "sha256": "e281b1ed18f882a973c16d54466c68e16ef9ad4cdd7ea3fd9a9c90cfa8e9d2ff"
+        }
+      ]
+    },
+    {
+      "name": "figure-composer",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "path": "figure-composer/runtime.py",
+          "sha256": "1d22e7fc7b3ad3ecef85bb759515c87942894056d2646bf887724e7ce9c59667"
+        },
+        {
+          "path": "figure-composer/SKILL.md",
+          "sha256": "b48131f15091ca554ae7557590abad6c88229c68d015324cf47f45ecee0fd87a"
+        }
+      ]
+    },
+    {
+      "name": "figure-duplicate-audit",
+      "license": "AGPL-3.0-only (repository default)",
+      "files": [
+        {
+          "path": "figure-duplicate-audit/references/review-protocol.md",
+          "sha256": "bae0c3e4132e451d5955d1fa143ba041cb6eedfaa2dfb910421e3cdb80e70eac"
+        },
+        {
+          "path": "figure-duplicate-audit/scripts/audit_figures.py",
+          "sha256": "50e631ffb2b86a4966e9cf893a1324ead2d31e8b200ee7ea9987234c614596a7"
+        },
+        {
+          "path": "figure-duplicate-audit/SKILL.md",
+          "sha256": "2453c292cea5ccf254d1c5366a7eaa84a324b696f7435b2c1a72eab69a335b57"
+        },
+        {
+          "path": "figure-duplicate-audit/tests/fixtures/known-reuse-panels.json",
+          "sha256": "e54ce683de5c9afc40729618ba7f4a5c3dc29844a8b590ef10b150f17275b129"
+        },
+        {
+          "path": "figure-duplicate-audit/tests/test_audit_figures.py",
+          "sha256": "25c5bae74af40d899591afb1e02cb49e91b66cdb076823da479dcee9a5e3e1e2"
+        }
+      ]
+    },
+    {
+      "name": "figure-style",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "path": "figure-style/runtime.py",
+          "sha256": "0eb7d2733fb1f255c50abb075af761d36278596afec44fb98e0fbaf6a942271f"
+        },
+        {
+          "path": "figure-style/SKILL.md",
+          "sha256": "aa656486a874288cfd0099b70e6b2fac16f5e4dd441fae0426f68035127856af"
+        }
+      ]
+    },
+    {
+      "name": "indication-dossier",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "path": "indication-dossier/references/phases.md",
+          "sha256": "a12607edf4eeea6d17f976ec5e1dc7b734eba0e0ae5caf9f1d25eaa7d211f657"
+        },
+        {
+          "path": "indication-dossier/references/standards.md",
+          "sha256": "3dcb3e6f77ab1a9440b9daacab080bd552ed44ad4356a05e815722b63aa732a3"
+        },
+        {
+          "path": "indication-dossier/references/waypoints.md",
+          "sha256": "180632fd1bc9224793ec1b611e963eb4c14dc17ffb4adf157baea2619bb5ebb2"
+        },
+        {
+          "path": "indication-dossier/SKILL.md",
+          "sha256": "46c0d213d29c45b0e4c9d0bf7c6bdcc0ba99a8099c3c046a2a53732c9d27ef1d"
+        }
+      ]
+    },
+    {
+      "name": "journal-club-ppt",
+      "license": "AGPL-3.0-only (repository default)",
+      "files": [
+        {
+          "path": "journal-club-ppt/SKILL.md",
+          "sha256": "5af66753687e36eabb6649a74f72c5060e87efabdc158dd43b278e4f7708b673"
+        }
+      ]
+    },
+    {
+      "name": "literature-review",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "path": "literature-review/runtime.py",
+          "sha256": "529b0c04b6467b33fc422122653a864b5e629fe3c5e3661c7668fe4a2b1d6470"
+        },
+        {
+          "path": "literature-review/SKILL.md",
+          "sha256": "2540eb798eca377139c67693791aa4697dd27a08c36160045d47a1f07983a7e6"
+        }
+      ]
+    },
+    {
+      "name": "local-env-setup",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "path": "local-env-setup/SKILL.md",
+          "sha256": "23cae1b84f0c52fd321ead2e25440c7beab8b83bfed593a566f89d3b037e7c9a"
+        }
+      ]
+    },
+    {
+      "name": "paper-narrative",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "path": "paper-narrative/runtime.py",
+          "sha256": "9560ad5741d22f2b651360c4eed577c8fbcccb72efb145c58e5d598f0e2187b5"
+        },
+        {
+          "path": "paper-narrative/SKILL.md",
+          "sha256": "5227cfe656d4c0a065b200b1781d3150e8f4cb855bfb7c850591ce5163ab1c7a"
+        }
+      ]
+    },
+    {
+      "name": "pdf-explore",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "path": "pdf-explore/runtime.py",
+          "sha256": "28a73c1f1c53245adb7bb2950d0b71e71b53902f7603f7023c43eeca87b092bf"
+        },
+        {
+          "path": "pdf-explore/SKILL.md",
+          "sha256": "3521a67cf36310c65940b6c5c837a50a015f0d6f2ce4c1ad29d39e8d8d49fdf6"
+        }
+      ]
+    },
+    {
+      "name": "pixi-environment-builder",
+      "license": "AGPL-3.0-only (repository default)",
+      "files": [
+        {
+          "path": "pixi-environment-builder/SKILL.md",
+          "sha256": "9a302a29fabb91487207269ae076416f90c4390b950c76a633df7114e48c50fa"
+        }
+      ]
+    },
+    {
+      "name": "probe-compute-environment",
+      "license": "AGPL-3.0-only (repository default)",
+      "files": [
+        {
+          "path": "probe-compute-environment/agents/openai.yaml",
+          "sha256": "00885768766efa50d9eba7ab0623766aa72d43dd22add0b54d3f5638901f4aa5"
+        },
+        {
+          "path": "probe-compute-environment/SKILL.md",
+          "sha256": "e624d5aa90b7493822c5babaad888c94e2abc4d9873e348d47077f1eb6fb24a2"
+        }
+      ]
+    },
+    {
+      "name": "public-data-access",
+      "license": "AGPL-3.0-only (repository default)",
+      "files": [
+        {
+          "path": "public-data-access/references/download-plan-schema.md",
+          "sha256": "567deda219dd2fd7deffa3ee07376fd0c405c291b323050438c2397844e1397b"
+        },
+        {
+          "path": "public-data-access/references/geokit.md",
+          "sha256": "3d368e1b5a1d478ad68c07482b71bfaaaf8355e14a1537ea44e55e930cf9b05e"
+        },
+        {
+          "path": "public-data-access/references/provider-routing.md",
+          "sha256": "cb53b780fe9a8b9af224ef25587a760a0eb9fe05d9010daf2a14a1eeaf5f6985"
+        },
+        {
+          "path": "public-data-access/scripts/public_data_plan.py",
+          "sha256": "53cfc0f47c9306d660fb096066027f13c561ba802af3dfd9e0ea0fb855f9945e"
+        },
+        {
+          "path": "public-data-access/SKILL.md",
+          "sha256": "72bb6c56aaab71ae8fa31d1707360becc9f75cc88b4ca8418e6baeefdac88b83"
+        }
+      ]
+    },
+    {
+      "name": "remote-compute-ssh",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "path": "remote-compute-ssh/SKILL.md",
+          "sha256": "f99c34138a2108a14739274049d2ba06b75a890978286f6e06ee31c0eddec675"
+        }
+      ]
+    },
+    {
+      "name": "self-awareness",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "path": "self-awareness/SKILL.md",
+          "sha256": "bb25be928024d80046078dc63e7c9ab0533163b89880e508c08cf3e367631ec5"
+        }
+      ]
+    },
+    {
+      "name": "singlecell-qc",
+      "license": "AGPL-3.0-only (repository default)",
+      "files": [
+        {
+          "path": "singlecell-qc/assets/gene_sets/chrY_genes_human.txt",
+          "sha256": "257f313aae6d6219b13e4a7b9c8230a069989dcb1cae4c5d15a3918854a02167"
+        },
+        {
+          "path": "singlecell-qc/assets/gene_sets/hbb_genes_human.txt",
+          "sha256": "df8b7d36ec901503f94e7ffaaa3c403f916524e269a2c132d3f9ebeb4760c2db"
+        },
+        {
+          "path": "singlecell-qc/assets/gene_sets/hbb_genes_mouse.txt",
+          "sha256": "55cf21b13e694dc8615c2afc82734fc7e2031f31222bc4d163b6fe22b4b6506a"
+        },
+        {
+          "path": "singlecell-qc/assets/qc_thresholds.example.yaml",
+          "sha256": "7624476266ae2d56b09bd745b500061373f4b4649467960a0c8df473850707bd"
+        },
+        {
+          "path": "singlecell-qc/references/filtering-strategies.md",
+          "sha256": "b4d0ee0ae762c7ba7f0d5a54e2fdb18a45ffb473059793187265fa869c1f2ef7"
+        },
+        {
+          "path": "singlecell-qc/references/human-in-the-loop.md",
+          "sha256": "2f6e1d4fea0671c5393319aecd1d5107ae620aabf98ace31b281bee31ed33b97"
+        },
+        {
+          "path": "singlecell-qc/references/metrics-catalog.md",
+          "sha256": "39e3b1e688166e42c333cf84441d533022f1699fac2e0262c4ecbb0c6db51fc0"
+        },
+        {
+          "path": "singlecell-qc/references/project-layout.md",
+          "sha256": "d94534011c42bce97feae0db681a459be1f06c347f8d7cc3fa3b42897349d606"
+        },
+        {
+          "path": "singlecell-qc/references/python-scanpy.md",
+          "sha256": "649ff5db5e5aefffa12dd29fb8311f46fa2ca1236b32b52beb9a32729daea1de"
+        },
+        {
+          "path": "singlecell-qc/references/r-seurat.md",
+          "sha256": "5e7653bebf7700176d2c4f2ec8912d99a3cf475778a4062be09f5d66b489f2eb"
+        },
+        {
+          "path": "singlecell-qc/scripts/calculate_metrics.py",
+          "sha256": "71cb8562130ea90844911e90491ac98d72c083aa1b26f83d75c51cffabdc6b3c"
+        },
+        {
+          "path": "singlecell-qc/scripts/calculate_metrics.R",
+          "sha256": "10a83ec86279a0b859b2a34a77a3ab99447e787e8792edd797b0452929da8948"
+        },
+        {
+          "path": "singlecell-qc/scripts/inspect_qc_metadata.py",
+          "sha256": "0cc3a283e80c5f9b54e49d1f2021bd439e869c3f0ea03430ebd1f7d4e19c4ba4"
+        },
+        {
+          "path": "singlecell-qc/SKILL.md",
+          "sha256": "de67a7f1d5448c18c2b1d5e7ac532c7d5fe8a61b303e304c32ee07295748695a"
+        }
+      ]
+    },
+    {
+      "name": "skill-creator",
+      "license": "AGPL-3.0-only (repository default)",
+      "files": [
+        {
+          "path": "skill-creator/scripts/package_skill.py",
+          "sha256": "7ab2b2ae15d1f69ddb820901b96eaf2158d86592b80d68da5ee23aa7941355d8"
+        },
+        {
+          "path": "skill-creator/scripts/quick_validate.py",
+          "sha256": "acdcf089f8c0232622f0cb72bbf5e436902c24edb84a2942aa2378629b8a73a2"
+        },
+        {
+          "path": "skill-creator/SKILL.md",
+          "sha256": "3f163321e4df5b39b47952e0216bc1bbcabf423001d84c2b690d2bb27874d882"
+        }
+      ]
+    },
+    {
+      "name": "social-note",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "path": "social-note/SKILL.md",
+          "sha256": "3edfa9432ff06fbde2d8472f34532221ea3f745769e67a8399a2af2128474f62"
+        }
+      ]
+    },
+    {
+      "name": "word-zotero-citations",
+      "license": "AGPL-3.0-only (repository default)",
+      "files": [
+        {
+          "path": "word-zotero-citations/assets/templates/offline-run-summary.md",
+          "sha256": "0630d9b130023df95496a9dd701c1d3b481c5d04dd207211d7bfe84e18e11de8"
+        },
+        {
+          "path": "word-zotero-citations/evals/task-cases.json",
+          "sha256": "53a1592fca33da3f0bc4932f75166d7d0af6c680caeb69b6355f015a9dc95dd1"
+        },
+        {
+          "path": "word-zotero-citations/evals/trigger-cases.json",
+          "sha256": "a406843e297f8344be59f815bf32908f585f64d0f6681c2f62a490b4e506d433"
+        },
+        {
+          "path": "word-zotero-citations/references/contracts.md",
+          "sha256": "0a78930beb9d4ff59762efa926dd15db50a3d5cdbf7a8aef12a91d120150855e"
+        },
+        {
+          "path": "word-zotero-citations/references/implementation-map.md",
+          "sha256": "0424d6b951605e9a59452eaedb034817e65272e15a0034425d6e94a2561d3754"
+        },
+        {
+          "path": "word-zotero-citations/references/live-refresh-protocol.md",
+          "sha256": "9ffbe1167005ff6d35729888d7b3b7bf67005b1c5c657aeaf43fb778708ac244"
+        },
+        {
+          "path": "word-zotero-citations/references/live-run-recipe.md",
+          "sha256": "b42577c99845e50d3dc1b84497f9c6a4dc2f1cfb001e8748f5cf222124ec7c20"
+        },
+        {
+          "path": "word-zotero-citations/references/recovery-and-rollback.md",
+          "sha256": "45b57693b3d7443c8dd843014c692fc9d54a365df8f1aa766e994215c44b85ec"
+        },
+        {
+          "path": "word-zotero-citations/references/verification-matrix.md",
+          "sha256": "fc2a5da5458289148da2e32a1ae6ba87727c7236938191eeafb43504429bfb24"
+        },
+        {
+          "path": "word-zotero-citations/references/zotero-mcp-configuration.md",
+          "sha256": "056a604952a16ac37751346c7b9dc12aaebfced1f92c6e758f5037c6aec028fa"
+        },
+        {
+          "path": "word-zotero-citations/scripts/refresh_word_zotero.ps1",
+          "sha256": "d58fa3bb7256ddb092ff2923929e415c6621c5709c3950e2b638e2b5b2ab73fa"
+        },
+        {
+          "path": "word-zotero-citations/scripts/run_live_workflow.py",
+          "sha256": "84d6e7853ebd712964716cf61446e9b63bee684a4ff3a4747b9440c3caccde6b"
+        },
+        {
+          "path": "word-zotero-citations/scripts/validate_word_zotero_ui.ps1",
+          "sha256": "9b62ac74347ebebfed92207042b8cdf3146e236006881a0ae507368e16d38b1b"
+        },
+        {
+          "path": "word-zotero-citations/scripts/verify_skill.py",
+          "sha256": "9d71a7fb92787222746a9cd5a410e8df2a3c0af9744494ebf474d0fc066052e1"
+        },
+        {
+          "path": "word-zotero-citations/SKILL.md",
+          "sha256": "495d3538f076b6bf22a94b332c54ddb595243daab40d3af48377afbb5aef56e0"
+        }
+      ]
+    }
+  ]
+}

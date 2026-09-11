@@ -1,0 +1,110 @@
+# 内置科学 Skills 与 MCP
+
+来源为 [wisp-science](https://github.com/xuzhougeng/wisp-science)，固定提交
+`3628a4209e494ba6fbef1095bb964782f7d2c430`，获取日期 2026-09-11。
+此快照捆绑 26 个 Skill 包，以及 23 个实际原生科学工具域。它们随 Windows
+桌面资源/可执行文件一起提供，无需克隆上游或安装 Python MCP 服务。
+
+## 操作
+
+1. 打开设置的 Skills 与 MCP 页面。原有 9 个单细胞包继续保留，新包位于
+   `wisp_science` 分类；默认启用 13 个科研技能，其他 13 个可手动启用。
+   首次安装后的用户启停选择在重启后保留。
+2. Agent 用 `search_skills` 找到已启用技能，再以返回的 UUID 调用 `use_skill`。
+   默认结果包含指南、OmicsOps 兼容性说明和资源目录。读取脚本时传入例如
+   `sections: ["Resource: runtime.py"]`，使用目录中的精确名称。
+   脚本原文与参考资料完整返回并参与冻结哈希；单次最多 512 KiB，超限报错，
+   不截断代码。修改过的已安装包必须重新导入，才能以新哈希使用。
+3. 在“内置科学 MCP”区域搜索数据库，选择后点击“添加内置 MCP”。
+   这只保存默认停用、未授权的本地 stdio 声明；重复添加不会重置配置或授权。
+4. 打开项目，批准一次检查并发现工具；检查成功后启用，逐工具批准调用。
+   Agent 使用现有 MCP 发现与调用工具。检查、启用、运行/会话授权仍由宿主裁决。
+   原有 PubMed MCP 配置和 NCBI 凭据入口继续保留。
+
+## Skill 清单
+
+默认启用：`analysis-workflow`、`audit-biomedical-paper-evidence`、
+`figure-composer`、`figure-duplicate-audit`、`figure-style`、
+`indication-dossier`、`journal-club-ppt`、`literature-review`、`paper-narrative`、
+`pdf-explore`、`public-data-access`、`singlecell-qc`、`social-note`。
+
+默认关闭：`agent-infini`、`browser-use`、`compute-env-setup`、`custom-theme`、
+`customize`、`distill-concept-books`、`local-env-setup`、`pixi-environment-builder`、
+`probe-compute-environment`、`remote-compute-ssh`、`self-awareness`、
+`skill-creator`、`word-zotero-citations`。
+
+包保留原始内容及所有附件；包外的宿主说明限定实际支持的操作。
+Wisp 专有 `configure`、specialist/theme 导入、`.wisp` 发现机制等并没有因此实现。
+Word/Zotero、InfiniSynapse/scimaster 及科研 Python/R 库仍是可选外部依赖。
+加载 Skill 不安装这些依赖，也不执行 sidecar。需要的脚本须通过已有批准的文件
+写入/运行工具在当前项目下准备，或显式载入持久内核；不能把本地 Skill 路径
+当作 SSH 主机上的路径。
+
+## 科学 MCP 域
+
+| 域 | 主要数据源或操作 |
+| --- | --- |
+| biomart | Ensembl BioMart 注释、标识符转换 |
+| biorxiv | bioRxiv、medRxiv 预印本 |
+| cancer-models | cBioPortal、Cell Model Passports |
+| cellguide | CELLxGENE CellGuide |
+| chembl | ChEMBL 化合物、靶点、活性 |
+| chemistry | PubChem、ChEBI、Rhea、BindingDB |
+| clinical-genomics | CIViC、ClinGen、Open Targets |
+| clinical-trials | ClinicalTrials.gov |
+| drug-regulatory | openFDA |
+| expression | GTEx、PanglaoDB |
+| genes-ontologies | MyGene、UniProt、OLS、QuickGO、Reactome、KEGG |
+| genomes | Ensembl、UCSC |
+| human-genetics | GWAS Catalog、eQTL Catalogue、PheWeb |
+| literature | OpenAlex、arXiv |
+| omics-archives | GEO、ArrayExpress、MetaboLights、MGnify、PRIDE |
+| protein-annotation | InterPro/Pfam、Human Protein Atlas、STRING |
+| pubmed | NCBI、Europe PMC、开放全文与访问元数据 |
+| regulation | ENCODE、JASPAR、UniBind |
+| research-resources | Antibody Registry、Grants.gov |
+| rna | Rfam 注释、比对与序列检索 |
+| structures-interactions | PDB、AlphaFold、EMDB、Complex Portal、IntAct |
+| variants | CADD、gnomAD、ClinVar、dbSNP |
+| zinc | ZINC、SmallWorld、三维分区引用 |
+
+设置中的工具数量来自已编译客户端的实际目录。每个进程只暴露和执行所选域的
+工具；跨域名称、未知工具及不合法参数被拒绝。查询结果保留结构化来源信息，
+错误保留 MCP `isError` 语义。RNA 序列检索和 ZINC 作业提交不声明为只读；
+HTTP POST 失败不会自动重试，避免重复派发。
+
+## 执行、数据和凭据边界
+
+内置客户端仍需网络；外部数据库会收到查询词、标识符或显式提交的序列。
+引用下载地址不等于数据已下载，也不等于实际分析已运行。默认保留大数据远端
+引用；现有本地 system 与 SSH system/Micromamba 约束不变。
+
+可选环境凭据只从固定白名单读取：`NCBI_API_KEY`、`NCBI_EMAIL`、
+`NCBI_ADMIN_EMAIL`、`OPERON_CONTACT_EMAIL`、`OPENALEX_API_KEY`、
+`OPENFDA_API_KEY`、`CIVIC_API_KEY`。MCP 配置仍使用现有 keyring 引用机制；
+不要把密钥填入普通环境变量值或写入 Skill 示例中的配置文件。未传凭据时使用
+上游匿名请求路径，服务限制、速率限制或付费要求由各数据库决定。
+
+## 来源与许可
+
+Skills 的原始文件哈希见 `skills/wisp-science/SOURCE.json`，原许可与第三方
+声明随包分发。`crates/omicsops-bio/UPSTREAM.md` 记录原生实现的来源与适配。
+用户明确同意直接引入后的 AGPL-3.0-only 组合许可，根目录 `LICENSE` 和 Cargo
+许可声明已更新。单独声明 Apache/MIT 等许可的组件继续保留原声明；本次调整
+不撤销此前版本已授予的许可。
+
+上游还捆绑 Python/R kernel worker、浏览器扩展、ESR1/RNA-seq 示例与种子清单；
+另有不属于应用捆绑目录的 community-skills。本次仅列出，未导入这些内容。
+
+## 手工 smoke 与验收边界
+
+在一次性 Windows 项目中确认所有 Skill 可见，关闭一个默认 Skill 后重启仍关闭；
+启用带资源的 Skill，确认可以读取指定资源，加载本身不执行代码。
+添加 `omics-archives` 和 `pubmed`，重复添加不增加记录；批准检查后只发现各自域
+工具，未启用/未授权时 Agent 无法调用。配置可选凭据时确认仅保存 keyring 引用。
+在受控联网条件下分别检索一个公开标识符并核对返回原始来源；SSH 场景额外确认
+脚本仅在所选远端执行，且没有引用本地应用数据路径。
+
+自动测试使用临时目录、临时 SQLite、模拟 HTTP/Tauri 和本地 MCP 进程，
+不依赖真实 SSH、模型或公共数据库。构建与工具发现成功不代表所有公网端点、
+可选依赖或科研工作流已通过端到端验收。实际检查结果记录在实施计划末尾。

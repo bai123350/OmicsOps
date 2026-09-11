@@ -7,6 +7,25 @@ use serde_json::json;
 use uuid::Uuid;
 
 #[test]
+fn bundled_mcp_catalog_and_request_use_shared_snake_case_contract() {
+    let value = json!({"id":"pubmed", "name":"Science · pubmed", "description":"Literature", "description_zh":"文献", "tool_count":7});
+    let preset: crate::dto::BundledMcpPreset = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(preset).unwrap(), value);
+    let request: crate::dto::AddBundledMcpServerRequest =
+        serde_json::from_value(json!({"preset_id":"pubmed"})).unwrap();
+    assert_eq!(
+        serde_json::to_value(request).unwrap(),
+        json!({"preset_id":"pubmed"})
+    );
+    assert!(
+        serde_json::from_value::<crate::dto::AddBundledMcpServerRequest>(
+            json!({"preset_id":"pubmed", "command":"arbitrary.exe"})
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn catalog_refresh_is_explicit_and_round_trips_through_shared_dto() {
     let mut value = json!({"label":"test","provider":"open_ai_compatible","base_url":"https://api.openai.com/v1","model":"gpt-4o"});
     let legacy: crate::dto::SaveModelProfileRequest =

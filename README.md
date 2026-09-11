@@ -17,6 +17,12 @@ OmicsOps 是面向科研与生物信息学的 Windows-first Tauri 桌面 Agent�
 
 Rust 控制层负责凭据、审批、权限检查、执行状态、SSH 和审计。Skills、MCP 和子 Agent 都遵循当前运行的能力与审批边界；加载技能或收到模型建议不会自动扩大权限。
 
+当前额外捆绑 [wisp-science](https://github.com/xuzhougeng/wisp-science) 的 26 个 Skills
+与 23 个原生科学工具域。设置 → Skills 与 MCP 中可启停技能、搜索并添加内置 MCP；
+添加后仍需检查、启用和逐工具授权。脚本和参考文件通过 `use_skill` 按需读取。
+完整清单、依赖限制和操作步骤见 [内置科学工具说明](docs/bundled-science.md)。
+本次引入后的组合项目使用 AGPL-3.0-only，见 [LICENSE](LICENSE)；第三方技能保留原许可。
+
 执行契约包含版本化工具协议、与计划内容绑定的审批、只追加的哈希链事件、可验证检查点、进程组恢复记录及可审计运行包。它们用于追踪实际执行过程，不能把模型生成的方案或解释直接当作已完成的科研结果。
 
 ## 对话使用流程

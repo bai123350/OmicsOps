@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "default_enabled": [
+    "analysis-workflow", "audit-biomedical-paper-evidence", "figure-composer",
+    "figure-duplicate-audit", "figure-style", "indication-dossier",
+    "journal-club-ppt", "literature-review", "paper-narrative", "pdf-explore",
+    "public-data-access", "singlecell-qc", "social-note"
+  ],
+  "categories": {
+    "wisp_science": [
+      "agent-infini", "analysis-workflow", "audit-biomedical-paper-evidence",
+      "browser-use", "compute-env-setup", "custom-theme", "customize",
+      "distill-concept-books", "figure-composer", "figure-duplicate-audit",
+      "figure-style", "indication-dossier", "journal-club-ppt", "literature-review",
+      "local-env-setup", "paper-narrative", "pdf-explore", "pixi-environment-builder",
+      "probe-compute-environment", "public-data-access", "remote-compute-ssh",
+      "self-awareness", "singlecell-qc", "skill-creator", "social-note",
+      "word-zotero-citations"
+    ]
+  }
+}

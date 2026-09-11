@@ -391,6 +391,14 @@ export interface McpEnvBinding {
   credential_reference?: string | null;
 }
 
+export interface BundledMcpPreset {
+  id: string;
+  name: string;
+  description: string;
+  description_zh: string;
+  tool_count: number;
+}
+
 export interface McpServerProfile {
   id: string;
   name: string;

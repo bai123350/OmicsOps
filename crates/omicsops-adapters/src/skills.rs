@@ -51,6 +51,20 @@ const ALLOWED_CAPABILITIES: &[&str] = &[
     "submit_remote_job",
 ];
 
+#[cfg(test)]
+mod frontmatter_tests {
+    use super::*;
+
+    #[test]
+    fn nested_service_metadata_does_not_override_skill_identity_or_capabilities() {
+        let markdown = "---\nname: literature-review\nversion: 1.2.3\nmetadata:\n  name: OpenAlex\n  version: service-v1\n  capabilities: [not-a-host-grant]\ncapabilities:\n  - read_project_files\n---\n# Review\n";
+        let (name, version, capabilities) = parse_skill_frontmatter(markdown).unwrap();
+        assert_eq!(name, "literature-review");
+        assert_eq!(version.as_deref(), Some("1.2.3"));
+        assert_eq!(capabilities, ["read_project_files"]);
+    }
+}
+
 impl SkillEntry {
     pub fn file(path: impl Into<String>) -> Self {
         Self {
@@ -296,13 +310,20 @@ fn parse_skill_frontmatter(contents: &str) -> AdapterResult<(String, Option<Stri
         if line == "---" {
             break;
         }
-        if let Some(value) = line.strip_prefix("name:") {
+        // Package identity and grants are top-level frontmatter fields. Nested
+        // third-party metadata can also contain name/version/capabilities.
+        let field = if raw.starts_with(char::is_whitespace) {
+            ""
+        } else {
+            line
+        };
+        if let Some(value) = field.strip_prefix("name:") {
             name = Some(unquote(value.trim()).to_owned());
             reading_capabilities = false;
-        } else if let Some(value) = line.strip_prefix("version:") {
+        } else if let Some(value) = field.strip_prefix("version:") {
             version = Some(unquote(value.trim()).to_owned());
             reading_capabilities = false;
-        } else if let Some(value) = line.strip_prefix("capabilities:") {
+        } else if let Some(value) = field.strip_prefix("capabilities:") {
             reading_capabilities = true;
             let value = value.trim().trim_start_matches('[').trim_end_matches(']');
             for capability in value

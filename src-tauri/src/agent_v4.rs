@@ -39,8 +39,8 @@ pub use omicsops_dto::{
 };
 use omicsops_knowledge::{
     KnowledgeErrorV4, McpToolIndexV4, MemoryDocumentV4, SkillDocumentV4,
-    authorize_mcp_read_only_target, authorize_mcp_use, freeze_skill, markdown_sections,
-    schema_digest, search_memory, search_skills,
+    authorize_mcp_read_only_target, authorize_mcp_use, markdown_sections, schema_digest,
+    search_memory, search_skills,
 };
 use omicsops_mcp::McpSessionManager;
 use omicsops_process::background_command;
@@ -4025,10 +4025,7 @@ impl DesktopToolExecutorV4 {
             .await?
             .into_iter()
             .map(|package| {
-                let markdown = std::fs::read_to_string(
-                    std::path::Path::new(&package.source_path).join("SKILL.md"),
-                )
-                .map_err(|error| format!("cannot read Skill {}: {error}", package.name))?;
+                let markdown = crate::skill_commands::render_skill_package_markdown(&package)?;
                 Ok(SkillDocumentV4 {
                     skill_id: package.id,
                     name: package.name,
@@ -4694,14 +4691,12 @@ impl DesktopToolExecutorV4 {
                     .filter_map(Value::as_str)
                     .map(str::to_owned)
                     .collect::<Vec<_>>();
-                let document = self
-                    .skill_documents()
+                let package = crate::skill_commands::agent_skill_packages(&self.repository)
                     .await?
                     .into_iter()
-                    .find(|document| document.skill_id == skill_id)
+                    .find(|package| package.id == skill_id)
                     .ok_or("enabled Skill was not found")?;
-                let frozen =
-                    freeze_skill(&document, &sections).map_err(|error| error.to_string())?;
+                let frozen = crate::skill_commands::freeze_skill_package(&package, &sections)?;
                 (
                     serde_json::to_string(&frozen).map_err(|error| error.to_string())?,
                     serde_json::to_value(&frozen).map_err(|error| error.to_string())?,
