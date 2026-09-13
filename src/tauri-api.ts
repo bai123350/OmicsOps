@@ -252,23 +252,6 @@ export async function saveMcpServer(request: SaveMcpServerRequest): Promise<McpS
   return invoke("save_mcp_server", { request: { ...request, args: request.args ?? [] } });
 }
 
-/**
- * Create or update the native PubMed MCP preset.  The key is sent only for
- * this command so the desktop host can put it in the system credential vault;
- * it is never part of the persisted MCP profile returned to the UI.
- *
- * The command is intentionally kept small so older hosts can implement the
- * preset without exposing the MCP runtime to the webview.
- */
-export async function addPubMedMcpServer(request: { api_key?: string; admin_email?: string } = {}): Promise<McpServerProfile> {
-  return invoke("add_pubmed_mcp_server", {
-    request: {
-      api_key: request.api_key?.trim() || null,
-      admin_email: request.admin_email?.trim() || null,
-    },
-  });
-}
-
 export async function setMcpServerEnabled(serverId: string, enabled: boolean): Promise<McpServerProfile> {
   return invoke("set_mcp_server_enabled", { request: { server_id: serverId, enabled } });
 }
@@ -472,3 +455,8 @@ export async function agentSaveIterationSettings(settings: import("./types").Age
 }
 
 export async function agentV4SuggestFollowUps(runId: string): Promise<string[]> { return isTauri() ? invoke("agent_v4_suggest_follow_up_questions", { runId }) : []; }
+
+/** Stores optional NCBI credentials through the host keyring path for the unified PubMed preset. */
+export async function configurePubMedMcpCredentials(request: { api_key?: string; admin_email?: string } = {}): Promise<McpServerProfile> {
+  return invoke("add_pubmed_mcp_server", { request: { api_key: request.api_key?.trim() || null, admin_email: request.admin_email?.trim() || null } });
+}

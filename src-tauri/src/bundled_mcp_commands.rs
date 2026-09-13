@@ -36,7 +36,7 @@ pub fn list_bundled_mcp_presets() -> Vec<BundledMcpPreset> {
         .collect()
 }
 
-fn preset_server_id(preset_id: &str) -> Uuid {
+pub(crate) fn preset_server_id(preset_id: &str) -> Uuid {
     let hash = Sha256::digest(format!("omicsops:bundled-science-mcp:{preset_id}"));
     let mut bytes = [0; 16];
     bytes.copy_from_slice(&hash[..16]);
@@ -55,6 +55,109 @@ pub async fn install_bundled_mcp_servers(
     for preset in list_bundled_mcp_presets() {
         register_preset(repository, &preset.id, executable).await?;
     }
+    migrate_legacy_pubmed(repository, executable).await?;
+    Ok(())
+}
+
+/// Retain the old row for frozen run references, but stop advertising two PubMed servers.
+async fn migrate_legacy_pubmed(repository: &Store, executable: &Path) -> Result<(), String> {
+    let mut legacy = repository
+        .list_json::<McpServerProfile>("mcp_server")
+        .await
+        .map_err(|e| e.to_string())?;
+    legacy.retain(|profile| {
+        profile.status != "superseded"
+            && profile.args == ["--omicsops-pubmed-mcp"]
+            && (Path::new(&profile.command) == executable
+                || (Path::new(&profile.command)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case("omicsops-desktop.exe"))
+                    && executable
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.eq_ignore_ascii_case("omicsops-desktop.exe"))))
+    });
+    legacy.sort_by_key(|profile| (std::cmp::Reverse(profile.updated_at), profile.id));
+    if legacy.is_empty() {
+        return Ok(());
+    }
+    let mut unified = register_preset(repository, "pubmed", executable).await?;
+    // Custom declarations at the stable ID belong to the user and must not be overwritten.
+    if unified.command != executable.to_string_lossy()
+        || unified.args != ["--omicsops-bio-mcp", "pubmed"]
+    {
+        return Ok(());
+    }
+    let untouched = unified.config_version <= 1
+        && unified.last_inspected_at.is_none()
+        && !unified.launch_approved
+        && unified.env_bindings.is_empty();
+    let mut bindings = unified.env_bindings.clone();
+    for old in &legacy {
+        for binding in &old.env_bindings {
+            if !bindings.iter().any(|item| {
+                item.name == binding.name
+                    || (matches!(item.name.as_str(), "NCBI_EMAIL" | "NCBI_ADMIN_EMAIL")
+                        && matches!(binding.name.as_str(), "NCBI_EMAIL" | "NCBI_ADMIN_EMAIL"))
+            }) {
+                bindings.push(binding.clone());
+            }
+        }
+    }
+    let old = &legacy[0];
+    let updated = mcp_profile_from_request(
+        SaveMcpServerRequest {
+            id: Some(unified.id),
+            name: unified.name.clone(),
+            command: unified.command.clone(),
+            args: unified.args.clone(),
+            cwd: if untouched {
+                old.cwd.clone()
+            } else {
+                unified.cwd.clone()
+            },
+            timeout_secs: if untouched {
+                old.timeout_secs
+            } else {
+                unified.timeout_secs
+            },
+            env_bindings: bindings,
+        },
+        Some(&unified),
+        Utc::now(),
+    )?;
+    let enable = if untouched {
+        old.enabled
+    } else {
+        unified.enabled
+    };
+    unified = updated;
+    // Changed declarations must be re-inspected and reapproved; no legacy grants transfer.
+    if untouched {
+        unified.enabled = enable;
+    }
+    let previous_catalog = unified.tool_catalog_sha256.clone();
+    populate_compiled_catalog(&mut unified, "pubmed")?;
+    if unified.tool_catalog_sha256 != previous_catalog {
+        unified.approved_tools.clear();
+    }
+    repository
+        .put_json("mcp_server", &unified.id.to_string(), &unified)
+        .await
+        .map_err(|e| e.to_string())?;
+    for mut old in legacy {
+        old.enabled = false;
+        old.launch_approved = false;
+        old.approved_tools.clear();
+        old.status = "superseded".into();
+        old.config_version = old.config_version.saturating_add(1);
+        old.updated_at = Utc::now();
+        repository
+            .put_json("mcp_server", &old.id.to_string(), &old)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -72,7 +175,7 @@ pub async fn add_bundled_mcp_server(
     Ok(profile)
 }
 
-async fn register_preset(
+pub(crate) async fn register_preset(
     repository: &Store,
     preset_id: &str,
     executable: &Path,
@@ -124,7 +227,7 @@ async fn register_preset(
     Ok(profile)
 }
 
-fn populate_compiled_catalog(
+pub(crate) fn populate_compiled_catalog(
     profile: &mut McpServerProfile,
     preset_id: &str,
 ) -> Result<(), String> {
@@ -140,6 +243,157 @@ fn populate_compiled_catalog(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_migrates_legacy_pubmed_without_copying_grants_and_is_idempotent() {
+        let store = Store::open_in_memory().await.unwrap();
+        let exe = Path::new(r"C:\OmicsOps\omicsops-desktop.exe");
+        let mut legacy = mcp_profile_from_request(
+            SaveMcpServerRequest {
+                id: Some(Uuid::new_v4()),
+                name: "PubMed".into(),
+                command: exe.to_string_lossy().into(),
+                args: vec!["--omicsops-pubmed-mcp".into()],
+                cwd: None,
+                timeout_secs: 90,
+                env_bindings: vec![omicsops_mcp::McpEnvBinding {
+                    name: "NCBI_API_KEY".into(),
+                    value: None,
+                    credential_reference: Some("mcp/legacy/NCBI_API_KEY".into()),
+                }],
+            },
+            None,
+            Utc::now(),
+        )
+        .unwrap();
+        legacy.enabled = true;
+        legacy.launch_approved = true;
+        legacy.approved_tools = vec!["pubmed_search".into()];
+        store
+            .put_json("mcp_server", &legacy.id.to_string(), &legacy)
+            .await
+            .unwrap();
+        install_bundled_mcp_servers(&store, exe).await.unwrap();
+        let unified = register_preset(&store, "pubmed", exe).await.unwrap();
+        assert_eq!(unified.env_bindings, legacy.env_bindings);
+        assert_eq!(unified.args, ["--omicsops-bio-mcp", "pubmed"]);
+        assert_eq!(
+            unified.tools.len(),
+            crate::bio_mcp::bundled_tools("pubmed").len()
+        );
+        assert!(!unified.launch_approved);
+        assert!(unified.approved_tools.is_empty());
+        let archived = store
+            .get_json::<McpServerProfile>("mcp_server", &legacy.id.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!archived.enabled);
+        assert_eq!(archived.status, "superseded");
+        assert_eq!(archived.env_bindings, legacy.env_bindings);
+        install_bundled_mcp_servers(&store, exe).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(register_preset(&store, "pubmed", exe).await.unwrap()).unwrap(),
+            serde_json::to_value(unified).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_preserves_configured_unified_credentials_and_disabled_choice() {
+        let store = Store::open_in_memory().await.unwrap();
+        let exe = Path::new(r"C:\OmicsOps\omicsops-desktop.exe");
+        let mut unified = register_preset(&store, "pubmed", exe).await.unwrap();
+        unified.enabled = false;
+        unified.env_bindings = vec![omicsops_mcp::McpEnvBinding {
+            name: "NCBI_API_KEY".into(),
+            value: None,
+            credential_reference: Some("canonical-key".into()),
+        }];
+        unified.config_version = 5;
+        store
+            .put_json("mcp_server", &unified.id.to_string(), &unified)
+            .await
+            .unwrap();
+        let mut legacy = unified.clone();
+        legacy.id = Uuid::new_v4();
+        legacy.args = vec!["--omicsops-pubmed-mcp".into()];
+        legacy.enabled = true;
+        legacy.env_bindings[0].credential_reference = Some("legacy-key".into());
+        store
+            .put_json("mcp_server", &legacy.id.to_string(), &legacy)
+            .await
+            .unwrap();
+        install_bundled_mcp_servers(&store, exe).await.unwrap();
+        let saved = register_preset(&store, "pubmed", exe).await.unwrap();
+        assert_eq!(saved.env_bindings, unified.env_bindings);
+        assert!(!saved.enabled);
+    }
+
+    #[tokio::test]
+    async fn migration_revokes_grants_when_compiled_catalog_changes() {
+        let store = Store::open_in_memory().await.unwrap();
+        let exe = Path::new(r"C:\OmicsOps\omicsops-desktop.exe");
+        let mut unified = register_preset(&store, "pubmed", exe).await.unwrap();
+        let mut legacy = unified.clone();
+        legacy.id = Uuid::new_v4();
+        legacy.args = vec!["--omicsops-pubmed-mcp".into()];
+        unified.tools[0]["inputSchema"] = serde_json::json!({"type":"object"});
+        unified.tool_catalog_sha256 = Some(omicsops_mcp::catalog_digest(&unified.tools));
+        unified.launch_approved = true;
+        unified.approved_tools = vec!["pubmed_search".into()];
+        store
+            .put_json("mcp_server", &unified.id.to_string(), &unified)
+            .await
+            .unwrap();
+        store
+            .put_json("mcp_server", &legacy.id.to_string(), &legacy)
+            .await
+            .unwrap();
+        install_bundled_mcp_servers(&store, exe).await.unwrap();
+        assert!(
+            register_preset(&store, "pubmed", exe)
+                .await
+                .unwrap()
+                .approved_tools
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_does_not_replace_a_custom_unified_command() {
+        let store = Store::open_in_memory().await.unwrap();
+        let exe = Path::new(r"C:\OmicsOps\omicsops-desktop.exe");
+        let mut unified = register_preset(&store, "pubmed", exe).await.unwrap();
+        let mut legacy = unified.clone();
+        legacy.id = Uuid::new_v4();
+        legacy.args = vec!["--omicsops-pubmed-mcp".into()];
+        unified.command = "custom-mcp.exe".into();
+        store
+            .put_json("mcp_server", &unified.id.to_string(), &unified)
+            .await
+            .unwrap();
+        store
+            .put_json("mcp_server", &legacy.id.to_string(), &legacy)
+            .await
+            .unwrap();
+        install_bundled_mcp_servers(&store, exe).await.unwrap();
+        assert_eq!(
+            register_preset(&store, "pubmed", exe)
+                .await
+                .unwrap()
+                .command,
+            "custom-mcp.exe"
+        );
+        assert_eq!(
+            store
+                .get_json::<McpServerProfile>("mcp_server", &legacy.id.to_string())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            legacy.status
+        );
+    }
 
     #[tokio::test]
     async fn startup_installs_all_domains_and_preserves_user_choices_on_restart() {

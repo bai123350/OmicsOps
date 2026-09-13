@@ -238,19 +238,23 @@ describe("SettingsPanel model providers", () => {
     expect(onSetMcpToolApproval).toHaveBeenCalledWith("mcp-1", "search_papers", true);
   });
 
-  it("adds the native PubMed preset without skipping the approval workflow", async () => {
-    const onAddPubMedMcp = vi.fn().mockResolvedValue({});
-    render(<SettingsPanel locale="zh-CN" onClose={() => undefined} onAddPubMedMcp={onAddPubMedMcp} />);
-
-    fireEvent.click(screen.getByRole("button", { name: "技能与 MCP" }));
-    fireEvent.change(screen.getByLabelText("NCBI API key"), { target: { value: "ncbi-secret" } });
-    fireEvent.change(screen.getByLabelText("NCBI admin email"), { target: { value: "scientist@example.org" } });
-    fireEvent.click(screen.getByRole("button", { name: "一键添加 PubMed MCP" }));
-
-    await waitFor(() => expect(onAddPubMedMcp).toHaveBeenCalledWith({ api_key: "ncbi-secret", admin_email: "scientist@example.org" }));
-    expect(screen.getByRole("button", { name: "一键添加 PubMed MCP" })).toBeInTheDocument();
+  it("adds PubMed only through the unified scientific catalog without bypassing approvals", async () => {
+    const list = vi.fn().mockResolvedValue([{ id: "pubmed", name: "PubMed", description: "Literature", description_zh: "文献检索", tool_count: 3 }]);
+    const add = vi.fn().mockResolvedValue({});
+    const inspect = vi.fn();
+    const approve = vi.fn();
+    render(<SettingsPanel locale="zh-CN" initialSection="skills" onClose={() => undefined} onListBundledMcpPresets={list} onAddBundledMcp={add} onInspectMcpServer={inspect} onSetMcpToolApproval={approve} />);
+    expect(screen.queryByRole("region", { name: "PubMed MCP 预设" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "一键添加 PubMed MCP" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("NCBI API key")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("NCBI admin email")).not.toBeInTheDocument();
+    await screen.findByRole("option", { name: "PubMed · 3 个工具" });
+    fireEvent.change(screen.getByLabelText("选择内置 MCP"), { target: { value: "pubmed" } });
+    fireEvent.click(screen.getByRole("button", { name: "添加内置 MCP" }));
+    await waitFor(() => expect(add).toHaveBeenCalledWith({ preset_id: "pubmed" }));
+    expect(inspect).not.toHaveBeenCalled();
+    expect(approve).not.toHaveBeenCalled();
   });
-
   it("persists MCP working directory, timeout, and credential environment bindings", async () => {
     const onSaveMcpServer = vi.fn().mockResolvedValue({});
     render(<SettingsPanel locale="zh-CN" onClose={() => undefined} onSaveMcpServer={onSaveMcpServer} />);

@@ -4095,14 +4095,9 @@ impl DesktopToolExecutorV4 {
             .map_err(|error| error.to_string())?;
         let mut index = Vec::new();
         for profile in profiles {
-            let profile = crate::p1_commands::refresh_bundled_pubmed_profile(
-                &self.repository,
-                &self.mcp_sessions,
-                &self.credentials,
-                self.project_id,
-                profile,
-            )
-            .await?;
+            if profile.status == "superseded" {
+                continue;
+            }
             for tool in &profile.tools {
                 let Some(name) = tool.get("name").and_then(Value::as_str) else {
                     continue;

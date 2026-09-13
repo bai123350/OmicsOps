@@ -28,3 +28,9 @@ describe("bundled MCP API", () => {
     expect(invoke).toHaveBeenCalledTimes(2);
   });
 });
+
+it("sends optional PubMed credentials only to the keyring command", async () => {
+  vi.mocked(invoke).mockResolvedValueOnce({ id: "pubmed" });
+  await api.configurePubMedMcpCredentials({ api_key: " secret ", admin_email: " admin@example.org " });
+  expect(invoke).toHaveBeenCalledWith("add_pubmed_mcp_server", { request: { api_key: "secret", admin_email: "admin@example.org" } });
+});

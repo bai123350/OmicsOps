@@ -3,10 +3,11 @@ import type { BundledMcpPreset, McpServerProfile } from "../../types";
 
 export interface BundledMcpProps {
   onListBundledMcpPresets?: () => Promise<BundledMcpPreset[]>;
+  onConfigurePubMedMcp?: (request: { api_key?: string; admin_email?: string }) => Promise<McpServerProfile>;
   onAddBundledMcp?: (request: { preset_id: string }) => Promise<McpServerProfile>;
 }
 
-export function BundledMcpPresets({ zh, busy, runAction, onListBundledMcpPresets, onAddBundledMcp }: BundledMcpProps & {
+export function BundledMcpPresets({ zh, busy, runAction, onListBundledMcpPresets, onAddBundledMcp, onConfigurePubMedMcp }: BundledMcpProps & {
   zh: boolean;
   busy: boolean;
   runAction: (key: string, action: () => Promise<unknown>) => Promise<void>;
@@ -45,6 +46,7 @@ export function BundledMcpPresets({ zh, busy, runAction, onListBundledMcpPresets
       </select></label>
     </div>
     {selected && <small>{zh ? selected.description_zh || selected.description : selected.description}</small>}
+    {selected?.id === "pubmed" && <PubMedCredentials zh={zh} busy={busy} configure={onConfigurePubMedMcp} runAction={runAction} />}
     {!loading && !error && filtered.length === 0 && <small>{zh ? "没有匹配的内置 MCP" : "No matching bundled MCP"}</small>}
     {added && <small role="status">{zh ? `已添加 ${added}，请在下方检查并授权。` : `Added ${added}. Inspect and approve it below.`}</small>}
     <div className="mcp-form-actions"><button className="primary" disabled={busy || loading || !selected || !onAddBundledMcp} onClick={() => {
@@ -53,4 +55,30 @@ export function BundledMcpPresets({ zh, busy, runAction, onListBundledMcpPresets
       void runAction("bundled", async () => { await onAddBundledMcp({ preset_id: selected.id }); setAdded(selected.name); });
     }}>{zh ? "添加内置 MCP" : "Add bundled MCP"}</button></div>
   </section>;
+}
+
+function PubMedCredentials({ zh, busy, configure, runAction }: {
+  zh: boolean; busy: boolean; configure: BundledMcpProps["onConfigurePubMedMcp"];
+  runAction: (key: string, action: () => Promise<unknown>) => Promise<void>;
+}) {
+  const [apiKey, setApiKey] = useState("");
+  const [email, setEmail] = useState("");
+  const [saved, setSaved] = useState(false);
+  return <details className="mcp-credential-config">
+    <summary>{zh ? "配置凭据" : "Configure credentials"}</summary>
+    <small>{zh ? "API key 保存在系统凭据库。留空保留已有密钥；修改后仍需检查并授权工具。" : "The API key is stored in the system credential vault. Leave it blank to keep the existing key; inspect and approve tools after changes."}</small>
+    <div className="mcp-preset-grid">
+      <label>{zh ? "NCBI API key（可选）" : "NCBI API key (optional)"}<input aria-label="NCBI API key" type="password" autoComplete="new-password" disabled={busy} value={apiKey} onChange={event => { setApiKey(event.target.value); setSaved(false); }} /></label>
+      <label>{zh ? "管理员邮箱（可选）" : "Admin email (optional)"}<input aria-label="NCBI admin email" type="email" disabled={busy} value={email} onChange={event => { setEmail(event.target.value); setSaved(false); }} /></label>
+    </div>
+    {saved && <small role="status">{zh ? "凭据已保存，请检查并授权工具。" : "Credentials saved. Inspect and approve tools."}</small>}
+    <div className="mcp-form-actions"><button disabled={busy || !configure} onClick={() => {
+      if (!configure) return;
+      setSaved(false);
+      void runAction("pubmed-credentials", async () => {
+        await configure({ api_key: apiKey, admin_email: email });
+        setApiKey(""); setSaved(true);
+      });
+    }}>{zh ? "保存 PubMed 凭据" : "Save PubMed credentials"}</button></div>
+  </details>;
 }

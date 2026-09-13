@@ -485,8 +485,14 @@ pub(crate) fn mcp_profile_from_request(
 pub async fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerProfile>, String> {
     let mut profiles = state
         .repository
-        .list_json("mcp_server")
+        .list_json::<McpServerProfile>("mcp_server")
         .await
+        .map(|profiles| {
+            profiles
+                .into_iter()
+                .filter(|profile| profile.status != "superseded")
+                .collect::<Vec<_>>()
+        })
         .map_err(|error| error.to_string())?;
     profiles.sort_by(|left: &McpServerProfile, right| right.updated_at.cmp(&left.updated_at));
     Ok(profiles)
@@ -523,54 +529,58 @@ pub async fn add_pubmed_mcp_server(
     state: State<'_, AppState>,
     request: AddPubMedMcpServerRequest,
 ) -> Result<McpServerProfile, String> {
-    let existing_id = state
-        .repository
-        .list_json::<McpServerProfile>("mcp_server")
-        .await
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .find(|profile| {
-            profile
-                .args
-                .iter()
-                .any(|arg| arg == "--omicsops-pubmed-mcp")
-        })
-        .map(|profile| profile.id);
-    let id = existing_id.unwrap_or_else(Uuid::new_v4);
+    let id = crate::bundled_mcp_commands::preset_server_id("pubmed");
     let _server_lock = state.mcp_sessions.lock_server(id).await;
-    let existing = state
-        .repository
-        .get_json::<McpServerProfile>("mcp_server", &id.to_string())
-        .await
-        .map_err(|error| error.to_string())?;
-    let api_key_account = format!("mcp/{id}/NCBI_API_KEY");
-    if let Some(api_key) = request
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("could not locate OmicsOps executable: {error}"))?;
+    let profile =
+        configure_pubmed_preset(&state.repository, &state.credentials, request, &executable)
+            .await?;
+    state.mcp_sessions.invalidate_server(id).await;
+    Ok(profile)
+}
+
+async fn configure_pubmed_preset(
+    repository: &Store,
+    credentials: &dyn CredentialVault,
+    request: AddPubMedMcpServerRequest,
+    executable: &Path,
+) -> Result<McpServerProfile, String> {
+    let existing =
+        crate::bundled_mcp_commands::register_preset(repository, "pubmed", executable).await?;
+    let id = existing.id;
+    let canonical_account = format!("mcp/{id}/NCBI_API_KEY");
+    let supplied_key = request
         .api_key
         .as_deref()
         .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        state
-            .credentials
-            .set(&api_key_account, api_key)
+        .filter(|value| !value.is_empty());
+    if let Some(api_key) = supplied_key {
+        credentials
+            .set(&canonical_account, api_key)
             .map_err(|error| error.to_string())?;
     }
-    let mut env_bindings = existing
-        .as_ref()
-        .map(|profile| profile.env_bindings.clone())
-        .unwrap_or_default();
-    env_bindings
-        .retain(|binding| binding.name != "NCBI_API_KEY" && binding.name != "NCBI_ADMIN_EMAIL");
-    if state
-        .credentials
-        .get(&api_key_account)
-        .map_err(|error| error.to_string())?
-        .is_some()
-    {
+    let mut env_bindings = existing.env_bindings.clone();
+    if supplied_key.is_some() {
+        env_bindings.retain(|binding| binding.name != "NCBI_API_KEY");
         env_bindings.push(McpEnvBinding {
             name: "NCBI_API_KEY".into(),
             value: None,
-            credential_reference: Some(api_key_account),
+            credential_reference: Some(canonical_account.clone()),
+        });
+    } else if !env_bindings
+        .iter()
+        .any(|binding| binding.name == "NCBI_API_KEY")
+        && credentials
+            .get(&canonical_account)
+            .map_err(|error| error.to_string())?
+            .is_some()
+    {
+        // Migrated references remain intact; reuse the canonical vault entry only when no binding exists.
+        env_bindings.push(McpEnvBinding {
+            name: "NCBI_API_KEY".into(),
+            value: None,
+            credential_reference: Some(canonical_account),
         });
     }
     if let Some(email) = request
@@ -578,46 +588,44 @@ pub async fn add_pubmed_mcp_server(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .or_else(|| {
-            existing.as_ref().and_then(|profile| {
-                profile
-                    .env_bindings
-                    .iter()
-                    .find(|binding| binding.name == "NCBI_ADMIN_EMAIL")
-                    .and_then(|binding| binding.value.clone())
-            })
-        })
     {
+        env_bindings
+            .retain(|binding| binding.name != "NCBI_ADMIN_EMAIL" && binding.name != "NCBI_EMAIL");
         env_bindings.push(McpEnvBinding {
-            name: "NCBI_ADMIN_EMAIL".into(),
-            value: Some(email),
+            name: "NCBI_EMAIL".into(),
+            value: Some(email.into()),
             credential_reference: None,
         });
     }
-    let command = std::env::current_exe()
-        .map_err(|error| format!("could not locate OmicsOps executable: {error}"))?
-        .to_string_lossy()
-        .into_owned();
-    let profile = mcp_profile_from_request(
+    let mut profile = mcp_profile_from_request(
         SaveMcpServerRequest {
             id: Some(id),
-            name: "PubMed".into(),
-            command,
-            args: vec!["--omicsops-pubmed-mcp".into()],
-            cwd: None,
-            timeout_secs: 60,
+            name: "Science · pubmed".into(),
+            command: executable.to_string_lossy().into_owned(),
+            args: vec!["--omicsops-bio-mcp".into(), "pubmed".into()],
+            cwd: existing.cwd.clone(),
+            timeout_secs: existing.timeout_secs,
             env_bindings,
         },
-        existing.as_ref(),
+        Some(&existing),
         Utc::now(),
     )?;
-    state
-        .repository
+    if supplied_key.is_some() {
+        // A key rotation changes runtime configuration even when its reference stays the same.
+        profile.enabled = false;
+        profile.launch_approved = false;
+        profile.approved_tools.clear();
+        profile.status = "disconnected".into();
+        profile.last_inspected_at = None;
+    }
+    crate::bundled_mcp_commands::populate_compiled_catalog(&mut profile, "pubmed")?;
+    if profile.tool_catalog_sha256 != existing.tool_catalog_sha256 {
+        profile.approved_tools.clear();
+    }
+    repository
         .put_json("mcp_server", &id.to_string(), &profile)
         .await
         .map_err(|error| error.to_string())?;
-    state.mcp_sessions.invalidate_server(id).await;
     Ok(profile)
 }
 
@@ -1105,6 +1113,161 @@ fn write_project_bundle(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn compatibility_pubmed_command_reuses_canonical_profile_and_vault_references() {
+        use omicsops_adapters::credentials::MemoryCredentialVault;
+        let repository = Store::open_in_memory().await.unwrap();
+        let vault = MemoryCredentialVault::default();
+        let exe = Path::new(r"C:\OmicsOps\omicsops-desktop.exe");
+        let mut existing = crate::bundled_mcp_commands::register_preset(&repository, "pubmed", exe)
+            .await
+            .unwrap();
+        vault
+            .set("mcp/legacy/NCBI_API_KEY", "fixture-private-value")
+            .unwrap();
+        existing.env_bindings = vec![
+            McpEnvBinding {
+                name: "NCBI_API_KEY".into(),
+                value: None,
+                credential_reference: Some("mcp/legacy/NCBI_API_KEY".into()),
+            },
+            McpEnvBinding {
+                name: "NCBI_ADMIN_EMAIL".into(),
+                value: Some("old@example.test".into()),
+                credential_reference: None,
+            },
+        ];
+        existing.env_bindings.push(McpEnvBinding {
+            name: "NCBI_EMAIL".into(),
+            value: Some("higher-priority-old@example.test".into()),
+            credential_reference: None,
+        });
+        existing.enabled = true;
+        existing.launch_approved = true;
+        existing.approved_tools = vec!["pubmed_search".into()];
+        repository
+            .put_json("mcp_server", &existing.id.to_string(), &existing)
+            .await
+            .unwrap();
+        let kept = configure_pubmed_preset(
+            &repository,
+            &vault,
+            AddPubMedMcpServerRequest {
+                api_key: None,
+                admin_email: None,
+            },
+            exe,
+        )
+        .await
+        .unwrap();
+        assert_eq!(kept.id, existing.id);
+        assert_eq!(kept.name, "Science · pubmed");
+        assert_eq!(kept.args, ["--omicsops-bio-mcp", "pubmed"]);
+        assert_eq!(kept.env_bindings, existing.env_bindings);
+        assert!(kept.enabled && kept.launch_approved);
+        assert_eq!(kept.approved_tools, existing.approved_tools);
+        assert!(
+            !serde_json::to_string(&kept)
+                .unwrap()
+                .contains("fixture-private-value")
+        );
+        assert_eq!(
+            repository
+                .list_json::<McpServerProfile>("mcp_server")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let changed = configure_pubmed_preset(
+            &repository,
+            &vault,
+            AddPubMedMcpServerRequest {
+                api_key: None,
+                admin_email: Some("new@example.test".into()),
+            },
+            exe,
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed.env_bindings.iter().filter(|binding| binding.name == "NCBI_EMAIL" || binding.name == "NCBI_ADMIN_EMAIL").count(), 1);
+        assert!(
+            changed
+                .env_bindings
+                .iter()
+                .any(|binding| binding.name == "NCBI_EMAIL"
+                    && binding.value.as_deref() == Some("new@example.test"))
+        );
+        assert!(!changed.enabled && !changed.launch_approved);
+        assert!(changed.approved_tools.is_empty());
+        assert!(!changed.tools.is_empty());
+        assert!(changed.tool_catalog_sha256.is_some());
+        assert_eq!(
+            changed.env_bindings[0].credential_reference.as_deref(),
+            Some("mcp/legacy/NCBI_API_KEY")
+        );
+    }
+
+    #[tokio::test]
+    async fn compatibility_pubmed_key_rotation_invalidates_grants_without_persisting_secret() {
+        use omicsops_adapters::credentials::MemoryCredentialVault;
+        let repository = Store::open_in_memory().await.unwrap();
+        let vault = MemoryCredentialVault::default();
+        let exe = Path::new("omicsops-desktop.exe");
+        let first = configure_pubmed_preset(
+            &repository,
+            &vault,
+            AddPubMedMcpServerRequest {
+                api_key: Some("fixture-first".into()),
+                admin_email: None,
+            },
+            exe,
+        )
+        .await
+        .unwrap();
+        let mut approved = first.clone();
+        approved.enabled = true;
+        approved.launch_approved = true;
+        approved.approved_tools = vec!["pubmed_search".into()];
+        repository
+            .put_json("mcp_server", &approved.id.to_string(), &approved)
+            .await
+            .unwrap();
+        let changed = configure_pubmed_preset(
+            &repository,
+            &vault,
+            AddPubMedMcpServerRequest {
+                api_key: Some("fixture-replacement".into()),
+                admin_email: None,
+            },
+            exe,
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed.env_bindings, first.env_bindings);
+        assert!(!changed.enabled && !changed.launch_approved);
+        assert!(changed.approved_tools.is_empty());
+        assert!(changed.last_inspected_at.is_none());
+        assert!(!changed.tools.is_empty());
+        let saved = repository
+            .get_json::<McpServerProfile>("mcp_server", &changed.id.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !serde_json::to_string(&saved)
+                .unwrap()
+                .contains("fixture-replacement")
+        );
+        assert_eq!(
+            vault
+                .get(&format!("mcp/{}/NCBI_API_KEY", changed.id))
+                .unwrap()
+                .as_deref(),
+            Some("fixture-replacement")
+        );
+    }
+
     use super::*;
     #[test]
     fn conflicts_keep_both_facts_and_link_sources() {
@@ -1459,77 +1622,4 @@ mod dispatch_boundary_tests {
             assert!(!mcp_error_before_dispatch(&error));
         }
     }
-}
-
-pub(crate) async fn refresh_bundled_pubmed_profile(
-    repository: &Store,
-    sessions: &McpSessionManager,
-    credentials: &dyn CredentialVault,
-    project_id: Uuid,
-    profile: McpServerProfile,
-) -> Result<McpServerProfile, String> {
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    if !is_bundled_pubmed_profile(&profile, &executable)
-        || !profile.enabled
-        || !profile.launch_approved
-    {
-        return Ok(profile);
-    }
-    let current = executable.to_string_lossy().into_owned();
-    if profile.command == current
-        && !profile.tools.is_empty()
-        && profile.tools.iter().all(|tool| {
-            tool.pointer("/annotations/readOnlyHint")
-                .and_then(Value::as_bool)
-                == Some(true)
-        })
-        && profile.tools.iter().any(|tool| {
-            tool.get("name").and_then(Value::as_str) == Some("pubmed_search")
-                && tool
-                    .pointer("/inputSchema/properties/query/maxLength")
-                    .and_then(Value::as_u64)
-                    == Some(500)
-        })
-    {
-        return Ok(profile);
-    }
-    let _lock = sessions.lock_server(profile.id).await;
-    let mut updated = mcp_server_profile(repository, profile.id).await?;
-    if !updated.enabled
-        || !updated.launch_approved
-        || !is_bundled_pubmed_profile(&updated, &executable)
-    {
-        return Ok(updated);
-    }
-    updated.command = current;
-    let config = resolved_mcp_config(&updated, project_id, credentials)?;
-    sessions.invalidate_server(updated.id).await;
-    let inspected = sessions
-        .inspect(config)
-        .await
-        .map_err(|error| error.to_string())?;
-    updated.tools = inspected.tools;
-    updated.capabilities = inspected.capabilities;
-    updated.tool_catalog_sha256 = Some(inspected.tool_catalog_sha256);
-    updated.catalog_generation = inspected.generation;
-    updated.approved_tools.clear();
-    updated.status = "ready".into();
-    updated.last_error = None;
-    updated.last_inspected_at = Some(Utc::now());
-    updated.updated_at = Utc::now();
-    repository
-        .put_json("mcp_server", &updated.id.to_string(), &updated)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(updated)
-}
-fn is_bundled_pubmed_profile(profile: &McpServerProfile, executable: &std::path::Path) -> bool {
-    profile.args == ["--omicsops-pubmed-mcp"]
-        && [std::path::Path::new(&profile.command), executable]
-            .iter()
-            .all(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.eq_ignore_ascii_case("omicsops-desktop.exe"))
-            })
 }

@@ -41,3 +41,46 @@ describe("bundled MCP presets", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 });
+
+it("configures PubMed credentials inside the unified preset and clears the secret", async () => {
+  const configure = vi.fn().mockResolvedValue({});
+  const add = vi.fn();
+  const save = vi.fn();
+  render(<SettingsPanel locale="en-US" initialSection="skills" onClose={vi.fn()} onListBundledMcpPresets={async () => [{ id: "pubmed", name: "PubMed", description: "Literature", description_zh: "文献", tool_count: 3 }]} onAddBundledMcp={add} onConfigurePubMedMcp={configure} onSaveMcpServer={save} />);
+  await screen.findByRole("option", { name: "PubMed · 3 tools" });
+  fireEvent.change(screen.getByLabelText("Select bundled MCP"), { target: { value: "pubmed" } });
+  fireEvent.click(screen.getByText("Configure credentials"));
+  const key = screen.getByLabelText("NCBI API key");
+  expect(key).toHaveAttribute("type", "password");
+  fireEvent.change(key, { target: { value: "ncbi-secret" } });
+  fireEvent.change(screen.getByLabelText("NCBI admin email"), { target: { value: "scientist@example.org" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save PubMed credentials" }));
+  await waitFor(() => expect(configure).toHaveBeenCalledWith({ api_key: "ncbi-secret", admin_email: "scientist@example.org" }));
+  await waitFor(() => expect(key).toHaveValue(""));
+  expect(add).not.toHaveBeenCalled();
+  expect(save).not.toHaveBeenCalled();
+  expect(screen.queryByRole("button", { name: "Add PubMed MCP" })).not.toBeInTheDocument();
+});
+
+it("keeps a failed credential edit private and clears it when leaving PubMed", async () => {
+  const configure = vi.fn().mockRejectedValue(new Error("credential vault unavailable"));
+  const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  try {
+    render(<SettingsPanel locale="en-US" initialSection="skills" onClose={vi.fn()} onListBundledMcpPresets={async () => [{ id: "pubmed", name: "PubMed", description: "Literature", description_zh: "文献", tool_count: 3 }, ...presets]} onConfigurePubMedMcp={configure} />);
+    await screen.findByRole("option", { name: "PubMed · 3 tools" });
+    fireEvent.change(screen.getByLabelText("Select bundled MCP"), { target: { value: "pubmed" } });
+    fireEvent.click(screen.getByText("Configure credentials"));
+    fireEvent.change(screen.getByLabelText("NCBI API key"), { target: { value: "retry-secret" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save PubMed credentials" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("credential vault unavailable");
+    expect(screen.getByLabelText("NCBI API key")).toHaveValue("retry-secret");
+    expect(screen.getByRole("alert")).not.toHaveTextContent("retry-secret");
+    expect(JSON.stringify([...log.mock.calls, ...warn.mock.calls, ...error.mock.calls])).not.toContain("retry-secret");
+    fireEvent.change(screen.getByLabelText("Select bundled MCP"), { target: { value: "uniprot" } });
+    expect(screen.queryByLabelText("NCBI API key")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Select bundled MCP"), { target: { value: "pubmed" } });
+    expect(screen.getByLabelText("NCBI API key")).toHaveValue("");
+  } finally { log.mockRestore(); warn.mockRestore(); error.mockRestore(); }
+});
