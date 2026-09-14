@@ -1447,6 +1447,6 @@ it("routes native idle sends through the durable queue and recovers the committe
     await waitFor(() => expect(enqueue).toHaveBeenCalledTimes(1));
     expect(submit).not.toHaveBeenCalled(); expect(start).not.toHaveBeenCalled();
     await waitFor(() => expect(input).toHaveValue(""));
-    await waitFor(() => expect(screen.getAllByText("原子提交的研究任务").length).toBeGreaterThan(1));
+    await waitFor(() => expect(screen.getAllByText("原子提交的研究任务")).toHaveLength(1));
   } finally { view.unmount(); Reflect.deleteProperty(window, "__TAURI_INTERNALS__"); }
 });

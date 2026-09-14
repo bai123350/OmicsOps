@@ -10,6 +10,12 @@
 
 **Spec:** E01 durable composer queue; fixed Wisp reference behavior in `main.rs` lines 3960–4006 and 4645–4715 and `agent_turn.rs` lines 1338–1475; no generic DAG or background scheduler.
 
+## Workspace UI adjustment (2026-09-14)
+
+The workspace no longer renders the Send queue panel between the conversation and the main composer. Queue records, including cancelled and failed history, do not occupy that area. The panel's edit, reorder, cancel and restore-to-composer controls are therefore no longer exposed there. The main composer, durable submission, FIFO dispatch, Stop action and queue recovery error remain unchanged; no stored queue records are deleted and no persistence or approval contracts change.
+
+Regression coverage checks all queue statuses while submitting through the main composer, and exercises side-chat material transfer through file selection and reference attachment. Manual Windows smoke: open a conversation with cancelled queue history, confirm the middle panel is absent, and send from the bottom composer. Real model/SSH acceptance is outside this UI change.
+
 ## Global Constraints
 
 - This document is design-only. The implementation starts only after the root agent reviews and accepts the contracts and transaction boundaries below.
