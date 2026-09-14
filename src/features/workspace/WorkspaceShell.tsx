@@ -1137,7 +1137,7 @@ function V4RunTrace({ locale, events, previewText, onAnswer, onDecideApproval, o
   const pauseReason = getV4PauseReason(events);
   const legacyMcpFailure = (!terminal || terminal.event.kind === "run_needs_attention" || terminal.event.kind === "run_failed") && events.some(({ event }) => event.kind === "tool_dispatch_uncertain" && event.tool_id === "use_mcp_tool" && !isV4UncertainResolved(events, event.call_id));
   const status = legacyMcpFailure ? (zh ? "失败" : "Failed") : terminal?.event.kind === "run_completed" ? (zh ? "已完成" : "Completed") : terminal?.event.kind === "run_cancelled" ? (zh ? "已终止" : "Cancelled") : terminal?.event.kind === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention") : terminal?.event.kind === "run_failed" ? (zh ? "失败" : "Failed") : pauseReason === "approval" ? (zh ? "等待工具审批" : "Waiting for approval") : pauseReason === "input" ? (zh ? "等待回答" : "Waiting for input") : pauseReason === "browser_connection" ? (zh ? "等待连接浏览器" : "Waiting for browser") : pauseReason === "browser_human" ? (zh ? "等待人工处理浏览器" : "Waiting for browser intervention") : pauseReason === "runtime_recovery" ? (zh ? "结果待恢复" : "Results ready to resume") : pauseReason === "uncertain" ? (zh ? "等待副作用核验" : "Waiting for verification") : (zh ? "运行中" : "Running");
-  const shouldExpand = !historical && (!terminal || Boolean(pauseReason) || terminal?.event.kind === "run_failed" || terminal?.event.kind === "run_needs_attention");
+  const shouldExpand = !historical && !terminal;
   async function resumeRun() {
     if (!onResume || !events[0] || resumeBusyRef.current) return;
     resumeBusyRef.current = true;
@@ -1169,7 +1169,7 @@ function V4RunTrace({ locale, events, previewText, onAnswer, onDecideApproval, o
 
       <section className="v4-process-timeline" aria-label={zh ? "工具调用详情" : "Tool call details"}>
       {[
-        ...progress.map(({ event, modelText }) => ({ sequence: event.sequence, node: <article aria-label={zh ? "模型输出" : "Model output"} className="v4-progress-row" key={`progress-${event.sequence}`}><span aria-hidden="true">−</span><strong>PROGRESS</strong><MarkdownContent markdown={modelText ?? ""} /></article> })),
+        ...progress.map(({ event, modelText }) => ({ sequence: event.sequence, node: <PublicProgress key={`progress-${event.sequence}`} markdown={modelText ?? ""} zh={zh} /> })),
         ...tools.map((tool) => ({ sequence: tool.firstSequence, node: <details className="v4-tool-trace" key={tool.callId} open={tool.status === "failed"}>
           <summary className="v4-tool-trace-heading"><span className={`v4-tool-mark ${tool.status}`} aria-label={toolStatusLabel(tool.status, zh)}>{tool.status === "failed" ? "×" : tool.status === "succeeded" || tool.status === "reused" ? "✓" : "○"}</span>{tool.toolId === "use_skill" && <span className="v4-skill-badge">SKILL</span>}<strong title={toolDisplayLabel(tool.toolId, zh)}>{tool.toolId === "use_skill" ? tool.subject ?? "use_skill" : compactToolLabel(tool.toolId)}</strong>{tool.subject && tool.toolId !== "use_skill" && <span className="v4-tool-subject" title={tool.subject}>{tool.subject}</span>}<span className={`v4-tool-status ${tool.status}`}>{toolStatusLabel(tool.status, zh)}</span><small className="v4-tool-metrics">{toolMetrics(tool, zh)}</small><ChevronRight size={13} /></summary>
           <div className="v4-tool-trace-body">
@@ -1179,7 +1179,7 @@ function V4RunTrace({ locale, events, previewText, onAnswer, onDecideApproval, o
           </div>
         </details> })),
       ].sort((a, b) => a.sequence - b.sequence).map(({ node }) => node)}
-      {!terminal && previewText && <article aria-label={zh ? "模型实时输出" : "Live model output"} className="v4-progress-row v4-streaming-row"><span aria-hidden="true">−</span><strong>PROGRESS</strong><div className="v4-streaming-text">{previewText}<span className="v4-streaming-cursor" aria-hidden="true">▍</span></div></article>}
+      {!terminal && previewText && <article aria-label={zh ? "模型实时输出" : "Live model output"} className="v4-progress-row v4-streaming-row"><span aria-hidden="true">−</span><strong>{zh ? "进度" : "Progress"}</strong><div className="v4-streaming-text">{previewText}<span className="v4-streaming-cursor" aria-hidden="true">▍</span></div></article>}
       </section>
         <details className="v4-process-context"><summary>{zh ? "诊断记录" : "Diagnostic records"}</summary><ol className="v4-diagnostic-events">{events.filter(({ event }) => event.kind !== "model_text").map((event) => <li key={event.sequence}><span>#{event.sequence}</span><code>{event.event.kind}</code><time dateTime={event.occurred_at}>{new Date(event.occurred_at).toLocaleTimeString()}</time></li>)}</ol></details>
       </div>
@@ -1261,6 +1261,18 @@ function isV4UncertainResolved(events: AgentRunEventV4[], callId: string) {
 }
 function isV4QuestionAnswered(events: AgentRunEventV4[], questionId: string) {
   return events.some((event) => event.event.kind === "user_input_answered" && event.event.question_id === questionId);
+}
+function PublicProgress({ markdown, zh }: { markdown: string; zh: boolean }) {
+  const [open, setOpen] = useState(false);
+  const firstLine = markdown.split(/\r?\n/).find((line) => line.trim())?.trim() ?? "";
+  const summary = Array.from(firstLine);
+  const preview = summary.slice(0, 100).join("") + (summary.length > 100 ? "…" : "");
+  return <article aria-label={zh ? "模型输出" : "Model output"} className="v4-progress-disclosure">
+    <button type="button" className="v4-progress-heading" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+      <span aria-hidden="true">−</span><strong>{zh ? "进度" : "Progress"}</strong><span className="v4-progress-preview">{preview}</span><ChevronRight size={13} />
+    </button>
+    {open && <MarkdownContent markdown={markdown} />}
+  </article>;
 }
 function MarkdownContent({ markdown }: { markdown: string }) {
   return <div className="markdown-content"><ReactMarkdown remarkPlugins={[remarkGfm]}>{markdown}</ReactMarkdown></div>;

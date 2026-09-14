@@ -263,7 +263,7 @@ describe("WorkspaceShell", () => {
       { ...base, sequence: 8, occurred_at: "2026-08-17T00:00:07Z", event: { kind: "tool_requested", call: { call_id: "e", tool_id: "edit", arguments: { path: "C:\\data\\output.txt" } } } },
     ]} />);
     const timeline = screen.getByRole("region", { name: "Tool call details" });
-    expect(Array.from(timeline.children).map((row) => row.querySelector(".markdown-content")?.textContent ?? row.querySelector("strong")?.textContent ?? row.textContent)).toEqual(["Inspect the file first.", "read", "Now save and revise.", "write", "edit"]);
+    expect(Array.from(timeline.children).map((row) => row.querySelector(".v4-progress-preview")?.textContent ?? row.querySelector("strong")?.textContent ?? row.textContent)).toEqual(["Inspect the file first.", "read", "Now save and revise.", "write", "edit"]);
     expect(timeline.closest("details")).toHaveClass("agent-run-fold");
     const read = within(timeline).getByText("read").closest("details")!;
     expect(read).not.toHaveAttribute("open");
@@ -310,7 +310,7 @@ describe("WorkspaceShell", () => {
     expect(screen.queryByRole("region", { name: "Agent 阶段轨迹" })).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "任务列表" })).not.toBeInTheDocument();
     expect(screen.getByText("公开摘要：先检查输入。")).toBeVisible();
-    expect(screen.getByText("PROGRESS")).toBeVisible();
+    expect(screen.getByText("进度")).toBeVisible();
     expect(screen.queryByText("private reasoning must never render")).not.toBeInTheDocument();
     expect(screen.queryByText("agent.update_tasks")).not.toBeInTheDocument();
     expect(screen.getByText("task_list_updated")).not.toBeVisible();
@@ -1072,4 +1072,28 @@ describe("Session follow-up wiring", () => {
     expect(screen.queryByRole("region", { name: "Suggested follow-up questions" })).not.toBeInTheDocument();
     expect(suggest).not.toHaveBeenCalled();
   });
+});
+
+it("collapses a finished failure while keeping its reason and final answer visible", () => {
+  const base = { schema_version: 4 as const, run_id: "failed-compact", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "h", occurred_at: "2026-09-14T00:00:00Z" };
+  render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId={base.run_id} messages={[{ id: "answer", role: "assistant", markdown: "已核验的部分结果" }]} agentRunEventsV4={[
+    { ...base, sequence: 1, event: { kind: "model_text", text: "正在检索。\n\n更详细的检索范围。" } },
+    { ...base, sequence: 2, event: { kind: "run_failed", message: "检索服务暂不可用" } },
+  ]} />);
+  expect(screen.getByText("执行过程").closest("details")).not.toHaveAttribute("open");
+  expect(screen.getByText("检索服务暂不可用")).toBeVisible();
+  expect(screen.getByText("已核验的部分结果")).toBeVisible();
+});
+
+it("expands public progress on demand and preserves the choice across streamed updates", () => {
+  const base = { schema_version: 4 as const, run_id: "progress-compact", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "h", occurred_at: "2026-09-14T00:00:00Z" };
+  const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: base.run_id, agentRunEventsV4: [{ ...base, sequence: 1, event: { kind: "model_text" as const, text: "正在检索。\n\n## 检索范围\n\nHi-C 与染色质结构。" } }] };
+  const { rerender } = render(<WorkspaceShell {...props} />);
+  expect(screen.queryByRole("heading", { name: "检索范围" })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: /进度.*正在检索/ }));
+  expect(screen.getByRole("heading", { name: "检索范围" })).toBeVisible();
+  rerender(<WorkspaceShell {...props} agentTextPreview={{ run_id: base.run_id, text: "继续核对引用" }} />);
+  expect(screen.getByRole("heading", { name: "检索范围" })).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: /进度.*正在检索/ }));
+  expect(screen.queryByRole("heading", { name: "检索范围" })).not.toBeInTheDocument();
 });
