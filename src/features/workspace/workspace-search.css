@@ -1,0 +1,46 @@
+.workspace-search-backdrop{position:fixed;inset:0;z-index:1100;display:grid;place-items:center;padding:24px;background:rgba(10,43,38,.58);backdrop-filter:blur(4px)}
+.workspace-search-dialog{width:min(760px,calc(100vw - 36px));max-height:min(720px,calc(100vh - 48px));display:flex;flex-direction:column;overflow:hidden;border:1px solid #9bd8cb;border-radius:18px;background:#fff;color:#233b37;box-shadow:0 28px 90px rgba(6,38,32,.36)}
+.workspace-search-header{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:22px 24px 19px;background:linear-gradient(135deg,#104e45,#0b766b);color:#fff}
+.workspace-search-kicker{display:block;color:#9ef0d4;font-size:9px;font-weight:750;letter-spacing:.14em;text-transform:uppercase}
+.workspace-search-header h2{margin:5px 0 3px;font-family:Georgia,"Noto Serif SC",serif;font-size:22px;font-weight:500;line-height:1.2}
+.workspace-search-header p{margin:0;color:#d0eee6;font-size:11px;line-height:1.45}
+.workspace-search-close{width:34px;height:34px;display:grid;place-items:center;flex:0 0 auto;border:1px solid rgba(213,255,243,.28);border-radius:9px;background:rgba(255,255,255,.08);color:#e4fff7}
+.workspace-search-close:hover,.workspace-search-close:focus-visible{background:rgba(255,255,255,.18);color:#fff}
+.workspace-search-body{min-height:0;display:flex;flex-direction:column;gap:12px;padding:18px 20px 14px}
+.workspace-search-input-wrap{display:flex;align-items:center;gap:9px;min-height:44px;padding:0 12px;border:1px solid #b8d8d1;border-radius:12px;background:#fbfefd;color:#14867b;box-shadow:0 1px 2px rgba(13,84,73,.07)}
+.workspace-search-input-wrap:focus-within{border-color:#47a99b;outline:2px solid rgba(27,156,141,.16);outline-offset:1px}
+.workspace-search-input-wrap input{width:100%;min-width:0;border:0;outline:0;background:transparent;color:#233b37;font:inherit;font-size:14px}
+.workspace-search-input-wrap input::placeholder{color:#8aa49e}
+.workspace-search-input-wrap kbd{padding:3px 6px;border:1px solid #d0e1dc;border-radius:5px;background:#f1f8f6;color:#6d8881;font:inherit;font-family:ui-monospace,Consolas,monospace;font-size:10px;white-space:nowrap}
+.workspace-search-status,.workspace-search-error{display:flex;align-items:center;gap:8px;min-height:31px;padding:7px 10px;border-radius:8px;font-size:11px;line-height:1.4}
+.workspace-search-status{background:#eef9f5;color:#297a6f}
+.workspace-search-error{justify-content:space-between;gap:14px;background:#fff5f2;color:#a33d31}
+.workspace-search-error>span{min-width:0}
+.workspace-search-error button{display:inline-flex;align-items:center;justify-content:center;gap:5px;flex:0 0 auto;padding:6px 9px;border:1px solid #e4aaa1;border-radius:7px;background:#fff;color:#a33d31;font:inherit;font-size:10px;font-weight:700}
+.workspace-search-error button:hover:not(:disabled){background:#fff0ed}
+.workspace-search-results{min-height:0;overflow-y:auto;padding:1px 2px 2px}
+.workspace-search-group+.workspace-search-group{margin-top:15px;padding-top:14px;border-top:1px solid #e4eeeb}
+.workspace-search-group h3{margin:0 5px 7px;color:#6e8982;font-size:10px;font-weight:750;letter-spacing:.1em;text-transform:uppercase}
+.workspace-search-result{display:flex;align-items:center;gap:9px;min-width:0;padding:8px 7px;border:1px solid transparent;border-radius:10px}
+.workspace-search-result.is-selected{border-color:#a8d6cc;background:#eff9f6}
+.workspace-search-result:hover{background:#f5fbf9}
+.workspace-search-result-icon{display:grid;place-items:center;width:31px;height:31px;flex:0 0 auto;border-radius:9px;background:#e8f4f1;color:#198b80}
+.workspace-search-result-open{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-rows:auto auto;align-items:center;flex:1;min-width:0;gap:2px 10px;padding:4px 2px;border:0;background:transparent;color:#25433d;text-align:left}
+.workspace-search-result-open:hover:not(:disabled){color:#0c796d}
+.workspace-search-result-open strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:650}
+.workspace-search-result-open small{min-width:0;overflow:hidden;color:#718983;font-size:10px;line-height:1.35;text-overflow:ellipsis;white-space:nowrap}
+.workspace-search-result-open>svg{grid-column:2;grid-row:1 / span 2;color:#6eaaa1}
+.workspace-search-result-actions{display:flex;align-items:center;gap:5px;flex:0 0 auto}
+.workspace-search-attach{display:inline-flex;align-items:center;justify-content:center;gap:5px;min-height:29px;padding:0 8px;border:1px solid #9bcfc3;border-radius:7px;background:#fff;color:#16796e;font:inherit;font-size:10px;font-weight:700}
+.workspace-search-attach:hover:not(:disabled){background:#eaf8f4}
+.workspace-search-empty{margin:18px 4px;padding:24px 12px;border:1px dashed #cbded9;border-radius:10px;color:#7c9690;font-size:11px;text-align:center}
+.workspace-search-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 20px;border-top:1px solid #e4eeeb;background:#fbfefd;color:#78918b;font-size:10px;line-height:1.4}
+.workspace-search-footer>span:first-child{min-width:0}
+.workspace-search-local-error{color:#a33d31}
+.workspace-search-pending{color:#168478;font-weight:700;white-space:nowrap}
+.workspace-search-dialog button{cursor:pointer}
+.workspace-search-dialog button:focus-visible,.workspace-search-dialog input:focus-visible{outline:2px solid #159b8e;outline-offset:2px}
+.workspace-search-dialog button:disabled{cursor:not-allowed;opacity:.5}
+.workspace-search-spin{animation:workspace-search-spin .85s linear infinite}
+@keyframes workspace-search-spin{to{transform:rotate(360deg)}}
+@media(max-width:620px){.workspace-search-backdrop{padding:12px}.workspace-search-dialog{width:calc(100vw - 24px);max-height:calc(100vh - 24px);border-radius:14px}.workspace-search-header{padding:18px 17px 16px}.workspace-search-header h2{font-size:19px}.workspace-search-body{padding:14px 13px 11px}.workspace-search-result{align-items:flex-start}.workspace-search-result-icon{margin-top:4px}.workspace-search-attach{min-height:31px;padding:0 7px}.workspace-search-footer{align-items:flex-start;flex-direction:column;padding:10px 14px}}

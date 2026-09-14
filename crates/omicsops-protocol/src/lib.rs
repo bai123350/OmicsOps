@@ -10,6 +10,10 @@ use uuid::Uuid;
 
 mod runtime_job;
 pub use runtime_job::*;
+mod context_usage;
+pub use context_usage::*;
+mod session_reviews;
+pub use session_reviews::*;
 
 pub const AGENT_RUNTIME_V4: &str = "omicsops.agent-runtime@4.0.0";
 
@@ -152,6 +156,50 @@ pub struct DelegatedModelBindingV4 {
     pub configuration_hash: String,
 }
 
+/// Conversation-scoped optional Agent capabilities.
+///
+/// These values are preferences for a new run. The host must snapshot them
+/// into the run before execution so changing the conversation setting cannot
+/// alter an already frozen run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConversationAgentPreferencesV4 {
+    pub delegation_enabled: bool,
+    pub auto_review: bool,
+    pub memory_enabled: bool,
+    /// None inherits the selected model profile; false requests standard service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_mode: Option<bool>,
+}
+
+impl Default for ConversationAgentPreferencesV4 {
+    fn default() -> Self {
+        Self {
+            delegation_enabled: true,
+            auto_review: true,
+            memory_enabled: true,
+            fast_mode: None,
+        }
+    }
+}
+
+/// The effective main-model tier at run creation. An existing snapshot with
+/// `fast_mode: None` freezes omission of service_tier (provider default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RunServiceTierV4 {
+    pub fast_mode: Option<bool>,
+}
+
+/// Exact model settings for a new run's independent automatic review request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewerModelBindingV4 {
+    pub profile_id: Uuid,
+    pub configuration_hash: String,
+    pub service_tier: RunServiceTierV4,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RunSpecV4 {
     pub schema_version: u8,
@@ -160,11 +208,17 @@ pub struct RunSpecV4 {
     pub project_id: Uuid,
     pub conversation_id: Uuid,
     pub model_profile_id: Uuid,
-    /// New ordinary runs bind the exact main profile execution settings.
+    /// New executable runs bind the exact main profile execution settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_configuration_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegated_model: Option<DelegatedModelBindingV4>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_preferences: Option<ConversationAgentPreferencesV4>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<RunServiceTierV4>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_model: Option<ReviewerModelBindingV4>,
     pub plan: ExecutionPlanV4,
     pub approved_plan_hash: String,
     #[serde(default, skip_serializing_if = "is_approved_plan_execution")]
@@ -201,6 +255,9 @@ impl RunSpecV4 {
             model_profile_id,
             plan,
             delegated_model: None,
+            conversation_preferences: None,
+            service_tier: None,
+            reviewer_model: None,
             model_configuration_hash: None,
             approved_plan_hash: actual,
             execution_kind: RunExecutionKindV4::ApprovedPlan,
@@ -268,6 +325,9 @@ impl RunSpecV4 {
             plan,
             approved_plan_hash: plan_hash,
             delegated_model: None,
+            conversation_preferences: None,
+            service_tier: None,
+            reviewer_model: None,
             model_configuration_hash: None,
             execution_kind: RunExecutionKindV4::ApprovedPlan,
             compute_selection: Some(selection),
@@ -327,15 +387,42 @@ impl RunSpecV4 {
         if let Some(hash) = &self.model_configuration_hash {
             value["model_configuration_hash"] = serde_json::json!(hash);
         }
+        if let Some(preferences) = &self.conversation_preferences {
+            value["conversation_preferences"] = serde_json::json!(preferences);
+        }
+        if let Some(tier) = &self.service_tier {
+            value["service_tier"] = serde_json::json!(tier);
+        }
+        if let Some(reviewer) = &self.reviewer_model {
+            value["reviewer_model"] = serde_json::json!(reviewer);
+        }
         Ok(hex::encode(Sha256::digest(
             serde_json::to_vec(&value).map_err(|_| ProtocolErrorV4::InvalidComputeSelection)?,
         )))
     }
 
     pub fn validate_integrity(&self) -> Result<(), ProtocolErrorV4> {
+        let compute_bound_execution = matches!(
+            self.execution_kind,
+            RunExecutionKindV4::ApprovedPlan | RunExecutionKindV4::OrdinaryAgent
+        ) && self.compute_selection.is_some();
+        if self.service_tier.is_some() && !compute_bound_execution {
+            return Err(ProtocolErrorV4::SpecHashMismatch);
+        }
+        if let Some(binding) = &self.reviewer_model {
+            if !compute_bound_execution
+                || binding.profile_id.is_nil()
+                || binding.configuration_hash.len() != 64
+                || !binding
+                    .configuration_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(ProtocolErrorV4::SpecHashMismatch);
+            }
+        }
         if let Some(hash) = &self.model_configuration_hash {
-            if self.execution_kind != RunExecutionKindV4::OrdinaryAgent
-                || self.compute_selection.is_none()
+            if !compute_bound_execution
                 || hash.len() != 64
                 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
             {
@@ -343,8 +430,7 @@ impl RunSpecV4 {
             }
         }
         if let Some(binding) = &self.delegated_model {
-            if self.execution_kind != RunExecutionKindV4::OrdinaryAgent
-                || self.compute_selection.is_none()
+            if !compute_bound_execution
                 || binding.configuration_hash.len() != 64
                 || !binding
                     .configuration_hash
@@ -1120,6 +1206,15 @@ pub enum AgentEventKindV4 {
         class: ModelErrorClassV4,
         message: String,
     },
+    /// Immutable identity for a provider attempt, persisted before dispatch.
+    ModelRequestStarted {
+        request: ModelRequestStartedV4,
+    },
+    /// Allowlisted provider usage, enriched with the request identity by
+    /// AgentCore. Raw provider payloads are intentionally excluded.
+    ModelUsageObserved {
+        observation: ModelUsageObservationV4,
+    },
     ToolRequested {
         call: ToolCallV4,
     },
@@ -1243,6 +1338,38 @@ pub enum AgentEventKindV4 {
     },
     ContextCheckpointed {
         checkpoint: ContextCheckpointV4,
+    },
+    /// Durable beginning of a manual context projection. This is a
+    /// non-terminal audit event; the original transcript remains untouched.
+    ContextCompactionStarted {
+        request_id: Uuid,
+        source_through_sequence: u64,
+        source_head_hash: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frozen_spec_hash: Option<String>,
+    },
+    /// Explicit no-op outcome when the current bounded projection already
+    /// fits. No archive is created and no history is removed.
+    ContextCompactionNotNeeded {
+        request_id: Uuid,
+        before_bytes: u64,
+    },
+    /// Durable successful result. The checkpoint itself is retained in the
+    /// existing ContextCheckpointed event; this event carries only its
+    /// bounded identity and hashes.
+    ContextCompactionCompleted {
+        request_id: Uuid,
+        archive: ContextArchiveV4,
+        checkpoint_through_sequence: u64,
+        checkpoint_sha256: String,
+        before_bytes: u64,
+        after_bytes: u64,
+    },
+    /// Durable failure outcome. The message is host-safe and bounded; it is
+    /// not a provider or database diagnostic.
+    ContextCompactionAttention {
+        request_id: Uuid,
+        message: String,
     },
     ScientificStateChanged {
         revision: u64,
@@ -1941,11 +2068,18 @@ mod tests {
         let mut approved = bound_main.clone();
         approved.execution_kind = RunExecutionKindV4::ApprovedPlan;
         approved.spec_hash = Some(approved.calculate_spec_hash().unwrap());
+        approved.validate_integrity().unwrap();
+        let mut tampered_approved = approved.clone();
+        tampered_approved.spec_hash = Some("e".repeat(64));
         assert_eq!(
-            approved.validate_integrity(),
+            tampered_approved.validate_integrity(),
             Err(ProtocolErrorV4::SpecHashMismatch)
         );
         let mut no_compute = bound_main.clone();
+        no_compute.delegated_model = Some(DelegatedModelBindingV4 {
+            profile_id: Uuid::new_v4(),
+            configuration_hash: "a".repeat(64),
+        });
         no_compute.compute_selection = None;
         no_compute.spec_hash = Some(no_compute.calculate_spec_hash().unwrap());
         assert_eq!(
@@ -1975,8 +2109,167 @@ mod tests {
         ordinary.spec_hash = Some(ordinary.calculate_spec_hash().unwrap());
         ordinary.execution_kind = RunExecutionKindV4::ApprovedPlan;
         ordinary.spec_hash = Some(ordinary.calculate_spec_hash().unwrap());
+        ordinary.validate_integrity().unwrap();
+    }
+
+    #[test]
+    fn conversation_agent_preferences_default_and_reject_unknown_fields() {
         assert_eq!(
-            ordinary.validate_integrity(),
+            ConversationAgentPreferencesV4::default(),
+            ConversationAgentPreferencesV4 {
+                delegation_enabled: true,
+                auto_review: true,
+                memory_enabled: true,
+                fast_mode: None
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(ConversationAgentPreferencesV4::default()).unwrap(),
+            serde_json::json!({
+                "delegation_enabled": true,
+                "auto_review": true,
+                "memory_enabled": true,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ConversationAgentPreferencesV4>(serde_json::json!({
+                "memory_enabled": false,
+            }))
+            .unwrap(),
+            ConversationAgentPreferencesV4 {
+                delegation_enabled: true,
+                auto_review: true,
+                memory_enabled: false,
+                fast_mode: None
+            }
+        );
+        assert!(
+            serde_json::from_value::<ConversationAgentPreferencesV4>(serde_json::json!({
+                "delegation_enabled": true,
+                "auto_review": true,
+                "memory_enabled": true,
+                "unexpected": false,
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn conversation_preferences_are_hash_bound_and_legacy_specs_keep_their_hash() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let model_profile_id = Uuid::new_v4();
+        let plan = ExecutionPlanV4 {
+            schema_version: 4,
+            objective: "preference snapshot".into(),
+            steps: vec!["execute".into()],
+            completion_criteria: vec!["verified".into()],
+            requested_capabilities: BTreeSet::new(),
+        };
+        let selection = local_selection();
+        let approval = RunSpecV4::approval_hash_for(
+            run_id,
+            project_id,
+            conversation_id,
+            model_profile_id,
+            &plan,
+            &selection,
+        )
+        .unwrap();
+        let legacy = RunSpecV4::freeze_with_compute(
+            run_id,
+            project_id,
+            conversation_id,
+            model_profile_id,
+            plan,
+            selection,
+            &approval,
+            Utc::now(),
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(&legacy).unwrap();
+        assert!(encoded.get("conversation_preferences").is_none());
+        assert!(encoded.get("service_tier").is_none());
+        assert!(encoded.get("reviewer_model").is_none());
+        let restored: RunSpecV4 = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored.conversation_preferences, None);
+        assert_eq!(
+            restored.calculate_spec_hash().unwrap(),
+            legacy.calculate_spec_hash().unwrap()
+        );
+
+        let mut frozen = legacy.clone();
+        let mut tier_hashes = BTreeSet::new();
+        for fast_mode in [None, Some(false), Some(true)] {
+            let mut tier_spec = legacy.clone();
+            tier_spec.service_tier = Some(RunServiceTierV4 { fast_mode });
+            let hash = tier_spec.calculate_spec_hash().unwrap();
+            assert_ne!(hash, legacy.calculate_spec_hash().unwrap());
+            assert!(tier_hashes.insert(hash.clone()));
+            tier_spec.spec_hash = Some(hash);
+            tier_spec.validate_integrity().unwrap();
+            let mut unbound = tier_spec.clone();
+            unbound.compute_selection = None;
+            assert_eq!(
+                unbound.validate_integrity(),
+                Err(ProtocolErrorV4::SpecHashMismatch)
+            );
+            let encoded = serde_json::to_value(&tier_spec).unwrap();
+            assert_eq!(
+                encoded["service_tier"]["fast_mode"],
+                serde_json::json!(fast_mode)
+            );
+            let mut restored: RunSpecV4 = serde_json::from_value(encoded).unwrap();
+            assert_eq!(restored.service_tier, tier_spec.service_tier);
+            restored.service_tier = None;
+            assert_eq!(
+                restored.validate_integrity(),
+                Err(ProtocolErrorV4::SpecHashMismatch)
+            );
+        }
+        let mut reviewer_spec = legacy.clone();
+        reviewer_spec.reviewer_model = Some(ReviewerModelBindingV4 {
+            profile_id: Uuid::new_v4(),
+            configuration_hash: "e".repeat(64),
+            service_tier: RunServiceTierV4 { fast_mode: None },
+        });
+        reviewer_spec.spec_hash = Some(reviewer_spec.calculate_spec_hash().unwrap());
+        reviewer_spec.validate_integrity().unwrap();
+        assert_ne!(reviewer_spec.spec_hash, legacy.spec_hash);
+        let restored: RunSpecV4 =
+            serde_json::from_value(serde_json::to_value(&reviewer_spec).unwrap()).unwrap();
+        assert_eq!(restored.reviewer_model, reviewer_spec.reviewer_model);
+        reviewer_spec
+            .reviewer_model
+            .as_mut()
+            .unwrap()
+            .service_tier
+            .fast_mode = Some(true);
+        assert_eq!(
+            reviewer_spec.validate_integrity(),
+            Err(ProtocolErrorV4::SpecHashMismatch)
+        );
+        frozen.conversation_preferences = Some(ConversationAgentPreferencesV4 {
+            delegation_enabled: false,
+            auto_review: true,
+            memory_enabled: false,
+            fast_mode: None,
+        });
+        frozen.spec_hash = Some(frozen.calculate_spec_hash().unwrap());
+        frozen.validate_integrity().unwrap();
+        assert_ne!(
+            frozen.calculate_spec_hash().unwrap(),
+            legacy.calculate_spec_hash().unwrap()
+        );
+
+        frozen
+            .conversation_preferences
+            .as_mut()
+            .unwrap()
+            .memory_enabled = true;
+        assert_eq!(
+            frozen.validate_integrity(),
             Err(ProtocolErrorV4::SpecHashMismatch)
         );
     }

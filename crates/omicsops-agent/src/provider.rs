@@ -24,6 +24,210 @@ pub struct ProviderRequest {
     pub require_strict_json_fallback: bool,
 }
 
+/// How a provider reports the numeric values in one usage sample.
+///
+/// The built-in adapters currently emit cumulative samples.  `Delta` is kept
+/// for a provider contract that explicitly documents deltas, while `Unknown`
+/// is deliberately not treated as additive evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderUsageAggregation {
+    Cumulative,
+    Delta,
+    Unknown,
+}
+
+/// Whether a usage sample is a complete provider response or an observation
+/// made while the response is still in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderUsageState {
+    Partial,
+    Final,
+    Interrupted,
+}
+
+/// Sanitized provider usage.  Every counter is optional: an absent provider
+/// field remains `None`, while a provider-reported zero is `Some(0)`.  Raw
+/// response JSON and unknown numeric fields intentionally have no place in
+/// this type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderUsageSample {
+    /// Stable only within one provider attempt.  A new attempt starts at zero.
+    pub sample_index: u32,
+    pub aggregation: ProviderUsageAggregation,
+    pub state: ProviderUsageState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    /// Provider-normalized prompt/context occupancy. This is distinct from
+    /// the billing/input facet: Anthropic only supplies it when its explicit
+    /// input, cache-read and cache-creation counters can be checked-added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_total_tokens: Option<u64>,
+}
+
+/// Coalesces cumulative or explicitly documented delta samples from one
+/// provider attempt.  Callers must create a fresh accumulator for every
+/// retry attempt; the sample index is intentionally scoped to that attempt.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderUsageAccumulator {
+    seen_sample_indices: BTreeSet<u32>,
+    merged: Option<ProviderUsageSample>,
+}
+
+impl ProviderUsageAccumulator {
+    pub fn push(&mut self, sample: ProviderUsageSample) -> Option<ProviderUsageSample> {
+        if !self.seen_sample_indices.insert(sample.sample_index) {
+            return self.merged.clone();
+        }
+
+        let Some(mut merged) = self.merged.take() else {
+            if sample.aggregation == ProviderUsageAggregation::Unknown {
+                self.merged = Some(ProviderUsageSample {
+                    input_tokens: None,
+                    context_tokens: None,
+                    output_tokens: None,
+                    reasoning_tokens: None,
+                    cache_read_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                    reported_total_tokens: None,
+                    ..sample
+                });
+            } else {
+                self.merged = Some(sample);
+            }
+            return self.merged.clone();
+        };
+
+        merged.sample_index = merged.sample_index.max(sample.sample_index);
+        merged.state = merge_usage_state(merged.state, sample.state);
+
+        if merged.aggregation == ProviderUsageAggregation::Unknown {
+            self.merged = Some(merged);
+            return self.merged.clone();
+        }
+
+        match (merged.aggregation, sample.aggregation) {
+            (ProviderUsageAggregation::Cumulative, ProviderUsageAggregation::Cumulative) => {
+                merge_cumulative_counters(&mut merged, &sample);
+            }
+            (ProviderUsageAggregation::Delta, ProviderUsageAggregation::Delta) => {
+                if !add_delta_counters(&mut merged, &sample) {
+                    merged.aggregation = ProviderUsageAggregation::Unknown;
+                }
+            }
+            (ProviderUsageAggregation::Unknown, _) | (_, ProviderUsageAggregation::Unknown) => {
+                merged.aggregation = ProviderUsageAggregation::Unknown;
+            }
+            _ => {
+                // Mixing cumulative and delta values cannot be recovered
+                // safely, so retain only the already verified subtotal and
+                // mark the aggregate ambiguous.
+                merged.aggregation = ProviderUsageAggregation::Unknown;
+            }
+        }
+
+        self.merged = Some(merged);
+        self.merged.clone()
+    }
+
+    pub fn snapshot(&self) -> Option<ProviderUsageSample> {
+        self.merged.clone()
+    }
+}
+
+pub fn coalesce_provider_usage_samples(
+    samples: impl IntoIterator<Item = ProviderUsageSample>,
+) -> Option<ProviderUsageSample> {
+    let mut accumulator = ProviderUsageAccumulator::default();
+    for sample in samples {
+        accumulator.push(sample);
+    }
+    accumulator.snapshot()
+}
+
+fn merge_usage_state(current: ProviderUsageState, next: ProviderUsageState) -> ProviderUsageState {
+    match (current, next) {
+        (ProviderUsageState::Interrupted, _) | (_, ProviderUsageState::Interrupted) => {
+            ProviderUsageState::Interrupted
+        }
+        (ProviderUsageState::Final, _) | (_, ProviderUsageState::Final) => {
+            ProviderUsageState::Final
+        }
+        _ => ProviderUsageState::Partial,
+    }
+}
+
+fn merge_max(current: &mut Option<u64>, next: Option<u64>) {
+    if let Some(next) = next {
+        *current = Some(current.map_or(next, |current| current.max(next)));
+    }
+}
+
+fn merge_cumulative_counters(merged: &mut ProviderUsageSample, sample: &ProviderUsageSample) {
+    merge_max(&mut merged.input_tokens, sample.input_tokens);
+    merge_max(&mut merged.context_tokens, sample.context_tokens);
+    merge_max(&mut merged.output_tokens, sample.output_tokens);
+    merge_max(&mut merged.reasoning_tokens, sample.reasoning_tokens);
+    merge_max(
+        &mut merged.cache_read_input_tokens,
+        sample.cache_read_input_tokens,
+    );
+    merge_max(
+        &mut merged.cache_creation_input_tokens,
+        sample.cache_creation_input_tokens,
+    );
+    merge_max(
+        &mut merged.reported_total_tokens,
+        sample.reported_total_tokens,
+    );
+}
+
+fn add_delta(current: &mut Option<u64>, next: Option<u64>) -> bool {
+    let Some(next) = next else {
+        return true;
+    };
+    let Some(current) = current else {
+        *current = Some(next);
+        return true;
+    };
+    let Some(sum) = current.checked_add(next) else {
+        return false;
+    };
+    *current = sum;
+    true
+}
+
+fn add_delta_counters(merged: &mut ProviderUsageSample, sample: &ProviderUsageSample) -> bool {
+    add_delta(&mut merged.input_tokens, sample.input_tokens)
+        && add_delta(&mut merged.context_tokens, sample.context_tokens)
+        && add_delta(&mut merged.output_tokens, sample.output_tokens)
+        && add_delta(&mut merged.reasoning_tokens, sample.reasoning_tokens)
+        && add_delta(
+            &mut merged.cache_read_input_tokens,
+            sample.cache_read_input_tokens,
+        )
+        && add_delta(
+            &mut merged.cache_creation_input_tokens,
+            sample.cache_creation_input_tokens,
+        )
+        && add_delta(
+            &mut merged.reported_total_tokens,
+            sample.reported_total_tokens,
+        )
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderStreamEvent {
@@ -51,6 +255,12 @@ pub enum ProviderStreamEvent {
         /// never raw response bodies. Reasoning tokens are not an effort report.
         #[serde(default)]
         provider_json: Value,
+    },
+    /// Typed, optional-counter usage emitted by the built-in adapters.  The
+    /// legacy `Usage` variant remains for compatibility with older providers;
+    /// new consumers should use this bounded variant.
+    UsageObserved {
+        sample: ProviderUsageSample,
     },
     Retrying {
         attempt: u8,

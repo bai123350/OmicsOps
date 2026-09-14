@@ -1,3 +1,13 @@
+import { useConversationBranchSend } from "./features/workspace/useConversationBranchSend";
+import { useContextUsage } from "./features/workspace/useContextUsage";
+import { useSideChat } from "./features/workspace/useSideChat";
+import { useWorkspaceSearch } from "./use-workspace-search";
+import { validateComposerReferences } from "./composer-reference-api";
+import { validateComposerAttachments } from "./composer-attachment-api";
+import { canAttachSearchEntry, type WorkspaceSearchEntry, type WorkspaceSearchRequest } from "./workspace-search";
+import { WorkspaceSearchDialog } from "./features/workspace/WorkspaceSearchDialog";
+import { referenceKey } from "./features/workspace/ComposerReferences";
+import type { ComposerReference } from "./types";
 import { useEffect, useRef, useState } from "react";
 import * as api from "./tauri-api";
 import type { AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendAvailabilityV4, ComputeSelectionV4, ConnectionProfile, ConversationAgentStateV4, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, ProjectArtifact, ProposedPlanRevisionV4, RemoteFileEntry, RunSummaryV4, SessionAgentModeV4, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
@@ -7,13 +17,73 @@ import { ApiModelPicker } from "./features/workspace/ApiModelPicker";
 import type { Locale } from "./features/workspace/copy";
 import { SettingsPanel } from "./features/settings/SettingsPanel";
 import { useConversationCapabilities } from "./features/workspace/useConversationCapabilities";
+import { useComposerQueue } from "./features/workspace/useComposerQueue";
+import { useComposerReplacement } from "./features/workspace/useComposerReplacement";
+import { useAgentStop } from "./features/workspace/useAgentStop";
+
+type SendMode = "chat" | "plan";
+
+interface PendingSubmission {
+  projectId: string;
+  conversationId: string;
+  markdown: string;
+  mode: SendMode;
+  references: ComposerReference[];
+  attachments: string[];
+  message: WorkspaceMessage;
+}
+
+export function samePendingSubmission(
+  pending: PendingSubmission,
+  projectId: string,
+  conversationId: string,
+  markdown: string,
+  mode: SendMode,
+  references: ComposerReference[],
+  attachments: string[],
+) {
+  const pendingReferenceKeys = pending.references.map(referenceKey);
+  const referenceKeys = references.map(referenceKey);
+  return pending.projectId === projectId
+    && pending.conversationId === conversationId
+    && pending.markdown === markdown
+    && pending.mode === mode
+    && JSON.stringify(pendingReferenceKeys) === JSON.stringify(referenceKeys)
+    && JSON.stringify(pending.attachments) === JSON.stringify(attachments);
+}
 
 export default function DesktopApp() {
   const [projects, setProjects] = useState<WorkspaceProject[]>([]);
   const [selected, setSelected] = useState<WorkspaceProject | null>(null);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const searchOpenRef = useRef(searchOpen);
+  searchOpenRef.current = searchOpen;
+  const searchActionGeneration = useRef(0);
+  const requestedConversation = useRef<{ projectId: string; conversationId: string } | null>(null);
+  const [searchRequest, setSearchRequest] = useState<WorkspaceSearchRequest | null>(null);
+  const workspaceSearch = useWorkspaceSearch(searchOpen, projects);
+  function openWorkspaceSearch() {
+    if (!searchOpenRef.current) searchActionGeneration.current += 1;
+    setSearchOpen(true);
+  }
+  function closeWorkspaceSearch() {
+    searchActionGeneration.current += 1;
+    setSearchOpen(false);
+  }
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.isComposing || event.keyCode === 229 || event.altKey || !(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "k") return;
+      event.preventDefault();
+      openWorkspaceSearch();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   const [locale, setLocale] = useState<Locale>("zh-CN");
   const [loading, setLoading] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsNavigationKey, setSettingsNavigationKey] = useState(0);
   const [conversations, setConversations] = useState<WorkspaceConversation[]>([]);
   const [conversation, setConversation] = useState<WorkspaceConversation | null>(null);
   const [conversationMode, setConversationMode] = useState<SessionAgentModeV4>("agent");
@@ -40,10 +110,15 @@ export default function DesktopApp() {
   const [planApproved, setPlanApproved] = useState(false);
   const [runId, setRunId] = useState<string | null>(null);
   const [runStartedAt, setRunStartedAt] = useState<string | null>(null);
-  const [runStopping, setRunStopping] = useState(false);
   const [agentTextPreview, setAgentTextPreview] = useState<import("./types").AgentTextPreviewV4 | null>(null);
   const [agentRunEventsV4, setAgentRunEventsV4] = useState<AgentRunEventV4[]>([]);
   const [conversationHydrating, setConversationHydrating] = useState(false);
+  const nativeQueueAvailable = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+  const queue = useComposerQueue(selected?.id, conversation?.id, nativeQueueAvailable && !conversationHydrating, refreshQueuedConversation);
+  const replacement = useComposerReplacement(selected?.id, conversation?.id, nativeQueueAvailable && !conversationHydrating, async () => { await queue.refresh(); await refreshQueuedConversation(); });
+  const contextUsage = useContextUsage(selected?.id, conversation?.id, nativeQueueAvailable && !conversationHydrating);
+  const sideChat = useSideChat(selected?.id, conversation?.id, nativeQueueAvailable && !conversationHydrating, activeModelProfileId);
+  const branchSend = useConversationBranchSend(selected?.id, conversation?.id, openCreatedBranch);
   const [remoteFiles, setRemoteFiles] = useState<RemoteFileEntry[]>([]);
   const [filesBusy, setFilesBusy] = useState(false);
   const [fileNotice, setFileNotice] = useState("");
@@ -80,11 +155,19 @@ export default function DesktopApp() {
   const currentConversationIdentity = useRef<{ projectId: string | null; conversationId: string | null }>({ projectId: null, conversationId: null });
   const messagesRef = useRef<WorkspaceMessage[]>([]);
   const messageSequenceRef = useRef(1);
+  const pendingSubmissionRef = useRef<PendingSubmission | null>(null);
   const lastGoalRef = useRef("");
   const agentRunEventsRef = useRef<AgentRunEventV4[]>([]);
   const agentEventGeneration = useRef(0);
   const conversationHydratingRef = useRef(false);
   currentConversationIdentity.current = { projectId: selected?.id ?? null, conversationId: conversation?.id ?? null };
+
+  useEffect(() => {
+    const pending = pendingSubmissionRef.current;
+    if (pending && (pending.projectId !== selected?.id || pending.conversationId !== conversation?.id)) {
+      pendingSubmissionRef.current = null;
+    }
+  }, [selected?.id, conversation?.id]);
 
   function reportRunPollingFailure(error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
@@ -236,11 +319,14 @@ export default function DesktopApp() {
   useEffect(() => {
     const token = ++projectRequestToken.current;
     let disposed = false;
+    const requested = requestedConversation.current;
+    requestedConversation.current = null;
     if (!selected) { setConversations([]); setConversation(null); return () => { disposed = true; }; }
     setHydrationState(true);
     api.listConversations(selected.id).then(async (items) => {
       if (disposed || !isCurrentConversationProject(selected.id, token)) return;
-      let active = items[0];
+      let active = requested?.projectId === selected.id ? items.find((item) => item.id === requested.conversationId) : items[0];
+      if (requested?.projectId === selected.id && !active) throw new Error("The requested saved conversation is no longer available.");
       if (!active) {
         active = await api.createConversation(selected.id);
         if (disposed || !isCurrentConversationProject(selected.id, token)) return;
@@ -346,7 +432,7 @@ export default function DesktopApp() {
     setPlanApproved(false);
     setRunId(null);
     setRunStartedAt(null);
-    setRunStopping(false);
+    agentStop.clear();
     if (!projectId) {
       setHydrationState(false);
       return () => { disposed = true; };
@@ -359,12 +445,19 @@ export default function DesktopApp() {
       return () => { disposed = true; };
     }
 
-    Promise.all([
-      api.listMessages(conversationId),
-      api.agentV4ConversationState(projectId, conversationId),
-      api.agentV4EventsForConversation(projectId, conversationId),
-    ])
-      .then(([storedMessages, snapshot, eventsV4]) => {
+    const storedMessages = api.listMessages(conversationId);
+    const eventsThenState = api.agentV4EventsForConversation(projectId, conversationId).then(async (eventsV4) => {
+      // Native event hydration reconciles an uncertain stop before returning.
+      // Read the durable snapshot only after that reconciliation has finished,
+      // otherwise an older running/locked snapshot can resurrect the run.
+      if (disposed || !isCurrentConversation(projectId, conversationId, token)) return null;
+      const snapshot = await api.agentV4ConversationState(projectId, conversationId);
+      return { snapshot, eventsV4 };
+    });
+    Promise.all([storedMessages, eventsThenState])
+      .then(([storedMessages, hydrated]) => {
+        if (!hydrated) return;
+        const { snapshot, eventsV4 } = hydrated;
         if (disposed || !isCurrentConversation(projectId, conversationId, token)) return;
         clearRecoveredRunPollingFailure();
         const mergedMessages = mergeWorkspaceMessages(messagesRef.current, storedMessages);
@@ -504,7 +597,7 @@ export default function DesktopApp() {
       agentEventGeneration.current += 1;
       const eventToken = conversationRequestToken.current;
       if (isTerminalAgentEventV4(event)) {
-        setRunStopping(false);
+        agentStop.markTerminal(event.run_id);
         setRunStartedAt(null);
         setRunId((current) => current === event.run_id ? null : current);
         if (event.event.kind === "run_completed") void refreshRemoteFiles(event.project_id);
@@ -541,7 +634,7 @@ export default function DesktopApp() {
         clearRecoveredRunPollingFailure();
         mergeAgentRunEvents(runEvents);
         if (runEvents.some(isTerminalAgentEventV4)) {
-          setRunStopping(false);
+          agentStop.markTerminal(activeRunId);
           setRunStartedAt(null);
           setRunId((current) => current === activeRunId ? null : current);
         }
@@ -617,6 +710,7 @@ export default function DesktopApp() {
     }
   }
   function resetConversationWork(hydrating = false) {
+    pendingSubmissionRef.current = null;
     messagesRef.current = [];
     messageSequenceRef.current = 1;
     lastGoalRef.current = "";
@@ -625,7 +719,7 @@ export default function DesktopApp() {
     setLastGoal("");
     if (!hydrating) setConversationMode("agent");
     setHydrationState(hydrating);
-    setConversationState(null); setV4Plan(null); setPlanApproved(false); setRunId(null); setRunStartedAt(null); setRunStopping(false); setAgentRunEventsV4([]);
+    setConversationState(null); setV4Plan(null); setPlanApproved(false); setRunId(null); setRunStartedAt(null); agentStop.clear(); setAgentRunEventsV4([]);
   }
 
   function currentComputeSelection(): ComputeSelectionV4 {
@@ -645,7 +739,7 @@ export default function DesktopApp() {
     };
   }
 
-  async function startV4Planning(goal: string, token = ++conversationRequestToken.current) {
+  async function startV4Planning(goal: string, token = ++conversationRequestToken.current, references: ComposerReference[] = [], attachments: string[] = []) {
     if (!selected || !conversation || !activeModel) throw new Error(locale === "zh-CN" ? "请先选择会话和模型。" : "Select a conversation and model first.");
     const projectId = selected.id;
     const conversationId = conversation.id;
@@ -654,6 +748,8 @@ export default function DesktopApp() {
       conversation_id: conversationId,
       model_profile_id: activeModel.id,
       objective: goal,
+      ...(references.length ? { references } : {}),
+      ...(attachments.length ? { attachments } : {}),
       compute_selection: currentComputeSelection(),
     });
     if (!isCurrentConversation(projectId, conversationId, token)) return summary;
@@ -661,7 +757,16 @@ export default function DesktopApp() {
     setRunId(summary.run_id);
     setRunStartedAt(new Date().toISOString());
     setPlanApproved(false);
-    const events = await api.agentV4Events(summary.run_id);
+    let events: AgentRunEventV4[] = [];
+    try {
+      events = await api.agentV4Events(summary.run_id);
+      if (isCurrentConversation(projectId, conversationId, token)) clearRecoveredRunPollingFailure();
+    } catch (error) {
+      // The native start has already been accepted. Keep its summary and let
+      // the polling effect retry the event read instead of turning this into
+      // a failed send.
+      if (isCurrentConversation(projectId, conversationId, token)) reportRunPollingFailure(error);
+    }
     if (!isCurrentConversation(projectId, conversationId, token)) return summary;
     mergeAgentRunEvents(events);
     // Reconcile the planning result with the durable conversation snapshot.
@@ -675,7 +780,7 @@ export default function DesktopApp() {
     return summary;
   }
 
-  async function startV4Direct(goal: string, token = ++conversationRequestToken.current) {
+  async function startV4Direct(goal: string, token = ++conversationRequestToken.current, references: ComposerReference[] = [], attachments: string[] = []) {
     if (!selected || !conversation || !activeModel) throw new Error(locale === "zh-CN" ? "请先选择会话和模型。" : "Select a conversation and model first.");
     const projectId = selected.id;
     const conversationId = conversation.id;
@@ -684,6 +789,8 @@ export default function DesktopApp() {
       conversation_id: conversationId,
       model_profile_id: activeModel.id,
       objective: goal,
+      ...(references.length ? { references } : {}),
+      ...(attachments.length ? { attachments } : {}),
       compute_selection: currentComputeSelection(),
     });
     if (!isCurrentConversation(projectId, conversationId, token)) return summary;
@@ -691,18 +798,100 @@ export default function DesktopApp() {
     setRunId(summary.run_id);
     setRunStartedAt(new Date().toISOString());
     setPlanApproved(false);
-    const events = await api.agentV4Events(summary.run_id);
+    let events: AgentRunEventV4[] = [];
+    try {
+      events = await api.agentV4Events(summary.run_id);
+      if (isCurrentConversation(projectId, conversationId, token)) clearRecoveredRunPollingFailure();
+    } catch (error) {
+      // Event history is a reconciliation read. A failure here must not
+      // cause the already-created native run to be submitted again.
+      if (isCurrentConversation(projectId, conversationId, token)) reportRunPollingFailure(error);
+    }
     if (!isCurrentConversation(projectId, conversationId, token)) return summary;
     mergeAgentRunEvents(events);
     return summary;
   }
 
-  async function selectConversation(conversationId: string) {
-    const next = conversations.find((item) => item.id === conversationId);
-    if (!next || next.id === conversation?.id) return;
+  function activateConversation(next: WorkspaceConversation) {
+    if (next.id === conversation?.id) return;
     ++conversationRequestToken.current;
     resetConversationWork(true);
     setConversation(next);
+  }
+
+  async function selectConversation(conversationId: string) {
+    const next = conversations.find((item) => item.id === conversationId);
+    if (next) activateConversation(next);
+  }
+
+  async function openSearchEntry(entry: WorkspaceSearchEntry): Promise<boolean> {
+    if (entry.kind === "action") {
+      if (entry.key === "action:files" && selected) {
+        setSettingsOpen(false);
+        setSearchRequest({ key: crypto.randomUUID(), kind: "files", projectId: selected.id });
+      }
+      else {
+        setSettingsSection(entry.key === "action:skills" ? "skills" : "models");
+        setSettingsNavigationKey((value) => value + 1);
+        setSettingsOpen(true);
+      }
+      return true;
+    }
+    if (entry.kind === "skill") { setSettingsSection("skills"); setSettingsNavigationKey((value) => value + 1); setSettingsOpen(true); return true; }
+    const sourceProject = projects.find((project) => project.id === entry.projectId);
+    if (!sourceProject) throw new Error("The source project is no longer available.");
+    if (entry.kind === "session") {
+      const reference = entry.item?.reference;
+      if (reference?.kind !== "session") return false;
+      const generation = searchActionGeneration.current;
+      const available = await api.listConversations(sourceProject.id);
+      if (generation !== searchActionGeneration.current) return false;
+      const target = available.find((item) => item.id === reference.id && item.project_id === sourceProject.id);
+      if (!target) throw new Error("The saved conversation is no longer available.");
+      setSettingsOpen(false);
+      setSearchRequest({ key: crypto.randomUUID(), kind: "reveal", projectId: sourceProject.id });
+      if (selected?.id === sourceProject.id) { setConversations(available); activateConversation(target); }
+      else {
+        requestedConversation.current = { projectId: sourceProject.id, conversationId: target.id };
+        setSelected(sourceProject);
+      }
+      return true;
+    }
+    requestedConversation.current = null;
+    setSettingsOpen(false);
+    if (entry.kind === "artifact" && entry.item) setSearchRequest({ key: crypto.randomUUID(), kind: "artifact", projectId: sourceProject.id, item: entry.item });
+    else setSearchRequest({ key: crypto.randomUUID(), kind: "reveal", projectId: sourceProject.id });
+    setSelected(sourceProject);
+    return true;
+  }
+
+  async function refreshQueuedConversation() {
+    const action = captureConversationAction();
+    if (!action || conversationHydratingRef.current) return;
+    const events = await api.agentV4EventsForConversation(action.projectId, action.conversationId);
+    if (!isCurrentConversationAction(action)) return;
+    agentRunEventsRef.current = mergeAgentRunEventsV4(agentRunEventsRef.current, events);
+    setAgentRunEventsV4(agentRunEventsRef.current);
+    const saved = await api.listMessages(action.conversationId);
+    if (!isCurrentConversationAction(action)) return;
+    const merged = mergeWorkspaceMessages(messagesRef.current, saved);
+    messagesRef.current = merged; setMessages(merged);
+    const next = merged.reduce((maximum, message) => Math.max(maximum, message.sequence + 1), 1);
+    messageSequenceRef.current = Math.max(messageSequenceRef.current, next);
+    setMessageSequence(messageSequenceRef.current);
+    await refreshConversationState(action.projectId, action.conversationId, action.token);
+  }
+
+  async function openCreatedBranch(branch: import("./types").ConversationBranchV4): Promise<boolean> {
+    const generation = captureConversationGeneration();
+    if (generation.projectId !== branch.project_id || generation.conversationId !== branch.source_conversation_id) return false;
+    const available = await api.listConversations(branch.project_id);
+    if (!isCurrentConversationGeneration(generation)) return false;
+    const target = available.find((item) => item.id === branch.branch_conversation_id && item.project_id === branch.project_id);
+    if (!target) throw new Error("The saved branch could not be loaded.");
+    setConversations(available);
+    activateConversation(target);
+    return true;
   }
 
   async function newConversation() {
@@ -750,9 +939,6 @@ export default function DesktopApp() {
       }
     }
   }
-  if (loading) return <div className="desktop-loading">OmicsOps</div>;
-  const settings = settingsOpen ? <SettingsPanel initialSection={settingsSection} locale={locale} onClose={() => setSettingsOpen(false)} modelProfiles={modelProfiles} skillPackages={skillPackages} mcpServers={mcpServers} connections={connections} selectedProject={selected} onSaveConnection={async (profile, secret) => { await api.saveConnection(profile, secret); setConnections(await api.listConnections()); }} onTestConnection={api.testConnection} onConfirmHostKey={async (profileId, fingerprint) => { await api.confirmHostKey(profileId, fingerprint); setConnections(await api.listConnections()); }} onBindProjectRemote={async (connectionId, remoteRoot) => { if (!selected) return; const updated = await api.updateProjectRemote(selected.id, connectionId, remoteRoot); setSelected(updated); setProjects((current) => current.map((project) => project.id === updated.id ? updated : project)); }} onSaveModel={async (request) => { const profile = await api.saveModelProfile(request); setModelProfiles((current) => [profile, ...current.filter((item) => item.id !== profile.id)]); setActiveModelProfileId(profile.id); }} onProbeModel={api.probeModelProfile} onListModels={api.listModelProfileModels} onImportSkill={async () => { const sourcePath = await api.chooseSkillDirectory(); if (!sourcePath) return; const skill = await api.importSkillDirectory(sourcePath); setSkillPackages((current) => [skill, ...current.filter((item) => item.id !== skill.id)]); }} onSetSkillEnabled={async (skillId, enabled) => { const updated = await api.setSkillEnabled(skillId, enabled); setSkillPackages(await api.listSkillPackages()); return updated; }} onSaveMcpServer={async (request) => { const updated = await api.saveMcpServer(request); setMcpServers(await api.listMcpServers()); return updated; }} onConfigurePubMedMcp={async (request) => { const updated = await api.configurePubMedMcpCredentials(request); setMcpServers(await api.listMcpServers()); return updated; }} onListBundledMcpPresets={api.listBundledMcpPresets} onAddBundledMcp={async (request) => { const updated = await api.addBundledMcpServer(request); setMcpServers(await api.listMcpServers()); return updated; }} onInspectMcpServer={async (serverId) => { if (!selected) throw new Error(locale === "zh-CN" ? "请先打开一个项目，再检查 MCP server。" : "Open a project before inspecting an MCP server."); await api.inspectConfiguredMcpServer(selected.id, serverId); setMcpServers(await api.listMcpServers()); }} onSetMcpServerEnabled={async (serverId, enabled) => { const updated = await api.setMcpServerEnabled(serverId, enabled); setMcpServers(await api.listMcpServers()); return updated; }} onSetMcpToolApproval={async (serverId, tool, approved) => { const updated = await api.setMcpToolApproval(serverId, tool, approved); setMcpServers(await api.listMcpServers()); return updated; }} /> : null;
-  if (!selected) return <><ProjectLibrary projects={projects} connections={connections} locale={locale} onLocaleChange={setLocale} onSettings={() => setSettingsOpen(true)} onOpen={setSelected} onDelete={async (projectId) => { await api.deleteProject(projectId); setProjects((current) => current.filter((project) => project.id !== projectId)); }} onChooseLocalRoot={api.chooseProjectDirectory} onCreate={async ({ template, name, localRoot, connectionId, remoteRoot }) => { const project = await api.createProject({ name, description: "", local_root: localRoot, template, connection_id: connectionId, remote_root: remoteRoot }); setProjects((current) => [project, ...current]); setSelected(project); }} />{settings}</>;
   const activeModel = modelProfiles.find((profile) => profile.id === activeModelProfileId) ?? null;
   const activeRunLastActivityAt = runId
     ? latestAgentRunEventV4(agentRunEventsV4.filter((event) => event.run_id === runId))?.occurred_at ?? runStartedAt
@@ -781,7 +967,53 @@ export default function DesktopApp() {
     || currentRunAwaitsPlanApproval,
   );
   const activePlanRunId = runId ?? latestPlanRevision?.run_id ?? latestRun?.run_id ?? v4Plan?.run_id ?? null;
+  const stopRunId = runId
+    ?? (latestRun && !isTerminalRunStatus(latestRun.status) ? latestRun.run_id : null)
+    ?? (latestPlanRevision && isActivePlanRevisionStatus(latestPlanRevision.status) ? latestPlanRevision.run_id : null);
+  const agentStop = useAgentStop(selected?.id && conversation?.id && stopRunId
+    ? { projectId: selected.id, conversationId: conversation.id, runId: stopRunId }
+    : null);
+  const runStopping = agentStop.stopping;
+  const stopNoticeRef = useRef("");
+  useEffect(() => {
+    if (!agentStop.error || !selected?.id || !conversation?.id) {
+      const previous = stopNoticeRef.current;
+      stopNoticeRef.current = "";
+      if (previous) setAgentNotice((current) => current === previous ? "" : current);
+      return;
+    }
+    const message = locale === "zh-CN" ? "停止状态更新失败，请重试。" : "Could not update the run stop state. Please retry.";
+    stopNoticeRef.current = message;
+    setAgentNotice(message);
+  }, [agentStop.error, conversation?.id, locale, selected?.id]);
 
+  if (loading) return <div className="desktop-loading">OmicsOps</div>;
+  const searchEntries: WorkspaceSearchEntry[] = [
+    ...workspaceSearch.entries,
+    { key: "action:models", kind: "action", label: locale === "zh-CN" ? "管理模型" : "Manage models", description: locale === "zh-CN" ? "打开模型设置" : "Open model settings" },
+    { key: "action:skills", kind: "action", label: locale === "zh-CN" ? "管理技能" : "Manage skills", description: locale === "zh-CN" ? "打开技能设置" : "Open skill settings" },
+    ...(selected ? [{ key: "action:files", kind: "action" as const, label: locale === "zh-CN" ? "项目文件" : "Project files", description: selected.name }] : []),
+  ];
+  const canAttachFromSearch = (entry: WorkspaceSearchEntry) => !agentBusy && !conversationLocked && !modelSelectionBusy && !runId && canAttachSearchEntry(entry, selected?.id, conversation?.project_id === selected?.id ? conversation?.id : undefined);
+  const searchDialog = searchOpen ? <WorkspaceSearchDialog entries={searchEntries} zh={locale === "zh-CN"} loading={workspaceSearch.loading} failedProjects={workspaceSearch.failedProjects} onRetry={workspaceSearch.retry} onClose={closeWorkspaceSearch} onOpen={openSearchEntry} canAttach={canAttachFromSearch} onAttach={(entry) => {
+    if (!selected || !conversation || !entry.item || !canAttachFromSearch(entry)) return false;
+    setSearchRequest({ key: crypto.randomUUID(), kind: "attach", projectId: selected.id, conversationId: conversation.id, item: entry.item });
+    return true;
+  }} /> : null;
+  const settings = settingsOpen ? <SettingsPanel key={settingsNavigationKey} initialSection={settingsSection} locale={locale} onClose={() => setSettingsOpen(false)} modelProfiles={modelProfiles} skillPackages={skillPackages} mcpServers={mcpServers} connections={connections} selectedProject={selected} onSaveConnection={async (profile, secret) => { await api.saveConnection(profile, secret); setConnections(await api.listConnections()); }} onTestConnection={api.testConnection} onConfirmHostKey={async (profileId, fingerprint) => { await api.confirmHostKey(profileId, fingerprint); setConnections(await api.listConnections()); }} onBindProjectRemote={async (connectionId, remoteRoot) => { if (!selected) return; const updated = await api.updateProjectRemote(selected.id, connectionId, remoteRoot); setSelected(updated); setProjects((current) => current.map((project) => project.id === updated.id ? updated : project)); }} onSaveModel={async (request) => {
+    if (modelSelectionInFlight.current) throw new Error("Model selection is currently locked");
+    modelSelectionInFlight.current = true;
+    setModelSelectionBusy(true);
+    try {
+      const profile = await api.saveModelProfile(request);
+      setModelProfiles((current) => [profile, ...current.filter((item) => item.id !== profile.id)]);
+      setActiveModelProfileId(profile.id);
+    } finally {
+      modelSelectionInFlight.current = false;
+      setModelSelectionBusy(false);
+    }
+  }} onProbeModel={api.probeModelProfile} onListModels={api.listModelProfileModels} onImportSkill={async () => { const sourcePath = await api.chooseSkillDirectory(); if (!sourcePath) return; const skill = await api.importSkillDirectory(sourcePath); setSkillPackages((current) => [skill, ...current.filter((item) => item.id !== skill.id)]); }} onSetSkillEnabled={async (skillId, enabled) => { const updated = await api.setSkillEnabled(skillId, enabled); setSkillPackages(await api.listSkillPackages()); return updated; }} onSaveMcpServer={async (request) => { const updated = await api.saveMcpServer(request); setMcpServers(await api.listMcpServers()); return updated; }} onConfigurePubMedMcp={async (request) => { const updated = await api.configurePubMedMcpCredentials(request); setMcpServers(await api.listMcpServers()); return updated; }} onListBundledMcpPresets={api.listBundledMcpPresets} onAddBundledMcp={async (request) => { const updated = await api.addBundledMcpServer(request); setMcpServers(await api.listMcpServers()); return updated; }} onInspectMcpServer={async (serverId) => { if (!selected) throw new Error(locale === "zh-CN" ? "请先打开一个项目，再检查 MCP server。" : "Open a project before inspecting an MCP server."); await api.inspectConfiguredMcpServer(selected.id, serverId); setMcpServers(await api.listMcpServers()); }} onSetMcpServerEnabled={async (serverId, enabled) => { const updated = await api.setMcpServerEnabled(serverId, enabled); setMcpServers(await api.listMcpServers()); return updated; }} onSetMcpToolApproval={async (serverId, tool, approved) => { const updated = await api.setMcpToolApproval(serverId, tool, approved); setMcpServers(await api.listMcpServers()); return updated; }} /> : null;
+  if (!selected) return <><ProjectLibrary onOpenSearch={openWorkspaceSearch} projects={projects} connections={connections} locale={locale} onLocaleChange={setLocale} onSettings={() => setSettingsOpen(true)} onOpen={setSelected} onDelete={async (projectId) => { await api.deleteProject(projectId); setProjects((current) => current.filter((project) => project.id !== projectId)); }} onChooseLocalRoot={api.chooseProjectDirectory} onCreate={async ({ template, name, localRoot, connectionId, remoteRoot }) => { const project = await api.createProject({ name, description: "", local_root: localRoot, template, connection_id: connectionId, remote_root: remoteRoot }); setProjects((current) => [project, ...current]); setSelected(project); }} />{settings}{searchDialog}</>;
   async function changeConversationMode(nextMode: SessionAgentModeV4) {
     if (!selected || !conversation || nextMode === conversationMode) return;
     const projectId = selected.id;
@@ -903,7 +1135,7 @@ export default function DesktopApp() {
   }
 
   async function cancelRun() {
-    const targetRunId = runId ?? latestPlanRevision?.run_id ?? conversationState?.latest_run?.run_id ?? v4Plan?.run_id;
+    const targetRunId = activePlanRunId;
     if (!targetRunId) return;
     const projectId = selected?.id;
     const conversationId = conversation?.id;
@@ -912,19 +1144,35 @@ export default function DesktopApp() {
     const actionKey = `cancel:${targetRunId}:${token}`;
     if (runActionGuards.current.has(actionKey)) return;
     runActionGuards.current.add(actionKey);
-    setRunStopping(true);
     setAgentNotice("");
     let cancelObservedTerminal = false;
     try {
-      await api.agentV4Cancel(targetRunId);
-      const events = await api.agentV4Events(targetRunId);
-      if (!projectId || !conversationId || isCurrentConversation(projectId, conversationId, token)) {
-        const runEvents = events.filter((event) => event.run_id === targetRunId);
-        mergeAgentRunEvents(runEvents);
-        if (runEvents.some(isTerminalAgentEventV4)) {
-          cancelObservedTerminal = true;
+      if (!projectId || !conversationId) return;
+      const receipt = await agentStop.requestStop({ projectId, conversationId, runId: targetRunId });
+      if (!receipt) throw new Error("Agent stop requires an active desktop conversation.");
+      cancelObservedTerminal = receipt.status === "observed";
+      if (isCurrentConversation(projectId, conversationId, token)) {
+        if (cancelObservedTerminal) {
+          agentStop.markTerminal(targetRunId);
           setRunStartedAt(null);
           setRunId((current) => current === targetRunId ? null : current);
+        }
+        // The receipt is the durable stop acknowledgement. Event polling is
+        // only an immediate trace refresh; a transient read failure must not
+        // turn an accepted stop into a second request with a new id.
+        try {
+          const events = await api.agentV4Events(targetRunId);
+          if (!isCurrentConversation(projectId, conversationId, token)) return;
+          const runEvents = events.filter((event) => event.run_id === targetRunId);
+          mergeAgentRunEvents(runEvents);
+          if (runEvents.some(isTerminalAgentEventV4)) {
+            cancelObservedTerminal = true;
+            agentStop.markTerminal(targetRunId);
+            setRunStartedAt(null);
+            setRunId((current) => current === targetRunId ? null : current);
+          }
+        } catch (error) {
+          if (isCurrentConversation(projectId, conversationId, token)) reportRunPollingFailure(error);
         }
       }
     } catch (error) {
@@ -945,19 +1193,20 @@ export default function DesktopApp() {
         if (keepPlanMode && (!projectId || !conversationId || isCurrentConversation(projectId, conversationId, token))) setConversationMode("plan");
       }
       runActionGuards.current.delete(actionKey);
-      if (!projectId || !conversationId || isCurrentConversation(projectId, conversationId, token)) setRunStopping(false);
     }
   }
   const currentConversationAction = captureConversationAction();
   return <><WorkspaceShell
+    onOpenSearch={openWorkspaceSearch} searchRequest={searchRequest}
+    onSearchRequestHandled={(key) => setSearchRequest((current) => current?.key === key ? null : current)}
     onSuggestFollowUps={api.agentV4SuggestFollowUps}
     capabilitySummary={capabilities.summary} capabilitiesLoading={capabilities.loading}
     capabilitiesError={capabilities.error} onRefreshCapabilities={capabilities.refresh}
     project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template }}
     locale={locale} onLocaleChange={setLocale} onOpenSettings={(section = "models") => { setSettingsSection(section); setSettingsOpen(true); }} onBackToProjects={() => setSelected(null)}
-    conversations={conversations} activeConversationId={conversation?.id} onSelectConversation={selectConversation} onNewConversation={newConversation} onDeleteConversation={deleteConversation}
-    messages={messages} agentBusy={agentBusy} agentNotice={agentNotice} modelLabel={activeModel?.model}
-    composerBusy={modelSelectionBusy}
+    conversations={conversations} activeConversationId={conversation?.id} onSelectConversation={selectConversation} onNewConversation={newConversation} onOpenBranch={openCreatedBranch} onDeleteConversation={deleteConversation}
+    messages={messages} agentBusy={agentBusy} agentNotice={agentNotice} modelLabel={activeModel?.model} activeModelProfile={activeModel} modelProfiles={modelProfiles}
+    composerBusy={modelSelectionBusy || !conversation}
     modelPicker={<ApiModelPicker zh={locale === "zh-CN"} profiles={modelProfiles} activeProfileId={activeModelProfileId} disabled={agentBusy || conversationLocked || conversationHydrating || modelSelectionBusy || planLoading} onProfileChange={(id) => { if (!modelSelectionInFlight.current) setActiveModelProfileId(id); }} onManage={() => { setSettingsSection("models"); setSettingsOpen(true); }} onModelSelect={async (profile, model) => {
       if (modelSelectionInFlight.current || conversationLocked || conversationHydrating || agentBusy || profile.id !== activeModelProfileId) throw new Error("Model selection is currently locked");
       modelSelectionInFlight.current = true;
@@ -965,6 +1214,17 @@ export default function DesktopApp() {
       try {
         const updated = await api.saveModelProfile({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model });
         setModelProfiles((current) => current.map((item) => item.id === updated.id ? updated : item));
+      } finally {
+        modelSelectionInFlight.current = false;
+        setModelSelectionBusy(false);
+      }
+    }} onReasoningEffortChange={async (profile, effort) => {
+      if (modelSelectionInFlight.current || conversationLocked || conversationHydrating || agentBusy || planLoading || profile.id !== activeModelProfileId) throw new Error("Model selection is currently locked");
+      modelSelectionInFlight.current = true;
+      setModelSelectionBusy(true);
+      try {
+        const updated = await api.saveModelProfile({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model: profile.model, reasoning_effort: effort ?? null });
+        setModelProfiles((current) => current.map((item) => item === profile ? updated : item));
       } finally {
         modelSelectionInFlight.current = false;
         setModelSelectionBusy(false);
@@ -1104,7 +1364,23 @@ export default function DesktopApp() {
     onStopKernel={async (sessionId) => withKernelBusy(async () => replaceKernelSession(await api.stopKernel(sessionId)))} onPromoteKernelCell={api.promoteKernelCell}
     onUploadFiles={selected.connection_id && selected.remote_root ? uploadFiles : undefined} onRefreshFiles={selected.connection_id && selected.remote_root ? () => refreshRemoteFiles() : undefined} onDownloadFile={selected.connection_id && selected.remote_root ? downloadFile : undefined}
     onPreviewImage={selected.connection_id && selected.remote_root ? (relativePath) => api.previewProjectImage(selected.id, relativePath) : undefined}
-    onSend={async (markdown, mode) => {
+    branchSendOriginalMarkdown={branchSend.originalMarkdown} branchSendBusy={branchSend.busy} branchSendPending={branchSend.pending} branchSendError={branchSend.error} onRetryBranchSend={branchSend.retry}
+    onBranchSend={nativeQueueAvailable ? async (sourceMessageId, markdown, mode, references, attachments) => {
+      if (!selected || !conversation || !activeModel || conversationHydratingRef.current) return false;
+      return branchSend.submit({ sourceMessageId, message_markdown: markdown, mode: mode === "plan" ? "plan" : "agent", model_profile_id: activeModel.id, compute_selection: currentComputeSelection(), references, attachments });
+    } : undefined}
+    contextUsage={contextUsage.value} contextUsageError={contextUsage.error}
+    sideChat={nativeQueueAvailable ? sideChat : undefined}
+    queueItems={queue.items} queueError={queue.error} queueLoading={queue.loading} onQueueRefresh={queue.refresh} onQueueUpdate={queue.update} onQueueAction={queue.action}
+    replacement={nativeQueueAvailable ? { busy: replacement.busy, pending: replacement.pending, error: replacement.error, originalMarkdown: replacement.originalTurn?.message_markdown, retry: replacement.retry, send: async (markdown, mode, target, references, attachments) => {
+      if (!selected || !conversation || !activeModel) return false;
+      return replacement.send({ project_id: selected.id, conversation_id: conversation.id, mode: mode === "plan" ? "plan" : "agent", message_markdown: markdown, model_profile_id: activeModel.id, compute_selection: currentComputeSelection(), references, attachments }, target);
+    } } : undefined}
+    onQueue={nativeQueueAvailable ? async (markdown, mode, references = [], attachments = []) => {
+      if (!conversation || !activeModel || conversationHydratingRef.current || modelSelectionInFlight.current) return false;
+      return queue.enqueue({ project_id: selected.id, conversation_id: conversation.id, mode: mode === "plan" ? "plan" : "agent", message_markdown: markdown, model_profile_id: activeModel.id, compute_selection: currentComputeSelection(), references, attachments });
+    } : undefined}
+    onSend={async (markdown, mode, references = [], attachments = []) => {
       if (!conversation || !activeModel) { setSettingsOpen(true); return false; }
       if (conversationHydratingRef.current || conversationLocked || modelSelectionInFlight.current) return false;
       const projectId = selected.id;
@@ -1118,7 +1394,14 @@ export default function DesktopApp() {
       if (mode === "plan") {
         setPlanLoading(true);
         try {
-          const message = await api.submitMessage({ project_id: projectId, conversation_id: conversationId, markdown, sequence: messageSequence });
+          if (references.length) await validateComposerReferences(projectId, conversationId, references);
+          if (attachments.length) await validateComposerAttachments(projectId, conversationId, attachments, activeModel?.id);
+          if (!isCurrentConversation(projectId, conversationId, token)) return false;
+          const pending = pendingSubmissionRef.current;
+          const reusableMessage = pending && samePendingSubmission(pending, projectId, conversationId, markdown, mode, references, attachments)
+            ? pending.message
+            : null;
+          const message = reusableMessage ?? await api.submitMessage({ project_id: projectId, conversation_id: conversationId, markdown, sequence: messageSequence });
           if (!isCurrentConversation(projectId, conversationId, token)) return false;
           setMessages((current) => {
             const next = current.some((item) => item.id === message.id) ? current : [...current, message];
@@ -1130,8 +1413,15 @@ export default function DesktopApp() {
             messageSequenceRef.current = next;
             return next;
           });
-          await startV4Planning(markdown, token);
-          return isCurrentConversation(projectId, conversationId, token);
+          if (!reusableMessage) {
+            pendingSubmissionRef.current = { projectId, conversationId, markdown, mode, references: [...references], attachments: [...attachments], message };
+          }
+          await startV4Planning(markdown, token, references, attachments);
+          if (!isCurrentConversation(projectId, conversationId, token)) return false;
+          if (pendingSubmissionRef.current && samePendingSubmission(pendingSubmissionRef.current, projectId, conversationId, markdown, mode, references, attachments)) {
+            pendingSubmissionRef.current = null;
+          }
+          return true;
         } catch (error) {
           if (isCurrentConversation(projectId, conversationId, token)) setAgentNotice(error instanceof Error ? error.message : String(error));
           return false;
@@ -1143,7 +1433,14 @@ export default function DesktopApp() {
         }
       }
       try {
-        const message = await api.submitMessage({ project_id: projectId, conversation_id: conversationId, markdown, sequence: messageSequence });
+        if (references.length) await validateComposerReferences(projectId, conversationId, references);
+          if (attachments.length) await validateComposerAttachments(projectId, conversationId, attachments, activeModel?.id);
+        if (!isCurrentConversation(projectId, conversationId, token)) return false;
+        const pending = pendingSubmissionRef.current;
+        const reusableMessage = pending && samePendingSubmission(pending, projectId, conversationId, markdown, mode, references, attachments)
+          ? pending.message
+          : null;
+        const message = reusableMessage ?? await api.submitMessage({ project_id: projectId, conversation_id: conversationId, markdown, sequence: messageSequence });
         if (!isCurrentConversation(projectId, conversationId, token)) return false;
         setMessages((current) => {
           const next = current.some((item) => item.id === message.id) ? current : [...current, message];
@@ -1155,8 +1452,15 @@ export default function DesktopApp() {
           messageSequenceRef.current = next;
           return next;
         });
-        await startV4Direct(markdown, token);
-        return isCurrentConversation(projectId, conversationId, token);
+        if (!reusableMessage) {
+          pendingSubmissionRef.current = { projectId, conversationId, markdown, mode, references: [...references], attachments: [...attachments], message };
+        }
+        await startV4Direct(markdown, token, references, attachments);
+        if (!isCurrentConversation(projectId, conversationId, token)) return false;
+        if (pendingSubmissionRef.current && samePendingSubmission(pendingSubmissionRef.current, projectId, conversationId, markdown, mode, references, attachments)) {
+          pendingSubmissionRef.current = null;
+        }
+        return true;
       } catch (error) {
         if (isCurrentConversation(projectId, conversationId, token)) setAgentNotice(error instanceof Error ? error.message : String(error));
         return false;
@@ -1167,7 +1471,7 @@ export default function DesktopApp() {
     onApprovePlan={approvePlan}
     onRequestPlanRevision={requestPlanRevision}
     onCancelRun={activePlanRunId ? cancelRun : undefined}
-  />{settings}</>;
+  />{settings}{searchDialog}</>;
 }
 function mergeAgentRunEventsV4(current: AgentRunEventV4[], incoming: AgentRunEventV4[]) {
   return [...current, ...incoming]

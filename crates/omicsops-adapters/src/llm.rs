@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use omicsops_agent::provider::{
     Provider, ProviderRequest as ProviderModelRequest, ProviderStreamEvent,
+    ProviderUsageAggregation, ProviderUsageSample, ProviderUsageState,
 };
 use omicsops_agent::{AgentError, AgentResult, ModelContentPart, ModelMessageContent};
 use schemars::{JsonSchema, schema_for};
@@ -100,13 +101,26 @@ pub struct ProviderRequest {
 /// The adapter currently estimates input tokens by counting the UTF-8 bytes of
 /// the compact, serialized provider JSON. This is deliberately conservative
 /// and is not a substitute for a provider tokenizer. Image token costs are
-/// provider/model dependent, so requests containing images fail closed until a
-/// model-specific estimator is available.
+/// provider/model dependent, so this model-independent public type continues
+/// to reject image requests; the unified client has a separate, exact
+/// trusted-model estimator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestBudget {
     pub context_window_tokens: u32,
     pub reserved_output_tokens: u32,
     pub safety_margin_tokens: u32,
+}
+
+/// Measurements of one already-shaped provider request. JSON bytes describe
+/// the actual wire body; the text shape and image payload are reported as
+/// separate byte categories so callers never convert base64 bytes to tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestBudgetMetrics {
+    pub serialized_request_bytes: u64,
+    pub text_shape_bytes: u64,
+    pub image_payload_bytes: u64,
+    pub image_count: u32,
+    pub image_bound_tokens: Option<u64>,
 }
 
 impl RequestBudget {
@@ -117,7 +131,9 @@ impl RequestBudget {
     /// This uses compact UTF-8 byte length as a conservative estimate, rather
     /// than pretending to know the selected model's tokenizer. The complete
     /// JSON body is measured, so system content, messages, tool schemas and
-    /// provider formatting are all included.
+    /// provider formatting are all included. Image requests remain rejected by
+    /// this public model-independent method; the unified client has a separate,
+    /// exact trusted-model path for bounded image requests.
     pub fn estimate_input_tokens(&self, provider_json: &Value) -> AdapterResult<u64> {
         if contains_unknown_image(provider_json) {
             return Err(AdapterError::Llm(format!(
@@ -133,6 +149,23 @@ impl RequestBudget {
                     Self::ERROR_PREFIX
                 ))
             })
+    }
+
+    fn estimate_input_tokens_with_image_budget(
+        &self,
+        provider_json: &Value,
+        per_image_tokens: u64,
+    ) -> AdapterResult<u64> {
+        let (text_shape, image_count) = image_budget_shape(provider_json)?;
+        let text_tokens = serde_json::to_vec(&text_shape)
+            .map(|json| json.len() as u64)
+            .map_err(|error| {
+                AdapterError::Llm(format!(
+                    "{} could not serialize provider JSON for conservative UTF-8 byte estimation: {error}",
+                    Self::ERROR_PREFIX
+                ))
+            })?;
+        Ok(text_tokens.saturating_add(per_image_tokens.saturating_mul(image_count)))
     }
 
     /// Validate the complete provider JSON against this budget without doing
@@ -152,6 +185,32 @@ impl RequestBudget {
             )));
         }
         let estimated_input = self.estimate_input_tokens(provider_json)?;
+        self.validate_estimated_input(estimated_input)
+    }
+
+    fn validate_provider_json_with_image_budget(
+        &self,
+        provider_json: &Value,
+        per_image_tokens: u64,
+    ) -> AdapterResult<()> {
+        if self.context_window_tokens == 0 {
+            return Err(AdapterError::Llm(format!(
+                "{} context window must be greater than zero",
+                Self::ERROR_PREFIX
+            )));
+        }
+        if self.reserved_output_tokens == 0 {
+            return Err(AdapterError::Llm(format!(
+                "{} reserved output must be greater than zero",
+                Self::ERROR_PREFIX
+            )));
+        }
+        let estimated_input =
+            self.estimate_input_tokens_with_image_budget(provider_json, per_image_tokens)?;
+        self.validate_estimated_input(estimated_input)
+    }
+
+    fn validate_estimated_input(&self, estimated_input: u64) -> AdapterResult<()> {
         let required = estimated_input
             .saturating_add(u64::from(self.reserved_output_tokens))
             .saturating_add(u64::from(self.safety_margin_tokens));
@@ -176,12 +235,12 @@ fn contains_unknown_image(value: &Value) -> bool {
 }
 
 fn message_contains_image(message: &Value) -> bool {
-    if message
-        .get("images")
-        .and_then(Value::as_array)
-        .is_some_and(|images| !images.is_empty())
-    {
-        return true;
+    if let Some(images) = message.get("images") {
+        match images {
+            Value::Array(images) if images.is_empty() => {}
+            Value::Null => {}
+            _ => return true,
+        }
     }
     let Some(content) = message.get("content") else {
         return false;
@@ -198,6 +257,222 @@ fn message_contains_image(message: &Value) -> bool {
             .is_some_and(|kind| matches!(kind, "image" | "image_url")),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
     }
+}
+
+const IMAGE_BUDGET_PLACEHOLDER: &str = "data:image/placeholder;base64,IMAGE";
+
+/// Return a copy suitable for conservative text estimation and the number of
+/// image payloads represented by the original body. The image URL payload is
+/// deliberately replaced only in the copy; the actual request body keeps its
+/// original bytes and URL.
+fn image_budget_shape(provider_json: &Value) -> AdapterResult<(Value, u64)> {
+    let mut shape = provider_json.clone();
+    let Some(messages) = shape.get_mut("messages").and_then(Value::as_array_mut) else {
+        if contains_unknown_image(provider_json) {
+            return Err(AdapterError::Llm(
+                "request budget: image content has an unrecognized messages shape".into(),
+            ));
+        }
+        return Ok((shape, 0));
+    };
+
+    let mut image_count = 0_u64;
+    for message in messages {
+        if let Some(images) = message.get("images") {
+            if !images.as_array().is_some_and(Vec::is_empty) {
+                return Err(AdapterError::Llm(
+                    "request budget: image content uses an unsupported provider image field".into(),
+                ));
+            }
+        }
+        let Some(content) = message.get_mut("content") else {
+            continue;
+        };
+        match content {
+            Value::Array(parts) => {
+                for part in parts {
+                    sanitize_image_part(part, &mut image_count)?;
+                }
+            }
+            Value::Object(_) => sanitize_image_part(content, &mut image_count)?,
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
+    }
+    Ok((shape, image_count))
+}
+
+fn image_payload_base64_bytes(provider_json: &Value) -> u64 {
+    fn add_data_url_bytes(url: Option<&Value>, bytes: &mut u64) {
+        let Some(url) = url
+            .and_then(Value::as_str)
+            .filter(|url| url.starts_with("data:image/") && url.contains(','))
+        else {
+            return;
+        };
+        if let Some((_, payload)) = url.split_once(',') {
+            *bytes = bytes.saturating_add(payload.len() as u64);
+        }
+    }
+
+    fn add_image_part_bytes(part: &Value, bytes: &mut u64) {
+        match part.get("type").and_then(Value::as_str) {
+            Some("image_url") => add_data_url_bytes(
+                part.get("image_url").and_then(|image| image.get("url")),
+                bytes,
+            ),
+            Some("image") => {
+                let data = part
+                    .get("source")
+                    .and_then(|source| source.get("data"))
+                    .and_then(Value::as_str)
+                    .filter(|data| !data.is_empty());
+                if let Some(data) = data {
+                    *bytes = bytes.saturating_add(data.len() as u64);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Some(messages) = provider_json.get("messages").and_then(Value::as_array) else {
+        return 0;
+    };
+    let mut bytes: u64 = 0;
+    for message in messages {
+        if let Some(images) = message.get("images").and_then(Value::as_array) {
+            for image in images.iter().filter_map(Value::as_str) {
+                bytes = bytes.saturating_add(image.len() as u64);
+            }
+        }
+        let Some(content) = message.get("content") else {
+            continue;
+        };
+        match content {
+            Value::Array(parts) => parts
+                .iter()
+                .for_each(|part| add_image_part_bytes(part, &mut bytes)),
+            Value::Object(_) => add_image_part_bytes(content, &mut bytes),
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
+    }
+    bytes
+}
+
+fn sanitize_image_part(part: &mut Value, image_count: &mut u64) -> AdapterResult<()> {
+    let Some(kind) = part.get("type").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    match kind {
+        "image_url" => {
+            let image_url = part
+                .get_mut("image_url")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    AdapterError::Llm(
+                        "request budget: image_url content is malformed; refusing to estimate it"
+                            .into(),
+                    )
+                })?;
+            let url = image_url
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AdapterError::Llm(
+                        "request budget: image_url content has no URL; refusing to estimate it"
+                            .into(),
+                    )
+                })?;
+            let Some((metadata, payload)) = url.split_once(',') else {
+                return Err(AdapterError::Llm(
+                    "request budget: remote or malformed image URL is not supported".into(),
+                ));
+            };
+            if !metadata.starts_with("data:image/")
+                || !metadata.ends_with(";base64")
+                || payload.is_empty()
+                || payload.bytes().any(|byte| {
+                    !byte.is_ascii_alphanumeric()
+                        && !matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_')
+                })
+            {
+                return Err(AdapterError::Llm(
+                    "request budget: remote or malformed image URL is not supported".into(),
+                ));
+            }
+            image_url.insert("url".into(), Value::String(IMAGE_BUDGET_PLACEHOLDER.into()));
+            *image_count = image_count.saturating_add(1);
+            Ok(())
+        }
+        "image" => Err(AdapterError::Llm(
+            "request budget: image content uses an unsupported provider shape".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn visit_image_url_parts_mut(value: &mut Value, mut visit: impl FnMut(&mut Value)) {
+    let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages {
+        let Some(content) = message.get_mut("content") else {
+            continue;
+        };
+        match content {
+            Value::Array(parts) => {
+                for part in parts {
+                    if part.get("type").and_then(Value::as_str) == Some("image_url") {
+                        visit(part);
+                    }
+                }
+            }
+            Value::Object(part)
+                if part.get("type").and_then(Value::as_str) == Some("image_url") =>
+            {
+                visit(content);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn apply_high_image_detail(value: &mut Value) {
+    visit_image_url_parts_mut(value, |part| {
+        if let Some(image_url) = part.get_mut("image_url").and_then(Value::as_object_mut) {
+            image_url.insert("detail".into(), Value::String("high".into()));
+        }
+    });
+}
+
+fn image_urls_have_high_detail(value: &Value) -> bool {
+    let Some(messages) = value.get("messages").and_then(Value::as_array) else {
+        return true;
+    };
+    for message in messages {
+        let Some(content) = message.get("content") else {
+            continue;
+        };
+        let parts: Vec<&Value> = match content {
+            Value::Array(parts) => parts.iter().collect(),
+            Value::Object(_) => vec![content],
+            _ => Vec::new(),
+        };
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) != Some("image_url") {
+                continue;
+            }
+            if part
+                .get("image_url")
+                .and_then(Value::as_object)
+                .and_then(|image_url| image_url.get("detail"))
+                .and_then(Value::as_str)
+                != Some("high")
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -383,6 +658,45 @@ fn is_official_openai_endpoint(base_url: &Url) -> bool {
             .host_str()
             .is_some_and(|host| host.eq_ignore_ascii_case("api.openai.com"))
         && base_url.port_or_known_default() == Some(443)
+}
+
+fn is_trusted_openai_image_endpoint(base_url: &Url) -> bool {
+    if !is_official_openai_endpoint(base_url) {
+        return false;
+    }
+    matches!(base_url.path(), "" | "/" | "/v1" | "/v1/")
+}
+
+/// Conservative high-detail image bounds for the exact official model IDs
+/// whose vision token accounting is known to this adapter. These are model
+/// IDs, not families: a provider alias, proxy, or future sibling must fail
+/// closed until it receives its own reviewed bound.
+fn trusted_image_token_budget(
+    protocol: ProviderProtocol,
+    base_url: &Url,
+    model: &str,
+) -> Option<u64> {
+    if protocol != ProviderProtocol::OpenAiCompatible || !is_trusted_openai_image_endpoint(base_url)
+    {
+        return None;
+    }
+    match model {
+        "gpt-6-astra" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-5.5"
+        | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.4-nano" => Some(3_001),
+        "gpt-5.2" => Some(7_374),
+        "gpt-4.1-mini" | "gpt-4.1-mini-2025-04-14" => Some(9_955),
+        "gpt-4o" | "gpt-4.1" | "gpt-4.1-2025-04-14" => Some(1_446),
+        "gpt-4o-mini" => Some(48_170),
+        "gpt-5.1" => Some(1_191),
+        _ => None,
+    }
+}
+
+/// Credential-free capability check for a model profile before a client is
+/// constructed. This deliberately shares the exact host/path/protocol/model
+/// policy used by [`UnifiedModelClient::has_image_budget`].
+pub fn supports_image_budget(protocol: ProviderProtocol, base_url: &Url, model: &str) -> bool {
+    trusted_image_token_budget(protocol, base_url, model).is_some()
 }
 
 fn provider_message(
@@ -606,12 +920,8 @@ fn parse_provider_tool_response_with_aliases(
         }
         events.push(ProviderStreamEvent::ToolCallCompleted { call_id, index });
     }
-    if let Some((input_tokens, output_tokens, provider_json)) = usage_from_value(protocol, value) {
-        events.push(ProviderStreamEvent::Usage {
-            input_tokens,
-            output_tokens,
-            provider_json,
-        });
+    if let Some(sample) = usage_sample_from_value(protocol, value, 0, ProviderUsageState::Final) {
+        push_usage_events(&mut events, protocol, value, sample);
     }
     if events.is_empty() {
         return Err(AdapterError::Llm(
@@ -622,7 +932,7 @@ fn parse_provider_tool_response_with_aliases(
     Ok(events)
 }
 
-fn usage_from_value(protocol: ProviderProtocol, value: &Value) -> Option<(u64, u64, Value)> {
+fn usage_value(protocol: ProviderProtocol, value: &Value) -> Option<&Value> {
     let usage = match protocol {
         ProviderProtocol::OpenAiCompatible => value.get("usage")?,
         ProviderProtocol::Anthropic => value
@@ -630,36 +940,130 @@ fn usage_from_value(protocol: ProviderProtocol, value: &Value) -> Option<(u64, u
             .or_else(|| value.pointer("/message/usage"))?,
         ProviderProtocol::Ollama => value,
     };
-    let (input, output) = match protocol {
+    usage.is_object().then_some(usage)
+}
+
+fn usage_counter(value: &Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(Value::as_u64)
+}
+
+fn usage_sample_from_value(
+    protocol: ProviderProtocol,
+    value: &Value,
+    sample_index: u32,
+    state: ProviderUsageState,
+) -> Option<ProviderUsageSample> {
+    let usage = usage_value(protocol, value)?;
+    let (
+        input_tokens,
+        context_tokens,
+        output_tokens,
+        reasoning_tokens,
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
+        reported_total_tokens,
+    ) = match protocol {
         ProviderProtocol::OpenAiCompatible => (
+            usage_counter(usage, "prompt_tokens"),
+            usage_counter(usage, "prompt_tokens"),
+            usage_counter(usage, "completion_tokens"),
             usage
-                .get("prompt_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
+                .get("completion_tokens_details")
+                .and_then(|details| usage_counter(details, "reasoning_tokens")),
             usage
-                .get("completion_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
+                .get("prompt_tokens_details")
+                .and_then(|details| usage_counter(details, "cached_tokens")),
+            None,
+            usage_counter(usage, "total_tokens"),
         ),
         ProviderProtocol::Anthropic => (
-            usage
-                .get("input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            usage
-                .get("output_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
+            usage_counter(usage, "input_tokens"),
+            {
+                let input = usage_counter(usage, "input_tokens");
+                let cache_read = usage_counter(usage, "cache_read_input_tokens");
+                let cache_creation = usage_counter(usage, "cache_creation_input_tokens");
+                input.zip(cache_read).zip(cache_creation).and_then(
+                    |((input, cache_read), cache_creation)| {
+                        input
+                            .checked_add(cache_read)
+                            .and_then(|total| total.checked_add(cache_creation))
+                    },
+                )
+            },
+            usage_counter(usage, "output_tokens"),
+            None,
+            usage_counter(usage, "cache_read_input_tokens"),
+            usage_counter(usage, "cache_creation_input_tokens"),
+            None,
         ),
         ProviderProtocol::Ollama => (
-            usage
-                .get("prompt_eval_count")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            usage.get("eval_count").and_then(Value::as_u64).unwrap_or(0),
+            usage_counter(usage, "prompt_eval_count"),
+            usage_counter(usage, "prompt_eval_count"),
+            usage_counter(usage, "eval_count"),
+            None,
+            None,
+            None,
+            None,
         ),
     };
-    (input > 0 || output > 0).then(|| (input, output, safe_usage_metadata(protocol, usage)))
+    let has_counter = [
+        input_tokens,
+        context_tokens,
+        output_tokens,
+        reasoning_tokens,
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
+        reported_total_tokens,
+    ]
+    .iter()
+    .any(Option::is_some);
+    has_counter.then_some(ProviderUsageSample {
+        sample_index,
+        aggregation: ProviderUsageAggregation::Cumulative,
+        state,
+        input_tokens,
+        context_tokens,
+        output_tokens,
+        reasoning_tokens,
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
+        reported_total_tokens,
+    })
+}
+
+/// Compatibility view for the old tuple-only unit tests and callers inside
+/// this module.  New provider events use `ProviderUsageSample`, so missing
+/// counters are not collapsed at the adapter boundary.
+#[cfg(test)]
+fn usage_from_value(protocol: ProviderProtocol, value: &Value) -> Option<(u64, u64, Value)> {
+    let usage = usage_value(protocol, value)?;
+    let sample = usage_sample_from_value(protocol, value, 0, ProviderUsageState::Partial)?;
+    Some((
+        sample.input_tokens.unwrap_or(0),
+        sample.output_tokens.unwrap_or(0),
+        safe_usage_metadata(protocol, usage),
+    ))
+}
+
+fn push_usage_events(
+    events: &mut Vec<ProviderStreamEvent>,
+    protocol: ProviderProtocol,
+    value: &Value,
+    sample: ProviderUsageSample,
+) {
+    // Keep the old bounded event for older consumers while making the typed
+    // event the source of truth for new accounting. The compatibility event
+    // contains only the existing allowlisted metadata and never raw JSON.
+    events.push(ProviderStreamEvent::UsageObserved {
+        sample: sample.clone(),
+    });
+    if let Some(usage) = usage_value(protocol, value) {
+        events.push(ProviderStreamEvent::Usage {
+            input_tokens: sample.input_tokens.unwrap_or(0),
+            output_tokens: sample.output_tokens.unwrap_or(0),
+            provider_json: safe_usage_metadata(protocol, usage),
+        });
+    }
 }
 
 /// Usage is audit metadata, never a copy of the provider response. Keep a
@@ -829,6 +1233,7 @@ pub struct ProviderToolStreamDecoder {
     pending: Vec<u8>,
     active_calls: BTreeMap<u32, (String, String)>,
     tool_aliases: BTreeMap<String, String>,
+    next_usage_sample_index: u32,
     saw_completion: bool,
 }
 
@@ -839,6 +1244,7 @@ impl ProviderToolStreamDecoder {
             pending: Vec::new(),
             active_calls: BTreeMap::new(),
             tool_aliases: BTreeMap::new(),
+            next_usage_sample_index: 0,
             saw_completion: false,
         }
     }
@@ -849,8 +1255,58 @@ impl ProviderToolStreamDecoder {
             pending: Vec::new(),
             active_calls: BTreeMap::new(),
             tool_aliases: provider_tool_alias_map(request),
+            next_usage_sample_index: 0,
             saw_completion: false,
         }
+    }
+
+    fn usage_sample(&mut self, value: &Value) -> Option<ProviderUsageSample> {
+        let sample_index = self.next_usage_sample_index;
+        let state = match self.protocol {
+            ProviderProtocol::OpenAiCompatible => {
+                let terminal = value
+                    .pointer("/choices/0/finish_reason")
+                    .is_some_and(|reason| !reason.is_null())
+                    || self.saw_completion;
+                if terminal {
+                    ProviderUsageState::Final
+                } else {
+                    ProviderUsageState::Partial
+                }
+            }
+            ProviderProtocol::Anthropic => value
+                .get("type")
+                .and_then(Value::as_str)
+                .filter(|kind| *kind == "message_stop")
+                .map(|_| ProviderUsageState::Final)
+                .or_else(|| {
+                    value
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .filter(|kind| *kind == "message_delta")
+                        .and_then(|_| {
+                            value
+                                .pointer("/delta/stop_reason")
+                                .or_else(|| value.get("stop_reason"))
+                        })
+                        .and_then(Value::as_str)
+                        .map(|_| ProviderUsageState::Final)
+                })
+                .or_else(|| self.saw_completion.then_some(ProviderUsageState::Final))
+                .unwrap_or(ProviderUsageState::Partial),
+            ProviderProtocol::Ollama => value
+                .get("done")
+                .and_then(Value::as_bool)
+                .filter(|done| *done)
+                .map(|_| ProviderUsageState::Final)
+                .or_else(|| self.saw_completion.then_some(ProviderUsageState::Final))
+                .unwrap_or(ProviderUsageState::Partial),
+        };
+        let sample = usage_sample_from_value(self.protocol, value, sample_index, state);
+        if sample.is_some() {
+            self.next_usage_sample_index = self.next_usage_sample_index.saturating_add(1);
+        }
+        sample
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> AdapterResult<Vec<ProviderStreamEvent>> {
@@ -898,6 +1354,12 @@ impl ProviderToolStreamDecoder {
                 ProviderProtocol::Ollama => {
                     self.push_ollama(&value, &mut events)?;
                 }
+            }
+            if events
+                .iter()
+                .any(|event| matches!(event, ProviderStreamEvent::Completed))
+            {
+                self.saw_completion = true;
             }
         }
         self.saw_completion |= events
@@ -959,14 +1421,8 @@ impl ProviderToolStreamDecoder {
                 }
             }
         }
-        if let Some((input_tokens, output_tokens, provider_json)) =
-            usage_from_value(self.protocol, value)
-        {
-            events.push(ProviderStreamEvent::Usage {
-                input_tokens,
-                output_tokens,
-                provider_json,
-            });
+        if let Some(sample) = self.usage_sample(value) {
+            push_usage_events(events, self.protocol, value, sample);
         }
         if value
             .pointer("/choices/0/finish_reason")
@@ -1043,14 +1499,8 @@ impl ProviderToolStreamDecoder {
             Some("message_stop") => events.push(ProviderStreamEvent::Completed),
             _ => {}
         }
-        if let Some((input_tokens, output_tokens, provider_json)) =
-            usage_from_value(self.protocol, value)
-        {
-            events.push(ProviderStreamEvent::Usage {
-                input_tokens,
-                output_tokens,
-                provider_json,
-            });
+        if let Some(sample) = self.usage_sample(value) {
+            push_usage_events(events, self.protocol, value, sample);
         }
         Ok(())
     }
@@ -1103,14 +1553,8 @@ impl ProviderToolStreamDecoder {
                 }
             }
         }
-        if let Some((input_tokens, output_tokens, provider_json)) =
-            usage_from_value(self.protocol, value)
-        {
-            events.push(ProviderStreamEvent::Usage {
-                input_tokens,
-                output_tokens,
-                provider_json,
-            });
+        if let Some(sample) = self.usage_sample(value) {
+            push_usage_events(events, self.protocol, value, sample);
         }
         if value.get("done").and_then(Value::as_bool) == Some(true) {
             for (index, (call_id, _)) in &self.active_calls {
@@ -1165,6 +1609,7 @@ pub struct UnifiedModelClient {
     credential: Option<String>,
     request_budget: Option<RequestBudget>,
     reasoning_effort: Option<String>,
+    fast_mode: Option<bool>,
     http: reqwest::Client,
 }
 
@@ -1206,6 +1651,7 @@ impl UnifiedModelClient {
             credential,
             request_budget: None,
             reasoning_effort: None,
+            fast_mode: None,
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
                 .timeout(MODEL_REQUEST_TIMEOUT)
@@ -1241,10 +1687,41 @@ impl UnifiedModelClient {
         Ok(self)
     }
 
+    /// Attach the optional Fast mode setting. The wire field is emitted only
+    /// for the exact reviewed OpenAI endpoint and model; unsupported profiles
+    /// therefore retain the historical request shape.
+    pub fn with_fast_mode(mut self, fast_mode: Option<bool>) -> Self {
+        self.fast_mode = fast_mode;
+        self
+    }
+
     fn apply_reasoning_effort(&self, body: &mut Value) {
         if let Some(effort) = &self.reasoning_effort {
             body["reasoning_effort"] = json!(effort);
         }
+    }
+
+    fn apply_fast_mode(&self, body: &mut Value) -> AdapterResult<()> {
+        let Some(fast_mode) = self.fast_mode else {
+            return Ok(());
+        };
+        if self.protocol != ProviderProtocol::OpenAiCompatible
+            || !omicsops_core::workspace::supports_fast_mode(
+                omicsops_core::workspace::ModelProviderKind::OpenAiCompatible,
+                self.base_url.as_str(),
+                &self.model,
+            )
+        {
+            if fast_mode {
+                return Err(AdapterError::Llm(
+                    "explicit Fast mode requires an exact supported OpenAI endpoint and model"
+                        .into(),
+                ));
+            }
+            return Ok(());
+        }
+        body["service_tier"] = json!(if fast_mode { "priority" } else { "default" });
+        Ok(())
     }
 
     fn build_provider_request(
@@ -1259,16 +1736,109 @@ impl UnifiedModelClient {
             self.request_budget,
         )?;
         self.apply_reasoning_effort(&mut built.body);
+        self.apply_fast_mode(&mut built.body)?;
+        if self.image_token_budget().is_some() {
+            apply_high_image_detail(&mut built.body);
+        }
         Ok(built)
+    }
+
+    fn image_token_budget(&self) -> Option<u64> {
+        trusted_image_token_budget(self.protocol, &self.base_url, &self.model)
+    }
+
+    /// Whether this exact provider protocol, API host, base path, and model
+    /// have a reviewed high-detail image bound. Callers can use this before
+    /// persisting an image-capable request so an unknown model cannot be
+    /// treated as vision-capable by inference.
+    pub fn has_image_budget(&self) -> bool {
+        supports_image_budget(self.protocol, &self.base_url, &self.model)
+    }
+
+    /// Measure the same provider-shaped body that will be sent. The full JSON
+    /// length is exact for this serialized request; the text shape is the
+    /// conservative byte-only estimate after image payload replacement, and
+    /// image tokens use the reviewed per-image bound for this exact endpoint
+    /// and model.
+    pub fn measure_provider_request(
+        &self,
+        provider_request: &ProviderRequest,
+    ) -> AdapterResult<RequestBudgetMetrics> {
+        self.validate_provider_body(&provider_request.body)?;
+        let serialized_request_bytes = serde_json::to_vec(&provider_request.body)
+            .map_err(|error| AdapterError::Llm(format!("request budget: {error}")))?
+            .len() as u64;
+        let (text_shape, image_count) = image_budget_shape(&provider_request.body)?;
+        let text_shape_bytes = serde_json::to_vec(&text_shape)
+            .map_err(|error| AdapterError::Llm(format!("request budget: {error}")))?
+            .len() as u64;
+        let image_count = u32::try_from(image_count).map_err(|_| {
+            AdapterError::Llm("request budget: image count exceeds the supported bound".into())
+        })?;
+        let image_bound_tokens = if image_count == 0 {
+            Some(0)
+        } else {
+            self.image_token_budget()
+                .and_then(|per_image| per_image.checked_mul(u64::from(image_count)))
+        };
+        Ok(RequestBudgetMetrics {
+            serialized_request_bytes,
+            text_shape_bytes,
+            image_payload_bytes: image_payload_base64_bytes(&provider_request.body),
+            image_count,
+            image_bound_tokens,
+        })
+    }
+
+    /// Measure a model-shaped request after applying the same provider
+    /// formatting and reviewed image detail that the send path uses.
+    pub fn measure_model_request(
+        &self,
+        request: &ProviderModelRequest,
+    ) -> AdapterResult<RequestBudgetMetrics> {
+        let provider_request = self.build_provider_request(request)?;
+        self.measure_provider_request(&provider_request)
+    }
+
+    fn validate_provider_body(&self, body: &Value) -> AdapterResult<()> {
+        if body.get("model").and_then(Value::as_str) != Some(self.model.as_str()) {
+            return Err(AdapterError::Llm(format!(
+                "request budget: provider body model does not match selected model {}",
+                self.model
+            )));
+        }
+
+        if contains_unknown_image(body) {
+            let per_image_tokens = self.image_token_budget().ok_or_else(|| {
+                AdapterError::Llm(
+                    "request budget: image token cost is unknown for this protocol, API host, base path, or exact model; refusing to send".into(),
+                )
+            })?;
+            if !image_urls_have_high_detail(body) {
+                return Err(AdapterError::Llm(
+                    "request budget: trusted image requests must use detail high".into(),
+                ));
+            }
+            if let Some(budget) = self.request_budget {
+                budget.validate_provider_json_with_image_budget(body, per_image_tokens)?;
+            } else {
+                // Validate the wire shape even when no context reservation is
+                // configured. The actual image payload remains untouched.
+                image_budget_shape(body)?;
+            }
+            return Ok(());
+        }
+
+        if let Some(budget) = self.request_budget {
+            budget.validate_provider_json(body)?;
+        }
+        Ok(())
     }
 
     /// Validate the complete provider-shaped request before any network I/O.
     pub fn validate_request(&self, request: &ProviderModelRequest) -> AdapterResult<()> {
         let provider_request = self.build_provider_request(request)?;
-        if let Some(budget) = self.request_budget {
-            budget.validate_provider_json(&provider_request.body)?;
-        }
-        Ok(())
+        self.validate_provider_body(&provider_request.body)
     }
 
     async fn send_with_retry_provider(
@@ -1277,11 +1847,9 @@ impl UnifiedModelClient {
         body: &Value,
         on_event: &mut impl FnMut(ProviderStreamEvent),
     ) -> AdapterResult<reqwest::Response> {
-        if let Some(budget) = self.request_budget {
-            // Keep this check at the final send boundary so retries and the
-            // non-streaming fallback cannot bypass the same preflight.
-            budget.validate_provider_json(body)?;
-        }
+        // Keep this check at the final send boundary so retries and the
+        // non-streaming fallback cannot bypass the same preflight.
+        self.validate_provider_body(body)?;
         let mut retries = 0_u8;
         loop {
             let result = self
@@ -1330,9 +1898,7 @@ impl UnifiedModelClient {
         mut on_event: impl FnMut(ProviderStreamEvent),
     ) -> AdapterResult<()> {
         let provider_request = self.build_provider_request(&request)?;
-        if let Some(budget) = self.request_budget {
-            budget.validate_provider_json(&provider_request.body)?;
-        }
+        self.validate_provider_body(&provider_request.body)?;
         let response = self
             .send_with_retry_provider(
                 &provider_request.endpoint,
@@ -1399,6 +1965,60 @@ impl UnifiedModelClient {
         Ok(())
     }
 
+    /// Execute exactly one streaming provider request.
+    ///
+    /// Side-chat is an accepted durable operation with its own request ID, so
+    /// it must never inherit the normal model retry or non-streaming fallback
+    /// policy.  Keep the method separate from `stream_with_provider` so the
+    /// established Agent callers retain their existing retry behavior.
+    pub async fn stream_with_provider_once(
+        &self,
+        request: ProviderModelRequest,
+        mut on_event: impl FnMut(ProviderStreamEvent),
+    ) -> AdapterResult<()> {
+        let provider_request = self.build_provider_request(&request)?;
+        self.validate_provider_body(&provider_request.body)?;
+        let response = self
+            .authenticate(
+                self.http
+                    .post(provider_request.endpoint.clone())
+                    .json(&provider_request.body),
+            )
+            .send()
+            .await
+            .map_err(|_| {
+                AdapterError::Llm(format!(
+                    "{}: side-chat provider request failed",
+                    provider_request.endpoint
+                ))
+            })?;
+        if !response.status().is_success() {
+            return Err(AdapterError::Llm(format!(
+                "{} returned {}",
+                provider_request.endpoint,
+                response.status()
+            )));
+        }
+
+        let mut decoder = ProviderToolStreamDecoder::for_request(self.protocol, &request);
+        let mut bytes = response.bytes_stream();
+        while let Some(chunk) = bytes.next().await {
+            let chunk = chunk.map_err(|_| {
+                AdapterError::Llm(format!(
+                    "{}: side-chat provider stream failed",
+                    provider_request.endpoint
+                ))
+            })?;
+            for event in decoder.push(&chunk)? {
+                on_event(event);
+            }
+        }
+        for event in decoder.finish()? {
+            on_event(event);
+        }
+        Ok(())
+    }
+
     fn probe_body(&self) -> AdapterResult<Value> {
         let mut body = match self.protocol {
             ProviderProtocol::OpenAiCompatible => json!({
@@ -1420,6 +2040,7 @@ impl UnifiedModelClient {
             }),
         };
         self.apply_reasoning_effort(&mut body);
+        self.apply_fast_mode(&mut body)?;
         if self.reasoning_effort.is_some() {
             // Reasoning consumes output tokens too; the legacy 16-token
             // connection probe cannot exercise an explicit reasoning request.
@@ -1881,5 +2502,385 @@ mod reasoning_effort_tests {
         let probe = configured.probe_body().unwrap();
         assert_eq!(probe["max_completion_tokens"], 100);
         assert_eq!(probe["reasoning_effort"], "max");
+    }
+}
+
+#[cfg(test)]
+mod fast_mode_tests {
+    use super::*;
+
+    fn client(model: &str, base_url: &str) -> UnifiedModelClient {
+        UnifiedModelClient::new(
+            Uuid::new_v4(),
+            ProviderProtocol::OpenAiCompatible,
+            Url::parse(base_url).unwrap(),
+            model,
+            Some("test-only".into()),
+        )
+        .unwrap()
+    }
+
+    fn request() -> ProviderModelRequest {
+        ProviderModelRequest {
+            system: "test".into(),
+            messages: vec![],
+            tools: vec![],
+            require_strict_json_fallback: false,
+        }
+    }
+
+    #[test]
+    fn fast_mode_uses_exact_wire_values_in_request_probe_and_fallback() {
+        for (fast_mode, expected) in [(Some(true), "priority"), (Some(false), "default")] {
+            let client =
+                client("gpt-5.6-luna", "https://api.openai.com/v1").with_fast_mode(fast_mode);
+            let built = client.build_provider_request(&request()).unwrap();
+            assert_eq!(built.body["service_tier"], expected);
+            let mut fallback = built.body.clone();
+            fallback["stream"] = json!(false);
+            assert_eq!(fallback["service_tier"], expected);
+            assert_eq!(client.probe_body().unwrap()["service_tier"], expected);
+        }
+    }
+
+    #[test]
+    fn absent_or_unreviewed_fast_mode_does_not_leak_service_tier() {
+        let inherited = client("gpt-5.6-luna", "https://api.openai.com/v1");
+        assert!(
+            inherited
+                .build_provider_request(&request())
+                .unwrap()
+                .body
+                .get("service_tier")
+                .is_none()
+        );
+        assert!(
+            inherited
+                .probe_body()
+                .unwrap()
+                .get("service_tier")
+                .is_none()
+        );
+
+        for base_url in ["https://proxy.example/v1", "http://api.openai.com/v1"] {
+            let standard = client("gpt-5.6-luna", base_url).with_fast_mode(Some(false));
+            assert!(
+                standard
+                    .build_provider_request(&request())
+                    .unwrap()
+                    .body
+                    .get("service_tier")
+                    .is_none()
+            );
+            assert!(standard.probe_body().unwrap().get("service_tier").is_none());
+
+            let unsupported = client("gpt-5.6-luna", base_url).with_fast_mode(Some(true));
+            assert!(unsupported.build_provider_request(&request()).is_err());
+            assert!(unsupported.probe_body().is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod image_budget_tests {
+    use super::*;
+
+    fn client(model: &str, base_url: &str) -> UnifiedModelClient {
+        UnifiedModelClient::new(
+            Uuid::new_v4(),
+            ProviderProtocol::OpenAiCompatible,
+            Url::parse(base_url).unwrap(),
+            model,
+            Some("test-only".into()),
+        )
+        .unwrap()
+    }
+
+    fn request_with_images(count: usize) -> ProviderModelRequest {
+        let mut parts = vec![ModelContentPart::Text {
+            text: "inspect these images".into(),
+        }];
+        parts.extend((0..count).map(|_| ModelContentPart::Image {
+            media_type: "image/png".into(),
+            data_base64: "aW1hZ2U=".into(),
+        }));
+        ProviderModelRequest {
+            system: "You are a test model.".into(),
+            messages: vec![omicsops_agent::ModelMessage {
+                role: "user".into(),
+                content: ModelMessageContent::Parts(parts),
+            }],
+            tools: vec![],
+            require_strict_json_fallback: false,
+        }
+    }
+
+    fn request() -> ProviderModelRequest {
+        ProviderModelRequest {
+            system: "test".into(),
+            messages: vec![],
+            tools: vec![],
+            require_strict_json_fallback: false,
+        }
+    }
+
+    #[test]
+    fn image_budget_requires_exact_official_host_path_protocol_and_model() {
+        for model in [
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+            "gpt-5.2",
+            "gpt-4.1-mini",
+            "gpt-4.1-mini-2025-04-14",
+            "gpt-4o",
+            "gpt-4.1",
+            "gpt-4.1-2025-04-14",
+            "gpt-4o-mini",
+            "gpt-5.1",
+        ] {
+            assert!(
+                client(model, "https://api.openai.com/v1").has_image_budget(),
+                "{model}"
+            );
+        }
+        for model in [
+            "gpt-5.6-luna-preview",
+            "gpt-5.6-luna:latest",
+            "gpt-4.1-mini-2025-04-14-extra",
+            "GPT-5.6-luna",
+        ] {
+            assert!(
+                !client(model, "https://api.openai.com/v1").has_image_budget(),
+                "{model}"
+            );
+        }
+        for base_url in [
+            "https://api.openai.com/v2",
+            "https://api.openai.com:8443/v1",
+            "http://api.openai.com/v1",
+            "https://proxy.example/v1",
+        ] {
+            assert!(
+                !client("gpt-5.6-luna", base_url).has_image_budget(),
+                "{base_url}"
+            );
+        }
+        for base_url in [
+            "https://api.openai.com",
+            "https://api.openai.com/",
+            "https://api.openai.com/v1",
+            "https://api.openai.com/v1/",
+        ] {
+            assert!(
+                client("gpt-5.6-luna", base_url).has_image_budget(),
+                "{base_url}"
+            );
+        }
+        let anthropic = UnifiedModelClient::new(
+            Uuid::new_v4(),
+            ProviderProtocol::Anthropic,
+            Url::parse("https://api.openai.com/v1").unwrap(),
+            "gpt-5.6-luna",
+            Some("test-only".into()),
+        )
+        .unwrap();
+        assert!(!anthropic.has_image_budget());
+    }
+
+    #[test]
+    fn credential_free_capability_check_reuses_the_exact_policy() {
+        let official = Url::parse("https://api.openai.com/v1").unwrap();
+        assert!(supports_image_budget(
+            ProviderProtocol::OpenAiCompatible,
+            &official,
+            "gpt-5.6-luna"
+        ));
+        assert!(!supports_image_budget(
+            ProviderProtocol::OpenAiCompatible,
+            &official,
+            "gpt-5.6-luna-preview"
+        ));
+        assert!(!supports_image_budget(
+            ProviderProtocol::Anthropic,
+            &official,
+            "gpt-5.6-luna"
+        ));
+    }
+
+    #[test]
+    fn trusted_image_request_adds_high_detail_without_mutating_payload() {
+        let request = request_with_images(1);
+        let client = client("gpt-5.6-luna", "https://api.openai.com/v1");
+        let built = client.build_provider_request(&request).unwrap();
+        let image = &built.body["messages"][1]["content"][1];
+        assert_eq!(image["type"], "image_url");
+        assert_eq!(image["image_url"]["detail"], "high");
+        assert_eq!(image["image_url"]["url"], "data:image/png;base64,aW1hZ2U=");
+        let ModelMessageContent::Parts(parts) = &request.messages[0].content else {
+            panic!("test request should be multimodal");
+        };
+        assert!(matches!(
+            &parts[1],
+            ModelContentPart::Image { data_base64, .. } if data_base64 == "aW1hZ2U="
+        ));
+        client.validate_request(&request).unwrap();
+    }
+
+    #[test]
+    fn unknown_image_shape_or_model_fails_closed() {
+        let request = request_with_images(1);
+        let unknown = client("gpt-5.6-luna-preview", "https://api.openai.com/v1");
+        let error = unknown.validate_request(&request).unwrap_err();
+        assert!(error.to_string().contains("image token cost is unknown"));
+
+        let trusted = client("gpt-5.6-luna", "https://api.openai.com/v1");
+        let mut body = trusted.build_provider_request(&request).unwrap().body;
+        body["messages"][1]["content"][1]["image_url"]["url"] =
+            json!("https://example.test/image.png");
+        let error = trusted.validate_provider_body(&body).unwrap_err();
+        assert!(error.to_string().contains("remote or malformed image URL"));
+    }
+
+    #[test]
+    fn multiple_images_use_the_same_conservative_bound() {
+        let request = request_with_images(2);
+        let client = client("gpt-5.6-luna", "https://api.openai.com/v1");
+        let provisional = client.clone().with_request_budget(RequestBudget {
+            context_window_tokens: u32::MAX,
+            reserved_output_tokens: 1,
+            safety_margin_tokens: 0,
+        });
+        let body = provisional.build_provider_request(&request).unwrap().body;
+        let (shape, count) = image_budget_shape(&body).unwrap();
+        assert_eq!(count, 2);
+        let text_tokens = serde_json::to_vec(&shape).unwrap().len() as u64;
+        let per_image = trusted_image_token_budget(
+            ProviderProtocol::OpenAiCompatible,
+            &Url::parse("https://api.openai.com/v1").unwrap(),
+            "gpt-5.6-luna",
+        )
+        .unwrap();
+        let one_image_context = text_tokens + per_image + 1;
+        let budget = RequestBudget {
+            context_window_tokens: u32::try_from(one_image_context).unwrap(),
+            reserved_output_tokens: 1,
+            safety_margin_tokens: 0,
+        };
+        let error = client
+            .with_request_budget(budget)
+            .validate_request(&request)
+            .unwrap_err();
+        assert!(error.to_string().contains("request budget:"));
+        assert!(error.to_string().contains("exceeding context window"));
+    }
+
+    #[tokio::test]
+    async fn final_send_and_non_streaming_fallback_share_image_validation() {
+        let request = request_with_images(2);
+        let client = client("gpt-5.6-luna", "https://api.openai.com/v1");
+        let provisional = client.clone().with_request_budget(RequestBudget {
+            context_window_tokens: u32::MAX,
+            reserved_output_tokens: 1,
+            safety_margin_tokens: 0,
+        });
+        let body = provisional.build_provider_request(&request).unwrap().body;
+        let (shape, _) = image_budget_shape(&body).unwrap();
+        let text_tokens = serde_json::to_vec(&shape).unwrap().len() as u64;
+        let one_image_context = text_tokens + 3_001 + 1;
+        let client = client.with_request_budget(RequestBudget {
+            context_window_tokens: u32::try_from(one_image_context).unwrap(),
+            reserved_output_tokens: 1,
+            safety_margin_tokens: 0,
+        });
+        let body = client.build_provider_request(&request).unwrap().body;
+        let endpoint = Url::parse("https://api.openai.com/v1/chat/completions").unwrap();
+        let mut events = Vec::new();
+        let first = client
+            .send_with_retry_provider(&endpoint, &body, &mut |event| events.push(event))
+            .await
+            .unwrap_err()
+            .to_string();
+        let mut fallback = body.clone();
+        fallback["stream"] = Value::Bool(false);
+        let second = client
+            .send_with_retry_provider(&endpoint, &fallback, &mut |event| events.push(event))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(first.contains("request budget:") && first.contains("exceeding context window"));
+        assert!(second.contains("request budget:") && second.contains("exceeding context window"));
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn final_send_rejects_a_body_model_mismatch_before_network() {
+        let request = request_with_images(1);
+        let client = client("gpt-5.6-luna", "https://api.openai.com/v1");
+        let mut body = client.build_provider_request(&request).unwrap().body;
+        body["model"] = json!("gpt-5.6-luna-preview");
+        let mut events = Vec::new();
+        let error = client
+            .send_with_retry_provider(
+                &Url::parse("https://api.openai.com/v1/chat/completions").unwrap(),
+                &body,
+                &mut |event| events.push(event),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match selected model"));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn text_budget_estimation_keeps_the_public_byte_shape() {
+        let body = json!({
+            "model": "gpt-5.6-luna",
+            "messages": [{"role": "user", "content": "plain text"}],
+        });
+        let budget = RequestBudget {
+            context_window_tokens: 10_000,
+            reserved_output_tokens: 1,
+            safety_margin_tokens: 0,
+        };
+        assert_eq!(
+            budget.estimate_input_tokens(&body).unwrap(),
+            serde_json::to_vec(&body).unwrap().len() as u64
+        );
+        budget.validate_provider_json(&body).unwrap();
+    }
+
+    #[test]
+    fn request_metrics_keep_wire_bytes_and_image_bound_separate() {
+        let request = request_with_images(2);
+        let client = client("gpt-5.6-luna", "https://api.openai.com/v1");
+        let body = client.build_provider_request(&request).unwrap();
+        let metrics = client.measure_provider_request(&body).unwrap();
+        assert_eq!(metrics, client.measure_model_request(&request).unwrap());
+        assert_eq!(metrics.image_count, 2);
+        assert_eq!(metrics.image_bound_tokens, Some(6_002));
+        assert_eq!(
+            metrics.serialized_request_bytes,
+            serde_json::to_vec(&body.body).unwrap().len() as u64
+        );
+        assert!(metrics.image_payload_bytes > 0);
+        assert_ne!(metrics.text_shape_bytes, metrics.serialized_request_bytes);
+    }
+
+    #[test]
+    fn request_metrics_report_observed_zero_images_without_an_image_bound_guess() {
+        let request = request();
+        let client = client("gpt-5.6-luna", "https://api.openai.com/v1");
+        let body = client.build_provider_request(&request).unwrap();
+        let metrics = client.measure_provider_request(&body).unwrap();
+        assert_eq!(metrics.image_count, 0);
+        assert_eq!(metrics.image_bound_tokens, Some(0));
+        assert_eq!(metrics.image_payload_bytes, 0);
+        assert_eq!(metrics.text_shape_bytes, metrics.serialized_request_bytes);
     }
 }

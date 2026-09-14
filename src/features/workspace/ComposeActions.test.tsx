@@ -37,7 +37,7 @@ describe("ComposeActions", () => {
     const onClose = vi.fn();
     render(<ComposeActions zh={false} onFiles={vi.fn()} onReview={vi.fn()} onClose={onClose} />);
 
-    const share = screen.getByRole("menuitem", { name: /Share as image.*Unavailable/i });
+    const share = screen.getByRole("menuitem", { name: /Share conversation.*No messages/i });
     const save = screen.getByRole("menuitem", { name: /Save as skill.*Unavailable/i });
     expect(share).toBeDisabled();
     expect(save).toBeDisabled();
@@ -52,6 +52,6 @@ describe("ComposeActions", () => {
 
     expect(screen.getByRole("menuitem", { name: /添加文件/ })).toBeDisabled();
     expect(screen.getByRole("menuitem", { name: /管理技能/ })).toBeDisabled();
-    expect(screen.getByRole("menuitem", { name: /分享为图片.*暂不可用/ })).toHaveTextContent("分享为图片");
+    expect(screen.getByRole("menuitem", { name: /分享会话/ })).toBeDisabled();
   });
 });

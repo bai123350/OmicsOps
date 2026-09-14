@@ -1,0 +1,20 @@
+.side-chat-panel { min-width: 0; padding: 16px; color: #34473e; font-size: 13px; }
+.side-chat-heading, .side-chat-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.side-chat-note, .side-chat-turn-meta { color: #708177; line-height: 1.5; }
+.side-chat-panel label { display: grid; gap: 6px; }
+.side-chat-panel select, .side-chat-panel textarea { box-sizing: border-box; width: 100%; min-width: 0; border: 1px solid #dce3dc; border-radius: 10px; padding: 9px; color: inherit; background: white; font: inherit; }
+.side-chat-panel button { border: 1px solid #dce3dc; background: white; border-radius: 8px; padding: 6px 10px; color: inherit; cursor: pointer; }
+.side-chat-panel button:disabled { opacity: .5; cursor: default; }
+.side-chat-turn { border-bottom: 1px solid #e6ebe6; padding: 16px 0; overflow-wrap: anywhere; }
+.side-chat-question { padding: 1px 12px; background: #f0f6f2; border-radius: 12px; }
+.side-chat-answer { line-height: 1.6; }
+.side-chat-panel pre { overflow: auto; max-width: 100%; }
+.side-chat-panel table { display: block; overflow: auto; }
+.side-chat-sources { margin-top: 12px; }
+.side-chat-sources summary { cursor: pointer; color: #078a80; }
+.side-chat-sources > div { padding: 12px 0; }
+.side-chat-sources blockquote { margin: 8px 0; padding-left: 10px; border-left: 2px solid #a7c5b5; white-space: pre-wrap; color: #66766c; }
+.side-chat-panel form { margin-top: 16px; }
+.side-chat-panel textarea { min-height: 94px; resize: vertical; line-height: 1.5; }
+.side-chat-actions { justify-content: flex-end; margin-top: 8px; flex-wrap: wrap; }
+.side-chat-actions button[type="submit"] { background: #08988c; color: white; border-color: #08988c; min-width: 70px; }

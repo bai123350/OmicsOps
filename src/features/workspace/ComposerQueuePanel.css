@@ -1,0 +1,18 @@
+.composer-queue { border: 1px solid var(--border, #e5e3df); border-radius: 14px; background: var(--surface, #fff); padding: 12px; min-width: 0; }
+.composer-queue > header, .composer-queue-meta { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.composer-queue > header span, .composer-queue small { color: var(--text-muted, #77746f); font-size: 12px; overflow-wrap: anywhere; }
+.composer-queue ol { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 10px; }
+.composer-queue li { border-top: 1px solid var(--border, #e5e3df); padding-top: 10px; min-width: 0; }
+.composer-queue-meta { font-size: 12px; }
+.composer-queue-text { margin: 8px 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 120px; overflow: auto; }
+.composer-queue-material { display: block; margin-bottom: 8px; }
+.composer-queue-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.composer-queue button { display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--border, #e5e3df); border-radius: 8px; background: transparent; color: inherit; min-height: 30px; min-width: 30px; padding: 5px 9px; cursor: pointer; }
+.composer-queue button:disabled { opacity: .4; cursor: default; }
+.composer-queue textarea { box-sizing: border-box; width: 100%; min-height: 90px; resize: vertical; margin-top: 8px; padding: 8px; border: 1px solid var(--border, #e5e3df); border-radius: 8px; font: inherit; background: var(--surface, #fff); color: inherit; }
+.composer-queue [role="alert"] { font-size: 12px; color: #a04435; }
+
+.composer-queue ol { max-height: 260px; overflow-y: auto; }
+.composer-queue-failure { color: #a04435; font-size: 12px; }
+.composer-replacement-receipt { font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; color: #65736c; }
+.composer-replacement-receipt summary { cursor: pointer; }

@@ -91,6 +91,76 @@ CREATE TABLE IF NOT EXISTS messages (
     UNIQUE (frame_id, seq)
 );
 
+-- A branch relation is separate from the transcript rows so the source
+-- boundary and idempotent create request remain durable and queryable. The
+-- message ID is validated by the Store in the creation transaction; it is
+-- intentionally not a foreign key because deleting a source conversation is
+-- blocked while this relation exists.
+CREATE TABLE IF NOT EXISTS conversation_branches_v4 (
+    request_id TEXT PRIMARY KEY CHECK (length(trim(request_id)) > 0),
+    branch_conversation_id TEXT NOT NULL UNIQUE
+        REFERENCES conversation_records(frame_id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    source_conversation_id TEXT NOT NULL
+        REFERENCES conversation_records(frame_id) ON DELETE CASCADE,
+    source_message_id TEXT NOT NULL CHECK (length(trim(source_message_id)) > 0),
+    checkpoint_kind TEXT NOT NULL CHECK (checkpoint_kind IN ('before_user','after_response')),
+    source_sequence INTEGER NOT NULL CHECK (source_sequence >= 0),
+    source_head_sequence INTEGER NOT NULL CHECK (source_head_sequence >= 0),
+    boundary_hash TEXT NOT NULL CHECK (length(boundary_hash) = 64),
+    request_hash TEXT NOT NULL CHECK (length(request_hash) = 64),
+    state TEXT NOT NULL CHECK (state IN ('active','merged','archived')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    CHECK (source_sequence <= source_head_sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversation_branches_source
+    ON conversation_branches_v4(project_id, source_conversation_id, created_at, branch_conversation_id);
+
+-- Durable composer rows are accepted before a user message or Agent V4 run
+-- exists. The Store enforces the later message_id/run_id ownership invariant
+-- in the dispatch transaction; pending rows therefore intentionally do not
+-- carry foreign keys to those tables.
+CREATE TABLE IF NOT EXISTS composer_queue_v4 (
+    request_id TEXT PRIMARY KEY CHECK (length(trim(request_id)) > 0),
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversation_records(frame_id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL UNIQUE CHECK (length(trim(message_id)) > 0),
+    run_id TEXT NOT NULL UNIQUE CHECK (length(trim(run_id)) > 0),
+    position INTEGER NOT NULL CHECK (position > 0),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    mode TEXT NOT NULL CHECK (mode IN ('agent', 'plan')),
+    status TEXT NOT NULL CHECK (status IN ('pending','dispatching','running','completed','failed','cancelled','uncertain')),
+    message_markdown TEXT NOT NULL,
+    request_hash TEXT NOT NULL CHECK (length(request_hash) = 64),
+    frozen_json TEXT NOT NULL,
+    references_json TEXT NOT NULL,
+    attachments_json TEXT NOT NULL,
+    material_json TEXT NOT NULL,
+    dispatch_attempt INTEGER NOT NULL DEFAULT 0 CHECK (dispatch_attempt >= 0),
+    lease_owner TEXT,
+    lease_expires_at INTEGER,
+    cutin_message_id TEXT,
+    failure_code TEXT,
+    failure_message TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (conversation_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_composer_queue_fifo
+    ON composer_queue_v4(project_id, conversation_id, status, position);
+CREATE INDEX IF NOT EXISTS idx_composer_queue_lease
+    ON composer_queue_v4(status, lease_expires_at);
+
+CREATE TABLE IF NOT EXISTS composer_replacements_v4 (
+    request_id TEXT PRIMARY KEY REFERENCES composer_queue_v4(request_id) ON DELETE CASCADE,
+    target_run_id TEXT NOT NULL UNIQUE REFERENCES agent_runs_v4(run_id) ON DELETE CASCADE,
+    request_hash TEXT NOT NULL CHECK (length(request_hash) = 64),
+    receipt_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS session_branch_merges (
     id TEXT PRIMARY KEY CHECK (length(trim(id)) > 0),
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -823,6 +893,37 @@ CREATE TABLE IF NOT EXISTS agent_runs_v4 (
     updated_at INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS side_chat_turns_v4 (
+    request_id TEXT PRIMARY KEY CHECK (length(trim(request_id)) > 0),
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversation_records(frame_id) ON DELETE CASCADE,
+    parent_request_id TEXT REFERENCES side_chat_turns_v4(request_id) ON DELETE SET NULL,
+    request_hash TEXT NOT NULL CHECK (length(request_hash) = 64),
+    status TEXT NOT NULL CHECK (status IN ('queued','running','completed','no_evidence','failed','interrupted')),
+    value_json TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_side_chat_turns_context
+    ON side_chat_turns_v4(project_id, conversation_id, created_at DESC, request_id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_side_chat_turns_active
+    ON side_chat_turns_v4(project_id, conversation_id, status);
+
+CREATE TABLE IF NOT EXISTS agent_run_stop_requests_v4 (
+    request_id TEXT PRIMARY KEY CHECK (length(trim(request_id)) > 0),
+    run_id TEXT NOT NULL UNIQUE REFERENCES agent_runs_v4(run_id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversation_records(frame_id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('requested','observed')),
+    created_at INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_run_stop_requests_context
+    ON agent_run_stop_requests_v4(project_id, conversation_id, run_id);
+
 CREATE TABLE IF NOT EXISTS runtime_jobs_v4 (
     job_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES agent_runs_v4(run_id) ON DELETE CASCADE,
@@ -868,6 +969,32 @@ CREATE TABLE IF NOT EXISTS agent_context_archives_v4 (
     checkpoint_json TEXT NOT NULL,
     created_at INTEGER NOT NULL DEFAULT 0
 );
+
+-- A compaction receipt is an idempotent, bounded audit projection. The full
+-- transcript remains in agent_context_archives_v4; this table stores only
+-- scope, status, byte counts and hashes needed for reconciliation.
+CREATE TABLE IF NOT EXISTS agent_context_compactions_v4 (
+    request_id TEXT PRIMARY KEY CHECK (length(trim(request_id)) > 0),
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversation_records(frame_id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES agent_runs_v4(run_id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('started','not_needed','completed','attention')),
+    source_through_sequence INTEGER NOT NULL CHECK (source_through_sequence >= 0),
+    source_head_hash TEXT NOT NULL,
+    before_bytes INTEGER NOT NULL CHECK (before_bytes >= 0),
+    after_bytes INTEGER CHECK (after_bytes IS NULL OR after_bytes >= 0),
+    archive_id TEXT REFERENCES agent_context_archives_v4(archive_id) ON DELETE CASCADE,
+    checkpoint_through_sequence INTEGER
+        CHECK (checkpoint_through_sequence IS NULL OR checkpoint_through_sequence >= 0),
+    checkpoint_sha256 TEXT,
+    frozen_spec_hash TEXT,
+    message TEXT,
+    created_at INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_context_compactions_scope
+    ON agent_context_compactions_v4(project_id, conversation_id, run_id, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS browser_authorizations_v4 (
     id TEXT PRIMARY KEY CHECK (length(trim(id)) > 0),

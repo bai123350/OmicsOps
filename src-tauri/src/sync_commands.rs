@@ -1090,19 +1090,56 @@ async fn canonical_remote_root(
     }
 }
 
+/// Composer file references use the same trusted remote canonicalization as
+/// sync and preview operations, but keep the implementation private to this
+/// crate so callers cannot construct arbitrary SSH paths.
+pub(crate) async fn canonical_remote_root_for_composer(
+    session: &omicsops_adapters::ssh::SshSession,
+    remote_root: &str,
+) -> Result<String, String> {
+    canonical_remote_root(session, remote_root).await
+}
+
 async fn canonical_remote_file(
     session: &omicsops_adapters::ssh::SshSession,
     root: &str,
     relative: &str,
 ) -> Result<String, String> {
     let candidate = format!("{}/{}", root.trim_end_matches('/'), relative);
-    let output = session.execute_checked(&format!("root={} && file=$(realpath -- {}) && case \"$file\" in \"$root\"/*) test -f \"$file\" && printf '%s' \"$file\";; *) exit 73;; esac", shell_quote(root), shell_quote(&candidate))).await.map_err(|error| error.to_string())?;
+    let output = session
+        .execute_checked(&format!(
+            "root={} && raw={} && test ! -L \"$raw\" && file=$(realpath -- \"$raw\") && case \"$file\" in \"$root\"/*) test -f \"$file\" && printf '%s' \"$file\";; *) exit 73;; esac",
+            shell_quote(root),
+            shell_quote(&candidate),
+        ))
+        .await
+        .map_err(|error| error.to_string())?;
     let path = output.stdout.trim().to_owned();
     if path.is_empty() {
         Err("remote file did not resolve".into())
     } else {
         Ok(path)
     }
+}
+
+/// Validate one project-relative remote file without reading or downloading
+/// its contents.  The caller must have validated the relative path against
+/// its project binding before invoking this wrapper.
+pub(crate) async fn canonical_remote_file_for_composer(
+    session: &omicsops_adapters::ssh::SshSession,
+    root: &str,
+    relative: &str,
+) -> Result<String, String> {
+    let mut current = root.trim_end_matches('/').to_owned();
+    for component in relative.split('/') {
+        current.push('/');
+        current.push_str(component);
+        session
+            .execute_checked(&format!("test ! -L {}", shell_quote(&current)))
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    canonical_remote_file(session, root, relative).await
 }
 
 async fn remote_sha256(

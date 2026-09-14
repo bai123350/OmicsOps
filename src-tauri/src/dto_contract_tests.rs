@@ -4,7 +4,110 @@ use crate::dto::{
     SetConversationAgentModeRequestV4,
 };
 use serde_json::json;
+
+#[test]
+fn composer_attachment_boundary_contains_only_receipts_and_explicit_staging_bytes() {
+    let id = uuid::Uuid::new_v4();
+    let request: omicsops_dto::StageComposerAttachmentRequest = serde_json::from_value(json!({
+        "project_id":id, "conversation_id":id, "name":"qc.csv", "content_base64":"YSwx"
+    }))
+    .unwrap();
+    assert_eq!(request.name, "qc.csv");
+    assert!(serde_json::from_value::<omicsops_dto::StageComposerAttachmentRequest>(json!({
+        "project_id":id, "conversation_id":id, "name":"qc.csv", "content_base64":"YSwx", "path":"C:/unselected.txt"
+    })).is_err());
+    let receipt = omicsops_dto::ComposerAttachmentReceipt {
+        id,
+        project_id: id,
+        conversation_id: id,
+        name: "qc.csv".into(),
+        relative_path: format!(".omicsops/attachments/{id}/bytes.csv"),
+        size_bytes: 3,
+        sha256: "a".repeat(64),
+        media_type: "text/csv".into(),
+    };
+    let encoded = serde_json::to_value(receipt).unwrap();
+    assert_eq!(encoded["size_bytes"], 3);
+    assert!(encoded.get("content_base64").is_none());
+    assert!(encoded.get("absolute_path").is_none());
+}
 use uuid::Uuid;
+
+#[test]
+fn composer_reference_contract_uses_stable_tagged_ids() {
+    let id = Uuid::new_v4();
+    let project_id = Uuid::new_v4();
+    for payload in [
+        json!({"kind":"artifact","project_id":project_id,"id":id}),
+        json!({"kind":"session","project_id":project_id,"id":id}),
+        json!({"kind":"skill","id":id}),
+    ] {
+        let reference: omicsops_dto::ComposerReference =
+            serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(serde_json::to_value(reference).unwrap(), payload);
+    }
+    assert!(
+        serde_json::from_value::<omicsops_dto::ComposerReference>(
+            json!({"kind":"artifact","id":id})
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn start_requests_accept_legacy_payloads_and_preserve_reference_ids() {
+    let id = Uuid::new_v4();
+    let mut payload = json!({
+        "project_id":id,"conversation_id":id,"model_profile_id":id,"objective":"inspect",
+        "compute_selection":{"schema_version":4,"backend_id":"local","backend_kind":"local","autonomy_mode":"supervised","environment":"system","network_policy":"host_inherited"}
+    });
+    assert!(
+        serde_json::from_value::<crate::agent_v4::StartPlanningV4Request>(payload.clone())
+            .unwrap()
+            .references
+            .is_empty()
+    );
+    assert!(
+        serde_json::from_value::<crate::agent_v4::StartDirectV4Request>(payload.clone())
+            .unwrap()
+            .references
+            .is_empty()
+    );
+    payload["references"] = json!([{"kind":"skill","id":id}]);
+    let plan: crate::agent_v4::StartPlanningV4Request =
+        serde_json::from_value(payload.clone()).unwrap();
+    let direct: crate::agent_v4::StartDirectV4Request = serde_json::from_value(payload).unwrap();
+    assert_eq!(plan.references, direct.references);
+    assert_eq!(
+        serde_json::to_value(direct).unwrap()["references"],
+        json!([{"kind":"skill","id":id}])
+    );
+}
+
+#[test]
+fn conversation_export_uses_shared_bounded_format_contract() {
+    use omicsops_dto::{ConversationExportFormat, ConversationExportRequest};
+    let request = ConversationExportRequest {
+        format: ConversationExportFormat::Png,
+        content_base64: "test".into(),
+    };
+    assert_eq!(
+        serde_json::to_value(request).unwrap(),
+        json!({"format":"png","content_base64":"test"})
+    );
+    assert!(
+        serde_json::from_value::<ConversationExportRequest>(
+            json!({"format":"exe","content_base64":"test"})
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ConversationExportRequest>(
+            json!({"format":"html","content_base64":"test","path":"bypass"})
+        )
+        .is_err()
+    );
+}
 
 #[test]
 fn agent_iteration_settings_use_shared_validated_snake_case_contract() {
@@ -300,4 +403,203 @@ fn session_settings_defaults_preserve_legacy_records_and_validate_new_fields() {
     ] {
         assert!(serde_json::from_value::<AgentIterationSettingsV4>(invalid).is_err());
     }
+}
+
+#[test]
+fn workflow_references_only_transport_project_and_stable_id() {
+    let project_id = uuid::Uuid::new_v4();
+    let id = uuid::Uuid::new_v4();
+    let reference = omicsops_dto::ComposerReference::Workflow { project_id, id };
+    assert_eq!(
+        serde_json::to_value(reference).unwrap(),
+        serde_json::json!({
+            "kind": "workflow", "project_id": project_id, "id": id
+        })
+    );
+}
+
+#[test]
+fn quote_contract_keeps_source_verification_separate_from_stable_submission_id() {
+    let project_id = Uuid::new_v4();
+    let id = Uuid::new_v4();
+    assert_eq!(
+        serde_json::to_value(omicsops_dto::ComposerReference::Quote { project_id, id }).unwrap(),
+        json!({"kind":"quote","project_id":project_id,"id":id})
+    );
+    let request = json!({"project_id":project_id,"conversation_id":Uuid::new_v4(),"backend_id":"local","relative_path":"notes.md","sha256":"a".repeat(64),"text":"selected text"});
+    assert!(
+        serde_json::from_value::<omicsops_dto::CreateComposerQuoteRequest>(request.clone()).is_ok()
+    );
+    let mut forged = request;
+    forged["absolute_path"] = json!("C:\\outside\\secret.txt");
+    assert!(serde_json::from_value::<omicsops_dto::CreateComposerQuoteRequest>(forged).is_err());
+}
+
+#[test]
+fn workspace_file_contract_preserves_exact_source_without_attachment_bytes() {
+    let project_id = Uuid::new_v4();
+    for backend_id in ["local".to_owned(), format!("ssh:{}", Uuid::new_v4())] {
+        let reference = omicsops_dto::ComposerReference::WorkspaceFile {
+            project_id,
+            backend_id: backend_id.clone(),
+            relative_path: "results/counts.csv".into(),
+        };
+        let wire = serde_json::to_value(&reference).unwrap();
+        assert_eq!(
+            wire,
+            json!({"kind":"workspace_file","project_id":project_id,"backend_id":backend_id,"relative_path":"results/counts.csv"})
+        );
+        assert_eq!(
+            serde_json::from_value::<omicsops_dto::ComposerReference>(wire).unwrap(),
+            reference
+        );
+    }
+}
+
+#[test]
+fn conversation_preferences_use_shared_optional_behavior_contract() {
+    use omicsops_dto::ConversationAgentPreferencesV4;
+    let defaults: ConversationAgentPreferencesV4 = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(
+        serde_json::to_value(defaults).unwrap(),
+        json!({"delegation_enabled":true,"auto_review":true,"memory_enabled":true})
+    );
+    let disabled: ConversationAgentPreferencesV4 = serde_json::from_value(
+        json!({"delegation_enabled":false,"auto_review":false,"memory_enabled":false}),
+    )
+    .unwrap();
+    assert!(!disabled.memory_enabled && !disabled.auto_review && !disabled.delegation_enabled);
+    for mode in [serde_json::Value::Null, json!(true), json!(false)] {
+        let preferences: ConversationAgentPreferencesV4 =
+            serde_json::from_value(json!({"fast_mode": mode})).unwrap();
+        assert_eq!(preferences.fast_mode, mode.as_bool());
+    }
+    assert!(
+        serde_json::from_value::<ConversationAgentPreferencesV4>(json!({"fast_mode":"priority"}))
+            .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ConversationAgentPreferencesV4>(json!({"memory_enabled":"false"}))
+            .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ConversationAgentPreferencesV4>(json!({"grant_full_access":true}))
+            .is_err()
+    );
+}
+
+#[test]
+fn retrospective_review_contract_is_scoped_and_separate_from_run_verification() {
+    use omicsops_dto::{ReviewerSettingsV4, SessionReviewReportV4, SessionReviewRequestV4};
+    assert_eq!(
+        serde_json::to_value(ReviewerSettingsV4::default()).unwrap(),
+        json!({"backend":{"kind":"follow_session"}})
+    );
+    let request = json!({"request_id":Uuid::new_v4(), "project_id":Uuid::new_v4(), "conversation_id":Uuid::new_v4(), "model_profile_id":Uuid::new_v4()});
+    assert_eq!(
+        serde_json::to_value(
+            serde_json::from_value::<SessionReviewRequestV4>(request.clone()).unwrap()
+        )
+        .unwrap(),
+        request
+    );
+    let mut forged = request;
+    forged["sources"] = json!([{"text":"client supplied evidence"}]);
+    assert!(serde_json::from_value::<SessionReviewRequestV4>(forged).is_err());
+    let report = json!({"summary":"Read-only report", "findings":[{"severity":"warn","code":"missing_control","message":"Control is not described","source_ids":[Uuid::new_v4()]}]});
+    assert_eq!(
+        serde_json::to_value(
+            serde_json::from_value::<SessionReviewReportV4>(report.clone()).unwrap()
+        )
+        .unwrap(),
+        report
+    );
+    assert!(
+        serde_json::from_value::<SessionReviewReportV4>(
+            json!({"summary":"report","findings":[],"verified":true})
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn review_start_failure_preserves_dispatch_certainty_across_ui_boundary() {
+    use omicsops_dto::{SessionReviewStartErrorV4, SessionReviewStartFailureKindV4};
+    let failure = SessionReviewStartErrorV4 {
+        kind: SessionReviewStartFailureKindV4::Rejected,
+        message: "Review was not started".into(),
+    };
+    assert_eq!(
+        serde_json::to_value(failure).unwrap(),
+        json!({"kind":"rejected","message":"Review was not started"})
+    );
+    assert!(
+        serde_json::from_value::<SessionReviewStartErrorV4>(
+            json!({"kind":"unknown","message":"failure"})
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn stop_request_contract_is_scoped_and_does_not_accept_remote_cancellation_claims() {
+    let request = json!({"request_id":Uuid::new_v4(),"project_id":Uuid::new_v4(),"conversation_id":Uuid::new_v4(),"run_id":Uuid::new_v4()});
+    let parsed: omicsops_dto::StopRunRequestV4 = serde_json::from_value(request.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+    let mut forged = request;
+    forged["cancel_remote_jobs"] = json!(true);
+    assert!(serde_json::from_value::<omicsops_dto::StopRunRequestV4>(forged).is_err());
+    assert_eq!(
+        serde_json::to_value(omicsops_dto::StopRunStatusV4::Observed).unwrap(),
+        json!("observed")
+    );
+}
+
+#[test]
+fn branch_request_contract_cannot_copy_execution_authority() {
+    let request = json!({"request_id":Uuid::new_v4(),"project_id":Uuid::new_v4(),"source_conversation_id":Uuid::new_v4(),"source_message_id":Uuid::new_v4(),"checkpoint_kind":"after_response","expected_source_sequence":1,"expected_head_sequence":2,"expected_boundary_hash":"a".repeat(64),"title":"Alternative analysis"});
+    let parsed: omicsops_dto::CreateConversationBranchRequestV4 =
+        serde_json::from_value(request.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+    let mut forged = request;
+    forged["copy_approvals"] = json!(true);
+    assert!(
+        serde_json::from_value::<omicsops_dto::CreateConversationBranchRequestV4>(forged).is_err()
+    );
+}
+
+#[test]
+fn replacement_contract_binds_complete_turn_and_rejects_inherited_authority() {
+    use omicsops_dto::{
+        ComposerReplacementErrorV4, ComposerReplacementFailureKindV4, ReplaceComposerTurnRequestV4,
+    };
+    let request = json!({"turn":{"request_id":Uuid::new_v4(),"message_id":Uuid::new_v4(),"run_id":Uuid::new_v4(),"project_id":Uuid::new_v4(),"conversation_id":Uuid::new_v4(),"mode":"agent","message_markdown":"New goal","model_profile_id":Uuid::new_v4(),"compute_selection":{"schema_version":4,"backend_id":"local","backend_kind":"local","autonomy_mode":"supervised","approval_policy":"risk_based","environment":"system","network_policy":"host_inherited","container_image":null},"references":[],"attachments":[Uuid::new_v4()]},"target_run_id":Uuid::new_v4(),"expected_event_sequence":3,"expected_event_hash":"a".repeat(64),"stop_request_id":Uuid::new_v4()});
+    let parsed: ReplaceComposerTurnRequestV4 = serde_json::from_value(request.clone()).unwrap();
+    // ComputeSelection serializes its default policy and absent container
+    // sparsely; assert the normalized wire contract and the decoded meaning.
+    assert_eq!(
+        parsed.turn.compute_selection.approval_policy,
+        omicsops_protocol::ApprovalPolicyV4::RiskBased
+    );
+    let mut normalized = request.clone();
+    normalized["turn"]["compute_selection"]
+        .as_object_mut()
+        .unwrap()
+        .remove("approval_policy");
+    normalized["turn"]["compute_selection"]
+        .as_object_mut()
+        .unwrap()
+        .remove("container_image");
+    assert_eq!(serde_json::to_value(parsed).unwrap(), normalized);
+    let mut forged = request;
+    forged["copy_approvals"] = json!(true);
+    assert!(serde_json::from_value::<ReplaceComposerTurnRequestV4>(forged).is_err());
+    assert_eq!(
+        serde_json::to_value(ComposerReplacementErrorV4 {
+            kind: ComposerReplacementFailureKindV4::Unknown,
+            message: "Reconcile".into()
+        })
+        .unwrap(),
+        json!({"kind":"unknown","message":"Reconcile"})
+    );
 }

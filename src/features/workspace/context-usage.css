@@ -1,0 +1,18 @@
+.context-usage-panel { position: fixed; z-index: 110; width: 420px; max-width: calc(100vw - 24px); max-height: calc(100vh - 32px); min-width: min(300px, calc(100vw - 24px)); min-height: 220px; background: #fff; color: #35423c; border: 1px solid #dce2dc; border-radius: 16px; box-shadow: 0 12px 45px #18382b26; overflow: auto; resize: both; }
+.context-usage-panel.is-docked { right: 16px; bottom: 16px; }
+.context-usage-panel header { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid #e7ebe7; }
+.context-usage-panel.is-floating header { cursor: move; touch-action: none; }
+.context-usage-panel header strong { flex: 1; }
+.context-usage-panel button { background: #f4f7f4; color: inherit; border: 1px solid #dce2dc; border-radius: 7px; padding: 5px 9px; cursor: pointer; }
+.context-usage-panel button:disabled { opacity: .5; cursor: default; }
+.context-usage-content { padding: 8px 16px 16px; font-size: 13px; }
+.context-usage-total { font-size: 20px; font-weight: 600; overflow-wrap: anywhere; }
+.context-usage-panel progress { width: 100%; accent-color: #0a978c; }
+.context-usage-panel h3 { font-size: 13px; margin-top: 20px; }
+.context-usage-panel dl { display: grid; grid-template-columns: 1fr auto; gap: 7px 12px; }
+.context-usage-panel dd { margin: 0; font-variant-numeric: tabular-nums; }
+.context-usage-note { color: #748078; line-height: 1.5; }
+.context-usage-panel footer { display: flex; justify-content: flex-end; gap: 8px; }
+
+.context-usage-breakdown { display: contents; }
+.context-usage-panel dt { overflow-wrap: anywhere; min-width: 0; }

@@ -1,11 +1,16 @@
 import { useMemo, useState } from "react";
-import { ChevronDown, ChevronRight, Download, FileCode2, FileImage, FileJson, FileSpreadsheet, FileText, Folder, FolderOpen, RefreshCw, Upload } from "lucide-react";
+import { ChevronDown, ChevronRight, Download, Eye, Paperclip, FileCode2, FileImage, FileJson, FileSpreadsheet, FileText, Folder, FolderOpen, RefreshCw, Upload } from "lucide-react";
 
+import { WORKSPACE_FILE_DRAG_TYPE, type WorkspaceFileReference } from "../../composer-file-api";
 import type { RemoteFileEntry, SyncEntry } from "../../types";
 import type { Locale } from "./copy";
 
 interface Props {
   locale: Locale;
+  source?: "local" | "remote";
+  onPreviewText?: (relativePath: string) => void;
+  onAttach?: (relativePath: string) => void;
+  dragReference?: (relativePath: string) => WorkspaceFileReference;
   remoteFiles?: RemoteFileEntry[];
   busy: boolean;
   notice?: string;
@@ -26,15 +31,9 @@ interface RemoteTreeNode {
   children: RemoteTreeNode[];
 }
 
-export function RemoteFileTree({ locale, remoteFiles, busy, notice, onUpload, onRefresh, onDownload, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
+export function RemoteFileTree({ locale, source = "remote", onPreviewText, onAttach, dragReference, remoteFiles, busy, notice, onUpload, onRefresh, onDownload, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
   const zh = locale === "zh-CN";
-  const demoFiles: RemoteFileEntry[] = [
-    { relative_path: "data", directory: true, size_bytes: 0, modified_unix_seconds: 0 },
-    { relative_path: "analysis", directory: true, size_bytes: 0, modified_unix_seconds: 0 },
-    { relative_path: "results/umap.png", directory: false, size_bytes: 1_258_291, modified_unix_seconds: 0 },
-    { relative_path: "results/markers.csv", directory: false, size_bytes: 86_016, modified_unix_seconds: 0 },
-  ];
-  const files = remoteFiles ?? demoFiles;
+  const files = remoteFiles ?? [];
   const tree = useMemo(() => buildRemoteTree(files), [files]);
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set());
 
@@ -49,20 +48,21 @@ export function RemoteFileTree({ locale, remoteFiles, busy, notice, onUpload, on
 
   return <div className="file-tree">
     <div className="context-heading file-heading">
-      <div><b>{zh ? "项目文件" : "Project files"}</b><small>{zh ? "仅同步明确选择的文件" : "Explicit selective sync"}</small></div>
+      <div><b>{zh ? "项目文件" : "Project files"}</b><small>{source === "local" ? (zh ? "本地文件；附加引用不会上传" : "Local files; references do not upload") : (zh ? "远端文件；附加引用不会下载" : "Remote files; references do not download")}</small></div>
       <div className="file-heading-actions">
-        <button aria-label={zh ? "刷新远端目录" : "Refresh remote directory"} disabled={busy || !onRefresh} onClick={() => void onRefresh?.()}><RefreshCw size={14} /></button>
-        <button className="upload-action" aria-label={zh ? "选择上传文件" : "Choose files to upload"} disabled={busy || !onUpload} onClick={() => void onUpload?.()}><Upload size={14} /><span>{zh ? "上传" : "Upload"}</span></button>
+        <button aria-label={source === "local" ? (zh ? "刷新本地目录" : "Refresh local directory") : (zh ? "刷新远端目录" : "Refresh remote directory")} disabled={busy || !onRefresh} onClick={() => void onRefresh?.()}><RefreshCw size={14} /></button>
+        {source === "remote" && <button className="upload-action" aria-label={zh ? "选择上传文件" : "Choose files to upload"} disabled={busy || !onUpload} onClick={() => void onUpload?.()}><Upload size={14} /><span>{zh ? "上传" : "Upload"}</span></button>}
       </div>
     </div>
+    {source === "local" && <small className="file-list-limit">{zh ? "最多扫描 2,000 项、8 层目录；隐藏内部目录与符号链接。" : "Scans up to 2,000 entries and 8 directory levels; internal folders and symlinks are omitted."}</small>}
     {notice && <div className="file-notice" role="status">{notice}</div>}
     {syncEntries.length > 0 && <div className="sync-queue"><b>{zh ? "传输任务" : "Transfers"}</b>{syncEntries.slice(-5).reverse().map((entry) => <article key={entry.id}><span>{entry.relative_path}</span><small>{entry.state} · {formatBytes(entry.transferred_bytes)} / {formatBytes(entry.size_bytes)} · {entry.retry_count} retries</small><progress max={Math.max(1, entry.size_bytes)} value={entry.transferred_bytes} />{entry.error && <em>{entry.error}</em>}<div>{entry.state === "transferring" && <><button onClick={() => void onPauseSync?.(entry.id)}>{zh ? "暂停" : "Pause"}</button><button onClick={() => void onCancelSync?.(entry.id)}>{zh ? "取消" : "Cancel"}</button></>}{(["paused", "failed", "canceled"] as string[]).includes(entry.state) && <button onClick={() => void onRetrySync?.(entry.id)}>{zh ? "续传/重试" : "Resume/retry"}</button>}</div></article>)}</div>}
-    {files.length === 0 && <div className="empty-file-tree">{zh ? "远端目录为空" : "The remote directory is empty"}</div>}
-    {tree.length > 0 && <div className="remote-file-tree" role="tree" aria-label={zh ? "远端项目文件" : "Remote project files"}>{tree.map((node) => <RemoteTreeItem key={node.relativePath} node={node} depth={0} locale={locale} expandedPaths={expandedPaths} busy={busy} onToggle={toggleDirectory} onDownload={onDownload} />)}</div>}
+    {files.length === 0 && <div className="empty-file-tree">{source === "local" ? (zh ? "本地目录为空" : "The local directory is empty") : (zh ? "远端目录为空" : "The remote directory is empty")}</div>}
+    {tree.length > 0 && <div className="remote-file-tree" role="tree" aria-label={source === "local" ? (zh ? "本地项目文件" : "Local project files") : (zh ? "远端项目文件" : "Remote project files")}>{tree.map((node) => <RemoteTreeItem key={node.relativePath} node={node} depth={0} locale={locale} expandedPaths={expandedPaths} busy={busy} onToggle={toggleDirectory} onDownload={onDownload} onPreviewText={onPreviewText} onAttach={onAttach} dragReference={dragReference} />)}</div>}
   </div>;
 }
 
-function RemoteTreeItem({ node, depth, locale, expandedPaths, busy, onToggle, onDownload }: { node: RemoteTreeNode; depth: number; locale: Locale; expandedPaths: Set<string>; busy: boolean; onToggle: (relativePath: string) => void; onDownload?: (relativePath: string) => Promise<void> | void }) {
+function RemoteTreeItem({ node, depth, locale, expandedPaths, busy, onToggle, onDownload, onPreviewText, onAttach, dragReference }: { onPreviewText?: (relativePath: string) => void; onAttach?: (relativePath: string) => void; dragReference?: (relativePath: string) => WorkspaceFileReference; node: RemoteTreeNode; depth: number; locale: Locale; expandedPaths: Set<string>; busy: boolean; onToggle: (relativePath: string) => void; onDownload?: (relativePath: string) => Promise<void> | void }) {
   const zh = locale === "zh-CN";
   const expanded = expandedPaths.has(node.relativePath);
   const paddingLeft = 10 + depth * 16;
@@ -73,13 +73,19 @@ function RemoteTreeItem({ node, depth, locale, expandedPaths, busy, onToggle, on
         {expanded ? <FolderOpen className="remote-tree-folder-icon" size={16} /> : <Folder className="remote-tree-folder-icon" size={16} />}
         <span>{node.name}</span>
       </button>
-      {expanded && node.children.length > 0 && <div role="group">{node.children.map((child) => <RemoteTreeItem key={child.relativePath} node={child} depth={depth + 1} locale={locale} expandedPaths={expandedPaths} busy={busy} onToggle={onToggle} onDownload={onDownload} />)}</div>}
+      {expanded && node.children.length > 0 && <div role="group">{node.children.map((child) => <RemoteTreeItem key={child.relativePath} node={child} depth={depth + 1} locale={locale} expandedPaths={expandedPaths} busy={busy} onToggle={onToggle} onDownload={onDownload} onPreviewText={onPreviewText} onAttach={onAttach} dragReference={dragReference} />)}</div>}
     </>;
   }
-  return <div className="remote-tree-file" role="treeitem" aria-level={depth + 1} title={node.relativePath} style={{ paddingLeft: paddingLeft + 20 }}>
+  return <div draggable={Boolean(dragReference) && !busy} onDragStart={(event) => {
+    if (!dragReference || busy) { event.preventDefault(); return; }
+    event.dataTransfer.setData(WORKSPACE_FILE_DRAG_TYPE, JSON.stringify(dragReference(node.relativePath)));
+    event.dataTransfer.effectAllowed = "copy";
+  }} className="remote-tree-file" role="treeitem" aria-level={depth + 1} title={node.relativePath} style={{ paddingLeft: paddingLeft + 20 }}>
     <RemoteFileIcon relativePath={node.relativePath} />
     <span>{node.name}</span>
     <em>{formatBytes(node.sizeBytes)}</em>
+    {onPreviewText && <button aria-label={`${zh ? "预览文本" : "Preview text"} ${node.relativePath}`} disabled={busy} onClick={() => onPreviewText(node.relativePath)}><Eye size={13} /></button>}
+    {onAttach && <button aria-label={`${zh ? "附加引用" : "Attach reference"} ${node.relativePath}`} disabled={busy} onClick={() => onAttach(node.relativePath)}><Paperclip size={13} /></button>}
     {onDownload && <button aria-label={`${zh ? "下载" : "Download"} ${node.relativePath}`} disabled={busy} onClick={() => void onDownload(node.relativePath)}><Download size={13} /></button>}
   </div>;
 }

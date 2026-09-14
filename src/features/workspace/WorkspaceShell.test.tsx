@@ -1,6 +1,8 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import * as preferencesApi from "../../conversation-preferences-api";
+import * as guidanceApi from "../../tauri-api";
 import { WorkspaceShell } from "./WorkspaceShell";
 
 const project = {
@@ -9,6 +11,29 @@ const project = {
   status: "running" as const,
   template: "single_cell_rna_seq" as const,
 };
+
+const fastProfile = {
+  id: "fast-model",
+  label: "Fast model",
+  provider: "open_ai_compatible" as const,
+  base_url: "https://api.openai.com/v1",
+  model: "gpt-5.6-luna",
+  credential_reference: null,
+  supports_tools: true,
+  supports_vision: false,
+};
+
+afterEach(() => vi.restoreAllMocks());
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 describe("WorkspaceShell", () => {
   it.each(["running", "waiting_for_approval", "needs_attention", "cancelled", "completed"])("does not present an ordinary %s contract as a Plan or hide its trace", (status) => {
@@ -23,10 +48,75 @@ describe("WorkspaceShell", () => {
     expect(screen.getByText("正在核对文献记录。")).toBeVisible();
   });
 
-  it("removes the run guidance card even when guidance is available", () => {
+  it("opens independent guidance from send options while the main composer is locked", () => {
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} guidanceAvailable activeConversationId="conversation" activeRunId="run" runStarted />);
     expect(screen.queryByRole("region", { name: "运行中指导" })).not.toBeInTheDocument();
-    expect(screen.queryByText(/已接收的指导/)).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "发送选项" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /追加指导/ }));
+    expect(screen.getByRole("dialog", { name: "追加指导" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "追加指导" })).toBeEnabled();
+  });
+
+  it("keeps guidance out of Plan mode", () => {
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} guidanceAvailable agentMode="plan" activeConversationId="conversation" activeRunId="run" runStarted />);
+    fireEvent.click(screen.getByRole("button", { name: "发送选项" }));
+    expect(screen.queryByRole("menuitem", { name: /追加指导/ })).not.toBeInTheDocument();
+  });
+
+  it("keeps uncertain guidance identities separate when visiting another conversation", async () => {
+    vi.spyOn(guidanceApi, "agentV4ListGuidance").mockResolvedValue([]);
+    vi.spyOn(guidanceApi, "onAgentV4Event").mockResolvedValue(() => undefined);
+    const submit = vi.spyOn(guidanceApi, "agentV4SubmitGuidance").mockRejectedValue(new Error("connection lost"));
+    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, guidanceAvailable: true, runStarted: true };
+    const view = render(<WorkspaceShell {...props} activeConversationId="first" activeRunId="run-first" />);
+    const open = () => {
+      fireEvent.click(screen.getByRole("button", { name: "发送选项" }));
+      fireEvent.click(screen.getByRole("menuitem", { name: /追加指导/ }));
+    };
+    open();
+    fireEvent.change(screen.getByRole("textbox", { name: "追加指导" }), { target: { value: "第一会话指导" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送指导" }));
+    await screen.findByRole("alert");
+    const original = submit.mock.calls[0][0];
+    view.rerender(<WorkspaceShell {...props} activeConversationId="second" activeRunId="run-second" />);
+    open();
+    expect(screen.getByRole("textbox", { name: "追加指导" })).toHaveValue("");
+    view.rerender(<WorkspaceShell {...props} activeConversationId="first" activeRunId="run-first" />);
+    open();
+    expect(screen.getByRole("textbox", { name: "追加指导" })).toHaveValue("第一会话指导");
+    fireEvent.click(screen.getByRole("button", { name: "发送指导" }));
+    await waitFor(() => expect(submit).toHaveBeenCalledTimes(2));
+    expect(submit.mock.calls[1][0]).toEqual(original);
+  });
+
+  it.each([false, true])("clears only the exact composer text accepted as guidance (edited=%s)", async (edited) => {
+    vi.spyOn(guidanceApi, "agentV4ListGuidance").mockResolvedValue([]);
+    vi.spyOn(guidanceApi, "onAgentV4Event").mockResolvedValue(() => undefined);
+    vi.spyOn(guidanceApi, "agentV4SubmitGuidance").mockImplementation(async (request) => ({ ...request, ordinal: 1, accepted_at: "2026-09-14T00:00:00Z", consumed_at: null }));
+    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, guidanceAvailable: true, activeConversationId: "conversation" };
+    const view = render(<WorkspaceShell {...props} />);
+    const composer = screen.getByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(composer).toBeEnabled());
+    fireEvent.change(composer, { target: { value: "保留原始研究请求" } });
+    view.rerender(<WorkspaceShell {...props} activeRunId="run" runStarted />);
+    fireEvent.click(screen.getByRole("button", { name: "发送选项" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /追加指导/ }));
+    if (edited) fireEvent.change(screen.getByRole("textbox", { name: "追加指导" }), { target: { value: "另一个补充要求" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送指导" }));
+    await waitFor(() => expect(guidanceApi.agentV4SubmitGuidance).toHaveBeenCalledOnce());
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "追加指导" })).toHaveValue(""));
+    expect(composer).toHaveValue(edited ? "保留原始研究请求" : "");
+  });
+
+  it("reopens the latest ordinary run's guidance history after the run has finished", () => {
+    const plan = { schema_version: 4 as const, objective: "ordinary run", steps: ["inspect"], completion_criteria: ["report"], requested_capabilities: [] };
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} guidanceAvailable activeConversationId="conversation"
+      v4Plan={{ run_id: "finished-run", status: "completed", plan, plan_hash: "hash", compute_selection: null, approval_hash: null, session_mode: "agent" }} />);
+    fireEvent.click(screen.getByRole("button", { name: "发送选项" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /追加指导/ }));
+    expect(screen.queryByRole("textbox", { name: "追加指导" })).not.toBeInTheDocument();
+    expect(screen.getByText("当前运行暂不接受新的指导，可查看已接收历史。")).toBeInTheDocument();
   });
 
   it("pretty prints JSON results and reports displayed line counts", () => {
@@ -134,11 +224,11 @@ describe("WorkspaceShell", () => {
     rerender(<WorkspaceShell {...props} agentRunEventsV4={[event, { ...event, sequence: 2, event: { kind: "tool_finished", outcome: { call_id: "cell", tool_id: "runtime.execute", succeeded: true, model_content: "result", data: {}, provenance: [] } } }]} />);
     expect(screen.queryByRole("button", { name: "恢复已保存结果" })).not.toBeInTheDocument();
   });
-  it("switches the composer arrow to a stop square and restores it after cancellation", () => {
+  it("switches Send to a stop square and restores it after cancellation", () => {
     const cancel = vi.fn();
     const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, onCancelRun: cancel };
-    const { rerender, container } = render(<WorkspaceShell {...props} />);
-    expect(container.querySelector(".send-button .lucide-arrow-up")).toBeInTheDocument();
+    const { rerender } = render(<WorkspaceShell {...props} />);
+    expect(screen.getByRole("button", { name: "发送" })).toHaveTextContent("发送");
     rerender(<WorkspaceShell {...props} runStarted activeRunId="run-stop" composerBusy />);
     const stop = screen.getByRole("button", { name: "终止运行" });
     expect(stop.closest(".composer")).toBeInTheDocument();
@@ -156,7 +246,7 @@ describe("WorkspaceShell", () => {
       schema_version: 4, run_id: "run-stop", project_id: project.id, conversation_id: "c", sequence: 1, occurred_at: "2026-09-08T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "run_cancelled" },
     }]} />);
     expect(screen.queryByRole("button", { name: "终止运行" })).not.toBeInTheDocument();
-    expect(container.querySelector(".send-button .lucide-arrow-up")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "发送" })).toHaveTextContent("发送");
   });
 
   it("interleaves progress and individual read, write, edit calls even inside a batch", () => {
@@ -377,6 +467,147 @@ describe("WorkspaceShell", () => {
     expect(onApprovalPolicyChange).toHaveBeenCalledWith("full_access");
     expect(onAutonomyModeChange).toHaveBeenCalledWith("full_auto");
   });
+
+  it("hydrates conversation preferences and sends each switch with the active scope", async () => {
+    const loaded = { delegation_enabled: false, auto_review: true, memory_enabled: false };
+    const saved = { delegation_enabled: true, auto_review: true, memory_enabled: false };
+    const get = vi.spyOn(preferencesApi, "getConversationAgentPreferencesV4").mockResolvedValue(loaded);
+    const save = vi.spyOn(preferencesApi, "saveConversationAgentPreferencesV4").mockResolvedValue(saved);
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} activeConversationId="conversation-a" onSend={vi.fn().mockResolvedValue(true)} computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
+
+    await waitFor(() => expect(get).toHaveBeenCalledWith(project.id, "conversation-a"));
+    fireEvent.click(screen.getByRole("button", { name: "Agent permissions" }));
+    expect(screen.getByRole("menuitemcheckbox", { name: /Delegation/ })).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByRole("menuitemcheckbox", { name: /Auto-review/ })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("menuitemcheckbox", { name: /Use memory/ })).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: /Delegation/ }));
+
+    await waitFor(() => expect(save).toHaveBeenCalledWith(project.id, "conversation-a", saved));
+    expect(screen.getByRole("menuitemcheckbox", { name: /Delegation/ })).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("offers Fast mode near the model and persists menu choices including reset to inheritance", async () => {
+    const get = vi.spyOn(preferencesApi, "getConversationAgentPreferencesV4").mockResolvedValue({ delegation_enabled: true, auto_review: true, memory_enabled: true, fast_mode: null });
+    const save = vi.spyOn(preferencesApi, "saveConversationAgentPreferencesV4").mockImplementation(async (_projectId, _conversationId, preferences) => preferences);
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} activeConversationId="conversation-a" activeModelProfile={fastProfile} onSend={vi.fn().mockResolvedValue(true)} computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
+
+    await waitFor(() => expect(get).toHaveBeenCalledWith(project.id, "conversation-a"));
+    const fastToggle = screen.getByRole("button", { name: "Fast mode" });
+    expect(fastToggle).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(fastToggle);
+    await waitFor(() => expect(save).toHaveBeenNthCalledWith(1, project.id, "conversation-a", expect.objectContaining({ fast_mode: true })));
+    expect(fastToggle).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Agent permissions" }));
+    const select = screen.getByRole("combobox", { name: "Fast mode" });
+    expect(select).toHaveValue("fast");
+    fireEvent.change(select, { target: { value: "standard" } });
+    await waitFor(() => expect(save).toHaveBeenNthCalledWith(2, project.id, "conversation-a", expect.objectContaining({ fast_mode: false })));
+    fireEvent.change(select, { target: { value: "default" } });
+    await waitFor(() => expect(save).toHaveBeenNthCalledWith(3, project.id, "conversation-a", expect.objectContaining({ fast_mode: null })));
+  });
+
+  it("keeps a stale enabled Fast override available to turn off after an unsupported model switch", async () => {
+    const get = vi.spyOn(preferencesApi, "getConversationAgentPreferencesV4").mockResolvedValue({ delegation_enabled: true, auto_review: true, memory_enabled: true, fast_mode: true });
+    const save = vi.spyOn(preferencesApi, "saveConversationAgentPreferencesV4").mockResolvedValue({ delegation_enabled: true, auto_review: true, memory_enabled: true, fast_mode: null });
+    const unsupported = { ...fastProfile, base_url: "https://gateway.example/v1" };
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} activeConversationId="conversation-a" activeModelProfile={unsupported} />);
+
+    await waitFor(() => expect(get).toHaveBeenCalled());
+    const fastToggle = screen.getByRole("button", { name: "Fast mode" });
+    expect(fastToggle).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(fastToggle);
+    await waitFor(() => expect(save).toHaveBeenCalledWith(project.id, "conversation-a", expect.objectContaining({ fast_mode: null })));
+    expect(screen.queryByRole("button", { name: "Fast mode" })).not.toBeInTheDocument();
+  });
+
+  it("overrides a stale profile Fast default with standard, then restores that default from the menu", async () => {
+    const get = vi.spyOn(preferencesApi, "getConversationAgentPreferencesV4").mockResolvedValue({ delegation_enabled: true, auto_review: true, memory_enabled: true, fast_mode: null });
+    const save = vi.spyOn(preferencesApi, "saveConversationAgentPreferencesV4").mockImplementation(async (_projectId, _conversationId, preferences) => preferences);
+    const unsupportedProfile = { ...fastProfile, base_url: "https://gateway.example/v1", fast_mode: true as const };
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} activeConversationId="conversation-a" activeModelProfile={unsupportedProfile} />);
+
+    await waitFor(() => expect(get).toHaveBeenCalled());
+    const fastToggle = screen.getByRole("button", { name: "Fast mode" });
+    expect(fastToggle).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(fastToggle);
+    await waitFor(() => expect(save).toHaveBeenNthCalledWith(1, project.id, "conversation-a", expect.objectContaining({ fast_mode: false })));
+    expect(fastToggle).toHaveAttribute("aria-pressed", "false");
+
+    fireEvent.click(screen.getByRole("button", { name: "Agent permissions" }));
+    const select = screen.getByRole("combobox", { name: "Fast mode" });
+    expect(select).toHaveValue("standard");
+    fireEvent.change(select, { target: { value: "default" } });
+    await waitFor(() => expect(save).toHaveBeenNthCalledWith(2, project.id, "conversation-a", expect.objectContaining({ fast_mode: null })));
+    expect(fastToggle).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("locks Fast mode and Send while its preference save is pending", async () => {
+    const request = deferred<{ delegation_enabled: boolean; auto_review: boolean; memory_enabled: boolean; fast_mode: boolean }>();
+    vi.spyOn(preferencesApi, "getConversationAgentPreferencesV4").mockResolvedValue({ delegation_enabled: true, auto_review: true, memory_enabled: true, fast_mode: null });
+    vi.spyOn(preferencesApi, "saveConversationAgentPreferencesV4").mockReturnValue(request.promise);
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} activeConversationId="conversation-a" activeModelProfile={fastProfile} onSend={vi.fn()} computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Fast mode" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Fast mode" }));
+    expect(screen.getByRole("button", { name: "Fast mode" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    await act(async () => request.resolve({ delegation_enabled: true, auto_review: true, memory_enabled: true, fast_mode: true }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Fast mode" })).toBeEnabled());
+  });
+
+  it("rolls back a failed preference save and exposes a retry action without transport details", async () => {
+    const get = vi.spyOn(preferencesApi, "getConversationAgentPreferencesV4").mockResolvedValue({ delegation_enabled: true, auto_review: true, memory_enabled: true });
+    const save = vi.spyOn(preferencesApi, "saveConversationAgentPreferencesV4").mockRejectedValueOnce(new Error("private transport details")).mockResolvedValueOnce({ delegation_enabled: false, auto_review: true, memory_enabled: true });
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} activeConversationId="conversation-a" onSend={vi.fn().mockResolvedValue(true)} />);
+    await waitFor(() => expect(get).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "Agent permissions" }));
+    const delegation = screen.getByRole("menuitemcheckbox", { name: /Delegation/ });
+    fireEvent.click(delegation);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not save conversation preferences");
+    expect(screen.queryByText("private transport details")).not.toBeInTheDocument();
+    expect(delegation).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Retry conversation preferences" }));
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole("menuitemcheckbox", { name: /Delegation/ })).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("locks Send on a preference load failure and keeps a localized retry visible", async () => {
+    const get = vi.spyOn(preferencesApi, "getConversationAgentPreferencesV4")
+      .mockRejectedValueOnce(new Error("private load details"))
+      .mockResolvedValueOnce({ delegation_enabled: true, auto_review: true, memory_enabled: true });
+    const onSend = vi.fn();
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} activeConversationId="conversation-a" onSend={onSend} computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
+    fireEvent.change(screen.getByRole("textbox", { name: /描述研究目标/ }), { target: { value: "检查矩阵" } });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("会话偏好加载失败");
+    expect(screen.queryByText("private load details")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "重试会话偏好" }));
+    await waitFor(() => expect(get).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+  });
+
+  it("locks Send and preference switches during preference persistence", async () => {
+    const request = deferred<{ delegation_enabled: boolean; auto_review: boolean; memory_enabled: boolean }>();
+    vi.spyOn(preferencesApi, "getConversationAgentPreferencesV4").mockResolvedValue({ delegation_enabled: true, auto_review: true, memory_enabled: true });
+    vi.spyOn(preferencesApi, "saveConversationAgentPreferencesV4").mockReturnValue(request.promise);
+    const onSend = vi.fn();
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} activeConversationId="conversation-a" onSend={onSend} computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
+    fireEvent.change(screen.getByRole("textbox", { name: /Describe a research goal/ }), { target: { value: "Inspect the matrix" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Agent permissions" }));
+    const delegation = screen.getByRole("menuitemcheckbox", { name: /Delegation/ });
+    fireEvent.click(delegation);
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    expect(delegation).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Saving conversation preferences");
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(onSend).not.toHaveBeenCalled();
+    await act(async () => request.resolve({ delegation_enabled: false, auto_review: true, memory_enabled: true }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).toBeEnabled());
+  });
   it("keeps ordinary questions in chat until the user explicitly selects Plan mode from Agent controls", async () => {
     const onSend = vi.fn().mockResolvedValue(true);
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={onSend}
@@ -467,7 +698,7 @@ describe("WorkspaceShell", () => {
     expect(screen.queryByText("65%")).not.toBeInTheDocument();
     fireEvent.change(screen.getByRole("textbox", { name: /描述研究目标/ }), { target: { value: "检查 hg19 数据" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
-    expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toHaveValue("");
+    expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toHaveValue("检查 hg19 数据");
 
     rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={onSend} computeBackendId="local" computeBackends={[backend]} agentBusy agentNotice="503 model_not_found" />);
     expect(screen.getByRole("status")).toHaveTextContent("正在等待模型响应");

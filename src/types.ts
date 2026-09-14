@@ -112,6 +112,8 @@ export interface ModelProfile {
     reasoning_efforts: string[] | null;
   } | null;
   reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | null;
+  /** Null or omission uses the provider/profile default; true requests Fast. */
+  fast_mode?: boolean | null;
   delegated_model_profile_id?: string | null;
 }
 
@@ -229,6 +231,96 @@ export interface ConversationAgentStateV4 {
   latest_run: RunSummaryV4 | null;
 }
 
+/** Local stop intent status. `observed` only describes a local terminal run. */
+export type StopRunStatusV4 = "requested" | "observed";
+
+export interface StopRunRequestV4 {
+  request_id: string;
+  project_id: string;
+  conversation_id: string;
+  run_id: string;
+}
+
+export interface StopRunReceiptV4 {
+  request_id: string;
+  project_id: string;
+  conversation_id: string;
+  run_id: string;
+  status: StopRunStatusV4;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Preferences snapshotted into a new Agent V4 run. */
+export interface ConversationAgentPreferencesV4 {
+  delegation_enabled: boolean;
+  auto_review: boolean;
+  memory_enabled: boolean;
+  /** Null or omission inherits the selected model profile's service tier. */
+  fast_mode?: boolean | null;
+}
+
+export type ReviewerBackendChoiceV4 =
+  | { kind: "follow_session" }
+  | { kind: "default_http" }
+  | { kind: "http_profile"; profile_id: string };
+
+export interface ReviewerSettingsV4 {
+  backend: ReviewerBackendChoiceV4;
+  default_http_profile_id?: string | null;
+}
+
+export interface RunServiceTierV4 {
+  fast_mode?: boolean | null;
+}
+
+export interface SessionReviewRequestV4 {
+  request_id: string;
+  project_id: string;
+  conversation_id: string;
+  model_profile_id: string;
+}
+
+export interface SessionReviewSourceV4 {
+  message_id: string;
+  sequence: number;
+  role: string;
+  text: string;
+}
+
+export type SessionReviewSeverityV4 = "error" | "warn" | "ok";
+
+export interface SessionReviewFindingV4 {
+  severity: SessionReviewSeverityV4;
+  code: string;
+  message: string;
+  source_ids: string[];
+}
+
+export interface SessionReviewReportV4 {
+  summary: string;
+  findings: SessionReviewFindingV4[];
+}
+
+export type SessionReviewStatusV4 = "running" | "completed" | "failed" | "abandoned";
+
+export interface SessionReviewRecordV4 {
+  id: string;
+  project_id: string;
+  conversation_id: string;
+  reviewer_profile_id: string;
+  reviewer_configuration_hash: string;
+  source_snapshot_sha256: string;
+  source_message_count: number;
+  sources: SessionReviewSourceV4[];
+  status: SessionReviewStatusV4;
+  report: SessionReviewReportV4 | null;
+  error: string | null;
+  service_tier?: RunServiceTierV4 | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface ToolCallV4 { call_id: string; tool_id: string; arguments: Record<string, unknown> }
 export interface SubmitGuidanceV4Request {
   message_id: string;
@@ -271,6 +363,8 @@ export interface AgentV4Task {
 export type AgentEventKindV4 =
   | { kind: "run_created"; mode: "plan" | "execute" }
   | { kind: "model_text"; text: string }
+  | { kind: "model_request_started"; request: ModelRequestStartedV4 }
+  | { kind: "model_usage_observed"; observation: ModelUsageObservationV4 }
   | { kind: "model_retrying"; attempt: number; class: string; message: string }
   | { kind: "tool_requested"; call: ToolCallV4 }
   | { kind: "tool_approval_requested"; request: ToolApprovalRequestV4 }
@@ -301,6 +395,10 @@ export type AgentEventKindV4 =
   | { kind: "guidance_consumed"; message_id: string; markdown: string }
   | { kind: "runtime_recovery_available"; call_ids: string[] }
   | { kind: "context_archived"; archive: { archive_id: string; through_sequence: number; size_bytes: number; sha256: string } }
+  | { kind: "context_compaction_started"; request_id: string; source_through_sequence: number; source_head_hash: string; frozen_spec_hash?: string | null }
+  | { kind: "context_compaction_not_needed"; request_id: string; before_bytes: number }
+  | { kind: "context_compaction_completed"; request_id: string; archive: { archive_id: string; through_sequence: number; size_bytes: number; sha256: string }; checkpoint_through_sequence: number; checkpoint_sha256: string; before_bytes: number; after_bytes: number }
+  | { kind: "context_compaction_attention"; request_id: string; message: string }
   | { kind: "context_checkpointed"; checkpoint: { schema_version: 4; through_sequence: number; completion_criteria: string[]; unresolved_errors: string[]; recent_steps: string[]; scientific_state: unknown; task_shape?: AgentV4TaskShape | null; phase?: AgentV4Phase | null; task_revision?: number | null; tasks?: AgentV4Task[]; cycle_id?: number | null } }
   | { kind: "scientific_state_changed"; revision: number; state_sha256: string; changes: string[] }
   | { kind: "completion_proposed" | "run_completed" | "run_cancelled" }
@@ -513,4 +611,227 @@ export interface AgentIterationSettingsV4 {
   auto_continue_limit: number;
   auto_compact: boolean;
   follow_up_questions: boolean;
+}
+
+export type ComposerReference =
+  | { kind: "artifact"; project_id: string; id: string }
+  | { kind: "session"; project_id: string; id: string }
+  | { kind: "project"; project_id: string; id: string }
+  | { kind: "execution_context"; project_id: string; backend_id: string }
+  | { kind: "runtime"; project_id: string; backend_id: string; language: "python" | "r" }
+  | { kind: "workspace_file"; project_id: string; backend_id: string; relative_path: string }
+  | { kind: "workflow"; project_id: string; id: string }
+  | { kind: "quote"; project_id: string; id: string }
+  | { kind: "skill"; id: string };
+export type ComposerCatalogItem = { reference: ComposerReference; label: string; description: string };
+export interface ComposerTextPreview { project_id: string; backend_id: string; relative_path: string; sha256: string; text: string }
+export interface CreateComposerQuoteRequest { project_id: string; conversation_id: string; backend_id: string; relative_path: string; sha256: string; text: string }
+export interface ComposerAttachmentReceipt {
+  id: string;
+  project_id: string;
+  conversation_id: string;
+  name: string;
+  relative_path: string;
+  size_bytes: number;
+  sha256: string;
+  media_type: string;
+}
+
+export interface ComposerWorkflowTemplate {
+  id: string;
+  project_id: string;
+  name: string;
+  description: string;
+  steps: string[];
+  enabled: boolean;
+}
+export interface SaveComposerWorkflowRequest {
+  id?: string | null;
+  project_id: string;
+  name: string;
+  description: string;
+  steps: string[];
+  enabled: boolean;
+}
+
+export interface SessionReviewStartErrorV4 { kind: "rejected" | "uncertain"; message: string }
+
+// Shared wire contract: omicsops-dto/composer_queue.rs.
+export type ComposerQueueModeV4 = "agent" | "plan";
+export type ComposerQueueStatusV4 = "pending" | "dispatching" | "running" | "completed" | "failed" | "cancelled" | "uncertain";
+export type ComposerQueueActionV4 = "cancel" | "move_up" | "move_down" | "cut_in";
+export interface EnqueueComposerTurnRequestV4 {
+  request_id: string;
+  message_id: string;
+  run_id: string;
+  project_id: string;
+  conversation_id: string;
+  mode: ComposerQueueModeV4;
+  message_markdown: string;
+  model_profile_id: string;
+  compute_selection: ComputeSelectionV4;
+  references: ComposerReference[];
+  attachments: string[];
+}
+export interface UpdateComposerQueueRequestV4 {
+  project_id: string;
+  conversation_id: string;
+  request_id: string;
+  expected_revision: number;
+  message_markdown: string;
+  references: ComposerReference[];
+  attachments: string[];
+}
+export interface ComposerQueueActionRequestV4 {
+  project_id: string;
+  conversation_id: string;
+  request_id: string;
+  expected_revision: number;
+  action: ComposerQueueActionV4;
+}
+export interface DelegatedModelBindingV4 {
+  profile_id: string;
+  configuration_hash: string;
+}
+export interface ReviewerModelBindingV4 extends DelegatedModelBindingV4 {
+  service_tier: RunServiceTierV4;
+}
+export interface ComposerQueueFrozenConfigV4 {
+  model_profile_id: string;
+  model_configuration_hash: string;
+  conversation_preferences: ConversationAgentPreferencesV4;
+  service_tier: RunServiceTierV4;
+  delegated_model: DelegatedModelBindingV4 | null;
+  reviewer_model: ReviewerModelBindingV4 | null;
+  compute_selection: ComputeSelectionV4;
+}
+export interface ComposerQueueItemV4 extends Omit<EnqueueComposerTurnRequestV4, "model_profile_id" | "compute_selection"> {
+  replacement_target_run_id?: string;
+  replacement_receipt?: ComposerReplacementReceiptV4;
+  frozen: ComposerQueueFrozenConfigV4;
+  attachment_receipts: ComposerAttachmentReceipt[];
+  cut_in_message_id?: string | null;
+  failure_code?: "configuration_changed" | "material_changed" | "dispatch_failed" | "run_failed" | "cancelled_by_user" | "lease_uncertain" | null;
+  position: number;
+  revision: number;
+  status: ComposerQueueStatusV4;
+  created_at: string;
+  updated_at: string;
+}
+
+// Shared wire contract: omicsops-dto/conversation_branches.rs.
+export type ConversationBranchCheckpointKindV4 = "before_user" | "after_response";
+export interface ConversationBranchCheckpointV4 {
+  source_message_id: string;
+  source_sequence: number;
+  source_head_sequence: number;
+  checkpoint_kind: ConversationBranchCheckpointKindV4;
+  boundary_hash: string;
+}
+export interface CreateConversationBranchRequestV4 {
+  request_id: string;
+  project_id: string;
+  source_conversation_id: string;
+  source_message_id: string;
+  checkpoint_kind: ConversationBranchCheckpointKindV4;
+  expected_source_sequence: number;
+  expected_head_sequence: number;
+  expected_boundary_hash: string;
+  title: string;
+}
+export interface ConversationBranchV4 extends ConversationBranchCheckpointV4 {
+  request_id: string;
+  branch_conversation_id: string;
+  project_id: string;
+  source_conversation_id: string;
+  request_hash: string;
+  state: "active" | "merged" | "archived";
+  created_at: string;
+  updated_at: string;
+}
+
+export type ContextLimitSourceV4 = { kind: "exact_catalog"; source_provider: string; source_sha256: string } | { kind: "configured_bound" } | { kind: "unknown" };
+export interface ModelRequestStartedV4 { logical_request_id: string; attempt_id: string; model_profile_id: string; model_configuration_hash?: string | null; context_limit_tokens?: number | null; context_limit_source: ContextLimitSourceV4; serialized_request_bytes?: number | null; image_count?: number | null; image_bound_tokens?: number | null; breakdown?: Array<{ category: string; bytes?: number | null; tokens?: number | null; estimated: boolean }> | null }
+export interface ModelUsageObservationV4 extends Omit<ModelRequestStartedV4, "image_count" | "breakdown"> {
+  sample_index: number; state: "partial" | "final" | "interrupted"; aggregation: "cumulative" | "delta" | "unknown";
+  input_tokens?: number | null; output_tokens?: number | null; reasoning_tokens?: number | null;
+  cache_read_input_tokens?: number | null; cache_creation_input_tokens?: number | null; reported_total_tokens?: number | null;
+  context_tokens?: number | null; serialized_request_bytes?: number | null; image_bound_tokens?: number | null;
+}
+export interface ObservedCounterV4 { known?: number | null; incomplete_attempts: number }
+export interface UsageTotalsV4 {
+  input_tokens: ObservedCounterV4; output_tokens: ObservedCounterV4; reasoning_tokens: ObservedCounterV4;
+  cache_read_input_tokens: ObservedCounterV4; cache_creation_input_tokens: ObservedCounterV4; reported_total_tokens: ObservedCounterV4;
+  observed_attempts: number; final_attempts: number; partial_attempts: number; interrupted_attempts: number; unknown_attempts: number;
+}
+export interface ContextUsageSnapshotV4 {
+  project_id: string; conversation_id: string; run_id?: string | null; model_profile_id?: string | null; model_configuration_hash?: string | null;
+  last_request?: ModelUsageObservationV4 | null; observed_total: UsageTotalsV4;
+  current_context: { used_tokens?: number | null; max_tokens?: number | null; limit_source: ContextLimitSourceV4; estimated: boolean };
+  conservative_budget: { serialized_request_bytes?: number | null; host_context_max_bytes: number; image_count?: number | null; image_bound_tokens?: number | null; fits_host_budget?: boolean | null };
+  breakdown?: Array<{ category: string; bytes?: number | null; tokens?: number | null; estimated: boolean }> | null;
+  latest_compaction?: ContextCompactionReceiptV4 | null;
+}
+
+export interface ReplaceComposerTurnRequestV4 {
+  turn: EnqueueComposerTurnRequestV4;
+  target_run_id: string;
+  expected_event_sequence: number;
+  expected_event_hash: string;
+  stop_request_id: string;
+}
+export interface ComposerReplacementReceiptV4 {
+  request_id: string;
+  project_id: string;
+  conversation_id: string;
+  target_run_id: string;
+  source_message_id: string | null;
+  source_event_sequence: number;
+  source_event_hash: string;
+  stop: StopRunReceiptV4;
+  accepted_at: string;
+}
+
+export interface CompactContextRequestV4 {
+  request_id: string; project_id: string; conversation_id: string; run_id: string;
+}
+export interface ContextCompactionReceiptV4 extends CompactContextRequestV4 {
+  status: "not_needed" | "completed" | "attention";
+  source_through_sequence: number; source_head_hash: string; before_bytes: number;
+  after_bytes?: number | null;
+  archive?: { archive_id: string; through_sequence: number; size_bytes: number; sha256: string } | null;
+  checkpoint_through_sequence?: number | null; checkpoint_sha256?: string | null;
+  frozen_spec_hash?: string | null; message?: string | null;
+  created_at: string; updated_at: string;
+}
+
+export interface CreateConversationBranchAndSendRequestV4 {
+  branch: CreateConversationBranchRequestV4; message_markdown: string; mode: ComposerQueueModeV4; model_profile_id: string; compute_selection: ComputeSelectionV4;
+  queue_request_id: string; queue_message_id: string; queue_run_id: string; references: ComposerReference[]; attachments: string[];
+}
+export interface ConversationBranchSendReceiptV4 { branch: ConversationBranchV4; queue: ComposerQueueItemV4 }
+
+export type SideChatTurnStatusV4 = "queued" | "running" | "completed" | "no_evidence" | "failed" | "interrupted";
+export type SideChatFailureCodeV4 = "configuration_changed" | "material_changed" | "source_changed" | "provider_failed" | "invalid_response" | "invalid_citation" | "lease_uncertain" | "interrupted";
+export interface SideChatSendRequestV4 {
+  request_id: string; parent_request_id?: string | null; project_id: string; conversation_id: string;
+  model_profile_id: string; question_markdown: string; references: ComposerReference[]; attachments: string[];
+}
+export interface SideChatSourceV4 {
+  source_id: string; message_id?: string | null; message_content_sha256?: string | null; run_id?: string | null;
+  event_sequence?: number | null; event_hash?: string | null; sequence: number;
+  role: string; label: string; excerpt: string;
+}
+export interface SideChatSourceWatermarkV4 {
+  message_count: number; event_count: number; message_head_sequence?: number | null;
+  event_heads: Array<{ run_id: string; sequence: number; event_hash: string }>;
+}
+export interface SideChatSendErrorV4 { kind: "rejected" | "unknown"; code?: SideChatFailureCodeV4 | null; message: string }
+export interface SideChatTurnV4 {
+  id: string; request_id: string; parent_request_id?: string | null; project_id: string; conversation_id: string;
+  question_markdown: string; references: ComposerReference[]; attachments: string[];
+  model_profile_id: string; model_label: string; source_snapshot_sha256: string;
+  source_watermark: SideChatSourceWatermarkV4; sources: SideChatSourceV4[]; status: SideChatTurnStatusV4;
+  answer_markdown?: string | null; cited_source_ids: string[]; failure_code?: SideChatFailureCodeV4 | null;
+  usage?: UsageTotalsV4 | null; created_at: string; updated_at: string;
 }

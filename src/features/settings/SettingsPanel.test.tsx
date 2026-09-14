@@ -70,6 +70,28 @@ describe("SettingsPanel model providers", () => {
     expect(screen.getByRole("dialog")).toBeInTheDocument();
   });
 
+  it("round trips a profile Fast mode override and lets the user restore model inheritance", async () => {
+    const profile = { id: "fast", label: "Fast profile", provider: "open_ai_compatible" as const, base_url: "https://api.openai.com/v1", model: "gpt-5.6-luna", credential_reference: "model/fast", supports_tools: true, supports_vision: false, fast_mode: true as const };
+    const save = vi.fn().mockResolvedValue(undefined);
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[profile]} onSaveModel={save} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    const fastMode = screen.getByRole("combobox", { name: "Fast mode" });
+    expect(fastMode).toHaveValue("fast");
+    fireEvent.change(fastMode, { target: { value: "default" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    await waitFor(() => expect(save).toHaveBeenCalledWith(expect.objectContaining({ id: "fast", fast_mode: null })));
+  });
+
+  it("keeps Fast unavailable for unreviewed profile endpoints while allowing standard and default", () => {
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} />);
+    fireEvent.click(screen.getByRole("button", { name: "Configure OpenAI-compatible" }));
+    const fastMode = screen.getByRole("combobox", { name: "Fast mode" });
+    expect(within(fastMode).getByRole("option", { name: "Fast" })).toBeDisabled();
+    expect(within(fastMode).getByRole("option", { name: "Standard" })).toBeEnabled();
+    expect(within(fastMode).getByRole("option", { name: "Model default" })).toBeEnabled();
+  });
+
   it("keeps refresh intent available for retry after a failed save", async () => {
     const profile = { id: "unknown", label: "Unknown", provider: "open_ai_compatible" as const, base_url: "https://gateway.example/v1", model: "exact", credential_reference: null, supports_tools: true, supports_vision: false };
     const save = vi.fn().mockRejectedValueOnce(new Error("private diagnostic")).mockResolvedValue(undefined);

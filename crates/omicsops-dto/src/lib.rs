@@ -6,11 +6,37 @@
 use chrono::{DateTime, Utc};
 pub use omicsops_protocol::{
     AgentRequestRouteV4, BrowserApprovalBindingV4, BrowserApprovalScopeV4, BrowserAuthorizationV4,
-    BrowserSessionKindV4, BrowserTabSummaryV4,
+    BrowserSessionKindV4, BrowserTabSummaryV4, CompactContextRequestV4, ContextBudgetV4,
+    ContextCompactionReceiptV4, ContextCompactionStatusV4, ContextLimitSourceV4, ContextUsageRowV4,
+    ContextUsageSnapshotV4, ContextWindowUsageV4, ConversationAgentPreferencesV4,
+    ModelRequestStartedV4, ModelUsageObservationV4, ModelUsageSampleV4, ReviewerBackendChoiceV4,
+    ReviewerSettingsV4, SESSION_REVIEW_MAX_ERROR_BYTES, SESSION_REVIEW_MAX_FINDING_CODE_BYTES,
+    SESSION_REVIEW_MAX_FINDING_MESSAGE_BYTES, SESSION_REVIEW_MAX_FINDING_SOURCES,
+    SESSION_REVIEW_MAX_FINDINGS, SESSION_REVIEW_MAX_PER_PROJECT,
+    SESSION_REVIEW_MAX_REPORT_SUMMARY_BYTES, SESSION_REVIEW_MAX_SOURCE_SNAPSHOT_BYTES,
+    SESSION_REVIEW_MAX_SOURCE_TEXT_BYTES, SESSION_REVIEW_MAX_SOURCES, SessionReviewBeginResultV4,
+    SessionReviewFindingV4, SessionReviewRecordV4, SessionReviewReportV4, SessionReviewRequestV4,
+    SessionReviewSeverityV4, SessionReviewSourceV4, SessionReviewStatusV4, UsageAggregationV4,
+    UsageObservationStateV4, UsageTotalsV4, session_review_source_snapshot_hash,
+    session_review_source_snapshot_value,
 };
 use omicsops_protocol::{ComputeSelectionV4, ExecutionPlanV4};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationExportFormat {
+    Html,
+    Png,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationExportRequest {
+    pub format: ConversationExportFormat,
+    pub content_base64: String,
+}
 
 /// Main Agent model iterations. Zero disables the iteration limit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +168,14 @@ pub struct SaveModelProfileRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub reasoning_effort: Option<Option<String>>,
+    /// Omission preserves the stored mode; explicit null clears it; a bool
+    /// selects standard (`false`) or Fast (`true`) processing.
+    #[serde(
+        default,
+        deserialize_with = "explicit_nullable_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fast_mode: Option<Option<bool>>,
     /// Omission preserves an existing binding; explicit null restores inheritance.
     #[serde(
         default,
@@ -406,4 +440,93 @@ mod tests {
         assert_eq!(legacy.latest_plan_revision, None);
         assert_eq!(legacy.latest_run, None);
     }
+
+    #[test]
+    fn fast_mode_request_distinguishes_omission_clear_and_value() {
+        let base = serde_json::json!({
+            "label": "test",
+            "provider": "open_ai_compatible",
+            "base_url": "https://api.openai.com/v1",
+            "model": "gpt-5.6-luna"
+        });
+        let missing: SaveModelProfileRequest = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(missing.fast_mode, None);
+        assert!(
+            serde_json::to_value(missing)
+                .unwrap()
+                .get("fast_mode")
+                .is_none()
+        );
+        for value in [None, Some(false), Some(true)] {
+            let mut payload = base.clone();
+            payload["fast_mode"] = serde_json::json!(value);
+            let request: SaveModelProfileRequest = serde_json::from_value(payload).unwrap();
+            assert_eq!(request.fast_mode, Some(value));
+            let encoded = serde_json::to_value(request).unwrap();
+            assert_eq!(encoded["fast_mode"], serde_json::json!(value));
+        }
+    }
+}
+
+fn explicit_nullable_bool<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<bool>>, D::Error> {
+    Option::<bool>::deserialize(deserializer).map(Some)
+}
+
+mod composer_attachments;
+mod composer_references;
+pub use composer_attachments::{ComposerAttachmentReceipt, StageComposerAttachmentRequest};
+pub use composer_references::{
+    ComposerCatalogItem, ComposerReference, ComposerTextPreview, CreateComposerQuoteRequest,
+};
+
+mod composer_workflows;
+pub use composer_workflows::{ComposerWorkflowTemplate, SaveComposerWorkflowRequest};
+
+mod composer_queue;
+pub use composer_queue::{
+    ComposerQueueActionRequestV4, ComposerQueueActionV4, ComposerQueueFailureCodeV4,
+    ComposerQueueFrozenConfigV4, ComposerQueueItemV4, ComposerQueueMaterialSnapshotV4,
+    ComposerQueueModeV4, ComposerQueueStatusV4, ComposerReplacementErrorV4,
+    ComposerReplacementFailureKindV4, ComposerReplacementReceiptV4, EnqueueComposerTurnRequestV4,
+    ReplaceComposerTurnRequestV4, UpdateComposerQueueRequestV4,
+};
+
+mod conversation_branches;
+pub use conversation_branches::{
+    BranchCreateFailureKindV4, BranchCreateFailureV4, ConversationBranchCheckpointKindV4,
+    ConversationBranchCheckpointV4, ConversationBranchSendReceiptV4, ConversationBranchStateV4,
+    ConversationBranchV4, CreateConversationBranchAndSendRequestV4,
+    CreateConversationBranchRequestV4,
+};
+
+mod side_chat;
+pub use side_chat::{
+    SIDE_CHAT_MAX_ANSWER_BYTES, SIDE_CHAT_MAX_ATTACHMENTS, SIDE_CHAT_MAX_CITATIONS,
+    SIDE_CHAT_MAX_EVENT_HEADS, SIDE_CHAT_MAX_LABEL_BYTES, SIDE_CHAT_MAX_MODEL_LABEL_BYTES,
+    SIDE_CHAT_MAX_PER_PROJECT, SIDE_CHAT_MAX_QUESTION_BYTES, SIDE_CHAT_MAX_REFERENCES,
+    SIDE_CHAT_MAX_ROLE_BYTES, SIDE_CHAT_MAX_SOURCE_ID_BYTES, SIDE_CHAT_MAX_SOURCE_SNAPSHOT_BYTES,
+    SIDE_CHAT_MAX_SOURCE_TEXT_BYTES, SIDE_CHAT_MAX_SOURCES, SideChatBeginResultV4,
+    SideChatEventHeadV4, SideChatFailureCodeV4, SideChatGetRequestV4, SideChatListRequestV4,
+    SideChatSendErrorKindV4, SideChatSendErrorV4, SideChatSendRequestV4, SideChatSourceV4,
+    SideChatSourceWatermarkV4, SideChatTurnStatusV4, SideChatTurnV4, side_chat_request_hash,
+    side_chat_source_snapshot_hash, side_chat_source_snapshot_value,
+};
+
+mod run_stops;
+pub use run_stops::{StopRunReceiptV4, StopRunRequestV4, StopRunStatusV4};
+
+/// Distinguish a host preflight rejection from an unconfirmed dispatch result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionReviewStartFailureKindV4 {
+    Rejected,
+    Uncertain,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionReviewStartErrorV4 {
+    pub kind: SessionReviewStartFailureKindV4,
+    pub message: String,
 }

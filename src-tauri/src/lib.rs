@@ -6,9 +6,22 @@ pub mod browser_commands;
 pub mod bundled_mcp_commands;
 pub mod capability_commands;
 pub mod commands;
+pub mod composer_attachments;
+pub mod composer_files;
+pub mod composer_queue;
+mod composer_queue_driver;
+pub mod composer_quotes;
+pub mod composer_reference_validation;
+pub mod composer_references;
+pub mod composer_workflows;
+pub mod context_compaction;
+mod conversation_branch_material;
+pub mod conversation_branches;
+pub mod conversation_export;
 pub mod conversation_mode;
 #[cfg(test)]
 mod conversation_mode_tests;
+pub mod conversation_preferences;
 #[cfg(test)]
 mod conversation_state_tests;
 pub mod dto;
@@ -26,7 +39,10 @@ pub mod project_memory;
 pub mod pubmed_mcp;
 mod remote_jobs_v4;
 pub mod research_commands;
+mod run_ownership;
 mod runtime_jobs_v4;
+pub mod session_reviews;
+pub mod side_chat;
 pub mod skill_commands;
 pub mod sync_commands;
 pub mod workspace_commands;
@@ -85,6 +101,8 @@ pub fn run() {
                 let repository = Store::open(data_dir.join("omicsops.db"))
                     .await
                     .map_err(|error| error.to_string())?;
+                session_reviews::recover_interrupted_reviews(&repository, &data_dir).await?;
+                side_chat::recover_interrupted_side_chats(&repository, &data_dir).await?;
                 skill_commands::install_bundled_skills(
                     &repository,
                     &skills_root,
@@ -145,6 +163,20 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            conversation_export::save_conversation_export,
+            composer_references::composer_reference_catalog,
+            composer_files::list_local_composer_files,
+            composer_files::resolve_composer_clipboard_paths,
+            composer_workflows::list_composer_workflows,
+            composer_workflows::save_composer_workflow,
+            composer_quotes::preview_composer_file_text,
+            composer_quotes::create_composer_quote,
+            conversation_preferences::conversation_get_agent_preferences_v4,
+            conversation_preferences::conversation_save_agent_preferences_v4,
+            composer_attachments::choose_composer_attachments,
+            composer_attachments::stage_composer_attachment,
+            composer_attachments::validate_composer_attachments,
+            composer_reference_validation::validate_composer_references,
             commands::list_connections,
             commands::save_connection,
             commands::test_connection,
@@ -161,6 +193,8 @@ pub fn run() {
             agent_v4::agent_v4_request_plan_revision,
             agent_v4::agent_v4_resume,
             agent_v4::agent_v4_cancel,
+            agent_v4::agent_v4_request_stop,
+            agent_v4::agent_v4_get_stop,
             agent_v4::agent_v4_cancel_runtime_recovery,
             agent_v4::agent_v4_answer,
             agent_v4::agent_v4_submit_guidance,
@@ -169,10 +203,23 @@ pub fn run() {
             agent_v4::agent_v4_resolve_uncertain,
             agent_v4::agent_v4_events,
             agent_v4::agent_v4_events_for_conversation,
+            agent_v4::agent_v4_context_usage,
+            context_compaction::agent_v4_compact_context,
             browser_commands::browser_get_settings,
             follow_up_questions::agent_v4_suggest_follow_up_questions,
             agent_settings::agent_get_iteration_settings,
             agent_settings::agent_save_iteration_settings,
+            session_reviews::reviewer_get_settings_v4,
+            session_reviews::reviewer_save_settings_v4,
+            session_reviews::session_start_review_v4,
+            side_chat::side_chat_send_v4,
+            side_chat::side_chat_list_v4,
+            side_chat::side_chat_get_v4,
+            session_reviews::session_list_reviews_v4,
+            session_reviews::session_get_review_v4,
+            side_chat::side_chat_send_v4,
+            side_chat::side_chat_list_v4,
+            side_chat::side_chat_get_v4,
             browser_commands::browser_save_settings,
             browser_commands::browser_status,
             browser_commands::browser_setup,
@@ -200,9 +247,20 @@ pub fn run() {
             workspace_commands::create_project,
             workspace_commands::delete_project,
             workspace_commands::update_project_remote,
+            composer_queue::composer_queue_list,
+            composer_queue::composer_queue_enqueue,
+            composer_queue::composer_queue_replace,
+            composer_queue::composer_queue_update,
+            composer_queue::composer_queue_action,
+            composer_queue::composer_queue_reconcile,
             workspace_commands::list_conversations,
             workspace_commands::create_conversation,
             workspace_commands::delete_conversation,
+            conversation_branches::conversation_branch_checkpoint_v4,
+            conversation_branches::conversation_branch_create_v4,
+            conversation_branches::conversation_branch_create_and_send_v4,
+            conversation_branches::conversation_branch_get_v4,
+            conversation_branches::conversation_branch_list_v4,
             agent_commands::list_messages,
             agent_commands::submit_message,
             model_commands::list_model_profiles,

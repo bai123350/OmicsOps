@@ -15,6 +15,9 @@ export interface ComposeActionsProps {
   onFiles: () => void;
   onReview: () => void;
   onManageSkills?: () => void;
+  onManageWorkflows?: () => void;
+  onSaveSkill?: () => void;
+  onShare?: () => void;
   onClose: () => void;
 }
 
@@ -33,7 +36,7 @@ interface ComposeAction {
  * The menu only owns action dispatch. Its parent owns whether it is open and
  * how Escape closes it, so this component intentionally has no listeners.
  */
-export function ComposeActions({ zh, onAttach, onFiles, onReview, onManageSkills, onClose }: ComposeActionsProps) {
+export function ComposeActions({ zh, onAttach, onFiles, onReview, onManageSkills, onManageWorkflows, onSaveSkill, onShare, onClose }: ComposeActionsProps) {
   const addToMessage: ComposeAction[] = [
     {
       id: "attach",
@@ -52,6 +55,7 @@ export function ComposeActions({ zh, onAttach, onFiles, onReview, onManageSkills
   ];
 
   const session: ComposeAction[] = [
+    ...(onManageWorkflows ? [{ id: "manage-workflows", icon: Wrench, title: zh ? "管理工作流" : "Manage workflows", description: zh ? "编辑项目任务步骤模板" : "Edit project task recipes", onSelect: onManageWorkflows }] : []),
     {
       id: "review",
       icon: ClipboardCheck,
@@ -62,16 +66,16 @@ export function ComposeActions({ zh, onAttach, onFiles, onReview, onManageSkills
     {
       id: "share-image",
       icon: Image,
-      title: zh ? "分享为图片" : "Share as image",
-      description: zh ? "暂不可用" : "Unavailable",
-      unavailable: true,
+      title: zh ? "分享会话" : "Share conversation",
+      description: onShare ? (zh ? "选择内容，脱敏并导出 PNG 或 HTML" : "Select, redact and export PNG or HTML") : (zh ? "没有可分享的内容" : "No messages to share"),
+      onSelect: onShare,
     },
     {
       id: "save-skill",
       icon: BookmarkPlus,
       title: zh ? "保存为技能" : "Save as skill",
-      description: zh ? "暂不可用" : "Unavailable",
-      unavailable: true,
+      description: onSaveSkill ? (zh ? "从当前会话准备可复用技能" : "Prepare a reusable skill from this session") : (zh ? "暂不可用" : "Unavailable"),
+      onSelect: onSaveSkill,
     },
     {
       id: "manage-skills",

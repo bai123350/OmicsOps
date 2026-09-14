@@ -1,7 +1,8 @@
 import { useMemo, useState } from "react";
-import { BookOpen, ChevronRight, Dna, FilePlus2, FlaskConical, FolderOpen, HardDrive, Languages, Library, Plus, Server, Settings, Sparkles, Trash2, X } from "lucide-react";
+import { BookOpen, ChevronRight, Dna, FilePlus2, FlaskConical, FolderOpen, HardDrive, Languages, Library, Plus, Search, Server, Settings, Sparkles, Trash2, X } from "lucide-react";
 import type { ConnectionProfile, WorkspaceProject, WorkspaceTemplate } from "../../types";
 import type { Locale } from "../workspace/copy";
+import { useWindowEscapeLayer } from "../settings/BrowserSettings";
 import "./project-library.css";
 import "./create-project.css";
 
@@ -23,6 +24,7 @@ interface Props {
   onOpen: (project: WorkspaceProject) => void;
   onDelete: (projectId: string) => Promise<void>;
   onSettings: () => void;
+  onOpenSearch?: () => void;
 }
 
 const templates = [
@@ -32,7 +34,7 @@ const templates = [
   { id: "blank", zh: "空白研究项目", en: "Blank research project", zhDescription: "从自由对话、文件和远端环境开始", enDescription: "Start from conversation, files, and remote compute", icon: FilePlus2 },
 ] satisfies Array<{ id: WorkspaceTemplate; zh: string; en: string; zhDescription: string; enDescription: string; icon: typeof Dna }>;
 
-export function ProjectLibrary({ projects, connections = [], locale, onLocaleChange, onChooseLocalRoot, onCreate, onOpen, onDelete, onSettings }: Props) {
+export function ProjectLibrary({ projects, connections = [], locale, onLocaleChange, onChooseLocalRoot, onCreate, onOpen, onDelete, onSettings, onOpenSearch }: Props) {
   const zh = locale === "zh-CN";
   const trustedConnections = useMemo(() => connections.filter((connection) => connection.host_key_fingerprint), [connections]);
   const [template, setTemplate] = useState<WorkspaceTemplate | null>(null);
@@ -45,6 +47,7 @@ export function ProjectLibrary({ projects, connections = [], locale, onLocaleCha
   const [error, setError] = useState("");
   const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState("");
+  useWindowEscapeLayer(template !== null, () => { if (!submitting) setTemplate(null); });
   const selectedConnection = connections.find((connection) => connection.id === connectionId);
 
   function beginCreate(id: WorkspaceTemplate, initialName: string) {
@@ -81,7 +84,7 @@ export function ProjectLibrary({ projects, connections = [], locale, onLocaleCha
   }
 
   return <div className="library-page">
-    <header className="library-topbar"><div className="library-brand"><span><Sparkles size={19} /></span><b>OmicsOps</b></div><div><button onClick={() => onLocaleChange(zh ? "en-US" : "zh-CN")}><Languages size={16} />{zh ? "English" : "简体中文"}</button><button onClick={onSettings}><Settings size={16} />{zh ? "设置" : "Settings"}</button></div></header>
+    <header className="library-topbar"><div className="library-brand"><span><Sparkles size={19} /></span><b>OmicsOps</b></div><div>{onOpenSearch && <button onClick={onOpenSearch}><Search size={16} />{zh ? "搜索工作区" : "Search workspace"}<kbd>Ctrl+K</kbd></button>}<button onClick={() => onLocaleChange(zh ? "en-US" : "zh-CN")}><Languages size={16} />{zh ? "English" : "简体中文"}</button><button onClick={onSettings}><Settings size={16} />{zh ? "设置" : "Settings"}</button></div></header>
     <main className="library-main">
       <section className="library-hero"><span>LOCAL WORKSPACE · OPTIONAL REMOTE COMPUTE</span><h1>{zh ? "生命科学项目" : "Life science projects"}</h1><p>{zh ? "每个项目都保存在你选择的本地目录；大型分析可显式绑定可信远端 Linux。" : "Every project lives in a local folder you choose; large analyses can explicitly use a trusted remote Linux host."}</p></section>
       {projects.length > 0 && <section><div className="section-title"><h2>{zh ? "最近项目" : "Recent projects"}</h2></div>{deleteError && <p className="project-delete-error" role="alert">{deleteError}</p>}<div className="recent-projects">{projects.map((project) => { const connection = connections.find((item) => item.id === project.connection_id); const deleting = deletingProjectId === project.id; return <article className="recent-project-card" key={project.id}><button className="recent-project-open" disabled={deletingProjectId !== null} onClick={() => onOpen(project)}><span className="recent-icon"><Library size={19} /></span><span><b>{project.name}</b><small><HardDrive size={11} />{project.local_root}</small><small className={connection ? "remote-target" : "local-target"}>{connection ? <><Server size={11} />{connection.username}@{connection.host}:{connection.port} · {project.remote_root}</> : <><HardDrive size={11} />{zh ? "仅本地，未启用远端计算" : "Local only; remote compute disabled"}</>}</small></span><ChevronRight size={17} /></button><button className="recent-project-delete" aria-label={zh ? `删除项目：${project.name}` : `Delete project: ${project.name}`} title={zh ? "删除项目" : "Delete project"} disabled={deletingProjectId !== null} onClick={() => void deleteProject(project)}>{deleting ? <span className="delete-spinner" aria-hidden="true">…</span> : <Trash2 size={17} />}</button></article>; })}</div></section>}

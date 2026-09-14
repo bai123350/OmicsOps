@@ -806,6 +806,258 @@ async fn legacy_approval_service_creates_revision_one_then_approves_atomically()
 }
 
 #[tokio::test]
+async fn revision_approval_persists_frozen_model_configuration_before_profile_changes() {
+    let store = Store::open_in_memory().await.unwrap();
+    let project = Project::new(
+        Uuid::new_v4(),
+        "frozen approval project",
+        r"C:\data\frozen-approval",
+        ProjectTemplate::Blank,
+        Utc::now(),
+    );
+    store.save_project(&project).await.unwrap();
+    let conversation = Conversation::new(Uuid::new_v4(), project.id, "approval", Utc::now());
+    store.save_conversation(&conversation).await.unwrap();
+
+    let child_id = Uuid::new_v4();
+    let main_profile: omicsops_core::workspace::ModelProfile = serde_json::from_value(json!({
+        "id": Uuid::new_v4(),
+        "label": "main",
+        "provider": "ollama",
+        "base_url": "http://127.0.0.1:11434",
+        "model": "main-exact",
+        "credential_reference": null,
+        "supports_tools": true,
+        "supports_vision": false,
+        "delegated_model_profile_id": child_id,
+    }))
+    .unwrap();
+    let child_profile: omicsops_core::workspace::ModelProfile = serde_json::from_value(json!({
+        "id": child_id,
+        "label": "child",
+        "provider": "ollama",
+        "base_url": "http://127.0.0.1:11434",
+        "model": "child-exact",
+        "credential_reference": null,
+        "supports_tools": true,
+        "supports_vision": false,
+    }))
+    .unwrap();
+    let reviewer_profile: omicsops_core::workspace::ModelProfile = serde_json::from_value(json!({
+        "id": Uuid::new_v4(),
+        "label": "reviewer",
+        "provider": "ollama",
+        "base_url": "http://127.0.0.1:11434",
+        "model": "reviewer-exact",
+        "credential_reference": null,
+        "supports_tools": true,
+        "supports_vision": false,
+    }))
+    .unwrap();
+    store.save_model_profile(&main_profile).await.unwrap();
+    store.save_model_profile(&child_profile).await.unwrap();
+    store.save_model_profile(&reviewer_profile).await.unwrap();
+
+    let preferences = omicsops_protocol::ConversationAgentPreferencesV4 {
+        delegation_enabled: true,
+        auto_review: true,
+        memory_enabled: false,
+        fast_mode: None,
+    };
+
+    let reviewer_binding = omicsops_protocol::ReviewerModelBindingV4 {
+        profile_id: reviewer_profile.id,
+        configuration_hash: reviewer_profile.execution_configuration_hash(),
+        service_tier: omicsops_protocol::RunServiceTierV4 { fast_mode: None },
+    };
+    let delegated_binding = omicsops_protocol::DelegatedModelBindingV4 {
+        profile_id: child_id,
+        configuration_hash: child_profile.execution_configuration_hash(),
+    };
+    // The current global selection differs from the planning snapshot.
+    store
+        .save_reviewer_settings(&Default::default())
+        .await
+        .unwrap();
+    let run_id = Uuid::new_v4();
+    store
+        .save_agent_run_v4(
+            run_id,
+            project.id,
+            conversation.id,
+            "awaiting_approval",
+            &json!({
+                "status": "awaiting_approval",
+                "conversation_preferences": preferences,
+                "service_tier": {"fast_mode": null},
+                "reviewer_model": reviewer_binding,
+                "model_configuration_hash": main_profile.execution_configuration_hash(),
+                "delegated_model": delegated_binding,
+            }),
+        )
+        .await
+        .unwrap();
+    let plan = ExecutionPlanV4 {
+        schema_version: 4,
+        objective: "frozen approval".into(),
+        steps: vec!["inspect".into()],
+        completion_criteria: vec!["evidence".into()],
+        requested_capabilities: BTreeSet::new(),
+    };
+    let plan_hash = plan.canonical_hash().unwrap();
+    store
+        .create_proposed_plan_revision_v4(
+            project.id,
+            conversation.id,
+            run_id,
+            1,
+            plan.clone(),
+            "# frozen approval".into(),
+            plan_hash.clone(),
+            PlanRevisionStatusV4::Pending,
+            None,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let selection = ComputeSelectionV4 {
+        schema_version: 4,
+        backend_id: "local".into(),
+        backend_kind: ComputeBackendKindV4::Local,
+        autonomy_mode: AutonomyModeV4::Supervised,
+        approval_policy: ApprovalPolicyV4::RiskBased,
+        environment: "system".into(),
+        network_policy: NetworkPolicyV4::HostInherited,
+        container_image: None,
+    };
+    let approval_hash = RunSpecV4::approval_hash_for(
+        run_id,
+        project.id,
+        conversation.id,
+        main_profile.id,
+        &plan,
+        &selection,
+    )
+    .unwrap();
+    let run_value = json!({
+        "status": "awaiting_approval",
+        "conversation_preferences": preferences,
+        "service_tier": {"fast_mode": null},
+        "reviewer_model": reviewer_binding,
+        "model_configuration_hash": main_profile.execution_configuration_hash(),
+        "delegated_model": delegated_binding,
+    });
+    let mut changed_child = child_profile.clone();
+    changed_child.model = "child-changed-before-approval".into();
+    store.save_model_profile(&changed_child).await.unwrap();
+    let changed_error = approve_plan_revision_for_command(
+        &store,
+        PlanApprovalRunContext {
+            project_id: project.id,
+            conversation_id: conversation.id,
+            run_id,
+            model_profile_id: main_profile.id,
+        },
+        Some(plan_hash.as_str()),
+        plan.clone(),
+        selection.clone(),
+        &ApprovePlanV4Request {
+            run_id,
+            approval_hash: Some(approval_hash.clone()),
+            plan_hash: None,
+            revision: Some(1),
+        },
+        &run_value,
+    )
+    .await
+    .unwrap_err();
+    assert!(changed_error.contains("delegated"), "{changed_error}");
+    assert_eq!(
+        store
+            .proposed_plan_revisions_v4(project.id, conversation.id)
+            .await
+            .unwrap()
+            .first()
+            .unwrap()
+            .status,
+        PlanRevisionStatusV4::Pending
+    );
+    store.save_model_profile(&child_profile).await.unwrap();
+    let result = approve_plan_revision_for_command(
+        &store,
+        PlanApprovalRunContext {
+            project_id: project.id,
+            conversation_id: conversation.id,
+            run_id,
+            model_profile_id: main_profile.id,
+        },
+        Some(plan_hash.as_str()),
+        plan,
+        selection,
+        &ApprovePlanV4Request {
+            run_id,
+            approval_hash: Some(approval_hash),
+            plan_hash: None,
+            revision: Some(1),
+        },
+        &run_value,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.spec.reviewer_model.as_ref(), Some(&reviewer_binding));
+    assert_eq!(result.spec.conversation_preferences, Some(preferences));
+    assert_eq!(
+        result.spec.service_tier,
+        Some(omicsops_protocol::RunServiceTierV4 { fast_mode: None })
+    );
+    assert!(
+        store
+            .get_conversation_agent_preferences(project.id, conversation.id)
+            .await
+            .unwrap()
+            .memory_enabled,
+        "approval must use the planning snapshot, not current preferences"
+    );
+    let frozen_hash = main_profile.execution_configuration_hash();
+    assert_eq!(
+        result.spec.model_configuration_hash.as_deref(),
+        Some(frozen_hash.as_str())
+    );
+    let delegated = result.spec.delegated_model.as_ref().unwrap();
+    assert_eq!(delegated.profile_id, child_id);
+    assert_eq!(
+        delegated.configuration_hash,
+        child_profile.execution_configuration_hash()
+    );
+    let persisted = store.agent_run_v4(run_id).await.unwrap().unwrap();
+    let persisted_spec: RunSpecV4 = serde_json::from_value(persisted["spec"].clone()).unwrap();
+    assert_eq!(
+        persisted_spec.model_configuration_hash.as_deref(),
+        Some(frozen_hash.as_str())
+    );
+
+    assert_eq!(persisted_spec.conversation_preferences, Some(preferences));
+    assert_eq!(persisted_spec.service_tier, result.spec.service_tier);
+    assert_eq!(
+        persisted_spec.reviewer_model.as_ref(),
+        Some(&reviewer_binding)
+    );
+    assert_eq!(
+        persisted_spec.delegated_model.as_ref(),
+        Some(&delegated_binding)
+    );
+    let mut changed_profile = main_profile.clone();
+    changed_profile.model = "main-changed".into();
+    store.save_model_profile(&changed_profile).await.unwrap();
+    assert_ne!(
+        changed_profile.execution_configuration_hash(),
+        frozen_hash,
+        "a changed profile must no longer match the persisted approval hash"
+    );
+}
+
+#[tokio::test]
 async fn legacy_approval_service_rejects_bad_hash_before_materialization() {
     let store = Store::open_in_memory().await.unwrap();
     let project = Project::new(

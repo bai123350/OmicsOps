@@ -9,58 +9,10 @@ impl Store {
         &self,
         request: &SubmitGuidanceV4Request,
     ) -> Result<GuidanceRecordV4, StoreError> {
-        let markdown = request.markdown.trim();
-        if markdown.is_empty() || markdown.len() > 2048 {
-            return Err(StoreError::InvalidInput(
-                "guidance must contain 1..2048 UTF-8 bytes".into(),
-            ));
-        }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let (status, spec) = guidance_spec(
-            &mut tx,
-            request.project_id,
-            request.conversation_id,
-            request.run_id,
-        )
-        .await?;
-        if let Some(row) = sqlx::query("SELECT run_id,ordinal,markdown,accepted_at,consumed_at FROM agent_guidance_v4 WHERE message_id=?1")
-            .bind(request.message_id.to_string()).fetch_optional(&mut *tx).await? {
-            if row.try_get::<String,_>(0)? != request.run_id.to_string() || row.try_get::<String,_>(2)? != markdown {
-                return Err(StoreError::InvalidInput("guidance message id already belongs to a different request".into()));
-            }
-            return guidance_record(request.message_id, &spec, row);
-        }
-        let events = load_agent_events_in_tx(&mut tx, request.run_id).await?;
-        if status != "running" || events.iter().any(is_terminal_event) {
-            return Err(StoreError::InvalidInput(
-                "guidance requires an active ordinary Agent run".into(),
-            ));
-        }
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM agent_guidance_v4 WHERE run_id=?1")
-                .bind(request.run_id.to_string())
-                .fetch_one(&mut *tx)
-                .await?;
-        if count >= 16 {
-            return Err(StoreError::InvalidInput(
-                "run guidance limit reached (16 messages)".into(),
-            ));
-        }
-        let accepted_at = from_timestamp(timestamp(Utc::now()), "guidance accepted timestamp")?;
-        sqlx::query("INSERT INTO agent_guidance_v4(message_id,run_id,ordinal,markdown,accepted_at) VALUES (?1,?2,?3,?4,?5)")
-            .bind(request.message_id.to_string()).bind(request.run_id.to_string()).bind(count + 1).bind(markdown)
-            .bind(timestamp(accepted_at)).execute(&mut *tx).await?;
+        let record = accept_guidance_in_tx_v4(&mut tx, request).await?;
         tx.commit().await?;
-        Ok(GuidanceRecordV4 {
-            message_id: request.message_id,
-            run_id: request.run_id,
-            project_id: request.project_id,
-            conversation_id: request.conversation_id,
-            ordinal: (count + 1) as u64,
-            markdown: markdown.into(),
-            accepted_at,
-            consumed_at: None,
-        })
+        Ok(record)
     }
 
     pub async fn list_guidance_v4(
@@ -145,6 +97,85 @@ impl Store {
         tx.commit().await?;
         Ok(consumed)
     }
+}
+
+/// Accept one guidance request inside a caller-owned transaction. Queue
+/// cut-in uses this helper so its run/stop/event/limit/idempotency rules stay
+/// identical to the ordinary guidance command while the caller can commit a
+/// second state transition atomically.
+pub(super) async fn accept_guidance_in_tx_v4(
+    tx: &mut SqliteConnection,
+    request: &SubmitGuidanceV4Request,
+) -> Result<GuidanceRecordV4, StoreError> {
+    let markdown = request.markdown.trim();
+    if markdown.is_empty() || markdown.len() > 2048 {
+        return Err(StoreError::InvalidInput(
+            "guidance must contain 1..2048 UTF-8 bytes".into(),
+        ));
+    }
+    let (status, spec) = guidance_spec(
+        tx,
+        request.project_id,
+        request.conversation_id,
+        request.run_id,
+    )
+    .await?;
+    if let Some(row) = sqlx::query(
+        "SELECT run_id,ordinal,markdown,accepted_at,consumed_at
+         FROM agent_guidance_v4 WHERE message_id=?1",
+    )
+    .bind(request.message_id.to_string())
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        if row.try_get::<String, _>(0)? != request.run_id.to_string()
+            || row.try_get::<String, _>(2)? != markdown
+        {
+            return Err(StoreError::InvalidInput(
+                "guidance message id already belongs to a different request".into(),
+            ));
+        }
+        return guidance_record(request.message_id, &spec, row);
+    }
+    run_stops::ensure_no_stop_request_in_tx(&mut *tx, request.run_id).await?;
+    let events = load_agent_events_in_tx(&mut *tx, request.run_id).await?;
+    if status != "running" || events.iter().any(is_terminal_event) {
+        return Err(StoreError::InvalidInput(
+            "guidance requires an active ordinary Agent run".into(),
+        ));
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_guidance_v4 WHERE run_id=?1")
+        .bind(request.run_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+    if count >= 16 {
+        return Err(StoreError::InvalidInput(
+            "run guidance limit reached (16 messages)".into(),
+        ));
+    }
+    let accepted_at = from_timestamp(timestamp(Utc::now()), "guidance accepted timestamp")?;
+    sqlx::query(
+        "INSERT INTO agent_guidance_v4
+         (message_id,run_id,ordinal,markdown,accepted_at)
+         VALUES (?1,?2,?3,?4,?5)",
+    )
+    .bind(request.message_id.to_string())
+    .bind(request.run_id.to_string())
+    .bind(count + 1)
+    .bind(markdown)
+    .bind(timestamp(accepted_at))
+    .execute(&mut *tx)
+    .await?;
+    Ok(GuidanceRecordV4 {
+        message_id: request.message_id,
+        run_id: request.run_id,
+        project_id: request.project_id,
+        conversation_id: request.conversation_id,
+        ordinal: (count + 1) as u64,
+        markdown: markdown.into(),
+        accepted_at,
+        consumed_at: None,
+    })
 }
 
 async fn guidance_spec(

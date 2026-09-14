@@ -1,3 +1,4 @@
+import type { ComposerReference } from "./types";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -41,6 +42,8 @@ import type {
   McpServerProfile,
   BundledMcpPreset,
 } from "./types";
+
+export { agentV4GetStop, agentV4RequestStop } from "./agent-stop-api";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -141,8 +144,8 @@ export async function listModelProfiles(): Promise<ModelProfile[]> {
   return isTauri() ? invoke("list_model_profiles") : [];
 }
 
-export async function saveModelProfile(request: { id?: string; label: string; provider: ModelProfile["provider"]; base_url: string; model: string; credential?: string; refresh_catalog?: boolean; reasoning_effort?: ModelProfile["reasoning_effort"]; delegated_model_profile_id?: string | null }): Promise<ModelProfile> {
-  if (!isTauri()) return { id: request.id ?? crypto.randomUUID(), label: request.label, provider: request.provider, base_url: request.base_url, model: request.model, credential_reference: request.provider === "ollama" ? null : "model/demo", supports_tools: true, supports_vision: false };
+export async function saveModelProfile(request: { id?: string; label: string; provider: ModelProfile["provider"]; base_url: string; model: string; credential?: string; refresh_catalog?: boolean; reasoning_effort?: ModelProfile["reasoning_effort"]; fast_mode?: ModelProfile["fast_mode"]; delegated_model_profile_id?: string | null }): Promise<ModelProfile> {
+  if (!isTauri()) return { id: request.id ?? crypto.randomUUID(), label: request.label, provider: request.provider, base_url: request.base_url, model: request.model, credential_reference: request.provider === "ollama" ? null : "model/demo", supports_tools: true, supports_vision: false, fast_mode: request.fast_mode };
   return invoke("save_model_profile", { request });
 }
 
@@ -396,11 +399,11 @@ export async function agentV4ComputeBackends(projectId: string, containerImage?:
   return invoke("agent_v4_compute_backends", { request: { project_id: projectId, container_image: containerImage || null } });
 }
 
-export async function agentV4StartPlanning(request: { project_id: string; conversation_id: string; model_profile_id: string; objective: string; compute_selection: ComputeSelectionV4 }): Promise<RunSummaryV4> {
+export async function agentV4StartPlanning(request: { project_id: string; conversation_id: string; model_profile_id: string; objective: string; compute_selection: ComputeSelectionV4; references?: ComposerReference[]; attachments?: string[] }): Promise<RunSummaryV4> {
   return invoke("agent_v4_start_planning", { request });
 }
 
-export async function agentV4StartDirect(request: { project_id: string; conversation_id: string; model_profile_id: string; objective: string; compute_selection: ComputeSelectionV4 }): Promise<RunSummaryV4> {
+export async function agentV4StartDirect(request: { project_id: string; conversation_id: string; model_profile_id: string; objective: string; compute_selection: ComputeSelectionV4; references?: ComposerReference[]; attachments?: string[] }): Promise<RunSummaryV4> {
   return invoke("agent_v4_start_direct", { request });
 }
 

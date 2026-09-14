@@ -1,9 +1,13 @@
+import * as queueApi from "./composer-queue-api";
+import * as preferencesApi from "./conversation-preferences-api";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import DesktopApp from "./DesktopApp";
+import DesktopApp, { samePendingSubmission } from "./DesktopApp";
 import * as api from "./tauri-api";
-import type { AgentRunEventV4, ConversationAgentStateV4, ExecutionPlanV4, KernelEvent, ProposedPlanRevisionV4, RunSummaryV4, SyncEntry } from "./types";
+import * as referenceApi from "./composer-reference-api";
+import * as attachmentApi from "./composer-attachment-api";
+import type { AgentRunEventV4, ComposerReference, ConversationAgentStateV4, ExecutionPlanV4, KernelEvent, ProposedPlanRevisionV4, RunSummaryV4, StopRunReceiptV4, SyncEntry, WorkspaceMessage } from "./types";
 
 beforeEach(() => vi.restoreAllMocks());
 
@@ -22,6 +26,18 @@ function stateRevision(conversationId: string, runId = "run-plan", status: Propo
 
 function stateRun(runId = "run-plan", status = "awaiting_approval", plan: ExecutionPlanV4 | null = statePlan, approvalHash: string | null = "approval-state", planRevision: number | null = 2): RunSummaryV4 {
   return { run_id: runId, status, plan, plan_hash: plan ? `hash-${runId}-${planRevision ?? 1}` : null, compute_selection: null, approval_hash: approvalHash, plan_revision: planRevision, session_mode: "plan" };
+}
+
+function stopReceipt(projectId: string, conversationId: string, runId: string, status: StopRunReceiptV4["status"] = "observed"): StopRunReceiptV4 {
+  return {
+    request_id: `stop-request-${runId}`,
+    project_id: projectId,
+    conversation_id: conversationId,
+    run_id: runId,
+    status,
+    created_at: "2026-08-20T00:00:00.000Z",
+    updated_at: "2026-08-20T00:00:01.000Z",
+  };
 }
 
 function stateSnapshot(conversationId: string, overrides: Partial<ConversationAgentStateV4> = {}): ConversationAgentStateV4 {
@@ -61,6 +77,293 @@ function setupConversationStateHarness() {
 }
 
 describe("DesktopApp", () => {
+  it("opens shared search from workspace and project library, attaching without losing the draft", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    const reference = { kind: "artifact" as const, project_id: stateProject.id, id: "artifact-search" };
+    vi.spyOn(referenceApi, "composerReferenceCatalog").mockResolvedValue([{ reference, label: "Search QC", description: "Quality evidence" }]);
+    render(<DesktopApp />);
+    const input = await screen.findByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(stateSpy).toHaveBeenCalled());
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "Keep my question" } });
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    expect(await screen.findByRole("dialog", { name: "搜索工作区" })).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "附加 Search QC" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "搜索工作区" })).not.toBeInTheDocument());
+    expect(input).toHaveValue("Keep my question");
+    expect(screen.getByRole("button", { name: "移除引用：Search QC" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "返回项目主页" }));
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    expect(await screen.findByRole("dialog", { name: "搜索工作区" })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "搜索工作区" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /搜索工作区/ })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    fireEvent.click(await screen.findByRole("button", { name: `打开 ${stateProject.name}` }));
+    await screen.findByRole("textbox", { name: /描述研究目标/ });
+    expect(screen.queryByRole("button", { name: "移除引用：Search QC" })).not.toBeInTheDocument();
+  });
+
+  it("opens the requested saved conversation in another project instead of its first conversation", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    const other = { ...stateProject, id: "project-other", name: "Other project" };
+    const first = { ...stateConversations[0], project_id: other.id, id: "other-first", title: "Other first" };
+    const requested = { ...first, id: "other-requested", title: "Requested saved session" };
+    vi.mocked(api.listProjects).mockResolvedValue([stateProject, other]);
+    vi.mocked(api.listConversations).mockImplementation(async (projectId) => projectId === other.id ? [first, requested] : stateConversations);
+    stateSpy.mockImplementation(async (projectId, conversationId) => ({ ...stateSnapshot(conversationId), project_id: projectId }));
+    vi.spyOn(referenceApi, "composerReferenceCatalog").mockImplementation(async (projectId) => projectId === other.id ? [{ reference: { kind: "session", project_id: other.id, id: requested.id }, label: requested.title, description: "Saved transcript" }] : []);
+    render(<DesktopApp />);
+    await screen.findByRole("textbox", { name: /描述研究目标/ });
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    fireEvent.click(await screen.findByRole("button", { name: `打开 ${requested.title}` }));
+    await waitFor(() => expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent(requested.title));
+    await waitFor(() => expect(api.listMessages).toHaveBeenCalledWith(requested.id));
+  });
+
+  it("ignores a pending search navigation after immediate Escape", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    vi.spyOn(referenceApi, "composerReferenceCatalog").mockResolvedValue([{ reference: { kind: "session", project_id: stateProject.id, id: stateConversations[1].id }, label: "Pending search session", description: "Saved transcript" }]);
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    const pending = deferred<typeof stateConversations>();
+    vi.mocked(api.listConversations).mockReturnValueOnce(pending.promise);
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    fireEvent.click(await screen.findByRole("button", { name: "打开 Pending search session" }));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "搜索工作区" })).not.toBeInTheDocument();
+    await act(async () => pending.resolve(stateConversations));
+    expect(screen.getByRole("heading", { name: stateConversations[0].title })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: stateConversations[1].title })).not.toBeInTheDocument();
+  });
+
+  it("hides search Attach actions while a plan revision is pending even when snapshot lock is false", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId, {
+      mode: "plan",
+      latest_plan_revision: stateRevision(conversationId),
+      latest_run: stateRun(),
+    }));
+    vi.spyOn(referenceApi, "composerReferenceCatalog").mockResolvedValue([{
+      reference: { kind: "artifact" as const, project_id: stateProject.id, id: "pending-plan-artifact" },
+      label: "Pending plan report",
+      description: "Quality evidence",
+    }]);
+    render(<DesktopApp />);
+    await screen.findByRole("button", { name: "批准并运行" });
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    await screen.findByRole("dialog", { name: "搜索工作区" });
+    expect(screen.queryByRole("button", { name: "附加 Pending plan report" })).not.toBeInTheDocument();
+  });
+
+  it("keeps search above an active share dialog and Escape closes only search", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    vi.mocked(api.listMessages).mockResolvedValue([{
+      id: "share-message",
+      project_id: stateProject.id,
+      conversation_id: stateConversations[0].id,
+      sequence: 1,
+      role: "user",
+      markdown: "A shareable research note",
+      created_at: "2026-09-13T00:00:00Z",
+    }]);
+    vi.spyOn(referenceApi, "composerReferenceCatalog").mockResolvedValue([]);
+    render(<DesktopApp />);
+    const input = await screen.findByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "添加上下文或选择模式" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /分享会话/ }));
+    const share = await screen.findByRole("dialog", { name: "分享会话" });
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    const search = await screen.findByRole("dialog", { name: "搜索工作区" });
+    const searchBackdrop = search.parentElement;
+    const shareBackdrop = share.parentElement;
+    expect(searchBackdrop).not.toBeNull();
+    expect(shareBackdrop).not.toBeNull();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "搜索工作区" })).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "分享会话" })).toBe(share);
+  });
+
+  it("routes search settings actions when Settings is already on another section", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    vi.spyOn(referenceApi, "composerReferenceCatalog").mockResolvedValue([]);
+    render(<DesktopApp />);
+    const input = await screen.findByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    await screen.findByRole("dialog", { name: "工作台设置" });
+    fireEvent.click(screen.getByRole("button", { name: "远端计算" }));
+    expect(await screen.findByRole("heading", { level: 3, name: "远端 Linux 计算" })).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    fireEvent.click(await screen.findByRole("button", { name: "打开 管理技能" }));
+    await waitFor(() => expect(screen.getByRole("heading", { level: 3, name: "科研 Skills" })).toBeInTheDocument());
+    expect(screen.getByRole("dialog", { name: "工作台设置" })).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    fireEvent.click(await screen.findByRole("button", { name: "打开 管理模型" }));
+    await waitFor(() => expect(screen.getByRole("heading", { level: 3, name: "模型提供方" })).toBeInTheDocument());
+    expect(screen.getByRole("dialog", { name: "工作台设置" })).toBeInTheDocument();
+  });
+
+  it("closes Settings before search opens project files", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    vi.spyOn(referenceApi, "composerReferenceCatalog").mockResolvedValue([]);
+    render(<DesktopApp />);
+    const input = await screen.findByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    await screen.findByRole("dialog", { name: "工作台设置" });
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    fireEvent.click(await screen.findByRole("button", { name: "打开 项目文件" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "工作台设置" })).not.toBeInTheDocument());
+    const filesTab = await screen.findByRole("tab", { name: "Files" });
+    expect(filesTab).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("closes Settings before search opens another project", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    const other = { ...stateProject, id: "project-other-search", name: "Other search project" };
+    const otherConversation = { ...stateConversations[0], project_id: other.id, id: "other-search-conversation", title: "Other project conversation" };
+    vi.mocked(api.listProjects).mockResolvedValue([stateProject, other]);
+    vi.mocked(api.listConversations).mockImplementation(async (projectId) => projectId === other.id ? [otherConversation] : stateConversations);
+    vi.mocked(api.listMessages).mockResolvedValue([]);
+    stateSpy.mockImplementation(async (projectId, conversationId) => ({ ...stateSnapshot(conversationId), project_id: projectId }));
+    vi.spyOn(referenceApi, "composerReferenceCatalog").mockResolvedValue([]);
+    render(<DesktopApp />);
+    const input = await screen.findByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    await screen.findByRole("dialog", { name: "工作台设置" });
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    fireEvent.click(await screen.findByRole("button", { name: `打开 ${other.name}` }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "工作台设置" })).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("main", { name: "科研对话" })).toHaveTextContent(other.name));
+  });
+
+  it.each(["agent", "plan"] as const)("validates references before persisting a %s send and retains a rejected draft", async (mode) => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId, { mode }));
+    const reference = { kind: "artifact" as const, project_id: stateProject.id, id: "artifact-qc" };
+    vi.spyOn(referenceApi, "composerReferenceCatalog").mockResolvedValue([{ reference, label: "QC report", description: "QC" }]);
+    const validate = vi.spyOn(referenceApi, "validateComposerReferences").mockRejectedValue(new Error("Reference no longer available"));
+    const submit = vi.spyOn(api, "submitMessage");
+    const start = vi.spyOn(api, mode === "agent" ? "agentV4StartDirect" : "agentV4StartPlanning");
+    render(<DesktopApp />);
+    const input = await screen.findByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(stateSpy).toHaveBeenCalled());
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "Summarize @QC", selectionStart: 13 } });
+    fireEvent.click(await screen.findByRole("option", { name: /QC report/ }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(validate).toHaveBeenCalledWith(stateProject.id, stateConversations[0].id, [reference]));
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    expect(submit).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+    expect(input).toHaveValue("Summarize ");
+    expect(screen.getByRole("button", { name: /移除.*QC report/ })).toBeInTheDocument();
+  });
+
+  it.each(["agent", "plan"] as const)("preflights and sends stable attachment IDs through %s", async (mode) => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId, { mode }));
+    vi.spyOn(attachmentApi, "stageComposerAttachment").mockResolvedValue({ id: "plot-attachment", project_id: stateProject.id, conversation_id: stateConversations[0].id, name: "plot.png", relative_path: ".omicsops/attachments/plot/bytes.png", size_bytes: 4, sha256: "a".repeat(64), media_type: "image/png" });
+    const validation = vi.spyOn(attachmentApi, "validateComposerAttachments").mockRejectedValueOnce(new Error("Attachment changed")).mockResolvedValue(undefined);
+    const submit = vi.spyOn(api, "submitMessage").mockResolvedValue({ id: "message-attachment", project_id: stateProject.id, conversation_id: stateConversations[0].id, sequence: 1, role: "user", markdown: "Inspect plot", created_at: "2026-09-13T00:00:00Z" });
+    const start = vi.spyOn(api, mode === "agent" ? "agentV4StartDirect" : "agentV4StartPlanning").mockResolvedValue(stateRun());
+    render(<DesktopApp />);
+    const input = await screen.findByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "Inspect plot" } });
+    fireEvent.paste(input, { clipboardData: { files: [new File(["data"], "plot.png", { type: "image/png" })] } });
+    await screen.findByText("plot.png");
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(validation).toHaveBeenCalledWith(stateProject.id, stateConversations[0].id, ["plot-attachment"], expect.any(String)));
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    expect(submit).not.toHaveBeenCalled();
+    expect(input).toHaveValue("Inspect plot");
+    expect(screen.getByText("plot.png")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(start).toHaveBeenCalledWith(expect.objectContaining({ objective: "Inspect plot", attachments: ["plot-attachment"] })));
+    expect(submit).toHaveBeenCalledOnce();
+    expect(JSON.stringify(start.mock.calls)).not.toContain("content_base64");
+  });
+
+  it.each(["agent", "plan"] as const)("transports selected reference IDs into a %s request", async (mode) => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId, { mode }));
+    const reference = { kind: "artifact" as const, project_id: stateProject.id, id: "artifact-qc" };
+    vi.spyOn(referenceApi, "composerReferenceCatalog").mockResolvedValue([{ reference, label: "QC report", description: "QC" }]);
+    vi.spyOn(api, "submitMessage").mockResolvedValue({ id: "message-reference", project_id: stateProject.id, conversation_id: stateConversations[0].id, sequence: 1, role: "user", markdown: "Summarize", created_at: "2026-09-13T00:00:00Z" });
+    const start = vi.spyOn(api, mode === "agent" ? "agentV4StartDirect" : "agentV4StartPlanning").mockResolvedValue(stateRun());
+    render(<DesktopApp />);
+    const input = await screen.findByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(stateSpy).toHaveBeenCalled());
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "Summarize @QC", selectionStart: 13 } });
+    fireEvent.click(await screen.findByRole("option", { name: /QC report/ }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(start).toHaveBeenCalledWith(expect.objectContaining({ objective: "Summarize", references: [reference] })));
+  });
+
+  it("rejects a settings model save while reasoning effort persistence is in flight", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    const profile = { ...stateModel, reasoning_effort: "high" as const };
+    vi.mocked(api.listModelProfiles).mockResolvedValue([profile]);
+    vi.spyOn(api, "listModelProfileModels").mockResolvedValue([profile.model]);
+    const saved = deferred<Awaited<ReturnType<typeof api.saveModelProfile>>>();
+    const save = vi.spyOn(api, "saveModelProfile").mockReturnValue(saved.promise);
+    render(<DesktopApp />);
+    await screen.findByText(/Agent 模式：LOCAL/);
+    const selector = screen.getByRole("button", { name: "选择模型" });
+    await waitFor(() => expect(selector).toBeEnabled());
+    fireEvent.click(selector);
+    fireEvent.click(screen.getByRole("button", { name: "推理强度: high" }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "默认" }));
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+    fireEvent.change(screen.getByRole("textbox", { name: /^Model$/ }), { target: { value: "settings-model" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存提供方" }));
+    expect(await screen.findByText("保存失败，请检查模型配置后重试。")).toBeInTheDocument();
+    expect(save).toHaveBeenCalledTimes(1);
+    await act(async () => saved.resolve({ ...profile, reasoning_effort: null }));
+    save.mockResolvedValue({ ...profile, model: "settings-model" });
+    fireEvent.click(screen.getByRole("button", { name: "保存提供方" }));
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(2));
+  });
+  it("persists an explicit default reasoning effort and locks sends until saved", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    const profile = { ...stateModel, reasoning_effort: "high" as const };
+    vi.mocked(api.listModelProfiles).mockResolvedValue([profile]);
+    vi.spyOn(api, "listModelProfileModels").mockResolvedValue([profile.model]);
+    const saved = deferred<Awaited<ReturnType<typeof api.saveModelProfile>>>();
+    const save = vi.spyOn(api, "saveModelProfile").mockReturnValue(saved.promise);
+    render(<DesktopApp />);
+    await screen.findByText(/Agent 模式：LOCAL/);
+    const selector = screen.getByRole("button", { name: "选择模型" });
+    await waitFor(() => expect(selector).toBeEnabled());
+    fireEvent.click(selector);
+    fireEvent.click(screen.getByRole("button", { name: "推理强度: high" }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "默认" }));
+    expect(save).toHaveBeenCalledWith({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model: profile.model, reasoning_effort: null });
+    expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toBeDisabled();
+    await act(async () => saved.resolve({ ...profile, reasoning_effort: null }));
+    expect(await screen.findByRole("button", { name: "推理强度: 默认" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toBeEnabled();
+  });
   it("refreshes shared memory counts after deleting another conversation", async () => {
     const { stateSpy } = setupConversationStateHarness();
     stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
@@ -161,7 +464,7 @@ describe("DesktopApp", () => {
     vi.spyOn(api, "submitMessage").mockResolvedValue({ id: "message-1", project_id: project.id, conversation_id: conversation.id, sequence: 1, role: "user", markdown: "先解释一下这个矩阵格式", created_at: "2026-08-21T00:00:00Z" });
     const startDirect = vi.spyOn(api, "agentV4StartDirect").mockResolvedValue({ run_id: "run-direct", status: "running", plan: null, plan_hash: null, compute_selection: { schema_version: 4, backend_id: "local", backend_kind: "local", autonomy_mode: "supervised", environment: "system", network_policy: "host_inherited", container_image: null }, approval_hash: null });
     const startPlanning = vi.spyOn(api, "agentV4StartPlanning");
-    const cancelRun = vi.spyOn(api, "agentV4Cancel").mockResolvedValue();
+    const requestStop = vi.spyOn(api, "agentV4RequestStop").mockResolvedValue(stopReceipt(project.id, conversation.id, "run-direct"));
     vi.spyOn(api, "agentV4Events").mockResolvedValue([]);
 
     render(<DesktopApp />);
@@ -174,8 +477,40 @@ describe("DesktopApp", () => {
     expect(startPlanning).not.toHaveBeenCalled();
     expect(await screen.findByRole("button", { name: "添加上下文或选择模式" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "终止运行" }));
-    await waitFor(() => expect(cancelRun).toHaveBeenCalledWith("run-direct"));
+    await waitFor(() => expect(requestStop).toHaveBeenCalledWith(expect.objectContaining({ project_id: project.id, conversation_id: conversation.id, run_id: "run-direct" })));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "终止运行" })).not.toBeInTheDocument());
+  });
+
+  it("keeps an accepted stop busy and reuses its request id after a retryable failure", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    const activeRun = { ...stateRun("run-direct", "running", null, null, null), session_mode: "agent" as const };
+    stateSpy.mockResolvedValue(stateSnapshot("conversation-agent", { latest_run: activeRun }));
+    const requestStop = vi.spyOn(api, "agentV4RequestStop")
+      .mockRejectedValueOnce(new Error("temporary stop transport failure"))
+      .mockResolvedValueOnce(stopReceipt(stateProject.id, "conversation-agent", "run-direct", "requested"));
+
+    render(<DesktopApp />);
+    const stop = await screen.findByRole("button", { name: "终止运行" });
+    fireEvent.click(stop);
+    await waitFor(() => expect(requestStop).toHaveBeenCalledTimes(1));
     expect(screen.getByRole("button", { name: "终止运行" })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "终止运行" }));
+    await waitFor(() => expect(requestStop).toHaveBeenCalledTimes(2));
+    expect(requestStop.mock.calls[0][0].request_id).toBe(requestStop.mock.calls[1][0].request_id);
+    expect(await screen.findByRole("button", { name: "终止中…" })).toBeDisabled();
+  });
+
+  it("shows a localized scoped stop lookup error while leaving retry available", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    const activeRun = { ...stateRun("run-stop", "running", null, null, null), session_mode: "agent" as const };
+    stateSpy.mockResolvedValue(stateSnapshot("conversation-agent", { latest_run: activeRun }));
+    vi.spyOn(api, "agentV4GetStop").mockRejectedValue(new Error("native stop details"));
+
+    render(<DesktopApp />);
+    expect(await screen.findByRole("button", { name: "终止运行" })).toBeEnabled();
+    expect(await screen.findByText("停止状态更新失败，请重试。")).toBeInTheDocument();
+    expect(screen.queryByText("native stop details")).not.toBeInTheDocument();
   });
 
   it("does not let a previous conversation send clear the new session busy state", async () => {
@@ -208,6 +543,157 @@ describe("DesktopApp", () => {
 
     newSubmit.resolve({ id: "new-message", project_id: stateProject.id, conversation_id: "conversation-plan", sequence: 1, role: "user", markdown: "新会话请求", created_at: "2026-08-20T00:00:00Z" });
     await waitFor(() => expect(api.agentV4StartDirect).toHaveBeenCalledWith(expect.objectContaining({ conversation_id: "conversation-plan" })));
+  });
+
+  it.each(["agent", "plan"] as const)("reuses the persisted %s message after a failed native start", async (mode) => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId, { mode }));
+    const submit = vi.spyOn(api, "submitMessage").mockResolvedValue({
+      id: `message-${mode}-retry`, project_id: stateProject.id, conversation_id: stateConversations[0].id,
+      sequence: 1, role: "user", markdown: "Retry this native run", created_at: "2026-09-13T00:00:00Z",
+    });
+    const startDirect = vi.spyOn(api, "agentV4StartDirect");
+    const startPlanning = vi.spyOn(api, "agentV4StartPlanning");
+    const start = mode === "agent" ? startDirect : startPlanning;
+    start
+      .mockRejectedValueOnce(new Error("native start rejected"))
+      .mockResolvedValueOnce(mode === "plan"
+        ? stateRun(`run-${mode}-retry`, "awaiting_approval")
+        : { ...stateRun(`run-${mode}-retry`, "running", null, null, null), session_mode: "agent" });
+    vi.spyOn(api, "agentV4Events").mockResolvedValue([]);
+
+    render(<DesktopApp />);
+    const input = await screen.findByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "Retry this native run" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(input).toHaveValue("Retry this native run");
+
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(input).toHaveValue(""));
+    expect(submit).toHaveBeenCalledTimes(1);
+  });
+
+  it("persists a new message when the failed-start draft changes before retry", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    const submit = vi.spyOn(api, "submitMessage").mockImplementation(async (request) => ({
+      id: `message-${request.markdown}`, project_id: request.project_id, conversation_id: request.conversation_id,
+      sequence: request.sequence, role: "user", markdown: request.markdown, created_at: "2026-09-13T00:00:00Z",
+    }));
+    const start = vi.spyOn(api, "agentV4StartDirect")
+      .mockRejectedValueOnce(new Error("first native start rejected"))
+      .mockRejectedValueOnce(new Error("second native start rejected"));
+    vi.spyOn(api, "agentV4Events").mockResolvedValue([]);
+
+    render(<DesktopApp />);
+    const input = await screen.findByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "First native run" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+
+    fireEvent.change(input, { target: { value: "Changed native run" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(2));
+    expect(submit).toHaveBeenCalledTimes(2);
+    expect(submit.mock.calls.map(([request]) => request.markdown)).toEqual(["First native run", "Changed native run"]);
+    expect(start.mock.calls.map(([request]) => request.objective)).toEqual(["First native run", "Changed native run"]);
+  });
+
+  it("matches a failed-start retry by stable reference IDs, while a changed ID starts a new submission", () => {
+    const firstReference: ComposerReference = { kind: "artifact", project_id: stateProject.id, id: "artifact-1" };
+    const equivalentReference = { id: "artifact-1", project_id: stateProject.id, kind: "artifact" as const };
+    const pendingMessage: WorkspaceMessage = {
+      id: "message-reference-retry", project_id: stateProject.id, conversation_id: stateConversations[0].id,
+      sequence: 1, role: "user", markdown: "Retry with a reference", created_at: "2026-09-13T00:00:00Z",
+    };
+    const pending = {
+      projectId: stateProject.id,
+      conversationId: stateConversations[0].id,
+      markdown: pendingMessage.markdown,
+      mode: "chat" as const,
+      references: [firstReference],
+      attachments: [],
+      message: pendingMessage,
+    };
+    expect(samePendingSubmission(pending, pending.projectId, pending.conversationId, pending.markdown, pending.mode, [equivalentReference], [])).toBe(true);
+    expect(samePendingSubmission(pending, pending.projectId, pending.conversationId, pending.markdown, pending.mode, [{ ...equivalentReference, id: "artifact-2" }], [])).toBe(false);
+  });
+
+  it.each(["agent", "plan"] as const)("keeps an accepted %s run when event history reconciliation fails", async (mode) => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId, { mode }));
+    vi.spyOn(api, "submitMessage").mockResolvedValue({
+      id: `message-${mode}-events`, project_id: stateProject.id, conversation_id: stateConversations[0].id,
+      sequence: 1, role: "user", markdown: "Accept despite event read", created_at: "2026-09-13T00:00:00Z",
+    });
+    const accepted = mode === "plan"
+      ? stateRun(`run-${mode}-events`, "awaiting_approval")
+      : { ...stateRun(`run-${mode}-events`, "running", null, null, null), session_mode: "agent" as const };
+    const startDirect = vi.spyOn(api, "agentV4StartDirect");
+    const startPlanning = vi.spyOn(api, "agentV4StartPlanning");
+    const start = mode === "agent" ? startDirect : startPlanning;
+    start.mockResolvedValue(accepted);
+    const events = vi.spyOn(api, "agentV4Events")
+      .mockRejectedValueOnce(new Error("event history unavailable"))
+      .mockResolvedValue([]);
+
+    render(<DesktopApp />);
+    const input = await screen.findByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "Accept despite event read" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(input).toHaveValue(""));
+    expect(events).toHaveBeenCalledWith(accepted.run_id);
+    expect(screen.queryByText("消息未能发送")).not.toBeInTheDocument();
+    expect(screen.queryByText("native start rejected")).not.toBeInTheDocument();
+  });
+
+  it("ignores a stale native-start failure after switching conversations", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (projectId, conversationId) => ({ ...stateSnapshot(conversationId), project_id: projectId }));
+    const oldStart = deferred<Awaited<ReturnType<typeof api.agentV4StartDirect>>>();
+    const submit = vi.spyOn(api, "submitMessage").mockImplementation(async (request) => ({
+      id: `message-${request.conversation_id}`, project_id: request.project_id, conversation_id: request.conversation_id,
+      sequence: request.sequence, role: "user", markdown: request.markdown, created_at: "2026-09-13T00:00:00Z",
+    }));
+    const start = vi.spyOn(api, "agentV4StartDirect")
+      .mockImplementationOnce(() => oldStart.promise)
+      .mockResolvedValue({ ...stateRun("new-session-run", "running", null, null, null), session_mode: "agent" });
+    vi.spyOn(api, "agentV4Events").mockResolvedValue([]);
+
+    render(<DesktopApp />);
+    const firstInput = await screen.findByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(firstInput).toBeEnabled());
+    fireEvent.change(firstInput, { target: { value: "Old session request" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "Plan 会话" }));
+    await screen.findByRole("heading", { name: "Plan 会话" });
+    await act(async () => oldStart.reject(new Error("old native start failed")));
+    await waitFor(() => expect(screen.queryByText("old native start failed")).not.toBeInTheDocument());
+
+    const secondInput = screen.getByRole("textbox", { name: /描述研究目标/ });
+    fireEvent.change(secondInput, { target: { value: "New session request" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(2));
+    expect(submit).toHaveBeenCalledWith(expect.objectContaining({ conversation_id: "conversation-plan", markdown: "New session request" }));
+    expect(start).toHaveBeenLastCalledWith(expect.objectContaining({ conversation_id: "conversation-plan", objective: "New session request" }));
   });
 
   it("surfaces an Agent event subscription failure instead of silently waiting", async () => {
@@ -371,6 +857,24 @@ describe("DesktopApp", () => {
     expect(await screen.findByText("修订 2 · 待审批")).toBeInTheDocument();
   });
 
+  it("reconciles Agent events before reading the durable state after a stop", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    const historical = deferred<AgentRunEventV4[]>();
+    vi.spyOn(api, "agentV4EventsForConversation").mockReturnValue(historical.promise);
+    stateSpy.mockResolvedValue(stateSnapshot("conversation-agent", {
+      latest_run: stateRun("run-after-stop", "completed", null, null, null),
+    }));
+
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: "Agent 会话" });
+    await waitFor(() => expect(api.agentV4EventsForConversation).toHaveBeenCalledWith(stateProject.id, "conversation-agent"));
+    expect(stateSpy).not.toHaveBeenCalled();
+
+    historical.resolve([agentEvent("conversation-agent", "run-after-stop", 1, { kind: "run_cancelled" })]);
+    await waitFor(() => expect(stateSpy).toHaveBeenCalledWith(stateProject.id, "conversation-agent"));
+    expect(screen.queryByRole("button", { name: "终止运行" })).not.toBeInTheDocument();
+  });
+
   it("merges live messages into a deferred hydration without rolling back sequence", async () => {
     const { stateSpy } = setupConversationStateHarness();
     stateSpy.mockResolvedValue(stateSnapshot("conversation-agent"));
@@ -440,7 +944,7 @@ describe("DesktopApp", () => {
     vi.spyOn(api, "agentV4EventsForConversation").mockReturnValue(historical.promise);
     let emit!: Parameters<typeof api.onAgentV4Event>[0];
     vi.spyOn(api, "onAgentV4Event").mockImplementation(async (callback) => { emit = callback; return () => undefined; });
-    const cancel = vi.spyOn(api, "agentV4Cancel").mockResolvedValue();
+    const requestStop = vi.spyOn(api, "agentV4RequestStop").mockResolvedValue(stopReceipt(stateProject.id, "conversation-agent", "new-live-run"));
 
     render(<DesktopApp />);
     await screen.findByRole("heading", { name: "Agent 会话" });
@@ -449,7 +953,31 @@ describe("DesktopApp", () => {
     historical.resolve([agentEvent("conversation-agent", "old-history-run", 59, { kind: "run_created", mode: "execute" })]);
     expect(await screen.findByText("new live run")).toBeInTheDocument();
     fireEvent.click(await screen.findByRole("button", { name: "终止运行" }));
-    await waitFor(() => expect(cancel).toHaveBeenCalledWith("new-live-run"));
+    await waitFor(() => expect(requestStop).toHaveBeenCalledWith(expect.objectContaining({ project_id: stateProject.id, conversation_id: "conversation-agent", run_id: "new-live-run" })));
+  });
+
+  it("ignores delayed stop event reconciliation after switching conversations", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    const delayedEvents = deferred<AgentRunEventV4[]>();
+    const events = vi.spyOn(api, "agentV4Events").mockReturnValue(delayedEvents.promise);
+    vi.spyOn(api, "agentV4RequestStop").mockResolvedValue(stopReceipt(stateProject.id, "conversation-agent", "stop-run", "requested"));
+    let emit!: Parameters<typeof api.onAgentV4Event>[0];
+    vi.spyOn(api, "onAgentV4Event").mockImplementation(async (callback) => { emit = callback; return () => undefined; });
+
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: "Agent 会话" });
+    await waitFor(() => expect(emit).toBeDefined());
+    await act(async () => emit(agentEvent("conversation-agent", "stop-run", 1, { kind: "model_text", text: "run before stop" })));
+    fireEvent.click(await screen.findByRole("button", { name: "终止运行" }));
+    await waitFor(() => expect(events).toHaveBeenCalledWith("stop-run"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Plan 会话" }));
+    await screen.findByRole("heading", { name: "Plan 会话" });
+    await act(async () => delayedEvents.resolve([agentEvent("conversation-agent", "stop-run", 2, { kind: "run_failed", message: "stale stop event" })]));
+
+    expect(screen.queryByText("stale stop event")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Plan 会话" })).toBeInTheDocument();
   });
 
   it("ignores events delivered to an old conversation listener after switching sessions", async () => {
@@ -675,11 +1203,11 @@ describe("DesktopApp", () => {
     stateSpy
       .mockResolvedValueOnce(stateSnapshot("conversation-agent", { mode: "plan", locked: true, latest_plan_revision: pending, latest_run: stateRun() }))
       .mockResolvedValue(stateSnapshot("conversation-agent", { mode: "plan", locked: false, latest_plan_revision: cancelled, latest_run: stateRun("run-plan", "cancelled", statePlan, "approval-state", 2) }));
-    const cancel = vi.spyOn(api, "agentV4Cancel").mockResolvedValue();
+    const requestStop = vi.spyOn(api, "agentV4RequestStop").mockResolvedValue(stopReceipt(stateProject.id, "conversation-agent", "run-plan"));
 
     render(<DesktopApp />);
     fireEvent.click(await screen.findByRole("button", { name: "取消计划" }));
-    await waitFor(() => expect(cancel).toHaveBeenCalledWith("run-plan"));
+    await waitFor(() => expect(requestStop).toHaveBeenCalledWith(expect.objectContaining({ project_id: stateProject.id, conversation_id: "conversation-agent", run_id: "run-plan" })));
 
     expect(await screen.findByText("修订 2 · 已取消")).toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toBeEnabled();
@@ -893,4 +1421,32 @@ it("streams public preview only for the current conversation and clears on commi
   expect(screen.getByRole("article", { name: "模型实时输出" })).toHaveTextContent("Live progress");
   await act(async () => emit(agentEvent("conversation-agent", "live-run", 2, { kind: "model_text", text: "Live progress" })));
   expect(screen.getAllByText("Live progress")).toHaveLength(1);
+});
+
+it("routes native idle sends through the durable queue and recovers the committed message", async () => {
+  const { stateSpy } = setupConversationStateHarness();
+  stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+  for (const name of ["onConversationEvent", "onConversationUpdated", "onSyncEvent", "onKernelEvent", "onAgentV4Event", "onAgentV4TextPreview"] as const) vi.spyOn(api, name).mockResolvedValue(() => {});
+  vi.spyOn(api, "getConversationCapabilitiesV4").mockResolvedValue({ project_id: stateProject.id, conversation_id: stateConversations[0].id, skills: [], mcp_servers: [], memory_count: 0 });
+  vi.spyOn(preferencesApi, "getConversationAgentPreferencesV4").mockResolvedValue({ delegation_enabled: true, auto_review: true, memory_enabled: true });
+  vi.spyOn(queueApi, "reconcileComposerQueue").mockResolvedValue([]);
+  const submit = vi.spyOn(api, "submitMessage");
+  const start = vi.spyOn(api, "agentV4StartDirect");
+  const enqueue = vi.spyOn(queueApi, "enqueueComposerTurn").mockImplementation(async (request) => {
+    vi.mocked(api.listMessages).mockResolvedValue([{ id: request.message_id, project_id: request.project_id, conversation_id: request.conversation_id, sequence: 1, role: "user", markdown: request.message_markdown, created_at: "2026-09-14T00:00:00Z" }]);
+    return { ...request, position: 1, revision: 2, status: "running", frozen: { model_profile_id: request.model_profile_id, model_configuration_hash: "hash", compute_selection: request.compute_selection, conversation_preferences: { delegation_enabled: true, auto_review: true, memory_enabled: true }, service_tier: {}, delegated_model: null, reviewer_model: null }, attachment_receipts: [], created_at: "now", updated_at: "now" };
+  });
+  Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: { invoke: vi.fn().mockResolvedValue([]) } });
+  const view = render(<DesktopApp />);
+  try {
+    const input = await screen.findByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "原子提交的研究任务" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(enqueue).toHaveBeenCalledTimes(1));
+    expect(submit).not.toHaveBeenCalled(); expect(start).not.toHaveBeenCalled();
+    await waitFor(() => expect(input).toHaveValue(""));
+    await waitFor(() => expect(screen.getAllByText("原子提交的研究任务").length).toBeGreaterThan(1));
+  } finally { view.unmount(); Reflect.deleteProperty(window, "__TAURI_INTERNALS__"); }
 });

@@ -1,18 +1,41 @@
-import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
+import { ContextUsagePanel, type ContextUsageView } from "./ContextUsagePanel";
+import { SideChatPanel } from "./SideChatPanel";
+import type { SideChatController } from "./useSideChat";
+import { listLocalComposerFiles, parseClipboardFilePaths, parseWorkspaceFileDrag, resolveComposerClipboardPaths, WORKSPACE_FILE_DRAG_TYPE, type WorkspaceFileReference } from "../../composer-file-api";
+import type { WorkspaceSearchRequest } from "../../workspace-search";
+import type { ComposerPickerCommand } from "./ComposerReferences";
+import type { ComposerReference, ComposerCatalogItem, SubmitGuidanceV4Request, ConversationBranchV4, ComposerQueueItemV4, ComposerQueueActionRequestV4, UpdateComposerQueueRequestV4 } from "../../types";
+import { composerReferenceCatalog } from "../../composer-reference-api";
+import { ComposerReferencePicker, ComposerReferenceChips, parseComposerTrigger, referenceKey } from "./ComposerReferences";
+import { ComposerFilePreviewDialog } from "./ComposerFilePreviewDialog";
+import { WorkflowLibraryDialog } from "./WorkflowLibraryDialog";
+import { ComposerQueuePanel } from "./ComposerQueuePanel";
+import { useConversationBranch } from "./useConversationBranch";
+import { ConversationBranchBanner } from "./ConversationBranchBanner";
+import { GuidanceDialog } from "./GuidanceDialog";
+import { ReviewerSettingsDialog } from "./ReviewerSettingsDialog";
+import { SessionReviewDialog } from "./SessionReviewDialog";
+import { ComposerAttachments } from "./ComposerAttachments";
+import { useComposerAttachments } from "./useComposerAttachments";
+import { useConversationAgentPreferences, type ConversationAgentPreferenceKey } from "./useConversationAgentPreferences";
+import { useSessionReviews } from "./useSessionReviews";
+import { supportsFastMode } from "../../fast-mode";
+import { Fragment, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
-  Activity, ArrowLeft, ArrowUp, Bot, Check, ChevronRight, ClipboardList, Database, Expand, FileBarChart, FileText,
+  Activity, ArrowLeft, Bot, Check, ChevronRight, ClipboardList, Database, Expand, FileBarChart, FileText,
   FlaskConical, Folder, Hand, MessageSquarePlus, NotebookPen, Plus,
-  Search, Settings, Shield, ShieldAlert, ShieldCheck, Sparkles, Square, Trash2, X, Orbit, Monitor, ChevronDown, Gauge, Zap, PanelRight,
+  Search, Settings, Shield, ShieldAlert, ShieldCheck, Sparkles, Square, Trash2, X, SlidersHorizontal, Monitor, ChevronDown, Gauge, PanelRight, Zap,
 } from "lucide-react";
 import { copy, type Locale } from "./copy";
-import type { AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, BrowserApprovalScopeV4, ComputeBackendAvailabilityV4, ConversationCapabilitiesV4, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, MemoryFact, NotebookEntry, ProposedPlanRevisionV4, ProjectArtifact, ProjectImagePreview, RunSummaryV4, SessionAgentModeV4, SyncEntry, WorkspaceConversation } from "../../types";
+import type { AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, BrowserApprovalScopeV4, ComputeBackendAvailabilityV4, ConversationCapabilitiesV4, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, MemoryFact, ModelProfile, NotebookEntry, ProposedPlanRevisionV4, ProjectArtifact, ProjectImagePreview, RunSummaryV4, SessionAgentModeV4, SyncEntry, WorkspaceConversation } from "../../types";
 import { FollowUpQuestions } from "./FollowUpQuestions";
 import { ConversationCapabilities } from "./ConversationCapabilities";
 import { RemoteFileTree } from "./RemoteFileTree";
 import { KernelPanel } from "./KernelPanel";
 import { ComposeActions } from "./ComposeActions";
+import { ShareConversationDialog } from "./ShareConversationDialog";
 import { RuntimeDialog } from "./RuntimeDialog";
 import { useWindowEscapeLayer } from "../settings/BrowserSettings";
 import { collectNotebookCells, collectDelegatedTasks, collectProvenance, isSidebarPreviewImage } from "./sidebarData";
@@ -30,6 +53,7 @@ import "./composer.css";
 import "./sidebar.css";
 
 export interface WorkspaceProject {
+  connection_id?: string | null;
   id: string;
   name: string;
   status: "ready" | "running" | "waiting_for_input" | "needs_attention" | "archived";
@@ -48,16 +72,44 @@ interface Props {
   capabilitiesError?: string;
   onRefreshCapabilities?: () => void;
   onSelectConversation?: (conversationId: string) => Promise<void> | void;
+  onBranchSend?: (sourceMessageId: string, message: string, mode: "chat" | "plan", references: ComposerReference[], attachments: string[]) => Promise<boolean>;
+  branchSendOriginalMarkdown?: string;
+  branchSendBusy?: boolean;
+  branchSendPending?: boolean;
+  branchSendError?: boolean;
+  onRetryBranchSend?: () => Promise<boolean>;
+  onOpenBranch?: (branch: ConversationBranchV4) => Promise<boolean>;
   onNewConversation?: () => Promise<void> | void;
   onDeleteConversation?: (conversationId: string) => Promise<void> | void;
   onSuggestFollowUps?: (runId: string) => Promise<string[]>;
-  onSend?: (message: string, mode: "chat" | "plan") => Promise<boolean | void> | boolean | void;
+  referenceCatalog?: ComposerCatalogItem[];
+  onOpenSearch?: () => void;
+  searchRequest?: WorkspaceSearchRequest | null;
+  onSearchRequestHandled?: (key: string) => void;
+  contextUsage?: ContextUsageView | null;
+  contextUsageError?: boolean;
+  sideChat?: SideChatController;
+  queueItems?: ComposerQueueItemV4[];
+  queueError?: boolean;
+  queueLoading?: boolean;
+  onQueueRefresh?: () => Promise<void>;
+  onQueueUpdate?: (request: UpdateComposerQueueRequestV4) => Promise<unknown>;
+  onQueueAction?: (request: ComposerQueueActionRequestV4) => Promise<unknown>;
+  onQueue?: (message: string, mode: "chat" | "plan", references?: ComposerReference[], attachments?: string[]) => Promise<boolean>;
+  replacement?: {
+    busy: boolean; pending: boolean; error: boolean; originalMarkdown?: string;
+    send: (message: string, mode: "chat" | "plan", target: { run_id: string; sequence: number; event_hash: string }, references: ComposerReference[], attachments: string[]) => Promise<boolean>;
+    retry: () => Promise<boolean>;
+  };
+  onSend?: (message: string, mode: "chat" | "plan", references?: ComposerReference[], attachments?: string[]) => Promise<boolean | void> | boolean | void;
   messages?: Array<{ id: string; role: "user" | "assistant" | "tool" | "system"; markdown: string; created_at?: string }>;
   streamingAssistant?: string;
   agentBusy?: boolean;
   agentNotice?: string;
   agentRetryNotice?: string;
   modelLabel?: string;
+  activeModelProfile?: ModelProfile | null;
+  modelProfiles?: ModelProfile[];
   modelPicker?: ReactNode;
   composerBusy?: boolean;
   modelOptions?: Array<{ id: string; label: string }>;
@@ -134,11 +186,18 @@ interface Props {
   onRetrySync?: (id: string) => Promise<void> | void;
 }
 
-type ContextTab = "files" | "plan" | "artifacts" | "notebook" | "environment" | "provenance" | "agents" | "records";
+type ContextTab = "files" | "plan" | "artifacts" | "notebook" | "environment" | "provenance" | "agents" | "records" | "side-chat";
 const DEFAULT_CONTEXT_TABS: ContextTab[] = ["artifacts", "agents", "files", "environment"];
 const AGENT_STALL_THRESHOLD_MS = 90_000;
+type ComposerCommandInvocation = { id: string; args: string; raw: string };
+function parseComposerCommand(text: string): ComposerCommandInvocation | null {
+  const raw = text.trim();
+  const match = /^\/([a-z][a-z0-9-]*)(?:\s+([\s\S]*))?$/i.exec(raw);
+  if (!match) return null;
+  return { id: match[1].toLowerCase(), args: match[2] ?? "", raw };
+}
 
-export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, conversations = [], activeConversationId, capabilitySummary, capabilitiesLoading, capabilitiesError, onRefreshCapabilities, onSelectConversation, onNewConversation, onDeleteConversation, onSend, onSuggestFollowUps, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, modelPicker, composerBusy = false, modelOptions = [], modelId, onModelChange, agentMode, onAgentModeChange, conversationLocked = false, conversationHydrating = false, planActionBusy = false, v4Plan, latestPlanRevision, computeBackends = [], computeBackendId = "", containerImage = "", autonomyMode = "supervised", approvalPolicy = "risk_based", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onApprovalPolicyChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onRequestPlanRevision, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, activeRunLastActivityAt, agentRunEventsV4 = [], agentTextPreview, guidanceAvailable = false, onAnswerAgentQuestionV4, onDecideToolApprovalV4, onResolveUncertainV4, onResumeAgentRunV4, onCancelRuntimeRecoveryV4, onCloseBrowserRunTabsV4, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
+export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, conversations = [], activeConversationId, capabilitySummary, capabilitiesLoading, capabilitiesError, onRefreshCapabilities, onSelectConversation, onNewConversation, onDeleteConversation, onOpenBranch, onBranchSend, branchSendOriginalMarkdown, branchSendBusy = false, branchSendPending = false, branchSendError = false, onRetryBranchSend, onSend, onQueue, replacement, sideChat, contextUsage = null, contextUsageError = false, queueItems = [], queueError = false, queueLoading = false, onQueueRefresh, onQueueUpdate, onQueueAction, referenceCatalog, onOpenSearch, searchRequest, onSearchRequestHandled, onSuggestFollowUps, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", agentRetryNotice = "", modelLabel, activeModelProfile, modelProfiles = [], modelPicker, composerBusy = false, modelOptions = [], modelId, onModelChange, agentMode, onAgentModeChange, conversationLocked = false, conversationHydrating = false, planActionBusy = false, v4Plan, latestPlanRevision, computeBackends = [], computeBackendId = "", containerImage = "", autonomyMode = "supervised", approvalPolicy = "risk_based", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onApprovalPolicyChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onRequestPlanRevision, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, activeRunLastActivityAt, agentRunEventsV4 = [], agentTextPreview, guidanceAvailable = false, onAnswerAgentQuestionV4, onDecideToolApprovalV4, onResolveUncertainV4, onResumeAgentRunV4, onCancelRuntimeRecoveryV4, onCloseBrowserRunTabsV4, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
   const t = copy[locale];
   const zh = locale === "zh-CN";
   const [tab, setTab] = useState<ContextTab>("artifacts");
@@ -150,7 +209,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const notebookCells = collectNotebookCells(messages, sidebarEvents);
   const delegatedTasks = collectDelegatedTasks(sidebarEvents);
   const provenanceRows = collectProvenance(sidebarEvents);
-  const sidebarSections: Array<{ id: ContextTab | "highlights" | "side-chat"; label: string; unavailable?: string }> = [
+  const sidebarSections: Array<{ id: ContextTab | "highlights"; label: string; unavailable?: string }> = [
     { id: "artifacts", label: `Artifacts (${projectArtifacts.length})` },
     { id: "agents", label: "Agents" },
     { id: "notebook", label: `Notebook (${notebookCells.length})` },
@@ -158,7 +217,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     { id: "files", label: "Files" },
     { id: "provenance", label: `Provenance (${provenanceRows.length})` },
     { id: "environment", label: "Environment" },
-    { id: "side-chat", label: "Side chat", unavailable: zh ? "需要带证据引用的独立问答接口；当前尚未接入。" : "Requires an independent evidence-backed chat API; it is not connected." },
+    { id: "side-chat", label: "Side chat", unavailable: sideChat ? undefined : (zh ? "独立旁聊需要桌面宿主。" : "Side chat requires the desktop host.") },
   ];
   const tabLabel = (id: ContextTab) => id === "plan" ? "Plan" : id === "records" ? (zh ? "研究记录" : "Research records") : sidebarSections.find((section) => section.id === id)!.label;
   function openSidebarSection(id: ContextTab) {
@@ -181,6 +240,133 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   useWindowEscapeLayer(sidebarOpen && sectionMenuOpen, () => setSectionMenuOpen(false));
   const [expanded, setExpanded] = useState(false);
   const [draft, setDraft] = useState("");
+  const branchDrafts = useRef(new Map<string, string>());
+  const branching = useConversationBranch(project.id, activeConversationId, locale, onOpenBranch ? async (branch) => {
+    const opened = await onOpenBranch(branch);
+    if (opened) { const key = `${branch.project_id}:${branch.source_conversation_id}`; const sourceDraft = branchDrafts.current.get(key); if (sourceDraft !== undefined) { branchDrafts.current.delete(key); setDraft(sourceDraft); } }
+    return opened;
+  } : undefined);
+  const branchDisabled = branchSendBusy || branchSendPending || !onOpenBranch || agentBusy || conversationLocked || conversationHydrating || composerBusy || branching.busy || branching.retryAvailable;
+  const lastBranchAnchor = [...messages].reverse().find((message) => message.role === "user");
+  async function branchAt(sourceMessageId: string, kind: "before_user" | "after_response", title?: string): Promise<boolean> {
+    if (branchDisabled) return false;
+    setSendMenuOpen(false);
+    if (title !== undefined && onBranchSend && (title.trim() || attachments.receipts.length)) {
+      const generation = sendGenerationRef.current;
+      const text = title.trim() || (zh ? "请查看附件。" : "Please inspect the attached files.");
+      const references = selectedReferences;
+      const ids = attachments.receipts.map((receipt) => receipt.id);
+      if (attachmentsBlocked || fileReferenceOperation.current || !computeReady) return false;
+      try {
+        const accepted = await onBranchSend(sourceMessageId, text, planModeEnabled ? "plan" : "chat", references.map((item) => item.reference), ids);
+        if (!accepted || generation !== sendGenerationRef.current) return accepted;
+        setDraft((current) => current === title ? "" : current);
+        setSelectedReferences((current) => current === references ? [] : current);
+        attachments.clearAccepted(ids);
+        return true;
+      } catch {
+        if (generation === sendGenerationRef.current) setSendError(true);
+        return false;
+      }
+    }
+    const sourceText = title === undefined ? messages.find((message) => message.id === sourceMessageId && message.role === "user")?.markdown : undefined;
+    if (sourceText !== undefined) branchDrafts.current.set(`${project.id}:${activeConversationId}`, sourceText);
+    return branching.start(sourceMessageId, kind, title?.trim() || (zh ? "会话分支" : "Conversation branch"));
+  }
+  const draftRef = useRef<HTMLTextAreaElement>(null);
+  const handledSearchRequest = useRef<string | null>(null);
+  const [referenceNotice, setReferenceNotice] = useState("");
+  const [openedSearchArtifact, setOpenedSearchArtifact] = useState<ComposerCatalogItem | null>(null);
+  const [selectedReferences, setSelectedReferences] = useState<ComposerCatalogItem[]>([]);
+  const [fileSource, setFileSource] = useState<"local" | "remote">(() => project.connection_id || (project.connection_id === undefined && (remoteFiles?.length || onRefreshFiles)) ? "remote" : "local");
+  const [localFiles, setLocalFiles] = useState<import("../../types").RemoteFileEntry[]>([]);
+  const [localFilesBusy, setLocalFilesBusy] = useState(false);
+  const [localFilesError, setLocalFilesError] = useState("");
+  const [fileRefreshVersion, setFileRefreshVersion] = useState(0);
+  const [fileReferenceBusy, setFileReferenceBusy] = useState(false);
+  const fileReferenceOperation = useRef<object | null>(null);
+  const remoteRefreshRef = useRef(onRefreshFiles);
+  remoteRefreshRef.current = onRefreshFiles;
+  useEffect(() => {
+    setFileSource(project.connection_id || (project.connection_id === undefined && (remoteFiles?.length || onRefreshFiles)) ? "remote" : "local");
+    setLocalFiles([]);
+  }, [project.id, project.connection_id]);
+  useEffect(() => {
+    fileReferenceOperation.current = null;
+    setFileReferenceBusy(false);
+    return () => { fileReferenceOperation.current = null; };
+  }, [project.id, activeConversationId]);
+  useEffect(() => {
+    if (!sidebarOpen || tab !== "files") return;
+    if (fileSource === "remote") { void remoteRefreshRef.current?.(); return; }
+    let active = true;
+    setLocalFiles([]); setLocalFilesBusy(true); setLocalFilesError("");
+    listLocalComposerFiles(project.id).then((files) => { if (active) setLocalFiles(files); })
+      .catch(() => { if (active) setLocalFilesError(locale === "zh-CN" ? "本地目录加载失败，请刷新重试。" : "Could not load local files. Refresh to retry."); })
+      .finally(() => { if (active) setLocalFilesBusy(false); });
+    return () => { active = false; };
+  }, [sidebarOpen, tab, fileSource, project.id, fileRefreshVersion, locale]);
+
+  const attachments = useComposerAttachments(project.id, activeConversationId);
+  const attachmentsBlocked = attachments.busy || attachments.items.some((item) => item.status !== "ready");
+  const [referenceTrigger, setReferenceTrigger] = useState<ReturnType<typeof parseComposerTrigger>>(null);
+  const [fileTextPreview, setFileTextPreview] = useState<WorkspaceFileReference | null>(null);
+  const [workflowLibraryOpen, setWorkflowLibraryOpen] = useState(false);
+  const [guidanceDialogOpen, setGuidanceDialogOpen] = useState(false);
+  const guidanceDraftAtOpenRef = useRef<string | null>(null);
+  const guidancePendingRequestsRef = useRef(new Map<string, { current: SubmitGuidanceV4Request | null }>());
+  const [reviewDialogOpen, setReviewDialogOpen] = useState(false);
+  const [reviewerSettingsOpen, setReviewerSettingsOpen] = useState(false);
+  const [trajectoryOpen, setTrajectoryOpen] = useState(false);
+  const [workflowCatalogVersion, setWorkflowCatalogVersion] = useState(0);
+  const [catalog, setCatalog] = useState<ComposerCatalogItem[]>([]);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [catalogError, setCatalogError] = useState("");
+  const [composerCommandNotice, setComposerCommandNotice] = useState("");
+  const referencesOpen = referenceTrigger !== null;
+  useEffect(() => {
+    if (!referencesOpen || referenceCatalog) return;
+    let current = true;
+    setCatalog([]);
+    setCatalogLoading(true);
+    setCatalogError("");
+    composerReferenceCatalog(project.id).then((items) => {
+      if (current) setCatalog(items);
+    }).catch(() => {
+      if (current) setCatalogError(locale === "zh-CN" ? "引用加载失败，请重新打开重试。" : "Could not load references. Reopen to retry.");
+    }).finally(() => { if (current) setCatalogLoading(false); });
+    return () => { current = false; };
+  }, [referencesOpen, project.id, referenceCatalog, locale, workflowCatalogVersion]);
+  function selectReference(item: ComposerCatalogItem) {
+    if (!referenceTrigger) return false;
+    if (selectedReferences.length >= 12 && !selectedReferences.some((entry) => referenceKey(entry.reference) === referenceKey(item.reference))) {
+      setCatalogError(locale === "zh-CN" ? "每条消息最多引用 12 项。请先移除一项。" : "A message can reference up to 12 items. Remove one first.");
+      return false;
+    }
+    setSelectedReferences((items) => items.some((entry) => referenceKey(entry.reference) === referenceKey(item.reference)) || items.length >= 12 ? items : [...items, item]);
+    const { start, end } = referenceTrigger;
+    setDraft((text) => text.slice(0, start) + text.slice(end));
+    setReferenceTrigger(null);
+    setCatalogError("");
+    requestAnimationFrame(() => { draftRef.current?.focus(); draftRef.current?.setSelectionRange(start, start); });
+  }
+  const manualDraftHeight = useRef(false);
+  const resizeStartHeight = useRef<number | null>(null);
+  const [sendError, setSendError] = useState(false);
+  const [sharing, setSharing] = useState(false);
+  const [contextUsageOpen, setContextUsageOpen] = useState(false);
+  useEffect(() => setContextUsageOpen(false), [project.id, activeConversationId]);
+  const [modifierSend, setModifierSend] = useState(() => {
+    try { return localStorage.getItem("omicsops.composer.modifierSend") === "true"; } catch { return false; }
+  });
+  useLayoutEffect(() => {
+    const input = draftRef.current;
+    if (!input) return;
+    if (!draft) manualDraftHeight.current = false;
+    if (manualDraftHeight.current) return;
+    input.style.height = "0px";
+    input.style.height = `${input.scrollHeight}px`;
+  }, [draft]);
   const [localMode, setLocalMode] = useState<SessionAgentModeV4>("agent");
   const [planSessionActive, setPlanSessionActive] = useState(false);
   const [composerMenuOpen, setComposerMenuOpen] = useState(false);
@@ -188,6 +374,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const [permissionMenuOpen, setPermissionMenuOpen] = useState(false);
   const [runtimeLanguage, setRuntimeLanguage] = useState<KernelLanguage | null>(null);
   const [sendMenuOpen, setSendMenuOpen] = useState(false);
+  const sendOptionsRef = useRef<HTMLButtonElement>(null);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   useWindowEscapeLayer(expanded, () => setExpanded(false));
   useWindowEscapeLayer(composerMenuOpen, () => setComposerMenuOpen(false));
@@ -196,6 +383,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   useWindowEscapeLayer(sendMenuOpen, () => setSendMenuOpen(false));
   useWindowEscapeLayer(modelMenuOpen, () => setModelMenuOpen(false));
   useWindowEscapeLayer(runtimeLanguage !== null, () => setRuntimeLanguage(null));
+  useWindowEscapeLayer(trajectoryOpen, () => { setTrajectoryOpen(false); draftRef.current?.focus(); });
   const [sentMessages, setSentMessages] = useState<string[]>([]);
   const [approved, setApproved] = useState(false);
   const [sendBusy, setSendBusy] = useState(false);
@@ -227,18 +415,45 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
       .filter((event) => event.run_id === effectiveActiveRunId)
       .sort((left, right) => left.sequence - right.sequence)
     : [];
+  const currentScopeRunEventsV4 = activeConversationId
+    ? agentRunEventsV4.filter((event) => event.project_id === project.id && event.conversation_id === activeConversationId)
+    : [];
+  const trajectoryRuns = groupAgentRunEventsV4(currentScopeRunEventsV4);
   const runFinished = Boolean(effectiveTerminalAgentEventV4(activeRunEventsV4));
   const runPaused = getV4PauseReason(activeRunEventsV4) !== null;
   const runActive = runStarted && !runFinished && !runPaused;
-  const showStopButton = Boolean(onCancelRun && (runActive || runStopping));
-  const stopLabel = runStopping ? (zh ? "终止中…" : "Stopping…") : (zh ? "终止运行" : "Stop run");
+  const stopAvailable = Boolean(onCancelRun && (runActive || runStopping));
+  const showStopButton = stopAvailable && !(onQueue && (draft.trim() || attachments.receipts.length));
+  const stopLabel = runStopping ? (zh ? "终止中…" : "Stopping…") : onQueue ? (zh ? "停止当前运行" : "Stop current run") : (zh ? "终止运行" : "Stop run");
   const [watchdogNow, setWatchdogNow] = useState(() => Date.now());
   const lastActivityMs = activeRunLastActivityAt ? Date.parse(activeRunLastActivityAt) : Number.NaN;
   const runStalled = runActive && Number.isFinite(lastActivityMs) && watchdogNow - lastActivityMs > AGENT_STALL_THRESHOLD_MS;
   // A paused run still owns the conversation sequence. Keep the composer
   // locked while approval/input cards remain usable inside the run trace.
-  const composerDisabled = composerBusy || conversationHydrating || sendBusy || agentBusy || conversationLocked || (runStarted && !runFinished);
-  const sendLabel = composerDisabled || planLoading ? (planModeEnabled ? (zh ? "规划中…" : "Planning…") : (zh ? "执行中…" : "Running…")) : t.send;
+  const existingComposerDisabled = fileReferenceBusy || composerBusy || conversationHydrating || sendBusy || agentBusy || conversationLocked || (runStarted && !runFinished);
+  const agentPreferences = useConversationAgentPreferences(project.id, activeConversationId ?? null, existingComposerDisabled);
+  const sessionReviews = useSessionReviews(project.id, activeConversationId ?? null, activeModelProfile);
+  const reviewBusy = sessionReviews.busy;
+  const fastMode = agentPreferences.preferences.fast_mode ?? null;
+  const profileFastMode = activeModelProfile?.fast_mode ?? null;
+  const effectiveFastMode = fastMode ?? profileFastMode;
+  const fastModeAvailable = activeModelProfile ? supportsFastMode(activeModelProfile) : false;
+  // Keep a stale enabled override visible after switching models so it can be
+  // turned off. The host remains the authority and will reject unsupported
+  // enabled requests when a new run is started.
+  const showFastMode = fastModeAvailable || fastMode === true || profileFastMode === true;
+  const fastModeLocked = existingComposerDisabled || agentPreferences.busy || Boolean(agentPreferences.loadError) || !activeConversationId;
+  const fastModeButtonDisabled = fastModeLocked || (!fastModeAvailable && fastMode !== true && profileFastMode !== true);
+  const fastModeOption = fastMode === true ? "fast" : fastMode === false ? "standard" : "default";
+  const queueBacklog = queueItems.some((item) => item.project_id === project.id && item.conversation_id === activeConversationId && !["completed", "failed", "cancelled"].includes(item.status));
+  const queuedSend = Boolean(onQueue && (agentBusy || conversationLocked || (runStarted && !runFinished) || reviewBusy || planLoading || queueBacklog));
+  const composerDisabled = onQueue ? fileReferenceBusy || composerBusy || conversationHydrating || sendBusy || queueLoading : existingComposerDisabled;
+  const preferenceError = agentPreferences.loadError
+    ? (zh ? "会话偏好加载失败，请重试。" : agentPreferences.loadError)
+    : agentPreferences.saveError
+      ? (zh ? "会话偏好保存失败，请重试。" : agentPreferences.saveError)
+      : "";
+  const sendLabel = fileReferenceBusy ? (zh ? "校验路径中…" : "Checking paths…") : queuedSend ? (zh ? "加入队列" : "Add to queue") : reviewBusy ? (zh ? "审核中…" : "Reviewing…") : composerDisabled || planLoading ? (planModeEnabled ? (zh ? "规划中…" : "Planning…") : (zh ? "执行中…" : "Running…")) : queuedSend ? (zh ? "加入队列" : "Add to queue") : t.send;
   const activeConversation = conversations.find((item) => item.id === activeConversationId);
   const conversationTitle = activeConversation?.title || (zh ? "新会话" : "New conversation");
   const historicalAgentRunEventsV4 = effectiveActiveRunId
@@ -254,8 +469,87 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     const status = language === "python" ? selectedBackend?.python_status : selectedBackend?.r_status;
     return status === "available" ? (zh ? "可用" : "AVAILABLE") : status === "unavailable" ? (zh ? "不可用" : "UNAVAILABLE") : (zh ? "待检测" : "UNVERIFIED");
   }
+  function openProjectFiles() { openSidebarSection("files"); setFileRefreshVersion((value) => value + 1); }
+  function appendFileReferences(items: ComposerCatalogItem[]) {
+    const allowed = items.every((item) => item.reference.kind === "workspace_file" && item.reference.project_id === project.id &&
+      (item.reference.backend_id === "local" || item.reference.backend_id === `ssh:${project.connection_id}`));
+    if (!allowed) { setReferenceNotice(zh ? "只能附加当前项目的文件引用。" : "Only files from this project can be attached."); return; }
+    setSelectedReferences((current) => {
+      const added = items.filter((item, index) => !current.some((entry) => referenceKey(entry.reference) === referenceKey(item.reference)) && items.findIndex((entry) => referenceKey(entry.reference) === referenceKey(item.reference)) === index);
+      if (current.length + added.length > 12) { setReferenceNotice(zh ? "每条消息最多引用 12 项。" : "A message can reference up to 12 items."); return current; }
+      return [...current, ...added];
+    });
+    setReferenceTrigger(null);
+    draftRef.current?.focus();
+  }
+  function attachWorkspaceFile(reference: WorkspaceFileReference) {
+    if (composerDisabled) return;
+    appendFileReferences([{ reference, label: reference.relative_path, description: reference.backend_id === "local" ? (zh ? "本地文件引用；未上传" : "Local file reference; not uploaded") : (zh ? "SSH 文件引用；未下载" : "SSH file reference; not downloaded") }]);
+  }
+  async function attachClipboardPaths(paths: string[]) {
+    if (composerDisabled || fileReferenceOperation.current) return;
+    const operation = {};
+    fileReferenceOperation.current = operation; setFileReferenceBusy(true); setReferenceNotice("");
+    try {
+      const items = await resolveComposerClipboardPaths(project.id, paths);
+      if (fileReferenceOperation.current !== operation) return;
+      appendFileReferences(items);
+    } catch {
+      if (fileReferenceOperation.current === operation) setReferenceNotice(zh ? "路径无法附加。请确认文件存在于当前项目内。" : "Could not attach paths. Check that the files exist inside this project.");
+    } finally {
+      if (fileReferenceOperation.current === operation) { fileReferenceOperation.current = null; setFileReferenceBusy(false); }
+    }
+  }
+  const fileBackendId = fileSource === "local" ? "local" : project.connection_id ? `ssh:${project.connection_id}` : null;
+  const currentFileReference = (relativePath: string): WorkspaceFileReference => ({ kind: "workspace_file", project_id: project.id, backend_id: fileBackendId!, relative_path: relativePath });
+
+  const restoreState = useRef({ projectId: project.id, conversationId: activeConversationId, draft, references: selectedReferences, attachmentCount: attachments.items.length });
+  restoreState.current = { projectId: project.id, conversationId: activeConversationId, draft, references: selectedReferences, attachmentCount: attachments.items.length };
+  async function restoreQueuedDraft(item: ComposerQueueItemV4) {
+    if (!onQueueAction || item.attachments.length !== item.attachment_receipts.length || item.attachments.some((id) => !item.attachment_receipts.some((receipt) => receipt.id === id))) throw new Error("Queued material is unavailable");
+    const available = () => restoreState.current.projectId === item.project_id && restoreState.current.conversationId === item.conversation_id && !restoreState.current.draft && !restoreState.current.references.length && !restoreState.current.attachmentCount;
+    if (!available()) throw new Error("Composer already contains a draft");
+    if (item.status === "pending") await onQueueAction({ project_id: item.project_id, conversation_id: item.conversation_id, request_id: item.request_id, expected_revision: item.revision, action: "cancel" });
+    if (!available() || !attachments.restoreReceipts(item.attachment_receipts)) throw new Error("Composer changed during restore");
+    setSelectedReferences(item.references.map((reference) => (referenceCatalog ?? catalog).find((entry) => JSON.stringify(entry.reference) === JSON.stringify(reference)) ?? { reference, label: reference.kind, description: zh ? "从发送队列恢复的引用" : "Reference restored from the send queue" }));
+    setDraft(item.message_markdown); draftRef.current?.focus();
+  }
   function closeComposerMenus() {
+    setReferenceTrigger(null);
     setComposerMenuOpen(false); setPermissionMenuOpen(false); setComputeMenuOpen(false); setModelMenuOpen(false); setSendMenuOpen(false);
+  }
+  function guidancePendingRequestForScope(runId: string) {
+    const key = `${project.id}:${activeConversationId}:${runId}`;
+    let pending = guidancePendingRequestsRef.current.get(key);
+    if (!pending) {
+      for (const [scope, value] of guidancePendingRequestsRef.current) {
+        if (value.current === null) guidancePendingRequestsRef.current.delete(scope);
+      }
+      pending = { current: null };
+      guidancePendingRequestsRef.current.set(key, pending);
+    }
+    return pending;
+  }
+  function openGuidanceDialog() {
+    if (!guidanceDialogAvailable) return;
+    const hasComposerContext = attachments.items.length > 0 || attachments.receipts.length > 0 || selectedReferences.length > 0;
+    guidanceDraftAtOpenRef.current = !hasComposerContext && draft ? draft : null;
+    // The menu item is removed as the dialog mounts; focus the stable launch
+    // control first so the dialog can restore to a connected element.
+    sendOptionsRef.current?.focus();
+    closeComposerMenus();
+    setGuidanceDialogOpen(true);
+  }
+  function closeGuidanceDialog() {
+    setGuidanceDialogOpen(false);
+    guidanceDraftAtOpenRef.current = null;
+  }
+  function handleGuidanceAccepted(markdown: string) {
+    const openedDraft = guidanceDraftAtOpenRef.current;
+    if (openedDraft === null || openedDraft.trim() !== markdown) return;
+    guidanceDraftAtOpenRef.current = null;
+    if (attachments.items.length > 0 || attachments.receipts.length > 0 || selectedReferences.length > 0) return;
+    setDraft((current) => current === openedDraft ? "" : current);
   }
   // Older hosts may return the ordinary run's internal contract. Only expose an actual Plan.
   const hasApprovalPlan = Boolean(v4Plan?.plan && (
@@ -271,15 +565,75 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const showPlanPanel = planModeEnabled || planLoading || (!controlledMode && (planSessionActive || hasApprovalPlan));
   const executeStart = activeRunEventsV4.findIndex((event) => event.event.kind === "mode_changed" && event.event.mode === "execute");
   const visibleActiveRunEventsV4 = hasApprovalPlan && executeStart >= 0 ? activeRunEventsV4.slice(executeStart) : hasApprovalPlan ? [] : activeRunEventsV4;
+  const guidanceRunId = effectiveActiveRunId ?? (guidanceAvailable && !planModeEnabled && !hasApprovalPlan ? v4Plan?.run_id ?? null : null);
+  // History remains readable after a run pauses or finishes, while new
+  // guidance is accepted only by an ordinary Agent run that is still active.
+  const guidanceDialogAvailable = Boolean(
+      guidanceAvailable
+        && activeConversationId
+        && guidanceRunId
+      && !planModeEnabled
+      && !hasApprovalPlan,
+  );
+  const guidanceEnabled = guidanceDialogAvailable && runStarted && !runFinished && !runPaused && !runStopping;
 
   useEffect(() => { if (!controlledMode) setLocalMode("agent"); setPlanSessionActive(false); }, [activeConversationId, controlledMode]);
   useEffect(() => {
     sendGenerationRef.current += 1;
     sendBusyRef.current = false;
     setSendBusy(false);
+    setSendError(false);
+    setSharing(false);
+    setWorkflowLibraryOpen(false);
+    setGuidanceDialogOpen(false);
+    guidanceDraftAtOpenRef.current = null;
+    setReviewDialogOpen(false);
+    setReviewerSettingsOpen(false);
+    setTrajectoryOpen(false);
+    setFileTextPreview(null);
+    setReferenceTrigger(null);
+    setSelectedReferences([]);
+    setReferenceNotice("");
+    setComposerCommandNotice("");
     followingLatestRef.current = true;
     setFollowingLatest(true);
-  }, [activeConversationId]);
+  }, [project.id, activeConversationId]);
+  useEffect(() => {
+    if (!searchRequest || handledSearchRequest.current === searchRequest.key || searchRequest.projectId !== project.id) return;
+    handledSearchRequest.current = searchRequest.key;
+    onSearchRequestHandled?.(searchRequest.key);
+    setSharing(false);
+    setGuidanceDialogOpen(false);
+    guidanceDraftAtOpenRef.current = null;
+    setWorkflowLibraryOpen(false);
+    setFileTextPreview(null);
+    setRuntimeLanguage(null);
+    setExpanded(false);
+    closeComposerMenus();
+    if (searchRequest.kind === "reveal") return;
+    if (searchRequest.kind === "files") { openProjectFiles(); return; }
+    if (searchRequest.kind === "artifact") {
+      setOpenedSearchArtifact(searchRequest.item);
+      openSidebarSection("artifacts");
+      return;
+    }
+    if (searchRequest.conversationId !== activeConversationId) return;
+    if (composerDisabled) {
+      setReferenceNotice(zh ? "当前消息暂不可编辑，请稍后重新附加引用。" : "The message is currently locked. Attach the reference again when it is editable.");
+      return;
+    }
+    const item = searchRequest.item;
+    const reference = item.reference;
+    if (reference.kind !== "skill" && (reference.project_id !== project.id || (reference.kind === "session" && reference.id === activeConversationId))) return;
+    if (selectedReferences.some((entry) => referenceKey(entry.reference) === referenceKey(reference))) { draftRef.current?.focus(); return; }
+    if (selectedReferences.length >= 12) {
+      setReferenceNotice(zh ? "每条消息最多引用 12 项。请先移除一项。" : "A message can reference up to 12 items. Remove one first.");
+      return;
+    }
+    setSelectedReferences((items) => [...items, item]);
+    setReferenceNotice("");
+    draftRef.current?.focus();
+  }, [searchRequest, project.id, activeConversationId, composerDisabled, selectedReferences, zh, onSearchRequestHandled]);
   useEffect(() => { if (showPlanPanel) openSidebarSection("plan"); }, [showPlanPanel]);
   useEffect(() => {
     if (!runActive || !activeRunLastActivityAt) {
@@ -329,28 +683,238 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     setLocalMode(nextMode);
   }
 
+  const replacementDraft = useRef<{ generation: number; draft: string; references: typeof selectedReferences; attachments: string[] } | null>(null);
+  const replacementHead = activeRunEventsV4.at(-1);
+  const replacementDisabled = !replacement || replacement.busy || replacement.pending || composerDisabled || attachmentsBlocked || !computeReady || agentPreferences.busy || Boolean(agentPreferences.loadError) || runStopping || runFinished || !replacementHead || !activeRunId || (!draft.trim() && !attachments.receipts.length);
+  function clearReplacementDraft() {
+    const submitted = replacementDraft.current;
+    if (submitted && submitted.generation === sendGenerationRef.current) {
+      setDraft((current) => current === submitted.draft ? "" : current);
+      setSelectedReferences((current) => current === submitted.references ? [] : current);
+      attachments.clearAccepted(submitted.attachments);
+    }
+    replacementDraft.current = null;
+  }
+  async function replaceCurrentTurn() {
+    if (!replacement || replacementDisabled || !replacementHead || !activeRunId || fileReferenceOperation.current) return;
+    const submitted = { generation: sendGenerationRef.current, draft, references: selectedReferences, attachments: attachments.receipts.map((receipt) => receipt.id) };
+    replacementDraft.current = submitted;
+    setSendMenuOpen(false);
+    const accepted = await replacement.send(draft.trim() || (zh ? "请查看附件。" : "Please inspect the attached files."), planModeEnabled ? "plan" : "chat", { run_id: activeRunId, sequence: replacementHead.sequence, event_hash: replacementHead.event_hash }, selectedReferences.map((item) => item.reference), submitted.attachments);
+    if (accepted && replacementDraft.current === submitted) clearReplacementDraft();
+  }
+  async function retryReplacement() {
+    if (!replacement) return;
+    const submitted = replacementDraft.current;
+    if (await replacement.retry()) {
+      if (replacementDraft.current === submitted) clearReplacementDraft();
+    }
+  }
   async function send() {
-    const message = draft.trim();
-    if (!message || composerDisabled || sendBusyRef.current) return;
+    const submittedDraft = draft;
+    const message = submittedDraft.trim() || (attachments.receipts.length ? (zh ? "请查看附件。" : "Please inspect the attached files.") : "");
+    if (typedComposerCommand) { typedComposerCommand.onSelect(); return; }
+    if (!message || fileReferenceOperation.current || attachmentsBlocked || composerDisabled || (!onQueue && reviewBusy) || agentPreferences.busy || Boolean(agentPreferences.loadError) || (!onQueue && planLoading) || ((onSend || onQueue) && !computeReady) || sendBusyRef.current) return;
     const sendGeneration = sendGenerationRef.current;
     sendBusyRef.current = true;
     setSendBusy(true);
-    setDraft("");
+    setSendError(false);
     try {
-      if (onSend) {
+      const submit = onQueue ?? onSend;
+      if (submit) {
         const mode = planModeEnabled ? "plan" : "chat";
         setPlanSessionActive(mode === "plan");
-        const accepted = await onSend(message, mode);
-        if (accepted === false && sendGeneration === sendGenerationRef.current) setDraft((current) => current || message);
+        const attachmentIds = attachments.receipts.map((receipt) => receipt.id);
+        const accepted = attachmentIds.length
+          ? await submit(message, mode, selectedReferences.map((item) => item.reference), attachmentIds)
+          : selectedReferences.length ? await submit(message, mode, selectedReferences.map((item) => item.reference)) : await submit(message, mode);
+        if (sendGeneration === sendGenerationRef.current) {
+          if (accepted === false) setSendError(true);
+          else {
+            setDraft((current) => current === submittedDraft ? "" : current);
+            setSelectedReferences((current) => current.filter((item) => !selectedReferences.some((sent) => referenceKey(sent.reference) === referenceKey(item.reference))));
+            setReferenceTrigger(null);
+            attachments.clearAccepted(attachmentIds);
+          }
+        }
       } else {
         setSentMessages((current) => [...current, message]);
+        setDraft("");
+        setSelectedReferences([]);
+        setReferenceTrigger(null);
       }
+    } catch {
+      if (sendGeneration === sendGenerationRef.current) setSendError(true);
     } finally {
       if (sendGeneration === sendGenerationRef.current) {
         sendBusyRef.current = false;
         setSendBusy(false);
       }
     }
+  }
+
+  const sideComposerAttempts = useRef(new Map<string, { draft: string; references: ComposerCatalogItem[]; ids: string[]; generation: number }>());
+  const sideScope = `${project.id}:${activeConversationId ?? ""}`;
+  function clearAcceptedSideDraft(scope: string) {
+    const attempt = sideComposerAttempts.current.get(scope);
+    sideComposerAttempts.current.delete(scope);
+    if (!attempt || attempt.generation !== sendGenerationRef.current) return;
+    setDraft((current) => current === attempt.draft ? "" : current);
+    // Only clear the submitted selection instance; edits can re-add the same reference.
+    setSelectedReferences((current) => current === attempt.references ? [] : current);
+    attachments.clearAccepted(attempt.ids);
+  }
+  async function sendSideQuestion(question?: string, originalDraft = draft, fromCommand = false): Promise<boolean> {
+    if (!sideChat || !activeConversationId) {
+      if (fromCommand) setComposerCommandNotice(zh ? "独立旁聊需要桌面宿主。" : "Side chat requires the desktop host.");
+      return false;
+    }
+    closeComposerMenus(); openSidebarSection("side-chat");
+    const hasMaterial = attachments.receipts.length > 0 || selectedReferences.length > 0;
+    const requestedQuestion = question === undefined ? draft.trim() : question.trim();
+    if (!requestedQuestion && !hasMaterial) return true;
+    if (!sideChat.ready || !sideChat.modelId || sideChat.busy || sideChat.pending || attachmentsBlocked || fileReferenceOperation.current) {
+      if (fromCommand) setComposerCommandNotice(zh ? "独立旁聊当前不可用，请稍后重试。" : "Side chat is unavailable right now. Retry in a moment.");
+      return false;
+    }
+    const attempt = { draft: originalDraft, references: selectedReferences, ids: attachments.receipts.map((receipt) => receipt.id), generation: sendGenerationRef.current };
+    sideComposerAttempts.current.set(sideScope, attempt);
+    try {
+      const accepted = await sideChat.send({ question_markdown: requestedQuestion || (zh ? "请解释所选资料。" : "Please explain the selected material."), references: attempt.references.map((item) => item.reference), attachments: attempt.ids });
+      if (accepted) clearAcceptedSideDraft(sideScope);
+      return accepted;
+    } catch {
+      if (fromCommand) setComposerCommandNotice(zh ? "独立旁聊状态未能确认，原始命令已保留。请重试。" : "Side chat status could not be confirmed; the original command is preserved. Retry.");
+      return false;
+    }
+  }
+  async function retrySideQuestion() {
+    if (!sideChat) return false;
+    const accepted = await sideChat.retry();
+    if (accepted) clearAcceptedSideDraft(sideScope);
+    return accepted;
+  }
+  function revealSideChatSource(messageId: string) {
+    if (!messages.some((message) => message.id === messageId)) return;
+    const node = [...(messageStreamRef.current?.querySelectorAll<HTMLElement>("[data-message-id]") ?? [])].find((element) => element.dataset.messageId === messageId);
+    if (node) { followingLatestRef.current = false; setFollowingLatest(false); node.scrollIntoView({ block: "center" }); node.focus(); }
+  }
+
+  function prepareSkill() {
+    const request = zh
+      ? "请根据当前会话中已验证的方法和证据，整理可复用的技能：生成 SKILL.md，说明适用条件、输入输出、环境依赖、执行步骤和验证方法。区分已执行结果与建议；保存前检查内容和路径，并遵守当前审批策略。"
+      : "Prepare a reusable skill from the verified methods and evidence in this conversation. Generate SKILL.md with applicability, inputs, outputs, environment dependencies, execution steps and validation. Distinguish executed results from suggestions; check the content and path before saving under the current approval policy.";
+    setDraft((current) => [current, request].filter(Boolean).join("\n\n"));
+    draftRef.current?.focus();
+  }
+
+  function runComposerCommand(action: () => void, options: { preserveDraft?: boolean; allowLocked?: boolean } = {}): boolean {
+    if (!options.allowLocked && composerDisabled) return false;
+    setComposerCommandNotice("");
+    const trigger = referenceTrigger ?? parseComposerTrigger(draft, draft.length);
+    if (!options.preserveDraft) {
+      if (trigger?.kind === "skill") setDraft((text) => text.slice(0, trigger.start) + text.slice(trigger.end));
+      else if (/^\/[a-z-]+$/i.test(draft.trim())) setDraft("");
+    }
+    setReferenceTrigger(null);
+    closeComposerMenus();
+    action();
+    return true;
+  }
+  function openTrajectory(): boolean {
+    if (!activeConversationId) {
+      setComposerCommandNotice(zh ? "当前没有可查看运行轨迹的会话。" : "There is no conversation to show a run trajectory for.");
+      return false;
+    }
+    closeComposerMenus();
+    setTrajectoryOpen(true);
+    return true;
+  }
+  function runBtwCommand(invocation: ComposerCommandInvocation): boolean {
+    const originalDraft = draft;
+    setComposerCommandNotice("");
+    if (!invocation.args.trim()) {
+      if (!sideChat || !activeConversationId) {
+        setComposerCommandNotice(zh ? "独立旁聊需要桌面宿主。" : "Side chat requires the desktop host.");
+        return false;
+      }
+      closeComposerMenus();
+      openSidebarSection("side-chat");
+      return true;
+    }
+    void sendSideQuestion(invocation.args, originalDraft, true);
+    return true;
+  }
+  function runForkCommand(invocation: ComposerCommandInvocation): boolean {
+    const originalDraft = draft;
+    const request = invocation.args.trim();
+    setComposerCommandNotice("");
+    if (!request) {
+      setComposerCommandNotice(zh ? "用法：/fork <请求>" : "Usage: /fork <request>");
+      closeComposerMenus();
+      return false;
+    }
+    if (!onBranchSend) {
+      setComposerCommandNotice(zh ? "分支发送需要桌面宿主。" : "Branch sending requires the desktop host.");
+      closeComposerMenus();
+      return false;
+    }
+    if (branchDisabled || !lastBranchAnchor) {
+      setComposerCommandNotice(!onOpenBranch ? (zh ? "当前宿主不支持创建分支。" : "Branching is unavailable in this host.") : (zh ? "当前会话已锁定，暂时不能创建分支。" : "Branching is locked while this conversation is active."));
+      closeComposerMenus();
+      return false;
+    }
+    if (!computeReady) {
+      setComposerCommandNotice(zh ? "请选择可用的计算配置后再创建分支。" : "Choose an available compute configuration before branching.");
+      closeComposerMenus();
+      return false;
+    }
+    const generation = sendGenerationRef.current;
+    closeComposerMenus();
+    void branchAt(lastBranchAnchor.id, "after_response", request).then((accepted) => {
+      if (accepted && generation === sendGenerationRef.current) setDraft((current) => current === originalDraft ? "" : current);
+    });
+    return true;
+  }
+  const composerCommands: ComposerPickerCommand[] = [
+    { id: "btw", label: "/btw", description: zh ? "不中断主任务，询问独立旁聊" : "Ask side chat without interrupting the main run", onSelect: () => runBtwCommand(parseComposerCommand(draft) ?? { id: "btw", args: "", raw: draft }) },
+    { id: "fork", label: "/fork", description: zh ? "创建分支并发送请求" : "Create a branch and send a request", onSelect: () => runForkCommand(parseComposerCommand(draft) ?? { id: "fork", args: "", raw: draft }) },
+    { id: "trajectory", label: "/trajectory", description: zh ? "查看当前会话的运行轨迹" : "View the current conversation's run trajectory", onSelect: () => activeConversationId ? runComposerCommand(openTrajectory, { allowLocked: true }) : openTrajectory() },
+    { id: "context", label: "/context", description: zh ? "查看上下文用量" : "Inspect context usage", onSelect: () => runComposerCommand(() => setContextUsageOpen(true)) },
+    { id: "workflows", label: "/workflows", description: zh ? "管理项目工作流" : "Manage project workflows", onSelect: () => runComposerCommand(() => setWorkflowLibraryOpen(true)) },
+    ...(!modeLocked ? [{ id: "plan", label: "/plan", description: zh ? "切换先做计划模式" : "Toggle plan-first mode", onSelect: () => runComposerCommand(() => chooseMode(planModeEnabled ? "agent" : "plan")) }] : []),
+    { id: "permission", label: "/permission", description: zh ? "打开权限选项" : "Open permission options", onSelect: () => runComposerCommand(() => setPermissionMenuOpen(true)) },
+    ...(activeConversationId ? [{ id: "review", label: "/review", description: zh ? "回看并审核当前会话" : "Review the current conversation", onSelect: () => runComposerCommand(() => setReviewDialogOpen(true)) }] : []),
+    { id: "files", label: "/files", description: zh ? "浏览项目文件" : "Browse project files", onSelect: () => runComposerCommand(openProjectFiles) },
+    { id: "save-as-skill", label: "/save-as-skill", description: zh ? "准备可复用技能草稿" : "Prepare a reusable skill draft", onSelect: () => runComposerCommand(prepareSkill) },
+    ...(onOpenSettings ? [{ id: "skills", label: "/skills", description: zh ? "管理技能" : "Manage skills", onSelect: () => runComposerCommand(() => onOpenSettings("skills")) }] : []),
+    ...(activeConversationId ? [{ id: "upload", label: "/upload", description: zh ? "添加本地附件" : "Attach local files", onSelect: () => runComposerCommand(() => { void attachments.chooseFiles(); }) }] : []),
+    ...(messages.length ? [{ id: "share", label: "/share", description: zh ? "预览并导出会话" : "Preview and export conversation", onSelect: () => runComposerCommand(() => setSharing(true)) }] : []),
+  ];
+  const composerCommandInvocation = parseComposerCommand(draft);
+  const typedComposerCommand = composerCommandInvocation && composerCommands.find((command) => command.id === composerCommandInvocation.id && (command.id === "btw" || command.id === "fork" || !composerCommandInvocation.args.trim()));
+
+  function toggleModifierSend() {
+    const next = !modifierSend;
+    setModifierSend(next);
+    try { localStorage.setItem("omicsops.composer.modifierSend", String(next)); } catch { /* Keep the session preference when browser storage is unavailable. */ }
+  }
+
+  function toggleAgentPreference(key: ConversationAgentPreferenceKey) {
+    if (existingComposerDisabled || agentPreferences.busy || agentPreferences.loadError || !activeConversationId) return;
+    agentPreferences.toggle(key);
+  }
+
+  function chooseFastMode(option: string) {
+    if (option === "fast" && !fastModeAvailable && fastMode !== true) return;
+    agentPreferences.setFastMode(option === "fast" ? true : option === "standard" ? false : null);
+  }
+
+  function toggleFastMode() {
+    const next = effectiveFastMode === true
+      ? (fastMode === null && profileFastMode === true ? false : null)
+      : true;
+    agentPreferences.setFastMode(next);
   }
 
   async function approvePlan() {
@@ -383,7 +947,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     <nav className="project-rail" aria-label={t.projects}>
       <div className="science-brand"><span className="brand-orbit"><FlaskConical size={20} /></span><div><strong>OmicsOps</strong><small>Life Science Workspace</small></div></div>
       <button className="rail-home" onClick={onBackToProjects} aria-label={zh ? "返回项目主页" : "Back to project home"}><ArrowLeft size={15} />{zh ? "返回项目主页" : "Project home"}</button>
-      <button className="rail-search"><Search size={15} />{zh ? "搜索项目" : "Search projects"}</button>
+      <button className="rail-search" onClick={onOpenSearch} disabled={!onOpenSearch}><Search size={15} />{zh ? "搜索项目" : "Search projects"}</button>
       <div className="rail-section"><span>{zh ? "项目" : "Projects"}</span><button className="project-row active"><span className="project-glyph"><Database size={16} /></span><span><strong>{project.name}</strong><small>{t.status}</small></span><ChevronRight size={14} /></button></div>
       <div className="rail-section sessions"><span>{zh ? "会话" : "Sessions"}</span><div className="session-list">{conversations.map((item) => { const title = item.title || (zh ? "新会话" : "New conversation"); const active = item.id === activeConversationId; const deleteDisabled = deletingConversationId !== null || conversationHydrating || conversationLocked || (active && (agentBusy || runActive)); return <div className={`session-entry ${active ? "active" : ""}`} key={item.id}><button className="session-row" aria-current={active ? "page" : undefined} onClick={() => void onSelectConversation?.(item.id)}><Sparkles size={15} /><span title={item.title}>{title}</span></button><button className="session-delete" aria-label={zh ? `删除会话：${title}` : `Delete conversation: ${title}`} title={zh ? "删除会话" : "Delete conversation"} disabled={deleteDisabled || !onDeleteConversation} onClick={() => void deleteConversation(item)}><Trash2 size={14} /></button></div>; })}</div><button className="new-session" disabled={conversationHydrating || agentBusy || conversationLocked} onClick={() => void onNewConversation?.()}><MessageSquarePlus size={15} />{t.newConversation}</button></div>
       <ConversationCapabilities projectId={project.id} conversationId={activeConversationId} summary={capabilitySummary} loading={capabilitiesLoading} error={capabilitiesError} onRefresh={onRefreshCapabilities} locale={locale} onLocaleChange={onLocaleChange} onOpenSettings={onOpenSettings} />
@@ -400,8 +964,14 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
         {!onSend && <article className="message user-message"><MarkdownContent markdown={zh ? "比较两批 PBMC，检查批次效应并生成可复现的分析报告。" : "Compare two PBMC batches, assess batch effects, and generate a reproducible report."} /></article>}
         {messages.length === 0 && <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><MarkdownContent markdown={zh ? "描述你的研究目标。我会按需查阅资料、调用工具并核验结果；需要先讨论方案时可切换到 Plan。" : "Describe your research goal. I will inspect relevant evidence, use tools, and verify results. Choose Plan when you want to discuss the approach first."} /></div></article>}
         {sentMessages.map((message, index) => <article className="message user-message" key={`${index}-${message}`}><MarkdownContent markdown={message} /></article>)}
-        {messages.map((message) => <Fragment key={message.id}>
-          {message.role === "user" ? <article className="message user-message"><MarkdownContent markdown={message.markdown} /></article> : message.role === "assistant" ? <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><MarkdownContent markdown={message.markdown} /></div></article> : null}
+        {onOpenBranch && activeConversationId && <ConversationBranchBanner projectId={project.id} conversationId={activeConversationId} locale={locale} onSelect={onSelectConversation} />}
+        {branching.error && <div className="agent-notice" role="alert"><span>{branching.error}</span>{branching.retryAvailable && <button disabled={branching.busy} onClick={() => void branching.retry()}>{zh ? "重试分支" : "Retry branch"}</button>}</div>}
+        {messages.map((message, messageIndex) => <Fragment key={message.id}>
+          {message.role === "user" ? <article className="message user-message" data-message-id={message.id} tabIndex={-1}><MarkdownContent markdown={message.markdown} /></article> : message.role === "assistant" ? <article className="message assistant-message" data-message-id={message.id} tabIndex={-1}><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><MarkdownContent markdown={message.markdown} /></div></article> : null}
+          {onOpenBranch && (message.role === "user" || message.role === "assistant") && <div className="message-branch-actions"><button type="button" disabled={branchDisabled || !messages.slice(0, messageIndex + 1).some((entry) => entry.role === "user")} onClick={() => {
+            const anchor = messages.slice(0, messageIndex + 1).reverse().find((entry) => entry.role === "user");
+            if (anchor) branchAt(anchor.id, message.role === "user" ? "before_user" : "after_response");
+          }}>{message.role === "user" ? (zh ? "从此消息前分叉" : "Branch before this message") : (zh ? "从此回复后分叉" : "Branch after this response")}</button></div>}
           {runTimelineV4.afterMessage.get(message.id)?.map((run) => <V4RunTrace locale={locale} events={run.events} onAnswer={onAnswerAgentQuestionV4} onDecideApproval={onDecideToolApprovalV4} onResolveUncertain={onResolveUncertainV4} onResume={onResumeAgentRunV4} onCancelRecovery={onCancelRuntimeRecoveryV4} onCloseBrowserTabs={onCloseBrowserRunTabsV4} historical key={run.runId} />)}
         </Fragment>)}
         {streamingAssistant && <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent · {zh ? "生成中" : "streaming"}</strong><MarkdownContent markdown={streamingAssistant} /></div></article>}
@@ -423,20 +993,48 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
       }}>↓ {zh ? "回到最新" : "Back to latest"}</button>}
       </section>
       <footer className="composer">
+        {branchSendError && <p role="alert">{zh ? "分支发送或打开未确认，原始消息和材料已保留。" : "Branch sending or opening was not confirmed; the original message and material are retained."}</p>}
+        {branchSendPending && onRetryBranchSend && <button type="button" disabled={branchSendBusy} onClick={() => { const original = branchSendOriginalMarkdown; void onRetryBranchSend().then((accepted) => { if (accepted && original) setDraft((current) => current.trim() === original ? "" : current); }); }}>{zh ? "重试原分支发送" : "Retry original branch send"}</button>}
+        {replacement?.error && <p role="alert" className="composer-error">{replacement.pending ? (zh ? "替换请求状态待核对，原草稿已保留。" : "Replacement status is unconfirmed; the original draft is retained.") : (zh ? "替换请求未接收，请刷新运行状态后重试。" : "Replacement was not accepted. Refresh the run before trying again.")}{replacement.pending && <><span>{replacement.originalMarkdown}</span><button type="button" disabled={replacement.busy || conversationHydrating} onClick={() => void retryReplacement()}>{zh ? "核对原替换请求" : "Reconcile original replacement"}</button></>}</p>}
+        {queueItems.length > 0 && activeConversationId && onQueueUpdate && onQueueAction && <ComposerQueuePanel projectId={project.id} conversationId={activeConversationId} locale={locale} items={queueItems} onUpdate={onQueueUpdate} onAction={onQueueAction} onRefresh={onQueueRefresh} onRestore={restoreQueuedDraft} cutInAvailable={guidanceEnabled} restoreDisabled={Boolean(draft || selectedReferences.length || attachments.items.length || conversationHydrating || composerBusy || sendBusy)} />}
+         {queueError && <p role="alert" className="composer-error">{zh ? "队列状态未能确认，请刷新后重试。" : "Queue state could not be confirmed. Refresh and retry."}<button type="button" onClick={() => void onQueueRefresh?.()}>{zh ? "刷新队列" : "Refresh queue"}</button></p>}
+         {sendError && <p role="alert" className="composer-error">{zh ? "消息未能发送，草稿已保留。请重试。" : "Your message could not be sent. The draft is preserved; please retry."}</p>}
+         {composerCommandNotice && <p role="alert" className="composer-error">{composerCommandNotice}</p>}
+         {(agentPreferences.loading || agentPreferences.saving) && <p className="agent-preferences-status" role="status">{agentPreferences.loading ? (zh ? "正在加载会话偏好…" : "Loading conversation preferences…") : (zh ? "正在保存会话偏好…" : "Saving conversation preferences…")}</p>}
+         {preferenceError && <p className="agent-preferences-error" role="alert"><span>{preferenceError}</span><button type="button" aria-label={zh ? "重试会话偏好" : "Retry conversation preferences"} onClick={() => agentPreferences.retry()} disabled={agentPreferences.saving}>{zh ? "重试" : "Retry"}</button></p>}
 
-        <div className="composer-runtime-bar">
+         <div className="composer-runtime-bar">
           <div className="composer-menu-anchor compute-anchor">
             <button className="runtime-host" aria-label={zh ? "选择计算后端" : "Choose compute backend"} aria-expanded={computeMenuOpen} onClick={() => { const next = !computeMenuOpen; closeComposerMenus(); setComputeMenuOpen(next); }}><Monitor size={17} /><b>{backendLabel}</b><ChevronDown size={13} /></button>
-            {computeMenuOpen && <div className="composer-compute-menu"><ComputeBackendSelector locale={locale} backends={computeBackends} backendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} environment={computeEnvironment} busy={computeBusy || composerDisabled} onBackendChange={onComputeBackendChange} onImageChange={onContainerImageChange} onAutonomyChange={onAutonomyModeChange} onEnvironmentChange={onComputeEnvironmentChange} /><button className="compute-settings-link" disabled={!onOpenSettings} onClick={() => { setComputeMenuOpen(false); onOpenSettings?.("remote"); }}>{zh ? "添加 SSH 主机 / 管理环境" : "Add SSH host / Manage environments"}<ChevronRight size={14} /></button></div>}
+            {computeMenuOpen && <div className="composer-compute-menu"><ComputeBackendSelector locale={locale} backends={computeBackends} backendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} environment={computeEnvironment} busy={computeBusy || existingComposerDisabled} onBackendChange={onComputeBackendChange} onImageChange={onContainerImageChange} onAutonomyChange={onAutonomyModeChange} onEnvironmentChange={onComputeEnvironmentChange} /><button className="compute-settings-link" disabled={!onOpenSettings} onClick={() => { setComputeMenuOpen(false); onOpenSettings?.("remote"); }}>{zh ? "添加 SSH 主机 / 管理环境" : "Add SSH host / Manage environments"}<ChevronRight size={14} /></button></div>}
           </div>
           {(["python", "r"] as const).map((language) => <button key={language} className="runtime-pill" aria-label={`${language === "python" ? "Python" : "R"} ${zh ? "环境" : "environment"}`} onClick={() => { closeComposerMenus(); setRuntimeLanguage(language); }}><b>{language === "python" ? "Python" : "R"}</b><span>{runtimeStatus(language)}</span></button>)}
         </div>
-        <div className={`composer-input ${planModeEnabled ? "is-plan-mode" : ""}`}>
-          <textarea aria-label={t.composer} placeholder={planModeEnabled ? (zh ? "描述需要规划和执行的任务" : "Describe the task to plan and execute") : t.composer} value={draft} disabled={composerDisabled} onChange={(event) => setDraft(event.target.value)} />
+        <div className={`composer-input ${planModeEnabled ? "is-plan-mode" : ""}`} onDragOver={(event) => { if (event.dataTransfer.types.includes(WORKSPACE_FILE_DRAG_TYPE) || event.dataTransfer.types.includes("Files")) { event.preventDefault(); event.dataTransfer.dropEffect = composerDisabled ? "none" : "copy"; } }} onDrop={(event) => {
+            if (event.dataTransfer.types.includes(WORKSPACE_FILE_DRAG_TYPE)) {
+              event.preventDefault(); const reference = parseWorkspaceFileDrag(event.dataTransfer.getData(WORKSPACE_FILE_DRAG_TYPE));
+              if (reference) attachWorkspaceFile(reference); else setReferenceNotice(zh ? "文件引用无效。" : "Invalid file reference.");
+              return;
+            }
+            if (!event.dataTransfer.files.length) return;
+            event.preventDefault(); if (!composerDisabled) void attachments.addFiles(Array.from(event.dataTransfer.files));
+          }}>
+          {referenceNotice && <p className="composer-error" role="alert">{referenceNotice}</p>}
+          <ComposerAttachments items={attachments.items} zh={zh} disabled={composerDisabled} onRemove={attachments.remove} onRetry={attachments.retry} />
+          {attachments.pickerBusyNotice && <p role="alert">{zh ? "请等待当前附件选择或处理完成，再添加其他附件。" : "Wait for the current file selection or upload to finish, then add more attachments."}</p>}
+          {attachments.limitReached && <p role="alert">{zh ? "部分附件未添加：每次最多 8 个、单个 20 MiB、合计 40 MiB。请移除附件后重试。" : "Some attachments were not added: maximum 8 files, 20 MiB each and 40 MiB total. Remove attachments and try again."}</p>}
+          <ComposerReferenceChips references={selectedReferences.map((item) => item.reference)} items={selectedReferences} disabled={composerDisabled} zh={zh} onRemove={(reference) => { setSelectedReferences((items) => items.filter((entry) => referenceKey(entry.reference) !== referenceKey(reference))); setCatalogError(""); setReferenceNotice(""); }} />
+          {referenceTrigger && <ComposerReferencePicker commands={composerCommands} inputRef={draftRef} items={(referenceCatalog ?? catalog).filter((item) => !(item.reference.kind === "session" && item.reference.id === activeConversationId))} trigger={referenceTrigger} onSelect={selectReference} onClose={() => setReferenceTrigger(null)} zh={zh} loading={catalogLoading} error={catalogError} />}
+          <textarea ref={draftRef} onPaste={(event) => {
+            const images = Array.from(event.clipboardData.files).filter((file) => file.type.startsWith("image/"));
+            if (images.length) { event.preventDefault(); if (!composerDisabled) void attachments.addFiles(images); return; }
+            const paths = parseClipboardFilePaths(event.clipboardData.getData?.("text/plain") ?? "");
+            if (paths) { event.preventDefault(); void attachClipboardPaths(paths); }
+          }} onPointerDown={(event) => { resizeStartHeight.current = event.currentTarget.getBoundingClientRect().height; }} onPointerUp={(event) => { if (resizeStartHeight.current !== null && Math.abs(event.currentTarget.getBoundingClientRect().height - resizeStartHeight.current) > 1) manualDraftHeight.current = true; resizeStartHeight.current = null; }} aria-label={t.composer} placeholder={`${planModeEnabled ? (zh ? "描述需要规划和执行的任务" : "Describe the task to plan and execute") : t.composer} — ${zh ? "@ 产物与环境，# 项目与会话，/ 命令、工作流与技能" : "@ artifacts and environments, # projects and sessions, / commands, workflows and skills"}`} value={draft} disabled={composerDisabled} onChange={(event) => { setDraft(event.target.value); setReferenceTrigger(parseComposerTrigger(event.target.value, event.target.selectionStart)); setSendError(false); setComposerCommandNotice(""); }} onSelect={(event) => { const input = event.currentTarget; setReferenceTrigger(parseComposerTrigger(input.value, input.selectionStart)); }} onKeyDown={(event) => { if (event.defaultPrevented) return; if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229 && (!modifierSend || event.ctrlKey || event.metaKey)) { event.preventDefault(); void send(); } }} />
           <div className="composer-toolbar">
-            <div className="composer-menu-anchor"><button className="composer-tool" aria-label={zh ? "添加上下文或选择模式" : "Add context or choose mode"} aria-expanded={composerMenuOpen} onClick={() => { const next = !composerMenuOpen; closeComposerMenus(); setComposerMenuOpen(next); }}><Plus size={20} /></button>{composerMenuOpen && <ComposeActions zh={zh} onClose={() => setComposerMenuOpen(false)} onAttach={onUploadFiles ? () => { void onUploadFiles(); } : undefined} onFiles={() => openSidebarSection("files")} onReview={() => setDraft((current) => [current, zh ? "请审查当前会话中的方法、证据和结论，指出潜在问题与需要补充的验证。" : "Review the methods, evidence, and conclusions in this conversation. Identify potential issues and missing validation."].filter(Boolean).join("\n\n"))} onManageSkills={onOpenSettings ? () => onOpenSettings("skills") : undefined} />}</div>
+            <div className="composer-menu-anchor"><button className="composer-tool" aria-label={zh ? "添加上下文或选择模式" : "Add context or choose mode"} aria-expanded={composerMenuOpen} onClick={() => { const next = !composerMenuOpen; closeComposerMenus(); setComposerMenuOpen(next); }}><Plus size={20} /></button>{composerMenuOpen && <ComposeActions zh={zh} onClose={() => setComposerMenuOpen(false)} onAttach={activeConversationId && !composerDisabled ? () => { void attachments.chooseFiles(); } : undefined} onFiles={openProjectFiles} onReview={() => setReviewDialogOpen(true)} onShare={messages.length ? () => setSharing(true) : undefined} onSaveSkill={composerDisabled ? undefined : prepareSkill} onManageWorkflows={() => setWorkflowLibraryOpen(true)} onManageSkills={onOpenSettings ? () => onOpenSettings("skills") : undefined} />}</div>
             <div className="composer-menu-anchor permission-anchor">
-              <button className="composer-tool composer-orbit" title={zh ? "Agent 控制" : "Agent controls"} aria-label={zh ? "Agent 权限" : "Agent permissions"} aria-expanded={permissionMenuOpen} onClick={() => { const next = !permissionMenuOpen; closeComposerMenus(); setPermissionMenuOpen(next); }}><Orbit size={21} /></button>
+              <button className="composer-tool composer-orbit" title={zh ? "Agent 控制" : "Agent controls"} aria-label={zh ? "Agent 权限" : "Agent permissions"} aria-expanded={permissionMenuOpen} onClick={() => { const next = !permissionMenuOpen; closeComposerMenus(); setPermissionMenuOpen(next); }}><SlidersHorizontal size={21} /></button>
               {permissionMenuOpen && <div className="permission-menu" role="menu" aria-label={zh ? "Agent 权限选项" : "Agent permission options"}>
                 <button className="agent-control-row" role="menuitemcheckbox" aria-checked={planModeEnabled} disabled={modeLocked} onClick={() => chooseMode(planModeEnabled ? "agent" : "plan")}><span>{zh ? "先做计划" : "Plan first"}</span><i className={`control-switch ${planModeEnabled ? "is-on" : ""}`} /></button>
                 <header><b>{zh ? "应如何批准 Agent 操作？" : "How should Agent actions be approved?"}</b><small>{selectedBackend?.descriptor.kind.toUpperCase() ?? "—"}</small></header>
@@ -444,20 +1042,32 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
                 <PermissionOption icon={<ShieldCheck size={17} />} active={approvalPolicy === "risk_based"} title={zh ? "帮我批准" : "Risk based"} description={zh ? "仅对检测到的风险操作请求批准" : "Ask only for operations detected as risky"} onClick={() => { onApprovalPolicyChange?.("risk_based"); onAutonomyModeChange?.("supervised"); setPermissionMenuOpen(false); }} />
                 <PermissionOption icon={<ShieldAlert size={17} />} active={approvalPolicy === "full_access"} danger disabled={!selectedBackendIsContainer} title={zh ? "完全访问权限" : "Full access"} description={selectedBackendIsContainer ? (zh ? "仅限离线 Docker/Podman 容器" : "Offline Docker/Podman containers only") : (zh ? "需要可用的 Docker/Podman 隔离" : "Requires available Docker/Podman isolation")} onClick={() => { onApprovalPolicyChange?.("full_access"); onAutonomyModeChange?.("full_auto"); setPermissionMenuOpen(false); }} />
                 <div className="agent-control-divider" />
+                <button className="agent-control-row" role="menuitemcheckbox" aria-checked={modifierSend} onClick={toggleModifierSend}><span>{zh ? "使用 Ctrl/Cmd+Enter 发送" : "Send with Ctrl/Cmd+Enter"}</span><i className={`control-switch ${modifierSend ? "is-on" : ""}`} /></button>
                 <button role="menuitem" className="agent-control-row" disabled><span>{zh ? "完成方式" : "Completion"}</span><small>{zh ? "会话内" : "Inline"}</small></button>
-                {[(zh ? "子任务委派" : "Delegation"), (zh ? "自动审查" : "Auto-review"), (zh ? "分析工具失败" : "Analyze tool failures"), (zh ? "审查模型" : "Reviewer model"), (zh ? "专家代理" : "Specialist")].map((label) => <button key={label} role="menuitem" className="agent-control-row" disabled><span>{label}</span><small>{zh ? "暂未支持" : "Unavailable"}</small></button>)}
+                <PreferenceToggle active={agentPreferences.preferences.delegation_enabled} disabled={existingComposerDisabled || agentPreferences.busy || Boolean(agentPreferences.loadError) || !activeConversationId} title={zh ? "子任务委派" : "Delegation"} description={zh ? "允许 Agent 在批准范围内委派子任务" : "Allow Agent to delegate within the approved scope"} onClick={() => toggleAgentPreference("delegation_enabled")} />
+                <PreferenceToggle active={agentPreferences.preferences.auto_review} disabled={existingComposerDisabled || agentPreferences.busy || Boolean(agentPreferences.loadError) || !activeConversationId} title={zh ? "自动审查" : "Auto-review"} description={zh ? "可选的模型审查；证据和结果核验仍然必需" : "Run an optional model review; evidence and result checks remain required"} onClick={() => toggleAgentPreference("auto_review")} />
+                <PreferenceToggle active={agentPreferences.preferences.memory_enabled} disabled={existingComposerDisabled || agentPreferences.busy || Boolean(agentPreferences.loadError) || !activeConversationId} title={zh ? "使用记忆" : "Use memory"} description={zh ? "允许 Agent 检索项目记忆" : "Allow Agent to retrieve project memory"} onClick={() => toggleAgentPreference("memory_enabled")} />
+                {showFastMode && <label className="fast-mode-select"><span><b>{zh ? "Fast 模式" : "Fast mode"}</b><small>{zh ? "请求 Fast 处理；可用性取决于提供方" : "Requests Fast processing; availability depends on the provider"}</small></span><select aria-label={zh ? "Fast 模式" : "Fast mode"} value={fastModeOption} disabled={fastModeLocked} onChange={(event) => chooseFastMode(event.target.value)}>
+                  <option value="default">{zh ? "模型默认" : "Model default"}</option>
+                  <option value="standard">{zh ? "标准" : "Standard"}</option>
+                  <option value="fast" disabled={!fastModeAvailable && fastMode !== true}>Fast</option>
+                </select></label>}
+                 <button role="menuitem" className="agent-control-row" onClick={() => { setPermissionMenuOpen(false); setReviewerSettingsOpen(true); }}><span>{zh ? "审查模型" : "Reviewer model"}</span><small>{zh ? "配置只读审核模型" : "Configure read-only reviewer"}</small><ChevronRight size={14} /></button>
+                 <button role="menuitem" className="agent-control-row" disabled><span>{zh ? "分析工具失败" : "Analyze tool failures"}</span><small>{zh ? "暂未支持" : "Unavailable"}</small></button>
+                 <button role="menuitem" className="agent-control-row" disabled><span>{zh ? "专家代理" : "Specialist"}</span><small>{zh ? "暂未支持" : "Unavailable"}</small></button>
                 <button role="menuitem" className="agent-control-row" onClick={() => { openSidebarSection("records"); setPermissionMenuOpen(false); }}><span>{zh ? "记忆与研究记录" : "Memory & notebook"}</span><ChevronRight size={14} /></button>
                 <button role="menuitem" className="agent-control-row" onClick={() => setComputeMenuOpen(true)}><span>{zh ? "计算环境" : "Compute"}</span><span>{backendLabel}<ChevronRight size={14} /></span></button>
               </div>}
             </div>
             {planModeEnabled && <button className="composer-mode-chip" disabled={modeLocked} onClick={() => chooseMode("agent")}><Activity size={14} />Plan<X size={13} /></button>}
-            <div className="composer-send-controls">
-            <span className="context-meter" title={zh ? "当前接口尚未提供上下文用量" : "Context usage is not reported by the current API"} aria-label={zh ? "上下文用量未知" : "Context usage unknown"}><Gauge size={19} /><span>—</span></span>
-            <button className={`composer-tool ${planModeEnabled ? "" : "is-active"}`} disabled={modeLocked} aria-label={zh ? "直接执行模式" : "Direct execution mode"} aria-pressed={!planModeEnabled} title={zh ? "直接执行 / 先做计划" : "Execute directly / Plan first"} onClick={() => chooseMode(planModeEnabled ? "agent" : "plan")}><Zap size={20} /></button>
-            {modelPicker ? <div onClickCapture={closeComposerMenus}>{modelPicker}</div> : <div className="composer-menu-anchor model-anchor"><button className="composer-model" disabled={composerDisabled} aria-label={zh ? "选择模型" : "Choose model"} aria-expanded={modelMenuOpen} onClick={() => { const next = !modelMenuOpen; closeComposerMenus(); setModelMenuOpen(next); }}><span>{modelLabel || (zh ? "选择模型" : "Choose model")}</span><ChevronDown size={12} /></button>{modelMenuOpen && <div className="model-menu" role="menu">{modelOptions.map((model) => <button role="menuitemradio" aria-checked={model.id === modelId} key={model.id} disabled={!onModelChange} onClick={() => { onModelChange?.(model.id); setModelMenuOpen(false); }}>{model.label}{model.id === modelId && <Check size={14} />}</button>)}<button role="menuitem" disabled={!onOpenSettings} onClick={() => { setModelMenuOpen(false); onOpenSettings?.(); }}>{zh ? "管理模型" : "Manage models"}<Settings size={14} /></button></div>}</div>}
+             <div className="composer-send-controls">
+             <button type="button" className="context-meter" aria-label={zh ? "查看上下文用量" : "Inspect context usage"} onClick={() => setContextUsageOpen(true)}><Gauge size={19} /><span>{contextUsage?.contextTokens != null && contextUsage.contextLimit != null && contextUsage.contextLimit > 0 ? `${contextUsage.estimated ? "≈" : ""}${(100 * contextUsage.contextTokens / contextUsage.contextLimit).toFixed(0)}%` : "—"}</span></button>
+             {showFastMode && <button className={`composer-tool fast-mode-toggle ${effectiveFastMode === true ? "is-active" : ""}`} disabled={fastModeButtonDisabled} aria-label={zh ? "Fast 模式" : "Fast mode"} aria-pressed={effectiveFastMode === true} title={zh ? "请求 Fast 处理；可用性取决于提供方" : "Request Fast processing; availability depends on the provider"} onClick={toggleFastMode}><Zap size={19} /></button>}
+             {modelPicker ? <div onClickCapture={closeComposerMenus}>{modelPicker}</div> : <div className="composer-menu-anchor model-anchor"><button className="composer-model" disabled={composerDisabled} aria-label={zh ? "选择模型" : "Choose model"} aria-expanded={modelMenuOpen} onClick={() => { const next = !modelMenuOpen; closeComposerMenus(); setModelMenuOpen(next); }}><span>{modelLabel || (zh ? "选择模型" : "Choose model")}</span><ChevronDown size={12} /></button>{modelMenuOpen && <div className="model-menu" role="menu">{modelOptions.map((model) => <button role="menuitemradio" aria-checked={model.id === modelId} key={model.id} disabled={!onModelChange} onClick={() => { onModelChange?.(model.id); setModelMenuOpen(false); }}>{model.label}{model.id === modelId && <Check size={14} />}</button>)}<button role="menuitem" disabled={!onOpenSettings} onClick={() => { setModelMenuOpen(false); onOpenSettings?.(); }}>{zh ? "管理模型" : "Manage models"}<Settings size={14} /></button></div>}</div>}
             <div className="composer-send-group">
-            <button className={`send-button ${showStopButton ? "is-stop" : ""}`} aria-label={showStopButton ? stopLabel : sendLabel} title={showStopButton ? stopLabel : sendLabel} aria-busy={showStopButton && runStopping} disabled={showStopButton ? runStopping : composerDisabled || planLoading || !draft.trim() || Boolean(onSend && !computeReady)} onClick={showStopButton ? () => { void onCancelRun?.(); } : send}>{showStopButton ? <Square size={16} fill="currentColor" /> : <ArrowUp size={21} />}</button>
-            <div className="composer-menu-anchor"><button className="send-options" aria-label={zh ? "发送选项" : "Send options"} aria-expanded={sendMenuOpen} onClick={() => { const next = !sendMenuOpen; closeComposerMenus(); setSendMenuOpen(next); }}><ChevronDown size={17} /></button>{sendMenuOpen && <div className="model-menu send-menu" role="menu">{(["agent", "plan"] as const).map((mode) => <button key={mode} role="menuitemradio" aria-checked={effectiveMode === mode} disabled={modeLocked} onClick={() => { chooseMode(mode); setSendMenuOpen(false); }}>{mode === "plan" ? (zh ? "先做计划" : "Plan first") : (zh ? "直接执行" : "Execute directly")}{effectiveMode === mode && <Check size={14} />}</button>)}</div>}</div>
+             {stopAvailable && !showStopButton && <button type="button" className="composer-tool" aria-label={stopLabel} title={stopLabel} disabled={runStopping} onClick={() => void onCancelRun?.()}><Square size={16} fill="currentColor" /></button>}
+             <button className={`send-button ${showStopButton ? "is-stop" : ""}`} aria-label={showStopButton ? stopLabel : sendLabel} title={showStopButton ? stopLabel : sendLabel} aria-busy={showStopButton && runStopping} disabled={showStopButton ? runStopping : composerDisabled || (!onQueue && reviewBusy) || agentPreferences.busy || Boolean(agentPreferences.loadError) || (!onQueue && planLoading) || attachmentsBlocked || (!draft.trim() && !attachments.receipts.length) || Boolean((onSend || onQueue) && !computeReady && !typedComposerCommand)} onClick={showStopButton ? () => { void onCancelRun?.(); } : send}>{showStopButton ? <Square size={16} fill="currentColor" /> : <span>{queuedSend ? (zh ? "加入队列" : "Add to queue") : t.send}</span>}</button>
+            <div className="composer-menu-anchor"><button ref={sendOptionsRef} className="send-options" aria-label={zh ? "发送选项" : "Send options"} aria-expanded={sendMenuOpen} onClick={() => { const next = !sendMenuOpen; closeComposerMenus(); setSendMenuOpen(next); }}><ChevronDown size={17} /></button>{sendMenuOpen && <div className="model-menu send-menu" role="menu">{replacement && <button type="button" role="menuitem" disabled={replacementDisabled} onClick={() => void replaceCurrentTurn()}><span>{zh ? "中断并替换" : "Interrupt and replace"}</span><small>{zh ? "停止当前运行，安全结束后优先发送此草稿" : "Stop the current run, then send this draft first after safe settlement"}</small></button>}{sideChat && <button type="button" role="menuitem" onClick={() => void sendSideQuestion()}><span>{zh ? "独立旁聊" : "Side chat"}</span><small>{zh ? "根据证据回答，不打断主任务" : "Ask about evidence while the main task continues"}</small></button>}{onOpenBranch && <button type="button" role="menuitem" disabled={branchDisabled || !lastBranchAnchor} onClick={() => { if (lastBranchAnchor) branchAt(lastBranchAnchor.id, "after_response", draft); }}><span>{zh ? "分叉会话" : "Branch conversation"}</span><small>{onBranchSend && (draft.trim() || attachments.receipts.length) ? (zh ? "创建分支并发送完整草稿" : "Create a branch and send the complete draft") : (zh ? "从最近一轮创建分支" : "Branch from the latest turn")}</small></button>}{guidanceDialogAvailable && <button type="button" role="menuitem" className="guidance-menu-item" onClick={openGuidanceDialog}><span>{zh ? "追加指导" : "Add guidance"}</span><small>{guidanceEnabled ? (zh ? "追加到当前运行" : "Append to the current run") : (zh ? "仅查看已接收历史" : "View received history only")}</small></button>}{(["agent", "plan"] as const).map((mode) => <button key={mode} role="menuitemradio" aria-checked={effectiveMode === mode} disabled={modeLocked} onClick={() => { chooseMode(mode); setSendMenuOpen(false); }}>{mode === "plan" ? (zh ? "先做计划" : "Plan first") : (zh ? "直接执行" : "Execute directly")}{effectiveMode === mode && <Check size={14} />}</button>)}</div>}</div>
             </div>
             </div>
           </div>
@@ -466,6 +1076,17 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
       </footer>
     </main>
 
+    {fileTextPreview && activeConversationId && <ComposerFilePreviewDialog key={`${project.id}:${activeConversationId}:${referenceKey(fileTextPreview)}`} reference={fileTextPreview} conversationId={activeConversationId} zh={zh} disabled={composerDisabled || selectedReferences.length >= 12} onClose={() => setFileTextPreview(null)} onAttach={(item) => {
+      if (composerDisabled || item.reference.kind !== "quote" || item.reference.project_id !== project.id) return;
+      setSelectedReferences((current) => current.length >= 12 || current.some((entry) => referenceKey(entry.reference) === referenceKey(item.reference)) ? current : [...current, item]);
+      setFileTextPreview(null); draftRef.current?.focus();
+    }} />}
+    {reviewDialogOpen && activeConversationId && <SessionReviewDialog key={`${project.id}:${activeConversationId}`} locale={locale} records={sessionReviews.records} loading={sessionReviews.loading} busy={sessionReviews.busy} startDisabled={!messages.some((message) => message.role !== "system" && message.markdown.trim()) || existingComposerDisabled || agentPreferences.busy || Boolean(agentPreferences.loadError)} startDisabledReason={!messages.some((message) => message.role !== "system" && message.markdown.trim()) ? (zh ? "先发送一条消息后再发起审核。" : "Send a message before requesting a review.") : undefined} error={sessionReviews.error} modelProfiles={modelProfiles} onStartReview={sessionReviews.startReview} onRetry={sessionReviews.retry} onOpenReviewerSettings={() => setReviewerSettingsOpen(true)} onClose={() => setReviewDialogOpen(false)} />}
+    {guidanceDialogOpen && guidanceDialogAvailable && activeConversationId && guidanceRunId && <GuidanceDialog key={`${project.id}:${activeConversationId}:${guidanceRunId}`} runId={guidanceRunId} projectId={project.id} conversationId={activeConversationId} enabled={guidanceEnabled} locale={locale} initialDraft={guidanceDraftAtOpenRef.current ?? undefined} pendingRequest={guidancePendingRequestForScope(guidanceRunId)} composerHasAttachments={attachments.items.length > 0 || attachments.receipts.length > 0} composerHasReferences={selectedReferences.length > 0} onAccepted={handleGuidanceAccepted} onClose={closeGuidanceDialog} />}
+    {reviewerSettingsOpen && <ReviewerSettingsDialog zh={zh} modelProfiles={modelProfiles} onClose={() => setReviewerSettingsOpen(false)} />}
+    {workflowLibraryOpen && <WorkflowLibraryDialog key={project.id} projectId={project.id} zh={zh} onClose={() => { setWorkflowLibraryOpen(false); draftRef.current?.focus(); }} onChanged={() => setWorkflowCatalogVersion((value) => value + 1)} />}
+    {sharing && <ShareConversationDialog key={`${project.id}:${activeConversationId}`} messages={messages} locale={locale} onClose={() => { setSharing(false); draftRef.current?.focus(); }} />}
+    {contextUsageOpen && <ContextUsagePanel error={contextUsageError} value={contextUsage} locale={locale} onClose={() => setContextUsageOpen(false)} onNewConversation={!conversationHydrating && !agentBusy && !conversationLocked && onNewConversation ? () => { setContextUsageOpen(false); void onNewConversation(); } : undefined} />}
     {sidebarOpen && <aside id="workspace-sidebar" className="context-pane workspace-sidebar" aria-label={t.context}>
       <div className="sidebar-heading">
         <div className="sidebar-tab-scroll" role="tablist" aria-label={zh ? "已打开的侧栏标签" : "Open sidebar tabs"}>
@@ -475,9 +1096,9 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
           </div>)}
         </div>
         <button className="sidebar-tab-add" aria-label={zh ? "添加侧栏标签" : "Add sidebar tab"} aria-haspopup="menu" aria-expanded={sectionMenuOpen} onClick={() => setSectionMenuOpen((open) => !open)}><Plus size={16} /></button>
-        {sectionMenuOpen && <><button className="sidebar-menu-backdrop" aria-label={zh ? "关闭侧栏菜单" : "Close sidebar menu"} onClick={() => setSectionMenuOpen(false)} /><div className="sidebar-section-menu" role="menu" aria-label={zh ? "侧栏内容" : "Sidebar sections"}>{sidebarSections.map((section) => { const isOpen = openTabs.some((id) => id === section.id); return <button key={section.id} role="menuitemcheckbox" aria-checked={isOpen} disabled={Boolean(section.unavailable)} title={section.unavailable} onClick={() => { if (section.id !== "highlights" && section.id !== "side-chat") openSidebarSection(section.id); }}><span>{section.label}</span>{isOpen && <Check size={18} />}</button>; })}</div></>}
+        {sectionMenuOpen && <><button className="sidebar-menu-backdrop" aria-label={zh ? "关闭侧栏菜单" : "Close sidebar menu"} onClick={() => setSectionMenuOpen(false)} /><div className="sidebar-section-menu" role="menu" aria-label={zh ? "侧栏内容" : "Sidebar sections"}>{sidebarSections.map((section) => { const isOpen = openTabs.some((id) => id === section.id); return <button key={section.id} role="menuitemcheckbox" aria-checked={isOpen} disabled={Boolean(section.unavailable)} title={section.unavailable} onClick={() => { if (section.id !== "highlights") openSidebarSection(section.id); }}><span>{section.label}</span>{isOpen && <Check size={18} />}</button>; })}</div></>}
       </div>
-      <div className="context-content" id="sidebar-tab-content" role="tabpanel" aria-labelledby={`sidebar-tab-${tab}`}>{tab === "files" && <RemoteFileTree locale={locale} remoteFiles={remoteFiles ?? []} busy={filesBusy} notice={fileNotice} onUpload={onUploadFiles} onRefresh={onRefreshFiles} onDownload={onDownloadFile} syncEntries={syncEntries} onPauseSync={onPauseSync} onCancelSync={onCancelSync} onRetrySync={onRetrySync} />}{tab === "plan" && <V4PlanPanel locale={locale} active={showPlanPanel} planLoading={planLoading} v4Plan={visiblePlan} latestPlanRevision={latestPlanRevision} conversationLocked={conversationLocked} planActionBusy={effectivePlanActionBusy} planApproved={planApproved || approved || approvePlanBusy} runStarted={runStarted} events={activeRunEventsV4} onApprove={approvePlan} onRequestPlanRevision={onRequestPlanRevision} onCancel={onCancelRun} />}{tab === "artifacts" && <><ArtifactCatalog artifacts={projectArtifacts} locale={locale} onSelect={(path) => { setSelectedImagePath(path); setExpanded(true); }} />{imageFiles.length > 0 && <><div className="context-toolbar"><span>{t.artifactPreview}</span><button aria-label={t.expand} onClick={() => setExpanded(true)}><Expand size={16} /></button></div>{preview}</>}</>}{tab === "notebook" && <CodeNotebook cells={notebookCells} locale={locale} />}{tab === "agents" && <DelegatedAgents tasks={delegatedTasks} locale={locale} />}{tab === "records" && <Notebook locale={locale} entries={notebookEntries} artifacts={projectArtifacts} facts={memoryFacts} onSearch={onSearchMemory} onExport={onExportNotebook} />}{tab === "environment" && <><EnvironmentContexts backends={computeBackends} selectedId={computeBackendId} environment={computeEnvironment} locale={locale} /><KernelPanel locale={locale} sessions={kernelSessions} events={kernelEvents} busy={kernelBusy} notice={kernelNotice} onStart={onStartKernel} onExecute={onExecuteKernel} onInterrupt={onInterruptKernel} onStop={onStopKernel} onPromote={onPromoteKernelCell} /></>}{tab === "provenance" && <ProvenancePanel rows={provenanceRows} locale={locale} />}</div>
+      <div className="context-content" id="sidebar-tab-content" role="tabpanel" aria-labelledby={`sidebar-tab-${tab}`}>{tab === "side-chat" && sideChat && activeConversationId && <SideChatPanel key={`${project.id}:${activeConversationId}`} projectId={project.id} conversationId={activeConversationId} locale={locale} records={sideChat.records} models={modelProfiles} modelId={sideChat.modelId} onModelChange={sideChat.setModelId} draftValue={sideChat.draft} onDraftChange={sideChat.setDraft} loading={sideChat.loading} disabled={!sideChat.ready} busy={sideChat.busy} pending={sideChat.pending} error={sideChat.error} originalQuestion={sideChat.originalQuestion} onSend={(question) => sideChat.send({ question_markdown: question, references: [], attachments: [] })} onRefresh={sideChat.refresh} hasMore={sideChat.hasMore} loadingOlder={sideChat.loadingOlder} onLoadOlder={sideChat.loadOlder} onRetry={retrySideQuestion} onRetryTurn={(turn) => sideChat.send({ question_markdown: turn.question_markdown, references: turn.references, attachments: turn.attachments, parent_request_id: turn.request_id })} onOpenSource={revealSideChatSource} />}{tab === "files" && <><div className="file-source-options" role="group" aria-label={zh ? "文件来源" : "File source"}><button aria-pressed={fileSource === "local"} onClick={() => setFileSource("local")}>{zh ? "本地" : "Local"}</button><button aria-pressed={fileSource === "remote"} disabled={!project.connection_id && !onRefreshFiles && !remoteFiles?.length} onClick={() => setFileSource("remote")}>SSH</button></div><RemoteFileTree locale={locale} source={fileSource} remoteFiles={fileSource === "local" ? localFiles : remoteFiles ?? []} busy={fileSource === "local" ? localFilesBusy : filesBusy} notice={fileSource === "local" ? localFilesError : fileNotice} onUpload={fileSource === "remote" ? onUploadFiles : undefined} onRefresh={() => setFileRefreshVersion((value) => value + 1)} onDownload={fileSource === "remote" ? onDownloadFile : undefined} onPreviewText={activeConversationId && !composerDisabled && fileBackendId ? (path) => setFileTextPreview(currentFileReference(path)) : undefined} onAttach={!composerDisabled && fileBackendId ? (path) => attachWorkspaceFile(currentFileReference(path)) : undefined} dragReference={!composerDisabled && fileBackendId ? currentFileReference : undefined} syncEntries={fileSource === "remote" ? syncEntries : []} onPauseSync={onPauseSync} onCancelSync={onCancelSync} onRetrySync={onRetrySync} /></>}{tab === "plan" && <V4PlanPanel locale={locale} active={showPlanPanel} planLoading={planLoading} v4Plan={visiblePlan} latestPlanRevision={latestPlanRevision} conversationLocked={conversationLocked} planActionBusy={effectivePlanActionBusy} planApproved={planApproved || approved || approvePlanBusy} runStarted={runStarted} events={activeRunEventsV4} onApprove={approvePlan} onRequestPlanRevision={onRequestPlanRevision} onCancel={onCancelRun} />}{tab === "artifacts" && <>{openedSearchArtifact?.reference.kind === "artifact" && openedSearchArtifact.reference.project_id === project.id && <section className="sidebar-data-card" aria-label={zh ? "选中的产物" : "Selected artifact"}><b>{openedSearchArtifact.label}</b><p>{openedSearchArtifact.description}</p><small>ID: {openedSearchArtifact.reference.id}</small><button onClick={() => setOpenedSearchArtifact(null)}>{zh ? "关闭详情" : "Close details"}</button></section>}<ArtifactCatalog artifacts={projectArtifacts} locale={locale} onSelect={(path) => { setSelectedImagePath(path); setExpanded(true); }} />{imageFiles.length > 0 && <><div className="context-toolbar"><span>{t.artifactPreview}</span><button aria-label={t.expand} onClick={() => setExpanded(true)}><Expand size={16} /></button></div>{preview}</>}</>}{tab === "notebook" && <CodeNotebook cells={notebookCells} locale={locale} />}{tab === "agents" && <DelegatedAgents tasks={delegatedTasks} locale={locale} />}{tab === "records" && <Notebook locale={locale} entries={notebookEntries} artifacts={projectArtifacts} facts={memoryFacts} onSearch={onSearchMemory} onExport={onExportNotebook} />}{tab === "environment" && <><EnvironmentContexts backends={computeBackends} selectedId={computeBackendId} environment={computeEnvironment} locale={locale} /><KernelPanel locale={locale} sessions={kernelSessions} events={kernelEvents} busy={kernelBusy} notice={kernelNotice} onStart={onStartKernel} onExecute={onExecuteKernel} onInterrupt={onInterruptKernel} onStop={onStopKernel} onPromote={onPromoteKernelCell} /></>}{tab === "provenance" && <ProvenancePanel rows={provenanceRows} locale={locale} />}</div>
     </aside>}
     {runtimeLanguage && <RuntimeDialog zh={zh} language={runtimeLanguage} onLanguageChange={setRuntimeLanguage} backend={selectedBackend} environment={computeEnvironment} onClose={() => setRuntimeLanguage(null)} onSettings={onOpenSettings ? () => { setRuntimeLanguage(null); onOpenSettings("remote"); } : undefined} onPrepare={(language) => {
       const name = language === "python" ? "Python" : "R";
@@ -486,6 +1107,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
       setRuntimeLanguage(null);
     }} />}
     {expanded && <div className="preview-overlay" role="dialog" aria-modal="true" aria-label={t.artifactPreview}><header><div><small>{project.name}</small><h2>{t.artifactPreview}</h2></div><button aria-label="Close" onClick={() => setExpanded(false)}><X /></button></header>{preview}</div>}
+    {trajectoryOpen && <div className="preview-overlay" role="dialog" aria-modal="true" aria-label={zh ? "运行轨迹" : "Run trajectory"}><header><div><small>{project.name}</small><h2>{zh ? "运行轨迹" : "Run trajectory"}</h2></div><button aria-label={zh ? "关闭运行轨迹" : "Close run trajectory"} onClick={() => { setTrajectoryOpen(false); draftRef.current?.focus(); }}><X /></button></header><div style={{ minHeight: 0, overflow: "auto", padding: "16px 20px" }}>{trajectoryRuns.length > 0 ? trajectoryRuns.map((run) => <V4RunTrace key={run.runId} locale={locale} events={run.events} historical />) : <p role="status">{zh ? "当前会话暂无已记录的运行轨迹。" : "No recorded run trajectory is available for this conversation."}</p>}</div></div>}
   </div>;
 }
 
@@ -498,6 +1120,9 @@ function ComputeBackendSelector({ locale, backends, backendId, containerImage, a
 
 function PermissionOption({ icon, active, danger = false, disabled = false, title, description, onClick }: { icon: ReactNode; active: boolean; danger?: boolean; disabled?: boolean; title: string; description: string; onClick: () => void }) {
   return <button role="menuitemradio" aria-checked={active} disabled={disabled} className={`${active ? "active" : ""} ${danger ? "danger" : ""}`} onClick={onClick}><span className="permission-icon">{icon}</span><span><b>{title}</b><small>{description}</small></span>{active && <Check size={15} />}</button>;
+}
+function PreferenceToggle({ active, disabled, title, description, onClick }: { active: boolean; disabled: boolean; title: string; description: string; onClick: () => void }) {
+  return <button className={`agent-control-row preference-toggle ${active ? "active" : ""}`} role="menuitemcheckbox" aria-checked={active} disabled={disabled} onClick={onClick}><span><b>{title}</b><small>{description}</small></span><i className={`control-switch ${active ? "is-on" : ""}`} aria-hidden="true" /></button>;
 }
 function FileTree({ locale }: { locale: Locale }) { const zh = locale === "zh-CN"; return <div className="file-tree"><div className="context-heading"><b>{zh ? "项目文件" : "Project files"}</b><small>{zh ? "选择性同步" : "Selective sync"}</small></div><div className="tree-folder"><Folder size={15} />data <span>{zh ? "远端" : "remote"}</span></div><div className="tree-folder"><Folder size={15} />analysis</div><div className="tree-file"><FileBarChart size={15} />umap.png <em>1.2 MB</em></div><div className="tree-file"><FileText size={15} />markers.csv <em>84 KB</em></div><div className="tree-file"><NotebookPen size={15} />report.md <em>12 KB</em></div></div>; }
 function V4RunTrace({ locale, events, previewText, onAnswer, onDecideApproval, onResolveUncertain, onResume, onCancelRecovery, onCloseBrowserTabs, historical = false }: { locale: Locale; events: AgentRunEventV4[]; previewText?: string | null; onAnswer?: (runId: string, questionId: string, answer: string) => Promise<void> | void; onDecideApproval?: (runId: string, approvalId: string, callHash: string, decision: "approved" | "denied", browserScope?: BrowserApprovalScopeV4) => Promise<void> | void; onResolveUncertain?: (runId: string, callId: string, resolution: "side_effect_observed" | "side_effect_not_observed" | "compensated", evidence: string) => Promise<void> | void; onResume?: (runId: string) => Promise<void> | void; onCancelRecovery?: (runId: string) => Promise<void> | void; onCloseBrowserTabs?: (runId: string, sessions: Array<"shared" | "workspace">) => Promise<void> | void; historical?: boolean }) {

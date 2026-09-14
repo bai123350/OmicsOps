@@ -34,7 +34,15 @@ pub fn model_profile_from_request(
     }
     let model = request.model.trim().to_owned();
     let reasoning_effort = request.reasoning_effort.flatten();
+    let fast_mode = request.fast_mode.flatten();
     omicsops_core::workspace::validate_reasoning_effort(provider, reasoning_effort.as_deref())?;
+    if fast_mode == Some(true)
+        && !omicsops_core::workspace::supports_fast_mode(provider, base_url.as_str(), &model)
+    {
+        return Err(
+            "explicit Fast mode requires an exact supported OpenAI endpoint and model".into(),
+        );
+    }
     let supports_vision = exact_model_supports_vision(provider, &base_url, &model);
     let catalog = exact_model_capabilities(provider, &base_url, &model);
     if request.refresh_catalog && catalog.is_none() {
@@ -55,6 +63,7 @@ pub fn model_profile_from_request(
             .or_else(|| catalog.map(|row| row.capabilities.context_limit)),
         catalog_capabilities: catalog.map(|row| row.capabilities.clone()),
         reasoning_effort,
+        fast_mode,
         delegated_model_profile_id: request.delegated_model_profile_id.flatten(),
     })
 }
@@ -66,6 +75,7 @@ fn merge_existing_profile(
     preserve_binding: bool,
     preserve_window: bool,
     preserve_effort: bool,
+    preserve_fast_mode: bool,
     refresh_catalog: bool,
 ) {
     let Some(existing) = existing else {
@@ -89,6 +99,9 @@ fn merge_existing_profile(
         if preserve_effort {
             profile.reasoning_effort = existing.reasoning_effort.clone();
         }
+        if preserve_fast_mode {
+            profile.fast_mode = existing.fast_mode;
+        }
     }
 }
 
@@ -97,6 +110,11 @@ fn validate_profile_capabilities(profile: &ModelProfile) -> Result<(), String> {
         profile.provider,
         profile.reasoning_effort.as_deref(),
     )?;
+    if profile.fast_mode == Some(true) && !profile.supports_fast_mode() {
+        return Err(
+            "explicit Fast mode requires an exact supported OpenAI endpoint and model".into(),
+        );
+    }
     if profile.context_window_tokens == Some(0) {
         return Err("context window must be positive".into());
     }
@@ -140,6 +158,7 @@ pub async fn save_model_profile(
     let preserve_binding = request.delegated_model_profile_id.is_none();
     let preserve_window = request.context_window_tokens.is_none();
     let preserve_effort = request.reasoning_effort.is_none();
+    let preserve_fast_mode = request.fast_mode.is_none();
     let mut profile = model_profile_from_request(request)?;
     let existing = state
         .repository
@@ -152,6 +171,7 @@ pub async fn save_model_profile(
         preserve_binding,
         preserve_window,
         preserve_effort,
+        preserve_fast_mode,
         refresh_catalog,
     );
     validate_profile_capabilities(&profile)?;
@@ -245,6 +265,11 @@ async fn client_for_profile(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "model profile not found".to_string())?;
+    if profile.fast_mode == Some(true) && !profile.supports_fast_mode() {
+        return Err(
+            "explicit Fast mode requires an exact supported OpenAI endpoint and model".into(),
+        );
+    }
     let credential = match &profile.credential_reference {
         Some(reference) => state
             .credentials
@@ -266,6 +291,7 @@ async fn client_for_profile(
         credential,
     )
     .and_then(|client| client.with_reasoning_effort(profile.reasoning_effort))
+    .map(|client| client.with_fast_mode(profile.fast_mode))
     .map(|client| match budget {
         Some(budget) => client.with_request_budget(budget),
         None => client,
@@ -288,6 +314,7 @@ mod tests {
             context_window_tokens: None,
             refresh_catalog: false,
             reasoning_effort: None,
+            fast_mode: None,
             delegated_model_profile_id: None,
         }
     }
@@ -309,7 +336,7 @@ mod tests {
         input.id = Some(saved.id);
         input.refresh_catalog = true;
         let mut refreshed = model_profile_from_request(input.clone()).unwrap();
-        merge_existing_profile(&mut refreshed, Some(&saved), true, true, true, true);
+        merge_existing_profile(&mut refreshed, Some(&saved), true, true, true, true, true);
         validate_profile_capabilities(&refreshed).unwrap();
         assert!(refreshed.catalog_capabilities.is_some());
         assert_eq!(refreshed.context_window_tokens, Some(1050000));
@@ -320,14 +347,22 @@ mod tests {
         );
         assert_ne!(refreshed.execution_configuration_hash(), old_hash);
         let mut repeated = model_profile_from_request(input.clone()).unwrap();
-        merge_existing_profile(&mut repeated, Some(&refreshed), true, true, true, true);
+        merge_existing_profile(
+            &mut repeated,
+            Some(&refreshed),
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
         assert_eq!(
             repeated.execution_configuration_hash(),
             refreshed.execution_configuration_hash()
         );
         input.context_window_tokens = Some(64000);
         let mut custom = model_profile_from_request(input).unwrap();
-        merge_existing_profile(&mut custom, Some(&saved), true, false, true, true);
+        merge_existing_profile(&mut custom, Some(&saved), true, false, true, true, true);
         assert_eq!(custom.context_window_tokens, Some(64000));
     }
 
@@ -342,7 +377,7 @@ mod tests {
         legacy.reasoning_effort = Some("max".into());
         input.refresh_catalog = true;
         let mut refreshed = model_profile_from_request(input).unwrap();
-        merge_existing_profile(&mut refreshed, Some(&legacy), true, true, true, true);
+        merge_existing_profile(&mut refreshed, Some(&legacy), true, true, true, true, true);
         assert!(validate_profile_capabilities(&refreshed).is_err());
         refreshed.reasoning_effort = None;
         assert!(validate_profile_capabilities(&refreshed).is_ok());
@@ -437,7 +472,7 @@ mod tests {
         .unwrap();
         edited.id = old.id;
         edited.label = "Renamed".into();
-        merge_existing_profile(&mut edited, Some(&old), true, true, true, false);
+        merge_existing_profile(&mut edited, Some(&old), true, true, true, true, false);
         assert_eq!(edited.execution_configuration_hash(), hash);
         assert!(edited.catalog_capabilities.is_none());
         assert_eq!(edited.effective_context_window_tokens(), 32768);
@@ -449,7 +484,7 @@ mod tests {
         ))
         .unwrap();
         replacement.id = old.id;
-        merge_existing_profile(&mut replacement, Some(&old), true, true, true, false);
+        merge_existing_profile(&mut replacement, Some(&old), true, true, true, true, false);
         assert!(replacement.catalog_capabilities.is_some());
         assert_ne!(replacement.execution_configuration_hash(), hash);
     }
@@ -477,7 +512,7 @@ mod tests {
         ))
         .unwrap();
         edited.id = saved.id;
-        merge_existing_profile(&mut edited, Some(&saved), true, true, true, false);
+        merge_existing_profile(&mut edited, Some(&saved), true, true, true, true, false);
         assert_eq!(edited.catalog_capabilities, saved.catalog_capabilities);
         assert_eq!(
             edited.execution_configuration_hash(),
@@ -527,5 +562,67 @@ mod tests {
                     .supports_vision
             );
         }
+    }
+
+    #[test]
+    fn fast_mode_conversion_round_trips_supported_profile_values() {
+        for value in [false, true] {
+            let mut input = request(
+                "open_ai_compatible",
+                "https://api.openai.com/v1",
+                "gpt-5.6-luna",
+            );
+            input.fast_mode = Some(Some(value));
+            let profile = model_profile_from_request(input).unwrap();
+            assert_eq!(profile.fast_mode, Some(value));
+            assert!(profile.supports_fast_mode());
+        }
+    }
+
+    #[test]
+    fn explicit_fast_mode_rejects_unknown_endpoint_model_and_provider() {
+        for (provider, base_url, model) in [
+            (
+                "open_ai_compatible",
+                "https://gateway.example/v1",
+                "gpt-5.6-luna",
+            ),
+            (
+                "open_ai_compatible",
+                "https://api.openai.com/v1",
+                "gpt-5.6-luna-preview",
+            ),
+            ("anthropic", "https://api.openai.com/v1", "gpt-5.6-luna"),
+            ("ollama", "http://127.0.0.1:11434", "gpt-5.6-luna"),
+        ] {
+            let mut input = request(provider, base_url, model);
+            input.fast_mode = Some(Some(true));
+            assert!(model_profile_from_request(input).is_err());
+        }
+    }
+
+    #[test]
+    fn fast_mode_edit_omission_preserves_and_null_clears_existing_value() {
+        let mut saved_request = request(
+            "open_ai_compatible",
+            "https://api.openai.com/v1",
+            "gpt-5.6-luna",
+        );
+        saved_request.fast_mode = Some(Some(true));
+        let mut saved = model_profile_from_request(saved_request.clone()).unwrap();
+
+        saved_request.id = Some(saved.id);
+        saved_request.fast_mode = None;
+        let mut omitted = model_profile_from_request(saved_request.clone()).unwrap();
+        merge_existing_profile(&mut omitted, Some(&saved), true, true, true, true, false);
+        assert_eq!(omitted.fast_mode, Some(true));
+
+        saved_request.fast_mode = Some(None);
+        let mut cleared = model_profile_from_request(saved_request).unwrap();
+        merge_existing_profile(&mut cleared, Some(&saved), true, true, true, false, false);
+        assert_eq!(cleared.fast_mode, None);
+
+        saved.fast_mode = Some(false);
+        assert_eq!(saved.fast_mode, Some(false));
     }
 }

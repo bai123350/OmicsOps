@@ -166,4 +166,62 @@ describe("ApiModelPicker", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Choose model" })).toHaveAttribute("aria-expanded", "false"));
     expect(screen.queryByRole("menu", { name: "API models" })).not.toBeInTheDocument();
   });
+
+  it("offers only exact catalog efforts and preserves an unsupported stored value", async () => {
+    vi.mocked(listModelProfileModels).mockResolvedValue([]);
+    renderPicker({ profiles: [profile({ reasoning_effort: "ultra", catalog_capabilities: { source_provider: "test", source_sha256: "hash", context_limit: 100, input_limit: null, output_limit: 10, reasoning: true, reasoning_efforts: ["low", "high"] } })], onReasoningEffortChange: vi.fn() });
+    openPicker();
+    fireEvent.click(screen.getByRole("button", { name: "Reasoning effort: ultra" }));
+    expect(screen.getByRole("menuitemradio", { name: "Default" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitemradio", { name: "low" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitemradio", { name: "high" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitemradio", { name: "medium" })).not.toBeInTheDocument();
+    expect(screen.getByRole("menuitemradio", { name: /ultra.*unavailable/i })).toBeDisabled();
+    expect(screen.getByRole("menuitemradio", { name: /ultra.*unavailable/i })).toHaveAttribute("aria-checked", "true");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("menu", { name: "Reasoning effort" })).not.toBeInTheDocument();
+    expect(screen.getByRole("menu", { name: "API models" })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("menu", { name: "API models" })).not.toBeInTheDocument();
+    await waitFor(() => expect(listModelProfileModels).toHaveBeenCalled());
+  });
+
+  it("does not infer efforts for unknown capabilities and clears to default explicitly", async () => {
+    vi.mocked(listModelProfileModels).mockResolvedValue([]);
+    const save = deferred<void>();
+    const onReasoningEffortChange = vi.fn().mockReturnValue(save.promise);
+    renderPicker({ profiles: [profile({ model: "gpt-5", reasoning_effort: "high" })], onReasoningEffortChange });
+    openPicker();
+    fireEvent.click(screen.getByRole("button", { name: "Reasoning effort: high" }));
+    expect(screen.queryByRole("menuitemradio", { name: "low" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Default" }));
+    expect(onReasoningEffortChange).toHaveBeenCalledWith(expect.objectContaining({ id: "profile-a" }), null);
+    expect(screen.getByRole("menuitemradio", { name: "Default" })).toBeDisabled();
+    expect(screen.getByRole("menuitemradio", { name: "gpt-5" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Default" }));
+    expect(onReasoningEffortChange).toHaveBeenCalledTimes(1);
+    save.reject(new Error("secret response"));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("Could not save reasoning effort"));
+    expect(screen.getByRole("button", { name: "Reasoning effort: high" })).toBeInTheDocument();
+    expect(screen.queryByText("secret response")).not.toBeInTheDocument();
+  });
+
+  it("ignores a failed effort save after the active profile changes", async () => {
+    vi.mocked(listModelProfileModels).mockResolvedValue([]);
+    const save = deferred<void>();
+    const onReasoningEffortChange = vi.fn().mockReturnValue(save.promise);
+    const first = profile({ reasoning_effort: "high" });
+    const second = profile({ id: "profile-b", model: "second", reasoning_effort: "low" });
+    const props = { zh: false, profiles: [first, second], activeProfileId: first.id, disabled: false, onProfileChange: vi.fn(), onModelSelect: vi.fn(), onManage: vi.fn(), onReasoningEffortChange };
+    const { rerender } = render(<ApiModelPicker {...props} />);
+    openPicker();
+    fireEvent.click(screen.getByRole("button", { name: "Reasoning effort: high" }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Default" }));
+    rerender(<ApiModelPicker {...props} activeProfileId={second.id} />);
+    save.reject(new Error("old profile failure"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Reasoning effort: low" })).toBeEnabled());
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("menu", { name: "Reasoning effort" })).not.toBeInTheDocument();
+    expect(screen.getByRole("menuitemradio", { name: "second" })).toHaveAttribute("aria-checked", "true");
+  });
 });

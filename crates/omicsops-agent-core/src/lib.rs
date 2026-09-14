@@ -2,17 +2,22 @@ use async_trait::async_trait;
 mod context_views;
 mod progress;
 use chrono::Utc;
-use futures_util::future::join_all;
+use futures_util::{
+    future::join_all,
+    stream::{FuturesUnordered, StreamExt},
+};
 use omicsops_protocol::{
     AgentEventKindV4, AgentEventV4, AgentInputReasonV4, AgentPhaseV4, AgentRequestRouteV4,
     AgentTaskListUpdateV4, AgentTaskShapeSourceV4, AgentTaskShapeV4, AgentTaskStatusV4,
     AgentTaskV4, ApprovalPolicyV4, BrowserSessionKindV4, CompletionEvidenceRefV4,
     CompletionProposalV4, ComputeBackendKindV4, ContextArchiveV4, ContextCheckpointV4,
-    DelegatedTaskNodeV4, DelegationGraphOutcomeV4, DelegationGraphV4, DelegationIsolationV4,
-    DelegationNodeOutcomeV4, DelegationNodeStatusV4, DeterministicVerificationV4, ExecutionPlanV4,
-    ExternalExecutorOutcomeV4, ExternalExecutorTaskV4, ModelFailureV4, ReviewerReportV4,
-    RunExecutionKindV4, RunModeV4, RunSpecV4, ScientificBridgeV4, ToolApprovalDecisionV4,
-    ToolApprovalRequestV4, ToolCallV4, ToolDescriptorV4, ToolEffectV4, ToolOutcomeV4,
+    ContextLimitSourceV4, ContextUsageRowV4, ConversationAgentPreferencesV4, DelegatedTaskNodeV4,
+    DelegationGraphOutcomeV4, DelegationGraphV4, DelegationIsolationV4, DelegationNodeOutcomeV4,
+    DelegationNodeStatusV4, DeterministicVerificationV4, ExecutionPlanV4,
+    ExternalExecutorOutcomeV4, ExternalExecutorTaskV4, ModelFailureV4, ModelRequestStartedV4,
+    ModelUsageObservationV4, ModelUsageSampleV4, ReviewerReportV4, RunExecutionKindV4, RunModeV4,
+    RunSpecV4, ScientificBridgeV4, ToolApprovalDecisionV4, ToolApprovalRequestV4, ToolCallV4,
+    ToolDescriptorV4, ToolEffectV4, ToolOutcomeV4, UsageAggregationV4, UsageObservationStateV4,
     VerificationFindingV4, VerificationSeverityV4,
 };
 use omicsops_science::{AnalysisStatusV4, EvidenceSourceV4, ScientificStateV4};
@@ -28,6 +33,8 @@ use std::{
 };
 use thiserror::Error;
 use uuid::Uuid;
+
+const CANCELLED_DISPATCH_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Stop invoking a server after two returned business failures; preflight rejections do not count.
 pub fn failed_mcp_servers(events: &[AgentEventV4]) -> std::collections::BTreeSet<String> {
@@ -133,6 +140,124 @@ pub enum ModelStreamEventV4 {
         delay_ms: u64,
         message: String,
     },
+    /// Bounded provider usage data for the current request attempt. AgentCore
+    /// attaches durable request/attempt identity before it persists this.
+    Usage(ModelUsageSampleV4),
+}
+
+/// Frozen model metadata used to qualify usage observations. Unknown values
+/// remain unknown so byte budgets or default windows cannot masquerade as
+/// provider token counts or exact catalog limits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelUsageMetadataV4 {
+    pub model_profile_id: Uuid,
+    pub model_configuration_hash: Option<String>,
+    pub context_limit_tokens: Option<u64>,
+    pub context_limit_source: ContextLimitSourceV4,
+}
+
+impl Default for ModelUsageMetadataV4 {
+    fn default() -> Self {
+        Self {
+            model_profile_id: Uuid::nil(),
+            model_configuration_hash: None,
+            context_limit_tokens: None,
+            context_limit_source: ContextLimitSourceV4::Unknown,
+        }
+    }
+}
+
+/// Request-specific budget facts measured from the final provider payload.
+/// These remain optional because a port may be unable to read an image or
+/// shape an untrusted gateway request before dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ModelUsageRequestMetadataV4 {
+    pub serialized_request_bytes: Option<u64>,
+    pub image_count: Option<u32>,
+    pub image_bound_tokens: Option<u64>,
+    pub breakdown: Option<Vec<ContextUsageRowV4>>,
+}
+
+fn model_usage_observation(
+    logical_request_id: Uuid,
+    attempt_id: Uuid,
+    metadata: &ModelUsageMetadataV4,
+    request_metadata: &ModelUsageRequestMetadataV4,
+    sample: ModelUsageSampleV4,
+) -> ModelUsageObservationV4 {
+    ModelUsageObservationV4 {
+        logical_request_id,
+        attempt_id,
+        sample_index: sample.sample_index,
+        model_profile_id: metadata.model_profile_id,
+        model_configuration_hash: metadata.model_configuration_hash.clone(),
+        state: sample.state,
+        aggregation: sample.aggregation,
+        input_tokens: sample.input_tokens,
+        output_tokens: sample.output_tokens,
+        reasoning_tokens: sample.reasoning_tokens,
+        cache_read_input_tokens: sample.cache_read_input_tokens,
+        cache_creation_input_tokens: sample.cache_creation_input_tokens,
+        reported_total_tokens: sample.reported_total_tokens,
+        // The adapter has already normalized provider-specific context
+        // semantics. Cache counters remain separate and are never added here.
+        context_tokens: sample.context_tokens,
+        context_limit_tokens: metadata.context_limit_tokens,
+        context_limit_source: metadata.context_limit_source.clone(),
+        serialized_request_bytes: request_metadata.serialized_request_bytes,
+        image_bound_tokens: request_metadata.image_bound_tokens,
+    }
+}
+
+fn model_request_started(
+    logical_request_id: Uuid,
+    attempt_id: Uuid,
+    metadata: &ModelUsageMetadataV4,
+    request_metadata: &ModelUsageRequestMetadataV4,
+) -> AgentEventKindV4 {
+    AgentEventKindV4::ModelRequestStarted {
+        request: ModelRequestStartedV4 {
+            logical_request_id,
+            attempt_id,
+            model_profile_id: metadata.model_profile_id,
+            model_configuration_hash: metadata.model_configuration_hash.clone(),
+            context_limit_tokens: metadata.context_limit_tokens,
+            context_limit_source: metadata.context_limit_source.clone(),
+            serialized_request_bytes: request_metadata.serialized_request_bytes,
+            image_count: request_metadata.image_count,
+            image_bound_tokens: request_metadata.image_bound_tokens,
+            breakdown: request_metadata.breakdown.clone(),
+        },
+    }
+}
+
+fn unknown_model_usage(
+    logical_request_id: Uuid,
+    attempt_id: Uuid,
+    metadata: &ModelUsageMetadataV4,
+    request_metadata: &ModelUsageRequestMetadataV4,
+    state: UsageObservationStateV4,
+) -> AgentEventKindV4 {
+    AgentEventKindV4::ModelUsageObserved {
+        observation: model_usage_observation(
+            logical_request_id,
+            attempt_id,
+            metadata,
+            request_metadata,
+            ModelUsageSampleV4 {
+                sample_index: 0,
+                state,
+                aggregation: UsageAggregationV4::Unknown,
+                input_tokens: None,
+                context_tokens: None,
+                output_tokens: None,
+                reasoning_tokens: None,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+                reported_total_tokens: None,
+            },
+        ),
+    }
 }
 
 #[async_trait]
@@ -161,6 +286,20 @@ pub trait ModelPortV4: Send + Sync {
     /// adapters must also enforce this at their final network boundary.
     fn validate_request(&self, _request: &ModelRequestV4) -> Result<(), ModelFailureV4> {
         Ok(())
+    }
+
+    /// Return the immutable profile/configuration and context-limit
+    /// provenance for the next provider attempt. Implementations without a
+    /// provider catalog deliberately return unknown metadata.
+    fn usage_metadata(&self) -> ModelUsageMetadataV4 {
+        ModelUsageMetadataV4::default()
+    }
+
+    /// Return measurements for the exact provider payload that the next
+    /// attempt will shape. Ports that cannot measure it must leave the facts
+    /// unknown instead of converting bytes or image data into token counts.
+    fn usage_request_metadata(&self, _request: &ModelRequestV4) -> ModelUsageRequestMetadataV4 {
+        ModelUsageRequestMetadataV4::default()
     }
 
     async fn stream(
@@ -1024,6 +1163,16 @@ impl AgentCoreV4<'_> {
                     AgentEventKindV4::ToolRequested { call: call.clone() },
                 )
                 .await?;
+                if let Some(capability) = optional_capability_disabled(spec, &call.tool_id) {
+                    self.push(
+                        spec.run_id,
+                        AgentEventKindV4::ToolFinished {
+                            outcome: disabled_capability_outcome(&call, capability, false),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
                 let mut workflow_events = self
                     .events
                     .load(spec.run_id)
@@ -1517,32 +1666,76 @@ impl AgentCoreV4<'_> {
                     )
                     .await?;
                 }
-                let futures = dispatch.into_iter().map(|call| async move {
-                    let result = self.execute_with_guidance(spec, &call).await;
-                    (call, result)
-                });
-                let mut batch = Box::pin(join_all(futures));
-                let outcomes = loop {
-                    tokio::select! {
-                        outcomes = &mut batch => break outcomes,
-                        _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                            if cancelled.load(Ordering::SeqCst) {
-                                drop(batch);
-                                self.tools.interrupt(spec.run_id).await.map_err(AgentCoreErrorV4::Tool)?;
-                                self.push(spec.run_id, AgentEventKindV4::RunCancelled)
-                                    .await?;
-                                return Err(AgentCoreErrorV4::Cancelled);
+                let mut in_flight = FuturesUnordered::new();
+                let mut pending_calls = BTreeMap::<usize, ToolCallV4>::new();
+                let mut indexed_outcomes = (0..dispatch.len())
+                    .map(|_| None)
+                    .collect::<Vec<Option<(ToolCallV4, Result<ToolOutcomeV4, String>)>>>();
+                for (index, call) in dispatch.into_iter().enumerate() {
+                    pending_calls.insert(index, call.clone());
+                    in_flight.push(async move {
+                        let result = self.execute_with_guidance(spec, &call).await;
+                        (index, call, result)
+                    });
+                }
+                let mut cancellation_requested = false;
+                let mut cancellation_deadline = None;
+                while !in_flight.is_empty() {
+                    if let Some(deadline) = cancellation_deadline {
+                        tokio::select! {
+                            result = in_flight.next() => {
+                                if let Some((index, call, result)) = result {
+                                    pending_calls.remove(&index);
+                                    indexed_outcomes[index] = Some((call, result));
+                                }
+                            }
+                            _ = tokio::time::sleep_until(deadline) => {
+                                break;
+                            }
+                        }
+                    } else {
+                        tokio::select! {
+                            result = in_flight.next() => {
+                                if let Some((index, call, result)) = result {
+                                    pending_calls.remove(&index);
+                                    indexed_outcomes[index] = Some((call, result));
+                                }
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                                if cancelled.load(Ordering::SeqCst) {
+                                    cancellation_requested = true;
+                                    // Interrupt is a best-effort request. Bound it as well so
+                                    // a broken executor cannot make Stop wait forever.
+                                    let _ = tokio::time::timeout(
+                                        CANCELLED_DISPATCH_DRAIN_TIMEOUT,
+                                        self.tools.interrupt(spec.run_id),
+                                    )
+                                    .await;
+                                    cancellation_deadline = Some(
+                                        tokio::time::Instant::now()
+                                            + CANCELLED_DISPATCH_DRAIN_TIMEOUT,
+                                    );
+                                }
                             }
                         }
                     }
-                };
-                let mut batch_succeeded = 0_u32;
-                let mut batch_failed = 0_u32;
-                let mut routed = None;
-                for (call, result) in outcomes {
-                    let mut outcome = match result {
-                        Ok(outcome) => outcome,
-                        Err(error) => {
+                }
+                if cancelled.load(Ordering::SeqCst) {
+                    cancellation_requested = true;
+                }
+                let mut unresolved_side_effects = Vec::new();
+                if cancellation_requested && !pending_calls.is_empty() {
+                    let pending = pending_calls.values().cloned().collect::<Vec<_>>();
+                    for call in pending {
+                        if self.tools.effect(&call.tool_id) == Some(ToolEffectV4::ReadOnly) {
+                            self.push(
+                                spec.run_id,
+                                AgentEventKindV4::ToolFinished {
+                                    outcome: cancelled_read_outcome(&call),
+                                },
+                            )
+                            .await?;
+                        } else {
                             self.push(
                                 spec.run_id,
                                 AgentEventKindV4::ToolDispatchUncertain {
@@ -1551,6 +1744,44 @@ impl AgentCoreV4<'_> {
                                 },
                             )
                             .await?;
+                            unresolved_side_effects.push(call.call_id);
+                        }
+                    }
+                    // Every abandoned side-effect future is now represented durably.
+                }
+                drop(in_flight);
+                let outcomes = indexed_outcomes.into_iter().flatten().collect::<Vec<_>>();
+                let mut batch_succeeded = 0_u32;
+                let mut batch_failed = 0_u32;
+                let mut routed = None;
+                for (call, result) in outcomes {
+                    let mut outcome = match result {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            if cancellation_requested
+                                && self.tools.effect(&call.tool_id) == Some(ToolEffectV4::ReadOnly)
+                            {
+                                self.push(
+                                    spec.run_id,
+                                    AgentEventKindV4::ToolFinished {
+                                        outcome: cancelled_read_outcome(&call),
+                                    },
+                                )
+                                .await?;
+                                continue;
+                            }
+                            self.push(
+                                spec.run_id,
+                                AgentEventKindV4::ToolDispatchUncertain {
+                                    call_id: call.call_id.clone(),
+                                    tool_id: call.tool_id.clone(),
+                                },
+                            )
+                            .await?;
+                            if cancellation_requested {
+                                unresolved_side_effects.push(call.call_id);
+                                continue;
+                            }
                             return Err(AgentCoreErrorV4::UncertainSideEffect(format!(
                                 "{}: {error}",
                                 call.call_id
@@ -1586,7 +1817,8 @@ impl AgentCoreV4<'_> {
                                 .map_err(AgentCoreErrorV4::Tool)?,
                         );
                     }
-                    if !outcome.succeeded
+                    if !cancellation_requested
+                        && !outcome.succeeded
                         && outcome.data.get("error_kind").and_then(Value::as_str)
                             == Some("browser_connection_required")
                     {
@@ -1626,7 +1858,8 @@ impl AgentCoreV4<'_> {
                         }
                         return Err(AgentCoreErrorV4::WaitingForInput);
                     }
-                    if !outcome.succeeded
+                    if !cancellation_requested
+                        && !outcome.succeeded
                         && outcome.data.get("error_kind").and_then(Value::as_str)
                             == Some("human_intervention_required")
                     {
@@ -1685,6 +1918,33 @@ impl AgentCoreV4<'_> {
                         },
                     )
                     .await?;
+                }
+                if cancelled.load(Ordering::SeqCst) {
+                    cancellation_requested = true;
+                }
+                if cancellation_requested {
+                    if !unresolved_side_effects.is_empty() {
+                        let unresolved_side_effects = unresolved_side_effects
+                            .into_iter()
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect::<Vec<_>>();
+                        let message = format!(
+                            "run stop left side-effect dispatches unresolved: {}",
+                            unresolved_side_effects.join(", ")
+                        );
+                        self.push(
+                            spec.run_id,
+                            AgentEventKindV4::RunNeedsAttention {
+                                message: message.clone(),
+                            },
+                        )
+                        .await?;
+                        return Err(AgentCoreErrorV4::NeedsAttention(message));
+                    }
+                    self.push(spec.run_id, AgentEventKindV4::RunCancelled)
+                        .await?;
+                    return Err(AgentCoreErrorV4::Cancelled);
                 }
                 if let Some((route, task_shape, source, reason)) = routed {
                     let task_shape = if latest_task_shape(
@@ -1864,6 +2124,12 @@ impl AgentCoreV4<'_> {
                         .await?;
                     return Err(AgentCoreErrorV4::Cancelled);
                 }
+                if !auto_review_enabled(spec) {
+                    if self.complete_if_no_guidance(spec.run_id).await? {
+                        return Ok(());
+                    }
+                    continue;
+                }
                 let review = self
                     .review_with_retry(
                         spec.run_id,
@@ -1994,6 +2260,11 @@ impl AgentCoreV4<'_> {
     ) -> Result<DelegationGraphOutcomeV4, AgentCoreErrorV4> {
         if cancelled.load(Ordering::SeqCst) {
             return Err(AgentCoreErrorV4::Cancelled);
+        }
+        if !conversation_preferences(spec).delegation_enabled {
+            return Err(AgentCoreErrorV4::Delegation(
+                "delegation is disabled for this frozen conversation run".into(),
+            ));
         }
         let nodes = validate_delegation_graph_v4(&graph, spec, self.tools, limits)
             .map_err(AgentCoreErrorV4::Delegation)?;
@@ -2177,6 +2448,7 @@ impl AgentCoreV4<'_> {
                     dependency_outputs,
                     limits,
                     cancelled,
+                    conversation_preferences(spec).memory_enabled,
                     (spec.execution_kind == RunExecutionKindV4::OrdinaryAgent)
                         .then_some(spec.run_id),
                 )
@@ -2225,6 +2497,7 @@ impl AgentCoreV4<'_> {
             dependency_outputs,
             limits,
             cancelled,
+            true,
             None,
         )
         .await
@@ -2237,6 +2510,7 @@ impl AgentCoreV4<'_> {
         dependency_outputs: BTreeMap<String, Value>,
         limits: AgentLimitsV4,
         cancelled: &AtomicBool,
+        memory_enabled: bool,
         guidance_run_id: Option<Uuid>,
     ) -> DelegationNodeOutcomeV4 {
         let mut tool_outcomes = Vec::new();
@@ -2247,7 +2521,9 @@ impl AgentCoreV4<'_> {
             .descriptors(RunModeV4::Execute)
             .into_iter()
             .filter(|tool| {
-                node.capabilities.contains(&tool.id) && tool.effect == ToolEffectV4::ReadOnly
+                node.capabilities.contains(&tool.id)
+                    && tool.effect == ToolEffectV4::ReadOnly
+                    && (memory_enabled || tool.id != "search_memory")
             })
             .collect::<Vec<_>>();
         descriptors.push(delegated_result_descriptor(&node.output_schema));
@@ -2355,7 +2631,8 @@ impl AgentCoreV4<'_> {
                     );
                 }
                 let allowed = node.capabilities.contains(&call.tool_id)
-                    && self.tools.effect(&call.tool_id) == Some(ToolEffectV4::ReadOnly);
+                    && self.tools.effect(&call.tool_id) == Some(ToolEffectV4::ReadOnly)
+                    && (memory_enabled || call.tool_id != "search_memory");
                 let mut stop_after_tool = None;
                 let outcome = if !allowed {
                     ToolOutcomeV4 {
@@ -2500,6 +2777,8 @@ impl AgentCoreV4<'_> {
         self.model
             .validate_request(&request)
             .map_err(|error| AgentCoreErrorV4::NeedsAttention(error.message))?;
+        let logical_request_id = Uuid::new_v4();
+        let usage_metadata = self.model.usage_metadata();
         let mut attempt = 0_u8;
         let mut output_repair_attempted = false;
         loop {
@@ -2516,6 +2795,18 @@ impl AgentCoreV4<'_> {
                     return Err(AgentCoreErrorV4::GuidancePending);
                 }
             }
+            let request_usage_metadata = self.model.usage_request_metadata(&request);
+            let mut current_attempt_id = Uuid::new_v4();
+            self.push(
+                run_id,
+                model_request_started(
+                    logical_request_id,
+                    current_attempt_id,
+                    &usage_metadata,
+                    &request_usage_metadata,
+                ),
+            )
+            .await?;
             let mut callback_events = Vec::new();
             let mut streamed_text = String::new();
             let _preview = ModelTextPreviewGuard {
@@ -2523,61 +2814,112 @@ impl AgentCoreV4<'_> {
                 run_id,
             };
             let mut last_preview = None::<Instant>;
-            let mut on_event = |event| {
-                let kind = match event {
-                    ModelStreamEventV4::TextDelta(text) => {
-                        streamed_text.push_str(&text);
-                        if persist_text
-                            && last_preview
-                                .is_none_or(|last| last.elapsed() >= Duration::from_millis(40))
-                        {
-                            self.events.preview_model_text(run_id, Some(&streamed_text));
-                            last_preview = Some(Instant::now());
-                        }
-                        return;
+            let mut saw_usage = false;
+            let mut on_event = |event| match event {
+                ModelStreamEventV4::TextDelta(text) => {
+                    streamed_text.push_str(&text);
+                    if persist_text
+                        && last_preview
+                            .is_none_or(|last| last.elapsed() >= Duration::from_millis(40))
+                    {
+                        self.events.preview_model_text(run_id, Some(&streamed_text));
+                        last_preview = Some(Instant::now());
                     }
-                    ModelStreamEventV4::ProviderRetrying {
-                        attempt,
-                        delay_ms,
-                        message,
-                    } => AgentEventKindV4::ModelRetrying {
+                }
+                ModelStreamEventV4::ProviderRetrying {
+                    attempt,
+                    delay_ms,
+                    message,
+                } => {
+                    callback_events.push(AgentEventKindV4::ModelRetrying {
                         attempt,
                         class: omicsops_protocol::ModelErrorClassV4::Transport,
                         message: format!("{message}; retry delay {delay_ms}ms"),
-                    },
-                };
-                callback_events.push(kind);
+                    });
+                    if !saw_usage {
+                        callback_events.push(unknown_model_usage(
+                            logical_request_id,
+                            current_attempt_id,
+                            &usage_metadata,
+                            &request_usage_metadata,
+                            UsageObservationStateV4::Interrupted,
+                        ));
+                    }
+                    current_attempt_id = Uuid::new_v4();
+                    saw_usage = false;
+                    callback_events.push(model_request_started(
+                        logical_request_id,
+                        current_attempt_id,
+                        &usage_metadata,
+                        &request_usage_metadata,
+                    ));
+                }
+                ModelStreamEventV4::Usage(sample) => {
+                    saw_usage = true;
+                    callback_events.push(AgentEventKindV4::ModelUsageObserved {
+                        observation: model_usage_observation(
+                            logical_request_id,
+                            current_attempt_id,
+                            &usage_metadata,
+                            &request_usage_metadata,
+                            sample,
+                        ),
+                    });
+                }
             };
             let mut completion = Box::pin(self.model.stream(request.clone(), &mut on_event));
             let deadline = tokio::time::sleep(attempt_timeout);
             tokio::pin!(deadline);
-            let result = loop {
+            let result: Result<Result<ModelTurnV4, ModelFailureV4>, AgentCoreErrorV4> = loop {
                 tokio::select! {
-                    result = &mut completion => break result,
+                    result = &mut completion => break Ok(result),
                     _ = &mut deadline => {
-                        break Err(ModelFailureV4::transient(
+                        break Ok(Err(ModelFailureV4::transient(
                             omicsops_protocol::ModelErrorClassV4::Timeout,
                             format!("model produced no completed turn within {} seconds", attempt_timeout.as_secs()),
-                        ));
+                        )));
                     }
                     _ = tokio::time::sleep(Duration::from_millis(50)), if cancelled.is_some() => {
                         if cancelled.is_some_and(|token| token.load(Ordering::SeqCst)) {
-                            if let Some(token) = cancelled {
-                                self.stop_if_cancelled(run_id, token).await?;
-                            }
-                            return Err(AgentCoreErrorV4::Cancelled);
+                            break Err(AgentCoreErrorV4::Cancelled);
                         }
-                        if self.events.has_pending_guidance(run_id).await.map_err(AgentCoreErrorV4::Store)? {
-                            return Err(AgentCoreErrorV4::GuidancePending);
+                        match self.events.has_pending_guidance(run_id).await {
+                            Ok(true) => break Err(AgentCoreErrorV4::GuidancePending),
+                            Ok(false) => {}
+                            Err(error) => break Err(AgentCoreErrorV4::Store(error)),
                         }
                     }
                 }
             };
             drop(completion);
             drop(on_event);
+            if !saw_usage {
+                let state = if matches!(result, Ok(Ok(_))) {
+                    UsageObservationStateV4::Final
+                } else {
+                    UsageObservationStateV4::Interrupted
+                };
+                callback_events.push(unknown_model_usage(
+                    logical_request_id,
+                    current_attempt_id,
+                    &usage_metadata,
+                    &request_usage_metadata,
+                    state,
+                ));
+            }
             for kind in callback_events {
                 self.push(run_id, kind).await?;
             }
+            let result = match result {
+                Ok(result) => result,
+                Err(error @ AgentCoreErrorV4::Cancelled) => {
+                    if let Some(token) = cancelled {
+                        self.stop_if_cancelled(run_id, token).await?;
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
             match result {
                 Ok(mut turn) => {
                     let completed_text = if turn.public_text.is_empty() {
@@ -2821,6 +3163,9 @@ impl AgentCoreV4<'_> {
                 return Err(AgentCoreErrorV4::NeedsAttention(message));
             }
         }
+        if !auto_review_enabled(spec) {
+            return self.complete_if_no_guidance(spec.run_id).await;
+        }
         let review = self
             .review_with_retry(
                 spec.run_id,
@@ -2949,10 +3294,37 @@ impl AgentCoreV4<'_> {
             .await?;
         }
         for (call, dispatched) in pending.into_values() {
+            if !dispatched {
+                if let Some(capability) = optional_capability_disabled(spec, &call.tool_id) {
+                    self.push(
+                        run_id,
+                        AgentEventKindV4::ToolFinished {
+                            outcome: disabled_capability_outcome(&call, capability, false),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
+            }
             let effect = self
                 .tools
                 .effect(&call.tool_id)
                 .ok_or_else(|| AgentCoreErrorV4::Tool(format!("unknown tool {}", call.tool_id)))?;
+            if let Some(capability) = optional_capability_disabled(spec, &call.tool_id) {
+                // A read-only call that was already marked dispatched must
+                // not be replayed after a restart. Side-effecting calls still
+                // follow the existing uncertainty/reconciliation path.
+                if !dispatched || effect == ToolEffectV4::ReadOnly {
+                    self.push(
+                        run_id,
+                        AgentEventKindV4::ToolFinished {
+                            outcome: disabled_capability_outcome(&call, capability, dispatched),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
+            }
             if dispatched && effect != ToolEffectV4::ReadOnly {
                 if cancelled.load(Ordering::SeqCst) {
                     return Err(AgentCoreErrorV4::Cancelled);
@@ -3808,6 +4180,7 @@ impl AgentCoreV4<'_> {
                 .filter(|tool| {
                     (!discovered || tool.id != "search_mcp_tools")
                         && (!all_blocked || tool.id != "use_mcp_tool")
+                        && optional_capability_disabled(spec, &tool.id).is_none()
                 })
                 .collect(),
             image_refs: screenshot_image_refs(events),
@@ -4817,6 +5190,64 @@ fn phase_for_calls(calls: &[ToolCallV4]) -> AgentPhaseV4 {
     }
 }
 
+fn conversation_preferences(spec: &RunSpecV4) -> ConversationAgentPreferencesV4 {
+    // `None` is the legacy wire shape. Preserve its historical behavior when
+    // resuming old frozen runs; new runs snapshot explicit preferences into
+    // the spec and never consult mutable conversation settings here.
+    spec.conversation_preferences.unwrap_or_default()
+}
+
+fn auto_review_enabled(spec: &RunSpecV4) -> bool {
+    conversation_preferences(spec).auto_review
+}
+
+fn optional_capability_disabled(spec: &RunSpecV4, tool_id: &str) -> Option<&'static str> {
+    let preferences = conversation_preferences(spec);
+    match tool_id {
+        "agent.delegate" if !preferences.delegation_enabled => Some("delegation"),
+        "search_memory" if !preferences.memory_enabled => Some("memory"),
+        _ => None,
+    }
+}
+
+fn disabled_capability_outcome(
+    call: &ToolCallV4,
+    capability: &str,
+    operation_dispatched: bool,
+) -> ToolOutcomeV4 {
+    ToolOutcomeV4 {
+        call_id: call.call_id.clone(),
+        tool_id: call.tool_id.clone(),
+        succeeded: false,
+        model_content: format!(
+            "Host disabled the optional {capability} capability for this frozen conversation run; no new operation was dispatched."
+        ),
+        data: json!({
+            "error_kind": "optional_capability_disabled",
+            "capability": capability,
+            "recoverable": true,
+            "operation_dispatched": operation_dispatched,
+        }),
+        provenance: vec!["conversation-preferences-v4".into()],
+    }
+}
+
+fn cancelled_read_outcome(call: &ToolCallV4) -> ToolOutcomeV4 {
+    ToolOutcomeV4 {
+        call_id: call.call_id.clone(),
+        tool_id: call.tool_id.clone(),
+        succeeded: false,
+        model_content: "The read-only tool call was cancelled before a result was available."
+            .into(),
+        data: json!({
+            "error_kind": "cancelled",
+            "recoverable": true,
+            "operation_dispatched": true,
+        }),
+        provenance: vec!["host-cancellation-v4".into()],
+    }
+}
+
 fn is_task_tool(tool_id: &str) -> bool {
     if tool_id == context_views::READ_RESULT_TOOL {
         return false;
@@ -5411,6 +5842,91 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum UsageScriptMode {
+        RetryOnce,
+        ProviderRetryEvent,
+        PermanentError,
+        CancelAfterUsage,
+        NoUsage,
+    }
+
+    struct UsageScriptModel {
+        mode: UsageScriptMode,
+        calls: AtomicUsize,
+        cancelled: Option<Arc<AtomicBool>>,
+        request_metadata: Option<ModelUsageRequestMetadataV4>,
+    }
+
+    #[async_trait]
+    impl ModelPortV4 for UsageScriptModel {
+        fn usage_request_metadata(&self, _request: &ModelRequestV4) -> ModelUsageRequestMetadataV4 {
+            self.request_metadata.clone().unwrap_or_default()
+        }
+
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if matches!(self.mode, UsageScriptMode::ProviderRetryEvent) {
+                on_event(ModelStreamEventV4::ProviderRetrying {
+                    attempt: 1,
+                    delay_ms: 1,
+                    message: "provider retry fixture".into(),
+                });
+            }
+            if !matches!(self.mode, UsageScriptMode::NoUsage) {
+                on_event(ModelStreamEventV4::Usage(ModelUsageSampleV4 {
+                    sample_index: 0,
+                    state: if matches!(self.mode, UsageScriptMode::CancelAfterUsage) {
+                        UsageObservationStateV4::Partial
+                    } else {
+                        UsageObservationStateV4::Final
+                    },
+                    aggregation: UsageAggregationV4::Cumulative,
+                    input_tokens: Some(4),
+                    context_tokens: Some(4),
+                    output_tokens: Some(2),
+                    reasoning_tokens: None,
+                    cache_read_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                    reported_total_tokens: None,
+                }));
+            }
+            match self.mode {
+                UsageScriptMode::RetryOnce if call == 0 => Err(ModelFailureV4::transient(
+                    omicsops_protocol::ModelErrorClassV4::Transport,
+                    "retry fixture",
+                )),
+                UsageScriptMode::PermanentError => Err(ModelFailureV4::permanent(
+                    omicsops_protocol::ModelErrorClassV4::Server,
+                    "provider fixture failed after usage",
+                )),
+                UsageScriptMode::CancelAfterUsage => {
+                    if let Some(cancelled) = &self.cancelled {
+                        cancelled.store(true, AtomicOrdering::SeqCst);
+                    }
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    unreachable!("the core cancellation boundary should drop this attempt")
+                }
+                UsageScriptMode::RetryOnce => Ok(ModelTurnV4 {
+                    public_text: "done".into(),
+                    tool_calls: vec![],
+                }),
+                UsageScriptMode::ProviderRetryEvent => Ok(ModelTurnV4 {
+                    public_text: "done after provider retry".into(),
+                    tool_calls: vec![],
+                }),
+                UsageScriptMode::NoUsage => Ok(ModelTurnV4 {
+                    public_text: "done without usage".into(),
+                    tool_calls: vec![],
+                }),
+            }
+        }
+    }
+
     #[test]
     fn prompt_layers_are_ordered_testable_and_do_not_preload_skill_content() {
         let layers = PromptLayersV4 {
@@ -5495,6 +6011,63 @@ mod tests {
                 tool_id: call.tool_id,
                 succeeded: true,
                 model_content: "files".into(),
+                data: json!({}),
+                provenance: vec![],
+            })
+        }
+    }
+
+    struct OptionalCapabilityTools {
+        execute_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ToolPortV4 for OptionalCapabilityTools {
+        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
+            vec![
+                ToolDescriptorV4 {
+                    id: "agent.delegate".into(),
+                    description: "delegate independent work".into(),
+                    input_schema: json!({"type":"object"}),
+                    effect: ToolEffectV4::Delegation,
+                },
+                ToolDescriptorV4 {
+                    id: "search_memory".into(),
+                    description: "search saved memory".into(),
+                    input_schema: json!({"type":"object"}),
+                    effect: ToolEffectV4::ReadOnly,
+                },
+                ToolDescriptorV4 {
+                    id: "save_memory".into(),
+                    description: "save a memory note".into(),
+                    input_schema: json!({"type":"object"}),
+                    effect: ToolEffectV4::Mutating,
+                },
+                ToolDescriptorV4 {
+                    id: "project.list".into(),
+                    description: "list project metadata".into(),
+                    input_schema: json!({"type":"object"}),
+                    effect: ToolEffectV4::ReadOnly,
+                },
+            ]
+        }
+
+        fn effect(&self, tool_id: &str) -> Option<ToolEffectV4> {
+            match tool_id {
+                "agent.delegate" => Some(ToolEffectV4::Delegation),
+                "search_memory" | "project.list" => Some(ToolEffectV4::ReadOnly),
+                "save_memory" => Some(ToolEffectV4::Mutating),
+                _ => None,
+            }
+        }
+
+        async fn execute(&self, _: RunModeV4, call: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            self.execute_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(ToolOutcomeV4 {
+                call_id: call.call_id,
+                tool_id: call.tool_id,
+                succeeded: true,
+                model_content: "optional capability executed".into(),
                 data: json!({}),
                 provenance: vec![],
             })
@@ -5838,6 +6411,349 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(model_text, vec!["我先检查输入目录。"]);
+    }
+
+    fn seed_model_run(store: &MemoryStore) -> Uuid {
+        let run_id = Uuid::new_v4();
+        store
+            .append_direct(&AgentEventV4::first(
+                run_id,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Utc::now(),
+                AgentEventKindV4::RunCreated {
+                    mode: RunModeV4::Execute,
+                },
+            ))
+            .unwrap();
+        run_id
+    }
+
+    #[tokio::test]
+    async fn each_retry_gets_a_distinct_attempt_id_and_preserves_usage_observations() {
+        let store = MemoryStore::default();
+        let run_id = seed_model_run(&store);
+        let model = UsageScriptModel {
+            mode: UsageScriptMode::RetryOnce,
+            calls: AtomicUsize::new(0),
+            cancelled: None,
+            request_metadata: None,
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+
+        core.model_turn(
+            run_id,
+            ModelRequestV4 {
+                system: String::new(),
+                context: String::new(),
+                tools: vec![],
+                image_refs: vec![],
+            },
+            1,
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let events = store.load_direct(run_id).unwrap();
+        let starts = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEventKindV4::ModelRequestStarted { request } => Some(request),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let observations = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEventKindV4::ModelUsageObserved { observation } => Some(observation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(starts.len(), 2);
+        assert_ne!(starts[0].attempt_id, starts[1].attempt_id);
+        assert_eq!(observations.len(), 2);
+        assert_eq!(
+            observations[0].logical_request_id,
+            observations[1].logical_request_id
+        );
+        assert_eq!(observations[0].attempt_id, starts[0].attempt_id);
+        assert_eq!(observations[1].attempt_id, starts[1].attempt_id);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::ModelRetrying { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_retry_callback_starts_a_distinct_usage_attempt() {
+        let store = MemoryStore::default();
+        let run_id = seed_model_run(&store);
+        let model = UsageScriptModel {
+            mode: UsageScriptMode::ProviderRetryEvent,
+            calls: AtomicUsize::new(0),
+            cancelled: None,
+            request_metadata: None,
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+
+        core.model_turn(
+            run_id,
+            ModelRequestV4 {
+                system: String::new(),
+                context: String::new(),
+                tools: vec![],
+                image_refs: vec![],
+            },
+            0,
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let events = store.load_direct(run_id).unwrap();
+        let starts = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEventKindV4::ModelRequestStarted { request } => Some(request),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let observations = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEventKindV4::ModelUsageObserved { observation } => Some(observation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(observations.len(), 2);
+        assert_ne!(starts[0].attempt_id, starts[1].attempt_id);
+        assert_eq!(observations[0].attempt_id, starts[0].attempt_id);
+        assert_eq!(observations[1].attempt_id, starts[1].attempt_id);
+        assert_eq!(observations[0].aggregation, UsageAggregationV4::Unknown);
+        assert_eq!(observations[1].output_tokens, Some(2));
+        assert_eq!(
+            observations[0].logical_request_id,
+            observations[1].logical_request_id
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_error_flushes_usage_before_returning_the_error() {
+        let store = MemoryStore::default();
+        let run_id = seed_model_run(&store);
+        let model = UsageScriptModel {
+            mode: UsageScriptMode::PermanentError,
+            calls: AtomicUsize::new(0),
+            cancelled: None,
+            request_metadata: None,
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+
+        let result = core
+            .model_turn(
+                run_id,
+                ModelRequestV4 {
+                    system: String::new(),
+                    context: String::new(),
+                    tools: vec![],
+                    image_refs: vec![],
+                },
+                0,
+                Duration::from_secs(1),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::Model(message)) if message.contains("provider fixture"))
+        );
+        let events = store.load_direct(run_id).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::ModelUsageObserved { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_turn_without_provider_usage_is_recorded_as_unknown() {
+        let store = MemoryStore::default();
+        let run_id = seed_model_run(&store);
+        let model = UsageScriptModel {
+            mode: UsageScriptMode::NoUsage,
+            calls: AtomicUsize::new(0),
+            cancelled: None,
+            request_metadata: None,
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+
+        core.model_turn(
+            run_id,
+            ModelRequestV4 {
+                system: String::new(),
+                context: String::new(),
+                tools: vec![],
+                image_refs: vec![],
+            },
+            0,
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .unwrap();
+        let event = store
+            .load_direct(run_id)
+            .unwrap()
+            .into_iter()
+            .find_map(|event| match event.event {
+                AgentEventKindV4::ModelUsageObserved { observation } => Some(observation),
+                _ => None,
+            })
+            .expect("missing provider usage should be represented");
+        assert_eq!(event.aggregation, UsageAggregationV4::Unknown);
+        assert_eq!(event.state, UsageObservationStateV4::Final);
+        assert_eq!(event.input_tokens, None);
+        assert_eq!(event.output_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn request_budget_metadata_is_persisted_before_and_after_a_turn() {
+        let store = MemoryStore::default();
+        let run_id = seed_model_run(&store);
+        let model = UsageScriptModel {
+            mode: UsageScriptMode::NoUsage,
+            calls: AtomicUsize::new(0),
+            cancelled: None,
+            request_metadata: Some(ModelUsageRequestMetadataV4 {
+                serialized_request_bytes: Some(4_096),
+                image_count: Some(1),
+                image_bound_tokens: Some(3_001),
+                breakdown: Some(vec![ContextUsageRowV4 {
+                    category: "provider_json".into(),
+                    bytes: Some(4_096),
+                    tokens: None,
+                    estimated: false,
+                }]),
+            }),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+
+        core.model_turn(
+            run_id,
+            ModelRequestV4 {
+                system: String::new(),
+                context: String::new(),
+                tools: vec![],
+                image_refs: vec![],
+            },
+            0,
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let events = store.load_direct(run_id).unwrap();
+        let started = events
+            .iter()
+            .find_map(|event| match &event.event {
+                AgentEventKindV4::ModelRequestStarted { request } => Some(request),
+                _ => None,
+            })
+            .expect("request boundary should be durable");
+        assert_eq!(started.serialized_request_bytes, Some(4_096));
+        assert_eq!(started.image_count, Some(1));
+        assert_eq!(started.image_bound_tokens, Some(3_001));
+        assert_eq!(started.breakdown.as_ref().map(Vec::len), Some(1));
+
+        let observed = events
+            .iter()
+            .find_map(|event| match &event.event {
+                AgentEventKindV4::ModelUsageObserved { observation } => Some(observation),
+                _ => None,
+            })
+            .expect("a missing provider callback should still be represented");
+        assert_eq!(observed.serialized_request_bytes, Some(4_096));
+        assert_eq!(observed.image_bound_tokens, Some(3_001));
+    }
+
+    #[tokio::test]
+    async fn cancellation_flushes_partial_usage_before_the_terminal_event() {
+        let store = MemoryStore::default();
+        let run_id = seed_model_run(&store);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let model = UsageScriptModel {
+            mode: UsageScriptMode::CancelAfterUsage,
+            calls: AtomicUsize::new(0),
+            cancelled: Some(cancelled.clone()),
+            request_metadata: None,
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+
+        let result = core
+            .model_turn(
+                run_id,
+                ModelRequestV4 {
+                    system: String::new(),
+                    context: String::new(),
+                    tools: vec![],
+                    image_refs: vec![],
+                },
+                0,
+                Duration::from_secs(1),
+                Some(&cancelled),
+            )
+            .await;
+        assert!(matches!(result, Err(AgentCoreErrorV4::Cancelled)));
+        let events = store.load_direct(run_id).unwrap();
+        let usage_sequence = events
+            .iter()
+            .find_map(|event| {
+                matches!(event.event, AgentEventKindV4::ModelUsageObserved { .. })
+                    .then_some(event.sequence)
+            })
+            .expect("partial usage should be persisted");
+        let terminal_sequence = events
+            .iter()
+            .find_map(|event| {
+                matches!(event.event, AgentEventKindV4::RunCancelled).then_some(event.sequence)
+            })
+            .expect("cancellation should remain durable");
+        assert!(usage_sequence < terminal_sequence);
     }
     #[tokio::test]
     async fn planning_can_inspect_then_freeze_a_hashable_plan() {
@@ -7713,7 +8629,7 @@ mod tests {
                 tool_calls: vec![ToolCallV4 {
                     call_id: "done".into(),
                     tool_id: "agent.complete".into(),
-                    arguments: json!({"schema_version":4,"summary":"repaired execution completed","answer_markdown":"## Result\n\nThe execution was repaired and completed.","criteria":[{"criterion":"verified output","evidence":[{"kind":"event","sequence":9}]}]}),
+                    arguments: json!({"schema_version":4,"summary":"repaired execution completed","answer_markdown":"## Result\n\nThe execution was repaired and completed.","criteria":[{"criterion":"verified output","evidence":[{"kind":"event","sequence":13}]}]}),
                 }],
             },
         ]));
@@ -7914,7 +8830,7 @@ mod tests {
                 tool_calls: vec![ToolCallV4 {
                     call_id: "done".into(),
                     tool_id: "agent.complete".into(),
-                    arguments: json!({"schema_version":4,"summary":"analysis completed","answer_markdown":"## Result\n\nThe analysis completed successfully.","criteria":[{"criterion":"verified output","evidence":[{"kind":"event","sequence":6}]}]}),
+                    arguments: json!({"schema_version":4,"summary":"analysis completed","answer_markdown":"## Result\n\nThe analysis completed successfully.","criteria":[{"criterion":"verified output","evidence":[{"kind":"event","sequence":8}]}]}),
                 }],
             },
         ]));
@@ -7943,8 +8859,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(revisions, vec![1, 2]);
-        assert!(events.windows(2).all(|pair| pair[1].verify().is_ok()
-            && pair[1].previous_hash == pair[0].event_hash));
+        assert!(events
+            .windows(2)
+            .all(|pair| pair[1].verify().is_ok() && pair[1].previous_hash == pair[0].event_hash));
     }
 
     struct FlakyPlanModel(AtomicUsize);
@@ -8164,8 +9081,506 @@ mod tests {
         .execute_with_limits(&spec, AgentLimitsV4::default(), cancelled.as_ref())
         .await
         .unwrap_err();
-        assert!(matches!(error, AgentCoreErrorV4::Cancelled));
+        assert!(matches!(
+            error,
+            AgentCoreErrorV4::NeedsAttention(message) if message.contains("long")
+        ));
         assert_eq!(tools.interrupts.load(AtomicOrdering::SeqCst), 1);
+        let events = store.load_direct(run_id).unwrap();
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEventKindV4::ToolDispatchUncertain { call_id, .. }
+                    if call_id == "long"
+            )
+        }));
+        assert!(
+            events
+                .iter()
+                .any(|event| { matches!(event.event, AgentEventKindV4::RunNeedsAttention { .. }) })
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::RunCancelled))
+        );
+    }
+
+    struct FutureDropProbe(Arc<AtomicBool>);
+
+    impl Drop for FutureDropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, AtomicOrdering::SeqCst);
+        }
+    }
+
+    struct BlockingSideEffectTools {
+        entered: Arc<tokio::sync::Notify>,
+        calls: AtomicUsize,
+        future_dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ToolPortV4 for BlockingSideEffectTools {
+        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
+            vec![ToolDescriptorV4 {
+                id: "runtime.execute".into(),
+                description: "execute code".into(),
+                input_schema: json!({}),
+                effect: ToolEffectV4::Runtime,
+            }]
+        }
+
+        fn effect(&self, tool_id: &str) -> Option<ToolEffectV4> {
+            (tool_id == "runtime.execute").then_some(ToolEffectV4::Runtime)
+        }
+
+        async fn execute(&self, _: RunModeV4, _: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.entered.notify_one();
+            let _probe = FutureDropProbe(self.future_dropped.clone());
+            std::future::pending::<()>().await;
+            unreachable!("the blocked fixture never completes")
+        }
+    }
+
+    struct ControlledCancellationTools {
+        tool_id: &'static str,
+        effect: ToolEffectV4,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        release_on_interrupt: bool,
+        calls: AtomicUsize,
+        future_dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ToolPortV4 for ControlledCancellationTools {
+        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
+            vec![ToolDescriptorV4 {
+                id: self.tool_id.into(),
+                description: "cancellation fixture".into(),
+                input_schema: json!({}),
+                effect: self.effect,
+            }]
+        }
+
+        fn effect(&self, tool_id: &str) -> Option<ToolEffectV4> {
+            (tool_id == self.tool_id).then_some(self.effect)
+        }
+
+        async fn execute(&self, _: RunModeV4, call: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.entered.notify_one();
+            let _probe = FutureDropProbe(self.future_dropped.clone());
+            if self.release_on_interrupt {
+                self.release.notified().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+            Ok(ToolOutcomeV4 {
+                call_id: call.call_id,
+                tool_id: call.tool_id,
+                succeeded: true,
+                model_content: "completed after interruption request".into(),
+                data: json!({"operation_dispatched":true}),
+                provenance: vec!["cancellation-fixture".into()],
+            })
+        }
+
+        async fn interrupt(&self, _: Uuid) -> Result<(), String> {
+            if self.release_on_interrupt {
+                self.release.notify_waiters();
+            }
+            Ok(())
+        }
+    }
+
+    struct MixedCancellationTools {
+        entered: Arc<tokio::sync::Notify>,
+        entered_count: Arc<AtomicUsize>,
+        release: Arc<tokio::sync::Notify>,
+        calls: AtomicUsize,
+        future_dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ToolPortV4 for MixedCancellationTools {
+        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
+            vec![
+                ToolDescriptorV4 {
+                    id: "browser.waiting".into(),
+                    description: "browser fixture".into(),
+                    input_schema: json!({}),
+                    effect: ToolEffectV4::Network,
+                },
+                ToolDescriptorV4 {
+                    id: "blocked-side-effect".into(),
+                    description: "blocked fixture".into(),
+                    input_schema: json!({}),
+                    effect: ToolEffectV4::Runtime,
+                },
+            ]
+        }
+
+        fn effect(&self, tool_id: &str) -> Option<ToolEffectV4> {
+            match tool_id {
+                "browser.waiting" => Some(ToolEffectV4::Network),
+                "blocked-side-effect" => Some(ToolEffectV4::Runtime),
+                _ => None,
+            }
+        }
+
+        async fn execute(&self, _: RunModeV4, call: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.entered_count.fetch_add(1, AtomicOrdering::SeqCst);
+            self.entered.notify_waiters();
+            let _probe = FutureDropProbe(self.future_dropped.clone());
+            if call.call_id == "browser-completed" {
+                self.release.notified().await;
+                return Ok(ToolOutcomeV4 {
+                    call_id: call.call_id,
+                    tool_id: call.tool_id,
+                    succeeded: false,
+                    model_content: "browser connection required".into(),
+                    data: json!({
+                        "error_kind":"browser_connection_required",
+                        "session":"workspace",
+                        "protocol_version":1,
+                    }),
+                    provenance: vec![],
+                });
+            }
+            std::future::pending::<()>().await;
+            unreachable!("the blocked fixture never completes")
+        }
+
+        async fn interrupt(&self, _: Uuid) -> Result<(), String> {
+            self.release.notify_waiters();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_records_unresolved_side_effect_before_abandoning_its_future() {
+        let run_id = Uuid::new_v4();
+        let spec = execution_spec(run_id);
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
+            public_text: String::new(),
+            tool_calls: vec![ToolCallV4 {
+                call_id: "blocked-side-effect".into(),
+                tool_id: "runtime.execute".into(),
+                arguments: json!({"language":"python","code":"write_output()"}),
+            }],
+        }]));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let future_dropped = Arc::new(AtomicBool::new(false));
+        let tools = BlockingSideEffectTools {
+            entered: entered.clone(),
+            calls: AtomicUsize::new(0),
+            future_dropped: future_dropped.clone(),
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let setter = cancelled.clone();
+        tokio::spawn(async move {
+            entered.notified().await;
+            setter.store(true, Ordering::SeqCst);
+        });
+
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            core.execute_with_limits(&spec, AgentLimitsV4::default(), cancelled.as_ref()),
+        )
+        .await
+        .expect("cancellation must remain bounded")
+        .expect_err("unresolved side effects require attention");
+
+        assert!(
+            matches!(result, AgentCoreErrorV4::NeedsAttention(message) if message.contains("blocked-side-effect"))
+        );
+        assert_eq!(tools.calls.load(AtomicOrdering::SeqCst), 1);
+        assert!(future_dropped.load(AtomicOrdering::SeqCst));
+        let events = store.load_direct(run_id).unwrap();
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEventKindV4::ToolDispatchUncertain { call_id, .. }
+                    if call_id == "blocked-side-effect"
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEventKindV4::RunNeedsAttention { message }
+                    if message.contains("blocked-side-effect")
+            )
+        }));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::RunCancelled))
+        );
+        let recovery = core
+            .recover_interrupted_dispatches(
+                &spec,
+                AgentLimitsV4::default(),
+                &AtomicBool::new(false),
+            )
+            .await;
+        assert!(matches!(
+            recovery,
+            Err(AgentCoreErrorV4::UncertainSideEffect(call_id))
+                if call_id == "blocked-side-effect"
+        ));
+        assert_eq!(tools.calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_preserves_a_side_effect_that_finishes_after_interrupt() {
+        let run_id = Uuid::new_v4();
+        let spec = execution_spec(run_id);
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
+            public_text: String::new(),
+            tool_calls: vec![ToolCallV4 {
+                call_id: "completed-side-effect".into(),
+                tool_id: "runtime.execute".into(),
+                arguments: json!({"language":"python","code":"write_output()"}),
+            }],
+        }]));
+        let tools = ControlledCancellationTools {
+            tool_id: "runtime.execute",
+            effect: ToolEffectV4::Runtime,
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            release_on_interrupt: true,
+            calls: AtomicUsize::new(0),
+            future_dropped: Arc::new(AtomicBool::new(false)),
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let setter = cancelled.clone();
+        let entered = tools.entered.clone();
+        tokio::spawn(async move {
+            entered.notified().await;
+            setter.store(true, Ordering::SeqCst);
+        });
+
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            core.execute_with_limits(&spec, AgentLimitsV4::default(), cancelled.as_ref()),
+        )
+        .await
+        .expect("cancellation must remain bounded")
+        .expect_err("cancellation returns a cancelled result");
+        assert!(matches!(result, AgentCoreErrorV4::Cancelled));
+        assert_eq!(tools.calls.load(AtomicOrdering::SeqCst), 1);
+        let events = store.load_direct(run_id).unwrap();
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEventKindV4::ToolFinished { outcome }
+                    if outcome.call_id == "completed-side-effect"
+                        && outcome.succeeded
+            )
+        }));
+        assert!(!events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEventKindV4::ToolDispatchUncertain { call_id, .. }
+                    if call_id == "completed-side-effect"
+            )
+        }));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::RunCancelled))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| { matches!(event.event, AgentEventKindV4::RunNeedsAttention { .. }) })
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_closes_a_pending_read_without_replaying_it() {
+        let run_id = Uuid::new_v4();
+        let spec = execution_spec(run_id);
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
+            public_text: String::new(),
+            tool_calls: vec![ToolCallV4 {
+                call_id: "cancelled-read".into(),
+                tool_id: "project.list".into(),
+                arguments: json!({"path":"."}),
+            }],
+        }]));
+        let tools = ControlledCancellationTools {
+            tool_id: "project.list",
+            effect: ToolEffectV4::ReadOnly,
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            release_on_interrupt: false,
+            calls: AtomicUsize::new(0),
+            future_dropped: Arc::new(AtomicBool::new(false)),
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let setter = cancelled.clone();
+        let entered = tools.entered.clone();
+        tokio::spawn(async move {
+            entered.notified().await;
+            setter.store(true, Ordering::SeqCst);
+        });
+
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            core.execute_with_limits(&spec, AgentLimitsV4::default(), cancelled.as_ref()),
+        )
+        .await
+        .expect("cancellation must remain bounded")
+        .expect_err("cancellation returns a cancelled result");
+        assert!(matches!(result, AgentCoreErrorV4::Cancelled));
+        let events = store.load_direct(run_id).unwrap();
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEventKindV4::ToolFinished { outcome }
+                    if outcome.call_id == "cancelled-read"
+                        && outcome.data["error_kind"] == "cancelled"
+            )
+        }));
+        assert!(!events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEventKindV4::ToolDispatchUncertain { call_id, .. }
+                    if call_id == "cancelled-read"
+            )
+        }));
+        assert_eq!(tools.calls.load(AtomicOrdering::SeqCst), 1);
+        core.recover_interrupted_dispatches(
+            &spec,
+            AgentLimitsV4::default(),
+            &AtomicBool::new(false),
+        )
+        .await
+        .expect("cancelled reads are closed in the event chain");
+        assert_eq!(tools.calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_drains_completed_browser_error_before_marking_pending_side_effect() {
+        let run_id = Uuid::new_v4();
+        let spec = execution_spec(run_id);
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
+            public_text: String::new(),
+            tool_calls: vec![
+                ToolCallV4 {
+                    call_id: "browser-completed".into(),
+                    tool_id: "browser.waiting".into(),
+                    arguments: json!({}),
+                },
+                ToolCallV4 {
+                    call_id: "blocked-side-effect".into(),
+                    tool_id: "blocked-side-effect".into(),
+                    arguments: json!({}),
+                },
+            ],
+        }]));
+        let tools = MixedCancellationTools {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            entered_count: Arc::new(AtomicUsize::new(0)),
+            release: Arc::new(tokio::sync::Notify::new()),
+            calls: AtomicUsize::new(0),
+            future_dropped: Arc::new(AtomicBool::new(false)),
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let setter = cancelled.clone();
+        let entered = tools.entered.clone();
+        let entered_count = tools.entered_count.clone();
+        // The setter waits until both side-effect calls have entered the host
+        // executor so the fixture exercises one completed and one unresolved
+        // dispatch in the same batch.
+        tokio::spawn(async move {
+            loop {
+                if entered_count.load(AtomicOrdering::SeqCst) == 2 {
+                    setter.store(true, Ordering::SeqCst);
+                    break;
+                }
+                entered.notified().await;
+            }
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            AgentCoreV4 {
+                model: &model,
+                tools: &tools,
+                events: &store,
+                science: None,
+            }
+            .execute_with_limits(&spec, AgentLimitsV4::default(), cancelled.as_ref()),
+        )
+        .await
+        .expect("cancellation must remain bounded")
+        .expect_err("the pending side effect requires attention");
+
+        assert!(
+            matches!(result, AgentCoreErrorV4::NeedsAttention(message) if message.contains("blocked-side-effect"))
+        );
+        assert_eq!(tools.calls.load(AtomicOrdering::SeqCst), 2);
+        let events = store.load_direct(run_id).unwrap();
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEventKindV4::ToolFinished { outcome }
+                    if outcome.call_id == "browser-completed" && !outcome.succeeded
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEventKindV4::ToolDispatchUncertain { call_id, .. }
+                    if call_id == "blocked-side-effect"
+            )
+        }));
+        assert!(
+            events
+                .iter()
+                .any(|event| { matches!(event.event, AgentEventKindV4::RunNeedsAttention { .. }) })
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::RunCancelled))
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event.event,
+            AgentEventKindV4::BrowserConnectionRequired { .. }
+        )));
     }
 
     struct SlowModel;
@@ -8460,6 +9875,34 @@ mod tests {
         }
     }
 
+    struct UsageWaitingModel {
+        entered: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl ModelPortV4 for UsageWaitingModel {
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            on_event(ModelStreamEventV4::Usage(ModelUsageSampleV4 {
+                sample_index: 0,
+                state: UsageObservationStateV4::Partial,
+                aggregation: UsageAggregationV4::Cumulative,
+                input_tokens: Some(3),
+                context_tokens: Some(3),
+                output_tokens: Some(1),
+                reasoning_tokens: None,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+                reported_total_tokens: None,
+            }));
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+    }
+
     #[tokio::test]
     async fn guidance_interrupts_model_wait_then_is_applied_once_and_survives_checkpoint() {
         let store = GuidanceTestStore::default();
@@ -8523,6 +9966,56 @@ mod tests {
             projected["frozen_plan"],
             serde_json::to_value(&spec.plan).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn guidance_poll_failure_flushes_usage_before_returning_the_error() {
+        let store = GuidanceTestStore::default();
+        let run_id = seed_model_run(&store.inner);
+        let model = UsageWaitingModel {
+            entered: Default::default(),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let cancelled = AtomicBool::new(false);
+        let trigger_failure = async {
+            model.entered.notified().await;
+            store.fail_next_poll.store(true, Ordering::SeqCst);
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                core.model_turn(
+                    run_id,
+                    ModelRequestV4 {
+                        system: String::new(),
+                        context: String::new(),
+                        tools: vec![],
+                        image_refs: vec![],
+                    },
+                    0,
+                    Duration::from_secs(1),
+                    Some(&cancelled),
+                ),
+                trigger_failure,
+            )
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::Store(message)) if message.contains("inbox"))
+        );
+        let events = store.inner.load_direct(run_id).unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            AgentEventKindV4::ModelUsageObserved { observation }
+                if observation.input_tokens == Some(3)
+                    && observation.output_tokens == Some(1)
+                    && observation.state == UsageObservationStateV4::Partial
+        )));
     }
 
     #[tokio::test]
@@ -9150,6 +10643,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_run_checkpoint_projection_preserves_pause_guidance_authority_and_evidence() {
+        let spec = ordinary_execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        append_test_event(
+            &store,
+            spec.run_id,
+            AgentEventKindV4::ModelText {
+                text: "historical model evidence ".repeat(8_000),
+            },
+        );
+        append_test_event(
+            &store,
+            spec.run_id,
+            AgentEventKindV4::InputRequested {
+                question_id: "question-before".into(),
+                question: "Which evidence should be retained?".into(),
+                reason: AgentInputReasonV4::Decision,
+            },
+        );
+        append_test_event(
+            &store,
+            spec.run_id,
+            AgentEventKindV4::UserInputAnswered {
+                question_id: "question-before".into(),
+                answer: "retain evidence-ref-123".into(),
+            },
+        );
+        append_test_event(
+            &store,
+            spec.run_id,
+            AgentEventKindV4::GuidanceConsumed {
+                message_id: Uuid::new_v4(),
+                markdown: "keep the cited evidence in the next request".into(),
+            },
+        );
+        append_test_event(
+            &store,
+            spec.run_id,
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: "evidence-call".into(),
+                    tool_id: "runtime.execute".into(),
+                    succeeded: true,
+                    model_content: "evidence-ref-123".into(),
+                    data: json!({"evidence_id":"evidence-ref-123"}),
+                    provenance: vec![],
+                },
+            },
+        );
+        append_test_event(
+            &store,
+            spec.run_id,
+            AgentEventKindV4::InputRequested {
+                question_id: "question-pending".into(),
+                question: "Choose the next evidence check.".into(),
+                reason: AgentInputReasonV4::Decision,
+            },
+        );
+
+        let model = BudgetOnlyModel {
+            request_limit: 256 * 1024,
+            requests: Mutex::new(vec![]),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let limits = AgentLimitsV4 {
+            auto_compact: false,
+            ..AgentLimitsV4::default()
+        };
+        let before = core.context_for(&spec, limits).await.unwrap();
+
+        let source = store.events.lock().unwrap().last().unwrap().clone();
+        let checkpoint = ContextCheckpointV4 {
+            schema_version: 4,
+            through_sequence: source.sequence,
+            completion_criteria: spec.plan.completion_criteria.clone(),
+            unresolved_errors: vec![],
+            recent_steps: vec![
+                "model: historical model evidence".into(),
+                "input question-before: retain evidence-ref-123".into(),
+                "tool runtime.execute: evidence-ref-123".into(),
+                "pending input question-pending (Decision): Choose the next evidence check.".into(),
+            ],
+            scientific_state: Value::Null,
+            task_shape: None,
+            phase: None,
+            task_revision: None,
+            tasks: vec![],
+            cycle_id: None,
+        };
+        let archive = ContextArchiveV4 {
+            archive_id: Uuid::new_v4(),
+            through_sequence: source.sequence,
+            size_bytes: before.len() as u64,
+            sha256: "manual-fixture".into(),
+        };
+        let archived = AgentEventV4::next(
+            &source,
+            Utc::now(),
+            AgentEventKindV4::ContextArchived { archive },
+        );
+        store.append_direct(&archived).unwrap();
+        store
+            .append_direct(&AgentEventV4::next(
+                &archived,
+                Utc::now(),
+                AgentEventKindV4::ContextCheckpointed { checkpoint },
+            ))
+            .unwrap();
+
+        let after = core.context_for(&spec, limits).await.unwrap();
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].context.len() < requests[0].context.len());
+        assert_eq!(requests[0].context, before);
+        assert_eq!(requests[1].context, after);
+        for marker in [
+            "question-before",
+            "retain evidence-ref-123",
+            "question-pending",
+            "Choose the next evidence check",
+            "keep the cited evidence in the next request",
+            "evidence-ref-123",
+        ] {
+            assert!(after.contains(marker), "checkpoint lost marker {marker}");
+        }
+        let value: Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(value["frozen_plan"], json!(spec.plan));
+        assert_eq!(value["compute_selection"], json!(spec.compute_selection));
+        assert_eq!(
+            value["compute_selection"]["autonomy_mode"],
+            json!("supervised")
+        );
+    }
+
+    #[tokio::test]
     async fn unshrinkable_request_stops_without_dispatch_or_duplicate_compaction() {
         let spec = execution_spec(Uuid::new_v4());
         let store = MemoryStore::default();
@@ -9659,6 +11293,267 @@ mod tests {
                 .last()
                 .unwrap()
                 .event,
+            AgentEventKindV4::RunCompleted
+        ));
+        assert!(
+            store
+                .load_direct(spec.run_id)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::ReviewerFinished { .. }))
+        );
+    }
+
+    #[test]
+    fn conversation_preferences_filter_optional_tools_and_legacy_defaults_enable_them() {
+        let spec = execution_spec(Uuid::new_v4());
+        let tools = OptionalCapabilityTools {
+            execute_calls: AtomicUsize::new(0),
+        };
+        let core = AgentCoreV4 {
+            model: &ScriptedModel(Mutex::new(vec![])),
+            tools: &tools,
+            events: &MemoryStore::default(),
+            science: None,
+        };
+        let legacy = core.execution_request(&spec, String::new(), &[]);
+        assert!(legacy.tools.iter().any(|tool| tool.id == "agent.delegate"));
+        assert!(legacy.tools.iter().any(|tool| tool.id == "search_memory"));
+        assert!(legacy.tools.iter().any(|tool| tool.id == "save_memory"));
+
+        let mut disabled = spec;
+        disabled.conversation_preferences = Some(ConversationAgentPreferencesV4 {
+            delegation_enabled: false,
+            auto_review: false,
+            memory_enabled: false,
+            fast_mode: None,
+        });
+        let request = core.execution_request(&disabled, String::new(), &[]);
+        assert!(!request.tools.iter().any(|tool| tool.id == "agent.delegate"));
+        assert!(!request.tools.iter().any(|tool| tool.id == "search_memory"));
+        assert!(request.tools.iter().any(|tool| tool.id == "save_memory"));
+        assert!(request.tools.iter().any(|tool| tool.id == "project.list"));
+    }
+
+    #[tokio::test]
+    async fn disabled_optional_calls_are_rejected_before_dispatch_even_when_malformed() {
+        let mut spec = execution_spec(Uuid::new_v4());
+        spec.conversation_preferences = Some(ConversationAgentPreferencesV4 {
+            delegation_enabled: false,
+            auto_review: true,
+            memory_enabled: false,
+            fast_mode: None,
+        });
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
+            public_text: String::new(),
+            tool_calls: vec![
+                ToolCallV4 {
+                    call_id: "malformed-delegate".into(),
+                    tool_id: "agent.delegate".into(),
+                    arguments: json!({"not":"a delegation graph"}),
+                },
+                ToolCallV4 {
+                    call_id: "memory-disabled".into(),
+                    tool_id: "search_memory".into(),
+                    arguments: json!("malformed search arguments"),
+                },
+            ],
+        }]));
+        let tools = OptionalCapabilityTools {
+            execute_calls: AtomicUsize::new(0),
+        };
+        let error = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        }
+        .execute_with_limits(
+            &spec,
+            AgentLimitsV4 {
+                max_turns: 1,
+                ..AgentLimitsV4::default()
+            },
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AgentCoreErrorV4::MissingCompletion));
+        assert_eq!(tools.execute_calls.load(AtomicOrdering::SeqCst), 0);
+        let events = store.load_direct(spec.run_id).unwrap();
+        for call_id in ["malformed-delegate", "memory-disabled"] {
+            assert!(events.iter().any(|event| matches!(
+                &event.event,
+                AgentEventKindV4::ToolFinished { outcome }
+                    if outcome.call_id == call_id
+                        && outcome.data.get("error_kind").and_then(Value::as_str)
+                            == Some("optional_capability_disabled")
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn disabling_review_keeps_deterministic_gate_and_skips_reviewer() {
+        let mut spec = execution_spec(Uuid::new_v4());
+        spec.conversation_preferences = Some(ConversationAgentPreferencesV4 {
+            delegation_enabled: true,
+            auto_review: false,
+            memory_enabled: true,
+            fast_mode: None,
+        });
+        let store = MemoryStore::default();
+        let evidence_sequence = seed_success_evidence(&store, &spec);
+        let model = ReviewingModel {
+            turns: Mutex::new(vec![ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![ToolCallV4 {
+                    call_id: "complete-without-review".into(),
+                    tool_id: "agent.complete".into(),
+                    arguments: completion_arguments(evidence_sequence),
+                }],
+            }]),
+            reviews: Mutex::new(vec![]),
+        };
+        AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        }
+        .execute(&spec, 1)
+        .await
+        .unwrap();
+        let events = store.load_direct(spec.run_id).unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            AgentEventKindV4::DeterministicVerificationFinished { report } if report.passed
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::ReviewerFinished { .. }))
+        );
+        assert!(matches!(
+            events.last().unwrap().event,
+            AgentEventKindV4::RunCompleted
+        ));
+    }
+
+    #[tokio::test]
+    async fn disabling_review_still_rejects_failed_deterministic_verification() {
+        let mut spec = execution_spec(Uuid::new_v4());
+        spec.conversation_preferences = Some(ConversationAgentPreferencesV4 {
+            delegation_enabled: true,
+            auto_review: false,
+            memory_enabled: true,
+            fast_mode: None,
+        });
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = ReviewingModel {
+            turns: Mutex::new(vec![ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![ToolCallV4 {
+                    call_id: "missing-evidence".into(),
+                    tool_id: "agent.complete".into(),
+                    arguments: json!({
+                        "schema_version":4,
+                        "summary":"unsupported",
+                        "answer_markdown":"not verified",
+                        "criteria":[{"criterion":"verified output","evidence":[]}]
+                    }),
+                }],
+            }]),
+            reviews: Mutex::new(vec![]),
+        };
+        let error = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        }
+        .execute(&spec, 1)
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AgentCoreErrorV4::MissingCompletion));
+        let events = store.load_direct(spec.run_id).unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            AgentEventKindV4::DeterministicVerificationFinished { report } if !report.passed
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::RunCompleted))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::ReviewerFinished { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_review_applies_when_resuming_a_pending_review() {
+        let mut spec = execution_spec(Uuid::new_v4());
+        spec.conversation_preferences = Some(ConversationAgentPreferencesV4 {
+            delegation_enabled: true,
+            auto_review: false,
+            memory_enabled: true,
+            fast_mode: None,
+        });
+        let store = MemoryStore::default();
+        let evidence_sequence = seed_success_evidence(&store, &spec);
+        let proposal = CompletionProposalV4 {
+            schema_version: 4,
+            summary: "persisted completion".into(),
+            answer_markdown: "Persisted completion.".into(),
+            criteria: vec![CompletionCriterionEvidenceV4 {
+                criterion: "verified output".into(),
+                evidence: vec![CompletionEvidenceRefV4::Event {
+                    sequence: evidence_sequence,
+                }],
+            }],
+        };
+        for kind in [
+            AgentEventKindV4::CompletionProposed,
+            AgentEventKindV4::CompletionProposalSubmitted { proposal },
+            AgentEventKindV4::DeterministicVerificationFinished {
+                report: DeterministicVerificationV4 {
+                    schema_version: 4,
+                    passed: true,
+                    findings: vec![],
+                },
+            },
+        ] {
+            let previous = store.events.lock().unwrap().last().unwrap().clone();
+            store
+                .append_direct(&AgentEventV4::next(&previous, Utc::now(), kind))
+                .unwrap();
+        }
+        let model = ReviewingModel {
+            turns: Mutex::new(vec![]),
+            reviews: Mutex::new(vec![]),
+        };
+        AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        }
+        .execute(&spec, 1)
+        .await
+        .unwrap();
+        let events = store.load_direct(spec.run_id).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::ReviewerFinished { .. }))
+        );
+        assert!(matches!(
+            events.last().unwrap().event,
             AgentEventKindV4::RunCompleted
         ));
     }
@@ -10689,6 +12584,7 @@ mod tests {
                     BTreeMap::new(),
                     AgentLimitsV4::default(),
                     &cancelled,
+                    true,
                     Some(Uuid::new_v4())
                 ),
                 fail_inbox

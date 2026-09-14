@@ -1,0 +1,103 @@
+.composer-attachments {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 9px;
+  max-height: min(220px, 30vh);
+  overflow-y: auto;
+}
+
+.composer-attachment {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid #c7dfda;
+  border-radius: 11px;
+  background: #eff8f5;
+  color: #2f625b;
+}
+
+.composer-attachment-uploading { border-color: #b8d9d2; }
+.composer-attachment-error { border-color: #edc9c6; background: #fff7f6; color: #8d302d; }
+
+.composer-attachment-copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.composer-attachment-heading {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 7px;
+}
+
+.composer-attachment-heading strong {
+  overflow: hidden;
+  color: #2d3b38;
+  font-size: 12px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-attachment-image {
+  flex: 0 0 auto;
+  padding: 2px 5px;
+  border: 1px solid #9ccdc4;
+  border-radius: 999px;
+  color: #35786f;
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: .03em;
+  text-transform: uppercase;
+}
+
+.composer-attachment-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: #6b827c;
+  font-size: 10px;
+}
+
+.composer-attachment-error {
+  color: #a52a2a;
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.composer-attachment-actions {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 5px;
+}
+
+.composer-attachment-action,
+.composer-attachment-remove {
+  padding: 4px 7px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #39756c;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.composer-attachment-remove { color: #70807b; }
+.composer-attachment-action:hover:not(:disabled),
+.composer-attachment-remove:hover:not(:disabled) { background: #d9ece8; }
+.composer-attachment-action:disabled,
+.composer-attachment-remove:disabled { cursor: default; opacity: .5; }
+.composer-attachment-action:focus-visible,
+.composer-attachment-remove:focus-visible { outline: 2px solid #169c90; outline-offset: 2px; }
+
+@media (max-width: 560px) {
+  .composer-attachment { align-items: flex-start; }
+  .composer-attachment-actions { flex-direction: column; align-items: stretch; }
+}

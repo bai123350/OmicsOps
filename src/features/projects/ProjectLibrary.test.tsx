@@ -27,6 +27,14 @@ const recentProject = {
 };
 
 describe("ProjectLibrary project location flow", () => {
+  it("closes the create dialog on window Escape without moving focus into it", () => {
+    render(<ProjectLibrary {...baseProps} onChooseLocalRoot={vi.fn().mockResolvedValue(null)} onCreate={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: /单细胞 RNA 测序/ }));
+    expect(screen.getByRole("button", { name: "创建项目" })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("button", { name: "创建项目" })).not.toBeInTheDocument();
+  });
+
   it("makes a local-only project explicit before creation", async () => {
     const onCreate = vi.fn().mockResolvedValue(undefined);
     render(<ProjectLibrary {...baseProps} connections={[]} onChooseLocalRoot={vi.fn().mockResolvedValue("E:/Science/pbmc")} onCreate={onCreate} />);

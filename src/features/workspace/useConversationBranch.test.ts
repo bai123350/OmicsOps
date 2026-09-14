@@ -1,0 +1,51 @@
+import { act, renderHook } from "@testing-library/react";
+import { beforeEach, expect, it, vi } from "vitest";
+import { conversationBranchCheckpoint, createConversationBranch } from "../../conversation-branch-api";
+import { useConversationBranch } from "./useConversationBranch";
+vi.mock("../../conversation-branch-api", () => ({ conversationBranchCheckpoint: vi.fn(), createConversationBranch: vi.fn() }));
+const checkpoint = { source_message_id: "m1", source_sequence: 1, source_head_sequence: 2, checkpoint_kind: "after_response" as const, boundary_hash: "hash" };
+const branch = { ...checkpoint, request_id: "q", branch_conversation_id: "b1", project_id: "p1", source_conversation_id: "c1", request_hash: "request-hash", state: "active" as const, created_at: "now", updated_at: "now" };
+beforeEach(() => { vi.clearAllMocks(); vi.mocked(conversationBranchCheckpoint).mockResolvedValue(checkpoint); vi.mocked(createConversationBranch).mockResolvedValue(branch); });
+it("retries the exact frozen request after an unknown create result", async () => {
+  vi.mocked(createConversationBranch).mockRejectedValueOnce(new Error("lost response"));
+  const open = vi.fn().mockResolvedValue(true);
+  const { result } = renderHook(() => useConversationBranch("p1", "c1", "en-US", open));
+  await act(async () => { await result.current.start("m1", "after_response", "My branch"); });
+  const first = vi.mocked(createConversationBranch).mock.calls[0][0];
+  expect(result.current.retryAvailable).toBe(true);
+  await act(async () => { await result.current.retry(); });
+  expect(vi.mocked(createConversationBranch).mock.calls[1][0]).toEqual(first);
+  expect(conversationBranchCheckpoint).toHaveBeenCalledTimes(1);
+  expect(open).toHaveBeenCalledWith(branch);
+});
+it("does not create another branch when refreshing the UI after commit fails", async () => {
+  const open = vi.fn().mockRejectedValueOnce(new Error("refresh failed")).mockResolvedValue(true);
+  const { result } = renderHook(() => useConversationBranch("p1", "c1", "en-US", open));
+  await act(async () => { await result.current.start("m1", "after_response", "My branch"); });
+  await act(async () => { await result.current.retry(); });
+  expect(createConversationBranch).toHaveBeenCalledTimes(1);
+  expect(open).toHaveBeenCalledTimes(2);
+});
+it("releases known rejected checkpoints so a fresh attempt can reload the boundary", async () => {
+  vi.mocked(createConversationBranch).mockRejectedValueOnce({ kind: "rejected", message: "stale" });
+  const { result } = renderHook(() => useConversationBranch("p1", "c1", "en-US", vi.fn().mockResolvedValue(true)));
+  await act(async () => { await result.current.start("m1", "after_response", "Branch"); });
+  expect(result.current.retryAvailable).toBe(false);
+  await act(async () => { await result.current.start("m1", "after_response", "Branch"); });
+  expect(conversationBranchCheckpoint).toHaveBeenCalledTimes(2);
+});
+it("retains an in-flight result for its source without opening it over another conversation", async () => {
+  let resolve!: (value: typeof branch) => void;
+  vi.mocked(createConversationBranch).mockImplementationOnce(() => new Promise((yes) => { resolve = yes; }));
+  const open = vi.fn().mockResolvedValue(true);
+  const { result, rerender } = renderHook(({ id }) => useConversationBranch("p1", id, "en-US", open), { initialProps: { id: "c1" } });
+  let pending!: Promise<boolean>;
+  await act(async () => { pending = result.current.start("m1", "after_response", "Branch"); });
+  rerender({ id: "c2" });
+  await act(async () => { resolve(branch); await pending; });
+  expect(open).not.toHaveBeenCalled();
+  rerender({ id: "c1" });
+  await act(async () => { await result.current.retry(); });
+  expect(createConversationBranch).toHaveBeenCalledTimes(1);
+  expect(open).toHaveBeenCalledWith(branch);
+});

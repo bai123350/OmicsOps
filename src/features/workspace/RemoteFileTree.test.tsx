@@ -35,3 +35,31 @@ describe("RemoteFileTree", () => {
     expect(screen.queryByText("summary.json")).not.toBeInTheDocument();
   });
 });
+
+it("attaches and drags a file reference without downloading or exposing directory actions", () => {
+  const onAttach = vi.fn(); const onDownload = vi.fn();
+  const reference = { kind: "workspace_file" as const, project_id: "project-a", backend_id: "local", relative_path: "README.md" };
+  render(<RemoteFileTree locale="en-US" source="local" remoteFiles={files} busy={false} onAttach={onAttach} onDownload={onDownload} dragReference={() => reference} />);
+  fireEvent.click(screen.getByRole("button", { name: "Attach reference README.md" }));
+  expect(onAttach).toHaveBeenCalledWith("README.md");
+  expect(onDownload).not.toHaveBeenCalled();
+  expect(screen.queryByRole("button", { name: "Attach reference src" })).not.toBeInTheDocument();
+  const setData = vi.fn();
+  fireEvent.dragStart(screen.getByText("README.md").closest('[role="treeitem"]')!, { dataTransfer: { setData } });
+  expect(setData).toHaveBeenCalledWith("application/x-omicsops-workspace-file", JSON.stringify(reference));
+});
+
+it("does not invent file entries when no listing is provided", () => {
+  render(<RemoteFileTree locale="en-US" busy={false} />);
+  expect(screen.queryByRole("tree")).not.toBeInTheDocument();
+});
+
+it("reads text only through the explicit preview action", () => {
+  const onPreviewText = vi.fn(); const onAttach = vi.fn();
+  render(<RemoteFileTree locale="en-US" source="local" remoteFiles={files} busy={false} onPreviewText={onPreviewText} onAttach={onAttach} />);
+  fireEvent.click(screen.getByRole("button", { name: "Attach reference README.md" }));
+  expect(onPreviewText).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Preview text README.md" }));
+  expect(onPreviewText).toHaveBeenCalledWith("README.md");
+  expect(screen.queryByRole("button", { name: "Preview text src" })).not.toBeInTheDocument();
+});

@@ -10,3 +10,7 @@
 .api-model-menu p { margin: 0; padding: 4px 6px; font-size: 11px; line-height: 1.5; color: #64756c; }
 .api-model-menu p[role=alert] { color: #a04834; }
 .model-menu .api-model-manage { border-top: 1px solid #e7ebe7; border-radius: 0; flex-shrink: 0; }
+.api-effort-anchor { position: relative; flex-shrink: 0; border-top: 1px solid #e7ebe7; }
+.api-effort-menu { position: static; max-height: min(300px, 40vh); overflow-y: auto; overscroll-behavior: contain; margin-top: 4px; padding: 6px; border: 1px solid #dde3de; border-radius: 10px; background: #fff; }
+.api-effort-menu button[aria-checked=true] { background: #e7f3ec; }
+.api-effort-menu button span { overflow-wrap: anywhere; }

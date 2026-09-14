@@ -265,6 +265,11 @@ pub struct ModelProfile {
     /// Explicit OpenAI-compatible wire request; not a capability declaration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Optional Fast mode request: `None` inherits the provider/project
+    /// default, `Some(false)` requests standard processing, and `Some(true)`
+    /// requests Fast mode for the exact reviewed OpenAI models below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_mode: Option<bool>,
     /// Optional profile for read-only delegation in newly created ordinary runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegated_model_profile_id: Option<Uuid>,
@@ -283,6 +288,10 @@ impl ModelProfile {
         // Preserve hashes of legacy profiles that never requested an effort.
         if let Some(effort) = &self.reasoning_effort {
             value["reasoning_effort"] = serde_json::json!(effort);
+        }
+        // Preserve hashes of legacy profiles that never selected a Fast mode.
+        if let Some(fast_mode) = self.fast_mode {
+            value["fast_mode"] = serde_json::json!(fast_mode);
         }
         if self.effective_output_tokens() != 4096 {
             value["reserved_output_tokens"] = serde_json::json!(self.effective_output_tokens());
@@ -315,6 +324,42 @@ impl ModelProfile {
                 .max(1)
         })
     }
+
+    /// Whether this profile is allowed to request Fast mode under the exact
+    /// reviewed OpenAI endpoint and model contract.
+    pub fn supports_fast_mode(&self) -> bool {
+        supports_fast_mode(self.provider, &self.base_url, &self.model)
+    }
+}
+
+const FAST_MODELS: [&str; 4] = [
+    "gpt-6-astra",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+];
+
+/// Return whether an exact provider endpoint and model have the reviewed
+/// Fast mode capability. Model families, aliases and custom gateways are not
+/// inferred as supported.
+pub fn supports_fast_mode(provider: ModelProviderKind, base_url: &str, model: &str) -> bool {
+    if provider != ModelProviderKind::OpenAiCompatible {
+        return false;
+    }
+    let Ok(url) = url::Url::parse(base_url) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("api.openai.com"))
+        && url.port_or_known_default() == Some(443)
+        && matches!(url.path(), "" | "/" | "/v1" | "/v1/")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && FAST_MODELS.contains(&model)
 }
 
 pub fn validate_reasoning_effort(
@@ -384,6 +429,122 @@ pub fn conflict_sibling_path(relative_path: &str, version: u32) -> String {
         format!("{relative_path}.conflict-{version}")
     } else {
         format!("{stem}.conflict-{version}.{extension}")
+    }
+}
+
+#[cfg(test)]
+mod fast_mode_tests {
+    use super::*;
+
+    fn profile(base_url: &str, model: &str, provider: ModelProviderKind) -> ModelProfile {
+        serde_json::from_value(serde_json::json!({
+            "id": Uuid::from_u128(1),
+            "label": "test",
+            "provider": provider,
+            "base_url": base_url,
+            "model": model,
+            "credential_reference": null,
+            "supports_tools": true,
+            "supports_vision": false
+        }))
+        .expect("profile fixture")
+    }
+
+    #[test]
+    fn fast_mode_requires_exact_official_endpoint_path_and_model() {
+        for base_url in [
+            "https://api.openai.com",
+            "https://api.openai.com/",
+            "https://api.openai.com/v1",
+            "https://api.openai.com/v1/",
+            "https://API.OPENAI.COM:443/v1",
+        ] {
+            for model in [
+                "gpt-6-astra",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+            ] {
+                assert!(
+                    profile(base_url, model, ModelProviderKind::OpenAiCompatible)
+                        .supports_fast_mode(),
+                    "{base_url} {model}"
+                );
+            }
+        }
+
+        for (base_url, model, provider) in [
+            (
+                "http://api.openai.com/v1",
+                "gpt-5.6-luna",
+                ModelProviderKind::OpenAiCompatible,
+            ),
+            (
+                "https://api.openai.com:8443/v1",
+                "gpt-5.6-luna",
+                ModelProviderKind::OpenAiCompatible,
+            ),
+            (
+                "https://api.openai.com/v2",
+                "gpt-5.6-luna",
+                ModelProviderKind::OpenAiCompatible,
+            ),
+            (
+                "https://api.openai.com/v1/chat/completions",
+                "gpt-5.6-luna",
+                ModelProviderKind::OpenAiCompatible,
+            ),
+            (
+                "https://proxy.example/v1",
+                "gpt-5.6-luna",
+                ModelProviderKind::OpenAiCompatible,
+            ),
+            (
+                "https://api.openai.com/v1",
+                "gpt-5.6-luna-preview",
+                ModelProviderKind::OpenAiCompatible,
+            ),
+            (
+                "https://api.openai.com/v1",
+                "GPT-5.6-luna",
+                ModelProviderKind::OpenAiCompatible,
+            ),
+            (
+                "https://api.openai.com/v1",
+                "gpt-5.6-luna",
+                ModelProviderKind::Anthropic,
+            ),
+            (
+                "https://api.openai.com/v1",
+                "gpt-5.6-luna",
+                ModelProviderKind::Ollama,
+            ),
+        ] {
+            assert!(
+                !profile(base_url, model, provider).supports_fast_mode(),
+                "unexpected fast-mode support for {base_url} {model} {provider:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_mode_hash_is_backward_compatible_for_legacy_and_none() {
+        let mut profile = profile(
+            "https://api.openai.com/v1",
+            "gpt-5.6-luna",
+            ModelProviderKind::OpenAiCompatible,
+        );
+        let legacy_hash = profile.execution_configuration_hash();
+        let encoded = serde_json::to_value(&profile).expect("serialize profile");
+        assert!(encoded.get("fast_mode").is_none());
+
+        profile.fast_mode = None;
+        assert_eq!(profile.execution_configuration_hash(), legacy_hash);
+        profile.fast_mode = Some(false);
+        let default_hash = profile.execution_configuration_hash();
+        assert_ne!(default_hash, legacy_hash);
+        profile.fast_mode = Some(true);
+        assert_ne!(profile.execution_configuration_hash(), default_hash);
     }
 }
 
