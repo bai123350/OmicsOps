@@ -1156,3 +1156,33 @@ it("folds earlier activity in a long run without discarding its evidence", () =>
   expect(screen.getByText("file-0.md")).toBeVisible();
   expect(screen.getByText("last.md")).toBeVisible();
 });
+
+it("omits empty assistant replies and copies the original answer Markdown", async () => {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+  try {
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={vi.fn()} messages={[{ id: "empty", role: "assistant", markdown: "  \n " }, { id: "answer", role: "assistant", markdown: "## 结果\n\n**已核验**的内容" }]} />);
+    expect(document.querySelector('[data-message-id="empty"]')).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "复制回复" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "已复制" })).toBeVisible());
+    expect(writeText).toHaveBeenCalledWith("## 结果\n\n**已核验**的内容");
+  } finally {
+    if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard);
+    else Reflect.deleteProperty(navigator, "clipboard");
+  }
+});
+
+it("reports a clipboard failure without removing the answer", async () => {
+  const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: vi.fn().mockRejectedValue(new Error("denied")) } });
+  try {
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} onSend={vi.fn()} messages={[{ id: "answer", role: "assistant", markdown: "Verified answer" }]} />);
+    fireEvent.click(screen.getByRole("button", { name: "Copy response" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("Copy failed");
+    expect(screen.getByText("Verified answer")).toBeVisible();
+  } finally {
+    if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard);
+    else Reflect.deleteProperty(navigator, "clipboard");
+  }
+});

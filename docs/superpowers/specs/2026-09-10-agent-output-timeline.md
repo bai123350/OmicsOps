@@ -53,3 +53,10 @@ Skill 标题优先采用成功/复用结果中与请求 skill_id 一致的冻结
 本模块验证：对话组件 83 项测试、Web 构建和 diff 检查通过。新增测试覆盖收起执行过程后实时 Markdown 可见，以及长历史默认折叠、展开后跨更新保持可见。
 
 参考源码：https://github.com/xuzhougeng/wisp-science/blob/main/ui/src/chat_render.rs 、https://github.com/openai/codex/blob/main/codex-rs/tui/src/streaming/controller.rs 。
+
+## 2026-09-15：回复阅读层级
+
+完成回复去掉重复头像和 Agent 标题，正文采用居中、最大约 820px 的阅读列；用户气泡、公开正文、工具活动采用不同的间距和文字层级。空白 assistant 消息及其分叉动作不再产生占位。正文支持复制原始 Markdown，剪贴板失败保留正文并显示可重试提示。工具行减少高饱和色和间距，同时重新显示展开详情的工具 ID、输入/结果标签，保持可核验性。
+
+最终确定性验证：`cargo test --workspace` 1083 passed、11 ignored；`npm test` 563 前端测试与 22 扩展测试通过；`npm run build` 通过（现有大 chunk 警告）；`git diff --check` 通过。对话组件 85 项测试通过。
+Windows 视觉验收尝试使用隔离模拟页面，窗口工具能列出 Chrome，但实际控制时应用授权等待超时，因此视觉验收仍未完成。未调用真实模型或 SSH、未做 macOS 验收；没有新增覆盖层、协议、持久化或审批边界变化。

@@ -708,3 +708,30 @@
 .v4-live-response { margin-top: 18px; }
 .response-eyebrow { display: block; margin-bottom: 10px; color: #667085; font-size: 12px; }
 .v4-live-response .v4-streaming-cursor { display: inline-block; font-size: 12px; }
+
+/* Conversation-first hierarchy: prose is primary, activity is secondary. */
+.conversation-pane .message-stream { padding-inline: max(24px, calc((100% - 820px) / 2)); gap: 18px; }
+.message-stream > .response-message { width: 100%; max-width: none; padding: 8px 0 0; margin: 0; background: transparent; border: 0; box-shadow: none; }
+.response-message .markdown-content { font-size: 15px; line-height: 1.85; }
+.response-actions { display: flex; align-items: center; gap: 8px; margin-top: 12px; color: #667085; font-size: 12px; }
+.response-actions button { display: grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: #667085; cursor: pointer; }
+.response-actions button:hover { background: #e9edf2; color: #172033; }
+.response-actions button:focus-visible { outline: 2px solid #315bd4; outline-offset: 2px; }
+.message-stream .user-message { max-width: min(85%, 640px); border-radius: 18px 18px 4px 18px; padding: 12px 18px; background: #edf0f5; border-color: #e1e6ee; }
+.v4-process-timeline { gap: 2px; }
+.agent-v4-run > .agent-run-fold-body { padding: 6px 0 8px 16px; border-left: 1px solid #dde3eb; margin-left: 6px; }
+.v4-conversation-run .v4-tool-trace > summary { min-height: 30px; padding: 4px 6px; gap: 8px; }
+.v4-conversation-run .v4-tool-trace > summary:hover { background: #eef1f5; border-radius: 6px; }
+.v4-tool-trace-heading > strong { flex: 0 1 auto; color: #475467; font-weight: 500; font-size: 12px; }
+.v4-tool-subject { font-size: 12px; color: #667085; }
+.v4-tool-metrics { font-size: 10px; color: #788394; }
+.v4-progress-heading { padding: 7px 6px; }
+.v4-tool-trace-body > small { display: block; color: #667085; font-size: 11px; }
+.v4-tool-trace-body > b { display: block; color: #667085; font-size: 11px; font-weight: 500; }
+.v4-tool-trace-body > :is(code, pre) { border-color: #dfe5ed; background: #f4f6f9; font-size: 12px; }
+.message-branch-actions { margin-top: -10px; font-size: 11px; }
+@media (max-width: 700px) {
+  .conversation-pane .message-stream { padding-inline: 16px; }
+  .response-message .markdown-content { font-size: 14px; }
+  .v4-tool-trace-heading > strong { max-width: 50%; }
+}

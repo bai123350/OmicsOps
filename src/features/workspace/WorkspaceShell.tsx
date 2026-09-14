@@ -23,7 +23,7 @@ import { Fragment, useEffect, useLayoutEffect, useRef, useState, type ReactNode 
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
-  Activity, ArrowLeft, Bot, Check, ChevronRight, ClipboardList, Database, Expand, FileBarChart, FileText,
+  Activity, ArrowLeft, Bot, Check, ChevronRight, ClipboardList, Copy, Database, Expand, FileBarChart, FileText,
   FlaskConical, Folder, Hand, MessageSquarePlus, NotebookPen, Plus,
   Search, Settings, Shield, ShieldAlert, ShieldCheck, Sparkles, Square, Trash2, X, SlidersHorizontal, Monitor, ChevronDown, Gauge, PanelRight, Zap,
 } from "lucide-react";
@@ -955,8 +955,8 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
         {onOpenBranch && activeConversationId && <ConversationBranchBanner projectId={project.id} conversationId={activeConversationId} locale={locale} onSelect={onSelectConversation} />}
         {branching.error && <div className="agent-notice" role="alert"><span>{branching.error}</span>{branching.retryAvailable && <button disabled={branching.busy} onClick={() => void branching.retry()}>{zh ? "重试分支" : "Retry branch"}</button>}</div>}
         {messages.map((message, messageIndex) => <Fragment key={message.id}>
-          {message.role === "user" ? <article className="message user-message" data-message-id={message.id} tabIndex={-1}><MarkdownContent markdown={message.markdown} /></article> : message.role === "assistant" ? <article className="message assistant-message" data-message-id={message.id} tabIndex={-1}><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><MarkdownContent markdown={message.markdown} /></div></article> : null}
-          {onOpenBranch && (message.role === "user" || message.role === "assistant") && <div className="message-branch-actions"><button type="button" disabled={branchDisabled || !messages.slice(0, messageIndex + 1).some((entry) => entry.role === "user")} onClick={() => {
+          {message.role === "user" ? <article className="message user-message" data-message-id={message.id} tabIndex={-1}><MarkdownContent markdown={message.markdown} /></article> : message.role === "assistant" && message.markdown.trim() ? <article className="message assistant-message response-message" aria-label={zh ? "Agent 回复" : "Agent response"} data-message-id={message.id} tabIndex={-1}><ResponseBody markdown={message.markdown} zh={zh} /></article> : null}
+          {onOpenBranch && (message.role === "user" || (message.role === "assistant" && message.markdown.trim())) && <div className="message-branch-actions"><button type="button" disabled={branchDisabled || !messages.slice(0, messageIndex + 1).some((entry) => entry.role === "user")} onClick={() => {
             const anchor = messages.slice(0, messageIndex + 1).reverse().find((entry) => entry.role === "user");
             if (anchor) branchAt(anchor.id, message.role === "user" ? "before_user" : "after_response");
           }}>{message.role === "user" ? (zh ? "从此消息前分叉" : "Branch before this message") : (zh ? "从此回复后分叉" : "Branch after this response")}</button></div>}
@@ -1262,6 +1262,22 @@ function isV4UncertainResolved(events: AgentRunEventV4[], callId: string) {
 }
 function isV4QuestionAnswered(events: AgentRunEventV4[], questionId: string) {
   return events.some((event) => event.event.kind === "user_input_answered" && event.event.question_id === questionId);
+}
+function ResponseBody({ markdown, zh }: { markdown: string; zh: boolean }) {
+  const [copied, setCopied] = useState<string | null>(null);
+  const [copyFailed, setCopyFailed] = useState(false);
+  async function copyResponse() {
+    setCopyFailed(false);
+    try { await navigator.clipboard.writeText(markdown); setCopied(markdown); }
+    catch { setCopied(null); setCopyFailed(true); }
+  }
+  const label = copied === markdown ? (zh ? "已复制" : "Copied") : (zh ? "复制回复" : "Copy response");
+  return <div className="response-body">
+    <MarkdownContent markdown={markdown} />
+    <footer className="response-actions"><button type="button" aria-label={label} title={label} onClick={() => void copyResponse()}>{copied === markdown ? <Check size={14} /> : <Copy size={14} />}</button>
+      {copyFailed && <span role="status">{zh ? "复制失败，请手动选择正文。" : "Copy failed. Select the response manually."}</span>}
+    </footer>
+  </div>;
 }
 function ActivityWindow({ children, zh }: { children: ReactNode[]; zh: boolean }) {
   const earlierCount = Math.max(0, children.length - 6);
