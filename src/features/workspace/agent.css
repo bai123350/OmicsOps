@@ -674,3 +674,30 @@
 .v4-progress-heading[aria-expanded="true"] svg { transform: rotate(90deg); }
 .v4-progress-heading:focus-visible { outline: 2px solid #315bd4; outline-offset: 2px; border-radius: 4px; }
 .v4-progress-disclosure > .markdown-content { margin: 2px 0 12px 24px; color: #475467; }
+
+/* Give research answers a readable hierarchy without widening the conversation. */
+.assistant-message > div:last-child { flex: 1; }
+.assistant-message .markdown-content { font-size: 14px; line-height: 1.8; color: #263445; }
+.assistant-message .markdown-content p { margin: 0 0 1em; line-height: inherit; }
+.assistant-message .markdown-content h1 { font-size: 23px; }
+.assistant-message .markdown-content h2 { font-size: 19px; }
+.assistant-message .markdown-content h3 { font-size: 16px; }
+.assistant-message .markdown-content :is(h1, h2, h3, h4) { margin: 1.4em 0 .6em; line-height: 1.4; color: #172033; }
+.assistant-message .markdown-content > :first-child { margin-top: 0; }
+.assistant-message .markdown-content > :last-child { margin-bottom: 0; }
+.assistant-message .markdown-content :is(ul, ol) { margin: .65em 0 1em; padding-left: 1.6em; }
+.assistant-message .markdown-content li { margin: .3em 0; }
+.assistant-message .markdown-content blockquote { margin: 1em 0; padding: .6em 1em; border-left: 3px solid #b4c6e6; background: #f0f4fa; border-radius: 0 6px 6px 0; }
+.markdown-content a { text-underline-offset: 3px; }
+.markdown-table-scroll { max-width: 100%; overflow-x: auto; margin: 1em 0; border: 1px solid #dfe5ed; border-radius: 8px; }
+.markdown-table-scroll:focus-visible { outline: 2px solid #315bd4; outline-offset: 2px; }
+.markdown-content .markdown-table-scroll table { display: table; width: 100%; margin: 0; font-size: 13px; line-height: 1.6; }
+.markdown-content .markdown-table-scroll :is(th, td) { padding: 10px 14px; border: 0; border-bottom: 1px solid #e4e9f0; min-width: 110px; vertical-align: top; }
+.markdown-content .markdown-table-scroll th { background: #edf2f8; font-weight: 600; }
+.markdown-content .markdown-table-scroll tr:last-child td { border-bottom: 0; }
+.assistant-message .markdown-content pre { padding: 14px 16px; line-height: 1.65; }
+.v4-tool-trace-heading > strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 700px) {
+  .assistant-message .markdown-content { font-size: 13px; }
+  .markdown-content .markdown-table-scroll :is(th, td) { padding: 8px 10px; }
+}

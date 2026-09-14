@@ -1171,7 +1171,7 @@ function V4RunTrace({ locale, events, previewText, onAnswer, onDecideApproval, o
       {[
         ...progress.map(({ event, modelText }) => ({ sequence: event.sequence, node: <PublicProgress key={`progress-${event.sequence}`} markdown={modelText ?? ""} zh={zh} /> })),
         ...tools.map((tool) => ({ sequence: tool.firstSequence, node: <details className="v4-tool-trace" key={tool.callId} open={tool.status === "failed"}>
-          <summary className="v4-tool-trace-heading"><span className={`v4-tool-mark ${tool.status}`} aria-label={toolStatusLabel(tool.status, zh)}>{tool.status === "failed" ? "×" : tool.status === "succeeded" || tool.status === "reused" ? "✓" : "○"}</span>{tool.toolId === "use_skill" && <span className="v4-skill-badge">SKILL</span>}<strong title={toolDisplayLabel(tool.toolId, zh)}>{tool.toolId === "use_skill" ? tool.subject ?? "use_skill" : compactToolLabel(tool.toolId)}</strong>{tool.subject && tool.toolId !== "use_skill" && <span className="v4-tool-subject" title={tool.subject}>{tool.subject}</span>}<span className={`v4-tool-status ${tool.status}`}>{toolStatusLabel(tool.status, zh)}</span><small className="v4-tool-metrics">{toolMetrics(tool, zh)}</small><ChevronRight size={13} /></summary>
+          <summary className="v4-tool-trace-heading"><span className={`v4-tool-mark ${tool.status}`} aria-label={toolStatusLabel(tool.status, zh)}>{tool.status === "failed" ? "×" : tool.status === "succeeded" || tool.status === "reused" ? "✓" : "○"}</span>{tool.toolId === "use_skill" && <span className="v4-skill-badge">SKILL</span>}<strong title={toolDisplayLabel(tool.toolId, zh)}>{tool.toolId === "use_skill" ? skillDisplayName(tool, zh) : compactToolLabel(tool.toolId)}</strong>{tool.subject && tool.toolId !== "use_skill" && <span className="v4-tool-subject" title={tool.subject}>{tool.subject}</span>}<span className={`v4-tool-status ${tool.status}`}>{toolStatusLabel(tool.status, zh)}</span><small className="v4-tool-metrics">{toolMetrics(tool, zh)}</small><ChevronRight size={13} /></summary>
           <div className="v4-tool-trace-body">
             <small>{tool.toolId} · #{tool.firstSequence}–#{tool.lastSequence}</small>
             {tool.argumentsPreview && <><b>{zh ? "输入" : "Input"}</b><code>{tool.argumentsPreview}</code></>}
@@ -1275,7 +1275,7 @@ function PublicProgress({ markdown, zh }: { markdown: string; zh: boolean }) {
   </article>;
 }
 function MarkdownContent({ markdown }: { markdown: string }) {
-  return <div className="markdown-content"><ReactMarkdown remarkPlugins={[remarkGfm]}>{markdown}</ReactMarkdown></div>;
+  return <div className="markdown-content"><ReactMarkdown remarkPlugins={[remarkGfm]} components={{ table: ({ children }) => <div className="markdown-table-scroll" role="region" aria-label="表格 / Table" tabIndex={0}><table>{children}</table></div> }}>{markdown}</ReactMarkdown></div>;
 }
 function coalesceV4ModelText(events: AgentRunEventV4[]): Array<{ event: AgentRunEventV4; lastEvent: AgentRunEventV4; modelText?: string }> {
   const entries: Array<{ event: AgentRunEventV4; lastEvent: AgentRunEventV4; modelText?: string }> = [];
@@ -1372,6 +1372,20 @@ function toolSubject(value: unknown): string | undefined {
     if (typeof value === "string" && value.trim()) return value.trim();
   }
   return undefined;
+}
+function skillDisplayName(tool: MergedV4ToolCall, zh: boolean): string {
+  const fallback = zh ? "加载技能" : "Load skill";
+  try {
+    const args = JSON.parse(tool.argumentsPreview || "{}");
+    if (tool.status === "succeeded" || tool.status === "reused") {
+      try {
+        const frozen = JSON.parse(tool.outcome ?? "null");
+        if (frozen && typeof frozen.skill_id === "string" && frozen.skill_id === args.skill_id && typeof frozen.name === "string" && frozen.name.trim()) return frozen.name.trim();
+      } catch { /* Legacy non-JSON outcomes keep the request label. */ }
+    }
+    const name = args.skill_name ?? args.name;
+    return typeof name === "string" && name.trim() ? name.trim() : fallback;
+  } catch { return fallback; }
 }
 function compactToolLabel(toolId: string) {
   const labels: Record<string, string> = { "project.read": "read", "project.write": "write", "project.edit": "edit", "project.list": "list", "use_skill": "SKILL", "runtime.execute": "execute", "runtime.python": "python", "runtime.r": "R", "agent.delegate": "agent" };

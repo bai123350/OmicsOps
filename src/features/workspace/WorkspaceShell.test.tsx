@@ -1097,3 +1097,37 @@ it("expands public progress on demand and preserves the choice across streamed u
   fireEvent.click(screen.getByRole("button", { name: /进度.*正在检索/ }));
   expect(screen.queryByRole("heading", { name: "检索范围" })).not.toBeInTheDocument();
 });
+
+it("uses the frozen skill name while keeping its ID in the tool evidence", () => {
+  const base = { schema_version: 4 as const, run_id: "skill-readable", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "h", occurred_at: "2026-09-14T00:00:00Z" };
+  const skillId = "f99c620a-e92e-470c-b52d-aa64734665e4";
+  render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId={base.run_id} agentRunEventsV4={[
+    { ...base, sequence: 1, event: { kind: "tool_requested", call: { call_id: "skill", tool_id: "use_skill", arguments: { skill_id: skillId } } } },
+    { ...base, sequence: 2, event: { kind: "tool_finished", outcome: { call_id: "skill", tool_id: "use_skill", succeeded: true, model_content: JSON.stringify({ skill_id: skillId, name: "文献综述" }), data: { skill_id: skillId, name: "文献综述" }, provenance: [] } } },
+  ]} />);
+  const step = screen.getByText("SKILL").closest("details")!;
+  expect(step.querySelector("summary")).toHaveTextContent("文献综述");
+  expect(step.querySelector("summary")).not.toHaveTextContent(skillId);
+  expect(step.querySelector("code")).toHaveTextContent(skillId);
+});
+
+it("keeps unnamed skills readable without substituting an unrelated result name", () => {
+  const base = { schema_version: 4 as const, run_id: "skill-legacy", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "h", occurred_at: "2026-09-14T00:00:00Z" };
+  render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} runStarted activeRunId={base.run_id} agentRunEventsV4={[
+    { ...base, sequence: 1, event: { kind: "tool_requested", call: { call_id: "skill", tool_id: "use_skill", arguments: { skill_id: "original-id" } } } },
+    { ...base, sequence: 2, event: { kind: "tool_finished", outcome: { call_id: "skill", tool_id: "use_skill", succeeded: true, model_content: JSON.stringify({ skill_id: "different-id", name: "Wrong skill" }), data: null, provenance: [] } } },
+  ]} />);
+  const heading = screen.getByText("SKILL").closest("summary")!;
+  expect(heading).toHaveTextContent("Load skill");
+  expect(heading).not.toHaveTextContent("Wrong skill");
+  expect(heading).not.toHaveTextContent("original-id");
+});
+
+it("provides a keyboard accessible scroll region for wide answer tables", () => {
+  render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} messages={[{ id: "wide", role: "assistant", markdown: "## 文献比较\n\n| 论文 | 结论 |\n| --- | --- |\n| Hi-C | 染色质结构 |\n\n[原文](https://example.org/paper)\n\n<script>alert(1)</script>" }]} />);
+  const table = screen.getByRole("table");
+  expect(table.parentElement).toHaveAttribute("tabindex", "0");
+  expect(table.parentElement).toHaveAttribute("role", "region");
+  expect(screen.getByRole("link", { name: "原文" })).toHaveAttribute("href", "https://example.org/paper");
+  expect(document.querySelector(".markdown-content script")).toBeNull();
+});
