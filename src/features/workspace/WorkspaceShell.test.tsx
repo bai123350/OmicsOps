@@ -1131,3 +1131,28 @@ it("provides a keyboard accessible scroll region for wide answer tables", () => 
   expect(screen.getByRole("link", { name: "原文" })).toHaveAttribute("href", "https://example.org/paper");
   expect(document.querySelector(".markdown-content script")).toBeNull();
 });
+
+it("keeps live Markdown visible when execution details are collapsed", () => {
+  const base = { schema_version: 4 as const, run_id: "live-markdown", project_id: project.id, conversation_id: "c", previous_hash: "", event_hash: "h", occurred_at: "2026-09-15T00:00:00Z" };
+  render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId={base.run_id} agentRunEventsV4={[{ ...base, sequence: 1, event: { kind: "run_created", mode: "execute" } }]} agentTextPreview={{ run_id: base.run_id, text: "## 正在核对文献\n\n- **检查来源**\n- 对比研究方法" }} />);
+  const live = screen.getByRole("article", { name: "模型实时输出" });
+  expect(live.closest("details")).toBeNull();
+  expect(within(live).getByRole("heading", { name: "正在核对文献" })).toBeVisible();
+  expect(within(live).getAllByRole("listitem")).toHaveLength(2);
+  fireEvent.click(screen.getByText("执行过程"));
+  expect(live).toBeVisible();
+});
+
+it("folds earlier activity in a long run without discarding its evidence", () => {
+  const base = { schema_version: 4 as const, run_id: "long-activity", project_id: project.id, conversation_id: "c", previous_hash: "", event_hash: "h", occurred_at: "2026-09-15T00:00:00Z" };
+  const events = Array.from({ length: 9 }, (_, i) => ({ ...base, sequence: i + 1, event: { kind: "tool_requested" as const, call: { call_id: `call-${i}`, tool_id: "project.read", arguments: { path: `file-${i}.md` } } } }));
+  const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: base.run_id };
+  const { rerender } = render(<WorkspaceShell {...props} agentRunEventsV4={events} />);
+  expect(screen.getByText("file-0.md")).not.toBeVisible();
+  expect(screen.getByText("file-8.md")).toBeVisible();
+  fireEvent.click(screen.getByText(/较早活动/));
+  expect(screen.getByText("file-0.md")).toBeVisible();
+  rerender(<WorkspaceShell {...props} agentRunEventsV4={[...events, { ...base, sequence: 10, event: { kind: "tool_requested", call: { call_id: "last", tool_id: "project.read", arguments: { path: "last.md" } } } }]} />);
+  expect(screen.getByText("file-0.md")).toBeVisible();
+  expect(screen.getByText("last.md")).toBeVisible();
+});

@@ -43,3 +43,13 @@ Skill 标题优先采用成功/复用结果中与请求 skill_id 一致的冻结
 最终验证：`cargo test --workspace` 1083 passed、11 ignored；`npm test` 前端 559 passed、浏览器扩展 22 passed；`npm run build` 通过（保留现有大 chunk 提示）；`git diff --check` 通过。对话组件定向测试 81 passed。
 浏览器人工 smoke 未完成：隔离模拟页面的内置浏览器导航超时，Chrome 工具连接失败，不能据此宣称视觉验收通过。真实模型/SSH、macOS 和桌面安装包验收未执行；本次未改桌面组合、打包或安装逻辑。
 待人工核对：打开长回复检查标题/表格和窄窗口滚动；展开进度后等待实时更新；失败后确认原因及已有回答仍可见；展开工具查看原始输入/结果与 Skill ID。
+
+## 2026-09-15：实时正文与活动窗口
+
+对照 Wisp `ui/src/chat_render.rs` 的连续活动折叠和 Codex `codex-rs/tui/src/streaming/controller.rs` 的流式正文/历史分离后，实时公开文本改为在执行折叠区之外渲染安全 Markdown；收起过程不隐藏正在生成的正文。预览仍使用原 run_id 过滤和持久事件替换，不新增模型内容或内部推理。这里借鉴公开 CLI/TUI 的组织方式，不声称取得 Codex 桌面 UI 源码，也不复制其终端专用渲染算法。
+
+活动超过 6 项时，较早项归入独立的“较早活动”折叠区，最近 6 项直接展示。原始顺序、工具输入/结果和总步骤数保留，展开较早活动后新事件不会强制收起该区域。失败/审批/恢复提示继续独立展示。
+
+本模块验证：对话组件 83 项测试、Web 构建和 diff 检查通过。新增测试覆盖收起执行过程后实时 Markdown 可见，以及长历史默认折叠、展开后跨更新保持可见。
+
+参考源码：https://github.com/xuzhougeng/wisp-science/blob/main/ui/src/chat_render.rs 、https://github.com/openai/codex/blob/main/codex-rs/tui/src/streaming/controller.rs 。

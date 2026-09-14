@@ -1167,7 +1167,7 @@ function V4RunTrace({ locale, events, previewText, onAnswer, onDecideApproval, o
       <summary><span className="agent-run-fold-title"><span><b>{zh ? "执行过程" : terminal ? "Processed" : "Processing"}</b><small>{terminal ? (zh ? "工具调用与验证记录" : "Tool calls and verification") : (zh ? "Agent 正在处理任务" : "Agent is working")}</small></span><ChevronRight size={15} /></span><span>{status} · {tools.length} {zh ? "个步骤" : tools.length === 1 ? "step" : "steps"}{eventDuration(events[0]?.occurred_at, (terminal ?? latest)?.occurred_at) && ` · ${eventDuration(events[0]?.occurred_at, (terminal ?? latest)?.occurred_at)}`}</span></summary>
       <div className="agent-run-fold-body">
 
-      <section className="v4-process-timeline" aria-label={zh ? "工具调用详情" : "Tool call details"}>
+      <section className="v4-process-timeline" aria-label={zh ? "工具调用详情" : "Tool call details"}><ActivityWindow zh={zh}>
       {[
         ...progress.map(({ event, modelText }) => ({ sequence: event.sequence, node: <PublicProgress key={`progress-${event.sequence}`} markdown={modelText ?? ""} zh={zh} /> })),
         ...tools.map((tool) => ({ sequence: tool.firstSequence, node: <details className="v4-tool-trace" key={tool.callId} open={tool.status === "failed"}>
@@ -1178,12 +1178,13 @@ function V4RunTrace({ locale, events, previewText, onAnswer, onDecideApproval, o
             {tool.outcome !== undefined && <><b>{zh ? "结果" : "Result"}</b><pre>{tool.outcome}</pre></>}
           </div>
         </details> })),
-      ].sort((a, b) => a.sequence - b.sequence).map(({ node }) => node)}
-      {!terminal && previewText && <article aria-label={zh ? "模型实时输出" : "Live model output"} className="v4-progress-row v4-streaming-row"><span aria-hidden="true">−</span><strong>{zh ? "进度" : "Progress"}</strong><div className="v4-streaming-text">{previewText}<span className="v4-streaming-cursor" aria-hidden="true">▍</span></div></article>}
+      ].sort((a, b) => a.sequence - b.sequence).map(({ node }) => node)}</ActivityWindow>
+
       </section>
         <details className="v4-process-context"><summary>{zh ? "诊断记录" : "Diagnostic records"}</summary><ol className="v4-diagnostic-events">{events.filter(({ event }) => event.kind !== "model_text").map((event) => <li key={event.sequence}><span>#{event.sequence}</span><code>{event.event.kind}</code><time dateTime={event.occurred_at}>{new Date(event.occurred_at).toLocaleTimeString()}</time></li>)}</ol></details>
       </div>
     </details>
+      {!terminal && previewText && <article aria-label={zh ? "模型实时输出" : "Live model output"} className="message assistant-message v4-live-response"><div><small className="response-eyebrow">{zh ? "正在回复" : "Responding"}</small><MarkdownContent markdown={previewText} /><span className="v4-streaming-cursor" aria-hidden="true">▍</span></div></article>}
       {technicalEntries.map(({ event }) => (<article className={`message assistant-message agent-work-update ${event.event.kind === "input_requested" ? "v4-input-decision-entry" : ""}`} key={`${event.run_id}-${event.sequence}`}>
         <div><div className="agent-work-heading"><strong>{v4EventLabel(event, zh)}</strong></div>
           {v4EventContent(event, zh) && <MarkdownContent markdown={v4EventContent(event, zh)} />}
@@ -1261,6 +1262,16 @@ function isV4UncertainResolved(events: AgentRunEventV4[], callId: string) {
 }
 function isV4QuestionAnswered(events: AgentRunEventV4[], questionId: string) {
   return events.some((event) => event.event.kind === "user_input_answered" && event.event.question_id === questionId);
+}
+function ActivityWindow({ children, zh }: { children: ReactNode[]; zh: boolean }) {
+  const earlierCount = Math.max(0, children.length - 6);
+  return <>
+    {earlierCount > 0 && <details className="v4-earlier-activity">
+      <summary>{zh ? `较早活动 · ${earlierCount} 项` : `Earlier activity · ${earlierCount} items`}</summary>
+      {children.slice(0, earlierCount)}
+    </details>}
+    {children.slice(earlierCount)}
+  </>;
 }
 function PublicProgress({ markdown, zh }: { markdown: string; zh: boolean }) {
   const [open, setOpen] = useState(false);

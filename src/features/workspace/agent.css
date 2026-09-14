@@ -701,3 +701,10 @@
   .assistant-message .markdown-content { font-size: 13px; }
   .markdown-content .markdown-table-scroll :is(th, td) { padding: 8px 10px; }
 }
+
+.v4-earlier-activity { margin-bottom: 8px; }
+.v4-earlier-activity > summary { padding: 8px 4px; color: #667085; font-size: 12px; cursor: pointer; }
+.v4-earlier-activity[open] { border-bottom: 1px solid #e4e7ec; padding-bottom: 8px; }
+.v4-live-response { margin-top: 18px; }
+.response-eyebrow { display: block; margin-bottom: 10px; color: #667085; font-size: 12px; }
+.v4-live-response .v4-streaming-cursor { display: inline-block; font-size: 12px; }
