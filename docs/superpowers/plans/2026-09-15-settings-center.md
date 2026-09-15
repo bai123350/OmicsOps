@@ -32,19 +32,19 @@
 | Session | 基础已有行为已源码核对，最终验收待做 | 现有迭代/继续/压缩/后续问题偏好完整管理与反馈 | B2；baseline-review |
 | Appearance | 616dbae 已提交及接入；已做指定表面视觉检查 | 实际主题、字体与界面缩放；自定义CSS导入不在基础范围 | B4 |
 | Pet | 5bd7213 + 85c78ac 已提交并接入 | 内置窗口内伴侣、外观与启停；运行状态目前仅有可选组件接口，未连接实际运行；自定义资源/独立桌面窗口不在基础范围 | B8 |
-| Credentials | 完整切片已锁定，实现中 | 非敏感引用目录、受限替换、自定义keyring创建及未引用项删除 | B5；独立credentials计划 |
+| Credentials | 34afb53 + 26c4438 已提交接入，定向验证通过；最终全套待重跑 | 非敏感引用目录、受限替换、自定义keyring创建及未引用项删除；列表快照串行化 | B5；独立credentials计划 |
 | Permissions | 8eb938e + 70e9917 已提交并接入 | 真实 scope 授权列表及逐项撤销，不改冻结计划；竞态修复已测 | B5 |
 | Environments | SSH已有；system探测、新建入口与绑定错误反馈待补 | system真实探测、SSH 配置/信任/运行环境管理；backend目录不等于解释器探测 | B2；baseline-review |
 | Storage | 6745ee3 + 85c78ac 已提交并接入 | 真实应用/项目占用统计、范围筛选；不扩为清理 | B6 |
-| Usage | 独立可执行计划已锁定，未实现 | 跨会话 token/模型/UTC日周/工具统计、项目与会话分页 | B6；独立usage计划 |
+| Usage | 实现中，架构审阅问题已交owner修复；未完成 | 跨会话 token/模型/UTC日周/工具统计、项目与会话分页 | B6；独立usage计划 |
 | Models | 基础已有行为已源码核对，最终验收待做 | 完整现有 provider 管理；ACP 为可选扩展，不作为页面完成前提 | B2 + B7；baseline-review |
-| Quick Actions | 9f2ea7a native已提交，CRUD/picker接线中 | 用户动作 CRUD、工作流绑定及可见草稿插入，不自动提交 | B4，依赖 Workflows |
+| Quick Actions | 9f2ea7a + 4051103 + 3931cad 已提交接入，定向验证通过；最终全套待重跑 | 用户动作 CRUD、工作流绑定及可见草稿插入，不自动提交 | B4，依赖 Workflows |
 | Workflows | fcbc589 已提交并接入 | 可用文本配方库设置页及真实调用；图执行引擎为可选扩展 | B2 + B7 |
-| Specialists | 9f2ea7a native已提交，CRUD/picker接线中 | 项目角色模板CRUD、启停与可见草稿插入；独立专家运行、模型/工具白名单为可选扩展 | B7 |
-| Memory | 4d21d19 + 3d28e5d + 49743f5 + 3367023 已提交并接入，搜索待补 | 项目记忆文件列表与显式增改删已实现；文件搜索待补；全局习惯记忆为独立可选作用域，不声明已实现 | B4 |
+| Specialists | 9f2ea7a + 4051103 + 3931cad 已提交接入，定向验证通过；最终全套待重跑 | 项目角色模板CRUD、启停与可见草稿插入；独立专家运行、模型/工具白名单为可选扩展 | B7 |
+| Memory | 基础CRUD/导航已提交；2837101 + 1cd6088 补齐待处理草稿保护和文件名筛选；最终全套待重跑 | 项目记忆文件列表、按文件名筛选与显式增改删；无正文全文搜索或全局习惯作用域承诺 | B4 |
 | Skills | ff22647 独立页已提交；详情/文件/安全删除及启停错误反馈待补 | 管理实际安装源与启停，补齐有界详情/文件读取及受管删除 | B2 + B7；baseline-review |
 | Plugins | 生命周期切片已锁定，未实现 | 本地声明包验证/安装/更新/启停/安全移除及所有权绑定 | B7；plugins-general计划 |
-| Browser | 基础调用已核对；首次加载失败后的保存门控待修 | 现有配置/会话/域名/授权管理，失败不能以默认值覆盖未知配置 | B2；baseline-review |
+| Browser | ce37b5f 已修首次加载失败后的保存门控，定向验证通过；最终全套待重跑 | 现有配置/会话/域名/授权管理，失败不能以默认值覆盖未知配置 | B2；baseline-review |
 | Connections | ff22647 独立页已提交；literal环境绑定编辑保留语义待修 | MCP stdio 管理与真实检查/授权；HTTP/OAuth 为可选扩展 | B2 + B7；baseline-review |
 | Remote Access | 6c2a40d + 49743f5 已提交并接入 | 现有项目本地/SSH传输与同步管理，明确范围/状态/恢复；上游渠道平台不在基础页范围 | B8 |
 
@@ -312,6 +312,12 @@ HTTP/OAuth MCP、插件包管理不是 stdio Connections 页完成条件；后�
 以上独立计划细化并优先于同页较早的mini-slice接口；适配边界仍保留。没有将说明、mock或孤立组件登记为整页完成。
 
 ### 本轮已提交里程碑和验证范围
+
+- 主代理报告：Credentials `34afb53` 原始native定向11 tests、frontend/API/SettingsPanel 64 tests、Web build及desktop build通过；`26c4438` 凭据快照串行化修复后Credentials 7 tests通过。该记录不等于真实服务端密钥或SSH验收。
+- 主代理报告：Memory `2837101` 待处理草稿保护、`1cd6088` 文件名筛选已提交，最终定向11 tests通过；Browser `ce37b5f` 保存baseline门控定向4 tests通过。
+- 主代理报告：Quick Actions/Specialists工作区插入接线 `4051103`、卡片间距修复 `3931cad` 已提交，templates整合153 tests及Web build通过；这是用户可见草稿插入，不是独立专家运行。
+- 主代理新增视觉检查：当前dist/Vite preview、headless Edge 720×600、显式dark与OS light相反、uiScale1.2，逐一实际点击当前18个导航（含额外Privacy，Usage/Plugins尚未进入此dist）；所有 `.settings-layout > main` 的clientWidth=scrollWidth=410，document width=viewport720。无Tauri宿主/未选项目，只证明导航和小窗页面框架无横溢；不能证明有数据时完整页面或原生行为。Storage有数据fixture的padding问题另在修，尚未据此标全部视觉通过。
+- 上述新增提交之后，最终 `cargo test --workspace`、`npm test`、`npm run build` 和必要desktop build仍待统一重跑；Usage与Connections在写，未登记完成。
 
 - 主代理报告：Memory/Remote Access导航 `49743f5`，相邻142 tests及build通过；Permissions竞态修复 `70e9917`，61 tests及build通过。
 - 主代理报告：templates native `9f2ea7a` 后执行新鲜 `cargo test --workspace`，exit 0；真实SSH/model/PBMC ignored验收仍未执行。后续凭据/用量修改后须重新运行最终完整检查。
