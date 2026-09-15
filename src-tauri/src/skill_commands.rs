@@ -5,6 +5,7 @@ use std::{
 
 use omicsops_adapters::skills::{InstalledSkillPackage, install_skill_directory};
 use omicsops_core::workspace::SkillPackage;
+use omicsops_dto::SkillOrigin;
 use omicsops_knowledge::SkillSectionV4;
 use omicsops_store::Store;
 use serde::Deserialize;
@@ -12,7 +13,10 @@ use sha2::{Digest, Sha256};
 use tauri::State;
 use uuid::Uuid;
 
-use crate::commands::AppState;
+use crate::{
+    commands::AppState,
+    skill_settings::{installation_receipt, record_installation_receipt},
+};
 
 const LEGACY_PLACEHOLDER_SKILLS: &[&str] = &["scrna-qc", "bulk-rnaseq-de", "literature-review"];
 const MAX_AGENT_SKILL_CONTEXT_BYTES: usize = 512 * 1024;
@@ -88,9 +92,11 @@ pub async fn install_bundled_skills(
             default_enabled_keys.contains(key) && !existing_names.contains(&installed.name);
         persist_installed(
             repository,
+            skills_root,
             installed,
             enabled_by_default,
             category_by_key.get(key).cloned(),
+            SkillOrigin::Bundled,
         )
         .await?;
     }
@@ -167,15 +173,26 @@ pub async fn import_skill_directory(
     }
     let installed = install_skill_directory(Path::new(&request.source_path), &state.skills_root)
         .map_err(|error| error.to_string())?;
-    persist_installed(&state.repository, installed, false, None).await
+    persist_installed(
+        &state.repository,
+        &state.skills_root,
+        installed,
+        false,
+        None,
+        SkillOrigin::ManagedImport,
+    )
+    .await
 }
 
 async fn persist_installed(
     repository: &Store,
+    skills_root: &Path,
     installed: InstalledSkillPackage,
     enabled_by_default: bool,
     category: Option<String>,
+    requested_origin: SkillOrigin,
 ) -> Result<SkillPackage, String> {
+    let created_new_directory = installed.created_new_directory;
     let package = SkillPackage {
         id: Uuid::new_v4(),
         name: installed.name,
@@ -186,10 +203,35 @@ async fn persist_installed(
         capabilities: installed.capabilities,
         category,
     };
-    repository
+    let proposed_id = package.id;
+    let persisted = repository
         .upsert_skill_package_by_sha(&package, enabled_by_default)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    let existing_receipt = installation_receipt(repository, &persisted).await?;
+    let origin = if requested_origin == SkillOrigin::Bundled {
+        SkillOrigin::Bundled
+    } else if existing_receipt.is_some() {
+        requested_origin
+    } else if created_new_directory && persisted.id == proposed_id {
+        SkillOrigin::ManagedImport
+    } else if path_is_within(Path::new(&persisted.source_path), skills_root) {
+        SkillOrigin::LegacyUnknown
+    } else {
+        SkillOrigin::External
+    };
+    let owns_files = origin == SkillOrigin::ManagedImport
+        && created_new_directory
+        && persisted.id == proposed_id;
+    record_installation_receipt(repository, &persisted, origin, owns_files).await?;
+    Ok(persisted)
+}
+
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    match (path.canonicalize(), root.canonicalize()) {
+        (Ok(path), Ok(root)) => path.starts_with(root),
+        _ => path.starts_with(root),
+    }
 }
 
 pub async fn agent_skill_packages(repository: &Store) -> Result<Vec<SkillPackage>, String> {
@@ -626,6 +668,73 @@ mod tests {
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].id, first.id);
         assert!(!packages[0].enabled);
+        let receipt = installation_receipt(&store, &packages[0])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.origin, SkillOrigin::Bundled);
+        assert!(!receipt.owns_files);
+    }
+
+    #[tokio::test]
+    async fn bundled_install_upgrades_a_matching_manual_receipt_and_manual_cannot_reclaim_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        let source = bundle.join("sample");
+        let installed_root = dir.path().join("installed");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: sample\n---\n# Sample\n",
+        )
+        .unwrap();
+        let store = Store::open_in_memory().await.unwrap();
+
+        let first = install_skill_directory(&source, &installed_root).unwrap();
+        let package = persist_installed(
+            &store,
+            &installed_root,
+            first,
+            false,
+            None,
+            SkillOrigin::ManagedImport,
+        )
+        .await
+        .unwrap();
+        let receipt = installation_receipt(&store, &package)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.origin, SkillOrigin::ManagedImport);
+        assert!(receipt.owns_files);
+
+        install_bundled_skills(&store, &installed_root, &bundle)
+            .await
+            .unwrap();
+        let stored = store.list_skill_packages().await.unwrap();
+        assert_eq!(stored.len(), 1);
+        let bundled = installation_receipt(&store, &stored[0])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bundled.origin, SkillOrigin::Bundled);
+        assert!(!bundled.owns_files);
+
+        let repeated = install_skill_directory(&source, &installed_root).unwrap();
+        assert!(!repeated.created_new_directory);
+        let same = persist_installed(
+            &store,
+            &installed_root,
+            repeated,
+            false,
+            None,
+            SkillOrigin::ManagedImport,
+        )
+        .await
+        .unwrap();
+        let protected = installation_receipt(&store, &same).await.unwrap().unwrap();
+        assert_eq!(protected.origin, SkillOrigin::Bundled);
+        assert!(!protected.owns_files);
     }
 
     #[tokio::test]
@@ -780,11 +889,26 @@ mod tests {
             sha256: "shared-source-sha".into(),
             capabilities: vec!["read_project_files".into()],
             install_path: PathBuf::from(r"C:\OmicsOps\skills\same-source"),
+            created_new_directory: true,
         };
 
         let (left, right) = tokio::join!(
-            persist_installed(&store, installed.clone(), false, None),
-            persist_installed(&store, installed, false, None),
+            persist_installed(
+                &store,
+                Path::new(r"C:\OmicsOps\skills"),
+                installed.clone(),
+                false,
+                None,
+                SkillOrigin::ManagedImport,
+            ),
+            persist_installed(
+                &store,
+                Path::new(r"C:\OmicsOps\skills"),
+                installed,
+                false,
+                None,
+                SkillOrigin::ManagedImport,
+            ),
         );
         let left = left.unwrap();
         let right = right.unwrap();

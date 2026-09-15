@@ -534,6 +534,9 @@ pub use usage_settings::{
     UsageGroup, UsageTool,
 };
 
+mod skill_settings;
+pub use skill_settings::{SkillInstallationReceipt, SkillOrigin};
+
 mod memory_files;
 pub use memory_files::{
     CreateMemoryFileRequestV4, DeleteMemoryFileRequestV4, MemoryFileSummaryV4, MemoryFileV4,

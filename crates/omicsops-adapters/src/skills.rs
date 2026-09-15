@@ -32,6 +32,9 @@ pub struct InstalledSkillPackage {
     pub sha256: String,
     pub capabilities: Vec<String>,
     pub install_path: PathBuf,
+    /// True only when this invocation completed the final rename into the
+    /// managed skill root. Callers must not infer ownership from `exists()`.
+    pub created_new_directory: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -159,7 +162,7 @@ pub fn install_skill_directory(
                 received: stored.sha256,
             });
         }
-        return Ok(installed_from_inspection(inspection, resolved));
+        return Ok(installed_from_inspection(inspection, resolved, false));
     }
     let parent = package_root
         .parent()
@@ -192,12 +195,13 @@ pub fn install_skill_directory(
         let _ = fs::remove_dir_all(&temporary);
     }
     copy_result?;
-    Ok(installed_from_inspection(inspection, package_root))
+    Ok(installed_from_inspection(inspection, package_root, true))
 }
 
 fn installed_from_inspection(
     inspection: InspectedSkillPackage,
     install_path: PathBuf,
+    created_new_directory: bool,
 ) -> InstalledSkillPackage {
     InstalledSkillPackage {
         name: inspection.name,
@@ -205,6 +209,7 @@ fn installed_from_inspection(
         sha256: inspection.sha256,
         capabilities: inspection.capabilities,
         install_path,
+        created_new_directory,
     }
 }
 
@@ -418,4 +423,29 @@ fn normalize_inside_root(path: &Path) -> AdapterResult<PathBuf> {
         return Err(AdapterError::InvalidInput("empty skill path".into()));
     }
     Ok(normalized)
+}
+
+#[cfg(test)]
+mod installation_tests {
+    use super::*;
+
+    #[test]
+    fn installation_reports_only_the_rename_that_created_the_managed_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("installed");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: receipt-test\n---\n# Test\n",
+        )
+        .unwrap();
+
+        let first = install_skill_directory(&source, &destination).unwrap();
+        let repeated = install_skill_directory(&source, &destination).unwrap();
+        assert!(first.created_new_directory);
+        assert!(!repeated.created_new_directory);
+        assert_eq!(first.install_path, repeated.install_path);
+        assert_eq!(first.sha256, repeated.sha256);
+    }
 }

@@ -47,6 +47,7 @@ mod runtime_jobs_v4;
 pub mod session_reviews;
 pub mod side_chat;
 pub mod skill_commands;
+pub mod skill_settings;
 pub mod storage_settings;
 pub mod sync_commands;
 pub mod usage_settings;

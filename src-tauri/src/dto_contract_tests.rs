@@ -878,3 +878,31 @@ fn general_settings_contract_keeps_probe_truth_separate_from_update_configuratio
     assert_eq!(value["r"]["status"], "missing");
     assert!(value.get("dependencies_installed").is_none());
 }
+
+#[test]
+fn skill_installation_receipt_records_origin_without_file_contents() {
+    use omicsops_dto::{SkillInstallationReceipt, SkillOrigin};
+
+    let skill_id = uuid::Uuid::from_u128(41);
+    let receipt = SkillInstallationReceipt {
+        skill_id,
+        package_sha256: "a".repeat(64),
+        installed_root: r"C:\OmicsOps\skills\sample\sha".into(),
+        origin: SkillOrigin::ManagedImport,
+        owns_files: true,
+        plugin_installation_id: None,
+        phase: "active".into(),
+    };
+    assert_eq!(
+        serde_json::to_value(receipt).unwrap(),
+        json!({
+            "skill_id": skill_id,
+            "package_sha256": "a".repeat(64),
+            "installed_root": r"C:\OmicsOps\skills\sample\sha",
+            "origin": "managed_import",
+            "owns_files": true,
+            "plugin_installation_id": null,
+            "phase": "active"
+        })
+    );
+}
