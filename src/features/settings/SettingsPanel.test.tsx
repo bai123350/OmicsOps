@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SettingsPanel } from "./SettingsPanel";
 import { setComposerSendPreference } from "./useComposerSendPreference";
+import { AppearanceProvider } from "../../use-appearance";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -230,9 +231,29 @@ describe("SettingsPanel model providers", () => {
   });
   it("opens directly on Skills when launched from the composer", () => {
     render(<SettingsPanel locale="en-US" initialSection="skills" onClose={() => undefined} />);
-    expect(screen.getByRole("button", { name: "Skills and MCP" })).toHaveClass("active");
-    expect(screen.getByRole("button", { name: "Skills and MCP" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("button", { name: "Skills" })).toHaveClass("active");
+    expect(screen.getByRole("button", { name: "Skills" })).toHaveAttribute("aria-current", "page");
     expect(screen.getByText("Research Skills")).toBeInTheDocument();
+    expect(screen.queryByLabelText("MCP server configuration")).not.toBeInTheDocument();
+  });
+
+  it("keeps Skills and MCP Connections as separate real settings pages", () => {
+    render(<SettingsPanel locale="en-US" initialSection="skills" onClose={() => undefined} />);
+
+    expect(screen.getByRole("button", { name: "Environments" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Skills" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Connections" }));
+    expect(screen.getByRole("heading", { name: "MCP Connections" })).toBeInTheDocument();
+    expect(screen.getByLabelText("MCP server configuration")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Import skill directory" })).not.toBeInTheDocument();
+  });
+
+  it("renders Appearance only inside the shared provider", () => {
+    render(<AppearanceProvider><SettingsPanel locale="en-US" initialSection="appearance" onClose={() => undefined} /></AppearanceProvider>);
+
+    expect(screen.getByRole("button", { name: "Appearance" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("heading", { name: "Appearance" })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Theme" })).toHaveValue("system");
   });
 
   it("explains privacy boundaries and links to the existing capability settings without a project", () => {
@@ -248,8 +269,11 @@ describe("SettingsPanel model providers", () => {
     expect(screen.getByText(/停止 Agent 不会取消已经派发的远端计算/)).toBeInTheDocument();
     expect(screen.getByText(/当前未打开项目/)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "管理技能与 MCP" }));
-    expect(screen.getByRole("button", { name: "技能与 MCP" })).toHaveAttribute("aria-current", "page");
+    fireEvent.click(screen.getByRole("button", { name: "管理 Skills" }));
+    expect(screen.getByRole("button", { name: "Skills" })).toHaveAttribute("aria-current", "page");
+    fireEvent.click(screen.getByRole("button", { name: "隐私与权限" }));
+    fireEvent.click(screen.getByRole("button", { name: "管理 MCP 连接" }));
+    expect(screen.getByRole("button", { name: "连接" })).toHaveAttribute("aria-current", "page");
     fireEvent.click(screen.getByRole("button", { name: "隐私与权限" }));
     fireEvent.click(screen.getByRole("button", { name: "管理浏览器" }));
     expect(screen.getByRole("button", { name: "浏览器" })).toHaveAttribute("aria-current", "page");
@@ -292,7 +316,8 @@ describe("SettingsPanel model providers", () => {
     expect(within(navigation).getByText("Workspace")).toBeInTheDocument();
     expect(within(navigation).getByText("Capabilities")).toBeInTheDocument();
     expect(within(navigation).getByRole("button", { name: "General" })).toBeInTheDocument();
-    expect(within(navigation).getByRole("button", { name: "Skills and MCP" })).toBeInTheDocument();
+    expect(within(navigation).getByRole("button", { name: "Skills" })).toBeInTheDocument();
+    expect(within(navigation).getByRole("button", { name: "Connections" })).toBeInTheDocument();
     expect(within(navigation).queryByRole("button", { name: "Pet" })).not.toBeInTheDocument();
   });
 
@@ -304,7 +329,7 @@ describe("SettingsPanel model providers", () => {
     const search = screen.getByRole("searchbox", { name: "Search settings" });
     fireEvent.change(search, { target: { value: "技能" } });
     const navigation = screen.getByRole("navigation", { name: "Settings pages" });
-    expect(within(navigation).getByRole("button", { name: "Skills and MCP" })).toBeInTheDocument();
+    expect(within(navigation).getByRole("button", { name: "Skills" })).toBeInTheDocument();
     expect(within(navigation).queryByRole("button", { name: "General" })).not.toBeInTheDocument();
     expect(screen.getByLabelText("Profile label")).toHaveValue("My DeepSeek");
 
@@ -456,7 +481,7 @@ describe("SettingsPanel model providers", () => {
     const onSetSkillEnabled = vi.fn().mockResolvedValue({});
     render(<SettingsPanel locale="zh-CN" onClose={() => undefined} skillPackages={[{ id: "skill-1", name: "scrna-qc", version: "1.2.0", source_path: "skills/scrna-qc/hash", sha256: "abcdef1234567890", enabled: false, capabilities: ["read_project_files"], category: "single_cell" }]} onImportSkill={onImportSkill} onSetSkillEnabled={onSetSkillEnabled} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "技能与 MCP" }));
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
     expect(screen.getByText(/固定 GitHub 快照/)).toBeInTheDocument();
     expect(screen.getByText("组学技能")).toBeInTheDocument();
     expect(screen.getByText("单细胞组学")).toBeInTheDocument();
@@ -476,7 +501,7 @@ describe("SettingsPanel model providers", () => {
     const onSetMcpToolApproval = vi.fn().mockResolvedValue(server);
     render(<SettingsPanel locale="zh-CN" onClose={() => undefined} selectedProject={{ id: "project-1", name: "PBMC", description: "", local_root: "E:/PBMC", remote_root: null, connection_id: null, template: "single_cell_rna_seq", status: "ready", ollama_only: false, created_at: "", updated_at: "" }} mcpServers={[server]} onSaveMcpServer={onSaveMcpServer} onInspectMcpServer={onInspectMcpServer} onSetMcpToolApproval={onSetMcpToolApproval} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "技能与 MCP" }));
+    fireEvent.click(screen.getByRole("button", { name: "连接" }));
     fireEvent.change(screen.getByLabelText("MCP server name"), { target: { value: "local-files" } });
     fireEvent.change(screen.getByLabelText("MCP server command"), { target: { value: "npx" } });
     fireEvent.change(screen.getByLabelText("MCP server arguments"), { target: { value: "-y\nfilesystem-mcp" } });
@@ -499,7 +524,7 @@ describe("SettingsPanel model providers", () => {
     const add = vi.fn().mockResolvedValue({});
     const inspect = vi.fn();
     const approve = vi.fn();
-    render(<SettingsPanel locale="zh-CN" initialSection="skills" onClose={() => undefined} onListBundledMcpPresets={list} onAddBundledMcp={add} onInspectMcpServer={inspect} onSetMcpToolApproval={approve} />);
+    render(<SettingsPanel locale="zh-CN" initialSection="connections" onClose={() => undefined} onListBundledMcpPresets={list} onAddBundledMcp={add} onInspectMcpServer={inspect} onSetMcpToolApproval={approve} />);
     expect(screen.queryByRole("region", { name: "PubMed MCP 预设" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "一键添加 PubMed MCP" })).not.toBeInTheDocument();
     expect(screen.queryByLabelText("NCBI API key")).not.toBeInTheDocument();
@@ -515,7 +540,7 @@ describe("SettingsPanel model providers", () => {
     const onSaveMcpServer = vi.fn().mockResolvedValue({});
     render(<SettingsPanel locale="zh-CN" onClose={() => undefined} onSaveMcpServer={onSaveMcpServer} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "技能与 MCP" }));
+    fireEvent.click(screen.getByRole("button", { name: "连接" }));
     fireEvent.change(screen.getByLabelText("MCP server name"), { target: { value: "pubmed" } });
     fireEvent.change(screen.getByLabelText("MCP server command"), { target: { value: "omicsops-desktop" } });
     fireEvent.change(screen.getByLabelText("MCP working directory"), { target: { value: "E:/Science/project" } });
@@ -537,7 +562,7 @@ describe("SettingsPanel model providers", () => {
   it("shows MCP runtime status and bounded diagnostics", async () => {
     const server = { id: "mcp-failed", name: "pubmed", command: "omicsops-desktop", args: ["--mcp-server", "pubmed"], enabled: false, launch_approved: false, approved_tools: [], tools: [], capabilities: {}, status: "failed", last_error: "server exited with code 1", stderr_tail: "invalid configuration", last_inspected_at: null, created_at: "", updated_at: "" };
     render(<SettingsPanel locale="en-US" onClose={() => undefined} mcpServers={[server]} />);
-    fireEvent.click(screen.getByRole("button", { name: "Skills and MCP" }));
+    fireEvent.click(screen.getByRole("button", { name: "Connections" }));
     expect(screen.getByText("Last run failed")).toBeInTheDocument();
     fireEvent.click(screen.getByText("Latest diagnostics"));
     expect(screen.getByText(/server exited with code 1/)).toBeInTheDocument();
@@ -551,7 +576,7 @@ describe("SettingsPanel model providers", () => {
     const onConfirmHostKey = vi.fn().mockResolvedValue(undefined);
     render(<SettingsPanel locale="zh-CN" onClose={() => undefined} connections={[connection]} onTestConnection={onTestConnection} onConfirmHostKey={onConfirmHostKey} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "远端计算" }));
+    fireEvent.click(screen.getByRole("button", { name: "环境" }));
     fireEvent.click(screen.getByRole("button", { name: "测试连接" }));
     expect(await screen.findByText("等待确认主机指纹")).toBeInTheDocument();
     expect(screen.queryByText(/Linux 6.8/)).not.toBeInTheDocument();

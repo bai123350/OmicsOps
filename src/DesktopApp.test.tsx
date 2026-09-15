@@ -214,7 +214,7 @@ describe("DesktopApp", () => {
     await waitFor(() => expect(input).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "设置" }));
     await screen.findByRole("dialog", { name: "工作台设置" });
-    fireEvent.click(screen.getByRole("button", { name: "远端计算" }));
+    fireEvent.click(screen.getByRole("button", { name: "环境" }));
     expect(await screen.findByRole("heading", { level: 3, name: "远端 Linux 计算" })).toBeInTheDocument();
 
     fireEvent.keyDown(window, { key: "k", ctrlKey: true });
@@ -226,6 +226,10 @@ describe("DesktopApp", () => {
     fireEvent.click(await screen.findByRole("button", { name: "打开 管理模型" }));
     await waitFor(() => expect(screen.getByRole("heading", { level: 3, name: "模型提供方" })).toBeInTheDocument());
     expect(screen.getByRole("dialog", { name: "工作台设置" })).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    fireEvent.click(await screen.findByRole("button", { name: "打开 管理 MCP" }));
+    await waitFor(() => expect(screen.getByRole("heading", { level: 3, name: "MCP 连接" })).toBeInTheDocument());
   });
 
   it("closes Settings before search opens project files", async () => {

@@ -13,7 +13,7 @@ describe("bundled MCP presets", () => {
     const add = vi.fn().mockResolvedValue({});
     const inspect = vi.fn();
     const approve = vi.fn();
-    render(<SettingsPanel locale="zh-CN" initialSection="skills" onClose={() => undefined} onListBundledMcpPresets={list} onAddBundledMcp={add} onInspectMcpServer={inspect} onSetMcpToolApproval={approve} />);
+    render(<SettingsPanel locale="zh-CN" initialSection="connections" onClose={() => undefined} onListBundledMcpPresets={list} onAddBundledMcp={add} onInspectMcpServer={inspect} onSetMcpToolApproval={approve} />);
     expect(await screen.findByRole("option", { name: "UniProt · 6 个工具" })).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("搜索内置 MCP"), { target: { value: "基因组" } });
     expect(screen.queryByRole("option", { name: /UniProt/ })).not.toBeInTheDocument();
@@ -29,7 +29,7 @@ describe("bundled MCP presets", () => {
   it("surfaces load and add failures and allows retry", async () => {
     const list = vi.fn().mockRejectedValueOnce(new Error("catalog unavailable")).mockResolvedValue(presets);
     const add = vi.fn().mockRejectedValueOnce(new Error("registration failed")).mockResolvedValue({});
-    render(<SettingsPanel locale="en-US" initialSection="skills" onClose={() => undefined} onListBundledMcpPresets={list} onAddBundledMcp={add} />);
+    render(<SettingsPanel locale="en-US" initialSection="connections" onClose={() => undefined} onListBundledMcpPresets={list} onAddBundledMcp={add} />);
     expect(await screen.findByRole("alert")).toHaveTextContent("catalog unavailable");
     fireEvent.click(screen.getByRole("button", { name: "Retry catalog" }));
     await screen.findByRole("option", { name: "UniProt · 6 tools" });
@@ -46,7 +46,7 @@ it("configures PubMed credentials inside the unified preset and clears the secre
   const configure = vi.fn().mockResolvedValue({});
   const add = vi.fn();
   const save = vi.fn();
-  render(<SettingsPanel locale="en-US" initialSection="skills" onClose={vi.fn()} onListBundledMcpPresets={async () => [{ id: "pubmed", name: "PubMed", description: "Literature", description_zh: "文献", tool_count: 3 }]} onAddBundledMcp={add} onConfigurePubMedMcp={configure} onSaveMcpServer={save} />);
+  render(<SettingsPanel locale="en-US" initialSection="connections" onClose={vi.fn()} onListBundledMcpPresets={async () => [{ id: "pubmed", name: "PubMed", description: "Literature", description_zh: "文献", tool_count: 3 }]} onAddBundledMcp={add} onConfigurePubMedMcp={configure} onSaveMcpServer={save} />);
   await screen.findByRole("option", { name: "PubMed · 3 tools" });
   fireEvent.change(screen.getByLabelText("Select bundled MCP"), { target: { value: "pubmed" } });
   fireEvent.click(screen.getByText("Configure credentials"));
@@ -68,7 +68,7 @@ it("keeps a failed credential edit private and clears it when leaving PubMed", a
   const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
   const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
   try {
-    render(<SettingsPanel locale="en-US" initialSection="skills" onClose={vi.fn()} onListBundledMcpPresets={async () => [{ id: "pubmed", name: "PubMed", description: "Literature", description_zh: "文献", tool_count: 3 }, ...presets]} onConfigurePubMedMcp={configure} />);
+    render(<SettingsPanel locale="en-US" initialSection="connections" onClose={vi.fn()} onListBundledMcpPresets={async () => [{ id: "pubmed", name: "PubMed", description: "Literature", description_zh: "文献", tool_count: 3 }, ...presets]} onConfigurePubMedMcp={configure} />);
     await screen.findByRole("option", { name: "PubMed · 3 tools" });
     fireEvent.change(screen.getByLabelText("Select bundled MCP"), { target: { value: "pubmed" } });
     fireEvent.click(screen.getByText("Configure credentials"));

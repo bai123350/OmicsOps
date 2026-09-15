@@ -872,7 +872,7 @@ export default function DesktopApp() {
         setSearchRequest({ key: crypto.randomUUID(), kind: "files", projectId: selected.id });
       }
       else {
-        setSettingsSection(entry.key === "action:skills" ? "skills" : "models");
+        setSettingsSection(entry.key === "action:skills" ? "skills" : entry.key === "action:mcp" ? "connections" : "models");
         setSettingsNavigationKey((value) => value + 1);
         setSettingsOpen(true);
       }
@@ -1033,6 +1033,7 @@ export default function DesktopApp() {
     ...workspaceSearch.entries,
     { key: "action:models", kind: "action", label: locale === "zh-CN" ? "管理模型" : "Manage models", description: locale === "zh-CN" ? "打开模型设置" : "Open model settings" },
     { key: "action:skills", kind: "action", label: locale === "zh-CN" ? "管理技能" : "Manage skills", description: locale === "zh-CN" ? "打开技能设置" : "Open skill settings" },
+    { key: "action:mcp", kind: "action", label: locale === "zh-CN" ? "管理 MCP" : "Manage MCP", description: locale === "zh-CN" ? "打开 MCP 连接设置" : "Open MCP connection settings" },
     ...(selected ? [{ key: "action:files", kind: "action" as const, label: locale === "zh-CN" ? "项目文件" : "Project files", description: selected.name }] : []),
   ];
   const canAttachFromSearch = (entry: WorkspaceSearchEntry) => !agentBusy && !conversationLocked && !modelSelectionBusy && !runId && canAttachSearchEntry(entry, selected?.id, conversation?.project_id === selected?.id ? conversation?.id : undefined);
