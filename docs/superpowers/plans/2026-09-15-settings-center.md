@@ -28,7 +28,7 @@
 
 | 页面 | 当前状态 | 可用页的交付范围 | 批次/依赖 |
 |---|---|---|---|
-| General | G1 native b67f2c2 + UI75bdf7e 已提交验证；目录失效预检/notice在补，G2/G3待做，全页部分 | 语言、共享发送偏好、项目内恢复、选择操作、通知、实际目录语义、真实更新状态及环境/网络入口 | B1 + B3 |
+| General | G1含8db2719目录预检/notice、G2 a3e4c7b已接入验证；G3通知待做，全页部分 | 语言、共享发送偏好、项目内恢复、选择操作、通知、实际目录语义、真实更新状态及环境/网络入口 | B1 + B3 |
 | Session | 基础已有行为已源码核对，最终验收待做 | 现有迭代/继续/压缩/后续问题偏好完整管理与反馈 | B2；baseline-review |
 | Appearance | 616dbae 已提交及接入；已做指定表面视觉检查 | 实际主题、字体与界面缩放；自定义CSS导入不在基础范围 | B4 |
 | Pet | 5bd7213 + 85c78ac 已提交并接入 | 内置窗口内伴侣、外观与启停；运行状态目前仅有可选组件接口，未连接实际运行；自定义资源/独立桌面窗口不在基础范围 | B8 |
@@ -42,7 +42,7 @@
 | Workflows | fcbc589 已提交并接入 | 可用文本配方库设置页及真实调用；图执行引擎为可选扩展 | B2 + B7 |
 | Specialists | 9f2ea7a + 4051103 + 3931cad 已提交接入，定向验证通过；最终全套待重跑 | 项目角色模板CRUD、启停与可见草稿插入；独立专家运行、模型/工具白名单为可选扩展 | B7 |
 | Memory | 基础CRUD/导航已提交；2837101 + 1cd6088 补齐待处理草稿保护和文件名筛选；最终全套待重跑 | 项目记忆文件列表、按文件名筛选与显式增改删；无正文全文搜索或全局习惯作用域承诺 | B4 |
-| Skills | d7ba5e9 S1来源receipt已提交；父junction修复和S2/S3进行中，整页未完成 | 管理实际安装源与启停，补齐有界详情/文件读取及受管删除 | B2 + B7；baseline-review |
+| Skills | S1 d7ba5e9及父junction修复f18f45b、S2 native831a659已提交；UI/S3管理进行中，整页未完成 | 管理实际安装源与启停，补齐有界详情/文件读取及受管删除 | B2 + B7；baseline-review |
 | Plugins | 生命周期切片已锁定，未实现 | 本地声明包验证/安装/更新/启停/安全移除及所有权绑定 | B7；plugins-general计划 |
 | Browser | ce37b5f 已修首次加载失败后的保存门控，定向验证通过；最终全套待重跑 | 现有配置/会话/域名/授权管理，失败不能以默认值覆盖未知配置 | B2；baseline-review |
 | Connections | b5c3156 + 60c4b69 完整页修复已提交，定向与输入焦点检查通过；最终全套待跑 | MCP stdio 管理与真实检查/授权，环境变量编辑保留与输入焦点已修复；HTTP/OAuth 为可选扩展 | B2 + B7；baseline-review |
@@ -321,9 +321,10 @@ HTTP/OAuth MCP、插件包管理不是 stdio Connections 页完成条件；后�
 - 主代理报告：Usage native `ff03b2b` + `b7aace8`，Store最终5/5、native 7/7通过；整页 `57dfbc4` 的API 2 + Usage 9 + Settings 60 + Desktop 77 = 148/148及Web build通过。
 - 主代理报告：Storage `901bb76` CSS修复，定向3/3及Web build通过；根已查看有数据fixture截图，1440×1000与720×600、dark、uiScale1.2且OS light，内容clientWidth/scrollWidth分别956/956和410/410，无横溢。当前有效图为 `C:/Users/jindong/.codex/visualizations/2026/09/15/01a0a4d8-424b-7122-b3e4-925d0df0a256/settings-storage-ui-fixture-verified.png`，旧 `storage-ui-fixture.png`已过时。mock响应只证明布局，不证明真实磁盘扫描。
 - 主代理报告：共因长内容布局 `13d9c57`，Usage 9 + Storage 3 + Settings 61 = 73/73、Web build及Rust workspace全套通过。根actual dist、Edge 720×600、dark120%验证：Storage 15分类main clientHeight/scrollHeight为436/1830，各卡clientWidth=scrollWidth；Usage main高度436/1424，6个统计section均clientWidth=scrollWidth，均已滚至底部。截图目录 `C:/Users/jindong/.codex/visualizations/2026/09/15/01a0a4d8-424b-7122-b3e4-925d0df0a256/` 下 `settings-storage-long-content-verified.png`、`settings-usage-long-content-verified.png`；旧 `settings-usage-ui-fixture.png`为缺陷图。这些数据fixture证明布局，不是原生统计端到端验收。
-- 主代理报告：General G1 native `b67f2c2`，7/7及desktop build通过；UI `75bdf7e`，72/72及Web build通过。根mock native fixture的found/missing呈现正确，main高度436/1100、宽410/410，截图同目录 `settings-general-native-fixture.png`；不是真解释器验收。目录失效宿主预检/ProjectLibrary notice仍在补，G2/G3未完成，General仍部分。
+- 主代理报告：General G1 native `b67f2c2`，7/7及desktop build通过；UI `75bdf7e`，72/72及Web build通过。根mock native fixture的found/missing呈现正确，main高度436/1100、宽410/410，截图同目录 `settings-general-native-fixture.png`；不是真解释器验收。目录失效宿主预检/ProjectLibrary notice后由 `8db2719`补齐，native 8、frontend 12及Web build通过。G2 `a3e4c7b`全部接入，164 tests及Web build通过；G3通知待做，General仍部分。
 - 主代理报告：Environments `c306e0a` 已接system probe、新SSH入口、字段busy、绑定反馈及防旧绑定拉回项目；Settings 64、Settings + Desktop 142/142及Web build通过。
-- 主代理报告：Skills S1 `d7ba5e9` 来源receipt切片，adapter 2/2、native 16/16、fmt通过；父junction修复与S2/S3仍进行。基础功能剩余General、Skills、Plugins，不能将局部提交标为整页完成。
+- 主代理报告：Skills S1 `d7ba5e9` 来源receipt切片，adapter 2/2、native 16/16、fmt通过；父junction修复 `f18f45b`已提交，S2 native `831a659`有界详情/文件预览已提交，native 11 tests通过；UI/S3管理仍进行。基础功能剩余General G3通知、Skills管理、Plugins，不能将局部提交标为整页完成。
+- 主代理报告：General G2根实际Edge dist + mock Tauri消息UI检查通过：旧草稿保留、引用追加、未调用发送mutation、立即window Escape关闭选区toolbar、textarea.setSelectionRange不触发toolbar。这是UI mock验证，不是模型/SSH端到端验收。
 - 上述新增提交之后，最终 `cargo test --workspace`、`npm test`、`npm run build` 和必要desktop build仍待统一重跑。某次Vitest阶段711项通过后，npm参数被末尾node --test解析导致整体命令失败；不能记录成完整 `npm test` 成功。
 
 - 主代理报告：Memory/Remote Access导航 `49743f5`，相邻142 tests及build通过；Permissions竞态修复 `70e9917`，61 tests及build通过。
