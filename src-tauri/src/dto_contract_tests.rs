@@ -830,3 +830,51 @@ fn mcp_environment_save_contract_distinguishes_keep_from_replace() {
         .is_err()
     );
 }
+
+#[test]
+fn general_settings_contract_keeps_probe_truth_separate_from_update_configuration() {
+    use omicsops_dto::{
+        GeneralNativePreferences, GeneralSystemStatus, GeneralUpdateStatus,
+        SystemInterpreterDiagnostic, SystemInterpreterDiagnostics, SystemInterpreterStatus,
+    };
+
+    assert_eq!(
+        serde_json::to_value(GeneralNativePreferences {
+            project_directory_start: Some(r"C:\Science".into()),
+        })
+        .unwrap(),
+        json!({"project_directory_start":r"C:\Science"})
+    );
+    assert_eq!(
+        serde_json::to_value(GeneralSystemStatus {
+            app_version: "1.2.3".into(),
+            app_data_directory: r"C:\OmicsOps\Data".into(),
+            update_status: GeneralUpdateStatus::Unconfigured,
+            update_source_configured: false,
+        })
+        .unwrap(),
+        json!({
+            "app_version":"1.2.3",
+            "app_data_directory":r"C:\OmicsOps\Data",
+            "update_status":"unconfigured",
+            "update_source_configured":false
+        })
+    );
+    let diagnostics = SystemInterpreterDiagnostics {
+        python: SystemInterpreterDiagnostic {
+            program: "python".into(),
+            status: SystemInterpreterStatus::Found,
+            detail: None,
+        },
+        r: SystemInterpreterDiagnostic {
+            program: "Rscript".into(),
+            status: SystemInterpreterStatus::Missing,
+            detail: Some("not found on system PATH".into()),
+        },
+        checked_at: "2026-09-15T00:00:00Z".into(),
+    };
+    let value = serde_json::to_value(diagnostics).unwrap();
+    assert_eq!(value["python"]["status"], "found");
+    assert_eq!(value["r"]["status"], "missing");
+    assert!(value.get("dependencies_installed").is_none());
+}

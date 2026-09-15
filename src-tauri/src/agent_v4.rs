@@ -5857,7 +5857,7 @@ impl RuntimeEnvironmentPortV4 for LocalEnvironmentPortV4 {
             KernelLanguageV4::Python => "python",
             KernelLanguageV4::R => "Rscript",
         };
-        if !program_available(program).await {
+        if !crate::general_settings::program_available(program).await {
             return Err("selected interpreter is unavailable".into());
         }
         Ok(())
@@ -8061,15 +8061,6 @@ fn legacy_ssh_selection(project: &Project) -> Result<ComputeSelectionV4, String>
     })
 }
 
-async fn program_available(program: &str) -> bool {
-    background_command(program)
-        .arg("--version")
-        .kill_on_drop(true)
-        .output()
-        .await
-        .is_ok_and(|output| output.status.success())
-}
-
 async fn inspect_container_image(program: &str, image: &str) -> (Option<String>, Option<String>) {
     if image.trim().is_empty() || image.chars().any(char::is_whitespace) {
         return (None, Some("container image reference is invalid".into()));
@@ -8162,7 +8153,9 @@ async fn validate_compute_selection(
     validate_compute_binding(&state.repository, project, selection).await?;
     match selection.backend_kind {
         ComputeBackendKindV4::Local => {
-            if !program_available("python").await && !program_available("Rscript").await {
+            if !crate::general_settings::program_available("python").await
+                && !crate::general_settings::program_available("Rscript").await
+            {
                 return Err("local backend requires Python or R".into());
             }
         }

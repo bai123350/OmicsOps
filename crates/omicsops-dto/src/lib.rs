@@ -499,6 +499,12 @@ pub use credentials_settings::{
 mod mcp_settings;
 pub use mcp_settings::SaveMcpEnvBindingRequest;
 
+mod general_settings;
+pub use general_settings::{
+    GeneralNativePreferences, GeneralSystemStatus, GeneralUpdateStatus,
+    SystemInterpreterDiagnostic, SystemInterpreterDiagnostics, SystemInterpreterStatus,
+};
+
 mod composer_queue;
 pub use composer_queue::{
     ComposerQueueActionRequestV4, ComposerQueueActionV4, ComposerQueueFailureCodeV4,

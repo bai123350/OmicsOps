@@ -29,6 +29,7 @@ pub mod dto;
 #[cfg(test)]
 mod dto_contract_tests;
 mod follow_up_questions;
+pub mod general_settings;
 pub mod inspection;
 pub mod kernel_commands;
 mod model_catalog_shared;
@@ -222,6 +223,10 @@ pub fn run() {
             follow_up_questions::agent_v4_suggest_follow_up_questions,
             agent_settings::agent_get_iteration_settings,
             agent_settings::agent_save_iteration_settings,
+            general_settings::settings_general_preferences,
+            general_settings::settings_save_general_preferences,
+            general_settings::settings_general_system_status,
+            general_settings::settings_probe_system_interpreters,
             session_reviews::reviewer_get_settings_v4,
             session_reviews::reviewer_save_settings_v4,
             session_reviews::session_start_review_v4,
