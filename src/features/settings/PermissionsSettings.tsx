@@ -24,10 +24,13 @@ export function PermissionsSettings({ locale, mcpServers, onSetMcpLaunchApproval
   const [browserError, setBrowserError] = useState("");
   const [revokingAuthorization, setRevokingAuthorization] = useState<string | null>(null);
   const browserRequest = useRef(0);
+  const browserOperation = useRef<"load" | "revoke" | null>(null);
 
   useEffect(() => setProfiles(mcpServers), [mcpServers]);
 
   const loadBrowserAuthorizations = useCallback(async () => {
+    if (browserOperation.current) return;
+    browserOperation.current = "load";
     const request = ++browserRequest.current;
     setBrowserLoading(true);
     setBrowserError("");
@@ -39,13 +42,19 @@ export function PermissionsSettings({ locale, mcpServers, onSetMcpLaunchApproval
       if (browserRequest.current !== request) return;
       setBrowserError(errorMessage(error));
     } finally {
-      if (browserRequest.current === request) setBrowserLoading(false);
+      if (browserRequest.current === request) {
+        browserOperation.current = null;
+        setBrowserLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
     void loadBrowserAuthorizations();
-    return () => { ++browserRequest.current; };
+    return () => {
+      ++browserRequest.current;
+      browserOperation.current = null;
+    };
   }, [loadBrowserAuthorizations]);
 
   async function updateMcpServer(serverId: string, action: () => Promise<McpServerProfile>) {
@@ -65,7 +74,8 @@ export function PermissionsSettings({ locale, mcpServers, onSetMcpLaunchApproval
   }
 
   async function revokeBrowserAuthorization(authorization: BrowserAuthorizationV4) {
-    if (revokingAuthorization) return;
+    if (browserOperation.current) return;
+    browserOperation.current = "revoke";
     setRevokingAuthorization(authorization.id);
     setBrowserError("");
     try {
@@ -75,6 +85,7 @@ export function PermissionsSettings({ locale, mcpServers, onSetMcpLaunchApproval
     } catch (error) {
       setBrowserError(errorMessage(error));
     } finally {
+      browserOperation.current = null;
       setRevokingAuthorization(null);
     }
   }
@@ -105,13 +116,13 @@ export function PermissionsSettings({ locale, mcpServers, onSetMcpLaunchApproval
 
     <section className="permissions-card" aria-labelledby="browser-permissions-heading">
       <div className="permissions-card-heading"><Globe2 size={18} /><span><h4 id="browser-permissions-heading">{zh ? "浏览器授权" : "Browser authorizations"}</h4><p>{zh ? "每项授权保留原始 scope、capability、目标主机、session 与协议版本。" : "Each authorization retains its actual scope, capability, target host, session, and protocol version."}</p></span></div>
-      {browserError && <div className="permissions-error-row"><p className="permissions-error" role="alert">{browserError}</p><button type="button" onClick={() => void loadBrowserAuthorizations()}>{zh ? "重试浏览器授权" : "Retry browser authorizations"}</button></div>}
+      {browserError && <div className="permissions-error-row"><p className="permissions-error" role="alert">{browserError}</p><button type="button" disabled={browserLoading || revokingAuthorization !== null} onClick={() => void loadBrowserAuthorizations()}>{zh ? "重试浏览器授权" : "Retry browser authorizations"}</button></div>}
       {browserLoading ? <p className="permissions-loading"><LoaderCircle className="spin" size={15} />{zh ? "正在读取浏览器授权…" : "Loading browser authorizations…"}</p> : authorizations.length === 0 ? <p className="permissions-empty">{zh ? "暂无持久浏览器授权。" : "No durable browser authorizations."}</p> : <div className="permissions-list">{authorizations.map((authorization) => {
         const context = [authorization.project_id && `${zh ? "项目" : "project"}: ${authorization.project_id}`, authorization.conversation_id && `${zh ? "会话" : "conversation"}: ${authorization.conversation_id}`].filter(Boolean).join(" · ");
         const host = authorization.binding.target_host || (zh ? "浏览器 session" : "Browser session");
         return <article className="permission-browser-row" key={authorization.id}>
           <span className="permission-browser-main"><span className="permission-tags"><b>{scopeLabel(authorization.scope, zh)}</b><code>{authorization.binding.capability}</code></span><strong>{host}</strong><small>{sessionLabel(authorization.binding.session, zh)} · protocol v{authorization.binding.protocol_version}{context ? ` · ${context}` : ""}</small><code className="permission-id">{authorization.id}</code></span>
-          <button type="button" disabled={revokingAuthorization !== null} aria-label={zh ? `撤销 ${host} 的浏览器授权` : `Revoke browser authorization for ${host}`} onClick={() => void revokeBrowserAuthorization(authorization)}>{revokingAuthorization === authorization.id && <LoaderCircle className="spin" size={13} />}{zh ? "撤销" : "Revoke"}</button>
+          <button type="button" disabled={browserLoading || revokingAuthorization !== null} aria-label={zh ? `撤销 ${host} 的浏览器授权` : `Revoke browser authorization for ${host}`} onClick={() => void revokeBrowserAuthorization(authorization)}>{revokingAuthorization === authorization.id && <LoaderCircle className="spin" size={13} />}{zh ? "撤销" : "Revoke"}</button>
         </article>;
       })}</div>}
     </section>

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { McpServerProfile } from "../../types";
@@ -43,6 +43,12 @@ function mockedApi() {
     browserListAuthorizations: ReturnType<typeof vi.fn>;
     browserRevokeAuthorization: ReturnType<typeof vi.fn>;
   };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((next) => { resolve = next; });
+  return { promise, resolve };
 }
 
 beforeEach(() => {
@@ -131,5 +137,27 @@ describe("PermissionsSettings", () => {
 
     expect(await screen.findByText("pubmed.ncbi.nlm.nih.gov")).toBeInTheDocument();
     expect(mockedApi().browserListAuthorizations).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not let a retry read race a browser revocation", async () => {
+    mockedApi().browserRevokeAuthorization.mockRejectedValueOnce(new Error("temporary revoke failure"));
+    render(<PermissionsSettings locale="en-US" mcpServers={[]} />);
+    const revoke = await screen.findByRole("button", { name: "Revoke browser authorization for pubmed.ncbi.nlm.nih.gov" });
+    fireEvent.click(revoke);
+    expect(await screen.findByRole("alert")).toHaveTextContent("temporary revoke failure");
+
+    const staleSnapshot = deferred<typeof authorization[]>();
+    mockedApi().browserListAuthorizations.mockReturnValueOnce(staleSnapshot.promise);
+    mockedApi().browserRevokeAuthorization.mockResolvedValueOnce(true);
+    const retry = screen.getByRole("button", { name: "Retry browser authorizations" });
+    act(() => {
+      retry.click();
+      revoke.click();
+    });
+
+    expect(mockedApi().browserListAuthorizations).toHaveBeenCalledTimes(2);
+    expect(mockedApi().browserRevokeAuthorization).toHaveBeenCalledTimes(1);
+    staleSnapshot.resolve([authorization]);
+    expect(await screen.findByText("pubmed.ncbi.nlm.nih.gov")).toBeInTheDocument();
   });
 });
