@@ -29,23 +29,23 @@
 | 页面 | 当前状态 | 可用页的交付范围 | 批次/依赖 |
 |---|---|---|---|
 | General | B1 已提交、全页部分 | 语言、共享发送偏好、项目内恢复、选择操作、通知、实际目录语义、真实更新状态及环境/网络入口 | B1 + B3 |
-| Session | 已有部分 | 现有迭代/继续/压缩偏好完整管理与反馈 | B2 |
+| Session | 基础已有行为已源码核对，最终验收待做 | 现有迭代/继续/压缩/后续问题偏好完整管理与反馈 | B2；baseline-review |
 | Appearance | 616dbae 已提交及接入；已做指定表面视觉检查 | 实际主题、字体与界面缩放；自定义CSS导入不在基础范围 | B4 |
 | Pet | 5bd7213 + 85c78ac 已提交并接入 | 内置窗口内伴侣、外观与启停；运行状态目前仅有可选组件接口，未连接实际运行；自定义资源/独立桌面窗口不在基础范围 | B8 |
 | Credentials | 完整切片已锁定，实现中 | 非敏感引用目录、受限替换、自定义keyring创建及未引用项删除 | B5；独立credentials计划 |
 | Permissions | 8eb938e + 70e9917 已提交并接入 | 真实 scope 授权列表及逐项撤销，不改冻结计划；竞态修复已测 | B5 |
-| Environments | 已有部分 | system 探测、SSH 配置/信任/运行环境管理；遵守本地限制 | B2 |
+| Environments | SSH已有；system探测、新建入口与绑定错误反馈待补 | system真实探测、SSH 配置/信任/运行环境管理；backend目录不等于解释器探测 | B2；baseline-review |
 | Storage | 6745ee3 + 85c78ac 已提交并接入 | 真实应用/项目占用统计、范围筛选；不扩为清理 | B6 |
 | Usage | 独立可执行计划已锁定，未实现 | 跨会话 token/模型/UTC日周/工具统计、项目与会话分页 | B6；独立usage计划 |
-| Models | 已有部分 | 完整现有 provider 管理；ACP 为可选扩展，不作为页面完成前提 | B2 + B7 |
+| Models | 基础已有行为已源码核对，最终验收待做 | 完整现有 provider 管理；ACP 为可选扩展，不作为页面完成前提 | B2 + B7；baseline-review |
 | Quick Actions | 9f2ea7a native已提交，CRUD/picker接线中 | 用户动作 CRUD、工作流绑定及可见草稿插入，不自动提交 | B4，依赖 Workflows |
 | Workflows | fcbc589 已提交并接入 | 可用文本配方库设置页及真实调用；图执行引擎为可选扩展 | B2 + B7 |
 | Specialists | 9f2ea7a native已提交，CRUD/picker接线中 | 项目角色模板CRUD、启停与可见草稿插入；独立专家运行、模型/工具白名单为可选扩展 | B7 |
 | Memory | 4d21d19 + 3d28e5d + 49743f5 + 3367023 已提交并接入，搜索待补 | 项目记忆文件列表与显式增改删已实现；文件搜索待补；全局习惯记忆为独立可选作用域，不声明已实现 | B4 |
-| Skills | ff22647 已提交独立页 | 管理实际安装源与启停；详情/文件及安全删除仍按实际实现逐项验收 | B2 + B7 |
+| Skills | ff22647 独立页已提交；详情/文件/安全删除及启停错误反馈待补 | 管理实际安装源与启停，补齐有界详情/文件读取及受管删除 | B2 + B7；baseline-review |
 | Plugins | 生命周期切片已锁定，未实现 | 本地声明包验证/安装/更新/启停/安全移除及所有权绑定 | B7；plugins-general计划 |
-| Browser | 已有部分 | 现有配置/会话/域名/授权完整可用页 | B2 |
-| Connections | ff22647 已提交独立页 | MCP stdio 管理与真实检查/授权；HTTP/OAuth 为可选扩展 | B2 + B7 |
+| Browser | 基础调用已核对；首次加载失败后的保存门控待修 | 现有配置/会话/域名/授权管理，失败不能以默认值覆盖未知配置 | B2；baseline-review |
+| Connections | ff22647 独立页已提交；literal环境绑定编辑保留语义待修 | MCP stdio 管理与真实检查/授权；HTTP/OAuth 为可选扩展 | B2 + B7；baseline-review |
 | Remote Access | 6c2a40d + 49743f5 已提交并接入 | 现有项目本地/SSH传输与同步管理，明确范围/状态/恢复；上游渠道平台不在基础页范围 | B8 |
 
 批次顺序不强制串行：B1 先建立设置承载与 General 核心；B2 整合已有能力；B3 接原生偏好；B4 用户内容和视觉；B5 授权/秘密；B6 只读统计；B7 适合 OmicsOps 的专家/扩展管理；B8 项目传输与 Pet。后续批次在开工前追加明确文件、协议、测试用例和提交任务，不将本 master 当作尚未设计子系统的代码规格。
@@ -302,6 +302,8 @@ HTTP/OAuth MCP、插件包管理不是 stdio Connections 页完成条件；后�
 ## 审阅与交付记录
 
 ### 剩余页已锁定的派发规格
+
+- [六个基础页调用核验](../specs/2026-09-15-settings-baseline-review.md)：Session/Models基础功能已连接；Environments/Skills/Browser/Connections的具体缺口与最小测试要求已列明。代码阅读不是最终验收。
 
 - [Credentials独立计划](2026-09-15-credentials-settings.md)：真实keyring目录/创建/替换/未引用删除；canonical owner、防alias绕过、expected reference及MCP删除竞态已定义。
 - [Usage独立计划](2026-09-15-usage-settings.md)：固定事件快照、完整run分页合并、项目/会话/模型/日周/工具；不估账单、不把缺失当0。

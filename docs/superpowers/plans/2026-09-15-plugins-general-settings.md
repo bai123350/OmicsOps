@@ -92,14 +92,15 @@ struct GeneralSystemStatus {
 // settings_general_preferences() -> GeneralNativePreferences
 // settings_save_general_preferences(preferences) -> GeneralNativePreferences
 // settings_general_system_status() -> GeneralSystemStatus
+// settings_probe_system_interpreters() -> SystemInterpreterDiagnostics
 ```
 
 版本来自 `app.package_info().version`，路径来自app.path().app_data_dir。仓库无正式发布源，真实update_status固定由配置检测结果产生`unconfigured`，页面显示“未配置更新源”与当前版本，并提供“重新读取更新配置”按钮；不能放可点击的虚假“检查更新”或auto-update开关。此适配不要求创建release/tag或假远程版本。已有可信源将来落库才新增HTTP检查协议。
 
-General环境卡提供system探测动作，调用现有runtime system diagnostics，不允许手工Python/R路径，显示“找到可执行文件”及依赖未验证；SSH管理跳Environments。网络卡列明模型HTTP与MCP stdio真实配置入口：Models可实际编辑base URL并probe，Connections可实际编辑stdio命令/env并inspect；点击导航保留原设置工作区。此批没有统一代理设置，不显示system/direct/custom假选项、不读取可能带密码的环境代理值。不把SSH称HTTP代理受控；HTTP传输和子进程继承环境的范围明确。
+General环境卡提供system探测动作，但当前没有可直接调用的settings system diagnostics命令。`agent_v4_compute_backends`及`configured_process_backends`只检查配置，python_status/r_status固定unverified，不能当解释器探测。新增只读命令 `settings_probe_system_interpreters() -> SystemInterpreterDiagnostics`，其中结果包含python/Rscript各自的found/missing/error状态和checked_at；复用 `agent_v4.rs::LocalEnvironmentPortV4::check_interpreter` → `program_available` 的实际检查，可提取窄的共享probe helper并注入测试runner。固定仅检查system PATH的python/Rscript，不接受用户输入任意program或自定义路径，不隐式准备/安装环境；超时及执行失败必须与未找到区分。General和Environments共用此诊断命令，显示“找到可执行文件”且依赖未验证；SSH管理跳Environments。网络卡列明模型HTTP与MCP stdio真实配置入口：Models可实际编辑base URL并probe，Connections可实际编辑stdio命令/env并inspect；点击导航保留原设置工作区。此批没有统一代理设置，不显示system/direct/custom假选项、不读取可能带密码的环境代理值。不把SSH称HTTP代理受控；HTTP传输和子进程继承环境的范围明确。
 
 - [ ] 临时Store测试偏好保存/清除重载，路径无效拒绝、没有mkdir/移动DB；选择器mock断言defaultPath传递正确、取消保留创建表单；偏好变更不改已选localRoot。
-- [ ] 状态DTO测试真实version、unconfigured不是latest；UI测试显示版本与缺源原因且无假开关；环境/网络按钮指向对应真实功能，system探测失败保留错误。
+- [ ] 状态DTO测试真实version、unconfigured不是latest；UI测试显示版本与缺源原因且无假开关；环境/网络按钮指向对应真实功能。新增system probe用模拟runner验证只查python/Rscript、无安装/SSH调用，found/missing/error及超时分别返回；UI点击真实命令后渲染结果，不能复用backend目录的unverified当成功。
 - [ ] 实现后运行general/ProjectLibrary/SettingsPanel定向测试，再完整检查/desktop构建，提交G1。目录选择Windows人工验证，macOS未验证明确记录。
 
 ## G2：消息正文选择浮窗与共享开关
