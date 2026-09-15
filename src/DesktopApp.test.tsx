@@ -8,6 +8,7 @@ import DesktopApp, { samePendingSubmission } from "./DesktopApp";
 import * as api from "./tauri-api";
 import * as referenceApi from "./composer-reference-api";
 import * as attachmentApi from "./composer-attachment-api";
+import * as usageApi from "./usage-settings-api";
 import type { AgentRunEventV4, ComposerReference, ConversationAgentStateV4, ExecutionPlanV4, KernelEvent, ProposedPlanRevisionV4, RunSummaryV4, StopRunReceiptV4, SyncEntry, WorkspaceMessage } from "./types";
 
 beforeEach(() => {
@@ -1303,6 +1304,50 @@ describe("DesktopApp", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     fireEvent.click(screen.getByRole("button", { name: "设置" }));
     expect(screen.getByRole("button", { name: "常规" })).toHaveAttribute("aria-current", "page");
+  });
+
+  it("opens the exact persisted conversation selected from Usage settings", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    const emptyCounter = { known: null, incomplete_attempts: 0 };
+    const totals = { input_tokens: { known: 12, incomplete_attempts: 0 }, output_tokens: emptyCounter, reasoning_tokens: emptyCounter, cache_read_input_tokens: emptyCounter, cache_creation_input_tokens: emptyCounter, reported_total_tokens: emptyCounter, observed_attempts: 1, final_attempts: 1, partial_attempts: 0, interrupted_attempts: 0, unknown_attempts: 0 };
+    vi.spyOn(usageApi, "settingsUsagePage").mockResolvedValue({ totals, projects: [], models: [], days: [], tools: [], next_cursor: null, scanned_runs: 1, omitted_runs: 0, unattributed_events: 0, snapshot_at: "2026-09-15T00:00:00Z", completeness: "complete" });
+    vi.spyOn(usageApi, "settingsUsageConversations").mockResolvedValue({ items: [{ project_id: stateProject.id, conversation_id: stateConversations[1].id, label: stateConversations[1].title, latest_activity: "2026-09-15T00:00:00Z", totals, incomplete: false }], next_cursor: null, snapshot_at: "2026-09-15T00:00:00Z" });
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("button", { name: "用量" }));
+    await screen.findByText(stateConversations[1].title);
+    fireEvent.click(screen.getByRole("button", { name: "打开" }));
+
+    expect(await screen.findByRole("heading", { name: stateConversations[1].title })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "工作台设置" })).not.toBeInTheDocument();
+  });
+
+  it("ignores a cross-project Usage navigation that resolves after Settings closes", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (projectId, conversationId) => ({ ...stateSnapshot(conversationId), project_id: projectId }));
+    const otherProject = { ...stateProject, id: "project-other-usage", name: "Other usage project" };
+    const otherConversation = { ...stateConversations[0], id: "conversation-other-usage", project_id: otherProject.id, title: "Other usage conversation" };
+    vi.mocked(api.listProjects).mockResolvedValue([stateProject, otherProject]);
+    const pending = deferred<Awaited<ReturnType<typeof api.listConversations>>>();
+    vi.mocked(api.listConversations).mockImplementation((projectId) => projectId === otherProject.id ? pending.promise : Promise.resolve(stateConversations));
+    const emptyCounter = { known: null, incomplete_attempts: 0 };
+    const totals = { input_tokens: { known: 12, incomplete_attempts: 0 }, output_tokens: emptyCounter, reasoning_tokens: emptyCounter, cache_read_input_tokens: emptyCounter, cache_creation_input_tokens: emptyCounter, reported_total_tokens: emptyCounter, observed_attempts: 1, final_attempts: 1, partial_attempts: 0, interrupted_attempts: 0, unknown_attempts: 0 };
+    vi.spyOn(usageApi, "settingsUsagePage").mockResolvedValue({ totals, projects: [], models: [], days: [], tools: [], next_cursor: null, scanned_runs: 1, omitted_runs: 0, unattributed_events: 0, snapshot_at: "2026-09-15T00:00:00Z", completeness: "complete" });
+    vi.spyOn(usageApi, "settingsUsageConversations").mockResolvedValue({ items: [{ project_id: otherProject.id, conversation_id: otherConversation.id, label: otherConversation.title, latest_activity: "2026-09-15T00:00:00Z", totals, incomplete: false }], next_cursor: null, snapshot_at: "2026-09-15T00:00:00Z" });
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("button", { name: "用量" }));
+    await screen.findByText(otherConversation.title);
+    fireEvent.click(screen.getByRole("button", { name: "打开" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+
+    await act(async () => pending.resolve([otherConversation]));
+    expect(screen.getByRole("heading", { name: stateConversations[0].title })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: otherConversation.title })).not.toBeInTheDocument();
   });
 
   it("persists the existing project-library language switch across remounts", async () => {

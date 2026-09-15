@@ -9,6 +9,7 @@ import * as api from "../../tauri-api";
 import { PetPreferencesProvider } from "../../use-pet-preferences";
 import * as memoryApi from "../../memory-settings-api";
 import * as credentialsApi from "../../credentials-settings-api";
+import * as usageApi from "../../usage-settings-api";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -282,6 +283,22 @@ describe("SettingsPanel model providers", () => {
     expect(api.settingsStorageUsage).toHaveBeenCalledWith(undefined);
   });
 
+  it("registers Usage with real project scope and exact conversation selection", async () => {
+    const selectedProject = { id: "project-1", name: "PBMC", description: "", local_root: "E:/PBMC", remote_root: null, connection_id: null, template: "single_cell_rna_seq" as const, status: "ready" as const, ollama_only: false, created_at: "", updated_at: "" };
+    const emptyCounter = { known: null, incomplete_attempts: 0 };
+    const totals = { input_tokens: { known: 42, incomplete_attempts: 0 }, output_tokens: emptyCounter, reasoning_tokens: emptyCounter, cache_read_input_tokens: emptyCounter, cache_creation_input_tokens: emptyCounter, reported_total_tokens: emptyCounter, observed_attempts: 1, final_attempts: 1, partial_attempts: 0, interrupted_attempts: 0, unknown_attempts: 0 };
+    vi.spyOn(usageApi, "settingsUsagePage").mockResolvedValue({ totals, projects: [], models: [], days: [], tools: [], next_cursor: null, scanned_runs: 1, omitted_runs: 0, unattributed_events: 0, snapshot_at: "2026-09-15T00:00:00Z", completeness: "complete" });
+    vi.spyOn(usageApi, "settingsUsageConversations").mockResolvedValue({ items: [{ project_id: "project-1", conversation_id: "conversation-1", label: "QC session", latest_activity: "2026-09-15T00:00:00Z", totals, incomplete: false }], next_cursor: null, snapshot_at: "2026-09-15T00:00:00Z" });
+    const open = vi.fn();
+    render(<SettingsPanel locale="en-US" initialSection="usage" projects={[selectedProject]} selectedProject={selectedProject} onOpenUsageConversation={open} onClose={() => undefined} />);
+
+    expect(screen.getByRole("button", { name: "Usage" })).toHaveAttribute("aria-current", "page");
+    expect(await screen.findByText("QC session")).toBeInTheDocument();
+    expect(usageApi.settingsUsagePage).toHaveBeenCalledWith(expect.objectContaining({ project_id: "project-1" }), null);
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    expect(open).toHaveBeenCalledWith("project-1", "conversation-1");
+  });
+
   it("registers Permissions as a real authorization inventory", async () => {
     vi.spyOn(api, "browserListAuthorizations").mockResolvedValue([]);
     const mcp = { id: "mcp-1", name: "PubMed", command: "omicsops-desktop", args: [], enabled: true, launch_approved: false, approved_tools: ["search_papers"], tools: [{ name: "search_papers", description: "Search papers" }], capabilities: {}, last_inspected_at: "2026-09-15T00:00:00Z", created_at: "", updated_at: "" };
@@ -455,6 +472,7 @@ describe("SettingsPanel model providers", () => {
     expect(within(navigation).getByRole("button", { name: "Workflows" })).toBeInTheDocument();
     expect(within(navigation).getByRole("button", { name: "Pet" })).toBeInTheDocument();
     expect(within(navigation).getByRole("button", { name: "Storage" })).toBeInTheDocument();
+    expect(within(navigation).getByRole("button", { name: "Usage" })).toBeInTheDocument();
     expect(within(navigation).getByRole("button", { name: "Permissions" })).toBeInTheDocument();
     expect(within(navigation).getByRole("button", { name: "Memory" })).toBeInTheDocument();
     expect(within(navigation).getByRole("button", { name: "Remote Access" })).toBeInTheDocument();

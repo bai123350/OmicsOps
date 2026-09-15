@@ -84,7 +84,14 @@ export default function DesktopApp() {
   const [locale, setLocale] = usePersistentLocale();
   const [loading, setLoading] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsOpenRef = useRef(settingsOpen);
+  settingsOpenRef.current = settingsOpen;
+  const usageOpenGeneration = useRef(0);
   const [settingsNavigationKey, setSettingsNavigationKey] = useState(0);
+  function closeSettings() {
+    usageOpenGeneration.current += 1;
+    setSettingsOpen(false);
+  }
   const [conversations, setConversations] = useState<WorkspaceConversation[]>([]);
   const [conversation, setConversation] = useState<WorkspaceConversation | null>(null);
   const [conversationMode, setConversationMode] = useState<SessionAgentModeV4>("agent");
@@ -869,7 +876,7 @@ export default function DesktopApp() {
   async function openSearchEntry(entry: WorkspaceSearchEntry): Promise<boolean> {
     if (entry.kind === "action") {
       if (entry.key === "action:files" && selected) {
-        setSettingsOpen(false);
+        closeSettings();
         setSearchRequest({ key: crypto.randomUUID(), kind: "files", projectId: selected.id });
       }
       else {
@@ -890,7 +897,7 @@ export default function DesktopApp() {
       if (generation !== searchActionGeneration.current) return false;
       const target = available.find((item) => item.id === reference.id && item.project_id === sourceProject.id);
       if (!target) throw new Error("The saved conversation is no longer available.");
-      setSettingsOpen(false);
+      closeSettings();
       setSearchRequest({ key: crypto.randomUUID(), kind: "reveal", projectId: sourceProject.id });
       if (selected?.id === sourceProject.id) { setConversations(available); activateConversation(target); }
       else {
@@ -900,11 +907,29 @@ export default function DesktopApp() {
       return true;
     }
     requestedConversation.current = null;
-    setSettingsOpen(false);
+    closeSettings();
     if (entry.kind === "artifact" && entry.item) setSearchRequest({ key: crypto.randomUUID(), kind: "artifact", projectId: sourceProject.id, item: entry.item });
     else setSearchRequest({ key: crypto.randomUUID(), kind: "reveal", projectId: sourceProject.id });
     setSelected(sourceProject);
     return true;
+  }
+
+  async function openUsageConversation(projectId: string, conversationId: string) {
+    const operation = ++usageOpenGeneration.current;
+    const sourceProject = projects.find((project) => project.id === projectId);
+    if (!sourceProject) throw new Error("usage project unavailable");
+    const available = selected?.id === projectId ? conversations : await api.listConversations(projectId);
+    if (operation !== usageOpenGeneration.current || !settingsOpenRef.current) return;
+    const target = available.find((item) => item.id === conversationId && item.project_id === projectId);
+    if (!target) throw new Error("saved conversation unavailable");
+    closeSettings();
+    if (selected?.id === projectId) {
+      setConversations(available);
+      activateConversation(target);
+    } else {
+      requestedConversation.current = { projectId, conversationId };
+      setSelected(sourceProject);
+    }
   }
 
   async function refreshQueuedConversation() {
@@ -1043,7 +1068,7 @@ export default function DesktopApp() {
     setSearchRequest({ key: crypto.randomUUID(), kind: "attach", projectId: selected.id, conversationId: conversation.id, item: entry.item });
     return true;
   }} /> : null;
-  const settings = settingsOpen ? <SettingsPanel key={settingsNavigationKey} initialSection={settingsSection} locale={locale} onLocaleChange={setLocale} onClose={() => setSettingsOpen(false)} modelProfiles={modelProfiles} skillPackages={skillPackages} mcpServers={mcpServers} connections={connections} selectedProject={selected} onWorkflowsChanged={() => setWorkflowCatalogVersion((value) => value + 1)} onMemoryChanged={capabilities.refresh} onSaveConnection={async (profile, secret) => { await api.saveConnection(profile, secret); setConnections(await api.listConnections()); }} onTestConnection={api.testConnection} onConfirmHostKey={async (profileId, fingerprint) => { await api.confirmHostKey(profileId, fingerprint); setConnections(await api.listConnections()); }} onBindProjectRemote={async (connectionId, remoteRoot) => { if (!selected) return; const updated = await api.updateProjectRemote(selected.id, connectionId, remoteRoot); setSelected(updated); setProjects((current) => current.map((project) => project.id === updated.id ? updated : project)); }} onSaveModel={async (request) => {
+  const settings = settingsOpen ? <SettingsPanel key={settingsNavigationKey} initialSection={settingsSection} locale={locale} onLocaleChange={setLocale} onClose={closeSettings} modelProfiles={modelProfiles} skillPackages={skillPackages} mcpServers={mcpServers} connections={connections} projects={projects} selectedProject={selected} onOpenUsageConversation={openUsageConversation} onWorkflowsChanged={() => setWorkflowCatalogVersion((value) => value + 1)} onMemoryChanged={capabilities.refresh} onSaveConnection={async (profile, secret) => { await api.saveConnection(profile, secret); setConnections(await api.listConnections()); }} onTestConnection={api.testConnection} onConfirmHostKey={async (profileId, fingerprint) => { await api.confirmHostKey(profileId, fingerprint); setConnections(await api.listConnections()); }} onBindProjectRemote={async (connectionId, remoteRoot) => { if (!selected) return; const updated = await api.updateProjectRemote(selected.id, connectionId, remoteRoot); setSelected(updated); setProjects((current) => current.map((project) => project.id === updated.id ? updated : project)); }} onSaveModel={async (request) => {
     if (modelSelectionInFlight.current) throw new Error("Model selection is currently locked");
     modelSelectionInFlight.current = true;
     setModelSelectionBusy(true);
