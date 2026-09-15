@@ -54,6 +54,24 @@ describe("CredentialsSettings", () => {
     expect(screen.getByText(/does not mean the secret is missing/i)).toBeInTheDocument();
   });
 
+  it("does not cross a list snapshot with create, replace, or editor refresh", async () => {
+    let finishInitial!: (entries: CredentialEntry[]) => void;
+    mocks.listCredentials.mockReturnValueOnce(new Promise((resolve) => { finishInitial = resolve; }));
+    render(<CredentialsSettings locale="en-US" onOpenOwner={vi.fn()} />);
+    expect(screen.getByRole("button", { name: "New credential" })).toBeDisabled();
+    finishInitial([managed]);
+    expect(await screen.findByText("NCBI token")).toBeInTheDocument();
+
+    let finishRefresh!: (entries: CredentialEntry[]) => void;
+    mocks.listCredentials.mockReturnValueOnce(new Promise((resolve) => { finishRefresh = resolve; }));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(screen.getByRole("button", { name: "Replace" })).toBeDisabled();
+    finishRefresh([managed]);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Replace" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Replace" }));
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeDisabled();
+  });
+
   it("retains replacement input after a safe failure and sends entity identity plus type", async () => {
     mocks.replaceCredential.mockRejectedValue(new Error("secret-sentinel raw error"));
     render(<CredentialsSettings locale="en-US" onOpenOwner={vi.fn()} />);

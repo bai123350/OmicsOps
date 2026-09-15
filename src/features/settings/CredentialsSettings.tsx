@@ -31,6 +31,7 @@ export function CredentialsSettings({ locale, onOpenOwner }: Props) {
   const [editor, setEditor] = useState<Editor | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<CredentialEntry | null>(null);
   const generation = useRef(0);
+  const editorOpen = creating || editor !== null || confirmDelete !== null;
 
   const closeCreate = useCallback(() => {
     if (busy) return;
@@ -147,8 +148,8 @@ export function CredentialsSettings({ locale, onOpenOwner }: Props) {
       <p>{zh ? "查看实际配置引用的凭据状态，并通过 Windows Credential Manager 或系统 keyring 替换秘密。UI 不会接收或显示现有秘密。" : "Review credentials referenced by actual configurations and replace secrets through Windows Credential Manager or the system keyring. The UI never receives or displays existing secrets."}</p>
     </div>
     <div className="credentials-toolbar">
-      <button type="button" disabled={busy || loading} onClick={() => void load()}><RefreshCw size={14} />{zh ? "刷新" : "Refresh"}</button>
-      <button type="button" className="primary" disabled={busy} onClick={() => { setCreating(true); setEditor(null); setConfirmDelete(null); }}><Plus size={14} />{zh ? "新建凭据" : "New credential"}</button>
+      <button type="button" disabled={busy || loading || editorOpen} onClick={() => void load()}><RefreshCw size={14} />{zh ? "刷新" : "Refresh"}</button>
+      <button type="button" className="primary" disabled={busy || loading} onClick={() => { setCreating(true); setEditor(null); setConfirmDelete(null); }}><Plus size={14} />{zh ? "新建凭据" : "New credential"}</button>
     </div>
     {error && <p className="credentials-error" role="alert">{error}</p>}
     {creating && <section className="credential-editor" role="dialog" aria-label={zh ? "新建凭据" : "New credential"}>
@@ -170,7 +171,7 @@ export function CredentialsSettings({ locale, onOpenOwner }: Props) {
       <Trash2 size={18} /><span><b>{zh ? `删除“${confirmDelete.label}”？` : `Delete “${confirmDelete.label}”?`}</b><small>{zh ? "这会从系统 keyring 清除秘密并删除非敏感目录条目。" : "This removes the secret from the system keyring and deletes the non-secret directory entry."}</small></span>
       <div><button disabled={busy} onClick={closeDelete}>{zh ? "取消" : "Cancel"}</button><button className="danger" disabled={busy} onClick={() => void confirmDeletion()}>{busy && <LoaderCircle className="spin" size={13} />}{zh ? "删除" : "Delete"}</button></div>
     </section>}
-    {loading ? <p className="credentials-loading"><LoaderCircle className="spin" size={15} />{zh ? "正在读取凭据目录…" : "Loading credential directory…"}</p> : entries.length === 0 ? <div className="credentials-empty"><KeyRound size={22} /><b>{zh ? "暂无凭据引用" : "No credential references"}</b><small>{zh ? "模型、SSH 或 MCP 配置保存凭据引用后会显示在这里。" : "Credentials appear here after a model, SSH, or MCP configuration stores a reference."}</small></div> : <div className="credentials-list">{entries.map((entry) => <CredentialRow key={entry.reference} entry={entry} zh={zh} busy={busy} onOpenOwner={onOpenOwner} onReplace={() => { setEditor({ entry, secret: "", path: "", passphrase: "" }); setCreating(false); setConfirmDelete(null); }} onDelete={() => { setConfirmDelete(entry); setCreating(false); setEditor(null); }} />)}</div>}
+    {loading && entries.length === 0 ? <p className="credentials-loading"><LoaderCircle className="spin" size={15} />{zh ? "正在读取凭据目录…" : "Loading credential directory…"}</p> : entries.length === 0 ? <div className="credentials-empty"><KeyRound size={22} /><b>{zh ? "暂无凭据引用" : "No credential references"}</b><small>{zh ? "模型、SSH 或 MCP 配置保存凭据引用后会显示在这里。" : "Credentials appear here after a model, SSH, or MCP configuration stores a reference."}</small></div> : <div className="credentials-list">{entries.map((entry) => <CredentialRow key={entry.reference} entry={entry} zh={zh} busy={busy || loading} onOpenOwner={onOpenOwner} onReplace={() => { setEditor({ entry, secret: "", path: "", passphrase: "" }); setCreating(false); setConfirmDelete(null); }} onDelete={() => { setConfirmDelete(entry); setCreating(false); setEditor(null); }} />)}</div>}
     <div className="settings-note"><ShieldCheck size={18} /><span><b>{zh ? "仅影响未来解析" : "Applies to future resolution"}</b><small>{zh ? "替换或删除不会撤销服务端密钥，也不会取消已经派发的本地或远端计算。受管凭据只会在你把引用填入 MCP 环境变量时使用。" : "Replacement or deletion does not revoke a server-side key or cancel dispatched local or remote computation. A managed credential is used only when you place its reference in an MCP environment binding."}</small></span></div>
   </main>;
 }
