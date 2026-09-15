@@ -1,6 +1,13 @@
 .project-template-settings {
   display: grid;
+  align-content: start;
   gap: 16px;
+}
+
+.project-template-settings > .appearance-card {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 16px 18px;
 }
 
 .project-template-toolbar,
@@ -94,11 +101,15 @@
 }
 
 .project-template-error {
-  color: #fca5a5;
+  color: #b42318;
 }
 
 .project-template-empty {
   color: var(--text-muted, #94a3b8);
+}
+
+html[data-omicsops-theme="dark"] #root .project-template-error {
+  color: #ffb4ab;
 }
 
 @media (max-width: 720px) {
