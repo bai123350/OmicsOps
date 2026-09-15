@@ -28,9 +28,9 @@
 
 | 页面 | 当前状态 | 可用页的交付范围 | 批次/依赖 |
 |---|---|---|---|
-| General | 已有部分 | 语言、共享发送偏好、项目内恢复、选择操作、通知、实际目录语义、真实更新状态及环境/网络入口 | B1 + B3 |
+| General | B1 已提交、全页部分 | 语言、共享发送偏好、项目内恢复、选择操作、通知、实际目录语义、真实更新状态及环境/网络入口 | B1 + B3 |
 | Session | 已有部分 | 现有迭代/继续/压缩偏好完整管理与反馈 | B2 |
-| Appearance | 未实现 | 实际主题、字体与字号应用；导入需明确安全边界 | B4 |
+| Appearance | 组件与根接入已提交，整合验收中 | 实际主题、字体与字号应用；导入需明确安全边界 | B4 |
 | Pet | 未实现 | 实际宠物展示、启停及资源管理 | B8 |
 | Credentials | 已有 vault | 非敏感凭据目录、设置/替换/清除与引用一致性 | B5 |
 | Permissions | 授权散落 | 真实 scope 授权列表及逐项撤销，不改冻结计划 | B5 |
@@ -230,9 +230,79 @@ HTTP/OAuth MCP、插件包管理不是 stdio Connections 页完成条件；后�
 - [ ] 运行 `npm test -- src/use-appearance.test.tsx src/features/settings/AppearanceSettings.test.tsx` 和 `npm run build`；浏览器实际检查 light/dark/system、四档缩放、项目库/工作区/设置/模型表单/审批浮层，确认对比度、滚动和不裁剪。JSDOM 属性测试不替代视觉验证。
 - [ ] 独立提交组件/hook/CSS，再由 SettingsPanel 所有者加 appearance 导航并补立即 Escape/搜索测试。只有根应用与导航均接通、视觉核对通过后更新 Appearance 完成状态。
 
+## 后续页面的最小真实功能与可派发切片
+
+以下任务不修改正在整合的 SettingsPanel/DesktopApp/WorkspaceShell，也不占用 Storage 实现者的共享 DTO/native 注册文件。先由独立实现者提交组件、API 模块、后端纯函数和测试，再由对应所有者统一接线。只有接线完成且真实操作通过才更新页面完成状态；单独组件提交只是中间交付。
+
+### Pet：窗口内研究伴侣
+
+**文件：** 新增 `src/features/settings/PetSettings.tsx`、`src/features/workspace/ResearchCompanion.tsx`、`src/use-pet-preference.ts` 及测试/CSS。根所有者随后在工作区挂载伴侣并注册设置页。
+
+**接口：** 偏好 `enabled: boolean`，只存 `omicsops.pet.enabled`；`ResearchCompanion({ status: "idle" | "running" | "needs_attention", onOpenCurrentRun })` 展示内置 SVG/CSS 伴侣及来自当前运行的状态，不生成或冒充科研建议。设置页实时预览与开关实际控制工作区显示；隐藏不影响运行。
+
+- [ ] 测试关闭后不渲染、重载保存、状态从 props 更新、点击查看运行只调用显式回调；reduced-motion 下停止装饰动画。
+- [ ] 实现可访问的静态/轻动效组件，不创建原生独立桌面窗口、不下载资源、不轮询模型；可关闭浮层进入窗口 Escape 栈，避免遮挡输入和审批。
+- [ ] 定向测试、构建、实际检查小窗口与120%缩放；根集成后才登记 Pet 页可用。上游自定义资源目录/桌面游走宠物不在基础范围。
+
+### Quick Actions：工作流快捷插入
+
+**文件：** 新增 `src/features/settings/QuickActionsSettings.tsx`、`src/quick-actions-api.ts`；后端 `src-tauri/src/quick_actions.rs` 与临时 Store 测试。共享 DTO 与注册在 Storage 所有者完成后由主代理一次接入。
+
+**接口：** 项目拥有 `QuickAction { id, project_id, name, description, workflow_id, enabled }`；list/save/delete 命令按项目校验，存 Store JSON kind `quick_action_v1`，上限100条/name100字/description500字。保存校验引用配方属于当前项目；插入时再次确认存在且启用。前端回调 `onInsertWorkflow(workflowId)` 使用既有 ComposerReference workflow 解析，不自动提交。
+
+- [ ] 写后端测试：跨项目引用拒绝、悬空引用返回明确不可用、编辑不改变owner、删除只删除动作不删除配方、启停持久化。
+- [ ] 写UI测试：新增/编辑/禁用/删除调用真实API，按钮显式插入一次；被禁用/删除的配方不可插入；未选项目能选择项目而不是创建假全局动作。
+- [ ] 在独立组件中完成CRUD与错误反馈，最后由工作区所有者接入 onInsertWorkflow，保留草稿和已有引用，数量限制仍由既有composer边界裁决。
+
+### Specialists：明确标识为角色模板
+
+**文件：** 新增 `src/features/settings/SpecialistsSettings.tsx`、`src/specialists-api.ts`、`src-tauri/src/specialist_templates.rs` 及测试。
+
+**接口：** 项目角色模板 `SpecialistTemplate { id, project_id, name, description, prompt, enabled }`，Store JSON `specialist_template_v1`；list/save/delete。prompt 非空、UTF-8字节上限16KiB、name100字；执行前使用既有秘密内容校验。回调 `onInsertPrompt(text)` 把带可见模板名称的文本插入当前用户草稿，不作为隐藏系统提示、不自动选工具或修改审批。
+
+- [ ] 测试跨项目隔离、输入限制、启停删除、保存失败保留编辑；插入保留原草稿，只产生一次用户可见文本，不调用发送/启动 API。
+- [ ] 预置内容可作为可复制示例，不冒充已执行的子Agent；用户可编辑创建自己的科研角色模板。
+- [ ] 页面显式“角色模板，插入后由你发送”，工作区旧 disabled Specialist 菜单由整合所有者换成真实模板选择。模型白名单、独立专家运行、并行编排属于可选后续，不能声明本批已实现。
+
+### Plugins：受管声明包，不重复包装已有 MCP 注册
+
+现有 `src-tauri/src/bundled_mcp_commands.rs:51` 启动即注册全部内置 MCP，`add_bundled_mcp_server` 幂等补登记。因此仅把“添加内置MCP”改名“安装插件”不算交付。基础包应确有新安装清单和受管文件，同时只复用允许的声明能力。
+
+**文件：** 新增 `src-tauri/src/integration_packages.rs`、`src/integration-packages-api.ts`、`src/features/settings/PluginsSettings.tsx`、包安装测试。先锁定本地包格式，再接注册；不与 skills/MCP owner 并行修改同一旧文件。
+
+**最小格式：** 本地目录中的版本化 manifest，声明 package id/version、包内相对 SKILL.md 文件及其 SHA256、已编译 MCP preset ID 引用。禁止自定义二进制、安装脚本、任意命令、绝对/父目录/链接路径及未经支持远程 URL。清单和字节摘要决定安装内容，包不是新的审批主体。
+
+**生命周期：** 先只读检查并给出文件/绑定预览，再用户点击安装；安装到独立受管目录，持久化安装清单和状态后才登记可发现的技能/内置连接。默认不授予启动或工具权限；失败返回具体阶段、保留可重试状态，不宣称已安装。移除只停用并删除本包拥有且摘要未被用户修改的文件/绑定；其他连接/技能与冻结运行引用保留，不能批量删除共享对象。已有安装按同摘要幂等；不同版本先明确更新差异，不盲目覆盖。
+
+- [ ] 先实现 manifest解析/路径与hash验证/受管临时目录安装的纯函数测试：路径穿越、symlink、篡改hash、重复安装、写失败和用户修改文件保护。
+- [ ] 用模拟注册器测试声明登记，不起进程、不授权；后端状态查询证明安装结果，UI列表/详情/移除接真实命令。
+- [ ] 本页与 Skills/Connections 的区别是包来源、版本和所有权生命周期；具体技能启停、连接检查与授权仍转到对应页面。ZIP/远程仓库/市场和任意脚本插件不在基础包范围。
+
+### Remote Access：项目 SSH 文件传输与同步
+
+**文件：** 新增 `src/features/settings/RemoteAccessSettings.tsx` 与测试。复用 `src/tauri-api.ts` 的 listSyncEntries/pauseSyncTransfer/cancelSyncTransfer/retrySyncTransfer、uploadSelectedFiles/downloadProjectFile；父级传选定项目和现有文件选择入口。
+
+**接口：** 组件以 projectId/绑定的connection与remoteRoot为范围，显示真实传输条目、方向/路径/状态、显式上传/下载和状态允许的暂停/取消/重试。列表异步返回必须按项目代次丢弃迟到结果；同一条目操作期间禁重复。
+
+- [ ] 测试无SSH绑定时提供Environments绑定入口，不能假装通道在线；切项目不泄漏旧列表；上传只接项目内选择，下载冲突保留实际返回状态。
+- [ ] 测试暂停/取消/重试失败保留原记录并显示可重试错误，刷新读取真实状态；取消文件传输绝不能标记Agent/远端计算取消。
+- [ ] 页名说明“项目SSH传输”，显式记录与Wisp的relay/shared-folder/消息渠道不同；不宣称跨设备账户同步。现有选择性数据传输本身是可用页面，不要求实现飞书/微信平台。
+
+## Memory、Credentials、Permissions、Usage 的后端小切片
+
+| 切片 | 实际基础与最小新增 | 必须通过的测试 / 不能伪造的边界 |
+|---|---|---|
+| Memory 文件管理 | `project_memory.rs` 已有files/read/save且save不覆盖；新增按projectId+安全basename的list/read/create/update/delete命令，update/delete带expected SHA256，写入用同目录临时文件与原子替换；只访问 `.omicsops/memory` | 跨项目/路径穿越/保留名/链接拒绝，256KiB限制，摘要冲突不覆盖，删除不扫整个目录，写入沿用脱敏。UI显示文件真相源，不声称全局习惯或自动推理记忆。 |
+| Credentials 目录与受限写入 | vault已有get/set/delete但禁止向UI回传get值。先从模型/SSH/MCP引用及内置NCBI配置生成非秘密使用目录；修改通过既有owner保存路径，新自定义凭据使用受管命名空间并只返回存在状态 | 未知/其他命名空间拒绝，秘密不进Store/错误/事件；删除有使用者时返回依赖而非破坏共享引用；不要实现任意keyring账户枚举。 |
+| Permissions 汇总与撤销 | 已有MCP launch/tool审批和browser授权查询/撤销；新增合并DTO或前端独立查询，保留真实类型及scope；调用现有撤销函数，不能写通用grant表替代真实授权 | MCP撤销启动时同时停用并清工具授权、session invalidate；browser撤销按ID；失败不假刷新为已撤销；冻结运行快照不被此设置改写。新授权仍通过原有审查入口。 |
+| Usage 分页/汇总 | 使用现有ModelUsageObserved与attempt合并；先项目范围概览+稳定会话分页+模型分组，后追加日计数/工具排行 | 有限查询、重复sample/累积报告去重、重试与缺失保持可见、附件/旁聊归属不混淆、跨项目隔离；未知不变0，不造货币价格。 |
+
+每个切片先由后端代理在新模块/测试定义契约，再安排 DTO/注册 owner 接入，避免和当前 Storage 并行编辑同一共享文件。审阅必须看真实调用与持久化结果，组件mock通过不能替代后端验证。
+
 ## 审阅与交付记录
 
 - [x] 源码审计提交：`0a6ef68`。
 - [x] 全 19 页范围及项目内恢复修正：`994203c`。
-- [ ] B1 设置工作区与 General 核心：实现提交、检查结果与审阅结果在完成时登记。
+- [x] B1 设置工作区/共享快捷键：`64ad747`；项目候选查询：`470906d`；恢复接线：`3779c6c`。定向检查已通过（主代理记录），完整检查待整合；General 仍缺其余字段。
+- [x] Appearance 组件、持久化与根接入：`616dbae`。主代理已检查 Edge 大小窗口/dark 120% 并修布局对比；完整检查和最终导航整合仍待记录，不能据此标全部设置完成。
 - [ ] B2–B8：各批开工前追加可执行子计划，完成后逐页更新 master；未实现项始终保留未完成状态。
