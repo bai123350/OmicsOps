@@ -33,7 +33,9 @@ export function SkillDetails({
     setLoading(true);
     setError(false);
     setPreview(null);
+    setPreviewBusy(false);
     setPreviewError(false);
+    previewOperation.current = false;
     void settingsSkillDetail(skillId)
       .then((value) => {
         if (generation.current === request) setDetail(value);

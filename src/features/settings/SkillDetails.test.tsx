@@ -109,4 +109,23 @@ describe("SkillDetails", () => {
     resolveFirst(detail());
     await waitFor(() => expect(screen.queryByRole("heading", { name: "QC reviewer" })).not.toBeInTheDocument());
   });
+
+  it("clears a stale preview operation when switching skill IDs", async () => {
+    let resolvePreview!: (value: { relative_path: string; content: string; redacted: boolean; package_sha256: string }) => void;
+    vi.mocked(api.settingsReadSkillFile).mockImplementationOnce(() => new Promise((resolve) => { resolvePreview = resolve; }));
+    vi.mocked(api.settingsSkillDetail)
+      .mockResolvedValueOnce(detail())
+      .mockResolvedValueOnce({ ...detail(), skill: { ...detail().skill, id: "skill-2", name: "Second" } });
+
+    const view = render(<SkillDetails skillId="skill-1" locale="en-US" onClose={() => undefined} />);
+    await screen.findByRole("heading", { name: "QC reviewer" });
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    expect(screen.getByRole("button", { name: "Reading…" })).toBeDisabled();
+
+    view.rerender(<SkillDetails skillId="skill-2" locale="en-US" onClose={() => undefined} />);
+    await screen.findByRole("heading", { name: "Second" });
+    expect(screen.getByRole("button", { name: "Preview" })).toBeEnabled();
+    resolvePreview({ relative_path: "SKILL.md", content: "old", redacted: false, package_sha256: "a".repeat(64) });
+    await waitFor(() => expect(screen.queryByText("old")).not.toBeInTheDocument());
+  });
 });
