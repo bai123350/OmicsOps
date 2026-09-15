@@ -40,6 +40,8 @@ import { ShareConversationDialog } from "./ShareConversationDialog";
 import { RuntimeDialog } from "./RuntimeDialog";
 import { useWindowEscapeLayer } from "../settings/BrowserSettings";
 import { useComposerSendPreference } from "../settings/useComposerSendPreference";
+import { useGeneralPreferences } from "../../use-general-preferences";
+import { MessageSelectionActions, type MessageSelectionQuote } from "./MessageSelectionActions";
 import { collectNotebookCells, collectDelegatedTasks, collectProvenance, isSidebarPreviewImage } from "./sidebarData";
 import { ArtifactCatalog, CodeNotebook, DelegatedAgents, EnvironmentContexts, ProvenancePanel } from "./SidebarPanels";
 import { V4PlanPanel } from "./V4PlanPanel";
@@ -205,6 +207,7 @@ function parseComposerCommand(text: string): ComposerCommandInvocation | null {
 export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, conversations = [], activeConversationId, capabilitySummary, capabilitiesLoading, capabilitiesError, onRefreshCapabilities, onSelectConversation, onNewConversation, onDeleteConversation, onOpenBranch, onBranchSend, branchSendOriginalMarkdown, branchSendBusy = false, branchSendPending = false, branchSendError = false, onRetryBranchSend, onSend, onQueue, replacement, sideChat, contextUsage = null, contextUsageError = false, queueItems = [], queueError = false, queueLoading = false, onQueueRefresh, referenceCatalog, workflowCatalogVersion = 0, onOpenSearch, searchRequest, onSearchRequestHandled, onSuggestFollowUps, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", conversationLoadError = "", onRetryConversationLoad, agentRetryNotice = "", modelLabel, activeModelProfile, modelProfiles = [], modelPicker, composerBusy = false, modelOptions = [], modelId, onModelChange, agentMode, onAgentModeChange, conversationLocked = false, conversationHydrating = false, planActionBusy = false, v4Plan, latestPlanRevision, computeBackends = [], computeBackendId = "", containerImage = "", autonomyMode = "supervised", approvalPolicy = "risk_based", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onApprovalPolicyChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onRequestPlanRevision, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, activeRunLastActivityAt, agentRunEventsV4 = [], agentTextPreview, guidanceAvailable = false, onAnswerAgentQuestionV4, onDecideToolApprovalV4, onResolveUncertainV4, onResumeAgentRunV4, onCancelRuntimeRecoveryV4, onCloseBrowserRunTabsV4, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
   const t = copy[locale];
   const zh = locale === "zh-CN";
+  const { selectionActionsEnabled } = useGeneralPreferences();
   const [tab, setTab] = useState<ContextTab>("artifacts");
   const [openTabs, setOpenTabs] = useState<ContextTab[]>(DEFAULT_CONTEXT_TABS);
   const [draggedTab, setDraggedTab] = useState<ContextTab | null>(null);
@@ -533,6 +536,16 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   function insertSpecialistDraft(template: SpecialistTemplate) {
     if (composerDisabled || template.project_id !== project.id || !template.enabled) return;
     const block = `${zh ? "[专家角色：" : "[Specialist: "}${template.name}]\n${template.instructions}`;
+    setDraft((current) => current ? `${current}\n\n${block}` : block);
+    setSendError(false);
+    requestAnimationFrame(() => draftRef.current?.focus());
+  }
+  function insertSelectionQuote(selection: MessageSelectionQuote) {
+    const source = selection.role === "user"
+      ? (zh ? "你的消息" : "You")
+      : (zh ? "Agent 回复" : "Agent response");
+    const quotedText = selection.text.split("\n").map((line) => `> ${line}`).join("\n");
+    const block = `${zh ? "[引用自" : "[Quoted from"} ${source}]\n${quotedText}`;
     setDraft((current) => current ? `${current}\n\n${block}` : block);
     setSendError(false);
     requestAnimationFrame(() => draftRef.current?.focus());
@@ -986,7 +999,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
         {onOpenBranch && activeConversationId && <ConversationBranchBanner projectId={project.id} conversationId={activeConversationId} locale={locale} onSelect={onSelectConversation} />}
         {branching.error && <div className="agent-notice" role="alert"><span>{branching.error}</span>{branching.retryAvailable && <button disabled={branching.busy} onClick={() => void branching.retry()}>{zh ? "重试分支" : "Retry branch"}</button>}</div>}
         {messages.map((message, messageIndex) => <Fragment key={message.id}>
-          {message.role === "user" ? <article className="message user-message" data-message-id={message.id} tabIndex={-1}><MarkdownContent markdown={message.markdown} /></article> : message.role === "assistant" && message.markdown.trim() ? <article className="message assistant-message response-message" aria-label={zh ? "Agent 回复" : "Agent response"} data-message-id={message.id} tabIndex={-1}><ResponseBody markdown={message.markdown} zh={zh} /></article> : null}
+          {message.role === "user" ? <article className="message user-message" data-message-id={message.id} tabIndex={-1}><MarkdownContent markdown={message.markdown} selectionScope={{ messageId: message.id, role: "user", projectId: project.id, conversationId: activeConversationId ?? "" }} /></article> : message.role === "assistant" && message.markdown.trim() ? <article className="message assistant-message response-message" aria-label={zh ? "Agent 回复" : "Agent response"} data-message-id={message.id} tabIndex={-1}><ResponseBody markdown={message.markdown} zh={zh} selectionScope={{ messageId: message.id, role: "assistant", projectId: project.id, conversationId: activeConversationId ?? "" }} /></article> : null}
           {onOpenBranch && (message.role === "user" || (message.role === "assistant" && message.markdown.trim())) && <div className="message-branch-actions"><button type="button" disabled={branchDisabled || !messages.slice(0, messageIndex + 1).some((entry) => entry.role === "user")} onClick={() => {
             const anchor = messages.slice(0, messageIndex + 1).reverse().find((entry) => entry.role === "user");
             if (anchor) branchAt(anchor.id, message.role === "user" ? "before_user" : "after_response");
@@ -1012,6 +1025,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
         setFollowingLatest(true);
       }}>↓ {zh ? "回到最新" : "Back to latest"}</button>}
       </section>
+      <MessageSelectionActions enabled={selectionActionsEnabled && Boolean(activeConversationId)} locale={locale} projectId={project.id} conversationId={activeConversationId ?? ""} onQuote={insertSelectionQuote} />
       <footer className="composer">
         {branchSendError && <p role="alert">{zh ? "分支发送或打开未确认，原始消息和材料已保留。" : "Branch sending or opening was not confirmed; the original message and material are retained."}</p>}
         {branchSendPending && onRetryBranchSend && <button type="button" disabled={branchSendBusy} onClick={() => { const original = branchSendOriginalMarkdown; void onRetryBranchSend().then((accepted) => { if (accepted && original) setDraft((current) => current.trim() === original ? "" : current); }); }}>{zh ? "重试原分支发送" : "Retry original branch send"}</button>}
@@ -1280,7 +1294,9 @@ function isV4UncertainResolved(events: AgentRunEventV4[], callId: string) {
 function isV4QuestionAnswered(events: AgentRunEventV4[], questionId: string) {
   return events.some((event) => event.event.kind === "user_input_answered" && event.event.question_id === questionId);
 }
-function ResponseBody({ markdown, zh }: { markdown: string; zh: boolean }) {
+type MessageSelectionScope = { messageId: string; role: "user" | "assistant"; projectId: string; conversationId: string };
+
+function ResponseBody({ markdown, zh, selectionScope }: { markdown: string; zh: boolean; selectionScope?: MessageSelectionScope }) {
   const [copied, setCopied] = useState<string | null>(null);
   const [copyFailed, setCopyFailed] = useState(false);
   async function copyResponse() {
@@ -1290,7 +1306,7 @@ function ResponseBody({ markdown, zh }: { markdown: string; zh: boolean }) {
   }
   const label = copied === markdown ? (zh ? "已复制" : "Copied") : (zh ? "复制回复" : "Copy response");
   return <div className="response-body">
-    <MarkdownContent markdown={markdown} />
+    <MarkdownContent markdown={markdown} selectionScope={selectionScope} />
     <footer className="response-actions"><button type="button" aria-label={label} title={label} onClick={() => void copyResponse()}>{copied === markdown ? <Check size={14} /> : <Copy size={14} />}</button>
       {copyFailed && <span role="status">{zh ? "复制失败，请手动选择正文。" : "Copy failed. Select the response manually."}</span>}
     </footer>
@@ -1318,8 +1334,14 @@ function PublicProgress({ markdown, zh }: { markdown: string; zh: boolean }) {
     {open && <MarkdownContent markdown={markdown} />}
   </article>;
 }
-function MarkdownContent({ markdown }: { markdown: string }) {
-  return <div className="markdown-content"><ReactMarkdown remarkPlugins={[remarkGfm]} components={{ table: ({ children }) => <div className="markdown-table-scroll" role="region" aria-label="表格 / Table" tabIndex={0}><table>{children}</table></div> }}>{markdown}</ReactMarkdown></div>;
+function MarkdownContent({ markdown, selectionScope }: { markdown: string; selectionScope?: MessageSelectionScope }) {
+  return <div className="markdown-content"
+    data-message-selection-body={selectionScope ? true : undefined}
+    data-message-id={selectionScope?.messageId}
+    data-message-role={selectionScope?.role}
+    data-project-id={selectionScope?.projectId}
+    data-conversation-id={selectionScope?.conversationId}
+  ><ReactMarkdown remarkPlugins={[remarkGfm]} components={{ table: ({ children }) => <div className="markdown-table-scroll" role="region" aria-label="表格 / Table" tabIndex={0}><table>{children}</table></div> }}>{markdown}</ReactMarkdown></div>;
 }
 function coalesceV4ModelText(events: AgentRunEventV4[]): Array<{ event: AgentRunEventV4; lastEvent: AgentRunEventV4; modelText?: string }> {
   const entries: Array<{ event: AgentRunEventV4; lastEvent: AgentRunEventV4; modelText?: string }> = [];

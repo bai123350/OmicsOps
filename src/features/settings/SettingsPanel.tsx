@@ -22,6 +22,7 @@ import { CredentialsSettings } from "./CredentialsSettings";
 import { GeneralAdvancedSettings } from "./GeneralAdvancedSettings";
 import { UsageSettings } from "./UsageSettings";
 import { settingsProbeSystemInterpreters } from "../../general-settings-api";
+import { useGeneralPreferences } from "../../use-general-preferences";
 import "./settings.css";
 import "./model-form.css";
 import "./remote-form.css";
@@ -280,11 +281,13 @@ function GeneralSettings({ locale, onLocaleChange, onNavigate }: { locale: Local
   const zh = locale === "zh-CN";
   const [modifierSend, setModifierSend] = useComposerSendPreference();
   const [resumeLastSession, setResumeLastSession] = useResumeLastSessionPreference();
+  const { selectionActionsEnabled, setSelectionActionsEnabled } = useGeneralPreferences();
   return <main className="general-settings">
     <div className="settings-heading"><h3>{zh ? "常规" : "General"}</h3><p>{zh ? "管理跨项目共享的界面和输入偏好。更改会立即生效。" : "Manage interface and input preferences shared across projects. Changes apply immediately."}</p></div>
     <label className="general-setting-row"><span><b>{zh ? "界面语言" : "Interface language"}</b><small>{zh ? "此偏好适用于项目主页、工作区和设置。" : "This preference applies to the project library, workspace, and settings."}</small></span><select aria-label={zh ? "界面语言" : "Interface language"} value={locale} disabled={!onLocaleChange} onChange={(event) => onLocaleChange?.(event.target.value as Locale)}><option value="zh-CN">简体中文</option><option value="en-US">English</option></select></label>
     <label className="general-setting-row"><span><b>{zh ? "发送快捷键" : "Send shortcut"}</b><small>{zh ? "仅控制主对话输入框；Shift+Enter 始终换行，输入法确认不会发送。" : "Controls the main composer only. Shift+Enter always inserts a new line, and IME confirmation never sends."}</small></span><select aria-label={zh ? "发送快捷键" : "Send shortcut"} value={modifierSend ? "modifier" : "enter"} onChange={(event) => setModifierSend(event.target.value === "modifier")}><option value="enter">Enter</option><option value="modifier">Ctrl/Cmd+Enter</option></select></label>
     <label className="general-setting-row"><span><b>{zh ? "恢复上次会话" : "Resume last session"}</b><small>{zh ? "下次打开项目时恢复最近使用且包含用户消息的会话。关闭后将新建空白会话；当前会话会保持打开。" : "Reopen the most recently used session with a user message the next time a project opens. When disabled, a blank session is created; the current session stays open."}</small></span><input type="checkbox" aria-label={zh ? "恢复上次会话" : "Resume last session"} checked={resumeLastSession} onChange={(event) => setResumeLastSession(event.target.checked)} /></label>
+    <label className="general-setting-row"><span><b>{zh ? "显示文字选区操作" : "Show text selection actions"}</b><small>{zh ? "在当前会话的单条消息正文中选择文字时显示复制和引用操作。引用只追加到草稿，不会自动发送。" : "Show copy and quote actions for text selected within one message in the current session. Quotes are appended to the draft and are never sent automatically."}</small></span><input type="checkbox" aria-label={zh ? "显示文字选区操作" : "Show text selection actions"} checked={selectionActionsEnabled} onChange={(event) => setSelectionActionsEnabled(event.target.checked)} /></label>
     <GeneralAdvancedSettings locale={locale} onNavigate={onNavigate} />
   </main>;
 }

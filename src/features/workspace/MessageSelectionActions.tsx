@@ -1,0 +1,136 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+
+import { useWindowEscapeLayer } from "../settings/BrowserSettings";
+import type { Locale } from "./copy";
+import "./MessageSelectionActions.css";
+
+const MAX_SELECTION_BYTES = 16 * 1024;
+
+export interface MessageSelectionQuote {
+  text: string;
+  role: "user" | "assistant";
+}
+
+interface SelectionSnapshot extends MessageSelectionQuote {
+  left: number;
+  top: number;
+}
+
+interface MessageSelectionActionsProps {
+  enabled: boolean;
+  locale: Locale;
+  projectId: string;
+  conversationId: string;
+  onQuote: (selection: MessageSelectionQuote) => void;
+}
+
+function selectionBody(node: Node | null): HTMLElement | null {
+  const element = node instanceof Element ? node : node?.parentElement;
+  return element?.closest<HTMLElement>("[data-message-selection-body]") ?? null;
+}
+
+function captureSelection(projectId: string, conversationId: string): SelectionSnapshot | null {
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount !== 1 || selection.isCollapsed) return null;
+
+  const anchorBody = selectionBody(selection.anchorNode);
+  const focusBody = selectionBody(selection.focusNode);
+  if (!anchorBody || anchorBody !== focusBody) return null;
+  if (anchorBody.dataset.projectId !== projectId || anchorBody.dataset.conversationId !== conversationId) return null;
+
+  const role = anchorBody.dataset.messageRole;
+  if (role !== "user" && role !== "assistant") return null;
+
+  const range = selection.getRangeAt(0);
+  if (!anchorBody.contains(range.commonAncestorContainer)) return null;
+  const text = selection.toString();
+  if (!text.trim() || new TextEncoder().encode(text).byteLength > MAX_SELECTION_BYTES) return null;
+
+  const rect = range.getBoundingClientRect();
+  return {
+    text,
+    role,
+    left: Math.max(8, Math.min(rect.left, window.innerWidth - 190)),
+    top: Math.max(8, rect.top - 44),
+  };
+}
+
+export function MessageSelectionActions({
+  enabled,
+  locale,
+  projectId,
+  conversationId,
+  onQuote,
+}: MessageSelectionActionsProps) {
+  const [snapshot, setSnapshot] = useState<SelectionSnapshot | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const generation = useRef(0);
+  const close = useCallback(() => {
+    generation.current += 1;
+    setSnapshot(null);
+    setError(null);
+  }, []);
+
+  useWindowEscapeLayer(snapshot !== null, close);
+
+  useEffect(() => {
+    close();
+  }, [close, conversationId, enabled, projectId]);
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+
+    const refresh = () => {
+      generation.current += 1;
+      setError(null);
+      setSnapshot(captureSelection(projectId, conversationId));
+    };
+    const dismiss = () => close();
+    document.addEventListener("selectionchange", refresh);
+    window.addEventListener("blur", dismiss);
+    window.addEventListener("scroll", dismiss, true);
+    return () => {
+      document.removeEventListener("selectionchange", refresh);
+      window.removeEventListener("blur", dismiss);
+      window.removeEventListener("scroll", dismiss, true);
+    };
+  }, [close, conversationId, enabled, projectId]);
+
+  if (!snapshot) return null;
+
+  const copy = async () => {
+    const requestGeneration = generation.current;
+    try {
+      await navigator.clipboard.writeText(snapshot.text);
+      if (requestGeneration !== generation.current) return;
+      window.getSelection()?.removeAllRanges();
+      close();
+    } catch {
+      if (requestGeneration !== generation.current) return;
+      setError(locale === "zh-CN"
+        ? "复制失败。请重试或手动复制所选文字。"
+        : "Copy failed. Retry or select the text manually.");
+    }
+  };
+
+  const quote = () => {
+    onQuote({ text: snapshot.text, role: snapshot.role });
+    window.getSelection()?.removeAllRanges();
+    close();
+  };
+
+  return <div
+    className="message-selection-actions"
+    role="toolbar"
+    aria-label={locale === "zh-CN" ? "消息选区操作" : "Message selection actions"}
+    style={{ left: snapshot.left, top: snapshot.top }}
+  >
+    <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => void copy()}>
+      {locale === "zh-CN" ? "复制" : "Copy selection"}
+    </button>
+    <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={quote}>
+      {locale === "zh-CN" ? "引用到草稿" : "Quote in draft"}
+    </button>
+    {error ? <span role="alert">{error}</span> : null}
+  </div>;
+}

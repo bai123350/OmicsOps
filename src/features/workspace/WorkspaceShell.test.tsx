@@ -8,6 +8,7 @@ import * as guidanceApi from "../../tauri-api";
 import { WorkspaceShell } from "./WorkspaceShell";
 import { SettingsPanel } from "../settings/SettingsPanel";
 import { setComposerSendPreference } from "../settings/useComposerSendPreference";
+import { setSelectionActionsEnabled } from "../../use-general-preferences";
 
 const project = {
   id: "project-1",
@@ -27,9 +28,28 @@ const fastProfile = {
   supports_vision: false,
 };
 
+const originalRangeRect = Object.getOwnPropertyDescriptor(Range.prototype, "getBoundingClientRect");
+
+function selectVisibleMessageText(node: Text) {
+  Object.defineProperty(Range.prototype, "getBoundingClientRect", {
+    configurable: true,
+    value: vi.fn(() => ({ x: 20, y: 30, top: 30, left: 20, right: 120, bottom: 48, width: 100, height: 18, toJSON: () => ({}) })),
+  });
+  const range = document.createRange();
+  range.selectNodeContents(node);
+  const selection = window.getSelection()!;
+  selection.removeAllRanges();
+  selection.addRange(range);
+  act(() => document.dispatchEvent(new Event("selectionchange")));
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   setComposerSendPreference(false);
+  setSelectionActionsEnabled(true);
+  window.getSelection()?.removeAllRanges();
+  if (originalRangeRect) Object.defineProperty(Range.prototype, "getBoundingClientRect", originalRangeRect);
+  else delete (Range.prototype as Partial<Range>).getBoundingClientRect;
 });
 
 function deferred<T>() {
@@ -103,6 +123,25 @@ describe("WorkspaceShell", () => {
     fireEvent.change(composer, { target: { value: "Use Enter" } });
     fireEvent.keyDown(composer, { key: "Enter", code: "Enter" });
     await waitFor(() => expect(onSend).toHaveBeenLastCalledWith("Use Enter", "chat"));
+  });
+
+  it("quotes selected persisted message text into the existing draft without sending and hides actions when disabled", () => {
+    setSelectionActionsEnabled(true);
+    const onSend = vi.fn();
+    render(<><WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} onSend={onSend} activeConversationId="conversation-1" messages={[{ id: "assistant-1", role: "assistant", markdown: "Verified observation" }]} /><SettingsPanel locale="en-US" initialSection="general" onClose={() => undefined} /></>);
+    const composer = screen.getByRole("textbox", { name: /Describe a research goal/ });
+    fireEvent.change(composer, { target: { value: "Keep this draft" } });
+    selectVisibleMessageText(screen.getByText("Verified observation").firstChild as Text);
+    fireEvent.click(screen.getByRole("button", { name: "Quote in draft" }));
+
+    expect(composer).toHaveValue("Keep this draft\n\n[Quoted from Agent response]\n> Verified observation");
+    expect(onSend).not.toHaveBeenCalled();
+
+    selectVisibleMessageText(screen.getByText("Verified observation").firstChild as Text);
+    expect(screen.getByRole("toolbar", { name: "Message selection actions" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Show text selection actions" }));
+    expect(screen.queryByRole("toolbar", { name: "Message selection actions" })).not.toBeInTheDocument();
+    expect(window.localStorage.getItem("omicsops.general.selectionActionsEnabled")).toBe("false");
   });
 
   it.each([
