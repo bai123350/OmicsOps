@@ -46,6 +46,11 @@ pub(crate) mod run_stops;
 mod runtime_jobs;
 mod session_reviews;
 mod side_chat;
+mod usage;
+pub use usage::{
+    UsageConversationEventPage, UsageConversationEventSet, UsageEventPage, UsageEventRow,
+    UsageEventRun, UsageSnapshotBoundary,
+};
 const INIT_SQL: &str = include_str!("../migrations/init.sql");
 mod composer_queue;
 mod composer_queue_dispatch;

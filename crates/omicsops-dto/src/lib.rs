@@ -519,6 +519,12 @@ pub use storage_usage::{
     StorageUsageScopeV4, StorageUsageSnapshotV4, StorageUsageStatusV4,
 };
 
+mod usage_settings;
+pub use usage_settings::{
+    UsageAggregatePage, UsageConversationPage, UsageConversationRow, UsageDay, UsageFilter,
+    UsageGroup, UsageTool,
+};
+
 mod memory_files;
 pub use memory_files::{
     CreateMemoryFileRequestV4, DeleteMemoryFileRequestV4, MemoryFileSummaryV4, MemoryFileV4,

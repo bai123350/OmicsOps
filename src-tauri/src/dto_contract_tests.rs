@@ -765,3 +765,44 @@ fn credential_settings_contract_uses_entity_targets_without_secret_outputs() {
         .is_err()
     );
 }
+
+#[test]
+fn usage_settings_contract_keeps_missing_counters_distinct_from_zero_and_excludes_raw_events() {
+    use omicsops_dto::{UsageAggregatePage, UsageFilter};
+    use omicsops_protocol::UsageTotalsV4;
+
+    let project_id = Uuid::from_u128(77);
+    let filter = UsageFilter {
+        project_id: Some(project_id),
+        from: Some("2026-09-01T00:00:00Z".into()),
+        until: None,
+    };
+    assert_eq!(
+        serde_json::to_value(filter).unwrap(),
+        json!({"project_id":project_id,"from":"2026-09-01T00:00:00Z"})
+    );
+    let page = UsageAggregatePage {
+        totals: UsageTotalsV4::default(),
+        projects: vec![],
+        models: vec![],
+        days: vec![],
+        tools: vec![],
+        next_cursor: None,
+        scanned_runs: 0,
+        omitted_runs: 0,
+        unattributed_events: 0,
+        snapshot_at: "2026-09-15T00:00:00Z".into(),
+        completeness: "complete".into(),
+    };
+    let value = serde_json::to_value(page).unwrap();
+    assert_eq!(
+        value["totals"]["input_tokens"],
+        json!({"incomplete_attempts":0})
+    );
+    assert!(value.get("events").is_none());
+    assert!(value.get("tool_arguments").is_none());
+    assert!(
+        serde_json::from_value::<UsageFilter>(json!({"project_id":project_id,"raw_events":true}))
+            .is_err()
+    );
+}

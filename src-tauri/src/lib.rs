@@ -48,6 +48,7 @@ pub mod side_chat;
 pub mod skill_commands;
 pub mod storage_settings;
 pub mod sync_commands;
+pub mod usage_settings;
 pub mod workspace_commands;
 
 use commands::AppState;
@@ -179,6 +180,8 @@ pub fn run() {
             project_templates::list_specialist_templates,
             project_templates::save_specialist_template,
             project_templates::delete_specialist_template,
+            usage_settings::settings_usage_page,
+            usage_settings::settings_usage_conversations,
             composer_quotes::preview_composer_file_text,
             composer_quotes::create_composer_quote,
             conversation_preferences::conversation_get_agent_preferences_v4,

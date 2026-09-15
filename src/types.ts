@@ -815,6 +815,20 @@ export interface ContextUsageSnapshotV4 {
   breakdown?: Array<{ category: string; bytes?: number | null; tokens?: number | null; estimated: boolean }> | null;
   latest_compaction?: ContextCompactionReceiptV4 | null;
 }
+export interface UsageFilter { project_id?: string | null; from?: string | null; until?: string | null }
+export interface UsageGroup { key: string; label: string; totals: UsageTotalsV4 }
+export interface UsageDay { date: string; attempts: number; tools: number; totals: UsageTotalsV4 }
+export interface UsageTool { tool_id: string; dispatched: number; succeeded: number; failed: number; uncertain: number }
+export interface UsageAggregatePage {
+  totals: UsageTotalsV4; projects: UsageGroup[]; models: UsageGroup[]; days: UsageDay[]; tools: UsageTool[];
+  next_cursor?: string | null; scanned_runs: number; omitted_runs: number; unattributed_events: number;
+  snapshot_at: string; completeness: "complete" | "partial" | string;
+}
+export interface UsageConversationRow {
+  project_id: string; conversation_id: string; label: string; latest_activity: string;
+  totals: UsageTotalsV4; incomplete: boolean;
+}
+export interface UsageConversationPage { items: UsageConversationRow[]; next_cursor?: string | null; snapshot_at: string }
 
 export interface ReplaceComposerTurnRequestV4 {
   turn: EnqueueComposerTurnRequestV4;
