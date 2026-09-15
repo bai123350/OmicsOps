@@ -6,6 +6,56 @@ use crate::dto::{
 use serde_json::json;
 
 #[test]
+fn storage_usage_snapshot_preserves_partial_and_unknown_bytes() {
+    let project_id = uuid::Uuid::from_u128(1);
+    let snapshot = omicsops_dto::StorageUsageSnapshotV4 {
+        scope: omicsops_dto::StorageUsageScopeV4::Project,
+        project_id: Some(project_id),
+        entries: vec![omicsops_dto::StorageUsageEntryV4 {
+            category: omicsops_dto::StorageUsageCategoryV4::ProjectRoot,
+            project_id: Some(project_id),
+            path: r"C:\data\project".into(),
+            known_logical_bytes: None,
+            status: omicsops_dto::StorageUsageStatusV4::Partial,
+            scanned_entries: 0,
+            skipped_links: 0,
+            issue: Some(omicsops_dto::StorageScanIssueV4::Unreadable),
+        }],
+        known_logical_bytes: 0,
+        status: omicsops_dto::StorageUsageStatusV4::Partial,
+        scanned_entries: 0,
+        skipped_links: 0,
+        limits: omicsops_dto::StorageScanLimitsV4 {
+            max_entries: 100_000,
+            max_duration_ms: 2_000,
+        },
+    };
+
+    assert_eq!(
+        serde_json::to_value(snapshot).unwrap(),
+        json!({
+            "scope": "project",
+            "project_id": project_id,
+            "entries": [{
+                "category": "project_root",
+                "project_id": project_id,
+                "path": r"C:\data\project",
+                "known_logical_bytes": null,
+                "status": "partial",
+                "scanned_entries": 0,
+                "skipped_links": 0,
+                "issue": "unreadable"
+            }],
+            "known_logical_bytes": 0,
+            "status": "partial",
+            "scanned_entries": 0,
+            "skipped_links": 0,
+            "limits": { "max_entries": 100_000, "max_duration_ms": 2_000 }
+        })
+    );
+}
+
+#[test]
 fn composer_attachment_boundary_contains_only_receipts_and_explicit_staging_bytes() {
     let id = uuid::Uuid::new_v4();
     let request: omicsops_dto::StageComposerAttachmentRequest = serde_json::from_value(json!({

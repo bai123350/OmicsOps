@@ -44,6 +44,7 @@ mod runtime_jobs_v4;
 pub mod session_reviews;
 pub mod side_chat;
 pub mod skill_commands;
+pub mod storage_settings;
 pub mod sync_commands;
 pub mod workspace_commands;
 
@@ -257,6 +258,7 @@ pub fn run() {
             workspace_commands::latest_used_conversation,
             workspace_commands::create_conversation,
             workspace_commands::delete_conversation,
+            storage_settings::settings_storage_usage,
             conversation_branches::conversation_branch_checkpoint_v4,
             conversation_branches::conversation_branch_create_v4,
             conversation_branches::conversation_branch_create_and_send_v4,

@@ -92,6 +92,38 @@ export interface WorkspaceMessage {
   created_at: string;
 }
 
+export type StorageUsageScopeV4 = "managed" | "project";
+export type StorageUsageCategoryV4 = "database" | "skills" | "browser" | "project_metadata" | "project_root";
+export type StorageUsageStatusV4 = "complete" | "partial";
+export type StorageScanIssueV4 = "not_created" | "missing" | "unreadable" | "entry_limit" | "time_limit";
+
+export interface StorageScanLimitsV4 {
+  max_entries: number;
+  max_duration_ms: number;
+}
+
+export interface StorageUsageEntryV4 {
+  category: StorageUsageCategoryV4;
+  project_id: string | null;
+  path: string;
+  known_logical_bytes: number | null;
+  status: StorageUsageStatusV4;
+  scanned_entries: number;
+  skipped_links: number;
+  issue: StorageScanIssueV4 | null;
+}
+
+export interface StorageUsageSnapshotV4 {
+  scope: StorageUsageScopeV4;
+  project_id: string | null;
+  entries: StorageUsageEntryV4[];
+  known_logical_bytes: number;
+  status: StorageUsageStatusV4;
+  scanned_entries: number;
+  skipped_links: number;
+  limits: StorageScanLimitsV4;
+}
+
 export interface ModelProfile {
   id: string;
   label: string;

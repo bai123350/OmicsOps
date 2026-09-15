@@ -501,6 +501,12 @@ pub use conversation_branches::{
     CreateConversationBranchRequestV4,
 };
 
+mod storage_usage;
+pub use storage_usage::{
+    StorageScanIssueV4, StorageScanLimitsV4, StorageUsageCategoryV4, StorageUsageEntryV4,
+    StorageUsageScopeV4, StorageUsageSnapshotV4, StorageUsageStatusV4,
+};
+
 mod side_chat;
 pub use side_chat::{
     SIDE_CHAT_MAX_ANSWER_BYTES, SIDE_CHAT_MAX_ATTACHMENTS, SIDE_CHAT_MAX_CITATIONS,

@@ -22,6 +22,7 @@ import type {
   WorkspaceProject,
   WorkspaceTemplate,
   WorkspaceMessage,
+  StorageUsageSnapshotV4,
   ModelProfile,
   ModelProbeResult,
   RemoteFileEntry,
@@ -80,6 +81,11 @@ export async function listConversations(projectId: string): Promise<WorkspaceCon
 
 export async function latestUsedConversation(projectId: string): Promise<WorkspaceConversation | null> {
   return isTauri() ? invoke("latest_used_conversation", { projectId }) : null;
+}
+
+export async function settingsStorageUsage(projectId?: string): Promise<StorageUsageSnapshotV4> {
+  if (!isTauri()) throw new Error("Storage usage is available only in the desktop app");
+  return invoke("settings_storage_usage", { projectId: projectId ?? null });
 }
 
 export async function createConversation(projectId: string, title?: string): Promise<WorkspaceConversation> {
