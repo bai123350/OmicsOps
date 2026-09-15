@@ -1,5 +1,6 @@
 import * as queueApi from "./composer-queue-api";
 import * as preferencesApi from "./conversation-preferences-api";
+import { StrictMode } from "react";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -12,6 +13,7 @@ import type { AgentRunEventV4, ComposerReference, ConversationAgentStateV4, Exec
 beforeEach(() => {
   vi.restoreAllMocks();
   window.localStorage.clear();
+  vi.spyOn(api, "latestUsedConversation").mockResolvedValue(null);
 });
 
 const stateProject = { id: "project-state", name: "状态测试项目", description: "", local_root: "E:/Science/state", remote_root: null, connection_id: null, template: "single_cell_rna_seq" as const, status: "running" as const, ollama_only: false, created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" };
@@ -71,6 +73,7 @@ function agentEvent(conversationId: string, runId: string, sequence: number, eve
 function setupConversationStateHarness() {
   vi.spyOn(api, "listProjects").mockResolvedValue([stateProject]);
   vi.spyOn(api, "listConversations").mockResolvedValue(stateConversations);
+  vi.mocked(api.latestUsedConversation).mockResolvedValue(stateConversations[0]);
   vi.spyOn(api, "listMessages").mockResolvedValue([]);
   vi.spyOn(api, "listModelProfiles").mockResolvedValue([stateModel]);
   vi.spyOn(api, "agentV4ComputeBackends").mockResolvedValue([stateBackend]);
@@ -108,21 +111,30 @@ describe("DesktopApp", () => {
     expect(screen.queryByRole("button", { name: "移除引用：Search QC" })).not.toBeInTheDocument();
   });
 
-  it("opens the requested saved conversation in another project instead of its first conversation", async () => {
+  it("keeps an explicitly requested conversation through a failed project load and retry", async () => {
     const { stateSpy } = setupConversationStateHarness();
     const other = { ...stateProject, id: "project-other", name: "Other project" };
     const first = { ...stateConversations[0], project_id: other.id, id: "other-first", title: "Other first" };
     const requested = { ...first, id: "other-requested", title: "Requested saved session" };
     vi.mocked(api.listProjects).mockResolvedValue([stateProject, other]);
-    vi.mocked(api.listConversations).mockImplementation(async (projectId) => projectId === other.id ? [first, requested] : stateConversations);
+    let otherReads = 0;
+    vi.mocked(api.listConversations).mockImplementation(async (projectId) => {
+      if (projectId !== other.id) return stateConversations;
+      otherReads += 1;
+      if (otherReads === 2) throw new Error("temporary conversation list failure");
+      return [first, requested];
+    });
+    vi.mocked(api.latestUsedConversation).mockImplementation(async (projectId) => projectId === other.id ? first : stateConversations[0]);
     stateSpy.mockImplementation(async (projectId, conversationId) => ({ ...stateSnapshot(conversationId), project_id: projectId }));
     vi.spyOn(referenceApi, "composerReferenceCatalog").mockImplementation(async (projectId) => projectId === other.id ? [{ reference: { kind: "session", project_id: other.id, id: requested.id }, label: requested.title, description: "Saved transcript" }] : []);
     render(<DesktopApp />);
     await screen.findByRole("textbox", { name: /描述研究目标/ });
     fireEvent.keyDown(window, { key: "k", ctrlKey: true });
     fireEvent.click(await screen.findByRole("button", { name: `打开 ${requested.title}` }));
+    fireEvent.click(await screen.findByRole("button", { name: "重试会话恢复" }));
     await waitFor(() => expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent(requested.title));
     await waitFor(() => expect(api.listMessages).toHaveBeenCalledWith(requested.id));
+    expect(api.latestUsedConversation).not.toHaveBeenCalledWith(other.id);
   });
 
   it("ignores a pending search navigation after immediate Escape", async () => {
@@ -461,6 +473,7 @@ describe("DesktopApp", () => {
     const model = { id: "model-1", label: "Test model", provider: "ollama" as const, base_url: "http://localhost:11434", model: "test", credential_reference: null, supports_tools: true, supports_vision: false };
     vi.spyOn(api, "listProjects").mockResolvedValue([project]);
     vi.spyOn(api, "listConversations").mockResolvedValue([conversation]);
+    vi.mocked(api.latestUsedConversation).mockResolvedValue(conversation);
     vi.spyOn(api, "listMessages").mockResolvedValue([]);
     vi.spyOn(api, "listModelProfiles").mockResolvedValue([model]);
     vi.spyOn(api, "agentV4ComputeBackends").mockResolvedValue([{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]);
@@ -719,6 +732,7 @@ describe("DesktopApp", () => {
       const progress = { ...base, sequence: 2, occurred_at: "2026-08-24T00:00:02Z", event: { kind: "model_text" as const, text: "轮询恢复了进度。" } };
       vi.spyOn(api, "listProjects").mockResolvedValue([project]);
       vi.spyOn(api, "listConversations").mockResolvedValue([conversation]);
+      vi.mocked(api.latestUsedConversation).mockResolvedValue(conversation);
       vi.spyOn(api, "listMessages").mockResolvedValue([]);
       vi.spyOn(api, "listModelProfiles").mockResolvedValue([model]);
       vi.spyOn(api, "agentV4ComputeBackends").mockResolvedValue([{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]);
@@ -759,6 +773,7 @@ describe("DesktopApp", () => {
     const planned = { run_id: "run-v4", status: "awaiting_approval", plan: { schema_version: 4 as const, objective: "执行完整 QC", steps: ["检查输入", "执行 QC"], completion_criteria: ["报告已生成"], requested_capabilities: ["runtime.execute"] }, plan_hash: "plan-hash", compute_selection: selection, approval_hash: "approval-hash" };
     vi.spyOn(api, "listProjects").mockResolvedValue([project]);
     vi.spyOn(api, "listConversations").mockResolvedValue([conversation]);
+    vi.mocked(api.latestUsedConversation).mockResolvedValue(conversation);
     vi.spyOn(api, "listMessages").mockResolvedValue([]);
     vi.spyOn(api, "listModelProfiles").mockResolvedValue([model]);
     vi.spyOn(api, "agentV4ComputeBackends").mockResolvedValue([{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]);
@@ -1313,12 +1328,146 @@ describe("DesktopApp", () => {
     expect(screen.getByRole("combobox", { name: "Interface language" })).toHaveValue("en-US");
   });
 
+  it("restores the backend-selected latest used conversation instead of list order", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    vi.mocked(api.latestUsedConversation).mockResolvedValue(stateConversations[1]);
+
+    render(<DesktopApp />);
+
+    expect(await screen.findByRole("heading", { name: "Plan 会话" })).toBeInTheDocument();
+    expect(api.listMessages).toHaveBeenCalledWith(stateConversations[1].id);
+  });
+
+  it("creates a blank conversation when resume is enabled but the backend has no candidate", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    const blank = { ...stateConversations[0], id: "blank-no-candidate", title: "" };
+    vi.mocked(api.latestUsedConversation).mockResolvedValue(null);
+    const create = vi.spyOn(api, "createConversation").mockResolvedValue(blank);
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+
+    render(<DesktopApp />);
+
+    expect(await screen.findByRole("heading", { name: "新会话" })).toBeInTheDocument();
+    expect(create).toHaveBeenCalledOnce();
+    expect(create).toHaveBeenCalledWith(stateProject.id);
+  });
+
+  it("starts a blank conversation without querying history when resume is disabled", async () => {
+    window.localStorage.setItem("omicsops.sessions.resumeLast", "false");
+    const { stateSpy } = setupConversationStateHarness();
+    const blank = { ...stateConversations[0], id: "blank-disabled", title: "" };
+    const latest = vi.mocked(api.latestUsedConversation);
+    latest.mockClear();
+    const create = vi.spyOn(api, "createConversation").mockResolvedValue(blank);
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+
+    render(<DesktopApp />);
+
+    expect(await screen.findByRole("heading", { name: "新会话" })).toBeInTheDocument();
+    expect(latest).not.toHaveBeenCalled();
+    expect(create).toHaveBeenCalledWith(stateProject.id);
+  });
+
+  it("keeps the current conversation open when the resume preference changes", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    const create = vi.spyOn(api, "createConversation");
+
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: "Agent 会话" });
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("button", { name: "常规" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "恢复上次会话" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+
+    expect(screen.getByRole("heading", { name: "Agent 会话" })).toBeInTheDocument();
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("shows a retry action when the latest-session query fails", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    vi.mocked(api.latestUsedConversation)
+      .mockRejectedValueOnce(new Error("latest session unavailable"))
+      .mockResolvedValueOnce(stateConversations[1]);
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+
+    render(<DesktopApp />);
+
+    const retry = await screen.findByRole("button", { name: "重试会话恢复" });
+    expect(screen.getByRole("alert")).toHaveTextContent("无法恢复此项目的会话");
+    fireEvent.click(retry);
+    expect(await screen.findByRole("heading", { name: "Plan 会话" })).toBeInTheDocument();
+    expect(api.latestUsedConversation).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores a late latest-session response after switching projects", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    const projectB = { ...stateProject, id: "project-b", name: "项目 B" };
+    const conversationB = { ...stateConversations[0], id: "conversation-b", project_id: projectB.id, title: "项目 B 会话" };
+    const lateA = deferred<Awaited<ReturnType<typeof api.latestUsedConversation>>>();
+    vi.mocked(api.listProjects).mockResolvedValue([stateProject, projectB]);
+    vi.mocked(api.listConversations).mockImplementation(async (projectId) => projectId === projectB.id ? [conversationB] : stateConversations);
+    vi.mocked(api.latestUsedConversation).mockImplementation((projectId) => projectId === projectB.id ? Promise.resolve(conversationB) : lateA.promise);
+    stateSpy.mockImplementation(async (projectId, conversationId) => ({ ...stateSnapshot(conversationId), project_id: projectId }));
+
+    render(<DesktopApp />);
+    await screen.findByRole("main", { name: "科研对话" });
+    fireEvent.click(screen.getByRole("button", { name: "返回项目主页" }));
+    fireEvent.click(await screen.findByRole("button", { name: /^项目 B/ }));
+    expect(await screen.findByRole("heading", { name: "项目 B 会话" })).toBeInTheDocument();
+    await act(async () => lateA.resolve(stateConversations[1]));
+
+    expect(screen.getByRole("heading", { name: "项目 B 会话" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Plan 会话" })).not.toBeInTheDocument();
+  });
+
+  it("clears the old conversation and disables its composer when the next project fails to load", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    const projectB = { ...stateProject, id: "project-b", name: "项目 B" };
+    const conversationB = { ...stateConversations[0], id: "conversation-b", project_id: projectB.id, title: "项目 B 会话" };
+    vi.mocked(api.listProjects).mockResolvedValue([stateProject, projectB]);
+    vi.mocked(api.listConversations).mockImplementation(async (projectId) => projectId === projectB.id ? [conversationB] : stateConversations);
+    vi.mocked(api.latestUsedConversation).mockImplementation(async (projectId) => {
+      if (projectId === projectB.id) throw new Error("restore lookup failed");
+      return stateConversations[0];
+    });
+    stateSpy.mockImplementation(async (projectId, conversationId) => ({ ...stateSnapshot(conversationId), project_id: projectId }));
+
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: "Agent 会话" });
+    fireEvent.click(screen.getByRole("button", { name: "返回项目主页" }));
+    fireEvent.click(await screen.findByRole("button", { name: /^项目 B/ }));
+    await screen.findByRole("button", { name: "重试会话恢复" });
+
+    expect(screen.queryByRole("heading", { name: "Agent 会话" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Agent 会话" })).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toBeDisabled();
+  });
+
+  it("deduplicates blank conversation creation during StrictMode effect replay", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    const pending = deferred<Awaited<ReturnType<typeof api.createConversation>>>();
+    vi.mocked(api.listConversations).mockResolvedValue([]);
+    vi.mocked(api.latestUsedConversation).mockResolvedValue(null);
+    const create = vi.spyOn(api, "createConversation").mockReturnValue(pending.promise);
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+
+    render(<StrictMode><DesktopApp /></StrictMode>);
+    await waitFor(() => expect(create).toHaveBeenCalledOnce());
+    await act(async () => pending.resolve({ ...stateConversations[0], id: "strict-blank", title: "" }));
+
+    expect(await screen.findByRole("heading", { name: "新会话" })).toBeInTheDocument();
+    expect(create).toHaveBeenCalledOnce();
+  });
+
   it("creates and switches to an empty conversation when New conversation is clicked", async () => {
     const project = { id: "project-1", name: "PBMC 项目", description: "", local_root: "E:/Science/pbmc", remote_root: null, connection_id: null, template: "single_cell_rna_seq" as const, status: "running" as const, ollama_only: false, created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" };
     const existing = { id: "conversation-1", project_id: project.id, title: "旧问题", status: "idle" as const, model_profile_id: null, created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" };
     const created = { ...existing, id: "conversation-2", title: "", created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z" };
     vi.spyOn(api, "listProjects").mockResolvedValue([project]);
     vi.spyOn(api, "listConversations").mockResolvedValue([existing]);
+    vi.mocked(api.latestUsedConversation).mockResolvedValue(existing);
     vi.spyOn(api, "listMessages").mockResolvedValue([]);
     const createConversation = vi.spyOn(api, "createConversation").mockResolvedValue(created);
 
@@ -1354,6 +1503,7 @@ describe("DesktopApp", () => {
     const next = { ...active, id: "conversation-1", title: "保留的问题", created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" };
     vi.spyOn(api, "listProjects").mockResolvedValue([project]);
     vi.spyOn(api, "listConversations").mockResolvedValue([active, next]);
+    vi.mocked(api.latestUsedConversation).mockResolvedValue(active);
     vi.spyOn(api, "listMessages").mockResolvedValue([]);
     const deleteConversation = vi.spyOn(api, "deleteConversation").mockResolvedValue(undefined);
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
@@ -1393,6 +1543,7 @@ describe("DesktopApp", () => {
     const conversationB = { ...stateConversations[0], id: "conversation-b", project_id: projectB.id, title: "会话 B" };
     vi.spyOn(api, "listProjects").mockResolvedValue([projectA, projectB]);
     vi.spyOn(api, "listConversations").mockImplementation(async (projectId) => projectId === projectA.id ? [conversationA] : [conversationB]);
+    vi.mocked(api.latestUsedConversation).mockImplementation(async (projectId) => projectId === projectA.id ? conversationA : conversationB);
     vi.spyOn(api, "listMessages").mockResolvedValue([]);
     vi.spyOn(api, "listModelProfiles").mockResolvedValue([stateModel]);
     vi.spyOn(api, "agentV4ComputeBackends").mockResolvedValue([stateBackend]);

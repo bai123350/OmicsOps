@@ -20,6 +20,7 @@ import { useConversationCapabilities } from "./features/workspace/useConversatio
 import { useComposerQueue } from "./features/workspace/useComposerQueue";
 import { useComposerReplacement } from "./features/workspace/useComposerReplacement";
 import { useAgentStop } from "./features/workspace/useAgentStop";
+import { useResumeLastSessionPreference } from "./features/settings/useResumeLastSessionPreference";
 
 type SendMode = "chat" | "plan";
 
@@ -113,6 +114,9 @@ export default function DesktopApp() {
   const [agentTextPreview, setAgentTextPreview] = useState<import("./types").AgentTextPreviewV4 | null>(null);
   const [agentRunEventsV4, setAgentRunEventsV4] = useState<AgentRunEventV4[]>([]);
   const [conversationHydrating, setConversationHydrating] = useState(false);
+  const [conversationLoadError, setConversationLoadError] = useState("");
+  const [conversationLoadRetry, setConversationLoadRetry] = useState(0);
+  const [resumeLastSession] = useResumeLastSessionPreference();
   const nativeQueueAvailable = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
   const queue = useComposerQueue(selected?.id, conversation?.id, nativeQueueAvailable && !conversationHydrating, refreshQueuedConversation);
   const replacement = useComposerReplacement(selected?.id, conversation?.id, nativeQueueAvailable && !conversationHydrating, async () => { await queue.refresh(); await refreshQueuedConversation(); });
@@ -152,6 +156,8 @@ export default function DesktopApp() {
   const conversationSnapshotRequestSequence = useRef(0);
   const conversationModeRequestSequence = useRef(0);
   const projectRequestToken = useRef(0);
+  const blankConversationRequests = useRef(new Map<string, Promise<WorkspaceConversation>>());
+  const blankConversationProject = useRef<string | null>(null);
   const currentConversationIdentity = useRef<{ projectId: string | null; conversationId: string | null }>({ projectId: null, conversationId: null });
   const messagesRef = useRef<WorkspaceMessage[]>([]);
   const messageSequenceRef = useRef(1);
@@ -232,6 +238,18 @@ export default function DesktopApp() {
   function setHydrationState(value: boolean) {
     conversationHydratingRef.current = value;
     setConversationHydrating(value);
+  }
+
+  function createBlankConversation(projectId: string): Promise<WorkspaceConversation> {
+    const existing = blankConversationRequests.current.get(projectId);
+    if (existing) return existing;
+    const request = api.createConversation(projectId);
+    blankConversationRequests.current.set(projectId, request);
+    void request.then(
+      () => undefined,
+      () => { if (blankConversationRequests.current.get(projectId) === request) blankConversationRequests.current.delete(projectId); },
+    );
+    return request;
   }
 
   function mergeAgentRunEvents(incoming: AgentRunEventV4[]) {
@@ -319,28 +337,51 @@ export default function DesktopApp() {
   useEffect(() => {
     const token = ++projectRequestToken.current;
     let disposed = false;
+    const selectedProjectId = selected?.id ?? null;
+    if (blankConversationProject.current !== selectedProjectId) {
+      blankConversationProject.current = selectedProjectId;
+      blankConversationRequests.current.clear();
+    }
     const requested = requestedConversation.current;
     requestedConversation.current = null;
-    if (!selected) { setConversations([]); setConversation(null); return () => { disposed = true; }; }
+    const shouldResume = resumeLastSession;
+    if (!selected) {
+      setConversations([]);
+      setConversation(null);
+      setConversationLoadError("");
+      setHydrationState(false);
+      return () => { disposed = true; };
+    }
+    setConversationLoadError("");
     setHydrationState(true);
-    api.listConversations(selected.id).then(async (items) => {
+    setConversations([]);
+    setConversation(null);
+    const requestedForProject = requested?.projectId === selected.id ? requested : null;
+    const loadConversation = async () => {
+      const [items, latest] = await Promise.all([
+        api.listConversations(selected.id),
+        requestedForProject || !shouldResume ? Promise.resolve(null) : api.latestUsedConversation(selected.id),
+      ]);
       if (disposed || !isCurrentConversationProject(selected.id, token)) return;
-      let active = requested?.projectId === selected.id ? items.find((item) => item.id === requested.conversationId) : items[0];
-      if (requested?.projectId === selected.id && !active) throw new Error("The requested saved conversation is no longer available.");
+      let active = requestedForProject ? items.find((item) => item.id === requestedForProject.conversationId) : latest;
+      if (requestedForProject && !active) throw new Error("The requested saved conversation is no longer available.");
+      if (active && active.project_id !== selected.id) throw new Error("The restored conversation belongs to another project.");
       if (!active) {
-        active = await api.createConversation(selected.id);
+        active = await createBlankConversation(selected.id);
         if (disposed || !isCurrentConversationProject(selected.id, token)) return;
       }
-      setConversations(items.length ? items : [active]);
+      setConversations(items.some((item) => item.id === active.id) ? items : [active, ...items]);
       setConversation(active);
-    }).catch((error) => {
+    };
+    void loadConversation().catch(() => {
       if (!disposed && isCurrentConversationProject(selected.id, token)) {
+        if (requestedForProject) requestedConversation.current = requestedForProject;
         setHydrationState(false);
-        setAgentNotice(error instanceof Error ? error.message : String(error));
+        setConversationLoadError(locale === "zh-CN" ? "无法恢复此项目的会话。请重试。" : "Could not restore this project's sessions. Please retry.");
       }
     });
     return () => { disposed = true; };
-  }, [selected?.id]);
+  }, [selected?.id, conversationLoadRetry]);
   useEffect(() => {
     let disposed = false;
     if (!selected) { setComputeBackends([]); return () => { disposed = true; }; }
@@ -1205,7 +1246,7 @@ export default function DesktopApp() {
     project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template }}
     locale={locale} onLocaleChange={setLocale} onOpenSettings={(section = "models") => { setSettingsSection(section); setSettingsOpen(true); }} onBackToProjects={() => setSelected(null)}
     conversations={conversations} activeConversationId={conversation?.id} onSelectConversation={selectConversation} onNewConversation={newConversation} onOpenBranch={openCreatedBranch} onDeleteConversation={deleteConversation}
-    messages={messages} agentBusy={agentBusy} agentNotice={agentNotice} modelLabel={activeModel?.model} activeModelProfile={activeModel} modelProfiles={modelProfiles}
+    messages={messages} agentBusy={agentBusy} agentNotice={agentNotice} conversationLoadError={conversationLoadError} onRetryConversationLoad={() => setConversationLoadRetry((value) => value + 1)} modelLabel={activeModel?.model} activeModelProfile={activeModel} modelProfiles={modelProfiles}
     composerBusy={modelSelectionBusy || !conversation}
     modelPicker={<ApiModelPicker zh={locale === "zh-CN"} profiles={modelProfiles} activeProfileId={activeModelProfileId} disabled={agentBusy || conversationLocked || conversationHydrating || modelSelectionBusy || planLoading} onProfileChange={(id) => { if (!modelSelectionInFlight.current) setActiveModelProfileId(id); }} onManage={() => { setSettingsSection("models"); setSettingsOpen(true); }} onModelSelect={async (profile, model) => {
       if (modelSelectionInFlight.current || conversationLocked || conversationHydrating || agentBusy || profile.id !== activeModelProfileId) throw new Error("Model selection is currently locked");

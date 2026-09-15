@@ -314,6 +314,16 @@ describe("SettingsPanel model providers", () => {
     expect(screen.getByRole("heading", { name: "Model providers" })).toBeInTheDocument();
   });
 
+  it("finds Model providers with the upstream Models page name", () => {
+    render(<SettingsPanel locale="en-US" initialSection="general" onClose={() => undefined} />);
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search settings" }), { target: { value: "Models" } });
+
+    const navigation = screen.getByRole("navigation", { name: "Settings pages" });
+    expect(within(navigation).getByRole("button", { name: "Model providers" })).toBeInTheDocument();
+    expect(within(navigation).queryByRole("status")).not.toBeInTheDocument();
+  });
+
   it("changes the main composer send shortcut immediately and keeps the legacy storage key", () => {
     render(<SettingsPanel locale="en-US" initialSection="general" onClose={() => undefined} />);
 
@@ -323,6 +333,29 @@ describe("SettingsPanel model providers", () => {
     expect(shortcut).toHaveValue("modifier");
     expect(window.localStorage.getItem("omicsops.composer.modifierSend")).toBe("true");
     expect(screen.getByText(/main composer/i)).toBeInTheDocument();
+  });
+
+  it("defaults to resuming the last session and persists the next-project preference", () => {
+    render(<SettingsPanel locale="en-US" initialSection="general" onClose={() => undefined} />);
+
+    const preference = screen.getByRole("checkbox", { name: "Resume last session" });
+    expect(preference).toBeChecked();
+    fireEvent.click(preference);
+
+    expect(preference).not.toBeChecked();
+    expect(window.localStorage.getItem("omicsops.sessions.resumeLast")).toBe("false");
+    expect(screen.getByText(/current session stays open/i)).toBeInTheDocument();
+  });
+
+  it("keeps the resume preference usable when persistence fails", () => {
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new Error("quota exceeded"); });
+    render(<SettingsPanel locale="en-US" initialSection="general" onClose={() => undefined} />);
+
+    const preference = screen.getByRole("checkbox", { name: "Resume last session" });
+    const previous = (preference as HTMLInputElement).checked;
+    fireEvent.click(preference);
+
+    expect(preference).toHaveProperty("checked", !previous);
   });
 
   it("keeps the send shortcut usable for this session when browser storage is unavailable", () => {

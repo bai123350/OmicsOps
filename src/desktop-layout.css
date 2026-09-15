@@ -44,10 +44,6 @@ body { min-width: 0; }
 .template-icon { width: 34px; height: 34px; border-radius: 8px; }
 .settings-backdrop { padding: 0; }
 .settings-backdrop > .settings-panel { width: 100vw; height: 100vh; }
-.settings-layout { grid-template-columns: 180px minmax(0, 1fr); height: calc(100% - 56px); }
-.settings-layout > nav { padding: 10px 8px; overflow-y: auto; }
-.settings-layout > nav button { padding: 8px; }
-.settings-layout > main { padding: 18px; }
 .create-project-dialog { width: min(660px, 94vw); }
 .create-project-dialog > header { height: 56px; }
 @media (max-width: 1050px) {

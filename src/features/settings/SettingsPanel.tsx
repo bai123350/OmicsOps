@@ -8,6 +8,7 @@ import { BrowserSettings, useWindowEscapeLayer } from "./BrowserSettings";
 import { BundledMcpPresets, type BundledMcpProps } from "./BundledMcpPresets";
 import { AgentSettings } from "./AgentSettings";
 import { useComposerSendPreference } from "./useComposerSendPreference";
+import { useResumeLastSessionPreference } from "./useResumeLastSessionPreference";
 import "./settings.css";
 import "./model-form.css";
 import "./remote-form.css";
@@ -204,7 +205,7 @@ function SettingsNavigation({ locale, section, onNavigate }: { locale: Locale; s
       id: "capabilities",
       label: zh ? "能力" : "Capabilities",
       items: [
-        { section: "models" as const, zh: "模型提供方", en: "Model providers", keywords: ["model", "模型", "provider"], icon: Bot },
+        { section: "models" as const, zh: "模型提供方", en: "Model providers", keywords: ["model", "models", "模型", "provider"], icon: Bot },
         { section: "skills" as const, zh: "技能与 MCP", en: "Skills and MCP", keywords: ["skill", "技能", "connection", "连接"], icon: Wrench },
         { section: "browser" as const, zh: "浏览器", en: "Browser", keywords: ["browser", "浏览器", "web"], icon: Globe2 },
       ],
@@ -238,10 +239,12 @@ function contextWindowError(value: string, dirty: boolean, zh: boolean): string 
 function GeneralSettings({ locale, onLocaleChange }: { locale: Locale; onLocaleChange?: (locale: Locale) => void }) {
   const zh = locale === "zh-CN";
   const [modifierSend, setModifierSend] = useComposerSendPreference();
+  const [resumeLastSession, setResumeLastSession] = useResumeLastSessionPreference();
   return <main className="general-settings">
     <div className="settings-heading"><h3>{zh ? "常规" : "General"}</h3><p>{zh ? "管理跨项目共享的界面和输入偏好。更改会立即生效。" : "Manage interface and input preferences shared across projects. Changes apply immediately."}</p></div>
     <label className="general-setting-row"><span><b>{zh ? "界面语言" : "Interface language"}</b><small>{zh ? "此偏好适用于项目主页、工作区和设置。" : "This preference applies to the project library, workspace, and settings."}</small></span><select aria-label={zh ? "界面语言" : "Interface language"} value={locale} disabled={!onLocaleChange} onChange={(event) => onLocaleChange?.(event.target.value as Locale)}><option value="zh-CN">简体中文</option><option value="en-US">English</option></select></label>
     <label className="general-setting-row"><span><b>{zh ? "发送快捷键" : "Send shortcut"}</b><small>{zh ? "仅控制主对话输入框；Shift+Enter 始终换行，输入法确认不会发送。" : "Controls the main composer only. Shift+Enter always inserts a new line, and IME confirmation never sends."}</small></span><select aria-label={zh ? "发送快捷键" : "Send shortcut"} value={modifierSend ? "modifier" : "enter"} onChange={(event) => setModifierSend(event.target.value === "modifier")}><option value="enter">Enter</option><option value="modifier">Ctrl/Cmd+Enter</option></select></label>
+    <label className="general-setting-row"><span><b>{zh ? "恢复上次会话" : "Resume last session"}</b><small>{zh ? "下次打开项目时恢复最近使用且包含用户消息的会话。关闭后将新建空白会话；当前会话会保持打开。" : "Reopen the most recently used session with a user message the next time a project opens. When disabled, a blank session is created; the current session stays open."}</small></span><input type="checkbox" aria-label={zh ? "恢复上次会话" : "Resume last session"} checked={resumeLastSession} onChange={(event) => setResumeLastSession(event.target.checked)} /></label>
   </main>;
 }
 
