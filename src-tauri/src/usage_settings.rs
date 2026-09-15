@@ -536,8 +536,8 @@ fn model_identity(
     };
     let hash_label = hash
         .as_deref()
-        .map(|value| &value[..value.len().min(12)])
-        .unwrap_or("unknown");
+        .map(|value| value.chars().take(12).collect::<String>())
+        .unwrap_or_else(|| "unknown".into());
     let key = format!("{profile_id}:{}", hash.as_deref().unwrap_or("unknown"));
     let label = profiles
         .iter()
@@ -996,6 +996,21 @@ mod tests {
         assert_eq!(projection.models.len(), 2);
         let keys = projection.models.keys().collect::<Vec<_>>();
         assert_ne!(keys[0], keys[1]);
+    }
+
+    #[test]
+    fn shortens_malformed_non_ascii_hash_labels_without_panicking() {
+        let profile = Uuid::from_u128(9);
+        let mut malformed = request(10, 101, profile);
+        malformed.model_configuration_hash = Some("aéé".repeat(10));
+        let attempt = Attempt {
+            start: Some((Utc::now(), malformed)),
+            ..Attempt::default()
+        };
+
+        let (key, label) = model_identity(&attempt, &[], false, &[]);
+        assert!(key.contains("aééaéé"));
+        assert_eq!(label.chars().filter(|value| *value == 'é').count(), 8);
     }
 
     #[test]

@@ -210,41 +210,36 @@ impl Store {
             .await?;
         let has_more = candidates.len() > limit as usize;
         let mut items = Vec::new();
+        let mut remaining_event_budget = MAX_EVENTS_PER_PAGE;
         for candidate in candidates.into_iter().take(limit as usize) {
             let project_text: String = candidate.get(0);
             let conversation_text: String = candidate.get(1);
             let label: String = candidate.get(2);
             let latest_activity_ms: i64 = candidate.get(3);
-            let counts_sql = format!(
-                "SELECT run_id,COUNT(*)
-                 FROM agent_events_v4 WHERE rowid<=?1 AND project_id=?2 AND conversation_id=?3
-                   AND {RELEVANT_EVENT_SQL}
-                 GROUP BY run_id ORDER BY run_id ASC LIMIT ?4"
-            );
-            let run_counts = sqlx::query(&counts_sql)
-                .bind(boundary.rowid)
-                .bind(&project_text)
-                .bind(&conversation_text)
-                .bind(MAX_EVENTS_PER_PAGE + 1)
-                .fetch_all(&mut *tx)
-                .await?;
-            let mut incomplete = run_counts.len() > MAX_EVENTS_PER_PAGE as usize;
-            let mut selected_run_ids = Vec::new();
-            let mut total_events = 0_i64;
-            for row in run_counts {
-                let run_id_text: String = row.get(0);
-                let event_count: i64 = row.get(1);
-                if event_count > MAX_EVENTS_PER_RUN {
-                    incomplete = true;
-                    continue;
-                }
-                if total_events.saturating_add(event_count) > MAX_EVENTS_PER_PAGE {
-                    incomplete = true;
-                    break;
-                }
-                total_events += event_count;
-                selected_run_ids.push(run_id_text);
-            }
+            let (selected_run_ids, incomplete) = if remaining_event_budget == 0 {
+                (Vec::new(), true)
+            } else {
+                let counts_sql = format!(
+                    "SELECT run_id,COUNT(*)
+                     FROM agent_events_v4 WHERE rowid<=?1 AND project_id=?2 AND conversation_id=?3
+                       AND {RELEVANT_EVENT_SQL}
+                     GROUP BY run_id ORDER BY run_id ASC LIMIT ?4"
+                );
+                let metadata_limit = remaining_event_budget.saturating_add(1);
+                let rows = sqlx::query(&counts_sql)
+                    .bind(boundary.rowid)
+                    .bind(&project_text)
+                    .bind(&conversation_text)
+                    .bind(metadata_limit)
+                    .fetch_all(&mut *tx)
+                    .await?;
+                let truncated = rows.len() > remaining_event_budget as usize;
+                let counts = rows
+                    .into_iter()
+                    .map(|row| (row.get::<String, _>(0), row.get::<i64, _>(1)))
+                    .collect();
+                plan_conversation_runs(counts, &mut remaining_event_budget, truncated)
+            };
             let mut by_run = std::collections::BTreeMap::<Uuid, Vec<UsageEventRow>>::new();
             for chunk in selected_run_ids.chunks(400) {
                 let mut events = QueryBuilder::<Sqlite>::new(
@@ -298,6 +293,28 @@ impl Store {
             has_more,
         })
     }
+}
+
+fn plan_conversation_runs(
+    run_counts: Vec<(String, i64)>,
+    remaining_event_budget: &mut i64,
+    metadata_truncated: bool,
+) -> (Vec<String>, bool) {
+    let mut incomplete = metadata_truncated;
+    let mut selected = Vec::new();
+    for (run_id, event_count) in run_counts {
+        if event_count <= 0 || event_count > MAX_EVENTS_PER_RUN {
+            incomplete = true;
+            continue;
+        }
+        if event_count > *remaining_event_budget {
+            incomplete = true;
+            break;
+        }
+        *remaining_event_budget -= event_count;
+        selected.push(run_id);
+    }
+    (selected, incomplete)
 }
 
 async fn validate_boundary(
@@ -476,5 +493,31 @@ mod tests {
         assert_eq!(page.items[0].runs.len(), 1);
         assert_eq!(page.items[0].runs[0].run_id, included_run);
         assert_eq!(page.items[0].runs[0].events.len(), 1);
+    }
+
+    #[test]
+    fn shares_the_event_budget_across_two_conversations() {
+        let mut remaining = MAX_EVENTS_PER_PAGE;
+        let first = vec![
+            ("a".into(), 20_000),
+            ("b".into(), 20_000),
+            ("c".into(), 20_000),
+        ];
+        let second = vec![
+            ("d".into(), 20_000),
+            ("e".into(), 20_000),
+            ("f".into(), 20_000),
+        ];
+
+        let (first_selected, first_incomplete) =
+            plan_conversation_runs(first, &mut remaining, false);
+        let (second_selected, second_incomplete) =
+            plan_conversation_runs(second, &mut remaining, false);
+
+        assert_eq!(first_selected.len(), 3);
+        assert!(!first_incomplete);
+        assert_eq!(second_selected.len(), 2);
+        assert!(second_incomplete);
+        assert_eq!(remaining, 0);
     }
 }
