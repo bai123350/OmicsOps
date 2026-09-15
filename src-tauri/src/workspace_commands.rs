@@ -302,6 +302,32 @@ pub async fn list_conversations(
     Ok(conversations)
 }
 
+pub(crate) async fn latest_used_conversation_response(
+    repository: &omicsops_store::Store,
+    project_id: Uuid,
+) -> Result<Option<Conversation>, String> {
+    if repository
+        .get_project(project_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return Err("project was not found".into());
+    }
+    repository
+        .latest_used_conversation(project_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn latest_used_conversation(
+    state: State<'_, AppState>,
+    project_id: Uuid,
+) -> Result<Option<Conversation>, String> {
+    latest_used_conversation_response(&state.repository, project_id).await
+}
+
 pub fn conversation_title_needs_first_message(title: &str) -> bool {
     matches!(
         title.trim(),
@@ -344,4 +370,21 @@ pub async fn delete_conversation(
         return Err("conversation was not found in this project".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omicsops_store::Store;
+
+    #[tokio::test]
+    async fn latest_used_conversation_rejects_an_unknown_project() {
+        let store = Store::open_in_memory().await.unwrap();
+
+        let error = latest_used_conversation_response(&store, Uuid::from_u128(42))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "project was not found");
+    }
 }

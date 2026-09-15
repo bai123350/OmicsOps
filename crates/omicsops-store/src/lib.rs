@@ -937,6 +937,39 @@ impl Store {
         rows.into_iter().map(conversation_from_row).collect()
     }
 
+    /// Return the most recently active conversation in this project that has
+    /// received at least one user message. Activity comes only from the main
+    /// transcript and is independent of conversation metadata updates.
+    pub async fn latest_used_conversation(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Option<Conversation>, StoreError> {
+        let row = sqlx::query(
+            "SELECT c.frame_id,c.project_id,c.title,c.status,c.model_profile_id,
+                    c.created_at,c.updated_at
+             FROM conversation_records c
+             WHERE c.project_id=?1
+               AND EXISTS (
+                   SELECT 1 FROM messages u
+                   WHERE u.frame_id=c.frame_id
+                     AND u.conversation_id=c.frame_id
+                     AND u.project_id=c.project_id
+                     AND u.role='user'
+               )
+             ORDER BY (
+                 SELECT MAX(m.ts) FROM messages m
+                 WHERE m.frame_id=c.frame_id
+                   AND m.conversation_id=c.frame_id
+                   AND m.project_id=c.project_id
+             ) DESC,c.frame_id ASC
+             LIMIT 1",
+        )
+        .bind(project_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(conversation_from_row).transpose()
+    }
+
     pub async fn delete_conversation(
         &self,
         project_id: Uuid,

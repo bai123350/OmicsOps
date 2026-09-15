@@ -254,6 +254,7 @@ pub fn run() {
             composer_queue::composer_queue_action,
             composer_queue::composer_queue_reconcile,
             workspace_commands::list_conversations,
+            workspace_commands::latest_used_conversation,
             workspace_commands::create_conversation,
             workspace_commands::delete_conversation,
             conversation_branches::conversation_branch_checkpoint_v4,

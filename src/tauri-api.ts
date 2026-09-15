@@ -78,6 +78,10 @@ export async function listConversations(projectId: string): Promise<WorkspaceCon
   return isTauri() ? invoke("list_conversations", { projectId }) : [];
 }
 
+export async function latestUsedConversation(projectId: string): Promise<WorkspaceConversation | null> {
+  return isTauri() ? invoke("latest_used_conversation", { projectId }) : null;
+}
+
 export async function createConversation(projectId: string, title?: string): Promise<WorkspaceConversation> {
   if (!isTauri()) {
     const now = new Date().toISOString();
