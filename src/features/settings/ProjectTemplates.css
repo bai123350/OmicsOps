@@ -49,7 +49,16 @@
   gap: 12px;
 }
 
-.project-template-editor > label:not(.project-template-enabled) {
+.project-template-editor fieldset {
+  border: 0;
+  display: grid;
+  gap: 12px;
+  margin: 0;
+  min-width: 0;
+  padding: 0;
+}
+
+.project-template-editor fieldset > label:not(.project-template-enabled) {
   display: grid;
   gap: 6px;
 }

@@ -35,6 +35,7 @@ export function QuickActionsSettings({
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState(false);
   const sequence = useRef(0);
+  const saveInFlight = useRef(false);
 
   function closeEditor() {
     if (!saving) {
@@ -74,6 +75,7 @@ export function QuickActionsSettings({
     setSaveError(false);
     setDeleteError(false);
     setLoadError(false);
+    saveInFlight.current = false;
     if (!selectedProject) {
       setLoading(false);
       return;
@@ -118,8 +120,9 @@ export function QuickActionsSettings({
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    if (!selectedProject || !editor || !workflowAvailable(editor.workflow_id)) return;
+    if (saveInFlight.current || !selectedProject || !editor || !workflowAvailable(editor.workflow_id)) return;
     const request = sequence.current;
+    saveInFlight.current = true;
     setSaving(true);
     setSaveError(false);
     try {
@@ -132,7 +135,10 @@ export function QuickActionsSettings({
     } catch {
       if (request === sequence.current) setSaveError(true);
     } finally {
-      if (request === sequence.current) setSaving(false);
+      if (request === sequence.current) {
+        saveInFlight.current = false;
+        setSaving(false);
+      }
     }
   }
 
@@ -189,6 +195,7 @@ export function QuickActionsSettings({
 
           {editor && <form className="appearance-card project-template-editor" onSubmit={submit}>
             <div className="appearance-group-heading"><h4>{editor.id ? (zh ? "编辑快捷操作" : "Edit quick action") : (zh ? "新建快捷操作" : "New quick action")}</h4></div>
+            <fieldset disabled={saving}>
             <label><span>{zh ? "名称" : "Name"}</span><input aria-label={zh ? "快捷操作名称" : "Quick action name"} maxLength={100} value={editor.name} onChange={(event) => setEditor({ ...editor, name: event.target.value })} /></label>
             <label><span>{zh ? "说明" : "Description"}</span><textarea aria-label={zh ? "快捷操作说明" : "Quick action description"} maxLength={500} value={editor.description} onChange={(event) => setEditor({ ...editor, description: event.target.value })} /></label>
             <label><span>{zh ? "工作流" : "Workflow"}</span>
@@ -202,6 +209,7 @@ export function QuickActionsSettings({
             <label className="project-template-enabled"><input type="checkbox" aria-label={zh ? "已启用" : "Enabled"} checked={editor.enabled} onChange={(event) => setEditor({ ...editor, enabled: event.target.checked })} /><span>{zh ? "启用" : "Enabled"}</span></label>
             {saveError && <p className="project-template-error" role="alert">{zh ? "无法保存快捷操作。请检查字段后重试。" : "Could not save quick action. Check the fields and try again."}</p>}
             <div className="project-template-actions"><button type="button" onClick={closeEditor} disabled={saving}>{zh ? "取消" : "Cancel"}</button><button type="submit" disabled={saving || !editor.name.trim() || !workflowAvailable(editor.workflow_id)}>{saving ? (zh ? "保存中…" : "Saving…") : zh ? "保存快捷操作" : "Save quick action"}</button></div>
+            </fieldset>
           </form>}
 
           {!loading && !loadError && actions.length === 0 ? <p className="project-template-empty">{zh ? "还没有快捷操作。" : "No quick actions yet."}</p> : <div className="project-template-list">

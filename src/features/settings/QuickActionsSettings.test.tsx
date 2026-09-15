@@ -132,6 +132,26 @@ describe("QuickActionsSettings", () => {
     expect(screen.getByLabelText("Workflow")).toHaveValue("workflow-1");
   });
 
+  it("locks the editor and submits a new action only once while saving", async () => {
+    const pending = deferred<QuickAction>();
+    api.saveQuickAction.mockReturnValue(pending.promise);
+    render(<QuickActionsSettings selectedProject={project("project-1", "PBMC")} locale="en-US" />);
+    await screen.findByText("No quick actions yet.");
+    fireEvent.click(screen.getByRole("button", { name: "New quick action" }));
+    fireEvent.change(screen.getByLabelText("Quick action name"), { target: { value: "Stable draft" } });
+    const save = screen.getByRole("button", { name: "Save quick action" });
+
+    fireEvent.click(save);
+    fireEvent.submit(save.closest("form")!);
+
+    expect(api.saveQuickAction).toHaveBeenCalledTimes(1);
+    expect(screen.getByLabelText("Quick action name")).toBeDisabled();
+    expect(screen.getByLabelText("Quick action description")).toBeDisabled();
+    expect(screen.getByLabelText("Workflow")).toBeDisabled();
+    pending.resolve(action);
+    await waitFor(() => expect(screen.queryByLabelText("Quick action name")).not.toBeInTheDocument());
+  });
+
   it("keeps disabled or missing workflow bindings visible but unavailable", async () => {
     api.listQuickActions.mockResolvedValue([
       action,
