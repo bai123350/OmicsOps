@@ -92,6 +92,17 @@ export interface WorkspaceMessage {
   created_at: string;
 }
 
+export interface MemoryFileSummaryV4 {
+  project_id: string;
+  name: string;
+  size_bytes: number;
+  sha256: string;
+}
+
+export interface MemoryFileV4 extends MemoryFileSummaryV4 {
+  content: string;
+}
+
 export type StorageUsageScopeV4 = "managed" | "project";
 export type StorageUsageCategoryV4 = "database" | "skills" | "browser" | "project_metadata" | "project_root";
 export type StorageUsageStatusV4 = "complete" | "partial";

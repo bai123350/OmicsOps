@@ -6,6 +6,28 @@ use crate::dto::{
 use serde_json::json;
 
 #[test]
+fn memory_file_contract_carries_project_owner_and_content_hash() {
+    let project_id = uuid::Uuid::from_u128(9);
+    let file = omicsops_dto::MemoryFileV4 {
+        project_id,
+        name: "study.md".into(),
+        content: "# Study".into(),
+        size_bytes: 7,
+        sha256: "a".repeat(64),
+    };
+    assert_eq!(
+        serde_json::to_value(file).unwrap(),
+        json!({
+            "project_id": project_id,
+            "name": "study.md",
+            "content": "# Study",
+            "size_bytes": 7,
+            "sha256": "a".repeat(64)
+        })
+    );
+}
+
+#[test]
 fn storage_usage_snapshot_preserves_partial_and_unknown_bytes() {
     let project_id = uuid::Uuid::from_u128(1);
     let snapshot = omicsops_dto::StorageUsageSnapshotV4 {

@@ -507,6 +507,12 @@ pub use storage_usage::{
     StorageUsageScopeV4, StorageUsageSnapshotV4, StorageUsageStatusV4,
 };
 
+mod memory_files;
+pub use memory_files::{
+    CreateMemoryFileRequestV4, DeleteMemoryFileRequestV4, MemoryFileSummaryV4, MemoryFileV4,
+    UpdateMemoryFileRequestV4,
+};
+
 mod side_chat;
 pub use side_chat::{
     SIDE_CHAT_MAX_ANSWER_BYTES, SIDE_CHAT_MAX_ATTACHMENTS, SIDE_CHAT_MAX_CITATIONS,

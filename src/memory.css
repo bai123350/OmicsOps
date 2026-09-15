@@ -1,0 +1,124 @@
+.memory-layout {
+  display: grid;
+  grid-template-columns: minmax(210px, 280px) minmax(0, 1fr);
+  gap: 18px;
+  max-width: 1040px;
+  margin: 22px clamp(24px, 5vw, 56px) 0;
+}
+
+.memory-layout .appearance-card {
+  margin: 0;
+}
+
+.memory-list-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.memory-file-list ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.memory-file-list li + li {
+  border-top: 1px solid var(--omicsops-border);
+}
+
+.memory-file-list li > button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 13px 16px;
+  border: 0;
+  border-radius: 0;
+  color: var(--omicsops-text);
+  background: transparent;
+  text-align: left;
+}
+
+.memory-file-list li > button.active {
+  background: color-mix(in srgb, var(--omicsops-accent) 14%, var(--omicsops-surface));
+}
+
+.memory-file-list small,
+.memory-list-message {
+  color: var(--omicsops-text-muted);
+}
+
+.memory-list-message,
+.memory-empty {
+  padding: 18px 20px;
+  font-size: 12px;
+}
+
+.memory-form {
+  display: grid;
+  gap: 15px;
+  padding: 18px 20px;
+}
+
+.memory-form label {
+  display: grid;
+  gap: 7px;
+  color: var(--omicsops-text-muted);
+  font-size: 11px;
+}
+
+.memory-form input,
+.memory-form textarea {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--omicsops-border);
+  border-radius: 8px;
+  color: var(--omicsops-text);
+  background: var(--omicsops-surface-raised);
+}
+
+.memory-form textarea {
+  min-height: 220px;
+  resize: vertical;
+  font-family: var(--omicsops-code-font);
+  line-height: 1.5;
+}
+
+.memory-actions,
+.memory-delete-confirm,
+.memory-conflict {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.memory-delete-confirm,
+.memory-conflict {
+  padding: 10px 12px;
+  border: 1px solid var(--omicsops-border);
+  border-radius: 8px;
+  background: var(--omicsops-surface-muted);
+  font-size: 11px;
+}
+
+.memory-conflict,
+.memory-error,
+.memory-actions .danger {
+  color: var(--omicsops-danger, #a63737);
+}
+
+.memory-error {
+  margin: 0;
+  font-size: 11px;
+}
+
+@media (max-width: 760px) {
+  .memory-layout {
+    grid-template-columns: minmax(0, 1fr);
+    margin-inline: 18px;
+  }
+}
