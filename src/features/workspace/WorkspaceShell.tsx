@@ -9,6 +9,8 @@ import { composerReferenceCatalog } from "../../composer-reference-api";
 import { ComposerReferencePicker, ComposerReferenceChips, parseComposerTrigger, referenceKey } from "./ComposerReferences";
 import { ComposerFilePreviewDialog } from "./ComposerFilePreviewDialog";
 import { WorkflowLibraryDialog } from "./WorkflowLibraryDialog";
+import { ProjectTemplatePicker } from "./ProjectTemplatePicker";
+import type { SpecialistTemplate } from "../../project-template-types";
 import { useConversationBranch } from "./useConversationBranch";
 import { ConversationBranchBanner } from "./ConversationBranchBanner";
 import { GuidanceDialog } from "./GuidanceDialog";
@@ -28,7 +30,7 @@ import {
   Search, Settings, Shield, ShieldAlert, ShieldCheck, Sparkles, Square, Trash2, X, SlidersHorizontal, Monitor, ChevronDown, Gauge, PanelRight, Zap,
 } from "lucide-react";
 import { copy, type Locale } from "./copy";
-import type { AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, BrowserApprovalScopeV4, ComputeBackendAvailabilityV4, ConversationCapabilitiesV4, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, MemoryFact, ModelProfile, NotebookEntry, ProposedPlanRevisionV4, ProjectArtifact, ProjectImagePreview, RunSummaryV4, SessionAgentModeV4, SyncEntry, WorkspaceConversation } from "../../types";
+import type { AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, BrowserApprovalScopeV4, ComposerWorkflowTemplate, ComputeBackendAvailabilityV4, ConversationCapabilitiesV4, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, MemoryFact, ModelProfile, NotebookEntry, ProposedPlanRevisionV4, ProjectArtifact, ProjectImagePreview, RunSummaryV4, SessionAgentModeV4, SyncEntry, WorkspaceConversation } from "../../types";
 import { FollowUpQuestions } from "./FollowUpQuestions";
 import { ConversationCapabilities } from "./ConversationCapabilities";
 import { RemoteFileTree } from "./RemoteFileTree";
@@ -315,6 +317,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const [referenceTrigger, setReferenceTrigger] = useState<ReturnType<typeof parseComposerTrigger>>(null);
   const [fileTextPreview, setFileTextPreview] = useState<WorkspaceFileReference | null>(null);
   const [workflowLibraryOpen, setWorkflowLibraryOpen] = useState(false);
+  const [projectTemplatePickerOpen, setProjectTemplatePickerOpen] = useState(false);
   const [guidanceDialogOpen, setGuidanceDialogOpen] = useState(false);
   const guidanceDraftAtOpenRef = useRef<string | null>(null);
   const guidancePendingRequestsRef = useRef(new Map<string, { current: SubmitGuidanceV4Request | null }>());
@@ -508,6 +511,32 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     setReferenceTrigger(null);
     setComposerMenuOpen(false); setPermissionMenuOpen(false); setComputeMenuOpen(false); setModelMenuOpen(false); setSendMenuOpen(false);
   }
+  function insertQuickActionWorkflow(workflow: ComposerWorkflowTemplate) {
+    if (composerDisabled || workflow.project_id !== project.id || !workflow.enabled) return;
+    const item: ComposerCatalogItem = {
+      reference: { kind: "workflow", project_id: project.id, id: workflow.id },
+      label: workflow.name,
+      description: workflow.description,
+    };
+    if (selectedReferences.some((entry) => referenceKey(entry.reference) === referenceKey(item.reference))) {
+      requestAnimationFrame(() => draftRef.current?.focus());
+      return;
+    }
+    if (selectedReferences.length >= 12) {
+      setReferenceNotice(zh ? "每条消息最多引用 12 项。请先移除一项。" : "A message can reference up to 12 items. Remove one first.");
+      return;
+    }
+    setSelectedReferences((current) => [...current, item]);
+    setReferenceNotice("");
+    requestAnimationFrame(() => draftRef.current?.focus());
+  }
+  function insertSpecialistDraft(template: SpecialistTemplate) {
+    if (composerDisabled || template.project_id !== project.id || !template.enabled) return;
+    const block = `${zh ? "[专家角色：" : "[Specialist: "}${template.name}]\n${template.instructions}`;
+    setDraft((current) => current ? `${current}\n\n${block}` : block);
+    setSendError(false);
+    requestAnimationFrame(() => draftRef.current?.focus());
+  }
   function guidancePendingRequestForScope(runId: string) {
     const key = `${project.id}:${activeConversationId}:${runId}`;
     let pending = guidancePendingRequestsRef.current.get(key);
@@ -575,6 +604,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     setSendError(false);
     setSharing(false);
     setWorkflowLibraryOpen(false);
+    setProjectTemplatePickerOpen(false);
     setGuidanceDialogOpen(false);
     guidanceDraftAtOpenRef.current = null;
     setReviewDialogOpen(false);
@@ -596,6 +626,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     setGuidanceDialogOpen(false);
     guidanceDraftAtOpenRef.current = null;
     setWorkflowLibraryOpen(false);
+    setProjectTemplatePickerOpen(false);
     setFileTextPreview(null);
     setRuntimeLanguage(null);
     setExpanded(false);
@@ -1042,7 +1073,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
                 </select></label>}
                  <button role="menuitem" className="agent-control-row" onClick={() => { setPermissionMenuOpen(false); setReviewerSettingsOpen(true); }}><span>{zh ? "审查模型" : "Reviewer model"}</span><small>{zh ? "配置只读审核模型" : "Configure read-only reviewer"}</small><ChevronRight size={14} /></button>
                  <button role="menuitem" className="agent-control-row" disabled><span>{zh ? "分析工具失败" : "Analyze tool failures"}</span><small>{zh ? "暂未支持" : "Unavailable"}</small></button>
-                 <button role="menuitem" className="agent-control-row" disabled><span>{zh ? "专家代理" : "Specialist"}</span><small>{zh ? "暂未支持" : "Unavailable"}</small></button>
+                 <button role="menuitem" className="agent-control-row" disabled={composerDisabled} onClick={() => { setPermissionMenuOpen(false); setProjectTemplatePickerOpen(true); }}><span>{zh ? "快捷操作与专家角色" : "Quick actions & roles"}</span><small>{zh ? "追加工作流引用或可见角色草稿" : "Insert a workflow reference or visible role draft"}</small><ChevronRight size={14} /></button>
                 <button role="menuitem" className="agent-control-row" onClick={() => { openSidebarSection("records"); setPermissionMenuOpen(false); }}><span>{zh ? "记忆与研究记录" : "Memory & notebook"}</span><ChevronRight size={14} /></button>
                 <button role="menuitem" className="agent-control-row" onClick={() => setComputeMenuOpen(true)}><span>{zh ? "计算环境" : "Compute"}</span><span>{backendLabel}<ChevronRight size={14} /></span></button>
               </div>}
@@ -1073,6 +1104,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     {guidanceDialogOpen && guidanceDialogAvailable && activeConversationId && guidanceRunId && <GuidanceDialog key={`${project.id}:${activeConversationId}:${guidanceRunId}`} runId={guidanceRunId} projectId={project.id} conversationId={activeConversationId} enabled={guidanceEnabled} locale={locale} initialDraft={guidanceDraftAtOpenRef.current ?? undefined} pendingRequest={guidancePendingRequestForScope(guidanceRunId)} composerHasAttachments={attachments.items.length > 0 || attachments.receipts.length > 0} composerHasReferences={selectedReferences.length > 0} onAccepted={handleGuidanceAccepted} onClose={closeGuidanceDialog} />}
     {reviewerSettingsOpen && <ReviewerSettingsDialog zh={zh} modelProfiles={modelProfiles} onClose={() => setReviewerSettingsOpen(false)} />}
     {workflowLibraryOpen && <WorkflowLibraryDialog key={project.id} projectId={project.id} zh={zh} onClose={() => { setWorkflowLibraryOpen(false); draftRef.current?.focus(); }} onChanged={() => setLocalWorkflowCatalogVersion((value) => value + 1)} />}
+    {projectTemplatePickerOpen && <ProjectTemplatePicker key={project.id} selectedProject={project} locale={locale} onSelectWorkflow={insertQuickActionWorkflow} onSelectSpecialist={insertSpecialistDraft} onClose={() => { setProjectTemplatePickerOpen(false); draftRef.current?.focus(); }} />}
     {sharing && <ShareConversationDialog key={`${project.id}:${activeConversationId}`} messages={messages} locale={locale} onClose={() => { setSharing(false); draftRef.current?.focus(); }} />}
     {contextUsageOpen && <ContextUsagePanel error={contextUsageError} value={contextUsage} locale={locale} onClose={() => setContextUsageOpen(false)} onNewConversation={!conversationHydrating && !agentBusy && !conversationLocked && onNewConversation ? () => { setContextUsageOpen(false); void onNewConversation(); } : undefined} />}
     {sidebarOpen && <aside id="workspace-sidebar" className="context-pane workspace-sidebar" aria-label={t.context}>

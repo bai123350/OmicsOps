@@ -2,6 +2,8 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import * as preferencesApi from "../../conversation-preferences-api";
+import * as projectTemplatesApi from "../../project-templates-api";
+import * as workflowApi from "../../composer-workflow-api";
 import * as guidanceApi from "../../tauri-api";
 import { WorkspaceShell } from "./WorkspaceShell";
 import { SettingsPanel } from "../settings/SettingsPanel";
@@ -41,6 +43,44 @@ function deferred<T>() {
 }
 
 describe("WorkspaceShell", () => {
+  it("inserts a Quick Action as an existing workflow reference without sending or running", async () => {
+    const workflow = { id: "workflow-1", project_id: project.id, name: "QC workflow", description: "Inspect counts", steps: ["Inspect counts"], enabled: true };
+    vi.spyOn(projectTemplatesApi, "listQuickActions").mockResolvedValue([{ id: "action-1", project_id: project.id, name: "Review QC", description: "Insert workflow", workflow_id: workflow.id, enabled: true }]);
+    vi.spyOn(projectTemplatesApi, "listSpecialistTemplates").mockResolvedValue([]);
+    vi.spyOn(workflowApi, "listComposerWorkflows").mockResolvedValue([workflow]);
+    const onSend = vi.fn();
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} onSend={onSend} />);
+
+    const composer = screen.getByRole("textbox", { name: /Describe a research goal/ });
+    fireEvent.change(composer, { target: { value: "Keep this draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Agent permissions" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Quick actions & roles/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Use Review QC" }));
+
+    expect(screen.getByText("QC workflow")).toBeInTheDocument();
+    expect(composer).toHaveValue("Keep this draft");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("appends Specialist instructions as visible draft text without sending or changing execution controls", async () => {
+    const specialist = { id: "specialist-1", project_id: project.id, name: "Methods reviewer", description: "Review methods", instructions: "Identify unsupported claims.", enabled: true };
+    vi.spyOn(projectTemplatesApi, "listQuickActions").mockResolvedValue([]);
+    vi.spyOn(projectTemplatesApi, "listSpecialistTemplates").mockResolvedValue([specialist]);
+    vi.spyOn(workflowApi, "listComposerWorkflows").mockResolvedValue([]);
+    const onSend = vi.fn();
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} onSend={onSend} />);
+
+    const composer = screen.getByRole("textbox", { name: /Describe a research goal/ });
+    fireEvent.change(composer, { target: { value: "Keep this draft exactly." } });
+    fireEvent.click(screen.getByRole("button", { name: "Agent permissions" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Quick actions & roles/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Use Methods reviewer" }));
+
+    expect(composer).toHaveValue("Keep this draft exactly.\n\n[Specialist: Methods reviewer]\nIdentify unsupported claims.");
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "Project template picker" })).not.toBeInTheDocument();
+  });
+
   it("updates the visible shortcut and main composer keyboard behavior when the shared preference changes", async () => {
     const onSend = vi.fn().mockResolvedValue(true);
     render(<><WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} onSend={onSend} computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} /><SettingsPanel locale="en-US" initialSection="general" onClose={() => undefined} /></>);

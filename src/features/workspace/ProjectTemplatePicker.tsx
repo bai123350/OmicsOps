@@ -18,7 +18,7 @@ export function ProjectTemplatePicker({
   onSelectSpecialist,
   onClose,
 }: {
-  selectedProject: WorkspaceProject | null;
+  selectedProject: Pick<WorkspaceProject, "id" | "name"> | null;
   locale: Locale;
   onSelectWorkflow: (workflow: ComposerWorkflowTemplate) => void;
   onSelectSpecialist: (template: SpecialistTemplate) => void;

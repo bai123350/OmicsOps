@@ -4,6 +4,7 @@ import { SettingsPanel } from "./SettingsPanel";
 import { setComposerSendPreference } from "./useComposerSendPreference";
 import { AppearanceProvider } from "../../use-appearance";
 import * as workflowApi from "../../composer-workflow-api";
+import * as projectTemplatesApi from "../../project-templates-api";
 import * as api from "../../tauri-api";
 import { PetPreferencesProvider } from "../../use-pet-preferences";
 import * as memoryApi from "../../memory-settings-api";
@@ -352,6 +353,25 @@ describe("SettingsPanel model providers", () => {
     expect(list).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Back to project library" }));
     expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("opens project-scoped Quick Actions and Specialists from searchable settings pages", async () => {
+    vi.spyOn(projectTemplatesApi, "listQuickActions").mockResolvedValue([]);
+    vi.spyOn(projectTemplatesApi, "listSpecialistTemplates").mockResolvedValue([]);
+    vi.spyOn(workflowApi, "listComposerWorkflows").mockResolvedValue([]);
+    const selectedProject = { id: "project-1", name: "PBMC", description: "", local_root: "E:/PBMC", remote_root: null, connection_id: null, template: "single_cell_rna_seq" as const, status: "ready" as const, ollama_only: false, created_at: "", updated_at: "" };
+    render(<SettingsPanel locale="en-US" selectedProject={selectedProject} onClose={() => undefined} />);
+
+    const search = screen.getByRole("searchbox", { name: "Search settings" });
+    fireEvent.change(search, { target: { value: "shortcut" } });
+    fireEvent.click(screen.getByRole("button", { name: "Quick Actions" }));
+    expect(await screen.findByRole("heading", { name: "Quick Actions" })).toBeInTheDocument();
+    expect(projectTemplatesApi.listQuickActions).toHaveBeenCalledWith("project-1");
+
+    fireEvent.change(search, { target: { value: "role" } });
+    fireEvent.click(screen.getByRole("button", { name: "Specialists" }));
+    expect(await screen.findByRole("heading", { name: "Specialists" })).toBeInTheDocument();
+    expect(projectTemplatesApi.listSpecialistTemplates).toHaveBeenCalledWith("project-1");
   });
 
   it("keeps privacy guidance separate from the permission inventory", () => {
