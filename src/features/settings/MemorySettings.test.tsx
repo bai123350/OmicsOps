@@ -129,6 +129,66 @@ describe("MemorySettings", () => {
     expect(screen.getByRole("button", { name: "Create file" })).toBeEnabled();
   });
 
+  it("locks new-file and file navigation while a save is pending", async () => {
+    const other = { ...summary, name: "other.md", size_bytes: 20, sha256: "hash-other" };
+    const saving = deferred<MemoryFileV4>();
+    api.listProjectMemoryFiles.mockResolvedValue([summary, other]);
+    api.updateProjectMemoryFile.mockReturnValue(saving.promise);
+    render(<MemorySettings selectedProject={project("p1", "PBMC")} locale="en-US" />);
+    expect(await screen.findByDisplayValue("first draft")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Memory content"), { target: { value: "saved draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    expect(screen.getByRole("button", { name: "New memory file" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /other\.md/ })).toBeDisabled();
+    saving.resolve({ ...file, content: "saved draft", sha256: "hash-2" });
+    await waitFor(() => expect(screen.getByRole("button", { name: "New memory file" })).toBeEnabled());
+  });
+
+  it("locks file navigation while deletion is pending", async () => {
+    const other = { ...summary, name: "other.md", size_bytes: 20, sha256: "hash-other" };
+    const deleting = deferred<boolean>();
+    api.listProjectMemoryFiles.mockResolvedValue([summary, other]);
+    api.deleteProjectMemoryFile.mockReturnValue(deleting.promise);
+    render(<MemorySettings selectedProject={project("p1", "PBMC")} locale="en-US" />);
+    expect(await screen.findByDisplayValue("first draft")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete file" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm delete" }));
+
+    expect(screen.getByRole("button", { name: "New memory file" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /other\.md/ })).toBeDisabled();
+    deleting.resolve(true);
+    await waitFor(() => expect(screen.getByRole("button", { name: "New memory file" })).toBeEnabled());
+  });
+
+  it("resets mutation state on project change and ignores the old completion", async () => {
+    const saving = deferred<MemoryFileV4>();
+    const onChanged = vi.fn();
+    api.listProjectMemoryFiles.mockResolvedValueOnce([summary]).mockResolvedValueOnce([]);
+    api.updateProjectMemoryFile.mockReturnValue(saving.promise);
+    const view = render(<MemorySettings selectedProject={project("p1", "Old")} locale="en-US" onChanged={onChanged} />);
+    expect(await screen.findByDisplayValue("first draft")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Memory content"), { target: { value: "old save" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    view.rerender(<MemorySettings selectedProject={project("p2", "New")} locale="en-US" onChanged={onChanged} />);
+
+    expect(await screen.findByText("No memory files yet.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "New memory file" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "New memory file" }));
+    fireEvent.change(screen.getByLabelText("Filename"), { target: { value: "new.md" } });
+    fireEvent.change(screen.getByLabelText("Memory content"), { target: { value: "new project draft" } });
+    expect(screen.getByRole("button", { name: "Create file" })).toBeEnabled();
+
+    saving.resolve({ ...file, content: "old save", sha256: "hash-old" });
+    await Promise.resolve();
+    expect(screen.getByLabelText("Memory content")).toHaveValue("new project draft");
+    expect(screen.getByRole("button", { name: "Create file" })).toBeEnabled();
+    expect(onChanged).not.toHaveBeenCalled();
+  });
+
   it("shows the project requirement in Chinese without inventing global memory", async () => {
     render(<MemorySettings selectedProject={null} locale="zh-CN" />);
     expect(screen.getByRole("heading", { name: "记忆文件" })).toBeInTheDocument();

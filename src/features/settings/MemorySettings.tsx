@@ -32,6 +32,7 @@ export function MemorySettings({
   const [conflict, setConflict] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const sequence = useRef(0);
+  const mutationInFlight = useRef(false);
 
   useEffect(() => {
     const request = ++sequence.current;
@@ -43,6 +44,8 @@ export function MemorySettings({
     setConfirmingDelete(false);
     setConflict(false);
     setError(null);
+    mutationInFlight.current = false;
+    setSaving(false);
     if (!selectedProject) {
       setLoading(false);
       return;
@@ -68,7 +71,7 @@ export function MemorySettings({
   }, [selectedProject?.id]);
 
   async function openFile(name: string) {
-    if (!selectedProject) return;
+    if (!selectedProject || mutationInFlight.current) return;
     const request = ++sequence.current;
     setLoading(true);
     setError(null);
@@ -88,8 +91,9 @@ export function MemorySettings({
   }
 
   async function saveFile() {
-    if (!selectedProject || (!creating && !selected)) return;
+    if (!selectedProject || (!creating && !selected) || mutationInFlight.current) return;
     const request = ++sequence.current;
+    mutationInFlight.current = true;
     setSaving(true);
     setError(null);
     try {
@@ -110,13 +114,17 @@ export function MemorySettings({
       if (message.includes("memory_conflict")) setConflict(true);
       else setError(message);
     } finally {
-      if (request === sequence.current) setSaving(false);
+      if (request === sequence.current) {
+        mutationInFlight.current = false;
+        setSaving(false);
+      }
     }
   }
 
   async function deleteFile() {
-    if (!selectedProject || !selected) return;
+    if (!selectedProject || !selected || mutationInFlight.current) return;
     const request = ++sequence.current;
+    mutationInFlight.current = true;
     setSaving(true);
     setError(null);
     try {
@@ -133,7 +141,10 @@ export function MemorySettings({
       if (message.includes("memory_conflict")) setConflict(true);
       else setError(message);
     } finally {
-      if (request === sequence.current) setSaving(false);
+      if (request === sequence.current) {
+        mutationInFlight.current = false;
+        setSaving(false);
+      }
     }
   }
 
@@ -165,7 +176,9 @@ export function MemorySettings({
               </div>
               <button
                 type="button"
+                disabled={saving}
                 onClick={() => {
+                  if (mutationInFlight.current) return;
                   ++sequence.current;
                   setLoading(false);
                   setCreating(true);
@@ -188,7 +201,7 @@ export function MemorySettings({
               <ul>
                 {files.map((file) => (
                   <li key={file.name}>
-                    <button type="button" className={selected?.name === file.name ? "active" : ""} onClick={() => void openFile(file.name)}>
+                    <button type="button" disabled={saving} className={selected?.name === file.name ? "active" : ""} onClick={() => void openFile(file.name)}>
                       <strong>{file.name}</strong>
                       <small>{formatBytes(file.size_bytes, locale)}</small>
                     </button>
@@ -230,13 +243,13 @@ export function MemorySettings({
                       {creating ? (zh ? "创建文件" : "Create file") : zh ? "保存更改" : "Save changes"}
                     </button>
                     {!creating && selected && !confirmingDelete && (
-                      <button type="button" className="danger" onClick={() => setConfirmingDelete(true)} disabled={loading || conflict}>{zh ? "删除文件" : "Delete file"}</button>
+                      <button type="button" className="danger" onClick={() => setConfirmingDelete(true)} disabled={loading || saving || conflict}>{zh ? "删除文件" : "Delete file"}</button>
                     )}
                     {confirmingDelete && selected && (
                       <div className="memory-delete-confirm">
                         <span>{zh ? `删除 ${selected.name}？此操作无法撤销。` : `Delete ${selected.name}? This cannot be undone.`}</span>
                         <button type="button" className="danger" onClick={() => void deleteFile()} disabled={loading || saving || conflict}>{zh ? "确认删除" : "Confirm delete"}</button>
-                        <button type="button" onClick={() => setConfirmingDelete(false)}>{zh ? "取消" : "Cancel"}</button>
+                        <button type="button" onClick={() => setConfirmingDelete(false)} disabled={saving}>{zh ? "取消" : "Cancel"}</button>
                       </div>
                     )}
                   </div>
