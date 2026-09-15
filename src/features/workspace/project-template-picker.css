@@ -1,0 +1,102 @@
+.project-template-picker-backdrop {
+  align-items: center;
+  background: rgba(2, 6, 23, 0.68);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  padding: 20px;
+  position: absolute;
+  z-index: 52;
+}
+
+.project-template-picker {
+  background: var(--panel-bg, #111827);
+  border: 1px solid rgba(148, 163, 184, 0.26);
+  border-radius: 16px;
+  box-shadow: 0 24px 60px rgba(2, 6, 23, 0.4);
+  display: grid;
+  gap: 16px;
+  max-height: min(720px, calc(100vh - 40px));
+  max-width: 880px;
+  overflow: auto;
+  padding: 20px;
+  width: 100%;
+}
+
+.project-template-picker > header {
+  align-items: flex-start;
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+}
+
+.project-template-picker h3,
+.project-template-picker h4,
+.project-template-picker p {
+  margin: 0;
+}
+
+.project-template-picker > header p,
+.project-template-picker-heading p,
+.project-template-picker-note,
+.project-template-picker-empty {
+  color: var(--text-muted, #94a3b8);
+  margin-top: 5px;
+}
+
+.project-template-picker-columns {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.project-template-picker-columns section {
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 12px;
+  min-width: 0;
+  padding: 14px;
+}
+
+.project-template-picker ul {
+  display: grid;
+  gap: 8px;
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+}
+
+.project-template-picker li button {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  text-align: left;
+  width: 100%;
+}
+
+.project-template-picker li button > span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.project-template-picker li button small {
+  color: var(--text-muted, #94a3b8);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-template-picker-error {
+  align-items: center;
+  color: #fca5a5;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+@media (max-width: 720px) {
+  .project-template-picker-columns {
+    grid-template-columns: 1fr;
+  }
+}
