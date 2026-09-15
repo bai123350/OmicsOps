@@ -484,6 +484,11 @@ pub use composer_references::{
 mod composer_workflows;
 pub use composer_workflows::{ComposerWorkflowTemplate, SaveComposerWorkflowRequest};
 
+mod project_templates;
+pub use project_templates::{
+    QuickAction, SaveQuickActionRequest, SaveSpecialistTemplateRequest, SpecialistTemplate,
+};
+
 mod composer_queue;
 pub use composer_queue::{
     ComposerQueueActionRequestV4, ComposerQueueActionV4, ComposerQueueFailureCodeV4,

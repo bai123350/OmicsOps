@@ -6,6 +6,51 @@ use crate::dto::{
 use serde_json::json;
 
 #[test]
+fn project_template_contracts_keep_owner_and_visible_content_fields() {
+    let project_id = uuid::Uuid::from_u128(9);
+    let workflow_id = uuid::Uuid::from_u128(10);
+    let action = omicsops_dto::QuickAction {
+        id: uuid::Uuid::from_u128(11),
+        project_id,
+        name: "Review QC".into(),
+        description: "Insert the saved workflow.".into(),
+        workflow_id,
+        enabled: true,
+    };
+    let specialist = omicsops_dto::SpecialistTemplate {
+        id: uuid::Uuid::from_u128(12),
+        project_id,
+        name: "Methods reviewer".into(),
+        description: "Review the user's draft.".into(),
+        instructions: "Identify unsupported claims.".into(),
+        enabled: false,
+    };
+
+    assert_eq!(
+        serde_json::to_value(action).unwrap(),
+        json!({
+            "id": uuid::Uuid::from_u128(11),
+            "project_id": project_id,
+            "name": "Review QC",
+            "description": "Insert the saved workflow.",
+            "workflow_id": workflow_id,
+            "enabled": true
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(specialist).unwrap(),
+        json!({
+            "id": uuid::Uuid::from_u128(12),
+            "project_id": project_id,
+            "name": "Methods reviewer",
+            "description": "Review the user's draft.",
+            "instructions": "Identify unsupported claims.",
+            "enabled": false
+        })
+    );
+}
+
+#[test]
 fn memory_file_contract_carries_project_owner_and_content_hash() {
     let project_id = uuid::Uuid::from_u128(9);
     let file = omicsops_dto::MemoryFileV4 {

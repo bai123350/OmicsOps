@@ -1580,6 +1580,17 @@ impl Store {
             .collect()
     }
 
+    /// Delete one exact generic JSON object. Callers must validate ownership
+    /// before using this low-level persistence operation.
+    pub async fn delete_json(&self, kind: &str, id: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query("DELETE FROM app_objects WHERE kind=?1 AND id=?2")
+            .bind(kind)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn save_agent_run_v4(
         &self,
         run_id: Uuid,

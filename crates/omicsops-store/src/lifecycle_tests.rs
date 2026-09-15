@@ -1582,3 +1582,32 @@ async fn v4_context_archive_owner_is_validated_on_reopen() -> Result<(), StoreEr
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn generic_json_delete_removes_only_the_exact_kind_and_id() -> Result<(), StoreError> {
+    let store = Store::open_in_memory().await?;
+    store
+        .put_json(
+            "quick_action_v1",
+            "same-id",
+            &serde_json::json!({ "value": "delete" }),
+        )
+        .await?;
+    store
+        .put_json(
+            "specialist_template_v1",
+            "same-id",
+            &serde_json::json!({ "value": "keep" }),
+        )
+        .await?;
+
+    assert!(store.delete_json("quick_action_v1", "same-id").await?);
+    assert!(!store.delete_json("quick_action_v1", "same-id").await?);
+    assert_eq!(
+        store
+            .get_json::<serde_json::Value>("specialist_template_v1", "same-id")
+            .await?,
+        Some(serde_json::json!({ "value": "keep" }))
+    );
+    Ok(())
+}

@@ -36,6 +36,7 @@ pub mod p1_commands;
 #[cfg(test)]
 mod plan_revision_tests;
 pub mod project_memory;
+pub mod project_templates;
 pub mod pubmed_mcp;
 mod remote_jobs_v4;
 pub mod research_commands;
@@ -170,6 +171,12 @@ pub fn run() {
             composer_files::resolve_composer_clipboard_paths,
             composer_workflows::list_composer_workflows,
             composer_workflows::save_composer_workflow,
+            project_templates::list_quick_actions,
+            project_templates::save_quick_action,
+            project_templates::delete_quick_action,
+            project_templates::list_specialist_templates,
+            project_templates::save_specialist_template,
+            project_templates::delete_specialist_template,
             composer_quotes::preview_composer_file_text,
             composer_quotes::create_composer_quote,
             conversation_preferences::conversation_get_agent_preferences_v4,
