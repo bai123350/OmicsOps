@@ -65,6 +65,17 @@ Windows Credential Manager/keyring 路径，不写入 SQLite。项目导出会�
 错误不回显可能含凭据的底层诊断，也不覆盖连接测试的状态。连接测试仍保留自己
 的成功或失败反馈。
 
+## 常规语言设置
+
+DesktopApp 通过 `usePersistentLocale` 统一管理语言偏好，专用 localStorage 键为
+`omicsops.locale`，只接受 `zh-CN` 和 `en-US`。键缺失、值非法或读取异常时回退
+简体中文；写入失败不阻止当前界面立即切换。项目主页和工作区已有语言入口继续
+使用同一个 setter。
+
+设置新增“常规”页面，语言选择无需保存并立即作用于整个应用。关闭设置后重开
+仍显示当前语言，应用重挂载则恢复已持久化值。独立渲染 SettingsPanel 且没有
+`onLocaleChange` 时控件禁用，以兼容只读或测试场景。
+
 ## 验证与手工检查
 
 自动测试覆盖旧设置默认值/完整往返、控件联动、取消和 Escape、截断预算、
@@ -75,11 +86,14 @@ Windows Credential Manager/keyring 路径，不写入 SQLite。项目导出会�
 npm run build:desktop。真实模型、MCP、SSH、安装后的验收须按 acceptance/README.md
 在一次性环境执行并单独记录，不能将构建或模拟测试当作真实验收。
 
-本次实际结果：cargo test --workspace 763 通过、11 ignored、0 失败；
-npm test 前端 200 项及扩展 22 项通过；npm run build 通过；
-cargo fmt --all -- --check、git diff --check 通过。
-独立审查发现的关闭压缩、重复建议请求、完整替代回复与表单联动问题已修复并复核。
-真实模型/MCP、SSH 和安装后的验收未执行。
+2026-09-15 Settings 增量在本机 Node.js 24 环境完成确定性验证：
+`cargo test --workspace` 退出码为 0，依赖真实环境的 ignored 测试未执行；
+`npm test` 退出码为 0，Vitest 67 个文件、582 项测试全部通过，浏览器扩展
+Node 测试 22 项全部通过；`npm run build` 退出码为 0；
+`npm run build:desktop` 退出码为 0，完成本地 release 编译并由 NSIS 生成一个
+Windows 安装包，未发布也未执行安装。相关 Settings、DesktopApp 和语言持久化
+局部测试共 110 项通过，`git diff --check` 通过。
 
-npm run build:desktop 通过，生成 Windows x64 安装包
-`target/release/bundle/nsis/OmicsOps_0.1.0_x64-setup.exe`，未执行安装。
+Edge 模拟 Tauri 预览确认预算非法值、保存、编辑回显、模型身份变更和目录发现
+反馈符合预期，也确认中英文立即切换、关闭设置后重开、页面重载恢复和切回中文。
+该预览没有调用真实模型 API。真实模型/MCP、SSH 和安装后的验收未执行。

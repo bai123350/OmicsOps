@@ -77,7 +77,7 @@ describe("SettingsPanel model providers", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
     expect(screen.getByLabelText("Configured context budget")).toHaveValue("32000");
-    expect(screen.getByText(/Leave unchanged or blank to keep the saved value/)).toBeInTheDocument();
+    expect(screen.getByText(/leave it blank or unchanged to keep its budget/i)).toBeInTheDocument();
     fireEvent.click(screen.getByLabelText("Refresh catalog capabilities"));
     fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
     await waitFor(() => expect(save).toHaveBeenCalledOnce());
@@ -266,6 +266,23 @@ describe("SettingsPanel model providers", () => {
     expect(screen.queryByText(/项目强制策略/)).not.toBeInTheDocument();
     expect(screen.getByText(/模型与外部服务可能接收提示词、结果或元数据/)).toBeInTheDocument();
     expect(screen.queryByText(/诊断包仅在主动导出时生成/)).not.toBeInTheDocument();
+  });
+
+  it("changes the interface language immediately from General without a save action", () => {
+    const onLocaleChange = vi.fn();
+    render(<SettingsPanel locale="zh-CN" initialSection="general" onLocaleChange={onLocaleChange} onClose={() => undefined} />);
+
+    expect(screen.getByRole("button", { name: "常规" })).toHaveAttribute("aria-current", "page");
+    fireEvent.change(screen.getByRole("combobox", { name: "界面语言" }), { target: { value: "en-US" } });
+    expect(onLocaleChange).toHaveBeenCalledWith("en-US");
+    expect(screen.queryByRole("button", { name: /保存/ })).not.toBeInTheDocument();
+  });
+
+  it("defaults to Chinese and disables General language controls without a change handler", () => {
+    render(<SettingsPanel initialSection="general" onClose={() => undefined} />);
+
+    expect(screen.getByRole("dialog", { name: "工作台设置" })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "界面语言" })).toBeDisabled();
   });
   it("collects provider configuration without rendering stored credentials", async () => {
     const onSaveModel = vi.fn().mockResolvedValue(undefined);

@@ -9,7 +9,10 @@ import * as referenceApi from "./composer-reference-api";
 import * as attachmentApi from "./composer-attachment-api";
 import type { AgentRunEventV4, ComposerReference, ConversationAgentStateV4, ExecutionPlanV4, KernelEvent, ProposedPlanRevisionV4, RunSummaryV4, StopRunReceiptV4, SyncEntry, WorkspaceMessage } from "./types";
 
-beforeEach(() => vi.restoreAllMocks());
+beforeEach(() => {
+  vi.restoreAllMocks();
+  window.localStorage.clear();
+});
 
 const stateProject = { id: "project-state", name: "状态测试项目", description: "", local_root: "E:/Science/state", remote_root: null, connection_id: null, template: "single_cell_rna_seq" as const, status: "running" as const, ollama_only: false, created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" };
 const stateConversations = [
@@ -1274,6 +1277,34 @@ describe("DesktopApp", () => {
     expect(dialog).toHaveTextContent("Ollama");
     expect(dialog).toHaveTextContent("隐私与权限");
     expect(dialog).not.toHaveTextContent("历史运行只读");
+  });
+
+  it("persists the existing project-library language switch across remounts", async () => {
+    vi.spyOn(api, "listProjects").mockResolvedValue([]);
+    const first = render(<DesktopApp />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "English" }));
+    expect(await screen.findByRole("button", { name: "Settings" })).toBeInTheDocument();
+    expect(window.localStorage.getItem("omicsops.locale")).toBe("en-US");
+    first.unmount();
+
+    render(<DesktopApp />);
+    expect(await screen.findByRole("button", { name: "Settings" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "简体中文" })).toBeInTheDocument();
+  });
+
+  it("applies General language changes immediately and keeps them after Settings closes and reopens", async () => {
+    vi.spyOn(api, "listProjects").mockResolvedValue([]);
+    render(<DesktopApp />);
+    fireEvent.click(await screen.findByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("button", { name: "常规" }));
+    fireEvent.change(screen.getByRole("combobox", { name: "界面语言" }), { target: { value: "en-US" } });
+
+    expect(await screen.findByRole("dialog", { name: "Workspace settings" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    fireEvent.click(screen.getByRole("button", { name: "General" }));
+    expect(screen.getByRole("combobox", { name: "Interface language" })).toHaveValue("en-US");
   });
 
   it("creates and switches to an empty conversation when New conversation is clicked", async () => {

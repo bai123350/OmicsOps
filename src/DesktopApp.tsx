@@ -14,8 +14,8 @@ import type { AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendA
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
 import { WorkspaceShell } from "./features/workspace/WorkspaceShell";
 import { ApiModelPicker } from "./features/workspace/ApiModelPicker";
-import type { Locale } from "./features/workspace/copy";
-import { SettingsPanel } from "./features/settings/SettingsPanel";
+import { SettingsPanel, type SettingsSection } from "./features/settings/SettingsPanel";
+import { usePersistentLocale } from "./use-persistent-locale";
 import { useConversationCapabilities } from "./features/workspace/useConversationCapabilities";
 import { useComposerQueue } from "./features/workspace/useComposerQueue";
 import { useComposerReplacement } from "./features/workspace/useComposerReplacement";
@@ -80,7 +80,7 @@ export default function DesktopApp() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
-  const [locale, setLocale] = useState<Locale>("zh-CN");
+  const [locale, setLocale] = usePersistentLocale();
   const [loading, setLoading] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsNavigationKey, setSettingsNavigationKey] = useState(0);
@@ -93,7 +93,7 @@ export default function DesktopApp() {
   const [agentBusy, setAgentBusy] = useState(false);
   const [agentNotice, setAgentNotice] = useState("");
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>([]);
-  const [settingsSection, setSettingsSection] = useState<"models" | "remote" | "skills">("models");
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("models");
   const [activeModelProfileId, setActiveModelProfileId] = useState<string | null>(null);
   const [modelSelectionBusy, setModelSelectionBusy] = useState(false);
   const modelSelectionInFlight = useRef(false);
@@ -1000,7 +1000,7 @@ export default function DesktopApp() {
     setSearchRequest({ key: crypto.randomUUID(), kind: "attach", projectId: selected.id, conversationId: conversation.id, item: entry.item });
     return true;
   }} /> : null;
-  const settings = settingsOpen ? <SettingsPanel key={settingsNavigationKey} initialSection={settingsSection} locale={locale} onClose={() => setSettingsOpen(false)} modelProfiles={modelProfiles} skillPackages={skillPackages} mcpServers={mcpServers} connections={connections} selectedProject={selected} onSaveConnection={async (profile, secret) => { await api.saveConnection(profile, secret); setConnections(await api.listConnections()); }} onTestConnection={api.testConnection} onConfirmHostKey={async (profileId, fingerprint) => { await api.confirmHostKey(profileId, fingerprint); setConnections(await api.listConnections()); }} onBindProjectRemote={async (connectionId, remoteRoot) => { if (!selected) return; const updated = await api.updateProjectRemote(selected.id, connectionId, remoteRoot); setSelected(updated); setProjects((current) => current.map((project) => project.id === updated.id ? updated : project)); }} onSaveModel={async (request) => {
+  const settings = settingsOpen ? <SettingsPanel key={settingsNavigationKey} initialSection={settingsSection} locale={locale} onLocaleChange={setLocale} onClose={() => setSettingsOpen(false)} modelProfiles={modelProfiles} skillPackages={skillPackages} mcpServers={mcpServers} connections={connections} selectedProject={selected} onSaveConnection={async (profile, secret) => { await api.saveConnection(profile, secret); setConnections(await api.listConnections()); }} onTestConnection={api.testConnection} onConfirmHostKey={async (profileId, fingerprint) => { await api.confirmHostKey(profileId, fingerprint); setConnections(await api.listConnections()); }} onBindProjectRemote={async (connectionId, remoteRoot) => { if (!selected) return; const updated = await api.updateProjectRemote(selected.id, connectionId, remoteRoot); setSelected(updated); setProjects((current) => current.map((project) => project.id === updated.id ? updated : project)); }} onSaveModel={async (request) => {
     if (modelSelectionInFlight.current) throw new Error("Model selection is currently locked");
     modelSelectionInFlight.current = true;
     setModelSelectionBusy(true);
