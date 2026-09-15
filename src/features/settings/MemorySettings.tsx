@@ -224,12 +224,12 @@ export function MemorySettings({
                   {creating && (
                     <label>
                       <span>{zh ? "文件名" : "Filename"}</span>
-                      <input aria-label={zh ? "文件名" : "Filename"} value={filename} onChange={(event) => setFilename(event.target.value)} placeholder="study.md" />
+                      <input disabled={saving} aria-label={zh ? "文件名" : "Filename"} value={filename} onChange={(event) => setFilename(event.target.value)} placeholder="study.md" />
                     </label>
                   )}
                   <label>
                     <span>{zh ? "记忆内容" : "Memory content"}</span>
-                    <textarea aria-label={zh ? "记忆内容" : "Memory content"} value={draft} onChange={(event) => setDraft(event.target.value)} rows={15} />
+                    <textarea disabled={saving} aria-label={zh ? "记忆内容" : "Memory content"} value={draft} onChange={(event) => setDraft(event.target.value)} rows={15} />
                   </label>
                   {conflict && (
                     <div className="memory-conflict" role="alert">

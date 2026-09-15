@@ -146,6 +146,25 @@ describe("MemorySettings", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "New memory file" })).toBeEnabled());
   });
 
+  it("locks the filename and content while creating so a late receipt cannot overwrite new input", async () => {
+    const saving = deferred<MemoryFileV4>();
+    api.listProjectMemoryFiles.mockResolvedValue([]);
+    api.createProjectMemoryFile.mockReturnValue(saving.promise);
+    render(<MemorySettings selectedProject={project("p1", "PBMC")} locale="en-US" />);
+    await screen.findByText("No memory files yet.");
+
+    fireEvent.click(screen.getByRole("button", { name: "New memory file" }));
+    fireEvent.change(screen.getByLabelText("Filename"), { target: { value: "pending.md" } });
+    fireEvent.change(screen.getByLabelText("Memory content"), { target: { value: "pending draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create file" }));
+
+    expect(screen.getByLabelText("Filename")).toBeDisabled();
+    expect(screen.getByLabelText("Memory content")).toBeDisabled();
+    saving.resolve({ ...file, name: "pending.md", content: "pending draft" });
+    await waitFor(() => expect(screen.queryByLabelText("Filename")).not.toBeInTheDocument());
+    expect(screen.getByLabelText("Memory content")).toBeEnabled();
+  });
+
   it("locks file navigation while deletion is pending", async () => {
     const other = { ...summary, name: "other.md", size_bytes: 20, sha256: "hash-other" };
     const deleting = deferred<boolean>();
