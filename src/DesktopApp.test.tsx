@@ -1266,17 +1266,23 @@ describe("DesktopApp", () => {
     await waitFor(() => expect(screen.queryByText("待删除项目")).not.toBeInTheDocument());
   });
 
-  it("centralizes model, remote compute, privacy, and permission settings", async () => {
+  it("opens ordinary Settings on General and resets there after a capability page", async () => {
     vi.spyOn(api, "listProjects").mockResolvedValue([]);
     render(<DesktopApp />);
     fireEvent.click(await screen.findByRole("button", { name: "设置" }));
 
     const dialog = screen.getByRole("dialog", { name: "工作台设置" });
+    expect(screen.getByRole("button", { name: "常规" })).toHaveAttribute("aria-current", "page");
+    expect(dialog).toHaveTextContent("发送快捷键");
+    fireEvent.click(screen.getByRole("button", { name: "模型提供方" }));
     expect(dialog).toHaveTextContent("Anthropic");
     expect(dialog).toHaveTextContent("OpenAI-compatible");
     expect(dialog).toHaveTextContent("Ollama");
     expect(dialog).toHaveTextContent("隐私与权限");
     expect(dialog).not.toHaveTextContent("历史运行只读");
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    expect(screen.getByRole("button", { name: "常规" })).toHaveAttribute("aria-current", "page");
   });
 
   it("persists the existing project-library language switch across remounts", async () => {

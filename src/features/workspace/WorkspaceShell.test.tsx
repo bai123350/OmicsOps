@@ -4,6 +4,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import * as preferencesApi from "../../conversation-preferences-api";
 import * as guidanceApi from "../../tauri-api";
 import { WorkspaceShell } from "./WorkspaceShell";
+import { SettingsPanel } from "../settings/SettingsPanel";
+import { setComposerSendPreference } from "../settings/useComposerSendPreference";
 
 const project = {
   id: "project-1",
@@ -23,7 +25,10 @@ const fastProfile = {
   supports_vision: false,
 };
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  setComposerSendPreference(false);
+});
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -36,6 +41,42 @@ function deferred<T>() {
 }
 
 describe("WorkspaceShell", () => {
+  it("updates the visible shortcut and main composer keyboard behavior when the shared preference changes", async () => {
+    const onSend = vi.fn().mockResolvedValue(true);
+    render(<><WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} onSend={onSend} computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} /><SettingsPanel locale="en-US" initialSection="general" onClose={() => undefined} /></>);
+    const composer = screen.getByRole("textbox", { name: /Describe a research goal/ });
+    fireEvent.change(composer, { target: { value: "Inspect counts" } });
+    fireEvent.click(screen.getByRole("button", { name: "Agent permissions" }));
+    const shortcut = screen.getByRole("menuitemcheckbox", { name: "Send with Ctrl/Cmd+Enter" });
+    expect(shortcut).toHaveAttribute("aria-checked", "false");
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Send shortcut" }), { target: { value: "modifier" } });
+    expect(shortcut).toHaveAttribute("aria-checked", "true");
+    fireEvent.keyDown(composer, { key: "Enter", code: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+    fireEvent.keyDown(composer, { key: "Enter", code: "Enter", ctrlKey: true });
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("Inspect counts", "chat"));
+
+    fireEvent.click(shortcut);
+    expect(screen.getByRole("combobox", { name: "Send shortcut" })).toHaveValue("enter");
+    await waitFor(() => expect(composer).toHaveValue(""));
+    fireEvent.change(composer, { target: { value: "Use Enter" } });
+    fireEvent.keyDown(composer, { key: "Enter", code: "Enter" });
+    await waitFor(() => expect(onSend).toHaveBeenLastCalledWith("Use Enter", "chat"));
+  });
+
+  it.each([
+    { label: "Shift+Enter", event: { key: "Enter", code: "Enter", shiftKey: true } },
+    { label: "IME composition", event: { key: "Enter", code: "Enter", isComposing: true } },
+    { label: "legacy IME keyCode", event: { key: "Enter", code: "Enter", keyCode: 229 } },
+  ])("does not send the main composer for $label", ({ event }) => {
+    const onSend = vi.fn();
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} onSend={onSend} />);
+    const composer = screen.getByRole("textbox", { name: /Describe a research goal/ });
+    fireEvent.change(composer, { target: { value: "Keep editing" } });
+    fireEvent.keyDown(composer, event);
+    expect(onSend).not.toHaveBeenCalled();
+  });
   it.each(["running", "waiting_for_approval", "needs_attention", "cancelled", "completed"])("does not present an ordinary %s contract as a Plan or hide its trace", (status) => {
     const plan = { schema_version: 4 as const, objective: "internal ordinary contract", steps: ["internal step"], completion_criteria: ["evidence"], requested_capabilities: [] };
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} agentMode="agent"

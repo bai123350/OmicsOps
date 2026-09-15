@@ -1,12 +1,13 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Bot, CheckCircle2, Cloud, FolderOpen, Globe2, KeyRound, Languages, Layers3, LoaderCircle, Monitor, Server, ShieldCheck, Wrench, X, XCircle } from "lucide-react";
+import { ArrowLeft, Bot, CheckCircle2, Cloud, FolderOpen, Globe2, KeyRound, Languages, Layers3, LoaderCircle, Monitor, Search, Server, ShieldCheck, Wrench, XCircle } from "lucide-react";
 import type { ConnectionProfile, ConnectionTestResult, McpEnvBinding, McpServerProfile, ModelProbeResult, ModelProfile, SkillPackage, WorkspaceProject } from "../../types";
 import type { Locale } from "../workspace/copy";
 import { supportsFastMode } from "../../fast-mode";
 import { BrowserSettings, useWindowEscapeLayer } from "./BrowserSettings";
 import { BundledMcpPresets, type BundledMcpProps } from "./BundledMcpPresets";
 import { AgentSettings } from "./AgentSettings";
+import { useComposerSendPreference } from "./useComposerSendPreference";
 import "./settings.css";
 import "./model-form.css";
 import "./remote-form.css";
@@ -141,9 +142,9 @@ export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection
   }
 
   return <div className="settings-backdrop"><section className="settings-panel" role="dialog" aria-modal="true" aria-label={zh ? "工作台设置" : "Workspace settings"}>
-    <header><div><small>OmicsOps Desktop</small><h2>{zh ? "工作台设置" : "Workspace settings"}</h2></div><button aria-label="Close" onClick={onClose}><X size={19} /></button></header>
+    <header><button className="settings-back" aria-label="Close" onClick={onClose}><ArrowLeft size={18} /><span>{zh ? "返回工作区" : "Back to workspace"}</span></button><div><small>OmicsOps Desktop</small><h2>{zh ? "设置" : "Settings"}</h2></div></header>
     <div className="settings-layout">
-      <nav aria-label={zh ? "设置页面" : "Settings pages"}><button aria-current={section === "general" ? "page" : undefined} className={section === "general" ? "active" : ""} onClick={() => navigate("general")}><Languages size={16} />{zh ? "常规" : "General"}</button><button aria-current={section === "agent" ? "page" : undefined} className={section === "agent" ? "active" : ""} onClick={() => navigate("agent")}><Bot size={16} />{zh ? "会话" : "Session"}</button><button aria-current={section === "models" ? "page" : undefined} className={section === "models" ? "active" : ""} onClick={() => navigate("models")}><Bot size={16} />{zh ? "模型提供方" : "Model providers"}</button><button aria-current={section === "remote" ? "page" : undefined} className={section === "remote" ? "active" : ""} onClick={() => navigate("remote")}><Server size={16} />{zh ? "远端计算" : "Remote compute"}</button><button aria-current={section === "skills" ? "page" : undefined} className={section === "skills" ? "active" : ""} onClick={() => navigate("skills")}><Wrench size={16} />{zh ? "技能与 MCP" : "Skills and MCP"}</button><button aria-current={section === "browser" ? "page" : undefined} className={section === "browser" ? "active" : ""} onClick={() => navigate("browser")}><Globe2 size={16} />{zh ? "浏览器" : "Browser"}</button><button aria-current={section === "privacy" ? "page" : undefined} className={section === "privacy" ? "active" : ""} onClick={() => navigate("privacy")}><ShieldCheck size={16} />{zh ? "隐私与权限" : "Privacy and permissions"}</button></nav>
+      <SettingsNavigation locale={locale} section={section} onNavigate={navigate} />
       {section === "models" ? <main><div className="settings-heading"><h3>{zh ? "模型提供方" : "Model providers"}</h3><p>{zh ? "密钥保存在 Windows Credential Manager，项目只记录引用。" : "Keys stay in Windows Credential Manager; projects store references only."}</p></div>
         <div className="provider-grid">
           <Provider icon={Cloud} name="Anthropic" detail="Messages API · tool use" configured={modelProfiles.some((profile) => profile.provider === "anthropic")} onConfigure={() => configure("anthropic")} />
@@ -184,6 +185,49 @@ export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection
   </section></div>;
 }
 
+function SettingsNavigation({ locale, section, onNavigate }: { locale: Locale; section: SettingsSection; onNavigate: (section: SettingsSection) => void }) {
+  const zh = locale === "zh-CN";
+  const [query, setQuery] = useState("");
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const groups = [
+    {
+      id: "workspace",
+      label: zh ? "工作区" : "Workspace",
+      items: [
+        { section: "general" as const, zh: "常规", en: "General", keywords: ["语言", "language", "shortcut", "快捷键"], icon: Languages },
+        { section: "agent" as const, zh: "会话", en: "Session", keywords: ["agent", "迭代", "上下文"], icon: Bot },
+        { section: "remote" as const, zh: "远端计算", en: "Remote compute", keywords: ["environment", "环境", "ssh"], icon: Server },
+        { section: "privacy" as const, zh: "隐私与权限", en: "Privacy and permissions", keywords: ["credential", "凭据", "approval", "授权"], icon: ShieldCheck },
+      ],
+    },
+    {
+      id: "capabilities",
+      label: zh ? "能力" : "Capabilities",
+      items: [
+        { section: "models" as const, zh: "模型提供方", en: "Model providers", keywords: ["model", "模型", "provider"], icon: Bot },
+        { section: "skills" as const, zh: "技能与 MCP", en: "Skills and MCP", keywords: ["skill", "技能", "connection", "连接"], icon: Wrench },
+        { section: "browser" as const, zh: "浏览器", en: "Browser", keywords: ["browser", "浏览器", "web"], icon: Globe2 },
+      ],
+    },
+  ];
+  const filteredGroups = groups.map((group) => ({
+    ...group,
+    items: group.items.filter((item) => !normalizedQuery || [item.zh, item.en, ...item.keywords].some((label) => label.toLocaleLowerCase().includes(normalizedQuery))),
+  })).filter((group) => group.items.length > 0);
+  const matchCount = filteredGroups.reduce((count, group) => count + group.items.length, 0);
+
+  return <nav aria-label={zh ? "设置页面" : "Settings pages"}>
+    <label className="settings-search"><Search size={15} /><input type="search" aria-label={zh ? "搜索设置" : "Search settings"} placeholder={zh ? "搜索设置" : "Search settings"} value={query} onChange={(event) => setQuery(event.target.value)} /></label>
+    <div className="settings-nav-scroll">
+      {filteredGroups.map((group) => <section className="settings-nav-group" key={group.id} aria-labelledby={`settings-group-${group.id}`}>
+        <h3 id={`settings-group-${group.id}`}>{group.label}</h3>
+        {group.items.map((item) => { const Icon = item.icon; return <button key={item.section} aria-current={section === item.section ? "page" : undefined} className={section === item.section ? "active" : ""} onClick={() => onNavigate(item.section)}><Icon size={16} />{zh ? item.zh : item.en}</button>; })}
+      </section>)}
+      {matchCount === 0 && <p className="settings-search-empty" role="status">{zh ? "没有匹配的设置" : "No matching settings"}</p>}
+    </div>
+  </nav>;
+}
+
 function contextWindowError(value: string, dirty: boolean, zh: boolean): string {
   if (!dirty || value.trim() === "") return "";
   if (!/^\d+$/.test(value.trim())) return zh ? "请输入 1 到 4294967295 的整数。" : "Enter a whole number from 1 to 4294967295.";
@@ -193,9 +237,11 @@ function contextWindowError(value: string, dirty: boolean, zh: boolean): string 
 
 function GeneralSettings({ locale, onLocaleChange }: { locale: Locale; onLocaleChange?: (locale: Locale) => void }) {
   const zh = locale === "zh-CN";
+  const [modifierSend, setModifierSend] = useComposerSendPreference();
   return <main className="general-settings">
-    <div className="settings-heading"><h3>{zh ? "常规" : "General"}</h3><p>{zh ? "选择工作台界面语言。更改会立即生效并用于下次启动。" : "Choose the workspace interface language. Changes apply immediately and are used on the next launch."}</p></div>
+    <div className="settings-heading"><h3>{zh ? "常规" : "General"}</h3><p>{zh ? "管理跨项目共享的界面和输入偏好。更改会立即生效。" : "Manage interface and input preferences shared across projects. Changes apply immediately."}</p></div>
     <label className="general-setting-row"><span><b>{zh ? "界面语言" : "Interface language"}</b><small>{zh ? "此偏好适用于项目主页、工作区和设置。" : "This preference applies to the project library, workspace, and settings."}</small></span><select aria-label={zh ? "界面语言" : "Interface language"} value={locale} disabled={!onLocaleChange} onChange={(event) => onLocaleChange?.(event.target.value as Locale)}><option value="zh-CN">简体中文</option><option value="en-US">English</option></select></label>
+    <label className="general-setting-row"><span><b>{zh ? "发送快捷键" : "Send shortcut"}</b><small>{zh ? "仅控制主对话输入框；Shift+Enter 始终换行，输入法确认不会发送。" : "Controls the main composer only. Shift+Enter always inserts a new line, and IME confirmation never sends."}</small></span><select aria-label={zh ? "发送快捷键" : "Send shortcut"} value={modifierSend ? "modifier" : "enter"} onChange={(event) => setModifierSend(event.target.value === "modifier")}><option value="enter">Enter</option><option value="modifier">Ctrl/Cmd+Enter</option></select></label>
   </main>;
 }
 

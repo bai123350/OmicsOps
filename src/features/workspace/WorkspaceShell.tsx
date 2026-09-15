@@ -37,6 +37,7 @@ import { ComposeActions } from "./ComposeActions";
 import { ShareConversationDialog } from "./ShareConversationDialog";
 import { RuntimeDialog } from "./RuntimeDialog";
 import { useWindowEscapeLayer } from "../settings/BrowserSettings";
+import { useComposerSendPreference } from "../settings/useComposerSendPreference";
 import { collectNotebookCells, collectDelegatedTasks, collectProvenance, isSidebarPreviewImage } from "./sidebarData";
 import { ArtifactCatalog, CodeNotebook, DelegatedAgents, EnvironmentContexts, ProvenancePanel } from "./SidebarPanels";
 import { V4PlanPanel } from "./V4PlanPanel";
@@ -355,9 +356,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const [sharing, setSharing] = useState(false);
   const [contextUsageOpen, setContextUsageOpen] = useState(false);
   useEffect(() => setContextUsageOpen(false), [project.id, activeConversationId]);
-  const [modifierSend, setModifierSend] = useState(() => {
-    try { return localStorage.getItem("omicsops.composer.modifierSend") === "true"; } catch { return false; }
-  });
+  const [modifierSend, setModifierSend] = useComposerSendPreference();
   useLayoutEffect(() => {
     const input = draftRef.current;
     if (!input) return;
@@ -883,9 +882,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const typedComposerCommand = composerCommandInvocation && composerCommands.find((command) => command.id === composerCommandInvocation.id && (command.id === "btw" || command.id === "fork" || !composerCommandInvocation.args.trim()));
 
   function toggleModifierSend() {
-    const next = !modifierSend;
-    setModifierSend(next);
-    try { localStorage.setItem("omicsops.composer.modifierSend", String(next)); } catch { /* Keep the session preference when browser storage is unavailable. */ }
+    setModifierSend(!modifierSend);
   }
 
   function toggleAgentPreference(key: ConversationAgentPreferenceKey) {

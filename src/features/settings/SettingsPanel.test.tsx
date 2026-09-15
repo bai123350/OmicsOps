@@ -1,6 +1,12 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { SettingsPanel } from "./SettingsPanel";
+import { setComposerSendPreference } from "./useComposerSendPreference";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  setComposerSendPreference(false);
+});
 
 describe("SettingsPanel model providers", () => {
   it("saves the DeepSeek preset through the compatible provider and supports custom model IDs", async () => {
@@ -276,6 +282,67 @@ describe("SettingsPanel model providers", () => {
     fireEvent.change(screen.getByRole("combobox", { name: "界面语言" }), { target: { value: "en-US" } });
     expect(onLocaleChange).toHaveBeenCalledWith("en-US");
     expect(screen.queryByRole("button", { name: /保存/ })).not.toBeInTheDocument();
+  });
+
+  it("presents the implemented settings in scrollable Wisp groups with a visible return action", () => {
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} />);
+
+    expect(screen.getByRole("button", { name: "Close" })).toHaveTextContent("Back to workspace");
+    const navigation = screen.getByRole("navigation", { name: "Settings pages" });
+    expect(within(navigation).getByText("Workspace")).toBeInTheDocument();
+    expect(within(navigation).getByText("Capabilities")).toBeInTheDocument();
+    expect(within(navigation).getByRole("button", { name: "General" })).toBeInTheDocument();
+    expect(within(navigation).getByRole("button", { name: "Skills and MCP" })).toBeInTheDocument();
+    expect(within(navigation).queryByRole("button", { name: "Pet" })).not.toBeInTheDocument();
+  });
+
+  it("searches navigation labels in either language without changing or clearing the active page", () => {
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} />);
+    fireEvent.click(screen.getByRole("button", { name: "Configure DeepSeek" }));
+    fireEvent.change(screen.getByLabelText("Profile label"), { target: { value: "My DeepSeek" } });
+
+    const search = screen.getByRole("searchbox", { name: "Search settings" });
+    fireEvent.change(search, { target: { value: "技能" } });
+    const navigation = screen.getByRole("navigation", { name: "Settings pages" });
+    expect(within(navigation).getByRole("button", { name: "Skills and MCP" })).toBeInTheDocument();
+    expect(within(navigation).queryByRole("button", { name: "General" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Profile label")).toHaveValue("My DeepSeek");
+
+    fireEvent.change(search, { target: { value: "no-such-setting" } });
+    expect(within(navigation).getByRole("status")).toHaveTextContent("No matching settings");
+    expect(screen.getByLabelText("Profile label")).toHaveValue("My DeepSeek");
+    expect(screen.getByRole("heading", { name: "Model providers" })).toBeInTheDocument();
+  });
+
+  it("changes the main composer send shortcut immediately and keeps the legacy storage key", () => {
+    render(<SettingsPanel locale="en-US" initialSection="general" onClose={() => undefined} />);
+
+    const shortcut = screen.getByRole("combobox", { name: "Send shortcut" });
+    expect(shortcut).toHaveValue("enter");
+    fireEvent.change(shortcut, { target: { value: "modifier" } });
+    expect(shortcut).toHaveValue("modifier");
+    expect(window.localStorage.getItem("omicsops.composer.modifierSend")).toBe("true");
+    expect(screen.getByText(/main composer/i)).toBeInTheDocument();
+  });
+
+  it("keeps the send shortcut usable for this session when browser storage is unavailable", () => {
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => { throw new Error("storage blocked"); });
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new Error("storage blocked"); });
+    render(<SettingsPanel locale="en-US" initialSection="general" onClose={() => undefined} />);
+
+    const shortcut = screen.getByRole("combobox", { name: "Send shortcut" });
+    fireEvent.change(shortcut, { target: { value: "modifier" } });
+    expect(shortcut).toHaveValue("modifier");
+  });
+
+  it("keeps the in-memory send shortcut when reading works but persistence fails", () => {
+    window.localStorage.setItem("omicsops.composer.modifierSend", "false");
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new Error("quota exceeded"); });
+    render(<SettingsPanel locale="en-US" initialSection="general" onClose={() => undefined} />);
+
+    const shortcut = screen.getByRole("combobox", { name: "Send shortcut" });
+    fireEvent.change(shortcut, { target: { value: "modifier" } });
+    expect(shortcut).toHaveValue("modifier");
   });
 
   it("defaults to Chinese and disables General language controls without a change handler", () => {
