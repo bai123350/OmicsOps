@@ -185,6 +185,8 @@ describe("SettingsPanel model providers", () => {
     expect(screen.getByRole("heading", { name: "隐私与权限" })).toBeInTheDocument();
     expect(screen.getByText(/模型、MCP 或外部服务可能接收提示词、结果或元数据/)).toBeInTheDocument();
     expect(screen.getByText(/Windows Credential Manager 或系统 keyring/)).toBeInTheDocument();
+    expect(screen.getByText(/项目导出可能包含你选择导出的正文、记忆和产物/)).toBeInTheDocument();
+    expect(screen.queryByText(/项目导出只保存引用或脱敏信息/)).not.toBeInTheDocument();
     expect(screen.getByText(/停止 Agent 不会取消已经派发的远端计算/)).toBeInTheDocument();
     expect(screen.getByText(/当前未打开项目/)).toBeInTheDocument();
 
@@ -210,6 +212,8 @@ describe("SettingsPanel model providers", () => {
     render(<SettingsPanel locale="zh-CN" onClose={() => undefined} />);
     expect(screen.getByRole("button", { name: "会话" })).toBeInTheDocument();
     expect(screen.queryByText(/项目强制策略/)).not.toBeInTheDocument();
+    expect(screen.getByText(/模型与外部服务可能接收提示词、结果或元数据/)).toBeInTheDocument();
+    expect(screen.queryByText(/诊断包仅在主动导出时生成/)).not.toBeInTheDocument();
   });
   it("collects provider configuration without rendering stored credentials", async () => {
     const onSaveModel = vi.fn().mockResolvedValue(undefined);
