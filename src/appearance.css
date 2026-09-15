@@ -531,6 +531,14 @@ html[data-omicsops-theme="dark"] #root .browser-settings :is(.browser-toggle, .b
   color: #b7c0cf;
 }
 
+html[data-omicsops-theme="dark"] #root .browser-settings :is(
+  .browser-field > span,
+  .browser-domain-editor label > span,
+  .browser-extension-entry > span
+) {
+  color: #f2f4f7;
+}
+
 html[data-omicsops-theme="dark"] #root .mcp-connections-settings :is(.mcp-subheading, .mcp-env-row) button {
   color: #d0d5dd;
   background-color: #1d2939;
