@@ -279,6 +279,18 @@ describe("SettingsPanel model providers", () => {
     expect(api.settingsStorageUsage).toHaveBeenCalledWith(undefined);
   });
 
+  it("registers Permissions as a real authorization inventory", async () => {
+    vi.spyOn(api, "browserListAuthorizations").mockResolvedValue([]);
+    const mcp = { id: "mcp-1", name: "PubMed", command: "omicsops-desktop", args: [], enabled: true, launch_approved: false, approved_tools: ["search_papers"], tools: [{ name: "search_papers", description: "Search papers" }], capabilities: {}, last_inspected_at: "2026-09-15T00:00:00Z", created_at: "", updated_at: "" };
+    const revoke = vi.fn().mockResolvedValue({ ...mcp, approved_tools: [] });
+    render(<SettingsPanel locale="en-US" initialSection="permissions" onClose={() => undefined} mcpServers={[mcp]} onSetMcpToolApproval={revoke} />);
+
+    expect(screen.getByRole("button", { name: "Permissions" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("heading", { name: "MCP permissions" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Revoke search_papers permission for PubMed" }));
+    await waitFor(() => expect(revoke).toHaveBeenCalledWith("mcp-1", "search_papers", false));
+  });
+
   it("loads the current project workflow library inside Settings and reports saved catalog changes", async () => {
     vi.spyOn(workflowApi, "listComposerWorkflows").mockResolvedValue([{
       id: "workflow-qc", project_id: "project-1", name: "QC recipe", description: "Inspect counts", steps: ["Inspect"], enabled: true,
@@ -312,12 +324,12 @@ describe("SettingsPanel model providers", () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
-  it("explains privacy boundaries and links to the existing capability settings without a project", () => {
+  it("keeps privacy guidance separate from the permission inventory", () => {
     render(<SettingsPanel locale="zh-CN" onClose={() => undefined} selectedProject={null} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "隐私与权限" }));
-    expect(screen.getByRole("button", { name: "隐私与权限" })).toHaveAttribute("aria-current", "page");
-    expect(screen.getByRole("heading", { name: "隐私与权限" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "隐私" }));
+    expect(screen.getByRole("button", { name: "隐私" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("heading", { name: "隐私" })).toBeInTheDocument();
     expect(screen.getByText(/模型、MCP 或外部服务可能接收提示词、结果或元数据/)).toBeInTheDocument();
     expect(screen.getByText(/Windows Credential Manager 或系统 keyring/)).toBeInTheDocument();
     expect(screen.getByText(/项目导出可能包含你选择导出的正文、记忆和产物/)).toBeInTheDocument();
@@ -327,10 +339,10 @@ describe("SettingsPanel model providers", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "管理 Skills" }));
     expect(screen.getByRole("button", { name: "Skills" })).toHaveAttribute("aria-current", "page");
-    fireEvent.click(screen.getByRole("button", { name: "隐私与权限" }));
+    fireEvent.click(screen.getByRole("button", { name: "隐私" }));
     fireEvent.click(screen.getByRole("button", { name: "管理 MCP 连接" }));
     expect(screen.getByRole("button", { name: "连接" })).toHaveAttribute("aria-current", "page");
-    fireEvent.click(screen.getByRole("button", { name: "隐私与权限" }));
+    fireEvent.click(screen.getByRole("button", { name: "隐私" }));
     fireEvent.click(screen.getByRole("button", { name: "管理浏览器" }));
     expect(screen.getByRole("button", { name: "浏览器" })).toHaveAttribute("aria-current", "page");
   });
@@ -339,7 +351,7 @@ describe("SettingsPanel model providers", () => {
     const close = vi.fn();
     render(<SettingsPanel locale="en-US" onClose={close} />);
     fireEvent.click(screen.getByRole("button", { name: "Configure DeepSeek" }));
-    fireEvent.click(screen.getByRole("button", { name: "Privacy and permissions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Privacy" }));
 
     expect(screen.queryByLabelText("Model configuration")).not.toBeInTheDocument();
     fireEvent.keyDown(window, { key: "Escape" });
@@ -377,6 +389,7 @@ describe("SettingsPanel model providers", () => {
     expect(within(navigation).getByRole("button", { name: "Workflows" })).toBeInTheDocument();
     expect(within(navigation).getByRole("button", { name: "Pet" })).toBeInTheDocument();
     expect(within(navigation).getByRole("button", { name: "Storage" })).toBeInTheDocument();
+    expect(within(navigation).getByRole("button", { name: "Permissions" })).toBeInTheDocument();
   });
 
   it("searches navigation labels in either language without changing or clearing the active page", () => {

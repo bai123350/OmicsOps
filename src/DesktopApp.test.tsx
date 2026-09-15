@@ -1297,7 +1297,8 @@ describe("DesktopApp", () => {
     expect(dialog).toHaveTextContent("Anthropic");
     expect(dialog).toHaveTextContent("OpenAI-compatible");
     expect(dialog).toHaveTextContent("Ollama");
-    expect(dialog).toHaveTextContent("隐私与权限");
+    expect(dialog).toHaveTextContent("权限");
+    expect(dialog).toHaveTextContent("隐私");
     expect(dialog).not.toHaveTextContent("历史运行只读");
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     fireEvent.click(screen.getByRole("button", { name: "设置" }));
