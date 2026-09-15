@@ -12,3 +12,4 @@
 }
 
 .privacy-grid{display:grid;gap:10px}.privacy-grid article{display:grid;grid-template-columns:24px 1fr;gap:10px;padding:14px;border:1px solid #eaecf0;border-radius:10px;background:#fff;color:#475467}.privacy-grid article>svg{margin-top:2px;color:#087552}.privacy-grid b{display:block;color:#101828;font-size:12px}.privacy-grid p{margin:5px 0 9px;font-size:10px;line-height:1.55}.privacy-grid small{display:block;margin:-2px 0 9px;color:#667085;font-size:9px}.privacy-grid button{border:1px solid #d0d5dd;border-radius:7px;background:#fff;padding:6px 9px;color:#344054;font-size:10px}.privacy-actions{display:flex;gap:7px;flex-wrap:wrap}
+.model-form .field-error,.model-discovery-state.error{color:#b42318}.model-discovery-state{grid-column:1/-1;margin-top:8px;color:#667085;font-size:10px}

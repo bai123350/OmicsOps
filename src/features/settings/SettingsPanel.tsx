@@ -11,8 +11,8 @@ import "./settings.css";
 import "./model-form.css";
 import "./remote-form.css";
 
-type SaveModelRequest = { id?: string; label: string; provider: ModelProfile["provider"]; base_url: string; model: string; credential?: string; refresh_catalog?: boolean; reasoning_effort?: ModelProfile["reasoning_effort"]; fast_mode?: ModelProfile["fast_mode"]; delegated_model_profile_id?: string | null };
-type FormState = SaveModelRequest & { credential: string };
+type SaveModelRequest = { id?: string; label: string; provider: ModelProfile["provider"]; base_url: string; model: string; credential?: string; context_window_tokens?: number; refresh_catalog?: boolean; reasoning_effort?: ModelProfile["reasoning_effort"]; fast_mode?: ModelProfile["fast_mode"]; delegated_model_profile_id?: string | null };
+type FormState = Omit<SaveModelRequest, "context_window_tokens"> & { credential: string; contextWindowDraft: string; contextWindowDirty: boolean };
 type McpEnvFormBinding = McpEnvBinding & { mode: "literal" | "credential" };
 type SaveMcpServerRequest = { id?: string; name: string; command: string; args: string[]; cwd?: string | null; timeout_secs?: number | null; env_bindings?: McpEnvBinding[] };
 
@@ -44,12 +44,12 @@ interface Props extends BundledMcpProps {
 }
 
 const defaults: Record<ModelProfile["provider"], FormState> = {
-  anthropic: { provider: "anthropic", label: "Anthropic", base_url: "https://api.anthropic.com/", model: "", credential: "" },
-  open_ai_compatible: { provider: "open_ai_compatible", label: "OpenAI-compatible", base_url: "https://api.openai.com/", model: "", credential: "" },
-  ollama: { provider: "ollama", label: "Ollama", base_url: "http://127.0.0.1:11434/", model: "", credential: "" },
+  anthropic: { provider: "anthropic", label: "Anthropic", base_url: "https://api.anthropic.com/", model: "", credential: "", contextWindowDraft: "", contextWindowDirty: false },
+  open_ai_compatible: { provider: "open_ai_compatible", label: "OpenAI-compatible", base_url: "https://api.openai.com/", model: "", credential: "", contextWindowDraft: "", contextWindowDirty: false },
+  ollama: { provider: "ollama", label: "Ollama", base_url: "http://127.0.0.1:11434/", model: "", credential: "", contextWindowDraft: "", contextWindowDirty: false },
 };
 
-const deepSeekDefault: FormState = { provider: "open_ai_compatible", label: "DeepSeek", base_url: "https://api.deepseek.com/v1", model: "deepseek-v4-flash", credential: "" };
+const deepSeekDefault: FormState = { provider: "open_ai_compatible", label: "DeepSeek", base_url: "https://api.deepseek.com/v1", model: "deepseek-v4-flash", credential: "", contextWindowDraft: "", contextWindowDirty: false };
 const deepSeekModels = ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4-flash-vision-exp"];
 
 function isDeepSeek(profile: Pick<ModelProfile, "provider" | "base_url">): boolean {
@@ -72,7 +72,9 @@ export function SettingsPanel({ locale, initialSection = "models", onClose, mode
   const [skillError, setSkillError] = useState("");
   const [modelTests, setModelTests] = useState<Record<string, { state: "testing" | "success" | "error"; result?: ModelProbeResult; message?: string }>>({});
   const [modelChoices, setModelChoices] = useState<Record<string, string[]>>({});
+  const [modelDiscoveries, setModelDiscoveries] = useState<Record<string, { state: "loading" | "success" | "empty" | "error" }>>({});
   const fastModeAvailable = form ? supportsFastMode(form) : false;
+  const budgetError = form ? contextWindowError(form.contextWindowDraft, form.contextWindowDirty, zh) : "";
   useWindowEscapeLayer(true, onClose);
   useWindowEscapeLayer(form !== null && section === "models", () => setForm(null));
   const configure = (provider: ModelProfile["provider"]) => setForm({ ...defaults[provider] });
@@ -82,11 +84,16 @@ export function SettingsPanel({ locale, initialSection = "models", onClose, mode
   };
 
   async function saveProvider() {
-    if (!form || !onSaveModel) return;
+    if (!form || !onSaveModel || budgetError) return;
     setSaving(true);
     setModelSaveError("");
     try {
-      await onSaveModel({ ...form, credential: form.provider === "ollama" ? undefined : form.credential });
+      const { contextWindowDraft, contextWindowDirty, ...request } = form;
+      await onSaveModel({
+        ...request,
+        credential: form.provider === "ollama" ? undefined : form.credential,
+        ...(contextWindowDirty && contextWindowDraft.trim() ? { context_window_tokens: Number(contextWindowDraft.trim()) } : {}),
+      });
       setForm(null);
     } catch {
       setModelSaveError(zh ? "保存失败，请检查模型配置后重试。" : "Could not save. Check the model configuration and retry.");
@@ -120,12 +127,15 @@ export function SettingsPanel({ locale, initialSection = "models", onClose, mode
   }
 
   async function discoverModels(profileId: string) {
-    if (!onListModels) return;
+    if (!onListModels || modelDiscoveries[profileId]?.state === "loading") return;
+    setModelDiscoveries((current) => ({ ...current, [profileId]: { state: "loading" } }));
     try {
       const models = await onListModels(profileId);
       setModelChoices((current) => ({ ...current, [profileId]: models }));
-    } catch (error) {
-      setModelTests((current) => ({ ...current, [profileId]: { state: "error", message: error instanceof Error ? error.message : String(error) } }));
+      setModelDiscoveries((current) => ({ ...current, [profileId]: { state: models.length ? "success" : "empty" } }));
+    } catch {
+      setModelChoices((current) => ({ ...current, [profileId]: [] }));
+      setModelDiscoveries((current) => ({ ...current, [profileId]: { state: "error" } }));
     }
   }
 
@@ -143,9 +153,10 @@ export function SettingsPanel({ locale, initialSection = "models", onClose, mode
         {form && <section className="model-form" aria-label={zh ? "模型配置" : "Model configuration"}>
           <div className="model-form-grid">
             <label>{zh ? "配置名称" : "Profile label"}<input aria-label="Profile label" value={form.label} onChange={(event) => setForm({ ...form, label: event.target.value })} /></label>
-            <label>{zh ? "模型" : "Model"}<input aria-label="Model" list={isDeepSeek(form) ? "deepseek-models" : undefined} value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })} />{isDeepSeek(form) && <><datalist id="deepseek-models">{deepSeekModels.map((model) => <option key={model} value={model} />)}</datalist><small>{zh ? "可选择预设或输入模型 ID；保存后可查询当前可用模型。" : "Choose a preset or enter a model ID; discover available models after saving."}</small></>}</label>
-            <label className="wide">Base URL<input aria-label="Base URL" value={form.base_url} onChange={(event) => setForm({ ...form, base_url: event.target.value })} /></label>
+            <label>{zh ? "模型" : "Model"}<input aria-label="Model" list={isDeepSeek(form) ? "deepseek-models" : undefined} value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value, contextWindowDraft: "", contextWindowDirty: false })} />{isDeepSeek(form) && <><datalist id="deepseek-models">{deepSeekModels.map((model) => <option key={model} value={model} />)}</datalist><small>{zh ? "可选择预设或输入模型 ID；保存后可查询当前可用模型。" : "Choose a preset or enter a model ID; discover available models after saving."}</small></>}</label>
+            <label className="wide">Base URL<input aria-label="Base URL" value={form.base_url} onChange={(event) => setForm({ ...form, base_url: event.target.value, contextWindowDraft: "", contextWindowDirty: false })} /></label>
             {form.provider !== "ollama" && <label className="wide">API key<input aria-label="API key" type="password" autoComplete="new-password" value={form.credential} onChange={(event) => setForm({ ...form, credential: event.target.value })} /></label>}
+            <label className="wide">{zh ? "配置上下文预算" : "Configured context budget"}<input aria-label={zh ? "配置上下文预算" : "Configured context budget"} inputMode="numeric" value={form.contextWindowDraft} onChange={(event) => setForm({ ...form, contextWindowDraft: event.target.value, contextWindowDirty: true })} /><small>{zh ? "留空或不修改会省略该字段：同一模型身份保留已保存值；刷新目录时由宿主采用新的精确目录默认值。该值不是实际输入额度。" : "Leave unchanged or blank to keep the saved value for the same model identity; a catalog refresh lets the host adopt the new exact-catalog default. This is not the effective input allowance."}</small>{budgetError && <small className="field-error" role="alert">{budgetError}</small>}</label>
             {form.provider === "open_ai_compatible" && <label className="wide">{zh ? "请求推理档位" : "Requested reasoning effort"}<select aria-label="Requested reasoning effort" value={form.reasoning_effort ?? ""} onChange={(event) => setForm({ ...form, reasoning_effort: (event.target.value || null) as ModelProfile["reasoning_effort"] })}>
               <option value="">{zh ? "服务端默认" : "Provider default"}</option>
               {["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"].map((effort) => <option key={effort} value={effort}>{effort}</option>)}
@@ -155,7 +166,7 @@ export function SettingsPanel({ locale, initialSection = "models", onClose, mode
               <option value="standard">{zh ? "标准" : "Standard"}</option>
               <option value="fast" disabled={!fastModeAvailable && form.fast_mode !== true}>Fast</option>
             </select><small>{zh ? "请求 Fast 处理；可用性取决于提供方。" : "Requests Fast processing; availability depends on the provider."}</small></label>
-            {form.id && <label className="wide"><span><input type="checkbox" aria-label="Refresh catalog capabilities" checked={form.refresh_catalog ?? false} onChange={(event) => setForm({ ...form, refresh_catalog: event.target.checked })} />{zh ? "保存时采用当前目录能力" : "Adopt current catalog capabilities on save"}</span><small>{zh ? "更新能力快照并使用目录上下文额度。保留请求推理档位；能力或预算变化可能使旧运行无法恢复。目录未收录的模型无法刷新。" : "Updates the capability snapshot and uses the catalog context allowance. Keeps requested effort; capability or budget changes may prevent old runs from resuming. Requires an exact catalog entry."}</small></label>}
+            {form.id && <label className="wide"><span><input type="checkbox" aria-label="Refresh catalog capabilities" checked={form.refresh_catalog ?? false} onChange={(event) => setForm({ ...form, refresh_catalog: event.target.checked })} />{zh ? "保存时采用当前目录能力" : "Adopt current catalog capabilities on save"}</span><small>{zh ? "更新能力快照；配置预算未修改时采用新目录默认值。保留请求推理档位；能力或预算变化可能使旧运行无法恢复。目录未收录的模型无法刷新。" : "Updates the capability snapshot and adopts the new catalog default when the configured budget is unchanged. Keeps requested effort; capability or budget changes may prevent old runs from resuming. Requires an exact catalog entry."}</small></label>}
             <label className="wide">{zh ? "只读子 Agent 模型" : "Read-only subagent model"}<select aria-label="Read-only subagent model" value={form.delegated_model_profile_id ?? ""} onChange={(event) => setForm({ ...form, delegated_model_profile_id: event.target.value || null })}>
               <option value="">{zh ? "沿用主模型" : "Inherit main model"}</option>
               {modelProfiles.filter((profile) => profile.id !== form.id && profile.supports_tools).map((profile) => <option key={profile.id} value={profile.id}>{profile.label} · {profile.model}</option>)}
@@ -163,13 +174,20 @@ export function SettingsPanel({ locale, initialSection = "models", onClose, mode
             </select><small>{zh ? "用于新建普通 Agent 任务的只读委派；运行中任务保留原配置。" : "Used for read-only delegation in new ordinary Agent runs; existing runs keep their configuration."}</small></label>
           </div>
           {modelSaveError && <p role="alert">{modelSaveError}</p>}
-          <div className="model-form-actions"><button onClick={() => setForm(null)}>{zh ? "取消" : "Cancel"}</button><button className="primary" disabled={saving || !form.label.trim() || !form.model.trim()} onClick={saveProvider}>{zh ? "保存提供方" : "Save provider"}</button></div>
+          <div className="model-form-actions"><button onClick={() => setForm(null)}>{zh ? "取消" : "Cancel"}</button><button className="primary" disabled={saving || Boolean(budgetError) || !form.label.trim() || !form.model.trim()} onClick={saveProvider}>{zh ? "保存提供方" : "Save provider"}</button></div>
         </section>}
-        {modelProfiles.length > 0 && <div className="configured-models">{modelProfiles.map((profile) => { const probe = modelTests[profile.id]; const choices = modelChoices[profile.id] ?? []; const editProfile = (model: string) => setForm({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model, credential: "", reasoning_effort: profile.reasoning_effort ?? null, delegated_model_profile_id: profile.delegated_model_profile_id ?? null, ...(profile.fast_mode !== undefined ? { fast_mode: profile.fast_mode } : {}) }); return <div key={profile.id}><span><b>{profile.label}</b><small>{profile.model} · {profile.provider}</small>{profile.catalog_capabilities && <small>{zh ? "目录快照" : "Catalog snapshot"} (models.dev / {profile.catalog_capabilities.source_provider}) · {zh ? "上下文上限" : "Context limit"} {profile.catalog_capabilities.context_limit} · {zh ? "输出上限" : "Output limit"} {profile.catalog_capabilities.output_limit}</small>}</span><button onClick={() => editProfile(profile.model)}>{zh ? "编辑" : "Edit"}</button><button disabled={!onListModels} onClick={() => void discoverModels(profile.id)}>{zh ? "可用模型" : "Models"}</button><button disabled={probe?.state === "testing" || !onProbeModel} onClick={() => void testModel(profile.id)}>{probe?.state === "testing" ? <><LoaderCircle className="spin" size={13} />{zh ? "测试中" : "Testing"}</> : (zh ? "测试" : "Test")}</button>{choices.length > 0 && <div className="model-choices"><small>{zh ? "网关当前可用，点击后保存：" : "Available now; click to edit:"}</small>{choices.map((model) => <button key={model} onClick={() => editProfile(model)}>{model}</button>)}</div>}{probe?.state === "success" && probe.result && <div className="model-probe-result success" role="status"><CheckCircle2 size={15} /><span><b>{zh ? "连接成功" : "Connection succeeded"}</b><small>{probe.result.model} · {probe.result.latency_ms} ms · {probe.result.endpoint}</small><code>{probe.result.response_preview}</code></span></div>}{probe?.state === "error" && <div className="model-probe-result error" role="alert"><XCircle size={15} /><span><b>{zh ? "测试失败" : "Test failed"}</b><small>{probe.message}</small></span></div>}</div>; })}</div>}
+        {modelProfiles.length > 0 && <div className="configured-models">{modelProfiles.map((profile) => { const probe = modelTests[profile.id]; const discovery = modelDiscoveries[profile.id]; const choices = modelChoices[profile.id] ?? []; const editProfile = (model: string) => setForm({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model, credential: "", contextWindowDraft: model === profile.model ? String(profile.context_window_tokens ?? "") : "", contextWindowDirty: false, reasoning_effort: profile.reasoning_effort ?? null, delegated_model_profile_id: profile.delegated_model_profile_id ?? null, ...(profile.fast_mode !== undefined ? { fast_mode: profile.fast_mode } : {}) }); return <div key={profile.id}><span><b>{profile.label}</b><small>{profile.model} · {profile.provider}</small>{profile.catalog_capabilities && <small>{zh ? "目录快照" : "Catalog snapshot"} (models.dev / {profile.catalog_capabilities.source_provider}) · {zh ? "上下文上限" : "Context limit"} {profile.catalog_capabilities.context_limit} · {zh ? "输出上限" : "Output limit"} {profile.catalog_capabilities.output_limit}</small>}</span><button onClick={() => editProfile(profile.model)}>{zh ? "编辑" : "Edit"}</button><button disabled={!onListModels || discovery?.state === "loading"} onClick={() => void discoverModels(profile.id)}>{discovery?.state === "loading" ? <><LoaderCircle className="spin" size={13} />{zh ? "正在查询模型" : "Loading models"}</> : discovery?.state === "error" ? (zh ? "重试查询模型" : "Retry models") : (zh ? "可用模型" : "Models")}</button><button disabled={probe?.state === "testing" || !onProbeModel} onClick={() => void testModel(profile.id)}>{probe?.state === "testing" ? <><LoaderCircle className="spin" size={13} />{zh ? "测试中" : "Testing"}</> : (zh ? "测试" : "Test")}</button>{discovery?.state === "error" && <div className="model-discovery-state error" role="alert">{zh ? "无法查询可用模型，请重试。" : "Could not list models. Retry the query."}</div>}{discovery?.state === "empty" && <div className="model-discovery-state" role="status">{zh ? "提供方未返回任何模型。" : "The provider returned no models."}</div>}{choices.length > 0 && <div className="model-choices"><small>{zh ? "网关当前可用，点击后保存：" : "Available now; click to edit:"}</small>{choices.map((model) => <button key={model} onClick={() => editProfile(model)}>{model}</button>)}</div>}{probe?.state === "success" && probe.result && <div className="model-probe-result success" role="status"><CheckCircle2 size={15} /><span><b>{zh ? "连接成功" : "Connection succeeded"}</b><small>{probe.result.model} · {probe.result.latency_ms} ms · {probe.result.endpoint}</small><code>{probe.result.response_preview}</code></span></div>}{probe?.state === "error" && <div className="model-probe-result error" role="alert"><XCircle size={15} /><span><b>{zh ? "测试失败" : "Test failed"}</b><small>{probe.message}</small></span></div>}</div>; })}</div>}
         <div className="settings-note"><ShieldCheck size={18} /><span><b>{zh ? "外部服务边界" : "External service boundary"}</b><small>{zh ? "模型与外部服务可能接收提示词、结果或元数据；使用前请确认目标服务。" : "Models and external services may receive prompts, results, or metadata. Review the destination before use."}</small></span></div>
       </main> : section === "remote" ? <RemoteSettings locale={locale} connections={connections} selectedProject={selectedProject} onSave={onSaveConnection} onTest={onTestConnection} onConfirm={onConfirmHostKey} onBind={onBindProjectRemote} /> : section === "skills" ? <SkillsAndMcpSettings locale={locale} skillPackages={skillPackages} skillsBusy={skillsBusy} skillError={skillError} onImportSkill={onImportSkill ? importSkill : undefined} onSetSkillEnabled={onSetSkillEnabled} mcpServers={mcpServers} selectedProject={selectedProject} onSaveMcpServer={onSaveMcpServer} onInspectMcpServer={onInspectMcpServer} onSetMcpServerEnabled={onSetMcpServerEnabled} onSetMcpLaunchApproval={onSetMcpLaunchApproval} onSetMcpToolApproval={onSetMcpToolApproval} onListBundledMcpPresets={onListBundledMcpPresets} onAddBundledMcp={onAddBundledMcp} onConfigurePubMedMcp={onConfigurePubMedMcp} /> : section === "agent" ? <AgentSettings locale={locale} /> : section === "browser" ? <BrowserSettings locale={locale} /> : <PrivacySettings locale={locale} selectedProject={selectedProject} onNavigate={navigate} />}
     </div>
   </section></div>;
+}
+
+function contextWindowError(value: string, dirty: boolean, zh: boolean): string {
+  if (!dirty || value.trim() === "") return "";
+  if (!/^\d+$/.test(value.trim())) return zh ? "请输入 1 到 4294967295 的整数。" : "Enter a whole number from 1 to 4294967295.";
+  const parsed = Number(value.trim());
+  return Number.isSafeInteger(parsed) && parsed >= 1 && parsed <= 4294967295 ? "" : (zh ? "请输入 1 到 4294967295 的整数。" : "Enter a whole number from 1 to 4294967295.");
 }
 
 function PrivacySettings({ locale, selectedProject, onNavigate }: { locale: Locale; selectedProject?: WorkspaceProject | null; onNavigate: (section: SettingsSection) => void }) {

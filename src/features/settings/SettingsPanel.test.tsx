@@ -70,6 +70,58 @@ describe("SettingsPanel model providers", () => {
     expect(screen.getByRole("dialog")).toBeInTheDocument();
   });
 
+  it("shows a saved context budget but omits it until the user enters a non-empty replacement", async () => {
+    const profile = { id: "budget", label: "Budget", provider: "open_ai_compatible" as const, base_url: "https://api.openai.com/v1", model: "gpt-5.6-sol", credential_reference: null, supports_tools: true, supports_vision: false, context_window_tokens: 32000 };
+    const save = vi.fn().mockResolvedValue(undefined);
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[profile]} onSaveModel={save} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByLabelText("Configured context budget")).toHaveValue("32000");
+    expect(screen.getByText(/Leave unchanged or blank to keep the saved value/)).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("Refresh catalog capabilities"));
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    await waitFor(() => expect(save).toHaveBeenCalledOnce());
+    expect(save.mock.calls[0][0]).not.toHaveProperty("context_window_tokens");
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByLabelText("Configured context budget"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(2));
+    expect(save.mock.calls[1][0]).not.toHaveProperty("context_window_tokens");
+  });
+
+  it("submits only valid positive u32 context budgets", async () => {
+    const save = vi.fn().mockResolvedValue(undefined);
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} onSaveModel={save} />);
+    fireEvent.click(screen.getByRole("button", { name: "Configure OpenAI-compatible" }));
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "custom-model" } });
+    const budget = screen.getByLabelText("Configured context budget");
+
+    for (const invalid of ["0", "-1", "1.5", "4294967296", "abc"]) {
+      fireEvent.change(budget, { target: { value: invalid } });
+      expect(screen.getByRole("button", { name: "Save provider" })).toBeDisabled();
+      expect(screen.getByRole("alert")).toHaveTextContent("whole number from 1 to 4294967295");
+    }
+
+    fireEvent.change(budget, { target: { value: "4294967295" } });
+    expect(screen.getByRole("button", { name: "Save provider" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    await waitFor(() => expect(save).toHaveBeenCalledWith(expect.objectContaining({ context_window_tokens: 4294967295 })));
+  });
+
+  it("clears the context budget draft when the model identity changes", () => {
+    const profile = { id: "budget", label: "Budget", provider: "open_ai_compatible" as const, base_url: "https://api.openai.com/v1", model: "gpt-5.6-sol", credential_reference: null, supports_tools: true, supports_vision: false, context_window_tokens: 32000 };
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[profile]} />);
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    const budget = screen.getByLabelText("Configured context budget");
+    expect(budget).toHaveValue("32000");
+    fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "https://gateway.example/v1" } });
+    expect(budget).toHaveValue("");
+    fireEvent.change(budget, { target: { value: "64000" } });
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "other-model" } });
+    expect(budget).toHaveValue("");
+  });
+
   it("round trips a profile Fast mode override and lets the user restore model inheritance", async () => {
     const profile = { id: "fast", label: "Fast profile", provider: "open_ai_compatible" as const, base_url: "https://api.openai.com/v1", model: "gpt-5.6-luna", credential_reference: "model/fast", supports_tools: true, supports_vision: false, fast_mode: true as const };
     const save = vi.fn().mockResolvedValue(undefined);
@@ -255,6 +307,31 @@ describe("SettingsPanel model providers", () => {
     expect(screen.getByLabelText("Model")).toHaveValue("gpt-5.6-terra");
     expect(screen.getByLabelText("Base URL")).toHaveValue("https://models.example/v1");
     expect(screen.getByLabelText("API key")).toHaveValue("");
+  });
+
+  it("keeps model discovery feedback independent from probe state and supports a sanitized retry", async () => {
+    const profile = { id: "model-1", label: "Lab gateway", provider: "open_ai_compatible" as const, base_url: "https://models.example/v1", model: "science-model", credential_reference: "model/model-1", supports_tools: true, supports_vision: false };
+    let rejectDiscovery!: (error: Error) => void;
+    const firstDiscovery = new Promise<string[]>((_resolve, reject) => { rejectDiscovery = reject; });
+    const onListModels = vi.fn().mockReturnValueOnce(firstDiscovery).mockResolvedValueOnce([]);
+    const onProbeModel = vi.fn().mockResolvedValue({ endpoint: "https://models.example/v1/chat/completions", protocol: "OpenAiCompatible", model: "science-model", latency_ms: 42, response_preview: "OK" });
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[profile]} onListModels={onListModels} onProbeModel={onProbeModel} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Models" }));
+    expect(screen.getByRole("button", { name: "Loading models" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Loading models" }));
+    expect(onListModels).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("button", { name: "Test" }));
+    expect(await screen.findByText("Connection succeeded")).toBeInTheDocument();
+
+    rejectDiscovery(new Error("401 credential=secret-value"));
+    expect(await screen.findByText("Could not list models. Retry the query.")).toBeInTheDocument();
+    expect(screen.queryByText(/secret-value/)).not.toBeInTheDocument();
+    expect(screen.getByText("Connection succeeded")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry models" }));
+    expect(await screen.findByText("The provider returned no models.")).toBeInTheDocument();
+    expect(onListModels).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("Connection succeeded")).toBeInTheDocument();
   });
 
   it("imports versioned skills and keeps them disabled until explicit enablement", async () => {
