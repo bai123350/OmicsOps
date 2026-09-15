@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { SyncEntry, WorkspaceProject } from "../../types";
@@ -170,6 +170,27 @@ describe("RemoteAccessSettings", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("resume dispatch uncertain");
     expect(screen.getByText("results/broken.tsv")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Retry results/broken.tsv" })).toBeEnabled();
+  });
+
+  it("does not let an older refresh overwrite a successful retry", async () => {
+    const refresh = deferred<SyncEntry[]>();
+    const failed = entry("broken", "failed");
+    const resumed = entry("broken", "transferring", { error: null, updated_at: "2026-09-15T10:01:00Z" });
+    api.listSyncEntries.mockResolvedValueOnce([failed]).mockReturnValueOnce(refresh.promise);
+    api.retrySyncTransfer.mockResolvedValue(resumed);
+    render(<RemoteAccessSettings selectedProject={project("project-1")} locale="en-US" onOpenEnvironments={() => undefined} />);
+    expect(await screen.findByText("Failed")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh transfer records" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry results/broken.tsv" }));
+    expect(await screen.findByText("Transferring")).toBeInTheDocument();
+
+    await act(async () => {
+      refresh.resolve([failed]);
+      await refresh.promise;
+    });
+    expect(screen.getByText("Transferring")).toBeInTheDocument();
+    expect(screen.queryByText("Failed")).not.toBeInTheDocument();
   });
 
   it("passes only the selected project's root and relative paths to upload", async () => {

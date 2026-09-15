@@ -119,6 +119,8 @@ export function RemoteAccessSettings({
       } else {
         const next = await retrySyncTransfer(item.id);
         if (projectGeneration.current === generation) {
+          ++snapshotRequest.current;
+          setLoading(false);
           setEntries((current) => mergeEntries(current, [next], selectedProject.id));
         }
       }
@@ -150,6 +152,8 @@ export function RemoteAccessSettings({
       if (relativePaths.length === 0) return;
       const uploaded = await uploadSelectedFiles(project.id, relativePaths);
       if (projectGeneration.current === generation) {
+        ++snapshotRequest.current;
+        setLoading(false);
         setEntries((current) => mergeEntries(current, uploaded, project.id));
         setNotice(zh
           ? `${uploaded.length} 个文件传输已完成`
@@ -177,6 +181,8 @@ export function RemoteAccessSettings({
     try {
       const result = await downloadProjectFile(project.id, relativePath);
       if (projectGeneration.current === generation) {
+        ++snapshotRequest.current;
+        setLoading(false);
         setEntries((current) => mergeEntries(current, [result.entry], project.id));
         setNotice(result.conflict
           ? zh
