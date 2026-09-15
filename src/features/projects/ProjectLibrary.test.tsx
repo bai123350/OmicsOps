@@ -28,7 +28,7 @@ const recentProject = {
 
 describe("ProjectLibrary project location flow", () => {
   it("closes the create dialog on window Escape without moving focus into it", () => {
-    render(<ProjectLibrary {...baseProps} onChooseLocalRoot={vi.fn().mockResolvedValue(null)} onCreate={vi.fn()} />);
+    render(<ProjectLibrary {...baseProps} onChooseLocalRoot={vi.fn().mockResolvedValue({ path: null, usedFallback: false })} onCreate={vi.fn()} />);
     fireEvent.click(screen.getByRole("button", { name: /单细胞 RNA 测序/ }));
     expect(screen.getByRole("button", { name: "创建项目" })).toBeInTheDocument();
     fireEvent.keyDown(window, { key: "Escape" });
@@ -37,7 +37,7 @@ describe("ProjectLibrary project location flow", () => {
 
   it("makes a local-only project explicit before creation", async () => {
     const onCreate = vi.fn().mockResolvedValue(undefined);
-    render(<ProjectLibrary {...baseProps} connections={[]} onChooseLocalRoot={vi.fn().mockResolvedValue("E:/Science/pbmc")} onCreate={onCreate} />);
+    render(<ProjectLibrary {...baseProps} connections={[]} onChooseLocalRoot={vi.fn().mockResolvedValue({ path: "E:/Science/pbmc", usedFallback: false })} onCreate={onCreate} />);
 
     fireEvent.click(screen.getByRole("button", { name: /单细胞 RNA 测序/ }));
     expect(screen.getByRole("radio", { name: /仅本地/ })).toBeChecked();
@@ -51,7 +51,7 @@ describe("ProjectLibrary project location flow", () => {
   it("shows the exact trusted server address for hybrid projects", async () => {
     const connection = { id: "connection-1", label: "Lab Linux", host: "compute.example.org", port: 20090, username: "researcher", authentication: "password" as const, authentication_reference: "ssh/connection-1", host_key_fingerprint: "SHA256:trusted" };
     const onCreate = vi.fn().mockResolvedValue(undefined);
-    render(<ProjectLibrary {...baseProps} connections={[connection]} onChooseLocalRoot={vi.fn().mockResolvedValue("E:/Science/pbmc")} onCreate={onCreate} />);
+    render(<ProjectLibrary {...baseProps} connections={[connection]} onChooseLocalRoot={vi.fn().mockResolvedValue({ path: "E:/Science/pbmc", usedFallback: false })} onCreate={onCreate} />);
 
     fireEvent.click(screen.getByRole("button", { name: /单细胞 RNA 测序/ }));
     expect(screen.getByRole("radio", { name: /本地工作区 \+ 远端 Linux 计算/ })).toBeChecked();
@@ -74,6 +74,16 @@ describe("ProjectLibrary project location flow", () => {
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining("本地目录 E:/Science/pbmc 及远端文件不会被删除"));
     await waitFor(() => expect(onDelete).toHaveBeenCalledWith("project-1"));
     expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it("reports when a missing saved start folder falls back to the system picker", async () => {
+    render(<ProjectLibrary {...baseProps} onChooseLocalRoot={vi.fn().mockResolvedValue({ path: "E:/Replacement", usedFallback: true })} onCreate={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: /单细胞 RNA 测序/ }));
+
+    fireEvent.click(screen.getByRole("button", { name: "选择目录" }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent("保存的起始目录已不可用，文件夹选择器已使用系统默认位置");
+    expect(screen.getByText("E:/Replacement")).toBeInTheDocument();
   });
 
   it("keeps the project when deletion is canceled or fails", async () => {

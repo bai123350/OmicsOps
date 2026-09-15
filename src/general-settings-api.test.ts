@@ -7,6 +7,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open }));
 import {
   chooseProjectDirectoryStartingAt,
   settingsGeneralPreferences,
+  settingsProjectDirectoryStartAvailable,
   settingsGeneralSystemStatus,
   settingsProbeSystemInterpreters,
   settingsSaveGeneralPreferences,
@@ -29,26 +30,29 @@ describe("General settings API", () => {
     await settingsSaveGeneralPreferences({ project_directory_start: "E:/Science" });
     await settingsGeneralSystemStatus();
     await settingsProbeSystemInterpreters();
+    await settingsProjectDirectoryStartAvailable("E:/Science");
     expect(invoke.mock.calls).toEqual([
       ["settings_general_preferences"],
       ["settings_save_general_preferences", { preferences: { project_directory_start: "E:/Science" } }],
       ["settings_general_system_status"],
       ["settings_probe_system_interpreters"],
+      ["settings_project_directory_start_available", { path: "E:/Science" }],
     ]);
   });
 
   it("falls back to an ordinary picker when a saved start path is no longer usable", async () => {
-    open.mockRejectedValueOnce(new Error("missing default path")).mockResolvedValueOnce("E:/Replacement");
+    invoke.mockResolvedValueOnce(false);
+    open.mockResolvedValueOnce("E:/Replacement");
     await expect(chooseProjectDirectoryStartingAt("E:/Missing")).resolves.toEqual({ path: "E:/Replacement", usedFallback: true });
-    expect(open).toHaveBeenNthCalledWith(1, { directory: true, multiple: false, defaultPath: "E:/Missing" });
-    expect(open).toHaveBeenNthCalledWith(2, { directory: true, multiple: false });
+    expect(open).toHaveBeenCalledOnce();
+    expect(open).toHaveBeenCalledWith({ directory: true, multiple: false });
   });
 
   it("uses the persisted start for the project creation picker", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
-    invoke.mockResolvedValueOnce({ project_directory_start: "E:/Science" });
+    invoke.mockResolvedValueOnce({ project_directory_start: "E:/Science" }).mockResolvedValueOnce(true);
     open.mockResolvedValueOnce("E:/Science/PBMC");
-    await expect(chooseProjectDirectory()).resolves.toBe("E:/Science/PBMC");
+    await expect(chooseProjectDirectory()).resolves.toEqual({ path: "E:/Science/PBMC", usedFallback: false });
     expect(open).toHaveBeenCalledWith({ directory: true, multiple: false, defaultPath: "E:/Science" });
   });
 });

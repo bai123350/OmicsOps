@@ -3,6 +3,7 @@ import { BookOpen, ChevronRight, Dna, FilePlus2, FlaskConical, FolderOpen, HardD
 import type { ConnectionProfile, WorkspaceProject, WorkspaceTemplate } from "../../types";
 import type { Locale } from "../workspace/copy";
 import { useWindowEscapeLayer } from "../settings/BrowserSettings";
+import type { ProjectDirectoryChoice } from "../../general-settings-api";
 import "./project-library.css";
 import "./create-project.css";
 
@@ -19,7 +20,7 @@ interface Props {
   connections?: ConnectionProfile[];
   locale: Locale;
   onLocaleChange: (locale: Locale) => void;
-  onChooseLocalRoot: () => Promise<string | null>;
+  onChooseLocalRoot: () => Promise<ProjectDirectoryChoice>;
   onCreate: (options: CreateProjectOptions) => Promise<void>;
   onOpen: (project: WorkspaceProject) => void;
   onDelete: (projectId: string) => Promise<void>;
@@ -45,13 +46,14 @@ export function ProjectLibrary({ projects, connections = [], locale, onLocaleCha
   const [remoteRoot, setRemoteRoot] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  const [directoryNotice, setDirectoryNotice] = useState("");
   const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState("");
   useWindowEscapeLayer(template !== null, () => { if (!submitting) setTemplate(null); });
   const selectedConnection = connections.find((connection) => connection.id === connectionId);
 
   function beginCreate(id: WorkspaceTemplate, initialName: string) {
-    setTemplate(id); setName(initialName); setLocalRoot(""); setRemoteRoot(""); setError("");
+    setTemplate(id); setName(initialName); setLocalRoot(""); setRemoteRoot(""); setError(""); setDirectoryNotice("");
     const firstTrusted = trustedConnections[0];
     setCompute(firstTrusted ? "remote" : "local");
     setConnectionId(firstTrusted?.id ?? "");
@@ -92,7 +94,7 @@ export function ProjectLibrary({ projects, connections = [], locale, onLocaleCha
     </main>
     {template && <div className="create-project-backdrop"><section className="create-project-dialog" role="dialog" aria-modal="true" aria-label={zh ? "创建新项目" : "Create project"}><header><div><small>{zh ? "本地工作区与计算位置" : "Workspace and compute location"}</small><h2>{zh ? "创建新项目" : "Create project"}</h2></div><button aria-label="Close" onClick={() => setTemplate(null)}><X size={18} /></button></header><div className="create-project-body">
       <label>{zh ? "项目名称" : "Project name"}<input aria-label={zh ? "项目名称" : "Project name"} value={name} onChange={(event) => setName(event.target.value)} /></label>
-      <div className="location-card"><HardDrive size={20} /><div><b>{zh ? "本地工作区（必选）" : "Local workspace (required)"}</b><small>{zh ? "文献、笔记、脚本及选定产物保存在这里，不会自动全量上传。" : "Literature, notes, scripts, and selected artifacts live here and are never fully uploaded implicitly."}</small><code>{localRoot || (zh ? "尚未选择本地目录" : "No local folder selected")}</code></div><button onClick={async () => { const root = await onChooseLocalRoot(); if (root) setLocalRoot(root); }}><FolderOpen size={14} />{zh ? "选择目录" : "Choose"}</button></div>
+      <div className="location-card"><HardDrive size={20} /><div><b>{zh ? "本地工作区（必选）" : "Local workspace (required)"}</b><small>{zh ? "文献、笔记、脚本及选定产物保存在这里，不会自动全量上传。" : "Literature, notes, scripts, and selected artifacts live here and are never fully uploaded implicitly."}</small><code>{localRoot || (zh ? "尚未选择本地目录" : "No local folder selected")}</code>{directoryNotice && <small className="directory-fallback-notice" role="status">{directoryNotice}</small>}</div><button onClick={async () => { const choice = await onChooseLocalRoot(); if (choice.usedFallback) setDirectoryNotice(zh ? "保存的起始目录已不可用，文件夹选择器已使用系统默认位置。" : "The saved start folder is unavailable. The folder picker used the system default location."); if (choice.path) setLocalRoot(choice.path); }}><FolderOpen size={14} />{zh ? "选择目录" : "Choose"}</button></div>
       <fieldset className="compute-choice"><legend>{zh ? "分析在哪里运行？" : "Where should analyses run?"}</legend><label className={compute === "local" ? "active" : ""}><input type="radio" name="compute" checked={compute === "local"} onChange={() => setCompute("local")} /><HardDrive size={18} /><span><b>{zh ? "仅本地" : "Local only"}</b><small>{zh ? "创建本地工作区；SSH 分析和远端探索暂不可用。" : "Creates a local workspace; SSH analyses and remote exploration remain unavailable."}</small></span></label><label className={compute === "remote" ? "active" : ""}><input type="radio" name="compute" checked={compute === "remote"} onChange={() => setCompute("remote")} disabled={trustedConnections.length === 0} /><Server size={18} /><span><b>{zh ? "本地工作区 + 远端 Linux 计算" : "Local workspace + remote Linux compute"}</b><small>{trustedConnections.length ? (zh ? "只上传明确选择的文件，大型计算在服务器执行。" : "Only explicitly selected files are uploaded; large analyses run on the server.") : (zh ? "尚无已确认主机指纹的服务器，请先前往设置。" : "No trusted server is available; configure one in Settings first.")}</small></span></label></fieldset>
       {compute === "remote" && <div className="remote-create-fields"><label>{zh ? "远端服务器" : "Remote server"}<select aria-label={zh ? "远端服务器" : "Remote server"} value={connectionId} onChange={(event) => setConnectionId(event.target.value)}>{trustedConnections.map((connection) => <option key={connection.id} value={connection.id}>{connection.label} · {connection.username}@{connection.host}:{connection.port}</option>)}</select></label><label>{zh ? "服务器项目目录" : "Remote project directory"}<input aria-label={zh ? "服务器项目目录" : "Remote project directory"} placeholder="/home/user/omicsops/project" value={remoteRoot} onChange={(event) => setRemoteRoot(event.target.value)} /></label></div>}
       <div className="creation-summary"><b>{zh ? "创建摘要" : "Creation summary"}</b><span><HardDrive size={13} />{zh ? "存储" : "Storage"}: {localRoot || "—"}</span><span>{compute === "remote" && selectedConnection ? <><Server size={13} />{zh ? "计算" : "Compute"}: {selectedConnection.username}@{selectedConnection.host}:{selectedConnection.port}</> : <><HardDrive size={13} />{zh ? "计算" : "Compute"}: {zh ? "本机（不启用 SSH）" : "This computer (SSH disabled)"}</>}</span></div>

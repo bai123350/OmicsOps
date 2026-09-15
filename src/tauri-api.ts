@@ -2,7 +2,7 @@ import type { ComposerReference } from "./types";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { chooseProjectDirectoryStartingAt, settingsGeneralPreferences } from "./general-settings-api";
+import { chooseProjectDirectoryStartingAt, settingsGeneralPreferences, type ProjectDirectoryChoice } from "./general-settings-api";
 
 import type {
   ConnectionProfile,
@@ -57,12 +57,12 @@ export async function getConversationCapabilitiesV4(projectId: string, conversat
 export async function listProjects(): Promise<WorkspaceProject[]> {
   return isTauri() ? invoke("list_projects") : [];
 }
-export async function chooseProjectDirectory(): Promise<string | null> {
-  if (!isTauri()) return "E:/Science/omicsops-demo";
+export async function chooseProjectDirectory(): Promise<ProjectDirectoryChoice> {
+  if (!isTauri()) return { path: "E:/Science/omicsops-demo", usedFallback: false };
   const preferences = await settingsGeneralPreferences().catch(
     (): import("./types").GeneralNativePreferences => ({ project_directory_start: null }),
   );
-  return (await chooseProjectDirectoryStartingAt(preferences.project_directory_start)).path;
+  return chooseProjectDirectoryStartingAt(preferences.project_directory_start);
 }
 
 export async function createProject(request: { name: string; description: string; local_root: string; template: WorkspaceTemplate; connection_id?: string | null; remote_root?: string | null }): Promise<WorkspaceProject> {

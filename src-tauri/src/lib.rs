@@ -228,6 +228,7 @@ pub fn run() {
             general_settings::settings_save_general_preferences,
             general_settings::settings_general_system_status,
             general_settings::settings_probe_system_interpreters,
+            general_settings::settings_project_directory_start_available,
             session_reviews::reviewer_get_settings_v4,
             session_reviews::reviewer_save_settings_v4,
             session_reviews::session_start_review_v4,

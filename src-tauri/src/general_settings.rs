@@ -116,6 +116,10 @@ fn validate_project_directory_start(value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
+pub(crate) fn project_directory_start_available(value: &str) -> bool {
+    validate_project_directory_start(value).is_ok()
+}
+
 pub(crate) async fn load_preferences(
     repository: &Store,
 ) -> Result<GeneralNativePreferences, String> {
@@ -221,6 +225,11 @@ pub async fn settings_save_general_preferences(
     preferences: GeneralNativePreferences,
 ) -> Result<GeneralNativePreferences, String> {
     save_preferences(&state.repository, preferences).await
+}
+
+#[tauri::command]
+pub fn settings_project_directory_start_available(path: String) -> bool {
+    project_directory_start_available(&path)
 }
 
 #[tauri::command]
@@ -414,5 +423,14 @@ mod tests {
         assert!(inspected.contains(&root.path().to_path_buf()));
         assert!(inspected.contains(&junction));
         assert!(!inspected.contains(&child));
+    }
+
+    #[test]
+    fn directory_availability_detects_a_saved_folder_removed_after_save() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().into_owned();
+        assert!(project_directory_start_available(&path));
+        drop(root);
+        assert!(!project_directory_start_available(&path));
     }
 }
