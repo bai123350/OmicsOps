@@ -15,3 +15,15 @@
   opacity: .55;
   cursor: default;
 }
+
+/* Keep every report section at its natural height. The settings main element owns
+   vertical scrolling; sections only provide horizontal scrolling for wide tables. */
+.usage-settings {
+  grid-auto-rows: max-content;
+}
+
+.usage-section {
+  min-height: max-content;
+  overflow-x: auto;
+  overflow-y: visible;
+}
