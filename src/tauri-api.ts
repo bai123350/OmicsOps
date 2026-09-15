@@ -2,6 +2,7 @@ import type { ComposerReference } from "./types";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { chooseProjectDirectoryStartingAt, settingsGeneralPreferences } from "./general-settings-api";
 
 import type {
   ConnectionProfile,
@@ -58,8 +59,10 @@ export async function listProjects(): Promise<WorkspaceProject[]> {
 }
 export async function chooseProjectDirectory(): Promise<string | null> {
   if (!isTauri()) return "E:/Science/omicsops-demo";
-  const selected = await open({ directory: true, multiple: false });
-  return typeof selected === "string" ? selected : null;
+  const preferences = await settingsGeneralPreferences().catch(
+    (): import("./types").GeneralNativePreferences => ({ project_directory_start: null }),
+  );
+  return (await chooseProjectDirectoryStartingAt(preferences.project_directory_start)).path;
 }
 
 export async function createProject(request: { name: string; description: string; local_root: string; template: WorkspaceTemplate; connection_id?: string | null; remote_root?: string | null }): Promise<WorkspaceProject> {

@@ -9,6 +9,7 @@ import * as api from "../../tauri-api";
 import { PetPreferencesProvider } from "../../use-pet-preferences";
 import * as memoryApi from "../../memory-settings-api";
 import * as credentialsApi from "../../credentials-settings-api";
+import * as generalSettingsApi from "../../general-settings-api";
 import * as usageApi from "../../usage-settings-api";
 
 afterEach(() => {
@@ -457,6 +458,15 @@ describe("SettingsPanel model providers", () => {
     fireEvent.change(screen.getByRole("combobox", { name: "界面语言" }), { target: { value: "en-US" } });
     expect(onLocaleChange).toHaveBeenCalledWith("en-US");
     expect(screen.queryByRole("button", { name: /保存/ })).not.toBeInTheDocument();
+  });
+
+  it("shows native General status and routes its real configuration entry points", async () => {
+    vi.spyOn(generalSettingsApi, "settingsGeneralPreferences").mockResolvedValue({ project_directory_start: null });
+    vi.spyOn(generalSettingsApi, "settingsGeneralSystemStatus").mockResolvedValue({ app_version: "1.2.3", app_data_directory: "C:/AppData/OmicsOps", update_status: "unconfigured", update_source_configured: false });
+    render(<SettingsPanel locale="en-US" initialSection="general" onClose={() => undefined} />);
+    expect(await screen.findByText("Version 1.2.3")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Models" }));
+    expect(screen.getByRole("heading", { name: "Model providers" })).toBeInTheDocument();
   });
 
   it("presents the implemented settings in scrollable Wisp groups with a visible return action", () => {

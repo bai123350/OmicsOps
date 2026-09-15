@@ -819,6 +819,29 @@ export interface ContextUsageSnapshotV4 {
 export interface SaveMcpEnvBindingRequest extends McpEnvBinding {
   keep_existing?: boolean;
 }
+
+export interface GeneralNativePreferences {
+  project_directory_start?: string | null;
+}
+
+export interface GeneralSystemStatus {
+  app_version: string;
+  app_data_directory: string;
+  update_status: "unconfigured" | "configured";
+  update_source_configured: boolean;
+}
+
+export interface SystemInterpreterDiagnostic {
+  program: "python" | "Rscript";
+  status: "found" | "missing" | "error";
+  detail?: string | null;
+}
+
+export interface SystemInterpreterDiagnostics {
+  python: SystemInterpreterDiagnostic;
+  r: SystemInterpreterDiagnostic;
+  checked_at: string;
+}
 export interface UsageFilter { project_id?: string | null; from?: string | null; until?: string | null }
 export interface UsageGroup { key: string; label: string; totals: UsageTotalsV4 }
 export interface UsageDay { date: string; attempts: number; tools: number; totals: UsageTotalsV4 }
