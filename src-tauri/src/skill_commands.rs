@@ -509,7 +509,7 @@ fn frontmatter_bool(markdown: &str, key: &str) -> bool {
     })
 }
 
-fn skill_dependencies(markdown: &str) -> BTreeSet<String> {
+pub(crate) fn skill_dependencies(markdown: &str) -> BTreeSet<String> {
     let mut dependencies = BTreeSet::new();
     let mut reading = false;
     for line in frontmatter_lines(markdown) {

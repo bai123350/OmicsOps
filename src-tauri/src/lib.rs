@@ -301,6 +301,8 @@ pub fn run() {
             skill_commands::list_skill_packages,
             skill_commands::import_skill_directory,
             skill_commands::set_skill_enabled,
+            skill_settings::settings_skill_detail,
+            skill_settings::settings_read_skill_file,
             research_commands::search_research,
             kernel_commands::start_kernel,
             kernel_commands::execute_kernel_cell,

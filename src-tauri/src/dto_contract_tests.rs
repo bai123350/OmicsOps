@@ -906,3 +906,55 @@ fn skill_installation_receipt_records_origin_without_file_contents() {
         })
     );
 }
+
+#[test]
+fn skill_settings_detail_and_preview_are_bounded_public_contracts() {
+    use omicsops_dto::{
+        SkillFilePreview, SkillOrigin, SkillSettingsDetail, SkillSettingsFile, SkillSettingsPackage,
+    };
+    let skill_id = uuid::Uuid::from_u128(42);
+    let detail = SkillSettingsDetail {
+        skill: SkillSettingsPackage {
+            id: skill_id,
+            name: "QC".into(),
+            version: "1.0.0".into(),
+            source_path: r"C:\OmicsOps\skills\qc\sha".into(),
+            sha256: "a".repeat(64),
+            enabled: true,
+            capabilities: vec!["read_project_files".into()],
+            category: Some("analysis".into()),
+        },
+        origin: SkillOrigin::ManagedImport,
+        integrity: "verified".into(),
+        files: vec![SkillSettingsFile {
+            relative_path: "SKILL.md".into(),
+            size_bytes: 12,
+            previewable: true,
+        }],
+        inventory_complete: true,
+        dependent_skills: vec![],
+        can_remove_from_library: true,
+        can_delete_files: true,
+        blocking_reasons: vec![],
+    };
+    let detail_value = serde_json::to_value(detail).unwrap();
+    assert_eq!(detail_value["origin"], "managed_import");
+    assert_eq!(detail_value["files"][0]["relative_path"], "SKILL.md");
+    assert!(detail_value.get("content").is_none());
+
+    let preview = SkillFilePreview {
+        relative_path: "SKILL.md".into(),
+        content: "# QC".into(),
+        redacted: false,
+        package_sha256: "a".repeat(64),
+    };
+    assert_eq!(
+        serde_json::to_value(preview).unwrap(),
+        json!({
+            "relative_path":"SKILL.md",
+            "content":"# QC",
+            "redacted":false,
+            "package_sha256":"a".repeat(64)
+        })
+    );
+}

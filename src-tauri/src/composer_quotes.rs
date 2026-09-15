@@ -505,7 +505,7 @@ fn normalize_quote_path(path: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
-fn is_credential_filename(component: &str) -> bool {
+pub(crate) fn is_credential_filename(component: &str) -> bool {
     let lower = component.to_ascii_lowercase();
     if lower == ".env"
         || lower.starts_with(".env.")

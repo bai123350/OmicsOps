@@ -535,7 +535,10 @@ pub use usage_settings::{
 };
 
 mod skill_settings;
-pub use skill_settings::{SkillInstallationReceipt, SkillOrigin};
+pub use skill_settings::{
+    SkillFilePreview, SkillInstallationReceipt, SkillOrigin, SkillSettingsDetail,
+    SkillSettingsFile, SkillSettingsPackage,
+};
 
 mod memory_files;
 pub use memory_files::{
