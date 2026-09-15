@@ -509,6 +509,24 @@ describe("WorkspaceShell composer integration", () => {
     await waitFor(() => expect(onSend).toHaveBeenCalledWith("Review", "chat", [reference]));
   });
 
+  it("refreshes an open composer workflow picker after Settings saves the catalog", async () => {
+    const oldWorkflow = { reference: { kind: "workflow" as const, project_id: project.id, id: "workflow-old" }, label: "Old recipe", description: "Before save" };
+    const savedWorkflow = { reference: { kind: "workflow" as const, project_id: project.id, id: "workflow-new" }, label: "Saved recipe", description: "From Settings" };
+    const catalog = vi.spyOn(referenceApi, "composerReferenceCatalog")
+      .mockResolvedValueOnce([oldWorkflow])
+      .mockResolvedValueOnce([savedWorkflow]);
+    const view = renderShell({ workflowCatalogVersion: 0 });
+    const input = screen.getByRole("textbox", { name: /Describe a research goal/ });
+    fireEvent.change(input, { target: { value: "/", selectionStart: 1 } });
+    expect(await screen.findByRole("option", { name: /Old recipe/ })).toBeInTheDocument();
+
+    view.rerender(<WorkspaceShell project={project} locale="en-US" onLocaleChange={vi.fn()} computeBackends={[localBackend]} computeBackendId="local" workflowCatalogVersion={1} />);
+
+    expect(await screen.findByRole("option", { name: /Saved recipe/ })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: /Old recipe/ })).not.toBeInTheDocument();
+    expect(catalog).toHaveBeenCalledTimes(2);
+  });
+
   it("opens workflow management from the menu and preserves the draft on close", async () => {
     renderShell();
     const input = screen.getByRole("textbox", { name: /Describe a research goal/ });

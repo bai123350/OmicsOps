@@ -95,6 +95,7 @@ export default function DesktopApp() {
   const [agentNotice, setAgentNotice] = useState("");
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>([]);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
+  const [workflowCatalogVersion, setWorkflowCatalogVersion] = useState(0);
   const [activeModelProfileId, setActiveModelProfileId] = useState<string | null>(null);
   const [modelSelectionBusy, setModelSelectionBusy] = useState(false);
   const modelSelectionInFlight = useRef(false);
@@ -1042,7 +1043,7 @@ export default function DesktopApp() {
     setSearchRequest({ key: crypto.randomUUID(), kind: "attach", projectId: selected.id, conversationId: conversation.id, item: entry.item });
     return true;
   }} /> : null;
-  const settings = settingsOpen ? <SettingsPanel key={settingsNavigationKey} initialSection={settingsSection} locale={locale} onLocaleChange={setLocale} onClose={() => setSettingsOpen(false)} modelProfiles={modelProfiles} skillPackages={skillPackages} mcpServers={mcpServers} connections={connections} selectedProject={selected} onSaveConnection={async (profile, secret) => { await api.saveConnection(profile, secret); setConnections(await api.listConnections()); }} onTestConnection={api.testConnection} onConfirmHostKey={async (profileId, fingerprint) => { await api.confirmHostKey(profileId, fingerprint); setConnections(await api.listConnections()); }} onBindProjectRemote={async (connectionId, remoteRoot) => { if (!selected) return; const updated = await api.updateProjectRemote(selected.id, connectionId, remoteRoot); setSelected(updated); setProjects((current) => current.map((project) => project.id === updated.id ? updated : project)); }} onSaveModel={async (request) => {
+  const settings = settingsOpen ? <SettingsPanel key={settingsNavigationKey} initialSection={settingsSection} locale={locale} onLocaleChange={setLocale} onClose={() => setSettingsOpen(false)} modelProfiles={modelProfiles} skillPackages={skillPackages} mcpServers={mcpServers} connections={connections} selectedProject={selected} onWorkflowsChanged={() => setWorkflowCatalogVersion((value) => value + 1)} onSaveConnection={async (profile, secret) => { await api.saveConnection(profile, secret); setConnections(await api.listConnections()); }} onTestConnection={api.testConnection} onConfirmHostKey={async (profileId, fingerprint) => { await api.confirmHostKey(profileId, fingerprint); setConnections(await api.listConnections()); }} onBindProjectRemote={async (connectionId, remoteRoot) => { if (!selected) return; const updated = await api.updateProjectRemote(selected.id, connectionId, remoteRoot); setSelected(updated); setProjects((current) => current.map((project) => project.id === updated.id ? updated : project)); }} onSaveModel={async (request) => {
     if (modelSelectionInFlight.current) throw new Error("Model selection is currently locked");
     modelSelectionInFlight.current = true;
     setModelSelectionBusy(true);
@@ -1245,6 +1246,7 @@ export default function DesktopApp() {
     capabilitySummary={capabilities.summary} capabilitiesLoading={capabilities.loading}
     capabilitiesError={capabilities.error} onRefreshCapabilities={capabilities.refresh}
     project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template }}
+    workflowCatalogVersion={workflowCatalogVersion}
     locale={locale} onLocaleChange={setLocale} onOpenSettings={(section = "models") => { setSettingsSection(section); setSettingsOpen(true); }} onBackToProjects={() => setSelected(null)}
     conversations={conversations} activeConversationId={conversation?.id} onSelectConversation={selectConversation} onNewConversation={newConversation} onOpenBranch={openCreatedBranch} onDeleteConversation={deleteConversation}
     messages={messages} agentBusy={agentBusy} agentNotice={agentNotice} conversationLoadError={conversationLoadError} onRetryConversationLoad={() => setConversationLoadRetry((value) => value + 1)} modelLabel={activeModel?.model} activeModelProfile={activeModel} modelProfiles={modelProfiles}

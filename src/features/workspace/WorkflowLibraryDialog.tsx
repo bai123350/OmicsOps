@@ -38,6 +38,7 @@ export interface WorkflowLibraryDialogProps {
   zh: boolean;
   onClose: () => void;
   onChanged: () => void;
+  presentation?: "dialog" | "embedded";
 }
 
 interface WorkflowDraft {
@@ -118,7 +119,8 @@ function stepCountLabel(count: number, zh: boolean): string {
   return `${count} ${count === 1 ? "step" : "steps"}`;
 }
 
-export function WorkflowLibraryDialog({ projectId, zh, onClose, onChanged }: WorkflowLibraryDialogProps) {
+export function WorkflowLibraryDialog({ projectId, zh, onClose, onChanged, presentation = "dialog" }: WorkflowLibraryDialogProps) {
+  const dialogPresentation = presentation === "dialog";
   const [workflows, setWorkflows] = useState<ComposerWorkflowTemplate[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
@@ -148,10 +150,10 @@ export function WorkflowLibraryDialog({ projectId, zh, onClose, onChanged }: Wor
 
   useLayoutEffect(() => {
     mountedRef.current = true;
-    if (previousFocusRef.current === null && typeof document !== "undefined") {
+    if (dialogPresentation && previousFocusRef.current === null && typeof document !== "undefined") {
       previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     }
-    initialFocusRef.current?.focus();
+    if (dialogPresentation) initialFocusRef.current?.focus();
     return () => {
       mountedRef.current = false;
       loadGenerationRef.current += 1;
@@ -161,9 +163,9 @@ export function WorkflowLibraryDialog({ projectId, zh, onClose, onChanged }: Wor
       const dialog = dialogRef.current;
       const focusIsInDialog = Boolean(dialog && active && dialog.contains(active));
       const focusIsUnowned = active === null || (typeof document !== "undefined" && active === document.body);
-      if (previous?.isConnected && (focusIsInDialog || focusIsUnowned)) previous.focus();
+      if (dialogPresentation && previous?.isConnected && (focusIsInDialog || focusIsUnowned)) previous.focus();
     };
-  }, []);
+  }, [dialogPresentation]);
 
   const editorFocusIdentity = editor ? (editor.id ?? "__new_workflow__") : null;
   useLayoutEffect(() => {
@@ -229,7 +231,7 @@ export function WorkflowLibraryDialog({ projectId, zh, onClose, onChanged }: Wor
     setSaveError("");
   }, []);
 
-  useWindowEscapeLayer(true, closeLibrary);
+  useWindowEscapeLayer(dialogPresentation, closeLibrary);
   useWindowEscapeLayer(editor !== null, closeEditor);
 
   function rememberEditorLaunchFocus(trigger?: HTMLElement) {
@@ -367,17 +369,17 @@ export function WorkflowLibraryDialog({ projectId, zh, onClose, onChanged }: Wor
   const editorTitle = editor?.id ? (zh ? "编辑工作流" : "Edit workflow") : (zh ? "新建工作流" : "New workflow");
 
   return (
-    <div className="workflow-library-backdrop">
-      <section ref={dialogRef} className="workflow-library-dialog" role="dialog" aria-modal="true" aria-labelledby="workflow-library-title" aria-busy={loading || saveBusy || undefined} onKeyDown={handleDialogKeyDown}>
+    <div className={dialogPresentation ? "workflow-library-backdrop" : "workflow-library-embedded"}>
+      <section ref={dialogRef} className="workflow-library-dialog" role={dialogPresentation ? "dialog" : "region"} aria-modal={dialogPresentation || undefined} aria-labelledby="workflow-library-title" aria-busy={loading || saveBusy || undefined} onKeyDown={dialogPresentation ? handleDialogKeyDown : undefined}>
         <header className="workflow-library-header">
           <div>
             <span className="workflow-library-kicker">OmicsOps</span>
             <h2 id="workflow-library-title">{title}</h2>
             <p>{description}</p>
           </div>
-          <button ref={initialFocusRef} type="button" className="workflow-library-close" aria-label={zh ? "关闭工作流库" : "Close workflow library"} onClick={closeLibrary}>
+          {dialogPresentation && <button ref={initialFocusRef} type="button" className="workflow-library-close" aria-label={zh ? "关闭工作流库" : "Close workflow library"} onClick={closeLibrary}>
             <X size={18} />
-          </button>
+          </button>}
         </header>
 
         <div className="workflow-library-body">

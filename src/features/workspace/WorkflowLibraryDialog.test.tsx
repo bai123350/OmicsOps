@@ -60,6 +60,23 @@ beforeEach(() => {
 });
 
 describe("WorkflowLibraryDialog", () => {
+  it("embeds the shared library without a modal layer and keeps Escape scoped to its editor", async () => {
+    listWorkflows.mockResolvedValue([qcWorkflow]);
+    const onClose = vi.fn();
+    renderDialog({ presentation: "embedded", onClose });
+
+    const library = await screen.findByRole("region", { name: "Workflow library" });
+    expect(screen.queryByRole("dialog", { name: "Workflow library" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Close workflow library" })).not.toBeInTheDocument();
+    fireEvent.click(within(library).getByRole("button", { name: "Edit QC recipe" }));
+    expect(screen.getByRole("textbox", { name: "Workflow name" })).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("textbox", { name: "Workflow name" })).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Workflow library" })).toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
   it("lists persisted workflows and opens their ordered steps for editing", async () => {
     listWorkflows.mockResolvedValue([qcWorkflow]);
     renderDialog();

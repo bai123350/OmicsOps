@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { SettingsPanel } from "./SettingsPanel";
 import { setComposerSendPreference } from "./useComposerSendPreference";
 import { AppearanceProvider } from "../../use-appearance";
+import * as workflowApi from "../../composer-workflow-api";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -254,6 +255,39 @@ describe("SettingsPanel model providers", () => {
     expect(screen.getByRole("button", { name: "Appearance" })).toHaveAttribute("aria-current", "page");
     expect(screen.getByRole("heading", { name: "Appearance" })).toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: "Theme" })).toHaveValue("system");
+  });
+
+  it("loads the current project workflow library inside Settings and reports saved catalog changes", async () => {
+    vi.spyOn(workflowApi, "listComposerWorkflows").mockResolvedValue([{
+      id: "workflow-qc", project_id: "project-1", name: "QC recipe", description: "Inspect counts", steps: ["Inspect"], enabled: true,
+    }]);
+    vi.spyOn(workflowApi, "saveComposerWorkflow").mockResolvedValue({
+      id: "workflow-new", project_id: "project-1", name: "Evidence recipe", description: "", steps: ["Collect evidence"], enabled: true,
+    });
+    const onWorkflowsChanged = vi.fn();
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} selectedProject={{ id: "project-1", name: "PBMC", description: "", local_root: "E:/PBMC", remote_root: null, connection_id: null, template: "single_cell_rna_seq", status: "ready", ollama_only: false, created_at: "", updated_at: "" }} onWorkflowsChanged={onWorkflowsChanged} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Workflows" }));
+    expect(await screen.findByText("QC recipe")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Workflow library" })).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Workflow library" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "New workflow" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Workflow name" }), { target: { value: "Evidence recipe" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Step 1" }), { target: { value: "Collect evidence" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
+    await waitFor(() => expect(onWorkflowsChanged).toHaveBeenCalledOnce());
+  });
+
+  it("keeps project workflows actionable from the project library", () => {
+    const list = vi.spyOn(workflowApi, "listComposerWorkflows");
+    const close = vi.fn();
+    render(<SettingsPanel locale="en-US" initialSection="workflows" selectedProject={null} onClose={close} />);
+
+    expect(screen.getByRole("heading", { name: "Workflows" })).toBeInTheDocument();
+    expect(screen.getByText("Open a project first")).toBeInTheDocument();
+    expect(list).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Back to project library" }));
+    expect(close).toHaveBeenCalledOnce();
   });
 
   it("explains privacy boundaries and links to the existing capability settings without a project", () => {

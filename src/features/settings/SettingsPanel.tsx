@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowLeft, Bot, CheckCircle2, Cloud, FolderOpen, Globe2, KeyRound, Languages, Layers3, LoaderCircle, Monitor, Palette, PlugZap, Search, Server, ShieldCheck, Wrench, XCircle } from "lucide-react";
+import { ArrowLeft, Bot, CheckCircle2, ClipboardList, Cloud, FolderOpen, Globe2, KeyRound, Languages, Layers3, LoaderCircle, Monitor, Palette, PlugZap, Search, Server, ShieldCheck, Wrench, XCircle } from "lucide-react";
 import type { ConnectionProfile, ConnectionTestResult, McpEnvBinding, McpServerProfile, ModelProbeResult, ModelProfile, SkillPackage, WorkspaceProject } from "../../types";
 import type { Locale } from "../workspace/copy";
 import { supportsFastMode } from "../../fast-mode";
@@ -10,6 +10,7 @@ import { AgentSettings } from "./AgentSettings";
 import { AppearanceSettings } from "./AppearanceSettings";
 import { useComposerSendPreference } from "./useComposerSendPreference";
 import { useResumeLastSessionPreference } from "./useResumeLastSessionPreference";
+import { WorkflowLibraryDialog } from "../workspace/WorkflowLibraryDialog";
 import "./settings.css";
 import "./model-form.css";
 import "./remote-form.css";
@@ -19,7 +20,7 @@ type FormState = Omit<SaveModelRequest, "context_window_tokens"> & { credential:
 type McpEnvFormBinding = McpEnvBinding & { mode: "literal" | "credential" };
 type SaveMcpServerRequest = { id?: string; name: string; command: string; args: string[]; cwd?: string | null; timeout_secs?: number | null; env_bindings?: McpEnvBinding[] };
 
-export type SettingsSection = "general" | "models" | "remote" | "skills" | "connections" | "browser" | "agent" | "appearance" | "privacy";
+export type SettingsSection = "general" | "models" | "remote" | "skills" | "connections" | "workflows" | "browser" | "agent" | "appearance" | "privacy";
 
 interface Props extends BundledMcpProps {
   locale?: Locale;
@@ -45,6 +46,7 @@ interface Props extends BundledMcpProps {
   onTestConnection?: (profileId: string) => Promise<ConnectionTestResult>;
   onConfirmHostKey?: (profileId: string, fingerprint: string) => Promise<void>;
   onBindProjectRemote?: (connectionId: string, remoteRoot: string) => Promise<void>;
+  onWorkflowsChanged?: () => void;
 }
 
 const defaults: Record<ModelProfile["provider"], FormState> = {
@@ -66,7 +68,7 @@ function isDeepSeek(profile: Pick<ModelProfile, "provider" | "base_url">): boole
   }
 }
 
-export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection = "models", onClose, modelProfiles = [], onSaveModel, onProbeModel, onListModels, skillPackages = [], onImportSkill, onSetSkillEnabled, mcpServers = [], onSaveMcpServer, onInspectMcpServer, onSetMcpServerEnabled, onSetMcpLaunchApproval, onSetMcpToolApproval, onListBundledMcpPresets, onConfigurePubMedMcp, onAddBundledMcp, connections = [], selectedProject, onSaveConnection, onTestConnection, onConfirmHostKey, onBindProjectRemote }: Props) {
+export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection = "models", onClose, modelProfiles = [], onSaveModel, onProbeModel, onListModels, skillPackages = [], onImportSkill, onSetSkillEnabled, mcpServers = [], onSaveMcpServer, onInspectMcpServer, onSetMcpServerEnabled, onSetMcpLaunchApproval, onSetMcpToolApproval, onListBundledMcpPresets, onConfigurePubMedMcp, onAddBundledMcp, connections = [], selectedProject, onSaveConnection, onTestConnection, onConfirmHostKey, onBindProjectRemote, onWorkflowsChanged }: Props) {
   const zh = locale === "zh-CN";
   const [form, setForm] = useState<FormState | null>(null);
   const [saving, setSaving] = useState(false);
@@ -182,7 +184,7 @@ export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection
         </section>}
         {modelProfiles.length > 0 && <div className="configured-models">{modelProfiles.map((profile) => { const probe = modelTests[profile.id]; const discovery = modelDiscoveries[profile.id]; const choices = modelChoices[profile.id] ?? []; const editProfile = (model: string) => setForm({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model, credential: "", contextWindowDraft: model === profile.model ? String(profile.context_window_tokens ?? "") : "", contextWindowDirty: false, reasoning_effort: profile.reasoning_effort ?? null, delegated_model_profile_id: profile.delegated_model_profile_id ?? null, ...(profile.fast_mode !== undefined ? { fast_mode: profile.fast_mode } : {}) }); return <div key={profile.id}><span><b>{profile.label}</b><small>{profile.model} · {profile.provider}</small>{profile.catalog_capabilities && <small>{zh ? "目录快照" : "Catalog snapshot"} (models.dev / {profile.catalog_capabilities.source_provider}) · {zh ? "上下文上限" : "Context limit"} {profile.catalog_capabilities.context_limit} · {zh ? "输出上限" : "Output limit"} {profile.catalog_capabilities.output_limit}</small>}</span><button onClick={() => editProfile(profile.model)}>{zh ? "编辑" : "Edit"}</button><button disabled={!onListModels || discovery?.state === "loading"} onClick={() => void discoverModels(profile.id)}>{discovery?.state === "loading" ? <><LoaderCircle className="spin" size={13} />{zh ? "正在查询模型" : "Loading models"}</> : discovery?.state === "error" ? (zh ? "重试查询模型" : "Retry models") : (zh ? "可用模型" : "Models")}</button><button disabled={probe?.state === "testing" || !onProbeModel} onClick={() => void testModel(profile.id)}>{probe?.state === "testing" ? <><LoaderCircle className="spin" size={13} />{zh ? "测试中" : "Testing"}</> : (zh ? "测试" : "Test")}</button>{discovery?.state === "error" && <div className="model-discovery-state error" role="alert">{zh ? "无法查询可用模型，请重试。" : "Could not list models. Retry the query."}</div>}{discovery?.state === "empty" && <div className="model-discovery-state" role="status">{zh ? "提供方未返回任何模型。" : "The provider returned no models."}</div>}{choices.length > 0 && <div className="model-choices"><small>{zh ? "网关当前可用，点击后保存：" : "Available now; click to edit:"}</small>{choices.map((model) => <button key={model} onClick={() => editProfile(model)}>{model}</button>)}</div>}{probe?.state === "success" && probe.result && <div className="model-probe-result success" role="status"><CheckCircle2 size={15} /><span><b>{zh ? "连接成功" : "Connection succeeded"}</b><small>{probe.result.model} · {probe.result.latency_ms} ms · {probe.result.endpoint}</small><code>{probe.result.response_preview}</code></span></div>}{probe?.state === "error" && <div className="model-probe-result error" role="alert"><XCircle size={15} /><span><b>{zh ? "测试失败" : "Test failed"}</b><small>{probe.message}</small></span></div>}</div>; })}</div>}
         <div className="settings-note"><ShieldCheck size={18} /><span><b>{zh ? "外部服务边界" : "External service boundary"}</b><small>{zh ? "模型与外部服务可能接收提示词、结果或元数据；使用前请确认目标服务。" : "Models and external services may receive prompts, results, or metadata. Review the destination before use."}</small></span></div>
-      </main> : section === "remote" ? <RemoteSettings locale={locale} connections={connections} selectedProject={selectedProject} onSave={onSaveConnection} onTest={onTestConnection} onConfirm={onConfirmHostKey} onBind={onBindProjectRemote} /> : section === "skills" || section === "connections" ? <SkillsAndMcpSettings page={section} locale={locale} skillPackages={skillPackages} skillsBusy={skillsBusy} skillError={skillError} onImportSkill={onImportSkill ? importSkill : undefined} onSetSkillEnabled={onSetSkillEnabled} mcpServers={mcpServers} selectedProject={selectedProject} onSaveMcpServer={onSaveMcpServer} onInspectMcpServer={onInspectMcpServer} onSetMcpServerEnabled={onSetMcpServerEnabled} onSetMcpLaunchApproval={onSetMcpLaunchApproval} onSetMcpToolApproval={onSetMcpToolApproval} onListBundledMcpPresets={onListBundledMcpPresets} onAddBundledMcp={onAddBundledMcp} onConfigurePubMedMcp={onConfigurePubMedMcp} /> : section === "agent" ? <AgentSettings locale={locale} /> : section === "appearance" ? <AppearanceSettings locale={locale} /> : section === "browser" ? <BrowserSettings locale={locale} /> : section === "privacy" ? <PrivacySettings locale={locale} selectedProject={selectedProject} onNavigate={navigate} /> : <GeneralSettings locale={locale} onLocaleChange={onLocaleChange} />}
+      </main> : section === "remote" ? <RemoteSettings locale={locale} connections={connections} selectedProject={selectedProject} onSave={onSaveConnection} onTest={onTestConnection} onConfirm={onConfirmHostKey} onBind={onBindProjectRemote} /> : section === "skills" || section === "connections" ? <SkillsAndMcpSettings page={section} locale={locale} skillPackages={skillPackages} skillsBusy={skillsBusy} skillError={skillError} onImportSkill={onImportSkill ? importSkill : undefined} onSetSkillEnabled={onSetSkillEnabled} mcpServers={mcpServers} selectedProject={selectedProject} onSaveMcpServer={onSaveMcpServer} onInspectMcpServer={onInspectMcpServer} onSetMcpServerEnabled={onSetMcpServerEnabled} onSetMcpLaunchApproval={onSetMcpLaunchApproval} onSetMcpToolApproval={onSetMcpToolApproval} onListBundledMcpPresets={onListBundledMcpPresets} onAddBundledMcp={onAddBundledMcp} onConfigurePubMedMcp={onConfigurePubMedMcp} /> : section === "workflows" ? <WorkflowSettings locale={locale} selectedProject={selectedProject} onClose={onClose} onChanged={onWorkflowsChanged} /> : section === "agent" ? <AgentSettings locale={locale} /> : section === "appearance" ? <AppearanceSettings locale={locale} /> : section === "browser" ? <BrowserSettings locale={locale} /> : section === "privacy" ? <PrivacySettings locale={locale} selectedProject={selectedProject} onNavigate={navigate} /> : <GeneralSettings locale={locale} onLocaleChange={onLocaleChange} />}
     </div>
   </section></div>;
 }
@@ -210,6 +212,7 @@ function SettingsNavigation({ locale, section, onNavigate }: { locale: Locale; s
         { section: "models" as const, zh: "模型提供方", en: "Model providers", keywords: ["model", "models", "模型", "provider"], icon: Bot },
         { section: "skills" as const, zh: "Skills", en: "Skills", keywords: ["skill", "skills", "技能"], icon: Wrench },
         { section: "connections" as const, zh: "连接", en: "Connections", keywords: ["mcp", "MCP", "connection", "connections", "连接", "server"], icon: PlugZap },
+        { section: "workflows" as const, zh: "工作流", en: "Workflows", keywords: ["workflow", "workflows", "recipe", "recipes", "工作流", "配方"], icon: ClipboardList },
         { section: "browser" as const, zh: "浏览器", en: "Browser", keywords: ["browser", "浏览器", "web"], icon: Globe2 },
       ],
     },
@@ -230,6 +233,17 @@ function SettingsNavigation({ locale, section, onNavigate }: { locale: Locale; s
       {matchCount === 0 && <p className="settings-search-empty" role="status">{zh ? "没有匹配的设置" : "No matching settings"}</p>}
     </div>
   </nav>;
+}
+
+function WorkflowSettings({ locale, selectedProject, onClose, onChanged }: { locale: Locale; selectedProject?: WorkspaceProject | null; onClose: () => void; onChanged?: () => void }) {
+  const zh = locale === "zh-CN";
+  if (!selectedProject) return <main className="workflow-settings-unavailable">
+    <div className="settings-heading"><h3>{zh ? "工作流" : "Workflows"}</h3><p>{zh ? "工作流是属于项目的有序文本配方，可从主撰写器附加到 Agent 或计划。" : "Workflows are project-owned ordered text recipes that can be attached to an Agent or Plan from the main composer."}</p></div>
+    <div className="settings-note"><FolderOpen size={18} /><span><b>{zh ? "请先打开项目" : "Open a project first"}</b><small>{zh ? "返回项目主页并打开要管理工作流的项目。" : "Return to the project library and open the project whose workflows you want to manage."}</small></span><button type="button" onClick={onClose}>{zh ? "返回项目主页" : "Back to project library"}</button></div>
+  </main>;
+  return <main className="workflow-settings-page">
+    <WorkflowLibraryDialog key={selectedProject.id} projectId={selectedProject.id} zh={zh} presentation="embedded" onClose={() => undefined} onChanged={() => onChanged?.()} />
+  </main>;
 }
 
 function contextWindowError(value: string, dirty: boolean, zh: boolean): string {
