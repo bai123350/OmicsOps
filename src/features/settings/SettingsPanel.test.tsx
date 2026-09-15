@@ -698,6 +698,61 @@ describe("SettingsPanel model providers", () => {
     })));
   });
 
+  it("keeps saved MCP literals without returning them to the webview and can replace or remove them", async () => {
+    const server = {
+      id: "mcp-pubmed",
+      name: "pubmed",
+      command: "omicsops-desktop",
+      args: ["--mcp-server", "pubmed"],
+      env_bindings: [{ name: "NCBI_EMAIL" }],
+      enabled: true,
+      launch_approved: true,
+      approved_tools: ["search"],
+      tools: [{ name: "search" }],
+      capabilities: {},
+      last_inspected_at: "2026-09-15T00:00:00Z",
+      created_at: "",
+      updated_at: "",
+    };
+    const onSaveMcpServer = vi.fn().mockResolvedValue(server);
+    render(<SettingsPanel locale="en-US" initialSection="connections" onClose={() => undefined} mcpServers={[server]} onSaveMcpServer={onSaveMcpServer} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByText("Saved value will be kept")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("MCP server name"), { target: { value: "PubMed research" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save MCP server" }));
+    await waitFor(() => expect(onSaveMcpServer).toHaveBeenLastCalledWith(expect.objectContaining({
+      name: "PubMed research",
+      env_bindings: [{ name: "NCBI_EMAIL", keep_existing: true }],
+    })));
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByLabelText("MCP literal value 1"), { target: { value: "new@example.org" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save MCP server" }));
+    await waitFor(() => expect(onSaveMcpServer).toHaveBeenLastCalledWith(expect.objectContaining({
+      env_bindings: [{ name: "NCBI_EMAIL", value: "new@example.org" }],
+    })));
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove environment variable 1" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save MCP server" }));
+    await waitFor(() => expect(onSaveMcpServer).toHaveBeenLastCalledWith(expect.objectContaining({ env_bindings: [] })));
+  });
+
+  it("requires credential references for sensitive MCP environment variables", async () => {
+    const onSaveMcpServer = vi.fn().mockResolvedValue({});
+    render(<SettingsPanel locale="en-US" initialSection="connections" onClose={() => undefined} onSaveMcpServer={onSaveMcpServer} />);
+    fireEvent.change(screen.getByLabelText("MCP server name"), { target: { value: "sensitive" } });
+    fireEvent.change(screen.getByLabelText("MCP server command"), { target: { value: "mcp-server" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add variable" }));
+    fireEvent.change(screen.getByLabelText("MCP env name 1"), { target: { value: "ACCESS_TOKEN" } });
+    fireEvent.change(screen.getByLabelText("MCP env mode 1"), { target: { value: "literal" } });
+    fireEvent.change(screen.getByLabelText("MCP literal value 1"), { target: { value: "test-secret" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save MCP server" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Sensitive environment variables must use a credential reference");
+    expect(onSaveMcpServer).not.toHaveBeenCalled();
+  });
+
   it("shows MCP runtime status and bounded diagnostics", async () => {
     const server = { id: "mcp-failed", name: "pubmed", command: "omicsops-desktop", args: ["--mcp-server", "pubmed"], enabled: false, launch_approved: false, approved_tools: [], tools: [], capabilities: {}, status: "failed", last_error: "server exited with code 1", stderr_tail: "invalid configuration", last_inspected_at: null, created_at: "", updated_at: "" };
     render(<SettingsPanel locale="en-US" onClose={() => undefined} mcpServers={[server]} />);

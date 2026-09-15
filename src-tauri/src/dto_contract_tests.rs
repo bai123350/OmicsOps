@@ -806,3 +806,27 @@ fn usage_settings_contract_keeps_missing_counters_distinct_from_zero_and_exclude
             .is_err()
     );
 }
+
+#[test]
+fn mcp_environment_save_contract_distinguishes_keep_from_replace() {
+    use omicsops_dto::SaveMcpEnvBindingRequest;
+
+    assert_eq!(
+        serde_json::to_value(SaveMcpEnvBindingRequest {
+            name: "NCBI_EMAIL".into(),
+            value: None,
+            credential_reference: None,
+            keep_existing: true,
+        })
+        .unwrap(),
+        json!({"name":"NCBI_EMAIL","keep_existing":true})
+    );
+    assert!(
+        serde_json::from_value::<SaveMcpEnvBindingRequest>(json!({
+            "name":"NCBI_EMAIL",
+            "keep_existing":true,
+            "secret":"must-not-cross-this-contract"
+        }))
+        .is_err()
+    );
+}

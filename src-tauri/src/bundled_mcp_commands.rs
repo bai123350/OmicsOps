@@ -11,7 +11,10 @@ use uuid::Uuid;
 use crate::{
     commands::AppState,
     dto::{AddBundledMcpServerRequest, BundledMcpPreset},
-    p1_commands::{McpServerProfile, SaveMcpServerRequest, mcp_profile_from_request},
+    p1_commands::{
+        McpServerProfile, SaveMcpServerRequest, mcp_profile_from_request, public_mcp_profile,
+        replace_mcp_env_binding,
+    },
 };
 
 #[tauri::command]
@@ -122,7 +125,7 @@ async fn migrate_legacy_pubmed(repository: &Store, executable: &Path) -> Result<
             } else {
                 unified.timeout_secs
             },
-            env_bindings: bindings,
+            env_bindings: bindings.into_iter().map(replace_mcp_env_binding).collect(),
         },
         Some(&unified),
         Utc::now(),
@@ -172,7 +175,7 @@ pub async fn add_bundled_mcp_server(
         .map_err(|error| format!("cannot locate OmicsOps executable: {error}"))?;
     let profile = register_preset(&state.repository, &request.preset_id, &executable).await?;
     state.mcp_sessions.invalidate_server(id).await;
-    Ok(profile)
+    Ok(public_mcp_profile(profile))
 }
 
 pub(crate) async fn register_preset(
@@ -256,11 +259,11 @@ mod tests {
                 args: vec!["--omicsops-pubmed-mcp".into()],
                 cwd: None,
                 timeout_secs: 90,
-                env_bindings: vec![omicsops_mcp::McpEnvBinding {
+                env_bindings: vec![replace_mcp_env_binding(omicsops_mcp::McpEnvBinding {
                     name: "NCBI_API_KEY".into(),
                     value: None,
                     credential_reference: Some("mcp/legacy/NCBI_API_KEY".into()),
-                }],
+                })],
             },
             None,
             Utc::now(),

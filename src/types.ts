@@ -815,6 +815,10 @@ export interface ContextUsageSnapshotV4 {
   breakdown?: Array<{ category: string; bytes?: number | null; tokens?: number | null; estimated: boolean }> | null;
   latest_compaction?: ContextCompactionReceiptV4 | null;
 }
+
+export interface SaveMcpEnvBindingRequest extends McpEnvBinding {
+  keep_existing?: boolean;
+}
 export interface UsageFilter { project_id?: string | null; from?: string | null; until?: string | null }
 export interface UsageGroup { key: string; label: string; totals: UsageTotalsV4 }
 export interface UsageDay { date: string; attempts: number; tools: number; totals: UsageTotalsV4 }

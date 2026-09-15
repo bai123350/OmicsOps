@@ -20,6 +20,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::commands::AppState;
+use crate::dto::SaveMcpEnvBindingRequest;
 
 pub(crate) const MCP_SERVER_KIND: &str = "mcp_server";
 
@@ -273,6 +274,15 @@ pub struct McpServerProfile {
     pub updated_at: chrono::DateTime<Utc>,
 }
 
+pub(crate) fn replace_mcp_env_binding(binding: McpEnvBinding) -> SaveMcpEnvBindingRequest {
+    SaveMcpEnvBindingRequest {
+        name: binding.name,
+        value: binding.value,
+        credential_reference: binding.credential_reference,
+        keep_existing: false,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SaveMcpServerRequest {
     pub id: Option<Uuid>,
@@ -285,7 +295,7 @@ pub struct SaveMcpServerRequest {
     #[serde(default = "default_mcp_timeout_secs")]
     pub timeout_secs: u64,
     #[serde(default, alias = "env")]
-    pub env_bindings: Vec<McpEnvBinding>,
+    pub env_bindings: Vec<SaveMcpEnvBindingRequest>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -352,6 +362,112 @@ fn validate_mcp_declaration(name: &str, command: &str, args: &[String]) -> Resul
     Ok(())
 }
 
+fn is_sensitive_mcp_env_name(name: &str) -> bool {
+    let normalized = name
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    name.split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|part| {
+            matches!(
+                part.to_ascii_uppercase().as_str(),
+                "TOKEN"
+                    | "SECRET"
+                    | "PASSWORD"
+                    | "PASSWD"
+                    | "PASSPHRASE"
+                    | "KEY"
+                    | "AUTHORIZATION"
+                    | "CREDENTIAL"
+                    | "CREDENTIALS"
+            )
+        })
+        || ["APIKEY", "ACCESSKEY", "PRIVATEKEY", "SECRETKEY"]
+            .iter()
+            .any(|marker| normalized.contains(marker))
+}
+
+fn validate_mcp_literal(name: &str, value: &str) -> Result<(), String> {
+    if is_sensitive_mcp_env_name(name) || crate::composer_references::public_text(value) != value {
+        return Err(format!(
+            "sensitive MCP environment binding {name} must use a credential reference"
+        ));
+    }
+    Ok(())
+}
+
+fn requested_mcp_env_bindings(
+    requests: Vec<SaveMcpEnvBindingRequest>,
+    existing: Option<&McpServerProfile>,
+) -> Result<Vec<McpEnvBinding>, String> {
+    let mut bindings = Vec::with_capacity(requests.len());
+    for request in requests {
+        let name = request.name.trim().to_owned();
+        if bindings
+            .iter()
+            .any(|binding: &McpEnvBinding| binding.name == name)
+        {
+            return Err(format!("duplicate MCP environment binding: {name}"));
+        }
+        if request.keep_existing {
+            if request.value.is_some() || request.credential_reference.is_some() {
+                return Err(format!(
+                    "MCP environment binding {name} cannot keep and replace a value"
+                ));
+            }
+            let binding = existing
+                .and_then(|profile| {
+                    profile
+                        .env_bindings
+                        .iter()
+                        .find(|binding| binding.name == name)
+                })
+                .ok_or_else(|| format!("MCP environment binding {name} has no saved value"))?;
+            if let Some(value) = &binding.value {
+                validate_mcp_literal(&name, value)?;
+            }
+            bindings.push(binding.clone());
+            continue;
+        }
+        let binding = McpEnvBinding {
+            name,
+            value: request.value,
+            credential_reference: request
+                .credential_reference
+                .map(|reference| reference.trim().to_owned()),
+        };
+        binding.validate().map_err(|error| error.to_string())?;
+        match (&binding.value, &binding.credential_reference) {
+            (Some(value), None) if !value.is_empty() => {
+                validate_mcp_literal(&binding.name, value)?;
+            }
+            (None, Some(reference)) if !reference.is_empty() => {}
+            _ => {
+                return Err(format!(
+                    "MCP environment binding {} has no usable value",
+                    binding.name
+                ));
+            }
+        }
+        bindings.push(binding);
+    }
+    Ok(bindings)
+}
+
+pub(crate) fn public_mcp_profile(mut profile: McpServerProfile) -> McpServerProfile {
+    for binding in &mut profile.env_bindings {
+        binding.value = None;
+    }
+    profile.last_error = profile
+        .last_error
+        .map(|value| crate::composer_references::public_text(&value));
+    profile.stderr_tail = profile
+        .stderr_tail
+        .map(|value| crate::composer_references::public_text(&value));
+    profile
+}
+
 async fn mcp_server_profile(repository: &Store, id: Uuid) -> Result<McpServerProfile, String> {
     repository
         .get_json(MCP_SERVER_KIND, &id.to_string())
@@ -406,12 +522,13 @@ pub(crate) fn mcp_profile_from_request(
     now: chrono::DateTime<Utc>,
 ) -> Result<McpServerProfile, String> {
     validate_mcp_declaration(&request.name, &request.command, &request.args)?;
+    let env_bindings = requested_mcp_env_bindings(request.env_bindings, existing)?;
     let declaration_changed = existing.is_some_and(|profile| {
         profile.command != request.command.trim()
             || profile.args != request.args
             || profile.cwd != request.cwd
             || profile.timeout_secs != request.timeout_secs.clamp(1, 3_600)
-            || profile.env_bindings != request.env_bindings
+            || profile.env_bindings != env_bindings
     });
     Ok(McpServerProfile {
         id: request.id.unwrap_or_else(Uuid::new_v4),
@@ -420,7 +537,7 @@ pub(crate) fn mcp_profile_from_request(
         args: request.args,
         cwd: request.cwd,
         timeout_secs: request.timeout_secs.clamp(1, 3_600),
-        env_bindings: request.env_bindings,
+        env_bindings,
         enabled: existing.is_some_and(|profile| profile.enabled) && !declaration_changed,
         launch_approved: existing.is_some_and(|profile| profile.launch_approved)
             && !declaration_changed,
@@ -493,6 +610,7 @@ pub async fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServe
             profiles
                 .into_iter()
                 .filter(|profile| profile.status != "superseded")
+                .map(public_mcp_profile)
                 .collect::<Vec<_>>()
         })
         .map_err(|error| error.to_string())?;
@@ -525,7 +643,7 @@ pub async fn save_mcp_server(
     if existing.is_some() {
         state.mcp_sessions.invalidate_server(profile.id).await;
     }
-    Ok(profile)
+    Ok(public_mcp_profile(profile))
 }
 
 #[tauri::command]
@@ -541,7 +659,7 @@ pub async fn add_pubmed_mcp_server(
         configure_pubmed_preset(&state.repository, &state.credentials, request, &executable)
             .await?;
     state.mcp_sessions.invalidate_server(id).await;
-    Ok(profile)
+    Ok(public_mcp_profile(profile))
 }
 
 async fn configure_pubmed_preset(
@@ -609,7 +727,10 @@ async fn configure_pubmed_preset(
             args: vec!["--omicsops-bio-mcp".into(), "pubmed".into()],
             cwd: existing.cwd.clone(),
             timeout_secs: existing.timeout_secs,
-            env_bindings,
+            env_bindings: env_bindings
+                .into_iter()
+                .map(replace_mcp_env_binding)
+                .collect(),
         },
         Some(&existing),
         Utc::now(),
@@ -653,7 +774,7 @@ pub async fn set_mcp_server_enabled(
     if !request.enabled {
         state.mcp_sessions.invalidate_server(profile.id).await;
     }
-    Ok(profile)
+    Ok(public_mcp_profile(profile))
 }
 
 #[tauri::command]
@@ -677,7 +798,7 @@ pub async fn set_mcp_launch_approval(
     if !request.approved {
         state.mcp_sessions.invalidate_server(profile.id).await;
     }
-    Ok(profile)
+    Ok(public_mcp_profile(profile))
 }
 
 #[tauri::command]
@@ -710,7 +831,7 @@ pub async fn set_mcp_tool_approval(
     if !request.approved {
         state.mcp_sessions.invalidate_server(profile.id).await;
     }
-    Ok(profile)
+    Ok(public_mcp_profile(profile))
 }
 
 #[tauri::command]
@@ -1392,6 +1513,175 @@ mod tests {
         assert!(changed.approved_tools.is_empty());
         assert!(changed.tools.is_empty());
         assert!(changed.last_inspected_at.is_none());
+    }
+
+    #[test]
+    fn mcp_environment_edits_keep_hidden_literals_and_reject_sensitive_storage() {
+        let now = Utc::now();
+        let mut existing = mcp_profile_from_request(
+            SaveMcpServerRequest {
+                id: None,
+                name: "papers".into(),
+                command: "mcp-server".into(),
+                args: vec![],
+                cwd: None,
+                timeout_secs: 60,
+                env_bindings: vec![replace_mcp_env_binding(McpEnvBinding {
+                    name: "NCBI_EMAIL".into(),
+                    value: Some("admin@example.org".into()),
+                    credential_reference: None,
+                })],
+            },
+            None,
+            now,
+        )
+        .unwrap();
+        existing.enabled = true;
+        existing.launch_approved = true;
+        existing.approved_tools = vec!["search".into()];
+
+        let kept = mcp_profile_from_request(
+            SaveMcpServerRequest {
+                id: Some(existing.id),
+                name: "Paper search".into(),
+                command: existing.command.clone(),
+                args: existing.args.clone(),
+                cwd: existing.cwd.clone(),
+                timeout_secs: existing.timeout_secs,
+                env_bindings: vec![SaveMcpEnvBindingRequest {
+                    name: "NCBI_EMAIL".into(),
+                    value: None,
+                    credential_reference: None,
+                    keep_existing: true,
+                }],
+            },
+            Some(&existing),
+            now,
+        )
+        .unwrap();
+        assert_eq!(kept.env_bindings, existing.env_bindings);
+        assert!(kept.enabled && kept.launch_approved);
+        assert_eq!(kept.approved_tools, existing.approved_tools);
+
+        let mut kept = kept;
+        kept.stderr_tail = Some("password=diagnostic-secret".into());
+        let public = public_mcp_profile(kept);
+        assert_eq!(public.env_bindings[0].value, None);
+        let public_json = serde_json::to_string(&public).unwrap();
+        assert!(!public_json.contains("admin@example.org"));
+        assert!(!public_json.contains("diagnostic-secret"));
+
+        let rejected = mcp_profile_from_request(
+            SaveMcpServerRequest {
+                id: None,
+                name: "unsafe".into(),
+                command: "mcp-server".into(),
+                args: vec![],
+                cwd: None,
+                timeout_secs: 60,
+                env_bindings: vec![replace_mcp_env_binding(McpEnvBinding {
+                    name: "ACCESS_TOKEN".into(),
+                    value: Some("sqlite-sentinel-secret".into()),
+                    credential_reference: None,
+                })],
+            },
+            None,
+            now,
+        )
+        .unwrap_err();
+        assert_eq!(
+            rejected,
+            "sensitive MCP environment binding ACCESS_TOKEN must use a credential reference"
+        );
+    }
+
+    #[tokio::test]
+    async fn sensitive_mcp_literals_are_rejected_before_the_store_write() {
+        let repository = Store::open_in_memory().await.unwrap();
+        let request = SaveMcpServerRequest {
+            id: None,
+            name: "unsafe".into(),
+            command: "mcp-server".into(),
+            args: vec![],
+            cwd: None,
+            timeout_secs: 60,
+            env_bindings: vec![replace_mcp_env_binding(McpEnvBinding {
+                name: "SERVICE_API_KEY".into(),
+                value: Some("sqlite-sentinel-secret".into()),
+                credential_reference: None,
+            })],
+        };
+        if let Ok(profile) = mcp_profile_from_request(request, None, Utc::now()) {
+            repository
+                .put_json(MCP_SERVER_KIND, &profile.id.to_string(), &profile)
+                .await
+                .unwrap();
+        }
+        let stored = repository
+            .list_json::<Value>(MCP_SERVER_KIND)
+            .await
+            .unwrap();
+        assert!(stored.is_empty());
+        assert!(
+            !serde_json::to_string(&stored)
+                .unwrap()
+                .contains("sqlite-sentinel-secret")
+        );
+    }
+
+    #[test]
+    fn hidden_legacy_literals_are_revalidated_before_keep() {
+        let now = Utc::now();
+        let existing = McpServerProfile {
+            id: Uuid::new_v4(),
+            name: "legacy".into(),
+            command: "mcp-server".into(),
+            args: vec![],
+            cwd: None,
+            timeout_secs: 60,
+            env_bindings: vec![McpEnvBinding {
+                name: "OPTIONS".into(),
+                value: Some("password=legacy-secret".into()),
+                credential_reference: None,
+            }],
+            enabled: false,
+            launch_approved: false,
+            approved_tools: vec![],
+            tools: vec![],
+            capabilities: json!({}),
+            tool_catalog_sha256: None,
+            catalog_generation: 0,
+            config_version: 1,
+            status: "disconnected".into(),
+            last_error: None,
+            stderr_tail: None,
+            last_inspected_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let error = mcp_profile_from_request(
+            SaveMcpServerRequest {
+                id: Some(existing.id),
+                name: existing.name.clone(),
+                command: existing.command.clone(),
+                args: vec![],
+                cwd: None,
+                timeout_secs: 60,
+                env_bindings: vec![SaveMcpEnvBindingRequest {
+                    name: "OPTIONS".into(),
+                    value: None,
+                    credential_reference: None,
+                    keep_existing: true,
+                }],
+            },
+            Some(&existing),
+            now,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "sensitive MCP environment binding OPTIONS must use a credential reference"
+        );
     }
 }
 

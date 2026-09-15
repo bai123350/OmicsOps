@@ -39,7 +39,7 @@ import type {
   NotebookEntry,
   ProjectArtifact,
   McpResult,
-  McpEnvBinding,
+  SaveMcpEnvBindingRequest,
   McpServerProfile,
   BundledMcpPreset,
 } from "./types";
@@ -258,7 +258,7 @@ export interface SaveMcpServerRequest {
   args?: string[];
   cwd?: string | null;
   timeout_secs?: number | null;
-  env_bindings?: McpEnvBinding[];
+  env_bindings?: SaveMcpEnvBindingRequest[];
 }
 
 export async function saveMcpServer(request: SaveMcpServerRequest): Promise<McpServerProfile> {

@@ -496,6 +496,9 @@ pub use credentials_settings::{
     ManagedCredentialMetadata, ReplaceCredentialRequest,
 };
 
+mod mcp_settings;
+pub use mcp_settings::SaveMcpEnvBindingRequest;
+
 mod composer_queue;
 pub use composer_queue::{
     ComposerQueueActionRequestV4, ComposerQueueActionV4, ComposerQueueFailureCodeV4,

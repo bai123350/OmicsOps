@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ArrowLeft, Bot, Brain, CheckCircle2, ClipboardList, Cloud, Database, FolderOpen, Globe2, KeyRound, Languages, Layers3, LoaderCircle, Monitor, Palette, PlugZap, Search, Server, ShieldCheck, Sparkles, Wrench, XCircle } from "lucide-react";
-import type { ConnectionProfile, ConnectionTestResult, McpEnvBinding, McpServerProfile, ModelProbeResult, ModelProfile, SkillPackage, WorkspaceProject } from "../../types";
+import type { ConnectionProfile, ConnectionTestResult, McpEnvBinding, McpServerProfile, ModelProbeResult, ModelProfile, SaveMcpEnvBindingRequest, SkillPackage, WorkspaceProject } from "../../types";
 import type { Locale } from "../workspace/copy";
 import { supportsFastMode } from "../../fast-mode";
 import { BrowserSettings, useWindowEscapeLayer } from "./BrowserSettings";
@@ -25,8 +25,8 @@ import "./remote-form.css";
 
 type SaveModelRequest = { id?: string; label: string; provider: ModelProfile["provider"]; base_url: string; model: string; credential?: string; context_window_tokens?: number; refresh_catalog?: boolean; reasoning_effort?: ModelProfile["reasoning_effort"]; fast_mode?: ModelProfile["fast_mode"]; delegated_model_profile_id?: string | null };
 type FormState = Omit<SaveModelRequest, "context_window_tokens"> & { credential: string; contextWindowDraft: string; contextWindowDirty: boolean };
-type McpEnvFormBinding = McpEnvBinding & { mode: "literal" | "credential" };
-type SaveMcpServerRequest = { id?: string; name: string; command: string; args: string[]; cwd?: string | null; timeout_secs?: number | null; env_bindings?: McpEnvBinding[] };
+type McpEnvFormBinding = McpEnvBinding & { mode: "literal" | "credential"; keepExisting?: boolean };
+type SaveMcpServerRequest = { id?: string; name: string; command: string; args: string[]; cwd?: string | null; timeout_secs?: number | null; env_bindings?: SaveMcpEnvBindingRequest[] };
 
 export type SettingsSection = "general" | "models" | "remote" | "remote-access" | "skills" | "connections" | "workflows" | "quick-actions" | "specialists" | "browser" | "agent" | "appearance" | "pet" | "storage" | "permissions" | "credentials" | "memory" | "privacy";
 
@@ -299,6 +299,13 @@ function emptyMcpForm() {
   return { name: "", command: "", args: "", cwd: "", timeout_secs: 60, env_bindings: [] as McpEnvFormBinding[] };
 }
 
+function isSensitiveMcpEnvName(name: string) {
+  const parts = name.trim().toUpperCase().split(/[^A-Z0-9]+/).filter(Boolean);
+  const normalized = parts.join("");
+  return parts.some((part) => ["TOKEN", "SECRET", "PASSWORD", "PASSWD", "PASSPHRASE", "KEY", "AUTHORIZATION", "CREDENTIAL", "CREDENTIALS"].includes(part))
+    || ["APIKEY", "ACCESSKEY", "PRIVATEKEY", "SECRETKEY"].some((marker) => normalized.includes(marker));
+}
+
 function SkillsAndMcpSettings({ page, locale, skillPackages, skillsBusy, skillError, onImportSkill, onSetSkillEnabled, mcpServers, selectedProject, onSaveMcpServer, onInspectMcpServer, onSetMcpServerEnabled, onSetMcpLaunchApproval, onSetMcpToolApproval, onListBundledMcpPresets, onConfigurePubMedMcp, onAddBundledMcp }: BundledMcpProps & { page: "skills" | "connections"; locale: Locale; skillPackages: SkillPackage[]; skillsBusy: boolean; skillError: string; onImportSkill?: () => Promise<void>; onSetSkillEnabled?: Props["onSetSkillEnabled"]; mcpServers: McpServerProfile[]; selectedProject?: WorkspaceProject | null; onSaveMcpServer?: Props["onSaveMcpServer"]; onInspectMcpServer?: Props["onInspectMcpServer"]; onSetMcpServerEnabled?: Props["onSetMcpServerEnabled"]; onSetMcpLaunchApproval?: Props["onSetMcpLaunchApproval"]; onSetMcpToolApproval?: Props["onSetMcpToolApproval"] }) {
   const zh = locale === "zh-CN";
   const [mcpForm, setMcpForm] = useState<{ id?: string; name: string; command: string; args: string; cwd: string; timeout_secs: number; env_bindings: McpEnvFormBinding[] }>(emptyMcpForm());
@@ -315,17 +322,22 @@ function SkillsAndMcpSettings({ page, locale, skillPackages, skillsBusy, skillEr
     if (!onSaveMcpServer) return;
     setMcpBusy("save"); setMcpError("");
     try {
-      const env_bindings: McpEnvBinding[] = mcpForm.env_bindings.map((binding): McpEnvBinding => ({
+      const env_bindings: SaveMcpEnvBindingRequest[] = mcpForm.env_bindings.map((binding): SaveMcpEnvBindingRequest => ({
         name: binding.name.trim(),
-        ...(binding.mode === "credential"
+        ...(binding.keepExisting
+          ? { keep_existing: true }
+          : binding.mode === "credential"
           ? { credential_reference: binding.credential_reference?.trim() || null }
           : { value: binding.value ?? "" }),
       })).filter((binding) => binding.name.length > 0);
       if (mcpForm.env_bindings.some((binding) => !binding.name.trim())) {
         throw new Error(zh ? "环境变量名称不能为空。" : "Environment variable names cannot be empty.");
       }
-      if (env_bindings.some((binding) => !binding.value && !binding.credential_reference)) {
+      if (env_bindings.some((binding) => !binding.keep_existing && !binding.value && !binding.credential_reference)) {
         throw new Error(zh ? "请为每个环境变量填写值或凭据引用。" : "Provide a value or credential reference for every environment variable.");
+      }
+      if (mcpForm.env_bindings.some((binding) => binding.mode === "literal" && isSensitiveMcpEnvName(binding.name))) {
+        throw new Error(zh ? "敏感环境变量必须使用凭据引用。" : "Sensitive environment variables must use a credential reference.");
       }
       if (!Number.isInteger(mcpForm.timeout_secs) || mcpForm.timeout_secs < 1 || mcpForm.timeout_secs > 3600) {
         throw new Error(zh ? "超时必须是 1–3600 秒。" : "Timeout must be between 1 and 3600 seconds.");
@@ -370,6 +382,7 @@ function SkillsAndMcpSettings({ page, locale, skillPackages, skillsBusy, skillEr
         mode: binding.credential_reference ? "credential" : "literal",
         value: "",
         credential_reference: binding.credential_reference ?? "",
+        keepExisting: !binding.credential_reference,
       })),
     });
   }
@@ -379,7 +392,7 @@ function SkillsAndMcpSettings({ page, locale, skillPackages, skillsBusy, skillEr
   }
 
   function updateEnvBinding(index: number, update: Partial<McpEnvFormBinding>) {
-    setMcpForm((current) => ({ ...current, env_bindings: current.env_bindings.map((binding, candidate) => candidate === index ? { ...binding, ...update } : binding) }));
+    setMcpForm((current) => ({ ...current, env_bindings: current.env_bindings.map((binding, candidate) => candidate === index ? { ...binding, ...update, ...(update.name !== undefined || update.value !== undefined || update.mode !== undefined ? { keepExisting: false } : {}) } : binding) }));
   }
 
   function removeEnvBinding(index: number) {
@@ -411,7 +424,7 @@ function SkillsAndMcpSettings({ page, locale, skillPackages, skillsBusy, skillEr
 
     <section className="mcp-form" aria-label={zh ? "MCP server 配置" : "MCP server configuration"}>
       <div className="mcp-form-grid"><label>{zh ? "名称" : "Name"}<input aria-label="MCP server name" value={mcpForm.name} onChange={(event) => setMcpForm({ ...mcpForm, name: event.target.value })} /></label><label>{zh ? "启动命令" : "Command"}<input aria-label="MCP server command" placeholder="npx" value={mcpForm.command} onChange={(event) => setMcpForm({ ...mcpForm, command: event.target.value })} /></label><label>{zh ? "工作目录（可选）" : "Working directory (optional)"}<input aria-label="MCP working directory" placeholder={zh ? "继承项目目录" : "Inherit project directory"} value={mcpForm.cwd} onChange={(event) => setMcpForm({ ...mcpForm, cwd: event.target.value })} /></label><label>{zh ? "超时（秒）" : "Timeout (seconds)"}<input aria-label="MCP timeout seconds" type="number" min={1} max={3600} step={1} value={mcpForm.timeout_secs} onChange={(event) => setMcpForm({ ...mcpForm, timeout_secs: Number(event.target.value) })} /></label><label className="wide">{zh ? "参数（每行一个）" : "Arguments (one per line)"}<textarea aria-label="MCP server arguments" rows={3} placeholder={"-y\n@modelcontextprotocol/server-filesystem\nE:\\Science\\project"} value={mcpForm.args} onChange={(event) => setMcpForm({ ...mcpForm, args: event.target.value })} /></label></div>
-      <div className="mcp-env-bindings"><div className="mcp-subheading"><span><b>{zh ? "环境变量绑定" : "Environment bindings"}</b><small>{zh ? "建议使用凭据引用；literal 值不会显示在已保存的 server 卡片中。" : "Credential references are preferred; literal values are never shown on saved server cards."}</small></span><button type="button" onClick={addEnvBinding}>{zh ? "添加变量" : "Add variable"}</button></div>{mcpForm.env_bindings.length === 0 ? <small className="mcp-muted">{zh ? "未配置环境变量" : "No environment variables configured"}</small> : mcpForm.env_bindings.map((binding, index) => <div className="mcp-env-row" key={`${index}-${binding.name}`}><input aria-label={`MCP env name ${index + 1}`} placeholder="NCBI_API_KEY" value={binding.name} onChange={(event) => updateEnvBinding(index, { name: event.target.value })} /><select aria-label={`MCP env mode ${index + 1}`} value={binding.mode} onChange={(event) => updateEnvBinding(index, { mode: event.target.value as McpEnvFormBinding["mode"], value: "", credential_reference: "" })}><option value="credential">{zh ? "凭据引用" : "Credential reference"}</option><option value="literal">literal</option></select>{binding.mode === "credential" ? <input aria-label={`MCP credential reference ${index + 1}`} placeholder="ncbi/api-key" value={binding.credential_reference ?? ""} onChange={(event) => updateEnvBinding(index, { credential_reference: event.target.value })} /> : <input aria-label={`MCP literal value ${index + 1}`} type="password" autoComplete="new-password" placeholder={zh ? "仅在保存时提交" : "Sent only when saved"} value={binding.value ?? ""} onChange={(event) => updateEnvBinding(index, { value: event.target.value })} />}<button type="button" aria-label={`${zh ? "移除环境变量" : "Remove environment variable"} ${index + 1}`} onClick={() => removeEnvBinding(index)}>×</button></div>)}</div>
+      <div className="mcp-env-bindings"><div className="mcp-subheading"><span><b>{zh ? "环境变量绑定" : "Environment bindings"}</b><small>{zh ? "literal 仅用于非敏感配置。密码、令牌和密钥必须使用凭据引用；已保存的 literal 值不会返回界面。" : "Literal values are only for non-sensitive configuration. Passwords, tokens, and keys require credential references; saved literals are never returned to the UI."}</small></span><button type="button" onClick={addEnvBinding}>{zh ? "添加变量" : "Add variable"}</button></div>{mcpForm.env_bindings.length === 0 ? <small className="mcp-muted">{zh ? "未配置环境变量" : "No environment variables configured"}</small> : mcpForm.env_bindings.map((binding, index) => <div className="mcp-env-row" key={`${index}-${binding.name}`}><input aria-label={`MCP env name ${index + 1}`} placeholder="NCBI_API_KEY" value={binding.name} onChange={(event) => updateEnvBinding(index, { name: event.target.value })} /><select aria-label={`MCP env mode ${index + 1}`} value={binding.mode} onChange={(event) => updateEnvBinding(index, { mode: event.target.value as McpEnvFormBinding["mode"], value: "", credential_reference: "" })}><option value="credential">{zh ? "凭据引用" : "Credential reference"}</option><option value="literal">literal</option></select>{binding.mode === "credential" ? <input aria-label={`MCP credential reference ${index + 1}`} placeholder="ncbi/api-key" value={binding.credential_reference ?? ""} onChange={(event) => updateEnvBinding(index, { credential_reference: event.target.value })} /> : <span className="mcp-literal-editor"><input aria-label={`MCP literal value ${index + 1}`} type="password" autoComplete="new-password" placeholder={binding.keepExisting ? (zh ? "留空以保留" : "Leave blank to keep") : (zh ? "仅在保存时提交" : "Sent only when saved")} value={binding.value ?? ""} onChange={(event) => updateEnvBinding(index, { value: event.target.value })} />{binding.keepExisting && <small>{zh ? "将保留已保存的值" : "Saved value will be kept"}</small>}</span>}<button type="button" aria-label={`${zh ? "移除环境变量" : "Remove environment variable"} ${index + 1}`} onClick={() => removeEnvBinding(index)}>×</button></div>)}</div>
       <div className="mcp-form-actions">{mcpForm.id && <button onClick={() => setMcpForm(emptyMcpForm())}>{zh ? "取消编辑" : "Cancel edit"}</button>}<button className="primary" disabled={mcpBusy !== null || !onSaveMcpServer || !mcpForm.name.trim() || !mcpForm.command.trim()} onClick={() => void saveServer()}>{zh ? "保存 MCP server" : "Save MCP server"}</button></div>
     </section>
     {mcpError && <div className="skill-error" role="alert">{mcpError}</div>}
