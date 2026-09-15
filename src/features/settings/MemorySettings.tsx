@@ -25,6 +25,7 @@ export function MemorySettings({
   const [selected, setSelected] = useState<MemoryFileV4 | null>(null);
   const [draft, setDraft] = useState("");
   const [filename, setFilename] = useState("");
+  const [fileFilter, setFileFilter] = useState("");
   const [creating, setCreating] = useState(false);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -40,6 +41,7 @@ export function MemorySettings({
     setSelected(null);
     setDraft("");
     setFilename("");
+    setFileFilter("");
     setCreating(false);
     setConfirmingDelete(false);
     setConflict(false);
@@ -149,6 +151,8 @@ export function MemorySettings({
   }
 
   const editorVisible = creating || selected;
+  const normalizedFilter = fileFilter.trim().toLocaleLowerCase();
+  const visibleFiles = files.filter((file) => !normalizedFilter || file.name.toLocaleLowerCase().includes(normalizedFilter));
   return (
     <main className="appearance-settings memory-settings">
       <header className="appearance-heading">
@@ -193,13 +197,16 @@ export function MemorySettings({
                 {zh ? "新建" : "New memory file"}
               </button>
             </div>
+            {files.length > 0 && <input type="search" className="memory-file-filter" aria-label={zh ? "筛选记忆文件" : "Filter memory files"} placeholder={zh ? "按文件名筛选" : "Filter by filename"} value={fileFilter} onChange={(event) => setFileFilter(event.target.value)} />}
             {loading && files.length === 0 ? (
               <p className="memory-list-message">{zh ? "正在读取…" : "Loading…"}</p>
             ) : files.length === 0 ? (
               <p className="memory-list-message">{zh ? "还没有记忆文件。" : "No memory files yet."}</p>
+            ) : visibleFiles.length === 0 ? (
+              <p className="memory-list-message" role="status">{zh ? "没有匹配的文件名。" : "No matching filenames."}</p>
             ) : (
               <ul>
-                {files.map((file) => (
+                {visibleFiles.map((file) => (
                   <li key={file.name}>
                     <button type="button" disabled={saving} className={selected?.name === file.name ? "active" : ""} onClick={() => void openFile(file.name)}>
                       <strong>{file.name}</strong>

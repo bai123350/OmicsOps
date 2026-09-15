@@ -17,6 +17,17 @@
   gap: 12px;
 }
 
+.memory-file-filter {
+  box-sizing: border-box;
+  width: calc(100% - 24px);
+  margin: 0 12px 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--omicsops-border);
+  border-radius: 8px;
+  color: var(--omicsops-text);
+  background: var(--omicsops-surface-raised);
+}
+
 .memory-file-list ul {
   margin: 0;
   padding: 0;

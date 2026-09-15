@@ -129,6 +129,21 @@ describe("MemorySettings", () => {
     expect(screen.getByRole("button", { name: "Create file" })).toBeEnabled();
   });
 
+  it("filters the existing memory list by filename without searching file contents", async () => {
+    const other = { ...summary, name: "analysis-notes.md", size_bytes: 20, sha256: "hash-other" };
+    api.listProjectMemoryFiles.mockResolvedValue([summary, other]);
+    render(<MemorySettings selectedProject={project("p1", "PBMC")} locale="en-US" />);
+    expect(await screen.findByRole("button", { name: /analysis-notes\.md/ })).toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Filter memory files" }), { target: { value: "STUDY" } });
+    expect(screen.getByRole("button", { name: /study\.md/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /analysis-notes\.md/ })).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Filter memory files" }), { target: { value: "first draft" } });
+    expect(screen.getByRole("status")).toHaveTextContent("No matching filenames.");
+    expect(screen.getByLabelText("Memory content")).toHaveValue("first draft");
+  });
+
   it("locks new-file and file navigation while a save is pending", async () => {
     const other = { ...summary, name: "other.md", size_bytes: 20, sha256: "hash-other" };
     const saving = deferred<MemoryFileV4>();
