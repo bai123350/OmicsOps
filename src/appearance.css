@@ -519,6 +519,24 @@ html[data-omicsops-theme="dark"] #root :is(hr, .mcp-divider, .session-group + .s
   border-color: var(--omicsops-border);
 }
 
+html[data-omicsops-theme="dark"] #root .mcp-connections-settings .mcp-preset,
+html[data-omicsops-theme="dark"] #root .browser-settings :is(.browser-toggle, .browser-domain-editor) {
+  color: #f2f4f7;
+  background-color: #1d2638;
+  border-color: #475467;
+}
+
+html[data-omicsops-theme="dark"] #root .mcp-connections-settings .mcp-preset small,
+html[data-omicsops-theme="dark"] #root .browser-settings :is(.browser-toggle, .browser-domain-editor) small {
+  color: #b7c0cf;
+}
+
+html[data-omicsops-theme="dark"] #root .mcp-connections-settings :is(.mcp-subheading, .mcp-env-row) button {
+  color: #d0d5dd;
+  background-color: #1d2939;
+  border-color: #475467;
+}
+
 @media (max-width: 720px) {
   .appearance-heading {
     padding-inline: 18px;
