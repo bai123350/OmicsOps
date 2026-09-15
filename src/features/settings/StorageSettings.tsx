@@ -8,6 +8,7 @@ import type {
   WorkspaceProject,
 } from "../../types";
 import type { Locale } from "../workspace/copy";
+import "./StorageSettings.css";
 
 type ScopeChoice = "managed" | "project";
 
@@ -63,7 +64,7 @@ export function StorageSettings({
         </p>
       </header>
 
-      <section className="appearance-card">
+      <section className="appearance-card storage-scope-card">
         <label className="appearance-row">
           <span className="appearance-copy">
             <strong>{zh ? "扫描范围" : "Scan scope"}</strong>
@@ -96,7 +97,7 @@ export function StorageSettings({
       </section>
 
       {error && (
-        <section className="appearance-card" role="alert">
+        <section className="appearance-card storage-error" role="alert">
           <strong>{zh ? "无法读取存储占用" : "Storage usage could not be read"}</strong>
           <p>{error}</p>
           <button type="button" onClick={() => void load()}>{zh ? "重试" : "Retry"}</button>
@@ -105,7 +106,7 @@ export function StorageSettings({
 
       {snapshot && (
         <>
-          <section className="appearance-card" aria-live="polite">
+          <section className={`appearance-card storage-summary${snapshot.status === "partial" ? " is-partial" : ""}`} aria-live="polite">
             <div className="appearance-group-heading">
               <h4>{zh ? "逻辑文件字节数" : "Logical file bytes"}</h4>
               <p>
@@ -132,7 +133,7 @@ export function StorageSettings({
             </p>
           </section>
 
-          <section className="appearance-card">
+          <section className="appearance-card storage-categories">
             <div className="appearance-group-heading">
               <h4>{zh ? "分类" : "Categories"}</h4>
             </div>
