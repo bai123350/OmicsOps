@@ -11,6 +11,8 @@ import * as memoryApi from "../../memory-settings-api";
 import * as credentialsApi from "../../credentials-settings-api";
 import * as generalSettingsApi from "../../general-settings-api";
 import * as usageApi from "../../usage-settings-api";
+import * as skillSettingsApi from "../../skill-settings-api";
+import type { SkillPackage } from "../../types";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -669,6 +671,47 @@ describe("SettingsPanel model providers", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "启用" })).not.toBeDisabled());
     fireEvent.click(screen.getByRole("button", { name: "启用" }));
     expect(onSetSkillEnabled).toHaveBeenCalledWith("skill-1", true);
+  });
+
+  it("opens host-backed skill details and closes them before Settings", async () => {
+    vi.spyOn(skillSettingsApi, "settingsSkillDetail").mockResolvedValue({
+      skill: { id: "skill-1", name: "QC reviewer", version: "1.0.0", source_path: "skills/qc/hash", sha256: "a".repeat(64), enabled: true, capabilities: [], category: null },
+      origin: "managed_import",
+      integrity: "verified",
+      files: [],
+      inventory_complete: true,
+      dependent_skills: [],
+      can_remove_from_library: true,
+      can_delete_files: true,
+      blocking_reasons: [],
+    });
+    const close = vi.fn();
+    render(<SettingsPanel locale="en-US" initialSection="skills" onClose={close} skillPackages={[{ id: "skill-1", name: "QC reviewer", version: "1.0.0", source_path: "skills/qc/hash", sha256: "a".repeat(64), enabled: true, capabilities: [], category: null }]} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Details" }));
+    expect(await screen.findByRole("dialog", { name: "Skill details" })).toBeInTheDocument();
+    expect(skillSettingsApi.settingsSkillDetail).toHaveBeenCalledWith("skill-1");
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Skill details" })).not.toBeInTheDocument());
+    expect(close).not.toHaveBeenCalled();
+  });
+
+  it("keeps a failed skill toggle retryable and rejects duplicate clicks", async () => {
+    const first = deferred<SkillPackage>();
+    const onSetSkillEnabled = vi.fn()
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValueOnce({});
+    render(<SettingsPanel locale="en-US" initialSection="skills" onClose={() => undefined} skillPackages={[{ id: "skill-1", name: "QC reviewer", version: "1.0.0", source_path: "skills/qc/hash", sha256: "a".repeat(64), enabled: true, capabilities: [], category: null }]} onSetSkillEnabled={onSetSkillEnabled} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Disable" }));
+    fireEvent.click(screen.getByRole("button", { name: "Updating…" }));
+    expect(onSetSkillEnabled).toHaveBeenCalledTimes(1);
+    first.reject(new Error("token=secret-value"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not update the skill");
+    expect(screen.queryByText(/secret-value/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Disable" }));
+    await waitFor(() => expect(onSetSkillEnabled).toHaveBeenCalledTimes(2));
   });
 
   it("configures MCP without launching it and requires inspection plus per-tool approval", async () => {

@@ -21,6 +21,7 @@ import { SpecialistsSettings } from "./SpecialistsSettings";
 import { CredentialsSettings } from "./CredentialsSettings";
 import { GeneralAdvancedSettings } from "./GeneralAdvancedSettings";
 import { UsageSettings } from "./UsageSettings";
+import { SkillDetails } from "./SkillDetails";
 import { settingsProbeSystemInterpreters } from "../../general-settings-api";
 import { useGeneralPreferences } from "../../use-general-preferences";
 import "./settings.css";
@@ -323,6 +324,10 @@ function SkillsAndMcpSettings({ page, locale, skillPackages, skillsBusy, skillEr
   const [mcpBusy, setMcpBusy] = useState<string | null>(null);
   const [mcpError, setMcpError] = useState("");
   const [inspectionApprovals, setInspectionApprovals] = useState<Record<string, boolean>>({});
+  const skillAction = useRef(false);
+  const [skillActionBusy, setSkillActionBusy] = useState<string | null>(null);
+  const [skillActionError, setSkillActionError] = useState("");
+  const [detailSkillId, setDetailSkillId] = useState<string | null>(null);
   const categorizedSkills = skillPackages.filter((skill) => skill.category);
   const ungroupedSkills = skillPackages.filter((skill) => !skill.category);
   const skillGroups = Array.from(new Set(categorizedSkills.map((skill) => skill.category!)))
@@ -412,23 +417,39 @@ function SkillsAndMcpSettings({ page, locale, skillPackages, skillsBusy, skillEr
     setMcpForm((current) => ({ ...current, env_bindings: current.env_bindings.filter((_, candidate) => candidate !== index) }));
   }
 
+  async function toggleSkill(skill: SkillPackage) {
+    if (!onSetSkillEnabled || skillAction.current) return;
+    skillAction.current = true;
+    setSkillActionBusy(skill.id);
+    setSkillActionError("");
+    try {
+      await onSetSkillEnabled(skill.id, !skill.enabled);
+    } catch {
+      setSkillActionError(zh ? "无法更新技能状态。请重试。" : "Could not update the skill. Try again.");
+    } finally {
+      skillAction.current = false;
+      setSkillActionBusy(null);
+    }
+  }
+
   if (page === "skills") return <main className="skills-settings">
     <div className="settings-heading skill-heading"><div><h3>{zh ? "科研 Skills" : "Research Skills"}</h3><p>{zh ? "随应用提供的科研 Skills 来自固定 GitHub 快照；Agent 会读取已启用 Skill 及其依赖、示例和使用指南，并据此生成分析代码。也可以导入其他 Agent Skills 兼容目录。" : "Bundled research Skills come from a pinned GitHub snapshot. The Agent reads enabled Skills, dependencies, examples, and usage guides to generate analysis code. Other Agent Skills directories can also be imported."}</p></div><button className="skill-import" disabled={skillsBusy || !onImportSkill} onClick={() => void onImportSkill?.()}>{skillsBusy ? (zh ? "校验中…" : "Validating…") : (zh ? "导入技能目录" : "Import skill directory")}</button></div>
-    {skillError && <div className="skill-error" role="alert">{skillError}</div>}
+    {(skillError || skillActionError) && <div className="skill-error" role="alert">{skillActionError || skillError}</div>}
     {skillPackages.length === 0 ? <div className="skill-empty skill-library-empty">{zh ? "尚未导入科研技能" : "No research skills imported"}</div> : <div className="skill-library">
       {skillGroups.length > 0 && <section className="skill-domain" aria-label={zh ? "组学技能" : "Omics skills"}>
         <div className="skill-domain-title"><Layers3 size={18} /><span><b>{zh ? "组学技能" : "Omics skills"}</b><small>{zh ? `${skillGroups.length} 个分区 · ${categorizedSkills.length} Skills` : `${skillGroups.length} categories · ${categorizedSkills.length} Skills`}</small></span></div>
         <div className="skill-category-list">{skillGroups.map(([category, skills]) => <details className="skill-category" key={category} open>
           <summary><FolderOpen size={17} /><span><b>{skillCategoryLabel(category, zh)}</b><small>{skills.length} Skills · {skills.filter((skill) => skill.enabled).length} {zh ? "已启用" : "enabled"}</small></span></summary>
-          <div className="skill-list">{skills.map((skill) => <SkillCard key={skill.id} skill={skill} zh={zh} skillsBusy={skillsBusy} onSetSkillEnabled={onSetSkillEnabled} />)}</div>
+          <div className="skill-list">{skills.map((skill) => <SkillCard key={skill.id} skill={skill} zh={zh} busy={skillsBusy || skillActionBusy !== null} active={skillActionBusy === skill.id} canToggle={Boolean(onSetSkillEnabled)} onToggle={() => void toggleSkill(skill)} onOpen={() => setDetailSkillId(skill.id)} />)}</div>
         </details>)}</div>
       </section>}
       {ungroupedSkills.length > 0 && <section className="skill-domain ungrouped" aria-label={zh ? "未分组技能" : "Uncategorized skills"}>
         <div className="skill-domain-title"><FolderOpen size={18} /><span><b>{zh ? "未分组技能" : "Uncategorized skills"}</b><small>{zh ? "手动导入或尚未分类" : "Imported manually or not yet categorized"}</small></span></div>
-        <div className="skill-list">{ungroupedSkills.map((skill) => <SkillCard key={skill.id} skill={skill} zh={zh} skillsBusy={skillsBusy} onSetSkillEnabled={onSetSkillEnabled} />)}</div>
+        <div className="skill-list">{ungroupedSkills.map((skill) => <SkillCard key={skill.id} skill={skill} zh={zh} busy={skillsBusy || skillActionBusy !== null} active={skillActionBusy === skill.id} canToggle={Boolean(onSetSkillEnabled)} onToggle={() => void toggleSkill(skill)} onOpen={() => setDetailSkillId(skill.id)} />)}</div>
       </section>}
     </div>}
     <div className="settings-note"><ShieldCheck size={18} /><span><b>{zh ? "Skills 默认不启用" : "Skills are disabled by default"}</b><small>{zh ? "导入后请先检查来源、能力声明和使用说明，再决定是否启用。" : "Review the source, declared capabilities, and usage guide after import before enabling a Skill."}</small></span></div>
+    {detailSkillId && <SkillDetails key={detailSkillId} skillId={detailSkillId} locale={locale} onClose={() => setDetailSkillId(null)} />}
   </main>;
 
   return <main className="mcp-connections-settings">
@@ -471,8 +492,8 @@ function skillCategoryLabel(category: string, zh: boolean) {
   return category.replace(/_/g, " ");
 }
 
-function SkillCard({ skill, zh, skillsBusy, onSetSkillEnabled }: { skill: SkillPackage; zh: boolean; skillsBusy: boolean; onSetSkillEnabled?: Props["onSetSkillEnabled"] }) {
-  return <article><div className="skill-title"><span><b>{skill.name}</b><small>v{skill.version} · SHA-256 {skill.sha256.slice(0, 12)}</small></span><button disabled={skillsBusy || !onSetSkillEnabled} onClick={() => void onSetSkillEnabled?.(skill.id, !skill.enabled)}>{skill.enabled ? (zh ? "停用" : "Disable") : (zh ? "启用" : "Enable")}</button></div><div className="skill-capabilities">{skill.capabilities.length === 0 ? <em>{zh ? "无额外能力" : "No additional capabilities"}</em> : skill.capabilities.map((capability) => <em key={capability}>{capability}</em>)}</div><small className="skill-state">{skill.enabled ? (zh ? "已启用" : "Enabled") : (zh ? "已安装，等待启用" : "Installed, awaiting enablement")}</small></article>;
+function SkillCard({ skill, zh, busy, active, canToggle, onToggle, onOpen }: { skill: SkillPackage; zh: boolean; busy: boolean; active: boolean; canToggle: boolean; onToggle: () => void; onOpen: () => void }) {
+  return <article><div className="skill-title"><span><b>{skill.name}</b><small>v{skill.version} · SHA-256 {skill.sha256.slice(0, 12)}</small></span><span className="skill-card-actions"><button type="button" onClick={onOpen}>{zh ? "详情" : "Details"}</button><button type="button" disabled={busy || !canToggle} onClick={onToggle}>{active ? (zh ? "更新中…" : "Updating…") : skill.enabled ? (zh ? "停用" : "Disable") : (zh ? "启用" : "Enable")}</button></span></div><div className="skill-capabilities">{skill.capabilities.length === 0 ? <em>{zh ? "无额外能力" : "No additional capabilities"}</em> : skill.capabilities.map((capability) => <em key={capability}>{capability}</em>)}</div><small className="skill-state">{skill.enabled ? (zh ? "已启用" : "Enabled") : (zh ? "已安装，等待启用" : "Installed, awaiting enablement")}</small></article>;
 }
 
 type RemoteConnectionForm = { id: string; label: string; host: string; port: number; username: string; authentication: ConnectionProfile["authentication"]; secret: string; keyPath: string; passphrase: string };
