@@ -28,21 +28,21 @@
 
 | 页面 | 当前状态 | 可用页的交付范围 | 批次/依赖 |
 |---|---|---|---|
-| General | B1 已提交、全页部分 | 语言、共享发送偏好、项目内恢复、选择操作、通知、实际目录语义、真实更新状态及环境/网络入口 | B1 + B3 |
+| General | G1 native b67f2c2 + UI75bdf7e 已提交验证；目录失效预检/notice在补，G2/G3待做，全页部分 | 语言、共享发送偏好、项目内恢复、选择操作、通知、实际目录语义、真实更新状态及环境/网络入口 | B1 + B3 |
 | Session | 基础已有行为已源码核对，最终验收待做 | 现有迭代/继续/压缩/后续问题偏好完整管理与反馈 | B2；baseline-review |
 | Appearance | 616dbae 已提交及接入；已做指定表面视觉检查 | 实际主题、字体与界面缩放；自定义CSS导入不在基础范围 | B4 |
 | Pet | 5bd7213 + 85c78ac 已提交并接入 | 内置窗口内伴侣、外观与启停；运行状态目前仅有可选组件接口，未连接实际运行；自定义资源/独立桌面窗口不在基础范围 | B8 |
 | Credentials | 34afb53 + 26c4438 已提交接入，定向验证通过；最终全套待重跑 | 非敏感引用目录、受限替换、自定义keyring创建及未引用项删除；列表快照串行化 | B5；独立credentials计划 |
 | Permissions | 8eb938e + 70e9917 已提交并接入 | 真实 scope 授权列表及逐项撤销，不改冻结计划；竞态修复已测 | B5 |
-| Environments | SSH已有；system探测、新建入口与绑定错误反馈待补 | system真实探测、SSH 配置/信任/运行环境管理；backend目录不等于解释器探测 | B2；baseline-review |
+| Environments | c306e0a 已补system探测、新SSH入口、busy/绑定反馈及切项目竞态；定向通过，最终全套待跑 | system真实探测、SSH 配置/信任/运行环境管理；backend目录不等于解释器探测 | B2；baseline-review |
 | Storage | 6745ee3 + 85c78ac 已接入；901bb76 布局修复及有数据fixture视觉通过；最终全套待跑 | 真实应用/项目占用统计、范围筛选；不扩为清理；fixture不证明真实扫描 | B6 |
-| Usage | native ff03b2b + b7aace8 已提交验证；UI/route正在写，整页未完成 | 跨会话 token/模型/UTC日周/工具统计、项目与会话分页 | B6；独立usage计划 |
+| Usage | 57dfbc4 整页接入、13d9c57 长内容布局已提交验证；最终全套待重跑 | 跨会话 token/模型/UTC日周/工具统计、项目与会话分页 | B6；独立usage计划 |
 | Models | 基础已有行为已源码核对，最终验收待做 | 完整现有 provider 管理；ACP 为可选扩展，不作为页面完成前提 | B2 + B7；baseline-review |
 | Quick Actions | 9f2ea7a + 4051103 + 3931cad 已提交接入，定向验证通过；最终全套待重跑 | 用户动作 CRUD、工作流绑定及可见草稿插入，不自动提交 | B4，依赖 Workflows |
 | Workflows | fcbc589 已提交并接入 | 可用文本配方库设置页及真实调用；图执行引擎为可选扩展 | B2 + B7 |
 | Specialists | 9f2ea7a + 4051103 + 3931cad 已提交接入，定向验证通过；最终全套待重跑 | 项目角色模板CRUD、启停与可见草稿插入；独立专家运行、模型/工具白名单为可选扩展 | B7 |
 | Memory | 基础CRUD/导航已提交；2837101 + 1cd6088 补齐待处理草稿保护和文件名筛选；最终全套待重跑 | 项目记忆文件列表、按文件名筛选与显式增改删；无正文全文搜索或全局习惯作用域承诺 | B4 |
-| Skills | ff22647 独立页已提交；详情/文件/安全删除及启停错误反馈待补 | 管理实际安装源与启停，补齐有界详情/文件读取及受管删除 | B2 + B7；baseline-review |
+| Skills | d7ba5e9 S1来源receipt已提交；父junction修复和S2/S3进行中，整页未完成 | 管理实际安装源与启停，补齐有界详情/文件读取及受管删除 | B2 + B7；baseline-review |
 | Plugins | 生命周期切片已锁定，未实现 | 本地声明包验证/安装/更新/启停/安全移除及所有权绑定 | B7；plugins-general计划 |
 | Browser | ce37b5f 已修首次加载失败后的保存门控，定向验证通过；最终全套待重跑 | 现有配置/会话/域名/授权管理，失败不能以默认值覆盖未知配置 | B2；baseline-review |
 | Connections | b5c3156 + 60c4b69 完整页修复已提交，定向与输入焦点检查通过；最终全套待跑 | MCP stdio 管理与真实检查/授权，环境变量编辑保留与输入焦点已修复；HTTP/OAuth 为可选扩展 | B2 + B7；baseline-review |
@@ -318,8 +318,12 @@ HTTP/OAuth MCP、插件包管理不是 stdio Connections 页完成条件；后�
 - 主代理报告：Quick Actions/Specialists工作区插入接线 `4051103`、卡片间距修复 `3931cad` 已提交，templates整合153 tests及Web build通过；这是用户可见草稿插入，不是独立专家运行。
 - 主代理新增视觉检查：该批dist/Vite preview、headless Edge 720×600、显式dark与OS light相反、uiScale1.2，逐一实际点击当时18个导航（含额外Privacy，Usage/Plugins尚未进入该dist）；所有 `.settings-layout > main` 的clientWidth=scrollWidth=410，document width=viewport720。无Tauri宿主/未选项目，只证明导航和小窗页面框架无横溢；不能证明有数据时完整页面或原生行为。随后Storage数据fixture验证见下项。
 - 主代理报告：Connections `b5c3156`完整页修复，native MCP 25/25、Settings+API 61/61、Web build通过；`60c4b69`变量名逐字符失焦修复，Settings 59/59、Web build通过。根Edge 720×600使用keyboard.type('NCBI_EMAIL')实际得到完整值，焦点仍在env name 1；此检查证明真实键盘输入行为，不替代真实MCP进程/服务验收。
-- 主代理报告：Usage native `ff03b2b` + `b7aace8`已完成，Store最终5/5、native 7/7通过；UI与route仍在写，不能登记为整页完成。
+- 主代理报告：Usage native `ff03b2b` + `b7aace8`，Store最终5/5、native 7/7通过；整页 `57dfbc4` 的API 2 + Usage 9 + Settings 60 + Desktop 77 = 148/148及Web build通过。
 - 主代理报告：Storage `901bb76` CSS修复，定向3/3及Web build通过；根已查看有数据fixture截图，1440×1000与720×600、dark、uiScale1.2且OS light，内容clientWidth/scrollWidth分别956/956和410/410，无横溢。当前有效图为 `C:/Users/jindong/.codex/visualizations/2026/09/15/01a0a4d8-424b-7122-b3e4-925d0df0a256/settings-storage-ui-fixture-verified.png`，旧 `storage-ui-fixture.png`已过时。mock响应只证明布局，不证明真实磁盘扫描。
+- 主代理报告：共因长内容布局 `13d9c57`，Usage 9 + Storage 3 + Settings 61 = 73/73、Web build及Rust workspace全套通过。根actual dist、Edge 720×600、dark120%验证：Storage 15分类main clientHeight/scrollHeight为436/1830，各卡clientWidth=scrollWidth；Usage main高度436/1424，6个统计section均clientWidth=scrollWidth，均已滚至底部。截图目录 `C:/Users/jindong/.codex/visualizations/2026/09/15/01a0a4d8-424b-7122-b3e4-925d0df0a256/` 下 `settings-storage-long-content-verified.png`、`settings-usage-long-content-verified.png`；旧 `settings-usage-ui-fixture.png`为缺陷图。这些数据fixture证明布局，不是原生统计端到端验收。
+- 主代理报告：General G1 native `b67f2c2`，7/7及desktop build通过；UI `75bdf7e`，72/72及Web build通过。根mock native fixture的found/missing呈现正确，main高度436/1100、宽410/410，截图同目录 `settings-general-native-fixture.png`；不是真解释器验收。目录失效宿主预检/ProjectLibrary notice仍在补，G2/G3未完成，General仍部分。
+- 主代理报告：Environments `c306e0a` 已接system probe、新SSH入口、字段busy、绑定反馈及防旧绑定拉回项目；Settings 64、Settings + Desktop 142/142及Web build通过。
+- 主代理报告：Skills S1 `d7ba5e9` 来源receipt切片，adapter 2/2、native 16/16、fmt通过；父junction修复与S2/S3仍进行。基础功能剩余General、Skills、Plugins，不能将局部提交标为整页完成。
 - 上述新增提交之后，最终 `cargo test --workspace`、`npm test`、`npm run build` 和必要desktop build仍待统一重跑。某次Vitest阶段711项通过后，npm参数被末尾node --test解析导致整体命令失败；不能记录成完整 `npm test` 成功。
 
 - 主代理报告：Memory/Remote Access导航 `49743f5`，相邻142 tests及build通过；Permissions竞态修复 `70e9917`，61 tests及build通过。
