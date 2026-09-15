@@ -97,7 +97,7 @@ it("restores keyboard focus after a successful asynchronous edit", async () => {
   fireEvent.change(screen.getByRole("textbox"), { target: { value: "Edited" } });
   fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
   await waitFor(() => expect(screen.queryByRole("textbox")).toBeNull());
-  expect(edit).toHaveFocus();
+  await waitFor(() => expect(edit).toHaveFocus());
 });
 
 it("offers failed payload recovery without silently retrying execution", async () => {
