@@ -167,7 +167,7 @@ pub fn install_skill_directory(
     let parent = package_root
         .parent()
         .ok_or_else(|| AdapterError::InvalidInput("skill destination has no parent".into()))?;
-    fs::create_dir_all(parent)?;
+    ensure_managed_package_parent(&destination_root, parent)?;
     let temporary = parent.join(format!(".{}.importing", inspection.sha256));
     if temporary.exists() {
         fs::remove_dir_all(&temporary)?;
@@ -195,7 +195,41 @@ pub fn install_skill_directory(
         let _ = fs::remove_dir_all(&temporary);
     }
     copy_result?;
-    Ok(installed_from_inspection(inspection, package_root, true))
+    let resolved = package_root.canonicalize()?;
+    let metadata = fs::symlink_metadata(&package_root)?;
+    if !resolved.starts_with(&destination_root) || !metadata.is_dir() || is_reparse(&metadata) {
+        return Err(AdapterError::InvalidInput(
+            "installed skill path escapes the skill store".into(),
+        ));
+    }
+    Ok(installed_from_inspection(inspection, resolved, true))
+}
+
+fn ensure_managed_package_parent(destination_root: &Path, parent: &Path) -> AdapterResult<()> {
+    match fs::create_dir(parent) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = fs::symlink_metadata(parent)?;
+    let resolved = parent.canonicalize()?;
+    if !metadata.is_dir() || is_reparse(&metadata) || !resolved.starts_with(destination_root) {
+        return Err(AdapterError::InvalidInput(
+            "skill package parent escapes the skill store".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 fn installed_from_inspection(
@@ -447,5 +481,39 @@ mod installation_tests {
         assert!(!repeated.created_new_directory);
         assert_eq!(first.install_path, repeated.install_path);
         assert_eq!(first.sha256, repeated.sha256);
+    }
+
+    #[test]
+    fn installation_rejects_a_skill_name_directory_that_redirects_outside_the_store() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("installed");
+        let outside = temporary.path().join("outside");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: redirected\n---\n# Test\n",
+        )
+        .unwrap();
+        if create_directory_link(&outside, &destination.join("redirected")).is_err() {
+            // Windows hosts without Developer Mode may deny symlink creation.
+            return;
+        }
+
+        let error = install_skill_directory(&source, &destination).unwrap_err();
+        assert!(error.to_string().contains("parent escapes"));
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    #[cfg(windows)]
+    fn create_directory_link(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
+    #[cfg(unix)]
+    fn create_directory_link(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
     }
 }
