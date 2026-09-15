@@ -753,6 +753,19 @@ describe("SettingsPanel model providers", () => {
     expect(onSaveMcpServer).not.toHaveBeenCalled();
   });
 
+  it("keeps the MCP environment-name input mounted while typing", () => {
+    render(<SettingsPanel locale="en-US" initialSection="connections" onClose={() => undefined} onSaveMcpServer={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Add variable" }));
+    const input = screen.getByLabelText("MCP env name 1");
+    input.focus();
+    fireEvent.change(input, { target: { value: "N" } });
+    expect(screen.getByLabelText("MCP env name 1")).toBe(input);
+    expect(document.activeElement).toBe(input);
+    fireEvent.change(input, { target: { value: "NC" } });
+    expect(screen.getByLabelText("MCP env name 1")).toBe(input);
+    expect(document.activeElement).toBe(input);
+  });
+
   it("shows MCP runtime status and bounded diagnostics", async () => {
     const server = { id: "mcp-failed", name: "pubmed", command: "omicsops-desktop", args: ["--mcp-server", "pubmed"], enabled: false, launch_approved: false, approved_tools: [], tools: [], capabilities: {}, status: "failed", last_error: "server exited with code 1", stderr_tail: "invalid configuration", last_inspected_at: null, created_at: "", updated_at: "" };
     render(<SettingsPanel locale="en-US" onClose={() => undefined} mcpServers={[server]} />);
