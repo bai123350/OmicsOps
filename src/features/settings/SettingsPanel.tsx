@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ArrowLeft, Bot, Brain, CheckCircle2, ClipboardList, Cloud, Database, FolderOpen, Gauge, Globe2, KeyRound, Languages, Layers3, LoaderCircle, Monitor, Palette, PlugZap, Search, Server, ShieldCheck, Sparkles, Wrench, XCircle } from "lucide-react";
-import type { ConnectionProfile, ConnectionTestResult, McpEnvBinding, McpServerProfile, ModelProbeResult, ModelProfile, SaveMcpEnvBindingRequest, SkillPackage, WorkspaceProject } from "../../types";
+import type { ConnectionProfile, ConnectionTestResult, McpEnvBinding, McpServerProfile, ModelProbeResult, ModelProfile, SaveMcpEnvBindingRequest, SkillPackage, SystemInterpreterDiagnostics, WorkspaceProject } from "../../types";
 import type { Locale } from "../workspace/copy";
 import { supportsFastMode } from "../../fast-mode";
 import { BrowserSettings, useWindowEscapeLayer } from "./BrowserSettings";
@@ -21,6 +21,7 @@ import { SpecialistsSettings } from "./SpecialistsSettings";
 import { CredentialsSettings } from "./CredentialsSettings";
 import { GeneralAdvancedSettings } from "./GeneralAdvancedSettings";
 import { UsageSettings } from "./UsageSettings";
+import { settingsProbeSystemInterpreters } from "../../general-settings-api";
 import "./settings.css";
 import "./model-form.css";
 import "./remote-form.css";
@@ -471,15 +472,25 @@ function SkillCard({ skill, zh, skillsBusy, onSetSkillEnabled }: { skill: SkillP
   return <article><div className="skill-title"><span><b>{skill.name}</b><small>v{skill.version} · SHA-256 {skill.sha256.slice(0, 12)}</small></span><button disabled={skillsBusy || !onSetSkillEnabled} onClick={() => void onSetSkillEnabled?.(skill.id, !skill.enabled)}>{skill.enabled ? (zh ? "停用" : "Disable") : (zh ? "启用" : "Enable")}</button></div><div className="skill-capabilities">{skill.capabilities.length === 0 ? <em>{zh ? "无额外能力" : "No additional capabilities"}</em> : skill.capabilities.map((capability) => <em key={capability}>{capability}</em>)}</div><small className="skill-state">{skill.enabled ? (zh ? "已启用" : "Enabled") : (zh ? "已安装，等待启用" : "Installed, awaiting enablement")}</small></article>;
 }
 
+type RemoteConnectionForm = { id: string; label: string; host: string; port: number; username: string; authentication: ConnectionProfile["authentication"]; secret: string; keyPath: string; passphrase: string };
+
+function blankRemoteConnectionForm(): RemoteConnectionForm {
+  return { id: crypto.randomUUID(), label: "", host: "", port: 22, username: "", authentication: "password", secret: "", keyPath: "", passphrase: "" };
+}
+
 function RemoteSettings({ locale, connections, selectedProject, onSave, onTest, onConfirm, onBind }: { locale: Locale; connections: ConnectionProfile[]; selectedProject?: WorkspaceProject | null; onSave?: Props["onSaveConnection"]; onTest?: Props["onTestConnection"]; onConfirm?: Props["onConfirmHostKey"]; onBind?: Props["onBindProjectRemote"] }) {
   const zh = locale === "zh-CN";
-  const [form, setForm] = useState<{ id: string; label: string; host: string; port: number; username: string; authentication: ConnectionProfile["authentication"]; secret: string; keyPath: string; passphrase: string }>({ id: crypto.randomUUID(), label: "", host: "", port: 22, username: "", authentication: "password", secret: "", keyPath: "", passphrase: "" });
+  const [form, setForm] = useState<RemoteConnectionForm>(blankRemoteConnectionForm);
+  const [savedConnectionId, setSavedConnectionId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [bindingBusy, setBindingBusy] = useState(false);
+  const [probeBusy, setProbeBusy] = useState(false);
   const [error, setError] = useState("");
   const [results, setResults] = useState<Record<string, ConnectionTestResult>>({});
+  const [systemDiagnostics, setSystemDiagnostics] = useState<SystemInterpreterDiagnostics | null>(null);
   const [connectionId, setConnectionId] = useState(selectedProject?.connection_id ?? "");
   const [remoteRoot, setRemoteRoot] = useState(selectedProject?.remote_root ?? "");
-  const editingExisting = connections.some((profile) => profile.id === form.id);
+  const editingExisting = savedConnectionId === form.id || connections.some((profile) => profile.id === form.id);
   const selectedConnection = connections.find((profile) => profile.id === connectionId);
 
   async function saveConnection() {
@@ -488,6 +499,7 @@ function RemoteSettings({ locale, connections, selectedProject, onSave, onTest, 
     try {
       const secret = form.authentication === "password" ? form.secret : form.keyPath.trim() ? JSON.stringify({ path: form.keyPath, passphrase: form.passphrase || null }) : "";
       await onSave({ id: form.id, label: form.label, host: form.host, port: form.port, username: form.username, authentication: form.authentication, authentication_reference: `ssh/${form.id}`, host_key_fingerprint: null }, secret);
+      setSavedConnectionId(form.id);
       setForm((current) => ({ ...current, secret: "", passphrase: "" }));
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setBusy(false); }
@@ -511,10 +523,32 @@ function RemoteSettings({ locale, connections, selectedProject, onSave, onTest, 
     catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); setBusy(false); }
   }
 
+  async function probeSystemInterpreters() {
+    setProbeBusy(true); setError("");
+    try { setSystemDiagnostics(await settingsProbeSystemInterpreters()); }
+    catch { setError(zh ? "无法检查 system Python / R，请重试。" : "Could not check system Python / R. Retry."); }
+    finally { setProbeBusy(false); }
+  }
+
+  async function bindProject() {
+    if (!onBind) return;
+    setBusy(true); setBindingBusy(true); setError("");
+    try { await onBind(connectionId, remoteRoot); }
+    catch { setError(zh ? "无法保存项目绑定，请重试。" : "Could not save the project binding. Retry."); }
+    finally { setBusy(false); setBindingBusy(false); }
+  }
+
+  function startNewConnection() {
+    setForm(blankRemoteConnectionForm());
+    setSavedConnectionId(null);
+    setError("");
+  }
+
   return <main className="remote-settings"><div className="settings-heading"><h3>{zh ? "远端 Linux 计算" : "Remote Linux compute"}</h3><p>{zh ? "首次连接只读取主机指纹；确认后才发送凭据。密码仅保存到 Windows Credential Manager。" : "The first connection reads only the host key. Credentials are sent only after confirmation and stay in Windows Credential Manager."}</p></div>
-    <section className="remote-form"><div className="remote-grid"><label>{zh ? "名称" : "Label"}<input aria-label="SSH label" value={form.label} onChange={(event) => setForm({ ...form, label: event.target.value })} /></label><label>{zh ? "主机" : "Host"}<input aria-label="SSH host" value={form.host} onChange={(event) => setForm({ ...form, host: event.target.value })} /></label><label>{zh ? "端口" : "Port"}<input aria-label="SSH port" type="number" min="1" max="65535" value={form.port} onChange={(event) => setForm({ ...form, port: Number(event.target.value) })} /></label><label>{zh ? "用户名" : "Username"}<input aria-label="SSH username" value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} /></label><label>{zh ? "认证" : "Authentication"}<select aria-label="SSH authentication" value={form.authentication} onChange={(event) => setForm({ ...form, authentication: event.target.value as ConnectionProfile["authentication"] })}><option value="password">{zh ? "密码" : "Password"}</option><option value="private_key">{zh ? "私钥" : "Private key"}</option></select></label>{form.authentication === "password" ? <label>{editingExisting ? (zh ? "新密码（留空则保持不变）" : "New password (leave blank to keep)") : (zh ? "密码" : "Password")}<input aria-label="SSH password" type="password" autoComplete="new-password" value={form.secret} onChange={(event) => setForm({ ...form, secret: event.target.value })} /></label> : <><label>{zh ? "私钥路径" : "Private key path"}<input aria-label="SSH private key path" value={form.keyPath} onChange={(event) => setForm({ ...form, keyPath: event.target.value })} /></label><label>{zh ? "私钥口令（可选）" : "Passphrase (optional)"}<input aria-label="SSH passphrase" type="password" value={form.passphrase} onChange={(event) => setForm({ ...form, passphrase: event.target.value })} /></label></>}</div><button className="primary" disabled={busy || !form.label.trim() || !form.host.trim() || !form.username.trim() || (!editingExisting && (form.authentication === "password" ? !form.secret : !form.keyPath.trim()))} onClick={() => void saveConnection()}>{zh ? "保存连接" : "Save connection"}</button></section>
-    <div className="connection-list">{connections.map((profile) => { const result = results[profile.id]; return <article key={profile.id}><div><b>{profile.label}</b><small>{profile.username}@{profile.host}:{profile.port} · {profile.authentication}</small></div><div className="connection-actions"><button disabled={busy} onClick={() => setForm({ id: profile.id, label: profile.label, host: profile.host, port: profile.port, username: profile.username, authentication: profile.authentication, secret: "", keyPath: "", passphrase: "" })}>{zh ? "编辑" : "Edit"}</button><button disabled={busy || !onTest} onClick={() => void test(profile.id)}>{zh ? "测试连接" : "Test"}</button></div>{result && <div className="connection-result"><code>{result.fingerprint}</code><span>{result.trusted ? (zh ? "主机已信任" : "Host trusted") : (zh ? "等待确认主机指纹" : "Confirm host fingerprint")}</span>{!result.trusted && <button disabled={busy || !onConfirm} onClick={() => void confirm(profile.id, result.fingerprint)}>{zh ? "确认此指纹" : "Trust fingerprint"}</button>}{result.authenticated && <small>{result.serverOs} · {result.remoteUsername} · {result.latencyMs} ms · SFTP {result.sftpAvailable ? "✓" : "✗"} · Python {result.pythonAvailable ? "✓" : "✗"} · R {result.rAvailable ? "✓" : "✗"}</small>}</div>}</article>; })}</div>
-    {selectedProject && <section className="remote-binding"><b>{zh ? `绑定项目：${selectedProject.name}` : `Bind project: ${selectedProject.name}`}</b><select aria-label="Project SSH connection" value={connectionId} onChange={(event) => setConnectionId(event.target.value)}><option value="">{zh ? "选择连接" : "Select connection"}</option>{connections.map((profile) => <option key={profile.id} value={profile.id}>{profile.label}{profile.host_key_fingerprint ? "" : (zh ? "（未信任）" : " (untrusted)")}</option>)}</select><input aria-label="Remote project root" placeholder="/home/user/omicsops/project" value={remoteRoot} onChange={(event) => setRemoteRoot(event.target.value)} /><button disabled={busy || !selectedConnection?.host_key_fingerprint || !remoteRoot.startsWith("/") || !onBind} onClick={() => void onBind?.(connectionId, remoteRoot)}>{zh ? "保存项目绑定" : "Save project binding"}</button>{selectedConnection && !selectedConnection.host_key_fingerprint && <small>{zh ? "请先测试并确认该服务器的主机指纹。" : "Test and trust this server's host fingerprint first."}</small>}</section>}
+    <section className="remote-system-check"><div><b>{zh ? "本机 system Python / R" : "Local system Python / R"}</b><small>{zh ? "只检查 system PATH 中固定的 python 和 Rscript；不会安装环境，也不会验证项目依赖。" : "Checks fixed python and Rscript commands on the system PATH. It does not install environments or verify project dependencies."}</small>{systemDiagnostics && <div className="remote-system-results">{[systemDiagnostics.python, systemDiagnostics.r].map((item) => <span key={item.program}><code>{item.program}</code><small>{item.status === "found" ? item.detail : item.status === "missing" ? (zh ? "system PATH 中未找到" : "Not found on the system PATH") : (item.detail || (zh ? "检查失败" : "Probe failed"))}</small></span>)}</div>}</div><button disabled={busy || probeBusy} onClick={() => void probeSystemInterpreters()}>{probeBusy ? (zh ? "检查中…" : "Checking…") : (zh ? "检查 system 解释器" : "Check system interpreters")}</button></section>
+    <section className="remote-form"><fieldset className="remote-grid" disabled={busy}><label>{zh ? "名称" : "Label"}<input aria-label="SSH label" value={form.label} onChange={(event) => setForm({ ...form, label: event.target.value })} /></label><label>{zh ? "主机" : "Host"}<input aria-label="SSH host" value={form.host} onChange={(event) => setForm({ ...form, host: event.target.value })} /></label><label>{zh ? "端口" : "Port"}<input aria-label="SSH port" type="number" min="1" max="65535" value={form.port} onChange={(event) => setForm({ ...form, port: Number(event.target.value) })} /></label><label>{zh ? "用户名" : "Username"}<input aria-label="SSH username" value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} /></label><label>{zh ? "认证" : "Authentication"}<select aria-label="SSH authentication" value={form.authentication} onChange={(event) => setForm({ ...form, authentication: event.target.value as ConnectionProfile["authentication"] })}><option value="password">{zh ? "密码" : "Password"}</option><option value="private_key">{zh ? "私钥" : "Private key"}</option></select></label>{form.authentication === "password" ? <label>{editingExisting ? (zh ? "新密码（留空则保持不变）" : "New password (leave blank to keep)") : (zh ? "密码" : "Password")}<input aria-label="SSH password" type="password" autoComplete="new-password" value={form.secret} onChange={(event) => setForm({ ...form, secret: event.target.value })} /></label> : <><label>{zh ? "私钥路径" : "Private key path"}<input aria-label="SSH private key path" value={form.keyPath} onChange={(event) => setForm({ ...form, keyPath: event.target.value })} /></label><label>{zh ? "私钥口令（可选）" : "Passphrase (optional)"}<input aria-label="SSH passphrase" type="password" value={form.passphrase} onChange={(event) => setForm({ ...form, passphrase: event.target.value })} /></label></>}</fieldset><div className="remote-form-actions"><button className="primary" disabled={busy || !form.label.trim() || !form.host.trim() || !form.username.trim() || (!editingExisting && (form.authentication === "password" ? !form.secret : !form.keyPath.trim()))} onClick={() => void saveConnection()}>{zh ? "保存连接" : "Save connection"}</button>{editingExisting && <button disabled={busy} onClick={startNewConnection}>{zh ? "新建连接" : "New connection"}</button>}</div></section>
+    <div className="connection-list">{connections.map((profile) => { const result = results[profile.id]; return <article key={profile.id}><div><b>{profile.label}</b><small>{profile.username}@{profile.host}:{profile.port} · {profile.authentication}</small></div><div className="connection-actions"><button disabled={busy} onClick={() => { setSavedConnectionId(null); setForm({ id: profile.id, label: profile.label, host: profile.host, port: profile.port, username: profile.username, authentication: profile.authentication, secret: "", keyPath: "", passphrase: "" }); }}>{zh ? "编辑" : "Edit"}</button><button disabled={busy || !onTest} onClick={() => void test(profile.id)}>{zh ? "测试连接" : "Test"}</button></div>{result && <div className="connection-result"><code>{result.fingerprint}</code><span>{result.trusted ? (zh ? "主机已信任" : "Host trusted") : (zh ? "等待确认主机指纹" : "Confirm host fingerprint")}</span>{!result.trusted && <button disabled={busy || !onConfirm} onClick={() => void confirm(profile.id, result.fingerprint)}>{zh ? "确认此指纹" : "Trust fingerprint"}</button>}{result.authenticated && <small>{result.serverOs} · {result.remoteUsername} · {result.latencyMs} ms · SFTP {result.sftpAvailable ? "✓" : "✗"} · Python {result.pythonAvailable ? "✓" : "✗"} · R {result.rAvailable ? "✓" : "✗"}</small>}</div>}</article>; })}</div>
+    {selectedProject && <section className="remote-binding"><b>{zh ? `绑定项目：${selectedProject.name}` : `Bind project: ${selectedProject.name}`}</b><select aria-label="Project SSH connection" disabled={busy} value={connectionId} onChange={(event) => setConnectionId(event.target.value)}><option value="">{zh ? "选择连接" : "Select connection"}</option>{connections.map((profile) => <option key={profile.id} value={profile.id}>{profile.label}{profile.host_key_fingerprint ? "" : (zh ? "（未信任）" : " (untrusted)")}</option>)}</select><input aria-label="Remote project root" disabled={busy} placeholder="/home/user/omicsops/project" value={remoteRoot} onChange={(event) => setRemoteRoot(event.target.value)} /><button disabled={busy || !selectedConnection?.host_key_fingerprint || !remoteRoot.startsWith("/") || !onBind} onClick={() => void bindProject()}>{bindingBusy ? (zh ? "正在保存项目绑定…" : "Saving project binding…") : (zh ? "保存项目绑定" : "Save project binding")}</button>{selectedConnection && !selectedConnection.host_key_fingerprint && <small>{zh ? "请先测试并确认该服务器的主机指纹。" : "Test and trust this server's host fingerprint first."}</small>}</section>}
     {error && <div className="skill-error" role="alert">{error}</div>}
   </main>;
 }

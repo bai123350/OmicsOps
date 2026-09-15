@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SettingsPanel } from "./SettingsPanel";
 import { setComposerSendPreference } from "./useComposerSendPreference";
@@ -11,6 +11,16 @@ import * as memoryApi from "../../memory-settings-api";
 import * as credentialsApi from "../../credentials-settings-api";
 import * as generalSettingsApi from "../../general-settings-api";
 import * as usageApi from "../../usage-settings-api";
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((nextResolve, nextReject) => {
+    resolve = nextResolve;
+    reject = nextReject;
+  });
+  return { promise, resolve, reject };
+}
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -818,5 +828,60 @@ describe("SettingsPanel model providers", () => {
     fireEvent.click(screen.getByRole("button", { name: "确认此指纹" }));
     await waitFor(() => expect(onConfirmHostKey).toHaveBeenCalledWith("connection-1", "SHA256:test"));
     expect(await screen.findByText(/Linux 6.8/)).toBeInTheDocument();
+  });
+
+  it("checks fixed system interpreters from Environments without claiming dependencies are installed", async () => {
+    vi.spyOn(generalSettingsApi, "settingsProbeSystemInterpreters").mockResolvedValue({
+      python: { program: "python", status: "found", detail: "Python 3.13.1" },
+      r: { program: "Rscript", status: "missing", detail: null },
+      checked_at: "2026-09-16T00:00:00Z",
+    });
+    render(<SettingsPanel locale="en-US" initialSection="remote" onClose={() => undefined} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Check system interpreters" }));
+
+    expect(await screen.findByText("Python 3.13.1")).toBeInTheDocument();
+    expect(screen.getByText("Not found on the system PATH")).toBeInTheDocument();
+    expect(screen.getByText(/does not install environments or verify project dependencies/i)).toBeInTheDocument();
+  });
+
+  it("keeps project binding pending and reports a retryable failure", async () => {
+    const binding = deferred<void>();
+    const connection = { id: "connection-1", label: "Lab SSH", host: "compute.example.org", port: 22, username: "scientist", authentication: "password" as const, authentication_reference: "ssh/connection-1", host_key_fingerprint: "SHA256:trusted" };
+    const selectedProject = { id: "project-1", name: "PBMC", description: "", local_root: "E:/PBMC", remote_root: null, connection_id: null, template: "single_cell_rna_seq" as const, status: "ready" as const, ollama_only: false, created_at: "", updated_at: "" };
+    const onBindProjectRemote = vi.fn(() => binding.promise);
+    render(<SettingsPanel locale="en-US" initialSection="remote" onClose={() => undefined} connections={[connection]} selectedProject={selectedProject} onBindProjectRemote={onBindProjectRemote} />);
+    fireEvent.change(screen.getByLabelText("Project SSH connection"), { target: { value: connection.id } });
+    fireEvent.change(screen.getByLabelText("Remote project root"), { target: { value: "/srv/pbmc" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Save project binding" }));
+    expect(screen.getByRole("button", { name: "Saving project binding…" })).toBeDisabled();
+    expect(screen.getByLabelText("Project SSH connection")).toBeDisabled();
+    binding.reject(new Error("transport failed"));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not save the project binding. Retry.");
+    expect(onBindProjectRemote).toHaveBeenCalledWith("connection-1", "/srv/pbmc");
+  });
+
+  it("starts a fresh SSH form after saving a connection", async () => {
+    const save = deferred<void>();
+    const onSaveConnection = vi.fn(() => save.promise);
+    render(<SettingsPanel locale="en-US" initialSection="remote" onClose={() => undefined} onSaveConnection={onSaveConnection} />);
+    fireEvent.change(screen.getByLabelText("SSH label"), { target: { value: "Lab SSH" } });
+    fireEvent.change(screen.getByLabelText("SSH host"), { target: { value: "compute.example.org" } });
+    fireEvent.change(screen.getByLabelText("SSH username"), { target: { value: "scientist" } });
+    fireEvent.change(screen.getByLabelText("SSH password"), { target: { value: "test-only-password" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Save connection" }));
+    expect(screen.getByLabelText("SSH label")).toBeDisabled();
+    expect(screen.getByLabelText("SSH password")).toBeDisabled();
+    await act(async () => save.resolve());
+    expect(await screen.findByRole("button", { name: "New connection" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "New connection" }));
+
+    expect(screen.getByLabelText("SSH label")).toHaveValue("");
+    expect(screen.getByLabelText("SSH host")).toHaveValue("");
+    expect(screen.getByLabelText("SSH username")).toHaveValue("");
+    expect(screen.queryByRole("button", { name: "New connection" })).not.toBeInTheDocument();
   });
 });

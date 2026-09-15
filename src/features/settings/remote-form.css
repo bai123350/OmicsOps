@@ -1,9 +1,15 @@
 .remote-settings { display: flex; flex-direction: column; gap: 16px; }
-.remote-form, .remote-binding { border: 1px solid #dfe3e9; border-radius: 10px; padding: 13px; }
+.remote-form, .remote-binding, .remote-system-check { border: 1px solid #dfe3e9; border-radius: 10px; padding: 13px; }
 .remote-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.remote-grid:is(fieldset) { border: 0; padding: 0; margin: 0; min-width: 0; }
 .remote-grid label { color: #475467; font-size: 10px; display: flex; flex-direction: column; gap: 4px; }
 .remote-grid input, .remote-grid select, .remote-binding input, .remote-binding select { border: 1px solid #d0d5dd; border-radius: 7px; padding: 7px 8px; background: white; }
-.remote-form > button { margin-top: 10px; }
+.remote-form-actions { display: flex; gap: 8px; margin-top: 10px; }
+.remote-form-actions button, .remote-system-check button { border: 1px solid #d0d5dd; background: white; border-radius: 7px; padding: 7px 10px; }
+.remote-system-check { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.remote-system-check > div > small { display: block; color: #667085; margin-top: 4px; }
+.remote-system-results { display: grid; gap: 4px; margin-top: 8px; }
+.remote-system-results > span { display: flex; align-items: baseline; gap: 8px; }
 .remote-settings .primary, .remote-binding button { border: 0; background: #254fca; color: white; border-radius: 7px; padding: 7px 10px; }
 .remote-settings button:disabled { opacity: .5; cursor: not-allowed; }
 .connection-list { display: grid; gap: 8px; }

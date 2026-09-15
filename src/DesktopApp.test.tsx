@@ -1350,6 +1350,40 @@ describe("DesktopApp", () => {
     expect(screen.queryByRole("heading", { name: otherConversation.title })).not.toBeInTheDocument();
   });
 
+  it("does not return to an old project when its remote binding finishes late", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    const otherProject = { ...stateProject, id: "project-other-binding", name: "Other binding project" };
+    const otherConversation = { ...stateConversations[0], id: "conversation-other-binding", project_id: otherProject.id, title: "Other binding conversation" };
+    const connection = { id: "connection-binding", label: "Trusted cluster", host: "compute.example.org", port: 22, username: "scientist", authentication: "password" as const, authentication_reference: "ssh/connection-binding", host_key_fingerprint: "SHA256:trusted" };
+    const pending = deferred<Awaited<ReturnType<typeof api.updateProjectRemote>>>();
+    vi.mocked(api.listProjects).mockResolvedValue([stateProject, otherProject]);
+    vi.spyOn(api, "listConnections").mockResolvedValue([connection]);
+    vi.spyOn(api, "updateProjectRemote").mockReturnValue(pending.promise);
+    vi.mocked(api.listConversations).mockImplementation(async (projectId) => projectId === otherProject.id ? [otherConversation] : stateConversations);
+    vi.mocked(api.latestUsedConversation).mockImplementation(async (projectId) => projectId === otherProject.id ? otherConversation : stateConversations[0]);
+    stateSpy.mockImplementation(async (projectId, conversationId) => ({ ...stateSnapshot(conversationId), project_id: projectId }));
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("button", { name: "环境" }));
+    fireEvent.change(screen.getByLabelText("Project SSH connection"), { target: { value: connection.id } });
+    fireEvent.change(screen.getByLabelText("Remote project root"), { target: { value: "/srv/pbmc" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存项目绑定" }));
+    await waitFor(() => expect(api.updateProjectRemote).toHaveBeenCalledWith(stateProject.id, connection.id, "/srv/pbmc"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    fireEvent.click(screen.getByRole("button", { name: "返回项目主页" }));
+    const otherProjectButton = screen.getAllByRole("button", { name: new RegExp(otherProject.name) }).find((button) => button.classList.contains("recent-project-open"));
+    expect(otherProjectButton).toBeDefined();
+    fireEvent.click(otherProjectButton!);
+    expect(await screen.findByRole("heading", { name: otherConversation.title })).toBeInTheDocument();
+
+    await act(async () => pending.resolve({ ...stateProject, connection_id: connection.id, remote_root: "/srv/pbmc" }));
+    expect(screen.getByRole("heading", { name: otherConversation.title })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: stateConversations[0].title })).not.toBeInTheDocument();
+  });
+
   it("persists the existing project-library language switch across remounts", async () => {
     vi.spyOn(api, "listProjects").mockResolvedValue([]);
     const first = render(<DesktopApp />);
