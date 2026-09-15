@@ -1,0 +1,103 @@
+.project-template-settings {
+  display: grid;
+  gap: 16px;
+}
+
+.project-template-toolbar,
+.project-template-toolbar > span,
+.project-template-title,
+.project-template-actions,
+.project-template-delete-confirm {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.project-template-toolbar {
+  justify-content: space-between;
+}
+
+.project-template-toolbar > span {
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.project-template-list {
+  display: grid;
+  gap: 12px;
+}
+
+.project-template-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+}
+
+.project-template-item p {
+  margin: 6px 0;
+}
+
+.project-template-title small {
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 999px;
+  padding: 2px 7px;
+}
+
+.project-template-editor {
+  display: grid;
+  gap: 12px;
+}
+
+.project-template-editor > label:not(.project-template-enabled) {
+  display: grid;
+  gap: 6px;
+}
+
+.project-template-editor input,
+.project-template-editor textarea,
+.project-template-editor select {
+  width: 100%;
+}
+
+.project-template-enabled {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.project-template-enabled input {
+  width: auto;
+}
+
+.project-template-actions {
+  justify-content: flex-end;
+}
+
+.project-template-delete-confirm {
+  grid-column: 1 / -1;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.project-template-delete-confirm > span {
+  margin-right: auto;
+}
+
+.project-template-error {
+  color: #fca5a5;
+}
+
+.project-template-empty {
+  color: var(--text-muted, #94a3b8);
+}
+
+@media (max-width: 720px) {
+  .project-template-item {
+    grid-template-columns: 1fr;
+  }
+
+  .project-template-actions {
+    justify-content: flex-start;
+  }
+}
