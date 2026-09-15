@@ -30,23 +30,23 @@
 |---|---|---|---|
 | General | B1 已提交、全页部分 | 语言、共享发送偏好、项目内恢复、选择操作、通知、实际目录语义、真实更新状态及环境/网络入口 | B1 + B3 |
 | Session | 已有部分 | 现有迭代/继续/压缩偏好完整管理与反馈 | B2 |
-| Appearance | 组件与根接入已提交，整合验收中 | 实际主题、字体与字号应用；导入需明确安全边界 | B4 |
-| Pet | 未实现 | 实际宠物展示、启停及资源管理 | B8 |
-| Credentials | 已有 vault | 非敏感凭据目录、设置/替换/清除与引用一致性 | B5 |
-| Permissions | 授权散落 | 真实 scope 授权列表及逐项撤销，不改冻结计划 | B5 |
+| Appearance | 616dbae 已提交及接入；已做指定表面视觉检查 | 实际主题、字体与界面缩放；自定义CSS导入不在基础范围 | B4 |
+| Pet | 5bd7213 + 85c78ac 已提交并接入 | 内置窗口内伴侣、真实运行状态与启停；自定义资源/独立桌面窗口不在基础范围 | B8 |
+| Credentials | 完整切片已锁定，实现中 | 非敏感引用目录、受限替换、自定义keyring创建及未引用项删除 | B5；独立credentials计划 |
+| Permissions | 8eb938e + 70e9917 已提交并接入 | 真实 scope 授权列表及逐项撤销，不改冻结计划；竞态修复已测 | B5 |
 | Environments | 已有部分 | system 探测、SSH 配置/信任/运行环境管理；遵守本地限制 | B2 |
-| Storage | 未实现 | 真实应用/项目占用统计、范围筛选；不扩为清理 | B6 |
-| Usage | 已有会话观察 | 跨会话 token/模型/时间/工具统计、项目与会话分页 | B6 |
+| Storage | 6745ee3 + 85c78ac 已提交并接入 | 真实应用/项目占用统计、范围筛选；不扩为清理 | B6 |
+| Usage | 独立可执行计划已锁定，未实现 | 跨会话 token/模型/UTC日周/工具统计、项目与会话分页 | B6；独立usage计划 |
 | Models | 已有部分 | 完整现有 provider 管理；ACP 为可选扩展，不作为页面完成前提 | B2 + B7 |
-| Quick Actions | 固定动作 | 用户动作 CRUD、工作流绑定及真实调用 | B4，依赖 Workflows |
-| Workflows | 文本配方 | 可用配方库设置页及真实调用；图执行引擎为可选扩展 | B2 + B7 |
-| Specialists | 未实现 | 专家角色 CRUD、模型/工具约束、真实执行选择 | B7 |
-| Memory | 文件读写/搜索 | 项目记忆列表/搜索/显式变更，习惯记忆独立作用域 | B4 |
-| Skills | 已有部分 | 管理实际安装源、启停、详情/文件及安全删除边界 | B2 + B7 |
-| Plugins | 未实现 | 验证安装源/包、生命周期、启停/移除及工具绑定 | B7 |
+| Quick Actions | 9f2ea7a native已提交，CRUD/picker接线中 | 用户动作 CRUD、工作流绑定及可见草稿插入，不自动提交 | B4，依赖 Workflows |
+| Workflows | fcbc589 已提交并接入 | 可用文本配方库设置页及真实调用；图执行引擎为可选扩展 | B2 + B7 |
+| Specialists | 9f2ea7a native已提交，CRUD/picker接线中 | 项目角色模板CRUD、启停与可见草稿插入；独立专家运行、模型/工具白名单为可选扩展 | B7 |
+| Memory | 4d21d19 + 3d28e5d + 49743f5 已提交并接入 | 项目记忆文件列表/搜索/显式增改删；全局习惯记忆为独立可选作用域，不声明已实现 | B4 |
+| Skills | ff22647 已提交独立页 | 管理实际安装源与启停；详情/文件及安全删除仍按实际实现逐项验收 | B2 + B7 |
+| Plugins | 生命周期切片已锁定，未实现 | 本地声明包验证/安装/更新/启停/安全移除及所有权绑定 | B7；plugins-general计划 |
 | Browser | 已有部分 | 现有配置/会话/域名/授权完整可用页 | B2 |
-| Connections | stdio MCP | MCP stdio 管理与真实检查/授权；HTTP/OAuth 为可选扩展 | B2 + B7 |
-| Remote Access | SSH传输不同义 | 现有项目本地/SSH传输与同步管理，明确范围/状态/恢复；上游渠道平台不在基础页范围 | B8 |
+| Connections | ff22647 已提交独立页 | MCP stdio 管理与真实检查/授权；HTTP/OAuth 为可选扩展 | B2 + B7 |
+| Remote Access | 6c2a40d + 49743f5 已提交并接入 | 现有项目本地/SSH传输与同步管理，明确范围/状态/恢复；上游渠道平台不在基础页范围 | B8 |
 
 批次顺序不强制串行：B1 先建立设置承载与 General 核心；B2 整合已有能力；B3 接原生偏好；B4 用户内容和视觉；B5 授权/秘密；B6 只读统计；B7 适合 OmicsOps 的专家/扩展管理；B8 项目传输与 Pet。后续批次在开工前追加明确文件、协议、测试用例和提交任务，不将本 master 当作尚未设计子系统的代码规格。
 
@@ -300,6 +300,22 @@ HTTP/OAuth MCP、插件包管理不是 stdio Connections 页完成条件；后�
 每个切片先由后端代理在新模块/测试定义契约，再安排 DTO/注册 owner 接入，避免和当前 Storage 并行编辑同一共享文件。审阅必须看真实调用与持久化结果，组件mock通过不能替代后端验证。
 
 ## 审阅与交付记录
+
+### 剩余页已锁定的派发规格
+
+- [Credentials独立计划](2026-09-15-credentials-settings.md)：真实keyring目录/创建/替换/未引用删除；canonical owner、防alias绕过、expected reference及MCP删除竞态已定义。
+- [Usage独立计划](2026-09-15-usage-settings.md)：固定事件快照、完整run分页合并、项目/会话/模型/日周/工具；不估账单、不把缺失当0。
+- [Plugins与General剩余切片](2026-09-15-plugins-general-settings.md)：本地声明包安装/更新/启停/安全移除与恢复；General真实目录选择起始位置、正文选择动作、原生通知、版本/缺源状态及环境网络实际入口。语言/发送/恢复沿用B1。
+
+以上独立计划细化并优先于同页较早的mini-slice接口；适配边界仍保留。没有将说明、mock或孤立组件登记为整页完成。
+
+### 本轮已提交里程碑和验证范围
+
+- 主代理报告：Memory/Remote Access导航 `49743f5`，相邻142 tests及build通过；Permissions竞态修复 `70e9917`，61 tests及build通过。
+- 主代理报告：templates native `9f2ea7a` 后执行新鲜 `cargo test --workspace`，exit 0；真实SSH/model/PBMC ignored验收仍未执行。后续凭据/用量修改后须重新运行最终完整检查。
+- 主代理报告：前端79 files、664 tests及22 tests通过；Browser低对比修复 `45b4404` 后headless Edge 1440×1000、dark、uiScale1.2，6个Browser标签computed color均为rgb(242,244,247)，立即Escape关闭设置。Connections/Browser布局clientWidth=scrollWidth=1200（CSS缩放前）无横向溢出。
+- 已实际打开General/Connections/Browser/Permissions/Memory/Remote Access/Storage/Pet导航；此次预览无Tauri宿主、无选定项目，只证明UI导航/布局，不证明原生命令、真实项目数据或网络运行验收。
+- 当前有效截图：`C:/Users/jindong/.codex/visualizations/2026/09/15/01a0a4d8-424b-7122-b3e4-925d0df0a256/settings-browser-dark-verified.png`。较早review截图已被替代；其他表面或平台不据此视为视觉全部通过。
 
 - [x] 源码审计提交：`0a6ef68`。
 - [x] 全 19 页范围及项目内恢复修正：`994203c`。
