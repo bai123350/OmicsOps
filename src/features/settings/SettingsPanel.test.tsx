@@ -4,6 +4,8 @@ import { SettingsPanel } from "./SettingsPanel";
 import { setComposerSendPreference } from "./useComposerSendPreference";
 import { AppearanceProvider } from "../../use-appearance";
 import * as workflowApi from "../../composer-workflow-api";
+import * as api from "../../tauri-api";
+import { PetPreferencesProvider } from "../../use-pet-preferences";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -257,6 +259,26 @@ describe("SettingsPanel model providers", () => {
     expect(screen.getByRole("combobox", { name: "Theme" })).toHaveValue("system");
   });
 
+  it("registers the provider-backed Pet page as a real preference surface", () => {
+    render(<PetPreferencesProvider><SettingsPanel locale="en-US" initialSection="pet" onClose={() => undefined} /></PetPreferencesProvider>);
+
+    expect(screen.getByRole("button", { name: "Pet" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("heading", { name: "Research companion" })).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "Show research companion" })).not.toBeChecked();
+    expect(screen.getByLabelText("Pet preview")).toBeInTheDocument();
+  });
+
+  it("registers Storage and reads the bounded managed-data snapshot", async () => {
+    vi.spyOn(api, "settingsStorageUsage").mockResolvedValue({
+      scope: "managed", project_id: null, entries: [], known_logical_bytes: 0, status: "complete", scanned_entries: 0, skipped_links: 0, limits: { max_entries: 100_000, max_duration_ms: 2_000 },
+    });
+    render(<SettingsPanel locale="en-US" initialSection="storage" onClose={() => undefined} />);
+
+    expect(screen.getByRole("button", { name: "Storage" })).toHaveAttribute("aria-current", "page");
+    expect(await screen.findByRole("heading", { name: "Logical file bytes" })).toBeInTheDocument();
+    expect(api.settingsStorageUsage).toHaveBeenCalledWith(undefined);
+  });
+
   it("loads the current project workflow library inside Settings and reports saved catalog changes", async () => {
     vi.spyOn(workflowApi, "listComposerWorkflows").mockResolvedValue([{
       id: "workflow-qc", project_id: "project-1", name: "QC recipe", description: "Inspect counts", steps: ["Inspect"], enabled: true,
@@ -352,7 +374,9 @@ describe("SettingsPanel model providers", () => {
     expect(within(navigation).getByRole("button", { name: "General" })).toBeInTheDocument();
     expect(within(navigation).getByRole("button", { name: "Skills" })).toBeInTheDocument();
     expect(within(navigation).getByRole("button", { name: "Connections" })).toBeInTheDocument();
-    expect(within(navigation).queryByRole("button", { name: "Pet" })).not.toBeInTheDocument();
+    expect(within(navigation).getByRole("button", { name: "Workflows" })).toBeInTheDocument();
+    expect(within(navigation).getByRole("button", { name: "Pet" })).toBeInTheDocument();
+    expect(within(navigation).getByRole("button", { name: "Storage" })).toBeInTheDocument();
   });
 
   it("searches navigation labels in either language without changing or clearing the active page", () => {
