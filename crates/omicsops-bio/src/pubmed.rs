@@ -16,9 +16,9 @@ mod related;
 #[cfg(test)]
 mod tests;
 
-use crate::http::{Http, NCBI};
+use crate::http::{Http, NCBI, Response};
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::Method;
+use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -54,7 +54,7 @@ impl PubMed {
         };
         Self {
             http,
-            api_key: credential("NCBI_API_KEY"),
+            api_key: credential("NCBI_API_KEY").and_then(usable_ncbi_api_key),
             email: credential("NCBI_EMAIL"),
             ncbi: NCBI_EUTILS.into(),
             idconv: IDCONV.into(),
@@ -150,11 +150,7 @@ impl PubMed {
         path: &str,
         params: Vec<(String, String)>,
     ) -> Result<Value> {
-        let value = self
-            .http
-            .send(NCBI, Method::POST, &format!("{}{path}", self.ncbi), &params)
-            .await?
-            .json()?;
+        let value = self.ncbi_response(path, params).await?.json()?;
         if value.get("error").is_some() || value.get("ERROR").is_some() {
             bail!("PubMed rejected the request");
         }
@@ -166,10 +162,47 @@ impl PubMed {
         path: &str,
         params: Vec<(String, String)>,
     ) -> Result<String> {
-        self.http
-            .send(NCBI, Method::POST, &format!("{}{path}", self.ncbi), &params)
-            .await?
-            .text()
+        self.ncbi_response(path, params).await?.text()
+    }
+
+    async fn ncbi_response(&self, path: &str, params: Vec<(String, String)>) -> Result<Response> {
+        let url = format!("{}{path}", self.ncbi);
+        let response = self.http.send(NCBI, Method::POST, &url, &params).await?;
+        if response.status != StatusCode::BAD_REQUEST
+            || !params.iter().any(|(name, _)| name == "api_key")
+        {
+            return Ok(response);
+        }
+
+        let anonymous: Vec<_> = params
+            .into_iter()
+            .filter(|(name, _)| name != "api_key")
+            .collect();
+        self.http.send(NCBI, Method::POST, &url, &anonymous).await
+    }
+}
+
+// Optional keys copied from configuration templates must not become literal requests.
+fn usable_ncbi_api_key(value: String) -> Option<String> {
+    let value = value.trim();
+    let upper = value.to_ascii_uppercase();
+    if value.is_empty()
+        || value.starts_with("${")
+        || value.starts_with('%')
+        || value.starts_with('<')
+        || matches!(
+            upper.as_str(),
+            "YOUR_API_KEY"
+                | "YOUR_NCBI_API_KEY"
+                | "NCBI_API_KEY"
+                | "API_KEY"
+                | "REPLACE_ME"
+                | "CHANGEME"
+        )
+    {
+        None
+    } else {
+        Some(value.to_string())
     }
 }
 

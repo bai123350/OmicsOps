@@ -1062,30 +1062,20 @@ describe("DesktopApp", () => {
     expect(screen.queryByRole("region", { name: "远程 Agent 运行控制" })).not.toBeInTheDocument();
   });
 
-  it("ignores a late side-effect verification callback after switching sessions", async () => {
+  it("shows an uncertain dispatch as failure without carrying it into another session", async () => {
     const { stateSpy } = setupConversationStateHarness();
     stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
     const uncertain = agentEvent("conversation-agent", "uncertain-run", 1, { kind: "tool_dispatch_uncertain", call_id: "call-old", tool_id: "runtime.execute" });
-    const staleResult = agentEvent("conversation-agent", "uncertain-run", 2, { kind: "model_text", text: "旧会话核验后的输出" });
     vi.spyOn(api, "agentV4EventsForConversation").mockImplementation(async (_projectId, conversationId) => conversationId === "conversation-agent" ? [uncertain] : []);
-    const resolveUncertain = deferred<void>();
-    vi.spyOn(api, "agentV4ResolveUncertain").mockReturnValue(resolveUncertain.promise);
-    const resume = vi.spyOn(api, "agentV4Resume").mockResolvedValue();
-    let returnStaleEvents = false;
-    const events = vi.spyOn(api, "agentV4Events").mockImplementation(async () => returnStaleEvents ? [staleResult] : []);
 
     render(<DesktopApp />);
-    const evidence = await screen.findByRole("textbox", { name: "核验证据" });
-    fireEvent.change(evidence, { target: { value: "旧会话核验记录" } });
-    fireEvent.click(screen.getByRole("button", { name: "保存证据并继续" }));
+    expect(await screen.findByText(/失败 · 1 个步骤/)).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "核验证据" })).not.toBeInTheDocument();
+    expect(screen.getByText("工具调用失败")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Plan 会话" }));
     await screen.findByRole("heading", { name: "Plan 会话" });
 
-    returnStaleEvents = true;
-    resolveUncertain.resolve();
-    await waitFor(() => expect(resume).toHaveBeenCalledWith("uncertain-run"));
-    await waitFor(() => expect(events).toHaveBeenCalledWith("uncertain-run"));
-    expect(screen.queryByText("旧会话核验后的输出")).not.toBeInTheDocument();
+    expect(screen.queryByText("工具调用失败")).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "远程 Agent 运行控制" })).not.toBeInTheDocument();
   });
 

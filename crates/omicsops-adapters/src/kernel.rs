@@ -73,6 +73,8 @@ pub fn kernel_driver(language: KernelLanguage) -> &'static str {
 }
 
 const PYTHON_DRIVER: &str = r#"import contextlib, datetime, hashlib, io, json, pathlib, sys, traceback
+sys.stdin.reconfigure(encoding="utf-8")
+sys.stdout.reconfigure(encoding="utf-8")
 project = pathlib.Path(sys.argv[1]).resolve()
 project_id = sys.argv[2]
 session_id = sys.argv[3]
@@ -82,10 +84,11 @@ def emit(request_id, sequence, kind, payload=None):
     if payload is not None: event["event"]["payload"] = payload
     print(json.dumps(event, ensure_ascii=False), flush=True)
 for raw in sys.stdin:
+    request_id = "protocol"
+    sequence = 1
     try:
         request = json.loads(raw)
-        request_id = request["request_id"]
-        sequence = 1
+        request_id = request.get("request_id", "protocol")
         if request["action"] == "shutdown":
             emit(request_id, sequence, "stopped")
             break
@@ -110,7 +113,8 @@ for raw in sys.stdin:
             emit(request_id, sequence, "stderr", traceback.format_exc()); sequence += 1
             emit(request_id, sequence, "failed", {"message": str(error)})
     except Exception as error:
-        print(json.dumps({"protocol_error": str(error)}), flush=True)
+        event = {"project_id": project_id, "session_id": session_id, "request_id": request_id, "sequence": sequence, "occurred_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"), "event": {"kind": "failed", "payload": {"message": str(error)}}}
+        print(json.dumps(event), flush=True)
 "#;
 
 const R_DRIVER: &str = r#"suppressPackageStartupMessages(library(jsonlite))

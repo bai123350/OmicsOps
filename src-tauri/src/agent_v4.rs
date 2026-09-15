@@ -4200,9 +4200,6 @@ async fn spawn_execution(
         let waiting_for_approval = outcome
             .as_ref()
             .is_err_and(|error| error == "run is waiting for tool approval");
-        let uncertain = outcome
-            .as_ref()
-            .is_err_and(|error| error.contains("side-effect dispatch is uncertain"));
         let verifier_attention = outcome
             .as_ref()
             .is_err_and(|error| error.starts_with("run needs attention:"));
@@ -4271,7 +4268,7 @@ async fn spawn_execution(
             "waiting_for_input"
         } else if waiting_for_approval {
             "waiting_for_approval"
-        } else if uncertain || verifier_attention {
+        } else if verifier_attention {
             "needs_attention"
         } else if cancelled.load(Ordering::SeqCst) {
             "cancelled"
@@ -4285,15 +4282,7 @@ async fn spawn_execution(
                     repository: repository.clone(),
                     app: app.clone(),
                 };
-                let event = if uncertain || verifier_attention {
-                    AgentEventKindV4::RunNeedsAttention {
-                        message: error.clone(),
-                    }
-                } else {
-                    AgentEventKindV4::RunFailed {
-                        message: error.clone(),
-                    }
-                };
+                let (_, event) = execution_failure_terminal(error);
                 let already_recorded = verifier_attention
                     && repository
                         .agent_events_v4(spec.run_id)
@@ -4310,12 +4299,7 @@ async fn spawn_execution(
                     {
                         // The status row lets the reconciliation path repair a
                         // missing terminal event on the next UI poll/startup.
-                        record.status = if uncertain || verifier_attention {
-                            "needs_attention"
-                        } else {
-                            "failed"
-                        }
-                        .into();
+                        record.status = execution_failure_terminal(error).0.into();
                     }
                 }
             }
@@ -4418,6 +4402,24 @@ fn durable_terminal_status(events: &[AgentEventV4]) -> Option<&'static str> {
         AgentEventKindV4::RunCancelled => Some("cancelled"),
         _ => None,
     })
+}
+
+fn execution_failure_terminal(error: &str) -> (&'static str, AgentEventKindV4) {
+    if error.starts_with("run needs attention:") {
+        (
+            "needs_attention",
+            AgentEventKindV4::RunNeedsAttention {
+                message: error.into(),
+            },
+        )
+    } else {
+        (
+            "failed",
+            AgentEventKindV4::RunFailed {
+                message: error.into(),
+            },
+        )
+    }
 }
 
 fn settled_execution_status(
@@ -7483,6 +7485,7 @@ impl KernelBackendV4 for SshKernelBackendV4 {
                 key.run_id
             ),
             process: Mutex::new(Some(process)),
+            healthy: AtomicBool::new(true),
         }))
     }
 }
@@ -7494,6 +7497,7 @@ struct SshKernelProcessV4 {
     session: Arc<SshSession>,
     output_dir: String,
     process: Mutex<Option<SshJsonlProcess>>,
+    healthy: AtomicBool,
 }
 #[async_trait]
 impl KernelProcessV4 for SshKernelProcessV4 {
@@ -7503,76 +7507,89 @@ impl KernelProcessV4 for SshKernelProcessV4 {
     fn process_identity(&self) -> &str {
         &self.identity
     }
+    fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::SeqCst)
+    }
     async fn execute(
         &self,
         code: String,
         capture_paths: Vec<String>,
     ) -> Result<RuntimeResultV4, String> {
-        let request_id = Uuid::new_v4();
-        let mut guard = self.process.lock().await;
-        let process = guard.as_mut().ok_or("kernel is stopped")?;
-        process
-            .send(&KernelRequest::Execute {
-                session_id: self.id,
-                request_id,
-                code,
-                capture_paths,
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut decoder = KernelEventDecoder::new(self.project_id, self.id, request_id);
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        let mut artifacts = Vec::new();
-        let mut succeeded = false;
-        loop {
-            let event: KernelEvent = process
-                .receive()
+        let result = async {
+            let request_id = Uuid::new_v4();
+            let mut guard = self.process.lock().await;
+            let process = guard.as_mut().ok_or("kernel is stopped")?;
+            process
+                .send(&KernelRequest::Execute {
+                    session_id: self.id,
+                    request_id,
+                    code,
+                    capture_paths,
+                })
                 .await
-                .map_err(|e| e.to_string())?
-                .ok_or("kernel disconnected")?;
-            let event = decoder.accept(event).map_err(|e| e.to_string())?;
-            match event.event {
-                KernelEventKind::Stdout(content) => stdout.push_str(&content),
-                KernelEventKind::Stderr(content) => stderr.push_str(&content),
-                KernelEventKind::Artifact {
-                    relative_path,
-                    size_bytes,
-                    sha256,
-                } => artifacts.push(RuntimeArtifactV4 {
-                    relative_path,
-                    size_bytes,
-                    sha256,
-                }),
-                KernelEventKind::Completed => {
-                    succeeded = true;
-                    break;
+                .map_err(|e| e.to_string())?;
+            let mut decoder = KernelEventDecoder::new(self.project_id, self.id, request_id);
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            let mut artifacts = Vec::new();
+            let mut succeeded = false;
+            loop {
+                let event: KernelEvent = process
+                    .receive()
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or("kernel disconnected")?;
+                let event = decoder.accept(event).map_err(|e| e.to_string())?;
+                match event.event {
+                    KernelEventKind::Stdout(content) => stdout.push_str(&content),
+                    KernelEventKind::Stderr(content) => stderr.push_str(&content),
+                    KernelEventKind::Artifact {
+                        relative_path,
+                        size_bytes,
+                        sha256,
+                    } => artifacts.push(RuntimeArtifactV4 {
+                        relative_path,
+                        size_bytes,
+                        sha256,
+                    }),
+                    KernelEventKind::Completed => {
+                        succeeded = true;
+                        break;
+                    }
+                    KernelEventKind::Failed { message } => {
+                        stderr.push_str(&message);
+                        break;
+                    }
+                    _ => {}
                 }
-                KernelEventKind::Failed { message } => {
-                    stderr.push_str(&message);
-                    break;
-                }
-                _ => {}
             }
+            self.session
+                .execute_checked(&format!("mkdir -p {}", shell_quote(&self.output_dir)))
+                .await
+                .map_err(|e| e.to_string())?;
+            let stdout_capture = self.archive_output(request_id, "stdout", &stdout).await?;
+            let stderr_capture = self.archive_output(request_id, "stderr", &stderr).await?;
+            Ok(RuntimeResultV4 {
+                request_id,
+                session_id: self.id,
+                process_identity: self.identity.clone(),
+                stdout: stdout_capture.excerpt.clone(),
+                stderr: stderr_capture.excerpt.clone(),
+                stdout_capture: Some(stdout_capture),
+                stderr_capture: Some(stderr_capture),
+                succeeded,
+                artifacts,
+                software_versions: BTreeMap::new(),
+            })
         }
-        self.session
-            .execute_checked(&format!("mkdir -p {}", shell_quote(&self.output_dir)))
-            .await
-            .map_err(|e| e.to_string())?;
-        let stdout_capture = self.archive_output(request_id, "stdout", &stdout).await?;
-        let stderr_capture = self.archive_output(request_id, "stderr", &stderr).await?;
-        Ok(RuntimeResultV4 {
-            request_id,
-            session_id: self.id,
-            process_identity: self.identity.clone(),
-            stdout: stdout_capture.excerpt.clone(),
-            stderr: stderr_capture.excerpt.clone(),
-            stdout_capture: Some(stdout_capture),
-            stderr_capture: Some(stderr_capture),
-            succeeded,
-            artifacts,
-            software_versions: BTreeMap::new(),
-        })
+        .await;
+        if result.is_err() {
+            // An unconfirmed SSH transport/decoder result may leave unread
+            // events on the JSONL stream. The next cell must acquire a new
+            // remote process; the failed cell itself is never replayed.
+            self.healthy.store(false, Ordering::SeqCst);
+        }
+        result
     }
     async fn interrupt(&self) -> Result<(), String> {
         if let Some(process) = self.process.lock().await.take() {
@@ -9133,6 +9150,22 @@ mod tests {
             settled_execution_status(Some(&[first, cancelled]), "cancelled", true),
             "cancelled"
         );
+    }
+
+    #[test]
+    fn uncertain_dispatch_failure_is_terminal_failure_but_verifier_limit_needs_attention() {
+        let (status, event) = execution_failure_terminal(
+            "runtime.execute side-effect dispatch is uncertain; automatic retry disabled",
+        );
+        assert_eq!(status, "failed");
+        assert!(
+            matches!(event, AgentEventKindV4::RunFailed { message } if message.contains("side-effect dispatch is uncertain"))
+        );
+
+        let (status, event) =
+            execution_failure_terminal("run needs attention: deterministic verifier exhausted");
+        assert_eq!(status, "needs_attention");
+        assert!(matches!(event, AgentEventKindV4::RunNeedsAttention { .. }));
     }
 
     #[tokio::test]

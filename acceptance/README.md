@@ -54,11 +54,12 @@ read-only concurrency, per-project side-effect serialization, archive-first
 context compaction, and crash recovery that never automatically repeats a
 dispatched side effect whose outcome is missing.
 
-An uncertain dispatch moves the run to `needs_attention`. After independently
-checking remote state, record the conclusion with
-`agent_v4_resolve_uncertain` (call id, resolution and non-empty evidence), then
-call `agent_v4_resume`. The resolution is hash-chained and the original side
-effect is never replayed automatically.
+The desktop presents an uncertain dispatch as a failed tool/run, without a
+mandatory side-effect verification form. The original uncertain dispatch and
+unknown job state remain in the audit trail: a failed wait is not proof that
+remote execution stopped, and the original side effect is never replayed
+automatically. The host reconciliation API remains available for independently
+verified recovery; changing presentation does not manufacture a resolution.
 
 The Wisp-inspired loop increment additionally checks the complete provider
 request before dispatch and after compaction, permits one smaller-request retry
@@ -137,8 +138,8 @@ this change; automated tests use fake models and temporary SQLite databases.
 Use only the existing disposable acceptance environment. Execute a small synthetic
 Python or R cell, verify its result retains the kernel-session reference and adds
 a runtime-job reference. During another cell, stop the Agent or disconnect the
-backend and resume the original run: verify the original dispatch requires
-reconciliation and does not automatically execute again. An unknown record is
+backend and inspect the original run: verify it displays a failure without a
+verification form and does not automatically execute again. An unknown record is
 not proof that a remote process stopped. Check that normal subsequent cells with
 new call IDs still share the intended interpreter session. These manual scenarios
 have not been executed for this increment; deterministic tests use temporary SQLite

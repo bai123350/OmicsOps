@@ -2,7 +2,10 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -269,6 +272,7 @@ struct ProcessKernelV4 {
     project_root: PathBuf,
     output_dir: PathBuf,
     handle: Mutex<Option<ProcessHandle>>,
+    healthy: AtomicBool,
     container_cleanup: Option<(String, String)>,
 }
 
@@ -282,6 +286,10 @@ impl KernelProcessV4 for ProcessKernelV4 {
         &self.identity
     }
 
+    fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::SeqCst)
+    }
+
     async fn execute(
         &self,
         code: String,
@@ -293,111 +301,122 @@ impl KernelProcessV4 for ProcessKernelV4 {
         for path in &capture_paths {
             validate_capture_path(path)?;
         }
-        let request_id = Uuid::new_v4();
-        let request_id_text = request_id.to_string();
-        let mut guard = self.handle.lock().await;
-        let handle = guard.as_mut().ok_or("kernel process is stopped")?;
-        let request = json!({
-            "action":"execute",
-            "request_id":request_id,
-            "code":code,
-            "capture_paths":capture_paths,
-        });
-        handle
-            .stdin
-            .write_all(format!("{request}\n").as_bytes())
-            .await
-            .map_err(|error| error.to_string())?;
-        handle
-            .stdin
-            .flush()
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        let mut artifacts = Vec::new();
-        let succeeded = loop {
-            let line = handle
-                .lines
-                .next_line()
+        let result = async {
+            let request_id = Uuid::new_v4();
+            let request_id_text = request_id.to_string();
+            let mut guard = self.handle.lock().await;
+            let handle = guard.as_mut().ok_or("kernel process is stopped")?;
+            let request = json!({
+                "action":"execute",
+                "request_id":request_id,
+                "code":code,
+                "capture_paths":capture_paths,
+            });
+            handle
+                .stdin
+                .write_all(format!("{request}\n").as_bytes())
                 .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "kernel process disconnected".to_string())?;
-            let event: Value = serde_json::from_str(&line)
-                .map_err(|error| format!("invalid kernel JSONL event: {error}"))?;
-            if event.get("request_id").and_then(Value::as_str) != Some(request_id_text.as_str()) {
-                return Err("kernel event request identity mismatch".into());
-            }
-            match event.get("kind").and_then(Value::as_str) {
-                Some("stdout") => stdout.push_str(
-                    event
-                        .get("payload")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                ),
-                Some("stderr") => stderr.push_str(
-                    event
-                        .get("payload")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                ),
-                Some("artifact") => {
-                    // The worker is not an authority for scientific file facts.
-                    // The Rust Host re-reads the mounted project file and derives
-                    // its canonical path, byte size, and digest itself.
-                    artifacts.push(
-                        verify_runtime_artifact(
-                            &self.project_root,
-                            &required_string(&event, "relative_path")?,
-                        )
-                        .await?,
-                    );
+                .map_err(|error| error.to_string())?;
+            handle
+                .stdin
+                .flush()
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            let mut artifacts = Vec::new();
+            let succeeded = loop {
+                let line = handle
+                    .lines
+                    .next_line()
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "kernel process disconnected".to_string())?;
+                let event: Value = serde_json::from_str(&line)
+                    .map_err(|error| format!("invalid kernel JSONL event: {error}"))?;
+                if event.get("request_id").and_then(Value::as_str) != Some(request_id_text.as_str())
+                {
+                    return Err("kernel event request identity mismatch".into());
                 }
-                Some("completed") => break true,
-                Some("failed") => {
-                    stderr.push_str(
+                match event.get("kind").and_then(Value::as_str) {
+                    Some("stdout") => stdout.push_str(
                         event
-                            .get("message")
+                            .get("payload")
                             .and_then(Value::as_str)
-                            .unwrap_or("kernel failed"),
-                    );
-                    break false;
+                            .unwrap_or_default(),
+                    ),
+                    Some("stderr") => stderr.push_str(
+                        event
+                            .get("payload")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    ),
+                    Some("artifact") => {
+                        // The worker is not an authority for scientific file facts.
+                        // The Rust Host re-reads the mounted project file and derives
+                        // its canonical path, byte size, and digest itself.
+                        artifacts.push(
+                            verify_runtime_artifact(
+                                &self.project_root,
+                                &required_string(&event, "relative_path")?,
+                            )
+                            .await?,
+                        );
+                    }
+                    Some("completed") => break true,
+                    Some("failed") => {
+                        stderr.push_str(
+                            event
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("kernel failed"),
+                        );
+                        break false;
+                    }
+                    Some("started") => {}
+                    _ => return Err("unknown kernel JSONL event".into()),
                 }
-                Some("started") => {}
-                _ => return Err("unknown kernel JSONL event".into()),
-            }
-        };
-        fs::create_dir_all(&self.output_dir)
-            .await
-            .map_err(|error| error.to_string())?;
-        let stdout_capture = archive_output(
-            &self.project_root,
-            &self.output_dir,
-            request_id,
-            "stdout",
-            &stdout,
-        )
-        .await?;
-        let stderr_capture = archive_output(
-            &self.project_root,
-            &self.output_dir,
-            request_id,
-            "stderr",
-            &stderr,
-        )
-        .await?;
-        Ok(RuntimeResultV4 {
-            request_id,
-            session_id: self.id,
-            process_identity: self.identity.clone(),
-            stdout: stdout_capture.excerpt.clone(),
-            stderr: stderr_capture.excerpt.clone(),
-            stdout_capture: Some(stdout_capture),
-            stderr_capture: Some(stderr_capture),
-            succeeded,
-            artifacts,
-            software_versions: BTreeMap::new(),
-        })
+            };
+            fs::create_dir_all(&self.output_dir)
+                .await
+                .map_err(|error| error.to_string())?;
+            let stdout_capture = archive_output(
+                &self.project_root,
+                &self.output_dir,
+                request_id,
+                "stdout",
+                &stdout,
+            )
+            .await?;
+            let stderr_capture = archive_output(
+                &self.project_root,
+                &self.output_dir,
+                request_id,
+                "stderr",
+                &stderr,
+            )
+            .await?;
+            Ok(RuntimeResultV4 {
+                request_id,
+                session_id: self.id,
+                process_identity: self.identity.clone(),
+                stdout: stdout_capture.excerpt.clone(),
+                stderr: stderr_capture.excerpt.clone(),
+                stdout_capture: Some(stdout_capture),
+                stderr_capture: Some(stderr_capture),
+                succeeded,
+                artifacts,
+                software_versions: BTreeMap::new(),
+            })
+        }
+        .await;
+        if result.is_err() {
+            // An Err means the host did not consume a confirmed terminal
+            // response. Unread or malformed JSONL may remain on the wire, so a
+            // later cell must replace this process rather than reuse it.
+            self.healthy.store(false, Ordering::SeqCst);
+        }
+        result
     }
 
     async fn interrupt(&self) -> Result<(), String> {
@@ -455,6 +474,7 @@ async fn launch_process(
             stdin,
             lines: BufReader::new(stdout).lines(),
         })),
+        healthy: AtomicBool::new(true),
         container_cleanup,
     }))
 }
@@ -602,6 +622,8 @@ fn bounded_excerpt(value: &str, limit: usize) -> (String, bool) {
 }
 
 const PYTHON_DRIVER: &str = r#"import contextlib, hashlib, io, json, pathlib, sys, traceback
+sys.stdin.reconfigure(encoding="utf-8")
+sys.stdout.reconfigure(encoding="utf-8")
 project = pathlib.Path(sys.argv[1]).resolve()
 scope = {"__name__": "__omicsops_kernel__"}
 def emit(request_id, kind, **values):
@@ -609,8 +631,9 @@ def emit(request_id, kind, **values):
     event.update(values)
     print(json.dumps(event, ensure_ascii=False), flush=True)
 for raw in sys.stdin:
+    request_id = "protocol"
     try:
-        request = json.loads(raw); request_id = request["request_id"]
+        request = json.loads(raw); request_id = request.get("request_id", "protocol")
         emit(request_id, "started")
         stdout, stderr = io.StringIO(), io.StringIO()
         try:
@@ -632,7 +655,7 @@ for raw in sys.stdin:
             emit(request_id, "stderr", payload=traceback.format_exc())
             emit(request_id, "failed", message=str(error))
     except Exception as error:
-        print(json.dumps({"request_id":"protocol","kind":"failed","message":str(error)}), flush=True)
+        print(json.dumps({"request_id":request_id,"kind":"failed","message":str(error)}), flush=True)
 "#;
 
 const R_DRIVER: &str = r#"suppressPackageStartupMessages(library(jsonlite))
@@ -645,6 +668,68 @@ repeat { raw <- readLines(input,n=1,warn=FALSE); if (!length(raw)) break; reques
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn run_python_driver(project: &Path, code: &str) -> Option<Vec<Value>> {
+        if background_command("python")
+            .arg("--version")
+            .output()
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        let session_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let driver = write_driver(project, KernelLanguageV4::Python, session_id)
+            .await
+            .unwrap();
+        let mut command = background_command("python");
+        command
+            .arg("-u")
+            .arg(driver)
+            .arg(project)
+            .arg(Uuid::new_v4().to_string())
+            .arg(session_id.to_string())
+            .env("PYTHONIOENCODING", "ascii")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        stdin
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"action":"execute","request_id":request_id,"code":code,"capture_paths":[]})
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        stdin.flush().await.unwrap();
+        let mut lines = BufReader::new(stdout).lines();
+        let mut events = Vec::new();
+        loop {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(3), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let event: Value = serde_json::from_str(&line).unwrap();
+            let terminal = matches!(
+                event.get("kind").and_then(Value::as_str),
+                Some("completed" | "failed")
+            );
+            events.push(event);
+            if terminal {
+                break;
+            }
+        }
+        child.kill().await.unwrap();
+        Some(events)
+    }
 
     fn key(backend_id: &str, language: KernelLanguageV4) -> ExecutionContextKeyV4 {
         ExecutionContextKeyV4 {
@@ -690,6 +775,58 @@ mod tests {
         assert_eq!(first.artifacts[0].size_bytes, 13);
         assert_eq!(first.artifacts[0].sha256.len(), 64);
         manager.interrupt(&key).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn python_driver_uses_utf8_for_unicode_jsonl_on_ascii_hosts() {
+        let project = tempfile::tempdir().unwrap();
+        let Some(events) = run_python_driver(project.path(), "print('中文 🧬')").await else {
+            return;
+        };
+        let request_id = events[0]["request_id"].clone();
+
+        assert!(events.iter().all(|event| event["request_id"] == request_id));
+        assert!(events.iter().any(|event| {
+            event["kind"] == "stdout"
+                && event["payload"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("中文 🧬")
+        }));
+        assert_eq!(events.last().unwrap()["kind"], "completed");
+    }
+
+    #[tokio::test]
+    async fn python_driver_fallback_keeps_the_active_request_identity() {
+        let project = tempfile::tempdir().unwrap();
+        let Some(events) = run_python_driver(
+            project.path(),
+            "import sys\nsys.__stdout__.reconfigure(encoding='ascii')\nprint('🧬')",
+        )
+        .await
+        else {
+            return;
+        };
+
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["started", "failed"]
+        );
+        assert_eq!(events.last().unwrap()["kind"], "failed");
+        assert_eq!(
+            events.last().unwrap()["request_id"],
+            events[0]["request_id"]
+        );
+        assert_ne!(events.last().unwrap()["request_id"], "protocol");
+        assert!(
+            events.last().unwrap()["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ascii")
+        );
     }
 
     #[test]

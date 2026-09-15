@@ -10435,6 +10435,194 @@ mod tests {
             AgentEventKindV4::ToolFinished { outcome } if outcome.call_id == call.call_id && outcome.succeeded)));
     }
 
+    #[test]
+    fn successful_duplicate_result_projection_keeps_one_copy_and_scoped_retrieval() {
+        let spec = execution_spec(Uuid::new_v4());
+        let data = json!({
+            "summary": "差异表达完成🧬",
+            "rows": (0..128)
+                .map(|index| json!({"gene": format!("GENE{index}"), "log2_fold_change": 1.25}))
+                .collect::<Vec<_>>(),
+        });
+        let original_model_content = serde_json::to_string(&data).unwrap();
+        let event = AgentEventV4::first(
+            spec.run_id,
+            spec.project_id,
+            spec.conversation_id,
+            Utc::now(),
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: "duplicate-result".into(),
+                    tool_id: "analysis.result".into(),
+                    succeeded: true,
+                    model_content: original_model_content.clone(),
+                    data: data.clone(),
+                    provenance: vec!["verified-fixture".into()],
+                },
+            },
+        );
+        let durable_bytes = serde_json::to_vec(&event).unwrap().len();
+
+        let view = context_views::event_view(&event);
+        let view_bytes = serde_json::to_vec(&view).unwrap().len();
+
+        assert_eq!(view["event"]["outcome"]["data"], data);
+        assert!(view["event"]["outcome"].get("model_content").is_none());
+        assert_eq!(view["result_reference"]["field"], "model_content");
+        assert_eq!(view["sequence"], event.sequence);
+        assert_eq!(view["event_hash"], event.event_hash);
+        for redundant in [
+            "schema_version",
+            "run_id",
+            "project_id",
+            "conversation_id",
+            "occurred_at",
+            "previous_hash",
+        ] {
+            assert!(
+                view.get(redundant).is_none(),
+                "{redundant} remained in view"
+            );
+        }
+        assert!(
+            view_bytes * 2 < durable_bytes,
+            "model projection should remove over half of a duplicate result: durable={durable_bytes}, view={view_bytes}"
+        );
+        event.verify().unwrap();
+
+        let mut call = ToolCallV4 {
+            call_id: "read-duplicate".into(),
+            tool_id: context_views::READ_RESULT_TOOL.into(),
+            arguments: json!({"sequence":event.sequence,"event_hash":event.event_hash,
+                "field":"model_content","offset":0,"limit":7}),
+        };
+        let mut restored = String::new();
+        loop {
+            let page = context_views::read_result(&spec, &[event.clone()], &call).unwrap();
+            restored.push_str(page["content"].as_str().unwrap());
+            let Some(offset) = page["next_offset"].as_u64() else {
+                break;
+            };
+            call.arguments["offset"] = json!(offset);
+        }
+        assert_eq!(restored, original_model_content);
+    }
+
+    #[test]
+    fn result_projection_does_not_deduplicate_failures_or_distinct_model_content() {
+        let spec = execution_spec(Uuid::new_v4());
+        for (succeeded, model_content, data) in [
+            (
+                false,
+                r#"{"error":"Traceback: invalid UTF-8 🧬"}"#,
+                json!({"error":"Traceback: invalid UTF-8 🧬"}),
+            ),
+            (
+                true,
+                "Concise explanation needed by the model",
+                json!({"rows":[1, 2, 3]}),
+            ),
+        ] {
+            let event = AgentEventV4::first(
+                spec.run_id,
+                spec.project_id,
+                spec.conversation_id,
+                Utc::now(),
+                AgentEventKindV4::ToolFinished {
+                    outcome: ToolOutcomeV4 {
+                        call_id: "diagnostic-result".into(),
+                        tool_id: "analysis.result".into(),
+                        succeeded,
+                        model_content: model_content.into(),
+                        data,
+                        provenance: vec![],
+                    },
+                },
+            );
+
+            let view = context_views::event_view(&event);
+
+            assert_eq!(view["event"]["outcome"]["model_content"], model_content);
+        }
+    }
+
+    #[test]
+    fn duplicate_projection_is_left_inline_when_reference_would_cost_more() {
+        let spec = execution_spec(Uuid::new_v4());
+        let event = AgentEventV4::first(
+            spec.run_id,
+            spec.project_id,
+            spec.conversation_id,
+            Utc::now(),
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: "tiny-result".into(),
+                    tool_id: "analysis.result".into(),
+                    succeeded: true,
+                    model_content: "null".into(),
+                    data: Value::Null,
+                    provenance: vec![],
+                },
+            },
+        );
+
+        let view = context_views::event_view(&event);
+
+        assert_eq!(view["event"]["outcome"]["model_content"], "null");
+        assert!(view.get("result_reference").is_none());
+    }
+
+    #[test]
+    fn oversized_failure_projection_is_bounded_and_original_error_is_retrievable() {
+        let spec = execution_spec(Uuid::new_v4());
+        let error = format!(
+            "Traceback: invalid UTF-8 🧬\n{}",
+            "critical stack frame 数据\n".repeat(600)
+        );
+        let event = AgentEventV4::first(
+            spec.run_id,
+            spec.project_id,
+            spec.conversation_id,
+            Utc::now(),
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: "failed-result".into(),
+                    tool_id: "analysis.result".into(),
+                    succeeded: false,
+                    model_content: error.clone(),
+                    data: json!({"error":error}),
+                    provenance: vec![],
+                },
+            },
+        );
+
+        let view = context_views::event_view(&event);
+
+        let projected_error = view["event"]["outcome"]["model_content"].as_str().unwrap();
+        assert!(projected_error.len() < error.len());
+        assert!(projected_error.contains("model view shortened"));
+        assert_eq!(
+            view["event"]["outcome"]["data"]["omitted_from_model_view"],
+            true
+        );
+        let mut call = ToolCallV4 {
+            call_id: "read-error".into(),
+            tool_id: context_views::READ_RESULT_TOOL.into(),
+            arguments: json!({"sequence":event.sequence,"event_hash":event.event_hash,
+                "field":"model_content","offset":0,"limit":8192}),
+        };
+        let mut restored = String::new();
+        loop {
+            let page = context_views::read_result(&spec, &[event.clone()], &call).unwrap();
+            restored.push_str(page["content"].as_str().unwrap());
+            let Some(offset) = page["next_offset"].as_u64() else {
+                break;
+            };
+            call.arguments["offset"] = json!(offset);
+        }
+        assert_eq!(restored, error);
+    }
+
     struct OverflowModel {
         always_overflow: bool,
         requests: Mutex<Vec<ModelRequestV4>>,

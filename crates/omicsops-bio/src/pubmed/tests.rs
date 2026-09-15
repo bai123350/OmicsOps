@@ -104,16 +104,257 @@ fn summaries_preserve_requested_order_duplicates_and_missing_ids() {
 }
 
 fn test_client(base: &str) -> PubMed {
-    let mut client = PubMed::new(&[
-        ("NCBI_API_KEY".into(), "synthetic-key&value".into()),
-        ("NCBI_EMAIL".into(), "operator@example.test".into()),
-    ])
-    .unwrap();
+    test_client_with_credentials(
+        base,
+        &[
+            ("NCBI_API_KEY".into(), "synthetic-key&value".into()),
+            ("NCBI_EMAIL".into(), "operator@example.test".into()),
+        ],
+    )
+}
+
+fn test_client_with_credentials(base: &str, credentials: &[(String, String)]) -> PubMed {
+    let mut client = PubMed::new(credentials).unwrap();
     client.ncbi = base.to_string();
     client.idconv = format!("{base}idconv");
     client.europepmc = base.to_string();
     client.http = Http(reqwest::Client::builder().no_proxy().build().unwrap());
     client
+}
+
+#[tokio::test]
+async fn keyed_bad_request_retries_anonymously_and_preserves_search_parameters() {
+    let captured = Arc::new(StdMutex::new(Vec::<String>::new()));
+    let request_bodies = captured.clone();
+    let app = Router::new().route(
+        "/esearch.fcgi",
+        post(move |body: String| {
+            request_bodies.lock().unwrap().push(body.clone());
+            async move {
+                if body.contains("api_key=") {
+                    (StatusCode::BAD_REQUEST, "synthetic credential rejected").into_response()
+                } else {
+                    (
+                        StatusCode::OK,
+                        json!({"esearchresult": {"count": "3", "idlist": ["123"]}}).to_string(),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = test_client(&format!("http://{}/", listener.local_addr().unwrap()));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let result = client
+        .call(
+            "search_articles",
+            &json!({
+                "query": "gene[Title] & study",
+                "max_results": 1,
+                "retstart": 2,
+                "sort": "author",
+                "date_from": "2024/01",
+                "date_to": "2024/12"
+            }),
+        )
+        .await
+        .unwrap();
+    server.abort();
+
+    assert_eq!(result["pmids"], json!(["123"]));
+    let bodies = captured.lock().unwrap();
+    assert_eq!(bodies.len(), 2, "one keyed request and one anonymous retry");
+    assert!(bodies[0].contains("api_key=synthetic-key%26value"));
+    assert!(!bodies[1].contains("api_key="));
+    assert_eq!(
+        bodies[0].replace("&api_key=synthetic-key%26value", ""),
+        bodies[1],
+        "the retry must preserve every non-credential form parameter"
+    );
+}
+
+#[tokio::test]
+async fn keyed_bad_request_stops_after_one_anonymous_retry() {
+    let captured = Arc::new(StdMutex::new(Vec::<String>::new()));
+    let request_bodies = captured.clone();
+    let app = Router::new().route(
+        "/esearch.fcgi",
+        post(move |body: String| {
+            request_bodies.lock().unwrap().push(body);
+            async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "synthetic-key&value echoed upstream",
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = test_client(&format!("http://{}/", listener.local_addr().unwrap()));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let error = client
+        .call("search_articles", &json!({"query": "synthetic"}))
+        .await
+        .unwrap_err()
+        .to_string();
+    server.abort();
+
+    let bodies = captured.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    assert!(bodies[0].contains("api_key="));
+    assert!(!bodies[1].contains("api_key="));
+    assert_eq!(error, "NCBI returned HTTP 400");
+    assert!(!error.contains("synthetic-key"));
+}
+
+#[tokio::test]
+async fn bad_request_without_key_and_non_bad_request_with_key_are_not_retried() {
+    for (status, credentials, expect_key) in [
+        (StatusCode::BAD_REQUEST, vec![], false),
+        (
+            StatusCode::FORBIDDEN,
+            vec![("NCBI_API_KEY".into(), "synthetic-key&value".into())],
+            true,
+        ),
+    ] {
+        let captured = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let request_bodies = captured.clone();
+        let app = Router::new().route(
+            "/esearch.fcgi",
+            post(move |body: String| {
+                request_bodies.lock().unwrap().push(body);
+                async move { (status, "rejected") }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = test_client_with_credentials(
+            &format!("http://{}/", listener.local_addr().unwrap()),
+            &credentials,
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let error = client
+            .call("search_articles", &json!({"query": "synthetic"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        server.abort();
+
+        let bodies = captured.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            1,
+            "HTTP {status} must not get an extra request"
+        );
+        assert_eq!(bodies[0].contains("api_key="), expect_key);
+        assert_eq!(error, format!("NCBI returned HTTP {}", status.as_u16()));
+    }
+}
+
+#[tokio::test]
+async fn metadata_json_and_xml_requests_share_the_anonymous_fallback() {
+    let captured = Arc::new(StdMutex::new(Vec::<(String, String)>::new()));
+    let request_bodies = captured.clone();
+    let app = Router::new()
+        .route(
+            "/esummary.fcgi",
+            post({
+                let request_bodies = request_bodies.clone();
+                move |body: String| {
+                    request_bodies
+                        .lock()
+                        .unwrap()
+                        .push(("summary".into(), body.clone()));
+                    async move {
+                        if body.contains("api_key=") {
+                            (StatusCode::BAD_REQUEST, "key rejected").into_response()
+                        } else {
+                            (
+                                StatusCode::OK,
+                                json!({"result": {
+                                    "uids": ["123"],
+                                    "123": {"uid": "123", "title": "Invented article"}
+                                }})
+                                .to_string(),
+                            )
+                                .into_response()
+                        }
+                    }
+                }
+            }),
+        )
+        .route(
+            "/efetch.fcgi",
+            post(move |body: String| {
+                request_bodies
+                    .lock()
+                    .unwrap()
+                    .push(("fetch".into(), body.clone()));
+                async move {
+                    if body.contains("api_key=") {
+                        (StatusCode::BAD_REQUEST, "key rejected").into_response()
+                    } else {
+                        (
+                            StatusCode::OK,
+                            r#"<PubmedArticleSet><PubmedArticle><MedlineCitation><PMID>123</PMID><Article><Abstract><AbstractText>Invented abstract.</AbstractText></Abstract></Article></MedlineCitation></PubmedArticle></PubmedArticleSet>"#,
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = test_client(&format!("http://{}/", listener.local_addr().unwrap()));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let result = client
+        .call("get_article_metadata", &json!({"pmids": ["123"]}))
+        .await
+        .unwrap();
+    server.abort();
+
+    assert_eq!(result["records"][0]["abstract"], "Invented abstract.");
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[0].0, "summary");
+    assert!(requests[0].1.contains("api_key="));
+    assert_eq!(requests[1].0, "summary");
+    assert!(!requests[1].1.contains("api_key="));
+    assert_eq!(requests[2].0, "fetch");
+    assert!(requests[2].1.contains("api_key="));
+    assert_eq!(requests[3].0, "fetch");
+    assert!(!requests[3].1.contains("api_key="));
+}
+
+#[test]
+fn ncbi_key_normalization_omits_templates_but_accepts_trimmed_opaque_values() {
+    for value in [
+        "",
+        "   ",
+        "${NCBI_API_KEY}",
+        "%NCBI_API_KEY%",
+        "YOUR_API_KEY",
+        "your_ncbi_api_key",
+        "<api-key>",
+    ] {
+        let client = PubMed::new(&[("NCBI_API_KEY".into(), value.into())]).unwrap();
+        assert!(
+            !client
+                .ncbi_identity()
+                .iter()
+                .any(|(name, _)| name == "api_key")
+        );
+    }
+
+    let client = PubMed::new(&[("NCBI_API_KEY".into(), " opaque key:+/= ".into())]).unwrap();
+    assert!(
+        client
+            .ncbi_identity()
+            .contains(&("api_key".into(), "opaque key:+/=".into()))
+    );
 }
 
 async fn mock(

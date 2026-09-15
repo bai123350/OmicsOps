@@ -29,6 +29,21 @@ pub(crate) fn bounded_text(text: &str) -> String {
 
 pub(crate) fn event_view(event: &AgentEventV4) -> Value {
     let mut view = serde_json::to_value(event).expect("serializable event");
+    // The containing context is already scoped to one run. Keep the event's
+    // stable lookup identity, but do not repeat run identity and hash-chain
+    // fields in every model-only entry.
+    let envelope = view.as_object_mut().expect("event object");
+    for field in [
+        "schema_version",
+        "run_id",
+        "project_id",
+        "conversation_id",
+        "occurred_at",
+        "previous_hash",
+    ] {
+        envelope.remove(field);
+    }
+    view["model_projection"] = json!(true);
     let delegation = match &event.event {
         AgentEventKindV4::DelegationNodeFinished { outcome, .. } => Some(node_view(outcome)),
         AgentEventKindV4::DelegationGraphFinished { outcome, .. } => Some(graph_view(outcome)),
@@ -36,7 +51,7 @@ pub(crate) fn event_view(event: &AgentEventV4) -> Value {
     };
     if let Some(summary) = delegation {
         view["event"]["outcome"] = summary;
-        attach_reference(&mut view, event);
+        attach_reference(&mut view, event, "data");
         return view;
     }
     let outcome = match &event.event {
@@ -52,13 +67,33 @@ pub(crate) fn event_view(event: &AgentEventV4) -> Value {
                 "Delegation finished; see data for node conclusions and result_reference for the full trace."
             );
             view["event"]["outcome"]["data"] = summary;
-            attach_reference(&mut view, event);
+            attach_reference(&mut view, event, "data");
             return view;
         }
     }
     let data_bytes = serde_json::to_vec(&outcome.data)
         .expect("serializable data")
         .len();
+    let model_content_duplicates_data =
+        serde_json::to_string(&outcome.data).is_ok_and(|data| data == outcome.model_content);
+    if outcome.succeeded && data_bytes <= VIEW_BYTES && model_content_duplicates_data {
+        let original_bytes = serde_json::to_vec(&view)
+            .expect("serializable model view")
+            .len();
+        let mut deduplicated = view.clone();
+        deduplicated["event"]["outcome"]
+            .as_object_mut()
+            .expect("outcome object")
+            .remove("model_content");
+        attach_reference(&mut deduplicated, event, "model_content");
+        if serde_json::to_vec(&deduplicated)
+            .expect("serializable model view")
+            .len()
+            < original_bytes
+        {
+            return deduplicated;
+        }
+    }
     if outcome.model_content.len() <= VIEW_BYTES && data_bytes <= VIEW_BYTES {
         return view;
     }
@@ -77,11 +112,11 @@ pub(crate) fn event_view(event: &AgentEventV4) -> Value {
     view
 }
 
-fn attach_reference(view: &mut Value, event: &AgentEventV4) {
+fn attach_reference(view: &mut Value, event: &AgentEventV4, field: &str) {
     view["model_projection"] = json!(true);
     view["result_reference"] = json!({
         "tool": READ_RESULT_TOOL, "sequence": event.sequence,
-        "event_hash": event.event_hash, "field": "data",
+        "event_hash": event.event_hash, "field": field,
     });
 }
 

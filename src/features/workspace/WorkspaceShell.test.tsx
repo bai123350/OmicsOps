@@ -780,16 +780,16 @@ describe("WorkspaceShell", () => {
     expect(resume).toHaveBeenCalledWith("run-captcha");
   });
 
-  it("requires evidence before resolving an uncertain V4 dispatch", () => {
+  it("shows runtime uncertainty as a failure without requiring an evidence dialog", () => {
     const resolve = vi.fn();
     render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-uncertain" onResolveUncertainV4={resolve} agentRunEventsV4={[{
       schema_version: 4, run_id: "run-uncertain", project_id: project.id, conversation_id: "conversation-1", sequence: 1, occurred_at: "2026-08-17T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "tool_dispatch_uncertain", call_id: "call-1", tool_id: "runtime.execute" },
     }]} />);
-    const save = screen.getByRole("button", { name: "保存证据并继续" });
-    expect(save).toBeDisabled();
-    fireEvent.change(screen.getByRole("textbox", { name: "核验证据" }), { target: { value: "远端输出文件不存在" } });
-    fireEvent.click(save);
-    expect(resolve).toHaveBeenCalledWith("run-uncertain", "call-1", "side_effect_not_observed", "远端输出文件不存在");
+    expect(screen.queryByRole("textbox", { name: "核验证据" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "保存证据并继续" })).not.toBeInTheDocument();
+    expect(screen.getByText("工具调用失败")).toBeInTheDocument();
+    expect(screen.getByText(/失败 · 1 个步骤/)).toBeInTheDocument();
+    expect(resolve).not.toHaveBeenCalled();
   });
 
   it("shows the actual MCP tool and query in the trace summary", () => {
@@ -998,12 +998,12 @@ describe("WorkspaceShell", () => {
     expect(screen.getByRole("button", { name: "取消计划" })).toBeEnabled();
   });
 
-  it("guards answer and uncertain-dispatch recovery actions while preserving their controls during a run", async () => {
+  it("guards answer recovery actions while preserving their controls during a run", async () => {
     let releaseAnswer!: () => void;
     const onAnswer = vi.fn(() => new Promise<void>((resolve) => { releaseAnswer = resolve; }));
     const base = { schema_version: 4 as const, run_id: "run-input-guard", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
     const requested = { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "input_requested" as const, question_id: "species", question: "物种？" } };
-    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-input-guard" agentRunEventsV4={[requested]} onAnswerAgentQuestionV4={onAnswer} />);
+    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-input-guard" agentRunEventsV4={[requested]} onAnswerAgentQuestionV4={onAnswer} />);
     fireEvent.change(screen.getByRole("textbox", { name: "回答 V4 问题" }), { target: { value: "人" } });
     const answer = screen.getByRole("button", { name: "回答并恢复" });
     fireEvent.click(answer);
@@ -1013,19 +1013,6 @@ describe("WorkspaceShell", () => {
     releaseAnswer();
     await waitFor(() => expect(screen.getByRole("button", { name: "回答并恢复" })).toBeEnabled());
 
-    let releaseResolve!: () => void;
-    const onResolve = vi.fn(() => new Promise<void>((resolve) => { releaseResolve = resolve; }));
-    const uncertain = { ...base, run_id: "run-uncertain-guard", sequence: 1, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "tool_dispatch_uncertain" as const, call_id: "call-1", tool_id: "runtime.execute" } };
-    rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-uncertain-guard" agentRunEventsV4={[uncertain]} onResolveUncertainV4={onResolve} />);
-    fireEvent.click(screen.getByText("执行过程"));
-    fireEvent.change(screen.getByRole("textbox", { name: "核验证据" }), { target: { value: "已检查" } });
-    const resolve = screen.getByRole("button", { name: "保存证据并继续" });
-    fireEvent.click(resolve);
-    fireEvent.click(resolve);
-    expect(onResolve).toHaveBeenCalledTimes(1);
-    expect(resolve).toBeDisabled();
-    releaseResolve();
-    await waitFor(() => expect(screen.getByRole("button", { name: "保存证据并继续" })).toBeEnabled());
   });
 });
 

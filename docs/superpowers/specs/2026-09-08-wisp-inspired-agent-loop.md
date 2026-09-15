@@ -16,7 +16,9 @@
 
 实现采用 [OpenAI Chat API 的输出预算参数](https://developers.openai.com/api/reference/resources/chat)：精确官方 HTTPS host/443 使用 `max_completion_tokens`，兼容网关保留 `max_tokens`，不通过型号前缀推断能力。
 
-工具视图在 `context_views.rs` 构造：正文最多约 8 KiB，大型 data 用引用替代，持久化事件不改写；可用的 `agent.read_tool_result` 按当前 run/project/conversation、sequence、event hash 和 UTF-8 边界验证后返回 4–8192 字节分页。仅有此 capability 的执行上下文启用投影，Plan 不暴露工具。checkpoint 中的工具近期记录也保留引用；科学状态和未解决错误不静默截断，仍过大时预算保护会停止。
+工具视图在 `context_views.rs` 构造：正文最多约 8 KiB，大型 data 用引用替代，持久化事件不改写；可用的 `agent.read_tool_result` 按当前 run/project/conversation、sequence、event hash 和 UTF-8 边界验证后返回 4–8192 字节分页。仅有此 capability 的执行上下文启用投影，Plan 不暴露工具。模型投影已由外层上下文限定为一个 run，因此每条事件信封只保留检索所需的 sequence/event hash，不重复 project/run/conversation、时间和前序 hash。成功 outcome 的 `model_content` 若逐字节等于 `data` 的紧凑 JSON、data 未超过短视图上限且附加引用后的投影确实更小，投影只保留结构化 data，并附可读取原 `model_content` 的引用；持久事件、hash 和不同内容不变。失败 outcome 不采用此去重；超大错误正文仍保留 UTF-8 安全的首尾诊断片段及引用，可分页恢复完整原文。checkpoint 中的工具近期记录也使用同一投影和引用。
+
+2026-09-15 的一次只读运行快照用于记录优化前量级：17 次模型请求共报告 input 1,217,607、output 45,321、reasoning 35,275、cache-read input 348,412 token，单次 context 峰值 97,693，并产生 8 对 archive/checkpoint 事件；原始工具 outcome 中 `search_mcp_tools`、`agent.read_tool_result`、`runtime.execute`、`use_skill`、`search_skills` 分别累计 621,750、347,723、33,368、29,275、11,164 UTF-8 字节，28 个成功 outcome 的等价 JSON 重复正文累计 470,616 字节。这些是一个运行的观测基线，不能单独归因于本投影，也不代表 tokenizer 精确换算、账单价格或优化后的节省。
 
 `progress.rs` 从持久化 outcome 重建最多 32 个 observation；批次必须关闭且结果齐全才计入，比较规范参数、成功标记和结果，忽略根级 transport timing 字段。旧 `repeated_signature_limit` 配置沿用为重复 observation 阈值（至少 2）；用户回答/科学状态变化重置窗口。初版直接返回 needs-attention，未增加额外的模型修正轮次。截断响应、空响应和无 terminal marker 的流均不作为成功工具轮次。
 

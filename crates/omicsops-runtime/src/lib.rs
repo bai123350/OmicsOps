@@ -17,6 +17,13 @@ use uuid::Uuid;
 pub trait KernelProcessV4: Send + Sync {
     fn session_id(&self) -> Uuid;
     fn process_identity(&self) -> &str;
+    /// Whether a later cell may safely reuse this process after the previous
+    /// operation. Implementations should return false after losing protocol or
+    /// transport synchronization; the manager will replace the process without
+    /// replaying the failed cell.
+    fn is_healthy(&self) -> bool {
+        true
+    }
     async fn execute(
         &self,
         code: String,
@@ -114,13 +121,23 @@ impl RuntimeManagerV4 {
         &self,
         key: &ExecutionContextKeyV4,
     ) -> Result<Arc<dyn KernelProcessV4>, String> {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.get(key) {
-            return Ok(session.clone());
+        loop {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(session) = sessions.get(key) {
+                if session.is_healthy() {
+                    return Ok(session.clone());
+                }
+                let stale = sessions
+                    .remove(key)
+                    .expect("unhealthy session was read from the same map");
+                drop(sessions);
+                let _ = stale.interrupt().await;
+                continue;
+            }
+            let session = self.backend.launch(key).await?;
+            sessions.insert(key.clone(), session.clone());
+            return Ok(session);
         }
-        let session = self.backend.launch(key).await?;
-        sessions.insert(key.clone(), session.clone());
-        Ok(session)
     }
 
     pub async fn execute(
@@ -231,6 +248,8 @@ mod tests {
         identity: String,
         values: Mutex<HashMap<String, String>>,
     }
+    struct FailingBackend(AtomicUsize);
+    struct FailingProcess;
     #[async_trait]
     impl KernelBackendV4 for FakeBackend {
         fn descriptor(&self) -> ComputeBackendDescriptorV4 {
@@ -272,6 +291,28 @@ mod tests {
         }
     }
     #[async_trait]
+    impl KernelBackendV4 for FailingBackend {
+        fn descriptor(&self) -> ComputeBackendDescriptorV4 {
+            FakeBackend(AtomicUsize::new(0)).descriptor()
+        }
+
+        async fn launch(
+            &self,
+            _: &ExecutionContextKeyV4,
+        ) -> Result<Arc<dyn KernelProcessV4>, String> {
+            let launch = self.0.fetch_add(1, Ordering::SeqCst);
+            if launch == 0 {
+                Ok(Arc::new(FailingProcess))
+            } else {
+                Ok(Arc::new(FakeProcess {
+                    id: Uuid::new_v4(),
+                    identity: "replacement-process".into(),
+                    values: Mutex::new(HashMap::new()),
+                }))
+            }
+        }
+    }
+    #[async_trait]
     impl KernelProcessV4 for FakeProcess {
         fn session_id(&self) -> Uuid {
             self.id
@@ -304,6 +345,24 @@ mod tests {
             Ok(())
         }
     }
+    #[async_trait]
+    impl KernelProcessV4 for FailingProcess {
+        fn session_id(&self) -> Uuid {
+            Uuid::nil()
+        }
+        fn process_identity(&self) -> &str {
+            "failed-process"
+        }
+        fn is_healthy(&self) -> bool {
+            false
+        }
+        async fn execute(&self, _: String, _: Vec<String>) -> Result<RuntimeResultV4, String> {
+            Err("simulated kernel transport failure".into())
+        }
+        async fn interrupt(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
     #[tokio::test]
     async fn two_cells_reuse_one_process_and_namespace() {
         let backend = Arc::new(FakeBackend(AtomicUsize::new(0)));
@@ -326,6 +385,51 @@ mod tests {
         assert_eq!(first.session_id, second.session_id);
         assert_eq!(second.stdout, "42");
         assert_eq!(backend.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn execution_error_discards_cached_process_without_replaying_the_cell() {
+        let backend = Arc::new(FailingBackend(AtomicUsize::new(0)));
+        let manager = RuntimeManagerV4::new(backend.clone());
+        let key = ExecutionContextKeyV4 {
+            project_id: Uuid::new_v4(),
+            run_id: Uuid::new_v4(),
+            backend_id: "fake".into(),
+            language: KernelLanguageV4::Python,
+            environment: "system".into(),
+        };
+
+        let failed_session = manager.acquire(&key).await.unwrap();
+        let failed_job_id = Uuid::new_v4();
+        let failed_job = manager
+            .start_job(
+                &key,
+                failed_job_id,
+                failed_session.session_id(),
+                "first cell".into(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let error = failed_job.wait().await.unwrap_err();
+        manager.release_job(&key, failed_job_id).unwrap();
+        assert_eq!(error, "simulated kernel transport failure");
+        assert_eq!(backend.0.load(Ordering::SeqCst), 1);
+
+        let replacement = manager.acquire(&key).await.unwrap();
+        let replacement_job = manager
+            .start_job(
+                &key,
+                Uuid::new_v4(),
+                replacement.session_id(),
+                "second cell".into(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let result = replacement_job.wait().await.unwrap();
+        assert_eq!(result.process_identity, "replacement-process");
+        assert_eq!(backend.0.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
