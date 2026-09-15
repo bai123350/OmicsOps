@@ -173,7 +173,43 @@ describe("SettingsPanel model providers", () => {
   it("opens directly on Skills when launched from the composer", () => {
     render(<SettingsPanel locale="en-US" initialSection="skills" onClose={() => undefined} />);
     expect(screen.getByRole("button", { name: "Skills and MCP" })).toHaveClass("active");
+    expect(screen.getByRole("button", { name: "Skills and MCP" })).toHaveAttribute("aria-current", "page");
     expect(screen.getByText("Research Skills")).toBeInTheDocument();
+  });
+
+  it("explains privacy boundaries and links to the existing capability settings without a project", () => {
+    render(<SettingsPanel locale="zh-CN" onClose={() => undefined} selectedProject={null} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "隐私与权限" }));
+    expect(screen.getByRole("button", { name: "隐私与权限" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("heading", { name: "隐私与权限" })).toBeInTheDocument();
+    expect(screen.getByText(/模型、MCP 或外部服务可能接收提示词、结果或元数据/)).toBeInTheDocument();
+    expect(screen.getByText(/Windows Credential Manager 或系统 keyring/)).toBeInTheDocument();
+    expect(screen.getByText(/停止 Agent 不会取消已经派发的远端计算/)).toBeInTheDocument();
+    expect(screen.getByText(/当前未打开项目/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "管理技能与 MCP" }));
+    expect(screen.getByRole("button", { name: "技能与 MCP" })).toHaveAttribute("aria-current", "page");
+    fireEvent.click(screen.getByRole("button", { name: "隐私与权限" }));
+    fireEvent.click(screen.getByRole("button", { name: "管理浏览器" }));
+    expect(screen.getByRole("button", { name: "浏览器" })).toHaveAttribute("aria-current", "page");
+  });
+
+  it("does not let a hidden model form consume Escape after navigating to privacy", () => {
+    const close = vi.fn();
+    render(<SettingsPanel locale="en-US" onClose={close} />);
+    fireEvent.click(screen.getByRole("button", { name: "Configure DeepSeek" }));
+    fireEvent.click(screen.getByRole("button", { name: "Privacy and permissions" }));
+
+    expect(screen.queryByLabelText("Model configuration")).not.toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("uses the localized Session navigation label and removes unsupported Ollama policy copy", () => {
+    render(<SettingsPanel locale="zh-CN" onClose={() => undefined} />);
+    expect(screen.getByRole("button", { name: "会话" })).toBeInTheDocument();
+    expect(screen.queryByText(/项目强制策略/)).not.toBeInTheDocument();
   });
   it("collects provider configuration without rendering stored credentials", async () => {
     const onSaveModel = vi.fn().mockResolvedValue(undefined);

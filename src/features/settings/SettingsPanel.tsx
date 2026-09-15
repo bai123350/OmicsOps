@@ -16,9 +16,11 @@ type FormState = SaveModelRequest & { credential: string };
 type McpEnvFormBinding = McpEnvBinding & { mode: "literal" | "credential" };
 type SaveMcpServerRequest = { id?: string; name: string; command: string; args: string[]; cwd?: string | null; timeout_secs?: number | null; env_bindings?: McpEnvBinding[] };
 
+export type SettingsSection = "models" | "remote" | "skills" | "browser" | "agent" | "privacy";
+
 interface Props extends BundledMcpProps {
   locale: Locale;
-  initialSection?: "models" | "remote" | "skills" | "browser" | "agent";
+  initialSection?: SettingsSection;
   onClose: () => void;
   modelProfiles?: ModelProfile[];
   onSaveModel?: (request: SaveModelRequest) => Promise<void>;
@@ -65,15 +67,19 @@ export function SettingsPanel({ locale, initialSection = "models", onClose, mode
   const [form, setForm] = useState<FormState | null>(null);
   const [saving, setSaving] = useState(false);
   const [modelSaveError, setModelSaveError] = useState("");
-  const [section, setSection] = useState<"models" | "remote" | "skills" | "browser" | "agent">(initialSection);
+  const [section, setSection] = useState<SettingsSection>(initialSection);
   const [skillsBusy, setSkillsBusy] = useState(false);
   const [skillError, setSkillError] = useState("");
   const [modelTests, setModelTests] = useState<Record<string, { state: "testing" | "success" | "error"; result?: ModelProbeResult; message?: string }>>({});
   const [modelChoices, setModelChoices] = useState<Record<string, string[]>>({});
   const fastModeAvailable = form ? supportsFastMode(form) : false;
   useWindowEscapeLayer(true, onClose);
-  useWindowEscapeLayer(form !== null, () => setForm(null));
+  useWindowEscapeLayer(form !== null && section === "models", () => setForm(null));
   const configure = (provider: ModelProfile["provider"]) => setForm({ ...defaults[provider] });
+  const navigate = (nextSection: SettingsSection) => {
+    setForm(null);
+    setSection(nextSection);
+  };
 
   async function saveProvider() {
     if (!form || !onSaveModel) return;
@@ -126,13 +132,13 @@ export function SettingsPanel({ locale, initialSection = "models", onClose, mode
   return <div className="settings-backdrop"><section className="settings-panel" role="dialog" aria-modal="true" aria-label={zh ? "工作台设置" : "Workspace settings"}>
     <header><div><small>OmicsOps Desktop</small><h2>{zh ? "工作台设置" : "Workspace settings"}</h2></div><button aria-label="Close" onClick={onClose}><X size={19} /></button></header>
     <div className="settings-layout">
-      <nav><button className={section === "agent" ? "active" : ""} onClick={() => setSection("agent")}><Bot size={16} />Session</button><button className={section === "models" ? "active" : ""} onClick={() => setSection("models")}><Bot size={16} />{zh ? "模型提供方" : "Model providers"}</button><button className={section === "remote" ? "active" : ""} onClick={() => setSection("remote")}><Server size={16} />{zh ? "远端计算" : "Remote compute"}</button><button className={section === "skills" ? "active" : ""} onClick={() => setSection("skills")}><Wrench size={16} />{zh ? "技能与 MCP" : "Skills and MCP"}</button><button className={section === "browser" ? "active" : ""} onClick={() => setSection("browser")}><Globe2 size={16} />{zh ? "浏览器" : "Browser"}</button><button><ShieldCheck size={16} />{zh ? "隐私与权限" : "Privacy and permissions"}</button></nav>
+      <nav aria-label={zh ? "设置页面" : "Settings pages"}><button aria-current={section === "agent" ? "page" : undefined} className={section === "agent" ? "active" : ""} onClick={() => navigate("agent")}><Bot size={16} />{zh ? "会话" : "Session"}</button><button aria-current={section === "models" ? "page" : undefined} className={section === "models" ? "active" : ""} onClick={() => navigate("models")}><Bot size={16} />{zh ? "模型提供方" : "Model providers"}</button><button aria-current={section === "remote" ? "page" : undefined} className={section === "remote" ? "active" : ""} onClick={() => navigate("remote")}><Server size={16} />{zh ? "远端计算" : "Remote compute"}</button><button aria-current={section === "skills" ? "page" : undefined} className={section === "skills" ? "active" : ""} onClick={() => navigate("skills")}><Wrench size={16} />{zh ? "技能与 MCP" : "Skills and MCP"}</button><button aria-current={section === "browser" ? "page" : undefined} className={section === "browser" ? "active" : ""} onClick={() => navigate("browser")}><Globe2 size={16} />{zh ? "浏览器" : "Browser"}</button><button aria-current={section === "privacy" ? "page" : undefined} className={section === "privacy" ? "active" : ""} onClick={() => navigate("privacy")}><ShieldCheck size={16} />{zh ? "隐私与权限" : "Privacy and permissions"}</button></nav>
       {section === "models" ? <main><div className="settings-heading"><h3>{zh ? "模型提供方" : "Model providers"}</h3><p>{zh ? "密钥保存在 Windows Credential Manager，项目只记录引用。" : "Keys stay in Windows Credential Manager; projects store references only."}</p></div>
         <div className="provider-grid">
           <Provider icon={Cloud} name="Anthropic" detail="Messages API · tool use" configured={modelProfiles.some((profile) => profile.provider === "anthropic")} onConfigure={() => configure("anthropic")} />
           <Provider icon={KeyRound} name="OpenAI-compatible" detail="Chat Completions · custom Base URL" configured={modelProfiles.some((profile) => profile.provider === "open_ai_compatible")} onConfigure={() => configure("open_ai_compatible")} />
           <Provider icon={Cloud} name="DeepSeek" detail={zh ? "官方 API · Flash / Pro" : "Official API · Flash / Pro"} configured={modelProfiles.some(isDeepSeek)} onConfigure={() => setForm({ ...deepSeekDefault })} />
-          <Provider icon={Monitor} name="Ollama" detail={zh ? "本地模型 · 可设为项目强制策略" : "Local models · optional project-only policy"} configured={modelProfiles.some((profile) => profile.provider === "ollama")} onConfigure={() => configure("ollama")} />
+          <Provider icon={Monitor} name="Ollama" detail={zh ? "本地模型 · Ollama API" : "Local models · Ollama API"} configured={modelProfiles.some((profile) => profile.provider === "ollama")} onConfigure={() => configure("ollama")} />
         </div>
         {form && <section className="model-form" aria-label={zh ? "模型配置" : "Model configuration"}>
           <div className="model-form-grid">
@@ -161,9 +167,22 @@ export function SettingsPanel({ locale, initialSection = "models", onClose, mode
         </section>}
         {modelProfiles.length > 0 && <div className="configured-models">{modelProfiles.map((profile) => { const probe = modelTests[profile.id]; const choices = modelChoices[profile.id] ?? []; const editProfile = (model: string) => setForm({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model, credential: "", reasoning_effort: profile.reasoning_effort ?? null, delegated_model_profile_id: profile.delegated_model_profile_id ?? null, ...(profile.fast_mode !== undefined ? { fast_mode: profile.fast_mode } : {}) }); return <div key={profile.id}><span><b>{profile.label}</b><small>{profile.model} · {profile.provider}</small>{profile.catalog_capabilities && <small>{zh ? "目录快照" : "Catalog snapshot"} (models.dev / {profile.catalog_capabilities.source_provider}) · {zh ? "上下文上限" : "Context limit"} {profile.catalog_capabilities.context_limit} · {zh ? "输出上限" : "Output limit"} {profile.catalog_capabilities.output_limit}</small>}</span><button onClick={() => editProfile(profile.model)}>{zh ? "编辑" : "Edit"}</button><button disabled={!onListModels} onClick={() => void discoverModels(profile.id)}>{zh ? "可用模型" : "Models"}</button><button disabled={probe?.state === "testing" || !onProbeModel} onClick={() => void testModel(profile.id)}>{probe?.state === "testing" ? <><LoaderCircle className="spin" size={13} />{zh ? "测试中" : "Testing"}</> : (zh ? "测试" : "Test")}</button>{choices.length > 0 && <div className="model-choices"><small>{zh ? "网关当前可用，点击后保存：" : "Available now; click to edit:"}</small>{choices.map((model) => <button key={model} onClick={() => editProfile(model)}>{model}</button>)}</div>}{probe?.state === "success" && probe.result && <div className="model-probe-result success" role="status"><CheckCircle2 size={15} /><span><b>{zh ? "连接成功" : "Connection succeeded"}</b><small>{probe.result.model} · {probe.result.latency_ms} ms · {probe.result.endpoint}</small><code>{probe.result.response_preview}</code></span></div>}{probe?.state === "error" && <div className="model-probe-result error" role="alert"><XCircle size={15} /><span><b>{zh ? "测试失败" : "Test failed"}</b><small>{probe.message}</small></span></div>}</div>; })}</div>}
         <div className="settings-note"><ShieldCheck size={18} /><span><b>{zh ? "默认无遥测" : "Telemetry off by default"}</b><small>{zh ? "诊断包仅在主动导出时生成，并经过凭据脱敏。" : "Diagnostic bundles are generated only on export and redact credentials."}</small></span></div>
-      </main> : section === "remote" ? <RemoteSettings locale={locale} connections={connections} selectedProject={selectedProject} onSave={onSaveConnection} onTest={onTestConnection} onConfirm={onConfirmHostKey} onBind={onBindProjectRemote} /> : section === "skills" ? <SkillsAndMcpSettings locale={locale} skillPackages={skillPackages} skillsBusy={skillsBusy} skillError={skillError} onImportSkill={onImportSkill ? importSkill : undefined} onSetSkillEnabled={onSetSkillEnabled} mcpServers={mcpServers} selectedProject={selectedProject} onSaveMcpServer={onSaveMcpServer} onInspectMcpServer={onInspectMcpServer} onSetMcpServerEnabled={onSetMcpServerEnabled} onSetMcpLaunchApproval={onSetMcpLaunchApproval} onSetMcpToolApproval={onSetMcpToolApproval} onListBundledMcpPresets={onListBundledMcpPresets} onAddBundledMcp={onAddBundledMcp} onConfigurePubMedMcp={onConfigurePubMedMcp} /> : section === "agent" ? <AgentSettings locale={locale} /> : <BrowserSettings locale={locale} />}
+      </main> : section === "remote" ? <RemoteSettings locale={locale} connections={connections} selectedProject={selectedProject} onSave={onSaveConnection} onTest={onTestConnection} onConfirm={onConfirmHostKey} onBind={onBindProjectRemote} /> : section === "skills" ? <SkillsAndMcpSettings locale={locale} skillPackages={skillPackages} skillsBusy={skillsBusy} skillError={skillError} onImportSkill={onImportSkill ? importSkill : undefined} onSetSkillEnabled={onSetSkillEnabled} mcpServers={mcpServers} selectedProject={selectedProject} onSaveMcpServer={onSaveMcpServer} onInspectMcpServer={onInspectMcpServer} onSetMcpServerEnabled={onSetMcpServerEnabled} onSetMcpLaunchApproval={onSetMcpLaunchApproval} onSetMcpToolApproval={onSetMcpToolApproval} onListBundledMcpPresets={onListBundledMcpPresets} onAddBundledMcp={onAddBundledMcp} onConfigurePubMedMcp={onConfigurePubMedMcp} /> : section === "agent" ? <AgentSettings locale={locale} /> : section === "browser" ? <BrowserSettings locale={locale} /> : <PrivacySettings locale={locale} selectedProject={selectedProject} onNavigate={navigate} />}
     </div>
   </section></div>;
+}
+
+function PrivacySettings({ locale, selectedProject, onNavigate }: { locale: Locale; selectedProject?: WorkspaceProject | null; onNavigate: (section: SettingsSection) => void }) {
+  const zh = locale === "zh-CN";
+  return <main className="privacy-settings">
+    <div className="settings-heading"><h3>{zh ? "隐私与权限" : "Privacy and permissions"}</h3><p>{zh ? "查看数据可能离开设备的边界，以及实际执行权限由谁裁决。" : "Review when data may leave the device and who decides execution permissions."}</p></div>
+    <div className="privacy-grid">
+      <article><Globe2 size={18} /><div><b>{zh ? "外部传输" : "External transfers"}</b><p>{zh ? "模型、MCP 或外部服务可能接收提示词、结果或元数据；浏览器访问的网站也会接收正常网页请求。请在启用和调用前检查目标服务。" : "Models, MCP servers, or external services may receive prompts, results, or metadata. Websites opened in the browser also receive normal web requests. Review the destination before enabling or using it."}</p><div className="privacy-actions"><button onClick={() => onNavigate("skills")}>{zh ? "管理技能与 MCP" : "Manage Skills and MCP"}</button><button onClick={() => onNavigate("browser")}>{zh ? "管理浏览器" : "Manage browser"}</button></div></div></article>
+      <article><KeyRound size={18} /><div><b>{zh ? "凭据存储" : "Credential storage"}</b><p>{zh ? "API key、密码和凭据由现有 Windows Credential Manager 或系统 keyring 保存；SQLite、日志、模型上下文和项目导出只保存引用或脱敏信息。" : "API keys, passwords, and credentials use the existing Windows Credential Manager or system keyring. SQLite, logs, model context, and project exports keep references or redacted information only."}</p><button onClick={() => onNavigate("models")}>{zh ? "管理模型提供方" : "Manage model providers"}</button></div></article>
+      <article><FolderOpen size={18} /><div><b>{zh ? "本地与远端数据" : "Local and remote data"}</b><p>{zh ? "大型远端数据不会默认完整同步到本地。项目可以保存远端引用、校验和与元数据；文件传输需由你明确发起或选择同步范围。" : "Large remote datasets are not fully synchronized by default. A project can keep remote references, checksums, and metadata; file transfer requires an explicit action or selected sync scope."}</p>{!selectedProject && <small>{zh ? "当前未打开项目；打开项目后可管理它的远端计算与同步范围。" : "No project is open. Open one to manage its remote compute and sync scope."}</small>}<button onClick={() => onNavigate("remote")}>{zh ? "管理远端计算" : "Manage remote compute"}</button></div></article>
+      <article><ShieldCheck size={18} /><div><b>{zh ? "权限与远端运行" : "Permissions and remote runs"}</b><p>{zh ? "宿主应用负责执行能力和审批裁决；模型、Skills 与 MCP 不能绕过批准或扩大授权。停止 Agent 不会取消已经派发的远端计算，请在对应运行环境中单独确认作业状态。" : "The host application decides execution capabilities and approvals. Models, Skills, and MCP cannot bypass approval or broaden authorization. Stopping the Agent does not cancel remote computation that was already dispatched; confirm job state in its execution environment."}</p></div></article>
+    </div>
+  </main>;
 }
 
 function emptyMcpForm() {
