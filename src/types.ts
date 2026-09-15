@@ -816,6 +816,33 @@ export interface ContextUsageSnapshotV4 {
   latest_compaction?: ContextCompactionReceiptV4 | null;
 }
 
+export type SkillOrigin = "bundled" | "managed_import" | "plugin_owned" | "legacy_unknown" | "external";
+
+export interface SkillSettingsFile {
+  relative_path: string;
+  size_bytes: number;
+  previewable: boolean;
+}
+
+export interface SkillSettingsDetail {
+  skill: SkillPackage;
+  origin: SkillOrigin;
+  integrity: string;
+  files: SkillSettingsFile[];
+  inventory_complete: boolean;
+  dependent_skills: string[];
+  can_remove_from_library: boolean;
+  can_delete_files: boolean;
+  blocking_reasons: string[];
+}
+
+export interface SkillFilePreview {
+  relative_path: string;
+  content: string;
+  redacted: boolean;
+  package_sha256: string;
+}
+
 export interface SaveMcpEnvBindingRequest extends McpEnvBinding {
   keep_existing?: boolean;
 }
