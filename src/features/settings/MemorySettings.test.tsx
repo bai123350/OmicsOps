@@ -117,6 +117,18 @@ describe("MemorySettings", () => {
     expect(screen.queryByRole("button", { name: "study.md" })).not.toBeInTheDocument();
   });
 
+  it("can start a local draft while the initial file list is still loading", () => {
+    const late = deferred<MemoryFileSummaryV4[]>();
+    api.listProjectMemoryFiles.mockReturnValue(late.promise);
+    render(<MemorySettings selectedProject={project("p1", "PBMC")} locale="en-US" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "New memory file" }));
+    fireEvent.change(screen.getByLabelText("Filename"), { target: { value: "study.md" } });
+    fireEvent.change(screen.getByLabelText("Memory content"), { target: { value: "local draft" } });
+
+    expect(screen.getByRole("button", { name: "Create file" })).toBeEnabled();
+  });
+
   it("shows the project requirement in Chinese without inventing global memory", async () => {
     render(<MemorySettings selectedProject={null} locale="zh-CN" />);
     expect(screen.getByRole("heading", { name: "记忆文件" })).toBeInTheDocument();

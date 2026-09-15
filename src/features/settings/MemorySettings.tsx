@@ -167,6 +167,7 @@ export function MemorySettings({
                 type="button"
                 onClick={() => {
                   ++sequence.current;
+                  setLoading(false);
                   setCreating(true);
                   setSelected(null);
                   setDraft("");
