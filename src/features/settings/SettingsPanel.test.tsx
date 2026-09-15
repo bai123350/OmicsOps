@@ -6,6 +6,7 @@ import { AppearanceProvider } from "../../use-appearance";
 import * as workflowApi from "../../composer-workflow-api";
 import * as api from "../../tauri-api";
 import { PetPreferencesProvider } from "../../use-pet-preferences";
+import * as memoryApi from "../../memory-settings-api";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -291,6 +292,35 @@ describe("SettingsPanel model providers", () => {
     await waitFor(() => expect(revoke).toHaveBeenCalledWith("mcp-1", "search_papers", false));
   });
 
+  it("registers project Memory without inventing a global preference store", async () => {
+    vi.spyOn(memoryApi, "listProjectMemoryFiles").mockResolvedValue([]);
+    const createMemory = vi.spyOn(memoryApi, "createProjectMemoryFile").mockResolvedValue({ project_id: "project-1", name: "study.md", content: "verified fact", size_bytes: 13, sha256: "hash-1" });
+    const onMemoryChanged = vi.fn();
+    const selectedProject = { id: "project-1", name: "PBMC", description: "", local_root: "E:/PBMC", remote_root: null, connection_id: null, template: "single_cell_rna_seq" as const, status: "ready" as const, ollama_only: false, created_at: "", updated_at: "" };
+    render(<SettingsPanel locale="en-US" initialSection="memory" selectedProject={selectedProject} onMemoryChanged={onMemoryChanged} onClose={() => undefined} />);
+
+    expect(screen.getByRole("button", { name: "Memory" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("heading", { name: "Memory files" })).toBeInTheDocument();
+    expect(await screen.findByText("No memory files yet.")).toBeInTheDocument();
+    expect(screen.getByText(/not global preferences or inferred memory/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "New memory file" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Filename" }), { target: { value: "study.md" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Memory content" }), { target: { value: "verified fact" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create file" }));
+    await waitFor(() => expect(createMemory).toHaveBeenCalledWith("project-1", "study.md", "verified fact"));
+    expect(onMemoryChanged).toHaveBeenCalledOnce();
+  });
+
+  it("registers Remote Access separately and keeps legacy remote navigation mapped to Environments", () => {
+    render(<SettingsPanel locale="en-US" initialSection="remote-access" selectedProject={null} onClose={() => undefined} />);
+
+    expect(screen.getByRole("button", { name: "Remote Access" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("heading", { name: "Remote Access" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open Environments" }));
+    expect(screen.getByRole("button", { name: "Environments" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("heading", { name: "Remote Linux compute" })).toBeInTheDocument();
+  });
+
   it("loads the current project workflow library inside Settings and reports saved catalog changes", async () => {
     vi.spyOn(workflowApi, "listComposerWorkflows").mockResolvedValue([{
       id: "workflow-qc", project_id: "project-1", name: "QC recipe", description: "Inspect counts", steps: ["Inspect"], enabled: true,
@@ -390,6 +420,8 @@ describe("SettingsPanel model providers", () => {
     expect(within(navigation).getByRole("button", { name: "Pet" })).toBeInTheDocument();
     expect(within(navigation).getByRole("button", { name: "Storage" })).toBeInTheDocument();
     expect(within(navigation).getByRole("button", { name: "Permissions" })).toBeInTheDocument();
+    expect(within(navigation).getByRole("button", { name: "Memory" })).toBeInTheDocument();
+    expect(within(navigation).getByRole("button", { name: "Remote Access" })).toBeInTheDocument();
   });
 
   it("searches navigation labels in either language without changing or clearing the active page", () => {
