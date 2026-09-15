@@ -114,6 +114,18 @@ describe("BrowserSettings", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("authorization store unavailable");
   });
 
+  it("does not save defaults when the initial settings baseline could not be loaded", async () => {
+    mockedApi().browserGetSettings.mockRejectedValueOnce(new Error("browser settings unavailable"));
+    mockedApi().browserListAuthorizations.mockResolvedValueOnce([]);
+    render(<BrowserSettings locale="en-US" />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("browser settings unavailable");
+    const save = screen.getByRole("button", { name: "Save browser settings" });
+    expect(save).toBeDisabled();
+    fireEvent.click(save);
+    expect(mockedApi().browserSaveSettings).not.toHaveBeenCalled();
+  });
+
   it("closes only the revoke confirmation on Escape while the parent Settings dialog stays open", async () => {
     render(<SettingsPanel locale="en-US" onClose={() => undefined} />);
     fireEvent.click(screen.getByRole("button", { name: "Browser" }));

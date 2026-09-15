@@ -154,6 +154,7 @@ export function BrowserSettings({ locale = "en-US" }: BrowserSettingsProps) {
   const [authorizations, setAuthorizations] = useState<BrowserAuthorizationV4[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [setupBusy, setSetupBusy] = useState<BrowserSessionKindV4 | null>(null);
   const [revoking, setRevoking] = useState(false);
   const [revokeTarget, setRevokeTarget] = useState<BrowserAuthorizationV4 | null>(null);
@@ -184,6 +185,7 @@ export function BrowserSettings({ locale = "en-US" }: BrowserSettingsProps) {
     if (settingsResult.status === "fulfilled" && settingsResult.value) {
       setResponse(settingsResult.value);
       setConfig(normalizeConfig(settingsResult.value.config));
+      setSettingsLoaded(true);
     } else {
       errors.push(settingsResult.status === "rejected" ? errorMessage(settingsResult.reason) : (zh ? "桌面端返回了空的浏览器设置。" : "The desktop host returned empty browser settings."));
     }
@@ -230,6 +232,7 @@ export function BrowserSettings({ locale = "en-US" }: BrowserSettingsProps) {
   }
 
   async function saveSettings() {
+    if (!settingsLoaded) return;
     setSaving(true);
     setError(null);
     setNotice(null);
@@ -426,7 +429,7 @@ export function BrowserSettings({ locale = "en-US" }: BrowserSettingsProps) {
 
       <footer className="browser-settings-footer">
         <small>{zh ? "保存后配置才会用于新的浏览器 session。" : "Saved configuration is used by new browser sessions."}</small>
-        <button type="button" className="browser-primary-button" disabled={loading || saving} onClick={() => void saveSettings()}>
+        <button type="button" className="browser-primary-button" disabled={loading || saving || !settingsLoaded} onClick={() => void saveSettings()}>
           {saving ? <LoaderCircle size={15} className="browser-spin" /> : <Save size={15} />}
           {saving ? (zh ? "保存中…" : "Saving…") : (zh ? "保存浏览器设置" : "Save browser settings")}
         </button>
