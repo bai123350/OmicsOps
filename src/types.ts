@@ -878,3 +878,35 @@ export interface SideChatTurnV4 {
   answer_markdown?: string | null; cited_source_ids: string[]; failure_code?: SideChatFailureCodeV4 | null;
   usage?: UsageTotalsV4 | null; created_at: string; updated_at: string;
 }
+
+export type CredentialTarget =
+  | { kind: "model"; id: string }
+  | { kind: "ssh"; id: string }
+  | { kind: "mcp_binding"; server_id: string; name: string }
+  | { kind: "managed"; id: string };
+
+export type CredentialPresence = "present" | "missing" | "unavailable";
+export type CredentialValueKind = "api_key" | "password" | "ssh_private_key";
+
+export interface CredentialConsumer {
+  kind: "model" | "ssh" | "mcp" | string;
+  id: string;
+  label: string;
+  binding_name: string | null;
+}
+
+export interface CredentialEntry {
+  target: CredentialTarget;
+  reference: string;
+  label: string;
+  presence: CredentialPresence;
+  value_kind: CredentialValueKind;
+  consumers: CredentialConsumer[];
+  can_replace: boolean;
+  can_delete: boolean;
+}
+
+export interface CreateManagedCredentialRequest { label: string; secret: string }
+export type CreateCredentialResult = { kind: "saved"; entry: CredentialEntry } | { kind: "secret_save_not_confirmed"; entry: CredentialEntry };
+export interface ReplaceCredentialRequest { target: CredentialTarget; expected_reference: string; expected_value_kind: CredentialValueKind; secret: string }
+export type DeleteCredentialResult = { kind: "deleted" } | { kind: "in_use"; consumers: CredentialConsumer[] };

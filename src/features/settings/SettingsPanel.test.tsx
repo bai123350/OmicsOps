@@ -8,6 +8,7 @@ import * as projectTemplatesApi from "../../project-templates-api";
 import * as api from "../../tauri-api";
 import { PetPreferencesProvider } from "../../use-pet-preferences";
 import * as memoryApi from "../../memory-settings-api";
+import * as credentialsApi from "../../credentials-settings-api";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -291,6 +292,21 @@ describe("SettingsPanel model providers", () => {
     expect(screen.getByRole("heading", { name: "MCP permissions" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Revoke search_papers permission for PubMed" }));
     await waitFor(() => expect(revoke).toHaveBeenCalledWith("mcp-1", "search_papers", false));
+  });
+
+  it("registers Credentials as a searchable keyring inventory and keeps owner navigation inside Settings", async () => {
+    vi.spyOn(credentialsApi, "listCredentials").mockResolvedValue([{
+      target: { kind: "model", id: "model-1" }, reference: "model/model-1", label: "Primary model",
+      presence: "present", value_kind: "api_key", consumers: [{ kind: "model", id: "model-1", label: "Primary model", binding_name: null }], can_replace: true, can_delete: false,
+    }]);
+    render(<SettingsPanel locale="en-US" initialSection="credentials" onClose={() => undefined} />);
+
+    expect(await screen.findByRole("heading", { name: "Credentials" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Credentials" })).toHaveAttribute("aria-current", "page");
+    fireEvent.click(screen.getByRole("button", { name: "Open models" }));
+    expect(screen.getByRole("button", { name: "Model providers" })).toHaveAttribute("aria-current", "page");
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search settings" }), { target: { value: "keyring" } });
+    expect(screen.getByRole("button", { name: "Credentials" })).toBeInTheDocument();
   });
 
   it("registers project Memory without inventing a global preference store", async () => {

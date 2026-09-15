@@ -489,6 +489,13 @@ pub use project_templates::{
     QuickAction, SaveQuickActionRequest, SaveSpecialistTemplateRequest, SpecialistTemplate,
 };
 
+mod credentials_settings;
+pub use credentials_settings::{
+    CreateCredentialResult, CreateManagedCredentialRequest, CredentialConsumer, CredentialEntry,
+    CredentialPresence, CredentialTarget, CredentialValueKind, DeleteCredentialResult,
+    ManagedCredentialMetadata, ReplaceCredentialRequest,
+};
+
 mod composer_queue;
 pub use composer_queue::{
     ComposerQueueActionRequestV4, ComposerQueueActionV4, ComposerQueueFailureCodeV4,

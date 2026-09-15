@@ -24,6 +24,7 @@ mod conversation_mode_tests;
 pub mod conversation_preferences;
 #[cfg(test)]
 mod conversation_state_tests;
+pub mod credential_settings;
 pub mod dto;
 #[cfg(test)]
 mod dto_contract_tests;
@@ -162,6 +163,7 @@ pub fn run() {
                 sync_controls: Arc::new(Mutex::new(HashMap::new())),
                 browser,
             });
+            app.manage(credential_settings::CredentialMutationState::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -271,6 +273,10 @@ pub fn run() {
             workspace_commands::create_conversation,
             workspace_commands::delete_conversation,
             storage_settings::settings_storage_usage,
+            credential_settings::settings_list_credentials,
+            credential_settings::settings_create_credential,
+            credential_settings::settings_replace_credential,
+            credential_settings::settings_delete_credential,
             conversation_branches::conversation_branch_checkpoint_v4,
             conversation_branches::conversation_branch_create_v4,
             conversation_branches::conversation_branch_create_and_send_v4,

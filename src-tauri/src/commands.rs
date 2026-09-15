@@ -94,9 +94,11 @@ pub async fn list_connections(
 #[tauri::command]
 pub async fn save_connection(
     state: State<'_, AppState>,
+    credential_mutations: State<'_, crate::credential_settings::CredentialMutationState>,
     mut profile: ConnectionProfile,
     secret: String,
 ) -> Result<(), String> {
+    let _credential_guard = credential_mutations.lock.lock().await;
     let previous = state
         .repository
         .list_connections()

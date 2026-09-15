@@ -720,3 +720,48 @@ fn replacement_contract_binds_complete_turn_and_rejects_inherited_authority() {
         json!({"kind":"unknown","message":"Reconcile"})
     );
 }
+
+#[test]
+fn credential_settings_contract_uses_entity_targets_without_secret_outputs() {
+    use omicsops_dto::{
+        CredentialConsumer, CredentialEntry, CredentialPresence, CredentialTarget,
+        CredentialValueKind, ReplaceCredentialRequest,
+    };
+    let id = Uuid::from_u128(91);
+    let entry = CredentialEntry {
+        target: CredentialTarget::Ssh { id },
+        reference: format!("ssh/{id}"),
+        label: "Cluster".into(),
+        presence: CredentialPresence::Present,
+        value_kind: CredentialValueKind::SshPrivateKey,
+        consumers: vec![CredentialConsumer {
+            kind: "ssh".into(),
+            id,
+            label: "Cluster".into(),
+            binding_name: None,
+        }],
+        can_replace: true,
+        can_delete: false,
+    };
+    assert_eq!(
+        serde_json::to_value(entry).unwrap(),
+        json!({
+            "target":{"kind":"ssh","id":id},
+            "reference":format!("ssh/{id}"),
+            "label":"Cluster",
+            "presence":"present",
+            "value_kind":"ssh_private_key",
+            "consumers":[{"kind":"ssh","id":id,"label":"Cluster","binding_name":null}],
+            "can_replace":true,
+            "can_delete":false
+        })
+    );
+    assert!(
+        serde_json::from_value::<ReplaceCredentialRequest>(json!({
+            "target":{"kind":"managed","id":id},
+            "expected_reference":format!("settings/{id}"),
+            "secret":"value"
+        }))
+        .is_err()
+    );
+}

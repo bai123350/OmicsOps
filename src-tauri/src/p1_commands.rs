@@ -21,6 +21,8 @@ use uuid::Uuid;
 
 use crate::commands::AppState;
 
+pub(crate) const MCP_SERVER_KIND: &str = "mcp_server";
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemorySearchRequest {
     pub project_id: Uuid,
@@ -352,7 +354,7 @@ fn validate_mcp_declaration(name: &str, command: &str, args: &[String]) -> Resul
 
 async fn mcp_server_profile(repository: &Store, id: Uuid) -> Result<McpServerProfile, String> {
     repository
-        .get_json("mcp_server", &id.to_string())
+        .get_json(MCP_SERVER_KIND, &id.to_string())
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("MCP server {id} was not found"))
@@ -485,7 +487,7 @@ pub(crate) fn mcp_profile_from_request(
 pub async fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerProfile>, String> {
     let mut profiles = state
         .repository
-        .list_json::<McpServerProfile>("mcp_server")
+        .list_json::<McpServerProfile>(MCP_SERVER_KIND)
         .await
         .map(|profiles| {
             profiles
@@ -501,6 +503,7 @@ pub async fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServe
 #[tauri::command]
 pub async fn save_mcp_server(
     state: State<'_, AppState>,
+    credential_mutations: State<'_, crate::credential_settings::CredentialMutationState>,
     request: SaveMcpServerRequest,
 ) -> Result<McpServerProfile, String> {
     let _server_lock = match request.id {
@@ -513,11 +516,12 @@ pub async fn save_mcp_server(
         None => None,
     };
     let profile = mcp_profile_from_request(request, existing.as_ref(), now)?;
-    state
-        .repository
-        .put_json("mcp_server", &profile.id.to_string(), &profile)
-        .await
-        .map_err(|error| error.to_string())?;
+    crate::credential_settings::persist_mcp_profile_with_credential_guard(
+        &state.repository,
+        &credential_mutations,
+        &profile,
+    )
+    .await?;
     if existing.is_some() {
         state.mcp_sessions.invalidate_server(profile.id).await;
     }
