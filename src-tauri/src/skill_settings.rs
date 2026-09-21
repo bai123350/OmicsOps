@@ -95,6 +95,51 @@ pub(crate) async fn record_installation_receipt(
     Ok(receipt)
 }
 
+/// Record the ownership of one plugin-specific catalog row without allowing
+/// a plugin install to claim a bundled or independently imported package.
+pub(crate) async fn record_plugin_owned_receipt(
+    repository: &Store,
+    skill: &SkillPackage,
+    installation_id: Uuid,
+) -> Result<SkillInstallationReceipt, String> {
+    let _guard = RECEIPT_MUTATION
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let key = skill.id.to_string();
+    let existing = repository
+        .get_json::<SkillInstallationReceipt>(SKILL_INSTALLATION_KIND, &key)
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Some(existing) = &existing {
+        if existing.skill_id != skill.id
+            || existing.package_sha256 != skill.sha256
+            || !same_path(&existing.installed_root, &skill.source_path)
+        {
+            return Err("skill installation receipt conflicts with the catalog record".into());
+        }
+        if existing.origin != SkillOrigin::PluginOwned
+            || existing.plugin_installation_id != Some(installation_id)
+        {
+            return Err("plugin installation cannot claim an existing skill package".into());
+        }
+    }
+    let receipt = SkillInstallationReceipt {
+        skill_id: skill.id,
+        package_sha256: skill.sha256.clone(),
+        installed_root: skill.source_path.clone(),
+        origin: SkillOrigin::PluginOwned,
+        owns_files: false,
+        plugin_installation_id: Some(installation_id),
+        phase: "active".into(),
+    };
+    repository
+        .put_json(SKILL_INSTALLATION_KIND, &key, &receipt)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(receipt)
+}
+
 pub(crate) async fn installation_receipt(
     repository: &Store,
     skill: &SkillPackage,
@@ -119,6 +164,7 @@ pub async fn settings_skill_detail(
     state: State<'_, AppState>,
     skill_id: Uuid,
 ) -> Result<SkillSettingsDetail, String> {
+    let _guard = state.skills_gate.read().await;
     settings_skill_detail_for_repository(&state.repository, &state.skills_root, skill_id).await
 }
 
@@ -223,6 +269,7 @@ pub async fn settings_read_skill_file(
     relative_path: String,
     expected_package_sha256: String,
 ) -> Result<SkillFilePreview, String> {
+    let _guard = state.skills_gate.read().await;
     settings_read_skill_file_for_repository(
         &state.repository,
         &state.skills_root,
@@ -895,6 +942,83 @@ mod tests {
         assert_eq!(receipt.origin, SkillOrigin::PluginOwned);
         assert_eq!(receipt.plugin_installation_id, Some(plugin_id));
         assert!(!receipt.owns_files);
+    }
+
+    #[tokio::test]
+    async fn plugin_receipt_requires_an_independent_catalog_record_and_is_idempotent() {
+        let store = Store::open_in_memory().await.unwrap();
+        let skill = skill();
+        let installation_id = Uuid::new_v4();
+        let receipt = record_plugin_owned_receipt(&store, &skill, installation_id)
+            .await
+            .unwrap();
+        assert_eq!(receipt.origin, SkillOrigin::PluginOwned);
+        assert_eq!(receipt.plugin_installation_id, Some(installation_id));
+        assert!(!receipt.owns_files);
+        assert_eq!(
+            record_plugin_owned_receipt(&store, &skill, installation_id)
+                .await
+                .unwrap(),
+            receipt
+        );
+        assert!(
+            record_plugin_owned_receipt(&store, &skill, Uuid::new_v4())
+                .await
+                .is_err()
+        );
+
+        let independent = SkillPackage {
+            id: Uuid::new_v4(),
+            ..skill.clone()
+        };
+        record_installation_receipt(
+            &store,
+            &independent,
+            SkillOrigin::ManagedImport,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            record_plugin_owned_receipt(&store, &independent, installation_id)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_skill_gate_keeps_freeze_and_catalog_removal_mutually_exclusive() {
+        let temporary = tempfile::tempdir().unwrap();
+        let skills_root = temporary.path().join("skills");
+        fs::create_dir(&skills_root).unwrap();
+        let store = Store::open_in_memory().await.unwrap();
+        let skill = managed_skill(&store, &skills_root, &[]).await;
+        let gate = std::sync::Arc::new(tokio::sync::RwLock::new(()));
+
+        let read = gate.read().await;
+        let frozen = crate::skill_commands::freeze_skill_package(&skill, &[]).unwrap();
+        assert_eq!(frozen.package_sha256, skill.sha256);
+        assert!(!frozen.sections.is_empty());
+
+        let writer_store = store.clone();
+        let writer_gate = gate.clone();
+        let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _write = writer_gate.write().await;
+            writer_store.delete_skill_package(skill.id).await.unwrap();
+            let _ = finished_tx.send(());
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut finished_rx)
+                .await
+                .is_err()
+        );
+        drop(read);
+        tokio::time::timeout(std::time::Duration::from_secs(1), finished_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(store.list_skill_packages().await.unwrap().is_empty());
     }
 
     #[tokio::test]

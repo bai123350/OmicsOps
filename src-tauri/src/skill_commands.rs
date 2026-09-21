@@ -154,6 +154,7 @@ async fn retire_replaced_bundled_skills(
 
 #[tauri::command]
 pub async fn list_skill_packages(state: State<'_, AppState>) -> Result<Vec<SkillPackage>, String> {
+    let _guard = state.skills_gate.read().await;
     let mut skills = state
         .repository
         .list_skill_packages()
@@ -168,6 +169,7 @@ pub async fn import_skill_directory(
     state: State<'_, AppState>,
     request: ImportSkillRequest,
 ) -> Result<SkillPackage, String> {
+    let _guard = state.skills_gate.write().await;
     if request.source_path.trim().is_empty() {
         return Err("skill source directory is required".into());
     }
@@ -544,6 +546,7 @@ pub async fn set_skill_enabled(
     state: State<'_, AppState>,
     request: SetSkillEnabledRequest,
 ) -> Result<SkillPackage, String> {
+    let _guard = state.skills_gate.write().await;
     set_skill_enabled_in_repository(&state.repository, request.skill_id, request.enabled).await
 }
 

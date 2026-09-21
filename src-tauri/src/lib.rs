@@ -160,6 +160,7 @@ pub fn run() {
                 mcp_sessions: omicsops_mcp::McpSessionManager::new(),
                 active_runs: Arc::new(Mutex::new(HashMap::new())),
                 skills_root,
+                skills_gate: Arc::new(tokio::sync::RwLock::new(())),
                 research_last_request: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 active_kernels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 project_kernel_queues: Arc::new(tokio::sync::Mutex::new(HashMap::new())),

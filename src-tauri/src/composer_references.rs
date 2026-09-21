@@ -33,7 +33,24 @@ pub async fn composer_reference_catalog(
     state: State<'_, AppState>,
     project_id: Uuid,
 ) -> Result<Vec<ComposerCatalogItem>, String> {
+    let _guard = state.skills_gate.read().await;
     composer_reference_catalog_for_repository(&state.repository, project_id).await
+}
+
+pub(crate) async fn resolve_composer_references_for_state(
+    state: &AppState,
+    project_id: Uuid,
+    conversation_id: Uuid,
+    references: &[ComposerReference],
+) -> Result<String, String> {
+    let _guard = state.skills_gate.read().await;
+    resolve_composer_references(
+        &state.repository,
+        project_id,
+        conversation_id,
+        references,
+    )
+    .await
 }
 
 /// Store-only form used by deterministic tests and by non-Tauri callers.

@@ -31,6 +31,7 @@ pub struct AppState {
     pub mcp_sessions: McpSessionManager,
     pub active_runs: Arc<Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
     pub skills_root: PathBuf,
+    pub skills_gate: Arc<tokio::sync::RwLock<()>>,
     pub research_last_request: Arc<tokio::sync::Mutex<HashMap<String, std::time::Instant>>>,
     pub active_kernels: crate::kernel_commands::ActiveKernelMap,
     pub project_kernel_queues: Arc<tokio::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Semaphore>>>>,

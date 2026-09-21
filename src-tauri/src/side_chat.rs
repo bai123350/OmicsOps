@@ -518,8 +518,8 @@ pub async fn side_chat_send_v4(
     let profile_hash = profile.execution_configuration_hash();
     let mut selected = Vec::new();
     for reference in &request.references {
-        let text = crate::composer_references::resolve_composer_references(
-            &state.repository,
+        let text = crate::composer_references::resolve_composer_references_for_state(
+            &state,
             request.project_id,
             request.conversation_id,
             std::slice::from_ref(reference),

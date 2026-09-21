@@ -443,8 +443,8 @@ pub async fn agent_v4_start_planning(
     } else {
         None
     };
-    let mut reference_context = crate::composer_references::resolve_composer_references(
-        &state.repository,
+    let mut reference_context = crate::composer_references::resolve_composer_references_for_state(
+        &state,
         request.project_id,
         request.conversation_id,
         &request.references,
@@ -824,8 +824,8 @@ pub async fn agent_v4_start_direct(
         service_tier,
     )
     .await?;
-    let mut reference_context = crate::composer_references::resolve_composer_references(
-        &state.repository,
+    let mut reference_context = crate::composer_references::resolve_composer_references_for_state(
+        &state,
         request.project_id,
         request.conversation_id,
         &request.references,
@@ -1028,8 +1028,8 @@ pub(crate) async fn resolve_composer_queue_material(
         Some(&frozen.model_configuration_hash),
     )
     .await?;
-    let references_text = crate::composer_references::resolve_composer_references(
-        &state.repository,
+    let references_text = crate::composer_references::resolve_composer_references_for_state(
+        state,
         project_id,
         conversation_id,
         references,
@@ -5065,6 +5065,7 @@ async fn compose(
         backend_id: selection.backend_id.clone(),
         browser: state.browser.clone(),
         local_project_root: PathBuf::from(&project.local_root),
+        skills_gate: state.skills_gate.clone(),
         browser_authorizations: Arc::new(std::sync::Mutex::new(
             state
                 .repository
@@ -6052,6 +6053,7 @@ struct DesktopToolExecutorV4 {
     backend_id: String,
     browser: omicsops_browser::BrowserRuntime,
     local_project_root: PathBuf,
+    skills_gate: Arc<tokio::sync::RwLock<()>>,
     browser_authorizations: Arc<std::sync::Mutex<Vec<BrowserAuthorizationV4>>>,
     forced_route: Option<AgentRequestRouteV4>,
 }
@@ -6146,6 +6148,7 @@ impl DesktopToolExecutorV4 {
     }
 
     async fn skill_documents(&self) -> Result<Vec<SkillDocumentV4>, String> {
+        let _guard = self.skills_gate.read().await;
         crate::skill_commands::agent_skill_packages(&self.repository)
             .await?
             .into_iter()
@@ -6811,6 +6814,7 @@ impl DesktopToolExecutorV4 {
                     .filter_map(Value::as_str)
                     .map(str::to_owned)
                     .collect::<Vec<_>>();
+                let _guard = self.skills_gate.read().await;
                 let package = crate::skill_commands::agent_skill_packages(&self.repository)
                     .await?
                     .into_iter()
@@ -8836,6 +8840,7 @@ mod tests {
                 dir.path().join("extension"),
             ),
             local_project_root: dir.path().to_owned(),
+            skills_gate: Default::default(),
             browser_authorizations: Default::default(),
             forced_route: None,
         };
@@ -8913,6 +8918,7 @@ mod tests {
             mcp_sessions: McpSessionManager::new(),
             active_runs: Default::default(),
             skills_root: dir.path().join("skills"),
+            skills_gate: Default::default(),
             research_last_request: Default::default(),
             active_kernels: Default::default(),
             project_kernel_queues: Default::default(),
@@ -10799,6 +10805,7 @@ mod tests {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../browser-extension"),
             ),
             local_project_root: std::env::temp_dir(),
+            skills_gate: Default::default(),
             browser_authorizations: Arc::new(std::sync::Mutex::new(Vec::new())),
             forced_route: None,
         };
@@ -10914,6 +10921,7 @@ mod tests {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../browser-extension"),
             ),
             local_project_root: std::env::temp_dir(),
+            skills_gate: Default::default(),
             browser_authorizations: Arc::new(std::sync::Mutex::new(Vec::new())),
             forced_route: None,
         };

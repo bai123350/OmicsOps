@@ -13,8 +13,8 @@ pub async fn validate_composer_references(
     conversation_id: Uuid,
     references: Vec<ComposerReference>,
 ) -> Result<(), String> {
-    crate::composer_references::resolve_composer_references(
-        &state.repository,
+    crate::composer_references::resolve_composer_references_for_state(
+        &state,
         project_id,
         conversation_id,
         &references,
