@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 import { useWindowEscapeLayer } from "../settings/BrowserSettings";
 import type { Locale } from "./copy";
@@ -12,6 +13,12 @@ export interface MessageSelectionQuote {
 }
 
 interface SelectionSnapshot extends MessageSelectionQuote {
+  left: number;
+  top: number;
+  bottom: number;
+}
+
+interface ToolbarPosition {
   left: number;
   top: number;
 }
@@ -50,8 +57,9 @@ function captureSelection(projectId: string, conversationId: string): SelectionS
   return {
     text,
     role,
-    left: Math.max(8, Math.min(rect.left, window.innerWidth - 190)),
-    top: Math.max(8, rect.top - 44),
+    left: rect.left,
+    top: rect.top,
+    bottom: rect.bottom,
   };
 }
 
@@ -63,11 +71,14 @@ export function MessageSelectionActions({
   onQuote,
 }: MessageSelectionActionsProps) {
   const [snapshot, setSnapshot] = useState<SelectionSnapshot | null>(null);
+  const [position, setPosition] = useState<ToolbarPosition | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const toolbarRef = useRef<HTMLDivElement | null>(null);
   const generation = useRef(0);
   const close = useCallback(() => {
     generation.current += 1;
     setSnapshot(null);
+    setPosition(null);
     setError(null);
   }, []);
 
@@ -83,18 +94,37 @@ export function MessageSelectionActions({
     const refresh = () => {
       generation.current += 1;
       setError(null);
+      setPosition(null);
       setSnapshot(captureSelection(projectId, conversationId));
     };
     const dismiss = () => close();
     document.addEventListener("selectionchange", refresh);
     window.addEventListener("blur", dismiss);
+    window.addEventListener("resize", dismiss);
     window.addEventListener("scroll", dismiss, true);
+    const scaleObserver = new MutationObserver(dismiss);
+    scaleObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-omicsops-scale"] });
     return () => {
       document.removeEventListener("selectionchange", refresh);
       window.removeEventListener("blur", dismiss);
+      window.removeEventListener("resize", dismiss);
       window.removeEventListener("scroll", dismiss, true);
+      scaleObserver.disconnect();
     };
   }, [close, conversationId, enabled, projectId]);
+
+  useLayoutEffect(() => {
+    if (!snapshot || !toolbarRef.current) return;
+    const rect = toolbarRef.current.getBoundingClientRect();
+    const maxLeft = Math.max(8, window.innerWidth - rect.width - 8);
+    const maxTop = Math.max(8, window.innerHeight - rect.height - 8);
+    const above = snapshot.top - rect.height - 8;
+    const preferredTop = above >= 8 ? above : snapshot.bottom + 8;
+    setPosition({
+      left: Math.max(8, Math.min(snapshot.left, maxLeft)),
+      top: Math.max(8, Math.min(preferredTop, maxTop)),
+    });
+  }, [error, locale, snapshot]);
 
   if (!snapshot) return null;
 
@@ -119,11 +149,12 @@ export function MessageSelectionActions({
     close();
   };
 
-  return <div
+  return createPortal(<div
+    ref={toolbarRef}
     className="message-selection-actions"
     role="toolbar"
     aria-label={locale === "zh-CN" ? "消息选区操作" : "Message selection actions"}
-    style={{ left: snapshot.left, top: snapshot.top }}
+    style={position ? { left: position.left, top: position.top } : { left: 0, top: 0, visibility: "hidden" }}
   >
     <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => void copy()}>
       {locale === "zh-CN" ? "复制" : "Copy selection"}
@@ -132,5 +163,5 @@ export function MessageSelectionActions({
       {locale === "zh-CN" ? "引用到草稿" : "Quote in draft"}
     </button>
     {error ? <span role="alert">{error}</span> : null}
-  </div>;
+  </div>, document.body);
 }

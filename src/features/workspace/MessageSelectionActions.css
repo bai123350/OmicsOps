@@ -4,7 +4,10 @@
   display: flex;
   gap: 6px;
   align-items: center;
+  box-sizing: border-box;
   max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow: auto;
   padding: 6px;
   border: 1px solid #cbd5e1;
   border-radius: 10px;
