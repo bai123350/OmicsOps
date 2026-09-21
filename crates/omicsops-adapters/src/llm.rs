@@ -17,6 +17,18 @@ use crate::{AdapterError, AdapterResult};
 
 const MODEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const MODEL_MAX_RETRIES: u8 = 3;
+const OPENCODE_GO_USER_AGENT: &str = concat!("OmicsOps/", env!("CARGO_PKG_VERSION"));
+
+fn is_opencode_go_base_url(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.host_str() == Some("opencode.ai")
+        && url.port_or_known_default() == Some(443)
+        && matches!(url.path(), "/zen/go/v1" | "/zen/go/v1/")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
 
 fn retryable_model_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
@@ -37,6 +49,108 @@ mod retry_tests {
             assert!(!retryable_model_status(
                 reqwest::StatusCode::from_u16(status).unwrap()
             ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod opencode_go_tests {
+    use super::*;
+
+    fn client(base_url: &str, session_id: Uuid) -> UnifiedModelClient {
+        UnifiedModelClient::new(
+            Uuid::new_v4(),
+            ProviderProtocol::OpenAiCompatible,
+            Url::parse(base_url).unwrap(),
+            "glm-5.3-flash",
+            Some("test-only".into()),
+        )
+        .unwrap()
+        .with_session_id(session_id)
+    }
+
+    fn header<'a>(request: &'a reqwest::Request, name: &str) -> Option<&'a str> {
+        request
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    }
+
+    #[test]
+    fn exact_opencode_go_requests_carry_client_and_stable_conversation_identity() {
+        let conversation = Uuid::new_v4();
+        let expected_session = conversation.to_string();
+        let turn_one = client("https://opencode.ai/zen/go/v1", conversation);
+        let turn_two = client("https://opencode.ai:443/zen/go/v1/", conversation);
+        let other = client("https://opencode.ai/zen/go/v1", Uuid::new_v4());
+        let body = json!({"model":"glm-5.3-flash"});
+
+        for request in [
+            turn_one
+                .post_json_request(
+                    Url::parse("https://opencode.ai/zen/go/v1/chat/completions").unwrap(),
+                    &body,
+                )
+                .build()
+                .unwrap(),
+            turn_two
+                .post_json_request(
+                    Url::parse("https://opencode.ai/zen/go/v1/chat/completions").unwrap(),
+                    &body,
+                )
+                .build()
+                .unwrap(),
+            turn_one
+                .get_request(Url::parse("https://opencode.ai/zen/go/v1/models").unwrap())
+                .build()
+                .unwrap(),
+        ] {
+            assert_eq!(
+                header(&request, "user-agent"),
+                Some(concat!("OmicsOps/", env!("CARGO_PKG_VERSION")))
+            );
+            assert_eq!(
+                header(&request, "x-opencode-session"),
+                Some(expected_session.as_str())
+            );
+        }
+
+        let other_request = other
+            .get_request(Url::parse("https://opencode.ai/zen/go/v1/models").unwrap())
+            .build()
+            .unwrap();
+        assert_ne!(
+            header(&other_request, "x-opencode-session"),
+            Some(expected_session.as_str())
+        );
+    }
+
+    #[test]
+    fn opencode_headers_never_leak_to_lookalike_or_noncanonical_base_urls() {
+        let session = Uuid::new_v4();
+        let body = json!({"model":"glm-5.3-flash"});
+        for base_url in [
+            "http://opencode.ai/zen/go/v1",
+            "https://opencode.ai:8443/zen/go/v1",
+            "https://opencode.ai/zen/go/v1?forward=1",
+            "https://opencode.ai/zen/go/v1#fragment",
+            "https://user@opencode.ai/zen/go/v1",
+            "https://opencode.ai.example/zen/go/v1",
+            "https://opencode.ai/zen/go/v10",
+        ] {
+            let request = client(base_url, session)
+                .post_json_request(
+                    Url::parse("https://gateway.example/v1/chat/completions").unwrap(),
+                    &body,
+                )
+                .build()
+                .unwrap();
+            assert_eq!(header(&request, "x-opencode-session"), None, "{base_url}");
+            assert_ne!(
+                header(&request, "user-agent"),
+                Some(concat!("OmicsOps/", env!("CARGO_PKG_VERSION"))),
+                "{base_url}"
+            );
         }
     }
 }
@@ -1607,6 +1721,7 @@ pub struct UnifiedModelClient {
     base_url: Url,
     model: String,
     credential: Option<String>,
+    session_id: Uuid,
     request_budget: Option<RequestBudget>,
     reasoning_effort: Option<String>,
     fast_mode: Option<bool>,
@@ -1616,6 +1731,11 @@ pub struct UnifiedModelClient {
 impl UnifiedModelClient {
     fn authenticate(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         builder = builder.header(reqwest::header::ACCEPT_ENCODING, "identity");
+        if is_opencode_go_base_url(&self.base_url) {
+            builder = builder
+                .header(reqwest::header::USER_AGENT, OPENCODE_GO_USER_AGENT)
+                .header("x-opencode-session", self.session_id.to_string());
+        }
         match self.protocol {
             ProviderProtocol::Anthropic => builder
                 .header("x-api-key", self.credential.as_deref().unwrap_or_default())
@@ -1643,21 +1763,42 @@ impl UnifiedModelClient {
                 "model provider credential is required".into(),
             ));
         }
+        let opencode_go = is_opencode_go_base_url(&base_url);
         Ok(Self {
             profile_id,
             protocol,
             base_url,
             model: model.into(),
             credential,
+            session_id: Uuid::new_v4(),
             request_budget: None,
             reasoning_effort: None,
             fast_mode: None,
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
                 .timeout(MODEL_REQUEST_TIMEOUT)
+                .redirect(if opencode_go {
+                    reqwest::redirect::Policy::none()
+                } else {
+                    reqwest::redirect::Policy::limited(10)
+                })
                 .build()
                 .map_err(|error| AdapterError::Llm(error.to_string()))?,
         })
+    }
+
+    /// Bind requests to a stable opaque conversation identity.
+    pub fn with_session_id(mut self, session_id: Uuid) -> Self {
+        self.session_id = session_id;
+        self
+    }
+
+    fn post_json_request(&self, endpoint: Url, body: &Value) -> reqwest::RequestBuilder {
+        self.authenticate(self.http.post(endpoint).json(body))
+    }
+
+    fn get_request(&self, endpoint: Url) -> reqwest::RequestBuilder {
+        self.authenticate(self.http.get(endpoint))
     }
 
     /// Attach a preflight budget to subsequent model generation requests.
@@ -1852,10 +1993,7 @@ impl UnifiedModelClient {
         self.validate_provider_body(body)?;
         let mut retries = 0_u8;
         loop {
-            let result = self
-                .authenticate(self.http.post(endpoint.clone()).json(body))
-                .send()
-                .await;
+            let result = self.post_json_request(endpoint.clone(), body).send().await;
             match result {
                 Ok(response) if response.status().is_success() => return Ok(response),
                 Ok(response) => {
@@ -1979,11 +2117,7 @@ impl UnifiedModelClient {
         let provider_request = self.build_provider_request(&request)?;
         self.validate_provider_body(&provider_request.body)?;
         let response = self
-            .authenticate(
-                self.http
-                    .post(provider_request.endpoint.clone())
-                    .json(&provider_request.body),
-            )
+            .post_json_request(provider_request.endpoint.clone(), &provider_request.body)
             .send()
             .await
             .map_err(|_| {
@@ -2073,18 +2207,7 @@ impl UnifiedModelClient {
     pub async fn probe(&self) -> AdapterResult<ModelProbeResult> {
         let endpoint = provider_endpoint(self.protocol, self.base_url.clone())?;
         let body = self.probe_body()?;
-        let mut builder = self.http.post(endpoint.clone()).json(&body);
-        match self.protocol {
-            ProviderProtocol::Anthropic => {
-                builder = builder
-                    .header("x-api-key", self.credential.as_deref().unwrap_or_default())
-                    .header("anthropic-version", "2023-06-01");
-            }
-            ProviderProtocol::OpenAiCompatible => {
-                builder = builder.bearer_auth(self.credential.as_deref().unwrap_or_default());
-            }
-            ProviderProtocol::Ollama => {}
-        }
+        let builder = self.post_json_request(endpoint.clone(), &body);
         let started = Instant::now();
         let response = builder
             .send()
@@ -2130,18 +2253,7 @@ impl UnifiedModelClient {
 
     pub async fn list_models(&self) -> AdapterResult<Vec<String>> {
         let endpoint = provider_models_endpoint(self.protocol, self.base_url.clone())?;
-        let mut builder = self.http.get(endpoint.clone());
-        match self.protocol {
-            ProviderProtocol::Anthropic => {
-                builder = builder
-                    .header("x-api-key", self.credential.as_deref().unwrap_or_default())
-                    .header("anthropic-version", "2023-06-01");
-            }
-            ProviderProtocol::OpenAiCompatible => {
-                builder = builder.bearer_auth(self.credential.as_deref().unwrap_or_default());
-            }
-            ProviderProtocol::Ollama => {}
-        }
+        let builder = self.get_request(endpoint.clone());
         let response = builder
             .send()
             .await

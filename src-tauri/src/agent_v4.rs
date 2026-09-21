@@ -5100,6 +5100,7 @@ async fn compose(
             binding.clone(),
             Box::new(DesktopModelPortV4 {
                 client: crate::commands::unified_model_client_for_profile(state, &child)?
+                    .with_session_id(conversation_id)
                     .with_request_budget(RequestBudget {
                         context_window_tokens: child.effective_context_window_tokens(),
                         reserved_output_tokens: child.effective_output_tokens(),
@@ -5128,6 +5129,7 @@ async fn compose(
     let reviewer = match (reviewer_profile, reviewer_binding) {
         (Some(profile), Some(binding)) => Some(Box::new(DesktopModelPortV4 {
             client: crate::commands::unified_model_client_for_profile(state, &profile)?
+                .with_session_id(conversation_id)
                 .with_fast_mode(binding.service_tier.fast_mode)
                 .with_request_budget(RequestBudget {
                     context_window_tokens: profile.effective_context_window_tokens(),
@@ -5147,13 +5149,15 @@ async fn compose(
     };
     Ok((
         Arc::new(DesktopModelPortV4 {
-            client: main_client.with_request_budget(RequestBudget {
-                context_window_tokens: model_profile.effective_context_window_tokens(),
-                // This is a requested output allowance, not an inferred
-                // maximum capability of an unknown model.
-                reserved_output_tokens: model_profile.effective_output_tokens(),
-                safety_margin_tokens: 1024,
-            }),
+            client: main_client
+                .with_session_id(conversation_id)
+                .with_request_budget(RequestBudget {
+                    context_window_tokens: model_profile.effective_context_window_tokens(),
+                    // This is a requested output allowance, not an inferred
+                    // maximum capability of an unknown model.
+                    reserved_output_tokens: model_profile.effective_output_tokens(),
+                    safety_margin_tokens: 1024,
+                }),
             prompt,
             usage_metadata: usage_metadata_for_profile(&model_profile),
             resources: Some(resources.clone()),

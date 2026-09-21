@@ -12,6 +12,72 @@ use crate::model_catalog_shared::{exact_model_capabilities, exact_model_supports
 
 pub use omicsops_dto::SaveModelProfileRequest;
 
+const OPENCODE_GO_CHAT_MODELS: &[&str] = &[
+    "glm-5.3-flash",
+    "glm-5.3",
+    "glm-5.2",
+    "glm-5.1",
+    "kimi-k3",
+    "kimi-k2.7-code",
+    "kimi-k2.6",
+    "longcat-2.0",
+    "deepseek-v4.1-flash",
+    "deepseek-v4-pro",
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-vision-exp",
+    "mimo-v2.5",
+    "mimo-v2.5-pro",
+    "hy4-preview",
+    "hy3",
+];
+const OPENCODE_GO_MESSAGES_MODELS: &[&str] = &[
+    "minimax-m3",
+    "minimax-m2.7",
+    "minimax-m2.5",
+    "qwen3.8-max",
+    "qwen3.8-flash",
+    "qwen3.7-max",
+    "qwen3.7-plus",
+    "qwen3.6-plus",
+];
+const OPENCODE_GO_RESPONSES_MODELS: &[&str] = &[
+    "grok-4.6",
+    "gpt-5.6-luna",
+    "muse-spark-1.3-contributor",
+    "muse-spark-1.2-contributor",
+];
+
+fn is_opencode_go_base_url(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.host_str() == Some("opencode.ai")
+        && url.port_or_known_default() == Some(443)
+        && matches!(url.path(), "/zen/go/v1" | "/zen/go/v1/")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
+fn validate_opencode_go_protocol(
+    provider: ModelProviderKind,
+    base_url: &Url,
+    model: &str,
+) -> Result<(), String> {
+    if !is_opencode_go_base_url(base_url) {
+        return Ok(());
+    }
+    if OPENCODE_GO_RESPONSES_MODELS.contains(&model) {
+        return Err("this OpenCode Go model requires the unsupported Responses API".into());
+    }
+    if OPENCODE_GO_CHAT_MODELS.contains(&model) && provider != ModelProviderKind::OpenAiCompatible {
+        return Err("this OpenCode Go model requires the Chat Completions protocol".into());
+    }
+    if OPENCODE_GO_MESSAGES_MODELS.contains(&model) && provider != ModelProviderKind::Anthropic {
+        return Err("this OpenCode Go model requires the Anthropic Messages protocol".into());
+    }
+    Ok(())
+}
+
 pub fn model_profile_from_request(
     request: SaveModelProfileRequest,
 ) -> Result<ModelProfile, String> {
@@ -33,6 +99,7 @@ pub fn model_profile_from_request(
         return Err("choose another delegated profile or inherit the main model".into());
     }
     let model = request.model.trim().to_owned();
+    validate_opencode_go_protocol(provider, &base_url, &model)?;
     let reasoning_effort = request.reasoning_effort.flatten();
     let fast_mode = request.fast_mode.flatten();
     omicsops_core::workspace::validate_reasoning_effort(provider, reasoning_effort.as_deref())?;
@@ -317,6 +384,78 @@ mod tests {
             fast_mode: None,
             delegated_model_profile_id: None,
         }
+    }
+
+    #[test]
+    fn opencode_go_requires_the_exact_wire_protocol_and_rejects_responses_models() {
+        for model in ["glm-5.3-flash", "deepseek-v4.1-flash", "hy3"] {
+            assert!(
+                model_profile_from_request(request(
+                    "open_ai_compatible",
+                    "https://opencode.ai/zen/go/v1",
+                    model,
+                ))
+                .is_ok()
+            );
+            assert!(
+                model_profile_from_request(request(
+                    "anthropic",
+                    "https://opencode.ai/zen/go/v1",
+                    model,
+                ))
+                .is_err()
+            );
+        }
+        for model in ["minimax-m3", "qwen3.8-flash", "qwen3.6-plus"] {
+            assert!(
+                model_profile_from_request(request(
+                    "anthropic",
+                    "https://opencode.ai/zen/go/v1/",
+                    model,
+                ))
+                .is_ok()
+            );
+            assert!(
+                model_profile_from_request(request(
+                    "open_ai_compatible",
+                    "https://opencode.ai/zen/go/v1",
+                    model,
+                ))
+                .is_err()
+            );
+        }
+        for model in [
+            "grok-4.6",
+            "gpt-5.6-luna",
+            "muse-spark-1.3-contributor",
+            "muse-spark-1.2-contributor",
+        ] {
+            assert!(
+                model_profile_from_request(request(
+                    "open_ai_compatible",
+                    "https://opencode.ai/zen/go/v1",
+                    model,
+                ))
+                .is_err()
+            );
+        }
+
+        assert!(
+            model_profile_from_request(request(
+                "anthropic",
+                "https://opencode.ai/zen/go/v1",
+                "future-custom",
+            ))
+            .is_ok()
+        );
+        assert!(
+            model_profile_from_request(request(
+                "open_ai_compatible",
+                "https://proxy.example/zen/go/v1",
+                "minimax-m3",
+            ))
+            .is_ok()
+        );
     }
 
     #[test]

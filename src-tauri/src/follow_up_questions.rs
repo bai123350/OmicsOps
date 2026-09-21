@@ -102,7 +102,7 @@ fn questions_request(objective: &str, answer: &str) -> ProviderRequest {
 async fn prepare_questions(
     repository: &Store,
     run_id: Uuid,
-) -> Result<Option<(Uuid, ProviderRequest)>, String> {
+) -> Result<Option<(Uuid, Uuid, ProviderRequest)>, String> {
     if !crate::agent_settings::load_iteration_settings(repository)
         .await?
         .follow_up_questions
@@ -140,11 +140,21 @@ async fn prepare_questions(
         .ok_or("run model profile is missing")?
         .parse::<Uuid>()
         .map_err(|_| "invalid run model profile")?;
+    let conversation_id = run
+        .get("conversation_id")
+        .and_then(|value| value.as_str())
+        .ok_or("run conversation is missing")?
+        .parse::<Uuid>()
+        .map_err(|_| "invalid run conversation")?;
     let objective = run
         .get("objective")
         .and_then(|value| value.as_str())
         .unwrap_or("");
-    Ok(Some((profile_id, questions_request(objective, answer))))
+    Ok(Some((
+        profile_id,
+        conversation_id,
+        questions_request(objective, answer),
+    )))
 }
 
 #[tauri::command]
@@ -152,7 +162,9 @@ pub async fn agent_v4_suggest_follow_up_questions(
     state: State<'_, AppState>,
     run_id: Uuid,
 ) -> Result<Vec<String>, String> {
-    let Some((profile_id, request)) = prepare_questions(&state.repository, run_id).await? else {
+    let Some((profile_id, conversation_id, request)) =
+        prepare_questions(&state.repository, run_id).await?
+    else {
         return Ok(vec![]);
     };
     cached_questions(
@@ -166,6 +178,7 @@ pub async fn agent_v4_suggest_follow_up_questions(
                 .map_err(|error| error.to_string())?
                 .ok_or("run model profile not found")?;
             let client = crate::commands::unified_model_client_for_profile(&state, &profile)?
+                .with_session_id(conversation_id)
                 .with_request_budget(RequestBudget {
                     context_window_tokens: profile.effective_context_window_tokens(),
                     reserved_output_tokens: profile.effective_output_tokens().min(4096),

@@ -30,6 +30,73 @@ afterEach(() => {
 });
 
 describe("SettingsPanel model providers", () => {
+  it("configures OpenCode Go with exact protocol routing and blocks Responses-only models", async () => {
+    const save = vi.fn().mockResolvedValue(undefined);
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} onSaveModel={save} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Configure OpenCode Go" }));
+    expect(screen.getByLabelText("Base URL")).toHaveValue("https://opencode.ai/zen/go/v1");
+    expect(screen.getByLabelText("Model")).toHaveValue("glm-5.3-flash");
+    expect(screen.getByLabelText("API protocol")).toHaveValue("open_ai_compatible");
+    expect(screen.getByText(/bundled catalog has no OpenCode Go capability entries/i)).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Requested reasoning effort"), { target: { value: "high" } });
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "minimax-m3" } });
+    expect(screen.getByLabelText("API protocol")).toHaveValue("anthropic");
+    fireEvent.change(screen.getByLabelText("API key"), { target: { value: "test-only-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    await waitFor(() => expect(save).toHaveBeenCalledWith({
+      provider: "anthropic",
+      label: "OpenCode Go",
+      base_url: "https://opencode.ai/zen/go/v1",
+      model: "minimax-m3",
+      credential: "test-only-key",
+      reasoning_effort: null,
+    }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Configure OpenCode Go" }));
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "grok-4.6" } });
+    expect(screen.getByRole("alert")).toHaveTextContent("Responses API");
+    expect(screen.getByRole("button", { name: "Save provider" })).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "custom-go-model" } });
+    expect(screen.getByLabelText("API protocol")).toBeEnabled();
+    fireEvent.change(screen.getByLabelText("Requested reasoning effort"), { target: { value: "max" } });
+    fireEvent.change(screen.getByLabelText("API protocol"), { target: { value: "anthropic" } });
+    expect(screen.getByLabelText("API protocol")).toHaveValue("anthropic");
+    expect(screen.queryByLabelText("Requested reasoning effort")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save provider" })).toBeEnabled();
+  });
+
+  it("reconciles a reviewed OpenCode Go model when the Base URL becomes official", () => {
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} />);
+    fireEvent.click(screen.getByRole("button", { name: "Configure OpenAI-compatible" }));
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "minimax-m3" } });
+    fireEvent.change(screen.getByLabelText("Requested reasoning effort"), { target: { value: "high" } });
+    fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "https://opencode.ai/zen/go/v1" } });
+    expect(screen.getByLabelText("API protocol")).toHaveValue("anthropic");
+    expect(screen.queryByLabelText("Requested reasoning effort")).not.toBeInTheDocument();
+  });
+
+  it("preserves OpenCode Go protocol while editing and disables unsupported discovered models", async () => {
+    const profile = { id: "go", label: "Go messages", provider: "anthropic" as const, base_url: "https://opencode.ai:443/zen/go/v1/", model: "minimax-m2.7", credential_reference: "model/go", supports_tools: true, supports_vision: false };
+    const list = vi.fn().mockResolvedValue(["minimax-m2.7", "gpt-5.6-luna", "future-custom"]);
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[profile]} onListModels={list} />);
+
+    const card = screen.getByRole("button", { name: "Configure OpenCode Go" }).closest("article")!;
+    expect(within(card).getByText(/configured/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByLabelText("API protocol")).toHaveValue("anthropic");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Models" }));
+    await screen.findByRole("button", { name: /gpt-5.6-luna.*unsupported/i });
+    expect(screen.getByRole("button", { name: /gpt-5.6-luna.*unsupported/i })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "future-custom" }));
+    expect(screen.getByLabelText("Model")).toHaveValue("future-custom");
+    expect(screen.getByLabelText("API protocol")).toHaveValue("anthropic");
+  });
+
   it("saves the DeepSeek preset through the compatible provider and supports custom model IDs", async () => {
     const save = vi.fn().mockResolvedValue(undefined);
     render(<SettingsPanel locale="zh-CN" onClose={() => undefined} onSaveModel={save} />);
