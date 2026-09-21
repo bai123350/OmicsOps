@@ -42,6 +42,7 @@ const SCHEMA_VERSION: u32 = 4;
 mod context_compaction;
 mod conversation_branches;
 mod guidance;
+mod notification_receipts;
 pub(crate) mod run_stops;
 mod runtime_jobs;
 mod session_reviews;

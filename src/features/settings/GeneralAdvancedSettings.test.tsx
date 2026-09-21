@@ -10,7 +10,13 @@ const api = vi.hoisted(() => ({
   settingsProbeSystemInterpreters: vi.fn(),
   chooseProjectDirectoryStartingAt: vi.fn(),
 }));
+const notificationApi = vi.hoisted(() => ({
+  settingsNotificationStatus: vi.fn(),
+  settingsSetNotificationsEnabled: vi.fn(),
+  settingsSendTestNotification: vi.fn(),
+}));
 vi.mock("../../general-settings-api", () => api);
+vi.mock("../../notification-settings-api", () => notificationApi);
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -23,6 +29,9 @@ beforeEach(() => {
     r: { program: "Rscript", status: "missing", detail: "not found on system PATH" },
     checked_at: "2026-09-15T00:00:00Z",
   });
+  notificationApi.settingsNotificationStatus.mockResolvedValue({ preference_enabled: false, permission: "prompt", platform: "windows", last_failure: null });
+  notificationApi.settingsSetNotificationsEnabled.mockResolvedValue({ preference_enabled: true, permission: "denied", platform: "windows", last_failure: null });
+  notificationApi.settingsSendTestNotification.mockResolvedValue({ preference_enabled: true, permission: "granted", platform: "windows", last_failure: null });
 });
 
 describe("GeneralAdvancedSettings", () => {
@@ -56,5 +65,39 @@ describe("GeneralAdvancedSettings", () => {
     expect(await screen.findByText("Executable found; project dependencies not verified")).toBeInTheDocument();
     expect(screen.getByText("Not found on the system PATH")).toBeInTheDocument();
     expect(api.settingsProbeSystemInterpreters).toHaveBeenCalledWith();
+  });
+
+  it("keeps notifications off by default and exposes the real permission result", async () => {
+    render(<GeneralAdvancedSettings locale="en-US" onNavigate={vi.fn()} />);
+    expect(await screen.findByText("System notifications")).toBeInTheDocument();
+    expect(screen.getByText(/Permission not requested/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Enable notifications" }));
+    await waitFor(() => expect(notificationApi.settingsSetNotificationsEnabled).toHaveBeenCalledWith(true));
+    expect(await screen.findByText(/Permission denied by the system/)).toBeInTheDocument();
+  });
+
+  it("keeps general settings usable when notification status cannot be read", async () => {
+    notificationApi.settingsNotificationStatus.mockRejectedValueOnce(new Error("Notification status unavailable"));
+    render(<GeneralAdvancedSettings locale="en-US" onNavigate={vi.fn()} />);
+
+    expect(await screen.findByText("Version 1.2.3")).toBeInTheDocument();
+    expect(screen.getByText("Notification status unavailable")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry notification status" }));
+    expect(await screen.findByText(/Permission not requested/)).toBeInTheDocument();
+    expect(notificationApi.settingsNotificationStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it("sends an explicit test and keeps a visible native failure", async () => {
+    notificationApi.settingsNotificationStatus.mockResolvedValue({
+      preference_enabled: true,
+      permission: "granted",
+      platform: "windows",
+      last_failure: { message: "System notification delivery failed", occurred_at: "2026-09-15T00:00:00Z" },
+    });
+    notificationApi.settingsSendTestNotification.mockRejectedValueOnce(new Error("System notification delivery failed"));
+    render(<GeneralAdvancedSettings locale="en-US" onNavigate={vi.fn()} />);
+    expect(await screen.findByText("System notification delivery failed")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Send test notification" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("System notification delivery failed");
   });
 });

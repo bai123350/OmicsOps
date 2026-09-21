@@ -21,6 +21,7 @@ import { useComposerQueue } from "./features/workspace/useComposerQueue";
 import { useComposerReplacement } from "./features/workspace/useComposerReplacement";
 import { useAgentStop } from "./features/workspace/useAgentStop";
 import { useResumeLastSessionPreference } from "./features/settings/useResumeLastSessionPreference";
+import { useRunNotifications } from "./use-run-notifications";
 
 type SendMode = "chat" | "plan";
 
@@ -100,6 +101,7 @@ export default function DesktopApp() {
   const [messages, setMessages] = useState<WorkspaceMessage[]>([]);
   const [agentBusy, setAgentBusy] = useState(false);
   const [agentNotice, setAgentNotice] = useState("");
+  useRunNotifications((message) => setAgentNotice(message));
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>([]);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
   const [workflowCatalogVersion, setWorkflowCatalogVersion] = useState(0);

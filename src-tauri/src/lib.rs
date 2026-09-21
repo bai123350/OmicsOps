@@ -34,6 +34,7 @@ pub mod inspection;
 pub mod kernel_commands;
 mod model_catalog_shared;
 pub mod model_commands;
+pub mod notification_settings;
 pub mod p1_commands;
 #[cfg(test)]
 mod plan_revision_tests;
@@ -65,6 +66,7 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -230,6 +232,10 @@ pub fn run() {
             general_settings::settings_general_system_status,
             general_settings::settings_probe_system_interpreters,
             general_settings::settings_project_directory_start_available,
+            notification_settings::settings_notification_status,
+            notification_settings::settings_set_notifications_enabled,
+            notification_settings::settings_send_test_notification,
+            notification_settings::notify_run_event,
             session_reviews::reviewer_get_settings_v4,
             session_reviews::reviewer_save_settings_v4,
             session_reviews::session_start_review_v4,

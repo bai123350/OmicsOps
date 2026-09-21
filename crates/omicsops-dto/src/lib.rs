@@ -505,6 +505,12 @@ pub use general_settings::{
     SystemInterpreterDiagnostic, SystemInterpreterDiagnostics, SystemInterpreterStatus,
 };
 
+mod notification_settings;
+pub use notification_settings::{
+    NotificationFailure, NotificationPermission, NotificationPreferences, NotificationStatus,
+    RunNotificationOutcome, RunNotificationResult,
+};
+
 mod composer_queue;
 pub use composer_queue::{
     ComposerQueueActionRequestV4, ComposerQueueActionV4, ComposerQueueFailureCodeV4,

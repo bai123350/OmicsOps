@@ -869,6 +869,16 @@ export interface SystemInterpreterDiagnostics {
   r: SystemInterpreterDiagnostic;
   checked_at: string;
 }
+export type NotificationPermission = "granted" | "denied" | "prompt" | "unsupported";
+export interface NotificationFailure { message: string; occurred_at: string }
+export interface NotificationStatus {
+  preference_enabled: boolean;
+  permission: NotificationPermission;
+  platform: string;
+  last_failure?: NotificationFailure | null;
+}
+export type RunNotificationOutcome = "sent" | "skipped_disabled" | "skipped_foreground" | "skipped_permission" | "duplicate" | "failed";
+export interface RunNotificationResult { outcome: RunNotificationOutcome }
 export interface UsageFilter { project_id?: string | null; from?: string | null; until?: string | null }
 export interface UsageGroup { key: string; label: string; totals: UsageTotalsV4 }
 export interface UsageDay { date: string; attempts: number; tools: number; totals: UsageTotalsV4 }

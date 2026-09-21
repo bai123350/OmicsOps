@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { FolderOpen, LoaderCircle, MonitorCog, Network, Server } from "lucide-react";
+import { Bell, FolderOpen, LoaderCircle, MonitorCog, Network, Server } from "lucide-react";
 
-import type { GeneralNativePreferences, GeneralSystemStatus, SystemInterpreterDiagnostics } from "../../types";
+import type { GeneralNativePreferences, GeneralSystemStatus, NotificationStatus, SystemInterpreterDiagnostics } from "../../types";
 import type { Locale } from "../workspace/copy";
 import {
   chooseProjectDirectoryStartingAt,
@@ -10,6 +10,11 @@ import {
   settingsProbeSystemInterpreters,
   settingsSaveGeneralPreferences,
 } from "../../general-settings-api";
+import {
+  settingsNotificationStatus,
+  settingsSendTestNotification,
+  settingsSetNotificationsEnabled,
+} from "../../notification-settings-api";
 import "./GeneralAdvancedSettings.css";
 
 type Destination = "models" | "connections" | "remote";
@@ -19,8 +24,10 @@ export function GeneralAdvancedSettings({ locale, onNavigate }: { locale: Locale
   const [preferences, setPreferences] = useState<GeneralNativePreferences | null>(null);
   const [system, setSystem] = useState<GeneralSystemStatus | null>(null);
   const [diagnostics, setDiagnostics] = useState<SystemInterpreterDiagnostics | null>(null);
+  const [notifications, setNotifications] = useState<NotificationStatus | null>(null);
+  const [notificationError, setNotificationError] = useState("");
   const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState<"directory" | "system" | "probe" | null>(null);
+  const [busy, setBusy] = useState<"directory" | "system" | "probe" | "notifications" | "notification-test" | null>(null);
   const [error, setError] = useState("");
   const [directoryNotice, setDirectoryNotice] = useState("");
   const loadGeneration = useRef(0);
@@ -29,6 +36,15 @@ export function GeneralAdvancedSettings({ locale, onNavigate }: { locale: Locale
     const generation = ++loadGeneration.current;
     setLoading(true);
     setError("");
+    setNotificationError("");
+    void settingsNotificationStatus().then(
+      (nextNotifications) => {
+        if (generation === loadGeneration.current) setNotifications(nextNotifications);
+      },
+      (reason) => {
+        if (generation === loadGeneration.current) setNotificationError(reason instanceof Error ? reason.message : String(reason));
+      },
+    );
     try {
       const [nextPreferences, nextSystem] = await Promise.all([
         settingsGeneralPreferences(),
@@ -95,6 +111,38 @@ export function GeneralAdvancedSettings({ locale, onNavigate }: { locale: Locale
     finally { setBusy(null); }
   }
 
+  async function toggleNotifications() {
+    if (!notifications) return;
+    setBusy("notifications");
+    setNotificationError("");
+    try { setNotifications(await settingsSetNotificationsEnabled(!notifications.preference_enabled)); }
+    catch (reason) { setNotificationError(reason instanceof Error ? reason.message : String(reason)); }
+    finally { setBusy(null); }
+  }
+
+  async function sendTestNotification() {
+    setBusy("notification-test");
+    setNotificationError("");
+    try { setNotifications(await settingsSendTestNotification()); }
+    catch (reason) { setNotificationError(reason instanceof Error ? reason.message : String(reason)); }
+    finally { setBusy(null); }
+  }
+
+  async function reloadNotifications() {
+    setBusy("notifications");
+    setNotificationError("");
+    try { setNotifications(await settingsNotificationStatus()); }
+    catch (reason) { setNotificationError(reason instanceof Error ? reason.message : String(reason)); }
+    finally { setBusy(null); }
+  }
+
+  function permissionLabel(status: NotificationStatus) {
+    if (status.permission === "granted") return zh ? "系统权限已授予" : "Permission granted";
+    if (status.permission === "denied") return zh ? "系统已拒绝权限" : "Permission denied by the system";
+    if (status.permission === "unsupported") return zh ? "当前平台不支持" : "Unsupported on this platform";
+    return zh ? "尚未请求权限" : "Permission not requested";
+  }
+
   if (loading) return <section className="general-advanced-loading"><LoaderCircle className="spin" size={16} />{zh ? "正在读取本机设置…" : "Loading native settings…"}</section>;
   if (!preferences || !system) return <section className="general-advanced-error" role="alert"><span>{error || (zh ? "无法读取本机设置。" : "Could not load native settings.")}</span><button onClick={() => void load()}>{zh ? "重试" : "Retry"}</button></section>;
 
@@ -109,6 +157,11 @@ export function GeneralAdvancedSettings({ locale, onNavigate }: { locale: Locale
       <MonitorCog size={18} />
       <div><b>{zh ? "应用与更新状态" : "App and update status"}</b><p>{zh ? `版本 ${system.app_version}` : `Version ${system.app_version}`}</p><code>{system.app_data_directory}</code><small>{system.update_source_configured ? (zh ? "已配置更新源；此页面尚未执行网络更新检查。" : "An update source is configured; this page has not performed a network update check.") : (zh ? "未配置更新源。" : "No update source is configured.")}</small></div>
       <button disabled={busy !== null} onClick={() => void reloadSystem()}>{zh ? "重新读取配置" : "Reload configuration"}</button>
+    </section>
+    <section className="general-advanced-card">
+      <Bell size={18} />
+      <div><b>{zh ? "系统通知" : "System notifications"}</b><p>{zh ? "仅在应用位于后台时通知任务完成、失败或需要处理；通知内容不包含项目名、路径、样本或模型输出。" : "When the app is in the background, reports completed, failed, or attention-required tasks without project names, paths, samples, or model output."}</p>{notifications && <small data-status={notifications.permission}>{permissionLabel(notifications)} · {notifications.platform}</small>}{notifications?.last_failure && <small className="general-notification-failure">{notifications.last_failure.message}</small>}{notificationError && <small className="general-notification-failure" role="alert">{notificationError}</small>}</div>
+      {notifications ? <div className="general-advanced-actions"><button disabled={busy !== null} onClick={() => void toggleNotifications()}>{notifications.preference_enabled ? (zh ? "关闭通知" : "Disable notifications") : (zh ? "启用通知" : "Enable notifications")}</button><button disabled={busy !== null} onClick={() => void sendTestNotification()}>{busy === "notification-test" ? (zh ? "发送中…" : "Sending…") : (zh ? "发送测试通知" : "Send test notification")}</button></div> : <button disabled={busy !== null} onClick={() => void reloadNotifications()}>{zh ? "重试通知状态" : "Retry notification status"}</button>}
     </section>
     <section className="general-advanced-card">
       <Server size={18} />
