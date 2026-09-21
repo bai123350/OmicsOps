@@ -723,4 +723,49 @@ mod tests {
                 .any(|issue| issue.kind == ProvenanceIssueKindV4::MissingSoftwareVersion)
         );
     }
+
+    #[test]
+    fn bare_or_empty_requirements_match_recorded_versions_but_combined_strings_do_not() {
+        fn finish(requirements: BTreeSet<String>) -> ProvenanceManifestV4 {
+            let mut state = ScientificStateV4::new(Uuid::new_v4());
+            let data = state.register_dataset(dataset("data.h5ad", "a"), Utc::now());
+            let mut analysis = declaration(data.id);
+            analysis.software_requirements = requirements;
+            state
+                .start_analysis(
+                    Uuid::new_v4(),
+                    "call".into(),
+                    analysis,
+                    runtime(),
+                    Utc::now(),
+                )
+                .unwrap();
+            state
+                .finish_analysis(
+                    "call",
+                    true,
+                    None,
+                    None,
+                    vec![],
+                    BTreeMap::from([
+                        ("python".into(), "3.11".into()),
+                        ("numpy".into(), "2.1".into()),
+                    ]),
+                    "code".into(),
+                    Utc::now(),
+                )
+                .unwrap()
+                .2
+        }
+
+        assert!(finish(BTreeSet::new()).complete);
+        assert!(finish(BTreeSet::from(["numpy".into()])).complete);
+
+        let malformed = finish(BTreeSet::from(["python=3.11 urllib".into()]));
+        assert!(!malformed.complete);
+        assert!(malformed.issues.iter().any(|issue| {
+            issue.kind == ProvenanceIssueKindV4::MissingSoftwareVersion
+                && issue.message.contains("python=3.11 urllib")
+        }));
+    }
 }

@@ -512,7 +512,7 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
             "runtime.execute",
             "Execute code in a persistent kernel, or background=true for a detached one-shot SSH job. Background jobs survive disconnects and Agent Stop; they do not share kernel variables. Query runtime.remote_job_status after restart. Never resubmit to reconnect.",
             ToolEffectV4::Runtime,
-            json!({"type":"object","required":["language","code"],"properties":{"language":{"type":"string"},"environment":{"type":"string","default":"system"},"code":{"type":"string"},"background":{"type":"boolean","default":false},"capture_paths":{"type":"array"},"analysis":{"type":"object","required":["analysis_type","input_dataset_ids","sample_ids","method","parameters"],"properties":{"analysis_type":{"type":"string"},"input_dataset_ids":{"type":"array"},"sample_ids":{"type":"array"},"method":{"type":"string"},"parameters":{"type":"object"},"software_requirements":{"type":"array"},"database_versions":{"type":"object"},"random_seed":{"type":["integer","null"]}}}}}),
+            json!({"type":"object","required":["language","code"],"properties":{"language":{"type":"string"},"environment":{"type":"string","default":"system"},"code":{"type":"string"},"background":{"type":"boolean","default":false},"capture_paths":{"type":"array"},"analysis":{"type":"object","required":["analysis_type","input_dataset_ids","sample_ids","method","parameters"],"properties":{"analysis_type":{"type":"string"},"input_dataset_ids":{"type":"array"},"sample_ids":{"type":"array"},"method":{"type":"string"},"parameters":{"type":"object"},"software_requirements":{"type":"array","items":{"type":"string"},"description":"Provide bare installed Python distribution or R package names, one per item (for example numpy, pandas, or Seurat). Omit version constraints, combined strings, standard-library modules, and the Python/R interpreter; the Host records the interpreter automatically. Use [] for standard-library-only code."},"database_versions":{"type":"object"},"random_seed":{"type":["integer","null"]}}}}}),
         ),
         descriptor(
             "runtime.remote_job_status",
@@ -574,7 +574,7 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
             "agent.complete",
             "Propose completion with a user-visible final Markdown answer and evidence for every frozen completion criterion; the Host verifier and read-only Reviewer decide whether the run can finish",
             ToolEffectV4::Mutating,
-            json!({"type":"object","required":["schema_version","summary","answer_markdown","criteria"],"properties":{"schema_version":{"type":"integer","const":4},"summary":{"type":"string"},"answer_markdown":{"type":"string","minLength":1,"description":"User-visible final response rendered as Markdown. Include the actual result, key evidence or artifacts, and limitations or follow-up actions."},"criteria":{"type":"array","items":{"type":"object","required":["criterion","evidence"],"properties":{"criterion":{"type":"string"},"evidence":{"type":"array","items":{"type":"object","required":["kind"],"properties":{"kind":{"type":"string","enum":["event","artifact","evidence"]},"sequence":{"type":"integer"},"artifact_id":{"type":"string"},"evidence_id":{"type":"string"}}}}}}}}}),
+            json!({"type":"object","required":["schema_version","summary","answer_markdown","criteria"],"properties":{"schema_version":{"type":"integer","const":4},"summary":{"type":"string"},"answer_markdown":{"type":"string","minLength":1,"description":"User-visible final response rendered as Markdown. Include the actual result, key evidence or artifacts, and limitations or follow-up actions."},"criteria":{"type":"array","items":{"type":"object","required":["criterion","evidence"],"properties":{"criterion":{"type":"string","description":"Copy the exact frozen completion criterion text from frozen_plan.completion_criteria. Do not paraphrase or summarize it."},"evidence":{"type":"array","items":{"type":"object","required":["kind"],"properties":{"kind":{"type":"string","enum":["event","artifact","evidence"]},"sequence":{"type":"integer"},"artifact_id":{"type":"string"},"evidence_id":{"type":"string"}}}}}}}}}),
         ),
     ]
 }
@@ -1138,6 +1138,35 @@ mod tests {
     }
 
     #[test]
+    fn runtime_analysis_schema_explains_software_requirement_identifiers() {
+        let execute = builtin_tool_definitions_v4()
+            .into_iter()
+            .find(|tool| tool.id == "runtime.execute")
+            .unwrap();
+        let requirement = execute
+            .input_schema
+            .pointer("/properties/analysis/properties/software_requirements");
+        let item_type = requirement
+            .and_then(|schema| schema.pointer("/items/type"))
+            .and_then(Value::as_str);
+        let description = requirement
+            .and_then(|schema| schema.get("description"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        assert_eq!(item_type, Some("string"));
+        for phrase in [
+            "bare installed",
+            "one per item",
+            "version constraints",
+            "standard-library",
+            "interpreter",
+        ] {
+            assert!(description.contains(phrase), "{phrase}");
+        }
+    }
+
+    #[test]
     fn delegation_requires_frozen_execute_capability_and_is_never_visible_in_plan_mode() {
         let graph = ToolCallV4 {
             call_id: "delegate".into(),
@@ -1198,6 +1227,23 @@ mod tests {
             arguments: empty,
         };
         assert!(registry.validate(RunModeV4::Execute, &empty).is_err());
+    }
+
+    #[test]
+    fn completion_schema_explains_exact_frozen_criterion_identity() {
+        let completion = builtin_tool_definitions_v4()
+            .into_iter()
+            .find(|tool| tool.id == "agent.complete")
+            .unwrap();
+        let description = completion
+            .input_schema
+            .pointer("/properties/criteria/items/properties/criterion/description")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        assert!(description.contains("exact"));
+        assert!(description.contains("frozen completion criterion"));
+        assert!(description.contains("Do not paraphrase"));
     }
 
     struct ConcurrencyProbe {
