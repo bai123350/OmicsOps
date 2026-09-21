@@ -2,7 +2,7 @@
 //! references compiled MCP presets; inspecting or installing it never executes code.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     io::Read,
     path::{Component, Path, PathBuf},
@@ -418,6 +418,7 @@ async fn install_plugin(
             PluginPhase::Staging
         },
         cleanup_pending: false,
+        predecessor_installation_id: existing.as_ref().map(|plugin| plugin.installation_id),
         files: staged.inspection.files.clone(),
         skills: prepared.iter().map(|(_, owned)| owned.clone()).collect(),
         mcp_bindings: staged.inspection.bindings,
@@ -436,25 +437,14 @@ async fn install_plugin(
             return Err(error);
         }
     }
+    if let Err(error) = retire_predecessor(repository, &plugin).await {
+        plugin.phase = PluginPhase::NeedsAttention;
+        plugin.last_error = Some(error.clone());
+        save_plugin(repository, &plugin).await?;
+        return Err(error);
+    }
     plugin.phase = PluginPhase::Installed;
     save_plugin(repository, &plugin).await?;
-
-    if let Some(mut old) = existing {
-        for owned in &old.skills {
-            if skill_by_id(repository, owned.skill_id).await?.is_some() {
-                repository
-                    .set_skill_enabled_atomic(owned.skill_id, false)
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
-        }
-        old.enabled = false;
-        old.phase = PluginPhase::Removed;
-        old.cleanup_pending = false;
-        old.last_error =
-            Some("superseded by a newer local package; files retained for audit".into());
-        save_plugin(repository, &old).await?;
-    }
     Ok(plugin)
 }
 
@@ -505,11 +495,41 @@ async fn resume_plugin_registration(
         )
         .await?;
     }
+    retire_predecessor(repository, &plugin).await?;
     plugin.phase = PluginPhase::Installed;
     plugin.enabled = false;
     plugin.last_error = None;
     save_plugin(repository, &plugin).await?;
     Ok(plugin)
+}
+
+async fn retire_predecessor(repository: &Store, plugin: &InstalledPlugin) -> Result<(), String> {
+    let Some(predecessor_id) = plugin.predecessor_installation_id else {
+        return Ok(());
+    };
+    let Some(mut predecessor) = plugin_by_id(repository, predecessor_id).await? else {
+        return Err("plugin update predecessor record is missing".into());
+    };
+    if predecessor.package_id != plugin.package_id {
+        return Err("plugin update predecessor does not match the package id".into());
+    }
+    if predecessor.phase == PluginPhase::Removed {
+        return Ok(());
+    }
+    for owned in &predecessor.skills {
+        if skill_by_id(repository, owned.skill_id).await?.is_some() {
+            repository
+                .set_skill_enabled_atomic(owned.skill_id, false)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    predecessor.enabled = false;
+    predecessor.phase = PluginPhase::Removed;
+    predecessor.cleanup_pending = false;
+    predecessor.last_error =
+        Some("superseded by a newer local package; files retained for audit".into());
+    save_plugin(repository, &predecessor).await
 }
 
 fn prepare_plugin_skills(
@@ -601,12 +621,6 @@ async fn remove_plugin(
     let mut plugin = plugin_by_id(repository, request.installation_id)
         .await?
         .ok_or_else(|| "plugin installation was not found".to_owned())?;
-    if plugin.phase == PluginPhase::NeedsAttention && plugin.cleanup_pending {
-        if request.expected_digest != plugin.digest {
-            return Err("plugin changed; reopen its details before retrying cleanup".into());
-        }
-        return retry_plugin_cleanup(repository, plugins_root, plugin).await;
-    }
     if plugin.phase == PluginPhase::Removed {
         return Ok(PluginRemovalResult {
             installation_id: plugin.installation_id,
@@ -632,6 +646,13 @@ async fn remove_plugin(
         );
     }
     ensure_no_enabled_external_dependents(repository, &plugin).await?;
+    if matches!(
+        plugin.phase,
+        PluginPhase::NeedsAttention | PluginPhase::Removing
+    ) && plugin.cleanup_pending
+    {
+        return retry_plugin_cleanup(repository, plugins_root, plugin).await;
+    }
     plugin.phase = PluginPhase::Removing;
     plugin.enabled = false;
     save_plugin(repository, &plugin).await?;
@@ -688,21 +709,17 @@ async fn remove_plugin(
             _ => preserved_files.push(MANIFEST_NAME.into()),
         }
     }
-    if verified_for_delete.is_some() {
-        plugin.cleanup_pending = true;
-        save_plugin(repository, &plugin).await?;
-    }
+    plugin.cleanup_pending = true;
+    save_plugin(repository, &plugin).await?;
     for skill_id in &removable_skills {
-        repository
-            .delete_skill_package(*skill_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let _ = repository
-            .delete_json(
-                crate::skill_settings::SKILL_INSTALLATION_KIND,
-                &skill_id.to_string(),
-            )
-            .await;
+        if let Err(error) = unregister_owned_skill(repository, &plugin, *skill_id).await {
+            plugin.phase = PluginPhase::NeedsAttention;
+            plugin.last_error = Some(format!("plugin catalog cleanup was interrupted: {error}"));
+            save_plugin(repository, &plugin).await?;
+            return Err(
+                "plugin catalog cleanup was interrupted; retry from Plugins settings".into(),
+            );
+        }
     }
     for owned in &plugin.skills {
         if !removable_skills.contains(&owned.skill_id)
@@ -752,6 +769,10 @@ async fn retry_plugin_cleanup(
         .join("installs")
         .join(plugin.installation_id.to_string());
     if !candidate.exists() {
+        for owned in &plugin.skills {
+            unregister_owned_skill(repository, &plugin, owned.skill_id).await?;
+        }
+        let removed_references = plugin.mcp_bindings.len();
         plugin.phase = PluginPhase::Removed;
         plugin.cleanup_pending = false;
         plugin.mcp_bindings.clear();
@@ -762,7 +783,7 @@ async fn retry_plugin_cleanup(
             status: "removed".into(),
             removed_skills: 0,
             preserved_files: Vec::new(),
-            mcp_references_removed: 0,
+            mcp_references_removed: removed_references,
             message: "verified plugin cleanup had already completed".into(),
         });
     }
@@ -803,6 +824,28 @@ async fn retry_plugin_cleanup(
     }
     preserved.sort();
     preserved.dedup();
+    for owned in &plugin.skills {
+        let skill_file = normalize_relative_path(&format!("{}/SKILL.md", owned.relative_path))?;
+        let skill_root = install_root.join(normalize_relative_path(&owned.relative_path)?);
+        let unchanged = verified.contains_key(&skill_file)
+            && omicsops_adapters::skills::inspect_skill_directory(&skill_root)
+                .is_ok_and(|inspection| inspection.sha256 == owned.package_sha256);
+        if unchanged {
+            if let Err(error) = unregister_owned_skill(repository, &plugin, owned.skill_id).await {
+                plugin.phase = PluginPhase::NeedsAttention;
+                plugin.last_error =
+                    Some(format!("plugin catalog cleanup was interrupted: {error}"));
+                save_plugin(repository, &plugin).await?;
+                return Err(
+                    "plugin catalog cleanup is still blocked; retry from Plugins settings".into(),
+                );
+            }
+        } else if skill_by_id(repository, owned.skill_id).await?.is_some() {
+            let _ = repository
+                .set_skill_enabled_atomic(owned.skill_id, false)
+                .await;
+        }
+    }
     if preserved.is_empty() {
         if let Err(error) = remove_known_plugin_tree(&install_root, &verified) {
             plugin.last_error = Some(format!("verified cleanup was interrupted: {error}"));
@@ -812,6 +855,7 @@ async fn retry_plugin_cleanup(
             );
         }
     }
+    let removed_references = plugin.mcp_bindings.len();
     plugin.phase = PluginPhase::Removed;
     plugin.cleanup_pending = false;
     plugin.mcp_bindings.clear();
@@ -822,13 +866,75 @@ async fn retry_plugin_cleanup(
         status: "removed".into(),
         removed_skills: 0,
         preserved_files: preserved.clone(),
-        mcp_references_removed: 0,
+        mcp_references_removed: removed_references,
         message: if preserved.is_empty() {
             "verified plugin cleanup completed".into()
         } else {
             "modified plugin files were preserved".into()
         },
     })
+}
+
+async fn unregister_owned_skill(
+    repository: &Store,
+    plugin: &InstalledPlugin,
+    skill_id: Uuid,
+) -> Result<(), String> {
+    let owned = plugin
+        .skills
+        .iter()
+        .find(|owned| owned.skill_id == skill_id)
+        .ok_or_else(|| "plugin cleanup journal does not own the Skill".to_owned())?;
+    let skill = skill_by_id(repository, skill_id).await?;
+    let receipt = repository
+        .get_json::<SkillInstallationReceipt>(
+            crate::skill_settings::SKILL_INSTALLATION_KIND,
+            &skill_id.to_string(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if skill.is_none() && receipt.is_none() {
+        return Ok(());
+    }
+    let receipt = receipt.ok_or_else(|| {
+        format!(
+            "ownership receipt for plugin Skill {} is missing",
+            owned.name
+        )
+    })?;
+    if receipt.origin != SkillOrigin::PluginOwned
+        || receipt.plugin_installation_id != Some(plugin.installation_id)
+        || receipt.skill_id != skill_id
+        || receipt.package_sha256 != owned.package_sha256
+    {
+        return Err(format!(
+            "ownership receipt for plugin Skill {} changed",
+            owned.name
+        ));
+    }
+    if let Some(skill) = skill {
+        if skill.id != skill_id
+            || skill.sha256 != owned.package_sha256
+            || !same_path(
+                Path::new(&skill.source_path),
+                Path::new(&receipt.installed_root),
+            )
+        {
+            return Err(format!("plugin Skill {} changed", owned.name));
+        }
+        repository
+            .delete_skill_package(skill_id)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    repository
+        .delete_json(
+            crate::skill_settings::SKILL_INSTALLATION_KIND,
+            &skill_id.to_string(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 async fn ensure_no_enabled_external_dependents(
@@ -840,29 +946,59 @@ async fn ensure_no_enabled_external_dependents(
         .iter()
         .map(|owned| owned.skill_id)
         .collect::<BTreeSet<_>>();
-    let owned_names = plugin
-        .skills
-        .iter()
-        .map(|owned| owned.name.as_str())
-        .collect::<BTreeSet<_>>();
-    for skill in repository
+    let packages = repository
         .list_skill_packages()
         .await
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter(|skill| skill.enabled && !owned_ids.contains(&skill.id))
-    {
-        let markdown = fs::read_to_string(Path::new(&skill.source_path).join("SKILL.md")).map_err(
-            |error| format!("cannot verify Skill dependencies before plugin removal: {error}"),
-        )?;
-        if crate::skill_commands::skill_dependencies(&markdown)
-            .iter()
-            .any(|dependency| owned_names.contains(dependency.as_str()))
-        {
-            return Err(format!(
-                "enabled Skill {} still depends on this plugin",
-                skill.name
-            ));
+        .map_err(|error| error.to_string())?;
+    let mut available = owned_ids.clone();
+    for skill in &packages {
+        if !owned_ids.contains(&skill.id) && plugin_allows_skill(repository, skill.id).await? {
+            available.insert(skill.id);
+        }
+    }
+    let roots = packages
+        .iter()
+        .filter(|skill| {
+            skill.enabled && available.contains(&skill.id) && !owned_ids.contains(&skill.id)
+        })
+        .map(|skill| (skill.id, skill.name.clone()))
+        .collect::<Vec<_>>();
+    for (root_id, root_name) in roots {
+        let mut queue = VecDeque::from([root_id]);
+        let mut visited = BTreeSet::new();
+        while let Some(skill_id) = queue.pop_front() {
+            if !visited.insert(skill_id) {
+                continue;
+            }
+            let skill = packages
+                .iter()
+                .find(|candidate| candidate.id == skill_id)
+                .ok_or_else(|| {
+                    "Skill dependency catalog changed during plugin removal".to_owned()
+                })?;
+            let dependencies = crate::skill_settings::read_skill_dependencies_bounded(Path::new(
+                &skill.source_path,
+            ))
+            .map_err(|error| {
+                format!("cannot verify Skill dependencies before plugin removal: {error}")
+            })?;
+            for dependency in dependencies {
+                let Some(candidate) = packages.iter().find(|candidate| {
+                    available.contains(&candidate.id)
+                        && crate::skill_commands::skill_name_matches_dependency(
+                            &candidate.name,
+                            &dependency,
+                        )
+                }) else {
+                    continue;
+                };
+                if owned_ids.contains(&candidate.id) {
+                    return Err(format!(
+                        "enabled Skill {root_name} still depends on this plugin"
+                    ));
+                }
+                queue.push_back(candidate.id);
+            }
         }
     }
     Ok(())
@@ -1328,6 +1464,36 @@ mod tests {
         hash
     }
 
+    fn catalog_skill(
+        root: &Path,
+        name: &str,
+        enabled: bool,
+        dependencies: &[&str],
+    ) -> SkillPackage {
+        let directory = root.join(name);
+        fs::create_dir_all(&directory).unwrap();
+        let depends_on = dependencies
+            .iter()
+            .map(|dependency| format!("  - {dependency}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let markdown = format!(
+            "---\nname: {name}\nversion: 1.0.0\ndepends_on:\n{depends_on}\n---\n# {name}\n"
+        );
+        fs::write(directory.join("SKILL.md"), markdown).unwrap();
+        let inspection = omicsops_adapters::skills::inspect_skill_directory(&directory).unwrap();
+        SkillPackage {
+            id: Uuid::new_v4(),
+            name: inspection.name,
+            version: inspection.version,
+            source_path: directory.to_string_lossy().into_owned(),
+            sha256: inspection.sha256,
+            enabled,
+            capabilities: inspection.capabilities,
+            category: None,
+        }
+    }
+
     #[tokio::test]
     async fn inspection_is_strict_bounded_and_detects_source_changes() {
         let store = Store::open_in_memory().await.unwrap();
@@ -1349,12 +1515,10 @@ mod tests {
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
-        assert!(
-            inspect_plugin_source(&store, root.path())
-                .await
-                .unwrap_err()
-                .contains("unknown field")
-        );
+        assert!(inspect_plugin_source(&store, root.path())
+            .await
+            .unwrap_err()
+            .contains("unknown field"));
     }
 
     #[tokio::test]
@@ -1375,23 +1539,19 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-            assert!(
-                inspect_plugin_source(&store, root.path())
-                    .await
-                    .unwrap_err()
-                    .contains(expected)
-            );
+            assert!(inspect_plugin_source(&store, root.path())
+                .await
+                .unwrap_err()
+                .contains(expected));
         }
 
         let root = tempfile::tempdir().unwrap();
         fixture(root.path(), "lab.qc", "1.0.0");
         fs::write(root.path().join("skills/qc/helper.md"), "attachment").unwrap();
-        assert!(
-            inspect_plugin_source(&store, root.path())
-                .await
-                .unwrap_err()
-                .contains("undeclared file")
-        );
+        assert!(inspect_plugin_source(&store, root.path())
+            .await
+            .unwrap_err()
+            .contains("undeclared file"));
 
         fs::remove_file(root.path().join("skills/qc/helper.md")).unwrap();
         let markdown = b"---\nname: plugin-qc\n---\n[helper](helper.md)\n";
@@ -1404,12 +1564,10 @@ mod tests {
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
-        assert!(
-            inspect_plugin_source(&store, root.path())
-                .await
-                .unwrap_err()
-                .contains("standalone SKILL.md")
-        );
+        assert!(inspect_plugin_source(&store, root.path())
+            .await
+            .unwrap_err()
+            .contains("standalone SKILL.md"));
     }
 
     #[tokio::test]
@@ -1439,11 +1597,9 @@ mod tests {
         let installed = install_plugin(&store, &app.path().join("plugins"), request.clone())
             .await
             .unwrap();
-        assert!(
-            !plugin_allows_skill(&store, installed.skills[0].skill_id)
-                .await
-                .unwrap()
-        );
+        assert!(!plugin_allows_skill(&store, installed.skills[0].skill_id)
+            .await
+            .unwrap());
         let same = install_plugin(&store, &app.path().join("plugins"), request)
             .await
             .unwrap();
@@ -1458,11 +1614,9 @@ mod tests {
         .await
         .unwrap();
         assert!(enabled.enabled);
-        assert!(
-            plugin_allows_skill(&store, installed.skills[0].skill_id)
-                .await
-                .unwrap()
-        );
+        assert!(plugin_allows_skill(&store, installed.skills[0].skill_id)
+            .await
+            .unwrap());
 
         let result = remove_plugin(
             &store,
@@ -1476,13 +1630,11 @@ mod tests {
         .unwrap();
         assert_eq!(result.removed_skills, 1);
         assert!(result.preserved_files.is_empty());
-        assert!(
-            store
-                .list_json::<McpServerProfile>("mcp_server")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(store
+            .list_json::<McpServerProfile>("mcp_server")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1519,12 +1671,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            result
-                .preserved_files
-                .iter()
-                .any(|path| path == "skills/qc/SKILL.md")
-        );
+        assert!(result
+            .preserved_files
+            .iter()
+            .any(|path| path == "skills/qc/SKILL.md"));
         assert!(result.preserved_files.iter().any(|path| path == "note.txt"));
         assert!(root.exists());
     }
@@ -1626,6 +1776,180 @@ mod tests {
         assert_eq!(
             packages.iter().filter(|skill| skill.id == owned_id).count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn removal_blocks_suffix_and_transitive_dependencies_through_disabled_skills() {
+        let store = Store::open_in_memory().await.unwrap();
+        let app = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        fixture(source.path(), "lab.dependencies", "1.0.0");
+        let inspected = inspect_plugin_source(&store, source.path()).await.unwrap();
+        let installed = install_plugin(
+            &store,
+            &app.path().join("plugins"),
+            InstallPluginRequest {
+                source_path: source.path().to_string_lossy().into_owned(),
+                expected_digest: inspected.inspection.manifest_digest,
+                expected_old_digest: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let direct = catalog_skill(external.path(), "direct", true, &["qc"]);
+        store.save_skill_package(&direct).await.unwrap();
+        let request = RemovePluginRequest {
+            installation_id: installed.installation_id,
+            expected_digest: installed.digest.clone(),
+        };
+        assert!(
+            remove_plugin(&store, &app.path().join("plugins"), request.clone())
+                .await
+                .unwrap_err()
+                .contains("direct")
+        );
+        store
+            .set_skill_enabled_atomic(direct.id, false)
+            .await
+            .unwrap();
+
+        let middle = catalog_skill(external.path(), "middle", false, &["qc"]);
+        let outer = catalog_skill(external.path(), "outer", true, &["middle"]);
+        store.save_skill_package(&middle).await.unwrap();
+        store.save_skill_package(&outer).await.unwrap();
+        assert!(remove_plugin(&store, &app.path().join("plugins"), request)
+            .await
+            .unwrap_err()
+            .contains("outer"));
+    }
+
+    #[tokio::test]
+    async fn removing_cleanup_retry_unregisters_catalog_without_restart() {
+        let store = Store::open_in_memory().await.unwrap();
+        let app = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        fixture(source.path(), "lab.catalog-retry", "1.0.0");
+        let inspected = inspect_plugin_source(&store, source.path()).await.unwrap();
+        let mut installed = install_plugin(
+            &store,
+            &app.path().join("plugins"),
+            InstallPluginRequest {
+                source_path: source.path().to_string_lossy().into_owned(),
+                expected_digest: inspected.inspection.manifest_digest,
+                expected_old_digest: None,
+            },
+        )
+        .await
+        .unwrap();
+        installed.phase = PluginPhase::Removing;
+        installed.cleanup_pending = true;
+        save_plugin(&store, &installed).await.unwrap();
+
+        let result = remove_plugin(
+            &store,
+            &app.path().join("plugins"),
+            RemovePluginRequest {
+                installation_id: installed.installation_id,
+                expected_digest: installed.digest.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status, "removed");
+        assert!(skill_by_id(&store, installed.skills[0].skill_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_json::<SkillInstallationReceipt>(
+                crate::skill_settings::SKILL_INSTALLATION_KIND,
+                &installed.skills[0].skill_id.to_string(),
+            )
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn interrupted_update_recovery_retires_predecessor_before_activation() {
+        let store = Store::open_in_memory().await.unwrap();
+        let app = tempfile::tempdir().unwrap();
+        let old_source = tempfile::tempdir().unwrap();
+        let new_source = tempfile::tempdir().unwrap();
+        fixture(old_source.path(), "lab.update", "1.0.0");
+        let old_inspection = inspect_plugin_source(&store, old_source.path())
+            .await
+            .unwrap();
+        let mut old = install_plugin(
+            &store,
+            &app.path().join("plugins"),
+            InstallPluginRequest {
+                source_path: old_source.path().to_string_lossy().into_owned(),
+                expected_digest: old_inspection.inspection.manifest_digest,
+                expected_old_digest: None,
+            },
+        )
+        .await
+        .unwrap();
+        old = set_plugin_enabled(
+            &store,
+            SetPluginEnabledRequest {
+                installation_id: old.installation_id,
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        fixture(new_source.path(), "lab.update", "2.0.0");
+        let new_inspection = inspect_plugin_source(&store, new_source.path())
+            .await
+            .unwrap();
+        let request = InstallPluginRequest {
+            source_path: new_source.path().to_string_lossy().into_owned(),
+            expected_digest: new_inspection.inspection.manifest_digest,
+            expected_old_digest: Some(old.digest.clone()),
+        };
+        let mut current = install_plugin(&store, &app.path().join("plugins"), request.clone())
+            .await
+            .unwrap();
+
+        old.phase = PluginPhase::Installed;
+        old.enabled = true;
+        save_plugin(&store, &old).await.unwrap();
+        store
+            .set_skill_enabled_atomic(old.skills[0].skill_id, true)
+            .await
+            .unwrap();
+        current.phase = PluginPhase::NeedsAttention;
+        current.last_error = Some("simulated crash before predecessor retirement".into());
+        save_plugin(&store, &current).await.unwrap();
+
+        let recovered = install_plugin(
+            &store,
+            &app.path().join("plugins"),
+            InstallPluginRequest {
+                expected_old_digest: Some(current.digest.clone()),
+                ..request
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.phase, PluginPhase::Installed);
+        let retired = plugin_by_id(&store, old.installation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retired.phase, PluginPhase::Removed);
+        assert!(
+            !skill_by_id(&store, old.skills[0].skill_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
         );
     }
 

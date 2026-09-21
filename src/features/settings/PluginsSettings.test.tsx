@@ -20,7 +20,7 @@ const inspection: PluginInspection = {
 const installed: InstalledPlugin = {
   installation_id: "00000000-0000-0000-0000-000000000002", package_id: "lab.qc", version: "1.0.0", name: "QC helpers",
   digest: inspection.manifest_digest, source_path: inspection.source_path, trust: "local_unverified", enabled: false, phase: "installed",
-  cleanup_pending: false, files: inspection.files,
+  cleanup_pending: false, predecessor_installation_id: null, files: inspection.files,
   skills: [{ skill_id: "00000000-0000-0000-0000-000000000003", name: "plugin-qc", relative_path: "skills/qc", package_sha256: "d".repeat(64) }],
   mcp_bindings: inspection.bindings, last_error: null, created_at: "2026-09-21T00:00:00Z",
 };
@@ -48,6 +48,10 @@ describe("PluginsSettings", () => {
     await waitFor(() => expect(api.settingsInstallPlugin).toHaveBeenCalledWith(inspection.source_path, inspection.manifest_digest, null));
     expect(changed).toHaveBeenCalledTimes(1);
     expect(await screen.findByText("QC helpers")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Enable QC helpers" }));
+    await waitFor(() => expect(api.settingsSetPluginEnabled).toHaveBeenCalledWith(installed.installation_id, true));
+    fireEvent.click(screen.getByRole("button", { name: "Choose local package" }));
+    expect(await screen.findByRole("dialog", { name: "Plugin package preview" })).toBeInTheDocument();
   });
 
   it("keeps a failed operation retryable and ignores late inspection after unmount", async () => {
@@ -71,6 +75,29 @@ describe("PluginsSettings", () => {
     fireEvent.click(screen.getByRole("button", { name: "Remove QC helpers" }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm removal" }));
     await waitFor(() => expect(api.settingsRemovePlugin).toHaveBeenCalledWith(installed.installation_id, installed.digest));
+  });
+
+  it("retries a pending verified cleanup through removal instead of creating another installation", async () => {
+    const cleanup = { ...installed, enabled: false, phase: "needs_attention" as const, cleanup_pending: true };
+    vi.mocked(api.settingsListPlugins).mockResolvedValue([cleanup]);
+    render(<PluginsSettings locale="en-US" onOpenConnections={vi.fn()} />);
+    await screen.findByText("QC helpers");
+    fireEvent.click(screen.getByRole("button", { name: "Retry cleanup" }));
+    await waitFor(() => expect(api.settingsRemovePlugin).toHaveBeenCalledWith(cleanup.installation_id, cleanup.digest));
+    expect(api.settingsInspectPlugin).not.toHaveBeenCalled();
+    expect(api.settingsInstallPlugin).not.toHaveBeenCalled();
+  });
+
+  it("shows installed package provenance and contributions in details", async () => {
+    vi.mocked(api.settingsListPlugins).mockResolvedValue([installed]);
+    render(<PluginsSettings locale="en-US" onOpenConnections={vi.fn()} />);
+    await screen.findByText("QC helpers");
+    fireEvent.click(screen.getByRole("button", { name: "Details" }));
+    const dialog = await screen.findByRole("dialog", { name: "Plugin details" });
+    expect(dialog).toHaveTextContent(installed.source_path);
+    expect(dialog).toHaveTextContent(installed.digest);
+    expect(dialog).toHaveTextContent("plugin-qc");
+    expect(dialog).toHaveTextContent("pubmed");
   });
 
   it("closes only the top package preview on immediate Escape", async () => {

@@ -958,3 +958,58 @@ fn skill_settings_detail_and_preview_are_bounded_public_contracts() {
         })
     );
 }
+
+#[test]
+fn integration_package_contract_is_declarative_and_exposes_recovery_state() {
+    use omicsops_dto::{InstallPluginRequest, InstalledPlugin, PluginPhase};
+    let installation_id = uuid::Uuid::from_u128(45);
+    let request = InstallPluginRequest {
+        source_path: r"C:\Lab\qc-plugin".into(),
+        expected_digest: "c".repeat(64),
+        expected_old_digest: Some("b".repeat(64)),
+    };
+    assert_eq!(
+        serde_json::to_value(request).unwrap(),
+        json!({
+            "source_path": r"C:\Lab\qc-plugin",
+            "expected_digest": "c".repeat(64),
+            "expected_old_digest": "b".repeat(64)
+        })
+    );
+    assert!(
+        serde_json::from_value::<InstallPluginRequest>(json!({
+            "source_path": r"C:\Lab\qc-plugin",
+            "expected_digest": "c".repeat(64),
+            "expected_old_digest": null,
+            "script": "install.ps1"
+        }))
+        .is_err()
+    );
+
+    let value = serde_json::to_value(InstalledPlugin {
+        installation_id,
+        package_id: "lab.qc".into(),
+        version: "2.0.0".into(),
+        name: "QC helpers".into(),
+        digest: "c".repeat(64),
+        source_path: r"C:\Lab\qc-plugin".into(),
+        trust: "local_unverified".into(),
+        enabled: false,
+        phase: PluginPhase::NeedsAttention,
+        cleanup_pending: true,
+        predecessor_installation_id: Some(uuid::Uuid::from_u128(44)),
+        files: vec![],
+        skills: vec![],
+        mcp_bindings: vec![],
+        last_error: Some("cleanup can be retried".into()),
+        created_at: "2026-09-21T00:00:00Z".into(),
+    })
+    .unwrap();
+    assert_eq!(value["phase"], "needs_attention");
+    assert_eq!(value["cleanup_pending"], true);
+    assert_eq!(
+        value["predecessor_installation_id"],
+        uuid::Uuid::from_u128(44).to_string()
+    );
+    assert!(value.get("cleanup_path").is_none());
+}

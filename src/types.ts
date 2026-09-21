@@ -828,7 +828,7 @@ export interface PluginInspection {
 export interface PluginOwnedSkill { skill_id: string; name: string; relative_path: string; package_sha256: string }
 export interface InstalledPlugin {
   installation_id: string; package_id: string; version: string; name: string; digest: string; source_path: string;
-  trust: "local_unverified"; enabled: boolean; phase: PluginPhase; cleanup_pending: boolean; files: PluginFilePreview[]; skills: PluginOwnedSkill[];
+  trust: "local_unverified"; enabled: boolean; phase: PluginPhase; cleanup_pending: boolean; predecessor_installation_id?: string | null; files: PluginFilePreview[]; skills: PluginOwnedSkill[];
   mcp_bindings: PluginPresetBinding[]; last_error?: string | null; created_at: string;
 }
 export interface PluginRemovalResult {

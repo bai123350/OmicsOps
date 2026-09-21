@@ -261,8 +261,7 @@ pub async fn agent_skill_packages(repository: &Store) -> Result<Vec<SkillPackage
             for dependency in skill_dependencies(&markdown) {
                 if let Some(package) = packages.iter().find(|candidate| {
                     available.contains(&candidate.id)
-                        && (candidate.name == dependency
-                            || candidate.name.ends_with(&format!("-{dependency}")))
+                        && skill_name_matches_dependency(&candidate.name, &dependency)
                 }) {
                     discovered.insert(package.id);
                 }
@@ -540,6 +539,10 @@ pub(crate) fn skill_dependencies(markdown: &str) -> BTreeSet<String> {
         }
     }
     dependencies
+}
+
+pub(crate) fn skill_name_matches_dependency(name: &str, dependency: &str) -> bool {
+    name == dependency || name.ends_with(&format!("-{dependency}"))
 }
 
 fn frontmatter_lines(markdown: &str) -> impl Iterator<Item = &str> {

@@ -77,6 +77,8 @@ pub struct InstalledPlugin {
     #[serde(default)]
     pub cleanup_pending: bool,
     #[serde(default)]
+    pub predecessor_installation_id: Option<Uuid>,
+    #[serde(default)]
     pub files: Vec<PluginFilePreview>,
     pub skills: Vec<PluginOwnedSkill>,
     pub mcp_bindings: Vec<PluginPresetBinding>,

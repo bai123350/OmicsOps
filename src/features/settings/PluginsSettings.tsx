@@ -20,6 +20,7 @@ export function PluginsSettings({ locale, onOpenConnections, onChanged }: { loca
   const mounted = useRef(true);
   const [plugins, setPlugins] = useState<InstalledPlugin[]>([]);
   const [inspection, setInspection] = useState<PluginInspection | null>(null);
+  const [detailTarget, setDetailTarget] = useState<InstalledPlugin | null>(null);
   const [removeTarget, setRemoveTarget] = useState<InstalledPlugin | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -39,6 +40,7 @@ export function PluginsSettings({ locale, onOpenConnections, onChanged }: { loca
   }, []);
 
   useEffect(() => {
+    mounted.current = true;
     void refresh();
     return () => { mounted.current = false; listGeneration.current += 1; };
   }, [refresh]);
@@ -94,9 +96,13 @@ export function PluginsSettings({ locale, onOpenConnections, onChanged }: { loca
     setError("");
     setBusy(`retry:${plugin.installation_id}`);
     try {
-      const preview = await settingsInspectPlugin(plugin.source_path);
-      if (!mounted.current) return;
-      await settingsInstallPlugin(preview.source_path, preview.manifest_digest, plugin.digest);
+      if (plugin.cleanup_pending) {
+        await settingsRemovePlugin(plugin.installation_id, plugin.digest);
+      } else {
+        const preview = await settingsInspectPlugin(plugin.source_path);
+        if (!mounted.current) return;
+        await settingsInstallPlugin(preview.source_path, preview.manifest_digest, plugin.digest);
+      }
       if (!mounted.current) return;
       await refresh();
       onChanged?.();
@@ -127,13 +133,19 @@ export function PluginsSettings({ locale, onOpenConnections, onChanged }: { loca
       <div className="plugin-title"><span><b>{plugin.name}</b><small>{plugin.package_id} · {plugin.version} · {phaseLabel(plugin.phase, zh)}</small></span><em className={plugin.enabled ? "enabled" : ""}>{plugin.enabled ? (zh ? "已启用" : "Enabled") : (zh ? "已停用" : "Disabled")}</em></div>
       <p>{plugin.skills.length} Skills · {plugin.mcp_bindings.length} MCP {zh ? "共享引用" : "shared references"}</p>
       {plugin.last_error && <small className="plugin-warning">{plugin.last_error}</small>}
-      <div className="plugin-actions"><button type="button" disabled={Boolean(busy) || plugin.phase !== "installed"} aria-label={`${plugin.enabled ? (zh ? "停用" : "Disable") : (zh ? "启用" : "Enable")} ${plugin.name}`} onClick={() => void toggle(plugin)}>{plugin.enabled ? (zh ? "停用" : "Disable") : (zh ? "启用" : "Enable")}</button>{plugin.phase === "needs_attention" && <button type="button" disabled={Boolean(busy)} onClick={() => void retry(plugin)}>{zh ? "重试" : "Retry"}</button>}<button type="button" disabled={Boolean(busy)} aria-label={`${zh ? "移除" : "Remove"} ${plugin.name}`} onClick={() => setRemoveTarget(plugin)}>{zh ? "移除" : "Remove"}</button></div>
+      <div className="plugin-actions"><button type="button" onClick={() => setDetailTarget(plugin)}>{zh ? "详情" : "Details"}</button><button type="button" disabled={Boolean(busy) || plugin.phase !== "installed"} aria-label={`${plugin.enabled ? (zh ? "停用" : "Disable") : (zh ? "启用" : "Enable")} ${plugin.name}`} onClick={() => void toggle(plugin)}>{plugin.enabled ? (zh ? "停用" : "Disable") : (zh ? "启用" : "Enable")}</button>{plugin.phase === "needs_attention" && <button type="button" disabled={Boolean(busy)} onClick={() => void retry(plugin)}>{plugin.cleanup_pending ? (zh ? "重试清理" : "Retry cleanup") : (zh ? "重试安装" : "Retry install")}</button>}<button type="button" disabled={Boolean(busy)} aria-label={`${zh ? "移除" : "Remove"} ${plugin.name}`} onClick={() => setRemoveTarget(plugin)}>{zh ? "移除" : "Remove"}</button></div>
       {plugin.mcp_bindings.length > 0 && <button className="plugin-mcp-link" type="button" onClick={onOpenConnections}><PlugZap size={14} />{zh ? "查看共享 MCP 状态" : "View shared MCP status"}</button>}
     </article>)}</div>}
     <details className="plugin-template"><summary>{zh ? "查看 schema 1 模板" : "View schema 1 template"}</summary><pre>{manifestTemplate}</pre></details>
     {inspection && <PluginPreview inspection={inspection} busy={Boolean(busy)} zh={zh} onClose={() => setInspection(null)} onInstall={() => void install(inspection)} />}
+    {detailTarget && <PluginDetails plugin={detailTarget} zh={zh} onClose={() => setDetailTarget(null)} onOpenConnections={onOpenConnections} />}
     {removeTarget && <PluginRemoveConfirm plugin={removeTarget} busy={Boolean(busy)} zh={zh} onClose={() => setRemoveTarget(null)} onConfirm={() => void remove(removeTarget)} />}
   </main>;
+}
+
+function PluginDetails({ plugin, zh, onClose, onOpenConnections }: { plugin: InstalledPlugin; zh: boolean; onClose: () => void; onOpenConnections: () => void }) {
+  useWindowEscapeLayer(true, onClose);
+  return <div className="plugin-modal-overlay"><section className="plugin-dialog plugin-details" role="dialog" aria-modal="true" aria-label={zh ? "插件详情" : "Plugin details"}><header><div><small>{zh ? "本地未验证" : "Locally unverified"}</small><h3>{plugin.name} {plugin.version}</h3></div><button type="button" aria-label={zh ? "关闭插件详情" : "Close plugin details"} onClick={onClose}>×</button></header><div className="plugin-dialog-body"><dl className="plugin-metadata"><div><dt>{zh ? "包 ID" : "Package ID"}</dt><dd><code>{plugin.package_id}</code></dd></div><div><dt>{zh ? "来源" : "Source"}</dt><dd><code>{plugin.source_path}</code></dd></div><div><dt>SHA-256</dt><dd><code>{plugin.digest}</code></dd></div><div><dt>{zh ? "状态" : "Status"}</dt><dd>{phaseLabel(plugin.phase, zh)}</dd></div></dl><h4>Skills</h4><ul>{plugin.skills.map((skill) => <li key={skill.skill_id}><span><b>{skill.name}</b><br /><code>{skill.relative_path}/SKILL.md</code></span><small>{skill.package_sha256.slice(0, 12)}…</small></li>)}</ul><h4>{zh ? "共享 MCP 引用" : "Shared MCP references"}</h4>{plugin.mcp_bindings.length ? <><ul>{plugin.mcp_bindings.map((binding) => <li key={binding.preset_id}><code>{binding.preset_id}</code><small>{binding.configured ? (binding.enabled ? (zh ? "全局已启用" : "Globally enabled") : (zh ? "全局已停用" : "Globally disabled")) : (zh ? "未配置" : "Not configured")}</small></li>)}</ul><button className="plugin-mcp-link" type="button" onClick={onOpenConnections}><PlugZap size={14} />{zh ? "打开连接设置" : "Open connection settings"}</button></> : <p>{zh ? "无" : "None"}</p>}</div><footer><button type="button" onClick={onClose}>{zh ? "关闭" : "Close"}</button></footer></section></div>;
 }
 
 function PluginPreview({ inspection, busy, zh, onClose, onInstall }: { inspection: PluginInspection; busy: boolean; zh: boolean; onClose: () => void; onInstall: () => void }) {
