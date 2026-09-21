@@ -17,6 +17,7 @@ use crate::{AdapterError, AdapterResult};
 
 const MODEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const MODEL_MAX_RETRIES: u8 = 3;
+pub const MODEL_PROBE_OUTPUT_TOKENS: u32 = 4096;
 const OPENCODE_GO_USER_AGENT: &str = concat!("OmicsOps/", env!("CARGO_PKG_VERSION"));
 
 fn is_opencode_go_base_url(url: &Url) -> bool {
@@ -193,6 +194,267 @@ mod budget_tests {
             .unwrap_err();
         assert!(error.to_string().contains("request budget:"));
         assert!(events.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::mpsc,
+        thread,
+    };
+
+    fn probe_server(
+        response_for: impl FnOnce(&Value) -> Value + Send + 'static,
+    ) -> (Url, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut chunk).unwrap();
+                assert!(read > 0, "probe request ended before its headers");
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(index) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            while request.len() - header_end < content_length {
+                let read = stream.read(&mut chunk).unwrap();
+                assert!(read > 0, "probe request ended before its JSON body");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let body: Value =
+                serde_json::from_slice(&request[header_end..header_end + content_length]).unwrap();
+            let response = serde_json::to_vec(&response_for(&body)).unwrap();
+            let _ = request_tx.send(body);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len()
+            )
+            .unwrap();
+            stream.write_all(&response).unwrap();
+        });
+        (
+            Url::parse(&format!("http://{address}/v1")).unwrap(),
+            request_rx,
+            server,
+        )
+    }
+
+    fn client(protocol: ProviderProtocol, base_url: Url) -> UnifiedModelClient {
+        UnifiedModelClient::new(
+            Uuid::new_v4(),
+            protocol,
+            base_url,
+            "thinking-model",
+            Some("test-only".into()),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn plain_probe_reserves_room_for_models_with_implicit_reasoning() {
+        let (base_url, request, server) = probe_server(|body| {
+            if body["max_tokens"].as_u64().unwrap_or_default() >= 4096 {
+                json!({"choices":[{"finish_reason":"stop","message":{"content":"OK"}}]})
+            } else {
+                json!({"choices":[{"finish_reason":"length","message":{"content":"","reasoning_content":"still thinking"}}]})
+            }
+        });
+
+        let result = client(ProviderProtocol::OpenAiCompatible, base_url)
+            .probe()
+            .await;
+        let body = request.recv().unwrap();
+        server.join().unwrap();
+
+        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(result.unwrap().response_preview, "OK");
+    }
+
+    #[tokio::test]
+    async fn probe_clamps_a_larger_runtime_budget_to_its_own_limit() {
+        let (base_url, request, server) = probe_server(
+            |_| json!({"choices":[{"finish_reason":"stop","message":{"content":"OK"}}]}),
+        );
+
+        let result = client(ProviderProtocol::OpenAiCompatible, base_url)
+            .with_request_budget(RequestBudget {
+                context_window_tokens: 100_000,
+                reserved_output_tokens: 32_000,
+                safety_margin_tokens: 1024,
+            })
+            .probe()
+            .await;
+        let body = request.recv().unwrap();
+        server.join().unwrap();
+
+        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(result.unwrap().response_preview, "OK");
+    }
+
+    #[tokio::test]
+    async fn truncated_probe_reports_an_incomplete_test_reply() {
+        let (base_url, _, server) = probe_server(
+            |_| json!({"choices":[{"finish_reason":"length","message":{"content":"partial"}}]}),
+        );
+
+        let error = client(ProviderProtocol::OpenAiCompatible, base_url)
+            .probe()
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.to_string().contains("probe_response_incomplete:"));
+        assert!(error.to_string().contains("test reply"));
+        assert!(!error.to_string().contains("partial tool calls"));
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_a_blank_final_answer() {
+        let (base_url, _, server) = probe_server(
+            |_| json!({"choices":[{"finish_reason":"stop","message":{"content":"  \n"}}]}),
+        );
+
+        let error = client(ProviderProtocol::OpenAiCompatible, base_url)
+            .probe()
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+
+        assert!(
+            error
+                .to_string()
+                .contains("response did not match the selected provider protocol")
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_requires_a_protocol_terminal_completion() {
+        let cases = [
+            (
+                ProviderProtocol::OpenAiCompatible,
+                json!({"choices":[{"finish_reason":null,"message":{"content":"OK"}}]}),
+            ),
+            (
+                ProviderProtocol::Anthropic,
+                json!({"stop_reason":null,"content":[{"type":"text","text":"OK"}]}),
+            ),
+            (
+                ProviderProtocol::Ollama,
+                json!({"done":false,"message":{"content":"OK"}}),
+            ),
+        ];
+
+        for (protocol, response) in cases {
+            let (base_url, _, server) = probe_server(move |_| response);
+            let error = client(protocol, base_url).probe().await.unwrap_err();
+            server.join().unwrap();
+            assert!(
+                error.to_string().contains("probe_response_incomplete:"),
+                "{protocol:?}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_unsolicited_tool_payloads() {
+        let cases = [
+            (
+                ProviderProtocol::OpenAiCompatible,
+                json!({
+                    "choices":[{
+                        "finish_reason":"stop",
+                        "message":{"content":"OK","tool_calls":[{"id":"call-1"}]}
+                    }]
+                }),
+            ),
+            (
+                ProviderProtocol::Anthropic,
+                json!({
+                    "stop_reason":"end_turn",
+                    "content":[
+                        {"type":"text","text":"OK"},
+                        {"type":"tool_use","id":"call-1","name":"unexpected","input":{}}
+                    ]
+                }),
+            ),
+            (
+                ProviderProtocol::Ollama,
+                json!({
+                    "done":true,
+                    "done_reason":"stop",
+                    "message":{"content":"OK","tool_calls":[{"function":{"name":"unexpected"}}]}
+                }),
+            ),
+        ];
+
+        for (protocol, response) in cases {
+            let (base_url, _, server) = probe_server(move |_| response);
+            let error = client(protocol, base_url).probe().await.unwrap_err();
+            server.join().unwrap();
+            assert!(
+                error.to_string().contains("probe_response_incomplete:"),
+                "{protocol:?}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_probe_reads_text_after_a_thinking_block() {
+        let (base_url, _, server) = probe_server(|_| {
+            json!({
+                "stop_reason":"end_turn",
+                "content":[
+                    {"type":"thinking","thinking":"checking"},
+                    {"type":"text","text":"OK"}
+                ]
+            })
+        });
+
+        let result = client(ProviderProtocol::Anthropic, base_url).probe().await;
+        server.join().unwrap();
+
+        assert_eq!(result.unwrap().response_preview, "OK");
+    }
+
+    #[tokio::test]
+    async fn anthropic_probe_does_not_treat_non_text_blocks_as_a_final_answer() {
+        let (base_url, _, server) = probe_server(|_| {
+            json!({
+                "stop_reason":"end_turn",
+                "content":[{"type":"thinking","text":"not a final answer"}]
+            })
+        });
+
+        let error = client(ProviderProtocol::Anthropic, base_url)
+            .probe()
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+
+        assert!(
+            error
+                .to_string()
+                .contains("response did not match the selected provider protocol")
+        );
     }
 }
 
@@ -1697,14 +1959,7 @@ impl ProviderToolStreamDecoder {
 }
 
 fn validate_response_end(protocol: ProviderProtocol, value: &Value) -> AdapterResult<()> {
-    let reason = match protocol {
-        ProviderProtocol::OpenAiCompatible => value.pointer("/choices/0/finish_reason"),
-        ProviderProtocol::Anthropic => value
-            .get("stop_reason")
-            .or_else(|| value.pointer("/delta/stop_reason")),
-        ProviderProtocol::Ollama => value.get("done_reason"),
-    }
-    .and_then(Value::as_str);
+    let reason = response_end_reason(protocol, value);
     match reason {
         Some("length" | "max_tokens" | "model_context_window_exceeded") => Err(AdapterError::Llm(
             "truncated_output: provider exhausted its output allowance; partial tool calls cannot execute".into())),
@@ -1712,6 +1967,91 @@ fn validate_response_end(protocol: ProviderProtocol, value: &Value) -> AdapterRe
             "unsuccessful_model_response: provider did not finish the requested response".into())),
         _ => Ok(()),
     }
+}
+
+fn response_end_reason<'a>(protocol: ProviderProtocol, value: &'a Value) -> Option<&'a str> {
+    match protocol {
+        ProviderProtocol::OpenAiCompatible => value.pointer("/choices/0/finish_reason"),
+        ProviderProtocol::Anthropic => value
+            .get("stop_reason")
+            .or_else(|| value.pointer("/delta/stop_reason")),
+        ProviderProtocol::Ollama => value.get("done_reason"),
+    }
+    .and_then(Value::as_str)
+}
+
+fn validate_probe_response_end(protocol: ProviderProtocol, value: &Value) -> AdapterResult<()> {
+    if matches!(
+        response_end_reason(protocol, value),
+        Some("length" | "max_tokens" | "model_context_window_exceeded")
+    ) {
+        return Err(AdapterError::Llm(
+            "probe_response_incomplete: model endpoint responded but exhausted the probe output allowance before completing its test reply".into(),
+        ));
+    }
+    validate_response_end(protocol, value)?;
+    let has_tool_payload =
+        match protocol {
+            ProviderProtocol::OpenAiCompatible => {
+                value
+                    .pointer("/choices/0/message/tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty())
+                    || value
+                        .pointer("/choices/0/message/function_call")
+                        .is_some_and(|call| !call.is_null())
+            }
+            ProviderProtocol::Anthropic => value
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| part.get("type").and_then(Value::as_str) == Some("tool_use"))
+                }),
+            ProviderProtocol::Ollama => value
+                .pointer("/message/tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| !calls.is_empty()),
+        };
+    let completed = match protocol {
+        ProviderProtocol::OpenAiCompatible => response_end_reason(protocol, value) == Some("stop"),
+        ProviderProtocol::Anthropic => matches!(
+            response_end_reason(protocol, value),
+            Some("end_turn" | "stop_sequence")
+        ),
+        ProviderProtocol::Ollama => {
+            value.get("done").and_then(Value::as_bool) == Some(true)
+                && matches!(response_end_reason(protocol, value), None | Some("stop"))
+        }
+    };
+    if has_tool_payload || !completed {
+        return Err(AdapterError::Llm(
+            "probe_response_incomplete: model endpoint responded without a complete text-only test reply".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn probe_response_text<'a>(protocol: ProviderProtocol, value: &'a Value) -> Option<&'a str> {
+    let text = match protocol {
+        ProviderProtocol::OpenAiCompatible => value
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str),
+        ProviderProtocol::Anthropic => value
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|parts| {
+                parts
+                    .iter()
+                    .find(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+            })
+            .and_then(|part| part.get("text"))
+            .and_then(Value::as_str),
+        ProviderProtocol::Ollama => value.pointer("/message/content").and_then(Value::as_str),
+    }?;
+    let text = text.trim();
+    (!text.is_empty()).then_some(text)
 }
 
 #[derive(Debug, Clone)]
@@ -2158,48 +2498,52 @@ impl UnifiedModelClient {
             ProviderProtocol::OpenAiCompatible => json!({
                 "model": self.model,
                 "stream": false,
-                "max_tokens": 16,
+                "max_tokens": MODEL_PROBE_OUTPUT_TOKENS,
                 "messages": [{"role":"user", "content":"Reply with OK."}]
             }),
             ProviderProtocol::Anthropic => json!({
                 "model": self.model,
                 "stream": false,
-                "max_tokens": 16,
+                "max_tokens": MODEL_PROBE_OUTPUT_TOKENS,
                 "messages": [{"role":"user", "content":"Reply with OK."}]
             }),
             ProviderProtocol::Ollama => json!({
                 "model": self.model,
                 "stream": false,
+                "options": {"num_predict": MODEL_PROBE_OUTPUT_TOKENS},
                 "messages": [{"role":"user", "content":"Reply with OK."}]
             }),
         };
         self.apply_reasoning_effort(&mut body);
         self.apply_fast_mode(&mut body)?;
-        if self.reasoning_effort.is_some() {
-            // Reasoning consumes output tokens too; the legacy 16-token
-            // connection probe cannot exercise an explicit reasoning request.
-            body["max_tokens"] = json!(4096);
-            if is_official_openai_endpoint(&self.base_url) {
-                body.as_object_mut().unwrap().remove("max_tokens");
-                body["max_completion_tokens"] = json!(4096);
-            }
+        if self.protocol == ProviderProtocol::OpenAiCompatible
+            && is_official_openai_endpoint(&self.base_url)
+        {
+            body.as_object_mut().unwrap().remove("max_tokens");
+            body["max_completion_tokens"] = json!(MODEL_PROBE_OUTPUT_TOKENS);
         }
         if let Some(budget) = self.request_budget {
+            let probe_budget = RequestBudget {
+                reserved_output_tokens: budget
+                    .reserved_output_tokens
+                    .min(MODEL_PROBE_OUTPUT_TOKENS),
+                ..budget
+            };
             match self.protocol {
                 ProviderProtocol::OpenAiCompatible
                     if is_official_openai_endpoint(&self.base_url) =>
                 {
                     body.as_object_mut().unwrap().remove("max_tokens");
-                    body["max_completion_tokens"] = json!(budget.reserved_output_tokens);
+                    body["max_completion_tokens"] = json!(probe_budget.reserved_output_tokens);
                 }
                 ProviderProtocol::OpenAiCompatible | ProviderProtocol::Anthropic => {
-                    body["max_tokens"] = json!(budget.reserved_output_tokens);
+                    body["max_tokens"] = json!(probe_budget.reserved_output_tokens);
                 }
                 ProviderProtocol::Ollama => {
-                    body["options"] = json!({"num_predict": budget.reserved_output_tokens});
+                    body["options"] = json!({"num_predict": probe_budget.reserved_output_tokens});
                 }
             }
-            budget.validate_provider_json(&body)?;
+            probe_budget.validate_provider_json(&body)?;
         }
         Ok(body)
     }
@@ -2228,15 +2572,8 @@ impl UnifiedModelClient {
         let value: Value = serde_json::from_str(&text).map_err(|error| {
             AdapterError::Llm(format!("{} returned invalid JSON: {error}", endpoint))
         })?;
-        validate_response_end(self.protocol, &value)?;
-        let response_text = match self.protocol {
-            ProviderProtocol::OpenAiCompatible => value
-                .pointer("/choices/0/message/content")
-                .and_then(Value::as_str),
-            ProviderProtocol::Anthropic => value.pointer("/content/0/text").and_then(Value::as_str),
-            ProviderProtocol::Ollama => value.pointer("/message/content").and_then(Value::as_str),
-        }
-        .ok_or_else(|| {
+        validate_probe_response_end(self.protocol, &value)?;
+        let response_text = probe_response_text(self.protocol, &value).ok_or_else(|| {
             AdapterError::Llm(format!(
                 "{} succeeded but the response did not match the selected provider protocol",
                 endpoint

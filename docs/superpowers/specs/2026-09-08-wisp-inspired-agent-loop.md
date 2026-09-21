@@ -142,7 +142,7 @@ UI 显示执行、等待输入、等待审批、等待计算、上下文整理�
 
 ModelProfile JSON 新增可空 reasoning_effort，无表迁移或凭据字段。共享 SaveModelProfileRequest 省略保留/null 清空/字符串设置；native 在合并旧配置后再次验证协议和值，再写 keyring/数据库。仅 OpenAI-compatible 支持该请求字段，Anthropic/Ollama 显式设置时拒绝，绝不静默忽略。此字段表示请求值，不是模型能力或服务端确认的生效值；不增加前缀/家族匹配，不将 Codex Luna/max 身份当成任意服务的已验证型号。
 
-统一客户端对常规模型、独立子模型、结构化调用、重试和非流式 fallback 保留同一 reasoning_effort，完整预算覆盖该字段。probe 同样发送，显式档位默认预留 4096 输出 token（沿用已有运行请求额度，非模型上限），已有 RequestBudget 优先，并拒绝明确的截断/拒答响应。wire 字段参考 [OpenAI Chat API](https://developers.openai.com/api/reference/resources/chat)；可选字符串不代表所选精确模型支持这些档位。
+统一客户端对常规模型、独立子模型、结构化调用、重试和非流式 fallback 保留同一 reasoning_effort，完整预算覆盖该字段。probe 同样发送，并始终预留最多 4096 输出 token（沿用已有运行请求额度，非模型上限），因为兼容网关也可能在没有显式档位时强制推理；已有 RequestBudget 和精确目录输出上限只能将该探测额度收紧，不能抬高。probe 只有收到非空、纯文本且带协议终态的回复才成功，截断、拒答、未终止和意外工具调用均失败；常规模型与工具调用仍使用原有完成态安全校验。wire 字段参考 [OpenAI Chat API](https://developers.openai.com/api/reference/resources/chat)；可选字符串不代表所选精确模型支持这些档位。
 
 显式值加入子模型 execution_configuration_hash，未设置时不改变旧哈希。角色仍按既有冻结绑定验证；主模型沿用既有 profile 加载语义，不新增跨恢复的主模型配置快照。Windows/macOS 使用同一设置与适配器路径，无覆盖层/审批/隔离/数据驻留变化。完整 models.dev 精确能力目录、requested/effective/capability source 审计，以及自动简单任务模型路由仍待实施。
 

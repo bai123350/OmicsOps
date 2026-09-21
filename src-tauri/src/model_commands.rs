@@ -1,6 +1,9 @@
 use omicsops_adapters::{
     credentials::{CredentialVault, credential_account},
-    llm::{ModelProbeResult, ProviderProtocol, RequestBudget, UnifiedModelClient},
+    llm::{
+        MODEL_PROBE_OUTPUT_TOKENS, ModelProbeResult, ProviderProtocol, RequestBudget,
+        UnifiedModelClient,
+    },
 };
 use omicsops_core::workspace::{ModelProfile, ModelProviderKind};
 use tauri::State;
@@ -313,13 +316,7 @@ fn catalog_probe_budget(profile: &ModelProfile) -> Option<RequestBudget> {
         .as_ref()
         .map(|caps| RequestBudget {
             context_window_tokens: profile.effective_context_window_tokens(),
-            reserved_output_tokens: caps
-                .output_limit
-                .min(if profile.reasoning_effort.is_some() {
-                    4096
-                } else {
-                    16
-                }),
+            reserved_output_tokens: caps.output_limit.min(MODEL_PROBE_OUTPUT_TOKENS),
             safety_margin_tokens: 1024,
         })
 }
@@ -527,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn probes_cap_output_without_increasing_plain_probe_allowance() {
+    fn probes_cap_reasoning_safe_allowance_to_the_catalog_output_limit() {
         let mut profile = model_profile_from_request(request(
             "open_ai_compatible",
             "https://api.openai.com/v1",
@@ -538,7 +535,7 @@ mod tests {
             catalog_probe_budget(&profile)
                 .unwrap()
                 .reserved_output_tokens,
-            16
+            4096
         );
         profile.reasoning_effort = Some("max".into());
         assert_eq!(

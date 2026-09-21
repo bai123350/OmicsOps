@@ -16,6 +16,12 @@ has no OpenCode Go capability rows, so the UI says that unknown profiles use the
 conservative legacy context/output budget unless the user supplies an explicit context
 budget. No capability, tool, vision, or reasoning support is inferred for this gateway.
 
+The connection probe reserves up to 4,096 output tokens even when the profile has no explicit
+reasoning effort, because a gateway model may require reasoning internally. An exact catalog
+output limit or smaller request budget can reduce that allowance. The probe succeeds only after
+a non-empty, text-only terminal reply; a truncated, unterminated, refused, or tool-call response
+remains a failed test and does not weaken normal runtime completion checks.
+
 Only a base URL whose parsed scheme, host, effective port, path, user information, query,
 and fragment exactly match the official endpoint receives the OpenCode headers. Every
 probe, model-list request, primary/delegated model call, follow-up request, side chat, and
@@ -26,7 +32,10 @@ probe and discovery clients use a random UUID for their client lifetime. Redirec
 disabled for the trusted Go client so these headers cannot be forwarded to another host.
 
 Deterministic tests cover exact URL gating, header injection on POST and GET request paths,
-stable and distinct session UUIDs, protocol selection, Responses rejection, editing, and
-discovered-model handling. No live OpenCode request was executed because this checkout has
-no configured live-model credential/profile; deterministic success does not establish
-service availability or account access.
+stable and distinct session UUIDs, protocol selection, Responses rejection, editing,
+discovered-model handling, implicit-reasoning probe budgets, terminal responses, and rejection
+of truncated or tool-bearing probe replies. On 2026-09-21, the existing ignored live model test
+was explicitly run on Windows against a saved OpenCode Go `glm-5.3` profile and passed 1/1 in
+5.23 seconds. It resolved the credential through the system vault without printing or writing the
+secret and established endpoint authentication plus one complete minimal Chat Completions reply.
+It did not exercise a full Agent run, tool calling, SSH, or other OpenCode models.
