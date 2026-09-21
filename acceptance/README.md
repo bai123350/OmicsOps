@@ -55,6 +55,15 @@ loop must read it once and return the nonce in the final completed answer.
 cargo test -p omicsops-desktop agent_v4::go_live_acceptance_tests::live_opencode_go_agent_reads_file_and_returns_nonce -- --ignored --exact --nocapture
 ```
 
+On 2026-09-21, after aligning the production model timeout, the exact command
+above also passed 1/1 in 31.57 seconds using a saved `glm-5.3-flash` profile and
+the production default timeout. This isolated nonce/read-tool acceptance does
+not rerun the literature workflow or validate scientific provenance end to end.
+Deterministic checks passed: `cargo test --workspace` (1,254 passed, 12 ignored),
+`npm test` (789 frontend and 22 bridge tests), `npm run build`, and
+`npm run build:desktop`. The ignored tests in the workspace count are not live
+acceptance passes; the explicit Go result above is recorded separately.
+
 The run is bounded to four model turns, three tool calls, no model retries, and
 the production 180-second absolute timeout per model attempt. It is ignored
 during normal CI. A compiled, ignored, or unexecuted result is not a live
