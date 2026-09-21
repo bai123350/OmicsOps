@@ -2798,7 +2798,12 @@ mod tests {
         let mut blocked = detail;
         apply_run_blocker(&mut blocked, 2);
         assert!(!blocked.can_remove_from_library && !blocked.can_delete_files);
-        assert!(blocked.blocking_reasons.iter().any(|reason| reason.contains('2')));
+        assert!(
+            blocked
+                .blocking_reasons
+                .iter()
+                .any(|reason| reason.contains('2'))
+        );
     }
 
     #[tokio::test]

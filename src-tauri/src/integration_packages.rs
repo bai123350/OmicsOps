@@ -1515,10 +1515,12 @@ mod tests {
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
-        assert!(inspect_plugin_source(&store, root.path())
-            .await
-            .unwrap_err()
-            .contains("unknown field"));
+        assert!(
+            inspect_plugin_source(&store, root.path())
+                .await
+                .unwrap_err()
+                .contains("unknown field")
+        );
     }
 
     #[tokio::test]
@@ -1539,19 +1541,23 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-            assert!(inspect_plugin_source(&store, root.path())
-                .await
-                .unwrap_err()
-                .contains(expected));
+            assert!(
+                inspect_plugin_source(&store, root.path())
+                    .await
+                    .unwrap_err()
+                    .contains(expected)
+            );
         }
 
         let root = tempfile::tempdir().unwrap();
         fixture(root.path(), "lab.qc", "1.0.0");
         fs::write(root.path().join("skills/qc/helper.md"), "attachment").unwrap();
-        assert!(inspect_plugin_source(&store, root.path())
-            .await
-            .unwrap_err()
-            .contains("undeclared file"));
+        assert!(
+            inspect_plugin_source(&store, root.path())
+                .await
+                .unwrap_err()
+                .contains("undeclared file")
+        );
 
         fs::remove_file(root.path().join("skills/qc/helper.md")).unwrap();
         let markdown = b"---\nname: plugin-qc\n---\n[helper](helper.md)\n";
@@ -1564,10 +1570,12 @@ mod tests {
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
-        assert!(inspect_plugin_source(&store, root.path())
-            .await
-            .unwrap_err()
-            .contains("standalone SKILL.md"));
+        assert!(
+            inspect_plugin_source(&store, root.path())
+                .await
+                .unwrap_err()
+                .contains("standalone SKILL.md")
+        );
     }
 
     #[tokio::test]
@@ -1597,9 +1605,11 @@ mod tests {
         let installed = install_plugin(&store, &app.path().join("plugins"), request.clone())
             .await
             .unwrap();
-        assert!(!plugin_allows_skill(&store, installed.skills[0].skill_id)
-            .await
-            .unwrap());
+        assert!(
+            !plugin_allows_skill(&store, installed.skills[0].skill_id)
+                .await
+                .unwrap()
+        );
         let same = install_plugin(&store, &app.path().join("plugins"), request)
             .await
             .unwrap();
@@ -1614,9 +1624,11 @@ mod tests {
         .await
         .unwrap();
         assert!(enabled.enabled);
-        assert!(plugin_allows_skill(&store, installed.skills[0].skill_id)
-            .await
-            .unwrap());
+        assert!(
+            plugin_allows_skill(&store, installed.skills[0].skill_id)
+                .await
+                .unwrap()
+        );
 
         let result = remove_plugin(
             &store,
@@ -1630,11 +1642,13 @@ mod tests {
         .unwrap();
         assert_eq!(result.removed_skills, 1);
         assert!(result.preserved_files.is_empty());
-        assert!(store
-            .list_json::<McpServerProfile>("mcp_server")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .list_json::<McpServerProfile>("mcp_server")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1671,10 +1685,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(result
-            .preserved_files
-            .iter()
-            .any(|path| path == "skills/qc/SKILL.md"));
+        assert!(
+            result
+                .preserved_files
+                .iter()
+                .any(|path| path == "skills/qc/SKILL.md")
+        );
         assert!(result.preserved_files.iter().any(|path| path == "note.txt"));
         assert!(root.exists());
     }
@@ -1820,10 +1836,12 @@ mod tests {
         let outer = catalog_skill(external.path(), "outer", true, &["middle"]);
         store.save_skill_package(&middle).await.unwrap();
         store.save_skill_package(&outer).await.unwrap();
-        assert!(remove_plugin(&store, &app.path().join("plugins"), request)
-            .await
-            .unwrap_err()
-            .contains("outer"));
+        assert!(
+            remove_plugin(&store, &app.path().join("plugins"), request)
+                .await
+                .unwrap_err()
+                .contains("outer")
+        );
     }
 
     #[tokio::test]
@@ -1859,18 +1877,22 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.status, "removed");
-        assert!(skill_by_id(&store, installed.skills[0].skill_id)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(store
-            .get_json::<SkillInstallationReceipt>(
-                crate::skill_settings::SKILL_INSTALLATION_KIND,
-                &installed.skills[0].skill_id.to_string(),
-            )
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            skill_by_id(&store, installed.skills[0].skill_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_json::<SkillInstallationReceipt>(
+                    crate::skill_settings::SKILL_INSTALLATION_KIND,
+                    &installed.skills[0].skill_id.to_string(),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
