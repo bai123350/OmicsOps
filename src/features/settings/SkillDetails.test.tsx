@@ -47,6 +47,24 @@ describe("SkillDetails", () => {
     expect(screen.getByText("# QC")).toBeInTheDocument();
   });
 
+  it("sizes details and preview dialogs inside the compensated overlay", async () => {
+    document.documentElement.dataset.omicsopsScale = "1.2";
+    const view = render(<SkillDetails skillId="skill-1" locale="en-US" onClose={() => undefined} />);
+    await screen.findByRole("heading", { name: "QC reviewer" });
+
+    const details = screen.getByRole("dialog", { name: "Skill details" });
+    expect(details).toHaveClass("skill-details-dialog");
+    expect(details).toHaveStyle({ width: "min(720px, calc(100% - 36px))", maxHeight: "calc(100% - 48px)" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    const preview = await screen.findByRole("dialog", { name: "Skill file preview" });
+    expect(preview).toHaveClass("skill-preview-dialog");
+    expect(preview).toHaveStyle({ width: "min(780px, calc(100% - 28px))", maxHeight: "calc(100% - 32px)" });
+
+    view.unmount();
+    delete document.documentElement.dataset.omicsopsScale;
+  });
+
   it("keeps details open and blocks duplicate preview reads after a failure", async () => {
     let reject!: (reason: unknown) => void;
     vi.mocked(api.settingsReadSkillFile).mockImplementation(() => new Promise((_, nextReject) => { reject = nextReject; }));

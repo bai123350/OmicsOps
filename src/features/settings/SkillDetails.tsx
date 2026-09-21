@@ -6,6 +6,16 @@ import type { Locale } from "../workspace/copy";
 import { useWindowEscapeLayer } from "./BrowserSettings";
 import "./SkillDetails.css";
 
+const detailDialogStyle = {
+  width: "min(720px, calc(100% - 36px))",
+  maxHeight: "calc(100% - 48px)",
+};
+
+const previewDialogStyle = {
+  width: "min(780px, calc(100% - 28px))",
+  maxHeight: "calc(100% - 32px)",
+};
+
 export function SkillDetails({
   skillId,
   locale,
@@ -72,7 +82,7 @@ export function SkillDetails({
   }
 
   return <div className="skill-details-overlay" role="presentation">
-    <section className="skill-details-dialog" role="dialog" aria-modal="true" aria-label={zh ? "技能详情" : "Skill details"}>
+    <section className="skill-details-dialog" style={detailDialogStyle} role="dialog" aria-modal="true" aria-label={zh ? "技能详情" : "Skill details"}>
       <header>
         <div><small>{zh ? "已安装技能" : "Installed skill"}</small><h3>{detail?.skill.name ?? (zh ? "技能详情" : "Skill details")}</h3></div>
         <button type="button" onClick={onClose} aria-label={zh ? "关闭技能详情" : "Close skill details"}>×</button>
@@ -102,7 +112,7 @@ export function SkillDetails({
 
 function SkillPreviewDialog({ preview, zh, onClose }: { preview: SkillFilePreview; zh: boolean; onClose: () => void }) {
   useWindowEscapeLayer(true, onClose);
-  return <section className="skill-preview-dialog" role="dialog" aria-modal="true" aria-label={zh ? "技能文件预览" : "Skill file preview"}>
+  return <section className="skill-preview-dialog" style={previewDialogStyle} role="dialog" aria-modal="true" aria-label={zh ? "技能文件预览" : "Skill file preview"}>
     <header><div><small>{preview.redacted ? (zh ? "敏感内容已脱敏" : "Sensitive content redacted") : (zh ? "只读预览" : "Read-only preview")}</small><h3>{preview.relative_path}</h3></div><button type="button" onClick={onClose} aria-label={zh ? "关闭文件预览" : "Close file preview"}>×</button></header>
     <pre>{preview.content}</pre>
   </section>;
