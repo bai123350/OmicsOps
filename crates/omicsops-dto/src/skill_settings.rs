@@ -66,3 +66,39 @@ pub struct SkillFilePreview {
     pub redacted: bool,
     pub package_sha256: String,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillRemovalMode {
+    LibraryOnly,
+    OwnedFiles,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoveSkillRequest {
+    pub skill_id: Uuid,
+    pub expected_package_sha256: String,
+    pub mode: SkillRemovalMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillRemovalResult {
+    pub removed_from_library: bool,
+    pub files_removed: bool,
+    pub preserved_files: bool,
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillRemovalOperation {
+    pub operation_id: Uuid,
+    pub skill_id: Uuid,
+    pub name: String,
+    pub package_sha256: String,
+    pub phase: String,
+    pub preserved_files: bool,
+}

@@ -47,6 +47,7 @@ pub(crate) mod run_stops;
 mod runtime_jobs;
 mod session_reviews;
 mod side_chat;
+mod skill_removals;
 mod usage;
 pub use usage::{
     UsageConversationEventPage, UsageConversationEventSet, UsageEventPage, UsageEventRow,

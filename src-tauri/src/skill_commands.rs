@@ -565,6 +565,7 @@ pub async fn set_skill_enabled_in_repository(
     skill_id: Uuid,
     enabled: bool,
 ) -> Result<SkillPackage, String> {
+    crate::skill_settings::ensure_skill_mutation_allowed(repository, skill_id).await?;
     if enabled && !crate::integration_packages::plugin_allows_skill(repository, skill_id).await? {
         return Err("enable the parent plugin before enabling this Skill".into());
     }

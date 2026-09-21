@@ -18,6 +18,7 @@ pub async fn get_conversation_capabilities_v4(
     state: State<'_, AppState>,
     request: GetConversationCapabilitiesV4Request,
 ) -> Result<ConversationCapabilitiesV4, String> {
+    let _skills_guard = state.skills_gate.read().await;
     conversation_capabilities(&state.repository, &request).await
 }
 

@@ -112,6 +112,7 @@ pub fn run() {
                     .map_err(|error| error.to_string())?;
                 session_reviews::recover_interrupted_reviews(&repository, &data_dir).await?;
                 side_chat::recover_interrupted_side_chats(&repository, &data_dir).await?;
+                skill_settings::reconcile_skill_removals(&repository, &skills_root).await?;
                 skill_commands::install_bundled_skills(
                     &repository,
                     &skills_root,
@@ -318,6 +319,9 @@ pub fn run() {
             skill_commands::set_skill_enabled,
             skill_settings::settings_skill_detail,
             skill_settings::settings_read_skill_file,
+            skill_settings::settings_remove_skill,
+            skill_settings::settings_list_skill_removals,
+            skill_settings::settings_retry_skill_removal,
             research_commands::search_research,
             kernel_commands::start_kernel,
             kernel_commands::execute_kernel_cell,

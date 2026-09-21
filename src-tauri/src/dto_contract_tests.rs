@@ -960,6 +960,57 @@ fn skill_settings_detail_and_preview_are_bounded_public_contracts() {
 }
 
 #[test]
+fn skill_removal_contracts_expose_status_without_journal_paths() {
+    use omicsops_dto::{
+        RemoveSkillRequest, SkillRemovalMode, SkillRemovalOperation, SkillRemovalResult,
+    };
+    let skill_id = uuid::Uuid::from_u128(43);
+    let operation_id = uuid::Uuid::from_u128(44);
+    assert_eq!(
+        serde_json::to_value(RemoveSkillRequest {
+            skill_id,
+            expected_package_sha256: "b".repeat(64),
+            mode: SkillRemovalMode::OwnedFiles,
+        })
+        .unwrap(),
+        json!({
+            "skill_id": skill_id,
+            "expected_package_sha256": "b".repeat(64),
+            "mode": "owned_files"
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(SkillRemovalResult {
+            removed_from_library: true,
+            files_removed: false,
+            preserved_files: true,
+            status: "needs_attention".into(),
+            message: "cleanup can be retried".into(),
+        })
+        .unwrap(),
+        json!({
+            "removed_from_library": true,
+            "files_removed": false,
+            "preserved_files": true,
+            "status": "needs_attention",
+            "message": "cleanup can be retried"
+        })
+    );
+    let operation = serde_json::to_value(SkillRemovalOperation {
+        operation_id,
+        skill_id,
+        name: "QC".into(),
+        package_sha256: "b".repeat(64),
+        phase: "needs_attention".into(),
+        preserved_files: true,
+    })
+    .unwrap();
+    assert_eq!(operation["operation_id"], operation_id.to_string());
+    assert!(operation.get("original_root").is_none());
+    assert!(operation.get("quarantine_root").is_none());
+}
+
+#[test]
 fn integration_package_contract_is_declarative_and_exposes_recovery_state() {
     use omicsops_dto::{InstallPluginRequest, InstalledPlugin, PluginPhase};
     let installation_id = uuid::Uuid::from_u128(45);
