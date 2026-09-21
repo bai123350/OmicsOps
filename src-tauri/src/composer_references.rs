@@ -44,13 +44,7 @@ pub(crate) async fn resolve_composer_references_for_state(
     references: &[ComposerReference],
 ) -> Result<String, String> {
     let _guard = state.skills_gate.read().await;
-    resolve_composer_references(
-        &state.repository,
-        project_id,
-        conversation_id,
-        references,
-    )
-    .await
+    resolve_composer_references(&state.repository, project_id, conversation_id, references).await
 }
 
 /// Store-only form used by deterministic tests and by non-Tauri callers.
