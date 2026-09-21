@@ -34,4 +34,13 @@ describe("model profile API", () => {
       context_window_tokens: 64000,
     }));
   });
+
+  it("deletes the exact model profile through the native command", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+    vi.mocked(invoke).mockResolvedValueOnce(true);
+
+    await expect(api.deleteModelProfile("profile-1")).resolves.toBe(true);
+
+    expect(invoke).toHaveBeenCalledWith("delete_model_profile", { profileId: "profile-1" });
+  });
 });

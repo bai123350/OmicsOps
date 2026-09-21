@@ -1065,6 +1065,37 @@ export default function DesktopApp() {
     ...(selected ? [{ key: "action:files", kind: "action" as const, label: locale === "zh-CN" ? "项目文件" : "Project files", description: selected.name }] : []),
   ];
   const canAttachFromSearch = (entry: WorkspaceSearchEntry) => !agentBusy && !conversationLocked && !modelSelectionBusy && !runId && canAttachSearchEntry(entry, selected?.id, conversation?.project_id === selected?.id ? conversation?.id : undefined);
+  async function removeModelProfile(profileId: string) {
+    await api.deleteModelProfile(profileId);
+    setModelProfiles((current) => current.filter((profile) => profile.id !== profileId));
+    setActiveModelProfileId((current) => current === profileId ? null : current);
+
+    const projectId = selected?.id ?? null;
+    const projectToken = projectRequestToken.current;
+    const [profilesResult, conversationsResult] = await Promise.allSettled([
+      api.listModelProfiles(),
+      projectId ? api.listConversations(projectId) : Promise.resolve(null),
+    ]);
+    if (profilesResult.status === "fulfilled") {
+      setModelProfiles(profilesResult.value);
+      setActiveModelProfileId((current) => current && profilesResult.value.some((profile) => profile.id === current) ? current : null);
+    }
+    if (conversationsResult.status === "fulfilled" && conversationsResult.value
+      && projectId === currentConversationIdentity.current.projectId
+      && projectToken === projectRequestToken.current) {
+      const refreshedConversations = conversationsResult.value;
+      setConversations(refreshedConversations);
+      setConversation((current) => current
+        ? refreshedConversations.find((item) => item.id === current.id) ?? current
+        : current);
+    }
+    if (profilesResult.status === "rejected" || conversationsResult.status === "rejected") {
+      setAgentNotice(locale === "zh-CN"
+        ? "模型提供方已删除，但部分工作区状态无法刷新。请重新打开设置或项目。"
+        : "The model provider was deleted, but some workspace state could not be refreshed. Reopen settings or the project.");
+    }
+  }
+
   const searchDialog = searchOpen ? <WorkspaceSearchDialog entries={searchEntries} zh={locale === "zh-CN"} loading={workspaceSearch.loading} failedProjects={workspaceSearch.failedProjects} onRetry={workspaceSearch.retry} onClose={closeWorkspaceSearch} onOpen={openSearchEntry} canAttach={canAttachFromSearch} onAttach={(entry) => {
     if (!selected || !conversation || !entry.item || !canAttachFromSearch(entry)) return false;
     setSearchRequest({ key: crypto.randomUUID(), kind: "attach", projectId: selected.id, conversationId: conversation.id, item: entry.item });
@@ -1082,7 +1113,7 @@ export default function DesktopApp() {
       modelSelectionInFlight.current = false;
       setModelSelectionBusy(false);
     }
-  }} onProbeModel={api.probeModelProfile} onListModels={api.listModelProfileModels} onImportSkill={async () => { const sourcePath = await api.chooseSkillDirectory(); if (!sourcePath) return; const skill = await api.importSkillDirectory(sourcePath); setSkillPackages((current) => [skill, ...current.filter((item) => item.id !== skill.id)]); }} onSetSkillEnabled={async (skillId, enabled) => { const updated = await api.setSkillEnabled(skillId, enabled); setSkillPackages(await api.listSkillPackages()); return updated; }} onSkillsChanged={async () => setSkillPackages(await api.listSkillPackages())} onPluginsChanged={async () => setSkillPackages(await api.listSkillPackages())} onSaveMcpServer={async (request) => { const updated = await api.saveMcpServer(request); setMcpServers(await api.listMcpServers()); return updated; }} onConfigurePubMedMcp={async (request) => { const updated = await api.configurePubMedMcpCredentials(request); setMcpServers(await api.listMcpServers()); return updated; }} onListBundledMcpPresets={api.listBundledMcpPresets} onAddBundledMcp={async (request) => { const updated = await api.addBundledMcpServer(request); setMcpServers(await api.listMcpServers()); return updated; }} onInspectMcpServer={async (serverId) => { if (!selected) throw new Error(locale === "zh-CN" ? "请先打开一个项目，再检查 MCP server。" : "Open a project before inspecting an MCP server."); await api.inspectConfiguredMcpServer(selected.id, serverId); setMcpServers(await api.listMcpServers()); }} onSetMcpServerEnabled={async (serverId, enabled) => { const updated = await api.setMcpServerEnabled(serverId, enabled); setMcpServers(await api.listMcpServers()); return updated; }} onSetMcpLaunchApproval={async (serverId, approved) => { const updated = await api.setMcpLaunchApproval(serverId, approved); setMcpServers(await api.listMcpServers()); return updated; }} onSetMcpToolApproval={async (serverId, tool, approved) => { const updated = await api.setMcpToolApproval(serverId, tool, approved); setMcpServers(await api.listMcpServers()); return updated; }} /> : null;
+  }} onDeleteModel={removeModelProfile} onProbeModel={api.probeModelProfile} onListModels={api.listModelProfileModels} onImportSkill={async () => { const sourcePath = await api.chooseSkillDirectory(); if (!sourcePath) return; const skill = await api.importSkillDirectory(sourcePath); setSkillPackages((current) => [skill, ...current.filter((item) => item.id !== skill.id)]); }} onSetSkillEnabled={async (skillId, enabled) => { const updated = await api.setSkillEnabled(skillId, enabled); setSkillPackages(await api.listSkillPackages()); return updated; }} onSkillsChanged={async () => setSkillPackages(await api.listSkillPackages())} onPluginsChanged={async () => setSkillPackages(await api.listSkillPackages())} onSaveMcpServer={async (request) => { const updated = await api.saveMcpServer(request); setMcpServers(await api.listMcpServers()); return updated; }} onConfigurePubMedMcp={async (request) => { const updated = await api.configurePubMedMcpCredentials(request); setMcpServers(await api.listMcpServers()); return updated; }} onListBundledMcpPresets={api.listBundledMcpPresets} onAddBundledMcp={async (request) => { const updated = await api.addBundledMcpServer(request); setMcpServers(await api.listMcpServers()); return updated; }} onInspectMcpServer={async (serverId) => { if (!selected) throw new Error(locale === "zh-CN" ? "请先打开一个项目，再检查 MCP server。" : "Open a project before inspecting an MCP server."); await api.inspectConfiguredMcpServer(selected.id, serverId); setMcpServers(await api.listMcpServers()); }} onSetMcpServerEnabled={async (serverId, enabled) => { const updated = await api.setMcpServerEnabled(serverId, enabled); setMcpServers(await api.listMcpServers()); return updated; }} onSetMcpLaunchApproval={async (serverId, approved) => { const updated = await api.setMcpLaunchApproval(serverId, approved); setMcpServers(await api.listMcpServers()); return updated; }} onSetMcpToolApproval={async (serverId, tool, approved) => { const updated = await api.setMcpToolApproval(serverId, tool, approved); setMcpServers(await api.listMcpServers()); return updated; }} /> : null;
   if (!selected) return <><ProjectLibrary onOpenSearch={openWorkspaceSearch} projects={projects} connections={connections} locale={locale} onLocaleChange={setLocale} onSettings={() => { setSettingsSection("general"); setSettingsNavigationKey((value) => value + 1); setSettingsOpen(true); }} onOpen={setSelected} onDelete={async (projectId) => { await api.deleteProject(projectId); setProjects((current) => current.filter((project) => project.id !== projectId)); }} onChooseLocalRoot={api.chooseProjectDirectory} onCreate={async ({ template, name, localRoot, connectionId, remoteRoot }) => { const project = await api.createProject({ name, description: "", local_root: localRoot, template, connection_id: connectionId, remote_root: remoteRoot }); setProjects((current) => [project, ...current]); setSelected(project); }} />{settings}{searchDialog}</>;
   async function changeConversationMode(nextMode: SessionAgentModeV4) {
     if (!selected || !conversation || nextMode === conversationMode) return;

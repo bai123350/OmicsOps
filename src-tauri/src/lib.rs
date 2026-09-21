@@ -35,6 +35,7 @@ pub mod integration_packages;
 pub mod kernel_commands;
 mod model_catalog_shared;
 pub mod model_commands;
+pub mod model_deletion;
 pub mod notification_settings;
 pub mod p1_commands;
 #[cfg(test)]
@@ -312,6 +313,7 @@ pub fn run() {
             agent_commands::submit_message,
             model_commands::list_model_profiles,
             model_commands::save_model_profile,
+            model_deletion::delete_model_profile,
             model_commands::probe_model_profile,
             model_commands::list_model_profile_models,
             skill_commands::list_skill_packages,

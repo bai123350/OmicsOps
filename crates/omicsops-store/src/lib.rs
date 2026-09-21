@@ -42,6 +42,7 @@ const SCHEMA_VERSION: u32 = 4;
 mod context_compaction;
 mod conversation_branches;
 mod guidance;
+mod model_profiles;
 mod notification_receipts;
 pub(crate) mod run_stops;
 mod runtime_jobs;
@@ -103,6 +104,12 @@ pub enum StoreError {
     InvalidInput(String),
     #[error("migration failed: {0}")]
     Migration(String),
+    #[error("credential cleanup failed: {0}")]
+    Credential(String),
+    #[error(
+        "model profile database update failed after credential cleanup; the credential may need re-entry: {0}"
+    )]
+    CredentialDeletedDatabaseFailed(String),
 }
 
 /// Optional deterministic migration fault injection used by tests and by

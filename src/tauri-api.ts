@@ -162,6 +162,10 @@ export async function saveModelProfile(request: { id?: string; label: string; pr
   return invoke("save_model_profile", { request });
 }
 
+export async function deleteModelProfile(profileId: string): Promise<boolean> {
+  return isTauri() ? invoke("delete_model_profile", { profileId }) : true;
+}
+
 export async function probeModelProfile(profileId: string): Promise<ModelProbeResult> {
   if (!isTauri()) return { endpoint: "https://models.example/v1/chat/completions", protocol: "OpenAiCompatible", model: "demo", latency_ms: 25, response_preview: "OK" };
   return invoke("probe_model_profile", { profileId });

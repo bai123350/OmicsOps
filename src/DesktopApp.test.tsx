@@ -1,7 +1,7 @@
 import * as queueApi from "./composer-queue-api";
 import * as preferencesApi from "./conversation-preferences-api";
 import { StrictMode } from "react";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import DesktopApp, { samePendingSubmission } from "./DesktopApp";
@@ -84,6 +84,51 @@ function setupConversationStateHarness() {
 }
 
 describe("DesktopApp", () => {
+  it("refreshes model and conversation selections after deleting a profile", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    const listProfiles = vi.mocked(api.listModelProfiles);
+    const listConversations = vi.mocked(api.listConversations);
+    const remove = vi.spyOn(api, "deleteModelProfile").mockResolvedValue(true);
+    render(<DesktopApp />);
+    await screen.findByText(/Agent 模式：LOCAL/);
+
+    fireEvent.click(screen.getByRole("button", { name: "选择模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    expect(await screen.findByRole("button", { name: "删除 State model" })).toBeInTheDocument();
+    listProfiles.mockResolvedValue([]);
+    listConversations.mockResolvedValue(stateConversations.map((item) => ({ ...item, model_profile_id: null })));
+    fireEvent.click(screen.getByRole("button", { name: "删除 State model" }));
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "删除" }));
+
+    await waitFor(() => expect(remove).toHaveBeenCalledWith("model-state"));
+    await waitFor(() => expect(listProfiles).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(listConversations).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText("State model")).not.toBeInTheDocument();
+  });
+
+  it("keeps a completed deletion local when follow-up refreshes fail", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    const listProfiles = vi.mocked(api.listModelProfiles);
+    const listConversations = vi.mocked(api.listConversations);
+    vi.spyOn(api, "deleteModelProfile").mockResolvedValue(true);
+    render(<DesktopApp />);
+    await screen.findByText(/Agent 模式：LOCAL/);
+
+    fireEvent.click(screen.getByRole("button", { name: "选择模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    await screen.findByRole("button", { name: "删除 State model" });
+    listProfiles.mockRejectedValue(new Error("profile refresh failed"));
+    listConversations.mockRejectedValue(new Error("conversation refresh failed"));
+    fireEvent.click(screen.getByRole("button", { name: "删除 State model" }));
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "删除" }));
+
+    expect(await screen.findByText(/模型提供方已删除，但部分工作区状态无法刷新/)).toBeInTheDocument();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(screen.queryByText("State model")).not.toBeInTheDocument();
+  });
+
   it("opens shared search from workspace and project library, attaching without losing the draft", async () => {
     const { stateSpy } = setupConversationStateHarness();
     stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));

@@ -30,6 +30,47 @@ afterEach(() => {
 });
 
 describe("SettingsPanel model providers", () => {
+  it("confirms model deletion, keeps the dialog on failure, and closes only the confirmation on Escape", async () => {
+    const profile = { id: "delete-me", label: "Disposable model", provider: "ollama" as const, base_url: "http://127.0.0.1:11434", model: "temporary", credential_reference: null, supports_tools: true, supports_vision: false };
+    const remove = vi.fn().mockRejectedValueOnce(new Error("Stop the active run before deleting this model.")).mockResolvedValue(undefined);
+    const close = vi.fn();
+    render(<SettingsPanel locale="en-US" onClose={close} modelProfiles={[profile]} onDeleteModel={remove} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete Disposable model" }));
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("This removes the saved profile and its stored credential");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Workspace settings" })).toBeInTheDocument();
+    expect(close).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByLabelText("Model")).toHaveValue("temporary");
+    fireEvent.click(screen.getByRole("button", { name: "Delete Disposable model" }));
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Delete" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Stop the active run");
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(remove).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
+    expect(remove).toHaveBeenLastCalledWith("delete-me");
+    expect(screen.queryByLabelText("Model")).not.toBeInTheDocument();
+  });
+
+  it("clears a deleted delegated profile from another open model form", async () => {
+    const child = { id: "child", label: "Reader", provider: "ollama" as const, base_url: "http://127.0.0.1:11434", model: "reader", credential_reference: null, supports_tools: true, supports_vision: false };
+    const parent = { ...child, id: "parent", label: "Writer", model: "writer", delegated_model_profile_id: "child" };
+    const remove = vi.fn().mockResolvedValue(undefined);
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[parent, child]} onDeleteModel={remove} />);
+
+    fireEvent.click(screen.getAllByRole("button", { name: "Edit" })[0]);
+    expect(screen.getByLabelText("Read-only subagent model")).toHaveValue("child");
+    fireEvent.click(screen.getByRole("button", { name: "Delete Reader" }));
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Delete" }));
+
+    await waitFor(() => expect(remove).toHaveBeenCalledWith("child"));
+    expect(screen.getByLabelText("Read-only subagent model")).toHaveValue("");
+  });
+
   it("configures OpenCode Go with exact protocol routing and blocks Responses-only models", async () => {
     const save = vi.fn().mockResolvedValue(undefined);
     render(<SettingsPanel locale="en-US" onClose={() => undefined} onSaveModel={save} />);

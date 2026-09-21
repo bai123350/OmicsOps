@@ -218,8 +218,10 @@ pub async fn list_model_profiles(state: State<'_, AppState>) -> Result<Vec<Model
 #[tauri::command]
 pub async fn save_model_profile(
     state: State<'_, AppState>,
+    credential_mutations: State<'_, crate::credential_settings::CredentialMutationState>,
     request: SaveModelProfileRequest,
 ) -> Result<ModelProfile, String> {
+    let _credential_guard = credential_mutations.lock.lock().await;
     let refresh_catalog = request.refresh_catalog;
     let credential = request.credential.clone();
     let preserve_binding = request.delegated_model_profile_id.is_none();
