@@ -303,6 +303,8 @@ HTTP/OAuth MCP、插件包管理不是 stdio Connections 页完成条件；后�
 
 ### 剩余页已锁定的派发规格
 
+- [Windows最终手工smoke清单](../specs/2026-09-16-settings-windows-smoke.md)：19目标页及额外Privacy、窗口/隔离/草稿、测试keyring、通知、Skills和Plugins；步骤不等于通过记录，待实现项不得勾选。
+
 - [六个基础页调用核验](../specs/2026-09-15-settings-baseline-review.md)：Session/Models基础功能已连接；Environments/Skills/Browser/Connections的具体缺口与最小测试要求已列明。代码阅读不是最终验收。
 
 - [Credentials独立计划](2026-09-15-credentials-settings.md)：真实keyring目录/创建/替换/未引用删除；canonical owner、防alias绕过、expected reference及MCP删除竞态已定义。
