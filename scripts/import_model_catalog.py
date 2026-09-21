@@ -17,7 +17,24 @@ PROVIDERS = {
     "alibaba-cn": ("open_ai_compatible", None),
     "minimax": ("anthropic", None),
     "minimax-cn": ("anthropic", None),
+    "opencode-go": ("open_ai_compatible", None),
     "openrouter": ("open_ai_compatible", None),
+}
+
+# OpenCode Go exposes multiple wire protocols at one exact API endpoint. Only
+# models reviewed against the provider's published routing table are compiled;
+# Responses API models remain unsupported by OmicsOps.
+OPENCODE_GO_MODEL_PROTOCOLS = {
+    **{model: "open_ai_compatible" for model in (
+        "glm-5.3-flash", "glm-5.3", "glm-5.2", "glm-5.1", "kimi-k3",
+        "kimi-k2.7-code", "kimi-k2.6", "longcat-2.0", "deepseek-v4.1-flash",
+        "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp",
+        "mimo-v2.5", "mimo-v2.5-pro", "hy4-preview", "hy3",
+    )},
+    **{model: "anthropic" for model in (
+        "minimax-m3", "minimax-m2.7", "minimax-m2.5", "qwen3.8-max",
+        "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus",
+    )},
 }
 
 
@@ -31,6 +48,11 @@ def normalize(raw):
         if url.scheme != "https" or not url.hostname or url.username or url.query:
             raise ValueError(f"invalid public API endpoint: {provider_id}")
         for model_id, model in sorted(provider["models"].items()):
+            row_protocol = protocol
+            if provider_id == "opencode-go":
+                row_protocol = OPENCODE_GO_MODEL_PROTOCOLS.get(model_id)
+                if row_protocol is None:
+                    continue
             limit = model.get("limit", {})
             modalities = model.get("modalities", {})
             # Only text-producing models with usable, explicitly reported limits.
@@ -43,8 +65,8 @@ def normalize(raw):
             for option in model.get("reasoning_options", []):
                 if option.get("type") == "effort":
                     efforts = option["values"]
-            rows.append({
-                "provider": protocol, "host": url.hostname,
+            row = {
+                "provider": row_protocol, "host": url.hostname,
                 "port": url.port or 443, "model": model_id,
                 "supports_tools": model.get("tool_call") is True,
                 "supports_vision": "image" in modalities.get("input", []),
@@ -57,7 +79,10 @@ def normalize(raw):
                     "reasoning": model.get("reasoning") is True,
                     "reasoning_efforts": efforts,
                 },
-            })
+            }
+            if provider_id == "opencode-go":
+                row["path"] = url.path.rstrip("/")
+            rows.append(row)
     return {"source": "https://models.dev/api.json",
             "source_sha256": hashlib.sha256(raw).hexdigest(), "models": rows}
 

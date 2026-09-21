@@ -38,3 +38,43 @@ class CatalogImportTests(unittest.TestCase):
         source["deepseek"]["api"] = "http://example.test/v1"
         with self.assertRaises(ValueError):
             normalize(json.dumps(source).encode())
+
+    def test_opencode_go_keeps_the_exact_gateway_identity_and_merged_limits(self):
+        source = self.source()
+        source["opencode-go"] = {
+            "api": "https://opencode.ai/zen/go/v1",
+            "models": {
+                "glm-5.3": {
+                    "limit": {"context": 1_000_000, "output": 131_072},
+                    "modalities": {"input": ["text"], "output": ["text"]},
+                    "tool_call": True,
+                    "reasoning": True,
+                    "reasoning_options": [
+                        {"type": "effort", "values": ["low", "high", "max"]}
+                    ],
+                },
+                "minimax-m3": {
+                    "limit": {"context": 204_800, "output": 131_072},
+                    "modalities": {"input": ["text"], "output": ["text"]},
+                    "tool_call": True,
+                },
+                "grok-4.6": {
+                    "limit": {"context": 2_000_000, "output": 131_072},
+                    "modalities": {"input": ["text"], "output": ["text"]},
+                    "tool_call": True,
+                },
+            },
+        }
+
+        rows = normalize(json.dumps(source).encode())["models"]
+        go_rows = [item for item in rows if item["capabilities"]["source_provider"] == "opencode-go"]
+        self.assertEqual([item["model"] for item in go_rows], ["glm-5.3", "minimax-m3"])
+        row = go_rows[0]
+        self.assertEqual(
+            (row["provider"], row["host"], row["port"], row["path"], row["model"]),
+            ("open_ai_compatible", "opencode.ai", 443, "/zen/go/v1", "glm-5.3"),
+        )
+        self.assertEqual(row["capabilities"]["context_limit"], 1_000_000)
+        self.assertEqual(row["capabilities"]["output_limit"], 131_072)
+        self.assertEqual(row["capabilities"]["reasoning_efforts"], ["low", "high", "max"])
+        self.assertEqual(go_rows[1]["provider"], "anthropic")

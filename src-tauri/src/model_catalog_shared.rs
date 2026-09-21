@@ -8,6 +8,8 @@ pub(crate) struct CatalogModel {
     provider: ModelProviderKind,
     host: String,
     port: u16,
+    #[serde(default)]
+    path: Option<String>,
     model: String,
     pub supports_tools: bool,
     pub supports_vision: bool,
@@ -31,13 +33,20 @@ pub(crate) fn exact_model_capabilities(
     base_url: &Url,
     model_id: &str,
 ) -> Option<&'static CatalogModel> {
-    if base_url.scheme() != "https" {
+    if base_url.scheme() != "https"
+        || !base_url.username().is_empty()
+        || base_url.password().is_some()
+        || base_url.query().is_some()
+        || base_url.fragment().is_some()
+    {
         return None;
     }
+    let request_path = base_url.path().trim_end_matches('/');
     CATALOG.models.iter().find(|row| {
         row.provider == provider
             && Some(row.host.as_str()) == base_url.host_str()
             && Some(row.port) == base_url.port_or_known_default()
+            && row.path.as_deref().is_none_or(|path| path == request_path)
             && row.model == model_id
     })
 }
@@ -117,8 +126,8 @@ mod tests {
         assert!(CATALOG.models.len() > 500);
         for row in &CATALOG.models {
             assert!(keys.insert(format!(
-                "{:?}|{}|{}|{}",
-                row.provider, row.host, row.port, row.model
+                "{:?}|{}|{}|{:?}|{}",
+                row.provider, row.host, row.port, row.path, row.model
             )));
             assert!(row.capabilities.context_limit > 0 && row.capabilities.output_limit > 0);
             assert!(row.capabilities.input_limit.is_none_or(|value| value > 0));
@@ -151,6 +160,57 @@ mod tests {
                 ModelProviderKind::Anthropic,
                 &Url::parse("https://api.openai.com/v1").unwrap(),
                 "gpt-4o"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn opencode_go_glm_5_3_has_the_exact_compiled_budget() {
+        let row = exact_model_capabilities(
+            ModelProviderKind::OpenAiCompatible,
+            &Url::parse("https://opencode.ai/zen/go/v1").unwrap(),
+            "glm-5.3",
+        )
+        .expect("reviewed OpenCode Go model must have a compiled snapshot");
+        assert_eq!(row.capabilities.source_provider, "opencode-go");
+        assert_eq!(row.capabilities.context_limit, 1_000_000);
+        assert_eq!(row.capabilities.output_limit, 131_072);
+        assert!(row.supports_tools);
+        assert!(!row.supports_vision);
+        assert!(
+            exact_model_capabilities(
+                ModelProviderKind::OpenAiCompatible,
+                &Url::parse("https://opencode.ai/zen/go/v1/").unwrap(),
+                "glm-5.3",
+            )
+            .is_some()
+        );
+        for (url, model) in [
+            ("https://opencode.ai/zen/v1", "glm-5.3"),
+            ("https://opencode.ai/zen/go/v1/other", "glm-5.3"),
+            ("https://opencode.ai:8443/zen/go/v1", "glm-5.3"),
+            ("http://opencode.ai/zen/go/v1", "glm-5.3"),
+            ("https://user@opencode.ai/zen/go/v1", "glm-5.3"),
+            ("https://opencode.ai/zen/go/v1?route=other", "glm-5.3"),
+            ("https://opencode.ai/zen/go/v1#other", "glm-5.3"),
+            ("https://opencode.ai/zen/go/v1", "glm-5.3-sibling"),
+        ] {
+            assert!(
+                exact_model_capabilities(
+                    ModelProviderKind::OpenAiCompatible,
+                    &Url::parse(url).unwrap(),
+                    model,
+                )
+                .is_none(),
+                "unexpected match for {url} {model}"
+            );
+        }
+        assert!(
+            exact_model_capabilities(
+                ModelProviderKind::Anthropic,
+                &Url::parse("https://opencode.ai/zen/go/v1").unwrap(),
+                "glm-5.3",
             )
             .is_none()
         );

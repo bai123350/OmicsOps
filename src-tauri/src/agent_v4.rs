@@ -8456,6 +8456,9 @@ fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
 }
 
 #[cfg(test)]
+mod go_live_acceptance_tests;
+
+#[cfg(test)]
 mod tests {
     #[tokio::test]
     async fn reviewer_selection_is_frozen_and_disabled_review_needs_no_profile() {
@@ -9415,6 +9418,71 @@ mod tests {
                 .contains("HOST IMAGE NOTICE")
         );
         model.validate_request(&request).unwrap();
+    }
+
+    #[test]
+    fn opencode_go_catalog_budget_accepts_the_full_initial_agent_request() {
+        let profile = crate::model_commands::model_profile_from_request(
+            omicsops_dto::SaveModelProfileRequest {
+                id: None,
+                label: "OpenCode Go budget regression".into(),
+                provider: "open_ai_compatible".into(),
+                base_url: "https://opencode.ai/zen/go/v1".into(),
+                model: "glm-5.3".into(),
+                credential: None,
+                context_window_tokens: None,
+                refresh_catalog: false,
+                reasoning_effort: None,
+                fast_mode: None,
+                delegated_model_profile_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(profile.effective_context_window_tokens(), 1_000_000);
+        assert_eq!(profile.effective_output_tokens(), 16_384);
+
+        let model_for = |profile: &omicsops_core::workspace::ModelProfile| DesktopModelPortV4 {
+            client: UnifiedModelClient::new(
+                profile.id,
+                ProviderProtocol::OpenAiCompatible,
+                Url::parse(&profile.base_url).unwrap(),
+                profile.model.clone(),
+                Some("test-only-credential".into()),
+            )
+            .unwrap()
+            .with_request_budget(RequestBudget {
+                context_window_tokens: profile.effective_context_window_tokens(),
+                reserved_output_tokens: profile.effective_output_tokens(),
+                safety_margin_tokens: 1024,
+            }),
+            prompt: PromptLayersV4::default(),
+            usage_metadata: usage_metadata_for_profile(profile),
+            resources: None,
+            project_root: PathBuf::from("nonexistent-budget-test-root"),
+            supports_vision: profile.supports_vision,
+            input_images: vec![],
+            delegated: None,
+            reviewer: None,
+        };
+        let request = ModelRequestV4 {
+            system: "x".repeat(150_000),
+            context: "Answer a small synthetic research request using the available tools.".into(),
+            tools: builtin_tool_definitions_v4(),
+            image_refs: vec![],
+        };
+        let model = model_for(&profile);
+        let prepared = model.prepare_request(request.clone(), false).unwrap();
+        let metrics = model.client.measure_model_request(&prepared).unwrap();
+        assert!(metrics.serialized_request_bytes > 150_000);
+        model.validate_request(&request).unwrap();
+
+        let mut missing_snapshot = profile;
+        missing_snapshot.catalog_capabilities = None;
+        missing_snapshot.context_window_tokens = None;
+        let error = model_for(&missing_snapshot)
+            .validate_request(&request)
+            .unwrap_err();
+        assert!(error.message.contains("exceeding context window 32768"));
     }
 
     #[test]

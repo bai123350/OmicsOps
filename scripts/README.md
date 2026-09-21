@@ -1,11 +1,18 @@
 # Compiled model catalog
 
 `src-tauri/src/model_catalog.json` is a normalized snapshot of the public
-[models.dev API](https://models.dev/api.json), retrieved on 2026-09-09.
+[models.dev API](https://models.dev/api.json), retrieved on 2026-09-21.
 The artifact and every capability snapshot record the SHA-256 of the source.
-The snapshot contains 574 model entries.
-Only the eight explicitly mapped provider endpoints with supported protocols and
+The snapshot contains 616 model entries.
+Only the nine explicitly mapped provider endpoints with supported protocols and
 positive text-generation limits are included. No model family/prefix matching.
+OpenCode Go rows also bind the exact `/zen/go/v1` base path and use an explicit
+per-model Chat Completions or Anthropic Messages allowlist; Responses API rows
+are excluded.
+This single-source refresh also follows the current upstream catalog for the
+previously compiled providers: retired rows disappear, capability rows may
+change, and the MiniMax China endpoint now uses the upstream host. Saved
+profiles retain their persisted snapshots until an explicit refresh.
 Price data, automatic model routing, image token costs and runtime effective
 reasoning reports are not implemented by this increment.
 

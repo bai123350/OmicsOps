@@ -79,7 +79,8 @@ describe("SettingsPanel model providers", () => {
     expect(screen.getByLabelText("Base URL")).toHaveValue("https://opencode.ai/zen/go/v1");
     expect(screen.getByLabelText("Model")).toHaveValue("glm-5.3-flash");
     expect(screen.getByLabelText("API protocol")).toHaveValue("open_ai_compatible");
-    expect(screen.getByText(/bundled catalog has no OpenCode Go capability entries/i)).toBeInTheDocument();
+    expect(screen.getByText(/bundled catalog includes exact capabilities for reviewed OpenCode Go models/i)).toBeInTheDocument();
+    expect(screen.getByText(/profiles saved before this update/i)).toHaveTextContent(/Adopt current catalog capabilities/);
 
     fireEvent.change(screen.getByLabelText("Requested reasoning effort"), { target: { value: "high" } });
     fireEvent.change(screen.getByLabelText("Model"), { target: { value: "minimax-m3" } });

@@ -505,6 +505,36 @@ mod tests {
     }
 
     #[test]
+    fn opencode_go_refresh_repairs_a_legacy_profile_without_overwriting_a_user_limit() {
+        let mut input = request(
+            "open_ai_compatible",
+            "https://opencode.ai/zen/go/v1",
+            "glm-5.3",
+        );
+        let mut legacy = model_profile_from_request(input.clone()).unwrap();
+        assert_eq!(legacy.context_window_tokens, Some(1_000_000));
+        assert_eq!(
+            legacy.catalog_capabilities.as_ref().unwrap().output_limit,
+            131_072
+        );
+        legacy.catalog_capabilities = None;
+        legacy.context_window_tokens = None;
+
+        input.id = Some(legacy.id);
+        input.refresh_catalog = true;
+        let mut refreshed = model_profile_from_request(input.clone()).unwrap();
+        merge_existing_profile(&mut refreshed, Some(&legacy), true, true, true, true, true);
+        assert_eq!(refreshed.context_window_tokens, Some(1_000_000));
+        assert_eq!(refreshed.effective_context_window_tokens(), 1_000_000);
+
+        input.context_window_tokens = Some(64_000);
+        let mut bounded = model_profile_from_request(input).unwrap();
+        merge_existing_profile(&mut bounded, Some(&legacy), true, false, true, true, true);
+        assert_eq!(bounded.context_window_tokens, Some(64_000));
+        assert_eq!(bounded.effective_context_window_tokens(), 64_000);
+    }
+
+    #[test]
     fn refresh_rejects_unknown_endpoints_and_revalidates_saved_effort() {
         let mut unknown = request("open_ai_compatible", "https://gateway.example/v1", "gpt-4o");
         unknown.refresh_catalog = true;

@@ -28,6 +28,46 @@ OMICSOPS_LIVE_MODEL_NAME
 OMICSOPS_LIVE_MODEL_CREDENTIAL         # omitted only for Ollama
 ```
 
+## OpenCode Go ordinary Agent acceptance (Windows, opt-in)
+
+This ignored test validates a real production `model -> project.read -> model`
+exchange, rather than the smaller connection probe. Run the deterministic suite
+first. In the same Windows user session as OmicsOps, set
+`OMICSOPS_LIVE_MODEL_PROFILE_ID` to the UUID of an existing saved profile whose
+exact protocol, endpoint, and model are `open_ai_compatible`,
+`https://opencode.ai/zen/go/v1`, and `glm-5.3`. Its API key must already exist in
+Windows Credential Manager, and the profile must not impose a context bound below
+the compiled 1,000,000-token catalog limit.
+
+The test opens only that profile row from
+`%APPDATA%/io.omicsops.desktop/omicsops.db` through a read-only SQLite connection.
+It explicitly rebuilds the profile in a temporary Store with the current trusted
+catalog snapshot (1,000,000 context, 131,072 output), while retaining the saved
+keyring reference. It never opens the user database through `Store`, writes to the
+user database, prints the credential, uses SSH, or touches an existing project.
+The temporary project contains one random nonce file; the prompt names the file
+but does not contain the nonce. The production V4 composition and ordinary Agent
+loop must read it once and return the nonce in the final completed answer.
+
+```text
+cargo test -p omicsops-desktop agent_v4::go_live_acceptance_tests::live_opencode_go_agent_reads_file_and_returns_nonce -- --ignored --exact --nocapture
+```
+
+The run is bounded to four model turns, three tool calls, no model retries, and a
+90-second timeout per model attempt. It is ignored during normal CI. A compiled,
+ignored, or unexecuted result is not a live acceptance pass; record the actual
+command and result separately.
+
+On 2026-09-21, the exact command above was run on Windows with
+`OMICSOPS_LIVE_MODEL_PROFILE_ID` set to an existing saved OpenCode Go `glm-5.3`
+profile and passed 1/1 in 110.50 seconds. The durable event chain contained two
+real model requests around one successful `project.read`, the returned random
+nonce appeared in the completion answer, and the run recorded `RunCompleted`.
+This live fixture intentionally exposes only the read-only file tool plus Agent
+coordination tools. The separate deterministic budget regression covers the full
+built-in tool schema in an initial request larger than 150 KB. Neither result is
+an SSH, miRNA, or general scientific-workflow acceptance.
+
 ## Agent Runtime V4 stage-1 acceptance
 
 `agent_v4::tests::live_v4_model_plan_and_persistent_ssh_python_kernel` uses the

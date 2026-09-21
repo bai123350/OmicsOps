@@ -11,10 +11,23 @@ name or family.
 The currently documented Responses-only models are visible but disabled because OmicsOps
 does not implement the Responses protocol. The native save boundary rejects those exact
 models and rejects a known Chat or Messages model saved under the wrong protocol. Model
-discovery still comes from the provider `/models` endpoint. The bundled models.dev snapshot
-has no OpenCode Go capability rows, so the UI says that unknown profiles use the existing
-conservative legacy context/output budget unless the user supplies an explicit context
-budget. No capability, tool, vision, or reasoning support is inferred for this gateway.
+discovery still comes from the provider `/models` endpoint and supplies IDs rather than token
+limits. The bundled models.dev snapshot contains only reviewed OpenCode Go rows, keyed by exact
+wire protocol, HTTPS host/port, `/zen/go/v1` base path, and full model ID. The provider's merged
+`glm-5.3` row supplies a 1,000,000-token context limit and 131,072-token output limit. Responses
+models are excluded. No capability, tool, vision, or reasoning support is inferred from a model
+family, a sibling path, or an unknown gateway.
+
+Profiles saved before these rows existed retain their old frozen capability contract. The Models
+UI directs the user to edit such a profile, select **Adopt current catalog capabilities on save**,
+save it, and start a new conversation. That explicit refresh persists the exact snapshot and
+catalog default while retaining an explicitly entered lower context bound. Existing runs and
+approved plans are not rewritten.
+
+The catalog is regenerated as one reproducible models.dev snapshot rather than combining source
+versions. This refresh therefore also adopts current upstream rows for already supported providers,
+including retired model removal, capability updates, and the current MiniMax China endpoint. Saved
+profile snapshots remain unchanged unless explicitly refreshed.
 
 The connection probe reserves up to 4,096 output tokens even when the profile has no explicit
 reasoning effort, because a gateway model may require reasoning internally. An exact catalog
@@ -31,11 +44,23 @@ across turns and related auxiliary calls without transmitting conversation text.
 probe and discovery clients use a random UUID for their client lifetime. Redirects are
 disabled for the trusted Go client so these headers cannot be forwarded to another host.
 
-Deterministic tests cover exact URL gating, header injection on POST and GET request paths,
+Deterministic tests cover exact URL and catalog-path gating, header injection on POST and GET request paths,
 stable and distinct session UUIDs, protocol selection, Responses rejection, editing,
-discovered-model handling, implicit-reasoning probe budgets, terminal responses, and rejection
+discovered-model handling, explicit legacy-profile refresh, full built-in Agent tool-schema budget
+preflight, implicit-reasoning probe budgets, terminal responses, and rejection
 of truncated or tool-bearing probe replies. On 2026-09-21, the existing ignored live model test
 was explicitly run on Windows against a saved OpenCode Go `glm-5.3` profile and passed 1/1 in
 5.23 seconds. It resolved the credential through the system vault without printing or writing the
 secret and established endpoint authentication plus one complete minimal Chat Completions reply.
 It did not exercise a full Agent run, tool calling, SSH, or other OpenCode models.
+
+The separate ignored ordinary-Agent acceptance was also run on Windows on
+2026-09-21 with `OMICSOPS_LIVE_MODEL_PROFILE_ID` pointing to that saved profile.
+It passed 1/1 in 110.50 seconds through production V4 composition and execution:
+two real model requests surrounded one successful `project.read`, the model
+returned a random file nonce in its completion answer, and the durable event
+chain ended in `RunCompleted`. The live run deliberately exposed only the
+read-only file capability plus Agent coordination tools. A deterministic
+`DesktopModelPortV4` regression separately covers the full built-in tool schema
+and an initial serialized request larger than 150 KB. These checks do not accept
+SSH, miRNA analysis, other OpenCode models, or a general scientific workflow.
