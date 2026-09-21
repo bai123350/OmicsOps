@@ -1,5 +1,11 @@
 # Skills Settings Management Implementation Plan
 
+## 2026-09-21 implementation record
+
+S1 ownership receipts, S2 detail/preview and S3 guarded removal are implemented and connected. Final UI is in `9fc6824`, native lifecycle in `343e06a`, and format-only changes in `0a0f48f`. Library-only removal preserves files; owned-file removal records a durable journal, quarantines the installation, commits catalog removal transactionally, and cleans only files matching recorded proofs. Retry restores verified precommit quarantine or finishes postcommit cleanup, including partially deleted inventories. Unknown/changed files remain protected.
+
+Active or resumable runs and effective transitive dependencies block removal. Bundled and plugin-owned records cannot be deleted as ordinary imports. Plugin ownership resolves through its parent receipt. Pending removal cannot be reset by enable/import, and startup reconciliation precedes bundled installation. Native Skills tests 24/24, Store removal tests 2/2 and independent lifecycle review passed. Combined checks and native/manual limitations are in [settings verification](../specs/2026-09-21-settings-verification.md). Detailed tasks below retain the original plan.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 补齐Skills详情、受限文件读取、安全移除和启停失败反馈，保留来源所有权与运行证据。

@@ -1,5 +1,11 @@
 # Settings 基础页调用核验
 
+## 2026-09-21 收尾状态
+
+以下旧审计段落保留缺口发现过程，不代表当前仍未实现。General G3 已由 `0127562` 完成，G2 缩放定位由 `21a514f` 修复；Skills 详情及移除 UI/native 已由 `093c2e2`、`9fc6824`、`343e06a` 接通；Plugins 由 `b851013`、`1748cc9` 完成。全 19 个适配目标页面及额外 Privacy 均已接入。
+
+Skills 24 项原生定向测试、Store 2 项、Plugins 9 项、Plugins 数据契约 1 项通过；持久化清理恢复、旧插件退休、运行和有效传递依赖阻断、路径/junction 边界完成独立复审。最新全套结果及浏览器证据以 [2026-09-21 验证记录](2026-09-21-settings-verification.md) 为准。真实 OS 通知、keyring 手工 smoke 和模型/SSH验收仍未执行，不能从构建或模拟界面测试推断通过。
+
 日期：2026-09-15。依据source-audit和已批准的master基础适配范围，核对Session、Models、Environments、Skills、Browser、Connections当前源码。本文是代码阅读结果，未新增执行产品测试；后续实现提交和最终验收结果以master为准。ACP、HTTP/OAuth MCP、WSL导入和自定义本地解释器不在本次缺口清单。
 
 | 页面 | 可验证的既有调用 | 仍需修复或补齐 |

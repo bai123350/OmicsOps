@@ -1,5 +1,11 @@
 # Plugins and General Remaining Slices Implementation Plan
 
+## 2026-09-21 implementation record
+
+The planned basic scope is implemented and connected. General G1/G2/G3 are committed, including private native notifications (`0127562`) and the physical-coordinate selection toolbar fix (`21a514f`). Plugins installation, update, enable/disable, details, guarded removal and persisted recovery are committed in `b851013` and `1748cc9`. Packages contribute separately owned Skills and read-only references to shared MCP configurations; they do not execute installers or grant approvals.
+
+Recovery review covered interrupted catalog cleanup, partial file cleanup, interrupted update/predecessor retirement, disabled transitive dependencies, and shared-gate behavior. Plugins native tests 9/9, DTO contract 1/1 and frontend/API 8/8 passed. Final combined checks and explicit unexecuted live/native acceptance are recorded in [settings verification](../specs/2026-09-21-settings-verification.md). The detailed task descriptions below retain the original implementation plan rather than acting as a current completion checklist.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 交付声明式本地插件包生命周期，以及General尚缺的真实目录偏好、选择动作、通知和原生状态入口。

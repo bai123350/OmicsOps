@@ -7,9 +7,20 @@ The implementation adapts the 19 Wisp settings pages to OmicsOps. Privacy is an 
 ## Checks executed by the coordinating agent
 
 - `npm ci`: passed; 304 packages installed. `package-lock.json` unchanged.
-- `npm test`: passed; 96 Vitest files / 779 tests and 22 browser-extension tests. Both command stages exited successfully.
+- `npm test`: passed after the final Plugins refresh/API changes; 97 Vitest files / 781 tests and 22 browser-extension tests. Both command stages exited successfully. The earlier run had 779 Vitest tests before the last two API tests were added.
 - `npm run build`: passed. Vite reports the existing large-chunk advisory; this is not a build failure.
-- Final Rust workspace tests, formatting, and desktop build: pending native lifecycle changes at the time of this entry; results will be appended after code freezes.
+- `cargo test --workspace`: passed on final code at `0a0f48f`; 1,225 passed, 0 failed, 11 ignored, across 76 reported unit/integration/doc-test suites. Ignored live acceptance is not counted as passed.
+- `cargo fmt --all -- --check`: passed on final code at `0a0f48f`. Formatting-only corrections are isolated in `ff317af` and `0a0f48f`.
+- `npm run build:desktop`: passed against the same final code. Tauri completed the optimized Windows build and one x64 NSIS bundle at `target/release/bundle/nsis/OmicsOps_0.1.0_x64-setup.exe`. The linker emitted an informational library/object creation warning; no build failure occurred. This local artifact was not installed, committed, published, or distributed.
+
+## Final implementation commits
+
+- General notifications: `0127562`; selection-toolbar scaling: `21a514f`.
+- Skills shared mutation gate: `9343848`; removal UI/API: `9fc6824`; native removal/recovery: `343e06a`.
+- Plugins initial integration: `b851013`; lifecycle recovery, details/theme/refresh: `1748cc9`.
+- Dependency lock adjustment: `a5ce3c0`; formatting-only changes: `ff317af`, `0a0f48f`.
+
+Independent architecture review found and then verified fixes for precommit Skill restoration, partial cleanup retry, effective transitive dependencies, plugin catalog cleanup recovery, predecessor retirement during plugin updates, and restored-path junction/dangling-entry boundaries. Review was read-only; executed test evidence is listed separately above.
 
 ## Browser checks
 
