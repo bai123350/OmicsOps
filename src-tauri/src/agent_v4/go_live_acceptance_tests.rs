@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, path::PathBuf, sync::atomic::AtomicBool, time::Duration};
+use std::{collections::BTreeSet, path::PathBuf, sync::atomic::AtomicBool};
 
 use async_trait::async_trait;
 use omicsops_adapters::credentials::{CredentialVault, SystemCredentialVault};
@@ -18,7 +18,19 @@ use uuid::Uuid;
 use super::{AppState, DirectRunSnapshotV4, StartDirectV4Request, compose, prepare_direct_run_v4};
 
 const GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
-const GO_MODEL: &str = "glm-5.3";
+const GO_MODELS: [&str; 2] = ["glm-5.3", "glm-5.3-flash"];
+
+fn go_acceptance_model_allowed(model: &str) -> bool {
+    GO_MODELS.contains(&model)
+}
+
+#[test]
+fn live_go_acceptance_model_allowlist_is_exact() {
+    assert!(go_acceptance_model_allowed("glm-5.3"));
+    assert!(go_acceptance_model_allowed("glm-5.3-flash"));
+    assert!(!go_acceptance_model_allowed("glm-5.3-flash-preview"));
+    assert!(!go_acceptance_model_allowed("vendor/glm-5.3"));
+}
 
 struct TemporaryEventStore {
     repository: Store,
@@ -102,10 +114,11 @@ async fn selected_saved_profile() -> Result<ModelProfile, String> {
 fn refreshed_go_profile(source: &ModelProfile) -> Result<ModelProfile, String> {
     if source.provider != ModelProviderKind::OpenAiCompatible
         || source.base_url.trim_end_matches('/') != GO_BASE_URL
-        || source.model != GO_MODEL
+        || !go_acceptance_model_allowed(&source.model)
     {
         return Err(format!(
-            "the selected profile must use open_ai_compatible, {GO_BASE_URL}, and {GO_MODEL} exactly"
+            "the selected profile must use open_ai_compatible, {GO_BASE_URL}, and one of {} exactly",
+            GO_MODELS.join(", ")
         ));
     }
     let mut refreshed =
@@ -133,7 +146,7 @@ fn refreshed_go_profile(source: &ModelProfile) -> Result<ModelProfile, String> {
         || !refreshed.supports_tools
     {
         return Err(
-            "the compiled OpenCode Go glm-5.3 catalog contract is not context=1000000, output=131072, tools=true"
+            "the compiled OpenCode Go model catalog contract is not context=1000000, output=131072, tools=true"
                 .into(),
         );
     }
@@ -328,7 +341,6 @@ async fn run_live_go_agent_acceptance() -> Result<(), String> {
     let mut limits = AgentLimitsV4::ordinary(4);
     limits.max_tool_calls = 3;
     limits.max_model_retries = 0;
-    limits.model_attempt_timeout = Duration::from_secs(90);
     core.execute_with_limits(&spec, limits, &AtomicBool::new(false))
         .await
         .map_err(|error| error.to_string())?;

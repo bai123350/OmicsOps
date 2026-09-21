@@ -546,7 +546,11 @@ impl Default for AgentLimitsV4 {
             max_tool_calls: 96,
             repeated_signature_limit: 3,
             max_model_retries: 1,
-            model_attempt_timeout: Duration::from_secs(60),
+            // Keep the host's absolute model-turn bound aligned with the
+            // built-in provider transport. A shorter host deadline can abort
+            // a healthy reasoning response while the same request is still
+            // valid at the provider boundary.
+            model_attempt_timeout: Duration::from_secs(180),
             context_max_bytes: 256 * 1024,
             checkpoint_recent_events: 24,
             max_reviewer_corrections: 2,
@@ -9597,6 +9601,119 @@ mod tests {
                 tool_calls: vec![],
             })
         }
+    }
+
+    struct DelayedCompletionModel;
+
+    #[async_trait]
+    impl ModelPortV4 for DelayedCompletionModel {
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            tokio::time::sleep(Duration::from_secs(90)).await;
+            on_event(ModelStreamEventV4::TextDelta("completed".into()));
+            Ok(ModelTurnV4 {
+                public_text: "completed".into(),
+                tool_calls: vec![],
+            })
+        }
+    }
+
+    struct PendingModel;
+
+    #[async_trait]
+    impl ModelPortV4 for PendingModel {
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            std::future::pending().await
+        }
+    }
+
+    fn seed_model_turn(store: &MemoryStore, run_id: Uuid) {
+        store
+            .append_direct(&AgentEventV4::first(
+                run_id,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Utc::now(),
+                AgentEventKindV4::RunCreated {
+                    mode: RunModeV4::Execute,
+                },
+            ))
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_model_attempt_allows_completion_after_sixty_seconds() {
+        let run_id = Uuid::new_v4();
+        let store = MemoryStore::default();
+        seed_model_turn(&store, run_id);
+        let core = AgentCoreV4 {
+            model: &DelayedCompletionModel,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+
+        let started = tokio::time::Instant::now();
+        let turn = core
+            .model_turn(
+                run_id,
+                ModelRequestV4 {
+                    system: "system".into(),
+                    context: "context".into(),
+                    tools: vec![],
+                    image_refs: vec![],
+                },
+                0,
+                AgentLimitsV4::default().model_attempt_timeout,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(turn.public_text, "completed");
+        assert_eq!(started.elapsed(), Duration::from_secs(90));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_model_attempt_keeps_an_absolute_provider_aligned_bound() {
+        let run_id = Uuid::new_v4();
+        let store = MemoryStore::default();
+        seed_model_turn(&store, run_id);
+        let core = AgentCoreV4 {
+            model: &PendingModel,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+
+        let started = tokio::time::Instant::now();
+        let error = core
+            .model_turn(
+                run_id,
+                ModelRequestV4 {
+                    system: "system".into(),
+                    context: "context".into(),
+                    tools: vec![],
+                    image_refs: vec![],
+                },
+                0,
+                AgentLimitsV4::default().model_attempt_timeout,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, AgentCoreErrorV4::Model(message) if message.contains("180 seconds"))
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(180));
     }
 
     #[tokio::test]
