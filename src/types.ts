@@ -818,6 +818,24 @@ export interface ContextUsageSnapshotV4 {
 
 export type SkillOrigin = "bundled" | "managed_import" | "plugin_owned" | "legacy_unknown" | "external";
 
+export type PluginPhase = "staging" | "installed" | "updating" | "removing" | "needs_attention" | "removed";
+export interface PluginFilePreview { relative_path: string; size_bytes: number; sha256: string }
+export interface PluginPresetBinding { preset_id: string; server_id: string; ownership: "shared_reference"; configured: boolean; enabled: boolean }
+export interface PluginInspection {
+  manifest_digest: string; source_path: string; package_id: string; version: string; name: string;
+  files: PluginFilePreview[]; bindings: PluginPresetBinding[]; existing_installation_id?: string | null; changes: string[];
+}
+export interface PluginOwnedSkill { skill_id: string; name: string; relative_path: string; package_sha256: string }
+export interface InstalledPlugin {
+  installation_id: string; package_id: string; version: string; name: string; digest: string; source_path: string;
+  trust: "local_unverified"; enabled: boolean; phase: PluginPhase; cleanup_pending: boolean; files: PluginFilePreview[]; skills: PluginOwnedSkill[];
+  mcp_bindings: PluginPresetBinding[]; last_error?: string | null; created_at: string;
+}
+export interface PluginRemovalResult {
+  installation_id: string; status: string; removed_skills: number; preserved_files: string[];
+  mcp_references_removed: number; message: string;
+}
+
 export interface SkillSettingsFile {
   relative_path: string;
   size_bytes: number;

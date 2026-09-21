@@ -511,6 +511,13 @@ pub use notification_settings::{
     RunNotificationOutcome, RunNotificationResult,
 };
 
+mod integration_packages;
+pub use integration_packages::{
+    InstallPluginRequest, InstalledPlugin, PluginFilePreview, PluginInspection, PluginOwnedSkill,
+    PluginPhase, PluginPresetBinding, PluginRemovalResult, RemovePluginRequest,
+    SetPluginEnabledRequest,
+};
+
 mod composer_queue;
 pub use composer_queue::{
     ComposerQueueActionRequestV4, ComposerQueueActionV4, ComposerQueueFailureCodeV4,

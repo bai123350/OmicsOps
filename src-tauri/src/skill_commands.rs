@@ -241,9 +241,15 @@ pub async fn agent_skill_packages(repository: &Store) -> Result<Vec<SkillPackage
         .list_skill_packages()
         .await
         .map_err(|error| error.to_string())?;
+    let mut available = BTreeSet::new();
+    for skill in &packages {
+        if crate::integration_packages::plugin_allows_skill(repository, skill.id).await? {
+            available.insert(skill.id);
+        }
+    }
     let mut selected = packages
         .iter()
-        .filter(|skill| skill.enabled)
+        .filter(|skill| skill.enabled && available.contains(&skill.id))
         .map(|skill| skill.id)
         .collect::<BTreeSet<_>>();
 
@@ -254,8 +260,9 @@ pub async fn agent_skill_packages(repository: &Store) -> Result<Vec<SkillPackage
                 .map_err(|error| format!("cannot read enabled skill {}: {error}", skill.name))?;
             for dependency in skill_dependencies(&markdown) {
                 if let Some(package) = packages.iter().find(|candidate| {
-                    candidate.name == dependency
-                        || candidate.name.ends_with(&format!("-{dependency}"))
+                    available.contains(&candidate.id)
+                        && (candidate.name == dependency
+                            || candidate.name.ends_with(&format!("-{dependency}")))
                 }) {
                     discovered.insert(package.id);
                 }
@@ -555,6 +562,9 @@ pub async fn set_skill_enabled_in_repository(
     skill_id: Uuid,
     enabled: bool,
 ) -> Result<SkillPackage, String> {
+    if enabled && !crate::integration_packages::plugin_allows_skill(repository, skill_id).await? {
+        return Err("enable the parent plugin before enabling this Skill".into());
+    }
     repository
         .set_skill_enabled_atomic(skill_id, enabled)
         .await

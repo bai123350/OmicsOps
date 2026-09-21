@@ -31,6 +31,7 @@ mod dto_contract_tests;
 mod follow_up_questions;
 pub mod general_settings;
 pub mod inspection;
+pub mod integration_packages;
 pub mod kernel_commands;
 mod model_catalog_shared;
 pub mod model_commands;
@@ -139,6 +140,8 @@ pub fn run() {
                     &std::env::current_exe().map_err(|error| error.to_string())?,
                 )
                 .await?;
+                integration_packages::reconcile_plugins(&repository, &data_dir.join("plugins"))
+                    .await?;
                 if let Some(value) = repository
                     .browser_settings()
                     .await
@@ -232,6 +235,11 @@ pub fn run() {
             general_settings::settings_general_system_status,
             general_settings::settings_probe_system_interpreters,
             general_settings::settings_project_directory_start_available,
+            integration_packages::settings_inspect_plugin,
+            integration_packages::settings_install_plugin,
+            integration_packages::settings_list_plugins,
+            integration_packages::settings_set_plugin_enabled,
+            integration_packages::settings_remove_plugin,
             notification_settings::settings_notification_status,
             notification_settings::settings_set_notifications_enabled,
             notification_settings::settings_send_test_notification,

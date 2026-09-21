@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowLeft, Bot, Brain, CheckCircle2, ClipboardList, Cloud, Database, FolderOpen, Gauge, Globe2, KeyRound, Languages, Layers3, LoaderCircle, Monitor, Palette, PlugZap, Search, Server, ShieldCheck, Sparkles, Wrench, XCircle } from "lucide-react";
+import { ArrowLeft, Bot, Brain, CheckCircle2, ClipboardList, Cloud, Database, FolderOpen, Gauge, Globe2, KeyRound, Languages, Layers3, LoaderCircle, Monitor, PackageOpen, Palette, PlugZap, Search, Server, ShieldCheck, Sparkles, Wrench, XCircle } from "lucide-react";
 import type { ConnectionProfile, ConnectionTestResult, McpEnvBinding, McpServerProfile, ModelProbeResult, ModelProfile, SaveMcpEnvBindingRequest, SkillPackage, SystemInterpreterDiagnostics, WorkspaceProject } from "../../types";
 import type { Locale } from "../workspace/copy";
 import { supportsFastMode } from "../../fast-mode";
@@ -22,6 +22,7 @@ import { CredentialsSettings } from "./CredentialsSettings";
 import { GeneralAdvancedSettings } from "./GeneralAdvancedSettings";
 import { UsageSettings } from "./UsageSettings";
 import { SkillDetails } from "./SkillDetails";
+import { PluginsSettings } from "./PluginsSettings";
 import { settingsProbeSystemInterpreters } from "../../general-settings-api";
 import { useGeneralPreferences } from "../../use-general-preferences";
 import "./settings.css";
@@ -33,7 +34,7 @@ type FormState = Omit<SaveModelRequest, "context_window_tokens"> & { credential:
 type McpEnvFormBinding = McpEnvBinding & { rowKey: string; mode: "literal" | "credential"; keepExisting?: boolean };
 type SaveMcpServerRequest = { id?: string; name: string; command: string; args: string[]; cwd?: string | null; timeout_secs?: number | null; env_bindings?: SaveMcpEnvBindingRequest[] };
 
-export type SettingsSection = "general" | "models" | "remote" | "remote-access" | "skills" | "connections" | "workflows" | "quick-actions" | "specialists" | "browser" | "agent" | "appearance" | "pet" | "storage" | "usage" | "permissions" | "credentials" | "memory" | "privacy";
+export type SettingsSection = "general" | "models" | "remote" | "remote-access" | "skills" | "plugins" | "connections" | "workflows" | "quick-actions" | "specialists" | "browser" | "agent" | "appearance" | "pet" | "storage" | "usage" | "permissions" | "credentials" | "memory" | "privacy";
 
 interface Props extends BundledMcpProps {
   locale?: Locale;
@@ -63,6 +64,7 @@ interface Props extends BundledMcpProps {
   onBindProjectRemote?: (connectionId: string, remoteRoot: string) => Promise<void>;
   onWorkflowsChanged?: () => void;
   onMemoryChanged?: () => void;
+  onPluginsChanged?: () => void;
 }
 
 const defaults: Record<ModelProfile["provider"], FormState> = {
@@ -84,7 +86,7 @@ function isDeepSeek(profile: Pick<ModelProfile, "provider" | "base_url">): boole
   }
 }
 
-export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection = "models", onClose, modelProfiles = [], onSaveModel, onProbeModel, onListModels, skillPackages = [], onImportSkill, onSetSkillEnabled, mcpServers = [], onSaveMcpServer, onInspectMcpServer, onSetMcpServerEnabled, onSetMcpLaunchApproval, onSetMcpToolApproval, onListBundledMcpPresets, onConfigurePubMedMcp, onAddBundledMcp, connections = [], projects = [], selectedProject, onOpenUsageConversation, onSaveConnection, onTestConnection, onConfirmHostKey, onBindProjectRemote, onWorkflowsChanged, onMemoryChanged }: Props) {
+export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection = "models", onClose, modelProfiles = [], onSaveModel, onProbeModel, onListModels, skillPackages = [], onImportSkill, onSetSkillEnabled, mcpServers = [], onSaveMcpServer, onInspectMcpServer, onSetMcpServerEnabled, onSetMcpLaunchApproval, onSetMcpToolApproval, onListBundledMcpPresets, onConfigurePubMedMcp, onAddBundledMcp, connections = [], projects = [], selectedProject, onOpenUsageConversation, onSaveConnection, onTestConnection, onConfirmHostKey, onBindProjectRemote, onWorkflowsChanged, onMemoryChanged, onPluginsChanged }: Props) {
   const zh = locale === "zh-CN";
   const [form, setForm] = useState<FormState | null>(null);
   const [saving, setSaving] = useState(false);
@@ -165,7 +167,7 @@ export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection
     <header><button className="settings-back" aria-label="Close" onClick={onClose}><ArrowLeft size={18} /><span>{zh ? "返回工作区" : "Back to workspace"}</span></button><div><small>OmicsOps Desktop</small><h2>{zh ? "设置" : "Settings"}</h2></div></header>
     <div className="settings-layout">
       <SettingsNavigation locale={locale} section={section} onNavigate={navigate} />
-      {section === "models" ? <main><div className="settings-heading"><h3>{zh ? "模型提供方" : "Model providers"}</h3><p>{zh ? "密钥保存在 Windows Credential Manager，项目只记录引用。" : "Keys stay in Windows Credential Manager; projects store references only."}</p></div>
+      {section === "plugins" ? <PluginsSettings locale={locale} onOpenConnections={() => navigate("connections")} onChanged={onPluginsChanged} /> : section === "models" ? <main><div className="settings-heading"><h3>{zh ? "模型提供方" : "Model providers"}</h3><p>{zh ? "密钥保存在 Windows Credential Manager，项目只记录引用。" : "Keys stay in Windows Credential Manager; projects store references only."}</p></div>
         <div className="provider-grid">
           <Provider icon={Cloud} name="Anthropic" detail="Messages API · tool use" configured={modelProfiles.some((profile) => profile.provider === "anthropic")} onConfigure={() => configure("anthropic")} />
           <Provider icon={KeyRound} name="OpenAI-compatible" detail="Chat Completions · custom Base URL" configured={modelProfiles.some((profile) => profile.provider === "open_ai_compatible")} onConfigure={() => configure("open_ai_compatible")} />
@@ -232,6 +234,7 @@ function SettingsNavigation({ locale, section, onNavigate }: { locale: Locale; s
       items: [
         { section: "models" as const, zh: "模型提供方", en: "Model providers", keywords: ["model", "models", "模型", "provider"], icon: Bot },
         { section: "skills" as const, zh: "Skills", en: "Skills", keywords: ["skill", "skills", "技能"], icon: Wrench },
+        { section: "plugins" as const, zh: "插件", en: "Plugins", keywords: ["plugin", "plugins", "扩展", "插件", "package"], icon: PackageOpen },
         { section: "connections" as const, zh: "连接", en: "Connections", keywords: ["mcp", "MCP", "connection", "connections", "连接", "server"], icon: PlugZap },
         { section: "workflows" as const, zh: "工作流", en: "Workflows", keywords: ["workflow", "workflows", "recipe", "recipes", "工作流", "配方"], icon: ClipboardList },
         { section: "quick-actions" as const, zh: "快捷操作", en: "Quick Actions", keywords: ["quick action", "quick actions", "shortcut", "快捷操作", "快捷方式", "工作流"], icon: Sparkles },
