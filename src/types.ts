@@ -861,6 +861,23 @@ export interface SkillFilePreview {
   package_sha256: string;
 }
 
+export type SkillRemovalMode = "library_only" | "owned_files";
+export interface SkillRemovalResult {
+  removed_from_library: boolean;
+  files_removed: boolean;
+  preserved_files: boolean;
+  status: string;
+  message: string;
+}
+export interface SkillRemovalOperation {
+  operation_id: string;
+  skill_id: string;
+  name: string;
+  package_sha256: string;
+  phase: string;
+  preserved_files: boolean;
+}
+
 export interface SaveMcpEnvBindingRequest extends McpEnvBinding {
   keep_existing?: boolean;
 }

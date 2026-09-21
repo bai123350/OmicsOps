@@ -1,7 +1,7 @@
-import { useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ArrowLeft, Bot, Brain, CheckCircle2, ClipboardList, Cloud, Database, FolderOpen, Gauge, Globe2, KeyRound, Languages, Layers3, LoaderCircle, Monitor, PackageOpen, Palette, PlugZap, Search, Server, ShieldCheck, Sparkles, Wrench, XCircle } from "lucide-react";
-import type { ConnectionProfile, ConnectionTestResult, McpEnvBinding, McpServerProfile, ModelProbeResult, ModelProfile, SaveMcpEnvBindingRequest, SkillPackage, SystemInterpreterDiagnostics, WorkspaceProject } from "../../types";
+import type { ConnectionProfile, ConnectionTestResult, McpEnvBinding, McpServerProfile, ModelProbeResult, ModelProfile, SaveMcpEnvBindingRequest, SkillPackage, SkillRemovalOperation, SystemInterpreterDiagnostics, WorkspaceProject } from "../../types";
 import type { Locale } from "../workspace/copy";
 import { supportsFastMode } from "../../fast-mode";
 import { BrowserSettings, useWindowEscapeLayer } from "./BrowserSettings";
@@ -24,6 +24,7 @@ import { UsageSettings } from "./UsageSettings";
 import { SkillDetails } from "./SkillDetails";
 import { PluginsSettings } from "./PluginsSettings";
 import { settingsProbeSystemInterpreters } from "../../general-settings-api";
+import { settingsListSkillRemovals, settingsRetrySkillRemoval } from "../../skill-settings-api";
 import { useGeneralPreferences } from "../../use-general-preferences";
 import "./settings.css";
 import "./model-form.css";
@@ -48,6 +49,7 @@ interface Props extends BundledMcpProps {
   skillPackages?: SkillPackage[];
   onImportSkill?: () => Promise<void>;
   onSetSkillEnabled?: (skillId: string, enabled: boolean) => Promise<SkillPackage>;
+  onSkillsChanged?: () => Promise<void>;
   mcpServers?: McpServerProfile[];
   onSaveMcpServer?: (request: SaveMcpServerRequest) => Promise<McpServerProfile>;
   onInspectMcpServer?: (serverId: string) => Promise<void>;
@@ -86,7 +88,7 @@ function isDeepSeek(profile: Pick<ModelProfile, "provider" | "base_url">): boole
   }
 }
 
-export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection = "models", onClose, modelProfiles = [], onSaveModel, onProbeModel, onListModels, skillPackages = [], onImportSkill, onSetSkillEnabled, mcpServers = [], onSaveMcpServer, onInspectMcpServer, onSetMcpServerEnabled, onSetMcpLaunchApproval, onSetMcpToolApproval, onListBundledMcpPresets, onConfigurePubMedMcp, onAddBundledMcp, connections = [], projects = [], selectedProject, onOpenUsageConversation, onSaveConnection, onTestConnection, onConfirmHostKey, onBindProjectRemote, onWorkflowsChanged, onMemoryChanged, onPluginsChanged }: Props) {
+export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection = "models", onClose, modelProfiles = [], onSaveModel, onProbeModel, onListModels, skillPackages = [], onImportSkill, onSetSkillEnabled, onSkillsChanged, mcpServers = [], onSaveMcpServer, onInspectMcpServer, onSetMcpServerEnabled, onSetMcpLaunchApproval, onSetMcpToolApproval, onListBundledMcpPresets, onConfigurePubMedMcp, onAddBundledMcp, connections = [], projects = [], selectedProject, onOpenUsageConversation, onSaveConnection, onTestConnection, onConfirmHostKey, onBindProjectRemote, onWorkflowsChanged, onMemoryChanged, onPluginsChanged }: Props) {
   const zh = locale === "zh-CN";
   const [form, setForm] = useState<FormState | null>(null);
   const [saving, setSaving] = useState(false);
@@ -202,7 +204,7 @@ export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection
         </section>}
         {modelProfiles.length > 0 && <div className="configured-models">{modelProfiles.map((profile) => { const probe = modelTests[profile.id]; const discovery = modelDiscoveries[profile.id]; const choices = modelChoices[profile.id] ?? []; const editProfile = (model: string) => setForm({ id: profile.id, label: profile.label, provider: profile.provider, base_url: profile.base_url, model, credential: "", contextWindowDraft: model === profile.model ? String(profile.context_window_tokens ?? "") : "", contextWindowDirty: false, reasoning_effort: profile.reasoning_effort ?? null, delegated_model_profile_id: profile.delegated_model_profile_id ?? null, ...(profile.fast_mode !== undefined ? { fast_mode: profile.fast_mode } : {}) }); return <div key={profile.id}><span><b>{profile.label}</b><small>{profile.model} · {profile.provider}</small>{profile.catalog_capabilities && <small>{zh ? "目录快照" : "Catalog snapshot"} (models.dev / {profile.catalog_capabilities.source_provider}) · {zh ? "上下文上限" : "Context limit"} {profile.catalog_capabilities.context_limit} · {zh ? "输出上限" : "Output limit"} {profile.catalog_capabilities.output_limit}</small>}</span><button onClick={() => editProfile(profile.model)}>{zh ? "编辑" : "Edit"}</button><button disabled={!onListModels || discovery?.state === "loading"} onClick={() => void discoverModels(profile.id)}>{discovery?.state === "loading" ? <><LoaderCircle className="spin" size={13} />{zh ? "正在查询模型" : "Loading models"}</> : discovery?.state === "error" ? (zh ? "重试查询模型" : "Retry models") : (zh ? "可用模型" : "Models")}</button><button disabled={probe?.state === "testing" || !onProbeModel} onClick={() => void testModel(profile.id)}>{probe?.state === "testing" ? <><LoaderCircle className="spin" size={13} />{zh ? "测试中" : "Testing"}</> : (zh ? "测试" : "Test")}</button>{discovery?.state === "error" && <div className="model-discovery-state error" role="alert">{zh ? "无法查询可用模型，请重试。" : "Could not list models. Retry the query."}</div>}{discovery?.state === "empty" && <div className="model-discovery-state" role="status">{zh ? "提供方未返回任何模型。" : "The provider returned no models."}</div>}{choices.length > 0 && <div className="model-choices"><small>{zh ? "网关当前可用，点击后保存：" : "Available now; click to edit:"}</small>{choices.map((model) => <button key={model} onClick={() => editProfile(model)}>{model}</button>)}</div>}{probe?.state === "success" && probe.result && <div className="model-probe-result success" role="status"><CheckCircle2 size={15} /><span><b>{zh ? "连接成功" : "Connection succeeded"}</b><small>{probe.result.model} · {probe.result.latency_ms} ms · {probe.result.endpoint}</small><code>{probe.result.response_preview}</code></span></div>}{probe?.state === "error" && <div className="model-probe-result error" role="alert"><XCircle size={15} /><span><b>{zh ? "测试失败" : "Test failed"}</b><small>{probe.message}</small></span></div>}</div>; })}</div>}
         <div className="settings-note"><ShieldCheck size={18} /><span><b>{zh ? "外部服务边界" : "External service boundary"}</b><small>{zh ? "模型与外部服务可能接收提示词、结果或元数据；使用前请确认目标服务。" : "Models and external services may receive prompts, results, or metadata. Review the destination before use."}</small></span></div>
-      </main> : section === "remote" ? <RemoteSettings locale={locale} connections={connections} selectedProject={selectedProject} onSave={onSaveConnection} onTest={onTestConnection} onConfirm={onConfirmHostKey} onBind={onBindProjectRemote} /> : section === "remote-access" ? <RemoteAccessSettings locale={locale} selectedProject={selectedProject ?? null} onOpenEnvironments={() => navigate("remote")} /> : section === "skills" || section === "connections" ? <SkillsAndMcpSettings page={section} locale={locale} skillPackages={skillPackages} skillsBusy={skillsBusy} skillError={skillError} onImportSkill={onImportSkill ? importSkill : undefined} onSetSkillEnabled={onSetSkillEnabled} mcpServers={mcpServers} selectedProject={selectedProject} onSaveMcpServer={onSaveMcpServer} onInspectMcpServer={onInspectMcpServer} onSetMcpServerEnabled={onSetMcpServerEnabled} onSetMcpLaunchApproval={onSetMcpLaunchApproval} onSetMcpToolApproval={onSetMcpToolApproval} onListBundledMcpPresets={onListBundledMcpPresets} onAddBundledMcp={onAddBundledMcp} onConfigurePubMedMcp={onConfigurePubMedMcp} /> : section === "workflows" ? <WorkflowSettings locale={locale} selectedProject={selectedProject} onClose={onClose} onChanged={onWorkflowsChanged} /> : section === "quick-actions" ? <QuickActionsSettings selectedProject={selectedProject ?? null} locale={locale} /> : section === "specialists" ? <SpecialistsSettings selectedProject={selectedProject ?? null} locale={locale} /> : section === "memory" ? <MemorySettings locale={locale} selectedProject={selectedProject ?? null} onChanged={onMemoryChanged} /> : section === "agent" ? <AgentSettings locale={locale} /> : section === "appearance" ? <AppearanceSettings locale={locale} /> : section === "pet" ? <PetSettings locale={locale} /> : section === "storage" ? <StorageSettings locale={locale} selectedProject={selectedProject ?? null} /> : section === "usage" ? <UsageSettings locale={locale} projects={projects} selectedProjectId={selectedProject?.id} onOpenConversation={onOpenUsageConversation} /> : section === "browser" ? <BrowserSettings locale={locale} /> : section === "permissions" ? <PermissionsSettings locale={locale} mcpServers={mcpServers} onSetMcpLaunchApproval={onSetMcpLaunchApproval} onSetMcpToolApproval={onSetMcpToolApproval} /> : section === "credentials" ? <CredentialsSettings locale={locale} onOpenOwner={(owner) => navigate(owner)} /> : section === "privacy" ? <PrivacySettings locale={locale} selectedProject={selectedProject} onNavigate={navigate} /> : <GeneralSettings locale={locale} onLocaleChange={onLocaleChange} onNavigate={navigate} />}
+      </main> : section === "remote" ? <RemoteSettings locale={locale} connections={connections} selectedProject={selectedProject} onSave={onSaveConnection} onTest={onTestConnection} onConfirm={onConfirmHostKey} onBind={onBindProjectRemote} /> : section === "remote-access" ? <RemoteAccessSettings locale={locale} selectedProject={selectedProject ?? null} onOpenEnvironments={() => navigate("remote")} /> : section === "skills" || section === "connections" ? <SkillsAndMcpSettings page={section} locale={locale} skillPackages={skillPackages} skillsBusy={skillsBusy} skillError={skillError} onImportSkill={onImportSkill ? importSkill : undefined} onSetSkillEnabled={onSetSkillEnabled} onSkillsChanged={onSkillsChanged} onNavigatePlugins={() => navigate("plugins")} mcpServers={mcpServers} selectedProject={selectedProject} onSaveMcpServer={onSaveMcpServer} onInspectMcpServer={onInspectMcpServer} onSetMcpServerEnabled={onSetMcpServerEnabled} onSetMcpLaunchApproval={onSetMcpLaunchApproval} onSetMcpToolApproval={onSetMcpToolApproval} onListBundledMcpPresets={onListBundledMcpPresets} onAddBundledMcp={onAddBundledMcp} onConfigurePubMedMcp={onConfigurePubMedMcp} /> : section === "workflows" ? <WorkflowSettings locale={locale} selectedProject={selectedProject} onClose={onClose} onChanged={onWorkflowsChanged} /> : section === "quick-actions" ? <QuickActionsSettings selectedProject={selectedProject ?? null} locale={locale} /> : section === "specialists" ? <SpecialistsSettings selectedProject={selectedProject ?? null} locale={locale} /> : section === "memory" ? <MemorySettings locale={locale} selectedProject={selectedProject ?? null} onChanged={onMemoryChanged} /> : section === "agent" ? <AgentSettings locale={locale} /> : section === "appearance" ? <AppearanceSettings locale={locale} /> : section === "pet" ? <PetSettings locale={locale} /> : section === "storage" ? <StorageSettings locale={locale} selectedProject={selectedProject ?? null} /> : section === "usage" ? <UsageSettings locale={locale} projects={projects} selectedProjectId={selectedProject?.id} onOpenConversation={onOpenUsageConversation} /> : section === "browser" ? <BrowserSettings locale={locale} /> : section === "permissions" ? <PermissionsSettings locale={locale} mcpServers={mcpServers} onSetMcpLaunchApproval={onSetMcpLaunchApproval} onSetMcpToolApproval={onSetMcpToolApproval} /> : section === "credentials" ? <CredentialsSettings locale={locale} onOpenOwner={(owner) => navigate(owner)} /> : section === "privacy" ? <PrivacySettings locale={locale} selectedProject={selectedProject} onNavigate={navigate} /> : <GeneralSettings locale={locale} onLocaleChange={onLocaleChange} onNavigate={navigate} />}
     </div>
   </section></div>;
 }
@@ -320,7 +322,7 @@ function isSensitiveMcpEnvName(name: string) {
     || ["APIKEY", "ACCESSKEY", "PRIVATEKEY", "SECRETKEY"].some((marker) => normalized.includes(marker));
 }
 
-function SkillsAndMcpSettings({ page, locale, skillPackages, skillsBusy, skillError, onImportSkill, onSetSkillEnabled, mcpServers, selectedProject, onSaveMcpServer, onInspectMcpServer, onSetMcpServerEnabled, onSetMcpLaunchApproval, onSetMcpToolApproval, onListBundledMcpPresets, onConfigurePubMedMcp, onAddBundledMcp }: BundledMcpProps & { page: "skills" | "connections"; locale: Locale; skillPackages: SkillPackage[]; skillsBusy: boolean; skillError: string; onImportSkill?: () => Promise<void>; onSetSkillEnabled?: Props["onSetSkillEnabled"]; mcpServers: McpServerProfile[]; selectedProject?: WorkspaceProject | null; onSaveMcpServer?: Props["onSaveMcpServer"]; onInspectMcpServer?: Props["onInspectMcpServer"]; onSetMcpServerEnabled?: Props["onSetMcpServerEnabled"]; onSetMcpLaunchApproval?: Props["onSetMcpLaunchApproval"]; onSetMcpToolApproval?: Props["onSetMcpToolApproval"] }) {
+function SkillsAndMcpSettings({ page, locale, skillPackages, skillsBusy, skillError, onImportSkill, onSetSkillEnabled, onSkillsChanged, onNavigatePlugins, mcpServers, selectedProject, onSaveMcpServer, onInspectMcpServer, onSetMcpServerEnabled, onSetMcpLaunchApproval, onSetMcpToolApproval, onListBundledMcpPresets, onConfigurePubMedMcp, onAddBundledMcp }: BundledMcpProps & { page: "skills" | "connections"; locale: Locale; skillPackages: SkillPackage[]; skillsBusy: boolean; skillError: string; onImportSkill?: () => Promise<void>; onSetSkillEnabled?: Props["onSetSkillEnabled"]; onSkillsChanged?: Props["onSkillsChanged"]; onNavigatePlugins: () => void; mcpServers: McpServerProfile[]; selectedProject?: WorkspaceProject | null; onSaveMcpServer?: Props["onSaveMcpServer"]; onInspectMcpServer?: Props["onInspectMcpServer"]; onSetMcpServerEnabled?: Props["onSetMcpServerEnabled"]; onSetMcpLaunchApproval?: Props["onSetMcpLaunchApproval"]; onSetMcpToolApproval?: Props["onSetMcpToolApproval"] }) {
   const zh = locale === "zh-CN";
   const [mcpForm, setMcpForm] = useState<{ id?: string; name: string; command: string; args: string; cwd: string; timeout_secs: number; env_bindings: McpEnvFormBinding[] }>(emptyMcpForm());
   const nextEnvRowKey = useRef(0);
@@ -331,11 +333,43 @@ function SkillsAndMcpSettings({ page, locale, skillPackages, skillsBusy, skillEr
   const [skillActionBusy, setSkillActionBusy] = useState<string | null>(null);
   const [skillActionError, setSkillActionError] = useState("");
   const [detailSkillId, setDetailSkillId] = useState<string | null>(null);
+  const [removalOperations, setRemovalOperations] = useState<SkillRemovalOperation[]>([]);
+  const [removalOperationsError, setRemovalOperationsError] = useState(false);
+  const [removalOperationBusy, setRemovalOperationBusy] = useState<string | null>(null);
+  const [removalOperationMessage, setRemovalOperationMessage] = useState("");
   const categorizedSkills = skillPackages.filter((skill) => skill.category);
   const ungroupedSkills = skillPackages.filter((skill) => !skill.category);
   const skillGroups = Array.from(new Set(categorizedSkills.map((skill) => skill.category!)))
     .sort()
     .map((category) => [category, categorizedSkills.filter((skill) => skill.category === category)] as const);
+
+  const loadRemovalOperations = useCallback(async () => {
+    try {
+      setRemovalOperations(await settingsListSkillRemovals());
+      setRemovalOperationsError(false);
+    } catch {
+      setRemovalOperationsError(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (page === "skills") void loadRemovalOperations();
+  }, [loadRemovalOperations, page]);
+
+  async function retryRemoval(operationId: string) {
+    if (removalOperationBusy) return;
+    setRemovalOperationBusy(operationId);
+    setRemovalOperationMessage("");
+    try {
+      const result = await settingsRetrySkillRemoval(operationId);
+      setRemovalOperationMessage(result.message);
+      await Promise.all([onSkillsChanged?.(), loadRemovalOperations()]);
+    } catch {
+      setRemovalOperationMessage(zh ? "无法重试已验证清理。记录已保留，可再次重试。" : "Could not retry verified cleanup. The operation was kept and can be retried.");
+    } finally {
+      setRemovalOperationBusy(null);
+    }
+  }
 
   async function saveServer() {
     if (!onSaveMcpServer) return;
@@ -438,6 +472,12 @@ function SkillsAndMcpSettings({ page, locale, skillPackages, skillsBusy, skillEr
   if (page === "skills") return <main className="skills-settings">
     <div className="settings-heading skill-heading"><div><h3>{zh ? "科研 Skills" : "Research Skills"}</h3><p>{zh ? "随应用提供的科研 Skills 来自固定 GitHub 快照；Agent 会读取已启用 Skill 及其依赖、示例和使用指南，并据此生成分析代码。也可以导入其他 Agent Skills 兼容目录。" : "Bundled research Skills come from a pinned GitHub snapshot. The Agent reads enabled Skills, dependencies, examples, and usage guides to generate analysis code. Other Agent Skills directories can also be imported."}</p></div><button className="skill-import" disabled={skillsBusy || !onImportSkill} onClick={() => void onImportSkill?.()}>{skillsBusy ? (zh ? "校验中…" : "Validating…") : (zh ? "导入技能目录" : "Import skill directory")}</button></div>
     {(skillError || skillActionError) && <div className="skill-error" role="alert">{skillActionError || skillError}</div>}
+    {(removalOperationsError || removalOperations.length > 0 || removalOperationMessage) && <section className="skill-removal-operations" aria-label={zh ? "技能清理操作" : "Skill cleanup operations"}>
+      <div><b>{zh ? "待处理的文件清理" : "Pending file cleanup"}</b><small>{zh ? "这里只重试宿主已记录并验证的清理操作，不接受新路径。" : "Retries use only cleanup operations already recorded and verified by the host; no new path is accepted."}</small></div>
+      {removalOperationsError && <p role="status">{zh ? "暂时无法读取技能清理状态。" : "Skill cleanup status is temporarily unavailable."}</p>}
+      {removalOperationMessage && <p role="status">{removalOperationMessage}</p>}
+      {removalOperations.map((operation) => <article key={operation.operation_id}><span><b>{operation.name}</b><small>{operation.phase}{operation.preserved_files ? (zh ? " · 文件已保留" : " · files preserved") : ""}</small></span><button type="button" disabled={removalOperationBusy !== null} onClick={() => void retryRemoval(operation.operation_id)}>{removalOperationBusy === operation.operation_id ? (zh ? "重试中…" : "Retrying…") : (zh ? "重试已验证清理" : "Retry verified cleanup")}</button></article>)}
+    </section>}
     {skillPackages.length === 0 ? <div className="skill-empty skill-library-empty">{zh ? "尚未导入科研技能" : "No research skills imported"}</div> : <div className="skill-library">
       {skillGroups.length > 0 && <section className="skill-domain" aria-label={zh ? "组学技能" : "Omics skills"}>
         <div className="skill-domain-title"><Layers3 size={18} /><span><b>{zh ? "组学技能" : "Omics skills"}</b><small>{zh ? `${skillGroups.length} 个分区 · ${categorizedSkills.length} Skills` : `${skillGroups.length} categories · ${categorizedSkills.length} Skills`}</small></span></div>
@@ -452,7 +492,7 @@ function SkillsAndMcpSettings({ page, locale, skillPackages, skillsBusy, skillEr
       </section>}
     </div>}
     <div className="settings-note"><ShieldCheck size={18} /><span><b>{zh ? "Skills 默认不启用" : "Skills are disabled by default"}</b><small>{zh ? "导入后请先检查来源、能力声明和使用说明，再决定是否启用。" : "Review the source, declared capabilities, and usage guide after import before enabling a Skill."}</small></span></div>
-    {detailSkillId && <SkillDetails key={detailSkillId} skillId={detailSkillId} locale={locale} onClose={() => setDetailSkillId(null)} />}
+    {detailSkillId && <SkillDetails key={detailSkillId} skillId={detailSkillId} locale={locale} onClose={() => setDetailSkillId(null)} onRemoved={onSkillsChanged} onOperationsChanged={loadRemovalOperations} onNavigatePlugins={() => { setDetailSkillId(null); onNavigatePlugins(); }} />}
   </main>;
 
   return <main className="mcp-connections-settings">

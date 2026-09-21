@@ -714,6 +714,25 @@ describe("SettingsPanel model providers", () => {
     await waitFor(() => expect(onSetSkillEnabled).toHaveBeenCalledTimes(2));
   });
 
+  it("shows persisted partial cleanup and retries only its operation ID before refreshing skills", async () => {
+    vi.spyOn(skillSettingsApi, "settingsListSkillRemovals")
+      .mockResolvedValueOnce([{ operation_id: "operation-1", skill_id: "skill-1", name: "QC reviewer", package_sha256: "a".repeat(64), phase: "needs_attention", preserved_files: true }])
+      .mockResolvedValueOnce([]);
+    vi.spyOn(skillSettingsApi, "settingsRetrySkillRemoval").mockResolvedValue({ removed_from_library: true, files_removed: true, preserved_files: false, status: "removed", message: "Verified cleanup completed." });
+    const onSkillsChanged = vi.fn().mockResolvedValue(undefined);
+    render(<SettingsPanel locale="en-US" initialSection="skills" onClose={() => undefined} onSkillsChanged={onSkillsChanged} />);
+
+    expect(await screen.findByRole("region", { name: "Skill cleanup operations" })).toHaveTextContent("QC reviewer");
+    expect(screen.getByText(/files preserved/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry verified cleanup" }));
+
+    await waitFor(() => expect(skillSettingsApi.settingsRetrySkillRemoval).toHaveBeenCalledWith("operation-1"));
+    expect(onSkillsChanged).toHaveBeenCalledOnce();
+    await waitFor(() => expect(screen.queryByText(/files preserved/)).not.toBeInTheDocument());
+    expect(screen.getByText("Verified cleanup completed.")).toBeInTheDocument();
+    expect(skillSettingsApi.settingsListSkillRemovals).toHaveBeenCalledTimes(2);
+  });
+
   it("configures MCP without launching it and requires inspection plus per-tool approval", async () => {
     const server = { id: "mcp-1", name: "paper-search", command: "npx", args: ["paper-mcp"], enabled: false, launch_approved: false, approved_tools: [], tools: [{ name: "search_papers", description: "Search papers" }], capabilities: { tools: {} }, last_inspected_at: "2026-08-13T12:00:00Z", created_at: "2026-08-13T12:00:00Z", updated_at: "2026-08-13T12:00:00Z" };
     const onSaveMcpServer = vi.fn().mockResolvedValue(server);

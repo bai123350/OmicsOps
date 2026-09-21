@@ -10,6 +10,7 @@ import { SkillDetails } from "./SkillDetails";
 vi.mock("../../skill-settings-api", () => ({
   settingsSkillDetail: vi.fn(),
   settingsReadSkillFile: vi.fn(),
+  settingsRemoveSkill: vi.fn(),
 }));
 
 const detail = (): SkillSettingsDetail => ({
@@ -31,6 +32,7 @@ describe("SkillDetails", () => {
   beforeEach(() => {
     vi.mocked(api.settingsSkillDetail).mockReset().mockResolvedValue(detail());
     vi.mocked(api.settingsReadSkillFile).mockReset().mockResolvedValue({ relative_path: "SKILL.md", content: "# QC", redacted: false, package_sha256: "a".repeat(64) });
+    vi.mocked(api.settingsRemoveSkill).mockReset().mockResolvedValue({ removed_from_library: true, files_removed: true, preserved_files: false, status: "removed", message: "Removed" });
   });
 
   it("loads real host details and previews only the selected file", async () => {
@@ -145,5 +147,74 @@ describe("SkillDetails", () => {
     expect(screen.getByRole("button", { name: "Preview" })).toBeEnabled();
     resolvePreview({ relative_path: "SKILL.md", content: "old", redacted: false, package_sha256: "a".repeat(64) });
     await waitFor(() => expect(screen.queryByText("old")).not.toBeInTheDocument());
+  });
+
+  it("uses separate library and owned-file confirmations and closes only the top Escape layer", async () => {
+    const onClose = vi.fn();
+    const onRemoved = vi.fn().mockResolvedValue(undefined);
+    const onOperationsChanged = vi.fn().mockResolvedValue(undefined);
+    render(<SkillDetails skillId="skill-1" locale="en-US" onClose={onClose} onRemoved={onRemoved} onOperationsChanged={onOperationsChanged} />);
+    await screen.findByRole("heading", { name: "QC reviewer" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove from library (keep installed files)" }));
+    expect(screen.getByRole("dialog", { name: "Confirm skill removal" })).toHaveTextContent("Installed files will remain");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Confirm skill removal" })).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Skill details" })).toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove from library (keep installed files)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm library removal" }));
+    await waitFor(() => expect(api.settingsRemoveSkill).toHaveBeenCalledWith("skill-1", "a".repeat(64), "library_only"));
+    expect(onRemoved).toHaveBeenCalledOnce();
+    expect(onOperationsChanged).toHaveBeenCalledOnce();
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("keeps partial owned-file cleanup visible and refreshes both catalogs", async () => {
+    vi.mocked(api.settingsRemoveSkill).mockResolvedValue({ removed_from_library: true, files_removed: false, preserved_files: true, status: "needs_attention", message: "Verified cleanup is incomplete; files were preserved." });
+    const onClose = vi.fn();
+    const onRemoved = vi.fn().mockResolvedValue(undefined);
+    const onOperationsChanged = vi.fn().mockResolvedValue(undefined);
+    render(<SkillDetails skillId="skill-1" locale="en-US" onClose={onClose} onRemoved={onRemoved} onOperationsChanged={onOperationsChanged} />);
+    await screen.findByRole("heading", { name: "QC reviewer" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete owned installation files" }));
+    expect(screen.getByRole("dialog", { name: "Confirm skill removal" })).toHaveTextContent("Changed or unverified files will be preserved");
+    fireEvent.click(screen.getByRole("button", { name: "Confirm owned-file deletion" }));
+
+    expect(await screen.findByRole("status", { name: "Skill removal result" })).toHaveTextContent("files were preserved");
+    expect(api.settingsRemoveSkill).toHaveBeenCalledWith("skill-1", "a".repeat(64), "owned_files");
+    expect(onRemoved).toHaveBeenCalledOnce();
+    expect(onOperationsChanged).toHaveBeenCalledOnce();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "Skill details" })).toBeInTheDocument();
+  });
+
+  it("blocks duplicate removal requests and keeps a sanitized failure retryable", async () => {
+    let rejectRemoval!: (reason: unknown) => void;
+    vi.mocked(api.settingsRemoveSkill).mockImplementation(() => new Promise((_, reject) => { rejectRemoval = reject; }));
+    render(<SkillDetails skillId="skill-1" locale="en-US" onClose={() => undefined} />);
+    await screen.findByRole("heading", { name: "QC reviewer" });
+    fireEvent.click(screen.getByRole("button", { name: "Delete owned installation files" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm owned-file deletion" }));
+    expect(screen.getByRole("button", { name: "Working…" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Working…" }));
+    expect(api.settingsRemoveSkill).toHaveBeenCalledTimes(1);
+
+    rejectRemoval(new Error("token=secret-sentinel"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Skill removal or refresh did not finish");
+    expect(screen.queryByText(/secret-sentinel/)).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Confirm skill removal" })).toBeInTheDocument();
+  });
+
+  it("routes plugin-owned skills to plugin management instead of generic deletion", async () => {
+    vi.mocked(api.settingsSkillDetail).mockResolvedValue({ ...detail(), origin: "plugin_owned", can_remove_from_library: false, can_delete_files: false });
+    const onNavigatePlugins = vi.fn();
+    render(<SkillDetails skillId="skill-1" locale="en-US" onClose={() => undefined} onNavigatePlugins={onNavigatePlugins} />);
+    await screen.findByRole("heading", { name: "QC reviewer" });
+    fireEvent.click(screen.getByRole("button", { name: "Manage in Plugins" }));
+    expect(onNavigatePlugins).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("button", { name: /remove from library/i })).not.toBeInTheDocument();
   });
 });
