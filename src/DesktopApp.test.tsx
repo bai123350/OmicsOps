@@ -10,6 +10,7 @@ import * as api from "./tauri-api";
 import * as referenceApi from "./composer-reference-api";
 import * as attachmentApi from "./composer-attachment-api";
 import * as usageApi from "./usage-settings-api";
+import * as navigationApi from "./workspace-navigation-api";
 import type { AgentRunEventV4, ComposerReference, ConversationAgentStateV4, ExecutionPlanV4, KernelEvent, ProposedPlanRevisionV4, RunSummaryV4, StopRunReceiptV4, SyncEntry, WorkspaceMessage } from "./types";
 
 const render = (ui: ReactNode) => testingRender(ui, { wrapper: AppearanceProvider });
@@ -87,6 +88,68 @@ function setupConversationStateHarness() {
 }
 
 describe("DesktopApp", () => {
+  it("waits for asynchronous session search before closing the dialog", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    vi.spyOn(referenceApi, "composerReferenceCatalog").mockResolvedValue([{ reference: { kind: "session", project_id: stateProject.id, id: stateConversations[1].id }, label: "Async session", description: "Saved transcript" }]);
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    const pending = deferred<typeof stateConversations>();
+    vi.mocked(api.listConversations).mockReturnValueOnce(pending.promise);
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    fireEvent.click(await screen.findByRole("button", { name: "打开 Async session" }));
+    expect(screen.getByRole("dialog", { name: "搜索工作区" })).toBeInTheDocument();
+    await act(async () => pending.resolve(stateConversations));
+    expect(await screen.findByRole("heading", { name: stateConversations[1].title })).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "搜索工作区" })).not.toBeInTheDocument());
+  });
+
+  it("keeps a dirty manuscript when cancelling search navigation and permits retry", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    vi.spyOn(navigationApi, "isWorkspaceDesktopHost").mockReturnValue(true);
+    vi.spyOn(navigationApi, "listWorkspacePublications").mockResolvedValue([]);
+    vi.spyOn(referenceApi, "composerReferenceCatalog").mockResolvedValue([{ reference: { kind: "session", project_id: stateProject.id, id: stateConversations[1].id }, label: "Guarded session", description: "Saved transcript" }]);
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    fireEvent.click(screen.getByRole("button", { name: "发表工作区" }));
+    fireEvent.click(await screen.findByRole("button", { name: "新建稿件" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Markdown" }), { target: { value: "Keep this draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "文件" }));
+    await screen.findByRole("dialog", { name: "未保存的稿件" });
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    expect(screen.queryByRole("dialog", { name: "搜索工作区" })).not.toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    fireEvent.click(await screen.findByRole("button", { name: "打开 Guarded session" }));
+    expect(await screen.findByRole("dialog", { name: "未保存的稿件" })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByRole("textbox", { name: "Markdown" })).toHaveValue("Keep this draft");
+    expect(screen.getByRole("dialog", { name: "搜索工作区" })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "打开 Guarded session" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "打开 Guarded session" }));
+    fireEvent.click(await screen.findByRole("button", { name: "放弃并离开" }));
+    expect(await screen.findByRole("heading", { name: stateConversations[1].title })).toBeInTheDocument();
+  });
+
+  it("creates one session with Ctrl+N and suppresses the shortcut while a dialog is open", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    const create = vi.spyOn(api, "createConversation").mockResolvedValue({ ...stateConversations[0], id: "shortcut-session", title: "Shortcut session" });
+    render(<DesktopApp />);
+    const input = await screen.findByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.keyDown(window, { key: "n", ctrlKey: true, repeat: true });
+    expect(create).not.toHaveBeenCalled();
+    fireEvent.keyDown(window, { key: "n", ctrlKey: true });
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+    await screen.findByRole("heading", { name: "Shortcut session" });
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    await screen.findByRole("dialog", { name: "搜索工作区" });
+    fireEvent.keyDown(window, { key: "n", ctrlKey: true });
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
   it.each(["menu", "help", "help over search"])("closes chrome %s before the global search shortcut takes over", async (surface) => {
     vi.spyOn(api, "listProjects").mockResolvedValue([]);
     render(<DesktopApp />);
@@ -991,6 +1054,7 @@ describe("DesktopApp", () => {
 
     render(<DesktopApp />);
     await screen.findByRole("heading", { name: "Agent 会话" });
+    await waitFor(() => expect(stateSpy).toHaveBeenCalledWith(stateProject.id, "conversation-agent"));
     fireEvent.click(screen.getByRole("button", { name: "Agent 权限" }));
     const planMode = screen.getByRole("menuitemcheckbox", { name: "先做计划" });
     expect(planMode).toBeDisabled();
@@ -1440,6 +1504,7 @@ describe("DesktopApp", () => {
   it("opens the exact persisted conversation selected from Usage settings", async () => {
     const { stateSpy } = setupConversationStateHarness();
     stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    vi.spyOn(navigationApi, "listWorkspacePublications").mockResolvedValue([]);
     const emptyCounter = { known: null, incomplete_attempts: 0 };
     const totals = { input_tokens: { known: 12, incomplete_attempts: 0 }, output_tokens: emptyCounter, reasoning_tokens: emptyCounter, cache_read_input_tokens: emptyCounter, cache_creation_input_tokens: emptyCounter, reported_total_tokens: emptyCounter, observed_attempts: 1, final_attempts: 1, partial_attempts: 0, interrupted_attempts: 0, unknown_attempts: 0 };
     vi.spyOn(usageApi, "settingsUsagePage").mockResolvedValue({ totals, projects: [], models: [], days: [], tools: [], next_cursor: null, scanned_runs: 1, omitted_runs: 0, unattributed_events: 0, snapshot_at: "2026-09-15T00:00:00Z", completeness: "complete" });
@@ -1447,10 +1512,20 @@ describe("DesktopApp", () => {
     render(<DesktopApp />);
     await screen.findByRole("heading", { name: stateConversations[0].title });
 
+    fireEvent.click(screen.getByRole("button", { name: "发表工作区" }));
+    fireEvent.click(await screen.findByRole("button", { name: "新建稿件" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Markdown" }), { target: { value: "Unsaved usage navigation draft" } });
+
     fireEvent.click(screen.getByRole("button", { name: "设置" }));
     fireEvent.click(screen.getByRole("button", { name: "用量" }));
     await screen.findByText(stateConversations[1].title);
     fireEvent.click(screen.getByRole("button", { name: "打开" }));
+    expect(await screen.findByRole("dialog", { name: "未保存的稿件" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "继续编辑" }));
+    expect(screen.getByRole("textbox", { name: "Markdown" })).toHaveValue("Unsaved usage navigation draft");
+    await waitFor(() => expect(screen.getByRole("button", { name: "打开" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "打开" }));
+    fireEvent.click(await screen.findByRole("button", { name: "放弃并离开" }));
 
     expect(await screen.findByRole("heading", { name: stateConversations[1].title })).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "工作台设置" })).not.toBeInTheDocument();
@@ -1561,8 +1636,9 @@ describe("DesktopApp", () => {
 
     render(<DesktopApp />);
 
-    expect(await screen.findByRole("heading", { name: "新会话" })).toBeInTheDocument();
-    expect(create).toHaveBeenCalledOnce();
+    await waitFor(() => expect(create).toHaveBeenCalledOnce());
+    await waitFor(() => expect(api.listMessages).toHaveBeenCalledWith(blank.id));
+    expect(screen.getByRole("heading", { name: "新会话" })).toBeInTheDocument();
     expect(create).toHaveBeenCalledWith(stateProject.id);
   });
 
@@ -1577,9 +1653,10 @@ describe("DesktopApp", () => {
 
     render(<DesktopApp />);
 
-    expect(await screen.findByRole("heading", { name: "新会话" })).toBeInTheDocument();
+    await waitFor(() => expect(create).toHaveBeenCalledWith(stateProject.id));
+    await waitFor(() => expect(api.listMessages).toHaveBeenCalledWith(blank.id));
+    expect(screen.getByRole("heading", { name: "新会话" })).toBeInTheDocument();
     expect(latest).not.toHaveBeenCalled();
-    expect(create).toHaveBeenCalledWith(stateProject.id);
   });
 
   it("keeps the current conversation open when the resume preference changes", async () => {

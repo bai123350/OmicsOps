@@ -4,12 +4,14 @@ import type { ComputeBackendAvailabilityV4, ProjectArtifact } from "../../types"
 import type { Locale } from "./copy";
 import { isSidebarPreviewImage } from "./sidebarData";
 import type { collectProvenance, DelegatedTask, NotebookCell } from "./sidebarData";
+import { CollectSourceButton } from "./CollectSourceButton";
+import type { WorkspaceSourceRef } from "../../workspace-navigation-types";
 
 export function SidebarEmpty({ title, children }: { title: string; children: string }) {
   return <div className="sidebar-empty"><FileText size={25} /><b>{title}</b><p>{children}</p></div>;
 }
 
-export function CodeNotebook({ cells, locale }: { cells: NotebookCell[]; locale: Locale }) {
+export function CodeNotebook({ cells, locale, collectionSource }: { cells: NotebookCell[]; locale: Locale; collectionSource?: (cell: NotebookCell) => Promise<WorkspaceSourceRef> }) {
   const zh = locale === "zh-CN";
   const [copyError, setCopyError] = useState("");
   const status: Record<NotebookCell["status"], string> = zh
@@ -19,6 +21,7 @@ export function CodeNotebook({ cells, locale }: { cells: NotebookCell[]; locale:
   return <div className="sidebar-code-cells">{copyError && <p role="alert">{copyError}</p>}{cells.map((cell, index) => <section className="sidebar-code-cell" key={cell.id}>
     <header><span>[{index}]</span><b>{cell.language}</b><small>{cell.origin}</small><button aria-label={zh ? `复制代码 ${index}` : `Copy code ${index}`} onClick={async () => { setCopyError(""); try { await navigator.clipboard.writeText(cell.source); } catch { setCopyError(zh ? "复制失败，请手动选择代码。" : "Copy failed. Select the code manually."); } }}><Copy size={14} /></button></header>
     <pre><code>{cell.source}</code></pre><div className={`sidebar-cell-status ${cell.status}`}>{status[cell.status]}</div>
+    {collectionSource && <CollectSourceButton source={() => collectionSource(cell)} title={`${cell.language} ${index + 1}`} kind="code" zh={zh} />}
     {cell.output && <details open={cell.status === "failed"}><summary>{zh ? "输出" : "Output"}</summary><pre>{cell.output}</pre></details>}
   </section>)}</div>;
 }

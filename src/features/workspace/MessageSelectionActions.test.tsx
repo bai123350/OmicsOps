@@ -51,6 +51,14 @@ afterEach(() => {
 });
 
 describe("MessageSelectionActions", () => {
+  it("passes the source message identity when saving a selected excerpt", async () => {
+    const save = vi.fn().mockResolvedValue(undefined);
+    render(<>{message("m", "assistant", "Selected evidence")}<MessageSelectionActions enabled locale="en-US" projectId="project-1" conversationId="conversation-1" onQuote={vi.fn()} onSave={save} /></>);
+    selectText(screen.getByText("Selected evidence").firstChild as Text);
+    fireEvent.click(screen.getByRole("button", { name: "Save selection to library" }));
+    expect(save).toHaveBeenCalledWith({ messageId: "m", text: "Selected evidence", role: "assistant" });
+    await waitFor(() => expect(screen.queryByRole("toolbar")).not.toBeInTheDocument());
+  });
   it("copies the exact text selected within one visible message body", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });

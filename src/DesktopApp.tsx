@@ -8,7 +8,7 @@ import { canAttachSearchEntry, type WorkspaceSearchEntry, type WorkspaceSearchRe
 import { WorkspaceSearchDialog } from "./features/workspace/WorkspaceSearchDialog";
 import { referenceKey } from "./features/workspace/ComposerReferences";
 import type { ComposerReference } from "./types";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "./tauri-api";
 import type { AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendAvailabilityV4, ComputeSelectionV4, ConnectionProfile, ConversationAgentStateV4, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, ProjectArtifact, ProposedPlanRevisionV4, RemoteFileEntry, RunSummaryV4, SessionAgentModeV4, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
@@ -58,6 +58,8 @@ export function samePendingSubmission(
 }
 
 export default function DesktopApp() {
+  const workspaceNavigationGuard = useRef<(next: () => void, onCancel?: () => void) => void>((next) => next());
+  const registerWorkspaceNavigationGuard = useCallback((guard: (next: () => void, onCancel?: () => void) => void) => { workspaceNavigationGuard.current = guard; }, []);
   const [projects, setProjects] = useState<WorkspaceProject[]>([]);
   const [selected, setSelected] = useState<WorkspaceProject | null>(null);
   const [createProjectRequest, setCreateProjectRequest] = useState<string | null>(null);
@@ -71,6 +73,7 @@ export default function DesktopApp() {
   const [searchRequest, setSearchRequest] = useState<WorkspaceSearchRequest | null>(null);
   const workspaceSearch = useWorkspaceSearch(searchOpen, projects);
   function openWorkspaceSearch() {
+    if (document.querySelector('[data-navigation-decision="true"]')) return;
     setChromeDismissRequest((value) => value + 1);
     if (!searchOpenRef.current) searchActionGeneration.current += 1;
     setSearchOpen(true);
@@ -883,6 +886,16 @@ export default function DesktopApp() {
     if (next) activateConversation(next);
   }
 
+  function openGuardedSearchEntry(entry: WorkspaceSearchEntry): Promise<boolean> {
+    const generation = searchActionGeneration.current;
+    return new Promise((resolve, reject) => {
+      workspaceNavigationGuard.current(() => {
+        if (generation !== searchActionGeneration.current) { resolve(false); return; }
+        void openSearchEntry(entry).then(resolve, reject);
+      }, () => resolve(false));
+    });
+  }
+
   async function openSearchEntry(entry: WorkspaceSearchEntry): Promise<boolean> {
     if (entry.kind === "action") {
       if (entry.key === "action:files" && selected) {
@@ -924,6 +937,16 @@ export default function DesktopApp() {
     return true;
   }
 
+  function openGuardedUsageConversation(projectId: string, conversationId: string): Promise<void> {
+    const generation = usageOpenGeneration.current;
+    return new Promise((resolve, reject) => {
+      workspaceNavigationGuard.current(() => {
+        if (generation !== usageOpenGeneration.current || !settingsOpenRef.current) { resolve(); return; }
+        void openUsageConversation(projectId, conversationId).then(resolve, reject);
+      }, resolve);
+    });
+  }
+
   async function openUsageConversation(projectId: string, conversationId: string) {
     const operation = ++usageOpenGeneration.current;
     const sourceProject = projects.find((project) => project.id === projectId);
@@ -933,6 +956,7 @@ export default function DesktopApp() {
     const target = available.find((item) => item.id === conversationId && item.project_id === projectId);
     if (!target) throw new Error("saved conversation unavailable");
     closeSettings();
+    setSearchRequest({ key: crypto.randomUUID(), kind: "reveal", projectId });
     if (selected?.id === projectId) {
       setConversations(available);
       activateConversation(target);
@@ -982,6 +1006,7 @@ export default function DesktopApp() {
       ++conversationRequestToken.current;
       resetConversationWork(true);
       setConversation(created);
+      setSearchRequest({ key: crypto.randomUUID(), kind: "reveal", projectId: generation.projectId! });
     } catch (error) {
       if (isCurrentConversationGeneration(generation)) {
         setAgentNotice(error instanceof Error ? error.message : String(error));
@@ -1071,28 +1096,53 @@ export default function DesktopApp() {
     setSettingsOpen(true);
   }
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.repeat || event.isComposing || event.altKey || event.shiftKey || !(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "n") return;
+      if (!selected || loading || settingsOpen || searchOpen || agentBusy || conversationHydrating || conversationLocked || document.querySelector('[role="dialog"], [role="menu"]')) return;
+      event.preventDefault();
+      workspaceNavigationGuard.current(() => { void newConversation(); });
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [selected, loading, settingsOpen, searchOpen, agentBusy, conversationHydrating, conversationLocked]);
+
+  async function openWorkspaceSourceConversation(projectId: string, conversationId: string) {
+    const generation = captureConversationGeneration();
+    try {
+      const sourceProject = projects.find((item) => item.id === projectId);
+      if (!sourceProject) throw new Error(locale === "zh-CN" ? "来源项目已不存在。" : "The source project is no longer available.");
+      const available = selected?.id === projectId ? conversations : await api.listConversations(projectId);
+      if (!isCurrentConversationGeneration(generation)) return;
+      const target = available.find((item) => item.id === conversationId && item.project_id === projectId);
+      if (!target) throw new Error(locale === "zh-CN" ? "来源会话已不存在。" : "The source conversation is no longer available.");
+      if (selected?.id === projectId) { setConversations(available); activateConversation(target); }
+      else { requestedConversation.current = { projectId, conversationId }; setSelected(sourceProject); }
+    } catch (error) { if (isCurrentConversationGeneration(generation)) setAgentNotice(error instanceof Error ? error.message : String(error)); }
+  }
+
   const applicationMenu = <ApplicationMenuBar
     dismissRequest={chromeDismissRequest}
     locale={locale}
     hasProject={Boolean(selected)}
     newConversationDisabled={loading || agentBusy || conversationHydrating || conversationLocked}
-    onNewProject={() => {
+    onNewProject={() => workspaceNavigationGuard.current(() => {
       startupNavigationRequested.current = true;
       closeSettings();
       closeWorkspaceSearch();
       setSelected(null);
       setCreateProjectRequest(crypto.randomUUID());
-    }}
-    onNewConversation={newConversation}
-    onProjects={() => { startupNavigationRequested.current = true; closeSettings(); closeWorkspaceSearch(); setSelected(null); }}
+    })}
+    onNewConversation={() => workspaceNavigationGuard.current(() => { void newConversation(); })}
+    onProjects={() => workspaceNavigationGuard.current(() => { startupNavigationRequested.current = true; closeSettings(); closeWorkspaceSearch(); setSelected(null); })}
     onSearch={openWorkspaceSearch}
     onSettings={openApplicationSettings}
-    onFiles={() => {
+    onFiles={() => workspaceNavigationGuard.current(() => {
       if (!selected) return;
       closeSettings();
       closeWorkspaceSearch();
       setSearchRequest({ key: crypto.randomUUID(), kind: "files", projectId: selected.id });
-    }}
+    })}
   ><NativeWindowControls locale={locale} /></ApplicationMenuBar>;
 
   if (loading) return <div className="desktop-frame">{applicationMenu}<div className="desktop-frame-content"><div className="desktop-loading">OmicsOps</div></div></div>;
@@ -1135,12 +1185,12 @@ export default function DesktopApp() {
     }
   }
 
-  const searchDialog = searchOpen ? <WorkspaceSearchDialog entries={searchEntries} zh={locale === "zh-CN"} loading={workspaceSearch.loading} failedProjects={workspaceSearch.failedProjects} onRetry={workspaceSearch.retry} onClose={closeWorkspaceSearch} onOpen={openSearchEntry} canAttach={canAttachFromSearch} onAttach={(entry) => {
+  const searchDialog = searchOpen ? <WorkspaceSearchDialog entries={searchEntries} zh={locale === "zh-CN"} loading={workspaceSearch.loading} failedProjects={workspaceSearch.failedProjects} onRetry={workspaceSearch.retry} onClose={closeWorkspaceSearch} onOpen={openGuardedSearchEntry} canAttach={canAttachFromSearch} onAttach={(entry) => {
     if (!selected || !conversation || !entry.item || !canAttachFromSearch(entry)) return false;
     setSearchRequest({ key: crypto.randomUUID(), kind: "attach", projectId: selected.id, conversationId: conversation.id, item: entry.item });
     return true;
   }} /> : null;
-  const settings = settingsOpen ? <SettingsPanel key={settingsNavigationKey} initialSection={settingsSection} locale={locale} onLocaleChange={setLocale} onClose={closeSettings} modelProfiles={modelProfiles} skillPackages={skillPackages} mcpServers={mcpServers} connections={connections} projects={projects} selectedProject={selected} onOpenUsageConversation={openUsageConversation} onWorkflowsChanged={() => setWorkflowCatalogVersion((value) => value + 1)} onMemoryChanged={capabilities.refresh} onSaveConnection={async (profile, secret) => { await api.saveConnection(profile, secret); setConnections(await api.listConnections()); }} onTestConnection={api.testConnection} onConfirmHostKey={async (profileId, fingerprint) => { await api.confirmHostKey(profileId, fingerprint); setConnections(await api.listConnections()); }} onBindProjectRemote={async (connectionId, remoteRoot) => { if (!selected) return; const updated = await api.updateProjectRemote(selected.id, connectionId, remoteRoot); setSelected((current) => current?.id === updated.id ? updated : current); setProjects((current) => current.map((project) => project.id === updated.id ? updated : project)); }} onSaveModel={async (request) => {
+  const settings = settingsOpen ? <SettingsPanel key={settingsNavigationKey} initialSection={settingsSection} locale={locale} onLocaleChange={setLocale} onClose={closeSettings} modelProfiles={modelProfiles} skillPackages={skillPackages} mcpServers={mcpServers} connections={connections} projects={projects} selectedProject={selected} onOpenUsageConversation={openGuardedUsageConversation} onWorkflowsChanged={() => setWorkflowCatalogVersion((value) => value + 1)} onMemoryChanged={capabilities.refresh} onSaveConnection={async (profile, secret) => { await api.saveConnection(profile, secret); setConnections(await api.listConnections()); }} onTestConnection={api.testConnection} onConfirmHostKey={async (profileId, fingerprint) => { await api.confirmHostKey(profileId, fingerprint); setConnections(await api.listConnections()); }} onBindProjectRemote={async (connectionId, remoteRoot) => { if (!selected) return; const updated = await api.updateProjectRemote(selected.id, connectionId, remoteRoot); setSelected((current) => current?.id === updated.id ? updated : current); setProjects((current) => current.map((project) => project.id === updated.id ? updated : project)); }} onSaveModel={async (request) => {
     if (modelSelectionInFlight.current) throw new Error("Model selection is currently locked");
     modelSelectionInFlight.current = true;
     setModelSelectionBusy(true);
@@ -1338,6 +1388,7 @@ export default function DesktopApp() {
   const currentConversationAction = captureConversationAction();
   return <div className="desktop-frame">{applicationMenu}<div className="desktop-frame-content"><WorkspaceShell
     onOpenSearch={openWorkspaceSearch} searchRequest={searchRequest}
+    onRegisterNavigationGuard={registerWorkspaceNavigationGuard} onOpenSourceConversation={openWorkspaceSourceConversation}
     onSearchRequestHandled={(key) => setSearchRequest((current) => current?.key === key ? null : current)}
     onSuggestFollowUps={api.agentV4SuggestFollowUps}
     capabilitySummary={capabilities.summary} capabilitiesLoading={capabilities.loading}

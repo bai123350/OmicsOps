@@ -6,6 +6,94 @@ use crate::dto::{
 use serde_json::json;
 
 #[test]
+fn workspace_sources_preserve_exact_identity_and_explicit_null_selectors() {
+    use omicsops_dto::{SourceKind, WorkspaceSourceRef};
+    let project = uuid::Uuid::from_u128(9);
+    let source = WorkspaceSourceRef {
+        project_id: project,
+        kind: SourceKind::LegacyArtifact,
+        id: "artifact-1".into(),
+        conversation_id: None,
+        run_id: None,
+        sequence: None,
+        event_hash: None,
+        content_sha256: None,
+        start: None,
+        end: None,
+    };
+    assert_eq!(
+        serde_json::to_value(source).unwrap(),
+        json!({"project_id":project,"kind":"legacy_artifact","id":"artifact-1",
+        "conversation_id":null,"run_id":null,"sequence":null,"event_hash":null,"content_sha256":null,"start":null,"end":null})
+    );
+    assert!(
+        serde_json::from_value::<WorkspaceSourceRef>(
+            json!({"project_id":project,"kind":"message","id":"x","path":"../../private"})
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn workspace_snapshot_and_pages_keep_availability_and_nullable_cursors() {
+    use omicsops_dto::*;
+    let source = WorkspaceSourceRef {
+        project_id: uuid::Uuid::from_u128(1),
+        kind: SourceKind::Tool,
+        id: "call".into(),
+        conversation_id: Some(uuid::Uuid::from_u128(2)),
+        run_id: Some(uuid::Uuid::from_u128(3)),
+        sequence: Some(7),
+        event_hash: Some("a".repeat(64)),
+        content_sha256: None,
+        start: None,
+        end: None,
+    };
+    let snapshot = WorkspaceSourceSnapshot {
+        source,
+        title: "Python".into(),
+        text: "print(1)".into(),
+        sha256: "b".repeat(64),
+        status: "requested".into(),
+        metadata: std::collections::BTreeMap::new(),
+        availability: SourceAvailability::Missing,
+    };
+    let value = serde_json::to_value(snapshot).unwrap();
+    assert_eq!(value["availability"], "missing");
+    assert_eq!(value["status"], "requested");
+    assert_eq!(value["source"]["sequence"], 7);
+    assert_eq!(value["source"]["event_hash"], "a".repeat(64));
+    assert_eq!(
+        serde_json::to_value(JourneyPage {
+            entries: vec![],
+            next_offset: None
+        })
+        .unwrap(),
+        json!({"entries":[],"next_offset":null})
+    );
+    assert_eq!(
+        serde_json::to_value(LibraryPage {
+            items: vec![],
+            next_offset: Some(25),
+            source_projects: vec![LibrarySourceProject {
+                id: uuid::Uuid::from_u128(1),
+                name: "Saved project".into()
+            }],
+        })
+        .unwrap(),
+        json!({"items":[],"next_offset":25,"source_projects":[{"id":uuid::Uuid::from_u128(1),"name":"Saved project"}]})
+    );
+    let request: JourneyRequest = serde_json::from_value(
+        json!({"project_id":uuid::Uuid::from_u128(1),"query":"","kind":null,"offset":0,"limit":25}),
+    )
+    .unwrap();
+    assert_eq!(
+        request.status, None,
+        "older journey callers may omit the status filter"
+    );
+}
+
+#[test]
 fn project_template_contracts_keep_owner_and_visible_content_fields() {
     let project_id = uuid::Uuid::from_u128(9);
     let workflow_id = uuid::Uuid::from_u128(10);

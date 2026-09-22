@@ -55,6 +55,7 @@ pub mod storage_settings;
 pub mod sync_commands;
 pub mod usage_settings;
 pub mod workspace_commands;
+pub mod workspace_navigation;
 
 use commands::AppState;
 use omicsops_adapters::credentials::SystemCredentialVault;
@@ -303,6 +304,21 @@ pub fn run() {
             workspace_commands::latest_used_conversation,
             workspace_commands::create_conversation,
             workspace_commands::delete_conversation,
+            workspace_navigation::workspace_list_groups,
+            workspace_navigation::workspace_save_group,
+            workspace_navigation::workspace_delete_group,
+            workspace_navigation::workspace_move_conversations,
+            workspace_navigation::workspace_journey,
+            workspace_navigation::workspace_source_detail,
+            workspace_navigation::workspace_list_publications,
+            workspace_navigation::workspace_get_publication,
+            workspace_navigation::workspace_save_publication,
+            workspace_navigation::workspace_restore_publication,
+            workspace_navigation::workspace_export_publication,
+            workspace_navigation::workspace_list_library,
+            workspace_navigation::workspace_get_library_item,
+            workspace_navigation::workspace_save_library_item,
+            workspace_navigation::workspace_delete_library_item,
             storage_settings::settings_storage_usage,
             credential_settings::settings_list_credentials,
             credential_settings::settings_create_credential,

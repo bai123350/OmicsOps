@@ -473,6 +473,50 @@ CREATE TABLE IF NOT EXISTS publications (
     updated_at INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS conversation_groups (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name TEXT NOT NULL CHECK (length(trim(name)) BETWEEN 1 AND 80),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (project_id, name),
+    UNIQUE (id, project_id)
+);
+
+CREATE TABLE IF NOT EXISTS conversation_group_members (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversation_records(frame_id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    group_id TEXT NOT NULL,
+    FOREIGN KEY (group_id, project_id) REFERENCES conversation_groups(id, project_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_conversation_group_members_project ON conversation_group_members(project_id);
+
+-- The ledger holds request digests and committed result identifiers, never raw requests.
+CREATE TABLE IF NOT EXISTS workspace_request_ledger (
+    request_id TEXT PRIMARY KEY,
+    operation TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+-- Source identities deliberately have no cascading references: collections outlive their source.
+CREATE TABLE IF NOT EXISTS workspace_library (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('code', 'excerpt', 'artifact')),
+    title TEXT NOT NULL,
+    source_project_id TEXT NOT NULL,
+    source_project_name TEXT NOT NULL,
+    source_conversation_id TEXT,
+    source_conversation_title TEXT,
+    text_preview TEXT NOT NULL,
+    snapshot_text TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_library_created ON workspace_library(created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_workspace_library_source ON workspace_library(source_project_id, kind);
+
 CREATE TABLE IF NOT EXISTS publication_revisions (
     id TEXT PRIMARY KEY CHECK (length(trim(id)) > 0),
     publication_id TEXT NOT NULL REFERENCES publications(id) ON DELETE CASCADE,
@@ -482,6 +526,21 @@ CREATE TABLE IF NOT EXISTS publication_revisions (
     created_at INTEGER NOT NULL DEFAULT 0,
     UNIQUE (publication_id, revision)
 );
+
+CREATE TABLE IF NOT EXISTS publication_legacy_titles (
+    revision_id TEXT PRIMARY KEY REFERENCES publication_revisions(id) ON DELETE CASCADE,
+    title TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS trg_publication_revisions_immutable
+BEFORE UPDATE ON publication_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'publication revision content is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_workspace_library_immutable
+BEFORE UPDATE ON workspace_library
+BEGIN
+    SELECT RAISE(ABORT, 'library snapshot content is immutable');
+END;
 
 CREATE TABLE IF NOT EXISTS publication_items (
     id TEXT PRIMARY KEY CHECK (length(trim(id)) > 0),

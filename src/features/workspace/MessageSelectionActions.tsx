@@ -13,6 +13,7 @@ export interface MessageSelectionQuote {
 }
 
 interface SelectionSnapshot extends MessageSelectionQuote {
+  messageId?: string;
   left: number;
   top: number;
   bottom: number;
@@ -29,6 +30,7 @@ interface MessageSelectionActionsProps {
   projectId: string;
   conversationId: string;
   onQuote: (selection: MessageSelectionQuote) => void;
+  onSave?: (selection: MessageSelectionQuote & { messageId: string }) => Promise<void>;
 }
 
 function selectionBody(node: Node | null): HTMLElement | null {
@@ -57,6 +59,7 @@ function captureSelection(projectId: string, conversationId: string): SelectionS
   return {
     text,
     role,
+    messageId: anchorBody.dataset.messageId,
     left: rect.left,
     top: rect.top,
     bottom: rect.bottom,
@@ -69,12 +72,14 @@ export function MessageSelectionActions({
   projectId,
   conversationId,
   onQuote,
+  onSave,
 }: MessageSelectionActionsProps) {
   const [snapshot, setSnapshot] = useState<SelectionSnapshot | null>(null);
   const [position, setPosition] = useState<ToolbarPosition | null>(null);
   const [error, setError] = useState<string | null>(null);
   const toolbarRef = useRef<HTMLDivElement | null>(null);
   const generation = useRef(0);
+  const saveBusy = useRef(false);
   const close = useCallback(() => {
     generation.current += 1;
     setSnapshot(null);
@@ -162,6 +167,14 @@ export function MessageSelectionActions({
     <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={quote}>
       {locale === "zh-CN" ? "引用到草稿" : "Quote in draft"}
     </button>
+    {onSave && snapshot.messageId && <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={async () => {
+      if (saveBusy.current || !snapshot.messageId) return;
+      saveBusy.current = true;
+      const current = generation.current;
+      try { await onSave({ text: snapshot.text, role: snapshot.role, messageId: snapshot.messageId }); if (current === generation.current) { window.getSelection()?.removeAllRanges(); close(); } }
+      catch { if (current === generation.current) setError(locale === "zh-CN" ? "无法收藏此选区，请重试或收藏完整消息。" : "Could not save this selection. Retry or save the full message."); }
+      finally { saveBusy.current = false; }
+    }}>{locale === "zh-CN" ? "收藏选区到资料库" : "Save selection to library"}</button>}
     {error ? <span role="alert">{error}</span> : null}
   </div>, document.body);
 }

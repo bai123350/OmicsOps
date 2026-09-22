@@ -50,10 +50,13 @@ mod session_reviews;
 mod side_chat;
 mod skill_removals;
 mod usage;
+pub mod workspace_journey;
+pub mod workspace_navigation;
 pub use usage::{
     UsageConversationEventPage, UsageConversationEventSet, UsageEventPage, UsageEventRow,
     UsageEventRun, UsageSnapshotBoundary,
 };
+pub use workspace_navigation::{SaveLibraryRecord, SavePublicationRecord};
 const INIT_SQL: &str = include_str!("../migrations/init.sql");
 mod composer_queue;
 mod composer_queue_dispatch;

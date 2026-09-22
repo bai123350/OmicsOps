@@ -1,4 +1,5 @@
 import type { AgentRunEventV4 } from "../../types";
+import { workspaceSource, type WorkspaceSourceRef } from "../../workspace-navigation-types";
 
 // Read-only projections of the host's existing transcript/events. These views
 // never dispatch work or promote generated source to verified execution.
@@ -10,6 +11,8 @@ export interface NotebookCell {
   origin: "assistant" | "runtime" | "shell";
   status: "source" | "requested" | "returned" | "failed" | "uncertain" | "dispatched";
   runId?: string;
+  messageRange?: { messageId: string; start: number; end: number };
+  toolSource?: WorkspaceSourceRef;
 }
 type Message = { id: string; role: string; markdown: string };
 const record = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -20,7 +23,7 @@ export const isSidebarPreviewImage = (path: string) => /\.(png|jpe?g|gif|webp|bm
 export function collectNotebookCells(messages: Message[], events: AgentRunEventV4[]): NotebookCell[] {
   const executed = new Map<string, NotebookCell>();
   const background = new Set<string>();
-  for (const { run_id, event } of events) {
+  for (const { project_id, conversation_id, run_id, event, sequence, event_hash } of events) {
     if (event.kind === "tool_requested") {
       const { call } = event;
       const args = record(call.arguments);
@@ -31,7 +34,7 @@ export function collectNotebookCells(messages: Message[], events: AgentRunEventV
       if (!source.trim()) continue;
       const id = callKey(run_id, call.call_id);
       if (args.background === true) background.add(id);
-      executed.set(id, { id, language: shell ? "shell" : string(args.language) || (call.tool_id === "runtime.r" ? "r" : "python"), source, output: "", origin: shell ? "shell" : "runtime", status: "requested", runId: run_id });
+      executed.set(id, { id, language: shell ? "shell" : string(args.language) || (call.tool_id === "runtime.r" ? "r" : "python"), source, output: "", origin: shell ? "shell" : "runtime", status: "requested", runId: run_id, toolSource: workspaceSource(project_id, "tool", call.call_id, { conversation_id, run_id, sequence, event_hash }) });
     } else if (event.kind === "tool_finished" || event.kind === "tool_outcome_reused") {
       const id = callKey(run_id, event.outcome.call_id);
       const cell = executed.get(id);
@@ -52,17 +55,19 @@ export function collectNotebookCells(messages: Message[], events: AgentRunEventV
   for (const message of messages) {
     if (message.role !== "assistant") continue;
     const lines = message.markdown.split(/\r?\n/);
+    const lineStarts = [0, ...Array.from(message.markdown.matchAll(/\n/g), (match) => match.index! + 1)];
     for (let i = 0; i < lines.length; i++) {
       const start = /^ {0,3}(`{3,}|~{3,})([^\s`]*)[^\r\n]*$/.exec(lines[i]);
       if (!start) continue;
       const language = start[2].toLowerCase() || "text";
       const end = new RegExp(`^ {0,3}${start[1][0]}{${start[1].length},}\\s*$`);
       const source: string[] = [];
+      const firstSourceLine = i + 1;
       while (++i < lines.length && !end.test(lines[i])) source.push(lines[i]);
       if (i === lines.length) break; // Streaming, incomplete fences are not cells yet.
       const code = source.join("\n");
       if (["csv", "tsv", "fasta", "fa"].includes(language) || !code.trim() || executedSource.has(`${normalizeLanguage(language)}\n${code.trim()}`)) continue;
-      cells.push({ id: `${message.id}:${i}`, language, source: code, output: "", origin: "assistant", status: "source" });
+      cells.push({ id: `${message.id}:${i}`, language, source: code, output: "", origin: "assistant", status: "source", messageRange: { messageId: message.id, start: lineStarts[firstSourceLine], end: lineStarts[i] } });
     }
   }
   return [...cells, ...executed.values()];

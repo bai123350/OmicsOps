@@ -4,6 +4,13 @@ import { collectNotebookCells, collectDelegatedTasks, collectProvenance } from "
 
 const event = (sequence: number, payload: AgentEventKindV4, run_id = "run"): AgentRunEventV4 => ({ schema_version: 4, project_id: "p", conversation_id: "c", run_id, sequence, event: payload, occurred_at: "2026-09-11T00:00:00Z", previous_hash: "", event_hash: `hash-${sequence}` });
 describe("reference sidebar data projections", () => {
+  it("keeps exact CRLF message ranges and persisted tool identities for collection", () => {
+    const markdown = "说明\r\n```python\r\nprint('😀')\r\n```";
+    const cells = collectNotebookCells([{ id: "m", role: "assistant", markdown }], [event(9, { kind: "tool_requested", call: { call_id: "call", tool_id: "runtime.python", arguments: { code: "print(2)" } } })]);
+    expect(markdown.slice(cells[0].messageRange!.start, cells[0].messageRange!.end)).toBe("print('😀')\r\n");
+    expect(cells[0].messageRange?.messageId).toBe("m");
+    expect(cells[1].toolSource).toMatchObject({ id: "call", kind: "tool", run_id: "run", sequence: 9, event_hash: "hash-9", conversation_id: "c" });
+  });
   it("deduplicates executed assistant code but preserves repeated executions and skips data fences", () => {
     const cells = collectNotebookCells([{ id: "m", role: "assistant", markdown: "```python\nprint(1)\n```\n```csv\na,b\n```\n```r\nsummary(x)\n```" }], [
       event(1, { kind: "tool_requested", call: { call_id: "a", tool_id: "runtime.execute", arguments: { language: "python", code: "print(1)" } } }),
