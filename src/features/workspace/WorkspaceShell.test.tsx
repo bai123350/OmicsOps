@@ -44,6 +44,7 @@ function selectVisibleMessageText(node: Text) {
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   setComposerSendPreference(false);
   setSelectionActionsEnabled(true);
@@ -1151,6 +1152,105 @@ it("updates one live progress row then replaces it with the committed message", 
   rerender(<WorkspaceShell {...props} agentRunEventsV4={events} agentTextPreview={{ run_id: "other", text: "wrong run" }} />);
   expect(screen.queryByText("wrong run")).not.toBeInTheDocument();
 });
+
+it("shows a live model wait timer and labels streamed preview as generation", () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-09-22T12:02:13Z"));
+  const clearInterval = vi.spyOn(window, "clearInterval");
+  const base = { schema_version: 4 as const, run_id: "model-wait", project_id: project.id, conversation_id: "c", previous_hash: "", event_hash: "h" };
+  const events: import("../../types").AgentRunEventV4[] = [
+    { ...base, sequence: 1, occurred_at: "2026-09-22T11:59:00Z", event: { kind: "run_created", mode: "execute" } },
+    { ...base, sequence: 2, occurred_at: "2026-09-22T12:00:00Z", event: { kind: "model_request_started", request: modelRequest("attempt-1") } },
+  ];
+  const props = { project, locale: "en-US" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: base.run_id };
+  const { rerender, unmount } = render(<WorkspaceShell {...props} agentRunEventsV4={events} />);
+
+  expect(screen.getByText(/Waiting for model · 0 steps · request 2m 13s/)).toBeInTheDocument();
+  act(() => vi.advanceTimersByTime(1_000));
+  expect(screen.getByText(/Waiting for model · 0 steps · request 2m 14s/)).toBeInTheDocument();
+
+  rerender(<WorkspaceShell {...props} agentRunEventsV4={events} agentTextPreview={{ run_id: base.run_id, text: "First public tokens" }} />);
+  expect(screen.getByText(/Generating response · 0 steps · request 2m 14s/)).toBeInTheDocument();
+  unmount();
+  expect(clearInterval).toHaveBeenCalled();
+});
+
+it("tracks only the latest model attempt and clears waiting at durable boundaries", () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-09-22T12:00:30Z"));
+  const base = { schema_version: 4 as const, run_id: "attempts", project_id: project.id, conversation_id: "c", previous_hash: "", event_hash: "h" };
+  const event = (sequence: number, seconds: number, value: import("../../types").AgentEventKindV4): import("../../types").AgentRunEventV4 => ({
+    ...base,
+    sequence,
+    occurred_at: `2026-09-22T12:00:${String(seconds).padStart(2, "0")}Z`,
+    event: value,
+  });
+  const requestOne = event(1, 0, { kind: "model_request_started", request: modelRequest("attempt-1") });
+  const requestTwo = event(2, 10, { kind: "model_request_started", request: modelRequest("attempt-2") });
+  const staleFinal = event(3, 11, { kind: "model_usage_observed", observation: modelUsage("attempt-1", "final") });
+  const partial = event(4, 12, { kind: "model_usage_observed", observation: modelUsage("attempt-2", "partial") });
+  const props = { project, locale: "en-US" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: base.run_id };
+  const { rerender } = render(<WorkspaceShell {...props} agentRunEventsV4={[requestOne, requestTwo, staleFinal, partial]} />);
+
+  expect(screen.getByText(/Waiting for model · 0 steps · request 20s/)).toBeInTheDocument();
+
+  const matchingFinal = event(5, 13, { kind: "model_usage_observed", observation: modelUsage("attempt-2", "final") });
+  rerender(<WorkspaceShell {...props} agentRunEventsV4={[requestOne, requestTwo, staleFinal, partial, matchingFinal]} />);
+  expect(screen.queryByText(/Waiting for model/)).not.toBeInTheDocument();
+
+  const interruptedRequest = event(6, 14, { kind: "model_request_started", request: modelRequest("attempt-interrupted") });
+  const interrupted = event(7, 15, { kind: "model_usage_observed", observation: modelUsage("attempt-interrupted", "interrupted") });
+  rerender(<WorkspaceShell {...props} agentRunEventsV4={[interruptedRequest, interrupted]} />);
+  expect(screen.queryByText(/Waiting for model/)).not.toBeInTheDocument();
+
+  const requestThree = event(8, 16, { kind: "model_request_started", request: modelRequest("attempt-3") });
+  const committedText = event(9, 17, { kind: "model_text", text: "Completed response" });
+  rerender(<WorkspaceShell {...props} agentRunEventsV4={[requestOne, requestTwo, requestThree, committedText]} />);
+  expect(screen.queryByText(/Waiting for model/)).not.toBeInTheDocument();
+
+  const requestFour = event(10, 18, { kind: "model_request_started", request: modelRequest("attempt-4") });
+  const toolBoundary = event(11, 19, { kind: "tool_requested", call: { call_id: "read", tool_id: "project.read", arguments: {} } });
+  rerender(<WorkspaceShell {...props} agentRunEventsV4={[requestFour, toolBoundary]} />);
+  expect(screen.queryByText(/Waiting for model/)).not.toBeInTheDocument();
+
+  const paused = event(12, 20, { kind: "input_requested", question_id: "q", question: "Continue?" });
+  rerender(<WorkspaceShell {...props} agentRunEventsV4={[requestFour, paused]} />);
+  expect(screen.getByText(/Waiting for input · 0 steps/)).toBeInTheDocument();
+  expect(screen.queryByText(/Waiting for model/)).not.toBeInTheDocument();
+
+  const answered = event(13, 21, { kind: "user_input_answered", question_id: "q", answer: "Yes" });
+  rerender(<WorkspaceShell {...props} agentRunEventsV4={[requestFour, paused, answered]} />);
+  expect(screen.queryByText(/Waiting for model/)).not.toBeInTheDocument();
+
+  const requestFive = event(14, 22, { kind: "model_request_started", request: modelRequest("attempt-5") });
+  rerender(<WorkspaceShell {...props} agentRunEventsV4={[requestFour, paused, answered, requestFive]} />);
+  expect(screen.getByText(/Waiting for model · 0 steps · request 8s/)).toBeInTheDocument();
+
+  const terminal = event(15, 23, { kind: "run_cancelled" });
+  rerender(<WorkspaceShell {...props} agentRunEventsV4={[requestFour, terminal]} />);
+  expect(screen.queryByText(/Waiting for model/)).not.toBeInTheDocument();
+
+  rerender(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} agentRunEventsV4={[requestFour]} />);
+  expect(screen.queryByText(/Waiting for model/)).not.toBeInTheDocument();
+});
+
+function modelRequest(attemptId: string): import("../../types").ModelRequestStartedV4 {
+  return {
+    logical_request_id: "logical-request",
+    attempt_id: attemptId,
+    model_profile_id: "profile",
+    context_limit_source: { kind: "unknown" },
+  };
+}
+
+function modelUsage(attemptId: string, state: "partial" | "final" | "interrupted"): import("../../types").ModelUsageObservationV4 {
+  return {
+    ...modelRequest(attemptId),
+    sample_index: 0,
+    state,
+    aggregation: "unknown",
+  };
+}
 
 describe("Session follow-up wiring", () => {
   const base = { schema_version: 4 as const, run_id: "completed-session", project_id: project.id, conversation_id: "session-1", previous_hash: "", event_hash: "hash", occurred_at: "2026-09-12T00:00:01Z" };

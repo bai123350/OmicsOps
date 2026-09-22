@@ -85,7 +85,12 @@ pub(crate) fn event_view(event: &AgentEventV4) -> Value {
             .as_object_mut()
             .expect("outcome object")
             .remove("model_content");
-        attach_reference(&mut deduplicated, event, "model_content");
+        // A result page already carries the complete page and continuation
+        // metadata in data. Pointing it back at its own duplicate model_content
+        // invites recursive reads without making any information recoverable.
+        if outcome.tool_id != READ_RESULT_TOOL {
+            attach_reference(&mut deduplicated, event, "model_content");
+        }
         if serde_json::to_vec(&deduplicated)
             .expect("serializable model view")
             .len()
@@ -218,14 +223,69 @@ pub(crate) fn read_result(
     if offset > text.len() || !text.is_char_boundary(offset) {
         return Err("offset must be an in-range UTF-8 boundary; use next_offset".into());
     }
-    let mut end = offset.saturating_add(limit as usize).min(text.len());
-    while !text.is_char_boundary(end) {
-        end -= 1;
+    let mut requested_end = offset.saturating_add(limit as usize).min(text.len());
+    while !text.is_char_boundary(requested_end) {
+        requested_end -= 1;
     }
-    Ok(
-        json!({"content": &text[offset..end], "next_offset": (end < text.len()).then_some(end),
-        "total_bytes": text.len(), "sequence": sequence, "event_hash": hash, "field": field}),
-    )
+    let requested = result_page(&text, offset, requested_end, sequence, hash, field);
+    if serde_json::to_vec(&requested)
+        .expect("serializable result page")
+        .len()
+        <= VIEW_BYTES
+    {
+        return Ok(requested);
+    }
+
+    // `limit` bounds the raw UTF-8 slice, while the page is subsequently
+    // serialized into model_content. Quotes, backslashes, control characters,
+    // and page metadata can therefore make an 8192-byte slice exceed the model
+    // view budget. Find the largest UTF-8 prefix whose complete page remains
+    // inline. Callers must continue from the returned next_offset.
+    let mut boundaries = vec![offset];
+    boundaries.extend(
+        text[offset..requested_end]
+            .char_indices()
+            .skip(1)
+            .map(|(relative, _)| offset + relative),
+    );
+    boundaries.push(requested_end);
+    let mut low = 0;
+    let mut high = boundaries.len() - 1;
+    while low < high {
+        let middle = (low + high + 1) / 2;
+        let candidate_end = boundaries[middle];
+        // Use a numeric continuation while searching so serialized size stays
+        // monotonic even when candidate_end happens to equal the text length.
+        let candidate = json!({"content": &text[offset..candidate_end],
+            "next_offset": candidate_end, "total_bytes": text.len(),
+            "sequence": sequence, "event_hash": hash, "field": field});
+        if serde_json::to_vec(&candidate)
+            .expect("serializable result page")
+            .len()
+            <= VIEW_BYTES
+        {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let end = boundaries[low];
+    if end == offset {
+        return Err("result page metadata exceeds the model view budget".into());
+    }
+    Ok(result_page(&text, offset, end, sequence, hash, field))
+}
+
+fn result_page(
+    text: &str,
+    offset: usize,
+    end: usize,
+    sequence: u64,
+    hash: &str,
+    field: &str,
+) -> Value {
+    json!({"content": &text[offset..end], "next_offset": (end < text.len()).then_some(end),
+        "total_bytes": text.len(), "sequence": sequence, "event_hash": hash, "field": field})
 }
 
 pub(crate) fn read_outcome(
@@ -248,5 +308,123 @@ pub(crate) fn read_outcome(
         model_content: data.to_string(),
         data,
         provenance: vec!["host-scoped-result-read-v4".into()],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use chrono::Utc;
+    use omicsops_protocol::{
+        AgentEventKindV4, AgentEventV4, ExecutionPlanV4, RunSpecV4, ToolCallV4, ToolOutcomeV4,
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::{READ_RESULT_TOOL, VIEW_BYTES, event_view, read_outcome};
+
+    fn spec() -> RunSpecV4 {
+        let plan = ExecutionPlanV4 {
+            schema_version: 4,
+            objective: "read a stored result".into(),
+            steps: vec!["read pages".into()],
+            completion_criteria: vec!["restore the original".into()],
+            requested_capabilities: BTreeSet::from([READ_RESULT_TOOL.into()]),
+        };
+        let hash = plan.canonical_hash().unwrap();
+        RunSpecV4::freeze(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            plan,
+            &hash,
+            Utc::now(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn read_result_pages_stay_inline_after_event_projection_with_utf8_escapes() {
+        let spec = spec();
+        let original = "quoted: \\\"line\\\\break\n\t; unicode: 数据🧬; ".repeat(700);
+        let source = AgentEventV4::first(
+            spec.run_id,
+            spec.project_id,
+            spec.conversation_id,
+            Utc::now(),
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: "source".into(),
+                    tool_id: "project.read".into(),
+                    succeeded: true,
+                    model_content: original.clone(),
+                    data: json!({"content": original}),
+                    provenance: vec![],
+                },
+            },
+        );
+        let mut offset = 0_u64;
+        let mut restored = String::new();
+        let mut page_index = 0_u64;
+
+        loop {
+            let outcome = read_outcome(
+                &spec,
+                std::slice::from_ref(&source),
+                ToolCallV4 {
+                    call_id: format!("page-{page_index}"),
+                    tool_id: READ_RESULT_TOOL.into(),
+                    arguments: json!({
+                        "sequence": source.sequence,
+                        "event_hash": source.event_hash,
+                        "field": "model_content",
+                        "offset": offset,
+                        "limit": 8192,
+                    }),
+                },
+            );
+            assert!(outcome.succeeded);
+            assert!(
+                outcome.model_content.len() <= VIEW_BYTES,
+                "serialized page exceeded the model-view budget: {} bytes",
+                outcome.model_content.len()
+            );
+
+            let page_event = AgentEventV4::first(
+                spec.run_id,
+                spec.project_id,
+                spec.conversation_id,
+                Utc::now(),
+                AgentEventKindV4::ToolFinished {
+                    outcome: outcome.clone(),
+                },
+            );
+            let view = event_view(&page_event);
+            assert_eq!(view["event"]["outcome"]["data"], outcome.data);
+            assert!(view["event"]["outcome"].get("model_content").is_none());
+            assert!(view.get("result_reference").is_none());
+
+            let page = &view["event"]["outcome"]["data"];
+            let content = page["content"].as_str().unwrap();
+            restored.push_str(content);
+            let Some(next_offset) = page["next_offset"].as_u64() else {
+                break;
+            };
+            assert!(next_offset > offset);
+            assert!(original.is_char_boundary(next_offset as usize));
+            if page_index == 0 {
+                assert!(
+                    content.len() < 8192,
+                    "escaping overhead must consume budget"
+                );
+                assert_ne!(next_offset, 8192, "callers must follow next_offset");
+            }
+            offset = next_offset;
+            page_index += 1;
+        }
+
+        assert_eq!(restored, original);
     }
 }

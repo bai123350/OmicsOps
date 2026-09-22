@@ -1,0 +1,10 @@
+import React,{useState} from 'react';
+import {createRoot} from 'react-dom/client';
+import {WorkspaceShell} from './src/features/workspace/WorkspaceShell';
+import './src/styles.css';
+import './src/desktop-layout.css';
+const base={schema_version:4,run_id:'qa',project_id:'qa-project',conversation_id:'qa-conversation',previous_hash:'',event_hash:'qa',occurred_at:'2026-09-15T00:00:00Z'};
+const events=Array.from({length:9},(_,i)=>({...base,sequence:i+1,event:{kind:'tool_requested',call:{call_id:`call-${i}`,tool_id:'search_mcp_tools',arguments:{query:`Hi-C literature ${i+1}`}}}}));
+const answer='## Hi-C 文献调研\n\n以下是**模拟界面数据**，用于检查回复排版和活动折叠。\n\n### 研究方向\n\n- 三维基因组与染色质互作\n- 染色质结构域及调控机制\n\n| 方向 | 关注内容 | 状态 |\n| --- | --- | --- |\n| Hi-C | 全基因组互作 | 待核验 |\n| 调控机制 | 结构与表达 | 待检索 |\n\n> 尚未形成可引用的文献结论。\n\n```python\nprint("Hi-C analysis preview")\n```';
+function Demo(){const [done,setDone]=useState(false);return <><button style={{position:'fixed',top:8,right:12,zIndex:9999}} onClick={()=>setDone(!done)}>{done?'切换运行中':'切换已完成'}</button><WorkspaceShell project={{id:'qa-project',name:'视觉验收 · 模拟数据',status:'running',template:'single_cell_rna_seq'}} locale="zh-CN" onLocaleChange={()=>{}} onSend={async()=>false} runStarted activeRunId="qa" messages={[{id:'q',role:'user',markdown:'帮我调研 Hi-C 类三维基因组文章'},...(done?[{id:'a',role:'assistant',markdown:answer}]:[])]} agentRunEventsV4={done?[...events,{...base,sequence:10,event:{kind:'run_failed',message:'模拟检索服务不可用，已有内容已保留。'}}]:events} agentTextPreview={done?null:{run_id:'qa',text:answer}} /></>};
+createRoot(document.getElementById('root')).render(<Demo/>);

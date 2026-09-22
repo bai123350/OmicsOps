@@ -34,14 +34,6 @@ body { min-width: 0; }
 .compose-actions button { padding: 7px 5px; gap: 9px; }
 .compose-action-icon { width: 28px; height: 28px; border-radius: 7px; }
 .permission-menu > button.agent-control-row { padding: 9px; }
-.library-topbar { height: var(--desktop-header-height); padding: 0 22px; }
-.library-main { max-width: 1000px; padding: 32px 28px; }
-.library-hero { margin-bottom: 28px; }
-.library-hero h1 { font-size: 28px; }
-.library-hero p { font-size: 13px; }
-.section-title { margin-top: 24px; }
-.template-card { min-height: 92px; padding: 14px; gap: 10px; }
-.template-icon { width: 34px; height: 34px; border-radius: 8px; }
 .settings-backdrop { padding: 0; }
 .settings-backdrop > .settings-panel { width: 100vw; height: 100vh; }
 .create-project-dialog { width: min(660px, 94vw); }
@@ -53,5 +45,4 @@ body { min-width: 0; }
 @media (max-height: 620px) {
   .message-stream { padding-top: 14px; padding-bottom: 14px; }
   .session-list { max-height: 28vh; }
-  .library-main { padding-top: 24px; }
 }

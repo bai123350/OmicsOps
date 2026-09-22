@@ -200,8 +200,6 @@ html[data-omicsops-theme="dark"] {
 
 html[data-omicsops-theme="dark"] #root :is(
   .desktop-loading,
-  .library-page,
-  .library-main,
   .science-shell,
   .workspace,
   .conversation-pane,
@@ -220,8 +218,6 @@ html[data-omicsops-theme="dark"] #root :is(
 
 html[data-omicsops-theme="dark"] #root :is(
   .topbar,
-  .library-topbar,
-  .library-hero,
   .conversation-header,
   .composer,
   .composer-runtime-bar,

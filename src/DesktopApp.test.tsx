@@ -504,7 +504,7 @@ describe("DesktopApp", () => {
     vi.spyOn(api, "listProjects").mockResolvedValue([]);
     render(<DesktopApp />);
 
-    expect(await screen.findByRole("heading", { name: "生命科学项目" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "还没有项目" })).toBeInTheDocument();
     expect(screen.getByText("单细胞 RNA 测序")).toBeInTheDocument();
     expect(screen.getByText("文献综述")).toBeInTheDocument();
   });
@@ -1313,7 +1313,7 @@ describe("DesktopApp", () => {
     render(<DesktopApp />);
 
     fireEvent.click(await screen.findByRole("button", { name: "返回项目主页" }));
-    expect(await screen.findByRole("heading", { name: "生命科学项目" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "最近项目" })).toBeInTheDocument();
     expect(screen.getByText("PBMC 项目")).toBeInTheDocument();
   });
 
@@ -1419,9 +1419,7 @@ describe("DesktopApp", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     fireEvent.click(screen.getByRole("button", { name: "返回项目主页" }));
-    const otherProjectButton = screen.getAllByRole("button", { name: new RegExp(otherProject.name) }).find((button) => button.classList.contains("recent-project-open"));
-    expect(otherProjectButton).toBeDefined();
-    fireEvent.click(otherProjectButton!);
+    fireEvent.click(screen.getByRole("button", { name: `打开项目：${otherProject.name}` }));
     expect(await screen.findByRole("heading", { name: otherConversation.title })).toBeInTheDocument();
 
     await act(async () => pending.resolve({ ...stateProject, connection_id: connection.id, remote_root: "/srv/pbmc" }));
@@ -1433,14 +1431,14 @@ describe("DesktopApp", () => {
     vi.spyOn(api, "listProjects").mockResolvedValue([]);
     const first = render(<DesktopApp />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "English" }));
+    fireEvent.click(await screen.findByRole("button", { name: "切换为 English" }));
     expect(await screen.findByRole("button", { name: "Settings" })).toBeInTheDocument();
     expect(window.localStorage.getItem("omicsops.locale")).toBe("en-US");
     first.unmount();
 
     render(<DesktopApp />);
     expect(await screen.findByRole("button", { name: "Settings" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "简体中文" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Switch to 简体中文" })).toBeInTheDocument();
   });
 
   it("applies General language changes immediately and keeps them after Settings closes and reopens", async () => {
@@ -1543,7 +1541,7 @@ describe("DesktopApp", () => {
     render(<DesktopApp />);
     await screen.findByRole("main", { name: "科研对话" });
     fireEvent.click(screen.getByRole("button", { name: "返回项目主页" }));
-    fireEvent.click(await screen.findByRole("button", { name: /^项目 B/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "打开项目：项目 B" }));
     expect(await screen.findByRole("heading", { name: "项目 B 会话" })).toBeInTheDocument();
     await act(async () => lateA.resolve(stateConversations[1]));
 
@@ -1566,7 +1564,7 @@ describe("DesktopApp", () => {
     render(<DesktopApp />);
     await screen.findByRole("heading", { name: "Agent 会话" });
     fireEvent.click(screen.getByRole("button", { name: "返回项目主页" }));
-    fireEvent.click(await screen.findByRole("button", { name: /^项目 B/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "打开项目：项目 B" }));
     await screen.findByRole("button", { name: "重试会话恢复" });
 
     expect(screen.queryByRole("heading", { name: "Agent 会话" })).not.toBeInTheDocument();
@@ -1693,7 +1691,7 @@ describe("DesktopApp", () => {
     const oldKernel = kernelListeners[0];
     const oldSync = syncListeners[0];
     fireEvent.click(screen.getByRole("button", { name: "返回项目主页" }));
-    fireEvent.click(await screen.findByRole("button", { name: /^项目 B/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "打开项目：项目 B" }));
     await screen.findByRole("heading", { name: "会话 B" });
 
     const kernelEvent: KernelEvent = { project_id: projectA.id, session_id: "shared-kernel", request_id: "old-request", sequence: 1, occurred_at: "2026-08-20T00:00:00Z", event: { kind: "stdout", payload: "旧项目 kernel 泄漏" } };

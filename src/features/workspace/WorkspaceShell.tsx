@@ -1182,8 +1182,22 @@ function V4RunTrace({ locale, events, previewText, onAnswer, onDecideApproval, o
     || (latest.event.kind === "tool_requested" && latest.event.call.tool_id === "agent.complete")
   ));
   const pauseReason = getV4PauseReason(events);
+  const pendingModel = !historical && !terminal && !pauseReason ? pendingModelRequest(events) : null;
+  const [modelWaitNow, setModelWaitNow] = useState(() => Date.now());
+  useEffect(() => {
+    setModelWaitNow(Date.now());
+    if (!pendingModel || pendingModel.startedAtMs === null) return;
+    const timer = window.setInterval(() => setModelWaitNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [events[0]?.run_id, pendingModel?.attemptId, pendingModel?.startedAtMs]);
+  const modelWaitDuration = pendingModel?.startedAtMs === null || pendingModel === null
+    ? ""
+    : formatDuration(Math.max(0, modelWaitNow - pendingModel.startedAtMs));
+  const duration = modelWaitDuration
+    ? `${zh ? "本次请求" : "request"} ${modelWaitDuration}`
+    : eventDuration(events[0]?.occurred_at, (terminal ?? latest)?.occurred_at);
   const unresolvedDispatchFailure = (!terminal || terminal.event.kind === "run_needs_attention" || terminal.event.kind === "run_failed") && events.some(({ event }) => event.kind === "tool_dispatch_uncertain" && !isV4UncertainResolved(events, event.call_id));
-  const status = unresolvedDispatchFailure ? (zh ? "失败" : "Failed") : terminal?.event.kind === "run_completed" ? (zh ? "已完成" : "Completed") : terminal?.event.kind === "run_cancelled" ? (zh ? "已终止" : "Cancelled") : terminal?.event.kind === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention") : terminal?.event.kind === "run_failed" ? (zh ? "失败" : "Failed") : pauseReason === "approval" ? (zh ? "等待工具审批" : "Waiting for approval") : pauseReason === "input" ? (zh ? "等待回答" : "Waiting for input") : pauseReason === "browser_connection" ? (zh ? "等待连接浏览器" : "Waiting for browser") : pauseReason === "browser_human" ? (zh ? "等待人工处理浏览器" : "Waiting for browser intervention") : pauseReason === "runtime_recovery" ? (zh ? "结果待恢复" : "Results ready to resume") : (zh ? "运行中" : "Running");
+  const status = unresolvedDispatchFailure ? (zh ? "失败" : "Failed") : terminal?.event.kind === "run_completed" ? (zh ? "已完成" : "Completed") : terminal?.event.kind === "run_cancelled" ? (zh ? "已终止" : "Cancelled") : terminal?.event.kind === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention") : terminal?.event.kind === "run_failed" ? (zh ? "失败" : "Failed") : pauseReason === "approval" ? (zh ? "等待工具审批" : "Waiting for approval") : pauseReason === "input" ? (zh ? "等待回答" : "Waiting for input") : pauseReason === "browser_connection" ? (zh ? "等待连接浏览器" : "Waiting for browser") : pauseReason === "browser_human" ? (zh ? "等待人工处理浏览器" : "Waiting for browser intervention") : pauseReason === "runtime_recovery" ? (zh ? "结果待恢复" : "Results ready to resume") : pendingModel && previewText ? (zh ? "正在生成回复" : "Generating response") : pendingModel ? (zh ? "等待模型响应" : "Waiting for model") : (zh ? "运行中" : "Running");
   const shouldExpand = !historical && !terminal;
   async function resumeRun() {
     if (!onResume || !events[0] || resumeBusyRef.current) return;
@@ -1211,7 +1225,7 @@ function V4RunTrace({ locale, events, previewText, onAnswer, onDecideApproval, o
     {completionPending && <div className="agent-completion-pending" role="status"><span className="agent-working"><i />{zh ? "正在核验最终结果…" : "Verifying the final result…"}</span></div>}
     <section className="v4-conversation-run" aria-label={zh ? "分析对话" : "Analysis conversation"}>
     <details className={`agent-run-fold agent-v4-run ${historical ? "" : "is-active"}`} open={shouldExpand}>
-      <summary><span className="agent-run-fold-title"><span><b>{zh ? "执行过程" : terminal ? "Processed" : "Processing"}</b><small>{terminal ? (zh ? "工具调用与验证记录" : "Tool calls and verification") : (zh ? "Agent 正在处理任务" : "Agent is working")}</small></span><ChevronRight size={15} /></span><span>{status} · {tools.length} {zh ? "个步骤" : tools.length === 1 ? "step" : "steps"}{eventDuration(events[0]?.occurred_at, (terminal ?? latest)?.occurred_at) && ` · ${eventDuration(events[0]?.occurred_at, (terminal ?? latest)?.occurred_at)}`}</span></summary>
+      <summary><span className="agent-run-fold-title"><span><b>{zh ? "执行过程" : terminal ? "Processed" : "Processing"}</b><small>{terminal ? (zh ? "工具调用与验证记录" : "Tool calls and verification") : (zh ? "Agent 正在处理任务" : "Agent is working")}</small></span><ChevronRight size={15} /></span><span>{status} · {tools.length} {zh ? "个步骤" : tools.length === 1 ? "step" : "steps"}{duration && ` · ${duration}`}</span></summary>
       <div className="agent-run-fold-body">
 
       <section className="v4-process-timeline" aria-label={zh ? "工具调用详情" : "Tool call details"}><ActivityWindow zh={zh}>
@@ -1543,6 +1557,33 @@ function effectiveTerminalAgentEventV4(events: AgentRunEventV4[]): AgentRunEvent
     return laterEventsAreOnlyCleanup ? events[index] : undefined;
   }
   return undefined;
+}
+
+function pendingModelRequest(events: AgentRunEventV4[]): { attemptId: string; startedAtMs: number | null } | null {
+  let pending: { attemptId: string; startedAtMs: number | null } | null = null;
+  for (const item of events) {
+    const event = item.event;
+    if (event.kind === "model_request_started") {
+      const startedAtMs = Date.parse(item.occurred_at);
+      pending = {
+        attemptId: event.request.attempt_id,
+        startedAtMs: Number.isFinite(startedAtMs) ? startedAtMs : null,
+      };
+      continue;
+    }
+    if (event.kind === "model_usage_observed") {
+      if (pending && event.observation.attempt_id === pending.attemptId
+        && (event.observation.state === "final" || event.observation.state === "interrupted")) pending = null;
+      continue;
+    }
+    if (pending && (event.kind === "model_text" || event.kind === "cycle_finished"
+      || event.kind === "tool_requested" || event.kind === "plan_proposed"
+      || event.kind === "tool_approval_requested" || event.kind === "input_requested"
+      || event.kind === "browser_connection_required" || event.kind === "browser_human_intervention_required"
+      || event.kind === "runtime_recovery_available"
+      || isTerminalAgentEventV4(item))) pending = null;
+  }
+  return pending;
 }
 
 function getV4PauseReason(events: AgentRunEventV4[]): "approval" | "input" | "browser_connection" | "browser_human" | "uncertain" | "runtime_recovery" | null {

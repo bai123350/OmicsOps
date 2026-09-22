@@ -1,6 +1,6 @@
-.recent-projects small { display: flex; align-items: center; gap: 4px; }
-.recent-projects .remote-target { color: #176b4d; }
-.recent-projects .local-target { color: #b54708; }
+.recent-projects small { display: flex; align-items: center; min-width: 0; gap: 5px; }
+.recent-projects .remote-target { color: color-mix(in srgb, var(--omicsops-text-muted) 66%, var(--omicsops-accent)); }
+.recent-projects .local-target { color: var(--omicsops-text-muted); }
 .create-project-backdrop { position: fixed; inset: 0; z-index: 40; background: #10182880; display: grid; place-items: center; padding: 24px; }
 .create-project-dialog { width: min(720px, 94vw); max-height: 92vh; overflow: auto; background: white; border-radius: 14px; box-shadow: 0 25px 90px #10182855; }
 .create-project-dialog > header { height: 68px; border-bottom: 1px solid #e4e7ec; padding: 0 20px; display: flex; align-items: center; justify-content: space-between; }
