@@ -1,15 +1,18 @@
 import * as queueApi from "./composer-queue-api";
 import * as preferencesApi from "./conversation-preferences-api";
-import { StrictMode } from "react";
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { StrictMode, type ReactNode } from "react";
+import { act, fireEvent, render as testingRender, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import DesktopApp, { samePendingSubmission } from "./DesktopApp";
+import { AppearanceProvider } from "./use-appearance";
 import * as api from "./tauri-api";
 import * as referenceApi from "./composer-reference-api";
 import * as attachmentApi from "./composer-attachment-api";
 import * as usageApi from "./usage-settings-api";
 import type { AgentRunEventV4, ComposerReference, ConversationAgentStateV4, ExecutionPlanV4, KernelEvent, ProposedPlanRevisionV4, RunSummaryV4, StopRunReceiptV4, SyncEntry, WorkspaceMessage } from "./types";
+
+const render = (ui: ReactNode) => testingRender(ui, { wrapper: AppearanceProvider });
 
 beforeEach(() => {
   vi.restoreAllMocks();
@@ -84,6 +87,89 @@ function setupConversationStateHarness() {
 }
 
 describe("DesktopApp", () => {
+  it.each(["menu", "help", "help over search"])("closes chrome %s before the global search shortcut takes over", async (surface) => {
+    vi.spyOn(api, "listProjects").mockResolvedValue([]);
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: "最近项目" });
+    if (surface === "help over search") fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Help" }));
+    if (surface !== "menu") fireEvent.click(screen.getByRole("menuitem", { name: "快速入门" }));
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    expect(await screen.findByRole("dialog", { name: "搜索工作区" })).toBeInTheDocument();
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "快速入门" })).not.toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("honors a new-project menu action while the initial project list is loading", async () => {
+    const pendingProjects = deferred<typeof stateProject[]>();
+    vi.spyOn(api, "listProjects").mockReturnValue(pendingProjects.promise);
+    render(<DesktopApp />);
+    fireEvent.click(screen.getByRole("menuitem", { name: "File" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "新建项目" }));
+    await act(async () => pendingProjects.resolve([stateProject]));
+    expect(await screen.findByRole("dialog", { name: "创建新项目" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "最近项目" })).toBeInTheDocument();
+  });
+
+  it("offers the four application menus and opens a new project from File", async () => {
+    vi.spyOn(api, "listProjects").mockResolvedValue([]);
+    render(<DesktopApp />);
+    const bar = await screen.findByRole("menubar");
+    for (const name of ["File", "Edit", "View", "Help"]) {
+      expect(within(bar).getByRole("menuitem", { name })).toBeInTheDocument();
+    }
+    fireEvent.click(within(bar).getByRole("menuitem", { name: "File" }));
+    expect(screen.getByRole("menuitem", { name: "新会话" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("menuitem", { name: "新建项目" }));
+    expect(await screen.findByRole("dialog", { name: "创建新项目" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "项目名称" })).toHaveValue("空白研究项目");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "创建新项目" })).not.toBeInTheDocument();
+    fireEvent.click(within(bar).getByRole("menuitem", { name: "File" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "新建项目" }));
+    expect(await screen.findByRole("dialog", { name: "创建新项目" })).toBeInTheDocument();
+  });
+
+  it("routes menu actions in the workspace and dismisses only the top menu over settings", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Edit" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /搜索/ }));
+    expect(await screen.findByRole("dialog", { name: "搜索工作区" })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    fireEvent.click(screen.getByRole("menuitem", { name: "File" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "设置" }));
+    const settings = await screen.findByRole("dialog", { name: /设置/ });
+    fireEvent.click(screen.getByRole("menuitem", { name: "View" }));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(settings).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(settings).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitem", { name: "File" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "项目列表" }));
+    expect(await screen.findByRole("heading", { name: "最近项目" })).toBeInTheDocument();
+    expect(screen.getByRole("menubar")).toBeInTheDocument();
+  });
+
+  it("opens project files from View over settings", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    fireEvent.click(screen.getByRole("menuitem", { name: "File" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "设置" }));
+    await screen.findByRole("dialog", { name: "工作台设置" });
+    fireEvent.click(screen.getByRole("menuitem", { name: "View" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "项目文件" }));
+    expect(await screen.findByRole("tab", { name: "Files" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("dialog", { name: "工作台设置" })).not.toBeInTheDocument();
+  });
+
   it("refreshes model and conversation selections after deleting a profile", async () => {
     const { stateSpy } = setupConversationStateHarness();
     stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));

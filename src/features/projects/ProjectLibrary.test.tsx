@@ -38,6 +38,19 @@ const templateCases = [
 ] as const;
 
 describe("ProjectLibrary homepage actions", () => {
+  it("opens and consumes a menu request without reopening after Escape", () => {
+    const onCreateRequestHandled = vi.fn();
+    const props = { ...baseProps, onChooseLocalRoot: vi.fn(), onCreate: vi.fn(), onCreateRequestHandled };
+    const { rerender } = render(<ProjectLibrary {...props} createRequestKey="first" />);
+    expect(screen.getByRole("dialog", { name: "创建新项目" })).toBeInTheDocument();
+    expect(onCreateRequestHandled).toHaveBeenCalledWith("first");
+    fireEvent.keyDown(window, { key: "Escape" });
+    rerender(<ProjectLibrary {...props} createRequestKey={null} />);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    rerender(<ProjectLibrary {...props} createRequestKey="second" />);
+    expect(screen.getByRole("textbox", { name: "项目名称" })).toHaveValue("空白研究项目");
+  });
+
   it("keeps the brand promise and routes search, locale, and settings actions", () => {
     const onOpenSearch = vi.fn();
     const onLocaleChange = vi.fn();

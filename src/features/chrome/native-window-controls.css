@@ -1,0 +1,55 @@
+.native-window-controls {
+  position: relative;
+  display: flex;
+  align-self: stretch;
+  flex-shrink: 0;
+  color: var(--omicsops-text);
+}
+
+.native-window-controls > button {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  min-height: 38px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+}
+
+.native-window-controls > button:hover {
+  background: var(--omicsops-surface-muted);
+}
+
+.native-window-controls > button:focus-visible {
+  outline: 2px solid var(--omicsops-accent);
+  outline-offset: -3px;
+}
+
+.native-window-controls > .native-window-close:hover {
+  background: #c42b1c;
+  color: #fff;
+}
+
+.native-window-controls svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 1.5;
+  pointer-events: none;
+}
+
+.native-window-error {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 4px;
+  z-index: 20;
+  width: max-content;
+  max-width: 260px;
+  padding: 8px 12px;
+  border: 1px solid var(--omicsops-border);
+  border-radius: 6px;
+  background: var(--omicsops-surface-raised);
+  color: var(--omicsops-danger, #a63737);
+  font-size: 12px;
+}

@@ -1,0 +1,41 @@
+.desktop-frame {
+  --desktop-menu-height: 38px;
+  display: flex;
+  flex-direction: column;
+  height: var(--omicsops-unzoomed-viewport-height, 100vh);
+  overflow: hidden;
+}
+
+.desktop-frame-content {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.desktop-frame .desktop-frame-content > .library-page,
+.desktop-frame .desktop-frame-content > .desktop-loading {
+  min-height: 100%;
+}
+
+.desktop-frame .desktop-frame-content > .science-shell,
+html[data-omicsops-theme] #root .desktop-frame .science-shell {
+  height: 100%;
+  min-height: 0;
+}
+
+/* Reserve title-bar space for every dialog, including nested project dialogs. */
+.desktop-frame [class$="-backdrop"],
+html[data-omicsops-theme] #root .desktop-frame [class$="-backdrop"] {
+  top: var(--desktop-menu-height);
+  height: calc(var(--omicsops-unzoomed-viewport-height, 100vh) - var(--desktop-menu-height));
+}
+
+.desktop-frame [class$="-backdrop"] > [role="dialog"] {
+  max-height: 100%;
+}
+
+@media (max-width: 1050px) {
+  .desktop-frame .workspace-sidebar {
+    top: calc(var(--desktop-menu-height) + var(--desktop-header-height, 52px));
+  }
+}

@@ -22,6 +22,9 @@ import { useComposerReplacement } from "./features/workspace/useComposerReplacem
 import { useAgentStop } from "./features/workspace/useAgentStop";
 import { useResumeLastSessionPreference } from "./features/settings/useResumeLastSessionPreference";
 import { useRunNotifications } from "./use-run-notifications";
+import { ApplicationMenuBar } from "./features/chrome/ApplicationMenuBar";
+import { NativeWindowControls } from "./features/chrome/NativeWindowControls";
+import "./features/chrome/desktop-frame.css";
 
 type SendMode = "chat" | "plan";
 
@@ -57,6 +60,9 @@ export function samePendingSubmission(
 export default function DesktopApp() {
   const [projects, setProjects] = useState<WorkspaceProject[]>([]);
   const [selected, setSelected] = useState<WorkspaceProject | null>(null);
+  const [createProjectRequest, setCreateProjectRequest] = useState<string | null>(null);
+  const startupNavigationRequested = useRef(false);
+  const [chromeDismissRequest, setChromeDismissRequest] = useState(0);
   const [searchOpen, setSearchOpen] = useState(false);
   const searchOpenRef = useRef(searchOpen);
   searchOpenRef.current = searchOpen;
@@ -65,6 +71,7 @@ export default function DesktopApp() {
   const [searchRequest, setSearchRequest] = useState<WorkspaceSearchRequest | null>(null);
   const workspaceSearch = useWorkspaceSearch(searchOpen, projects);
   function openWorkspaceSearch() {
+    setChromeDismissRequest((value) => value + 1);
     if (!searchOpenRef.current) searchActionGeneration.current += 1;
     setSearchOpen(true);
   }
@@ -337,7 +344,8 @@ export default function DesktopApp() {
 
   useEffect(() => {
     Promise.all([api.listProjects(), api.listModelProfiles(), api.listSkillPackages(), api.listMcpServers(), api.listConnections()]).then(([items, profiles, skills, servers, savedConnections]) => {
-      setProjects(items); setSelected(items[0] ?? null);
+      setProjects(items);
+      if (!startupNavigationRequested.current) setSelected(items[0] ?? null);
       setModelProfiles(profiles); setActiveModelProfileId(profiles[0]?.id ?? null);
       setSkillPackages(skills);
       setMcpServers(servers);
@@ -1056,7 +1064,38 @@ export default function DesktopApp() {
     setAgentNotice(message);
   }, [agentStop.error, conversation?.id, locale, selected?.id]);
 
-  if (loading) return <div className="desktop-loading">OmicsOps</div>;
+  function openApplicationSettings(section: SettingsSection) {
+    closeWorkspaceSearch();
+    setSettingsSection(section);
+    setSettingsNavigationKey((value) => value + 1);
+    setSettingsOpen(true);
+  }
+
+  const applicationMenu = <ApplicationMenuBar
+    dismissRequest={chromeDismissRequest}
+    locale={locale}
+    hasProject={Boolean(selected)}
+    newConversationDisabled={loading || agentBusy || conversationHydrating || conversationLocked}
+    onNewProject={() => {
+      startupNavigationRequested.current = true;
+      closeSettings();
+      closeWorkspaceSearch();
+      setSelected(null);
+      setCreateProjectRequest(crypto.randomUUID());
+    }}
+    onNewConversation={newConversation}
+    onProjects={() => { startupNavigationRequested.current = true; closeSettings(); closeWorkspaceSearch(); setSelected(null); }}
+    onSearch={openWorkspaceSearch}
+    onSettings={openApplicationSettings}
+    onFiles={() => {
+      if (!selected) return;
+      closeSettings();
+      closeWorkspaceSearch();
+      setSearchRequest({ key: crypto.randomUUID(), kind: "files", projectId: selected.id });
+    }}
+  ><NativeWindowControls locale={locale} /></ApplicationMenuBar>;
+
+  if (loading) return <div className="desktop-frame">{applicationMenu}<div className="desktop-frame-content"><div className="desktop-loading">OmicsOps</div></div></div>;
   const searchEntries: WorkspaceSearchEntry[] = [
     ...workspaceSearch.entries,
     { key: "action:models", kind: "action", label: locale === "zh-CN" ? "管理模型" : "Manage models", description: locale === "zh-CN" ? "打开模型设置" : "Open model settings" },
@@ -1114,7 +1153,7 @@ export default function DesktopApp() {
       setModelSelectionBusy(false);
     }
   }} onDeleteModel={removeModelProfile} onProbeModel={api.probeModelProfile} onListModels={api.listModelProfileModels} onImportSkill={async () => { const sourcePath = await api.chooseSkillDirectory(); if (!sourcePath) return; const skill = await api.importSkillDirectory(sourcePath); setSkillPackages((current) => [skill, ...current.filter((item) => item.id !== skill.id)]); }} onSetSkillEnabled={async (skillId, enabled) => { const updated = await api.setSkillEnabled(skillId, enabled); setSkillPackages(await api.listSkillPackages()); return updated; }} onSkillsChanged={async () => setSkillPackages(await api.listSkillPackages())} onPluginsChanged={async () => setSkillPackages(await api.listSkillPackages())} onSaveMcpServer={async (request) => { const updated = await api.saveMcpServer(request); setMcpServers(await api.listMcpServers()); return updated; }} onConfigurePubMedMcp={async (request) => { const updated = await api.configurePubMedMcpCredentials(request); setMcpServers(await api.listMcpServers()); return updated; }} onListBundledMcpPresets={api.listBundledMcpPresets} onAddBundledMcp={async (request) => { const updated = await api.addBundledMcpServer(request); setMcpServers(await api.listMcpServers()); return updated; }} onInspectMcpServer={async (serverId) => { if (!selected) throw new Error(locale === "zh-CN" ? "请先打开一个项目，再检查 MCP server。" : "Open a project before inspecting an MCP server."); await api.inspectConfiguredMcpServer(selected.id, serverId); setMcpServers(await api.listMcpServers()); }} onSetMcpServerEnabled={async (serverId, enabled) => { const updated = await api.setMcpServerEnabled(serverId, enabled); setMcpServers(await api.listMcpServers()); return updated; }} onSetMcpLaunchApproval={async (serverId, approved) => { const updated = await api.setMcpLaunchApproval(serverId, approved); setMcpServers(await api.listMcpServers()); return updated; }} onSetMcpToolApproval={async (serverId, tool, approved) => { const updated = await api.setMcpToolApproval(serverId, tool, approved); setMcpServers(await api.listMcpServers()); return updated; }} /> : null;
-  if (!selected) return <><ProjectLibrary onOpenSearch={openWorkspaceSearch} projects={projects} connections={connections} locale={locale} onLocaleChange={setLocale} onSettings={() => { setSettingsSection("general"); setSettingsNavigationKey((value) => value + 1); setSettingsOpen(true); }} onOpen={setSelected} onDelete={async (projectId) => { await api.deleteProject(projectId); setProjects((current) => current.filter((project) => project.id !== projectId)); }} onChooseLocalRoot={api.chooseProjectDirectory} onCreate={async ({ template, name, localRoot, connectionId, remoteRoot }) => { const project = await api.createProject({ name, description: "", local_root: localRoot, template, connection_id: connectionId, remote_root: remoteRoot }); setProjects((current) => [project, ...current]); setSelected(project); }} />{settings}{searchDialog}</>;
+  if (!selected) return <div className="desktop-frame">{applicationMenu}<div className="desktop-frame-content"><ProjectLibrary createRequestKey={createProjectRequest} onCreateRequestHandled={(key) => setCreateProjectRequest((current) => current === key ? null : current)} onOpenSearch={openWorkspaceSearch} projects={projects} connections={connections} locale={locale} onLocaleChange={setLocale} onSettings={() => openApplicationSettings("general")} onOpen={setSelected} onDelete={async (projectId) => { await api.deleteProject(projectId); setProjects((current) => current.filter((project) => project.id !== projectId)); }} onChooseLocalRoot={api.chooseProjectDirectory} onCreate={async ({ template, name, localRoot, connectionId, remoteRoot }) => { const project = await api.createProject({ name, description: "", local_root: localRoot, template, connection_id: connectionId, remote_root: remoteRoot }); setProjects((current) => [project, ...current]); setSelected(project); }} /></div>{settings}{searchDialog}</div>;
   async function changeConversationMode(nextMode: SessionAgentModeV4) {
     if (!selected || !conversation || nextMode === conversationMode) return;
     const projectId = selected.id;
@@ -1297,7 +1336,7 @@ export default function DesktopApp() {
     }
   }
   const currentConversationAction = captureConversationAction();
-  return <><WorkspaceShell
+  return <div className="desktop-frame">{applicationMenu}<div className="desktop-frame-content"><WorkspaceShell
     onOpenSearch={openWorkspaceSearch} searchRequest={searchRequest}
     onSearchRequestHandled={(key) => setSearchRequest((current) => current?.key === key ? null : current)}
     onSuggestFollowUps={api.agentV4SuggestFollowUps}
@@ -1573,7 +1612,7 @@ export default function DesktopApp() {
     onApprovePlan={approvePlan}
     onRequestPlanRevision={requestPlanRevision}
     onCancelRun={activePlanRunId ? cancelRun : undefined}
-  />{settings}{searchDialog}</>;
+  /></div>{settings}{searchDialog}</div>;
 }
 function mergeAgentRunEventsV4(current: AgentRunEventV4[], incoming: AgentRunEventV4[]) {
   return [...current, ...incoming]

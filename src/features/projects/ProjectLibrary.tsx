@@ -1,4 +1,4 @@
-import { useId, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { BookOpen, ChevronRight, Dna, FilePlus2, FlaskConical, FolderOpen, HardDrive, Languages, Library, Plus, Search, Server, Settings, Sparkles, Trash2, X } from "lucide-react";
 import type { ConnectionProfile, WorkspaceProject, WorkspaceTemplate } from "../../types";
 import type { Locale } from "../workspace/copy";
@@ -26,6 +26,8 @@ interface Props {
   onDelete: (projectId: string) => Promise<void>;
   onSettings: () => void;
   onOpenSearch?: () => void;
+  createRequestKey?: string | null;
+  onCreateRequestHandled?: (key: string) => void;
 }
 
 const templates = [
@@ -35,7 +37,7 @@ const templates = [
   { id: "blank", zh: "空白研究项目", en: "Blank research project", zhDescription: "从自由对话、文件和远端环境开始", enDescription: "Start from conversation, files, and remote compute", icon: FilePlus2 },
 ] satisfies Array<{ id: WorkspaceTemplate; zh: string; en: string; zhDescription: string; enDescription: string; icon: typeof Dna }>;
 
-export function ProjectLibrary({ projects, connections = [], locale, onLocaleChange, onChooseLocalRoot, onCreate, onOpen, onDelete, onSettings, onOpenSearch }: Props) {
+export function ProjectLibrary({ projects, connections = [], locale, onLocaleChange, onChooseLocalRoot, onCreate, onOpen, onDelete, onSettings, onOpenSearch, createRequestKey, onCreateRequestHandled }: Props) {
   const zh = locale === "zh-CN";
   const projectDescriptionPrefix = useId();
   const trustedConnections = useMemo(() => connections.filter((connection) => connection.host_key_fingerprint), [connections]);
@@ -59,6 +61,14 @@ export function ProjectLibrary({ projects, connections = [], locale, onLocaleCha
     setCompute(firstTrusted ? "remote" : "local");
     setConnectionId(firstTrusted?.id ?? "");
   }
+
+  const handledCreateRequest = useRef<string | null>(null);
+  useEffect(() => {
+    if (!createRequestKey || handledCreateRequest.current === createRequestKey) return;
+    handledCreateRequest.current = createRequestKey;
+    beginCreate("blank", zh ? "空白研究项目" : "Blank research project");
+    onCreateRequestHandled?.(createRequestKey);
+  }, [createRequestKey, onCreateRequestHandled, zh]);
 
   async function create() {
     if (!template || !name.trim() || !localRoot) return;
