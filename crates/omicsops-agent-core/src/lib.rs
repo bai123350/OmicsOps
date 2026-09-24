@@ -135,6 +135,7 @@ pub struct ReviewerEvidenceV4 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelStreamEventV4 {
     TextDelta(String),
+    Activity(ModelActivityPhaseV4),
     ProviderRetrying {
         attempt: u8,
         delay_ms: u64,
@@ -143,6 +144,25 @@ pub enum ModelStreamEventV4 {
     /// Bounded provider usage data for the current request attempt. AgentCore
     /// attaches durable request/attempt identity before it persists this.
     Usage(ModelUsageSampleV4),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelActivityPhaseV4 {
+    Reasoning,
+    ToolCall,
+    Responding,
+    Retrying,
+}
+
+impl ModelActivityPhaseV4 {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reasoning => "reasoning",
+            Self::ToolCall => "tool_call",
+            Self::Responding => "responding",
+            Self::Retrying => "retrying",
+        }
+    }
 }
 
 /// Frozen model metadata used to qualify usage observations. Unknown values
@@ -461,6 +481,14 @@ pub trait ExternalExecutorPortV4: Send + Sync {
 
 #[async_trait]
 pub trait EventStoreV4: Send + Sync {
+    /// Payload-free live provider activity. This never enters the audit chain.
+    fn preview_model_activity(
+        &self,
+        _run_id: Uuid,
+        _attempt_id: Uuid,
+        _phase: ModelActivityPhaseV4,
+    ) {
+    }
     /// Ephemeral public text preview; never part of the audit/evidence chain.
     fn preview_model_text(&self, _run_id: Uuid, _text: Option<&str>) {}
     async fn append(&self, event: &AgentEventV4) -> Result<(), String>;
@@ -2811,79 +2839,99 @@ impl AgentCoreV4<'_> {
                 ),
             )
             .await?;
-            let mut callback_events = Vec::new();
+            let (callback_tx, mut callback_rx) = tokio::sync::mpsc::unbounded_channel();
             let mut streamed_text = String::new();
             let _preview = ModelTextPreviewGuard {
                 store: self.events,
                 run_id,
             };
             let mut last_preview = None::<Instant>;
+            let mut last_activity = None::<(ModelActivityPhaseV4, Instant)>;
             let mut saw_usage = false;
-            let mut on_event = |event| match event {
-                ModelStreamEventV4::TextDelta(text) => {
-                    streamed_text.push_str(&text);
-                    if persist_text
-                        && last_preview
-                            .is_none_or(|last| last.elapsed() >= Duration::from_millis(40))
-                    {
-                        self.events.preview_model_text(run_id, Some(&streamed_text));
-                        last_preview = Some(Instant::now());
+            let mut on_event = |event| {
+                let phase = match event {
+                    ModelStreamEventV4::TextDelta(text) => {
+                        streamed_text.push_str(&text);
+                        if persist_text
+                            && last_preview
+                                .is_none_or(|last| last.elapsed() >= Duration::from_millis(40))
+                        {
+                            self.events.preview_model_text(run_id, Some(&streamed_text));
+                            last_preview = Some(Instant::now());
+                        }
+                        Some(ModelActivityPhaseV4::Responding)
                     }
-                }
-                ModelStreamEventV4::ProviderRetrying {
-                    attempt,
-                    delay_ms,
-                    message,
-                } => {
-                    callback_events.push(AgentEventKindV4::ModelRetrying {
+                    ModelStreamEventV4::Activity(phase) => Some(phase),
+                    ModelStreamEventV4::ProviderRetrying {
                         attempt,
-                        class: omicsops_protocol::ModelErrorClassV4::Transport,
-                        message: format!("{message}; retry delay {delay_ms}ms"),
-                    });
-                    if !saw_usage {
-                        callback_events.push(unknown_model_usage(
+                        delay_ms,
+                        message,
+                    } => {
+                        let _ = callback_tx.send(AgentEventKindV4::ModelRetrying {
+                            attempt,
+                            class: omicsops_protocol::ModelErrorClassV4::Transport,
+                            message: format!("{message}; retry delay {delay_ms}ms"),
+                        });
+                        if !saw_usage {
+                            let _ = callback_tx.send(unknown_model_usage(
+                                logical_request_id,
+                                current_attempt_id,
+                                &usage_metadata,
+                                &request_usage_metadata,
+                                UsageObservationStateV4::Interrupted,
+                            ));
+                        }
+                        current_attempt_id = Uuid::new_v4();
+                        saw_usage = false;
+                        let _ = callback_tx.send(model_request_started(
                             logical_request_id,
                             current_attempt_id,
                             &usage_metadata,
                             &request_usage_metadata,
-                            UsageObservationStateV4::Interrupted,
                         ));
+                        Some(ModelActivityPhaseV4::Retrying)
                     }
-                    current_attempt_id = Uuid::new_v4();
-                    saw_usage = false;
-                    callback_events.push(model_request_started(
-                        logical_request_id,
-                        current_attempt_id,
-                        &usage_metadata,
-                        &request_usage_metadata,
-                    ));
-                }
-                ModelStreamEventV4::Usage(sample) => {
-                    saw_usage = true;
-                    callback_events.push(AgentEventKindV4::ModelUsageObserved {
-                        observation: model_usage_observation(
-                            logical_request_id,
-                            current_attempt_id,
-                            &usage_metadata,
-                            &request_usage_metadata,
-                            sample,
-                        ),
-                    });
+                    ModelStreamEventV4::Usage(sample) => {
+                        saw_usage = true;
+                        let _ = callback_tx.send(AgentEventKindV4::ModelUsageObserved {
+                            observation: model_usage_observation(
+                                logical_request_id,
+                                current_attempt_id,
+                                &usage_metadata,
+                                &request_usage_metadata,
+                                sample,
+                            ),
+                        });
+                        None
+                    }
+                };
+                if let Some(phase) = phase {
+                    let now = Instant::now();
+                    if phase == ModelActivityPhaseV4::Retrying
+                        || last_activity
+                            .is_none_or(|(_, at)| now.duration_since(at) >= Duration::from_secs(1))
+                    {
+                        self.events
+                            .preview_model_activity(run_id, current_attempt_id, phase);
+                        last_activity = Some((phase, now));
+                    }
                 }
             };
             let mut completion = Box::pin(self.model.stream(request.clone(), &mut on_event));
             let deadline = tokio::time::sleep(attempt_timeout);
             tokio::pin!(deadline);
+            let mut cancellation_poll = tokio::time::interval(Duration::from_millis(50));
             let result: Result<Result<ModelTurnV4, ModelFailureV4>, AgentCoreErrorV4> = loop {
                 tokio::select! {
                     result = &mut completion => break Ok(result),
+                    Some(kind) = callback_rx.recv() => self.push(run_id, kind).await?,
                     _ = &mut deadline => {
                         break Ok(Err(ModelFailureV4::transient(
                             omicsops_protocol::ModelErrorClassV4::Timeout,
                             format!("model produced no completed turn within {} seconds", attempt_timeout.as_secs()),
                         )));
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(50)), if cancelled.is_some() => {
+                    _ = cancellation_poll.tick(), if cancelled.is_some() => {
                         if cancelled.is_some_and(|token| token.load(Ordering::SeqCst)) {
                             break Err(AgentCoreErrorV4::Cancelled);
                         }
@@ -2897,22 +2945,26 @@ impl AgentCoreV4<'_> {
             };
             drop(completion);
             drop(on_event);
+            while let Ok(kind) = callback_rx.try_recv() {
+                self.push(run_id, kind).await?;
+            }
             if !saw_usage {
                 let state = if matches!(result, Ok(Ok(_))) {
                     UsageObservationStateV4::Final
                 } else {
                     UsageObservationStateV4::Interrupted
                 };
-                callback_events.push(unknown_model_usage(
-                    logical_request_id,
-                    current_attempt_id,
-                    &usage_metadata,
-                    &request_usage_metadata,
-                    state,
-                ));
-            }
-            for kind in callback_events {
-                self.push(run_id, kind).await?;
+                self.push(
+                    run_id,
+                    unknown_model_usage(
+                        logical_request_id,
+                        current_attempt_id,
+                        &usage_metadata,
+                        &request_usage_metadata,
+                        state,
+                    ),
+                )
+                .await?;
             }
             let result = match result {
                 Ok(result) => result,
@@ -6322,6 +6374,7 @@ mod tests {
     #[derive(Default)]
     struct MemoryStore {
         previews: Mutex<Vec<Option<String>>>,
+        activities: Mutex<Vec<ModelActivityPhaseV4>>,
         events: Mutex<Vec<AgentEventV4>>,
         archives: Mutex<Vec<String>>,
     }
@@ -6344,6 +6397,9 @@ mod tests {
     }
     #[async_trait]
     impl EventStoreV4 for MemoryStore {
+        fn preview_model_activity(&self, _: Uuid, _: Uuid, phase: ModelActivityPhaseV4) {
+            self.activities.lock().unwrap().push(phase);
+        }
         fn preview_model_text(&self, _: Uuid, text: Option<&str>) {
             self.previews.lock().unwrap().push(text.map(str::to_owned));
         }
@@ -6431,6 +6487,73 @@ mod tests {
             ))
             .unwrap();
         run_id
+    }
+
+    struct ActivityThenWaitModel;
+
+    #[async_trait]
+    impl ModelPortV4 for ActivityThenWaitModel {
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            on_event(ModelStreamEventV4::Activity(
+                ModelActivityPhaseV4::Reasoning,
+            ));
+            on_event(ModelStreamEventV4::ProviderRetrying {
+                attempt: 1,
+                delay_ms: 500,
+                message: "retry fixture".into(),
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_activity_and_provider_retry_are_visible_before_stream_finishes() {
+        let store = MemoryStore::default();
+        let run_id = seed_model_run(&store);
+        let core = AgentCoreV4 {
+            model: &ActivityThenWaitModel,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let request = ModelRequestV4 {
+            system: String::new(),
+            context: String::new(),
+            tools: vec![],
+            image_refs: vec![],
+        };
+        let mut turn = Box::pin(core.model_turn(run_id, request, 0, Duration::from_secs(1), None));
+        tokio::select! {
+            result = &mut turn => panic!("stream finished before observation: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+        }
+        assert_eq!(
+            *store.activities.lock().unwrap(),
+            vec![
+                ModelActivityPhaseV4::Reasoning,
+                ModelActivityPhaseV4::Retrying
+            ]
+        );
+        let events = store.load_direct(run_id).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::ModelRetrying { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !format!("{:?}", event.event).contains("private reasoning"))
+        );
+        turn.await.unwrap();
     }
 
     #[tokio::test]

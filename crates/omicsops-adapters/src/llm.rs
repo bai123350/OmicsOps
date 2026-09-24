@@ -1500,6 +1500,34 @@ fn safe_usage_metadata(protocol: ProviderProtocol, usage: &Value) -> Value {
 mod usage_metadata_tests {
     use super::*;
 
+    #[test]
+    fn reasoning_only_stream_packets_report_activity_without_revealing_reasoning() {
+        let secret = "private reasoning must stay out of events";
+        for (protocol, packet) in [
+            (
+                ProviderProtocol::OpenAiCompatible,
+                format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"{secret}\"}}}}]}}\n\n"
+                ),
+            ),
+            (
+                ProviderProtocol::Anthropic,
+                format!(
+                    "data: {{\"type\":\"content_block_delta\",\"delta\":{{\"thinking\":\"{secret}\"}}}}\n\n"
+                ),
+            ),
+            (
+                ProviderProtocol::Ollama,
+                format!("{{\"message\":{{\"thinking\":\"{secret}\"}}}}\n"),
+            ),
+        ] {
+            let mut decoder = ProviderToolStreamDecoder::new(protocol);
+            let events = decoder.push(packet.as_bytes()).unwrap();
+            assert_eq!(events, vec![ProviderStreamEvent::ReasoningActivity]);
+            assert!(!format!("{events:?}").contains(secret));
+        }
+    }
+
     fn only_usage(events: &[ProviderStreamEvent]) -> (u64, u64, Value) {
         let usage: Vec<_> = events
             .iter()
@@ -1749,6 +1777,13 @@ impl ProviderToolStreamDecoder {
         value: &Value,
         events: &mut Vec<ProviderStreamEvent>,
     ) -> AdapterResult<()> {
+        if value
+            .pointer("/choices/0/delta/reasoning_content")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+        {
+            events.push(ProviderStreamEvent::ReasoningActivity);
+        }
         if let Some(text) = value
             .pointer("/choices/0/delta/content")
             .and_then(Value::as_str)
@@ -1845,6 +1880,13 @@ impl ProviderToolStreamDecoder {
                 });
             }
             Some("content_block_delta") => {
+                if value
+                    .pointer("/delta/thinking")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+                {
+                    events.push(ProviderStreamEvent::ReasoningActivity);
+                }
                 if let Some(arguments) =
                     value.pointer("/delta/partial_json").and_then(Value::as_str)
                 {
@@ -1886,6 +1928,13 @@ impl ProviderToolStreamDecoder {
         value: &Value,
         events: &mut Vec<ProviderStreamEvent>,
     ) -> AdapterResult<()> {
+        if value
+            .pointer("/message/thinking")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+        {
+            events.push(ProviderStreamEvent::ReasoningActivity);
+        }
         if let Some(text) = value
             .pointer("/message/content")
             .and_then(Value::as_str)

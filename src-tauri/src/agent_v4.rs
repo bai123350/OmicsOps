@@ -26,10 +26,11 @@ use omicsops_agent::{
     KernelEvent, KernelEventDecoder, KernelEventKind, KernelLanguage, KernelRequest,
 };
 use omicsops_agent_core::{
-    AgentCoreErrorV4, AgentCoreV4, AgentLimitsV4, EventStoreV4, ModelImageRefV4, ModelPortV4,
-    ModelRequestV4, ModelStreamEventV4, ModelTurnV4, ModelUsageMetadataV4,
-    ModelUsageRequestMetadataV4, PlanApprovalScopeV4, PlanToolAuthorizationV4, PromptLayersV4,
-    ReviewerRequestV4, ScientificStateStoreV4, ScientificUpdateV4, ToolPortV4,
+    AgentCoreErrorV4, AgentCoreV4, AgentLimitsV4, EventStoreV4, ModelActivityPhaseV4,
+    ModelImageRefV4, ModelPortV4, ModelRequestV4, ModelStreamEventV4, ModelTurnV4,
+    ModelUsageMetadataV4, ModelUsageRequestMetadataV4, PlanApprovalScopeV4,
+    PlanToolAuthorizationV4, PromptLayersV4, ReviewerRequestV4, ScientificStateStoreV4,
+    ScientificUpdateV4, ToolPortV4,
 };
 use omicsops_core::{
     project::{require_remote_descendant, shell_quote},
@@ -5398,6 +5399,11 @@ impl ModelPortV4 for DesktopModelPortV4 {
         let mut accumulator_error = None;
         self.client
             .stream_with_provider(provider_request, |event| match event {
+                ProviderStreamEvent::ReasoningActivity => {
+                    on_event(ModelStreamEventV4::Activity(
+                        ModelActivityPhaseV4::Reasoning,
+                    ));
+                }
                 ProviderStreamEvent::TextDelta { text: delta } => {
                     text.push_str(&delta);
                     on_event(ModelStreamEventV4::TextDelta(delta));
@@ -5416,6 +5422,18 @@ impl ModelPortV4 for DesktopModelPortV4 {
                 }
                 ProviderStreamEvent::Error { code, message, .. } => {
                     provider_error = Some(classify_model_failure(&format!("{code}: {message}")));
+                }
+                event @ (ProviderStreamEvent::ToolCallStarted { .. }
+                | ProviderStreamEvent::ToolArgumentsDelta { .. })
+                    if accumulator_error.is_none() =>
+                {
+                    on_event(ModelStreamEventV4::Activity(ModelActivityPhaseV4::ToolCall));
+                    if let Err(error) = calls.push(&event) {
+                        accumulator_error = Some(ModelFailureV4::permanent(
+                            ModelErrorClassV4::InvalidResponse,
+                            error.to_string(),
+                        ));
+                    }
                 }
                 other if accumulator_error.is_none() => {
                     if let Err(error) = calls.push(&other) {
@@ -7702,6 +7720,16 @@ impl RepositoryEventStoreV4 {
 }
 #[async_trait]
 impl EventStoreV4 for RepositoryEventStoreV4 {
+    fn preview_model_activity(&self, run_id: Uuid, attempt_id: Uuid, phase: ModelActivityPhaseV4) {
+        let _ = self.app.emit(
+            "agent-v4-model-activity",
+            omicsops_dto::AgentModelActivityV4 {
+                run_id,
+                attempt_id,
+                phase: phase.as_str().into(),
+            },
+        );
+    }
     fn preview_model_text(&self, run_id: Uuid, text: Option<&str>) {
         let _ = self.app.emit(
             "agent-v4-text-preview",

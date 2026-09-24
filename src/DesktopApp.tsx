@@ -10,7 +10,7 @@ import { referenceKey } from "./features/workspace/ComposerReferences";
 import type { ComposerReference } from "./types";
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "./tauri-api";
-import type { AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendAvailabilityV4, ComputeSelectionV4, ConnectionProfile, ConversationAgentStateV4, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, ProjectArtifact, ProposedPlanRevisionV4, RemoteFileEntry, RunSummaryV4, SessionAgentModeV4, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
+import type { AgentModelActivityReceiptV4, AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendAvailabilityV4, ComputeSelectionV4, ConnectionProfile, ConversationAgentStateV4, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, ProjectArtifact, ProposedPlanRevisionV4, RemoteFileEntry, RunSummaryV4, SessionAgentModeV4, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
 import { WorkspaceShell } from "./features/workspace/WorkspaceShell";
 import { ApiModelPicker } from "./features/workspace/ApiModelPicker";
@@ -132,6 +132,7 @@ export default function DesktopApp() {
   const [runId, setRunId] = useState<string | null>(null);
   const [runStartedAt, setRunStartedAt] = useState<string | null>(null);
   const [agentTextPreview, setAgentTextPreview] = useState<import("./types").AgentTextPreviewV4 | null>(null);
+  const [agentModelActivity, setAgentModelActivity] = useState<AgentModelActivityReceiptV4 | null>(null);
   const [agentRunEventsV4, setAgentRunEventsV4] = useState<AgentRunEventV4[]>([]);
   const [conversationHydrating, setConversationHydrating] = useState(false);
   const [conversationLoadError, setConversationLoadError] = useState("");
@@ -642,6 +643,16 @@ export default function DesktopApp() {
       if (!disposed && isCurrentSubscriptionProject()) setAgentNotice(subscriptionError("sync", error));
     });
     setAgentTextPreview(null);
+    setAgentModelActivity(null);
+    api.onAgentV4ModelActivity((activity) => {
+      if (!isCurrentSubscriptionProject() || !subscriptionProjectId || !subscriptionConversationId
+        || !isCurrentConversationIdentity(subscriptionProjectId, subscriptionConversationId)
+        || !agentRunEventsRef.current.some((event) => event.run_id === activity.run_id && event.project_id === subscriptionProjectId && event.conversation_id === subscriptionConversationId)
+        || isTerminalAgentEventV4(agentRunEventsRef.current.filter((event) => event.run_id === activity.run_id).at(-1)!)) return;
+      setAgentModelActivity({ ...activity, received_at: new Date().toISOString() });
+    }).then((fn) => disposed ? fn() : unlisten.push(fn)).catch((error) => {
+      if (!disposed) setAgentNotice(subscriptionError("Agent activity", error));
+    });
     api.onAgentV4TextPreview((preview) => {
       if (!isCurrentSubscriptionProject() || !subscriptionProjectId || !subscriptionConversationId
         || !isCurrentConversationIdentity(subscriptionProjectId, subscriptionConversationId)
@@ -656,6 +667,7 @@ export default function DesktopApp() {
         || event.conversation_id !== subscriptionConversationId
         || !isCurrentConversationIdentity(subscriptionProjectId, subscriptionConversationId)) return;
       if (event.event.kind === "model_text" || isTerminalAgentEventV4(event)) setAgentTextPreview(null);
+      if (isTerminalAgentEventV4(event)) setAgentModelActivity(null);
       agentEventGeneration.current += 1;
       const eventToken = conversationRequestToken.current;
       if (isTerminalAgentEventV4(event)) {
@@ -781,7 +793,7 @@ export default function DesktopApp() {
     setLastGoal("");
     if (!hydrating) setConversationMode("agent");
     setHydrationState(hydrating);
-    setConversationState(null); setV4Plan(null); setPlanApproved(false); setRunId(null); setRunStartedAt(null); agentStop.clear(); setAgentRunEventsV4([]);
+    setConversationState(null); setV4Plan(null); setPlanApproved(false); setRunId(null); setRunStartedAt(null); setAgentModelActivity(null); agentStop.clear(); setAgentRunEventsV4([]);
   }
 
   function currentComputeSelection(): ComputeSelectionV4 {
@@ -1423,7 +1435,7 @@ export default function DesktopApp() {
       }
     }} />}
     agentMode={conversationMode} conversationLocked={conversationLocked} conversationHydrating={conversationHydrating} onAgentModeChange={changeConversationMode}
-    latestPlanRevision={latestPlanRevision} v4Plan={v4Plan} planLoading={planLoading} planApproved={planApproved} canStartRun={false} runStarted={Boolean(runId && !currentRunAwaitsPlanApproval)} activeRunId={runId} activeRunLastActivityAt={activeRunLastActivityAt} agentRunEventsV4={agentRunEventsV4} agentTextPreview={agentTextPreview}
+    latestPlanRevision={latestPlanRevision} v4Plan={v4Plan} planLoading={planLoading} planApproved={planApproved} canStartRun={false} runStarted={Boolean(runId && !currentRunAwaitsPlanApproval)} activeRunId={runId} activeRunLastActivityAt={activeRunLastActivityAt} agentRunEventsV4={agentRunEventsV4} agentTextPreview={agentTextPreview} agentModelActivity={agentModelActivity}
     guidanceAvailable={v4Plan?.session_mode === "agent" && !planApproved && latestPlanRevision?.run_id !== v4Plan?.run_id}
     computeBackends={computeBackends} computeBackendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} approvalPolicy={approvalPolicy} computeEnvironment={computeEnvironment} computeBusy={computeBusy}
     onComputeBackendChange={setComputeBackendId} onContainerImageChange={setContainerImage} onAutonomyModeChange={setAutonomyMode} onApprovalPolicyChange={setApprovalPolicy} onComputeEnvironmentChange={setComputeEnvironment}

@@ -1891,6 +1891,26 @@ it("streams public preview only for the current conversation and clears on commi
   expect(screen.getAllByText("Live progress")).toHaveLength(1);
 });
 
+it("accepts model activity after a same-run needs-attention resume", async () => {
+  setupConversationStateHarness();
+  let emit!: Parameters<typeof api.onAgentV4Event>[0];
+  let activity!: Parameters<typeof api.onAgentV4ModelActivity>[0];
+  vi.spyOn(api, "onAgentV4Event").mockImplementation(async (cb) => { emit = cb; return () => undefined; });
+  vi.spyOn(api, "onAgentV4ModelActivity").mockImplementation(async (cb) => { activity = cb; return () => undefined; });
+  render(<DesktopApp />);
+  await screen.findByRole("heading", { name: "Agent 会话" });
+  await waitFor(() => expect(activity).toBeDefined());
+  const run = "resumed-run";
+  const attempt = "resumed-attempt";
+  await act(async () => emit(agentEvent("conversation-agent", run, 1, { kind: "run_created", mode: "execute" })));
+  await act(async () => emit(agentEvent("conversation-agent", run, 2, { kind: "run_needs_attention", message: "resume required" })));
+  await act(async () => emit(agentEvent("conversation-agent", run, 3, { kind: "model_request_started", request: {
+    logical_request_id: "logical", attempt_id: attempt, model_profile_id: "profile", context_limit_source: { kind: "unknown" },
+  } })));
+  await act(async () => activity({ run_id: run, attempt_id: attempt, phase: "reasoning" }));
+  expect(screen.getByText(/模型正在推理/)).toBeInTheDocument();
+});
+
 it("routes native idle sends through the durable queue and recovers the committed message", async () => {
   const { stateSpy } = setupConversationStateHarness();
   stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));

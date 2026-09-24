@@ -591,6 +591,26 @@ fn streaming_preview_contract_clears_without_creating_an_audit_event() {
 }
 
 #[test]
+fn transient_model_activity_contract_contains_only_phase_and_run_identity() {
+    let run_id = Uuid::new_v4();
+    let attempt_id = Uuid::new_v4();
+    let activity = omicsops_dto::AgentModelActivityV4 {
+        run_id,
+        attempt_id,
+        phase: "reasoning".into(),
+    };
+    let value = serde_json::to_value(&activity).unwrap();
+    assert_eq!(
+        value,
+        json!({"run_id":run_id,"attempt_id":attempt_id,"phase":"reasoning"})
+    );
+    assert_eq!(
+        serde_json::from_value::<omicsops_dto::AgentModelActivityV4>(value).unwrap(),
+        activity
+    );
+}
+
+#[test]
 fn session_settings_defaults_preserve_legacy_records_and_validate_new_fields() {
     use crate::dto::AgentIterationSettingsV4;
     let legacy: AgentIterationSettingsV4 =

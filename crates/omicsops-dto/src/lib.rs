@@ -131,6 +131,15 @@ pub struct AgentTextPreviewV4 {
     pub text: Option<String>,
 }
 
+/// Transient provider progress with no prompt, reasoning, or tool arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentModelActivityV4 {
+    pub run_id: Uuid,
+    pub attempt_id: Uuid,
+    pub phase: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmitGuidanceV4Request {
     pub message_id: Uuid,
