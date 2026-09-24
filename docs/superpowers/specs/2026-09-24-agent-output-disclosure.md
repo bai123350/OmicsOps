@@ -2,9 +2,11 @@
 
 The V4 conversation keeps public progress inside the execution timeline and the final answer as a separate assistant message. During an active run, the latest public progress is expanded as rendered Markdown; its disclosure remains manually collapsible. A running tool call opens its input and detail view automatically. A successful or reused result closes its detail view while keeping the summary visible. Failed calls remain expanded so the error is visible.
 
-This uses the live-tool disclosure and Markdown progress pattern in [wisp-science's chat renderer](https://github.com/xuzhougeng/wisp-science/blob/main/ui/src/chat_render.rs) as a reference. OmicsOps keeps its existing evidence cards and hides private provider reasoning.
+This uses the live-tool disclosure and Markdown progress pattern in [wisp-science's chat renderer](https://github.com/xuzhougeng/wisp-science/blob/main/ui/src/chat_render.rs) as a reference. OmicsOps keeps its existing evidence cards.
 
-Earlier activity still folds after six items. Completed run timelines stay compact. Tool input and output continue through the existing redaction and evidence presentation paths; this change does not expose private model reasoning or create new audit events.
+The 2026-09-25 follow-up adds a separate, expandable live plain-text "模型思考" view for reasoning that an external provider actually streams. It uses a bounded, host-redacted, run-and-attempt-scoped transient channel; it never becomes the public Markdown progress or final answer. A pending model request or tool call shows its real state and elapsed duration outside the collapsible execution timeline. The clock changes only the displayed duration; it does not count as provider activity or suppress the 90-second silence warning. When no reasoning bytes arrive, the view states that the request was sent and is waiting for model content. Approval and user-input pauses do not present the agent as actively working.
+
+Earlier activity still folds after six items. Completed run timelines stay compact. Tool input and output continue through the existing redaction and evidence presentation paths. Reasoning preview is transient UI only and creates no audit events.
 
 Verified on 2026-09-24: `cargo test --workspace` (1,292 passed, 12 ignored), `npm test` (887 Vitest and 22 browser-extension tests passed), `npm run build`, and `npm run build:desktop` all passed. The desktop build produced a local NSIS bundle; it was not distributed.
 

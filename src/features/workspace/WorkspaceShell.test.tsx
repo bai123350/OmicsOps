@@ -516,8 +516,56 @@ describe("WorkspaceShell", () => {
         schema_version: 4, run_id: "run-reasoning", project_id: project.id, conversation_id: "conversation-1", sequence: 2,
         occurred_at: lastActivity, previous_hash: "a".repeat(64), event_hash: "b".repeat(64), event: { kind: "model_request_started", request: modelRequest("attempt-reasoning") },
       }]} />);
-    expect(screen.getByText(/模型正在推理/)).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "当前模型活动" })).toHaveTextContent("模型正在推理");
     expect(screen.queryByText(/超过 90 秒未收到模型数据或 Agent 事件/)).not.toBeInTheDocument();
+  });
+  it("shows the pending model request before provider content and streams supplied reasoning outside execution details", () => {
+    const started = new Date(Date.now() - 3_000).toISOString();
+    const base = { schema_version: 4 as const, run_id: "run-thinking", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash", occurred_at: started };
+    const events = [
+      { ...base, sequence: 1, event: { kind: "run_created" as const, mode: "execute" as const } },
+      { ...base, sequence: 2, event: { kind: "model_request_started" as const, request: modelRequest("attempt-thinking") } },
+    ];
+    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: base.run_id, agentRunEventsV4: events };
+    const { rerender } = render(<WorkspaceShell {...props} />);
+    const waiting = screen.getByRole("status", { name: "当前模型活动" });
+    expect(waiting).toHaveTextContent("等待模型响应");
+    expect(waiting).toHaveTextContent(/本次请求 3/);
+    expect(within(waiting).getByRole("timer")).toHaveAttribute("aria-live", "off");
+    expect(waiting.closest("details")).toBeNull();
+    expect(screen.queryByRole("article", { name: "模型思考" })).not.toBeInTheDocument();
+
+    rerender(<WorkspaceShell {...props} agentReasoningPreview={{ run_id: base.run_id, attempt_id: "attempt-thinking", text: "先核对输入" }} />);
+    const thinking = screen.getByRole("article", { name: "模型思考" });
+    expect(thinking).toHaveTextContent("先核对输入");
+    expect(thinking.closest("details")).toBeNull();
+    fireEvent.click(screen.getByText("执行过程"));
+    expect(thinking).toBeVisible();
+    expect(screen.getByRole("status", { name: "当前模型活动" })).toBeVisible();
+    rerender(<WorkspaceShell {...props} agentReasoningPreview={{ run_id: base.run_id, attempt_id: "attempt-thinking", text: "先核对输入\n再检查 <img src=x onerror=alert(1)>" }} />);
+    expect(thinking).toHaveTextContent("再检查 <img src=x onerror=alert(1)>");
+    expect(thinking.querySelector("img")).toBeNull();
+    fireEvent.click(within(thinking).getByText("模型思考"));
+    expect(thinking.querySelector("details")).not.toHaveAttribute("open");
+    rerender(<WorkspaceShell {...props} agentReasoningPreview={{ run_id: base.run_id, attempt_id: "attempt-thinking", text: "先核对输入" }} agentModelActivity={{ run_id: base.run_id, attempt_id: "attempt-thinking", phase: "tool_call", received_at: new Date().toISOString() }} />);
+    expect(thinking.querySelector("details")).not.toHaveAttribute("open");
+    expect(screen.getByRole("status", { name: "当前模型活动" })).toHaveTextContent("模型正在准备工具");
+    expect(thinking).toHaveTextContent("先核对输入");
+  });
+  it("shows the active tool and elapsed time outside execution details, but stops working status for approval", () => {
+    const started = new Date(Date.now() - 4_000).toISOString();
+    const base = { schema_version: 4 as const, run_id: "run-tool", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash", occurred_at: started };
+    const requested = { ...base, sequence: 1, event: { kind: "tool_requested" as const, call: { call_id: "read-1", tool_id: "project.read", arguments: { path: "input.tsv" } } } };
+    const running = { ...base, sequence: 2, event: { kind: "tool_dispatch_started" as const, call_id: "read-1", tool_id: "project.read", effect: "read_only", idempotency_key: "read-1" } };
+    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: base.run_id };
+    const { rerender } = render(<WorkspaceShell {...props} agentRunEventsV4={[requested, running]} />);
+    const status = screen.getByRole("status", { name: "当前工具活动" });
+    expect(status).toHaveTextContent("read");
+    expect(status).toHaveTextContent(/4/);
+    expect(within(status).getByRole("timer")).toHaveAttribute("aria-live", "off");
+    expect(status.closest("details")).toBeNull();
+    rerender(<WorkspaceShell {...props} agentRunEventsV4={[requested, running, { ...base, sequence: 3, event: { kind: "tool_approval_requested", request: { approval_id: "approval-1", call: requested.event.call, effect: "read_only", reason: "Review", call_hash: "a".repeat(64) } } }]} />);
+    expect(screen.queryByRole("status", { name: "当前工具活动" })).not.toBeInTheDocument();
   });
   it("coalesces character-sized V4 model deltas into one completed response", () => {
     const deltas = ["我", "先", "检查", "输入", "目录", "。"];

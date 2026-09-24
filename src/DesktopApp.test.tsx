@@ -1891,6 +1891,42 @@ it("streams public preview only for the current conversation and clears on commi
   expect(screen.getAllByText("Live progress")).toHaveLength(1);
 });
 
+it("keeps reasoning preview scoped to the current run and attempt across retry, terminal, and conversation changes", async () => {
+  setupConversationStateHarness();
+  let emit!: Parameters<typeof api.onAgentV4Event>[0];
+  let preview!: Parameters<typeof api.onAgentV4ReasoningPreview>[0];
+  vi.spyOn(api, "onAgentV4Event").mockImplementation(async (cb) => { emit = cb; return () => undefined; });
+  vi.spyOn(api, "onAgentV4ReasoningPreview").mockImplementation(async (cb) => { preview = cb; return () => undefined; });
+  render(<DesktopApp />);
+  await screen.findByRole("heading", { name: "Agent 会话" });
+  await waitFor(() => expect(preview).toBeDefined());
+  const run = "reasoning-run";
+  const request = (attemptId: string): AgentRunEventV4["event"] => ({ kind: "model_request_started", request: {
+    logical_request_id: "logical", attempt_id: attemptId, model_profile_id: "profile", context_limit_source: { kind: "unknown" },
+  } });
+  await act(async () => emit(agentEvent("conversation-agent", run, 1, { kind: "run_created", mode: "execute" })));
+  await act(async () => emit(agentEvent("conversation-agent", run, 2, request("attempt-1"))));
+  await act(async () => preview({ run_id: "foreign-run", attempt_id: "attempt-1", text: "foreign run" }));
+  await act(async () => preview({ run_id: run, attempt_id: "old-attempt", text: "foreign attempt" }));
+  expect(screen.queryByRole("article", { name: "模型思考" })).not.toBeInTheDocument();
+  await act(async () => preview({ run_id: run, attempt_id: "attempt-1", text: "第一段真实推理" }));
+  expect(screen.getByRole("article", { name: "模型思考" })).toHaveTextContent("第一段真实推理");
+  await act(async () => emit(agentEvent("conversation-agent", run, 3, { kind: "model_retrying", attempt: 2, class: "transient", message: "retry" })));
+  expect(screen.queryByRole("article", { name: "模型思考" })).not.toBeInTheDocument();
+  await act(async () => emit(agentEvent("conversation-agent", run, 4, request("attempt-2"))));
+  await act(async () => preview({ run_id: run, attempt_id: "attempt-2", text: "第二次真实推理" }));
+  await act(async () => preview({ run_id: run, attempt_id: "attempt-1", text: "late stale output" }));
+  await act(async () => emit(agentEvent("conversation-agent", run, 3, { kind: "model_retrying", attempt: 2, class: "transient", message: "retry" })));
+  expect(screen.getByRole("article", { name: "模型思考" })).toHaveTextContent("第二次真实推理");
+  await act(async () => emit(agentEvent("conversation-agent", run, 5, { kind: "run_cancelled" })));
+  await act(async () => preview({ run_id: run, attempt_id: "attempt-2", text: "late after cancel" }));
+  expect(screen.queryByRole("article", { name: "模型思考" })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Plan 会话" }));
+  await screen.findByRole("heading", { name: "Plan 会话" });
+  await act(async () => preview({ run_id: run, attempt_id: "attempt-2", text: "old conversation" }));
+  expect(screen.queryByRole("article", { name: "模型思考" })).not.toBeInTheDocument();
+});
+
 it("accepts model activity after a same-run needs-attention resume", async () => {
   setupConversationStateHarness();
   let emit!: Parameters<typeof api.onAgentV4Event>[0];
@@ -1908,7 +1944,7 @@ it("accepts model activity after a same-run needs-attention resume", async () =>
     logical_request_id: "logical", attempt_id: attempt, model_profile_id: "profile", context_limit_source: { kind: "unknown" },
   } })));
   await act(async () => activity({ run_id: run, attempt_id: attempt, phase: "reasoning" }));
-  expect(screen.getByText(/模型正在推理/)).toBeInTheDocument();
+  expect(screen.getByRole("status", { name: "当前模型活动" })).toHaveTextContent("模型正在推理");
 });
 
 it("routes native idle sends through the durable queue and recovers the committed message", async () => {

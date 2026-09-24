@@ -708,6 +708,17 @@
 .v4-live-response { margin-top: 18px; }
 .response-eyebrow { display: block; margin-bottom: 10px; color: #667085; font-size: 12px; }
 .v4-live-response .v4-streaming-cursor { display: inline-block; font-size: 12px; }
+.v4-live-activity { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 10px; padding: 9px 12px; border: 1px solid #dbe4f2; border-radius: 10px; background: #f7f9fd; color: #344054; font-size: 12px; }
+.v4-live-activity .agent-working { margin: 0; min-width: 0; }
+.v4-live-activity small { flex: none; color: #667085; font-variant-numeric: tabular-nums; }
+.v4-reasoning-preview { margin: 0 0 12px; padding: 12px 14px; border: 1px solid #e0e7f1; border-radius: 12px; background: #f8faff; color: #344054; }
+.v4-reasoning-preview summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #475467; font-size: 12px; font-weight: 600; cursor: pointer; list-style: none; }
+.v4-reasoning-preview summary::-webkit-details-marker { display: none; }
+.v4-reasoning-preview summary:focus-visible { outline: 2px solid #315bd4; outline-offset: 3px; }
+.v4-reasoning-preview summary svg { transition: transform 140ms ease; }
+.v4-reasoning-preview details[open] summary svg { transform: rotate(90deg); }
+.v4-reasoning-preview .agent-working { margin: 0; }
+.v4-reasoning-preview pre { max-height: 260px; overflow: auto; margin: 8px 0 0; font: inherit; font-size: 13px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* Conversation-first hierarchy: prose is primary, activity is secondary. */
 .conversation-pane .message-stream { padding-inline: max(24px, calc((100% - 820px) / 2)); gap: 18px; }

@@ -641,6 +641,7 @@ export interface FormalStepProposal {
 }
 
 export interface AgentTextPreviewV4 { run_id: string; text: string | null }
+export interface AgentReasoningPreviewV4 { run_id: string; attempt_id: string; text: string | null }
 export interface AgentModelActivityV4 { run_id: string; attempt_id: string; phase: "reasoning" | "tool_call" | "responding" | "retrying" }
 export type AgentModelActivityReceiptV4 = AgentModelActivityV4 & { received_at: string };
 export interface ConversationCapabilitiesV4 {

@@ -10,7 +10,7 @@ import { referenceKey } from "./features/workspace/ComposerReferences";
 import type { ComposerReference } from "./types";
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "./tauri-api";
-import type { AgentModelActivityReceiptV4, AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendAvailabilityV4, ComputeSelectionV4, ConnectionProfile, ConversationAgentStateV4, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, ProjectArtifact, ProposedPlanRevisionV4, RemoteFileEntry, RunSummaryV4, SessionAgentModeV4, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
+import type { AgentModelActivityReceiptV4, AgentReasoningPreviewV4, AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendAvailabilityV4, ComputeSelectionV4, ConnectionProfile, ConversationAgentStateV4, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, ProjectArtifact, ProposedPlanRevisionV4, RemoteFileEntry, RunSummaryV4, SessionAgentModeV4, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
 import { WorkspaceShell } from "./features/workspace/WorkspaceShell";
 import { ApiModelPicker } from "./features/workspace/ApiModelPicker";
@@ -132,6 +132,7 @@ export default function DesktopApp() {
   const [runId, setRunId] = useState<string | null>(null);
   const [runStartedAt, setRunStartedAt] = useState<string | null>(null);
   const [agentTextPreview, setAgentTextPreview] = useState<import("./types").AgentTextPreviewV4 | null>(null);
+  const [agentReasoningPreview, setAgentReasoningPreview] = useState<AgentReasoningPreviewV4 | null>(null);
   const [agentModelActivity, setAgentModelActivity] = useState<AgentModelActivityReceiptV4 | null>(null);
   const [agentRunEventsV4, setAgentRunEventsV4] = useState<AgentRunEventV4[]>([]);
   const [conversationHydrating, setConversationHydrating] = useState(false);
@@ -185,9 +186,11 @@ export default function DesktopApp() {
   const pendingSubmissionRef = useRef<PendingSubmission | null>(null);
   const lastGoalRef = useRef("");
   const agentRunEventsRef = useRef<AgentRunEventV4[]>([]);
+  const activeRunIdRef = useRef<string | null>(null);
   const agentEventGeneration = useRef(0);
   const conversationHydratingRef = useRef(false);
   currentConversationIdentity.current = { projectId: selected?.id ?? null, conversationId: conversation?.id ?? null };
+  activeRunIdRef.current = runId;
 
   useEffect(() => {
     const pending = pendingSubmissionRef.current;
@@ -491,6 +494,8 @@ export default function DesktopApp() {
     // for conversations that were persisted in Plan mode.
     setAgentRunEventsV4([]);
     agentRunEventsRef.current = [];
+    activeRunIdRef.current = null;
+    setAgentReasoningPreview(null);
     setV4Plan(null);
     setPlanApproved(false);
     setRunId(null);
@@ -643,6 +648,7 @@ export default function DesktopApp() {
       if (!disposed && isCurrentSubscriptionProject()) setAgentNotice(subscriptionError("sync", error));
     });
     setAgentTextPreview(null);
+    setAgentReasoningPreview(null);
     setAgentModelActivity(null);
     api.onAgentV4ModelActivity((activity) => {
       if (!isCurrentSubscriptionProject() || !subscriptionProjectId || !subscriptionConversationId
@@ -661,21 +667,37 @@ export default function DesktopApp() {
     }).then((fn) => disposed ? fn() : unlisten.push(fn)).catch((error) => {
       if (!disposed) setAgentNotice(subscriptionError("Agent streaming", error));
     });
+    api.onAgentV4ReasoningPreview((preview) => {
+      if (!isCurrentSubscriptionProject() || !subscriptionProjectId || !subscriptionConversationId
+        || !isCurrentConversationIdentity(subscriptionProjectId, subscriptionConversationId)
+        || activeRunIdRef.current !== preview.run_id
+        || pendingReasoningAttempt(agentRunEventsRef.current, preview.run_id) !== preview.attempt_id) return;
+      setAgentReasoningPreview(preview.text === null ? null : preview);
+    }).then((fn) => disposed ? fn() : unlisten.push(fn)).catch((error) => {
+      if (!disposed) setAgentNotice(subscriptionError("Agent reasoning streaming", error));
+    });
     api.onAgentV4Event((event) => {
       if (!isCurrentSubscriptionProject() || !subscriptionConversationId
         || event.project_id !== subscriptionProjectId
         || event.conversation_id !== subscriptionConversationId
         || !isCurrentConversationIdentity(subscriptionProjectId, subscriptionConversationId)) return;
+      const latestSequence = agentRunEventsRef.current.reduce((last, item) => item.run_id === event.run_id ? Math.max(last, item.sequence) : last, 0);
       if (event.event.kind === "model_text" || isTerminalAgentEventV4(event)) setAgentTextPreview(null);
       if (isTerminalAgentEventV4(event)) setAgentModelActivity(null);
+      if (event.sequence > latestSequence && (event.event.kind === "model_request_started" || event.event.kind === "model_retrying"
+        || event.event.kind === "model_text" || isTerminalAgentEventV4(event))) {
+        setAgentReasoningPreview((current) => current?.run_id === event.run_id ? null : current);
+      }
       agentEventGeneration.current += 1;
       const eventToken = conversationRequestToken.current;
       if (isTerminalAgentEventV4(event)) {
+        if (activeRunIdRef.current === event.run_id) activeRunIdRef.current = null;
         agentStop.markTerminal(event.run_id);
         setRunStartedAt(null);
         setRunId((current) => current === event.run_id ? null : current);
         if (event.event.kind === "run_completed") void refreshRemoteFiles(event.project_id);
       } else {
+        if (event.event.kind === "run_created" || !activeRunIdRef.current) activeRunIdRef.current = event.run_id;
         setRunId((current) => current ?? event.run_id);
         setRunStartedAt((current) => current ?? event.occurred_at);
       }
@@ -1435,7 +1457,7 @@ export default function DesktopApp() {
       }
     }} />}
     agentMode={conversationMode} conversationLocked={conversationLocked} conversationHydrating={conversationHydrating} onAgentModeChange={changeConversationMode}
-    latestPlanRevision={latestPlanRevision} v4Plan={v4Plan} planLoading={planLoading} planApproved={planApproved} canStartRun={false} runStarted={Boolean(runId && !currentRunAwaitsPlanApproval)} activeRunId={runId} activeRunLastActivityAt={activeRunLastActivityAt} agentRunEventsV4={agentRunEventsV4} agentTextPreview={agentTextPreview} agentModelActivity={agentModelActivity}
+    latestPlanRevision={latestPlanRevision} v4Plan={v4Plan} planLoading={planLoading} planApproved={planApproved} canStartRun={false} runStarted={Boolean(runId && !currentRunAwaitsPlanApproval)} activeRunId={runId} activeRunLastActivityAt={activeRunLastActivityAt} agentRunEventsV4={agentRunEventsV4} agentTextPreview={agentTextPreview} agentReasoningPreview={agentReasoningPreview} agentModelActivity={agentModelActivity}
     guidanceAvailable={v4Plan?.session_mode === "agent" && !planApproved && latestPlanRevision?.run_id !== v4Plan?.run_id}
     computeBackends={computeBackends} computeBackendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} approvalPolicy={approvalPolicy} computeEnvironment={computeEnvironment} computeBusy={computeBusy}
     onComputeBackendChange={setComputeBackendId} onContainerImageChange={setContainerImage} onAutonomyModeChange={setAutonomyMode} onApprovalPolicyChange={setApprovalPolicy} onComputeEnvironmentChange={setComputeEnvironment}
@@ -1726,4 +1748,19 @@ function isActivePlanRevisionStatus(status: ProposedPlanRevisionV4["status"] | u
 
 function isTerminalRunStatus(status: string) {
   return status === "completed" || status === "cancelled" || status === "failed" || status === "needs_attention";
+}
+
+function pendingReasoningAttempt(events: AgentRunEventV4[], runId: string): string | null {
+  let attemptId: string | null = null;
+  for (const item of events.filter((event) => event.run_id === runId).sort((left, right) => left.sequence - right.sequence)) {
+    const event = item.event;
+    if (event.kind === "model_request_started") attemptId = event.request.attempt_id;
+    else if (event.kind === "model_retrying" || event.kind === "model_text" || event.kind === "cycle_finished"
+      || event.kind === "tool_requested" || event.kind === "tool_approval_requested" || event.kind === "input_requested"
+      || event.kind === "browser_connection_required" || event.kind === "browser_human_intervention_required"
+      || event.kind === "runtime_recovery_available" || isTerminalAgentEventV4(item)) attemptId = null;
+    else if (event.kind === "model_usage_observed" && attemptId === event.observation.attempt_id
+      && (event.observation.state === "final" || event.observation.state === "interrupted")) attemptId = null;
+  }
+  return attemptId;
 }

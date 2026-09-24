@@ -167,6 +167,7 @@ interface Props {
   activeRunLastActivityAt?: string | null;
   agentRunEventsV4?: AgentRunEventV4[];
   agentTextPreview?: import("../../types").AgentTextPreviewV4 | null;
+  agentReasoningPreview?: import("../../types").AgentReasoningPreviewV4 | null;
   agentModelActivity?: import("../../types").AgentModelActivityReceiptV4 | null;
   guidanceAvailable?: boolean;
   onAnswerAgentQuestionV4?: (runId: string, questionId: string, answer: string) => Promise<void> | void;
@@ -213,7 +214,7 @@ function parseComposerCommand(text: string): ComposerCommandInvocation | null {
   return { id: match[1].toLowerCase(), args: match[2] ?? "", raw };
 }
 
-export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, onOpenSourceConversation, onRegisterNavigationGuard, conversations = [], activeConversationId, capabilitySummary, capabilitiesLoading, capabilitiesError, onRefreshCapabilities, onSelectConversation, onNewConversation, onDeleteConversation, onOpenBranch, onBranchSend, branchSendOriginalMarkdown, branchSendBusy = false, branchSendPending = false, branchSendError = false, onRetryBranchSend, onSend, onQueue, replacement, sideChat, contextUsage = null, contextUsageError = false, queueItems = [], queueError = false, queueLoading = false, onQueueRefresh, referenceCatalog, workflowCatalogVersion = 0, onOpenSearch, searchRequest, onSearchRequestHandled, onSuggestFollowUps, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", conversationLoadError = "", onRetryConversationLoad, agentRetryNotice = "", modelLabel, activeModelProfile, modelProfiles = [], modelPicker, composerBusy = false, modelOptions = [], modelId, onModelChange, agentMode, onAgentModeChange, conversationLocked = false, conversationHydrating = false, planActionBusy = false, v4Plan, latestPlanRevision, computeBackends = [], computeBackendId = "", containerImage = "", autonomyMode = "supervised", approvalPolicy = "risk_based", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onApprovalPolicyChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onRequestPlanRevision, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, activeRunLastActivityAt, agentRunEventsV4 = [], agentTextPreview, agentModelActivity, guidanceAvailable = false, onAnswerAgentQuestionV4, onDecideToolApprovalV4, onResolveUncertainV4, onResumeAgentRunV4, onCancelRuntimeRecoveryV4, onCloseBrowserRunTabsV4, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
+export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings, onBackToProjects, onOpenSourceConversation, onRegisterNavigationGuard, conversations = [], activeConversationId, capabilitySummary, capabilitiesLoading, capabilitiesError, onRefreshCapabilities, onSelectConversation, onNewConversation, onDeleteConversation, onOpenBranch, onBranchSend, branchSendOriginalMarkdown, branchSendBusy = false, branchSendPending = false, branchSendError = false, onRetryBranchSend, onSend, onQueue, replacement, sideChat, contextUsage = null, contextUsageError = false, queueItems = [], queueError = false, queueLoading = false, onQueueRefresh, referenceCatalog, workflowCatalogVersion = 0, onOpenSearch, searchRequest, onSearchRequestHandled, onSuggestFollowUps, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", conversationLoadError = "", onRetryConversationLoad, agentRetryNotice = "", modelLabel, activeModelProfile, modelProfiles = [], modelPicker, composerBusy = false, modelOptions = [], modelId, onModelChange, agentMode, onAgentModeChange, conversationLocked = false, conversationHydrating = false, planActionBusy = false, v4Plan, latestPlanRevision, computeBackends = [], computeBackendId = "", containerImage = "", autonomyMode = "supervised", approvalPolicy = "risk_based", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onApprovalPolicyChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onRequestPlanRevision, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, activeRunLastActivityAt, agentRunEventsV4 = [], agentTextPreview, agentReasoningPreview, agentModelActivity, guidanceAvailable = false, onAnswerAgentQuestionV4, onDecideToolApprovalV4, onResolveUncertainV4, onResumeAgentRunV4, onCancelRuntimeRecoveryV4, onCloseBrowserRunTabsV4, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
   const t = copy[locale];
   const zh = locale === "zh-CN";
   const { selectionActionsEnabled } = useGeneralPreferences();
@@ -714,7 +715,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
       if (followingLatestRef.current) stream.scrollTop = stream.scrollHeight;
     });
     return () => cancelAnimationFrame(frame);
-  }, [activeConversationId, messages.length, agentTextPreview?.text, streamingAssistant, agentBusy, agentNotice, planLoading, runStarted, latestAgentRunEventV4?.run_id, latestAgentRunEventV4?.sequence]);
+  }, [activeConversationId, messages.length, agentTextPreview?.text, agentReasoningPreview?.text, streamingAssistant, agentBusy, agentNotice, planLoading, runStarted, latestAgentRunEventV4?.run_id, latestAgentRunEventV4?.sequence]);
 
   useEffect(() => {
     if (selectedImagePath && imageFiles.some((entry) => entry.relative_path === selectedImagePath)) return;
@@ -1039,7 +1040,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
         {agentNotice && <div className="agent-notice" role="alert"><strong>{zh ? "对话未完成" : "Conversation did not complete"}</strong><span>{agentNotice}</span></div>}
         {planReady && <article className="message assistant-message plan-ready-message"><div className="assistant-avatar"><ClipboardList size={17} /></div><div><strong>OmicsOps Agent</strong><p>{zh ? "计划已生成，请在右侧 Plan 面板审核并决定是否运行。" : "The plan is ready. Review it in the Plan panel and decide whether to run it."}</p></div></article>}
         {runTimelineV4.unanchored.map((run) => <V4RunTrace locale={locale} events={run.events} onAnswer={onAnswerAgentQuestionV4} onDecideApproval={onDecideToolApprovalV4} onResolveUncertain={onResolveUncertainV4} onResume={onResumeAgentRunV4} onCancelRecovery={onCancelRuntimeRecoveryV4} onCloseBrowserTabs={onCloseBrowserRunTabsV4} historical key={run.runId} />)}
-        {visibleActiveRunEventsV4.length > 0 && <V4RunTrace locale={locale} events={visibleActiveRunEventsV4} previewText={agentTextPreview?.run_id === effectiveActiveRunId ? agentTextPreview.text : null} modelActivity={currentModelActivity} onAnswer={onAnswerAgentQuestionV4} onDecideApproval={onDecideToolApprovalV4} onResolveUncertain={onResolveUncertainV4} onResume={onResumeAgentRunV4} onCancelRecovery={onCancelRuntimeRecoveryV4} onCloseBrowserTabs={onCloseBrowserRunTabsV4} />}
+        {visibleActiveRunEventsV4.length > 0 && <V4RunTrace locale={locale} events={visibleActiveRunEventsV4} previewText={agentTextPreview?.run_id === effectiveActiveRunId ? agentTextPreview.text : null} reasoningPreview={agentReasoningPreview?.run_id === effectiveActiveRunId ? agentReasoningPreview : null} modelActivity={currentModelActivity} onAnswer={onAnswerAgentQuestionV4} onDecideApproval={onDecideToolApprovalV4} onResolveUncertain={onResolveUncertainV4} onResume={onResumeAgentRunV4} onCancelRecovery={onCancelRuntimeRecoveryV4} onCloseBrowserTabs={onCloseBrowserRunTabsV4} />}
         {!composerDisabled && effectiveActiveRunId && onSuggestFollowUps && effectiveTerminalAgentEventV4(activeRunEventsV4)?.event.kind === "run_completed" && <FollowUpQuestions key={`${project.id}:${activeConversationId}:${effectiveActiveRunId}`} runId={effectiveActiveRunId} generate={onSuggestFollowUps} onChoose={(question) => { setDraft(question); }} locale={locale} />}
         {runStarted && agentRunEventsV4.length === 0 && <article className="message assistant-message agent-pending" role="status"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><p>{zh ? "V4 运行正在启动…" : "Starting the V4 run…"}</p></div></article>}
         {runStalled && <div className="agent-retry-notice" role="status"><span>{zh ? "超过 90 秒未收到模型数据或 Agent 事件，任务可能卡住；仍可终止运行。" : "No model data or Agent event has arrived for 90 seconds; the run may be stuck. You can still stop it."}</span></div>}
@@ -1194,7 +1195,7 @@ function PreferenceToggle({ active, disabled, title, description, onClick }: { a
   return <button className={`agent-control-row preference-toggle ${active ? "active" : ""}`} role="menuitemcheckbox" aria-checked={active} disabled={disabled} onClick={onClick}><span><b>{title}</b><small>{description}</small></span><i className={`control-switch ${active ? "is-on" : ""}`} aria-hidden="true" /></button>;
 }
 function FileTree({ locale }: { locale: Locale }) { const zh = locale === "zh-CN"; return <div className="file-tree"><div className="context-heading"><b>{zh ? "项目文件" : "Project files"}</b><small>{zh ? "选择性同步" : "Selective sync"}</small></div><div className="tree-folder"><Folder size={15} />data <span>{zh ? "远端" : "remote"}</span></div><div className="tree-folder"><Folder size={15} />analysis</div><div className="tree-file"><FileBarChart size={15} />umap.png <em>1.2 MB</em></div><div className="tree-file"><FileText size={15} />markers.csv <em>84 KB</em></div><div className="tree-file"><NotebookPen size={15} />report.md <em>12 KB</em></div></div>; }
-function V4RunTrace({ locale, events, previewText, modelActivity, onAnswer, onDecideApproval, onResolveUncertain, onResume, onCancelRecovery, onCloseBrowserTabs, historical = false }: { locale: Locale; events: AgentRunEventV4[]; previewText?: string | null; modelActivity?: import("../../types").AgentModelActivityReceiptV4 | null; onAnswer?: (runId: string, questionId: string, answer: string) => Promise<void> | void; onDecideApproval?: (runId: string, approvalId: string, callHash: string, decision: "approved" | "denied", browserScope?: BrowserApprovalScopeV4) => Promise<void> | void; onResolveUncertain?: (runId: string, callId: string, resolution: "side_effect_observed" | "side_effect_not_observed" | "compensated", evidence: string) => Promise<void> | void; onResume?: (runId: string) => Promise<void> | void; onCancelRecovery?: (runId: string) => Promise<void> | void; onCloseBrowserTabs?: (runId: string, sessions: Array<"shared" | "workspace">) => Promise<void> | void; historical?: boolean }) {
+function V4RunTrace({ locale, events, previewText, reasoningPreview, modelActivity, onAnswer, onDecideApproval, onResolveUncertain, onResume, onCancelRecovery, onCloseBrowserTabs, historical = false }: { locale: Locale; events: AgentRunEventV4[]; previewText?: string | null; reasoningPreview?: import("../../types").AgentReasoningPreviewV4 | null; modelActivity?: import("../../types").AgentModelActivityReceiptV4 | null; onAnswer?: (runId: string, questionId: string, answer: string) => Promise<void> | void; onDecideApproval?: (runId: string, approvalId: string, callHash: string, decision: "approved" | "denied", browserScope?: BrowserApprovalScopeV4) => Promise<void> | void; onResolveUncertain?: (runId: string, callId: string, resolution: "side_effect_observed" | "side_effect_not_observed" | "compensated", evidence: string) => Promise<void> | void; onResume?: (runId: string) => Promise<void> | void; onCancelRecovery?: (runId: string) => Promise<void> | void; onCloseBrowserTabs?: (runId: string, sessions: Array<"shared" | "workspace">) => Promise<void> | void; historical?: boolean }) {
   const zh = locale === "zh-CN";
   const [resumeBusy, setResumeBusy] = useState(false);
   const resumeBusyRef = useRef(false);
@@ -1218,23 +1219,30 @@ function V4RunTrace({ locale, events, previewText, modelActivity, onAnswer, onDe
   ));
   const pauseReason = getV4PauseReason(events);
   const pendingModel = !historical && !terminal && !pauseReason ? pendingModelRequest(events) : null;
+  const activeTool = !historical && !terminal && !pauseReason
+    ? tools.filter((tool) => tool.status === "requested" || tool.status === "running").at(-1) : null;
+  const reasoningText = pendingModel && reasoningPreview?.run_id === events[0]?.run_id
+    && reasoningPreview.attempt_id === pendingModel.attemptId ? reasoningPreview.text : null;
   const [modelWaitNow, setModelWaitNow] = useState(() => Date.now());
   useEffect(() => {
     setModelWaitNow(Date.now());
-    if (!pendingModel || pendingModel.startedAtMs === null) return;
+    if ((!pendingModel || pendingModel.startedAtMs === null) && !activeTool) return;
     const timer = window.setInterval(() => setModelWaitNow(Date.now()), 1_000);
     return () => window.clearInterval(timer);
-  }, [events[0]?.run_id, pendingModel?.attemptId, pendingModel?.startedAtMs]);
+  }, [events[0]?.run_id, pendingModel?.attemptId, pendingModel?.startedAtMs, activeTool?.callId, activeTool?.startedAt]);
   const modelWaitDuration = pendingModel?.startedAtMs === null || pendingModel === null
     ? ""
     : formatDuration(Math.max(0, modelWaitNow - pendingModel.startedAtMs));
+  const toolStartedAtMs = activeTool?.startedAt ? Date.parse(activeTool.startedAt) : Number.NaN;
+  const toolWaitDuration = Number.isFinite(toolStartedAtMs)
+    ? formatDuration(Math.max(0, modelWaitNow - toolStartedAtMs)) : "";
   const recentActivity = pendingModel && modelActivity?.attempt_id === pendingModel.attemptId
     && modelWaitNow - Date.parse(modelActivity.received_at) < 15_000 ? modelActivity.phase : null;
   const duration = modelWaitDuration
     ? `${zh ? "本次请求" : "request"} ${modelWaitDuration}`
     : eventDuration(events[0]?.occurred_at, (terminal ?? latest)?.occurred_at);
   const unresolvedDispatchFailure = (!terminal || terminal.event.kind === "run_needs_attention" || terminal.event.kind === "run_failed") && events.some(({ event }) => event.kind === "tool_dispatch_uncertain" && !isV4UncertainResolved(events, event.call_id));
-  const status = unresolvedDispatchFailure ? (zh ? "失败" : "Failed") : terminal?.event.kind === "run_completed" ? (zh ? "已完成" : "Completed") : terminal?.event.kind === "run_cancelled" ? (zh ? "已终止" : "Cancelled") : terminal?.event.kind === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention") : terminal?.event.kind === "run_failed" ? (zh ? "失败" : "Failed") : pauseReason === "approval" ? (zh ? "等待工具审批" : "Waiting for approval") : pauseReason === "input" ? (zh ? "等待回答" : "Waiting for input") : pauseReason === "browser_connection" ? (zh ? "等待连接浏览器" : "Waiting for browser") : pauseReason === "browser_human" ? (zh ? "等待人工处理浏览器" : "Waiting for browser intervention") : pauseReason === "runtime_recovery" ? (zh ? "结果待恢复" : "Results ready to resume") : pendingModel && previewText ? (zh ? "正在生成回复" : "Generating response") : recentActivity === "reasoning" ? (zh ? "模型正在推理" : "Model reasoning") : recentActivity === "tool_call" ? (zh ? "模型正在准备工具" : "Preparing tools") : recentActivity === "retrying" ? (zh ? "模型正在重试" : "Retrying model") : pendingModel ? (zh ? "等待模型响应" : "Waiting for model") : (zh ? "运行中" : "Running");
+  const status = unresolvedDispatchFailure ? (zh ? "失败" : "Failed") : terminal?.event.kind === "run_completed" ? (zh ? "已完成" : "Completed") : terminal?.event.kind === "run_cancelled" ? (zh ? "已终止" : "Cancelled") : terminal?.event.kind === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention") : terminal?.event.kind === "run_failed" ? (zh ? "失败" : "Failed") : pauseReason === "approval" ? (zh ? "等待工具审批" : "Waiting for approval") : pauseReason === "input" ? (zh ? "等待回答" : "Waiting for input") : pauseReason === "browser_connection" ? (zh ? "等待连接浏览器" : "Waiting for browser") : pauseReason === "browser_human" ? (zh ? "等待人工处理浏览器" : "Waiting for browser intervention") : pauseReason === "runtime_recovery" ? (zh ? "结果待恢复" : "Results ready to resume") : pendingModel && previewText ? (zh ? "正在生成回复" : "Generating response") : recentActivity === "reasoning" ? (zh ? "模型正在推理" : "Model reasoning") : recentActivity === "tool_call" ? (zh ? "模型正在准备工具" : "Preparing tools") : recentActivity === "retrying" ? (zh ? "模型正在重试" : "Retrying model") : pendingModel && reasoningText ? (zh ? "等待模型继续输出" : "Waiting for more model output") : pendingModel ? (zh ? "等待模型响应" : "Waiting for model") : (zh ? "运行中" : "Running");
   const shouldExpand = !historical && !terminal;
   async function resumeRun() {
     if (!onResume || !events[0] || resumeBusyRef.current) return;
@@ -1261,6 +1269,9 @@ function V4RunTrace({ locale, events, previewText, modelActivity, onAnswer, onDe
   return <>
     {completionPending && <div className="agent-completion-pending" role="status"><span className="agent-working"><i />{zh ? "正在核验最终结果…" : "Verifying the final result…"}</span></div>}
     <section className="v4-conversation-run" aria-label={zh ? "分析对话" : "Analysis conversation"}>
+    {pendingModel && <div className="v4-live-activity" role="status" aria-label={zh ? "当前模型活动" : "Current model activity"}><span className="agent-working"><i />{status}</span><small role="timer" aria-live="off">{zh ? "本次请求" : "This request"} {modelWaitDuration}</small></div>}
+    {!pendingModel && activeTool && <div className="v4-live-activity" role="status" aria-label={zh ? "当前工具活动" : "Current tool activity"}><span className="agent-working"><i />{zh ? "正在运行工具" : "Running tool"} · {activeTool.toolId === "use_skill" ? skillDisplayName(activeTool, zh) : compactToolLabel(activeTool.toolId)}</span>{toolWaitDuration && <small role="timer" aria-live="off">{toolWaitDuration}</small>}</div>}
+    {reasoningText && <ReasoningPreview key={pendingModel?.attemptId} zh={zh} text={reasoningText} />}
     <details className={`agent-run-fold agent-v4-run ${historical ? "" : "is-active"}`} open={shouldExpand}>
       <summary><span className="agent-run-fold-title"><span><b>{zh ? "执行过程" : terminal ? "Processed" : "Processing"}</b><small>{terminal ? (zh ? "工具调用与验证记录" : "Tool calls and verification") : (zh ? "Agent 正在处理任务" : "Agent is working")}</small></span><ChevronRight size={15} /></span><span>{status} · {tools.length} {zh ? "个步骤" : tools.length === 1 ? "step" : "steps"}{duration && ` · ${duration}`}</span></summary>
       <div className="agent-run-fold-body">
@@ -1305,6 +1316,17 @@ function V4RunTrace({ locale, events, previewText, modelActivity, onAnswer, onDe
 
     </section>
   </>;
+}
+function ReasoningPreview({ zh, text }: { zh: boolean; text: string }) {
+  const detailsRef = useRef<HTMLDetailsElement>(null);
+  const contentRef = useRef<HTMLPreElement>(null);
+  const followingRef = useRef(true);
+  useLayoutEffect(() => { if (detailsRef.current) detailsRef.current.open = true; }, []);
+  useEffect(() => {
+    const content = contentRef.current;
+    if (content && followingRef.current) content.scrollTop = content.scrollHeight;
+  }, [text]);
+  return <article aria-label={zh ? "模型思考" : "Model thinking"} className="v4-reasoning-preview"><details ref={detailsRef}><summary><span className="agent-working"><i />{zh ? "模型思考" : "Model thinking"}</span><ChevronRight size={14} /></summary><pre ref={contentRef} onScroll={(event) => { const content = event.currentTarget; followingRef.current = content.scrollHeight - content.scrollTop - content.clientHeight < 32; }}>{text}</pre></details></article>;
 }
 function formatDuration(milliseconds: number) {
   if (milliseconds < 1_000) return `${Math.max(0, Math.round(milliseconds))} ms`;
