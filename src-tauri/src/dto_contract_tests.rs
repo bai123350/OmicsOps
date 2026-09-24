@@ -611,6 +611,34 @@ fn transient_model_activity_contract_contains_only_phase_and_run_identity() {
 }
 
 #[test]
+fn transient_reasoning_preview_contract_is_attempt_scoped_and_clearable() {
+    let run_id = Uuid::new_v4();
+    let attempt_id = Uuid::new_v4();
+    let preview = omicsops_dto::AgentReasoningPreviewV4 {
+        run_id,
+        attempt_id,
+        text: Some("检查输入。".into()),
+    };
+    let value = serde_json::to_value(&preview).unwrap();
+    assert_eq!(
+        value,
+        json!({"run_id":run_id,"attempt_id":attempt_id,"text":"检查输入。"})
+    );
+    assert_eq!(
+        serde_json::from_value::<omicsops_dto::AgentReasoningPreviewV4>(value).unwrap(),
+        preview
+    );
+    let clear = omicsops_dto::AgentReasoningPreviewV4 {
+        text: None,
+        ..preview
+    };
+    assert_eq!(
+        serde_json::to_value(clear).unwrap(),
+        json!({"run_id":run_id,"attempt_id":attempt_id,"text":null})
+    );
+}
+
+#[test]
 fn session_settings_defaults_preserve_legacy_records_and_validate_new_fields() {
     use crate::dto::AgentIterationSettingsV4;
     let legacy: AgentIterationSettingsV4 =

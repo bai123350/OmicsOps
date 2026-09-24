@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -89,6 +89,39 @@ impl Drop for ModelTextPreviewGuard<'_> {
     }
 }
 
+/// A preview belongs to one provider attempt, including after an internal
+/// retry changes its identity without leaving the outer model call.
+struct ModelReasoningPreviewGuard<'a> {
+    store: &'a dyn EventStoreV4,
+    run_id: Uuid,
+    state: Arc<Mutex<ReasoningPreviewState>>,
+}
+struct ReasoningPreviewState {
+    attempt_id: Uuid,
+    text: String,
+    dirty: bool,
+    last_sent: Option<Instant>,
+    started_visible: bool,
+}
+impl Drop for ModelReasoningPreviewGuard<'_> {
+    fn drop(&mut self) {
+        let attempt_id = self.state.lock().unwrap().attempt_id;
+        self.store
+            .preview_model_reasoning(self.run_id, attempt_id, None);
+    }
+}
+
+const MAX_REASONING_PREVIEW_BYTES: usize = 64 * 1024;
+
+fn append_bounded_reasoning(output: &mut String, delta: &str) {
+    let remaining = MAX_REASONING_PREVIEW_BYTES.saturating_sub(output.len());
+    let mut end = remaining.min(delta.len());
+    while !delta.is_char_boundary(end) {
+        end -= 1;
+    }
+    output.push_str(&delta[..end]);
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelRequestV4 {
     pub system: String,
@@ -135,6 +168,7 @@ pub struct ReviewerEvidenceV4 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelStreamEventV4 {
     TextDelta(String),
+    ReasoningDelta(String),
     Activity(ModelActivityPhaseV4),
     ProviderRetrying {
         attempt: u8,
@@ -489,6 +523,8 @@ pub trait EventStoreV4: Send + Sync {
         _phase: ModelActivityPhaseV4,
     ) {
     }
+    /// Redacted by the host before UI delivery; never persisted as an event.
+    fn preview_model_reasoning(&self, _run_id: Uuid, _attempt_id: Uuid, _text: Option<&str>) {}
     /// Ephemeral public text preview; never part of the audit/evidence chain.
     fn preview_model_text(&self, _run_id: Uuid, _text: Option<&str>) {}
     async fn append(&self, event: &AgentEventV4) -> Result<(), String>;
@@ -2845,6 +2881,19 @@ impl AgentCoreV4<'_> {
                 store: self.events,
                 run_id,
             };
+            let reasoning_state = Arc::new(Mutex::new(ReasoningPreviewState {
+                attempt_id: current_attempt_id,
+                text: String::new(),
+                dirty: false,
+                last_sent: None,
+                started_visible: true,
+            }));
+            let _reasoning_preview = ModelReasoningPreviewGuard {
+                store: self.events,
+                run_id,
+                state: Arc::clone(&reasoning_state),
+            };
+            let reasoning_state_for_events = Arc::clone(&reasoning_state);
             let mut last_preview = None::<Instant>;
             let mut last_activity = None::<(ModelActivityPhaseV4, Instant)>;
             let mut saw_usage = false;
@@ -2861,12 +2910,44 @@ impl AgentCoreV4<'_> {
                         }
                         Some(ModelActivityPhaseV4::Responding)
                     }
+                    ModelStreamEventV4::ReasoningDelta(text) => {
+                        if persist_text {
+                            let mut state = reasoning_state_for_events.lock().unwrap();
+                            let previous_len = state.text.len();
+                            append_bounded_reasoning(&mut state.text, &text);
+                            state.dirty |= state.text.len() != previous_len;
+                            if state.dirty
+                                && state.started_visible
+                                && state
+                                    .last_sent
+                                    .is_none_or(|last| last.elapsed() >= Duration::from_millis(40))
+                            {
+                                self.events.preview_model_reasoning(
+                                    run_id,
+                                    current_attempt_id,
+                                    Some(&state.text),
+                                );
+                                state.last_sent = Some(Instant::now());
+                                state.dirty = false;
+                            }
+                        }
+                        Some(ModelActivityPhaseV4::Reasoning)
+                    }
                     ModelStreamEventV4::Activity(phase) => Some(phase),
                     ModelStreamEventV4::ProviderRetrying {
                         attempt,
                         delay_ms,
                         message,
                     } => {
+                        self.events
+                            .preview_model_reasoning(run_id, current_attempt_id, None);
+                        {
+                            let mut state = reasoning_state_for_events.lock().unwrap();
+                            state.text.clear();
+                            state.dirty = false;
+                            state.last_sent = None;
+                            state.started_visible = false;
+                        }
                         let _ = callback_tx.send(AgentEventKindV4::ModelRetrying {
                             attempt,
                             class: omicsops_protocol::ModelErrorClassV4::Transport,
@@ -2882,6 +2963,7 @@ impl AgentCoreV4<'_> {
                             ));
                         }
                         current_attempt_id = Uuid::new_v4();
+                        reasoning_state_for_events.lock().unwrap().attempt_id = current_attempt_id;
                         saw_usage = false;
                         let _ = callback_tx.send(model_request_started(
                             logical_request_id,
@@ -2921,10 +3003,36 @@ impl AgentCoreV4<'_> {
             let deadline = tokio::time::sleep(attempt_timeout);
             tokio::pin!(deadline);
             let mut cancellation_poll = tokio::time::interval(Duration::from_millis(50));
+            let mut reasoning_flush = tokio::time::interval(Duration::from_millis(40));
             let result: Result<Result<ModelTurnV4, ModelFailureV4>, AgentCoreErrorV4> = loop {
                 tokio::select! {
                     result = &mut completion => break Ok(result),
-                    Some(kind) = callback_rx.recv() => self.push(run_id, kind).await?,
+                    Some(kind) = callback_rx.recv() => {
+                        let started_attempt = match &kind {
+                            AgentEventKindV4::ModelRequestStarted { request } => Some(request.attempt_id),
+                            _ => None,
+                        };
+                        self.push(run_id, kind).await?;
+                        if let Some(attempt_id) = started_attempt {
+                            let mut state = reasoning_state.lock().unwrap();
+                            if state.attempt_id == attempt_id {
+                                state.started_visible = true;
+                                if state.dirty {
+                                    self.events.preview_model_reasoning(run_id, state.attempt_id, Some(&state.text));
+                                    state.last_sent = Some(Instant::now());
+                                    state.dirty = false;
+                                }
+                            }
+                        }
+                    },
+                    _ = reasoning_flush.tick(), if persist_text => {
+                        let mut state = reasoning_state.lock().unwrap();
+                        if state.dirty && state.started_visible {
+                            self.events.preview_model_reasoning(run_id, state.attempt_id, Some(&state.text));
+                            state.last_sent = Some(Instant::now());
+                            state.dirty = false;
+                        }
+                    }
                     _ = &mut deadline => {
                         break Ok(Err(ModelFailureV4::transient(
                             omicsops_protocol::ModelErrorClassV4::Timeout,
@@ -6374,6 +6482,8 @@ mod tests {
     #[derive(Default)]
     struct MemoryStore {
         previews: Mutex<Vec<Option<String>>>,
+        reasoning_previews: Mutex<Vec<(Uuid, Option<String>)>>,
+        reasoning_start_visible: Mutex<Vec<bool>>,
         activities: Mutex<Vec<ModelActivityPhaseV4>>,
         events: Mutex<Vec<AgentEventV4>>,
         archives: Mutex<Vec<String>>,
@@ -6397,6 +6507,18 @@ mod tests {
     }
     #[async_trait]
     impl EventStoreV4 for MemoryStore {
+        fn preview_model_reasoning(&self, _: Uuid, attempt_id: Uuid, text: Option<&str>) {
+            if text.is_some() {
+                let started = self.events.lock().unwrap().iter().any(|event| {
+                    matches!(&event.event, AgentEventKindV4::ModelRequestStarted { request } if request.attempt_id == attempt_id)
+                });
+                self.reasoning_start_visible.lock().unwrap().push(started);
+            }
+            self.reasoning_previews
+                .lock()
+                .unwrap()
+                .push((attempt_id, text.map(str::to_owned)));
+        }
         fn preview_model_activity(&self, _: Uuid, _: Uuid, phase: ModelActivityPhaseV4) {
             self.activities.lock().unwrap().push(phase);
         }
@@ -6491,6 +6613,25 @@ mod tests {
 
     struct ActivityThenWaitModel;
 
+    struct BurstThenWaitModel;
+
+    #[async_trait]
+    impl ModelPortV4 for BurstThenWaitModel {
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            on_event(ModelStreamEventV4::ReasoningDelta("Inspecting ".into()));
+            on_event(ModelStreamEventV4::ReasoningDelta("inputs".into()));
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Ok(ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![],
+            })
+        }
+    }
+
     #[async_trait]
     impl ModelPortV4 for ActivityThenWaitModel {
         async fn stream(
@@ -6498,6 +6639,8 @@ mod tests {
             _: ModelRequestV4,
             on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
         ) -> Result<ModelTurnV4, ModelFailureV4> {
+            on_event(ModelStreamEventV4::ReasoningDelta("Inspecting ".into()));
+            on_event(ModelStreamEventV4::ReasoningDelta("inputs".into()));
             on_event(ModelStreamEventV4::Activity(
                 ModelActivityPhaseV4::Reasoning,
             ));
@@ -6506,6 +6649,7 @@ mod tests {
                 delay_ms: 500,
                 message: "retry fixture".into(),
             });
+            on_event(ModelStreamEventV4::ReasoningDelta("Checking retry".into()));
             tokio::time::sleep(Duration::from_millis(100)).await;
             Ok(ModelTurnV4 {
                 public_text: String::new(),
@@ -6542,6 +6686,27 @@ mod tests {
                 ModelActivityPhaseV4::Retrying
             ]
         );
+        let previews = store.reasoning_previews.lock().unwrap().clone();
+        assert!(
+            previews
+                .iter()
+                .any(|(_, text)| text.as_deref() == Some("Inspecting "))
+        );
+        assert!(previews.iter().any(|(_, text)| text.is_none()));
+        assert!(
+            previews
+                .iter()
+                .any(|(_, text)| text.as_deref() == Some("Checking retry"))
+        );
+        assert_ne!(previews.first().unwrap().0, previews.last().unwrap().0);
+        assert!(
+            store
+                .reasoning_start_visible
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|started| *started)
+        );
         let events = store.load_direct(run_id).unwrap();
         assert!(
             events
@@ -6554,6 +6719,114 @@ mod tests {
                 .all(|event| !format!("{:?}", event.event).contains("private reasoning"))
         );
         turn.await.unwrap();
+        assert!(
+            store
+                .reasoning_previews
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .1
+                .is_none()
+        );
+        assert!(store.load_direct(run_id).unwrap().iter().all(|event| {
+            !format!("{:?}", event.event).contains("Inspecting")
+                && !format!("{:?}", event.event).contains("Checking retry")
+        }));
+    }
+
+    #[tokio::test]
+    async fn burst_reasoning_flushes_while_provider_is_still_pending_and_clears_on_cancel() {
+        let store = MemoryStore::default();
+        let run_id = seed_model_run(&store);
+        let cancelled = AtomicBool::new(false);
+        let core = AgentCoreV4 {
+            model: &BurstThenWaitModel,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let request = ModelRequestV4 {
+            system: String::new(),
+            context: String::new(),
+            tools: vec![],
+            image_refs: vec![],
+        };
+        let mut turn =
+            Box::pin(core.model_turn(run_id, request, 0, Duration::from_secs(2), Some(&cancelled)));
+        tokio::select! {
+            result = &mut turn => panic!("stream completed before preview: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(90)) => {}
+        }
+        assert!(
+            store
+                .reasoning_previews
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, text)| text.as_deref() == Some("Inspecting inputs"))
+        );
+        cancelled.store(true, Ordering::SeqCst);
+        assert!(matches!(turn.await, Err(AgentCoreErrorV4::Cancelled)));
+        assert!(
+            store
+                .reasoning_previews
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .1
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_model_turn_never_previews_provider_reasoning() {
+        let store = MemoryStore::default();
+        let run_id = seed_model_run(&store);
+        let core = AgentCoreV4 {
+            model: &ActivityThenWaitModel,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        core.model_turn_with_policy(
+            run_id,
+            ModelRequestV4 {
+                system: String::new(),
+                context: String::new(),
+                tools: vec![],
+                image_refs: vec![],
+            },
+            0,
+            Duration::from_secs(1),
+            None,
+            false,
+            &mut 0,
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+        assert!(
+            store
+                .reasoning_previews
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, text)| text.is_none())
+        );
+    }
+
+    #[test]
+    fn bounded_reasoning_preview_never_breaks_utf8_or_loses_early_redaction_context() {
+        let mut preview = "password=secret\n".to_string();
+        append_bounded_reasoning(&mut preview, &"界".repeat(MAX_REASONING_PREVIEW_BYTES));
+        assert!(preview.len() <= MAX_REASONING_PREVIEW_BYTES);
+        assert!(preview.is_char_boundary(preview.len()));
+        assert!(preview.starts_with("password=secret\n"));
+        let before = preview.clone();
+        append_bounded_reasoning(&mut preview, "more");
+        assert_eq!(preview, before);
     }
 
     #[tokio::test]

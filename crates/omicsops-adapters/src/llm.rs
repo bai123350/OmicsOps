@@ -1501,7 +1501,7 @@ mod usage_metadata_tests {
     use super::*;
 
     #[test]
-    fn reasoning_only_stream_packets_report_activity_without_revealing_reasoning() {
+    fn reasoning_only_stream_packets_preserve_distinct_reasoning_deltas() {
         let secret = "private reasoning must stay out of events";
         for (protocol, packet) in [
             (
@@ -1523,9 +1523,37 @@ mod usage_metadata_tests {
         ] {
             let mut decoder = ProviderToolStreamDecoder::new(protocol);
             let events = decoder.push(packet.as_bytes()).unwrap();
-            assert_eq!(events, vec![ProviderStreamEvent::ReasoningActivity]);
-            assert!(!format!("{events:?}").contains(secret));
+            assert_eq!(
+                events,
+                vec![ProviderStreamEvent::ReasoningDelta {
+                    text: secret.into()
+                }]
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, ProviderStreamEvent::TextDelta { .. }))
+            );
         }
+    }
+
+    #[test]
+    fn fragmented_openai_reasoning_is_emitted_before_final_content_and_completion() {
+        let mut decoder = ProviderToolStreamDecoder::new(ProviderProtocol::OpenAiCompatible);
+        let prefix =
+            b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":null,\"reasoning\":\"Inspect";
+        assert!(decoder.push(prefix).unwrap().is_empty());
+        let reasoning = decoder.push(b"ing inputs\"}}]}\n\n").unwrap();
+        assert_eq!(
+            reasoning,
+            vec![ProviderStreamEvent::ReasoningDelta {
+                text: "Inspecting inputs".into()
+            }]
+        );
+        let final_events = decoder.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"Done\"},\"finish_reason\":\"stop\"}]}\n\n").unwrap();
+        assert!(
+            matches!(final_events.as_slice(), [ProviderStreamEvent::TextDelta { text }, ProviderStreamEvent::Completed] if text == "Done")
+        );
     }
 
     fn only_usage(events: &[ProviderStreamEvent]) -> (u64, u64, Value) {
@@ -1777,12 +1805,18 @@ impl ProviderToolStreamDecoder {
         value: &Value,
         events: &mut Vec<ProviderStreamEvent>,
     ) -> AdapterResult<()> {
-        if value
+        if let Some(text) = value
             .pointer("/choices/0/delta/reasoning_content")
             .and_then(Value::as_str)
-            .is_some_and(|text| !text.is_empty())
+            .filter(|text| !text.is_empty())
+            .or_else(|| {
+                value
+                    .pointer("/choices/0/delta/reasoning")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+            })
         {
-            events.push(ProviderStreamEvent::ReasoningActivity);
+            events.push(ProviderStreamEvent::ReasoningDelta { text: text.into() });
         }
         if let Some(text) = value
             .pointer("/choices/0/delta/content")
@@ -1880,12 +1914,12 @@ impl ProviderToolStreamDecoder {
                 });
             }
             Some("content_block_delta") => {
-                if value
+                if let Some(text) = value
                     .pointer("/delta/thinking")
                     .and_then(Value::as_str)
-                    .is_some_and(|text| !text.is_empty())
+                    .filter(|text| !text.is_empty())
                 {
-                    events.push(ProviderStreamEvent::ReasoningActivity);
+                    events.push(ProviderStreamEvent::ReasoningDelta { text: text.into() });
                 }
                 if let Some(arguments) =
                     value.pointer("/delta/partial_json").and_then(Value::as_str)
@@ -1928,12 +1962,12 @@ impl ProviderToolStreamDecoder {
         value: &Value,
         events: &mut Vec<ProviderStreamEvent>,
     ) -> AdapterResult<()> {
-        if value
+        if let Some(text) = value
             .pointer("/message/thinking")
             .and_then(Value::as_str)
-            .is_some_and(|text| !text.is_empty())
+            .filter(|text| !text.is_empty())
         {
-            events.push(ProviderStreamEvent::ReasoningActivity);
+            events.push(ProviderStreamEvent::ReasoningDelta { text: text.into() });
         }
         if let Some(text) = value
             .pointer("/message/content")

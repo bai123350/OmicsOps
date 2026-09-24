@@ -1128,6 +1128,17 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
+    #[test]
+    fn reasoning_snapshot_redaction_catches_split_assignments_and_partial_private_keys() {
+        let first = "Checking password";
+        assert_eq!(public_text(first), first);
+        let continued = "Checking password=secret-value and next step";
+        assert!(!public_text(continued).contains("secret-value"));
+        assert!(public_text(continued).contains("[REDACTED]"));
+        let pem = "Checking\n-----BEGIN RSA PRIVATE KEY-----\nMIIsecret";
+        assert!(!public_text(pem).contains("MIIsecret"));
+    }
+
     async fn fixture() -> (omicsops_store::Store, Project, Conversation, Conversation) {
         let store = omicsops_store::Store::open_in_memory().await.unwrap();
         let project = Project::new(

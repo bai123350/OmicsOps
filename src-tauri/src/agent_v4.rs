@@ -5399,10 +5399,8 @@ impl ModelPortV4 for DesktopModelPortV4 {
         let mut accumulator_error = None;
         self.client
             .stream_with_provider(provider_request, |event| match event {
-                ProviderStreamEvent::ReasoningActivity => {
-                    on_event(ModelStreamEventV4::Activity(
-                        ModelActivityPhaseV4::Reasoning,
-                    ));
+                ProviderStreamEvent::ReasoningDelta { text } => {
+                    on_event(ModelStreamEventV4::ReasoningDelta(text));
                 }
                 ProviderStreamEvent::TextDelta { text: delta } => {
                     text.push_str(&delta);
@@ -7720,6 +7718,16 @@ impl RepositoryEventStoreV4 {
 }
 #[async_trait]
 impl EventStoreV4 for RepositoryEventStoreV4 {
+    fn preview_model_reasoning(&self, run_id: Uuid, attempt_id: Uuid, text: Option<&str>) {
+        let _ = self.app.emit(
+            "agent-v4-reasoning-preview",
+            omicsops_dto::AgentReasoningPreviewV4 {
+                run_id,
+                attempt_id,
+                text: text.map(crate::composer_references::public_text),
+            },
+        );
+    }
     fn preview_model_activity(&self, run_id: Uuid, attempt_id: Uuid, phase: ModelActivityPhaseV4) {
         let _ = self.app.emit(
             "agent-v4-model-activity",

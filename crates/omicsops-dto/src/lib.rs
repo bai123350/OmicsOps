@@ -131,6 +131,16 @@ pub struct AgentTextPreviewV4 {
     pub text: Option<String>,
 }
 
+/// Bounded, redacted, transient provider reasoning snapshot for one attempt.
+/// None clears the currently displayed preview. Never store this DTO in audit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentReasoningPreviewV4 {
+    pub run_id: Uuid,
+    pub attempt_id: Uuid,
+    pub text: Option<String>,
+}
+
 /// Transient provider progress with no prompt, reasoning, or tool arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

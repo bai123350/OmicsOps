@@ -231,9 +231,11 @@ fn add_delta_counters(merged: &mut ProviderUsageSample, sample: &ProviderUsageSa
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderStreamEvent {
-    /// A provider supplied private reasoning bytes. No reasoning text crosses
-    /// this boundary; the host may use this signal only for live status.
-    ReasoningActivity,
+    /// Provider-supplied reasoning. Hosts may show a redacted, bounded,
+    /// transient preview; this must never enter the public/audit transcript.
+    ReasoningDelta {
+        text: String,
+    },
     TextDelta {
         text: String,
     },
