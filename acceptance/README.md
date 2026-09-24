@@ -86,6 +86,21 @@ coordination tools. The separate deterministic budget regression covers the full
 built-in tool schema in an initial request larger than 150 KB. Neither result is
 an SSH, miRNA, or general scientific-workflow acceptance.
 
+On 2026-09-25, the exact ignored command above passed 1/1 in 110.05 seconds on
+Windows with an existing saved `glm-5.3` profile. The real provider-to-Agent
+stream produced 402 nonempty transient reasoning snapshots across three model
+attempts; all 402 arrived before their result event. The largest snapshot was
+16,917 bytes, the first and last arrived 2,199 and 104,807 milliseconds after
+the first model request, and the preview was cleared three times. These are
+metadata counts only; the test printed or persisted neither reasoning text nor
+credentials. Deterministic checks also passed: `cargo test --workspace`
+(1,299 passed, 12 ignored), `npm test` (890 frontend and 22 bridge tests),
+`npm run build`, and `npm run build:desktop`. A separate browser check of a
+synthetic WorkspaceShell fixture confirmed the Thinking panel appears outside
+the collapsed trace and can be collapsed manually. That browser check is not
+native desktop or live model UI acceptance; the live test does not cover SSH or
+a miRNA workflow.
+
 ## Agent Runtime V4 stage-1 acceptance
 
 `agent_v4::tests::live_v4_model_plan_and_persistent_ssh_python_kernel` uses the
