@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, path::PathBuf, sync::atomic::AtomicBool};
+use std::{
+    collections::BTreeSet,
+    path::PathBuf,
+    sync::{Mutex, atomic::AtomicBool},
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use omicsops_adapters::credentials::{CredentialVault, SystemCredentialVault};
@@ -34,16 +39,114 @@ fn live_go_acceptance_model_allowlist_is_exact() {
 
 struct TemporaryEventStore {
     repository: Store,
+    run_id: Uuid,
+    reasoning_observation: Mutex<ReasoningObservation>,
+}
+
+#[derive(Debug, Default)]
+struct ReasoningObservation {
+    started_at: Option<Instant>,
+    active_attempt: Option<Uuid>,
+    attempts_with_content: BTreeSet<Uuid>,
+    nonempty_snapshots: usize,
+    snapshots_before_result: usize,
+    clear_updates: usize,
+    max_snapshot_bytes: usize,
+    first_nonempty_ms: Option<u128>,
+    last_nonempty_ms: Option<u128>,
+}
+
+impl ReasoningObservation {
+    fn observe_event(&mut self, kind: &AgentEventKindV4) {
+        match kind {
+            AgentEventKindV4::ModelRequestStarted { request } => {
+                self.started_at.get_or_insert_with(Instant::now);
+                self.active_attempt = Some(request.attempt_id);
+            }
+            AgentEventKindV4::ModelText { .. }
+            | AgentEventKindV4::ToolRequested { .. }
+            | AgentEventKindV4::RunCompleted
+            | AgentEventKindV4::RunFailed { .. }
+            | AgentEventKindV4::RunNeedsAttention { .. } => {
+                self.active_attempt = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn observe_preview(&mut self, attempt_id: Uuid, text: Option<&str>) {
+        let Some(text) = text else {
+            self.clear_updates += 1;
+            if self.active_attempt == Some(attempt_id) {
+                self.active_attempt = None;
+            }
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        let elapsed_ms = self
+            .started_at
+            .map(|started_at| started_at.elapsed().as_millis());
+        self.nonempty_snapshots += 1;
+        if self.active_attempt == Some(attempt_id) {
+            self.snapshots_before_result += 1;
+        }
+        self.attempts_with_content.insert(attempt_id);
+        self.max_snapshot_bytes = self.max_snapshot_bytes.max(text.len());
+        self.first_nonempty_ms = self.first_nonempty_ms.or(elapsed_ms);
+        self.last_nonempty_ms = elapsed_ms;
+    }
+}
+
+#[test]
+fn reasoning_observation_counts_only_matching_preterminal_snapshots_without_retaining_text() {
+    let attempt_id = Uuid::new_v4();
+    let other_attempt_id = Uuid::new_v4();
+    let mut observation = ReasoningObservation {
+        started_at: Some(Instant::now()),
+        active_attempt: Some(attempt_id),
+        ..Default::default()
+    };
+    let private_text = "SECRET_REASONING_PAYLOAD";
+
+    observation.observe_preview(other_attempt_id, Some(private_text));
+    observation.observe_preview(attempt_id, Some(private_text));
+    assert_eq!(observation.nonempty_snapshots, 2);
+    assert_eq!(observation.snapshots_before_result, 1);
+
+    observation.observe_preview(attempt_id, None);
+    observation.observe_preview(attempt_id, Some(private_text));
+    observation.active_attempt = Some(attempt_id);
+    observation.observe_event(&AgentEventKindV4::RunCompleted);
+    observation.observe_preview(attempt_id, Some(private_text));
+    assert_eq!(observation.nonempty_snapshots, 4);
+    assert_eq!(observation.snapshots_before_result, 1);
+    assert_eq!(observation.clear_updates, 1);
+    assert!(!format!("{observation:?}").contains(private_text));
 }
 
 #[async_trait]
 impl EventStoreV4 for TemporaryEventStore {
+    fn preview_model_reasoning(&self, run_id: Uuid, attempt_id: Uuid, text: Option<&str>) {
+        if run_id == self.run_id {
+            self.reasoning_observation
+                .lock()
+                .unwrap()
+                .observe_preview(attempt_id, text);
+        }
+    }
+
     async fn append(&self, event: &AgentEventV4) -> Result<(), String> {
         self.repository
             .append_agent_event_v4_with_conversation(event)
             .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        self.reasoning_observation
+            .lock()
+            .unwrap()
+            .observe_event(&event.event);
+        Ok(())
     }
 
     async fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String> {
@@ -286,6 +389,8 @@ async fn run_live_go_agent_acceptance() -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let events = TemporaryEventStore {
         repository: repository.clone(),
+        run_id,
+        reasoning_observation: Mutex::new(ReasoningObservation::default()),
     };
     events
         .append(&AgentEventV4::first(
@@ -341,9 +446,30 @@ async fn run_live_go_agent_acceptance() -> Result<(), String> {
     let mut limits = AgentLimitsV4::ordinary(4);
     limits.max_tool_calls = 3;
     limits.max_model_retries = 0;
-    core.execute_with_limits(&spec, limits, &AtomicBool::new(false))
-        .await
-        .map_err(|error| error.to_string())?;
+    let execution = core
+        .execute_with_limits(&spec, limits, &AtomicBool::new(false))
+        .await;
+
+    let reasoning = events.reasoning_observation.lock().unwrap();
+    println!(
+        "OpenCode Go reasoning preview: model={}, nonempty_snapshots={}, snapshots_before_result={}, attempts_with_content={}, max_snapshot_bytes={}, clear_updates={}, first_nonempty_ms={:?}, last_nonempty_ms={:?}",
+        profile.model,
+        reasoning.nonempty_snapshots,
+        reasoning.snapshots_before_result,
+        reasoning.attempts_with_content.len(),
+        reasoning.max_snapshot_bytes,
+        reasoning.clear_updates,
+        reasoning.first_nonempty_ms,
+        reasoning.last_nonempty_ms,
+    );
+    let snapshots_before_result = reasoning.snapshots_before_result;
+    drop(reasoning);
+    execution.map_err(|error| error.to_string())?;
+    if profile.model == "glm-5.3" && snapshots_before_result == 0 {
+        return Err(
+            "glm-5.3 produced no nonempty reasoning preview before a model result event".into(),
+        );
+    }
 
     let recorded = events.load(run_id).await?;
     let model_requests = recorded

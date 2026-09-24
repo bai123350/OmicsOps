@@ -50,6 +50,13 @@ user database, prints the credential, uses SSH, or touches an existing project.
 The temporary project contains one random nonce file; the prompt names the file
 but does not contain the nonce. The production V4 composition and ordinary Agent
 loop must read it once and return the nonce in the final completed answer.
+The same fixture observes ephemeral reasoning previews from the real provider
+stream. It prints only snapshot counts, byte lengths, attempt counts, and elapsed
+milliseconds since the first model request; it never prints or persists reasoning
+text. For `glm-5.3`, at least one nonempty preview must arrive before that model
+attempt's result event.
+The `glm-5.3-flash` profile reports the observation without requiring reasoning,
+because a valid response may omit it.
 
 ```text
 cargo test -p omicsops-desktop agent_v4::go_live_acceptance_tests::live_opencode_go_agent_reads_file_and_returns_nonce -- --ignored --exact --nocapture
