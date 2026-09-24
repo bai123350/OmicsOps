@@ -1267,8 +1267,8 @@ function V4RunTrace({ locale, events, previewText, modelActivity, onAnswer, onDe
 
       <section className="v4-process-timeline" aria-label={zh ? "工具调用详情" : "Tool call details"}><ActivityWindow zh={zh}>
       {[
-        ...progress.map(({ event, modelText }) => ({ sequence: event.sequence, node: <PublicProgress key={`progress-${event.sequence}`} markdown={modelText ?? ""} zh={zh} /> })),
-        ...tools.map((tool) => ({ sequence: tool.firstSequence, node: <details className="v4-tool-trace" key={tool.callId} open={tool.status === "failed"}>
+        ...progress.map(({ event, modelText }) => ({ sequence: event.sequence, node: <PublicProgress key={`progress-${event.sequence}`} markdown={modelText ?? ""} zh={zh} initiallyOpen={!historical && !terminal && progress.at(-1)?.event.sequence === event.sequence} /> })),
+        ...tools.map((tool) => ({ sequence: tool.firstSequence, node: <details className="v4-tool-trace" key={tool.callId} open={tool.status === "requested" || tool.status === "running" || tool.status === "failed"}>
           <summary className="v4-tool-trace-heading"><span className={`v4-tool-mark ${tool.status}`} aria-label={toolStatusLabel(tool.status, zh)}>{tool.status === "failed" ? "×" : tool.status === "succeeded" || tool.status === "reused" ? "✓" : "○"}</span>{tool.toolId === "use_skill" && <span className="v4-skill-badge">SKILL</span>}<strong title={toolDisplayLabel(tool.toolId, zh)}>{tool.toolId === "use_skill" ? skillDisplayName(tool, zh) : compactToolLabel(tool.toolId)}</strong>{tool.subject && tool.toolId !== "use_skill" && <span className="v4-tool-subject" title={tool.subject}>{tool.subject}</span>}<span className={`v4-tool-status ${tool.status}`}>{toolStatusLabel(tool.status, zh)}</span><small className="v4-tool-metrics">{toolMetrics(tool, zh)}</small><ChevronRight size={13} /></summary>
           <div className="v4-tool-trace-body">
             <small>{tool.toolId} · #{tool.firstSequence}–#{tool.lastSequence}</small>
@@ -1373,14 +1373,14 @@ function ActivityWindow({ children, zh }: { children: ReactNode[]; zh: boolean }
     {children.slice(earlierCount)}
   </>;
 }
-function PublicProgress({ markdown, zh }: { markdown: string; zh: boolean }) {
-  const [open, setOpen] = useState(false);
+function PublicProgress({ markdown, zh, initiallyOpen = false }: { markdown: string; zh: boolean; initiallyOpen?: boolean }) {
+  const [open, setOpen] = useState(initiallyOpen);
   const firstLine = markdown.split(/\r?\n/).find((line) => line.trim())?.trim() ?? "";
   const summary = Array.from(firstLine);
   const preview = summary.slice(0, 100).join("") + (summary.length > 100 ? "…" : "");
   return <article aria-label={zh ? "模型输出" : "Model output"} className="v4-progress-disclosure">
     <button type="button" className="v4-progress-heading" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
-      <span aria-hidden="true">−</span><strong>{zh ? "进度" : "Progress"}</strong><span className="v4-progress-preview">{preview}</span><ChevronRight size={13} />
+      <span aria-hidden="true">−</span><strong>{zh ? "进度" : "Progress"}</strong>{!open && <span className="v4-progress-preview">{preview}</span>}<ChevronRight size={13} />
     </button>
     {open && <MarkdownContent markdown={markdown} />}
   </article>;
