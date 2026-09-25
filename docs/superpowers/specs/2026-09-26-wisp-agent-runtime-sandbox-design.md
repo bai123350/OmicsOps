@@ -4,6 +4,8 @@
 
 实施计划：[Agent Runtime Boundaries Implementation Plan](../plans/2026-09-26-wisp-agent-runtime-boundaries.md)。
 
+源码核对：[固定提交的 Agent/Runtime 实现对照](2026-09-26-wisp-agent-runtime-source-audit.md)。该审计补充实际源码行号，区分可借鉴的远端身份校验与不照搬的取消收口语义，不扩张首期范围。
+
 用户已选择首期重点：明确 Agent 的执行位置、隔离能力、审批和恢复语义。本文将其收敛为可独立交付的运行边界视图；服务器容器沙盒留作后续独立设计。本文不授权改变已冻结的运行、审批或现有计算行为。
 
 ## 1. 用户问题与首期结果

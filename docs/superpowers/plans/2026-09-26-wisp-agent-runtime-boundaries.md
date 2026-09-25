@@ -10,6 +10,8 @@
 
 **Spec:** [已确认设计](../specs/2026-09-26-wisp-agent-runtime-sandbox-design.md)。先读该文档和根目录 `AGENTS.md`。
 
+**Source audit:** [固定提交源码对照](../specs/2026-09-26-wisp-agent-runtime-source-audit.md)。只读观察、宿主授权与远端防重派已核对到实现；上游二次取消强制收口不照搬。本计划仍待审，三个任务和接口保持不变。
+
 ## Global Constraints
 
 - “不新增服务器 daemon、云平台、作业表、对象检查器或新的模型执行工具；不迁移 Agent 编排；不改变本机 system Python/R 与 SSH system/Micromamba 支持范围。”
