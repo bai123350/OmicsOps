@@ -102,6 +102,29 @@ the collapsed trace and can be collapsed manually. That browser check is not
 native desktop or live model UI acceptance; the live test does not cover SSH or
 a miRNA workflow.
 
+After the stream-deadline correction on 2026-09-25, the same isolated fixture was
+explicitly executed with the existing saved `glm-5.3` profile and its `max`
+reasoning effort. This command reused the workspace test build; the exact test
+filter selected only the OpenCode fixture and no other ignored live tests:
+
+```text
+cargo test --workspace agent_v4::go_live_acceptance_tests::live_opencode_go_agent_reads_file_and_returns_nonce -- --ignored --exact --nocapture
+```
+
+It passed 1/1 in 139.96 seconds (exit 0), with 2,072 nonempty reasoning snapshots
+across three attempts, all observed before the corresponding result. The first
+and last snapshots arrived at 1,737 and 136,617 milliseconds; the largest preview
+was 16,594 bytes and three clear updates were observed. The production Agent read
+the temporary nonce file exactly once, returned that nonce, and completed.
+Only metadata was printed; credentials and reasoning text were not recorded.
+This run validates the real provider/tool/completion path, not a live request
+lasting beyond 180 seconds or the original miRNA research workflow. Deterministic
+tests cover active streams past the former deadline, silence, empty/usage/retry
+events, the hard cap, cancellation, partial tool calls, and unchanged summary
+deadlines. Final checks passed: `cargo test --workspace` (1,306 passed, 12 ignored),
+`npm test` (893 frontend and 22 bridge tests), `npm run build`,
+`npm run build:desktop`, and `cargo fmt --all -- --check`. No SSH acceptance was run.
+
 ## Agent Runtime V4 stage-1 acceptance
 
 `agent_v4::tests::live_v4_model_plan_and_persistent_ssh_python_kernel` uses the
