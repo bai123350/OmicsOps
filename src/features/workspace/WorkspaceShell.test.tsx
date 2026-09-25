@@ -431,7 +431,7 @@ describe("WorkspaceShell", () => {
     expect(screen.queryByRole("region", { name: "Agent 阶段轨迹" })).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "任务列表" })).not.toBeInTheDocument();
     expect(screen.getByText("公开摘要：先检查输入。")).toBeVisible();
-    expect(screen.getByText("进度")).toBeVisible();
+    expect(screen.getByText("PROGRESS")).toBeVisible();
     expect(screen.queryByText("private reasoning must never render")).not.toBeInTheDocument();
     expect(screen.queryByText("agent.update_tasks")).not.toBeInTheDocument();
     expect(screen.getByText("task_list_updated")).not.toBeVisible();
@@ -491,18 +491,37 @@ describe("WorkspaceShell", () => {
     expect(screen.getByRole("status")).toHaveTextContent("超过 90 秒未收到模型数据或 Agent 事件");
     expect(screen.getByRole("button", { name: "终止运行" })).toBeInTheDocument();
   });
-  it("shows active public Markdown and expands only the tool still running", () => {
+  it("keeps progress and running tool details folded in chronological execution rows", () => {
     const base = { schema_version: 4 as const, run_id: "run-live-steps", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash", occurred_at: "2026-08-17T00:00:00Z" };
     const progress = { ...base, sequence: 1, event: { kind: "model_text" as const, text: "## Checking input\n\n- Source verified" } };
     const requested = { ...base, sequence: 2, event: { kind: "tool_requested" as const, call: { call_id: "read-live", tool_id: "project.read", arguments: { path: "input.tsv" } } } };
     const props = { project, locale: "en-US" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: base.run_id };
     const { rerender } = render(<WorkspaceShell {...props} agentRunEventsV4={[progress, requested]} />);
     const timeline = screen.getByRole("region", { name: "Tool call details" });
-    expect(within(timeline).getByRole("heading", { name: "Checking input" })).toBeVisible();
+    expect(within(timeline).getByText(/Checking input/)).toBeVisible();
+    expect(within(timeline).queryByRole("heading", { name: "Checking input" })).not.toBeInTheDocument();
     const tool = within(timeline).getByText("read").closest("details")!;
-    expect(tool).toHaveAttribute("open");
+    expect(tool).not.toHaveAttribute("open");
+    expect(tool.querySelector("summary")).toHaveTextContent("input.tsv");
+    fireEvent.click(within(timeline).getByRole("button", { name: /PROGRESS.*Checking input/ }));
+    expect(within(timeline).getByRole("heading", { name: "Checking input" })).toBeVisible();
     rerender(<WorkspaceShell {...props} agentRunEventsV4={[progress, requested, { ...base, sequence: 3, event: { kind: "tool_finished", outcome: { call_id: "read-live", tool_id: "project.read", succeeded: true, model_content: "done", data: null, provenance: [] } } }]} />);
     expect(tool).not.toHaveAttribute("open");
+    expect(within(timeline).getByRole("heading", { name: "Checking input" })).toBeVisible();
+  });
+  it("orders model requests, progress, and tool rows by their durable event sequence", () => {
+    const base = { schema_version: 4 as const, run_id: "run-ordered", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash", occurred_at: new Date(Date.now() - 2_000).toISOString() };
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} runStarted activeRunId={base.run_id} agentRunEventsV4={[
+      { ...base, sequence: 1, event: { kind: "model_request_started", request: modelRequest("ordered-attempt") } },
+      { ...base, sequence: 2, event: { kind: "model_text", text: "Checking sources" } },
+      { ...base, sequence: 3, event: { kind: "tool_requested", call: { call_id: "ordered-read", tool_id: "project.read", arguments: { path: "source.tsv" } } } },
+    ]} />);
+    const rows = screen.getByRole("region", { name: "Tool call details" }).querySelectorAll(".v4-timeline-row");
+    expect([...rows].map((row) => row.textContent)).toEqual([
+      expect.stringContaining("MODEL REQUEST"),
+      expect.stringContaining("PROGRESS"),
+      expect.stringContaining("read"),
+    ]);
   });
   it("shows recent reasoning activity without a false silence warning", () => {
     const lastActivity = new Date(Date.now() - 90_001).toISOString();
@@ -519,7 +538,7 @@ describe("WorkspaceShell", () => {
     expect(screen.getByRole("status", { name: "当前模型活动" })).toHaveTextContent("模型正在推理");
     expect(screen.queryByText(/超过 90 秒未收到模型数据或 Agent 事件/)).not.toBeInTheDocument();
   });
-  it("shows the pending model request before provider content and streams supplied reasoning outside execution details", () => {
+  it("shows a real model request row and keeps live thinking folded inside execution details", () => {
     const started = new Date(Date.now() - 3_000).toISOString();
     const base = { schema_version: 4 as const, run_id: "run-thinking", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash", occurred_at: started };
     const events = [
@@ -533,24 +552,31 @@ describe("WorkspaceShell", () => {
     expect(waiting).toHaveTextContent(/本次请求 3/);
     expect(within(waiting).getByRole("timer")).toHaveAttribute("aria-live", "off");
     expect(waiting.closest("details")).toBeNull();
+    const timeline = screen.getByRole("region", { name: "工具调用详情" });
+    expect(within(timeline).getByText("MODEL REQUEST")).toBeVisible();
     expect(screen.queryByRole("article", { name: "模型思考" })).not.toBeInTheDocument();
 
     rerender(<WorkspaceShell {...props} agentReasoningPreview={{ run_id: base.run_id, attempt_id: "attempt-thinking", text: "先核对输入" }} />);
     const thinking = screen.getByRole("article", { name: "模型思考" });
-    expect(thinking).toHaveTextContent("先核对输入");
-    expect(thinking.closest("details")).toBeNull();
+    expect(thinking.closest(".agent-run-fold")).toBeInTheDocument();
+    expect(within(thinking).getByText("THINKING")).toBeVisible();
+    expect(thinking.querySelector("details")).not.toHaveAttribute("open");
     fireEvent.click(screen.getByText("执行过程"));
-    expect(thinking).toBeVisible();
+    expect(thinking).not.toBeVisible();
     expect(screen.getByRole("status", { name: "当前模型活动" })).toBeVisible();
+    fireEvent.click(screen.getByText("执行过程"));
+    fireEvent.click(within(thinking).getByText("THINKING"));
+    expect(thinking.querySelector("details")).toHaveAttribute("open");
     rerender(<WorkspaceShell {...props} agentReasoningPreview={{ run_id: base.run_id, attempt_id: "attempt-thinking", text: "先核对输入\n再检查 <img src=x onerror=alert(1)>" }} />);
     expect(thinking).toHaveTextContent("再检查 <img src=x onerror=alert(1)>");
     expect(thinking.querySelector("img")).toBeNull();
-    fireEvent.click(within(thinking).getByText("模型思考"));
+    fireEvent.click(within(thinking).getByText("THINKING"));
     expect(thinking.querySelector("details")).not.toHaveAttribute("open");
     rerender(<WorkspaceShell {...props} agentReasoningPreview={{ run_id: base.run_id, attempt_id: "attempt-thinking", text: "先核对输入" }} agentModelActivity={{ run_id: base.run_id, attempt_id: "attempt-thinking", phase: "tool_call", received_at: new Date().toISOString() }} />);
     expect(thinking.querySelector("details")).not.toHaveAttribute("open");
     expect(screen.getByRole("status", { name: "当前模型活动" })).toHaveTextContent("模型正在准备工具");
-    expect(thinking).toHaveTextContent("先核对输入");
+    rerender(<WorkspaceShell {...props} agentReasoningPreview={{ run_id: base.run_id, attempt_id: "stale-attempt", text: "旧推理泄漏" }} />);
+    expect(screen.queryByRole("article", { name: "模型思考" })).not.toBeInTheDocument();
   });
   it("shows the active tool and elapsed time outside execution details, but stops working status for approval", () => {
     const started = new Date(Date.now() - 4_000).toISOString();
@@ -1086,15 +1112,27 @@ describe("WorkspaceShell", () => {
     ]} />);
     fireEvent.click(screen.getByText("执行过程"));
     expect(screen.getAllByText(/runtime\.execute/)).toHaveLength(3);
-    expect(document.querySelector(".v4-tool-status.reused")).toBeInTheDocument();
-    expect(document.querySelector(".v4-tool-status.succeeded")).toBeInTheDocument();
-    expect(document.querySelector(".v4-tool-status.failed")).toBeInTheDocument();
-    expect(document.querySelector(".v4-tool-status.failed")?.closest("details")).toHaveAttribute("open");
-    expect(document.querySelector(".v4-tool-status.succeeded")).toBeInTheDocument();
+    expect(document.querySelector(".v4-tool-mark.reused")).toBeInTheDocument();
+    expect(document.querySelector(".v4-tool-mark.succeeded")).toBeInTheDocument();
+    expect(document.querySelector(".v4-tool-mark.failed")).toBeInTheDocument();
+    expect(document.querySelector(".v4-tool-mark.failed")?.closest("details")).not.toHaveAttribute("open");
+    expect(document.querySelector(".v4-tool-mark.succeeded")?.closest("details")).not.toHaveAttribute("open");
     expect(screen.getByText("QC complete")).toBeInTheDocument();
     expect(screen.getByText(/print\(1\)/)).toBeInTheDocument();
     expect(screen.getByText(/\[REDACTED\]/)).toBeInTheDocument();
     expect(screen.queryByText(/hidden/)).not.toBeInTheDocument();
+  });
+
+  it("does not keep increasing an unfinished tool duration after cancellation", () => {
+    const base = { schema_version: 4 as const, run_id: "run-cancelled-tool", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
+    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} activeRunId="run-cancelled-tool" agentRunEventsV4={[
+      { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "tool_requested" as const, call: { call_id: "old-call", tool_id: "project.read", arguments: { path: "old.txt" } } } },
+      { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "run_cancelled" as const } },
+    ]} />);
+    fireEvent.click(screen.getByText("Processed"));
+    const row = document.querySelector(".v4-tool-trace");
+    expect(row?.querySelector(".v4-tool-metrics")).toHaveTextContent("");
+    expect(row).not.toHaveAttribute("open");
   });
 
   it("auto-expands blocked runs while keeping the interaction card available", () => {
@@ -1230,7 +1268,7 @@ it("updates one live progress row then replaces it with the committed message", 
   expect(screen.queryByText("wrong run")).not.toBeInTheDocument();
 });
 
-it("shows a live model wait timer and labels streamed preview as generation", () => {
+it("keeps the run duration in the process header while showing a separate request wait timer", () => {
   vi.useFakeTimers();
   vi.setSystemTime(new Date("2026-09-22T12:02:13Z"));
   const clearInterval = vi.spyOn(window, "clearInterval");
@@ -1242,12 +1280,13 @@ it("shows a live model wait timer and labels streamed preview as generation", ()
   const props = { project, locale: "en-US" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: base.run_id };
   const { rerender, unmount } = render(<WorkspaceShell {...props} agentRunEventsV4={events} />);
 
-  expect(screen.getByText(/Waiting for model · 0 steps · request 2m 13s/)).toBeInTheDocument();
+  expect(screen.getByText(/Waiting for model · 0 steps · 3m 13s/)).toBeInTheDocument();
+  expect(screen.getByRole("status", { name: "Current model activity" })).toHaveTextContent("This request 2m 13s");
   act(() => vi.advanceTimersByTime(1_000));
-  expect(screen.getByText(/Waiting for model · 0 steps · request 2m 14s/)).toBeInTheDocument();
+  expect(screen.getByText(/Waiting for model · 0 steps · 3m 14s/)).toBeInTheDocument();
 
   rerender(<WorkspaceShell {...props} agentRunEventsV4={events} agentTextPreview={{ run_id: base.run_id, text: "First public tokens" }} />);
-  expect(screen.getByText(/Generating response · 0 steps · request 2m 14s/)).toBeInTheDocument();
+  expect(screen.getByText(/Generating response · 0 steps · 3m 14s/)).toBeInTheDocument();
   unmount();
   expect(clearInterval).toHaveBeenCalled();
 });
@@ -1269,7 +1308,8 @@ it("tracks only the latest model attempt and clears waiting at durable boundarie
   const props = { project, locale: "en-US" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: base.run_id };
   const { rerender } = render(<WorkspaceShell {...props} agentRunEventsV4={[requestOne, requestTwo, staleFinal, partial]} />);
 
-  expect(screen.getByText(/Waiting for model · 0 steps · request 20s/)).toBeInTheDocument();
+  expect(screen.getByText(/Waiting for model · 0 steps · 30s/)).toBeInTheDocument();
+  expect(screen.getByRole("status", { name: "Current model activity" })).toHaveTextContent("This request 20s");
 
   const matchingFinal = event(5, 13, { kind: "model_usage_observed", observation: modelUsage("attempt-2", "final") });
   rerender(<WorkspaceShell {...props} agentRunEventsV4={[requestOne, requestTwo, staleFinal, partial, matchingFinal]} />);
@@ -1301,7 +1341,8 @@ it("tracks only the latest model attempt and clears waiting at durable boundarie
 
   const requestFive = event(14, 22, { kind: "model_request_started", request: modelRequest("attempt-5") });
   rerender(<WorkspaceShell {...props} agentRunEventsV4={[requestFour, paused, answered, requestFive]} />);
-  expect(screen.getByText(/Waiting for model · 0 steps · request 8s/)).toBeInTheDocument();
+  expect(screen.getByText(/Waiting for model · 0 steps · 12s/)).toBeInTheDocument();
+  expect(screen.getByRole("status", { name: "Current model activity" })).toHaveTextContent("This request 8s");
 
   const terminal = event(15, 23, { kind: "run_cancelled" });
   rerender(<WorkspaceShell {...props} agentRunEventsV4={[requestFour, terminal]} />);
@@ -1369,16 +1410,21 @@ it("collapses a finished failure while keeping its reason and final answer visib
   expect(screen.getByText("已核验的部分结果")).toBeVisible();
 });
 
-it("shows current public progress by default and preserves a manual collapse across streamed updates", () => {
+it("shows a first-line progress snippet by default and preserves manual expansion across streamed updates", () => {
   const base = { schema_version: 4 as const, run_id: "progress-compact", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "h", occurred_at: "2026-09-14T00:00:00Z" };
   const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: base.run_id, agentRunEventsV4: [{ ...base, sequence: 1, event: { kind: "model_text" as const, text: "正在检索。\n\n## 检索范围\n\nHi-C 与染色质结构。" } }] };
   const { rerender } = render(<WorkspaceShell {...props} />);
+  expect(screen.queryByRole("heading", { name: "检索范围" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /PROGRESS.*正在检索/ })).toHaveAttribute("aria-expanded", "false");
+  fireEvent.click(screen.getByRole("button", { name: /PROGRESS.*正在检索/ }));
   expect(screen.getByRole("heading", { name: "检索范围" })).toBeVisible();
-  fireEvent.click(screen.getByRole("button", { name: "进度" }));
+  rerender(<WorkspaceShell {...props} agentRunEventsV4={[...props.agentRunEventsV4, { ...base, sequence: 2, event: { kind: "model_text", text: "\n继续核对引用。" } }]} />);
+  expect(screen.getByRole("heading", { name: "检索范围" })).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "PROGRESS" }));
   expect(screen.queryByRole("heading", { name: "检索范围" })).not.toBeInTheDocument();
   rerender(<WorkspaceShell {...props} agentTextPreview={{ run_id: base.run_id, text: "继续核对引用" }} />);
   expect(screen.queryByRole("heading", { name: "检索范围" })).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: /进度.*正在检索/ }));
+  fireEvent.click(screen.getByRole("button", { name: /PROGRESS.*正在检索/ }));
   expect(screen.getByRole("heading", { name: "检索范围" })).toBeVisible();
 });
 
@@ -1414,6 +1460,19 @@ it("provides a keyboard accessible scroll region for wide answer tables", () => 
   expect(table.parentElement).toHaveAttribute("role", "region");
   expect(screen.getByRole("link", { name: "原文" })).toHaveAttribute("href", "https://example.org/paper");
   expect(document.querySelector(".markdown-content script")).toBeNull();
+});
+
+it("labels the final response with only its persisted timestamp and preserves the answer content", () => {
+  const createdAt = "2026-09-25T09:41:00Z";
+  render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} messages={[
+    { id: "dated-answer", role: "assistant", markdown: "> 证据摘要\n\n1. **核对** `counts.tsv`\n\n[查看来源](https://example.org/source)", created_at: createdAt },
+    { id: "undated-answer", role: "assistant", markdown: "仍需核验的结果" },
+  ]} />);
+  const responses = screen.getAllByRole("article", { name: "Agent 回复" });
+  expect(within(responses[0]).getByText("OMICSOPS")).toBeVisible();
+  expect(within(responses[0]).getByRole("time")).toHaveAttribute("datetime", createdAt);
+  expect(within(responses[0]).getByRole("link", { name: "查看来源" })).toHaveAttribute("href", "https://example.org/source");
+  expect(within(responses[1]).queryByRole("time")).not.toBeInTheDocument();
 });
 
 it("keeps live Markdown visible when execution details are collapsed", () => {

@@ -1026,14 +1026,14 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
         {branching.error && <div className="agent-notice" role="alert"><span>{branching.error}</span>{branching.retryAvailable && <button disabled={branching.busy} onClick={() => void branching.retry()}>{zh ? "重试分支" : "Retry branch"}</button>}</div>}
         {messages.map((message, messageIndex) => <Fragment key={message.id}>
           {activeConversationId && (message.role === "user" || message.role === "assistant") && message.markdown.trim() && <CollectSourceButton key={`collect:${project.id}:${activeConversationId}:${message.id}`} source={() => messageLibrarySource(project.id, activeConversationId, message.id, message.markdown)} title={message.markdown.slice(0, 60)} kind="excerpt" zh={zh} />}
-          {message.role === "user" ? <article className="message user-message" data-message-id={message.id} tabIndex={-1}><MarkdownContent markdown={message.markdown} selectionScope={{ messageId: message.id, role: "user", projectId: project.id, conversationId: activeConversationId ?? "" }} /></article> : message.role === "assistant" && message.markdown.trim() ? <article className="message assistant-message response-message" aria-label={zh ? "Agent 回复" : "Agent response"} data-message-id={message.id} tabIndex={-1}><ResponseBody markdown={message.markdown} zh={zh} selectionScope={{ messageId: message.id, role: "assistant", projectId: project.id, conversationId: activeConversationId ?? "" }} /></article> : null}
+          {message.role === "user" ? <article className="message user-message" data-message-id={message.id} tabIndex={-1}><MarkdownContent markdown={message.markdown} selectionScope={{ messageId: message.id, role: "user", projectId: project.id, conversationId: activeConversationId ?? "" }} /></article> : message.role === "assistant" && message.markdown.trim() ? <article className="message assistant-message response-message" aria-label={zh ? "Agent 回复" : "Agent response"} data-message-id={message.id} tabIndex={-1}><ResponseBody markdown={message.markdown} zh={zh} createdAt={message.created_at} selectionScope={{ messageId: message.id, role: "assistant", projectId: project.id, conversationId: activeConversationId ?? "" }} /></article> : null}
           {onOpenBranch && (message.role === "user" || (message.role === "assistant" && message.markdown.trim())) && <div className="message-branch-actions"><button type="button" disabled={branchDisabled || !messages.slice(0, messageIndex + 1).some((entry) => entry.role === "user")} onClick={() => {
             const anchor = messages.slice(0, messageIndex + 1).reverse().find((entry) => entry.role === "user");
             if (anchor) branchAt(anchor.id, message.role === "user" ? "before_user" : "after_response");
           }}>{message.role === "user" ? (zh ? "从此消息前分叉" : "Branch before this message") : (zh ? "从此回复后分叉" : "Branch after this response")}</button></div>}
           {runTimelineV4.afterMessage.get(message.id)?.map((run) => <V4RunTrace locale={locale} events={run.events} onAnswer={onAnswerAgentQuestionV4} onDecideApproval={onDecideToolApprovalV4} onResolveUncertain={onResolveUncertainV4} onResume={onResumeAgentRunV4} onCancelRecovery={onCancelRuntimeRecoveryV4} onCloseBrowserTabs={onCloseBrowserRunTabsV4} historical key={run.runId} />)}
         </Fragment>)}
-        {streamingAssistant && <article className="message assistant-message"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent · {zh ? "生成中" : "streaming"}</strong><MarkdownContent markdown={streamingAssistant} /></div></article>}
+        {streamingAssistant && <article className="message assistant-message response-streaming"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent · {zh ? "生成中" : "streaming"}</strong><MarkdownContent markdown={streamingAssistant} /></div></article>}
         {agentBusy && !streamingAssistant && <article className="message assistant-message agent-pending" role="status"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><p>{zh ? "正在等待模型响应…" : "Waiting for the model…"}</p></div></article>}
         {agentRetryNotice && <div className="agent-retry-notice" role="status"><span className="agent-working"><i />{agentRetryNotice}</span></div>}
         {conversationLoadError && <div className="agent-notice" role="alert"><strong>{zh ? "会话恢复失败" : "Session restore failed"}</strong><span>{conversationLoadError}</span><button type="button" aria-label={zh ? "重试会话恢复" : "Retry session restore"} onClick={onRetryConversationLoad}>{zh ? "重试" : "Retry"}</button></div>}
@@ -1223,13 +1223,15 @@ function V4RunTrace({ locale, events, previewText, reasoningPreview, modelActivi
     ? tools.filter((tool) => tool.status === "requested" || tool.status === "running").at(-1) : null;
   const reasoningText = pendingModel && reasoningPreview?.run_id === events[0]?.run_id
     && reasoningPreview.attempt_id === pendingModel.attemptId ? reasoningPreview.text : null;
+  const modelRequests = events.filter((item) => item.event.kind === "model_request_started");
   const [modelWaitNow, setModelWaitNow] = useState(() => Date.now());
+  const runClockActive = !historical && !terminal && !pauseReason;
   useEffect(() => {
     setModelWaitNow(Date.now());
-    if ((!pendingModel || pendingModel.startedAtMs === null) && !activeTool) return;
+    if (!runClockActive) return;
     const timer = window.setInterval(() => setModelWaitNow(Date.now()), 1_000);
     return () => window.clearInterval(timer);
-  }, [events[0]?.run_id, pendingModel?.attemptId, pendingModel?.startedAtMs, activeTool?.callId, activeTool?.startedAt]);
+  }, [events[0]?.run_id, runClockActive]);
   const modelWaitDuration = pendingModel?.startedAtMs === null || pendingModel === null
     ? ""
     : formatDuration(Math.max(0, modelWaitNow - pendingModel.startedAtMs));
@@ -1238,9 +1240,10 @@ function V4RunTrace({ locale, events, previewText, reasoningPreview, modelActivi
     ? formatDuration(Math.max(0, modelWaitNow - toolStartedAtMs)) : "";
   const recentActivity = pendingModel && modelActivity?.attempt_id === pendingModel.attemptId
     && modelWaitNow - Date.parse(modelActivity.received_at) < 15_000 ? modelActivity.phase : null;
-  const duration = modelWaitDuration
-    ? `${zh ? "本次请求" : "request"} ${modelWaitDuration}`
-    : eventDuration(events[0]?.occurred_at, (terminal ?? latest)?.occurred_at);
+  const runStartedAtMs = Date.parse(events[0]?.occurred_at ?? "");
+  const runEndedAtMs = runClockActive ? modelWaitNow : Date.parse((terminal ?? latest)?.occurred_at ?? "");
+  const duration = Number.isFinite(runStartedAtMs) && Number.isFinite(runEndedAtMs)
+    ? formatDuration(Math.max(0, runEndedAtMs - runStartedAtMs)) : "";
   const unresolvedDispatchFailure = (!terminal || terminal.event.kind === "run_needs_attention" || terminal.event.kind === "run_failed") && events.some(({ event }) => event.kind === "tool_dispatch_uncertain" && !isV4UncertainResolved(events, event.call_id));
   const status = unresolvedDispatchFailure ? (zh ? "失败" : "Failed") : terminal?.event.kind === "run_completed" ? (zh ? "已完成" : "Completed") : terminal?.event.kind === "run_cancelled" ? (zh ? "已终止" : "Cancelled") : terminal?.event.kind === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention") : terminal?.event.kind === "run_failed" ? (zh ? "失败" : "Failed") : pauseReason === "approval" ? (zh ? "等待工具审批" : "Waiting for approval") : pauseReason === "input" ? (zh ? "等待回答" : "Waiting for input") : pauseReason === "browser_connection" ? (zh ? "等待连接浏览器" : "Waiting for browser") : pauseReason === "browser_human" ? (zh ? "等待人工处理浏览器" : "Waiting for browser intervention") : pauseReason === "runtime_recovery" ? (zh ? "结果待恢复" : "Results ready to resume") : pendingModel && previewText ? (zh ? "正在生成回复" : "Generating response") : recentActivity === "reasoning" ? (zh ? "模型正在推理" : "Model reasoning") : recentActivity === "tool_call" ? (zh ? "模型正在准备工具" : "Preparing tools") : recentActivity === "retrying" ? (zh ? "模型正在重试" : "Retrying model") : pendingModel && reasoningText ? (zh ? "等待模型继续输出" : "Waiting for more model output") : pendingModel ? (zh ? "等待模型响应" : "Waiting for model") : (zh ? "运行中" : "Running");
   const shouldExpand = !historical && !terminal;
@@ -1271,16 +1274,18 @@ function V4RunTrace({ locale, events, previewText, reasoningPreview, modelActivi
     <section className="v4-conversation-run" aria-label={zh ? "分析对话" : "Analysis conversation"}>
     {pendingModel && <div className="v4-live-activity" role="status" aria-label={zh ? "当前模型活动" : "Current model activity"}><span className="agent-working"><i />{status}</span><small role="timer" aria-live="off">{zh ? "本次请求" : "This request"} {modelWaitDuration}</small></div>}
     {!pendingModel && activeTool && <div className="v4-live-activity" role="status" aria-label={zh ? "当前工具活动" : "Current tool activity"}><span className="agent-working"><i />{zh ? "正在运行工具" : "Running tool"} · {activeTool.toolId === "use_skill" ? skillDisplayName(activeTool, zh) : compactToolLabel(activeTool.toolId)}</span>{toolWaitDuration && <small role="timer" aria-live="off">{toolWaitDuration}</small>}</div>}
-    {reasoningText && <ReasoningPreview key={pendingModel?.attemptId} zh={zh} text={reasoningText} />}
     <details className={`agent-run-fold agent-v4-run ${historical ? "" : "is-active"}`} open={shouldExpand}>
-      <summary><span className="agent-run-fold-title"><span><b>{zh ? "执行过程" : terminal ? "Processed" : "Processing"}</b><small>{terminal ? (zh ? "工具调用与验证记录" : "Tool calls and verification") : (zh ? "Agent 正在处理任务" : "Agent is working")}</small></span><ChevronRight size={15} /></span><span>{status} · {tools.length} {zh ? "个步骤" : tools.length === 1 ? "step" : "steps"}{duration && ` · ${duration}`}</span></summary>
+      <summary><span className="agent-run-fold-title"><span className="v4-process-mark" aria-hidden="true" /><span><b>{zh ? "执行过程" : terminal ? "Processed" : "Processing"}</b><small>{terminal ? (zh ? "工具调用与验证记录" : "Tool calls and verification") : (zh ? "Agent 正在处理任务" : "Agent is working")}</small></span></span><span>{status} · {tools.length} {zh ? "个步骤" : tools.length === 1 ? "step" : "steps"}{duration && ` · ${duration}`}</span></summary>
       <div className="agent-run-fold-body">
 
       <section className="v4-process-timeline" aria-label={zh ? "工具调用详情" : "Tool call details"}><ActivityWindow zh={zh}>
       {[
-        ...progress.map(({ event, modelText }) => ({ sequence: event.sequence, node: <PublicProgress key={`progress-${event.sequence}`} markdown={modelText ?? ""} zh={zh} initiallyOpen={!historical && !terminal && progress.at(-1)?.event.sequence === event.sequence} /> })),
-        ...tools.map((tool) => ({ sequence: tool.firstSequence, node: <details className="v4-tool-trace" key={tool.callId} open={tool.status === "requested" || tool.status === "running" || tool.status === "failed"}>
-          <summary className="v4-tool-trace-heading"><span className={`v4-tool-mark ${tool.status}`} aria-label={toolStatusLabel(tool.status, zh)}>{tool.status === "failed" ? "×" : tool.status === "succeeded" || tool.status === "reused" ? "✓" : "○"}</span>{tool.toolId === "use_skill" && <span className="v4-skill-badge">SKILL</span>}<strong title={toolDisplayLabel(tool.toolId, zh)}>{tool.toolId === "use_skill" ? skillDisplayName(tool, zh) : compactToolLabel(tool.toolId)}</strong>{tool.subject && tool.toolId !== "use_skill" && <span className="v4-tool-subject" title={tool.subject}>{tool.subject}</span>}<span className={`v4-tool-status ${tool.status}`}>{toolStatusLabel(tool.status, zh)}</span><small className="v4-tool-metrics">{toolMetrics(tool, zh)}</small><ChevronRight size={13} /></summary>
+        ...modelRequests.map((item) => ({ sequence: item.sequence, node: reasoningText && item.event.kind === "model_request_started" && item.event.request.attempt_id === pendingModel?.attemptId
+          ? <ReasoningPreview key={`request-${item.sequence}`} zh={zh} text={reasoningText} />
+          : <div className="v4-model-request-row v4-timeline-row" key={`request-${item.sequence}`}><span className="v4-row-mark" aria-hidden="true">○</span><strong>MODEL REQUEST</strong><small>{zh ? "请求已发送" : "Request sent"}</small></div> })),
+        ...progress.map(({ event, modelText }) => ({ sequence: event.sequence, node: <PublicProgress key={`progress-${event.sequence}`} markdown={modelText ?? ""} zh={zh} /> })),
+        ...tools.map((tool) => ({ sequence: tool.firstSequence, node: <details className="v4-tool-trace v4-timeline-row" key={tool.callId}>
+          <summary className="v4-tool-trace-heading"><span className={`v4-tool-mark ${tool.status}`} aria-label={toolStatusLabel(tool.status, zh)}>{tool.status === "failed" ? "×" : tool.status === "succeeded" || tool.status === "reused" ? "✓" : "○"}</span>{tool.toolId === "use_skill" && <span className="v4-skill-badge">SKILL</span>}<strong title={toolDisplayLabel(tool.toolId, zh)}>{tool.toolId === "use_skill" ? skillDisplayName(tool, zh) : compactToolLabel(tool.toolId)}</strong>{tool.subject && tool.toolId !== "use_skill" && <span className="v4-tool-subject" title={tool.subject}>{Array.from(tool.subject).slice(0, 80).join("")}{Array.from(tool.subject).length > 80 ? "…" : ""}</span>}<small className="v4-tool-metrics">{toolMetrics(tool, zh, runClockActive ? modelWaitNow : null)}</small><ChevronRight size={13} /></summary>
           <div className="v4-tool-trace-body">
             <small>{tool.toolId} · #{tool.firstSequence}–#{tool.lastSequence}</small>
             {tool.argumentsPreview && <><b>{zh ? "输入" : "Input"}</b><code>{tool.argumentsPreview}</code></>}
@@ -1318,15 +1323,13 @@ function V4RunTrace({ locale, events, previewText, reasoningPreview, modelActivi
   </>;
 }
 function ReasoningPreview({ zh, text }: { zh: boolean; text: string }) {
-  const detailsRef = useRef<HTMLDetailsElement>(null);
   const contentRef = useRef<HTMLPreElement>(null);
   const followingRef = useRef(true);
-  useLayoutEffect(() => { if (detailsRef.current) detailsRef.current.open = true; }, []);
   useEffect(() => {
     const content = contentRef.current;
     if (content && followingRef.current) content.scrollTop = content.scrollHeight;
   }, [text]);
-  return <article aria-label={zh ? "模型思考" : "Model thinking"} className="v4-reasoning-preview"><details ref={detailsRef}><summary><span className="agent-working"><i />{zh ? "模型思考" : "Model thinking"}</span><ChevronRight size={14} /></summary><pre ref={contentRef} onScroll={(event) => { const content = event.currentTarget; followingRef.current = content.scrollHeight - content.scrollTop - content.clientHeight < 32; }}>{text}</pre></details></article>;
+  return <article aria-label={zh ? "模型思考" : "Model thinking"} className="v4-reasoning-preview v4-timeline-row"><details><summary><span className="v4-row-mark" aria-hidden="true">○</span><strong>THINKING</strong><ChevronRight size={14} /></summary><pre ref={contentRef} onScroll={(event) => { const content = event.currentTarget; followingRef.current = content.scrollHeight - content.scrollTop - content.clientHeight < 32; }}>{text}</pre></details></article>;
 }
 function formatDuration(milliseconds: number) {
   if (milliseconds < 1_000) return `${Math.max(0, Math.round(milliseconds))} ms`;
@@ -1369,7 +1372,7 @@ function isV4QuestionAnswered(events: AgentRunEventV4[], questionId: string) {
 }
 type MessageSelectionScope = { messageId: string; role: "user" | "assistant"; projectId: string; conversationId: string };
 
-function ResponseBody({ markdown, zh, selectionScope }: { markdown: string; zh: boolean; selectionScope?: MessageSelectionScope }) {
+function ResponseBody({ markdown, zh, createdAt, selectionScope }: { markdown: string; zh: boolean; createdAt?: string | null; selectionScope?: MessageSelectionScope }) {
   const [copied, setCopied] = useState<string | null>(null);
   const [copyFailed, setCopyFailed] = useState(false);
   async function copyResponse() {
@@ -1378,7 +1381,10 @@ function ResponseBody({ markdown, zh, selectionScope }: { markdown: string; zh: 
     catch { setCopied(null); setCopyFailed(true); }
   }
   const label = copied === markdown ? (zh ? "已复制" : "Copied") : (zh ? "复制回复" : "Copy response");
+  const timestamp = createdAt && Number.isFinite(Date.parse(createdAt)) ? new Date(createdAt) : null;
+  const displayTime = timestamp ? `${String(timestamp.getMonth() + 1).padStart(2, "0")}-${String(timestamp.getDate()).padStart(2, "0")} ${String(timestamp.getHours()).padStart(2, "0")}:${String(timestamp.getMinutes()).padStart(2, "0")}` : null;
   return <div className="response-body">
+    <header className="response-identity"><Bot size={15} aria-hidden="true" /><strong>OMICSOPS</strong>{displayTime && <time dateTime={createdAt!}>{displayTime}</time>}</header>
     <MarkdownContent markdown={markdown} selectionScope={selectionScope} />
     <footer className="response-actions"><button type="button" aria-label={label} title={label} onClick={() => void copyResponse()}>{copied === markdown ? <Check size={14} /> : <Copy size={14} />}</button>
       {copyFailed && <span role="status">{zh ? "复制失败，请手动选择正文。" : "Copy failed. Select the response manually."}</span>}
@@ -1395,14 +1401,14 @@ function ActivityWindow({ children, zh }: { children: ReactNode[]; zh: boolean }
     {children.slice(earlierCount)}
   </>;
 }
-function PublicProgress({ markdown, zh, initiallyOpen = false }: { markdown: string; zh: boolean; initiallyOpen?: boolean }) {
-  const [open, setOpen] = useState(initiallyOpen);
+function PublicProgress({ markdown, zh }: { markdown: string; zh: boolean }) {
+  const [open, setOpen] = useState(false);
   const firstLine = markdown.split(/\r?\n/).find((line) => line.trim())?.trim() ?? "";
   const summary = Array.from(firstLine);
   const preview = summary.slice(0, 100).join("") + (summary.length > 100 ? "…" : "");
-  return <article aria-label={zh ? "模型输出" : "Model output"} className="v4-progress-disclosure">
+  return <article aria-label={zh ? "模型输出" : "Model output"} className="v4-progress-disclosure v4-timeline-row">
     <button type="button" className="v4-progress-heading" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
-      <span aria-hidden="true">−</span><strong>{zh ? "进度" : "Progress"}</strong>{!open && <span className="v4-progress-preview">{preview}</span>}<ChevronRight size={13} />
+      <span className="v4-row-mark" aria-hidden="true">−</span><strong>PROGRESS</strong>{!open && <span className="v4-progress-preview">{preview}</span>}<ChevronRight size={13} />
     </button>
     {open && <MarkdownContent markdown={markdown} />}
   </article>;
@@ -1535,8 +1541,9 @@ function eventDuration(start?: string, end?: string) {
   const duration = Date.parse(end) - Date.parse(start);
   return Number.isFinite(duration) && duration >= 0 ? `${Number((duration / 1000).toFixed(1))}s` : "";
 }
-function toolMetrics(tool: MergedV4ToolCall, zh: boolean) {
-  const duration = tool.status === "reused" ? "" : eventDuration(tool.startedAt, tool.finishedAt);
+function toolMetrics(tool: MergedV4ToolCall, zh: boolean, now: number | null) {
+  const end = tool.finishedAt ?? (now !== null && (tool.status === "requested" || tool.status === "running") ? new Date(now).toISOString() : undefined);
+  const duration = tool.status === "reused" ? "" : eventDuration(tool.startedAt, end);
   const lines = tool.outcome === undefined ? undefined : tool.outcome === "" ? 0 : tool.outcome.replace(/\r?\n$/, "").split(/\r?\n/).length;
   return [duration, lines === undefined ? "" : `${lines} ${zh ? "行" : lines === 1 ? "line" : "lines"}`].filter(Boolean).join(" · ");
 }
