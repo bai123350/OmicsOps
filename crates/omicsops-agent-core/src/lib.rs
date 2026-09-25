@@ -11914,6 +11914,115 @@ mod tests {
         assert_eq!(store.archives.lock().unwrap().len(), 1);
     }
 
+    struct BoundaryBudgetModel {
+        inner: BudgetOnlyModel,
+    }
+
+    #[async_trait]
+    impl ModelPortV4 for BoundaryBudgetModel {
+        fn prompt_layers(&self) -> PromptLayersV4 {
+            let mut layers = PromptLayersV4::default();
+            layers.environment.push_str("\nHOST RUNTIME BOUNDARY\nlocation=local_host; environment=system; dependencies not verified");
+            layers
+        }
+
+        fn validate_request(&self, request: &ModelRequestV4) -> Result<(), ModelFailureV4> {
+            self.inner.validate_request(request)
+        }
+
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            panic!("budget fixture must never dispatch")
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_boundary_survives_candidate_and_compacted_full_request_budget() {
+        let spec = ordinary_execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        for _ in 0..20 {
+            let previous = store.events.lock().unwrap().last().unwrap().clone();
+            store
+                .append_direct(&AgentEventV4::next(
+                    &previous,
+                    Utc::now(),
+                    AgentEventKindV4::ModelText {
+                        text: "科学数据".repeat(200),
+                    },
+                ))
+                .unwrap();
+        }
+        let model = BoundaryBudgetModel {
+            inner: BudgetOnlyModel {
+                request_limit: 30_000,
+                requests: Mutex::new(vec![]),
+            },
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        core.context_for(
+            &spec,
+            AgentLimitsV4 {
+                checkpoint_recent_events: 1,
+                ..AgentLimitsV4::default()
+            },
+        )
+        .await
+        .unwrap();
+        let requests = model.inner.requests.lock().unwrap();
+        assert!(requests.len() >= 2);
+        for request in requests.iter() {
+            assert!(request.system.contains("HOST RUNTIME BOUNDARY"));
+            let context: serde_json::Value = serde_json::from_str(&request.context).unwrap();
+            assert_eq!(
+                context["compute_selection"],
+                serde_json::to_value(&spec.compute_selection).unwrap()
+            );
+        }
+        assert!(requests.last().unwrap().context.len() < requests[0].context.len());
+    }
+
+    #[tokio::test]
+    async fn runtime_boundary_over_small_full_request_budget_stops_without_dispatch() {
+        let spec = ordinary_execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let before = store.events.lock().unwrap().clone();
+        let model = BoundaryBudgetModel {
+            inner: BudgetOnlyModel {
+                request_limit: 1,
+                requests: Mutex::new(vec![]),
+            },
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        assert!(matches!(
+            core.context_for(&spec, AgentLimitsV4::default()).await,
+            Err(AgentCoreErrorV4::NeedsAttention(_))
+        ));
+        let requests = model.inner.requests.lock().unwrap();
+        assert!(!requests.is_empty());
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.system.contains("HOST RUNTIME BOUNDARY"))
+        );
+        let after = store.events.lock().unwrap();
+        assert!(after.starts_with(&before));
+    }
+
     #[tokio::test]
     async fn same_run_checkpoint_projection_preserves_pause_guidance_authority_and_evidence() {
         let spec = ordinary_execution_spec(Uuid::new_v4());

@@ -4708,6 +4708,7 @@ struct DesktopResourceFactoryV4 {
     credentials: SystemCredentialVault,
     project: Project,
     selection: ComputeSelectionV4,
+    boundary_summary: String,
 }
 
 #[async_trait]
@@ -4820,12 +4821,9 @@ impl ExecutionResourceFactoryV4 for DesktopResourceFactoryV4 {
         }
         let mut prompt = filesystem.prompt_layers(&selection.backend_id).await?;
         prompt.environment.push_str(&format!(
-        "; frozen_environment={}; autonomy={:?}; approval_policy={:?}; network_policy={:?}; every runtime call must use the frozen environment; filesystem access does not verify interpreters or scientific dependencies",
-        selection.environment,
-        selection.autonomy_mode,
-        selection.approval_policy,
-        selection.network_policy
-    ));
+            "\n{}\nEvery runtime call must use the frozen environment. Filesystem access does not verify interpreters or scientific dependencies.",
+            self.boundary_summary
+        ));
         let runtime = Arc::new(RuntimeManagerV4::new(backend));
 
         Ok(ExecutionResourcesV4 {
@@ -5028,12 +5026,19 @@ async fn compose(
         Some(binding) => Some(load_frozen_reviewer_profile(&state.repository, binding).await?),
         None => None,
     };
+    let boundary = crate::runtime_boundary_v4::describe_runtime_boundary(
+        project.id,
+        RuntimeBoundarySourceV4::FrozenRun { run_id },
+        selection,
+    )?;
+    let boundary_summary = crate::runtime_boundary_v4::format_runtime_boundary(&boundary);
     let resources = Arc::new(ExecutionResourcesSlotV4 {
         factory: Arc::new(DesktopResourceFactoryV4 {
             repository: state.repository.clone(),
             credentials: state.credentials,
             project: project.clone(),
             selection: selection.clone(),
+            boundary_summary: boundary_summary.clone(),
         }),
         ready: tokio::sync::OnceCell::new(),
         remote_context: lazy_compute && selection.backend_kind == ComputeBackendKindV4::Ssh,
@@ -5044,12 +5049,8 @@ async fn compose(
             .prompt_layers(&selection.backend_id)
             .await?;
         prompt.environment = format!(
-            "Selected backend={}; frozen_environment={}; autonomy={:?}; approval_policy={:?}; network_policy={:?}. Execution resources and interpreters have not been checked. Research and knowledge tools do not require compute initialization. Project file and runtime tools use the selected backend, never a local fallback. SSH project rules are loaded before the first remote operation; a context-loaded result requires a new model turn before retry. Every runtime call must use the frozen environment.",
-            selection.backend_id,
-            selection.environment,
-            selection.autonomy_mode,
-            selection.approval_policy,
-            selection.network_policy
+            "{}\nExecution resources and interpreters have not been checked. Research and knowledge tools do not require compute initialization. Project file and runtime tools use the selected backend, never a local fallback. SSH project rules are loaded before the first remote operation; a context-loaded result requires a new model turn before retry. Every runtime call must use the frozen environment.",
+            boundary_summary
         );
         prompt
     } else {
@@ -8785,6 +8786,7 @@ mod tests {
         root: PathBuf,
         attempts: std::sync::atomic::AtomicUsize,
         fail_first: bool,
+        boundary_summary: Option<String>,
     }
     #[async_trait]
     impl ExecutionResourceFactoryV4 for MockResources {
@@ -8798,6 +8800,9 @@ mod tests {
             prompt.project_rules =
                 "REMOTE PROJECT RULES: use the declared reference assembly".into();
             prompt.environment = "mock selected remote environment".into();
+            if let Some(summary) = &self.boundary_summary {
+                prompt.environment.push_str(&format!("\n{summary}"));
+            }
             Ok(ExecutionResourcesV4 {
                 filesystem: Arc::new(LocalProjectFilesystemV4::new(self.root.to_str().unwrap())?),
                 environment_port: Arc::new(LocalEnvironmentPortV4),
@@ -8818,6 +8823,7 @@ mod tests {
             root: root.to_owned(),
             attempts: std::sync::atomic::AtomicUsize::new(0),
             fail_first,
+            boundary_summary: None,
         });
         (
             Arc::new(ExecutionResourcesSlotV4 {
@@ -9163,6 +9169,149 @@ mod tests {
             delegated: None,
             reviewer: None,
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_boundary_lazy_and_ready_model_prompts_reuse_frozen_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let selection: ComputeSelectionV4 = serde_json::from_value(json!({
+            "schema_version":4,"backend_id":"ssh:offline","backend_kind":"ssh",
+            "autonomy_mode":"supervised","environment":"rnaseq",
+            "network_policy":"host_inherited"
+        }))
+        .unwrap();
+        let view = crate::runtime_boundary_v4::describe_runtime_boundary(
+            Uuid::new_v4(),
+            RuntimeBoundarySourceV4::FrozenRun {
+                run_id: Uuid::new_v4(),
+            },
+            &selection,
+        )
+        .unwrap();
+        let summary = crate::runtime_boundary_v4::format_runtime_boundary(&view);
+        let factory = Arc::new(MockResources {
+            root: dir.path().to_owned(),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            fail_first: false,
+            boundary_summary: Some(summary.clone()),
+        });
+        let slot = Arc::new(ExecutionResourcesSlotV4 {
+            factory: factory.clone(),
+            ready: tokio::sync::OnceCell::new(),
+            remote_context: true,
+            context_observed: AtomicBool::new(false),
+        });
+        let mut model = budget_test_model(false, 100_000);
+        model.prompt.environment = format!(
+            "{summary}\nExecution resources and interpreters have not been checked. Project file and runtime tools never use a local fallback."
+        );
+        model.resources = Some(slot.clone());
+        let lazy = model
+            .prompt_layers()
+            .render_execution(RunExecutionKindV4::OrdinaryAgent);
+        assert!(lazy.contains(&summary));
+        assert!(lazy.contains("have not been checked"));
+        assert_eq!(factory.attempts.load(Ordering::SeqCst), 0);
+        slot.initialize().await.unwrap();
+        let ready = model
+            .prompt_layers()
+            .render_execution(RunExecutionKindV4::OrdinaryAgent);
+        assert!(ready.contains(&summary));
+        assert!(ready.contains("REMOTE PROJECT RULES"));
+        assert_eq!(ready.matches(&summary).count(), 1);
+        assert_eq!(factory.attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_boundary_real_local_factory_preserves_rules_and_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "SYNTHETIC PROJECT RULES").unwrap();
+        let repository = Store::open_in_memory().await.unwrap();
+        let project = Project::new(
+            Uuid::new_v4(),
+            "test",
+            dir.path().to_str().unwrap(),
+            omicsops_core::workspace::ProjectTemplate::Blank,
+            Utc::now(),
+        );
+        repository.save_project(&project).await.unwrap();
+        let selection: ComputeSelectionV4 = serde_json::from_value(json!({
+            "schema_version":4,"backend_id":"local","backend_kind":"local",
+            "autonomy_mode":"supervised","environment":"system",
+            "network_policy":"host_inherited"
+        }))
+        .unwrap();
+        let boundary = crate::runtime_boundary_v4::describe_runtime_boundary(
+            project.id,
+            RuntimeBoundarySourceV4::FrozenRun {
+                run_id: Uuid::new_v4(),
+            },
+            &selection,
+        )
+        .unwrap();
+        let summary = crate::runtime_boundary_v4::format_runtime_boundary(&boundary);
+        let factory = DesktopResourceFactoryV4 {
+            repository,
+            credentials: SystemCredentialVault,
+            project,
+            selection,
+            boundary_summary: summary.clone(),
+        };
+        let resources = factory.initialize().await.unwrap();
+        assert!(resources.prompt.environment.contains(&summary));
+        assert_eq!(resources.prompt.environment.matches(&summary).count(), 1);
+        assert!(
+            resources
+                .prompt
+                .project_rules
+                .contains("SYNTHETIC PROJECT RULES")
+        );
+        assert!(
+            resources
+                .prompt
+                .environment
+                .contains("Filesystem access does not verify")
+        );
+    }
+
+    #[test]
+    fn runtime_boundary_is_counted_in_desktop_full_provider_request_budget() {
+        let selection: ComputeSelectionV4 = serde_json::from_value(json!({
+            "schema_version":4,"backend_id":"local","backend_kind":"local",
+            "autonomy_mode":"supervised","environment":"system",
+            "network_policy":"host_inherited"
+        }))
+        .unwrap();
+        let view = crate::runtime_boundary_v4::describe_runtime_boundary(
+            Uuid::new_v4(),
+            RuntimeBoundarySourceV4::FrozenRun {
+                run_id: Uuid::new_v4(),
+            },
+            &selection,
+        )
+        .unwrap();
+        let summary = crate::runtime_boundary_v4::format_runtime_boundary(&view);
+        let request = ModelRequestV4 {
+            system: summary.clone(),
+            context: "research request".into(),
+            tools: vec![],
+            image_refs: vec![],
+        };
+        let probe = budget_test_model(false, 100_000);
+        let prepared = probe.prepare_request(request.clone(), false).unwrap();
+        assert!(prepared.system.contains(&summary));
+        let measured = probe.client.measure_model_request(&prepared).unwrap();
+        let window = u32::try_from(measured.serialized_request_bytes).unwrap() + 109;
+        let model = budget_test_model(false, window);
+        assert!(model.validate_request(&request).is_err());
+        assert!(
+            model
+                .validate_request(&ModelRequestV4 {
+                    system: String::new(),
+                    ..request
+                })
+                .is_ok()
+        );
     }
 
     #[tokio::test]
