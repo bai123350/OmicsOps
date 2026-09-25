@@ -1,9 +1,10 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { ComputeBackendAvailabilityV4 } from "../../types";
+import type { ComputeBackendAvailabilityV4, RuntimeBoundaryViewV4 } from "../../types";
 import { WorkspaceShell } from "./WorkspaceShell";
 import * as referenceApi from "../../composer-reference-api";
+import * as api from "../../tauri-api";
 import type { SideChatController } from "./useSideChat";
 
 afterEach(() => vi.restoreAllMocks());
@@ -32,6 +33,8 @@ const localBackend: ComputeBackendAvailabilityV4 = {
   r_status: "unavailable",
   resolved_image_id: null,
 };
+const runtimeSelection = { schema_version: 4 as const, backend_id: "local", backend_kind: "local" as const, autonomy_mode: "supervised" as const, approval_policy: "risk_based" as const, environment: "system", network_policy: "host_inherited" as const, container_image: null };
+const runtimeBoundary: RuntimeBoundaryViewV4 = { project_id: project.id, source: { kind: "draft_selection" }, compute_selection: runtimeSelection, execution_location: "local_host", isolation: "process", limits: ["same_user_permissions", "project_cwd_not_access_control"], interactive_lifecycle: "run_scoped_no_restart_reconnect", detached_job_lifecycle: "unsupported", verification: "not_checked_by_this_view" };
 
 function renderShell(overrides: Partial<React.ComponentProps<typeof WorkspaceShell>> = {}) {
   return render(
@@ -41,6 +44,7 @@ function renderShell(overrides: Partial<React.ComponentProps<typeof WorkspaceShe
       onLocaleChange={vi.fn()}
       computeBackends={[localBackend]}
       computeBackendId="local"
+      runtimeDraftSelection={runtimeSelection}
       {...overrides}
     />,
   );
@@ -186,6 +190,78 @@ describe("WorkspaceShell composer integration", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByRole("dialog", { name: "Run trajectory" })).not.toBeInTheDocument();
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it("opens the run-owned environment above trajectory and Escape closes one layer without actions", () => {
+    const query = vi.spyOn(api, "agentV4RuntimeBoundary").mockImplementation(() => new Promise(() => undefined));
+    const onCancelRun = vi.fn();
+    const onInterruptKernel = vi.fn();
+    const base = { schema_version: 4 as const, run_id: "run-recorded", project_id: project.id, conversation_id: "current", previous_hash: "", event_hash: "hash", occurred_at: "2026-09-14T00:00:00Z" };
+    renderShell({ activeConversationId: "current", onCancelRun, onInterruptKernel, agentRunEventsV4: [{ ...base, sequence: 1, event: { kind: "run_created", mode: "execute" } }] });
+    const input = screen.getByRole("textbox", { name: /Describe a research goal/ });
+    fireEvent.change(input, { target: { value: "/trajectory" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    const trajectory = screen.getByRole("dialog", { name: "Run trajectory" });
+    fireEvent.click(within(trajectory).getByRole("button", { name: "Run environment" }));
+    expect(query).toHaveBeenCalledWith({ source: "frozen_run", project_id: project.id, run_id: "run-recorded" });
+    expect(screen.getByRole("dialog", { name: "Runtimes" })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Runtimes" })).not.toBeInTheDocument();
+    expect(trajectory).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Run trajectory" })).not.toBeInTheDocument();
+    expect(onCancelRun).not.toHaveBeenCalled();
+    expect(onInterruptKernel).not.toHaveBeenCalled();
+  });
+
+  it("keeps a frozen run's boundary when the complete next-run selection changes", async () => {
+    const runId = "run-frozen-selection";
+    const events: import("../../types").AgentRunEventV4[] = [{
+      schema_version: 4, run_id: runId, project_id: project.id, conversation_id: "current",
+      sequence: 1, previous_hash: "", event_hash: "hash", occurred_at: "2026-09-14T00:00:00Z",
+      event: { kind: "run_created", mode: "execute" },
+    }];
+    const frozenBoundary: RuntimeBoundaryViewV4 = {
+      ...runtimeBoundary,
+      source: { kind: "frozen_run", run_id: runId },
+      compute_selection: { ...runtimeSelection, backend_id: "ssh:lab", backend_kind: "ssh", environment: "micromamba-lab" },
+      execution_location: "ssh_host",
+      detached_job_lifecycle: "ssh_linux_only",
+    };
+    const query = vi.spyOn(api, "agentV4RuntimeBoundary").mockResolvedValue(frozenBoundary);
+    const onOpenSettings = vi.fn();
+    const onSend = vi.fn();
+    const props = { project, locale: "en-US" as const, onLocaleChange: vi.fn(), activeConversationId: "current", agentRunEventsV4: events, computeBackends: [localBackend], computeBackendId: "local", onOpenSettings, onSend };
+    const view = render(<WorkspaceShell {...props} runtimeDraftSelection={runtimeSelection} />);
+    fireEvent.click(screen.getByRole("button", { name: "Run environment" }));
+    const dialog = screen.getByRole("dialog", { name: "Runtimes" });
+    await waitFor(() => expect(dialog).toHaveTextContent("SSH host process"));
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(query).toHaveBeenCalledWith({ source: "frozen_run", project_id: project.id, run_id: runId });
+
+    const nextRunSelection = { ...runtimeSelection, backend_id: "docker", backend_kind: "docker" as const, network_policy: "none" as const, container_image: { reference: "python:3.12", image_id: "sha256:new" } };
+    view.rerender(<WorkspaceShell {...props} runtimeDraftSelection={nextRunSelection} computeBackendId="docker" />);
+    expect(dialog).toHaveTextContent("SSH host process");
+    expect(dialog).toHaveTextContent("micromamba-lab");
+    expect(dialog).not.toHaveTextContent("Local compute container");
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(query).toHaveBeenCalledWith({ source: "frozen_run", project_id: project.id, run_id: runId });
+    expect(within(dialog).queryByRole("button", { name: "Ask Agent to prepare environment" })).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: "Configure SSH" })).not.toBeInTheDocument();
+    expect(onOpenSettings).not.toHaveBeenCalled();
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.getByRole("textbox", { name: /Describe a research goal/ })).toHaveValue("");
+  });
+
+  it("does not reopen a previous conversation's runtime dialog when switching back", () => {
+    const props = { project, locale: "en-US" as const, onLocaleChange: vi.fn(), computeBackends: [localBackend], computeBackendId: "local", runtimeDraftSelection: runtimeSelection };
+    const view = render(<WorkspaceShell {...props} activeConversationId="first" />);
+    fireEvent.click(screen.getByRole("button", { name: "Python environment" }));
+    expect(screen.getByRole("dialog", { name: "Runtimes" })).toBeInTheDocument();
+    view.rerender(<WorkspaceShell {...props} activeConversationId="second" />);
+    expect(screen.queryByRole("dialog", { name: "Runtimes" })).not.toBeInTheDocument();
+    view.rerender(<WorkspaceShell {...props} activeConversationId="first" />);
+    expect(screen.queryByRole("dialog", { name: "Runtimes" })).not.toBeInTheDocument();
   });
 
   it("executes a typed slash command from Send and preserves surrounding draft on selection", async () => {
@@ -407,7 +483,8 @@ describe("WorkspaceShell composer integration", () => {
     expect(screen.queryByRole("menu", { name: "Agent permission options" })).not.toBeInTheDocument();
   });
 
-  it("reports truthful Python and R availability and closes runtime dialogs on Escape", () => {
+  it("reports truthful Python and R availability and closes runtime dialogs on Escape", async () => {
+    vi.spyOn(api, "agentV4RuntimeBoundary").mockResolvedValue(runtimeBoundary);
     renderShell();
 
     const python = screen.getByRole("button", { name: "Python environment" });
@@ -416,22 +493,23 @@ describe("WorkspaceShell composer integration", () => {
     expect(r).toHaveTextContent("UNAVAILABLE");
 
     fireEvent.click(python);
-    expect(screen.getByRole("dialog", { name: "Runtimes" })).toHaveTextContent("Available");
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "Runtimes" })).toHaveTextContent("Available"));
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByRole("dialog", { name: "Runtimes" })).not.toBeInTheDocument();
 
     fireEvent.click(r);
-    expect(screen.getByRole("dialog", { name: "Runtimes" })).toHaveTextContent("Unavailable");
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "Runtimes" })).toHaveTextContent("Unavailable"));
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByRole("dialog", { name: "Runtimes" })).not.toBeInTheDocument();
   });
 
-  it("appends the prepare-environment request to the draft without sending it", () => {
+  it("appends the prepare-environment request to the draft without sending it", async () => {
+    vi.spyOn(api, "agentV4RuntimeBoundary").mockResolvedValue(runtimeBoundary);
     const onSend = vi.fn();
     renderShell({ onSend });
 
     fireEvent.click(screen.getByRole("button", { name: "Python environment" }));
-    fireEvent.click(screen.getByRole("button", { name: "Ask Agent to prepare environment" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Ask Agent to prepare environment" }));
 
     expect(onSend).not.toHaveBeenCalled();
     expect((screen.getByRole("textbox", { name: /Describe a research goal/ }) as HTMLTextAreaElement).value).toContain("Check the Python interpreter");

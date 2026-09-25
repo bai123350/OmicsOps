@@ -184,6 +184,25 @@ export interface ComputeSelectionV4 {
   container_image?: { reference: string; image_id: string } | null;
 }
 
+export type RuntimeBoundaryRequestV4 =
+  | { source: "draft_selection"; project_id: string; compute_selection: ComputeSelectionV4 }
+  | { source: "frozen_run"; project_id: string; run_id: string };
+
+export type RuntimeBoundarySourceV4 = { kind: "draft_selection" } | { kind: "frozen_run"; run_id: string };
+export type RuntimeBoundaryLimitV4 = "same_user_permissions" | "project_cwd_not_access_control" | "project_mount_read_write" | "read_only_rootfs" | "capabilities_dropped" | "no_new_privileges" | "pids_limit256" | "shared_kernel_not_vm";
+
+export interface RuntimeBoundaryViewV4 {
+  project_id: string;
+  source: RuntimeBoundarySourceV4;
+  compute_selection: ComputeSelectionV4;
+  execution_location: "local_host" | "ssh_host" | "local_container";
+  isolation: "process" | "container";
+  limits: RuntimeBoundaryLimitV4[];
+  interactive_lifecycle: "run_scoped_no_restart_reconnect";
+  detached_job_lifecycle: "unsupported" | "ssh_linux_only";
+  verification: "not_checked_by_this_view";
+}
+
 export interface ComputeBackendAvailabilityV4 {
   descriptor: {
     schema_version: 4;

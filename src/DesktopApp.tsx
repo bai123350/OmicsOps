@@ -121,6 +121,7 @@ export default function DesktopApp() {
   const [lastGoal, setLastGoal] = useState("");
   const [v4Plan, setV4Plan] = useState<RunSummaryV4 | null>(null);
   const [computeBackends, setComputeBackends] = useState<ComputeBackendAvailabilityV4[]>([]);
+  const [computeBackendsResponseKey, setComputeBackendsResponseKey] = useState<string | null>(null);
   const [computeBackendId, setComputeBackendId] = useState("local");
   const [containerImage, setContainerImage] = useState("");
   const [autonomyMode, setAutonomyMode] = useState<AutonomyModeV4>("supervised");
@@ -409,13 +410,15 @@ export default function DesktopApp() {
   }, [selected?.id, conversationLoadRetry]);
   useEffect(() => {
     let disposed = false;
-    if (!selected) { setComputeBackends([]); return () => { disposed = true; }; }
+    if (!selected) { setComputeBackends([]); setComputeBackendsResponseKey(null); return () => { disposed = true; }; }
+    const responseKey = JSON.stringify([selected.id, containerImage]);
     const timer = window.setTimeout(() => {
       setComputeBusy(true);
       api.agentV4ComputeBackends(selected.id, containerImage)
         .then((items) => {
           if (disposed) return;
           setComputeBackends(items);
+          setComputeBackendsResponseKey(responseKey);
           setComputeBackendId((current) => {
             if (items.some((item) => item.descriptor.backend_id === current && item.selectable)) return current;
             const preferred = selected.connection_id
@@ -822,7 +825,7 @@ export default function DesktopApp() {
     const backend = computeBackends.find((item) => item.descriptor.backend_id === computeBackendId);
     if (!backend?.selectable) throw new Error(locale === "zh-CN" ? "请选择一个有效的 V4 计算配置。" : "Select a valid V4 compute configuration.");
     const container = backend.descriptor.kind === "docker" || backend.descriptor.kind === "podman";
-    if (container && !backend.resolved_image_id) throw new Error(locale === "zh-CN" ? "容器镜像尚未在本机验证。" : "The container image has not been verified locally.");
+    if (container && (!containerImage.trim() || !backend.resolved_image_id)) throw new Error(locale === "zh-CN" ? "容器镜像尚未在本机验证。" : "The container image has not been verified locally.");
     return {
       schema_version: 4,
       backend_id: backend.descriptor.backend_id,
@@ -833,6 +836,12 @@ export default function DesktopApp() {
       network_policy: container ? "none" : "host_inherited",
       container_image: container ? { reference: containerImage.trim(), image_id: backend.resolved_image_id! } : null,
     };
+  }
+
+  let runtimeDraftSelection: ComputeSelectionV4 | null = null;
+  if (selected && !computeBusy && computeBackendsResponseKey === JSON.stringify([selected.id, containerImage])) {
+    try { runtimeDraftSelection = currentComputeSelection(); }
+    catch { /* Incomplete configuration is shown as such in the runtime dialog. */ }
   }
 
   async function startV4Planning(goal: string, token = ++conversationRequestToken.current, references: ComposerReference[] = [], attachments: string[] = []) {
@@ -1459,7 +1468,7 @@ export default function DesktopApp() {
     agentMode={conversationMode} conversationLocked={conversationLocked} conversationHydrating={conversationHydrating} onAgentModeChange={changeConversationMode}
     latestPlanRevision={latestPlanRevision} v4Plan={v4Plan} planLoading={planLoading} planApproved={planApproved} canStartRun={false} runStarted={Boolean(runId && !currentRunAwaitsPlanApproval)} activeRunId={runId} activeRunLastActivityAt={activeRunLastActivityAt} agentRunEventsV4={agentRunEventsV4} agentTextPreview={agentTextPreview} agentReasoningPreview={agentReasoningPreview} agentModelActivity={agentModelActivity}
     guidanceAvailable={v4Plan?.session_mode === "agent" && !planApproved && latestPlanRevision?.run_id !== v4Plan?.run_id}
-    computeBackends={computeBackends} computeBackendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} approvalPolicy={approvalPolicy} computeEnvironment={computeEnvironment} computeBusy={computeBusy}
+    computeBackends={computeBackends} runtimeDraftSelection={runtimeDraftSelection} computeBackendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} approvalPolicy={approvalPolicy} computeEnvironment={computeEnvironment} computeBusy={computeBusy}
     onComputeBackendChange={setComputeBackendId} onContainerImageChange={setContainerImage} onAutonomyModeChange={setAutonomyMode} onApprovalPolicyChange={setApprovalPolicy} onComputeEnvironmentChange={setComputeEnvironment}
     onAnswerAgentQuestionV4={async (answerRunId, questionId, answer) => {
       const action = currentConversationAction;

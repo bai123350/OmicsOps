@@ -19,6 +19,8 @@ import type {
   RequestPlanRevisionResponseV4,
   ComputeSelectionV4,
   ComputeBackendAvailabilityV4,
+  RuntimeBoundaryRequestV4,
+  RuntimeBoundaryViewV4,
   WorkspaceConversation,
   WorkspaceProject,
   WorkspaceTemplate,
@@ -414,6 +416,11 @@ export async function initializeProject(
 export async function agentV4ComputeBackends(projectId: string, containerImage?: string): Promise<ComputeBackendAvailabilityV4[]> {
   if (!isTauri()) return [];
   return invoke("agent_v4_compute_backends", { request: { project_id: projectId, container_image: containerImage || null } });
+}
+
+export async function agentV4RuntimeBoundary(request: RuntimeBoundaryRequestV4): Promise<RuntimeBoundaryViewV4> {
+  if (!isTauri()) throw new Error("Runtime boundaries require the desktop app");
+  return invoke("agent_v4_runtime_boundary", { request });
 }
 
 export async function agentV4StartPlanning(request: { project_id: string; conversation_id: string; model_profile_id: string; objective: string; compute_selection: ComputeSelectionV4; references?: ComposerReference[]; attachments?: string[] }): Promise<RunSummaryV4> {

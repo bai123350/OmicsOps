@@ -88,6 +88,49 @@ function setupConversationStateHarness() {
 }
 
 describe("DesktopApp", () => {
+  it("does not describe a container until its current project and image response resolves", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    const docker = { ...stateBackend, descriptor: { ...stateBackend.descriptor, backend_id: "docker", kind: "docker" as const, isolation: "container" as const, supports_network_policy: true }, python_status: "unverified" as const, r_status: "unverified" as const, resolved_image_id: "sha256:old" };
+    const pending = deferred<Awaited<ReturnType<typeof api.agentV4ComputeBackends>>>();
+    vi.mocked(api.agentV4ComputeBackends).mockImplementation((_projectId, image) => image ? pending.promise : Promise.resolve([stateBackend, docker]));
+    const boundary = vi.spyOn(api, "agentV4RuntimeBoundary").mockImplementation(async (request) => ({ project_id: request.project_id, source: { kind: "draft_selection" }, compute_selection: request.source === "draft_selection" ? request.compute_selection : { schema_version: 4, backend_id: "local", backend_kind: "local", autonomy_mode: "supervised", environment: "system", network_policy: "host_inherited" }, execution_location: "local_container", isolation: "container", limits: ["project_mount_read_write"], interactive_lifecycle: "run_scoped_no_restart_reconnect", detached_job_lifecycle: "unsupported", verification: "not_checked_by_this_view" }));
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
+    fireEvent.click(await screen.findByRole("radio", { name: /DOCKER/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Python 环境" }));
+    expect(screen.getByRole("dialog", { name: "运行时" })).toHaveTextContent("配置未完成");
+    expect(boundary).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "关闭运行时" }));
+    fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "容器镜像" }), { target: { value: "python:new" } });
+    fireEvent.click(screen.getByRole("button", { name: "Python 环境" }));
+    expect(screen.getByRole("dialog", { name: "运行时" })).toHaveTextContent("配置未完成");
+    expect(boundary).not.toHaveBeenCalled();
+    await waitFor(() => expect(api.agentV4ComputeBackends).toHaveBeenCalledWith(stateProject.id, "python:new"));
+    expect(boundary).not.toHaveBeenCalled();
+    await act(async () => pending.resolve([{ ...docker, resolved_image_id: "sha256:new" }]));
+    await waitFor(() => expect(boundary).toHaveBeenCalledWith(expect.objectContaining({ source: "draft_selection", compute_selection: expect.objectContaining({ container_image: { reference: "python:new", image_id: "sha256:new" } }) })));
+  });
+
+  it("clears a pending runtime boundary immediately when switching conversations", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    const pending = deferred<Awaited<ReturnType<typeof api.agentV4RuntimeBoundary>>>();
+    const query = vi.spyOn(api, "agentV4RuntimeBoundary").mockReturnValue(pending.promise);
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    await waitFor(() => expect(api.agentV4ComputeBackends).toHaveBeenCalledWith(stateProject.id, ""));
+    fireEvent.click(screen.getByRole("button", { name: "Python 环境" }));
+    await waitFor(() => expect(query).toHaveBeenCalledWith(expect.objectContaining({ source: "draft_selection", project_id: stateProject.id })));
+    expect(screen.getByRole("dialog", { name: "运行时" })).toHaveTextContent("正在加载运行边界");
+    fireEvent.click(screen.getByRole("button", { name: stateConversations[1].title }));
+    expect(screen.queryByRole("dialog", { name: "运行时" })).not.toBeInTheDocument();
+    await act(async () => pending.resolve({ project_id: stateProject.id, source: { kind: "draft_selection" }, compute_selection: { schema_version: 4, backend_id: "local", backend_kind: "local", autonomy_mode: "supervised", environment: "system", network_policy: "host_inherited" }, execution_location: "local_host", isolation: "process", limits: ["same_user_permissions"], interactive_lifecycle: "run_scoped_no_restart_reconnect", detached_job_lifecycle: "unsupported", verification: "not_checked_by_this_view" }));
+    expect(screen.queryByRole("dialog", { name: "运行时" })).not.toBeInTheDocument();
+  });
+
   it("waits for asynchronous session search before closing the dialog", async () => {
     const { stateSpy } = setupConversationStateHarness();
     stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
