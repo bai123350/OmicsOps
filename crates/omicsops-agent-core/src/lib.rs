@@ -4505,10 +4505,15 @@ impl AgentCoreV4<'_> {
                 Ok(()) => return Ok(candidate),
                 Err(error) if !limits.auto_compact => return Err(error),
                 Err(error)
-                    if latest_checkpoint
-                        .as_ref()
-                        .is_some_and(|checkpoint| checkpoint.recent_steps.is_empty())
-                        && recent.is_empty() =>
+                    if latest_checkpoint.as_ref().is_some_and(|checkpoint| {
+                        // Older checkpoints may have exhausted recent
+                        // steps while still retaining raw failed traces.
+                        // Allow one rebuild with retrievable error views.
+                        checkpoint.recent_steps.is_empty()
+                            && (!use_views
+                                || checkpoint.unresolved_errors
+                                    == checkpoint_unresolved_errors(&events, true))
+                    }) && recent.is_empty() =>
                 {
                     return Err(error);
                 }
@@ -4525,6 +4530,7 @@ impl AgentCoreV4<'_> {
                 .map_err(|error| AgentCoreErrorV4::Science(error.to_string()))?,
         );
         if use_views {
+            checkpoint.unresolved_errors = checkpoint_unresolved_errors(&events, true);
             checkpoint.recent_steps = events
                 .iter()
                 .rev()
@@ -5924,28 +5930,7 @@ fn build_checkpoint(
     recent_limit: usize,
     scientific_state: serde_json::Value,
 ) -> ContextCheckpointV4 {
-    let resolved_uncertain = events
-        .iter()
-        .filter_map(|event| match &event.event {
-            AgentEventKindV4::ToolDispatchResolved { call_id, .. } => Some(call_id.as_str()),
-            _ => None,
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    let unresolved_errors = events
-        .iter()
-        .filter_map(|event| match &event.event {
-            AgentEventKindV4::ToolFinished { outcome } if !outcome.succeeded => {
-                Some(format!("{}: {}", outcome.tool_id, outcome.model_content))
-            }
-            AgentEventKindV4::ToolDispatchUncertain { call_id, tool_id } => (!resolved_uncertain
-                .contains(call_id.as_str()))
-            .then(|| format!("uncertain dispatch {tool_id} ({call_id})")),
-            AgentEventKindV4::RunFailed { message } => Some(message.clone()),
-            _ => None,
-        })
-        .rev()
-        .take(12)
-        .collect();
+    let unresolved_errors = checkpoint_unresolved_errors(events, false);
     let recent_steps = events
         .iter()
         .rev()
@@ -5987,6 +5972,50 @@ fn build_checkpoint(
         tasks,
         cycle_id,
     }
+}
+
+fn checkpoint_unresolved_errors(events: &[AgentEventV4], use_views: bool) -> Vec<String> {
+    let resolved_uncertain = events
+        .iter()
+        .filter_map(|event| match &event.event {
+            AgentEventKindV4::ToolDispatchResolved { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    events
+        .iter()
+        .filter_map(|event| match &event.event {
+            AgentEventKindV4::ToolFinished { outcome } if !outcome.succeeded => {
+                let original = format!("{}: {}", outcome.tool_id, outcome.model_content);
+                if use_views {
+                    // Failures can embed an entire delegation trace. Keep the
+                    // failure details and a scoped reference, just as recent
+                    // tool results do, without copying the raw trace again.
+                    let projected = context_views::event_view(event).to_string();
+                    // A short error can cost less than a view with structured
+                    // data and reference metadata. Compare the strings as they
+                    // will actually be serialized inside the checkpoint.
+                    if serde_json::to_vec(&projected)
+                        .expect("serializable error")
+                        .len()
+                        < serde_json::to_vec(&original)
+                            .expect("serializable error")
+                            .len()
+                    {
+                        return Some(projected);
+                    }
+                }
+                Some(original)
+            }
+            AgentEventKindV4::ToolDispatchUncertain { call_id, tool_id } => (!resolved_uncertain
+                .contains(call_id.as_str()))
+            .then(|| format!("uncertain dispatch {tool_id} ({call_id})")),
+            AgentEventKindV4::RunFailed { message } => Some(message.clone()),
+            _ => None,
+        })
+        .rev()
+        .take(12)
+        .collect()
 }
 
 #[cfg(test)]
@@ -12116,6 +12145,221 @@ mod tests {
         let resumed = core.context_for(&spec, limits).await.unwrap();
         assert!(resumed.len() <= 30_000);
         assert_eq!(store.archives.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_delegation_checkpoint_bounds_errors_and_recovers_legacy_empty_checkpoint() {
+        for legacy_checkpoint in [false, true] {
+            let spec = execution_spec(Uuid::new_v4());
+            let store = MemoryStore::default();
+            seed_execution(&store, &spec);
+            let graph = DelegationGraphOutcomeV4 {
+                schema_version: 4,
+                nodes: BTreeMap::from([(
+                    "reader".into(),
+                    DelegationNodeOutcomeV4 {
+                        node_id: "reader".into(),
+                        status: DelegationNodeStatusV4::Failed,
+                        output: None,
+                        error: Some("child context budget exceeded; evidence retained".into()),
+                        tool_outcomes: vec![ToolOutcomeV4 {
+                            call_id: "literature-result".into(),
+                            tool_id: "read".into(),
+                            succeeded: true,
+                            model_content: "文献原始证据🧬".repeat(24_000),
+                            data: json!({"source":"synthetic-literature"}),
+                            provenance: vec![],
+                        }],
+                    },
+                )]),
+            };
+            let raw_graph = serde_json::to_string(&graph).unwrap();
+            assert!(raw_graph.len() > 500_000);
+            append_test_event(
+                &store,
+                spec.run_id,
+                AgentEventKindV4::ToolFinished {
+                    outcome: ToolOutcomeV4 {
+                        call_id: "failed-delegation".into(),
+                        tool_id: "agent.delegate".into(),
+                        succeeded: false,
+                        model_content: raw_graph.clone(),
+                        data: json!(graph),
+                        provenance: vec![],
+                    },
+                },
+            );
+            let failed_event = store.load_direct(spec.run_id).unwrap().pop().unwrap();
+            if legacy_checkpoint {
+                // Reproduce the persisted checkpoint produced by the old code,
+                // including its exhausted recent-step budget and raw error.
+                let history = store.load_direct(spec.run_id).unwrap();
+                let checkpoint = build_checkpoint(&spec, &history, 0, json!(null));
+                assert!(checkpoint.recent_steps.is_empty());
+                append_test_event(
+                    &store,
+                    spec.run_id,
+                    AgentEventKindV4::ContextCheckpointed { checkpoint },
+                );
+            }
+            let original = store.load_direct(spec.run_id).unwrap();
+            let model = BudgetOnlyModel {
+                request_limit: 30_000,
+                requests: Mutex::new(vec![]),
+            };
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &ResultReadTools,
+                events: &store,
+                science: None,
+            };
+            let context = core
+                .context_for_internal(&spec, AgentLimitsV4::default(), !legacy_checkpoint)
+                .await
+                .unwrap();
+            assert!(context.len() < 10_000);
+            let value: Value = serde_json::from_str(&context).unwrap();
+            assert_eq!(value["frozen_plan"], json!(spec.plan));
+            let error: Value = serde_json::from_str(
+                value["checkpoint"]["unresolved_errors"][0]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(error["event"]["outcome"]["succeeded"], false);
+            let node = &error["event"]["outcome"]["data"]["nodes"]["reader"];
+            assert_eq!(node["status"], "failed");
+            assert_eq!(
+                node["error"],
+                "child context budget exceeded; evidence retained"
+            );
+            assert!(node.get("tool_outcomes").is_none());
+            let reference = &error["result_reference"];
+            assert_eq!(reference["sequence"], failed_event.sequence);
+            assert_eq!(reference["event_hash"], failed_event.event_hash);
+            let mut call = ToolCallV4 {
+                call_id: "recover-original".into(),
+                tool_id: context_views::READ_RESULT_TOOL.into(),
+                arguments: json!({"sequence":reference["sequence"],
+                    "event_hash":reference["event_hash"],"field":reference["field"],
+                    "offset":0,"limit":8192}),
+            };
+            let events = store.load_direct(spec.run_id).unwrap();
+            let mut restored = String::new();
+            loop {
+                let page = context_views::read_result(&spec, &events, &call).unwrap();
+                restored.push_str(page["content"].as_str().unwrap());
+                let Some(offset) = page["next_offset"].as_u64() else {
+                    break;
+                };
+                call.arguments["offset"] = json!(offset);
+            }
+            assert_eq!(restored, json!(graph).to_string());
+            assert_eq!(&events[..original.len()], original.as_slice());
+            assert!(events.iter().all(|event| event.verify().is_ok()));
+            assert_eq!(store.archives.lock().unwrap().len(), 1);
+            assert!(
+                core.context_for(&spec, AgentLimitsV4::default())
+                    .await
+                    .is_ok()
+            );
+            assert_eq!(store.archives.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn short_checkpoint_errors_do_not_expand_into_structured_tool_data() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        for index in 0..12 {
+            append_test_event(
+                &store,
+                spec.run_id,
+                AgentEventKindV4::ToolFinished {
+                    outcome: ToolOutcomeV4 {
+                        call_id: format!("failed-mcp-{index}"),
+                        tool_id: "use_mcp_tool".into(),
+                        succeeded: false,
+                        model_content: "upstream unavailable".into(),
+                        data: json!({"diagnostics":"x".repeat(7_000)}),
+                        provenance: vec![],
+                    },
+                },
+            );
+        }
+        let model = BudgetOnlyModel {
+            request_limit: 15_000,
+            requests: Mutex::new(vec![]),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: None,
+        };
+        let context = core
+            .context_for(&spec, AgentLimitsV4::default())
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&context).unwrap();
+        let errors = value["checkpoint"]["unresolved_errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 12);
+        assert!(
+            errors
+                .iter()
+                .all(|error| error == "use_mcp_tool: upstream unavailable")
+        );
+        assert_eq!(store.archives.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_checkpoint_without_result_reader_retains_raw_error_and_stops() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let raw_error = "original failure details".repeat(25_000);
+        append_test_event(
+            &store,
+            spec.run_id,
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: "large-failure".into(),
+                    tool_id: "read".into(),
+                    succeeded: false,
+                    model_content: raw_error.clone(),
+                    data: json!(null),
+                    provenance: vec![],
+                },
+            },
+        );
+        let model = BudgetOnlyModel {
+            request_limit: 30_000,
+            requests: Mutex::new(vec![]),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                core.context_for(&spec, AgentLimitsV4::default()).await,
+                Err(AgentCoreErrorV4::NeedsAttention(_))
+            ));
+        }
+        let events = store.load_direct(spec.run_id).unwrap();
+        let AgentEventKindV4::ContextCheckpointed { checkpoint } = &events.last().unwrap().event
+        else {
+            panic!("expected durable checkpoint");
+        };
+        assert_eq!(
+            checkpoint.unresolved_errors,
+            vec![format!("read: {raw_error}")]
+        );
+        assert_eq!(store.archives.lock().unwrap().len(), 1);
+        assert!(model.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
