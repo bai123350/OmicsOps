@@ -27,6 +27,9 @@ use uuid::Uuid;
 mod workspace_navigation;
 pub use workspace_navigation::*;
 
+mod runtime_boundary;
+pub use runtime_boundary::*;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationExportFormat {

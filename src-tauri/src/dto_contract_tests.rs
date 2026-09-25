@@ -6,6 +6,16 @@ use crate::dto::{
 use serde_json::json;
 
 #[test]
+fn runtime_boundary_request_rejects_frozen_selection_override() {
+    use omicsops_dto::RuntimeBoundaryRequestV4;
+    let request = json!({
+        "source":"frozen_run", "project_id":Uuid::new_v4(),
+        "run_id":Uuid::new_v4(), "compute_selection":null
+    });
+    assert!(serde_json::from_value::<RuntimeBoundaryRequestV4>(request).is_err());
+}
+
+#[test]
 fn workspace_sources_preserve_exact_identity_and_explicit_null_selectors() {
     use omicsops_dto::{SourceKind, WorkspaceSourceRef};
     let project = uuid::Uuid::from_u128(9);

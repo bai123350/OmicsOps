@@ -40,6 +40,7 @@ pub use omicsops_dto::{
     AgentV4RequestPlanRevisionRequest, PlanRevisionStatusV4, ProposedPlanRevisionV4,
     RequestPlanRevisionResponseV4,
 };
+use omicsops_dto::{RuntimeBoundaryRequestV4, RuntimeBoundarySourceV4, RuntimeBoundaryViewV4};
 use omicsops_knowledge::{
     KnowledgeErrorV4, McpToolIndexV4, MemoryDocumentV4, SkillDocumentV4,
     authorize_mcp_read_only_target, authorize_mcp_use, markdown_sections, schema_digest,
@@ -8101,6 +8102,77 @@ async fn workspace_project(repository: &Store, project_id: Uuid) -> Result<Proje
         .ok_or_else(|| "project does not exist".to_string())
 }
 
+pub(crate) async fn runtime_boundary_response(
+    repository: &Store,
+    request: RuntimeBoundaryRequestV4,
+) -> Result<RuntimeBoundaryViewV4, String> {
+    match request {
+        RuntimeBoundaryRequestV4::DraftSelection {
+            project_id,
+            compute_selection,
+        } => {
+            let project = workspace_project(repository, project_id)
+                .await
+                .map_err(|_| "runtime_boundary_not_found".to_string())?;
+            validate_compute_binding(repository, &project, &compute_selection)
+                .await
+                .map_err(|_| "runtime_boundary_invalid_selection".to_string())?;
+            crate::runtime_boundary_v4::describe_runtime_boundary(
+                project_id,
+                RuntimeBoundarySourceV4::DraftSelection,
+                &compute_selection,
+            )
+        }
+        RuntimeBoundaryRequestV4::FrozenRun { project_id, run_id } => {
+            let value = repository
+                .agent_run_v4(run_id)
+                .await
+                .map_err(|_| "runtime_boundary_not_found".to_string())?
+                .ok_or_else(|| "runtime_boundary_not_found".to_string())?;
+            let record: RunRecordV4 = serde_json::from_value(value)
+                .map_err(|_| "runtime_boundary_invalid_selection".to_string())?;
+            if record.run_id != run_id || record.project_id != project_id {
+                return Err("runtime_boundary_scope_mismatch".into());
+            }
+            let selection = if let Some(spec) = &record.spec {
+                if spec.run_id != record.run_id
+                    || spec.project_id != record.project_id
+                    || spec.conversation_id != record.conversation_id
+                {
+                    return Err("runtime_boundary_scope_mismatch".into());
+                }
+                validate_frozen_spec(repository, spec)
+                    .await
+                    .map_err(|_| "runtime_boundary_invalid_selection".to_string())?;
+                if let (Some(inner), Some(outer)) =
+                    (&spec.compute_selection, &record.compute_selection)
+                {
+                    if inner != outer {
+                        return Err("runtime_boundary_selection_mismatch".into());
+                    }
+                }
+                spec.compute_selection.as_ref()
+            } else {
+                record.compute_selection.as_ref()
+            }
+            .ok_or_else(|| "runtime_boundary_missing_selection".to_string())?;
+            crate::runtime_boundary_v4::describe_runtime_boundary(
+                project_id,
+                RuntimeBoundarySourceV4::FrozenRun { run_id },
+                selection,
+            )
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn agent_v4_runtime_boundary(
+    state: State<'_, AppState>,
+    request: RuntimeBoundaryRequestV4,
+) -> Result<RuntimeBoundaryViewV4, String> {
+    runtime_boundary_response(&state.repository, request).await
+}
+
 fn legacy_ssh_selection(project: &Project) -> Result<ComputeSelectionV4, String> {
     let connection_id = project
         .connection_id
@@ -10279,6 +10351,282 @@ mod tests {
             serde_json::to_value(retry).unwrap()
         );
         assert_eq!(spec.spec_hash, retry_spec.spec_hash);
+    }
+
+    #[tokio::test]
+    async fn runtime_boundary_reads_frozen_selection_without_mutating_run() {
+        use omicsops_dto::{RuntimeBoundaryRequestV4, RuntimeBoundarySourceV4};
+        let repository = Store::open_in_memory().await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let project = Project::new(
+            Uuid::new_v4(),
+            "boundary",
+            directory.path().to_str().unwrap(),
+            omicsops_core::workspace::ProjectTemplate::Blank,
+            Utc::now(),
+        );
+        repository.save_project(&project).await.unwrap();
+        let conversation = omicsops_core::workspace::Conversation::new(
+            Uuid::new_v4(),
+            project.id,
+            "boundary",
+            Utc::now(),
+        );
+        repository.save_conversation(&conversation).await.unwrap();
+        let selection: ComputeSelectionV4 = serde_json::from_value(json!({
+            "schema_version":4,"backend_id":"local","backend_kind":"local",
+            "autonomy_mode":"supervised","environment":"system",
+            "network_policy":"host_inherited"
+        }))
+        .unwrap();
+        let run_id = Uuid::new_v4();
+        let request = StartDirectV4Request {
+            project_id: project.id,
+            conversation_id: conversation.id,
+            model_profile_id: Uuid::new_v4(),
+            objective: "inspect counts".into(),
+            compute_selection: selection.clone(),
+            references: vec![],
+            attachments: vec![],
+        };
+        let (mut record, spec) = prepare_direct_run_v4(
+            &request,
+            run_id,
+            "[]",
+            BTreeSet::from(["project.read".into()]),
+            DirectRunSnapshotV4 {
+                model_configuration_hash: "a".repeat(64),
+                conversation_preferences:
+                    omicsops_protocol::ConversationAgentPreferencesV4::default(),
+                service_tier: omicsops_protocol::RunServiceTierV4 { fast_mode: None },
+                reviewer_model: None,
+                delegated_model: None,
+                reference_context: String::new(),
+                input_images: vec![],
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        save_record(&repository, &record).await.unwrap();
+        let first = AgentEventV4::first(
+            run_id,
+            project.id,
+            conversation.id,
+            Utc::now(),
+            AgentEventKindV4::RunCreated {
+                mode: RunModeV4::Execute,
+            },
+        );
+        repository.append_agent_event_v4(&first).await.unwrap();
+        repository
+            .append_agent_event_v4(&AgentEventV4::next(
+                &first,
+                Utc::now(),
+                AgentEventKindV4::RunSpecFrozen {
+                    approval_hash: spec.approval_hash.clone().unwrap(),
+                    spec_hash: spec.spec_hash.clone().unwrap(),
+                },
+            ))
+            .await
+            .unwrap();
+        let before_record = repository.agent_run_v4(run_id).await.unwrap();
+        let before_events = repository.agent_events_v4(run_id).await.unwrap();
+        let view = runtime_boundary_response(
+            &repository,
+            RuntimeBoundaryRequestV4::FrozenRun {
+                project_id: project.id,
+                run_id,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(view.source, RuntimeBoundarySourceV4::FrozenRun { run_id });
+        assert_eq!(view.compute_selection, selection);
+        assert_eq!(
+            repository.agent_run_v4(run_id).await.unwrap(),
+            before_record
+        );
+        assert_eq!(
+            repository.agent_events_v4(run_id).await.unwrap(),
+            before_events
+        );
+        assert!(
+            runtime_boundary_response(
+                &repository,
+                RuntimeBoundaryRequestV4::FrozenRun {
+                    project_id: Uuid::new_v4(),
+                    run_id,
+                }
+            )
+            .await
+            .unwrap_err()
+            .starts_with("runtime_boundary_scope_mismatch")
+        );
+        record.compute_selection.as_mut().unwrap().environment = "other".into();
+        save_record(&repository, &record).await.unwrap();
+        assert!(
+            runtime_boundary_response(
+                &repository,
+                RuntimeBoundaryRequestV4::FrozenRun {
+                    project_id: project.id,
+                    run_id,
+                }
+            )
+            .await
+            .unwrap_err()
+            .starts_with("runtime_boundary_selection_mismatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_boundary_draft_requires_pinned_image_without_inspecting_engine() {
+        use omicsops_dto::RuntimeBoundaryRequestV4;
+        let repository = Store::open_in_memory().await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let project = Project::new(
+            Uuid::new_v4(),
+            "draft",
+            directory.path().to_str().unwrap(),
+            omicsops_core::workspace::ProjectTemplate::Blank,
+            Utc::now(),
+        );
+        repository.save_project(&project).await.unwrap();
+        let mut selection: ComputeSelectionV4 = serde_json::from_value(json!({
+            "schema_version":4,"backend_id":"docker","backend_kind":"docker",
+            "autonomy_mode":"supervised","environment":"system","network_policy":"none",
+            "container_image":{"reference":"synthetic-image:never-installed","image_id":"sha256:synthetic"}
+        })).unwrap();
+        let view = runtime_boundary_response(
+            &repository,
+            RuntimeBoundaryRequestV4::DraftSelection {
+                project_id: project.id,
+                compute_selection: selection.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(view.compute_selection, selection);
+        assert_eq!(
+            view.verification,
+            omicsops_dto::RuntimeBoundaryVerificationV4::NotCheckedByThisView
+        );
+        selection.container_image.as_mut().unwrap().image_id.clear();
+        assert_eq!(
+            runtime_boundary_response(
+                &repository,
+                RuntimeBoundaryRequestV4::DraftSelection {
+                    project_id: project.id,
+                    compute_selection: selection,
+                }
+            )
+            .await
+            .unwrap_err(),
+            "runtime_boundary_invalid_selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_boundary_legacy_record_never_infers_missing_selection_from_project() {
+        use omicsops_dto::RuntimeBoundaryRequestV4;
+        let repository = Store::open_in_memory().await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut project = Project::new(
+            Uuid::new_v4(),
+            "legacy",
+            directory.path().to_str().unwrap(),
+            omicsops_core::workspace::ProjectTemplate::Blank,
+            Utc::now(),
+        );
+        let connection = |id| ConnectionProfile {
+            id,
+            label: "offline".into(),
+            host: "192.0.2.1".into(),
+            port: 22,
+            username: "test".into(),
+            authentication: AuthenticationMethod::Password,
+            authentication_reference: "unused-test-reference".into(),
+            host_key_fingerprint: Some("SHA256:synthetic".into()),
+        };
+        let original_connection_id = Uuid::new_v4();
+        repository
+            .save_connection(&connection(original_connection_id))
+            .await
+            .unwrap();
+        project.connection_id = Some(original_connection_id);
+        project.remote_root = Some("/remote/original".into());
+        repository.save_project(&project).await.unwrap();
+        let conversation = omicsops_core::workspace::Conversation::new(
+            Uuid::new_v4(),
+            project.id,
+            "legacy",
+            Utc::now(),
+        );
+        repository.save_conversation(&conversation).await.unwrap();
+        let run_id = Uuid::new_v4();
+        let mut record = RunRecordV4 {
+            run_id,
+            project_id: project.id,
+            conversation_id: conversation.id,
+            model_profile_id: Uuid::new_v4(),
+            objective: "old run".into(),
+            reference_context: String::new(),
+            input_images: vec![],
+            conversation_preferences: None,
+            service_tier: None,
+            reviewer_model: None,
+            model_configuration_hash: None,
+            delegated_model: None,
+            status: "completed".into(),
+            plan: None,
+            plan_hash: None,
+            compute_selection: None,
+            approval_hash: None,
+            plan_revision: None,
+            spec: None,
+        };
+        save_record(&repository, &record).await.unwrap();
+        assert_eq!(
+            runtime_boundary_response(
+                &repository,
+                RuntimeBoundaryRequestV4::FrozenRun {
+                    project_id: project.id,
+                    run_id,
+                }
+            )
+            .await
+            .unwrap_err(),
+            "runtime_boundary_missing_selection"
+        );
+        record.compute_selection = Some(
+            serde_json::from_value(json!({
+                "schema_version":4,"backend_id":format!("ssh:{}", project.connection_id.unwrap()),
+                "backend_kind":"ssh","autonomy_mode":"supervised",
+                "environment":"rnaseq","network_policy":"host_inherited"
+            }))
+            .unwrap(),
+        );
+        save_record(&repository, &record).await.unwrap();
+        let replacement_connection_id = Uuid::new_v4();
+        repository
+            .save_connection(&connection(replacement_connection_id))
+            .await
+            .unwrap();
+        project.connection_id = Some(replacement_connection_id);
+        repository.save_project(&project).await.unwrap();
+        let view = runtime_boundary_response(
+            &repository,
+            RuntimeBoundaryRequestV4::FrozenRun {
+                project_id: project.id,
+                run_id,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(view.compute_selection, record.compute_selection.unwrap());
+        assert_eq!(
+            view.detached_job_lifecycle,
+            omicsops_dto::DetachedJobLifecycleV4::SshLinuxOnly
+        );
     }
 
     #[test]

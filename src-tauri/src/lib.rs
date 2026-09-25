@@ -47,6 +47,7 @@ mod remote_jobs_v4;
 pub mod research_commands;
 mod run_ownership;
 mod runtime_approval;
+mod runtime_boundary_v4;
 mod runtime_jobs_v4;
 pub mod session_reviews;
 pub mod side_chat;
@@ -217,6 +218,7 @@ pub fn run() {
             agent_v4::agent_v4_start_planning,
             agent_v4::agent_v4_start_direct,
             agent_v4::agent_v4_compute_backends,
+            agent_v4::agent_v4_runtime_boundary,
             agent_v4::agent_v4_conversation_state,
             agent_v4::agent_v4_approve_plan,
             agent_v4::agent_v4_request_plan_revision,
