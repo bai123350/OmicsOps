@@ -5398,7 +5398,7 @@ impl ModelPortV4 for DesktopModelPortV4 {
         let mut provider_error = None;
         let mut accumulator_error = None;
         self.client
-            .stream_with_provider(provider_request, |event| match event {
+            .stream_with_provider_v4(provider_request, |event| match event {
                 ProviderStreamEvent::ReasoningDelta { text } => {
                     on_event(ModelStreamEventV4::ReasoningDelta(text));
                 }
@@ -5425,7 +5425,16 @@ impl ModelPortV4 for DesktopModelPortV4 {
                 | ProviderStreamEvent::ToolArgumentsDelta { .. })
                     if accumulator_error.is_none() =>
                 {
-                    on_event(ModelStreamEventV4::Activity(ModelActivityPhaseV4::ToolCall));
+                    let meaningful = match &event {
+                        ProviderStreamEvent::ToolCallStarted { tool_id, .. } => !tool_id.is_empty(),
+                        ProviderStreamEvent::ToolArgumentsDelta { arguments, .. } => {
+                            !arguments.is_empty()
+                        }
+                        _ => false,
+                    };
+                    if meaningful {
+                        on_event(ModelStreamEventV4::Activity(ModelActivityPhaseV4::ToolCall));
+                    }
                     if let Err(error) = calls.push(&event) {
                         accumulator_error = Some(ModelFailureV4::permanent(
                             ModelErrorClassV4::InvalidResponse,

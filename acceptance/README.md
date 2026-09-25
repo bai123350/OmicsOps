@@ -72,7 +72,8 @@ Deterministic checks passed: `cargo test --workspace` (1,254 passed, 12 ignored)
 acceptance passes; the explicit Go result above is recorded separately.
 
 The run is bounded to four model turns, three tool calls, no model retries, and
-the production 180-second absolute timeout per model attempt. It is ignored
+the production 180-second meaningful-content idle timeout plus 15-minute hard
+total per ordinary model attempt. It is ignored
 during normal CI. A compiled, ignored, or unexecuted result is not a live
 acceptance pass; record the actual command and result separately.
 

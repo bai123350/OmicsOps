@@ -35,6 +35,13 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const CANCELLED_DISPATCH_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+const MODEL_STREAM_HARD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Debug, Clone, Copy)]
+enum ModelTurnTimeoutPolicy {
+    Absolute(Duration),
+    Stream { idle: Duration, total: Duration },
+}
 
 /// Stop invoking a server after two returned business failures; preflight rejections do not count.
 pub fn failed_mcp_servers(events: &[AgentEventV4]) -> std::collections::BTreeSet<String> {
@@ -2822,11 +2829,11 @@ impl AgentCoreV4<'_> {
             run_id,
             request,
             max_retries,
-            attempt_timeout,
             cancelled,
             persist_text,
             &mut 0,
             usize::MAX,
+            ModelTurnTimeoutPolicy::Absolute(attempt_timeout),
         )
         .await
     }
@@ -2836,11 +2843,11 @@ impl AgentCoreV4<'_> {
         run_id: Uuid,
         mut request: ModelRequestV4,
         max_retries: u8,
-        attempt_timeout: Duration,
         cancelled: Option<&AtomicBool>,
         persist_text: bool,
         continuation_remaining: &mut u32,
         context_max_bytes: usize,
+        timeout_policy: ModelTurnTimeoutPolicy,
     ) -> Result<ModelTurnV4, AgentCoreErrorV4> {
         self.model
             .validate_request(&request)
@@ -2897,7 +2904,20 @@ impl AgentCoreV4<'_> {
             let mut last_preview = None::<Instant>;
             let mut last_activity = None::<(ModelActivityPhaseV4, Instant)>;
             let mut saw_usage = false;
+            let (progress_tx, mut progress_rx) =
+                tokio::sync::watch::channel(tokio::time::Instant::now());
             let mut on_event = |event| {
+                // Only provider content advances the stream idle deadline.
+                // Retry/usage/activity previews can occur without generation.
+                if matches!(&event,
+                    ModelStreamEventV4::TextDelta(text) | ModelStreamEventV4::ReasoningDelta(text)
+                        if !text.is_empty()
+                ) || matches!(
+                    event,
+                    ModelStreamEventV4::Activity(ModelActivityPhaseV4::ToolCall)
+                ) {
+                    progress_tx.send_replace(tokio::time::Instant::now());
+                }
                 let phase = match event {
                     ModelStreamEventV4::TextDelta(text) => {
                         streamed_text.push_str(&text);
@@ -3000,13 +3020,60 @@ impl AgentCoreV4<'_> {
                 }
             };
             let mut completion = Box::pin(self.model.stream(request.clone(), &mut on_event));
-            let deadline = tokio::time::sleep(attempt_timeout);
-            tokio::pin!(deadline);
+            let started = tokio::time::Instant::now();
+            let (idle_timeout, hard_timeout) = match timeout_policy {
+                ModelTurnTimeoutPolicy::Absolute(bound) => (bound, bound),
+                ModelTurnTimeoutPolicy::Stream { idle, total } => (idle, total),
+            };
+            let idle_deadline = tokio::time::sleep(idle_timeout);
+            let hard_deadline = tokio::time::sleep(hard_timeout);
+            tokio::pin!(idle_deadline, hard_deadline);
+            let mut last_progress = started;
             let mut cancellation_poll = tokio::time::interval(Duration::from_millis(50));
             let mut reasoning_flush = tokio::time::interval(Duration::from_millis(40));
             let result: Result<Result<ModelTurnV4, ModelFailureV4>, AgentCoreErrorV4> = loop {
                 tokio::select! {
+                    biased;
+                    _ = &mut hard_deadline, if matches!(timeout_policy, ModelTurnTimeoutPolicy::Stream { .. }) => {
+                        break Ok(Err(ModelFailureV4::transient(
+                            omicsops_protocol::ModelErrorClassV4::Timeout,
+                            format!("model stream hard timeout after {} seconds total (last meaningful output {} seconds ago)",
+                                hard_timeout.as_secs(), last_progress.elapsed().as_secs()),
+                        )));
+                    }
+                    _ = cancellation_poll.tick(), if cancelled.is_some() => {
+                        if cancelled.is_some_and(|token| token.load(Ordering::SeqCst)) {
+                            break Err(AgentCoreErrorV4::Cancelled);
+                        }
+                        match self.events.has_pending_guidance(run_id).await {
+                            Ok(true) => break Err(AgentCoreErrorV4::GuidancePending),
+                            Ok(false) => {}
+                            Err(error) => break Err(AgentCoreErrorV4::Store(error)),
+                        }
+                    }
                     result = &mut completion => break Ok(result),
+                    changed = progress_rx.changed(), if matches!(timeout_policy, ModelTurnTimeoutPolicy::Stream { .. }) => {
+                        if changed.is_ok() {
+                            let progress_at = *progress_rx.borrow_and_update();
+                            if progress_at < idle_deadline.deadline() {
+                                last_progress = progress_at;
+                                idle_deadline.as_mut().reset(progress_at + idle_timeout);
+                            }
+                        }
+                    }
+                    _ = &mut idle_deadline => {
+                        let message = match timeout_policy {
+                            ModelTurnTimeoutPolicy::Absolute(bound) => format!(
+                                "model produced no completed turn within {} seconds", bound.as_secs()),
+                            ModelTurnTimeoutPolicy::Stream { idle, .. } => format!(
+                                "model stream idle timeout after {} seconds without meaningful output (attempt elapsed {} seconds)",
+                                idle.as_secs(), started.elapsed().as_secs()),
+                        };
+                        break Ok(Err(ModelFailureV4::transient(
+                            omicsops_protocol::ModelErrorClassV4::Timeout,
+                            message,
+                        )));
+                    }
                     Some(kind) = callback_rx.recv() => {
                         let started_attempt = match &kind {
                             AgentEventKindV4::ModelRequestStarted { request } => Some(request.attempt_id),
@@ -3031,22 +3098,6 @@ impl AgentCoreV4<'_> {
                             self.events.preview_model_reasoning(run_id, state.attempt_id, Some(&state.text));
                             state.last_sent = Some(Instant::now());
                             state.dirty = false;
-                        }
-                    }
-                    _ = &mut deadline => {
-                        break Ok(Err(ModelFailureV4::transient(
-                            omicsops_protocol::ModelErrorClassV4::Timeout,
-                            format!("model produced no completed turn within {} seconds", attempt_timeout.as_secs()),
-                        )));
-                    }
-                    _ = cancellation_poll.tick(), if cancelled.is_some() => {
-                        if cancelled.is_some_and(|token| token.load(Ordering::SeqCst)) {
-                            break Err(AgentCoreErrorV4::Cancelled);
-                        }
-                        match self.events.has_pending_guidance(run_id).await {
-                            Ok(true) => break Err(AgentCoreErrorV4::GuidancePending),
-                            Ok(false) => {}
-                            Err(error) => break Err(AgentCoreErrorV4::Store(error)),
                         }
                     }
                 }
@@ -4228,6 +4279,14 @@ impl AgentCoreV4<'_> {
         summary_limit: Option<u32>,
         continuation_remaining: &mut u32,
     ) -> Result<ModelTurnV4, AgentCoreErrorV4> {
+        let timeout_policy = if summary_limit.is_none() {
+            ModelTurnTimeoutPolicy::Stream {
+                idle: limits.model_attempt_timeout,
+                total: MODEL_STREAM_HARD_TIMEOUT,
+            }
+        } else {
+            ModelTurnTimeoutPolicy::Absolute(limits.model_attempt_timeout)
+        };
         let first = self
             .model_turn_with_policy(
                 spec.run_id,
@@ -4236,11 +4295,11 @@ impl AgentCoreV4<'_> {
                     summary_limit,
                 ),
                 limits.max_model_retries,
-                limits.model_attempt_timeout,
                 Some(cancelled),
                 summary_limit.is_none(),
                 continuation_remaining,
                 limits.context_max_bytes,
+                timeout_policy,
             )
             .await;
         if !limits.auto_compact || !matches!(first, Err(AgentCoreErrorV4::ContextOverflow(_))) {
@@ -4280,11 +4339,11 @@ impl AgentCoreV4<'_> {
                 summary_limit,
             ),
             0,
-            limits.model_attempt_timeout,
             Some(cancelled),
             summary_limit.is_none(),
             continuation_remaining,
             limits.context_max_bytes,
+            timeout_policy,
         )
         .await
     }
@@ -6799,11 +6858,11 @@ mod tests {
                 image_refs: vec![],
             },
             0,
-            Duration::from_secs(1),
             None,
             false,
             &mut 0,
             usize::MAX,
+            ModelTurnTimeoutPolicy::Absolute(Duration::from_secs(1)),
         )
         .await
         .unwrap();
@@ -10112,6 +10171,331 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_secs(180));
     }
 
+    struct TimedProgressModel {
+        steps: Vec<(Duration, ModelStreamEventV4)>,
+        final_delay: Duration,
+    }
+
+    #[async_trait]
+    impl ModelPortV4 for TimedProgressModel {
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            for (delay, event) in &self.steps {
+                tokio::time::sleep(*delay).await;
+                on_event(event.clone());
+            }
+            tokio::time::sleep(self.final_delay).await;
+            Ok(ModelTurnV4 {
+                public_text: "complete".into(),
+                tool_calls: vec![],
+            })
+        }
+    }
+
+    async fn timed_stream_result(
+        model: &TimedProgressModel,
+        idle: Duration,
+        total: Duration,
+    ) -> (Result<ModelTurnV4, AgentCoreErrorV4>, Duration) {
+        let run_id = Uuid::new_v4();
+        let store = MemoryStore::default();
+        seed_model_turn(&store, run_id);
+        let core = AgentCoreV4 {
+            model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let started = tokio::time::Instant::now();
+        let result = core
+            .model_turn_with_policy(
+                run_id,
+                ModelRequestV4 {
+                    system: "system".into(),
+                    context: "context".into(),
+                    tools: vec![],
+                    image_refs: vec![],
+                },
+                0,
+                None,
+                true,
+                &mut 0,
+                usize::MAX,
+                ModelTurnTimeoutPolicy::Stream { idle, total },
+            )
+            .await;
+        (result, started.elapsed())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn meaningful_stream_progress_can_complete_after_old_absolute_limit() {
+        let model = TimedProgressModel {
+            steps: vec![
+                (
+                    Duration::from_secs(100),
+                    ModelStreamEventV4::ReasoningDelta("thinking".into()),
+                ),
+                (
+                    Duration::from_secs(100),
+                    ModelStreamEventV4::Activity(ModelActivityPhaseV4::ToolCall),
+                ),
+                (
+                    Duration::from_secs(100),
+                    ModelStreamEventV4::TextDelta("answer".into()),
+                ),
+            ],
+            final_delay: Duration::from_secs(1),
+        };
+        let (result, elapsed) =
+            timed_stream_result(&model, Duration::from_secs(180), Duration::from_secs(900)).await;
+        assert_eq!(result.unwrap().public_text, "complete");
+        assert_eq!(elapsed, Duration::from_secs(301));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn iteration_summary_keeps_absolute_attempt_timeout_despite_progress() {
+        let run_id = Uuid::new_v4();
+        let spec = execution_spec(run_id);
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = TimedProgressModel {
+            steps: vec![
+                (
+                    Duration::from_secs(100),
+                    ModelStreamEventV4::ReasoningDelta("still summarizing".into()),
+                ),
+                (
+                    Duration::from_secs(100),
+                    ModelStreamEventV4::TextDelta("unfinished".into()),
+                ),
+            ],
+            final_delay: Duration::from_secs(1),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let started = tokio::time::Instant::now();
+        let error = core
+            .execution_model_turn(
+                &spec,
+                "{}".into(),
+                &store.load_direct(run_id).unwrap(),
+                AgentLimitsV4 {
+                    max_model_retries: 0,
+                    ..AgentLimitsV4::default()
+                },
+                &AtomicBool::new(false),
+                Some(1),
+                &mut 0,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AgentCoreErrorV4::Model(message) if message.contains("no completed turn within 180 seconds"))
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(180));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_activity_retry_and_usage_do_not_extend_stream_idle_timeout() {
+        let model = TimedProgressModel {
+            steps: vec![
+                (
+                    Duration::from_secs(10),
+                    ModelStreamEventV4::TextDelta(String::new()),
+                ),
+                (
+                    Duration::from_secs(10),
+                    ModelStreamEventV4::ReasoningDelta(String::new()),
+                ),
+                (
+                    Duration::from_secs(10),
+                    ModelStreamEventV4::Activity(ModelActivityPhaseV4::Responding),
+                ),
+                (
+                    Duration::from_secs(10),
+                    ModelStreamEventV4::ProviderRetrying {
+                        attempt: 1,
+                        delay_ms: 1000,
+                        message: "retry".into(),
+                    },
+                ),
+                (
+                    Duration::from_secs(10),
+                    ModelStreamEventV4::Usage(ModelUsageSampleV4 {
+                        sample_index: 0,
+                        state: UsageObservationStateV4::Partial,
+                        aggregation: UsageAggregationV4::Cumulative,
+                        input_tokens: Some(1),
+                        context_tokens: None,
+                        output_tokens: Some(1),
+                        reasoning_tokens: None,
+                        cache_read_input_tokens: None,
+                        cache_creation_input_tokens: None,
+                        reported_total_tokens: None,
+                    }),
+                ),
+            ],
+            final_delay: Duration::from_secs(100),
+        };
+        let (result, elapsed) =
+            timed_stream_result(&model, Duration::from_secs(60), Duration::from_secs(300)).await;
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::Model(message)) if message.contains("idle timeout") && message.contains("60 seconds"))
+        );
+        assert_eq!(elapsed, Duration::from_secs(60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_stream_stops_at_hard_total_deadline() {
+        let model = TimedProgressModel {
+            steps: (0..10)
+                .map(|index| {
+                    let event = if index == 3 {
+                        ModelStreamEventV4::ProviderRetrying {
+                            attempt: 1,
+                            delay_ms: 1000,
+                            message: "retry".into(),
+                        }
+                    } else {
+                        ModelStreamEventV4::ReasoningDelta("x".into())
+                    };
+                    (Duration::from_secs(10), event)
+                })
+                .collect(),
+            final_delay: Duration::from_secs(1),
+        };
+        let (result, elapsed) =
+            timed_stream_result(&model, Duration::from_secs(30), Duration::from_secs(65)).await;
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::Model(message)) if message.contains("hard timeout") && message.contains("65 seconds"))
+        );
+        assert_eq!(elapsed, Duration::from_secs(65));
+    }
+
+    struct PartialToolProgressModel;
+
+    #[async_trait]
+    impl ModelPortV4 for PartialToolProgressModel {
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            on_event(ModelStreamEventV4::Activity(ModelActivityPhaseV4::ToolCall));
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_partial_tool_stream_never_dispatches_a_tool() {
+        let run_id = Uuid::new_v4();
+        let spec = execution_spec(run_id);
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let tools = RuntimeTools {
+            calls: AtomicUsize::new(0),
+            interrupts: AtomicUsize::new(0),
+            fail_business: false,
+            delay_ms: 0,
+        };
+        let limits = AgentLimitsV4 {
+            max_model_retries: 0,
+            model_attempt_timeout: Duration::from_secs(20),
+            ..AgentLimitsV4::default()
+        };
+        let core = AgentCoreV4 {
+            model: &PartialToolProgressModel,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        let started = tokio::time::Instant::now();
+        let error = core
+            .execute_with_limits(&spec, limits, &AtomicBool::new(false))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AgentCoreErrorV4::Model(message) if message.contains("idle timeout"))
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
+        assert_eq!(tools.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            !store
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| { matches!(event.event, AgentEventKindV4::ToolRequested { .. }) })
+        );
+    }
+
+    struct AlwaysProgressingModel;
+
+    #[async_trait]
+    impl ModelPortV4 for AlwaysProgressingModel {
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            loop {
+                on_event(ModelStreamEventV4::ReasoningDelta("x".into()));
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_continuously_progressing_stream() {
+        let run_id = Uuid::new_v4();
+        let store = MemoryStore::default();
+        seed_model_turn(&store, run_id);
+        let core = AgentCoreV4 {
+            model: &AlwaysProgressingModel,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&cancelled);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            setter.store(true, Ordering::SeqCst);
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            core.model_turn_with_policy(
+                run_id,
+                ModelRequestV4 {
+                    system: "system".into(),
+                    context: "context".into(),
+                    tools: vec![],
+                    image_refs: vec![],
+                },
+                0,
+                Some(cancelled.as_ref()),
+                false,
+                &mut 0,
+                usize::MAX,
+                ModelTurnTimeoutPolicy::Stream {
+                    idle: Duration::from_secs(1),
+                    total: Duration::from_secs(2),
+                },
+            ),
+        )
+        .await
+        .expect("cancellation must not starve behind streaming progress");
+        assert!(matches!(result, Err(AgentCoreErrorV4::Cancelled)));
+    }
+
     #[tokio::test]
     async fn cancellation_drops_an_active_model_request() {
         let run_id = Uuid::new_v4();
@@ -10176,7 +10560,7 @@ mod tests {
         assert!(store.events.lock().unwrap().iter().any(|event| {
             matches!(&event.event, AgentEventKindV4::ModelRetrying { class, message, .. }
                 if *class == omicsops_protocol::ModelErrorClassV4::Timeout
-                    && message.contains("completed turn"))
+                    && message.contains("idle timeout"))
         }));
     }
 

@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::{AdapterError, AdapterResult};
 
 const MODEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+const MODEL_V4_STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MODEL_MAX_RETRIES: u8 = 3;
 pub const MODEL_PROBE_OUTPUT_TOKENS: u32 = 4096;
 const OPENCODE_GO_USER_AGENT: &str = concat!("OmicsOps/", env!("CARGO_PKG_VERSION"));
@@ -189,11 +190,45 @@ mod budget_tests {
                 &Url::parse("http://127.0.0.1:1/api/chat").unwrap(),
                 &body,
                 &mut |event| events.push(event),
+                None,
             )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("request budget:"));
         assert!(events.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod stream_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn v4_stream_request_has_a_longer_bounded_transport_timeout() {
+        let client = UnifiedModelClient::new(
+            Uuid::new_v4(),
+            ProviderProtocol::OpenAiCompatible,
+            Url::parse("https://example.org/v1").unwrap(),
+            "model",
+            Some("test-only".into()),
+        )
+        .unwrap();
+        let endpoint = Url::parse("https://example.org/v1/chat/completions").unwrap();
+        let body = json!({"model":"model", "stream":true});
+        let v4_request = client
+            .post_json_request_with_timeout(
+                endpoint.clone(),
+                &body,
+                Some(MODEL_V4_STREAM_REQUEST_TIMEOUT),
+            )
+            .build()
+            .unwrap();
+        let ordinary_request = client
+            .post_json_request_with_timeout(endpoint, &body, None)
+            .build()
+            .unwrap();
+        assert_eq!(v4_request.timeout(), Some(&Duration::from_secs(900)));
+        assert_eq!(ordinary_request.timeout(), None);
     }
 }
 
@@ -2220,6 +2255,20 @@ impl UnifiedModelClient {
         self.authenticate(self.http.post(endpoint).json(body))
     }
 
+    fn post_json_request_with_timeout(
+        &self,
+        endpoint: Url,
+        body: &Value,
+        timeout: Option<Duration>,
+    ) -> reqwest::RequestBuilder {
+        let request = self.post_json_request(endpoint, body);
+        if let Some(timeout) = timeout {
+            request.timeout(timeout)
+        } else {
+            request
+        }
+    }
+
     fn get_request(&self, endpoint: Url) -> reqwest::RequestBuilder {
         self.authenticate(self.http.get(endpoint))
     }
@@ -2410,13 +2459,17 @@ impl UnifiedModelClient {
         endpoint: &Url,
         body: &Value,
         on_event: &mut impl FnMut(ProviderStreamEvent),
+        request_timeout: Option<Duration>,
     ) -> AdapterResult<reqwest::Response> {
         // Keep this check at the final send boundary so retries and the
         // non-streaming fallback cannot bypass the same preflight.
         self.validate_provider_body(body)?;
         let mut retries = 0_u8;
         loop {
-            let result = self.post_json_request(endpoint.clone(), body).send().await;
+            let result = self
+                .post_json_request_with_timeout(endpoint.clone(), body, request_timeout)
+                .send()
+                .await;
             match result {
                 Ok(response) if response.status().is_success() => return Ok(response),
                 Ok(response) => {
@@ -2456,7 +2509,29 @@ impl UnifiedModelClient {
     pub async fn stream_with_provider(
         &self,
         request: ProviderModelRequest,
+        on_event: impl FnMut(ProviderStreamEvent),
+    ) -> AdapterResult<()> {
+        self.stream_with_provider_timeout(request, on_event, None)
+            .await
+    }
+
+    /// Stream an ordinary Agent V4 generation with the host's 15-minute hard
+    /// bound. Other model operations retain the shared 180-second transport
+    /// timeout, including the non-streaming fallback.
+    pub async fn stream_with_provider_v4(
+        &self,
+        request: ProviderModelRequest,
+        on_event: impl FnMut(ProviderStreamEvent),
+    ) -> AdapterResult<()> {
+        self.stream_with_provider_timeout(request, on_event, Some(MODEL_V4_STREAM_REQUEST_TIMEOUT))
+            .await
+    }
+
+    async fn stream_with_provider_timeout(
+        &self,
+        request: ProviderModelRequest,
         mut on_event: impl FnMut(ProviderStreamEvent),
+        request_timeout: Option<Duration>,
     ) -> AdapterResult<()> {
         let provider_request = self.build_provider_request(&request)?;
         self.validate_provider_body(&provider_request.body)?;
@@ -2465,6 +2540,7 @@ impl UnifiedModelClient {
                 &provider_request.endpoint,
                 &provider_request.body,
                 &mut on_event,
+                request_timeout,
             )
             .await?;
         let mut decoder = ProviderToolStreamDecoder::for_request(self.protocol, &request);
@@ -2481,6 +2557,7 @@ impl UnifiedModelClient {
                             &provider_request.endpoint,
                             &fallback_body,
                             &mut on_event,
+                            None,
                         )
                         .await
                         .map_err(|fallback_error| {
@@ -3334,14 +3411,14 @@ mod image_budget_tests {
         let endpoint = Url::parse("https://api.openai.com/v1/chat/completions").unwrap();
         let mut events = Vec::new();
         let first = client
-            .send_with_retry_provider(&endpoint, &body, &mut |event| events.push(event))
+            .send_with_retry_provider(&endpoint, &body, &mut |event| events.push(event), None)
             .await
             .unwrap_err()
             .to_string();
         let mut fallback = body.clone();
         fallback["stream"] = Value::Bool(false);
         let second = client
-            .send_with_retry_provider(&endpoint, &fallback, &mut |event| events.push(event))
+            .send_with_retry_provider(&endpoint, &fallback, &mut |event| events.push(event), None)
             .await
             .unwrap_err()
             .to_string();
@@ -3362,6 +3439,7 @@ mod image_budget_tests {
                 &Url::parse("https://api.openai.com/v1/chat/completions").unwrap(),
                 &body,
                 &mut |event| events.push(event),
+                None,
             )
             .await
             .unwrap_err();
