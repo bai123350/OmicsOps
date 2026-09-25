@@ -46,6 +46,7 @@ pub mod pubmed_mcp;
 mod remote_jobs_v4;
 pub mod research_commands;
 mod run_ownership;
+mod runtime_approval;
 mod runtime_jobs_v4;
 pub mod session_reviews;
 pub mod side_chat;

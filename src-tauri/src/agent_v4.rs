@@ -7256,6 +7256,9 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
     }
 
     async fn risk_based_target_approved(&self, call: &ToolCallV4) -> bool {
+        if call.tool_id == "runtime.execute" {
+            return crate::runtime_approval::ordinary_runtime_call_is_low_risk(&call.arguments);
+        }
         if call.tool_id != "use_mcp_tool" {
             return false;
         }
@@ -8896,6 +8899,17 @@ mod tests {
             browser_authorizations: Default::default(),
             forced_route: None,
         };
+        let ordinary = ToolCallV4 {
+            call_id: "ordinary-risk-check".into(),
+            tool_id: "runtime.execute".into(),
+            arguments: json!({"language":"python","code":"from pathlib import Path\nPath('results/summary.txt').write_text('ok')"}),
+        };
+        assert!(executor.risk_based_target_approved(&ordinary).await);
+        let risky = ToolCallV4 {
+            arguments: json!({"language":"python","code":"import subprocess\nsubprocess.run(['echo', 'x'])"}),
+            ..ordinary
+        };
+        assert!(!executor.risk_based_target_approved(&risky).await);
         assert!(
             executor
                 .prepare_call(&resource_call("project.list"))

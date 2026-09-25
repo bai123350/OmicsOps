@@ -6,12 +6,14 @@ use futures_util::{
     future::join_all,
     stream::{FuturesUnordered, StreamExt},
 };
+#[cfg(test)]
+use omicsops_protocol::ComputeBackendKindV4;
 use omicsops_protocol::{
     AgentEventKindV4, AgentEventV4, AgentInputReasonV4, AgentPhaseV4, AgentRequestRouteV4,
     AgentTaskListUpdateV4, AgentTaskShapeSourceV4, AgentTaskShapeV4, AgentTaskStatusV4,
     AgentTaskV4, ApprovalPolicyV4, BrowserSessionKindV4, CompletionEvidenceRefV4,
-    CompletionProposalV4, ComputeBackendKindV4, ContextArchiveV4, ContextCheckpointV4,
-    ContextLimitSourceV4, ContextUsageRowV4, ConversationAgentPreferencesV4, DelegatedTaskNodeV4,
+    CompletionProposalV4, ContextArchiveV4, ContextCheckpointV4, ContextLimitSourceV4,
+    ContextUsageRowV4, ConversationAgentPreferencesV4, DelegatedTaskNodeV4,
     DelegationGraphOutcomeV4, DelegationGraphV4, DelegationIsolationV4, DelegationNodeOutcomeV4,
     DelegationNodeStatusV4, DeterministicVerificationV4, ExecutionPlanV4,
     ExternalExecutorOutcomeV4, ExternalExecutorTaskV4, ModelFailureV4, ModelRequestStartedV4,
@@ -3634,7 +3636,10 @@ impl AgentCoreV4<'_> {
                     }
                     None => {
                         if !events.iter().any(|event| {
-                            matches!(&event.event, AgentEventKindV4::ToolApprovalRequested { request } if request.call.call_id == call.call_id)
+                            matches!(&event.event, AgentEventKindV4::ToolApprovalRequested { request }
+                                if request.mode == RunModeV4::Execute
+                                    && request.scope_hash.is_none()
+                                    && request.call.call_id == call.call_id)
                         }) {
                             let request = self.approval_request(spec, call, effect)?;
                             self.push(
@@ -4165,30 +4170,21 @@ impl AgentCoreV4<'_> {
             ApprovalPolicyV4::FullAccess => Ok(false),
             ApprovalPolicyV4::RequestApproval => Ok(true),
             ApprovalPolicyV4::RiskBased => {
+                if call.tool_id == "runtime.execute" {
+                    // A request already recorded for this call must still follow its
+                    // exact approval decision, even if the host policy changes on resume.
+                    if events.iter().any(|event| {
+                        matches!(&event.event, AgentEventKindV4::ToolApprovalRequested { request }
+                            if request.mode == RunModeV4::Execute
+                                && request.scope_hash.is_none()
+                                && request.call.call_id == call.call_id)
+                    }) {
+                        return Ok(true);
+                    }
+                    return Ok(!self.tools.risk_based_target_approved(call).await);
+                }
                 if self.tools.risk_based_target_approved(call).await {
                     return Ok(false);
-                }
-                if call.tool_id == "runtime.execute"
-                    && matches!(
-                        selection.backend_kind,
-                        ComputeBackendKindV4::Local | ComputeBackendKindV4::Ssh
-                    )
-                {
-                    for event in events {
-                        let AgentEventKindV4::ToolApprovalRequested { request } = &event.event
-                        else {
-                            continue;
-                        };
-                        if request.call.tool_id != "runtime.execute" {
-                            continue;
-                        }
-                        if self.approval_decision(spec, &request.call, request.effect, events)?
-                            == Some(ToolApprovalDecisionV4::Approved)
-                        {
-                            return Ok(false);
-                        }
-                    }
-                    return Ok(true);
                 }
                 if call.tool_id == "runtime.environment.ensure" {
                     return Ok(selection.environment != "system");
@@ -6214,8 +6210,10 @@ mod tests {
     #[async_trait]
     impl ToolPortV4 for FakeTools {
         async fn risk_based_target_approved(&self, call: &ToolCallV4) -> bool {
-            call.tool_id == "use_mcp_tool"
-                && call.arguments.get("fixture_approved") == Some(&json!(true))
+            (call.tool_id == "use_mcp_tool"
+                && call.arguments.get("fixture_approved") == Some(&json!(true)))
+                || (call.tool_id == "runtime.execute"
+                    && call.arguments.get("fixture_runtime_safe") == Some(&json!(true)))
         }
         fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
             vec![ToolDescriptorV4 {
@@ -8361,6 +8359,166 @@ mod tests {
                 .unwrap(),
             "compute Full Access must not bypass host browser authorization"
         );
+    }
+
+    #[tokio::test]
+    async fn risk_based_runtime_decision_is_per_call_for_local_and_ssh() {
+        let store = MemoryStore::default();
+        let model = ScriptedModel(Mutex::new(vec![]));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        for backend in [ComputeBackendKindV4::Local, ComputeBackendKindV4::Ssh] {
+            let spec =
+                supervised_execution_spec(Uuid::new_v4(), ApprovalPolicyV4::RiskBased, backend);
+            let safe = ToolCallV4 {
+                call_id: "safe".into(),
+                tool_id: "runtime.execute".into(),
+                arguments: json!({"language":"python","code":"print(1)","fixture_runtime_safe":true}),
+            };
+            assert!(
+                !core
+                    .tool_requires_approval(&spec, &safe, ToolEffectV4::Runtime, &[])
+                    .await
+                    .unwrap()
+            );
+            let risky = ToolCallV4 {
+                call_id: "risky".into(),
+                tool_id: "runtime.execute".into(),
+                arguments: json!({"language":"python","code":"import subprocess; subprocess.run(['x'])"}),
+            };
+            let request = ToolApprovalRequestV4::new(
+                spec.run_id,
+                spec.spec_hash.as_deref().unwrap(),
+                risky.clone(),
+                ToolEffectV4::Runtime,
+                "approval required",
+            )
+            .unwrap();
+            let requested = AgentEventV4::first(
+                spec.run_id,
+                spec.project_id,
+                spec.conversation_id,
+                Utc::now(),
+                AgentEventKindV4::ToolApprovalRequested {
+                    request: request.clone(),
+                },
+            );
+            let approved = AgentEventV4::next(
+                &requested,
+                Utc::now(),
+                AgentEventKindV4::ToolApprovalDecided {
+                    approval_id: request.approval_id,
+                    call_hash: request.call_hash,
+                    decision: ToolApprovalDecisionV4::Approved,
+                },
+            );
+            let later = ToolCallV4 {
+                call_id: "later".into(),
+                ..risky.clone()
+            };
+            assert!(
+                core.tool_requires_approval(
+                    &spec,
+                    &later,
+                    ToolEffectV4::Runtime,
+                    &[requested.clone(), approved.clone()]
+                )
+                .await
+                .unwrap()
+            );
+            assert!(
+                core.tool_requires_approval(
+                    &spec,
+                    &risky,
+                    ToolEffectV4::Runtime,
+                    &[requested, approved]
+                )
+                .await
+                .unwrap()
+            );
+            let existing_safe_request = ToolApprovalRequestV4::new(
+                spec.run_id,
+                spec.spec_hash.as_deref().unwrap(),
+                safe.clone(),
+                ToolEffectV4::Runtime,
+                "old request",
+            )
+            .unwrap();
+            let denied_request = AgentEventV4::first(
+                spec.run_id,
+                spec.project_id,
+                spec.conversation_id,
+                Utc::now(),
+                AgentEventKindV4::ToolApprovalRequested {
+                    request: existing_safe_request.clone(),
+                },
+            );
+            assert!(
+                core.tool_requires_approval(
+                    &spec,
+                    &safe,
+                    ToolEffectV4::Runtime,
+                    std::slice::from_ref(&denied_request)
+                )
+                .await
+                .unwrap()
+            );
+            let denied = AgentEventV4::next(
+                &denied_request,
+                Utc::now(),
+                AgentEventKindV4::ToolApprovalDecided {
+                    approval_id: existing_safe_request.approval_id,
+                    call_hash: existing_safe_request.call_hash,
+                    decision: ToolApprovalDecisionV4::Denied,
+                },
+            );
+            assert!(
+                core.tool_requires_approval(
+                    &spec,
+                    &safe,
+                    ToolEffectV4::Runtime,
+                    &[denied_request, denied]
+                )
+                .await
+                .unwrap()
+            );
+            let scoped = ToolApprovalRequestV4::new_with_scope(
+                spec.run_id,
+                "plan-scope",
+                safe.clone(),
+                ToolEffectV4::Runtime,
+                "plan",
+            )
+            .unwrap();
+            let scoped_event = AgentEventV4::first(
+                spec.run_id,
+                spec.project_id,
+                spec.conversation_id,
+                Utc::now(),
+                AgentEventKindV4::ToolApprovalRequested { request: scoped },
+            );
+            assert!(
+                !core
+                    .tool_requires_approval(&spec, &safe, ToolEffectV4::Runtime, &[scoped_event])
+                    .await
+                    .unwrap()
+            );
+            let mut request_policy = spec.clone();
+            request_policy
+                .compute_selection
+                .as_mut()
+                .unwrap()
+                .approval_policy = ApprovalPolicyV4::RequestApproval;
+            assert!(
+                core.tool_requires_approval(&request_policy, &safe, ToolEffectV4::Runtime, &[])
+                    .await
+                    .unwrap()
+            );
+        }
     }
 
     #[test]
