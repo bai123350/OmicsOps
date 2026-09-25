@@ -10,7 +10,7 @@
 
 **Spec:** [已确认设计](../specs/2026-09-26-wisp-agent-runtime-sandbox-design.md)。先读该文档和根目录 `AGENTS.md`。
 
-**Source audit:** [固定提交源码对照](../specs/2026-09-26-wisp-agent-runtime-source-audit.md)。只读观察、宿主授权与远端防重派已核对到实现；上游二次取消强制收口不照搬。本计划仍待审，三个任务和接口保持不变。
+**Source audit:** [固定提交源码对照](../specs/2026-09-26-wisp-agent-runtime-source-audit.md)。只读观察、宿主授权与远端防重派已核对到实现；上游二次取消强制收口不照搬。用户已确认执行本计划，三个任务和接口保持不变。
 
 ## Global Constraints
 
@@ -21,7 +21,7 @@
 - “当前容器代码只设置 PID 上限，不笼统写‘资源配额完整’。”计算容器 network none 不代表模型/MCP/浏览器离线；整个项目目录仍为可写挂载。
 - 生命周期描述不是探测结果；`ssh_linux_only` 不确认当前远端平台、Python3 或连接可用。无自动轮询、后台取消、跨重启交互内核接回。
 - 使用 Windows 可运行的临时目录、假执行器和模拟 Tauri 命令；不要求真实 SSH、R、GPU、网络或密钥。保留 keyring、审批和科研证据边界。
-- 用户已指定 Astra high 做架构，Sol high 实施代码，Luna max 做简单检索。此计划需用户审查后才实施；无需重问模型安排。三个任务顺序实施，每项通过验证后单独提交。
+- 用户已指定 Astra high 做架构，Sol high 实施代码，Luna max 做简单检索。用户已审查并确认执行；无需重问模型安排。三个任务顺序实施，每项通过验证后单独提交。
 
 ## Review Focus
 
@@ -91,7 +91,7 @@ pub async fn agent_v4_runtime_boundary(
 ) -> Result<RuntimeBoundaryViewV4, String>;
 ```
 
-- [ ] **1. 写失败测试。** DTO 契约测试拒绝混合来源，断言 view JSON 中 source 对象、限制代码及 `not_checked_by_this_view`。投影测试使用 serde 构造的现有 `ComputeSelectionV4`，覆盖 Local/SSH/Docker/Podman、SSH 非 system、非法 FullAccess+process、容器缺 image ID。代表性代码：
+- [x] **1. 写失败测试。** DTO 契约测试拒绝混合来源，断言 view JSON 中 source 对象、限制代码及 `not_checked_by_this_view`。投影测试使用 serde 构造的现有 `ComputeSelectionV4`，覆盖 Local/SSH/Docker/Podman、SSH 非 system、非法 FullAccess+process、容器缺 image ID。代表性代码：
 
 ```rust
 #[test]
@@ -104,11 +104,11 @@ fn runtime_boundary_request_cannot_override_frozen_run() {
 
 Resolver 测试复用 `prepared_direct_run_retains_reserved_identity_and_frozen_material` 中 `StartDirectV4Request`、`prepare_direct_run_v4`、`DirectRunSnapshotV4` 的构造，不手拼一个不完整 spec。Store 使用 `Store::open_in_memory()` 和现有 `Project::new`/`Conversation::new` 模式；保存 record、必要的 `RunSpecFrozen` 事件后检查跨项目拒绝、缺失选择、两份选择冲突、当前连接改绑后历史仍可读、查询前后 record JSON 与事件数量相同。没有 spec 的历史/计划记录用现有 `missing_terminal_events_are_repaired_without_interrupting_live_runs` 的完整 `RunRecordV4` fixture 改造，避免省略新增字段。
 
-- [ ] **2. 运行 RED。** `cargo test -p omicsops-desktop runtime_boundary -- --nocapture`；新增 API 尚不存在时应编译失败或行为断言失败，确认不是网络/真实运行时失败。
-- [ ] **3. 实现 DTO 与纯映射。** 先 `selection.validate()`；Local/SSH 生成 Process 和前两个限制代码，Docker/Podman 生成 Container 及后六个容器限制代码。所有后端为 `RunScopedNoRestartReconnect`，只有 SSH 为 `SshLinuxOnly`。project/source 只来自宿主参数；不复制网络/审批字段，不返回 profile、路径或认证内容。摘要格式化留任务 2。
-- [ ] **4. 实现 resolver 并注册命令。** wrapper 仅委托 `runtime_boundary_response(&state.repository, request)`。草稿调用 `workspace_project` 和不启动进程的 `validate_compute_binding`；完整镜像选择只做结构验证，不能重新 inspect。冻结分支先核对 `record.run_id/project_id`；`record.spec` 存在时验证其身份、`validate_frozen_spec` 完整性/事件锚点，采用 `spec.compute_selection`，若 record 外层也存在且不同则拒绝；无 spec 时可使用该 run 已保存的 `record.compute_selection`。两者均无选择返回 `runtime_boundary_missing_selection`，不得调用 `legacy_ssh_selection`。冻结查询不检查当前 SSH/环境/镜像是否仍存在，不调用当前绑定验证。其余可行动错误使用稳定前缀 `runtime_boundary_not_found`、`runtime_boundary_scope_mismatch`、`runtime_boundary_selection_mismatch` 或 `runtime_boundary_invalid_selection`，不要将凭据/底层服务器错误插入消息。
-- [ ] **5. 验证 GREEN 与只读结构。** `cargo test -p omicsops-dto`；`cargo test -p omicsops-desktop runtime_boundary`；`cargo test -p omicsops-desktop dto_contract_tests`。检查新查询的调用树只有 Store/纯验证；用不安装解释器、不配置镜像引擎的合成配置仍能返回描述，测试既不调用进程 runner，也不取 keyring。缺 image ID 的草稿必须失败，不能“补全”。
-- [ ] **6. 单独提交。** `git diff --check` 后只暂存本任务文件，提交 `feat(runtime): expose read-only execution boundary views`。未通过测试不提交成功声明。
+- [x] **2. 运行 RED。** `cargo test -p omicsops-desktop runtime_boundary -- --nocapture`；新增 API 尚不存在时应编译失败或行为断言失败，确认不是网络/真实运行时失败。
+- [x] **3. 实现 DTO 与纯映射。** 先 `selection.validate()`；Local/SSH 生成 Process 和前两个限制代码，Docker/Podman 生成 Container 及后六个容器限制代码。所有后端为 `RunScopedNoRestartReconnect`，只有 SSH 为 `SshLinuxOnly`。project/source 只来自宿主参数；不复制网络/审批字段，不返回 profile、路径或认证内容。摘要格式化留任务 2。
+- [x] **4. 实现 resolver 并注册命令。** wrapper 仅委托 `runtime_boundary_response(&state.repository, request)`。草稿调用 `workspace_project` 和不启动进程的 `validate_compute_binding`；完整镜像选择只做结构验证，不能重新 inspect。冻结分支先核对 `record.run_id/project_id`；`record.spec` 存在时验证其身份、`validate_frozen_spec` 完整性/事件锚点，采用 `spec.compute_selection`，若 record 外层也存在且不同则拒绝；无 spec 时可使用该 run 已保存的 `record.compute_selection`。两者均无选择返回 `runtime_boundary_missing_selection`，不得调用 `legacy_ssh_selection`。冻结查询不检查当前 SSH/环境/镜像是否仍存在，不调用当前绑定验证。其余可行动错误使用稳定前缀 `runtime_boundary_not_found`、`runtime_boundary_scope_mismatch`、`runtime_boundary_selection_mismatch` 或 `runtime_boundary_invalid_selection`，不要将凭据/底层服务器错误插入消息。
+- [x] **5. 验证 GREEN 与只读结构。** `cargo test -p omicsops-dto`；`cargo test -p omicsops-desktop runtime_boundary`；`cargo test -p omicsops-desktop dto_contract_tests`。检查新查询的调用树只有 Store/纯验证；用不安装解释器、不配置镜像引擎的合成配置仍能返回描述，测试既不调用进程 runner，也不取 keyring。缺 image ID 的草稿必须失败，不能“补全”。
+- [x] **6. 单独提交。** `git diff --check` 后只暂存本任务文件，提交 `feat(runtime): expose read-only execution boundary views`。未通过测试不提交成功声明。
 
 ## Task 2: Agent 上下文复用同一边界事实
 
@@ -116,7 +116,7 @@ Resolver 测试复用 `prepared_direct_run_retains_reserved_identity_and_frozen_
 
 **Interfaces:** 消费任务 1 的 `describe_runtime_boundary`；新增 `pub(crate) fn format_runtime_boundary(view: &RuntimeBoundaryViewV4) -> String`。输出以 `HOST RUNTIME BOUNDARY` 标记，最多 4,096 UTF-8 字节；固定模板只列枚举值和已验证且最多 128 字符的 environment，完整 backend/image 身份仍保留在已有 context 的 `compute_selection`，不截断后冒称完整。
 
-- [ ] **1. 写失败测试。** 在桌面 `budget_test_model` 上放入实际投影生成的摘要；验证 `prepare_request(request, false)` system 保留它，`validate_request` 的完整预算计入它。复用 `mock_resource_slot`/`MockResources`，只读取 `prompt_layers` 时 `attempts == 0`；资源初始化后依旧包含完全相同摘要及原项目规则。覆盖四后端、不宣称依赖就绪、SSH stop 不确认远端停止、容器 network none 不涵盖模型/MCP、固定上限。
+- [x] **1. 写失败测试。** 在桌面 `budget_test_model` 上放入实际投影生成的摘要；验证 `prepare_request(request, false)` system 保留它，`validate_request` 的完整预算计入它。复用 `mock_resource_slot`/`MockResources`，只读取 `prompt_layers` 时 `attempts == 0`；资源初始化后依旧包含完全相同摘要及原项目规则。覆盖四后端、不宣称依赖就绪、SSH stop 不确认远端停止、容器 network none 不涵盖模型/MCP、固定上限。
 
 在 core 的 `full_request_budget_compacts_even_when_context_bytes_fit` 旁增加只用于测试的 `BoundaryBudgetModel { inner: BudgetOnlyModel }`：`prompt_layers()` 返回 environment 中含固定边界标记的默认 layers，`validate_request()` 委托 inner，stream 保持不应被调用。复用带冻结选择的 `ordinary_execution_spec`、`MemoryStore`、`seed_execution`、`FakeTools` 和现有 20 条长 ModelText 的构造。取得 requests 后断言：
 
@@ -132,8 +132,8 @@ assert!(requests.last().unwrap().context.len() < requests[0].context.len());
 
 再用同样 fixture 的低完整预算证明连固定摘要也容不下时停止且不派发，不从 system 删除摘要以凑预算；原事件链保留。
 
-- [ ] **2. 运行 RED。** `cargo test -p omicsops-desktop runtime_boundary`；`cargo test -p omicsops-agent-core runtime_boundary`（新增 core 测试名称包含该前缀）。确认失败来自未接入摘要。
-- [ ] **3. 只在 desktop 组合一次摘要。** 在 `compose` 用 project_id/run_id/冻结 selection 构造 view，格式化为 `boundary_summary`。给 `DesktopResourceFactoryV4` 增加该 String 字段。用它替换约 5043 行 lazy 初始 environment 中重复的选择说明；保留资源未检查、没有 local fallback、SSH 规则需要下一模型轮次的说明。约 4820 行初始化后的 filesystem prompt 附加同一摘要，保留环境/规则事实与“filesystem 不验证依赖”说明。不要改变 `request_contains_context` 观察门禁或 `before_call` 初始化规则。
+- [x] **2. 运行 RED。** `cargo test -p omicsops-desktop runtime_boundary`；`cargo test -p omicsops-agent-core runtime_boundary`（新增 core 测试名称包含该前缀）。确认失败来自未接入摘要。
+- [x] **3. 只在 desktop 组合一次摘要。** 在 `compose` 用 project_id/run_id/冻结 selection 构造 view，格式化为 `boundary_summary`。给 `DesktopResourceFactoryV4` 增加该 String 字段。用它替换约 5043 行 lazy 初始 environment 中重复的选择说明；保留资源未检查、没有 local fallback、SSH 规则需要下一模型轮次的说明。约 4820 行初始化后的 filesystem prompt 附加同一摘要，保留环境/规则事实与“filesystem 不验证依赖”说明。不要改变 `request_contains_context` 观察门禁或 `before_call` 初始化规则。
 
 ```rust
 let boundary = describe_runtime_boundary(
@@ -144,8 +144,8 @@ let boundary_summary = format_runtime_boundary(&boundary);
 ```
 
 `DesktopModelPortV4::prompt_layers` 已优先读取 ready slot，否则用初始 prompt；`AgentCoreV4::execution_request` 每次从它组装 system，`validate_execution_context` 对 candidate/compacted 都调用此方法，随后 `DesktopModelPortV4::validate_request → prepare_request(false) → client.validate_request` 检查完整 provider 请求。沿用该路径即可，不向两份 context JSON 添加 UI DTO，也不新增 core 到 desktop/dto 依赖。
-- [ ] **4. 验证 GREEN 和回归。** `cargo test -p omicsops-desktop runtime_boundary`；`cargo test -p omicsops-desktop lazy_resources`；`cargo test -p omicsops-agent-core runtime_boundary`；`cargo test -p omicsops-agent-core full_request_budget`；`cargo test -p omicsops-desktop remote_jobs_v4`。新的摘要必须在原上下文预算内；不可扩大预算掩盖问题。
-- [ ] **5. 单独提交。** `git diff --check` 后提交本任务三个文件：`feat(agent): share host runtime boundaries in model context`。
+- [x] **4. 验证 GREEN 和回归。** `cargo test -p omicsops-desktop runtime_boundary`；`cargo test -p omicsops-desktop lazy_resources`；`cargo test -p omicsops-agent-core runtime_boundary`；`cargo test -p omicsops-agent-core full_request_budget`；`cargo test -p omicsops-desktop remote_jobs_v4`。新的摘要必须在原上下文预算内；不可扩大预算掩盖问题。
+- [x] **5. 单独提交。** `git diff --check` 后提交本任务三个文件：`feat(agent): share host runtime boundaries in model context`。
 
 ## Task 3: 草稿与当前/历史运行的真实边界展示
 
@@ -171,7 +171,7 @@ onRetryBoundary: () => void;
 // onPrepare becomes optional and is supplied only for draft mode.
 ```
 
-- [ ] **1. 写失败 API/hook 测试。** 参照 `tauri-api.model.test.ts` mock `invoke` 与 `__TAURI_INTERNALS__`；请求必须是 `invoke("agent_v4_runtime_boundary", { request })`。非 Tauri 直接拒绝“Runtime boundaries require the desktop app”，不能复制一套假边界映射或返回成功。hook 复用 `useConversationCapabilities.test.tsx` 的 `renderHook`/延迟 Promise/身份变化模式，新增 null 请求零调用、重试、错误后 view 清空、project/source/run/草稿完整选择不匹配拒绝、旧成功及旧失败均不能覆盖新请求。
+- [x] **1. 写失败 API/hook 测试。** 参照 `tauri-api.model.test.ts` mock `invoke` 与 `__TAURI_INTERNALS__`；请求必须是 `invoke("agent_v4_runtime_boundary", { request })`。非 Tauri 直接拒绝“Runtime boundaries require the desktop app”，不能复制一套假边界映射或返回成功。hook 复用 `useConversationCapabilities.test.tsx` 的 `renderHook`/延迟 Promise/身份变化模式，新增 null 请求零调用、重试、错误后 view 清空、project/source/run/草稿完整选择不匹配拒绝、旧成功及旧失败均不能覆盖新请求。
 
 ```ts
 it("does not query an incomplete draft", () => {
@@ -182,20 +182,36 @@ it("does not query an incomplete draft", () => {
 });
 ```
 
-- [ ] **2. 写失败 UI 测试。** 扩展 RuntimeDialog 的 `renderDialog`/localBackend/sshBackend fixture，加入四后端中英文宿主 view；测试 available 显示“已找到解释器”、system/SSH unverified 不再称镜像、依赖未验证、容器项目可写及网络作用域、SSH Linux 限定和 Stop 语义。冻结模式不显示当前探测状态、当前环境准备或修改入口。用 `DesktopApp.test.tsx` 的 `setupConversationStateHarness`/`stateSnapshot`/`agentEvent`/`deferred` 覆盖：草稿修改不改变所查看 run；容器未解析 ID/配置加载时显示未完成且不请求边界；切换会话立即清除旧视图。
+- [x] **2. 写失败 UI 测试。** 扩展 RuntimeDialog 的 `renderDialog`/localBackend/sshBackend fixture，加入四后端中英文宿主 view；测试 available 显示“已找到解释器”、system/SSH unverified 不再称镜像、依赖未验证、容器项目可写及网络作用域、SSH Linux 限定和 Stop 语义。冻结模式不显示当前探测状态、当前环境准备或修改入口。用 `DesktopApp.test.tsx` 的 `setupConversationStateHarness`/`stateSnapshot`/`agentEvent`/`deferred` 覆盖：草稿修改不改变所查看 run；容器未解析 ID/配置加载时显示未完成且不请求边界；切换会话立即清除旧视图。
 
 在 WorkspaceShell 的现有轨迹 fixture 中打开“运行轨迹”，点击某次 run 的“运行环境”，立即执行 `fireEvent.keyDown(window, { key: "Escape" })`：RuntimeDialog 消失、轨迹仍打开，第二次 Escape 关闭轨迹；`onCancelRun`、interrupt 与 `onPrepare` 均零调用。这是实际父子覆盖层测试，不只测试聚焦在对话框内的 Escape。
-- [ ] **3. 运行 RED。** `npx vitest run src/tauri-api.runtime-boundary.test.ts src/features/workspace/useRuntimeBoundary.test.tsx src/features/workspace/RuntimeDialog.test.tsx src/features/workspace/ComposerIntegration.test.tsx src/features/workspace/WorkspaceShell.test.tsx src/DesktopApp.test.tsx`。
-- [ ] **4. 实现 API 与防过期 hook。** 用包含完整 request 的稳定 JSON key 标识请求；state 保存该 key。返回值只有 state key 与当前 key 相同时才可见，effect cleanup/disposed 防止旧 Promise 提交；null 输入同步屏蔽 view/error。加载失败不恢复上一条成功数据，refresh 只重试当前请求。核对响应 project/source/run，草稿还需逐字段比较 compute selection（包含旧 approval_policy 默认值的现有 TS 规范化），不能仅比较 backend_id。
-- [ ] **5. 接线三种入口。** DesktopApp 用现有纯 `currentComputeSelection()` 构造完整草稿，捕获配置未完成并传 null，不增加后端探测。容器需当前 project/image 对应的既有 `agentV4ComputeBackends` 响应：在该 effect 保存成功响应所属 `{projectId, containerImage}`，不匹配当前输入或 computeBusy 时草稿为 null，防止新 tag 临时搭配旧 image ID。该键只防止过期观察，不改变派发验证或偷偷发新请求。
+- [x] **3. 运行 RED。** `npx vitest run src/tauri-api.runtime-boundary.test.ts src/features/workspace/useRuntimeBoundary.test.tsx src/features/workspace/RuntimeDialog.test.tsx src/features/workspace/ComposerIntegration.test.tsx src/features/workspace/WorkspaceShell.test.tsx src/DesktopApp.test.tsx`。
+- [x] **4. 实现 API 与防过期 hook。** 用包含完整 request 的稳定 JSON key 标识请求；state 保存该 key。返回值只有 state key 与当前 key 相同时才可见，effect cleanup/disposed 防止旧 Promise 提交；null 输入同步屏蔽 view/error。加载失败不恢复上一条成功数据，refresh 只重试当前请求。核对响应 project/source/run，草稿还需逐字段比较 compute selection（包含旧 approval_policy 默认值的现有 TS 规范化），不能仅比较 backend_id。
+- [x] **5. 接线三种入口。** DesktopApp 用现有纯 `currentComputeSelection()` 构造完整草稿，捕获配置未完成并传 null，不增加后端探测。容器需当前 project/image 对应的既有 `agentV4ComputeBackends` 响应：在该 effect 保存成功响应所属 `{projectId, containerImage}`，不匹配当前输入或 computeBusy 时草稿为 null，防止新 tag 临时搭配旧 image ID。该键只防止过期观察，不改变派发验证或偷偷发新请求。
 
 Composer Python/R 入口明确展示“下一次运行的配置”，用 `draft_selection`。给内部 `V4RunTrace` 增加 `onOpenRuntime?: (runId: string) => void` 并在当前、历史、轨迹各调用点传入；其按钮用自身 events 的 run_id 打开 `frozen_run`。WorkspaceShell 保存显式来源和语言，创建 request 传 hook；关闭或切换 project/conversation 后 request 为 null。已有 run 查询绝不使用 composer selection。
-- [ ] **6. 展示和 Escape。** RuntimeDialog 从 host view 渲染边界、来源、环境/策略；完整镜像身份可以放次级详情，不将配置当运行成功。只有 draft 且请求身份匹配的当前探测数据可单独标为“最近探测”；历史 view 全部显示该视图未执行验证，不携带当前 backend 状态。无 view/不完整/错误分别显示配置未完成、加载或可重试错误，不显示安全/可用承诺；frozen 模式禁用准备环境操作。沿用 `useWindowEscapeLayer`，从轨迹打开时 runtime 层须位于 trajectory 层之上，不能依赖 DOM focus。关闭只清空展示状态。
-- [ ] **7. GREEN 与完整验证。** 先重跑步骤 3 的定向命令；然后顺序执行 `cargo test --workspace`、`npm test`、`npm run build`、`npm run build:desktop`、`cargo fmt --all -- --check`、`git diff --check`。如仅格式失败，按 AGENTS.md 运行 fmt 并将纯格式变化单独提交；锁文件若变化必须 `npm ci`。不提交构建产物。
-- [ ] **8. 记录与提交。** 更新 spec/计划中实际命令结果；清楚记录真实模型、SSH、R/Micromamba、PBMC 验收是通过、失败或未执行，不能把 ignored 写成通过。完成 Windows 对话框/冻结来源/Escape smoke；若本机无法执行记录原因。Linux SSH 真环境按 `acceptance/README.md` 的一次性环境独立执行，缺条件不扩大权限或使用真实科研项目；macOS 未验证不承诺。提交 `feat(ui): show draft and frozen runtime boundaries`。
+- [x] **6. 展示和 Escape。** RuntimeDialog 从 host view 渲染边界、来源、环境/策略；完整镜像身份可以放次级详情，不将配置当运行成功。只有 draft 且请求身份匹配的当前探测数据可单独标为“最近探测”；历史 view 全部显示该视图未执行验证，不携带当前 backend 状态。无 view/不完整/错误分别显示配置未完成、加载或可重试错误，不显示安全/可用承诺；frozen 模式禁用准备环境操作。沿用 `useWindowEscapeLayer`，从轨迹打开时 runtime 层须位于 trajectory 层之上，不能依赖 DOM focus。关闭只清空展示状态。
+- [x] **7. GREEN 与完整验证。** 先重跑步骤 3 的定向命令；然后顺序执行 `cargo test --workspace`、`npm test`、`npm run build`、`npm run build:desktop`、`cargo fmt --all -- --check`、`git diff --check`。如仅格式失败，按 AGENTS.md 运行 fmt 并将纯格式变化单独提交；锁文件若变化必须 `npm ci`。不提交构建产物。
+- [x] **8. 记录与提交。** 更新 spec/计划中实际命令结果；清楚记录真实模型、SSH、R/Micromamba、PBMC 验收是通过、失败或未执行，不能把 ignored 写成通过。完成 Windows 对话框/冻结来源/Escape smoke；若本机无法执行记录原因。Linux SSH 真环境按 `acceptance/README.md` 的一次性环境独立执行，缺条件不扩大权限或使用真实科研项目；macOS 未验证不承诺。提交 `feat(ui): show draft and frozen runtime boundaries`。
 
 ## 自审与交接
 
 三个任务覆盖 spec 第 4 节全部首期契约；第 7 节服务器沙盒保持后续方向。核心不新增 DTO 依赖、模型工具、运行状态机或持久表。五项 Review Focus 均已归入对应失败测试，前端不会把当前探测当历史事实，查询不会因历史 SSH 改绑而拒绝说明。
 
-本计划尚未实施；编写计划不构成测试已通过。请用户审查计划是否准确体现已确认设计；获得审查确认后按已约定的模型分工和逐项验证/提交方式执行。
+用户已确认按此计划执行。实施与验证进度逐项记录；编写计划和勾选步骤本身不构成测试证据，完成情况以实际命令与结果为准。
+
+## 实施结果
+
+三个实施切片分别提交为 `d5f1ee0`、`660f9a9`、`4f6cf9a`，任务审查与整分支终审通过。实际验证、首次测试失败与复跑结果、未执行的真实环境和原生 GUI smoke 见[设计第 8 节](../specs/2026-09-26-wisp-agent-runtime-sandbox-design.md#8-本次工作与验证记录)。
+
+保留分支 `codex/wisp-agent-sandbox`；未合并、推送或发布。
+
+实施时的执行判断（按作出顺序记录）：
+
+1. 沿用用户指定的新分支及当前 checkout，不另建 worktree；若出现其他编辑并发，需通过差异复核解决冲突。`website/` 保持不动。
+2. 设计文档阶段复用本会话已通过的基线，代码阶段另做定向和最终检查；若基线判断有误，最终检查需重新定位回归。
+3. 由主任务在测试和审查通过后集中提交，实施代理不提交；代价是提交时间晚于代码完成，但每个切片仍独立提交。
+4. 各切片先跑相邻测试，完整检查集中执行；代价是跨模块问题可能直到完整检查才暴露。
+5. 格式化仅涉及本次新增代码，随功能提交；若有既有代码的纯格式变化则应拆成独立提交，本次未发现此类差异。
+6. UI 实施时并行验证已经稳定的 Rust 代码；若后来改动 Rust，必须重跑相关检查。本次后续只有前端改动。
+7. 审查新增的测试先只重跑受影响文件，生产代码未改变；为覆盖可能的测试间影响，交付前又将全部新增用例纳入最后一次 `npm test`。

@@ -1,6 +1,6 @@
 # 生信 Agent 运行边界与生命周期设计
 
-日期：2026-09-26。状态：**用户已确认设计，实施计划待审，尚未实施产品代码**。
+日期：2026-09-26。状态：**三项切片已实施、分别提交并通过审查；确定性验证与 Windows 打包通过，真实环境及手工验收限制见第 8 节**。
 
 实施计划：[Agent Runtime Boundaries Implementation Plan](../plans/2026-09-26-wisp-agent-runtime-boundaries.md)。
 
@@ -133,8 +133,25 @@ Windows 手工 smoke：检查本机/SSH/容器草稿说明，发起一次运行�
 
 ## 8. 本次工作与验证记录
 
-本次仅完成参考源码核对、现有边界分析及设计草案；未实施上述产品变更。
+用户已确认设计及三项实施计划。第一项已完成并提交为 `d5f1ee0`：宿主只读边界 DTO、投影和草稿/冻结运行查询。定向验证通过：DTO 30 项、桌面 runtime_boundary 6 项、DTO 契约 42 项。
 
-2026-09-26 基线验证由主任务执行：`cargo test --workspace` 通过（含明确 ignored 验收）；`npm test` 通过（893 项前端测试及 22 项桥接测试）；`npm run build` 通过，存在构建产物 chunk size 提示。它们是当前基线检查，不是本草案实现后的验证。
+第二项已完成并提交为 `660f9a9`：Agent 初始化前后复用同一宿主摘要。定向验证通过：桌面边界 9 项及随后新增的真实本地 factory 集成测试 1 项、惰性资源 3 项、core 边界 2 项、完整预算 3 项、远端作业 2 项（另有真实 SSH 测试 1 项 ignored）。core 新增测试在原实现上即通过，桌面格式化函数缺失提供 RED 证据；没有修改 core 生产逻辑。
 
-真实模型、SSH、R/Micromamba 和 PBMC 验收未执行；本次无产品代码/打包配置变更，`npm run build:desktop` 未执行。ignored 用例及成功 Web 构建不等于生产端到端验收。
+第三项已完成并提交为 `4f6cf9a`：原生 API、防过期查询 hook、草稿与冻结运行入口、运行边界双语说明和嵌套 Escape。未解析镜像或空镜像引用不发起查询；切换会话会清除旧对话框，修改草稿不会改变已查看的冻结运行。定向 UI 六文件测试 241 项通过；后续 DesktopApp 全文件 94 项通过，审查补充的冻结视图及四后端双语测试所在两文件 52 项通过。三个切片均经过独立审查，第三项的两处测试覆盖缺口已补齐并复审关闭。整分支 `98130fc..4f6cf9a` 终审通过，无需修复的 Critical、Important 或 Minor 问题；该结论不授权合并或发布。
+
+2026-09-26 实施后的完整验证：
+
+| 命令 | 实际结果 |
+| --- | --- |
+| `cargo test --workspace` | 1,324 通过，0 失败，12 ignored；针对最终 Rust 代码执行。 |
+| `npm test` | 首次 906 通过、1 失败；冻结生产代码后复跑为 907 项前端及 22 项桥接全部通过；纳入审查新增用例后的最终完整运行为 916 项前端及 22 项桥接全部通过。 |
+| `npx vitest run src/features/workspace/ComposerIntegration.test.tsx src/features/workspace/RuntimeDialog.test.tsx --reporter=dot` | 随后仅补充测试覆盖，两个受影响文件 52/52 通过；生产代码未再改变。 |
+| `npm run build` | 通过，TypeScript 与 Vite 生产构建完成。 |
+| `npm run build:desktop` | 通过，Windows x64 release 与 NSIS 打包完成；未发布、分发或安装产物。 |
+| `cargo fmt --all -- --check`、`git diff --check` | 通过。格式化仅涉及本次新增 Rust 代码，无独立的既有代码格式变更。 |
+
+首次前端全套失败位于未修改的 `SkillDetails` 嵌套 Escape 用例。精确命令 `npx vitest run src/features/settings/SkillDetails.test.tsx -t "closes the preview before details and the parent Escape layer"` 为 1 通过、10 项被过滤；之后完整复跑通过。失败未复现，现有日志不足以证明根因，没有据此修改该组件或宣称已修复。
+
+构建仍提示 Web chunk 大于 500 kB，以及 MSVC 创建导入库的 linker stdout；Rust workspace 编译另有一次增量缓存无法复用的访问提示。对应命令最终均以 0 退出。依赖锁文件未变化，未重复执行 `npm ci`。`website/` 未改动。
+
+真实模型、SSH、R/Micromamba、PBMC 验收未执行：当前进程未配置 `acceptance/README.md` 要求的一次性远端与模型验收环境变量。Windows 原生 GUI 手工 smoke 未执行，当前会话没有原生窗口交互工具；上述 jsdom 集成测试验证了草稿/冻结来源、切换与 Escape，但不替代原生端人工操作。macOS 未验证。ignored 用例、测试替身及成功构建均不等于生产端到端验收；服务器容器后端仍是第 7 节后续方向。

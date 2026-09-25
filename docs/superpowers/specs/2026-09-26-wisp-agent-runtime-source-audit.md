@@ -4,7 +4,7 @@
 
 固定提交：`b242fcbd1867551889643bfb7ee734dc48f7f5f1`。下文链接均固定到该提交和实际源码行；提案、README 不作为已实现能力证据。
 
-对应 [运行边界设计](2026-09-26-wisp-agent-runtime-sandbox-design.md) 与 [三项实施计划](../plans/2026-09-26-wisp-agent-runtime-boundaries.md)。设计已确认，实施计划仍待审；本轮没有实施产品代码。
+对应 [运行边界设计](2026-09-26-wisp-agent-runtime-sandbox-design.md) 与 [三项实施计划](../plans/2026-09-26-wisp-agent-runtime-boundaries.md)。源码核对阶段仅补充设计依据；随后用户已确认实施，实际进度与验证记录见设计和计划。
 
 ## 1. 对现方案的结论
 
