@@ -12,7 +12,8 @@
 .composer-input > .composer-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
 .composer-tool { width: 40px; height: 40px; padding: 0; border: 1px solid #d8d6cf; border-radius: 50%; background: #fff; color: #75766e; display: inline-flex; justify-content: center; align-items: center; flex: 0 0 auto; }
 .composer-tool:hover, .composer-tool[aria-expanded=true] { background: #eef7f5; border-color: #91bdb6; color: #12877e; }
-.composer-orbit { color: #6e7f91; }
+.composer-orbit { color: #23776f; border-color: #c5ddd7; background: #f3f9f7; transition: background .15s ease, border-color .15s ease, color .15s ease, box-shadow .15s ease; }
+.composer-orbit:hover, .composer-orbit[aria-expanded=true] { color: #086f65; border-color: #8dbfb4; background: #e9f5f1; box-shadow: 0 0 0 3px #0d948814; }
 .composer-tool.is-active { color: #118b81; }
 .fast-mode-toggle { color: #9a741c; }
 .fast-mode-toggle.is-active { color: #a86600; background: #fff7df; border-color: #e4be69; }

@@ -33,7 +33,7 @@ import remarkGfm from "remark-gfm";
 import {
   Activity, Bot, Check, ChevronRight, ClipboardList, Copy, Expand, FileBarChart, FileText,
   Folder, Hand, NotebookPen, Plus,
-  Search, Settings, Shield, ShieldAlert, ShieldCheck, Square, X, SlidersHorizontal, Monitor, ChevronDown, Gauge, PanelRight, Zap,
+  Search, Settings, Shield, ShieldAlert, ShieldCheck, Square, X, Monitor, ChevronDown, Gauge, PanelRight, Zap,
 } from "lucide-react";
 import { copy, type Locale } from "./copy";
 import type { AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, BrowserApprovalScopeV4, ComposerWorkflowTemplate, ComputeBackendAvailabilityV4, ConversationCapabilitiesV4, FormalStepProposal, KernelEvent, KernelLanguage, KernelSession, MemoryFact, ModelProfile, NotebookEntry, ProposedPlanRevisionV4, ProjectArtifact, ProjectImagePreview, RunSummaryV4, SessionAgentModeV4, SyncEntry, WorkspaceConversation } from "../../types";
@@ -1103,7 +1103,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
           <div className="composer-toolbar">
             <div className="composer-menu-anchor"><button className="composer-tool" aria-label={zh ? "添加上下文或选择模式" : "Add context or choose mode"} aria-expanded={composerMenuOpen} onClick={() => { const next = !composerMenuOpen; closeComposerMenus(); setComposerMenuOpen(next); }}><Plus size={20} /></button>{composerMenuOpen && <ComposeActions zh={zh} onClose={() => setComposerMenuOpen(false)} onAttach={activeConversationId && !composerDisabled ? () => { void attachments.chooseFiles(); } : undefined} onFiles={openProjectFiles} onReview={() => setReviewDialogOpen(true)} onShare={messages.length ? () => setSharing(true) : undefined} onSaveSkill={composerDisabled ? undefined : prepareSkill} onManageWorkflows={() => setWorkflowLibraryOpen(true)} onManageSkills={onOpenSettings ? () => onOpenSettings("skills") : undefined} />}</div>
             <div className="composer-menu-anchor permission-anchor">
-              <button className="composer-tool composer-orbit" title={zh ? "Agent 控制" : "Agent controls"} aria-label={zh ? "Agent 权限" : "Agent permissions"} aria-expanded={permissionMenuOpen} onClick={() => { const next = !permissionMenuOpen; closeComposerMenus(); setPermissionMenuOpen(next); }}><SlidersHorizontal size={21} /></button>
+              <button className="composer-tool composer-orbit" title={zh ? "Agent 控制" : "Agent controls"} aria-label={zh ? "Agent 权限" : "Agent permissions"} aria-expanded={permissionMenuOpen} onClick={() => { const next = !permissionMenuOpen; closeComposerMenus(); setPermissionMenuOpen(next); }}><Settings size={20} strokeWidth={2.1} /></button>
               {permissionMenuOpen && <div className="permission-menu" role="menu" aria-label={zh ? "Agent 权限选项" : "Agent permission options"}>
                 <button className="agent-control-row" role="menuitemcheckbox" aria-checked={planModeEnabled} disabled={modeLocked} onClick={() => chooseMode(planModeEnabled ? "agent" : "plan")}><span>{zh ? "先做计划" : "Plan first"}</span><i className={`control-switch ${planModeEnabled ? "is-on" : ""}`} /></button>
                 <header><b>{zh ? "应如何批准 Agent 操作？" : "How should Agent actions be approved?"}</b><small>{selectedBackend?.descriptor.kind.toUpperCase() ?? "—"}</small></header>
