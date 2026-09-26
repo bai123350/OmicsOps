@@ -131,6 +131,21 @@ deadlines. Final checks passed: `cargo test --workspace` (1,306 passed, 12 ignor
 `npm test` (893 frontend and 22 bridge tests), `npm run build`,
 `npm run build:desktop`, and `cargo fmt --all -- --check`. No SSH acceptance was run.
 
+On 2026-09-26, after matching output reservations to selected reasoning effort,
+the exact ignored OpenCode command above was executed with the saved
+`deepseek-v4.1-flash` profile and its `max` effort. The first isolated run failed
+after 172.16 seconds because the provider response stream ended after partial
+output (`error decoding response body`). A second fresh temporary run passed
+1/1 in 67.62 seconds (exit 0), read the nonce file exactly once, returned the
+nonce, and recorded `RunCompleted`. Both outcomes are retained; the pass is not
+a claim that provider stream failures or arbitrary long-output truncation are
+eliminated. No original research project or user database was modified.
+
+Deterministic checks passed: `cargo test --workspace` (1,356 passed, 12 ignored),
+`npm test` (944 frontend and 22 bridge tests), `npm run build`,
+`npm run build:desktop`, and `cargo fmt --all -- --check`. This small live test
+does not validate the original miRNA literature workflow, SSH, or native UI.
+
 ## Agent Runtime V4 stage-1 acceptance
 
 `agent_v4::tests::live_v4_model_plan_and_persistent_ssh_python_kernel` uses the
