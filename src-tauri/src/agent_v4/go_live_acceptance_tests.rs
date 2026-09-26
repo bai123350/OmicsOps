@@ -23,7 +23,7 @@ use uuid::Uuid;
 use super::{AppState, DirectRunSnapshotV4, StartDirectV4Request, compose, prepare_direct_run_v4};
 
 const GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
-const GO_MODELS: [&str; 2] = ["glm-5.3", "glm-5.3-flash"];
+const GO_MODELS: [&str; 3] = ["glm-5.3", "glm-5.3-flash", "deepseek-v4.1-flash"];
 
 fn go_acceptance_model_allowed(model: &str) -> bool {
     GO_MODELS.contains(&model)
@@ -33,8 +33,14 @@ fn go_acceptance_model_allowed(model: &str) -> bool {
 fn live_go_acceptance_model_allowlist_is_exact() {
     assert!(go_acceptance_model_allowed("glm-5.3"));
     assert!(go_acceptance_model_allowed("glm-5.3-flash"));
+    assert!(go_acceptance_model_allowed("deepseek-v4.1-flash"));
     assert!(!go_acceptance_model_allowed("glm-5.3-flash-preview"));
     assert!(!go_acceptance_model_allowed("vendor/glm-5.3"));
+    assert!(!go_acceptance_model_allowed("deepseek-v4.1"));
+    assert!(!go_acceptance_model_allowed(
+        "deepseek-v4.1-flash-vision-exp"
+    ));
+    assert!(!go_acceptance_model_allowed("vendor/deepseek-v4.1-flash"));
 }
 
 struct TemporaryEventStore {
@@ -243,15 +249,19 @@ fn refreshed_go_profile(source: &ModelProfile) -> Result<ModelProfile, String> {
         .catalog_capabilities
         .as_ref()
         .ok_or("the selected endpoint/model has no exact trusted entry in the compiled catalog")?;
+    let expected_output_limit = if source.model == "deepseek-v4.1-flash" {
+        384_000
+    } else {
+        131_072
+    };
     if capabilities.source_provider != "opencode-go"
         || capabilities.context_limit != 1_000_000
-        || capabilities.output_limit != 131_072
+        || capabilities.output_limit != expected_output_limit
         || !refreshed.supports_tools
     {
-        return Err(
-            "the compiled OpenCode Go model catalog contract is not context=1000000, output=131072, tools=true"
-                .into(),
-        );
+        return Err(format!(
+            "the compiled OpenCode Go model catalog contract is not context=1000000, output={expected_output_limit}, tools=true"
+        ));
     }
     if refreshed.effective_context_window_tokens() != 1_000_000 {
         return Err(

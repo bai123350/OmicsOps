@@ -35,8 +35,8 @@ exchange, rather than the smaller connection probe. Run the deterministic suite
 first. In the same Windows user session as OmicsOps, set
 `OMICSOPS_LIVE_MODEL_PROFILE_ID` to the UUID of an existing saved profile whose
 exact protocol, endpoint, and model are `open_ai_compatible`,
-`https://opencode.ai/zen/go/v1`, and either `glm-5.3` or
-`glm-5.3-flash`. These are exact allowlisted IDs; aliases, prefixes and longer
+`https://opencode.ai/zen/go/v1`, and one of `glm-5.3`, `glm-5.3-flash`, or
+`deepseek-v4.1-flash`. These are exact allowlisted IDs; aliases, prefixes and longer
 sibling IDs are rejected. Its API key must already exist in Windows Credential
 Manager, and the profile must not impose a context bound below the compiled
 1,000,000-token catalog limit.
@@ -44,7 +44,8 @@ Manager, and the profile must not impose a context bound below the compiled
 The test opens only that profile row from
 `%APPDATA%/io.omicsops.desktop/omicsops.db` through a read-only SQLite connection.
 It explicitly rebuilds the profile in a temporary Store with the current trusted
-catalog snapshot (1,000,000 context, 131,072 output), while retaining the saved
+catalog snapshot (1,000,000 context; 131,072 output for the two GLM IDs and
+384,000 output for the exact DeepSeek ID), while retaining the saved
 keyring reference. It never opens the user database through `Store`, writes to the
 user database, prints the credential, uses SSH, or touches an existing project.
 The temporary project contains one random nonce file; the prompt names the file
@@ -57,6 +58,11 @@ text. For `glm-5.3`, at least one nonempty preview must arrive before that model
 attempt's result event.
 The `glm-5.3-flash` profile reports the observation without requiring reasoning,
 because a valid response may omit it.
+The DeepSeek profile also reports observation counts without requiring reasoning
+previews. It retains the saved reasoning effort; at `max`, the application output
+reservation is 65,536 tokens, subject to the exact catalog and context bounds.
+The profile and its configuration hash are frozen only in the temporary Store;
+the original conversation and its historical runs are not resumed or modified.
 
 ```text
 cargo test -p omicsops-desktop agent_v4::go_live_acceptance_tests::live_opencode_go_agent_reads_file_and_returns_nonce -- --ignored --exact --nocapture
