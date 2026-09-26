@@ -895,9 +895,42 @@ pub struct ModelProbeResult {
     pub response_preview: String,
 }
 
+fn is_reviewed_glm_base_url(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.host_str() == Some("open.bigmodel.cn")
+        && url.port_or_known_default() == Some(443)
+        && matches!(
+            url.path(),
+            "/api/paas/v4" | "/api/paas/v4/" | "/api/coding/paas/v4" | "/api/coding/paas/v4/"
+        )
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
+fn is_local_lm_studio_base_url(url: &Url) -> bool {
+    url.scheme() == "http"
+        && matches!(
+            url.host(),
+            Some(url::Host::Domain("localhost"))
+                | Some(url::Host::Ipv4(std::net::Ipv4Addr::LOCALHOST))
+                | Some(url::Host::Ipv6(std::net::Ipv6Addr::LOCALHOST))
+        )
+        && url.port() == Some(1234)
+        && matches!(url.path(), "/" | "/v1" | "/v1/")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
 pub fn provider_endpoint(protocol: ProviderProtocol, mut base_url: Url) -> AdapterResult<Url> {
     let path = base_url.path().trim_end_matches('/');
     let suffix = match protocol {
+        ProviderProtocol::OpenAiCompatible if is_reviewed_glm_base_url(&base_url) => {
+            "chat/completions"
+        }
         ProviderProtocol::OpenAiCompatible if path.ends_with("/v1") => "chat/completions",
         ProviderProtocol::OpenAiCompatible => "v1/chat/completions",
         ProviderProtocol::Anthropic if path.ends_with("/v1") => "messages",
@@ -919,6 +952,7 @@ pub fn provider_models_endpoint(
 ) -> AdapterResult<Url> {
     let path = base_url.path().trim_end_matches('/');
     let suffix = match protocol {
+        ProviderProtocol::OpenAiCompatible if is_reviewed_glm_base_url(&base_url) => "models",
         ProviderProtocol::OpenAiCompatible | ProviderProtocol::Anthropic
             if path.ends_with("/v1") =>
         {
@@ -1006,10 +1040,11 @@ fn build_provider_request_with_optional_budget(
                 };
                 body[output_field] = json!(budget.reserved_output_tokens);
             }
+            let requires_credential = !is_local_lm_studio_base_url(&base_url);
             Ok(ProviderRequest {
                 endpoint: provider_endpoint(protocol, base_url)?,
                 body,
-                requires_credential: true,
+                requires_credential,
             })
         }
         ProviderProtocol::Anthropic => {
@@ -2198,9 +2233,10 @@ impl UnifiedModelClient {
             ProviderProtocol::Anthropic => builder
                 .header("x-api-key", self.credential.as_deref().unwrap_or_default())
                 .header("anthropic-version", "2023-06-01"),
-            ProviderProtocol::OpenAiCompatible => {
-                builder.bearer_auth(self.credential.as_deref().unwrap_or_default())
-            }
+            ProviderProtocol::OpenAiCompatible => match self.credential.as_deref() {
+                Some(secret) if !secret.trim().is_empty() => builder.bearer_auth(secret),
+                _ => builder,
+            },
             ProviderProtocol::Ollama => builder,
         }
     }
@@ -2213,6 +2249,8 @@ impl UnifiedModelClient {
         credential: Option<String>,
     ) -> AdapterResult<Self> {
         if protocol != ProviderProtocol::Ollama
+            && !(protocol == ProviderProtocol::OpenAiCompatible
+                && is_local_lm_studio_base_url(&base_url))
             && credential
                 .as_deref()
                 .is_none_or(|value| value.trim().is_empty())
@@ -2221,7 +2259,9 @@ impl UnifiedModelClient {
                 "model provider credential is required".into(),
             ));
         }
-        let opencode_go = is_opencode_go_base_url(&base_url);
+        let prevent_redirect = is_opencode_go_base_url(&base_url)
+            || (protocol == ProviderProtocol::OpenAiCompatible
+                && is_local_lm_studio_base_url(&base_url));
         Ok(Self {
             profile_id,
             protocol,
@@ -2235,7 +2275,7 @@ impl UnifiedModelClient {
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
                 .timeout(MODEL_REQUEST_TIMEOUT)
-                .redirect(if opencode_go {
+                .redirect(if prevent_redirect {
                     reqwest::redirect::Policy::none()
                 } else {
                     reqwest::redirect::Policy::limited(10)
@@ -3186,6 +3226,253 @@ mod fast_mode_tests {
             let unsupported = client("gpt-5.6-luna", base_url).with_fast_mode(Some(true));
             assert!(unsupported.build_provider_request(&request()).is_err());
             assert!(unsupported.probe_body().is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod local_openai_auth_tests {
+    use super::*;
+
+    #[test]
+    fn lm_studio_exact_loopback_accepts_no_key_and_omits_authorization() {
+        for base in [
+            "http://localhost:1234",
+            "http://localhost:1234/v1/",
+            "http://127.0.0.1:1234/v1",
+            "http://[::1]:1234/v1",
+        ] {
+            let client = UnifiedModelClient::new(
+                Uuid::new_v4(),
+                ProviderProtocol::OpenAiCompatible,
+                Url::parse(base).unwrap(),
+                "local-model",
+                None,
+            )
+            .unwrap();
+            let request = client
+                .get_request(
+                    provider_models_endpoint(client.protocol, client.base_url.clone()).unwrap(),
+                )
+                .build()
+                .unwrap();
+            assert!(
+                request
+                    .headers()
+                    .get(reqwest::header::AUTHORIZATION)
+                    .is_none(),
+                "{base}"
+            );
+            let post = client
+                .post_json_request(
+                    provider_endpoint(client.protocol, client.base_url.clone()).unwrap(),
+                    &json!({"model":"local-model"}),
+                )
+                .build()
+                .unwrap();
+            assert!(
+                post.headers().get(reqwest::header::AUTHORIZATION).is_none(),
+                "{base}"
+            );
+            let built = build_provider_request_with_tools(
+                client.protocol,
+                client.base_url.clone(),
+                "local-model",
+                &ProviderModelRequest {
+                    system: "test".into(),
+                    messages: vec![],
+                    tools: vec![],
+                    require_strict_json_fallback: false,
+                },
+            )
+            .unwrap();
+            assert!(!built.requires_credential, "{base}");
+        }
+    }
+
+    #[tokio::test]
+    async fn local_lm_studio_client_does_not_follow_redirects() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let client = UnifiedModelClient::new(
+            Uuid::new_v4(),
+            ProviderProtocol::OpenAiCompatible,
+            Url::parse("http://localhost:1234/v1").unwrap(),
+            "local-model",
+            None,
+        )
+        .unwrap();
+        let response = client
+            .get_request(Url::parse(&format!("http://127.0.0.1:{port}/models")).unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn only_exact_lm_studio_loopback_allows_missing_key() {
+        for base in [
+            "http://localhost:1235/v1",
+            "http://localhost:1234/other",
+            "http://localhost:1234/v1?mode=test",
+            "http://user@localhost:1234/v1",
+            "http://localhost.example:1234/v1",
+            "https://localhost:1234/v1",
+            "http://127.0.0.2:1234/v1",
+        ] {
+            assert!(
+                UnifiedModelClient::new(
+                    Uuid::new_v4(),
+                    ProviderProtocol::OpenAiCompatible,
+                    Url::parse(base).unwrap(),
+                    "local-model",
+                    None,
+                )
+                .is_err(),
+                "{base}"
+            );
+        }
+        let client = UnifiedModelClient::new(
+            Uuid::new_v4(),
+            ProviderProtocol::OpenAiCompatible,
+            Url::parse("http://localhost:1234/v1").unwrap(),
+            "local-model",
+            Some("optional-secret".into()),
+        )
+        .unwrap();
+        let request = client
+            .get_request(
+                provider_models_endpoint(client.protocol, client.base_url.clone()).unwrap(),
+            )
+            .build()
+            .unwrap();
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .unwrap(),
+            "Bearer optional-secret"
+        );
+    }
+
+    #[test]
+    fn reviewed_glm_paths_append_chat_and_models_without_inserting_v1() {
+        for (base, chat, models) in [
+            (
+                "https://open.bigmodel.cn/api/paas/v4",
+                "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+                "https://open.bigmodel.cn/api/paas/v4/models",
+            ),
+            (
+                "https://open.bigmodel.cn/api/coding/paas/v4/",
+                "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
+                "https://open.bigmodel.cn/api/coding/paas/v4/models",
+            ),
+        ] {
+            let url = Url::parse(base).unwrap();
+            assert_eq!(
+                provider_endpoint(ProviderProtocol::OpenAiCompatible, url.clone())
+                    .unwrap()
+                    .as_str(),
+                chat
+            );
+            assert_eq!(
+                provider_models_endpoint(ProviderProtocol::OpenAiCompatible, url)
+                    .unwrap()
+                    .as_str(),
+                models
+            );
+        }
+        let unknown = Url::parse("https://other.example/api/paas/v4").unwrap();
+        assert_eq!(
+            provider_endpoint(ProviderProtocol::OpenAiCompatible, unknown.clone())
+                .unwrap()
+                .as_str(),
+            "https://other.example/api/paas/v4/v1/chat/completions"
+        );
+        assert_eq!(
+            provider_models_endpoint(ProviderProtocol::OpenAiCompatible, unknown)
+                .unwrap()
+                .as_str(),
+            "https://other.example/api/paas/v4/v1/models"
+        );
+    }
+
+    #[test]
+    fn other_platform_presets_keep_their_wire_request_paths() {
+        for (protocol, base, expected) in [
+            (
+                ProviderProtocol::OpenAiCompatible,
+                "https://api.openai.com/v1",
+                "https://api.openai.com/v1/chat/completions",
+            ),
+            (
+                ProviderProtocol::OpenAiCompatible,
+                "https://api.deepseek.com/v1",
+                "https://api.deepseek.com/v1/chat/completions",
+            ),
+            (
+                ProviderProtocol::OpenAiCompatible,
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+            ),
+            (
+                ProviderProtocol::OpenAiCompatible,
+                "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+                "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions",
+            ),
+            (
+                ProviderProtocol::OpenAiCompatible,
+                "https://api.moonshot.cn/v1",
+                "https://api.moonshot.cn/v1/chat/completions",
+            ),
+            (
+                ProviderProtocol::OpenAiCompatible,
+                "https://api.kimi.com/coding/v1",
+                "https://api.kimi.com/coding/v1/chat/completions",
+            ),
+            (
+                ProviderProtocol::OpenAiCompatible,
+                "https://openrouter.ai/api/v1",
+                "https://openrouter.ai/api/v1/chat/completions",
+            ),
+            (
+                ProviderProtocol::OpenAiCompatible,
+                "http://127.0.0.1:1234/v1",
+                "http://127.0.0.1:1234/v1/chat/completions",
+            ),
+            (
+                ProviderProtocol::Anthropic,
+                "https://api.minimax.cn/anthropic",
+                "https://api.minimax.cn/anthropic/v1/messages",
+            ),
+            (
+                ProviderProtocol::Anthropic,
+                "https://api.minimax.io/anthropic",
+                "https://api.minimax.io/anthropic/v1/messages",
+            ),
+            (
+                ProviderProtocol::Ollama,
+                "http://127.0.0.1:11434/",
+                "http://127.0.0.1:11434/api/chat",
+            ),
+        ] {
+            assert_eq!(
+                provider_endpoint(protocol, Url::parse(base).unwrap())
+                    .unwrap()
+                    .as_str(),
+                expected,
+                "{base}"
+            );
         }
     }
 }

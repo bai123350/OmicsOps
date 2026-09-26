@@ -1,9 +1,6 @@
 use omicsops_adapters::{
     credentials::{CredentialVault, credential_account},
-    llm::{
-        MODEL_PROBE_OUTPUT_TOKENS, ModelProbeResult, ProviderProtocol, RequestBudget,
-        UnifiedModelClient,
-    },
+    llm::{MODEL_PROBE_OUTPUT_TOKENS, ModelProbeResult, RequestBudget, UnifiedModelClient},
 };
 use omicsops_core::workspace::{ModelProfile, ModelProviderKind};
 use tauri::State;
@@ -331,43 +328,17 @@ async fn client_for_profile(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "model profile not found".to_string())?;
-    if profile.fast_mode == Some(true) && !profile.supports_fast_mode() {
-        return Err(
-            "explicit Fast mode requires an exact supported OpenAI endpoint and model".into(),
-        );
-    }
-    let credential = match &profile.credential_reference {
-        Some(reference) => state
-            .credentials
-            .get(reference)
-            .map_err(|error| error.to_string())?,
-        None => None,
-    };
-    let protocol = match profile.provider {
-        ModelProviderKind::Anthropic => ProviderProtocol::Anthropic,
-        ModelProviderKind::OpenAiCompatible => ProviderProtocol::OpenAiCompatible,
-        ModelProviderKind::Ollama => ProviderProtocol::Ollama,
-    };
     let budget = catalog_probe_budget(&profile);
-    UnifiedModelClient::new(
-        profile.id,
-        protocol,
-        Url::parse(&profile.base_url).map_err(|error| error.to_string())?,
-        profile.model,
-        credential,
-    )
-    .and_then(|client| client.with_reasoning_effort(profile.reasoning_effort))
-    .map(|client| client.with_fast_mode(profile.fast_mode))
-    .map(|client| match budget {
+    crate::commands::unified_model_client_for_profile(state, &profile).map(|client| match budget {
         Some(budget) => client.with_request_budget(budget),
         None => client,
     })
-    .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omicsops_adapters::credentials::MemoryCredentialVault;
 
     fn request(provider: &str, base_url: &str, model: &str) -> SaveModelProfileRequest {
         SaveModelProfileRequest {
@@ -383,6 +354,31 @@ mod tests {
             fast_mode: None,
             delegated_model_profile_id: None,
         }
+    }
+
+    #[test]
+    fn saved_local_profile_with_empty_keyring_reference_reaches_runtime_client() {
+        let vault = MemoryCredentialVault::default();
+        let local = model_profile_from_request(request(
+            "open_ai_compatible",
+            "http://127.0.0.1:1234/v1",
+            "local-model",
+        ))
+        .unwrap();
+        assert!(local.credential_reference.is_some());
+        assert!(
+            crate::commands::unified_model_client_for_profile_with_vault(&vault, &local).is_ok()
+        );
+
+        let remote = model_profile_from_request(request(
+            "open_ai_compatible",
+            "https://gateway.example/v1",
+            "remote-model",
+        ))
+        .unwrap();
+        assert!(
+            crate::commands::unified_model_client_for_profile_with_vault(&vault, &remote).is_err()
+        );
     }
 
     #[test]

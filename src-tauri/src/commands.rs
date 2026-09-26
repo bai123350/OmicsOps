@@ -344,14 +344,20 @@ pub(crate) fn unified_model_client_for_profile(
     state: &AppState,
     profile: &omicsops_core::workspace::ModelProfile,
 ) -> Result<UnifiedModelClient, String> {
+    unified_model_client_for_profile_with_vault(&state.credentials, profile)
+}
+
+pub(crate) fn unified_model_client_for_profile_with_vault(
+    credentials: &dyn CredentialVault,
+    profile: &omicsops_core::workspace::ModelProfile,
+) -> Result<UnifiedModelClient, String> {
     if profile.fast_mode == Some(true) && !profile.supports_fast_mode() {
         return Err(
             "explicit Fast mode requires an exact supported OpenAI endpoint and model".into(),
         );
     }
     let credential = match &profile.credential_reference {
-        Some(reference) => state
-            .credentials
+        Some(reference) => credentials
             .get(reference)
             .map_err(|error| error.to_string())?,
         None => None,
