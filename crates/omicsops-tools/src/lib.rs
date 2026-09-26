@@ -434,12 +434,16 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "agent.read_tool_result",
-            "Read a bounded page of an original tool outcome or delegation trace from this run using its result_reference. Delegation traces use field data. Offsets and limits are UTF-8 bytes; use next_offset for the next page. Cannot read other runs or arbitrary files.",
+            "Read a bounded page of an original tool outcome or delegation trace from this run using its result_reference. For a successful search_mcp_tools result, use mcp_selector {view:directory} to browse compact server/tool names, optionally filtered by server_id; then use {view:tool,server_id,tool_name} to read exactly one complete original tool entry and schema. Keep field=data and follow next_offset if a page is partial. Offsets and limits are UTF-8 bytes. Cannot read other runs or arbitrary files.",
             ToolEffectV4::ReadOnly,
             json!({"type":"object","required":["sequence","event_hash","field","offset","limit"],"properties":{
                 "sequence":{"type":"integer","minimum":0},"event_hash":{"type":"string","minLength":1},
                 "field":{"type":"string","enum":["model_content","data"]},
-                "offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":4,"maximum":8192}
+                "offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":4,"maximum":8192},
+                "mcp_selector":{"oneOf":[
+                    {"type":"object","required":["view"],"properties":{"view":{"const":"directory"},"server_id":{"type":"string","minLength":1}},"additionalProperties":false},
+                    {"type":"object","required":["view","server_id","tool_name"],"properties":{"view":{"const":"tool"},"server_id":{"type":"string","minLength":1},"tool_name":{"type":"string","minLength":1}},"additionalProperties":false}
+                ]}
             }}),
         ),
         descriptor(

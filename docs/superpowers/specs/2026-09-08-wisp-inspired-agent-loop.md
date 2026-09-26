@@ -24,6 +24,8 @@
 
 用户要求本次工作中的简单任务和子 agent 使用 Luna、max 推理。它是开发执行偏好，不自动成为 OmicsOps 产品的默认模型。产品侧如需同样策略，应通过可配置 profile 绑定，并校验供应商精确模型 ID 和支持的推理档位；不把 Codex 内部模型别名直接写进供应商请求。
 
+2026-09-26 补充：成功的 MCP discovery 投影为带完整 server/tool 名称和简短描述的分页目录，保留原始事件引用。`agent.read_tool_result` 的可选 `mcp_selector` 在 `field=data` 时支持 `{view:"directory",server_id?}` 和 `{view:"tool",server_id,tool_name}`，分别读取精简目录和一个完整原始工具条目（含 schema 与绑定摘要）。选择发生在现有身份、hash 和事件完整性校验之后，且仅适用于成功的 `search_mcp_tools` 结果；无 selector 的原文分页及委派 trace 读取保持兼容。目录后续页继续使用相同 selector 与 `next_offset`，大 schema 也须翻页。完整原始事件仍用于绑定和审批，Plan 模式继续不暴露该读取工具。诊断、源码对照和验证见 [文献调研效率记录](2026-09-26-research-agent-efficiency.md)。
+
 ## 2. 参考证据
 
 通过 GitHub 插件读取 `xuzhougeng/wisp-science`，固定参考提交为 `31cc9457876b1f44d45542c27a82bc035f167bbb`。以下为实际读取的实现，不把 README 或设计愿景当作运行结果。

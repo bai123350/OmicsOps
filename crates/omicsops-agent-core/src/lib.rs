@@ -4360,7 +4360,7 @@ impl AgentCoreV4<'_> {
         system.push_str("\nCall search_mcp_tools at most once: it returns the complete enabled tool directory. Filter that directory locally; additional discovery queries cannot reveal unconfigured services.");
         let discovered = events.iter().any(|event| matches!(&event.event, AgentEventKindV4::ToolFinished { outcome } if outcome.tool_id == "search_mcp_tools" && outcome.succeeded));
         if discovered {
-            system.push_str("\nThe MCP directory has already been discovered. Filter that result and invoke its tools; do not repeat search_mcp_tools. Use agent.read_tool_result to read the original directory if compacted. Actual paper search, pagination and fetching records are separate from tool discovery.");
+            system.push_str("\nThe MCP directory has already been discovered. Filter that result and invoke its tools; do not repeat search_mcp_tools. Its compact result_reference can be paged with agent.read_tool_result and mcp_selector {view:directory}; select one complete original tool schema with mcp_selector {view:tool,server_id,tool_name}. Use field=data and next_offset for partial pages. Actual paper search, pagination and fetching records are separate from tool discovery.");
         }
         let blocked = failed_mcp_servers(events);
         let servers: std::collections::BTreeSet<String> = events
@@ -15775,6 +15775,166 @@ mod tests {
                 .any(|tool| tool.id == "agent.read_tool_result")
         );
         assert!(request.system.contains("do not repeat search_mcp_tools"));
+    }
+    struct SelectiveMcpModel {
+        turns: AtomicUsize,
+    }
+    #[async_trait]
+    impl ModelPortV4 for SelectiveMcpModel {
+        async fn stream(
+            &self,
+            request: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            let turn = self.turns.fetch_add(1, AtomicOrdering::SeqCst);
+            let context: Value = serde_json::from_str(&request.context).unwrap();
+            let events = context["recent_events"].as_array().unwrap();
+            let (tool_id, arguments) = match turn {
+                0 => ("search_mcp_tools", json!({"query":"papers"})),
+                1 => {
+                    assert!(
+                        !request
+                            .tools
+                            .iter()
+                            .any(|tool| tool.id == "search_mcp_tools")
+                    );
+                    assert!(request.system.contains("mcp_selector"));
+                    let projected = events
+                        .iter()
+                        .find(|event| event["event"]["outcome"]["tool_id"] == "search_mcp_tools")
+                        .unwrap();
+                    let first_page = projected["event"]["outcome"]["data"]["content"]
+                        .as_str()
+                        .unwrap();
+                    assert!(
+                        first_page.contains("target_papers"),
+                        "target identity must be visible to model"
+                    );
+                    let reference = &projected["result_reference"];
+                    (
+                        "agent.read_tool_result",
+                        json!({"sequence":reference["sequence"], "event_hash":reference["event_hash"],
+                        "field":"data", "offset":0, "limit":8192,
+                        "mcp_selector":{"view":"tool","server_id":"literature","tool_name":"target_papers"}}),
+                    )
+                }
+                2 => {
+                    let page = events
+                        .iter()
+                        .rev()
+                        .find(|event| {
+                            event["event"]["outcome"]["tool_id"] == "agent.read_tool_result"
+                        })
+                        .unwrap();
+                    let entry: Value = serde_json::from_str(
+                        page["event"]["outcome"]["data"]["content"]
+                            .as_str()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(entry["input_schema"]["required"], json!(["query"]));
+                    assert_eq!(page["event"]["outcome"]["data"]["next_offset"], Value::Null);
+                    (
+                        "use_mcp_tool",
+                        json!({"server_id":entry["server_id"],"tool":entry["tool_name"],
+                        "arguments":{"query":"microRNA"},"fixture_approved":true}),
+                    )
+                }
+                3 => {
+                    let evidence = events
+                        .iter()
+                        .rev()
+                        .find(|event| event["event"]["outcome"]["tool_id"] == "use_mcp_tool")
+                        .unwrap();
+                    assert_eq!(
+                        evidence["event"]["outcome"]["data"]["records"][0]["pmid"],
+                        "123"
+                    );
+                    (
+                        "agent.complete",
+                        completion_arguments(evidence["sequence"].as_u64().unwrap()),
+                    )
+                }
+                _ => panic!("workflow exceeded four model calls"),
+            };
+            Ok(ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![ToolCallV4 {
+                    call_id: format!("turn-{turn}"),
+                    tool_id: tool_id.into(),
+                    arguments,
+                }],
+            })
+        }
+        async fn review(&self, _: ReviewerRequestV4) -> Result<ReviewerReportV4, ModelFailureV4> {
+            Ok(review(VerificationSeverityV4::Ok))
+        }
+    }
+    struct SelectiveMcpTools;
+    #[async_trait]
+    impl ToolPortV4 for SelectiveMcpTools {
+        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
+            ["search_mcp_tools", "agent.read_tool_result", "use_mcp_tool"]
+                .into_iter()
+                .map(|id| ToolDescriptorV4 {
+                    id: id.into(),
+                    description: id.into(),
+                    input_schema: json!({}),
+                    effect: ToolEffectV4::ReadOnly,
+                })
+                .collect()
+        }
+        fn effect(&self, _: &str) -> Option<ToolEffectV4> {
+            Some(ToolEffectV4::ReadOnly)
+        }
+        async fn execute(&self, _: RunModeV4, call: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            let data = match call.tool_id.as_str() {
+                "search_mcp_tools" => json!({"tools": (0..247).map(|index| json!({
+                    "server_id":"literature", "server_name":"Literature", "tool_name": if index == 0 { "target_papers".into() } else { format!("other_{index:03}") },
+                    "description":"Search articles", "input_schema":{"type":"object","required":["query"],"properties":{"query":{"type":"string","description":"x".repeat(1_200)}}},
+                    "tool_catalog_sha256":"catalog", "schema_sha256":format!("schema-{index}"),
+                })).collect::<Vec<_>>()}),
+                "use_mcp_tool" => {
+                    assert_eq!(call.arguments["catalog_sha256"], "catalog");
+                    assert_eq!(call.arguments["schema_sha256"], "schema-0");
+                    json!({"records":[{"pmid":"123","title":"microRNA evidence"}]})
+                }
+                other => panic!("unexpected fake external tool: {other}"),
+            };
+            Ok(ToolOutcomeV4 {
+                call_id: call.call_id,
+                tool_id: call.tool_id,
+                succeeded: true,
+                model_content: data.to_string(),
+                data,
+                provenance: vec!["synthetic-fixture".into()],
+            })
+        }
+    }
+    #[tokio::test]
+    async fn selective_mcp_workflow_completes_with_evidence_in_four_model_calls() {
+        let spec = ordinary_execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = SelectiveMcpModel {
+            turns: AtomicUsize::new(0),
+        };
+        AgentCoreV4 {
+            model: &model,
+            tools: &SelectiveMcpTools,
+            events: &store,
+            science: None,
+        }
+        .execute_with_limits(&spec, AgentLimitsV4::ordinary(8), &AtomicBool::new(false))
+        .await
+        .unwrap();
+        assert_eq!(model.turns.load(AtomicOrdering::SeqCst), 4);
+        let events = store.load_direct(spec.run_id).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::RunCompleted))
+        );
     }
     struct IterationSummaryModel {
         requests: Mutex<Vec<ModelRequestV4>>,
