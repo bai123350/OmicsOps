@@ -4445,7 +4445,10 @@ impl AgentCoreV4<'_> {
             .await
             .map_err(AgentCoreErrorV4::Store)?;
         let scientific_state = self.scientific_snapshot(spec.project_id).await?;
-        let latest_checkpoint = events.iter().rev().find_map(|event| match &event.event {
+        let scientific_value = serde_json::to_value(&scientific_state)
+            .map_err(|error| AgentCoreErrorV4::Science(error.to_string()))?;
+        let latest_checkpoint_event = events.iter().rev().find(|event| matches!(event.event, AgentEventKindV4::ContextCheckpointed { .. }));
+        let latest_checkpoint = latest_checkpoint_event.and_then(|event| match &event.event {
             AgentEventKindV4::ContextCheckpointed { checkpoint } => Some(checkpoint.clone()),
             _ => None,
         });
@@ -4491,17 +4494,44 @@ impl AgentCoreV4<'_> {
                 }
             })
             .collect::<Vec<_>>();
-        let candidate = serde_json::to_string(&json!({
+        let render_context = |checkpoint: Option<&ContextCheckpointV4>, recent: &[Value], science: &Value| {
+            serde_json::to_string(&json!({
             "frozen_plan": spec.plan,
             "compute_selection": spec.compute_selection,
-            "checkpoint": latest_checkpoint,
-            "recent_events": recent_views,
-            "scientific_state": scientific_state,
+            "checkpoint": checkpoint.map(context_views::checkpoint_view),
+            "recent_events": recent,
+            "scientific_state": science,
             "active_guidance": active_guidance,
         }))
-        .map_err(|e| AgentCoreErrorV4::Store(e.to_string()))?;
+        .map_err(|e| AgentCoreErrorV4::Store(e.to_string()))
+        };
+        let fit_scientific_view = |checkpoint: &ContextCheckpointV4, recent: &[Value], view: &Value, request_events: &[AgentEventV4]| {
+            let mut model_checkpoint = checkpoint.clone();
+            loop {
+                let context = render_context(Some(&model_checkpoint), recent, view)?;
+                match self.validate_execution_context(spec, &context, request_events, limits) {
+                    Ok(()) => return Ok(context),
+                    Err(error) if model_checkpoint.recent_steps.is_empty() => return Err(error),
+                    Err(_) => { model_checkpoint.recent_steps.remove(0); }
+                }
+            }
+        };
+        let candidate = render_context(latest_checkpoint.as_ref(), &recent_views, &scientific_value)?;
         if !force_compaction {
-            match self.validate_execution_context(spec, &candidate, &events, limits) {
+            let candidate_validation = self.validate_execution_context(spec, &candidate, &events, limits);
+            // A prior durable snapshot can supply the same bounded view after
+            // reopening, without repeatedly archiving an unchanged snapshot.
+            if limits.auto_compact && use_views && candidate_validation.is_err() {
+                if let Some(view) = latest_checkpoint_event.and_then(|event| context_views::scientific_state_view(spec, &scientific_value, event)) {
+                    let checkpoint = latest_checkpoint.as_ref().expect("checkpoint source");
+                    match fit_scientific_view(checkpoint, &recent_views, &view, &events) {
+                        Ok(projected) => return Ok(projected),
+                        Err(error) if recent.is_empty() && checkpoint.unresolved_errors == checkpoint_unresolved_errors(&events, true) => return Err(error),
+                        Err(_) => {}
+                    }
+                }
+            }
+            match candidate_validation {
                 Ok(()) => return Ok(candidate),
                 Err(error) if !limits.auto_compact => return Err(error),
                 Err(error)
@@ -4509,7 +4539,8 @@ impl AgentCoreV4<'_> {
                         // Older checkpoints may have exhausted recent
                         // steps while still retaining raw failed traces.
                         // Allow one rebuild with retrievable error views.
-                        checkpoint.recent_steps.is_empty()
+                        checkpoint.scientific_state == scientific_value
+                            && checkpoint.recent_steps.is_empty()
                             && (!use_views
                                 || checkpoint.unresolved_errors
                                     == checkpoint_unresolved_errors(&events, true))
@@ -4526,8 +4557,7 @@ impl AgentCoreV4<'_> {
             spec,
             &events,
             limits.checkpoint_recent_events,
-            serde_json::to_value(&scientific_state)
-                .map_err(|error| AgentCoreErrorV4::Science(error.to_string()))?,
+            scientific_value.clone(),
         );
         if use_views {
             checkpoint.unresolved_errors = checkpoint_unresolved_errors(&events, true);
@@ -4555,15 +4585,21 @@ impl AgentCoreV4<'_> {
         // A fixed number of recent steps is not a byte budget: tool JSON can
         // expand again when embedded in checkpoint strings. Fit the actual
         // serialized request, keeping the newest steps and immutable state.
-        let (compacted, validation) = loop {
-            let compacted = serde_json::to_string(&json!({"frozen_plan":spec.plan,"compute_selection":spec.compute_selection,"checkpoint":checkpoint,"recent_events":[],"scientific_state":scientific_state,"active_guidance":active_guidance}))
-                .map_err(|e| AgentCoreErrorV4::Store(e.to_string()))?;
+        let original_recent_steps = checkpoint.recent_steps.clone();
+        let (mut compacted, mut validation) = loop {
+            let compacted = render_context(Some(&checkpoint), &[], &scientific_value)?;
             let validation = self.validate_execution_context(spec, &compacted, &events, limits);
             if validation.is_ok() || checkpoint.recent_steps.is_empty() {
                 break (compacted, validation);
             }
             checkpoint.recent_steps.remove(0);
         };
+        if validation.is_err() && use_views {
+            // The scientific snapshot may dominate the budget on its own.
+            // Keep the original recent steps in the durable checkpoint, then
+            // fit their model view against the actual bounded scientific view.
+            checkpoint.recent_steps = original_recent_steps;
+        }
         let archive = self
             .events
             .archive_context(spec.run_id, &transcript, &checkpoint)
@@ -4578,6 +4614,15 @@ impl AgentCoreV4<'_> {
             },
         )
         .await?;
+        if validation.is_err() && use_views {
+            let persisted = self.events.load(spec.run_id).await.map_err(AgentCoreErrorV4::Store)?;
+            if let Some(view) = persisted.iter().rev().find_map(|event| context_views::scientific_state_view(spec, &scientific_value, event)) {
+                match fit_scientific_view(&checkpoint, &[], &view, &persisted) {
+                    Ok(projected) => { compacted = projected; validation = Ok(()); }
+                    Err(error) => validation = Err(error),
+                }
+            }
+        }
         validation?;
         Ok(compacted)
     }
@@ -11985,6 +12030,147 @@ mod tests {
         ) -> Result<ModelTurnV4, ModelFailureV4> {
             panic!("budget-rejected requests must never reach the model")
         }
+    }
+
+    struct SnapshotScience(Mutex<ScientificStateV4>);
+
+    #[async_trait]
+    impl ScientificStateStoreV4 for SnapshotScience {
+        async fn snapshot(&self, _: Uuid) -> Result<ScientificStateV4, String> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        async fn before_tool(&self, _: Uuid, _: Uuid, _: &ToolCallV4) -> Result<Option<ScientificUpdateV4>, String> { Ok(None) }
+        async fn after_tool(&self, _: Uuid, _: Uuid, _: &ToolCallV4, _: &ToolOutcomeV4) -> Result<Option<ScientificUpdateV4>, String> { Ok(None) }
+    }
+
+    fn large_science(project_id: Uuid, bytes: usize) -> ScientificStateV4 {
+        let mut state = ScientificStateV4::new(project_id);
+        let id = Uuid::new_v4();
+        state.evidence.insert(id, omicsops_science::EvidenceRecordV4 {
+            schema_version: 4, id, project_id, source_call_id: "retained-evidence".into(),
+            claim: format!("{}数据🧬", "x".repeat(bytes)), sources: vec![],
+            strength: omicsops_science::EvidenceStrengthV4::Exploratory,
+            conflicts_with: Default::default(), valid: true, invalid_reason: None, recorded_at: Utc::now(),
+        });
+        state
+    }
+
+    #[tokio::test]
+    async fn scientific_context_deduplicates_checkpoint_but_retains_durable_snapshot() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let state = large_science(spec.project_id, 132_000);
+        let science = SnapshotScience(Mutex::new(state.clone()));
+        let model = BudgetOnlyModel { request_limit: 400_000, requests: Mutex::new(vec![]) };
+        let core = AgentCoreV4 { model: &model, tools: &ResultReadTools, events: &store, science: Some(&science) };
+        let context = core.context_for_internal(&spec, AgentLimitsV4::default(), true).await.unwrap();
+        let value: Value = serde_json::from_str(&context).unwrap();
+        assert_eq!(value["scientific_state"], json!(state));
+        assert_ne!(value["checkpoint"]["scientific_state"], json!(state));
+        assert!(context.len() < 150_000);
+        let events = store.events.lock().unwrap().clone();
+        let saved = events.iter().find_map(|event| match &event.event {
+            AgentEventKindV4::ContextCheckpointed { checkpoint } => Some(checkpoint), _ => None,
+        }).unwrap();
+        assert_eq!(saved.scientific_state, json!(state));
+        let restored = core.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&restored).unwrap()["scientific_state"], json!(state));
+        assert_eq!(store.archives.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scientific_context_large_snapshot_is_retrievable_and_refreshes_its_reference() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let previous = store.events.lock().unwrap().last().unwrap().clone();
+        store.append_direct(&AgentEventV4::next(&previous, Utc::now(), AgentEventKindV4::ToolFinished {
+            outcome: ToolOutcomeV4 { call_id: "new-result".into(), tool_id: "project.read".into(), succeeded: true,
+                model_content: "latest-science-evidence-marker".into(), data: json!({}), provenance: vec![] },
+        })).unwrap();
+        let state = large_science(spec.project_id, 300_000);
+        let science = SnapshotScience(Mutex::new(state.clone()));
+        let model = BudgetOnlyModel { request_limit: 40_000, requests: Mutex::new(vec![]) };
+        let core = AgentCoreV4 { model: &model, tools: &ResultReadTools, events: &store, science: Some(&science) };
+        let context = core.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        assert!(context.contains("latest-science-evidence-marker"));
+        let value: Value = serde_json::from_str(&context).unwrap();
+        let reference = &value["scientific_state"]["result_reference"];
+        assert_eq!(value["scientific_state"]["model_projection"], true);
+        let events = store.events.lock().unwrap().clone();
+        let mut args = reference.clone();
+        args["offset"] = json!(0); args["limit"] = json!(8192);
+        let mut restored = String::new();
+        loop {
+            let page = context_views::read_result(&spec, &events, &ToolCallV4 {
+                call_id: "science-page".into(), tool_id: context_views::READ_RESULT_TOOL.into(), arguments: args.clone(),
+            }).unwrap();
+            restored.push_str(page["content"].as_str().unwrap());
+            if page["next_offset"].is_null() { break; }
+            args["offset"] = page["next_offset"].clone();
+        }
+        assert_eq!(serde_json::from_str::<Value>(&restored).unwrap(), json!(state));
+        assert_eq!(value["scientific_state"]["snapshot_sha256"], state.digest());
+        let read = |arguments: Value, source_events: &[AgentEventV4], source_spec: &RunSpecV4| {
+            context_views::read_result(source_spec, source_events, &ToolCallV4 {
+                call_id: "bad-science-page".into(), tool_id: context_views::READ_RESULT_TOOL.into(), arguments,
+            })
+        };
+        for (key, invalid) in [
+            ("event_hash", json!("wrong-hash")), ("field", json!("data")),
+            ("offset", json!(-1)), ("offset", json!(restored.len() + 1)),
+            ("offset", json!(restored.find('数').unwrap() + 1)),
+            ("limit", json!(0)), ("mcp_selector", json!({"view":"directory"})),
+        ] {
+            let mut invalid_args = args.clone(); invalid_args[key] = invalid;
+            assert!(read(invalid_args, &events, &spec).is_err(), "accepted invalid {key}");
+        }
+        let mut other_spec = spec.clone(); other_spec.run_id = Uuid::new_v4();
+        assert!(read(args.clone(), &events, &other_spec).is_err());
+        other_spec = spec.clone(); other_spec.project_id = Uuid::new_v4();
+        assert!(read(args.clone(), &events, &other_spec).is_err());
+        other_spec = spec.clone(); other_spec.conversation_id = Uuid::new_v4();
+        assert!(read(args.clone(), &events, &other_spec).is_err());
+        let mut not_checkpoint = args.clone();
+        not_checkpoint["sequence"] = json!(events[0].sequence);
+        not_checkpoint["event_hash"] = json!(events[0].event_hash);
+        assert!(read(not_checkpoint, &events, &spec).is_err());
+        let mut tampered = events.clone();
+        if let AgentEventKindV4::ContextCheckpointed { checkpoint } = &mut tampered.last_mut().unwrap().event {
+            checkpoint.scientific_state["revision"] = json!(999);
+        }
+        assert!(read(args, &tampered, &spec).is_err());
+        assert!(core.context_for(&spec, AgentLimitsV4::default()).await.unwrap().contains("latest-science-evidence-marker"));
+        assert_eq!(store.archives.lock().unwrap().len(), 1);
+        science.0.lock().unwrap().revision += 1;
+        let updated = core.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        let updated: Value = serde_json::from_str(&updated).unwrap();
+        assert_ne!(updated["scientific_state"]["result_reference"], *reference);
+        assert_eq!(updated["scientific_state"]["revision"], 1);
+        assert_eq!(store.archives.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn scientific_context_cannot_hide_state_without_reader_or_successful_archive() {
+        let spec = execution_spec(Uuid::new_v4());
+        let state = large_science(spec.project_id, 300_000);
+        let science = SnapshotScience(Mutex::new(state));
+        let model = BudgetOnlyModel { request_limit: 400_000, requests: Mutex::new(vec![]) };
+        let store = MemoryStore::default(); seed_execution(&store, &spec);
+        let original = store.events.lock().unwrap().clone();
+        let core = AgentCoreV4 { model: &model, tools: &FakeTools, events: &store, science: Some(&science) };
+        assert!(matches!(core.context_for(&spec, AgentLimitsV4::default()).await, Err(AgentCoreErrorV4::NeedsAttention(_))));
+        assert_eq!(&store.events.lock().unwrap()[..original.len()], original.as_slice());
+        let failed = ArchiveFailureStore(MemoryStore::default()); seed_execution(&failed.0, &spec);
+        let original = failed.0.events.lock().unwrap().clone();
+        let core = AgentCoreV4 { model: &model, tools: &ResultReadTools, events: &failed, science: Some(&science) };
+        assert!(matches!(core.context_for(&spec, AgentLimitsV4::default()).await, Err(AgentCoreErrorV4::Store(_))));
+        assert_eq!(*failed.0.events.lock().unwrap(), original);
+        let core = AgentCoreV4 { model: &model, tools: &ResultReadTools, events: &store, science: Some(&science) };
+        let limits = AgentLimitsV4 { auto_compact: false, ..AgentLimitsV4::default() };
+        assert!(matches!(core.context_for(&spec, limits).await, Err(AgentCoreErrorV4::NeedsAttention(_))));
+        assert!(model.requests.lock().unwrap().is_empty(), "oversized candidates must not cross the model boundary");
     }
 
     #[tokio::test]

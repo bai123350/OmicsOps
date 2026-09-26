@@ -434,11 +434,11 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "agent.read_tool_result",
-            "Read a bounded page of an original tool outcome or delegation trace from this run using its result_reference. For a successful search_mcp_tools result, use mcp_selector {view:directory} to browse compact server/tool names, optionally filtered by server_id; then use {view:tool,server_id,tool_name} to read exactly one complete original tool entry and schema. Keep field=data and follow next_offset if a page is partial. Offsets and limits are UTF-8 bytes. Cannot read other runs or arbitrary files.",
+            "Read a bounded page of an original tool outcome, delegation trace, or checkpoint scientific snapshot from this run using its result_reference. Use field=scientific_state only for a checkpoint snapshot reference. For a successful search_mcp_tools result, use mcp_selector {view:directory} to browse compact server/tool names, optionally filtered by server_id; then use {view:tool,server_id,tool_name} to read exactly one complete original tool entry and schema with field=data. Follow next_offset if a page is partial. Offsets and limits are UTF-8 bytes. Cannot read other runs or arbitrary files.",
             ToolEffectV4::ReadOnly,
             json!({"type":"object","required":["sequence","event_hash","field","offset","limit"],"properties":{
                 "sequence":{"type":"integer","minimum":0},"event_hash":{"type":"string","minLength":1},
-                "field":{"type":"string","enum":["model_content","data"]},
+                "field":{"type":"string","enum":["model_content","data","scientific_state"]},
                 "offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":4,"maximum":8192},
                 "mcp_selector":{"oneOf":[
                     {"type":"object","required":["view"],"properties":{"view":{"const":"directory"},"server_id":{"type":"string","minLength":1}},"additionalProperties":false},
@@ -761,6 +761,17 @@ mod tests {
     }
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct Noop;
+    #[test]
+    fn scientific_snapshot_reader_is_authorized_only_for_execute_with_bounded_pages() {
+        let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap();
+        let call = ToolCallV4 { call_id: "snapshot-page".into(), tool_id: "agent.read_tool_result".into(),
+            arguments: json!({"sequence":1,"event_hash":"hash","field":"scientific_state","offset":0,"limit":8192}) };
+        assert!(registry.validate(RunModeV4::Execute, &call).is_ok());
+        assert!(registry.validate(RunModeV4::Plan, &call).is_err());
+        let definition = builtin_tool_definitions_v4().into_iter()
+            .find(|tool| tool.id == "agent.read_tool_result").unwrap();
+        assert_eq!(definition.input_schema["properties"]["limit"]["maximum"], 8192);
+    }
     #[async_trait]
     impl ToolExecutorV4 for Noop {
         async fn execute(&self, call: &ToolCallV4) -> Result<ToolOutcomeV4, String> {
