@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const READ_RESULT_TOOL: &str = "agent.read_tool_result";
 const VIEW_BYTES: usize = 8_192;
+pub(crate) const SCIENTIFIC_CODE_VIEW_MIN_BYTES: usize = 16_384;
 
 fn scientific_digest(value: &Value) -> Option<String> {
     serde_json::from_value::<omicsops_science::ScientificStateV4>(value.clone())
@@ -29,11 +30,11 @@ pub(crate) fn checkpoint_view(checkpoint: &ContextCheckpointV4) -> Value {
 }
 
 /// Only issue a retrieval reference after the complete snapshot is durable.
-pub(crate) fn scientific_state_view(
+fn checkpoint_for_state<'a>(
     spec: &RunSpecV4,
     state: &Value,
-    source: &AgentEventV4,
-) -> Option<Value> {
+    source: &'a AgentEventV4,
+) -> Option<&'a ContextCheckpointV4> {
     if source.run_id != spec.run_id
         || source.project_id != spec.project_id
         || source.conversation_id != spec.conversation_id
@@ -49,6 +50,55 @@ pub(crate) fn scientific_state_view(
     {
         return None;
     }
+    Some(checkpoint)
+}
+
+pub(crate) fn scientific_code_bytes(state: &Value) -> usize {
+    state
+        .get("provenance")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|records| records.values())
+        .filter_map(|record| record.get("code").and_then(Value::as_str))
+        .map(str::len)
+        .sum()
+}
+
+/// Keep every scientific field except repeated source code in the model view.
+/// The reference points to the complete, signed checkpoint snapshot.
+pub(crate) fn scientific_code_view(
+    spec: &RunSpecV4,
+    state: &Value,
+    source: &AgentEventV4,
+) -> Option<Value> {
+    checkpoint_for_state(spec, state, source)?;
+    let omitted = scientific_code_bytes(state);
+    if omitted <= SCIENTIFIC_CODE_VIEW_MIN_BYTES {
+        return None;
+    }
+    let mut view = state.clone();
+    if let Some(records) = view.get_mut("provenance").and_then(Value::as_object_mut) {
+        for record in records.values_mut() {
+            if let Some(fields) = record.as_object_mut() {
+                fields.remove("code");
+            }
+        }
+    }
+    view["model_projection"] = json!(true);
+    view["snapshot_sha256"] = json!(scientific_digest(state)?);
+    view["omitted_code_bytes"] = json!(omitted);
+    view["note"] = json!("Provenance source code is omitted from this model view. Read scientific_state using result_reference and follow next_offset when the original code is needed.");
+    attach_reference(&mut view, source, "scientific_state");
+    Some(view)
+}
+
+/// Only issue a retrieval reference after the complete snapshot is durable.
+pub(crate) fn scientific_state_view(
+    spec: &RunSpecV4,
+    state: &Value,
+    source: &AgentEventV4,
+) -> Option<Value> {
+    checkpoint_for_state(spec, state, source)?;
     let collections: serde_json::Map<String, Value> = [
         "datasets",
         "analyses",

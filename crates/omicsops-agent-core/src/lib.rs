@@ -4476,6 +4476,10 @@ impl AgentCoreV4<'_> {
             .descriptors(RunModeV4::Execute)
             .iter()
             .any(|tool| tool.id == context_views::READ_RESULT_TOOL);
+        let want_code_view = limits.auto_compact
+            && use_views
+            && context_views::scientific_code_bytes(&scientific_value)
+                > context_views::SCIENTIFIC_CODE_VIEW_MIN_BYTES;
         let active_guidance = events
             .iter()
             .filter_map(|event| match &event.event {
@@ -4530,12 +4534,26 @@ impl AgentCoreV4<'_> {
             };
         let candidate =
             render_context(latest_checkpoint.as_ref(), &recent_views, &scientific_value)?;
+        let mut candidate_fits = false;
         if !force_compaction {
             let candidate_validation =
                 self.validate_execution_context(spec, &candidate, &events, limits);
+            candidate_fits = candidate_validation.is_ok();
+            if want_code_view {
+                if let Some(view) = latest_checkpoint_event.and_then(|event| {
+                    context_views::scientific_code_view(spec, &scientific_value, event)
+                }) {
+                    let checkpoint = latest_checkpoint.as_ref().expect("checkpoint source");
+                    if let Ok(projected) =
+                        fit_scientific_view(checkpoint, &recent_views, &view, &events)
+                    {
+                        return Ok(projected);
+                    }
+                }
+            }
             // A prior durable snapshot can supply the same bounded view after
             // reopening, without repeatedly archiving an unchanged snapshot.
-            if limits.auto_compact && use_views && candidate_validation.is_err() {
+            if limits.auto_compact && use_views && (candidate_validation.is_err() || want_code_view) {
                 if let Some(view) = latest_checkpoint_event.and_then(|event| {
                     context_views::scientific_state_view(spec, &scientific_value, event)
                 }) {
@@ -4554,7 +4572,8 @@ impl AgentCoreV4<'_> {
                 }
             }
             match candidate_validation {
-                Ok(()) => return Ok(candidate),
+                Ok(()) if !want_code_view => return Ok(candidate),
+                Ok(()) => {}
                 Err(error) if !limits.auto_compact => return Err(error),
                 Err(error)
                     if latest_checkpoint.as_ref().is_some_and(|checkpoint| {
@@ -4616,17 +4635,21 @@ impl AgentCoreV4<'_> {
             }
             checkpoint.recent_steps.remove(0);
         };
-        if validation.is_err() && use_views {
+        if (validation.is_err() || want_code_view) && use_views {
             // The scientific snapshot may dominate the budget on its own.
             // Keep the original recent steps in the durable checkpoint, then
             // fit their model view against the actual bounded scientific view.
             checkpoint.recent_steps = original_recent_steps;
         }
-        let archive = self
+        let archive = match self
             .events
             .archive_context(spec.run_id, &transcript, &checkpoint)
             .await
-            .map_err(AgentCoreErrorV4::Store)?;
+        {
+            Ok(archive) => archive,
+            Err(_) if want_code_view && candidate_fits => return Ok(candidate),
+            Err(error) => return Err(AgentCoreErrorV4::Store(error)),
+        };
         self.push(spec.run_id, AgentEventKindV4::ContextArchived { archive })
             .await?;
         self.push(
@@ -4636,12 +4659,22 @@ impl AgentCoreV4<'_> {
             },
         )
         .await?;
-        if validation.is_err() && use_views {
+        if (validation.is_err() || want_code_view) && use_views {
             let persisted = self
                 .events
                 .load(spec.run_id)
                 .await
                 .map_err(AgentCoreErrorV4::Store)?;
+            if want_code_view {
+                if let Some(view) = persisted.iter().rev().find_map(|event| {
+                    context_views::scientific_code_view(spec, &scientific_value, event)
+                }) {
+                    if let Ok(projected) = fit_scientific_view(&checkpoint, &[], &view, &persisted)
+                    {
+                        return Ok(projected);
+                    }
+                }
+            }
             if let Some(view) = persisted.iter().rev().find_map(|event| {
                 context_views::scientific_state_view(spec, &scientific_value, event)
             }) {
@@ -12173,6 +12206,323 @@ mod tests {
             },
         );
         state
+    }
+
+    fn science_with_code(project_id: Uuid, code: String) -> ScientificStateV4 {
+        let mut state = large_science(project_id, 32);
+        let id = Uuid::new_v4();
+        state.provenance.insert(
+            id,
+            omicsops_science::ProvenanceManifestV4 {
+                schema_version: 4,
+                id,
+                project_id,
+                run_id: Uuid::new_v4(),
+                analysis_id: Uuid::new_v4(),
+                source_call_id: "science-code".into(),
+                code,
+                code_sha256: "original-code-sha".into(),
+                input_checksums: Default::default(),
+                output_artifact_ids: Default::default(),
+                software_versions: Default::default(),
+                database_versions: Default::default(),
+                environment: "system".into(),
+                random_seed: Some(42),
+                backend_id: "local".into(),
+                runtime_session_id: None,
+                runtime_process_identity: None,
+                issues: vec![],
+                complete: true,
+                recorded_at: Utc::now(),
+            },
+        );
+        state
+    }
+
+    #[tokio::test]
+    async fn large_provenance_code_uses_retrievable_projection_even_when_full_context_fits() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let state = science_with_code(spec.project_id, "🧬".repeat(4_097));
+        let science = SnapshotScience(Mutex::new(state.clone()));
+        let model = BudgetOnlyModel {
+            request_limit: 400_000,
+            requests: Mutex::new(vec![]),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: Some(&science),
+        };
+        let context = core.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        let value: Value = serde_json::from_str(&context).unwrap();
+        let projection = &value["scientific_state"];
+        assert_eq!(projection["model_projection"], true);
+        assert_eq!(projection["snapshot_sha256"], state.digest());
+        assert_eq!(projection["omitted_code_bytes"], 16_388);
+        let mut expected = json!(state);
+        for record in expected["provenance"].as_object_mut().unwrap().values_mut() {
+            record.as_object_mut().unwrap().remove("code");
+        }
+        for (key, original) in expected.as_object().unwrap() {
+            assert_eq!(&projection[key], original, "changed scientific field {key}");
+        }
+        let reference = &projection["result_reference"];
+        assert_eq!(reference["field"], "scientific_state");
+        let events = store.events.lock().unwrap().clone();
+        let full_context = core
+            .context_for(
+                &spec,
+                AgentLimitsV4 {
+                    auto_compact: false,
+                    ..AgentLimitsV4::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(context.len() < full_context.len());
+        println!(
+            "scientific code context bytes: full={}, projected={}",
+            full_context.len(),
+            context.len()
+        );
+        let mut invalid_source = events.last().unwrap().clone();
+        invalid_source.event_hash = "invalid".into();
+        assert!(context_views::scientific_code_view(&spec, &json!(state), &invalid_source).is_none());
+        let mut different_state = json!(state);
+        different_state["revision"] = json!(1);
+        assert!(context_views::scientific_code_view(&spec, &different_state, events.last().unwrap()).is_none());
+        let mut restored = String::new();
+        let mut offset = 0;
+        loop {
+            let page = context_views::read_result(
+                &spec,
+                &events,
+                &ToolCallV4 {
+                    call_id: "restore-code".into(),
+                    tool_id: context_views::READ_RESULT_TOOL.into(),
+                    arguments: json!({
+                        "sequence": reference["sequence"],
+                        "event_hash": reference["event_hash"],
+                        "field": "scientific_state",
+                        "offset": offset,
+                        "limit": 8192,
+                    }),
+                },
+            )
+            .unwrap();
+            restored.push_str(page["content"].as_str().unwrap());
+            if page["next_offset"].is_null() {
+                break;
+            }
+            offset = page["next_offset"].as_u64().unwrap();
+        }
+        assert_eq!(serde_json::from_str::<Value>(&restored).unwrap(), json!(state));
+        assert_eq!(store.archives.lock().unwrap().len(), 1);
+        let previous = store.events.lock().unwrap().last().unwrap().clone();
+        store
+            .append_direct(&AgentEventV4::next(
+                &previous,
+                Utc::now(),
+                AgentEventKindV4::ToolFinished {
+                    outcome: ToolOutcomeV4 {
+                        call_id: "latest-evidence".into(),
+                        tool_id: "project.read".into(),
+                        succeeded: true,
+                        model_content: "latest-tool-marker".into(),
+                        data: json!({}),
+                        provenance: vec![],
+                    },
+                },
+            ))
+            .unwrap();
+        let repeated = core.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        assert!(repeated.contains("latest-tool-marker"));
+        assert_eq!(serde_json::from_str::<Value>(&repeated).unwrap()["scientific_state"]["result_reference"], *reference);
+        assert_eq!(store.archives.lock().unwrap().len(), 1);
+        science.0.lock().unwrap().revision += 1;
+        let changed = core.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        let changed: Value = serde_json::from_str(&changed).unwrap();
+        assert_ne!(changed["scientific_state"]["result_reference"], *reference);
+        assert_eq!(store.archives.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn code_projection_preserves_latest_tool_when_full_science_exceeds_budget() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let previous = store.events.lock().unwrap().last().unwrap().clone();
+        store
+            .append_direct(&AgentEventV4::next(
+                &previous,
+                Utc::now(),
+                AgentEventKindV4::ToolFinished {
+                    outcome: ToolOutcomeV4 {
+                        call_id: "fresh-result".into(),
+                        tool_id: "project.read".into(),
+                        succeeded: true,
+                        model_content: "fresh-tool-evidence".into(),
+                        data: json!({}),
+                        provenance: vec![],
+                    },
+                },
+            ))
+            .unwrap();
+        let science = SnapshotScience(Mutex::new(science_with_code(
+            spec.project_id,
+            "x".repeat(20_000),
+        )));
+        let model = BudgetOnlyModel {
+            request_limit: 12_000,
+            requests: Mutex::new(vec![]),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: Some(&science),
+        };
+        let context = core.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        assert!(context.contains("fresh-tool-evidence"));
+        assert_eq!(serde_json::from_str::<Value>(&context).unwrap()["scientific_state"]["model_projection"], true);
+        let checkpoint = store.events.lock().unwrap().iter().rev().find_map(|event| match &event.event {
+            AgentEventKindV4::ContextCheckpointed { checkpoint } => Some(checkpoint.clone()),
+            _ => None,
+        }).unwrap();
+        assert!(checkpoint.recent_steps.iter().any(|step| step.contains("fresh-tool-evidence")));
+    }
+
+    #[tokio::test]
+    async fn provenance_code_projection_respects_utf8_threshold_and_reader_setting() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let science = SnapshotScience(Mutex::new(science_with_code(
+            spec.project_id,
+            "🧬".repeat(4_096),
+        )));
+        let model = BudgetOnlyModel {
+            request_limit: 400_000,
+            requests: Mutex::new(vec![]),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: Some(&science),
+        };
+        let at_threshold = core.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&at_threshold).unwrap()["scientific_state"],
+            json!(*science.0.lock().unwrap())
+        );
+        assert!(store.archives.lock().unwrap().is_empty());
+
+        science.0.lock().unwrap().provenance.values_mut().next().unwrap().code.push('a');
+        let above = core.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&above).unwrap()["scientific_state"]["omitted_code_bytes"],
+            16_385
+        );
+        assert_eq!(store.archives.lock().unwrap().len(), 1);
+
+        let no_compact = AgentLimitsV4 {
+            auto_compact: false,
+            ..AgentLimitsV4::default()
+        };
+        let full = core.context_for(&spec, no_compact).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&full).unwrap()["scientific_state"],
+            json!(*science.0.lock().unwrap())
+        );
+        let no_reader = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: Some(&science),
+        };
+        let full = no_reader.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&full).unwrap()["scientific_state"],
+            json!(*science.0.lock().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_code_archive_failure_uses_valid_full_candidate() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = ArchiveFailureStore(MemoryStore::default());
+        seed_execution(&store.0, &spec);
+        let original = store.0.events.lock().unwrap().clone();
+        let science = SnapshotScience(Mutex::new(science_with_code(
+            spec.project_id,
+            "x".repeat(16_385),
+        )));
+        let model = BudgetOnlyModel {
+            request_limit: 400_000,
+            requests: Mutex::new(vec![]),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: Some(&science),
+        };
+        let context = core.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&context).unwrap()["scientific_state"],
+            json!(*science.0.lock().unwrap())
+        );
+        assert_eq!(*store.0.events.lock().unwrap(), original);
+
+        assert!(matches!(
+            core.context_for_internal(&spec, AgentLimitsV4::default(), true)
+                .await,
+            Err(AgentCoreErrorV4::Store(_))
+        ));
+        let tight_model = BudgetOnlyModel {
+            request_limit: 1,
+            requests: Mutex::new(vec![]),
+        };
+        let over_budget = AgentCoreV4 {
+            model: &tight_model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: Some(&science),
+        };
+        assert!(matches!(
+            over_budget.context_for(&spec, AgentLimitsV4::default()).await,
+            Err(AgentCoreErrorV4::Store(_))
+        ));
+        assert_eq!(*store.0.events.lock().unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn code_view_over_budget_falls_back_to_retrievable_directory() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let mut state = science_with_code(spec.project_id, "x".repeat(17_000));
+        state.evidence.values_mut().next().unwrap().claim = "e".repeat(300_000);
+        let science = SnapshotScience(Mutex::new(state.clone()));
+        let model = BudgetOnlyModel {
+            request_limit: 40_000,
+            requests: Mutex::new(vec![]),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: Some(&science),
+        };
+        let context = core.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        let value: Value = serde_json::from_str(&context).unwrap();
+        assert_eq!(value["scientific_state"]["collections"]["evidence"]["count"], 1);
+        assert_eq!(value["scientific_state"]["result_reference"]["field"], "scientific_state");
+        assert_eq!(store.archives.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
