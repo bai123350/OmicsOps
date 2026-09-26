@@ -7054,6 +7054,70 @@ mod tests {
         );
     }
 
+    struct MissingTerminalModel {
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ModelPortV4 for MissingTerminalModel {
+        async fn stream(
+            &self,
+            request: ModelRequestV4,
+            on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            assert_eq!(request.context, "original request");
+            self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            on_event(ModelStreamEventV4::TextDelta("discarded partial text".into()));
+            Err(ModelFailureV4::transient(
+                omicsops_protocol::ModelErrorClassV4::Transport,
+                "model endpoint failed: incomplete model stream: no terminal provider event; tool calls were not dispatched",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_terminal_stream_stops_at_retry_limit_without_persisting_partial_output() {
+        let store = MemoryStore::default();
+        let run_id = seed_model_run(&store);
+        let model = MissingTerminalModel {
+            attempts: AtomicUsize::new(0),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let result = core
+            .model_turn(
+                run_id,
+                ModelRequestV4 {
+                    system: "system".into(),
+                    context: "original request".into(),
+                    tools: vec![],
+                    image_refs: vec![],
+                },
+                1,
+                Duration::from_secs(1),
+                None,
+            )
+            .await;
+        assert!(matches!(result, Err(AgentCoreErrorV4::Model(message)) if message.contains("no terminal provider event")));
+        assert_eq!(model.attempts.load(AtomicOrdering::SeqCst), 2);
+        let events = store.load_direct(run_id).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, AgentEventKindV4::ModelRetrying { .. }))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event.event,
+            AgentEventKindV4::ModelText { .. } | AgentEventKindV4::ToolDispatchStarted { .. }
+        )));
+    }
+
     #[tokio::test]
     async fn provider_retry_callback_starts_a_distinct_usage_attempt() {
         let store = MemoryStore::default();

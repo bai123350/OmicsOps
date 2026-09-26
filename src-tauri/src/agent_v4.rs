@@ -5629,6 +5629,7 @@ fn classify_model_failure(message: &str) -> ModelFailureV4 {
         || lower.contains("unexpected eof")
         || lower.contains("stream ended")
         || lower.contains("incomplete message")
+        || lower == "model endpoint failed: incomplete model stream: no terminal provider event; tool calls were not dispatched"
     {
         ModelFailureV4::transient(ModelErrorClassV4::Transport, message)
     } else if lower.contains("401") || lower.contains("403") || lower.contains("credential") {
@@ -10971,6 +10972,135 @@ mod tests {
             ModelErrorClassV4::Timeout
         );
         assert!(!classify_model_failure("401 unauthorized").retryable);
+    }
+
+    #[test]
+    fn missing_terminal_provider_event_is_retryable_only_for_the_adapter_error() {
+        let message = omicsops_adapters::AdapterError::Llm(
+            "incomplete model stream: no terminal provider event; tool calls were not dispatched"
+                .into(),
+        )
+        .to_string();
+        let failure = classify_model_failure(&message);
+        assert_eq!(failure.class, ModelErrorClassV4::Transport);
+        assert!(failure.retryable);
+
+        for message in [
+            "truncated_output: provider exhausted its output allowance",
+            "model endpoint failed: returned malformed JSON arguments: incomplete model stream",
+            "model endpoint failed: incomplete model stream: no terminal provider event; tool calls were dispatched",
+        ] {
+            let failure = classify_model_failure(message);
+            assert_eq!(failure.class, ModelErrorClassV4::InvalidResponse);
+            assert!(!failure.retryable);
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_stream_discards_complete_tool_arguments_when_terminal_event_is_missing() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = Url::parse(&format!("http://{}/v1", listener.local_addr().unwrap())).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for answer in ["discarded", "accepted"] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let header_end = loop {
+                    let mut buffer = [0_u8; 4096];
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0, "request ended before HTTP headers");
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(position) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break position + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                let content_length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|value| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() - header_end < content_length {
+                    let mut buffer = [0_u8; 4096];
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0, "request ended before JSON body");
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                requests.push(
+                    serde_json::from_slice::<serde_json::Value>(
+                        &bytes[header_end..header_end + content_length],
+                    )
+                    .unwrap(),
+                );
+                let delta = json!({"choices":[{"delta":{"tool_calls":[{
+                    "index":0,"id":"same-call","type":"function",
+                    "function":{"name":"read","arguments":json!({"value":answer}).to_string()}
+                }]}}]});
+                let mut body = format!("data: {delta}\n\n");
+                if answer == "accepted" {
+                    body.push_str("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n");
+                }
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+            requests
+        });
+        let model = DesktopModelPortV4 {
+            client: UnifiedModelClient::new(
+                Uuid::new_v4(),
+                ProviderProtocol::OpenAiCompatible,
+                base_url,
+                "fixture-model",
+                Some("test-only".into()),
+            )
+            .unwrap(),
+            prompt: PromptLayersV4::default(),
+            usage_metadata: ModelUsageMetadataV4::default(),
+            resources: None,
+            project_root: std::env::current_dir().unwrap(),
+            supports_vision: false,
+            input_images: vec![],
+            delegated: None,
+            reviewer: None,
+        };
+        let request = ModelRequestV4 {
+            system: "system".into(),
+            context: "original request".into(),
+            tools: vec![ToolDescriptorV4 {
+                id: "read".into(),
+                description: "read fixture".into(),
+                input_schema: json!({"type":"object"}),
+                effect: ToolEffectV4::ReadOnly,
+            }],
+            image_refs: vec![],
+        };
+        let first = model.stream(request.clone(), &mut |_| {}).await.unwrap_err();
+        assert_eq!(first.class, ModelErrorClassV4::Transport);
+        assert!(first.retryable);
+
+        let second = model.stream(request, &mut |_| {}).await.unwrap();
+        assert_eq!(second.tool_calls.len(), 1);
+        assert_eq!(second.tool_calls[0].call_id, "same-call");
+        assert_eq!(second.tool_calls[0].arguments, json!({"value":"accepted"}));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        assert!(requests[1].to_string().contains("original request"));
+        assert!(!requests[1].to_string().contains("discarded"));
     }
 
     #[test]
