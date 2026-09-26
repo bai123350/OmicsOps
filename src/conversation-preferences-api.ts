@@ -12,6 +12,8 @@ function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
+export class PreferenceSaveNotDispatchedError extends Error {}
+
 export async function getConversationAgentPreferencesV4(
   projectId: string,
   conversationId: string,
@@ -24,7 +26,17 @@ export async function saveConversationAgentPreferencesV4(
   projectId: string,
   conversationId: string,
   preferences: ConversationAgentPreferencesV4,
+  expiresAtMs = Date.now() + 10_000,
+): Promise<ConversationAgentPreferencesV4> {
+  if (!isTauri()) throw new PreferenceSaveNotDispatchedError("Conversation preferences require the desktop app.");
+  return invoke("conversation_save_agent_preferences_v4", { projectId, conversationId, preferences, expiresAtMs });
+}
+
+export async function reconcileConversationAgentPreferencesV4(
+  projectId: string,
+  conversationId: string,
+  expiresAtMs: number,
 ): Promise<ConversationAgentPreferencesV4> {
   if (!isTauri()) throw new Error("Conversation preferences require the desktop app.");
-  return invoke("conversation_save_agent_preferences_v4", { projectId, conversationId, preferences });
+  return invoke("conversation_reconcile_agent_preferences_v4", { projectId, conversationId, expiresAtMs });
 }

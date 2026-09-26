@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   DEFAULT_CONVERSATION_AGENT_PREFERENCES,
   getConversationAgentPreferencesV4,
+  reconcileConversationAgentPreferencesV4,
   saveConversationAgentPreferencesV4,
 } from "./conversation-preferences-api";
 import type { ConversationAgentPreferencesV4 } from "./types";
@@ -47,11 +48,23 @@ describe("conversation agent preferences API", () => {
     enableTauri();
     vi.mocked(invoke).mockResolvedValueOnce(preferences);
 
-    await expect(saveConversationAgentPreferencesV4("project-a", "conversation-a", preferences)).resolves.toEqual(preferences);
+    await expect(saveConversationAgentPreferencesV4("project-a", "conversation-a", preferences, 12345)).resolves.toEqual(preferences);
     expect(invoke).toHaveBeenCalledWith("conversation_save_agent_preferences_v4", {
       projectId: "project-a",
       conversationId: "conversation-a",
       preferences,
+      expiresAtMs: 12345,
+    });
+  });
+
+  it("uses the scoped native write fence before accepting a pending save result", async () => {
+    enableTauri();
+    vi.mocked(invoke).mockResolvedValueOnce(preferences);
+    await expect(reconcileConversationAgentPreferencesV4("project-a", "conversation-a", 12345)).resolves.toEqual(preferences);
+    expect(invoke).toHaveBeenCalledWith("conversation_reconcile_agent_preferences_v4", {
+      projectId: "project-a",
+      conversationId: "conversation-a",
+      expiresAtMs: 12345,
     });
   });
 });

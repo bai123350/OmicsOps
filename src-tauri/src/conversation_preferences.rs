@@ -1,5 +1,6 @@
 //! Conversation-scoped optional Agent preference commands.
 
+use chrono::Utc;
 use omicsops_dto::ConversationAgentPreferencesV4;
 use omicsops_store::Store;
 use tauri::State;
@@ -26,6 +27,7 @@ pub(crate) async fn get_conversation_agent_preferences_response(
     load_conversation_agent_preferences(repository, project_id, conversation_id).await
 }
 
+#[cfg(test)]
 pub(crate) async fn save_conversation_agent_preferences_response(
     repository: &Store,
     project_id: Uuid,
@@ -37,6 +39,42 @@ pub(crate) async fn save_conversation_agent_preferences_response(
         .await
         .map_err(|error| error.to_string())?;
     Ok(preferences)
+}
+
+pub(crate) async fn save_conversation_agent_preferences_with_deadline_response(
+    repository: &Store,
+    project_id: Uuid,
+    conversation_id: Uuid,
+    preferences: ConversationAgentPreferencesV4,
+    expires_at_ms: Option<i64>,
+) -> Result<ConversationAgentPreferencesV4, String> {
+    let expires_at_ms = expires_at_ms.unwrap_or_else(|| Utc::now().timestamp_millis() + 10_000);
+    repository
+        .set_conversation_agent_preferences_with_deadline(
+            project_id,
+            conversation_id,
+            preferences,
+            expires_at_ms,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(preferences)
+}
+
+pub(crate) async fn reconcile_conversation_agent_preferences_response(
+    repository: &Store,
+    project_id: Uuid,
+    conversation_id: Uuid,
+    expires_at_ms: i64,
+) -> Result<ConversationAgentPreferencesV4, String> {
+    repository
+        .reconcile_conversation_agent_preferences_after_deadline(
+            project_id,
+            conversation_id,
+            expires_at_ms,
+        )
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -55,12 +93,30 @@ pub async fn conversation_save_agent_preferences_v4(
     project_id: Uuid,
     conversation_id: Uuid,
     preferences: ConversationAgentPreferencesV4,
+    expires_at_ms: Option<i64>,
 ) -> Result<ConversationAgentPreferencesV4, String> {
-    save_conversation_agent_preferences_response(
+    save_conversation_agent_preferences_with_deadline_response(
         &state.repository,
         project_id,
         conversation_id,
         preferences,
+        expires_at_ms,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn conversation_reconcile_agent_preferences_v4(
+    state: State<'_, AppState>,
+    project_id: Uuid,
+    conversation_id: Uuid,
+    expires_at_ms: i64,
+) -> Result<ConversationAgentPreferencesV4, String> {
+    reconcile_conversation_agent_preferences_response(
+        &state.repository,
+        project_id,
+        conversation_id,
+        expires_at_ms,
     )
     .await
 }
@@ -161,6 +217,81 @@ mod tests {
                 .await
                 .unwrap(),
             ConversationAgentPreferencesV4::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_save_and_fenced_read_keep_project_scope() {
+        let (repository, project, conversation, other_project) = fixture().await;
+        let candidate = ConversationAgentPreferencesV4 {
+            delegation_enabled: false,
+            ..Default::default()
+        };
+        let future = Utc::now().timestamp_millis() + 10_000;
+        assert!(
+            save_conversation_agent_preferences_with_deadline_response(
+                &repository,
+                project.id,
+                conversation.id,
+                candidate,
+                Some(Utc::now().timestamp_millis() - 1),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            save_conversation_agent_preferences_with_deadline_response(
+                &repository,
+                project.id,
+                conversation.id,
+                candidate,
+                Some(Utc::now().timestamp_millis() + 31_000),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            reconcile_conversation_agent_preferences_response(
+                &repository,
+                project.id,
+                conversation.id,
+                future,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            save_conversation_agent_preferences_with_deadline_response(
+                &repository,
+                project.id,
+                conversation.id,
+                candidate,
+                Some(future),
+            )
+            .await
+            .unwrap(),
+            candidate
+        );
+        assert!(
+            reconcile_conversation_agent_preferences_response(
+                &repository,
+                other_project.id,
+                conversation.id,
+                Utc::now().timestamp_millis() - 1,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            reconcile_conversation_agent_preferences_response(
+                &repository,
+                project.id,
+                conversation.id,
+                Utc::now().timestamp_millis() - 1,
+            )
+            .await
+            .unwrap(),
+            candidate
         );
     }
 }

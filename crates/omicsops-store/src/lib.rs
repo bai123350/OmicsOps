@@ -680,9 +680,55 @@ impl Store {
         conversation_id: Uuid,
         preferences: ConversationAgentPreferencesV4,
     ) -> Result<(), StoreError> {
+        self.set_conversation_agent_preferences_inner(
+            project_id,
+            conversation_id,
+            preferences,
+            None,
+        )
+        .await
+    }
+
+    /// A desktop save may have lost its response. Its original deadline is
+    /// checked after acquiring SQLite's write lock, so a later fenced read
+    /// can prove that the old request can no longer commit.
+    pub async fn set_conversation_agent_preferences_with_deadline(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        preferences: ConversationAgentPreferencesV4,
+        expires_at_ms: i64,
+    ) -> Result<(), StoreError> {
+        let now = Utc::now().timestamp_millis();
+        if expires_at_ms <= now || expires_at_ms.saturating_sub(now) > 30_000 {
+            return Err(StoreError::InvalidInput(
+                "invalid preference save deadline".into(),
+            ));
+        }
+        self.set_conversation_agent_preferences_inner(
+            project_id,
+            conversation_id,
+            preferences,
+            Some(expires_at_ms),
+        )
+        .await
+    }
+
+    async fn set_conversation_agent_preferences_inner(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        preferences: ConversationAgentPreferencesV4,
+        expires_at_ms: Option<i64>,
+    ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         ensure_conversation_preferences_unlocked_executor(&mut *tx, project_id, conversation_id)
             .await?;
+        if expires_at_ms.is_some_and(|deadline| Utc::now().timestamp_millis() >= deadline) {
+            return Err(StoreError::InvalidInput(
+                "preference save deadline expired".into(),
+            ));
+        }
         sqlx::query(
             "INSERT INTO settings (scope,key,value_json,updated_at)
              VALUES (?1,?2,?3,?4)
@@ -697,6 +743,33 @@ impl Store {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn reconcile_conversation_agent_preferences_after_deadline(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        expires_at_ms: i64,
+    ) -> Result<ConversationAgentPreferencesV4, StoreError> {
+        if Utc::now().timestamp_millis() < expires_at_ms {
+            return Err(StoreError::InvalidInput(
+                "preference save deadline has not passed".into(),
+            ));
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        ensure_conversation_owner_executor(&mut *tx, project_id, conversation_id).await?;
+        let value = sqlx::query_scalar::<_, String>(
+            "SELECT value_json FROM settings WHERE scope=?1 AND key=?2",
+        )
+        .bind(SETTINGS_GLOBAL_SCOPE)
+        .bind(conversation_agent_preferences_setting_key(conversation_id))
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        value
+            .map(|value| serde_json::from_str(&value).map_err(StoreError::from))
+            .transpose()
+            .map(|value| value.unwrap_or_default())
     }
 
     pub async fn agent_iteration_settings(&self) -> Result<Option<Value>, StoreError> {

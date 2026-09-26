@@ -44,6 +44,9 @@ function selectVisibleMessageText(node: Text) {
 }
 
 afterEach(() => {
+  for (const key of Object.keys(localStorage)) {
+    if (key.startsWith("omicsops.preferences.pendingSave:")) localStorage.removeItem(key);
+  }
   vi.useRealTimers();
   vi.restoreAllMocks();
   setComposerSendPreference(false);
@@ -705,7 +708,7 @@ describe("WorkspaceShell", () => {
     expect(screen.getByRole("menuitemcheckbox", { name: /Use memory/ })).toHaveAttribute("aria-checked", "false");
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: /Delegation/ }));
 
-    await waitFor(() => expect(save).toHaveBeenCalledWith(project.id, "conversation-a", saved));
+    await waitFor(() => expect(save).toHaveBeenCalledWith(project.id, "conversation-a", saved, expect.any(Number)));
     expect(screen.getByRole("menuitemcheckbox", { name: /Delegation/ })).toHaveAttribute("aria-checked", "true");
   });
 
@@ -718,16 +721,16 @@ describe("WorkspaceShell", () => {
     const fastToggle = screen.getByRole("button", { name: "Fast mode" });
     expect(fastToggle).toHaveAttribute("aria-pressed", "false");
     fireEvent.click(fastToggle);
-    await waitFor(() => expect(save).toHaveBeenNthCalledWith(1, project.id, "conversation-a", expect.objectContaining({ fast_mode: true })));
+    await waitFor(() => expect(save).toHaveBeenNthCalledWith(1, project.id, "conversation-a", expect.objectContaining({ fast_mode: true }), expect.any(Number)));
     expect(fastToggle).toHaveAttribute("aria-pressed", "true");
 
     fireEvent.click(screen.getByRole("button", { name: "Agent permissions" }));
     const select = screen.getByRole("combobox", { name: "Fast mode" });
     expect(select).toHaveValue("fast");
     fireEvent.change(select, { target: { value: "standard" } });
-    await waitFor(() => expect(save).toHaveBeenNthCalledWith(2, project.id, "conversation-a", expect.objectContaining({ fast_mode: false })));
+    await waitFor(() => expect(save).toHaveBeenNthCalledWith(2, project.id, "conversation-a", expect.objectContaining({ fast_mode: false }), expect.any(Number)));
     fireEvent.change(select, { target: { value: "default" } });
-    await waitFor(() => expect(save).toHaveBeenNthCalledWith(3, project.id, "conversation-a", expect.objectContaining({ fast_mode: null })));
+    await waitFor(() => expect(save).toHaveBeenNthCalledWith(3, project.id, "conversation-a", expect.objectContaining({ fast_mode: null }), expect.any(Number)));
   });
 
   it("keeps a stale enabled Fast override available to turn off after an unsupported model switch", async () => {
@@ -740,7 +743,7 @@ describe("WorkspaceShell", () => {
     const fastToggle = screen.getByRole("button", { name: "Fast mode" });
     expect(fastToggle).toHaveAttribute("aria-pressed", "true");
     fireEvent.click(fastToggle);
-    await waitFor(() => expect(save).toHaveBeenCalledWith(project.id, "conversation-a", expect.objectContaining({ fast_mode: null })));
+    await waitFor(() => expect(save).toHaveBeenCalledWith(project.id, "conversation-a", expect.objectContaining({ fast_mode: null }), expect.any(Number)));
     expect(screen.queryByRole("button", { name: "Fast mode" })).not.toBeInTheDocument();
   });
 
@@ -754,14 +757,14 @@ describe("WorkspaceShell", () => {
     const fastToggle = screen.getByRole("button", { name: "Fast mode" });
     expect(fastToggle).toHaveAttribute("aria-pressed", "true");
     fireEvent.click(fastToggle);
-    await waitFor(() => expect(save).toHaveBeenNthCalledWith(1, project.id, "conversation-a", expect.objectContaining({ fast_mode: false })));
+    await waitFor(() => expect(save).toHaveBeenNthCalledWith(1, project.id, "conversation-a", expect.objectContaining({ fast_mode: false }), expect.any(Number)));
     expect(fastToggle).toHaveAttribute("aria-pressed", "false");
 
     fireEvent.click(screen.getByRole("button", { name: "Agent permissions" }));
     const select = screen.getByRole("combobox", { name: "Fast mode" });
     expect(select).toHaveValue("standard");
     fireEvent.change(select, { target: { value: "default" } });
-    await waitFor(() => expect(save).toHaveBeenNthCalledWith(2, project.id, "conversation-a", expect.objectContaining({ fast_mode: null })));
+    await waitFor(() => expect(save).toHaveBeenNthCalledWith(2, project.id, "conversation-a", expect.objectContaining({ fast_mode: null }), expect.any(Number)));
     expect(fastToggle).toHaveAttribute("aria-pressed", "true");
   });
 
@@ -779,7 +782,7 @@ describe("WorkspaceShell", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Fast mode" })).toBeEnabled());
   });
 
-  it("rolls back a failed preference save and exposes a retry action without transport details", async () => {
+  it("keeps an unconfirmed preference save blocked and offers reconciliation without repeating the write", async () => {
     const get = vi.spyOn(preferencesApi, "getConversationAgentPreferencesV4").mockResolvedValue({ delegation_enabled: true, auto_review: true, memory_enabled: true });
     const save = vi.spyOn(preferencesApi, "saveConversationAgentPreferencesV4").mockRejectedValueOnce(new Error("private transport details")).mockResolvedValueOnce({ delegation_enabled: false, auto_review: true, memory_enabled: true });
     render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} activeConversationId="conversation-a" onSend={vi.fn().mockResolvedValue(true)} />);
@@ -788,12 +791,12 @@ describe("WorkspaceShell", () => {
     const delegation = screen.getByRole("menuitemcheckbox", { name: /Delegation/ });
     fireEvent.click(delegation);
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("Could not save conversation preferences");
+    expect(await screen.findByRole("alert")).toHaveTextContent("preference save is unconfirmed");
     expect(screen.queryByText("private transport details")).not.toBeInTheDocument();
-    expect(delegation).toHaveAttribute("aria-checked", "true");
-    fireEvent.click(screen.getByRole("button", { name: "Retry conversation preferences" }));
-    await waitFor(() => expect(save).toHaveBeenCalledTimes(2));
     expect(screen.getByRole("menuitemcheckbox", { name: /Delegation/ })).toHaveAttribute("aria-checked", "false");
+    expect(delegation).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reconcile preference save" })).toBeEnabled();
+    expect(save).toHaveBeenCalledTimes(1);
   });
 
   it("locks Send on a preference load failure and keeps a localized retry visible", async () => {

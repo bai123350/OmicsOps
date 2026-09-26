@@ -203,6 +203,7 @@ pub fn run() {
             composer_quotes::create_composer_quote,
             conversation_preferences::conversation_get_agent_preferences_v4,
             conversation_preferences::conversation_save_agent_preferences_v4,
+            conversation_preferences::conversation_reconcile_agent_preferences_v4,
             composer_attachments::choose_composer_attachments,
             composer_attachments::stage_composer_attachment,
             composer_attachments::validate_composer_attachments,
