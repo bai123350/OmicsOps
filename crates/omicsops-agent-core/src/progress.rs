@@ -44,12 +44,16 @@ pub(crate) fn stalled(events: &[AgentEventV4], repetitions: u32) -> bool {
     let mut batched = BTreeSet::<String>::new();
     let mut results = BTreeMap::<String, u64>::new();
     let mut window = VecDeque::new();
+    let mut recent_observations = VecDeque::<Vec<u64>>::new();
+    let mut units_without_novelty = 0_u32;
     for event in events {
         let next = match &event.event {
             AgentEventKindV4::UserInputAnswered { .. }
             | AgentEventKindV4::GuidanceConsumed { .. }
             | AgentEventKindV4::ScientificStateChanged { .. } => {
                 window.clear();
+                recent_observations.clear();
+                units_without_novelty = 0;
                 None
             }
             AgentEventKindV4::ToolRequested { call } => {
@@ -68,7 +72,7 @@ pub(crate) fn stalled(events: &[AgentEventV4], repetitions: u32) -> bool {
                         results.insert(outcome.call_id.clone(), key);
                         None
                     } else {
-                        Some(key)
+                        Some(vec![key])
                     }
                 } else {
                     None
@@ -82,25 +86,83 @@ pub(crate) fn stalled(events: &[AgentEventV4], repetitions: u32) -> bool {
                 for id in call_ids {
                     batched.remove(id);
                 }
-                ordered
-                    .filter(|values| !values.is_empty())
-                    .map(|values| fingerprint(&json!(values)))
+                ordered.filter(|values| !values.is_empty())
             }
             _ => None,
         };
-        if let Some(next) = next {
-            window.push_back(next);
+        if let Some(observations) = next {
+            if observations
+                .iter()
+                .any(|value| !recent_observations.iter().any(|unit| unit.contains(value)))
+            {
+                units_without_novelty = 0;
+            } else {
+                units_without_novelty = units_without_novelty.saturating_add(1);
+            }
+            recent_observations.push_back(observations.clone());
+            if recent_observations.len() > WINDOW {
+                recent_observations.pop_front();
+            }
+            window.push_back(fingerprint(&json!(observations)));
             if window.len() > WINDOW {
                 window.pop_front();
             }
         }
     }
-    repeated_suffix(&window, repetitions)
+    repeated_suffix(&window, repetitions) || units_without_novelty >= repetitions.max(2)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    fn push(events: &mut Vec<AgentEventV4>, event: AgentEventKindV4) {
+        let next = match events.last() {
+            Some(previous) => AgentEventV4::next(previous, Utc::now(), event),
+            None => AgentEventV4::first(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Utc::now(),
+                event,
+            ),
+        };
+        events.push(next);
+    }
+
+    fn complete_observation(
+        events: &mut Vec<AgentEventV4>,
+        id: &str,
+        tool: &str,
+        args: Value,
+        data: Value,
+    ) {
+        push(
+            events,
+            AgentEventKindV4::ToolRequested {
+                call: ToolCallV4 {
+                    call_id: id.into(),
+                    tool_id: tool.into(),
+                    arguments: args,
+                },
+            },
+        );
+        push(
+            events,
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: id.into(),
+                    tool_id: tool.into(),
+                    succeeded: true,
+                    model_content: "result".into(),
+                    data,
+                    provenance: vec![],
+                },
+            },
+        );
+    }
     #[test]
     fn repeated_suffix_detects_a_and_ab_but_not_changed_observations() {
         assert!(repeated_suffix(&VecDeque::from([1, 1, 1]), 3));
@@ -129,6 +191,132 @@ mod tests {
         outcome.data["duration_ms"] = json!(900);
         assert_eq!(first, observation(&call, &outcome));
         outcome.data["state"] = json!("completed");
-        assert_ne!(first, observation(&call, &outcome));
+        let completed = observation(&call, &outcome);
+        assert_ne!(first, completed);
+        outcome.model_content = "completed with paper citation".into();
+        assert_ne!(completed, observation(&call, &outcome));
+    }
+
+    #[test]
+    fn varied_repeats_stop_only_after_two_complete_units_without_new_observations() {
+        let mut events = Vec::new();
+        for (id, tool, data) in [
+            ("read-1", "project.read", json!({"paper":"p1"})),
+            ("list-1", "project.list", json!({"files":["p1"]})),
+            ("verify-1", "artifact.verify", json!({"checksum":"sha1"})),
+            ("list-2", "project.list", json!({"files":["p1"]})),
+        ] {
+            complete_observation(&mut events, id, tool, json!({}), data);
+        }
+        assert!(!stalled(&events, 2));
+        complete_observation(
+            &mut events,
+            "read-2",
+            "project.read",
+            json!({}),
+            json!({"paper":"p1"}),
+        );
+        assert!(stalled(&events, 2));
+    }
+
+    #[test]
+    fn changed_scientific_result_and_page_are_new_observations() {
+        let mut events = Vec::new();
+        complete_observation(
+            &mut events,
+            "a",
+            "project.read",
+            json!({"offset":0}),
+            json!({"paper":"p1","checksum":"sha1","job":"running"}),
+        );
+        complete_observation(
+            &mut events,
+            "b",
+            "project.read",
+            json!({"offset":0}),
+            json!({"paper":"p2","checksum":"sha1","job":"running"}),
+        );
+        complete_observation(
+            &mut events,
+            "c",
+            "project.read",
+            json!({"offset":0}),
+            json!({"paper":"p2","checksum":"sha2","job":"running"}),
+        );
+        complete_observation(
+            &mut events,
+            "d",
+            "project.read",
+            json!({"offset":0}),
+            json!({"paper":"p2","checksum":"sha2","job":"completed"}),
+        );
+        complete_observation(
+            &mut events,
+            "e",
+            "project.read",
+            json!({"offset":50}),
+            json!({"paper":"p2","checksum":"sha2","job":"completed"}),
+        );
+        assert!(!stalled(&events, 2));
+    }
+
+    #[test]
+    fn input_guidance_and_scientific_state_each_reset_novelty_streak() {
+        for reset in [
+            AgentEventKindV4::UserInputAnswered {
+                question_id: "q".into(),
+                answer: "continue".into(),
+            },
+            AgentEventKindV4::GuidanceConsumed {
+                message_id: Uuid::new_v4(),
+                markdown: "continue".into(),
+            },
+            AgentEventKindV4::ScientificStateChanged {
+                revision: 1,
+                state_sha256: "new-state".into(),
+                changes: vec![],
+            },
+        ] {
+            let mut events = Vec::new();
+            complete_observation(
+                &mut events,
+                "a",
+                "project.read",
+                json!({}),
+                json!({"paper":"p1"}),
+            );
+            complete_observation(
+                &mut events,
+                "b",
+                "project.read",
+                json!({}),
+                json!({"paper":"p1"}),
+            );
+            push(&mut events, reset);
+            complete_observation(
+                &mut events,
+                "c",
+                "project.read",
+                json!({}),
+                json!({"paper":"p1"}),
+            );
+            assert!(!stalled(&events, 2));
+            complete_observation(
+                &mut events,
+                "d",
+                "project.read",
+                json!({}),
+                json!({"paper":"p2"}),
+            );
+            assert!(!stalled(&events, 2));
+            complete_observation(
+                &mut events,
+                "e",
+                "project.read",
+                json!({}),
+                json!({"paper":"p1"}),
+            );
+            assert!(!stalled(&events, 2));
+        }
     }
 }

@@ -20,7 +20,7 @@
 
 2026-09-15 的一次只读运行快照用于记录优化前量级：17 次模型请求共报告 input 1,217,607、output 45,321、reasoning 35,275、cache-read input 348,412 token，单次 context 峰值 97,693，并产生 8 对 archive/checkpoint 事件；原始工具 outcome 中 `search_mcp_tools`、`agent.read_tool_result`、`runtime.execute`、`use_skill`、`search_skills` 分别累计 621,750、347,723、33,368、29,275、11,164 UTF-8 字节，28 个成功 outcome 的等价 JSON 重复正文累计 470,616 字节。这些是一个运行的观测基线，不能单独归因于本投影，也不代表 tokenizer 精确换算、账单价格或优化后的节省。
 
-`progress.rs` 从持久化 outcome 重建最多 32 个 observation；批次必须关闭且结果齐全才计入，比较规范参数、成功标记和结果，忽略根级 transport timing 字段。旧 `repeated_signature_limit` 配置沿用为重复 observation 阈值（至少 2）；用户回答/科学状态变化重置窗口。初版直接返回 needs-attention，未增加额外的模型修正轮次。截断响应、空响应和无 terminal marker 的流均不作为成功工具轮次。
+`progress.rs` 从持久化 outcome 重建最近 32 个已完成观察单元；批次必须关闭且结果齐全才计入，比较规范参数、成功标记和结果，忽略根级 transport timing 字段。除原有完全重复后缀判断外，也比较本批成员是否在此前 32 个单元中出现过：连续没有新增稳定观察时，即使工具顺序、分组或子集改变，也会触发无进展保护。新内容、校验和、作业状态或分页参数仍视为新观察；空批和缺少结果的批次不计数。旧 `repeated_signature_limit` 配置沿用为阈值（至少 2）；用户回答、已消费指导和科学状态变化重置窗口及连续计数。保护返回 needs-attention，不增加额外模型轮次，也不宣称任务完成。截断响应、空响应和无 terminal marker 的流均不作为成功工具轮次。
 
 用户要求本次工作中的简单任务和子 agent 使用 Luna、max 推理。它是开发执行偏好，不自动成为 OmicsOps 产品的默认模型。产品侧如需同样策略，应通过可配置 profile 绑定，并校验供应商精确模型 ID 和支持的推理档位；不把 Codex 内部模型别名直接写进供应商请求。
 

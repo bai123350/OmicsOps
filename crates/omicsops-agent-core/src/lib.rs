@@ -9605,6 +9605,126 @@ mod tests {
         assert_eq!(tools.calls.load(AtomicOrdering::SeqCst), 2);
     }
 
+    struct CountingUnexpectedModel(AtomicUsize);
+
+    #[async_trait]
+    impl ModelPortV4 for CountingUnexpectedModel {
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            self.0.fetch_add(1, AtomicOrdering::SeqCst);
+            Err(ModelFailureV4::transient(
+                omicsops_protocol::ModelErrorClassV4::Server,
+                "unexpected model dispatch",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn reordered_unchanged_literature_batches_stop_before_model_dispatch() {
+        let spec = ordinary_execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        for (batch_id, tools) in [
+            (1, vec!["project.read", "project.list", "artifact.verify"]),
+            (2, vec!["artifact.verify", "project.read"]),
+            (3, vec!["project.list", "artifact.verify"]),
+        ] {
+            let call_ids: Vec<_> = tools
+                .iter()
+                .enumerate()
+                .map(|(index, _)| format!("literature-{batch_id}-{index}"))
+                .collect();
+            for (call_id, tool) in call_ids.iter().zip(&tools) {
+                append_test_event(
+                    &store,
+                    spec.run_id,
+                    AgentEventKindV4::ToolRequested {
+                        call: ToolCallV4 {
+                            call_id: call_id.clone(),
+                            tool_id: (*tool).into(),
+                            arguments: json!({}),
+                        },
+                    },
+                );
+            }
+            append_test_event(
+                &store,
+                spec.run_id,
+                AgentEventKindV4::ToolBatchStarted {
+                    batch_id,
+                    cycle_id: batch_id,
+                    phase: AgentPhaseV4::Executing,
+                    tool_names: tools.iter().map(|tool| (*tool).into()).collect(),
+                    call_ids: call_ids.clone(),
+                },
+            );
+            for (call_id, tool) in call_ids.iter().zip(&tools) {
+                let data = match *tool {
+                    "project.read" => json!({"paper":"p1"}),
+                    "project.list" => json!({"papers":["p1"]}),
+                    _ => json!({"checksum":"sha1"}),
+                };
+                append_test_event(
+                    &store,
+                    spec.run_id,
+                    AgentEventKindV4::ToolFinished {
+                        outcome: ToolOutcomeV4 {
+                            call_id: call_id.clone(),
+                            tool_id: (*tool).into(),
+                            succeeded: true,
+                            model_content: "stable evidence".into(),
+                            data,
+                            provenance: vec![],
+                        },
+                    },
+                );
+            }
+            append_test_event(
+                &store,
+                spec.run_id,
+                AgentEventKindV4::ToolBatchFinished {
+                    batch_id,
+                    cycle_id: batch_id,
+                    phase: AgentPhaseV4::Executing,
+                    tool_names: tools.iter().map(|tool| (*tool).into()).collect(),
+                    call_ids,
+                    duration_ms: batch_id,
+                    succeeded: tools.len() as u32,
+                    failed: 0,
+                },
+            );
+        }
+        let model = CountingUnexpectedModel(AtomicUsize::new(0));
+        let error = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        }
+        .execute_with_limits(
+            &spec,
+            AgentLimitsV4 {
+                repeated_signature_limit: 2,
+                ..AgentLimitsV4::ordinary(0)
+            },
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AgentCoreErrorV4::RepeatedToolCall(_)));
+        assert_eq!(model.0.load(AtomicOrdering::SeqCst), 0);
+        assert!(
+            !store
+                .load_direct(spec.run_id)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::RunCompleted))
+        );
+    }
+
     #[tokio::test]
     async fn progress_guard_waits_for_batch_close_and_resets_on_user_input() {
         let spec = execution_spec(Uuid::new_v4());
