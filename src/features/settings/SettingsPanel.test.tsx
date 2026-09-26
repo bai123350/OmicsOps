@@ -30,6 +30,30 @@ afterEach(() => {
 });
 
 describe("SettingsPanel model providers", () => {
+  it("reveals the model form only when configuring or editing a profile", () => {
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    const scrollIntoView = vi.fn();
+    Element.prototype.scrollIntoView = scrollIntoView;
+    try {
+      const profile = { id: "saved", label: "Saved model", provider: "open_ai_compatible" as const, base_url: "https://gateway.example/v1", model: "vendor/model", credential_reference: null, supports_tools: true, supports_vision: false };
+      render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[profile]} />);
+      fireEvent.click(screen.getByRole("button", { name: "Configure Kimi" }));
+      expect(scrollIntoView).toHaveBeenCalledTimes(1);
+      expect(scrollIntoView.mock.instances[0]).toBe(screen.getByRole("region", { name: "Model configuration" }));
+      fireEvent.change(screen.getByLabelText("Model"), { target: { value: "custom" } });
+      fireEvent.change(screen.getByLabelText("API key"), { target: { value: "test-only" } });
+      expect(scrollIntoView).toHaveBeenCalledTimes(1);
+      fireEvent.click(screen.getByRole("button", { name: "Configure LM Studio" }));
+      expect(scrollIntoView).toHaveBeenCalledTimes(2);
+      fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+      expect(scrollIntoView).toHaveBeenCalledTimes(3);
+      fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "https://other.example/v1" } });
+      expect(scrollIntoView).toHaveBeenCalledTimes(3);
+    } finally {
+      Element.prototype.scrollIntoView = originalScrollIntoView;
+    }
+  });
+
   it("confirms model deletion, keeps the dialog on failure, and closes only the confirmation on Escape", async () => {
     const profile = { id: "delete-me", label: "Disposable model", provider: "ollama" as const, base_url: "http://127.0.0.1:11434", model: "temporary", credential_reference: null, supports_tools: true, supports_vision: false };
     const remove = vi.fn().mockRejectedValueOnce(new Error("Stop the active run before deleting this model.")).mockResolvedValue(undefined);

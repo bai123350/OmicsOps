@@ -44,6 +44,7 @@ Kimi 的两个平台与 key 来源依据 [官方平台说明](https://www.kimi.c
 3. 仅对 `OpenAiCompatible` + `http` + `127.0.0.1`/`localhost`/IPv6 loopback + 端口 `1234` + 根路径或 `/v1`（含尾斜线）允许无密钥。拒绝 username/password/query/fragment。此条件是已审核的本地 LM Studio 配置，不证明服务进程身份。其它端口、LAN/公网地址、协议仍沿用现有凭据要求。用户配置本地 token 时仍使用 keyring 和 Bearer；无 token 时不发送空 Authorization。无认证本地 client 禁止重定向，不能把本地认证例外传播到远程目标。
 4. 后端保留非 Ollama 的凭据引用，确保可选 LM Studio token 仍沿用现有 keyring 生命周期；允许该引用暂无 secret。不往数据库存入占位密钥。不把其它 provider 的认证改成全局可选。
 5. Qwen `/compatible-mode/v1` 已会追加 `chat/completions`；MiniMax `/anthropic` 已会追加 `v1/messages`，无需改写。GLM 仅对 `OpenAiCompatible` + HTTPS `open.bigmodel.cn:443` + 精确 `/api/paas/v4` 或 `/api/coding/paas/v4`（允许尾斜线）直接追加 `chat/completions` / `models`；不得再插入 `v1`。同样拒绝 username/password/query/fragment，不把此特例应用到未知 host 或路径。不新增先后试发多个生成请求的 fallback。保护未知 `/gateway` 配置原有追加 `/v1/...` 的行为。模型发现失败保持可见错误，不伪造平台返回的列表；手动输入模型始终可用。
+6. 平台卡片多于单个窗口可见高度；点击配置入口、切换预设或编辑已保存配置时，表单滚动进入设置面板的可见区域。普通模型、地址和密钥输入不重复滚动，滚动不强制转移键盘焦点；Escape 仍由现有窗口级堆栈处理。
 
 ## 能力、恢复与安全
 
