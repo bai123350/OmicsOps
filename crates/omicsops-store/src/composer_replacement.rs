@@ -89,9 +89,9 @@ impl Store {
                 "replacement target changed; refresh before replacing",
             ));
         }
-        let other_active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs_v4 WHERE project_id=?1 AND conversation_id=?2 AND run_id<>?3 AND status IN ('running','planning','waiting_for_input','waiting_for_approval','awaiting_approval','needs_attention')")
-            .bind(turn.project_id.to_string()).bind(turn.conversation_id.to_string()).bind(request.target_run_id.to_string()).fetch_one(&mut *tx).await?;
-        if other_active != 0 {
+        if crate::composer_queue_dispatch::has_blocking_run_except_in_tx(
+            &mut tx, turn.project_id, turn.conversation_id, request.target_run_id,
+        ).await? {
             return Err(invalid("another run owns the conversation"));
         }
         let already_replaced: i64 = sqlx::query_scalar(
@@ -227,6 +227,8 @@ pub(super) async fn ensure_replacement_settled_in_tx(
     )
     .await?;
     let events = crate::load_agent_events_in_tx(&mut *tx, receipt.target_run_id).await?;
+    let run_status: String = sqlx::query_scalar("SELECT status FROM agent_runs_v4 WHERE run_id=?1")
+        .bind(receipt.target_run_id.to_string()).fetch_one(&mut *tx).await?;
     validate_event_chain_v4(&events)
         .map_err(|_| invalid("replacement target evidence is invalid"))?;
     if events.iter().any(|event| {
@@ -237,14 +239,17 @@ pub(super) async fn ensure_replacement_settled_in_tx(
         event.sequence == receipt.source_event_sequence
             && event.event_hash == receipt.source_event_hash
     }) || crate::has_unresolved_side_effect_dispatch(&events)
-        || !events.last().is_some_and(|event| {
+        || !events.iter().any(|event| {
             matches!(
                 event.event,
                 AgentEventKindV4::RunCompleted
                     | AgentEventKindV4::RunCancelled
                     | AgentEventKindV4::RunFailed { .. }
+                    | AgentEventKindV4::RunNeedsAttention { .. }
             )
         })
+        || (events.iter().any(|event| matches!(event.event, AgentEventKindV4::RunNeedsAttention { .. }))
+            && (run_status != "needs_attention" || !crate::composer_queue_dispatch::safe_needs_attention_in_tx(&mut *tx, receipt.project_id, receipt.conversation_id, receipt.target_run_id).await?))
     {
         return Err(invalid("replacement is waiting for safe target settlement"));
     }

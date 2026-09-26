@@ -51,6 +51,22 @@ const queued: ComposerQueueItemV4 = {
   frozen: { model_profile_id: "model", model_configuration_hash: "hash", compute_selection: { schema_version: 4, backend_id: "local", backend_kind: "local", autonomy_mode: "supervised", approval_policy: "risk_based", environment: "system", network_policy: "host_inherited", container_image: null }, conversation_preferences: { delegation_enabled: true, auto_review: true, memory_enabled: true }, service_tier: {}, delegated_model: null, reviewer_model: null },
   references: [{ kind: "artifact", project_id: "p", id: "artifact" }], attachments: ["file"], attachment_receipts: [{ id: "file", project_id: "p", conversation_id: "c", name: "counts.csv", size_bytes: 4, media_type: "text/csv", relative_path: ".omicsops/attachments/file/counts.csv", sha256: "hash" }],
 };
+it("shows attention in the conversation header after a terminal run", async () => {
+  render(<WorkspaceShell {...base} activeRunId="old" runStarted agentRunEventsV4={[{
+    schema_version: 4, run_id: "old", project_id: "p", conversation_id: "c", sequence: 1,
+    previous_hash: "", event_hash: "hash", occurred_at: "2026-09-14T00:00:00Z",
+    event: { kind: "run_needs_attention", message: "context limit" },
+  }]} queueItems={[{ ...queued, status: "failed" }]} onQueue={vi.fn()} />);
+  expect(document.querySelector(".conversation-header .live-status")).toHaveTextContent("Needs attention");
+  fireEvent.change(screen.getByRole("textbox", { name: /Describe/ }), { target: { value: "New work" } });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).toBeEnabled());
+});
+it("keeps accepted pending work visible as a queue send", async () => {
+  render(<WorkspaceShell {...base} queueItems={[queued]} onQueue={vi.fn()} />);
+  fireEvent.change(screen.getByRole("textbox", { name: /Describe/ }), { target: { value: "Fifth task" } });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Add to queue" })).toBeEnabled());
+  expect(document.querySelector(".conversation-header .live-status")).toHaveTextContent("Queued");
+});
 it.each(["pending", "dispatching", "running", "completed", "failed", "cancelled", "uncertain"] as const)("keeps %s queue records out of the composer area", async (status) => {
   const queue = vi.fn().mockResolvedValue(true);
   const action = vi.fn();

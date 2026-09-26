@@ -10,7 +10,7 @@ use omicsops_dto::{
 use omicsops_protocol::{
     AgentEventKindV4, AgentEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendKindV4,
     ComputeSelectionV4, ConversationAgentPreferencesV4, NetworkPolicyV4, RunModeV4,
-    RunServiceTierV4,
+    RunServiceTierV4, ToolEffectV4,
 };
 use omicsops_store::Store;
 use serde_json::{Value, json};
@@ -629,6 +629,128 @@ async fn needs_attention_run_blocks_fifo_claim() {
             .unwrap()
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn safe_needs_attention_without_queue_does_not_block_claim_or_commit() {
+    let (store, project, conversation) = fixture().await;
+    let pending = enqueue(&store, project.id, conversation.id, ComposerQueueModeV4::Plan, "next", "").await;
+    let old_run = Uuid::new_v4();
+    sqlx::query("INSERT INTO agent_runs_v4(run_id,project_id,conversation_id,status,value_json) VALUES (?1,?2,?3,'needs_attention','{}')")
+        .bind(old_run.to_string()).bind(project.id.to_string()).bind(conversation.id.to_string())
+        .execute(store.pool()).await.unwrap();
+    let created = AgentEventV4::first(old_run, project.id, conversation.id, Utc::now(), AgentEventKindV4::RunCreated { mode: RunModeV4::Execute });
+    store.append_agent_event_v4(&created).await.unwrap();
+    let attention = AgentEventV4::next(&created, Utc::now(), AgentEventKindV4::RunNeedsAttention { message: "context limit".into() });
+    store.append_agent_event_v4(&attention).await.unwrap();
+
+    let lease = store.claim_next_composer_queue(project.id, conversation.id, Utc::now()).await.unwrap().expect("safe historical run must allow FIFO");
+    assert_eq!(lease.item.request_id, pending.request_id);
+    let now = Utc::now();
+    store.commit_composer_queue_dispatch(&lease, &plan_value(&pending, &material("")), &[plan_event(&pending, now)], now).await.unwrap();
+    let status: String = sqlx::query_scalar("SELECT status FROM agent_runs_v4 WHERE run_id=?1").bind(old_run.to_string()).fetch_one(store.pool()).await.unwrap();
+    assert_eq!(status, "needs_attention");
+    assert_eq!(store.agent_events_v4(old_run).await.unwrap(), vec![created, attention]);
+}
+
+#[tokio::test]
+async fn attention_evidence_fail_closed_and_read_only_dispatch_is_safe() {
+    for effect in [ToolEffectV4::ReadOnly, ToolEffectV4::Mutating, ToolEffectV4::Runtime, ToolEffectV4::Network, ToolEffectV4::Delegation] {
+        let (store, project, conversation) = fixture().await;
+        let run = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_runs_v4(run_id,project_id,conversation_id,status,value_json) VALUES (?1,?2,?3,'needs_attention','{}')")
+            .bind(run.to_string()).bind(project.id.to_string()).bind(conversation.id.to_string()).execute(store.pool()).await.unwrap();
+        let first = AgentEventV4::first(run, project.id, conversation.id, Utc::now(), AgentEventKindV4::RunCreated { mode: RunModeV4::Execute });
+        store.append_agent_event_v4(&first).await.unwrap();
+        let dispatch = AgentEventV4::next(&first, Utc::now(), AgentEventKindV4::ToolDispatchStarted { call_id: "call".into(), tool_id: "tool".into(), effect, idempotency_key: "call".into() });
+        store.append_agent_event_v4(&dispatch).await.unwrap();
+        let terminal = AgentEventV4::next(&dispatch, Utc::now(), AgentEventKindV4::RunNeedsAttention { message: "context".into() });
+        store.append_agent_event_v4(&terminal).await.unwrap();
+        assert_eq!(store.safe_needs_attention_run(project.id, conversation.id, run).await.unwrap(), effect == ToolEffectV4::ReadOnly, "{effect:?}");
+    }
+    let (store, project, conversation) = fixture().await;
+    let run = Uuid::new_v4();
+    sqlx::query("INSERT INTO agent_runs_v4(run_id,project_id,conversation_id,status,value_json) VALUES (?1,?2,?3,'needs_attention','{}')")
+        .bind(run.to_string()).bind(project.id.to_string()).bind(conversation.id.to_string()).execute(store.pool()).await.unwrap();
+    let first = AgentEventV4::first(run, project.id, conversation.id, Utc::now(), AgentEventKindV4::RunCreated { mode: RunModeV4::Execute });
+    store.append_agent_event_v4(&first).await.unwrap();
+    let uncertain = AgentEventV4::next(&first, Utc::now(), AgentEventKindV4::ToolDispatchUncertain { call_id: "orphan".into(), tool_id: "tool".into() });
+    store.append_agent_event_v4(&uncertain).await.unwrap();
+    let terminal = AgentEventV4::next(&uncertain, Utc::now(), AgentEventKindV4::RunNeedsAttention { message: "context".into() });
+    store.append_agent_event_v4(&terminal).await.unwrap();
+    assert!(!store.safe_needs_attention_run(project.id, conversation.id, run).await.unwrap());
+}
+
+#[tokio::test]
+async fn attention_status_requires_valid_scoped_terminal_chain() {
+    for damage in ["status_running", "hash", "scope"] {
+        let (store, project, conversation) = fixture().await;
+        let run = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_runs_v4(run_id,project_id,conversation_id,status,value_json) VALUES (?1,?2,?3,'needs_attention','{}')")
+            .bind(run.to_string()).bind(project.id.to_string()).bind(conversation.id.to_string()).execute(store.pool()).await.unwrap();
+        let first = AgentEventV4::first(run, project.id, conversation.id, Utc::now(), AgentEventKindV4::RunCreated { mode: RunModeV4::Execute });
+        store.append_agent_event_v4(&first).await.unwrap();
+        let terminal = AgentEventV4::next(&first, Utc::now(), AgentEventKindV4::RunNeedsAttention { message: "context".into() });
+        store.append_agent_event_v4(&terminal).await.unwrap();
+        match damage {
+            "status_running" => { sqlx::query("UPDATE agent_runs_v4 SET status='running' WHERE run_id=?1").bind(run.to_string()).execute(store.pool()).await.unwrap(); }
+            "hash" => { sqlx::query("UPDATE agent_events_v4 SET value_json='{}' WHERE run_id=?1 AND sequence=2").bind(run.to_string()).execute(store.pool()).await.unwrap(); }
+            "scope" => {
+                let other = Conversation::new(Uuid::new_v4(), project.id, "other", Utc::now());
+                store.save_conversation(&other).await.unwrap();
+                sqlx::query("UPDATE agent_events_v4 SET conversation_id=?1 WHERE run_id=?2 AND sequence=2").bind(other.id.to_string()).bind(run.to_string()).execute(store.pool()).await.unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(!store.safe_needs_attention_run(project.id, conversation.id, run).await.unwrap(), "{damage}");
+        enqueue(&store, project.id, conversation.id, ComposerQueueModeV4::Plan, "blocked", "").await;
+        assert!(store.claim_next_composer_queue(project.id, conversation.id, Utc::now()).await.unwrap().is_none(), "{damage}");
+    }
+}
+
+#[tokio::test]
+async fn reopened_safe_needs_attention_queue_settles_and_four_pending_remain_fifo() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("attention-restart.sqlite");
+    let (project, conversation, old, pending, evidence) = {
+        let store = Store::open(&path).await.unwrap();
+        let project = Project::new(Uuid::new_v4(), "restart project", r"C:\data\restart-project", ProjectTemplate::Blank, Utc::now());
+        let conversation = Conversation::new(Uuid::new_v4(), project.id, "restart conversation", Utc::now());
+        store.save_project(&project).await.unwrap();
+        store.save_conversation(&conversation).await.unwrap();
+        store.save_model_profile(&profile("dispatch-test")).await.unwrap();
+        let old = enqueue(&store, project.id, conversation.id, ComposerQueueModeV4::Plan, "old", "").await;
+        let now = Utc::now();
+        let lease = store.claim_next_composer_queue(project.id, conversation.id, now).await.unwrap().unwrap();
+        let created = plan_event(&old, now);
+        store.commit_composer_queue_dispatch(&lease, &plan_value(&old, &material("")), &[created.clone()], now).await.unwrap();
+        let mut pending = Vec::new();
+        for i in 1..=4 {
+            pending.push(enqueue(&store, project.id, conversation.id, ComposerQueueModeV4::Plan, &format!("queued {i}"), "").await);
+        }
+        let attention = AgentEventV4::next(&created, now + Duration::seconds(1), AgentEventKindV4::RunNeedsAttention { message: "context limit".into() });
+        store.append_agent_event_v4(&attention).await.unwrap();
+        sqlx::query("UPDATE agent_runs_v4 SET status='needs_attention' WHERE run_id=?1").bind(old.run_id.to_string()).execute(store.pool()).await.unwrap();
+        sqlx::query("UPDATE proposed_plans SET status='cancelled' WHERE run_id=?1").bind(old.run_id.to_string()).execute(store.pool()).await.unwrap();
+        // Mimic an older database in which the event observer left the queue row running.
+        sqlx::query("UPDATE composer_queue_v4 SET status='running',failure_code=NULL WHERE request_id=?1").bind(old.request_id.to_string()).execute(store.pool()).await.unwrap();
+        (project, conversation, old, pending, vec![created, attention])
+    };
+    let store = Store::open(&path).await.unwrap();
+    let rows = store.reconcile_composer_queue(project.id, conversation.id, Utc::now()).await.unwrap();
+    assert_eq!(rows[0].status, ComposerQueueStatusV4::Failed);
+    assert_eq!(rows[0].failure_code, Some(ComposerQueueFailureCodeV4::RunFailed));
+    for (row, expected) in rows.iter().skip(1).zip(&pending) {
+        assert_eq!((row.request_id, row.message_id, row.run_id, row.message_markdown.as_str(), row.status), (expected.request_id, expected.message_id, expected.run_id, expected.message_markdown.as_str(), ComposerQueueStatusV4::Pending));
+    }
+    assert_eq!(store.reconcile_composer_queue(project.id, conversation.id, Utc::now()).await.unwrap(), rows);
+    assert_eq!(store.agent_events_v4(old.run_id).await.unwrap(), evidence);
+    let lease = store.claim_next_composer_queue(project.id, conversation.id, Utc::now()).await.unwrap().unwrap();
+    assert_eq!(lease.item.request_id, pending[0].request_id);
+    let now = Utc::now();
+    store.commit_composer_queue_dispatch(&lease, &plan_value(&pending[0], &material("")), &[plan_event(&pending[0], now)], now).await.unwrap();
+    let status: String = sqlx::query_scalar("SELECT status FROM agent_runs_v4 WHERE run_id=?1").bind(old.run_id.to_string()).fetch_one(store.pool()).await.unwrap();
+    assert_eq!(status, "needs_attention");
 }
 
 #[tokio::test]

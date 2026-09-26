@@ -32,7 +32,7 @@ async fn acquire_driver_in(directory: &Path, run_id: Uuid) -> Result<File, Strin
     Err("Run is owned by another action or window; check its state before retrying".into())
 }
 
-fn try_lease_in(data_dir: &Path, run_id: Uuid) -> Result<Option<File>, String> {
+pub(crate) fn try_lease_in(data_dir: &Path, run_id: Uuid) -> Result<Option<File>, String> {
     let directory = data_dir.join("agent-run-leases");
     std::fs::create_dir_all(&directory).map_err(|_| "Run ownership directory is unavailable")?;
     // Keep the inode: unlinking a lock file would allow two concurrent owners.

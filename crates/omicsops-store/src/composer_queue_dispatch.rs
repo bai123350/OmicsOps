@@ -26,6 +26,33 @@ fn invalid(message: &str) -> StoreError {
 }
 
 impl Store {
+    pub async fn safe_needs_attention_run(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<bool, StoreError> {
+        let mut connection = self.pool.acquire().await?;
+        let status: Option<String> = sqlx::query_scalar("SELECT status FROM agent_runs_v4 WHERE run_id=?1 AND project_id=?2 AND conversation_id=?3")
+            .bind(run_id.to_string()).bind(project_id.to_string()).bind(conversation_id.to_string())
+            .fetch_optional(&mut *connection).await?;
+        if status.as_deref() != Some("needs_attention") { return Ok(false); }
+        safe_needs_attention_in_tx(&mut connection, project_id, conversation_id, run_id).await
+    }
+
+    pub async fn preceding_composer_queue_runs(
+        &self,
+        item: &ComposerQueueItemV4,
+    ) -> Result<Vec<Uuid>, StoreError> {
+        // Include old direct runs without a queue row. A held OS lease means
+        // their terminal status may be durable while cleanup is still active.
+        let rows: Vec<String> = sqlx::query_scalar("SELECT run_id FROM agent_runs_v4 WHERE project_id=?1 AND conversation_id=?2 AND run_id<>?3 AND status='needs_attention' UNION SELECT run_id FROM composer_queue_v4 WHERE project_id=?1 AND conversation_id=?2 AND position<?4 AND status IN ('completed','failed','cancelled')")
+            .bind(item.project_id.to_string()).bind(item.conversation_id.to_string())
+            .bind(item.run_id.to_string()).bind(i64::try_from(item.position).map_err(|_| invalid("queue position exceeds SQLite range"))?)
+            .fetch_all(&self.pool).await?;
+        rows.into_iter().map(|id| crate::parse_uuid(id, "predecessor run id")).collect()
+    }
+
     pub async fn claim_next_composer_queue(
         &self,
         project_id: Uuid,
@@ -34,11 +61,10 @@ impl Store {
     ) -> Result<Option<ComposerQueueDispatchLeaseV4>, StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         crate::ensure_conversation_unlocked_executor(&mut tx, project_id, conversation_id).await?;
-        let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs_v4 WHERE project_id=?1 AND conversation_id=?2 AND status IN ('planning','running','waiting_for_input','waiting_for_approval','awaiting_approval','needs_attention')")
-            .bind(project_id.to_string()).bind(conversation_id.to_string()).fetch_one(&mut *tx).await?;
+        let active = has_blocking_run_in_tx(&mut tx, project_id, conversation_id).await?;
         let claimed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM composer_queue_v4 WHERE project_id=?1 AND conversation_id=?2 AND status IN ('dispatching','running','uncertain')")
             .bind(project_id.to_string()).bind(conversation_id.to_string()).fetch_one(&mut *tx).await?;
-        if active > 0 || claimed > 0 {
+        if active || claimed > 0 {
             tx.commit().await?;
             return Ok(None);
         }
@@ -124,9 +150,7 @@ impl Store {
             &item.frozen,
         )
         .await?;
-        let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs_v4 WHERE project_id=?1 AND conversation_id=?2 AND status IN ('planning','running','waiting_for_input','waiting_for_approval','awaiting_approval','needs_attention')")
-            .bind(item.project_id.to_string()).bind(item.conversation_id.to_string()).fetch_one(&mut *tx).await?;
-        if active > 0 {
+        if has_blocking_run_in_tx(&mut tx, item.project_id, item.conversation_id).await? {
             return Err(invalid("conversation became busy before queue dispatch"));
         }
         ensure_no_dispatch_side_effects(&mut tx, &item).await?;
@@ -317,6 +341,7 @@ impl Store {
                     && event.project_id == project_id
                     && event.conversation_id == conversation_id
             });
+            let safe_attention = safe_needs_attention_in_tx(&mut tx, project_id, conversation_id, run_id).await?;
             let next = if let (Some(run), Some((message_project, message_conversation))) =
                 (&run, &message)
             {
@@ -330,7 +355,7 @@ impl Store {
                 {
                     "uncertain"
                 } else {
-                    terminal_queue_status(&events).unwrap_or("running")
+                    terminal_queue_status(&events).or_else(|| safe_attention.then_some("failed")).unwrap_or("running")
                 }
             } else if run.is_none()
                 && message.is_none()
@@ -553,13 +578,94 @@ fn terminal_queue_status(events: &[AgentEventV4]) -> Option<&'static str> {
     })
 }
 
+fn safe_needs_attention_events(
+    events: &[AgentEventV4],
+    project_id: Uuid,
+    conversation_id: Uuid,
+    run_id: Uuid,
+) -> bool {
+    !events.is_empty()
+        && events.iter().all(|event| {
+            event.project_id == project_id
+                && event.conversation_id == conversation_id
+                && event.run_id == run_id
+        })
+        && events.iter().filter(|event| matches!(event.event, AgentEventKindV4::RunNeedsAttention { .. })).count() == 1
+        && events.iter().all(|event| !matches!(event.event, AgentEventKindV4::RunCompleted | AgentEventKindV4::RunFailed { .. } | AgentEventKindV4::RunCancelled))
+        && !crate::has_unresolved_side_effect_dispatch(events)
+}
+
+/// Validate the persisted JSON chain and the indexed columns before allowing a
+/// historical attention status to stop acting as a conversation barrier.
+pub(super) async fn safe_needs_attention_in_tx(
+    tx: &mut SqliteConnection,
+    project_id: Uuid,
+    conversation_id: Uuid,
+    run_id: Uuid,
+) -> Result<bool, StoreError> {
+    let rows = sqlx::query("SELECT project_id,conversation_id,sequence,previous_hash,event_hash,value_json FROM agent_events_v4 WHERE run_id=?1 ORDER BY sequence")
+        .bind(run_id.to_string()).fetch_all(&mut *tx).await?;
+    if rows.is_empty() { return Ok(false); }
+    let events = match crate::load_agent_events_in_tx(tx, run_id).await {
+        Ok(events) => events,
+        Err(_) => return Ok(false),
+    };
+    if events.len() != rows.len() || !safe_needs_attention_events(&events, project_id, conversation_id, run_id) {
+        return Ok(false);
+    }
+    for (row, event) in rows.iter().zip(&events) {
+        if row.try_get::<String, _>(0)? != project_id.to_string()
+            || row.try_get::<String, _>(1)? != conversation_id.to_string()
+            || row.try_get::<i64, _>(2)? != event.sequence as i64
+            || row.try_get::<String, _>(3)? != event.previous_hash
+            || row.try_get::<String, _>(4)? != event.event_hash
+        { return Ok(false); }
+    }
+    Ok(true)
+}
+
+pub(super) async fn has_blocking_run_in_tx(
+    tx: &mut SqliteConnection,
+    project_id: Uuid,
+    conversation_id: Uuid,
+) -> Result<bool, StoreError> {
+    has_blocking_run_except_in_tx(tx, project_id, conversation_id, Uuid::nil()).await
+}
+
+pub(super) async fn has_blocking_run_except_in_tx(
+    tx: &mut SqliteConnection,
+    project_id: Uuid,
+    conversation_id: Uuid,
+    except: Uuid,
+) -> Result<bool, StoreError> {
+    let rows = sqlx::query("SELECT run_id,status FROM agent_runs_v4 WHERE project_id=?1 AND conversation_id=?2 AND run_id<>?3 AND status IN ('planning','running','waiting_for_input','waiting_for_approval','awaiting_approval','needs_attention')")
+        .bind(project_id.to_string()).bind(conversation_id.to_string()).bind(except.to_string()).fetch_all(&mut *tx).await?;
+    for row in rows {
+        let status: String = row.try_get(1)?;
+        if status != "needs_attention" { return Ok(true); }
+        let run_id = crate::parse_uuid(row.try_get::<String, _>(0)?, "run id")?;
+        if !safe_needs_attention_in_tx(tx, project_id, conversation_id, run_id).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) async fn observe_terminal_event_in_tx(
     tx: &mut SqliteConnection,
     event: &AgentEventV4,
 ) -> Result<(), StoreError> {
-    let Some(status) = terminal_queue_status(std::slice::from_ref(event)) else {
+    let status = terminal_queue_status(std::slice::from_ref(event)).or_else(|| {
+        matches!(event.event, AgentEventKindV4::RunNeedsAttention { .. }).then_some("failed")
+    });
+    let Some(status) = status else {
         return Ok(());
     };
+    if matches!(event.event, AgentEventKindV4::RunNeedsAttention { .. })
+        && !safe_needs_attention_in_tx(tx, event.project_id, event.conversation_id, event.run_id).await?
+    {
+        return Ok(());
+    }
     let failure_code = match status {
         "failed" => Some(crate::enum_string(&ComposerQueueFailureCodeV4::RunFailed)?),
         "cancelled" => Some(crate::enum_string(

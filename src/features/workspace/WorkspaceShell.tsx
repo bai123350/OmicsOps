@@ -494,6 +494,15 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
   const fastModeButtonDisabled = fastModeLocked || (!fastModeAvailable && fastMode !== true && profileFastMode !== true);
   const fastModeOption = fastMode === true ? "fast" : fastMode === false ? "standard" : "default";
   const queueBacklog = queueItems.some((item) => item.project_id === project.id && item.conversation_id === activeConversationId && !["completed", "failed", "cancelled"].includes(item.status));
+  const headerTerminal = effectiveTerminalAgentEventV4(activeRunEventsV4)?.event.kind;
+  const headerStatus = headerTerminal === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention")
+    : headerTerminal === "run_completed" ? (zh ? "已完成" : "Completed")
+    : headerTerminal === "run_cancelled" ? (zh ? "已终止" : "Cancelled")
+    : headerTerminal === "run_failed" ? (zh ? "失败" : "Failed")
+    : runPaused ? (zh ? "等待处理" : "Waiting for input")
+    : runActive || agentBusy ? (zh ? "运行中" : "Running")
+    : queueBacklog ? (zh ? "队列待处理" : "Queued")
+    : (zh ? "就绪" : "Ready");
   const queuedSend = Boolean(onQueue && (agentBusy || conversationLocked || (runStarted && !runFinished) || reviewBusy || planLoading || queueBacklog));
   const composerDisabled = onQueue ? fileReferenceBusy || composerBusy || conversationHydrating || sendBusy || queueLoading : existingComposerDisabled;
   const preferenceError = agentPreferences.unconfirmed
@@ -1025,7 +1034,7 @@ export function WorkspaceShell({ project, locale, onLocaleChange, onOpenSettings
     {workspacePage !== "conversation" && workspacePage !== "files" && <WorkspaceResearchPages key={`research:${project.id}`} page={workspacePage} projectId={project.id} locale={locale} registerBeforeLeave={registerBeforeLeave} onOpenConversation={(projectId, conversationId) => leaveGuard.current(() => { setWorkspacePage("conversation"); if (onOpenSourceConversation) void onOpenSourceConversation(projectId, conversationId); else if (projectId === project.id) void onSelectConversation?.(conversationId); })} onInsert={(text) => leaveGuard.current(() => { setDraft((current) => current ? `${current}\n\n${text}` : text); setWorkspacePage("conversation"); requestAnimationFrame(() => draftRef.current?.focus()); })} />}
 
     <main className={`conversation-pane ${workspacePage !== "conversation" ? "workspace-content-hidden" : ""}`} hidden={workspacePage !== "conversation"} aria-label={t.research}>
-      <header className="conversation-header"><div><small>{project.name}</small><h1>{conversationTitle}</h1></div><div className="workspace-header-actions">{showPlanPanel && <button className="sidebar-plan-link" onClick={() => openSidebarSection("plan")}>{zh ? "查看 Plan" : "Review Plan"}</button>}<span className="live-status"><i />{t.status}</span><button className="sidebar-toggle" aria-label={sidebarOpen ? (zh ? "收起侧栏" : "Collapse sidebar") : (zh ? "展开侧栏" : "Expand sidebar")} aria-expanded={sidebarOpen} aria-controls="workspace-sidebar" onClick={() => { if (sidebarOpen) closeSidebar(); else { if (!openTabs.length) { setOpenTabs(["artifacts"]); setTab("artifacts"); } setSidebarOpen(true); } }}><PanelRight size={19} /></button></div></header>
+      <header className="conversation-header"><div><small>{project.name}</small><h1>{conversationTitle}</h1></div><div className="workspace-header-actions">{showPlanPanel && <button className="sidebar-plan-link" onClick={() => openSidebarSection("plan")}>{zh ? "查看 Plan" : "Review Plan"}</button>}<span className="live-status"><i />{headerStatus}</span><button className="sidebar-toggle" aria-label={sidebarOpen ? (zh ? "收起侧栏" : "Collapse sidebar") : (zh ? "展开侧栏" : "Expand sidebar")} aria-expanded={sidebarOpen} aria-controls="workspace-sidebar" onClick={() => { if (sidebarOpen) closeSidebar(); else { if (!openTabs.length) { setOpenTabs(["artifacts"]); setTab("artifacts"); } setSidebarOpen(true); } }}><PanelRight size={19} /></button></div></header>
       <section className="message-stream" aria-live="polite" ref={messageStreamRef} onScroll={(event) => {
         const stream = event.currentTarget;
         const following = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 64;
