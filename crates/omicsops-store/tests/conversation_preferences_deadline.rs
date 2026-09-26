@@ -92,12 +92,14 @@ async fn a_save_waiting_for_the_write_lock_expires_before_it_can_commit() {
     assert!(!pending.is_finished());
     tokio::time::sleep(Duration::from_millis(250)).await;
     writer.commit().await.unwrap();
-    assert!(pending
-        .await
-        .unwrap()
-        .unwrap_err()
-        .to_string()
-        .contains("preference save deadline expired"));
+    assert!(
+        pending
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("preference save deadline expired")
+    );
     assert_eq!(
         store
             .reconcile_conversation_agent_preferences_after_deadline(
