@@ -146,6 +146,21 @@ Deterministic checks passed: `cargo test --workspace` (1,356 passed, 12 ignored)
 `npm run build:desktop`, and `cargo fmt --all -- --check`. This small live test
 does not validate the original miRNA literature workflow, SSH, or native UI.
 
+After the incomplete-stream retry classification and scientific code projection
+changes on 2026-09-26, the same exact ignored OpenCode command passed 1/1 in
+171.95 seconds (exit 0) using `deepseek-v4.1-flash` with `max` effort. The test
+read its temporary nonce file and completed; no original project or saved
+configuration was changed. EOF recovery was tested separately with local SSE
+and bounded-retry fixtures, because this live run did not inject a disconnect.
+This small task is not a timing comparison against the original literature run.
+
+Deterministic checks passed: `cargo test --workspace` (1,364 passed, 12 ignored),
+`npm test` (944 frontend and 22 bridge tests), `npm run build`, and formatting.
+`npm run build:desktop` was blocked when replacing the executable: Windows
+reported access denied while two running OmicsOps instances held that file.
+The existing executable therefore remains the old build until those instances
+exit and the build is rerun. No application was forcibly terminated.
+
 ## Agent Runtime V4 stage-1 acceptance
 
 `agent_v4::tests::live_v4_model_plan_and_persistent_ssh_python_kernel` uses the
