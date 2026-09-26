@@ -155,6 +155,85 @@ describe("SettingsPanel model providers", () => {
     await waitFor(() => expect(screen.queryByLabelText("API key")).not.toBeInTheDocument());
   });
 
+  it.each([
+    ["OpenAI", "open_ai_compatible", "https://api.openai.com/v1"],
+    ["Kimi", "open_ai_compatible", "https://api.moonshot.cn/v1"],
+    ["Kimi Coding", "open_ai_compatible", "https://api.kimi.com/coding/v1"],
+    ["GLM", "open_ai_compatible", "https://open.bigmodel.cn/api/paas/v4"],
+    ["GLM Coding", "open_ai_compatible", "https://open.bigmodel.cn/api/coding/paas/v4"],
+    ["Qwen China", "open_ai_compatible", "https://dashscope.aliyuncs.com/compatible-mode/v1"],
+    ["Qwen International", "open_ai_compatible", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"],
+    ["MiniMax China", "anthropic", "https://api.minimax.cn/anthropic"],
+    ["MiniMax International", "anthropic", "https://api.minimax.io/anthropic"],
+    ["LM Studio", "open_ai_compatible", "http://127.0.0.1:1234/v1"],
+    ["OpenRouter", "open_ai_compatible", "https://openrouter.ai/api/v1"],
+  ] as const)("saves %s with its exact endpoint and a custom full model ID", async (name, provider, base_url) => {
+    const save = vi.fn().mockResolvedValue(undefined);
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} onSaveModel={save} />);
+    fireEvent.click(screen.getByRole("button", { name: `Configure ${name}` }));
+    expect(screen.getByLabelText("Base URL")).toHaveValue(base_url);
+    expect(screen.getByLabelText("Model")).toHaveValue("");
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "vendor/custom-exact-id" } });
+    if (name !== "LM Studio") fireEvent.change(screen.getByLabelText("API key"), { target: { value: "test-only-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    await waitFor(() => expect(save).toHaveBeenCalledOnce());
+    expect(save.mock.calls[0][0]).toEqual({
+      provider, label: name, base_url, model: "vendor/custom-exact-id",
+      credential: name === "LM Studio" ? undefined : "test-only-key",
+    });
+  });
+
+  it("explains local optional authentication and Coding subscription limits", () => {
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} />);
+    fireEvent.click(screen.getByRole("button", { name: "Configure LM Studio" }));
+    expect(screen.getByText(/local LM Studio.*key is optional/i)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "https://remote.example/v1" } });
+    expect(screen.queryByText(/local LM Studio.*key is optional/i)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Configure Kimi Coding" }));
+    expect(screen.getByText(/dedicated subscription key.*client eligibility/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Configure GLM Coding" }));
+    expect(screen.getByText(/dedicated subscription key.*client eligibility/i)).toBeInTheDocument();
+  });
+
+  it("marks only the saved provider endpoint and clears a new region's draft key", () => {
+    const profiles = [
+      { id: "mini-cn", label: "MiniMax", provider: "anthropic" as const, base_url: "https://api.minimax.cn:443/anthropic/", model: "custom", credential_reference: "model/mini-cn", supports_tools: true, supports_vision: false },
+      { id: "gateway", label: "Gateway", provider: "open_ai_compatible" as const, base_url: "https://gateway.example/v1", model: "vendor/exact", credential_reference: "model/gateway", supports_tools: true, supports_vision: false },
+    ];
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={profiles} />);
+    const card = (name: string) => screen.getByRole("button", { name: `Configure ${name}` }).closest("article")!;
+    expect(within(card("MiniMax China")).getByText(/configured/i)).toBeInTheDocument();
+    expect(within(card("OpenAI-compatible")).getByText(/configured/i)).toBeInTheDocument();
+    expect(within(card("MiniMax International")).queryByText(/configured/i)).not.toBeInTheDocument();
+    expect(within(card("Anthropic")).queryByText(/configured/i)).not.toBeInTheDocument();
+    expect(within(card("Qwen China")).queryByText(/configured/i)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getAllByRole("button", { name: "Edit" })[0]);
+    expect(screen.getByLabelText("Base URL")).toHaveValue("https://api.minimax.cn:443/anthropic/");
+    expect(screen.getByLabelText("API key")).toHaveValue("");
+    fireEvent.click(screen.getByRole("button", { name: "Configure Qwen China" }));
+    fireEvent.change(screen.getByLabelText("API key"), { target: { value: "china-test-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "Configure Qwen International" }));
+    expect(screen.getByLabelText("API key")).toHaveValue("");
+    expect(screen.getByLabelText("Model")).toHaveValue("");
+    expect(screen.getByLabelText("Base URL")).toHaveValue("https://dashscope-intl.aliyuncs.com/compatible-mode/v1");
+  });
+
+  it("can save an optional LM Studio token without exposing a saved key on edit", async () => {
+    const profile = { id: "local", label: "Local lab", provider: "open_ai_compatible" as const, base_url: "http://localhost:1234/v1", model: "local-model", credential_reference: "model/local", supports_tools: true, supports_vision: false };
+    const save = vi.fn().mockResolvedValue(undefined);
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[profile]} onSaveModel={save} />);
+    const card = screen.getByRole("button", { name: "Configure LM Studio" }).closest("article")!;
+    expect(within(card).getByText(/configured/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByLabelText("API key")).toHaveValue("");
+    fireEvent.change(screen.getByLabelText("API key"), { target: { value: "test-only-local-token" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    await waitFor(() => expect(save).toHaveBeenCalledOnce());
+    expect(save).toHaveBeenCalledWith(expect.objectContaining({ id: "local", credential: "test-only-local-token" }));
+    expect(save.mock.calls[0][0]).not.toHaveProperty("refresh_catalog");
+  });
+
   it.each(["https://api.deepseek.com", "https://api.deepseek.com/v1/", "https://api.deepseek.com:443/v1"])("recognizes saved official DeepSeek profiles at %s and edits without exposing credentials", (base_url) => {
     const profile = { id: "deepseek", label: "Lab model", provider: "open_ai_compatible" as const, base_url, model: "deepseek-v4-pro", credential_reference: "model/deepseek", supports_tools: true, supports_vision: false };
     render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[profile]} />);

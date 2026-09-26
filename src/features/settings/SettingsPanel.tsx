@@ -26,6 +26,7 @@ import { PluginsSettings } from "./PluginsSettings";
 import { settingsProbeSystemInterpreters } from "../../general-settings-api";
 import { settingsListSkillRemovals, settingsRetrySkillRemoval } from "../../skill-settings-api";
 import { useGeneralPreferences } from "../../use-general-preferences";
+import { isLocalLmStudioEndpoint, matchesModelProviderPreset, modelProviderPresets, type ModelProviderPreset } from "./modelProviderPresets";
 import "./settings.css";
 import "./model-form.css";
 import "./remote-form.css";
@@ -70,15 +71,7 @@ interface Props extends BundledMcpProps {
   onPluginsChanged?: () => void;
 }
 
-const defaults: Record<ModelProfile["provider"], FormState> = {
-  anthropic: { provider: "anthropic", label: "Anthropic", base_url: "https://api.anthropic.com/", model: "", credential: "", contextWindowDraft: "", contextWindowDirty: false },
-  open_ai_compatible: { provider: "open_ai_compatible", label: "OpenAI-compatible", base_url: "https://api.openai.com/", model: "", credential: "", contextWindowDraft: "", contextWindowDirty: false },
-  ollama: { provider: "ollama", label: "Ollama", base_url: "http://127.0.0.1:11434/", model: "", credential: "", contextWindowDraft: "", contextWindowDirty: false },
-};
-
-const deepSeekDefault: FormState = { provider: "open_ai_compatible", label: "DeepSeek", base_url: "https://api.deepseek.com/v1", model: "deepseek-v4-flash", credential: "", contextWindowDraft: "", contextWindowDirty: false };
 const deepSeekModels = ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4-flash-vision-exp"];
-const openCodeGoDefault: FormState = { provider: "open_ai_compatible", label: "OpenCode Go", base_url: "https://opencode.ai/zen/go/v1", model: "glm-5.3-flash", credential: "", contextWindowDraft: "", contextWindowDirty: false };
 const openCodeGoChatModels = ["glm-5.3-flash", "glm-5.3", "glm-5.2", "glm-5.1", "kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "longcat-2.0", "deepseek-v4.1-flash", "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "mimo-v2.5", "mimo-v2.5-pro", "hy4-preview", "hy3"];
 const openCodeGoMessagesModels = ["minimax-m3", "minimax-m2.7", "minimax-m2.5", "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus"];
 const openCodeGoResponsesModels = ["grok-4.6", "gpt-5.6-luna", "muse-spark-1.3-contributor", "muse-spark-1.2-contributor"];
@@ -116,13 +109,7 @@ function isOpenCodeGo(profile: Pick<ModelProfile, "provider" | "base_url">): boo
 }
 
 function isDeepSeek(profile: Pick<ModelProfile, "provider" | "base_url">): boolean {
-  if (profile.provider !== "open_ai_compatible") return false;
-  try {
-    const url = new URL(profile.base_url);
-    return url.protocol === "https:" && url.hostname === "api.deepseek.com" && url.port === "";
-  } catch {
-    return false;
-  }
+  return matchesModelProviderPreset(profile, modelProviderPresets.find((preset) => preset.id === "deepseek")!);
 }
 
 export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection = "models", onClose, modelProfiles = [], onSaveModel, onDeleteModel, onProbeModel, onListModels, skillPackages = [], onImportSkill, onSetSkillEnabled, onSkillsChanged, mcpServers = [], onSaveMcpServer, onInspectMcpServer, onSetMcpServerEnabled, onSetMcpLaunchApproval, onSetMcpToolApproval, onListBundledMcpPresets, onConfigurePubMedMcp, onAddBundledMcp, connections = [], projects = [], selectedProject, onOpenUsageConversation, onSaveConnection, onTestConnection, onConfirmHostKey, onBindProjectRemote, onWorkflowsChanged, onMemoryChanged, onPluginsChanged }: Props) {
@@ -145,7 +132,11 @@ export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection
   useWindowEscapeLayer(true, onClose);
   useWindowEscapeLayer(form !== null && section === "models", () => setForm(null));
   useWindowEscapeLayer(deleteTarget !== null, () => { if (!deleting) { setDeleteTarget(null); setDeleteError(""); } });
-  const configure = (provider: ModelProfile["provider"]) => setForm({ ...defaults[provider] });
+  const configurePreset = (preset: ModelProviderPreset) => setForm({
+    provider: preset.provider, label: preset.label, base_url: preset.base_url,
+    model: preset.id === "deepseek" ? "deepseek-v4-flash" : preset.id === "opencode-go" ? "glm-5.3-flash" : "",
+    credential: "", contextWindowDraft: "", contextWindowDirty: false,
+  });
   const navigate = (nextSection: SettingsSection) => {
     setForm(null);
     setSection(nextSection);
@@ -159,7 +150,7 @@ export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection
       const { contextWindowDraft, contextWindowDirty, ...request } = form;
       await onSaveModel({
         ...request,
-        credential: form.provider === "ollama" ? undefined : form.credential,
+        credential: form.provider === "ollama" || (isLocalLmStudioEndpoint(form) && !form.credential.trim()) ? undefined : form.credential,
         ...(contextWindowDirty && contextWindowDraft.trim() ? { context_window_tokens: Number(contextWindowDraft.trim()) } : {}),
       });
       setForm(null);
@@ -234,11 +225,7 @@ export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection
       <SettingsNavigation locale={locale} section={section} onNavigate={navigate} />
       {section === "plugins" ? <PluginsSettings locale={locale} onOpenConnections={() => navigate("connections")} onChanged={onPluginsChanged} /> : section === "models" ? <main><div className="settings-heading"><h3>{zh ? "模型提供方" : "Model providers"}</h3><p>{zh ? "密钥保存在 Windows Credential Manager，项目只记录引用。" : "Keys stay in Windows Credential Manager; projects store references only."}</p></div>
         <div className="provider-grid">
-          <Provider icon={Cloud} name="Anthropic" detail="Messages API · tool use" configured={modelProfiles.some((profile) => profile.provider === "anthropic")} onConfigure={() => configure("anthropic")} />
-          <Provider icon={KeyRound} name="OpenAI-compatible" detail="Chat Completions · custom Base URL" configured={modelProfiles.some((profile) => profile.provider === "open_ai_compatible")} onConfigure={() => configure("open_ai_compatible")} />
-          <Provider icon={Cloud} name="DeepSeek" detail={zh ? "官方 API · Flash / Pro" : "Official API · Flash / Pro"} configured={modelProfiles.some(isDeepSeek)} onConfigure={() => setForm({ ...deepSeekDefault })} />
-          <Provider icon={Globe2} name="OpenCode Go" detail={zh ? "官方端点 · Chat / Messages" : "Official endpoint · Chat / Messages"} configured={modelProfiles.some(isOpenCodeGo)} onConfigure={() => setForm({ ...openCodeGoDefault })} />
-          <Provider icon={Monitor} name="Ollama" detail={zh ? "本地模型 · Ollama API" : "Local models · Ollama API"} configured={modelProfiles.some((profile) => profile.provider === "ollama")} onConfigure={() => configure("ollama")} />
+          {modelProviderPresets.map((preset) => <Provider key={preset.id} icon={preset.id === "custom" ? KeyRound : preset.id === "ollama" || preset.id === "lm-studio" ? Monitor : preset.id === "opencode-go" ? Globe2 : Cloud} name={preset.label} detail={zh ? preset.detailZh : preset.detailEn} configured={modelProfiles.some((profile) => preset.id === "custom" ? profile.provider === "open_ai_compatible" && !modelProviderPresets.some((candidate) => candidate.id !== "custom" && matchesModelProviderPreset(profile, candidate)) : matchesModelProviderPreset(profile, preset))} onConfigure={() => configurePreset(preset)} />)}
         </div>
         {form && <section className="model-form" aria-label={zh ? "模型配置" : "Model configuration"}>
           <div className="model-form-grid">
@@ -247,6 +234,9 @@ export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection
             {isOpenCodeGo(form) && <label>{zh ? "API 协议" : "API protocol"}<select aria-label="API protocol" value={form.provider} disabled={openCodeGoProtocol(form.model) !== null} onChange={(event) => setForm(withModelProtocol(form, event.target.value as ModelProfile["provider"]))}><option value="open_ai_compatible">Chat Completions</option><option value="anthropic">Anthropic Messages</option></select></label>}
             <label className="wide">Base URL<input aria-label="Base URL" value={form.base_url} onChange={(event) => { const base_url = event.target.value; const next = { ...form, base_url, contextWindowDraft: "", contextWindowDirty: false }; const protocol = isOpenCodeGo(next) ? openCodeGoProtocol(form.model) : null; setForm(protocol ? withModelProtocol(next, protocol) : next); }} /></label>
             {form.provider !== "ollama" && <label className="wide">API key<input aria-label="API key" type="password" autoComplete="new-password" value={form.credential} onChange={(event) => setForm({ ...form, credential: event.target.value })} /></label>}
+            {isLocalLmStudioEndpoint(form) && <small className="wide">{zh ? "本机 LM Studio 默认无需密钥；密钥可选，设置后保存在系统凭据库。" : "For local LM Studio, the API key is optional; a supplied key is stored in the system keyring."}</small>}
+            {(modelProviderPresets.filter((preset) => preset.id === "kimi-coding" || preset.id === "glm-coding").some((preset) => matchesModelProviderPreset(form, preset))) && <small className="wide">{zh ? "Coding 套餐需使用专属密钥，并受服务方客户端适用范围限制；OmicsOps 未获该服务方认证为支持客户端。" : "Coding plans need a dedicated subscription key and are subject to provider client eligibility; OmicsOps is not certified as a supported client."}</small>}
+            {form.provider !== "ollama" && !isDeepSeek(form) && !isOpenCodeGo(form) && <small className="wide">{zh ? "请输入账户可用的完整模型 ID；保存后可查询服务端模型列表。预设不代表模型能力已验证。" : "Enter a full model ID available to your account; discover server models after saving. A preset does not verify model capabilities."}</small>}
             <label className="wide">{zh ? "配置上下文预算" : "Configured context budget"}<input aria-label={zh ? "配置上下文预算" : "Configured context budget"} inputMode="numeric" value={form.contextWindowDraft} onChange={(event) => setForm({ ...form, contextWindowDraft: event.target.value, contextWindowDirty: true })} /><small>{zh ? "手动填写时优先使用该值。编辑现有模型时，留空或不修改会保留原预算；更新目录或更换模型后留空，会采用新目录的默认预算。实际可用输入额度还受模型能力限制。" : "A value entered here takes priority. When editing a model, leave it blank or unchanged to keep its budget. After refreshing the catalog or changing models, leave it blank to use the new catalog default. The effective input allowance also depends on model capabilities."}</small>{budgetError && <small className="field-error" role="alert">{budgetError}</small>}</label>
             {isOpenCodeGo(form) && <small className="wide">{zh ? "捆绑目录已包含审核过的 OpenCode Go 模型精确能力。此前版本保存的配置：点击“编辑”，勾选“保存时采用当前目录能力”并保存，然后开始新对话；现有运行不会更新，恢复时可能需要还原原配置。" : "The bundled catalog includes exact capabilities for reviewed OpenCode Go models. For profiles saved before this update, choose Edit, select Adopt current catalog capabilities, save, then start a new conversation. Existing runs are not updated and may require the original configuration to resume."}</small>}
             {openCodeResponsesUnsupported && <p className="wide field-error" role="alert">{zh ? "此模型仅支持 Responses API，OmicsOps 当前无法使用。" : "This model requires the Responses API, which OmicsOps does not currently support."}</p>}
