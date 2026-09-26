@@ -4553,7 +4553,8 @@ impl AgentCoreV4<'_> {
             }
             // A prior durable snapshot can supply the same bounded view after
             // reopening, without repeatedly archiving an unchanged snapshot.
-            if limits.auto_compact && use_views && (candidate_validation.is_err() || want_code_view) {
+            if limits.auto_compact && use_views && (candidate_validation.is_err() || want_code_view)
+            {
                 if let Some(view) = latest_checkpoint_event.and_then(|event| {
                     context_views::scientific_state_view(spec, &scientific_value, event)
                 }) {
@@ -7100,7 +7101,9 @@ mod tests {
         ) -> Result<ModelTurnV4, ModelFailureV4> {
             assert_eq!(request.context, "original request");
             self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
-            on_event(ModelStreamEventV4::TextDelta("discarded partial text".into()));
+            on_event(ModelStreamEventV4::TextDelta(
+                "discarded partial text".into(),
+            ));
             Err(ModelFailureV4::transient(
                 omicsops_protocol::ModelErrorClassV4::Transport,
                 "model endpoint failed: incomplete model stream: no terminal provider event; tool calls were not dispatched",
@@ -7135,7 +7138,9 @@ mod tests {
                 None,
             )
             .await;
-        assert!(matches!(result, Err(AgentCoreErrorV4::Model(message)) if message.contains("no terminal provider event")));
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::Model(message)) if message.contains("no terminal provider event"))
+        );
         assert_eq!(model.attempts.load(AtomicOrdering::SeqCst), 2);
         let events = store.load_direct(run_id).unwrap();
         assert_eq!(
@@ -12256,7 +12261,10 @@ mod tests {
             events: &store,
             science: Some(&science),
         };
-        let context = core.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        let context = core
+            .context_for(&spec, AgentLimitsV4::default())
+            .await
+            .unwrap();
         let value: Value = serde_json::from_str(&context).unwrap();
         let projection = &value["scientific_state"];
         assert_eq!(projection["model_projection"], true);
@@ -12290,10 +12298,15 @@ mod tests {
         );
         let mut invalid_source = events.last().unwrap().clone();
         invalid_source.event_hash = "invalid".into();
-        assert!(context_views::scientific_code_view(&spec, &json!(state), &invalid_source).is_none());
+        assert!(
+            context_views::scientific_code_view(&spec, &json!(state), &invalid_source).is_none()
+        );
         let mut different_state = json!(state);
         different_state["revision"] = json!(1);
-        assert!(context_views::scientific_code_view(&spec, &different_state, events.last().unwrap()).is_none());
+        assert!(
+            context_views::scientific_code_view(&spec, &different_state, events.last().unwrap())
+                .is_none()
+        );
         let mut restored = String::new();
         let mut offset = 0;
         loop {
@@ -12319,7 +12332,10 @@ mod tests {
             }
             offset = page["next_offset"].as_u64().unwrap();
         }
-        assert_eq!(serde_json::from_str::<Value>(&restored).unwrap(), json!(state));
+        assert_eq!(
+            serde_json::from_str::<Value>(&restored).unwrap(),
+            json!(state)
+        );
         assert_eq!(store.archives.lock().unwrap().len(), 1);
         let previous = store.events.lock().unwrap().last().unwrap().clone();
         store
@@ -12338,12 +12354,21 @@ mod tests {
                 },
             ))
             .unwrap();
-        let repeated = core.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        let repeated = core
+            .context_for(&spec, AgentLimitsV4::default())
+            .await
+            .unwrap();
         assert!(repeated.contains("latest-tool-marker"));
-        assert_eq!(serde_json::from_str::<Value>(&repeated).unwrap()["scientific_state"]["result_reference"], *reference);
+        assert_eq!(
+            serde_json::from_str::<Value>(&repeated).unwrap()["scientific_state"]["result_reference"],
+            *reference
+        );
         assert_eq!(store.archives.lock().unwrap().len(), 1);
         science.0.lock().unwrap().revision += 1;
-        let changed = core.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        let changed = core
+            .context_for(&spec, AgentLimitsV4::default())
+            .await
+            .unwrap();
         let changed: Value = serde_json::from_str(&changed).unwrap();
         assert_ne!(changed["scientific_state"]["result_reference"], *reference);
         assert_eq!(store.archives.lock().unwrap().len(), 2);
@@ -12385,14 +12410,32 @@ mod tests {
             events: &store,
             science: Some(&science),
         };
-        let context = core.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        let context = core
+            .context_for(&spec, AgentLimitsV4::default())
+            .await
+            .unwrap();
         assert!(context.contains("fresh-tool-evidence"));
-        assert_eq!(serde_json::from_str::<Value>(&context).unwrap()["scientific_state"]["model_projection"], true);
-        let checkpoint = store.events.lock().unwrap().iter().rev().find_map(|event| match &event.event {
-            AgentEventKindV4::ContextCheckpointed { checkpoint } => Some(checkpoint.clone()),
-            _ => None,
-        }).unwrap();
-        assert!(checkpoint.recent_steps.iter().any(|step| step.contains("fresh-tool-evidence")));
+        assert_eq!(
+            serde_json::from_str::<Value>(&context).unwrap()["scientific_state"]["model_projection"],
+            true
+        );
+        let checkpoint = store
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|event| match &event.event {
+                AgentEventKindV4::ContextCheckpointed { checkpoint } => Some(checkpoint.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            checkpoint
+                .recent_steps
+                .iter()
+                .any(|step| step.contains("fresh-tool-evidence"))
+        );
     }
 
     #[tokio::test]
@@ -12414,15 +12457,30 @@ mod tests {
             events: &store,
             science: Some(&science),
         };
-        let at_threshold = core.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        let at_threshold = core
+            .context_for(&spec, AgentLimitsV4::default())
+            .await
+            .unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&at_threshold).unwrap()["scientific_state"],
             json!(*science.0.lock().unwrap())
         );
         assert!(store.archives.lock().unwrap().is_empty());
 
-        science.0.lock().unwrap().provenance.values_mut().next().unwrap().code.push('a');
-        let above = core.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        science
+            .0
+            .lock()
+            .unwrap()
+            .provenance
+            .values_mut()
+            .next()
+            .unwrap()
+            .code
+            .push('a');
+        let above = core
+            .context_for(&spec, AgentLimitsV4::default())
+            .await
+            .unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&above).unwrap()["scientific_state"]["omitted_code_bytes"],
             16_385
@@ -12444,7 +12502,10 @@ mod tests {
             events: &store,
             science: Some(&science),
         };
-        let full = no_reader.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        let full = no_reader
+            .context_for(&spec, AgentLimitsV4::default())
+            .await
+            .unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&full).unwrap()["scientific_state"],
             json!(*science.0.lock().unwrap())
@@ -12471,7 +12532,10 @@ mod tests {
             events: &store,
             science: Some(&science),
         };
-        let context = core.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        let context = core
+            .context_for(&spec, AgentLimitsV4::default())
+            .await
+            .unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&context).unwrap()["scientific_state"],
             json!(*science.0.lock().unwrap())
@@ -12494,7 +12558,9 @@ mod tests {
             science: Some(&science),
         };
         assert!(matches!(
-            over_budget.context_for(&spec, AgentLimitsV4::default()).await,
+            over_budget
+                .context_for(&spec, AgentLimitsV4::default())
+                .await,
             Err(AgentCoreErrorV4::Store(_))
         ));
         assert_eq!(*store.0.events.lock().unwrap(), original);
@@ -12518,10 +12584,19 @@ mod tests {
             events: &store,
             science: Some(&science),
         };
-        let context = core.context_for(&spec, AgentLimitsV4::default()).await.unwrap();
+        let context = core
+            .context_for(&spec, AgentLimitsV4::default())
+            .await
+            .unwrap();
         let value: Value = serde_json::from_str(&context).unwrap();
-        assert_eq!(value["scientific_state"]["collections"]["evidence"]["count"], 1);
-        assert_eq!(value["scientific_state"]["result_reference"]["field"], "scientific_state");
+        assert_eq!(
+            value["scientific_state"]["collections"]["evidence"]["count"],
+            1
+        );
+        assert_eq!(
+            value["scientific_state"]["result_reference"]["field"],
+            "scientific_state"
+        );
         assert_eq!(store.archives.lock().unwrap().len(), 1);
     }
 

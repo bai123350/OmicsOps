@@ -5629,7 +5629,8 @@ fn classify_model_failure(message: &str) -> ModelFailureV4 {
         || lower.contains("unexpected eof")
         || lower.contains("stream ended")
         || lower.contains("incomplete message")
-        || lower == "model endpoint failed: incomplete model stream: no terminal provider event; tool calls were not dispatched"
+        || lower
+            == "model endpoint failed: incomplete model stream: no terminal provider event; tool calls were not dispatched"
     {
         ModelFailureV4::transient(ModelErrorClassV4::Transport, message)
     } else if lower.contains("401") || lower.contains("403") || lower.contains("credential") {
@@ -11002,7 +11003,8 @@ mod tests {
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base_url = Url::parse(&format!("http://{}/v1", listener.local_addr().unwrap())).unwrap();
+        let base_url =
+            Url::parse(&format!("http://{}/v1", listener.local_addr().unwrap())).unwrap();
         let server = std::thread::spawn(move || {
             let mut requests = Vec::new();
             for answer in ["discarded", "accepted"] {
@@ -11047,7 +11049,9 @@ mod tests {
                 }]}}]});
                 let mut body = format!("data: {delta}\n\n");
                 if answer == "accepted" {
-                    body.push_str("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n");
+                    body.push_str(
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    );
                 }
                 write!(
                     socket,
@@ -11088,7 +11092,10 @@ mod tests {
             }],
             image_refs: vec![],
         };
-        let first = model.stream(request.clone(), &mut |_| {}).await.unwrap_err();
+        let first = model
+            .stream(request.clone(), &mut |_| {})
+            .await
+            .unwrap_err();
         assert_eq!(first.class, ModelErrorClassV4::Transport);
         assert!(first.retryable);
 

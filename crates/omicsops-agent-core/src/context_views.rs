@@ -87,7 +87,9 @@ pub(crate) fn scientific_code_view(
     view["model_projection"] = json!(true);
     view["snapshot_sha256"] = json!(scientific_digest(state)?);
     view["omitted_code_bytes"] = json!(omitted);
-    view["note"] = json!("Provenance source code is omitted from this model view. Read scientific_state using result_reference and follow next_offset when the original code is needed.");
+    view["note"] = json!(
+        "Provenance source code is omitted from this model view. Read scientific_state using result_reference and follow next_offset when the original code is needed."
+    );
     attach_reference(&mut view, source, "scientific_state");
     Some(view)
 }
