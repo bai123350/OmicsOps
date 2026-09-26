@@ -317,7 +317,15 @@ impl ModelProfile {
         self.catalog_capabilities.as_ref().map_or(4096, |caps| {
             // Reasoning and tool arguments share the provider output allowance.
             // Only exact catalog capabilities permit a larger reservation.
-            let requested = if caps.reasoning { 16_384 } else { 4096 };
+            let requested = if caps.reasoning {
+                match self.reasoning_effort.as_deref() {
+                    Some("high") => 32_768,
+                    Some("max" | "xhigh" | "ultra") => 65_536,
+                    _ => 16_384,
+                }
+            } else {
+                4096
+            };
             caps.output_limit
                 .min(requested)
                 .min(self.effective_context_window_tokens() / 2)
@@ -551,6 +559,75 @@ mod fast_mode_tests {
 #[cfg(test)]
 mod output_budget_tests {
     use super::*;
+
+    fn catalog_profile() -> ModelProfile {
+        let mut profile: ModelProfile = serde_json::from_value(serde_json::json!({
+            "id":Uuid::from_u128(42), "label":"OpenCode Go", "provider":"open_ai_compatible",
+            "base_url":"https://opencode.ai/zen/go/v1", "model":"deepseek-v4.1-flash",
+            "credential_reference":null, "supports_tools":true,"supports_vision":true,
+            "context_window_tokens":1_000_000
+        }))
+        .unwrap();
+        profile.catalog_capabilities = Some(ModelCatalogCapabilities {
+            source_provider: "opencode-go".into(),
+            source_sha256: "fixture".into(),
+            context_limit: 1_000_000,
+            input_limit: None,
+            output_limit: 384_000,
+            reasoning: true,
+            reasoning_efforts: Some(vec!["low".into(), "high".into(), "max".into()]),
+        });
+        profile
+    }
+
+    #[test]
+    fn exact_reasoning_catalog_reserves_output_for_selected_effort_and_hash() {
+        let mut profile = catalog_profile();
+        let default_hash = profile.execution_configuration_hash();
+        assert_eq!(profile.effective_output_tokens(), 16_384);
+        for effort in ["low", "medium"] {
+            profile.reasoning_effort = Some(effort.into());
+            assert_eq!(profile.effective_output_tokens(), 16_384, "{effort}");
+        }
+        profile.reasoning_effort = Some("high".into());
+        assert_eq!(profile.effective_output_tokens(), 32_768);
+        let high_hash = profile.execution_configuration_hash();
+        assert_ne!(high_hash, default_hash);
+        for effort in ["max", "xhigh", "ultra"] {
+            profile.reasoning_effort = Some(effort.into());
+            assert_eq!(profile.effective_output_tokens(), 65_536, "{effort}");
+        }
+        assert_ne!(profile.execution_configuration_hash(), high_hash);
+    }
+
+    #[test]
+    fn exact_reasoning_reservation_stays_within_catalog_and_context_limits() {
+        let mut profile = catalog_profile();
+        profile.reasoning_effort = Some("max".into());
+        profile.catalog_capabilities.as_mut().unwrap().output_limit = 24_576;
+        assert_eq!(profile.effective_output_tokens(), 24_576);
+        profile.catalog_capabilities.as_mut().unwrap().output_limit = 384_000;
+        profile.context_window_tokens = Some(40_000);
+        assert_eq!(profile.effective_output_tokens(), 20_000);
+        profile.catalog_capabilities.as_mut().unwrap().reasoning = false;
+        assert_eq!(profile.effective_output_tokens(), 4096);
+        profile.catalog_capabilities = None;
+        assert_eq!(profile.effective_output_tokens(), 4096);
+    }
+
+    #[test]
+    fn configuration_hash_tracks_effective_output_allowance_for_same_effort() {
+        let mut profile = catalog_profile();
+        profile.reasoning_effort = Some("max".into());
+        let wide_hash = profile.execution_configuration_hash();
+        profile.catalog_capabilities.as_mut().unwrap().output_limit = 131_072;
+        assert_eq!(profile.effective_output_tokens(), 65_536);
+        assert_eq!(profile.execution_configuration_hash(), wide_hash);
+        profile.catalog_capabilities.as_mut().unwrap().output_limit = 32_768;
+        assert_eq!(profile.effective_output_tokens(), 32_768);
+        assert_ne!(profile.execution_configuration_hash(), wide_hash);
+    }
+
     #[test]
     fn reasoning_output_reservation_uses_only_catalog_limits() {
         let mut profile: ModelProfile = serde_json::from_value(serde_json::json!({

@@ -9771,6 +9771,75 @@ mod tests {
     }
 
     #[test]
+    fn opencode_go_max_reasoning_budget_reaches_desktop_provider_request() {
+        let profile = crate::model_commands::model_profile_from_request(
+            omicsops_dto::SaveModelProfileRequest {
+                id: None,
+                label: "OpenCode Go max reasoning".into(),
+                provider: "open_ai_compatible".into(),
+                base_url: "https://opencode.ai/zen/go/v1".into(),
+                model: "deepseek-v4.1-flash".into(),
+                credential: None,
+                context_window_tokens: None,
+                refresh_catalog: false,
+                reasoning_effort: Some(Some("max".into())),
+                fast_mode: None,
+                delegated_model_profile_id: None,
+            },
+        )
+        .unwrap();
+        let budget = RequestBudget {
+            context_window_tokens: profile.effective_context_window_tokens(),
+            reserved_output_tokens: profile.effective_output_tokens(),
+            safety_margin_tokens: 1024,
+        };
+        let model = DesktopModelPortV4 {
+            client: UnifiedModelClient::new(
+                profile.id,
+                ProviderProtocol::OpenAiCompatible,
+                Url::parse(&profile.base_url).unwrap(),
+                profile.model.clone(),
+                Some("test-only-credential".into()),
+            )
+            .unwrap()
+            .with_request_budget(budget),
+            prompt: PromptLayersV4::default(),
+            usage_metadata: usage_metadata_for_profile(&profile),
+            resources: None,
+            project_root: PathBuf::from("nonexistent-budget-test-root"),
+            supports_vision: profile.supports_vision,
+            input_images: vec![],
+            delegated: None,
+            reviewer: None,
+        };
+        let request = ModelRequestV4 {
+            system: "Research assistant".into(),
+            context: "Find one article".into(),
+            tools: builtin_tool_definitions_v4(),
+            image_refs: vec![],
+        };
+        let prepared = model.prepare_request(request.clone(), false).unwrap();
+        let wire = omicsops_adapters::llm::build_provider_request_with_tools_and_budget(
+            ProviderProtocol::OpenAiCompatible,
+            Url::parse(&profile.base_url).unwrap(),
+            &profile.model,
+            &prepared,
+            model.client.request_budget().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            model
+                .client
+                .request_budget()
+                .unwrap()
+                .reserved_output_tokens,
+            65_536
+        );
+        assert_eq!(wire.body["max_tokens"], json!(65_536));
+        model.validate_request(&request).unwrap();
+    }
+
+    #[test]
     fn frozen_attachment_images_are_included_once_and_rechecked_before_model_use() {
         let directory = tempfile::tempdir().unwrap();
         let bytes = b"attachment image fixture";
