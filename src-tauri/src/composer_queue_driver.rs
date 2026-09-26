@@ -94,16 +94,31 @@ async fn drive(
             return Ok(());
         };
 
-        let mut predecessors = state.repository.preceding_composer_queue_runs(&lease.item).await.map_err(|error| error.to_string())?;
+        let mut predecessors = state
+            .repository
+            .preceding_composer_queue_runs(&lease.item)
+            .await
+            .map_err(|error| error.to_string())?;
         if let Some(target) = lease.item.replacement_target_run_id {
-            if !predecessors.contains(&target) { predecessors.push(target); }
+            if !predecessors.contains(&target) {
+                predecessors.push(target);
+            }
         }
-        let _predecessor_leases = match try_predecessor_leases(&predecessors, |run_id| crate::run_ownership::try_run_lease(app, run_id)) {
+        let _predecessor_leases = match try_predecessor_leases(&predecessors, |run_id| {
+            crate::run_ownership::try_run_lease(app, run_id)
+        }) {
             Ok(Some(leases)) => leases,
             blocked => {
-                state.repository.release_composer_queue_preparation(&lease, Utc::now(), None).await.map_err(|error| error.to_string())?;
+                state
+                    .repository
+                    .release_composer_queue_preparation(&lease, Utc::now(), None)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 match blocked {
-                    Ok(None) => { tokio::time::sleep(RUN_POLL_INTERVAL).await; continue 'drive; }
+                    Ok(None) => {
+                        tokio::time::sleep(RUN_POLL_INTERVAL).await;
+                        continue 'drive;
+                    }
                     Err(error) => return Err(error),
                     Ok(Some(_)) => unreachable!(),
                 }
@@ -168,11 +183,18 @@ fn classify_preparation_failure(error: &str) -> ComposerQueueFailureCodeV4 {
     }
 }
 
-fn try_predecessor_leases<F>(predecessors: &[Uuid], mut try_lease: F) -> Result<Option<Vec<File>>, String>
-where F: FnMut(Uuid) -> Result<Option<File>, String> {
+fn try_predecessor_leases<F>(
+    predecessors: &[Uuid],
+    mut try_lease: F,
+) -> Result<Option<Vec<File>>, String>
+where
+    F: FnMut(Uuid) -> Result<Option<File>, String>,
+{
     let mut leases = Vec::with_capacity(predecessors.len());
     for run_id in predecessors {
-        let Some(lease) = try_lease(*run_id)? else { return Ok(None); };
+        let Some(lease) = try_lease(*run_id)? else {
+            return Ok(None);
+        };
         leases.push(lease);
     }
     Ok(Some(leases))
@@ -211,10 +233,17 @@ async fn wait_for_run_settlement(
         // turn has a durable terminal event.  Do not treat the stop receipt
         // itself as a queue pause; an observed receipt remains stored for
         // restart reconciliation.
-        let safe_attention = if status == Some("needs_attention") && terminal_event_status == Some("needs_attention") {
-            state.repository.safe_needs_attention_run(item.project_id, item.conversation_id, item.run_id)
-                .await.map_err(|error| error.to_string())?
-        } else { false };
+        let safe_attention = if status == Some("needs_attention")
+            && terminal_event_status == Some("needs_attention")
+        {
+            state
+                .repository
+                .safe_needs_attention_run(item.project_id, item.conversation_id, item.run_id)
+                .await
+                .map_err(|error| error.to_string())?
+        } else {
+            false
+        };
         if let Some(advance) = settlement_decision(status, terminal_event_status, safe_attention) {
             return Ok(advance);
         }
@@ -222,7 +251,11 @@ async fn wait_for_run_settlement(
     }
 }
 
-fn settlement_decision(status: Option<&str>, terminal_event_status: Option<&str>, safe_attention: bool) -> Option<bool> {
+fn settlement_decision(
+    status: Option<&str>,
+    terminal_event_status: Option<&str>,
+    safe_attention: bool,
+) -> Option<bool> {
     match status {
         Some(status @ ("completed" | "failed" | "cancelled")) => match terminal_event_status {
             Some(event_status) if event_status == status => Some(true),
@@ -342,14 +375,35 @@ mod tests {
     fn predecessor_ownership_blocks_dispatch_until_cleanup_releases() {
         let directory = tempfile::tempdir().unwrap();
         let predecessor = Uuid::new_v4();
-        let owner = crate::run_ownership::try_lease_in(directory.path(), predecessor).unwrap().unwrap();
-        assert!(try_predecessor_leases(&[predecessor], |id| crate::run_ownership::try_lease_in(directory.path(), id)).unwrap().is_none());
+        let owner = crate::run_ownership::try_lease_in(directory.path(), predecessor)
+            .unwrap()
+            .unwrap();
+        assert!(
+            try_predecessor_leases(&[predecessor], |id| crate::run_ownership::try_lease_in(
+                directory.path(),
+                id
+            ))
+            .unwrap()
+            .is_none()
+        );
         drop(owner);
-        let leases = try_predecessor_leases(&[predecessor], |id| crate::run_ownership::try_lease_in(directory.path(), id)).unwrap().unwrap();
+        let leases = try_predecessor_leases(&[predecessor], |id| {
+            crate::run_ownership::try_lease_in(directory.path(), id)
+        })
+        .unwrap()
+        .unwrap();
         assert_eq!(leases.len(), 1);
-        assert!(crate::run_ownership::try_lease_in(directory.path(), predecessor).unwrap().is_none());
+        assert!(
+            crate::run_ownership::try_lease_in(directory.path(), predecessor)
+                .unwrap()
+                .is_none()
+        );
         drop(leases);
-        assert!(crate::run_ownership::try_lease_in(directory.path(), predecessor).unwrap().is_some());
+        assert!(
+            crate::run_ownership::try_lease_in(directory.path(), predecessor)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -371,7 +425,10 @@ mod tests {
             settlement_decision(Some("needs_attention"), Some("needs_attention"), true),
             Some(true)
         );
-        assert_eq!(settlement_decision(Some("needs_attention"), Some("needs_attention"), false), Some(false));
+        assert_eq!(
+            settlement_decision(Some("needs_attention"), Some("needs_attention"), false),
+            Some(false)
+        );
         assert_eq!(settlement_decision(Some("running"), None, false), None);
     }
 }

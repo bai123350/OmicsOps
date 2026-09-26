@@ -4337,8 +4337,10 @@ async fn spawn_execution(
         // and leave them visible for an explicit later kick instead of
         // immediately starting the next queued turn after a stopped run.
         let safe_attention = record.status == "needs_attention"
-            && repository.safe_needs_attention_run(spec.project_id, spec.conversation_id, spec.run_id)
-                .await.unwrap_or(false);
+            && repository
+                .safe_needs_attention_run(spec.project_id, spec.conversation_id, spec.run_id)
+                .await
+                .unwrap_or(false);
         if (matches!(record.status.as_str(), "completed" | "failed") || safe_attention)
             && repository
                 .get_run_stop_v4(spec.project_id, spec.conversation_id, spec.run_id)

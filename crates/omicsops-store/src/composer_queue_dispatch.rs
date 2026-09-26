@@ -36,7 +36,9 @@ impl Store {
         let status: Option<String> = sqlx::query_scalar("SELECT status FROM agent_runs_v4 WHERE run_id=?1 AND project_id=?2 AND conversation_id=?3")
             .bind(run_id.to_string()).bind(project_id.to_string()).bind(conversation_id.to_string())
             .fetch_optional(&mut *connection).await?;
-        if status.as_deref() != Some("needs_attention") { return Ok(false); }
+        if status.as_deref() != Some("needs_attention") {
+            return Ok(false);
+        }
         safe_needs_attention_in_tx(&mut connection, project_id, conversation_id, run_id).await
     }
 
@@ -50,7 +52,9 @@ impl Store {
             .bind(item.project_id.to_string()).bind(item.conversation_id.to_string())
             .bind(item.run_id.to_string()).bind(i64::try_from(item.position).map_err(|_| invalid("queue position exceeds SQLite range"))?)
             .fetch_all(&self.pool).await?;
-        rows.into_iter().map(|id| crate::parse_uuid(id, "predecessor run id")).collect()
+        rows.into_iter()
+            .map(|id| crate::parse_uuid(id, "predecessor run id"))
+            .collect()
     }
 
     pub async fn claim_next_composer_queue(
@@ -341,7 +345,8 @@ impl Store {
                     && event.project_id == project_id
                     && event.conversation_id == conversation_id
             });
-            let safe_attention = safe_needs_attention_in_tx(&mut tx, project_id, conversation_id, run_id).await?;
+            let safe_attention =
+                safe_needs_attention_in_tx(&mut tx, project_id, conversation_id, run_id).await?;
             let next = if let (Some(run), Some((message_project, message_conversation))) =
                 (&run, &message)
             {
@@ -355,7 +360,9 @@ impl Store {
                 {
                     "uncertain"
                 } else {
-                    terminal_queue_status(&events).or_else(|| safe_attention.then_some("failed")).unwrap_or("running")
+                    terminal_queue_status(&events)
+                        .or_else(|| safe_attention.then_some("failed"))
+                        .unwrap_or("running")
                 }
             } else if run.is_none()
                 && message.is_none()
@@ -590,8 +597,19 @@ fn safe_needs_attention_events(
                 && event.conversation_id == conversation_id
                 && event.run_id == run_id
         })
-        && events.iter().filter(|event| matches!(event.event, AgentEventKindV4::RunNeedsAttention { .. })).count() == 1
-        && events.iter().all(|event| !matches!(event.event, AgentEventKindV4::RunCompleted | AgentEventKindV4::RunFailed { .. } | AgentEventKindV4::RunCancelled))
+        && events
+            .iter()
+            .filter(|event| matches!(event.event, AgentEventKindV4::RunNeedsAttention { .. }))
+            .count()
+            == 1
+        && events.iter().all(|event| {
+            !matches!(
+                event.event,
+                AgentEventKindV4::RunCompleted
+                    | AgentEventKindV4::RunFailed { .. }
+                    | AgentEventKindV4::RunCancelled
+            )
+        })
         && !crate::has_unresolved_side_effect_dispatch(events)
 }
 
@@ -605,12 +623,16 @@ pub(super) async fn safe_needs_attention_in_tx(
 ) -> Result<bool, StoreError> {
     let rows = sqlx::query("SELECT project_id,conversation_id,sequence,previous_hash,event_hash,value_json FROM agent_events_v4 WHERE run_id=?1 ORDER BY sequence")
         .bind(run_id.to_string()).fetch_all(&mut *tx).await?;
-    if rows.is_empty() { return Ok(false); }
+    if rows.is_empty() {
+        return Ok(false);
+    }
     let events = match crate::load_agent_events_in_tx(tx, run_id).await {
         Ok(events) => events,
         Err(_) => return Ok(false),
     };
-    if events.len() != rows.len() || !safe_needs_attention_events(&events, project_id, conversation_id, run_id) {
+    if events.len() != rows.len()
+        || !safe_needs_attention_events(&events, project_id, conversation_id, run_id)
+    {
         return Ok(false);
     }
     for (row, event) in rows.iter().zip(&events) {
@@ -619,7 +641,9 @@ pub(super) async fn safe_needs_attention_in_tx(
             || row.try_get::<i64, _>(2)? != event.sequence as i64
             || row.try_get::<String, _>(3)? != event.previous_hash
             || row.try_get::<String, _>(4)? != event.event_hash
-        { return Ok(false); }
+        {
+            return Ok(false);
+        }
     }
     Ok(true)
 }
@@ -642,7 +666,9 @@ pub(super) async fn has_blocking_run_except_in_tx(
         .bind(project_id.to_string()).bind(conversation_id.to_string()).bind(except.to_string()).fetch_all(&mut *tx).await?;
     for row in rows {
         let status: String = row.try_get(1)?;
-        if status != "needs_attention" { return Ok(true); }
+        if status != "needs_attention" {
+            return Ok(true);
+        }
         let run_id = crate::parse_uuid(row.try_get::<String, _>(0)?, "run id")?;
         if !safe_needs_attention_in_tx(tx, project_id, conversation_id, run_id).await? {
             return Ok(true);
@@ -662,7 +688,8 @@ pub(super) async fn observe_terminal_event_in_tx(
         return Ok(());
     };
     if matches!(event.event, AgentEventKindV4::RunNeedsAttention { .. })
-        && !safe_needs_attention_in_tx(tx, event.project_id, event.conversation_id, event.run_id).await?
+        && !safe_needs_attention_in_tx(tx, event.project_id, event.conversation_id, event.run_id)
+            .await?
     {
         return Ok(());
     }
