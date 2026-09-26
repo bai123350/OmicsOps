@@ -764,13 +764,21 @@ mod tests {
     #[test]
     fn scientific_snapshot_reader_is_authorized_only_for_execute_with_bounded_pages() {
         let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap();
-        let call = ToolCallV4 { call_id: "snapshot-page".into(), tool_id: "agent.read_tool_result".into(),
-            arguments: json!({"sequence":1,"event_hash":"hash","field":"scientific_state","offset":0,"limit":8192}) };
+        let call = ToolCallV4 {
+            call_id: "snapshot-page".into(),
+            tool_id: "agent.read_tool_result".into(),
+            arguments: json!({"sequence":1,"event_hash":"hash","field":"scientific_state","offset":0,"limit":8192}),
+        };
         assert!(registry.validate(RunModeV4::Execute, &call).is_ok());
         assert!(registry.validate(RunModeV4::Plan, &call).is_err());
-        let definition = builtin_tool_definitions_v4().into_iter()
-            .find(|tool| tool.id == "agent.read_tool_result").unwrap();
-        assert_eq!(definition.input_schema["properties"]["limit"]["maximum"], 8192);
+        let definition = builtin_tool_definitions_v4()
+            .into_iter()
+            .find(|tool| tool.id == "agent.read_tool_result")
+            .unwrap();
+        assert_eq!(
+            definition.input_schema["properties"]["limit"]["maximum"],
+            8192
+        );
     }
     #[async_trait]
     impl ToolExecutorV4 for Noop {

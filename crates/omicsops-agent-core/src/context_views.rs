@@ -1,7 +1,7 @@
 //! Bounded model-only projections. Durable events remain the source of truth.
 use omicsops_protocol::{
-    AgentEventKindV4, AgentEventV4, ContextCheckpointV4, DelegationGraphOutcomeV4, DelegationNodeOutcomeV4, RunSpecV4,
-    ToolCallV4, ToolOutcomeV4,
+    AgentEventKindV4, AgentEventV4, ContextCheckpointV4, DelegationGraphOutcomeV4,
+    DelegationNodeOutcomeV4, RunSpecV4, ToolCallV4, ToolOutcomeV4,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -11,7 +11,8 @@ const VIEW_BYTES: usize = 8_192;
 
 fn scientific_digest(value: &Value) -> Option<String> {
     serde_json::from_value::<omicsops_science::ScientificStateV4>(value.clone())
-        .ok().map(|state| state.digest())
+        .ok()
+        .map(|state| state.digest())
 }
 
 /// The durable checkpoint retains the full historical scientific snapshot.
@@ -28,19 +29,47 @@ pub(crate) fn checkpoint_view(checkpoint: &ContextCheckpointV4) -> Value {
 }
 
 /// Only issue a retrieval reference after the complete snapshot is durable.
-pub(crate) fn scientific_state_view(spec: &RunSpecV4, state: &Value, source: &AgentEventV4) -> Option<Value> {
-    if source.run_id != spec.run_id || source.project_id != spec.project_id
-        || source.conversation_id != spec.conversation_id || source.verify().is_err() {
+pub(crate) fn scientific_state_view(
+    spec: &RunSpecV4,
+    state: &Value,
+    source: &AgentEventV4,
+) -> Option<Value> {
+    if source.run_id != spec.run_id
+        || source.project_id != spec.project_id
+        || source.conversation_id != spec.conversation_id
+        || source.verify().is_err()
+    {
         return None;
     }
-    let AgentEventKindV4::ContextCheckpointed { checkpoint } = &source.event else { return None; };
-    if checkpoint.scientific_state != *state || state.get("project_id") != Some(&json!(spec.project_id)) { return None; }
-    let collections: serde_json::Map<String, Value> = ["datasets", "analyses", "artifacts", "evidence", "provenance"]
-        .into_iter().map(|name| {
-            let records = state.get(name).and_then(Value::as_object);
-            let ids: Vec<_> = records.into_iter().flat_map(|records| records.keys()).take(8).collect();
-            (name.into(), json!({"count": records.map_or(0, |records| records.len()), "record_ids": ids}))
-        }).collect();
+    let AgentEventKindV4::ContextCheckpointed { checkpoint } = &source.event else {
+        return None;
+    };
+    if checkpoint.scientific_state != *state
+        || state.get("project_id") != Some(&json!(spec.project_id))
+    {
+        return None;
+    }
+    let collections: serde_json::Map<String, Value> = [
+        "datasets",
+        "analyses",
+        "artifacts",
+        "evidence",
+        "provenance",
+    ]
+    .into_iter()
+    .map(|name| {
+        let records = state.get(name).and_then(Value::as_object);
+        let ids: Vec<_> = records
+            .into_iter()
+            .flat_map(|records| records.keys())
+            .take(8)
+            .collect();
+        (
+            name.into(),
+            json!({"count": records.map_or(0, |records| records.len()), "record_ids": ids}),
+        )
+    })
+    .collect();
     let serialized = state.to_string();
     let mut view = json!({
         "schema_version": state.get("schema_version"), "project_id": spec.project_id,
@@ -320,7 +349,8 @@ pub(crate) fn read_result(
             if checkpoint.scientific_state.get("project_id") != Some(&json!(spec.project_id)) {
                 return Err("scientific snapshot does not belong to this project".into());
             }
-            serde_json::to_string(&checkpoint.scientific_state).map_err(|error| error.to_string())?
+            serde_json::to_string(&checkpoint.scientific_state)
+                .map_err(|error| error.to_string())?
         }
         _ => return Err("reference is not a tool outcome".into()),
     };
