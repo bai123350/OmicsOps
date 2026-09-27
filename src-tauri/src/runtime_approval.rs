@@ -86,6 +86,8 @@ fn lex(code: &str, r: bool, depth: usize) -> Option<Vec<Token>> {
     let mut tokens = Vec::new();
     let mut i = 0;
     let mut stack = Vec::new();
+    let mut line_start = true;
+    let mut indented = false;
     while i < bytes.len() {
         let ch = bytes[i];
         if ch == b'#' {
@@ -95,9 +97,21 @@ fn lex(code: &str, r: bool, depth: usize) -> Option<Vec<Token>> {
             continue;
         }
         if ch.is_ascii_whitespace() {
+            if !r && ch == b'\n' && stack.is_empty() {
+                tokens.push(Token::Mark(b'\n'));
+                line_start = true;
+                indented = false;
+            } else if !r && line_start && stack.is_empty() && matches!(ch, b' ' | b'\t') {
+                indented = true;
+            }
             i += 1;
             continue;
         }
+        if !r && line_start && indented && stack.is_empty() {
+            tokens.push(Token::Mark(b'\t'));
+        }
+        line_start = false;
+        indented = false;
         if ch.is_ascii_alphabetic() || ch == b'_' {
             let start = i;
             i += 1;
@@ -242,9 +256,185 @@ fn call_named(tokens: &[Token], i: usize, name: &str) -> bool {
     is_word(tokens.get(i), name) && is_mark(tokens.get(i + 1), b'(')
 }
 
+// This is deliberately a small proof for the common metadata workflow, not a
+// Python evaluator. Unproved syntax keeps the existing approval route.
+fn safe_os_path_uses(tokens: &[Token]) -> bool {
+    let mut names = std::collections::HashSet::new();
+    let mut imported = false;
+    for line in tokens.split(|token| is_mark(Some(token), b'\n')) {
+        // A semicolon can continue a conditional or indented suite after the
+        // first segment. No segment on that line may establish a path proof.
+        let simple_line = !line.iter().any(|token| is_mark(Some(token), b';'));
+        for statement in line.split(|token| is_mark(Some(token), b';')) {
+            if statement.is_empty() {
+                continue;
+            }
+            let mut import_positions = std::collections::HashSet::new();
+            if is_word(statement.first(), "import") {
+                for i in 1..statement.len() {
+                    if is_word(statement.get(i), "os") {
+                        if !(is_word(statement.get(i.wrapping_sub(1)), "import")
+                            || is_mark(statement.get(i.wrapping_sub(1)), b','))
+                            || !(i + 1 == statement.len() || is_mark(statement.get(i + 1), b','))
+                        {
+                            return false;
+                        }
+                        import_positions.insert(i);
+                        imported = true;
+                    }
+                }
+            }
+
+            // A later assignment invalidates a path name, even when its new value
+            // cannot be proved. Only a whole simple statement can establish one.
+            let complex_binding = statement
+                .iter()
+                .any(|token| {
+                    ["def", "lambda", "for", "case", "class", "import", "del"]
+                        .iter()
+                        .any(|keyword| is_word(Some(token), keyword))
+                });
+            let binding_start = statement
+                .iter()
+                .position(|token| is_word(Some(token), "for") || is_word(Some(token), "as"));
+            let binding_end = binding_start.and_then(|start| {
+                if is_word(statement.get(start), "for") {
+                    statement
+                        .iter()
+                        .enumerate()
+                        .skip(start + 1)
+                        .find(|(_, token)| is_word(Some(token), "in"))
+                        .map(|(i, _)| i)
+                } else {
+                    statement
+                        .iter()
+                        .enumerate()
+                        .skip(start + 1)
+                        .find(|(_, token)| is_mark(Some(token), b':'))
+                        .map(|(i, _)| i)
+                        .or(Some(statement.len()))
+                }
+            });
+            let mut nesting = 0;
+            let mut first_assignment = None;
+            for (i, token) in statement.iter().enumerate() {
+                match token {
+                    Token::Mark(b'(' | b'[' | b'{') => nesting += 1,
+                    Token::Mark(b')' | b']' | b'}') => nesting -= 1,
+                    Token::Mark(b'=') if nesting == 0 => {
+                        first_assignment = Some(i);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            for i in 0..statement.len() {
+                if let Token::Word(name) = &statement[i] {
+                    let next_is_assignment = is_mark(statement.get(i + 1), b'=')
+                        || (matches!(
+                            statement.get(i + 1),
+                            Some(Token::Mark(
+                                b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b':' | b'@'
+                            ))
+                        ) && is_mark(statement.get(i + 2), b'='));
+                    if next_is_assignment
+                        || is_word(statement.get(i.wrapping_sub(1)), "for")
+                        || is_word(statement.get(i.wrapping_sub(1)), "as")
+                        || binding_start
+                            .zip(binding_end)
+                            .is_some_and(|(start, end)| i > start && i < end)
+                        || first_assignment.is_some_and(|assignment| i < assignment)
+                        || complex_binding
+                    {
+                        names.remove(name);
+                    }
+                }
+            }
+            for (i, token) in statement.iter().enumerate() {
+                if is_word(Some(token), "os") && !import_positions.contains(&i) {
+                    if !imported || safe_os_path_call(statement, i, &names, 0).is_none() {
+                        return false;
+                    }
+                }
+            }
+            if simple_line {
+                if let (Some(Token::Word(name)), Some(Token::Mark(b'='))) =
+                    (statement.first(), statement.get(1))
+                {
+                    if safe_relative_path_expr(statement, 2, &names, 0) == Some(statement.len()) {
+                        names.insert(name.clone());
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+fn safe_relative_path_expr(
+    tokens: &[Token],
+    start: usize,
+    names: &std::collections::HashSet<String>,
+    depth: usize,
+) -> Option<usize> {
+    if depth > 4 {
+        return None;
+    }
+    match tokens.get(start)? {
+        Token::String(value) if !value.contains('\\') && !unsafe_project_path(value) => {
+            Some(start + 1)
+        }
+        Token::Word(name) if names.contains(name) => Some(start + 1),
+        Token::Word(name) if name == "os" => {
+            let (method, end) = safe_os_path_call(tokens, start, names, depth + 1)?;
+            (method == "join").then_some(end)
+        }
+        _ => None,
+    }
+}
+
+fn safe_os_path_call<'a>(
+    tokens: &'a [Token],
+    start: usize,
+    names: &std::collections::HashSet<String>,
+    depth: usize,
+) -> Option<(&'a str, usize)> {
+    if depth > 4
+        || !is_word(tokens.get(start), "os")
+        || !is_mark(tokens.get(start + 1), b'.')
+        || !is_word(tokens.get(start + 2), "path")
+        || !is_mark(tokens.get(start + 3), b'.')
+        || !is_mark(tokens.get(start + 5), b'(')
+    {
+        return None;
+    }
+    let Token::Word(method) = tokens.get(start + 4)? else {
+        return None;
+    };
+    if method != "join" && method != "getsize" {
+        return None;
+    }
+    let mut cursor = start + 6;
+    let mut arguments = 0;
+    loop {
+        cursor = safe_relative_path_expr(tokens, cursor, names, depth + 1)?;
+        arguments += 1;
+        if is_mark(tokens.get(cursor), b')') {
+            break;
+        }
+        if !is_mark(tokens.get(cursor), b',') {
+            return None;
+        }
+        cursor += 1;
+    }
+    if (method == "getsize" && arguments != 1) || (method == "join" && arguments < 2) {
+        return None;
+    }
+    Some((method, cursor + 1))
+}
+
 fn python_is_low_risk(tokens: &[Token]) -> bool {
     const RISKY_IMPORTS: &[&str] = &[
-        "os",
         "subprocess",
         "socket",
         "ctypes",
@@ -289,14 +479,12 @@ fn python_is_low_risk(tokens: &[Token]) -> bool {
         "chdir",
     ];
     const MUTATING_HTTP: &[&str] = &["post", "put", "patch", "delete"];
+    if !safe_os_path_uses(tokens) {
+        return false;
+    }
     let mut path_names = std::collections::HashSet::new();
     for pair in tokens.windows(4) {
-        if let [
-            Token::Word(name),
-            Token::Mark(b'='),
-            Token::Word(source),
-            Token::Mark(next),
-        ] = pair
+        if let [Token::Word(name), Token::Mark(b'='), Token::Word(source), Token::Mark(next)] = pair
         {
             if (source == "Path" && *next == b'(')
                 || (path_names.contains(source.as_str()) && *next == b'/')
@@ -616,6 +804,71 @@ L = [f"| {r['title'].replace('|', '\\|')} |" for r in data.get("resultList", {})
         let tokens = lex(code, false, 0).expect("representative Python tokenizes");
         assert!(python_is_low_risk(&tokens), "{tokens:?}");
         assert!(ordinary_runtime_call_is_low_risk(&python(code)));
+    }
+
+    #[test]
+    fn project_relative_os_path_metadata_is_ordinary() {
+        let code = r#"
+import csv, json, os
+root = "results/review"
+table = os.path.join(root, "study-counts.csv")
+with open(table, encoding="utf-8") as handle:
+    rows = list(csv.DictReader(handle))
+size = os.path.getsize(table)
+print(json.dumps({"rows": len(rows), "bytes": size}))
+"#;
+        assert!(ordinary_runtime_call_is_low_risk(&python(code)));
+        assert!(ordinary_runtime_call_is_low_risk(&python(
+            "import os\nprint(os.path.getsize(os.path.join('results', 'report.tsv')))"
+        )));
+    }
+
+    #[test]
+    fn os_path_escape_and_unproven_metadata_paths_require_approval() {
+        for code in [
+            "import os as operating\noperating.path.join('results', 'a')",
+            "from os import path\npath.join('results', 'a')",
+            "import os\nprint(os.environ)",
+            "import os\nprint(os.path)",
+            "import os\nfn = os.path.getsize",
+            "import os\nprint(os.path.__dict__)",
+            "import os\nprint(os.path.join('results', '../private'))",
+            "import os\nprint(os.path.getsize('../private'))",
+            "import os\nsource = input()\nprint(os.path.getsize(source))",
+            "import os\nroot = 'results'\nroot = input()\nprint(os.path.getsize(os.path.join(root, 'a')))",
+            "import os\nprint(getattr(os.path, 'getsize')('results/a'))",
+            "import os\nprint(os.path.join.__call__('results', 'a'))",
+        ] {
+            assert!(!ordinary_runtime_call_is_low_risk(&python(code)), "{code}");
+        }
+    }
+
+    #[test]
+    fn os_path_proof_rejects_escaped_and_rebound_names() {
+        for code in [
+            "import os\nprint(os.path.join('results', '\\x2e\\x2e/private'))",
+            "import os\nprint(os.path.getsize('results\\\\..\\\\private'))",
+            "import os\nprint(os.path.getsize('C:private'))",
+            "import os\nroot = 'results'\nroot += suffix\nprint(os.path.getsize(root))",
+            "import os\nroot = 'results'\nfor root in paths:\n    print(os.path.getsize(root))",
+            "import os\nroot = 'results'\nfor (_, root) in records:\n    print(os.path.getsize(root))",
+            "import os\nroot = 'results'\n[os.path.getsize(root) for i in values for (_, root) in records]",
+            "import os\nroot = 'results'\nmatch value:\n    case root:\n        print(os.path.getsize(root))",
+            "import os\nroot = 'results'\nclass root(metaclass=Meta):\n    pass\nprint(os.path.getsize(root))",
+            "import os\nroot = 'results'\nimport root\nprint(os.path.getsize(root))",
+            "import os\nroot = 'results'\nfrom package import root\nprint(os.path.getsize(root))",
+            "import os\nroot = 'results'\ndel root\nprint(os.path.getsize(root))",
+            "import os\nroot = 'results'\ndef size(root):\n    return os.path.getsize(root)",
+            "import os\nroot = 'results'\ndef f():\n    def g(root):\n        return os.path.getsize(root)\n    return g(path)\nprint(f())",
+            "import os\nroot = config['path']\nif False:\n    root = 'results'\nprint(os.path.getsize(root))",
+            "import os\nroot = config['path']\nif False: n = 1; root = 'results'\nprint(os.path.getsize(root))",
+            "import os\nroot = 'results'\n(root,) = paths\nprint(os.path.getsize(root))",
+            "import os\nroot = 'results'\nwith source as root:\n    pass\nprint(os.path.getsize(root))",
+            "import os\nroot = 'results'\nwith source as (root, other):\n    pass\nprint(os.path.getsize(root))",
+            "import os\nroot = 'results'\nroot := unknown\nprint(os.path.getsize(root))",
+        ] {
+            assert!(!ordinary_runtime_call_is_low_risk(&python(code)), "{code}");
+        }
     }
 
     #[test]
