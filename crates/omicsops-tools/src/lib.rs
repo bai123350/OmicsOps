@@ -434,14 +434,14 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "agent.read_tool_result",
-            "Read a bounded page of an original tool outcome, delegation trace, or checkpoint scientific snapshot from this run using its result_reference. Use field=scientific_state only for a checkpoint snapshot reference. For a successful search_mcp_tools result, use mcp_selector {view:directory} to browse compact server/tool names, optionally filtered by server_id; then use {view:tool,server_id,tool_name} to read exactly one complete original tool entry and schema with field=data. Follow next_offset if a page is partial. Offsets and limits are UTF-8 bytes. Cannot read other runs or arbitrary files.",
+            "Read a bounded page of an original tool outcome, delegation trace, or checkpoint scientific snapshot from this run using its result_reference. Use field=scientific_state only for a checkpoint snapshot reference. For a successful search_mcp_tools result, use mcp_selector {view:directory,query?,server_id?} to browse compact server/tool names. Query words match with OR against server, name, and complete description; omit or clear query to browse all tools. The initial result may use query_from_search=true to apply its frozen search query without repeating it in page metadata; remove that flag to clear the filter and never combine it with explicit query. matched_tools=0 means no match, not an empty catalog. Then use {view:tool,server_id,tool_name} to read exactly one complete original tool entry and schema with field=data. Follow next_offset if a page is partial. Offsets and limits are UTF-8 bytes. Cannot read other runs or arbitrary files.",
             ToolEffectV4::ReadOnly,
             json!({"type":"object","required":["sequence","event_hash","field","offset","limit"],"properties":{
                 "sequence":{"type":"integer","minimum":0},"event_hash":{"type":"string","minLength":1},
                 "field":{"type":"string","enum":["model_content","data","scientific_state"]},
                 "offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":4,"maximum":8192},
                 "mcp_selector":{"oneOf":[
-                    {"type":"object","required":["view"],"properties":{"view":{"const":"directory"},"server_id":{"type":"string","minLength":1}},"additionalProperties":false},
+                    {"type":"object","required":["view"],"properties":{"view":{"const":"directory"},"server_id":{"type":"string","minLength":1},"query":{"type":"string"},"query_from_search":{"const":true}},"additionalProperties":false},
                     {"type":"object","required":["view","server_id","tool_name"],"properties":{"view":{"const":"tool"},"server_id":{"type":"string","minLength":1},"tool_name":{"type":"string","minLength":1}},"additionalProperties":false}
                 ]}
             }}),
@@ -779,6 +779,12 @@ mod tests {
             definition.input_schema["properties"]["limit"]["maximum"],
             8192
         );
+        assert_eq!(
+            definition.input_schema["properties"]["mcp_selector"]["oneOf"][0]["properties"]["query"]
+                ["type"],
+            "string"
+        );
+        assert!(definition.description.contains("matched_tools=0"));
     }
     #[async_trait]
     impl ToolExecutorV4 for Noop {

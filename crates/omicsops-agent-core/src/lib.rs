@@ -4358,9 +4358,18 @@ impl AgentCoreV4<'_> {
             system.push_str("\nThe ordinary run plan is an internal execution contract, not a user-approved workflow. Older generated discovery steps are historical guidance, not mandatory prerequisites; preserve its objective, completion criteria, capabilities and compute binding. Apply active_guidance as additional user instructions in their recorded order. Guidance does not expand tool capabilities, bypass approval, or change the frozen compute environment. Reconcile your approach and completion with this guidance before proposing completion.");
         }
         system.push_str("\nCall search_mcp_tools at most once: it returns the complete enabled tool directory. Filter that directory locally; additional discovery queries cannot reveal unconfigured services.");
-        let discovered = events.iter().any(|event| matches!(&event.event, AgentEventKindV4::ToolFinished { outcome } if outcome.tool_id == "search_mcp_tools" && outcome.succeeded));
-        if discovered {
-            system.push_str("\nThe MCP directory has already been discovered. Filter that result and invoke its tools; do not repeat search_mcp_tools. Its compact result_reference can be paged with agent.read_tool_result and mcp_selector {view:directory}; select one complete original tool schema with mcp_selector {view:tool,server_id,tool_name}. Use field=data and next_offset for partial pages. Actual paper search, pagination and fetching records are separate from tool discovery.");
+        let directory_event = events.iter().rev().find(|event| {
+            event.run_id == spec.run_id
+                && event.project_id == spec.project_id
+                && event.conversation_id == spec.conversation_id
+                && matches!(&event.event, AgentEventKindV4::ToolFinished { outcome } if outcome.tool_id == "search_mcp_tools" && outcome.succeeded)
+                && event.verify().is_ok()
+        });
+        let discovered = directory_event.is_some();
+        if let Some(event) = directory_event {
+            let reference =
+                json!({"sequence":event.sequence,"event_hash":event.event_hash,"field":"data"});
+            system.push_str(&format!("\nThe MCP directory has already been discovered. Its verified result reference is {reference}. Use agent.read_tool_result with this reference, offset=0, limit=8192, and mcp_selector {{view:directory,query?}} to search the complete frozen directory by server, tool name, or full description. Query words match with OR; omit or clear query to browse all tools. matched_tools=0 means no match, not an empty catalog. Select one complete original tool schema with mcp_selector {{view:tool,server_id,tool_name}}. Follow next_offset for partial pages. Do not repeat search_mcp_tools. Actual paper search, pagination and fetching records are separate from tool discovery."));
         }
         let blocked = failed_mcp_servers(events);
         let servers: std::collections::BTreeSet<String> = events
@@ -16626,7 +16635,135 @@ mod tests {
                 .iter()
                 .any(|tool| tool.id == "agent.read_tool_result")
         );
-        assert!(request.system.contains("do not repeat search_mcp_tools"));
+        assert!(request.system.contains("Do not repeat search_mcp_tools"));
+    }
+    #[test]
+    fn compacted_request_keeps_a_verified_mcp_directory_reference() {
+        let model = ScriptedModel(Mutex::new(vec![]));
+        let store = MemoryStore::default();
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &DirectoryTools,
+            events: &store,
+            science: None,
+        };
+        let spec = supervised_execution_spec(
+            Uuid::new_v4(),
+            ApprovalPolicyV4::RiskBased,
+            ComputeBackendKindV4::Local,
+        );
+        let event = AgentEventV4::first(
+            spec.run_id,
+            spec.project_id,
+            spec.conversation_id,
+            Utc::now(),
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: "catalog".into(),
+                    tool_id: "search_mcp_tools".into(),
+                    succeeded: true,
+                    model_content: "untrusted catalog text".into(),
+                    data: json!({"tools": []}),
+                    provenance: vec![],
+                },
+            },
+        );
+        let expected =
+            json!({"sequence":event.sequence,"event_hash":event.event_hash,"field":"data"})
+                .to_string();
+        let request = core.execution_request(
+            &spec,
+            "{\"recent_events\":[]}".into(),
+            std::slice::from_ref(&event),
+        );
+        assert!(request.system.contains(&expected));
+        assert!(!request.system.contains("untrusted catalog text"));
+        assert!(
+            request
+                .tools
+                .iter()
+                .any(|tool| tool.id == "agent.read_tool_result")
+        );
+
+        let wrong_spec = supervised_execution_spec(
+            Uuid::new_v4(),
+            ApprovalPolicyV4::RiskBased,
+            ComputeBackendKindV4::Local,
+        );
+        assert!(
+            !core
+                .execution_request(&wrong_spec, String::new(), std::slice::from_ref(&event))
+                .system
+                .contains(&expected)
+        );
+        let mut altered = event.clone();
+        if let AgentEventKindV4::ToolFinished { outcome } = &mut altered.event {
+            outcome.model_content = "tampered".into();
+        }
+        assert!(
+            !core
+                .execution_request(&spec, String::new(), &[altered])
+                .system
+                .contains(&expected)
+        );
+    }
+    #[test]
+    fn verified_directory_reference_is_in_complete_provider_budget_check() {
+        let spec = supervised_execution_spec(
+            Uuid::new_v4(),
+            ApprovalPolicyV4::RiskBased,
+            ComputeBackendKindV4::Local,
+        );
+        let event = AgentEventV4::first(
+            spec.run_id,
+            spec.project_id,
+            spec.conversation_id,
+            Utc::now(),
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: "catalog".into(),
+                    tool_id: "search_mcp_tools".into(),
+                    succeeded: true,
+                    model_content: String::new(),
+                    data: json!({"tools": []}),
+                    provenance: vec![],
+                },
+            },
+        );
+        let store = MemoryStore::default();
+        let ordinary_model = ScriptedModel(Mutex::new(vec![]));
+        let ordinary_core = AgentCoreV4 {
+            model: &ordinary_model,
+            tools: &DirectoryTools,
+            events: &store,
+            science: None,
+        };
+        let context = "{\"recent_events\":[]}";
+        let request =
+            ordinary_core.execution_request(&spec, context.into(), std::slice::from_ref(&event));
+        let model = BudgetOnlyModel {
+            request_limit: serde_json::to_vec(&request).unwrap().len() - 1,
+            requests: Mutex::new(vec![]),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &DirectoryTools,
+            events: &store,
+            science: None,
+        };
+        assert!(
+            core.validate_execution_context(
+                &spec,
+                context,
+                std::slice::from_ref(&event),
+                AgentLimitsV4::default()
+            )
+            .is_err()
+        );
+        let captured = model.requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].system, request.system);
+        assert!(captured[0].system.contains(&event.event_hash));
     }
     struct SelectiveMcpModel {
         turns: AtomicUsize,

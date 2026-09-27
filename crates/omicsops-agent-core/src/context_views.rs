@@ -185,8 +185,19 @@ pub(crate) fn event_view(event: &AgentEventV4) -> Value {
         _ => return view,
     };
     if outcome.tool_id == "search_mcp_tools" && outcome.succeeded {
-        if let Ok(directory) = mcp_directory_text(&outcome.data, None) {
-            let selector = json!({"view":"directory"});
+        let query = outcome
+            .data
+            .get("query")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
+        if let Ok(directory) = mcp_directory_text(&outcome.data, None, query) {
+            let mut selector = json!({"view":"directory"});
+            if query.is_some() {
+                // The original query remains in the signed event. A short
+                // selector avoids repeating an arbitrarily long query in the
+                // reference and every page's metadata.
+                selector["query_from_search"] = json!(true);
+            }
             view["event"]["outcome"]
                 .as_object_mut()
                 .expect("outcome object")
@@ -207,7 +218,7 @@ pub(crate) fn event_view(event: &AgentEventV4) -> Value {
                     Some(&selector),
                     VIEW_BYTES,
                 )
-                .expect("directory page fits result budget");
+                .expect("short directory selector fits result budget");
                 view["event"]["outcome"]["data"] = page;
                 if view.to_string().len() <= VIEW_BYTES {
                     return view;
@@ -517,7 +528,9 @@ fn selected_mcp_text(data: &Value, selector: &Value) -> Result<String, String> {
         .ok_or("mcp_selector must be an object")?;
     match object.get("view").and_then(Value::as_str) {
         Some("directory") => {
-            if object.keys().any(|key| key != "view" && key != "server_id") {
+            if object.keys().any(|key| {
+                key != "view" && key != "server_id" && key != "query" && key != "query_from_search"
+            }) {
                 return Err("invalid directory selector field".into());
             }
             let server = match object.get("server_id") {
@@ -525,7 +538,25 @@ fn selected_mcp_text(data: &Value, selector: &Value) -> Result<String, String> {
                 Some(Value::String(id)) if !id.is_empty() => Some(id.as_str()),
                 _ => return Err("server_id must be a nonempty string".into()),
             };
-            mcp_directory_text(data, server)
+            let query = match object.get("query") {
+                None => None,
+                Some(Value::String(query)) => Some(query.as_str()),
+                _ => return Err("query must be a string".into()),
+            };
+            let query = match object.get("query_from_search") {
+                None => query,
+                Some(Value::Bool(true)) if query.is_none() => Some(
+                    data.get("query")
+                        .and_then(Value::as_str)
+                        .ok_or("frozen MCP search has no query")?,
+                ),
+                _ => {
+                    return Err(
+                        "query_from_search must be true and cannot be combined with query".into(),
+                    );
+                }
+            };
+            mcp_directory_text(data, server, query)
         }
         Some("tool") => {
             if object.len() != 3
@@ -581,9 +612,20 @@ fn mcp_tools(data: &Value) -> Result<&Vec<Value>, String> {
         .ok_or("MCP directory has no tools array".into())
 }
 
-fn mcp_directory_text(data: &Value, filter: Option<&str>) -> Result<String, String> {
+fn mcp_directory_text(
+    data: &Value,
+    filter: Option<&str>,
+    query: Option<&str>,
+) -> Result<String, String> {
     let mut identities = BTreeSet::new();
     let mut servers: BTreeMap<&str, (&str, Vec<Value>)> = BTreeMap::new();
+    let terms: Vec<String> = query
+        .unwrap_or("")
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect();
+    let mut selected_server_exists = false;
+    let mut matched_tools = 0;
     for entry in mcp_tools(data)? {
         let server = entry
             .get("server_id")
@@ -601,6 +643,7 @@ fn mcp_directory_text(data: &Value, filter: Option<&str>) -> Result<String, Stri
         if filter.is_some_and(|selected| selected != server) {
             continue;
         }
+        selected_server_exists = true;
         let server_name = entry
             .get("server_name")
             .and_then(Value::as_str)
@@ -609,24 +652,30 @@ fn mcp_directory_text(data: &Value, filter: Option<&str>) -> Result<String, Stri
             .get("description")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let mut end = description.len().min(96);
-        while !description.is_char_boundary(end) {
-            end -= 1;
+        if !terms.is_empty() {
+            let searchable = format!("{server} {server_name} {name} {description}").to_lowercase();
+            if !terms.iter().any(|term| searchable.contains(term)) {
+                continue;
+            }
         }
+        matched_tools += 1;
         servers
             .entry(server)
             .or_insert_with(|| (server_name, Vec::new()))
             .1
-            .push(json!({"tool_name":name, "description":&description[..end]}));
+            .push(json!({"tool_name":name}));
     }
-    if filter.is_some() && servers.is_empty() {
+    if filter.is_some() && !selected_server_exists {
         return Err("MCP server identity not found".into());
     }
     let groups: Vec<_> = servers
         .into_iter()
         .map(|(id, (name, tools))| json!({"server_id":id,"server_name":name,"tools":tools}))
         .collect();
-    Ok(json!({"servers":groups}).to_string())
+    Ok(
+        json!({"servers":groups,"total_tools":identities.len(),"matched_tools":matched_tools})
+            .to_string(),
+    )
 }
 
 pub(crate) fn read_outcome(
@@ -664,7 +713,7 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::{READ_RESULT_TOOL, VIEW_BYTES, event_view, read_outcome};
+    use super::{READ_RESULT_TOOL, VIEW_BYTES, event_view, page_text, read_outcome};
 
     fn spec() -> RunSpecV4 {
         let plan = ExecutionPlanV4 {
@@ -777,7 +826,7 @@ mod tests {
                     "server_id": if index % 2 == 0 { "server-a" } else { "server-b" },
                     "server_name": if index % 2 == 0 { "Server A" } else { "Server B" },
                     "tool_name": format!("tool_{index:03}"),
-                    "description": format!("Search research papers 数据🧬 {index}; {}", "x".repeat(300)),
+                    "description": format!("Search research papers 数据🧬 {index}; {}{}", "x".repeat(300), if index == 123 { " rare_marker" } else { "" }),
                     "input_schema": {"type":"object", "properties": {"query": {"type":"string", "description": "quoted \\\" schema 数据🧬 ".repeat(19)}}},
                     "tool_catalog_sha256": "catalog-hash",
                     "schema_sha256": format!("schema-{index}"),
@@ -815,6 +864,190 @@ mod tests {
             tool_id: READ_RESULT_TOOL.into(),
             arguments: json!({"sequence":event.sequence, "event_hash":event.event_hash,
                 "field":"data", "offset":offset, "limit":8192, "mcp_selector":selector}),
+        }
+    }
+
+    #[test]
+    fn mcp_query_finds_full_description_but_projects_one_compact_name() {
+        let spec = spec();
+        let (_, mut original) = large_directory(&spec);
+        original["query"] = json!("rare_marker");
+        let event = AgentEventV4::first(
+            spec.run_id,
+            spec.project_id,
+            spec.conversation_id,
+            Utc::now(),
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: "directory".into(),
+                    tool_id: "search_mcp_tools".into(),
+                    succeeded: true,
+                    model_content: original.to_string(),
+                    data: original.clone(),
+                    provenance: vec![],
+                },
+            },
+        );
+        let view = event_view(&event);
+        assert_eq!(
+            view["result_reference"]["mcp_selector"],
+            json!({"view":"directory","query_from_search":true})
+        );
+        let page = &view["event"]["outcome"]["data"];
+        assert!(
+            page["next_offset"].is_null(),
+            "a single match must not need another directory page"
+        );
+        let compact: serde_json::Value =
+            serde_json::from_str(page["content"].as_str().unwrap()).unwrap();
+        assert_eq!(compact["total_tools"], 247);
+        assert_eq!(compact["matched_tools"], 1);
+        assert_eq!(
+            compact["servers"][0]["tools"],
+            json!([{"tool_name":"tool_123"}])
+        );
+        assert!(page["total_bytes"].as_u64().unwrap() < 300);
+
+        let exact = read_outcome(
+            &spec,
+            std::slice::from_ref(&event),
+            directory_call(
+                &event,
+                json!({"view":"tool","server_id":"server-b","tool_name":"tool_123"}),
+                0,
+            ),
+        );
+        assert!(exact.succeeded);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(exact.data["content"].as_str().unwrap())
+                .unwrap(),
+            original["tools"][123]
+        );
+
+        let empty = read_outcome(
+            &spec,
+            std::slice::from_ref(&event),
+            directory_call(
+                &event,
+                json!({"view":"directory","query":"absent-keyword"}),
+                0,
+            ),
+        );
+        assert!(empty.succeeded);
+        let no_matches: serde_json::Value =
+            serde_json::from_str(empty.data["content"].as_str().unwrap()).unwrap();
+        assert_eq!(no_matches["total_tools"], 247);
+        assert_eq!(no_matches["matched_tools"], 0);
+        assert_eq!(no_matches["servers"], json!([]));
+    }
+
+    #[test]
+    fn mcp_query_uses_any_term_and_combines_with_server_identity() {
+        let spec = spec();
+        let (event, _) = large_directory(&spec);
+        let selected = read_outcome(
+            &spec,
+            std::slice::from_ref(&event),
+            directory_call(
+                &event,
+                json!({"view":"directory","server_id":"server-b","query":"absent rare_marker"}),
+                0,
+            ),
+        );
+        assert!(selected.succeeded, "{}", selected.model_content);
+        let match_in_full_description: serde_json::Value =
+            serde_json::from_str(selected.data["content"].as_str().unwrap()).unwrap();
+        assert_eq!(match_in_full_description["matched_tools"], 1);
+        assert_eq!(
+            match_in_full_description["servers"][0]["tools"],
+            json!([{"tool_name":"tool_123"}])
+        );
+
+        let other_server = read_outcome(
+            &spec,
+            std::slice::from_ref(&event),
+            directory_call(
+                &event,
+                json!({"view":"directory","server_id":"server-a","query":"rare_marker"}),
+                0,
+            ),
+        );
+        assert!(other_server.succeeded);
+        let no_match: serde_json::Value =
+            serde_json::from_str(other_server.data["content"].as_str().unwrap()).unwrap();
+        assert_eq!(no_match["total_tools"], 247);
+        assert_eq!(no_match["matched_tools"], 0);
+
+        let cleared = read_outcome(
+            &spec,
+            std::slice::from_ref(&event),
+            directory_call(&event, json!({"view":"directory","query":""}), 0),
+        );
+        assert!(cleared.succeeded);
+        assert_eq!(
+            cleared.data["total_bytes"],
+            event_view(&event)["event"]["outcome"]["data"]["total_bytes"]
+        );
+    }
+
+    #[test]
+    fn initial_directory_query_is_bounded_in_reference_and_pages_without_truncation() {
+        let spec = spec();
+        let (_, original) = large_directory(&spec);
+        for length in [4_000, 9_000] {
+            let mut data = original.clone();
+            data["query"] = json!(format!("{} rare_marker", "x".repeat(length)));
+            let event = AgentEventV4::first(
+                spec.run_id,
+                spec.project_id,
+                spec.conversation_id,
+                Utc::now(),
+                AgentEventKindV4::ToolFinished {
+                    outcome: ToolOutcomeV4 {
+                        call_id: "long-query".into(),
+                        tool_id: "search_mcp_tools".into(),
+                        succeeded: true,
+                        model_content: data.to_string(),
+                        data,
+                        provenance: vec![],
+                    },
+                },
+            );
+            let view = event_view(&event);
+            assert!(view.to_string().len() <= VIEW_BYTES);
+            let selector = view["result_reference"]["mcp_selector"].clone();
+            assert_eq!(
+                selector,
+                json!({"view":"directory","query_from_search":true})
+            );
+            let first = &view["event"]["outcome"]["data"];
+            assert!(first["next_offset"].is_null());
+            let selected = read_outcome(
+                &spec,
+                std::slice::from_ref(&event),
+                directory_call(&event, selector, 0),
+            );
+            assert!(selected.succeeded, "{}", selected.model_content);
+            assert_eq!(selected.data["content"], first["content"]);
+            let directory: serde_json::Value =
+                serde_json::from_str(first["content"].as_str().unwrap()).unwrap();
+            assert_eq!(directory["matched_tools"], 1);
+            assert_eq!(
+                directory["servers"][0]["tools"],
+                json!([{"tool_name":"tool_123"}])
+            );
+
+            let explicit = read_outcome(
+                &spec,
+                std::slice::from_ref(&event),
+                directory_call(
+                    &event,
+                    json!({"view":"directory","query":"x".repeat(9_000)}),
+                    0,
+                ),
+            );
+            assert!(!explicit.succeeded);
+            assert!(explicit.model_content.len() < 1_024);
         }
     }
 
@@ -942,8 +1175,47 @@ mod tests {
             legacy_pages > 30,
             "fixture should require many original pages"
         );
+        let mut prior_groups: BTreeMap<&str, (&str, Vec<serde_json::Value>)> = BTreeMap::new();
+        for tool in original["tools"].as_array().unwrap() {
+            let server = tool["server_id"].as_str().unwrap();
+            let server_name = tool["server_name"].as_str().unwrap();
+            let description = tool["description"].as_str().unwrap();
+            let mut end = description.len().min(96);
+            while !description.is_char_boundary(end) {
+                end -= 1;
+            }
+            prior_groups
+                .entry(server)
+                .or_insert_with(|| (server_name, vec![]))
+                .1
+                .push(json!({"tool_name":tool["tool_name"],"description":&description[..end]}));
+        }
+        let prior_directory = json!({"servers":prior_groups.into_iter().map(|(server_id,(server_name,tools))|
+            json!({"server_id":server_id,"server_name":server_name,"tools":tools})).collect::<Vec<_>>()}).to_string();
+        let mut prior_offset = 0;
+        let mut prior_pages = 0;
+        loop {
+            let prior_page = page_text(
+                &prior_directory,
+                prior_offset,
+                if prior_pages == 0 { 4_096 } else { 8_192 },
+                event.sequence,
+                &event.event_hash,
+                "data",
+                Some(&json!({"view":"directory"})),
+                if prior_pages == 0 { VIEW_BYTES } else { 6_144 },
+            )
+            .unwrap();
+            prior_pages += 1;
+            let Some(next_offset) = prior_page["next_offset"].as_u64() else {
+                break;
+            };
+            prior_offset = next_offset as usize;
+        }
+        assert!(prior_pages > pages);
         eprintln!(
-            "synthetic MCP fixture: original={original_bytes} bytes; compact directory={pages} pages; legacy original={legacy_pages} pages; exact tool=1 page; first projection={} bytes",
+            "synthetic MCP fixture: original={original_bytes} bytes; previous compact directory={} bytes/{prior_pages} pages; current name directory={} bytes/{pages} pages; raw original={legacy_pages} pages; exact tool=1 page; first projection={} bytes",
+            prior_directory.len(), directory.len(),
             view.to_string().len()
         );
     }
@@ -956,6 +1228,8 @@ mod tests {
             json!({"view":"tool","server_id":"server-b","tool_name":"missing"}),
             json!({"view":"tool","server_id":"server-a","tool_name":"tool_123"}),
             json!({"view":"directory","unexpected":true}),
+            json!({"view":"directory","query_from_search":true}),
+            json!({"view":"directory","query":"papers","query_from_search":true}),
             json!({"view":"tool","server_id":"server-b"}),
             json!({"view":"unknown"}),
         ] {
