@@ -287,13 +287,11 @@ fn safe_os_path_uses(tokens: &[Token]) -> bool {
 
             // A later assignment invalidates a path name, even when its new value
             // cannot be proved. Only a whole simple statement can establish one.
-            let complex_binding = statement
-                .iter()
-                .any(|token| {
-                    ["def", "lambda", "for", "case", "class", "import", "del"]
-                        .iter()
-                        .any(|keyword| is_word(Some(token), keyword))
-                });
+            let complex_binding = statement.iter().any(|token| {
+                ["def", "lambda", "for", "case", "class", "import", "del"]
+                    .iter()
+                    .any(|keyword| is_word(Some(token), keyword))
+            });
             let binding_start = statement
                 .iter()
                 .position(|token| is_word(Some(token), "for") || is_word(Some(token), "as"));
@@ -484,7 +482,12 @@ fn python_is_low_risk(tokens: &[Token]) -> bool {
     }
     let mut path_names = std::collections::HashSet::new();
     for pair in tokens.windows(4) {
-        if let [Token::Word(name), Token::Mark(b'='), Token::Word(source), Token::Mark(next)] = pair
+        if let [
+            Token::Word(name),
+            Token::Mark(b'='),
+            Token::Word(source),
+            Token::Mark(next),
+        ] = pair
         {
             if (source == "Path" && *next == b'(')
                 || (path_names.contains(source.as_str()) && *next == b'/')

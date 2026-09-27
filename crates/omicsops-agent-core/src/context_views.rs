@@ -1215,7 +1215,8 @@ mod tests {
         assert!(prior_pages > pages);
         eprintln!(
             "synthetic MCP fixture: original={original_bytes} bytes; previous compact directory={} bytes/{prior_pages} pages; current name directory={} bytes/{pages} pages; raw original={legacy_pages} pages; exact tool=1 page; first projection={} bytes",
-            prior_directory.len(), directory.len(),
+            prior_directory.len(),
+            directory.len(),
             view.to_string().len()
         );
     }
