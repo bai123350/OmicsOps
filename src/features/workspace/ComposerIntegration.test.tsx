@@ -41,7 +41,6 @@ function renderShell(overrides: Partial<React.ComponentProps<typeof WorkspaceShe
     <WorkspaceShell
       project={project}
       locale="en-US"
-      onLocaleChange={vi.fn()}
       computeBackends={[localBackend]}
       computeBackendId="local"
       runtimeDraftSelection={runtimeSelection}
@@ -61,11 +60,11 @@ describe("WorkspaceShell composer integration", () => {
     const input = screen.getByRole("textbox", { name: /Describe a research goal/ });
     fireEvent.change(input, { target: { value: "Keep this goal" } });
     const item = { reference: { kind: "session" as const, project_id: project.id, id: "saved" }, label: "Saved evidence", description: "" };
-    view.rerender(<WorkspaceShell project={project} locale="en-US" onLocaleChange={vi.fn()} activeConversationId="current" onSelectConversation={onSelectConversation} searchRequest={{ key: "attach-1", kind: "attach", projectId: project.id, conversationId: "current", item }} />);
+    view.rerender(<WorkspaceShell project={project} locale="en-US" activeConversationId="current" onSelectConversation={onSelectConversation} searchRequest={{ key: "attach-1", kind: "attach", projectId: project.id, conversationId: "current", item }} />);
     expect(screen.getByRole("button", { name: /Remove reference: Saved evidence/ })).toBeInTheDocument();
     expect(input).toHaveValue("Keep this goal");
     expect(onSelectConversation).not.toHaveBeenCalled();
-    view.rerender(<WorkspaceShell project={project} locale="en-US" onLocaleChange={vi.fn()} activeConversationId="different" searchRequest={{ key: "attach-1", kind: "attach", projectId: project.id, conversationId: "current", item }} />);
+    view.rerender(<WorkspaceShell project={project} locale="en-US" activeConversationId="different" searchRequest={{ key: "attach-1", kind: "attach", projectId: project.id, conversationId: "current", item }} />);
     expect(screen.queryByRole("button", { name: /Remove reference: Saved evidence/ })).not.toBeInTheDocument();
   });
 
@@ -231,7 +230,7 @@ describe("WorkspaceShell composer integration", () => {
     const query = vi.spyOn(api, "agentV4RuntimeBoundary").mockResolvedValue(frozenBoundary);
     const onOpenSettings = vi.fn();
     const onSend = vi.fn();
-    const props = { project, locale: "en-US" as const, onLocaleChange: vi.fn(), activeConversationId: "current", agentRunEventsV4: events, computeBackends: [localBackend], computeBackendId: "local", onOpenSettings, onSend };
+    const props = { project, locale: "en-US" as const, activeConversationId: "current", agentRunEventsV4: events, computeBackends: [localBackend], computeBackendId: "local", onOpenSettings, onSend };
     const view = render(<WorkspaceShell {...props} runtimeDraftSelection={runtimeSelection} />);
     fireEvent.click(screen.getByRole("button", { name: "Run environment" }));
     const dialog = screen.getByRole("dialog", { name: "Runtimes" });
@@ -254,7 +253,7 @@ describe("WorkspaceShell composer integration", () => {
   });
 
   it("does not reopen a previous conversation's runtime dialog when switching back", () => {
-    const props = { project, locale: "en-US" as const, onLocaleChange: vi.fn(), computeBackends: [localBackend], computeBackendId: "local", runtimeDraftSelection: runtimeSelection };
+    const props = { project, locale: "en-US" as const, computeBackends: [localBackend], computeBackendId: "local", runtimeDraftSelection: runtimeSelection };
     const view = render(<WorkspaceShell {...props} activeConversationId="first" />);
     fireEvent.click(screen.getByRole("button", { name: "Python environment" }));
     expect(screen.getByRole("dialog", { name: "Runtimes" })).toBeInTheDocument();
@@ -330,7 +329,7 @@ describe("WorkspaceShell composer integration", () => {
     const view = renderShell({ onSend: vi.fn() });
     fireEvent.change(screen.getByRole("textbox", { name: /Describe a research goal/ }), { target: { value: "@", selectionStart: 1 } });
     await waitFor(() => expect(catalog).toHaveBeenCalledTimes(1));
-    view.rerender(<WorkspaceShell project={{ ...project, id: "new-project" }} locale="en-US" onLocaleChange={vi.fn()} onSend={vi.fn()} />);
+    view.rerender(<WorkspaceShell project={{ ...project, id: "new-project" }} locale="en-US" onSend={vi.fn()} />);
     const input = screen.getByRole("textbox", { name: /Describe a research goal/ });
     fireEvent.change(input, { target: { value: "@New", selectionStart: 4 } });
     expect(await screen.findByRole("option", { name: /New result/ })).toBeInTheDocument();
@@ -561,7 +560,6 @@ describe("WorkspaceShell composer integration", () => {
       <WorkspaceShell
         project={project}
         locale="en-US"
-        onLocaleChange={vi.fn()}
         computeBackends={[localBackend]}
         computeBackendId="local"
         agentMode="agent"
@@ -598,7 +596,7 @@ describe("WorkspaceShell composer integration", () => {
     fireEvent.change(input, { target: { value: "/", selectionStart: 1 } });
     expect(await screen.findByRole("option", { name: /Old recipe/ })).toBeInTheDocument();
 
-    view.rerender(<WorkspaceShell project={project} locale="en-US" onLocaleChange={vi.fn()} computeBackends={[localBackend]} computeBackendId="local" workflowCatalogVersion={1} />);
+    view.rerender(<WorkspaceShell project={project} locale="en-US" computeBackends={[localBackend]} computeBackendId="local" workflowCatalogVersion={1} />);
 
     expect(await screen.findByRole("option", { name: /Saved recipe/ })).toBeInTheDocument();
     expect(screen.queryByRole("option", { name: /Old recipe/ })).not.toBeInTheDocument();

@@ -4,7 +4,7 @@ import { WorkspaceShell } from "./WorkspaceShell";
 import type { AgentRunEventV4 } from "../../types";
 const event: AgentRunEventV4 = { schema_version: 4, run_id: "run", project_id: "p", conversation_id: "c", sequence: 1, previous_hash: "", event_hash: "head", occurred_at: "2026-09-14T00:00:00Z", event: { kind: "run_created", mode: "execute" } };
 const base = {
-  project: { id: "p", name: "test", status: "ready" as const, template: "blank" as const }, locale: "en-US" as const, onLocaleChange: vi.fn(), activeConversationId: "c", activeRunId: "run", agentBusy: true, agentRunEventsV4: [event], onQueue: vi.fn(),
+  project: { id: "p", name: "test", status: "ready" as const, template: "blank" as const }, locale: "en-US" as const, activeConversationId: "c", activeRunId: "run", agentBusy: true, agentRunEventsV4: [event], onQueue: vi.fn(),
   computeBackendId: "local", computeBackends: [{ descriptor: { schema_version: 4 as const, backend_id: "local", kind: "local" as const, isolation: "process" as const, available: true, supports_python: true, supports_r: true, supports_network_policy: false }, selectable: true, reason: null, python_status: "available" as const, r_status: "available" as const, resolved_image_id: null }],
 };
 function controller() { return { busy: false, pending: false, error: false, send: vi.fn().mockResolvedValue(true), retry: vi.fn().mockResolvedValue(true) }; }

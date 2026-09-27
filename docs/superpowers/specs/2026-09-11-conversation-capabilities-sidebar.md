@@ -2,7 +2,8 @@
 
 Add the Wisp-inspired footer requested by the user: counts for Skills, MCP and
 Memory above vertical Capabilities and Settings actions, pinned to the bottom of
-the existing left conversation navigation. Preserve the language selector.
+the existing left conversation navigation. Interface language is selected in Settings → General;
+the footer contains no language shortcut.
 
 Counts come from a read-only snapshot validated against the active project and
 conversation. Skills count the Agent's selected packages including dependency

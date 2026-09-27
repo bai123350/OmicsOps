@@ -66,7 +66,7 @@ it("closes only the top usage panel with one Escape", () => {
 });
 
 it("opens usage details from the composer meter and closes them on conversation change", () => {
-  const props = { project: { id: "p", name: "test", status: "ready" as const, template: "blank" as const }, locale: "en-US" as const, onLocaleChange: vi.fn(), contextUsage: value };
+  const props = { project: { id: "p", name: "test", status: "ready" as const, template: "blank" as const }, locale: "en-US" as const, contextUsage: value };
   const view = render(<WorkspaceShell {...props} activeConversationId="c" />);
   fireEvent.click(screen.getByRole("button", { name: "Inspect context usage" }));
   expect(screen.getByRole("dialog", { name: "Context usage" })).toBeInTheDocument();
@@ -77,7 +77,7 @@ it("opens usage details from the composer meter and closes them on conversation 
 
 it("opens /context during a run instead of enqueueing it as a research message", async () => {
   const queue = vi.fn();
-  render(<WorkspaceShell project={{ id: "p", name: "test", status: "ready", template: "blank" }} locale="en-US" onLocaleChange={vi.fn()} activeConversationId="c" agentBusy onQueue={queue} />);
+  render(<WorkspaceShell project={{ id: "p", name: "test", status: "ready", template: "blank" }} locale="en-US" activeConversationId="c" agentBusy onQueue={queue} />);
   const input = screen.getByRole("textbox", { name: /Describe/ });
   fireEvent.change(input, { target: { value: "/context" } });
   await waitFor(() => expect(input).toBeEnabled());

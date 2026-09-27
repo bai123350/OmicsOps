@@ -8,7 +8,7 @@ afterEach(() => vi.restoreAllMocks());
 const project = { id: "attachment-project", name: "Attachment project", status: "ready" as const, template: "blank" as const };
 const backend: ComputeBackendAvailabilityV4 = { descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null };
 const receipt: ComposerAttachmentReceipt = { id: "attachment-1", project_id: project.id, conversation_id: "conversation", name: "plot.png", relative_path: ".omicsops/attachments/attachment-1/bytes.png", size_bytes: 4, sha256: "a".repeat(64), media_type: "image/png" };
-const props = { project, activeConversationId: "conversation", locale: "en-US" as const, onLocaleChange: vi.fn(), computeBackends: [backend], computeBackendId: "local" };
+const props = { project, activeConversationId: "conversation", locale: "en-US" as const, computeBackends: [backend], computeBackendId: "local" };
 
 describe("composer attachment integration", () => {
   it("blocks send while image paste uploads and retains files and text after a rejected send", async () => {

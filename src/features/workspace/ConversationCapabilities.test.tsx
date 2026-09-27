@@ -8,9 +8,15 @@ const summary = {
   skills: [{ id: "s1", name: "Literature", enabled: true }, { id: "s2", name: "Analysis", enabled: false }],
   mcp_servers: [{ id: "m1", name: "PubMed", enabled: true, tool_count: 12 }, { id: "m2", name: "ChEMBL", enabled: false, tool_count: 8 }],
 };
-const props = { project, locale: "en-US" as const, onLocaleChange: vi.fn(), activeConversationId: "c", capabilitySummary: summary };
+const props = { project, locale: "en-US" as const, activeConversationId: "c", capabilitySummary: summary };
 
 describe("conversation capabilities", () => {
+  it("keeps settings accessible without a language shortcut in the sidebar footer", () => {
+    render(<WorkspaceShell {...props} onOpenSettings={vi.fn()} />);
+    expect(screen.getByRole("button", { name: "Settings" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "简体中文" })).not.toBeInTheDocument();
+  });
+
   it("counts enabled skills and MCP servers and opens an actionable scoped overview", () => {
     const onOpenSettings = vi.fn();
     render(<WorkspaceShell {...props} onOpenSettings={onOpenSettings} />);

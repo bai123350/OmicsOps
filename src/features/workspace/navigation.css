@@ -6,7 +6,6 @@
 .capability-footer button:hover:not(:disabled),.capability-footer button:focus-visible{background:#273448;color:#fff;outline:2px solid transparent}
 .capability-footer button:focus-visible{box-shadow:0 0 0 2px #6d8cff}
 .capability-footer button:disabled{opacity:.5;cursor:not-allowed}
-.capability-footer .rail-language{color:#8491a5;font-size:11px;padding-top:6px;padding-bottom:6px}
 .capabilities-backdrop{position:fixed;inset:0;z-index:30;display:grid;place-items:center;padding:24px;background:#10182866;backdrop-filter:blur(3px)}
 .capabilities-dialog{width:min(640px,100%);max-height:calc(100vh - 48px);display:flex;flex-direction:column;background:#fff;color:#172033;border:1px solid #dfe4ea;border-radius:16px;box-shadow:0 24px 80px #10182840;overflow:hidden}
 .capabilities-dialog>header{display:flex;justify-content:space-between;align-items:center;padding:20px 24px;border-bottom:1px solid #e4e7ec}

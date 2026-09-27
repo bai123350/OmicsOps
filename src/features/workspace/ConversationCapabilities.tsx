@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Grid2X2, Languages, Settings, X } from "lucide-react";
+import { Grid2X2, Settings, X } from "lucide-react";
 import type { ConversationCapabilitiesV4 } from "../../types";
 import { useWindowEscapeLayer } from "../settings/BrowserSettings";
 import type { Locale } from "./copy";
@@ -12,11 +12,10 @@ interface Props {
   error?: string;
   onRefresh?: () => void;
   locale: Locale;
-  onLocaleChange: (locale: Locale) => void;
   onOpenSettings?: (section?: "models" | "remote" | "skills") => void;
 }
 
-export function ConversationCapabilities({ projectId, conversationId, summary, loading = false, error, onRefresh, locale, onLocaleChange, onOpenSettings }: Props) {
+export function ConversationCapabilities({ projectId, conversationId, summary, loading = false, error, onRefresh, locale, onOpenSettings }: Props) {
   const zh = locale === "zh-CN";
   const [open, setOpen] = useState(false);
   useWindowEscapeLayer(open, () => setOpen(false));
@@ -30,7 +29,6 @@ export function ConversationCapabilities({ projectId, conversationId, summary, l
       <div className="capability-counts" aria-live="polite" aria-label={status} title={status}>{counts}</div>
       <button onClick={() => setOpen(true)} aria-haspopup="dialog"><Grid2X2 size={18} />Capabilities</button>
       <button disabled={!onOpenSettings} onClick={() => onOpenSettings?.("models")}><Settings size={18} />{zh ? "设置" : "Settings"}</button>
-      <button className="rail-language" onClick={() => onLocaleChange(zh ? "en-US" : "zh-CN")}><Languages size={14} />{zh ? "English" : "简体中文"}</button>
     </div>
     {open && <div className="capabilities-backdrop" onClick={(event) => { if (event.target === event.currentTarget) setOpen(false); }}>
       <section className="capabilities-dialog" role="dialog" aria-modal="true" aria-labelledby="conversation-capabilities-title">

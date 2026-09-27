@@ -8,7 +8,6 @@ import { useWindowEscapeLayer } from "../settings/BrowserSettings";
 const baseProps = {
   projects: [],
   locale: "zh-CN" as const,
-  onLocaleChange: () => undefined,
   onOpen: () => undefined,
   onDelete: vi.fn().mockResolvedValue(undefined),
   onSettings: () => undefined,
@@ -51,20 +50,18 @@ describe("ProjectLibrary homepage actions", () => {
     expect(screen.getByRole("textbox", { name: "项目名称" })).toHaveValue("空白研究项目");
   });
 
-  it("keeps the brand promise and routes search, locale, and settings actions", () => {
+  it("keeps the brand promise and routes search and settings without a language shortcut", () => {
     const onOpenSearch = vi.fn();
-    const onLocaleChange = vi.fn();
     const onSettings = vi.fn();
-    render(<ProjectLibrary {...baseProps} onOpenSearch={onOpenSearch} onLocaleChange={onLocaleChange} onSettings={onSettings} onChooseLocalRoot={vi.fn()} onCreate={vi.fn()} />);
+    render(<ProjectLibrary {...baseProps} onOpenSearch={onOpenSearch} onSettings={onSettings} onChooseLocalRoot={vi.fn()} onCreate={vi.fn()} />);
 
     expect(screen.getByText("OmicsOps")).toBeInTheDocument();
     expect(screen.getByText("面向可复现科研的本地工作台")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "切换为 English" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "搜索工作区" }));
-    fireEvent.click(screen.getByRole("button", { name: "切换为 English" }));
     fireEvent.click(screen.getByRole("button", { name: "设置" }));
 
     expect(onOpenSearch).toHaveBeenCalledOnce();
-    expect(onLocaleChange).toHaveBeenCalledWith("en-US");
     expect(onSettings).toHaveBeenCalledOnce();
   });
 

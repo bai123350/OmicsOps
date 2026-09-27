@@ -1631,18 +1631,22 @@ describe("DesktopApp", () => {
     expect(screen.queryByRole("heading", { name: stateConversations[0].title })).not.toBeInTheDocument();
   });
 
-  it("persists the existing project-library language switch across remounts", async () => {
+  it("persists the General language selection across remounts", async () => {
     vi.spyOn(api, "listProjects").mockResolvedValue([]);
     const first = render(<DesktopApp />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "切换为 English" }));
+    fireEvent.click(await screen.findByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("button", { name: "常规" }));
+    fireEvent.change(screen.getByRole("combobox", { name: "界面语言" }), { target: { value: "en-US" } });
     expect(await screen.findByRole("button", { name: "Settings" })).toBeInTheDocument();
     expect(window.localStorage.getItem("omicsops.locale")).toBe("en-US");
     first.unmount();
 
     render(<DesktopApp />);
     expect(await screen.findByRole("button", { name: "Settings" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Switch to 简体中文" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    fireEvent.click(screen.getByRole("button", { name: "General" }));
+    expect(screen.getByRole("combobox", { name: "Interface language" })).toHaveValue("en-US");
   });
 
   it("applies General language changes immediately and keeps them after Settings closes and reopens", async () => {

@@ -73,7 +73,7 @@ describe("WorkspaceShell", () => {
     vi.spyOn(projectTemplatesApi, "listSpecialistTemplates").mockResolvedValue([]);
     vi.spyOn(workflowApi, "listComposerWorkflows").mockResolvedValue([workflow]);
     const onSend = vi.fn();
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} onSend={onSend} />);
+    render(<WorkspaceShell project={project} locale="en-US" onSend={onSend} />);
 
     const composer = screen.getByRole("textbox", { name: /Describe a research goal/ });
     fireEvent.change(composer, { target: { value: "Keep this draft" } });
@@ -92,7 +92,7 @@ describe("WorkspaceShell", () => {
     vi.spyOn(projectTemplatesApi, "listSpecialistTemplates").mockResolvedValue([specialist]);
     vi.spyOn(workflowApi, "listComposerWorkflows").mockResolvedValue([]);
     const onSend = vi.fn();
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} onSend={onSend} />);
+    render(<WorkspaceShell project={project} locale="en-US" onSend={onSend} />);
 
     const composer = screen.getByRole("textbox", { name: /Describe a research goal/ });
     fireEvent.change(composer, { target: { value: "Keep this draft exactly." } });
@@ -107,7 +107,7 @@ describe("WorkspaceShell", () => {
 
   it("updates the visible shortcut and main composer keyboard behavior when the shared preference changes", async () => {
     const onSend = vi.fn().mockResolvedValue(true);
-    render(<><WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} onSend={onSend} computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} /><SettingsPanel locale="en-US" initialSection="general" onClose={() => undefined} /></>);
+    render(<><WorkspaceShell project={project} locale="en-US" onSend={onSend} computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} /><SettingsPanel locale="en-US" initialSection="general" onClose={() => undefined} /></>);
     const composer = screen.getByRole("textbox", { name: /Describe a research goal/ });
     fireEvent.change(composer, { target: { value: "Inspect counts" } });
     fireEvent.click(screen.getByRole("button", { name: "Agent permissions" }));
@@ -132,7 +132,7 @@ describe("WorkspaceShell", () => {
   it("quotes selected persisted message text into the existing draft without sending and hides actions when disabled", () => {
     setSelectionActionsEnabled(true);
     const onSend = vi.fn();
-    render(<><WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} onSend={onSend} activeConversationId="conversation-1" messages={[{ id: "assistant-1", role: "assistant", markdown: "Verified observation" }]} /><SettingsPanel locale="en-US" initialSection="general" onClose={() => undefined} /></>);
+    render(<><WorkspaceShell project={project} locale="en-US" onSend={onSend} activeConversationId="conversation-1" messages={[{ id: "assistant-1", role: "assistant", markdown: "Verified observation" }]} /><SettingsPanel locale="en-US" initialSection="general" onClose={() => undefined} /></>);
     const composer = screen.getByRole("textbox", { name: /Describe a research goal/ });
     fireEvent.change(composer, { target: { value: "Keep this draft" } });
     selectVisibleMessageText(screen.getByText("Verified observation").firstChild as Text);
@@ -154,7 +154,7 @@ describe("WorkspaceShell", () => {
     { label: "legacy IME keyCode", event: { key: "Enter", code: "Enter", keyCode: 229 } },
   ])("does not send the main composer for $label", ({ event }) => {
     const onSend = vi.fn();
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} onSend={onSend} />);
+    render(<WorkspaceShell project={project} locale="en-US" onSend={onSend} />);
     const composer = screen.getByRole("textbox", { name: /Describe a research goal/ });
     fireEvent.change(composer, { target: { value: "Keep editing" } });
     fireEvent.keyDown(composer, event);
@@ -162,7 +162,7 @@ describe("WorkspaceShell", () => {
   });
   it.each(["running", "waiting_for_approval", "needs_attention", "cancelled", "completed"])("does not present an ordinary %s contract as a Plan or hide its trace", (status) => {
     const plan = { schema_version: 4 as const, objective: "internal ordinary contract", steps: ["internal step"], completion_criteria: ["evidence"], requested_capabilities: [] };
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} agentMode="agent"
+    render(<WorkspaceShell project={project} locale="zh-CN" agentMode="agent"
       activeRunId="ordinary" runStarted={status === "running" || status === "waiting_for_approval"}
       v4Plan={{ run_id: "ordinary", status, plan, plan_hash: "internal", compute_selection: null, approval_hash: "internal", session_mode: "agent" }}
       agentRunEventsV4={[{ schema_version: 4, run_id: "ordinary", project_id: project.id, conversation_id: "c", sequence: 1, occurred_at: "2026-09-10T00:00:00Z", previous_hash: "", event_hash: "h", event: { kind: "model_text", text: "正在核对文献记录。" } }]} />);
@@ -173,7 +173,7 @@ describe("WorkspaceShell", () => {
   });
 
   it("opens independent guidance from send options while the main composer is locked", () => {
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} guidanceAvailable activeConversationId="conversation" activeRunId="run" runStarted />);
+    render(<WorkspaceShell project={project} locale="zh-CN" guidanceAvailable activeConversationId="conversation" activeRunId="run" runStarted />);
     expect(screen.queryByRole("region", { name: "运行中指导" })).not.toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "发送选项" }));
@@ -183,7 +183,7 @@ describe("WorkspaceShell", () => {
   });
 
   it("keeps guidance out of Plan mode", () => {
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} guidanceAvailable agentMode="plan" activeConversationId="conversation" activeRunId="run" runStarted />);
+    render(<WorkspaceShell project={project} locale="zh-CN" guidanceAvailable agentMode="plan" activeConversationId="conversation" activeRunId="run" runStarted />);
     fireEvent.click(screen.getByRole("button", { name: "发送选项" }));
     expect(screen.queryByRole("menuitem", { name: /追加指导/ })).not.toBeInTheDocument();
   });
@@ -192,7 +192,7 @@ describe("WorkspaceShell", () => {
     vi.spyOn(guidanceApi, "agentV4ListGuidance").mockResolvedValue([]);
     vi.spyOn(guidanceApi, "onAgentV4Event").mockResolvedValue(() => undefined);
     const submit = vi.spyOn(guidanceApi, "agentV4SubmitGuidance").mockRejectedValue(new Error("connection lost"));
-    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, guidanceAvailable: true, runStarted: true };
+    const props = { project, locale: "zh-CN" as const, guidanceAvailable: true, runStarted: true };
     const view = render(<WorkspaceShell {...props} activeConversationId="first" activeRunId="run-first" />);
     const open = () => {
       fireEvent.click(screen.getByRole("button", { name: "发送选项" }));
@@ -218,7 +218,7 @@ describe("WorkspaceShell", () => {
     vi.spyOn(guidanceApi, "agentV4ListGuidance").mockResolvedValue([]);
     vi.spyOn(guidanceApi, "onAgentV4Event").mockResolvedValue(() => undefined);
     vi.spyOn(guidanceApi, "agentV4SubmitGuidance").mockImplementation(async (request) => ({ ...request, ordinal: 1, accepted_at: "2026-09-14T00:00:00Z", consumed_at: null }));
-    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, guidanceAvailable: true, activeConversationId: "conversation" };
+    const props = { project, locale: "zh-CN" as const, guidanceAvailable: true, activeConversationId: "conversation" };
     const view = render(<WorkspaceShell {...props} />);
     const composer = screen.getByRole("textbox", { name: /描述研究目标/ });
     await waitFor(() => expect(composer).toBeEnabled());
@@ -235,7 +235,7 @@ describe("WorkspaceShell", () => {
 
   it("reopens the latest ordinary run's guidance history after the run has finished", () => {
     const plan = { schema_version: 4 as const, objective: "ordinary run", steps: ["inspect"], completion_criteria: ["report"], requested_capabilities: [] };
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} guidanceAvailable activeConversationId="conversation"
+    render(<WorkspaceShell project={project} locale="zh-CN" guidanceAvailable activeConversationId="conversation"
       v4Plan={{ run_id: "finished-run", status: "completed", plan, plan_hash: "hash", compute_selection: null, approval_hash: null, session_mode: "agent" }} />);
     fireEvent.click(screen.getByRole("button", { name: "发送选项" }));
     fireEvent.click(screen.getByRole("menuitem", { name: /追加指导/ }));
@@ -245,7 +245,7 @@ describe("WorkspaceShell", () => {
 
   it("pretty prints JSON results and reports displayed line counts", () => {
     const base = { schema_version: 4 as const, run_id: "json", project_id: project.id, conversation_id: "c", previous_hash: "", event_hash: "h", occurred_at: "2026-09-10T00:00:00Z" };
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="json" agentRunEventsV4={[
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="json" agentRunEventsV4={[
       { ...base, sequence: 1, event: { kind: "tool_requested", call: { call_id: "s", tool_id: "search_skills", arguments: { query: "literature" } } } },
       { ...base, sequence: 2, event: { kind: "tool_finished", outcome: { call_id: "s", tool_id: "search_skills", succeeded: true, model_content: '{"results":["literature-review"]}', data: null, provenance: [] } } },
     ]} />);
@@ -257,7 +257,7 @@ describe("WorkspaceShell", () => {
 
   it("shows the ready card only for a pending approval plan", () => {
     const plan = { schema_version: 4 as const, objective: "用户请求的计划", steps: ["检查"], completion_criteria: ["核验"], requested_capabilities: [] };
-    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, agentMode: "plan" as const };
+    const props = { project, locale: "zh-CN" as const, agentMode: "plan" as const };
     const summary = { run_id: "plan-run", status: "awaiting_approval", plan, plan_hash: "h", compute_selection: null, approval_hash: "a", session_mode: "plan" as const };
     const { rerender } = render(<WorkspaceShell {...props} v4Plan={summary} />);
     expect(screen.getByText(/计划已生成/)).toBeVisible();
@@ -267,7 +267,7 @@ describe("WorkspaceShell", () => {
 
   it.each(["zh-CN", "en-US"] as const)("keeps bookkeeping out of the conversation and explains attention in %s", (locale) => {
     const base = { schema_version: 4 as const, run_id: "run-attention", project_id: project.id, conversation_id: "conversation-1", occurred_at: "2026-09-10T00:00:00Z", previous_hash: "", event_hash: "hash" };
-    render(<WorkspaceShell project={project} locale={locale} onLocaleChange={() => undefined} agentRunEventsV4={[
+    render(<WorkspaceShell project={project} locale={locale} agentRunEventsV4={[
       { ...base, sequence: 1, event: { kind: "run_created", mode: "execute" } },
       { ...base, sequence: 2, event: { kind: "context_archived", archive: { archive_id: "private-archive", through_sequence: 1, size_bytes: 100, sha256: "hash" } } },
       { ...base, sequence: 3, event: { kind: "context_checkpointed", checkpoint: { schema_version: 4, through_sequence: 2, completion_criteria: [], unresolved_errors: [], recent_steps: [], scientific_state: {} } } },
@@ -288,7 +288,7 @@ describe("WorkspaceShell", () => {
 
   it("collapses completed progress while keeping the final answer visible", () => {
     const base = { schema_version: 4 as const, run_id: "run-visible", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined}
+    render(<WorkspaceShell project={project} locale="zh-CN"
       messages={[
         { id: "request", role: "user", markdown: "检查数据", created_at: "2026-09-10T00:00:00Z" },
         { id: "answer", role: "assistant", markdown: "已检查 **3 个样本**。", created_at: "2026-09-10T00:00:05Z" },
@@ -309,7 +309,7 @@ describe("WorkspaceShell", () => {
     const cancel = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
     const resume = vi.fn();
     const event = { schema_version: 4 as const, run_id: "receipt-run", project_id: project.id, conversation_id: "c", sequence: 1, occurred_at: "2026-09-09T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "runtime_recovery_available" as const, call_ids: ["cell"] } };
-    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: event.run_id, onResumeAgentRunV4: resume, onCancelRuntimeRecoveryV4: cancel };
+    const props = { project, locale: "zh-CN" as const, runStarted: true, activeRunId: event.run_id, onResumeAgentRunV4: resume, onCancelRuntimeRecoveryV4: cancel };
     const { rerender } = render(<WorkspaceShell {...props} agentRunEventsV4={[event]} />);
     fireEvent.click(screen.getByRole("button", { name: "取消此运行" }));
     fireEvent.click(screen.getByRole("button", { name: "取消中…" }));
@@ -326,7 +326,7 @@ describe("WorkspaceShell", () => {
   it("keeps a rejected recovery cancellation retryable without transport details", async () => {
     const cancel = vi.fn().mockRejectedValue(new Error("private transport"));
     const event = { schema_version: 4 as const, run_id: "receipt-run", project_id: project.id, conversation_id: "c", sequence: 1, occurred_at: "2026-09-09T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "runtime_recovery_available" as const, call_ids: ["cell"] } };
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} agentRunEventsV4={[event]} onCancelRuntimeRecoveryV4={cancel} />);
+    render(<WorkspaceShell project={project} locale="zh-CN" agentRunEventsV4={[event]} onCancelRuntimeRecoveryV4={cancel} />);
     fireEvent.click(screen.getByRole("button", { name: "取消此运行" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("取消失败");
     expect(screen.getByRole("button", { name: "取消此运行" })).toBeEnabled();
@@ -336,7 +336,7 @@ describe("WorkspaceShell", () => {
     let finish: (() => void) | undefined;
     const resume = vi.fn(() => new Promise<void>((resolve) => { finish = resolve; }));
     const event = { schema_version: 4 as const, run_id: "receipt-run", project_id: project.id, conversation_id: "c", sequence: 1, occurred_at: "2026-09-09T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "runtime_recovery_available" as const, call_ids: ["cell"] } };
-    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: event.run_id, onResumeAgentRunV4: resume, onCancelRuntimeRecoveryV4: vi.fn() };
+    const props = { project, locale: "zh-CN" as const, runStarted: true, activeRunId: event.run_id, onResumeAgentRunV4: resume, onCancelRuntimeRecoveryV4: vi.fn() };
     const { rerender } = render(<WorkspaceShell {...props} agentRunEventsV4={[event]} />);
     fireEvent.click(screen.getByRole("button", { name: "恢复已保存结果" }));
     expect(screen.getByRole("button", { name: "恢复中…" })).toBeDisabled();
@@ -350,7 +350,7 @@ describe("WorkspaceShell", () => {
   });
   it("switches Send to a stop square and restores it after cancellation", () => {
     const cancel = vi.fn();
-    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, onCancelRun: cancel };
+    const props = { project, locale: "zh-CN" as const, onCancelRun: cancel };
     const { rerender } = render(<WorkspaceShell {...props} />);
     expect(screen.getByRole("button", { name: "发送" })).toHaveTextContent("发送");
     rerender(<WorkspaceShell {...props} runStarted activeRunId="run-stop" composerBusy />);
@@ -376,7 +376,7 @@ describe("WorkspaceShell", () => {
   it("interleaves progress and individual read, write, edit calls even inside a batch", () => {
     const base = { schema_version: 4 as const, run_id: "run-compact", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
     const longOutput = `${"a".repeat(900)}\r\nlast line\r\n`;
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} runStarted activeRunId={base.run_id} agentRunEventsV4={[
+    render(<WorkspaceShell project={project} locale="en-US" runStarted activeRunId={base.run_id} agentRunEventsV4={[
       { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "cycle_started", cycle_id: 1 } },
       { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "model_text", text: "Inspect the file first." } },
       { ...base, sequence: 3, occurred_at: "2026-08-17T00:00:02Z", event: { kind: "tool_batch_started", batch_id: 1, cycle_id: 1, phase: "executing", tool_names: ["project.read", "write", "edit"], call_ids: ["r", "w", "e"] } },
@@ -399,7 +399,7 @@ describe("WorkspaceShell", () => {
   });
 
   it("preserves reading position on new output and returns to the latest on demand", async () => {
-    const props = { project, locale: "en-US" as const, onLocaleChange: () => undefined, onSend: vi.fn() };
+    const props = { project, locale: "en-US" as const, onSend: vi.fn() };
     const { container, rerender } = render(<WorkspaceShell {...props} streamingAssistant="First" />);
     const stream = container.querySelector(".message-stream") as HTMLElement;
     Object.defineProperties(stream, { scrollHeight: { configurable: true, value: 1200 }, clientHeight: { configurable: true, value: 400 } });
@@ -429,7 +429,7 @@ describe("WorkspaceShell", () => {
       { ...base, sequence: 7, occurred_at: "2026-08-17T00:00:06Z", event: { kind: "tool_batch_started" as const, batch_id: 2, cycle_id: 1, phase: "organizing" as const, tool_names: ["agent.update_tasks"], call_ids: ["update-1"] } },
       { ...base, sequence: 8, occurred_at: "2026-08-17T00:00:07Z", event: { kind: "tool_batch_finished" as const, batch_id: 2, cycle_id: 1, phase: "organizing" as const, tool_names: ["agent.update_tasks"], call_ids: ["update-1"], duration_ms: 0, succeeded: 1, failed: 0 } },
     ];
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-guided" agentRunEventsV4={events} />);
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-guided" agentRunEventsV4={events} />);
 
     expect(screen.queryByRole("region", { name: "Agent 阶段轨迹" })).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "任务列表" })).not.toBeInTheDocument();
@@ -444,7 +444,7 @@ describe("WorkspaceShell", () => {
   it("summarizes tool batches by phase and model cycle while keeping input decisions in the same run", () => {
     const onAnswer = vi.fn();
     const base = { schema_version: 4 as const, run_id: "run-batch", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} runStarted activeRunId="run-batch" onAnswerAgentQuestionV4={onAnswer} agentRunEventsV4={[
+    render(<WorkspaceShell project={project} locale="en-US" runStarted activeRunId="run-batch" onAnswerAgentQuestionV4={onAnswer} agentRunEventsV4={[
       { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "task_shape_selected" as const, task_shape: "multi_step" as const, source: "model" as const, reason: "requires verification" } },
       { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "cycle_started" as const, cycle_id: 3 } },
       { ...base, sequence: 3, occurred_at: "2026-08-17T00:00:02Z", event: { kind: "tool_batch_started" as const, batch_id: 8, cycle_id: 3, phase: "executing" as const, tool_names: ["project.read", "runtime.execute"], call_ids: ["call-1", "call-2"] } },
@@ -464,7 +464,7 @@ describe("WorkspaceShell", () => {
 
   it("keeps fast-path runs compact and omits an empty task panel", () => {
     const base = { schema_version: 4 as const, run_id: "run-fast", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} runStarted activeRunId="run-fast" agentRunEventsV4={[
+    render(<WorkspaceShell project={project} locale="en-US" runStarted activeRunId="run-fast" agentRunEventsV4={[
       { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "task_shape_selected" as const, task_shape: "fast" as const, source: "host" as const, reason: "one bounded operation" } },
       { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "task_list_updated" as const, revision: 1, change_summary: "no tasks needed", tasks: [] } },
     ]} />);
@@ -474,7 +474,7 @@ describe("WorkspaceShell", () => {
   });
 
   it("renders the V4 hash-chained trajectory", () => {
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-v4" agentRunEventsV4={[{
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-v4" agentRunEventsV4={[{
       schema_version: 4, run_id: "run-v4", project_id: project.id, conversation_id: "conversation-1", sequence: 1,
       occurred_at: "2026-08-17T00:00:00Z", previous_hash: "", event_hash: "a".repeat(64), event: { kind: "run_created", mode: "plan" },
     }]} />);
@@ -486,7 +486,7 @@ describe("WorkspaceShell", () => {
   it("warns when an active run has been silent for 90 seconds without hiding stop", () => {
     const onCancel = vi.fn();
     const lastActivity = new Date(Date.now() - 90_001).toISOString();
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-stalled" activeRunLastActivityAt={lastActivity} onCancelRun={onCancel} agentRunEventsV4={[{
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-stalled" activeRunLastActivityAt={lastActivity} onCancelRun={onCancel} agentRunEventsV4={[{
       schema_version: 4, run_id: "run-stalled", project_id: project.id, conversation_id: "conversation-1", sequence: 1,
       occurred_at: lastActivity, previous_hash: "", event_hash: "a".repeat(64), event: { kind: "run_created", mode: "execute" },
     }]} />);
@@ -498,7 +498,7 @@ describe("WorkspaceShell", () => {
     const base = { schema_version: 4 as const, run_id: "run-live-steps", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash", occurred_at: "2026-08-17T00:00:00Z" };
     const progress = { ...base, sequence: 1, event: { kind: "model_text" as const, text: "## Checking input\n\n- Source verified" } };
     const requested = { ...base, sequence: 2, event: { kind: "tool_requested" as const, call: { call_id: "read-live", tool_id: "project.read", arguments: { path: "input.tsv" } } } };
-    const props = { project, locale: "en-US" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: base.run_id };
+    const props = { project, locale: "en-US" as const, runStarted: true, activeRunId: base.run_id };
     const { rerender } = render(<WorkspaceShell {...props} agentRunEventsV4={[progress, requested]} />);
     const timeline = screen.getByRole("region", { name: "Tool call details" });
     expect(within(timeline).getByText(/Checking input/)).toBeVisible();
@@ -514,7 +514,7 @@ describe("WorkspaceShell", () => {
   });
   it("orders model requests, progress, and tool rows by their durable event sequence", () => {
     const base = { schema_version: 4 as const, run_id: "run-ordered", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash", occurred_at: new Date(Date.now() - 2_000).toISOString() };
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} runStarted activeRunId={base.run_id} agentRunEventsV4={[
+    render(<WorkspaceShell project={project} locale="en-US" runStarted activeRunId={base.run_id} agentRunEventsV4={[
       { ...base, sequence: 1, event: { kind: "model_request_started", request: modelRequest("ordered-attempt") } },
       { ...base, sequence: 2, event: { kind: "model_text", text: "Checking sources" } },
       { ...base, sequence: 3, event: { kind: "tool_requested", call: { call_id: "ordered-read", tool_id: "project.read", arguments: { path: "source.tsv" } } } },
@@ -528,7 +528,7 @@ describe("WorkspaceShell", () => {
   });
   it("shows recent reasoning activity without a false silence warning", () => {
     const lastActivity = new Date(Date.now() - 90_001).toISOString();
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined}
+    render(<WorkspaceShell project={project} locale="zh-CN"
       runStarted activeRunId="run-reasoning" activeRunLastActivityAt={lastActivity}
       agentModelActivity={{ run_id: "run-reasoning", attempt_id: "attempt-reasoning", phase: "reasoning", received_at: new Date().toISOString() }}
       agentRunEventsV4={[{
@@ -548,7 +548,7 @@ describe("WorkspaceShell", () => {
       { ...base, sequence: 1, event: { kind: "run_created" as const, mode: "execute" as const } },
       { ...base, sequence: 2, event: { kind: "model_request_started" as const, request: modelRequest("attempt-thinking") } },
     ];
-    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: base.run_id, agentRunEventsV4: events };
+    const props = { project, locale: "zh-CN" as const, runStarted: true, activeRunId: base.run_id, agentRunEventsV4: events };
     const { rerender } = render(<WorkspaceShell {...props} />);
     const waiting = screen.getByRole("status", { name: "当前模型活动" });
     expect(waiting).toHaveTextContent("等待模型响应");
@@ -586,7 +586,7 @@ describe("WorkspaceShell", () => {
     const base = { schema_version: 4 as const, run_id: "run-tool", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash", occurred_at: started };
     const requested = { ...base, sequence: 1, event: { kind: "tool_requested" as const, call: { call_id: "read-1", tool_id: "project.read", arguments: { path: "input.tsv" } } } };
     const running = { ...base, sequence: 2, event: { kind: "tool_dispatch_started" as const, call_id: "read-1", tool_id: "project.read", effect: "read_only", idempotency_key: "read-1" } };
-    const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: base.run_id };
+    const props = { project, locale: "zh-CN" as const, runStarted: true, activeRunId: base.run_id };
     const { rerender } = render(<WorkspaceShell {...props} agentRunEventsV4={[requested, running]} />);
     const status = screen.getByRole("status", { name: "当前工具活动" });
     expect(status).toHaveTextContent("read");
@@ -598,7 +598,7 @@ describe("WorkspaceShell", () => {
   });
   it("coalesces character-sized V4 model deltas into one completed response", () => {
     const deltas = ["我", "先", "检查", "输入", "目录", "。"];
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-v4-text" agentRunEventsV4={deltas.map((text, index) => ({
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-v4-text" agentRunEventsV4={deltas.map((text, index) => ({
       schema_version: 4 as const, run_id: "run-v4-text", project_id: project.id, conversation_id: "conversation-1", sequence: index + 1,
       occurred_at: "2026-08-17T00:00:00Z", previous_hash: String(index), event_hash: String(index + 1), event: { kind: "model_text" as const, text },
     }))} />);
@@ -609,7 +609,7 @@ describe("WorkspaceShell", () => {
     const onAnswer = vi.fn();
     const base = { schema_version: 4 as const, run_id: "run-question", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
     const requested = { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "input_requested" as const, question_id: "species", question: "该数据来自人还是小鼠？" } };
-    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-question" agentRunEventsV4={[requested]} onAnswerAgentQuestionV4={onAnswer} />);
+    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-question" agentRunEventsV4={[requested]} onAnswerAgentQuestionV4={onAnswer} />);
 
     expect(screen.getByText("需要补充信息")).toBeInTheDocument();
     expect(screen.getByText("该数据来自人还是小鼠？")).toBeInTheDocument();
@@ -617,7 +617,7 @@ describe("WorkspaceShell", () => {
     fireEvent.click(screen.getByRole("button", { name: "回答并恢复" }));
     expect(onAnswer).toHaveBeenCalledWith("run-question", "species", "人");
 
-    rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-question" agentRunEventsV4={[requested,
+    rerender(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-question" agentRunEventsV4={[requested,
       { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:02Z", event: { kind: "user_input_answered" as const, question_id: "species", answer: "人" } },
     ]} onAnswerAgentQuestionV4={onAnswer} />);
     expect(screen.getByText("已提交回答：人")).toBeInTheDocument();
@@ -625,7 +625,7 @@ describe("WorkspaceShell", () => {
   });
   it("restores a completed V4 run after its persisted user message", () => {
     const base = { schema_version: 4 as const, run_id: "run-history", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined}
+    render(<WorkspaceShell project={project} locale="zh-CN"
       messages={[{ id: "message-1", role: "user", markdown: "检查矩阵", created_at: "2026-08-17T00:00:00Z" }]}
       agentRunEventsV4={[
         { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "run_created", mode: "execute" } },
@@ -644,13 +644,13 @@ describe("WorkspaceShell", () => {
       { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "run_created" as const, mode: "execute" as const } },
       { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:02Z", event: { kind: "run_failed" as const, message: "system environment cannot be created or changed" } },
     ];
-    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} agentRunEventsV4={failed} onResumeAgentRunV4={onResume} />);
+    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" agentRunEventsV4={failed} onResumeAgentRunV4={onResume} />);
 
     fireEvent.click(screen.getByText("执行过程"));
     expect(screen.queryByRole("button", { name: "继续运行" })).not.toBeInTheDocument();
     expect(screen.queryByText("修正运行条件后可从已验证事件链继续。")).not.toBeInTheDocument();
 
-    rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-recover" agentRunEventsV4={[...failed,
+    rerender(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-recover" agentRunEventsV4={[...failed,
       { ...base, sequence: 3, occurred_at: "2026-08-17T00:00:03Z", event: { kind: "tool_dispatch_resolved" as const, call_id: "call-1", resolution: "side_effect_not_observed" as const, evidence: "immutable system ensure" } },
     ]} onResumeAgentRunV4={onResume} />);
     expect(screen.getByText(/运行中 · 0 个步骤/)).toBeInTheDocument();
@@ -659,7 +659,7 @@ describe("WorkspaceShell", () => {
   it("shows all compute choices in chat and keeps full access container-only", () => {
     const onBackendChange = vi.fn();
     const onApprovalPolicyChange = vi.fn();
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={() => true}
+    render(<WorkspaceShell project={project} locale="zh-CN" onSend={() => true}
       computeBackendId="local" onComputeBackendChange={onBackendChange} onApprovalPolicyChange={onApprovalPolicyChange}
       computeBackends={[
         { descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null },
@@ -683,7 +683,7 @@ describe("WorkspaceShell", () => {
   it("enables full access only for an available offline container", () => {
     const onApprovalPolicyChange = vi.fn();
     const onAutonomyModeChange = vi.fn();
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={() => true}
+    render(<WorkspaceShell project={project} locale="zh-CN" onSend={() => true}
       computeBackendId="docker" onApprovalPolicyChange={onApprovalPolicyChange} onAutonomyModeChange={onAutonomyModeChange}
       computeBackends={[{ descriptor: { schema_version: 4, backend_id: "docker", kind: "docker", isolation: "container", available: true, supports_python: true, supports_r: true, supports_network_policy: true }, selectable: true, reason: null, python_status: "unverified", r_status: "unverified", resolved_image_id: "sha256:abc" }]} />);
     fireEvent.click(screen.getByRole("button", { name: "Agent 权限" }));
@@ -699,7 +699,7 @@ describe("WorkspaceShell", () => {
     const saved = { delegation_enabled: true, auto_review: true, memory_enabled: false };
     const get = vi.spyOn(preferencesApi, "getConversationAgentPreferencesV4").mockResolvedValue(loaded);
     const save = vi.spyOn(preferencesApi, "saveConversationAgentPreferencesV4").mockResolvedValue(saved);
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} activeConversationId="conversation-a" onSend={vi.fn().mockResolvedValue(true)} computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
+    render(<WorkspaceShell project={project} locale="en-US" activeConversationId="conversation-a" onSend={vi.fn().mockResolvedValue(true)} computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
 
     await waitFor(() => expect(get).toHaveBeenCalledWith(project.id, "conversation-a"));
     fireEvent.click(screen.getByRole("button", { name: "Agent permissions" }));
@@ -715,7 +715,7 @@ describe("WorkspaceShell", () => {
   it("offers Fast mode near the model and persists menu choices including reset to inheritance", async () => {
     const get = vi.spyOn(preferencesApi, "getConversationAgentPreferencesV4").mockResolvedValue({ delegation_enabled: true, auto_review: true, memory_enabled: true, fast_mode: null });
     const save = vi.spyOn(preferencesApi, "saveConversationAgentPreferencesV4").mockImplementation(async (_projectId, _conversationId, preferences) => preferences);
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} activeConversationId="conversation-a" activeModelProfile={fastProfile} onSend={vi.fn().mockResolvedValue(true)} computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
+    render(<WorkspaceShell project={project} locale="en-US" activeConversationId="conversation-a" activeModelProfile={fastProfile} onSend={vi.fn().mockResolvedValue(true)} computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
 
     await waitFor(() => expect(get).toHaveBeenCalledWith(project.id, "conversation-a"));
     const fastToggle = screen.getByRole("button", { name: "Fast mode" });
@@ -737,7 +737,7 @@ describe("WorkspaceShell", () => {
     const get = vi.spyOn(preferencesApi, "getConversationAgentPreferencesV4").mockResolvedValue({ delegation_enabled: true, auto_review: true, memory_enabled: true, fast_mode: true });
     const save = vi.spyOn(preferencesApi, "saveConversationAgentPreferencesV4").mockResolvedValue({ delegation_enabled: true, auto_review: true, memory_enabled: true, fast_mode: null });
     const unsupported = { ...fastProfile, base_url: "https://gateway.example/v1" };
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} activeConversationId="conversation-a" activeModelProfile={unsupported} />);
+    render(<WorkspaceShell project={project} locale="en-US" activeConversationId="conversation-a" activeModelProfile={unsupported} />);
 
     await waitFor(() => expect(get).toHaveBeenCalled());
     const fastToggle = screen.getByRole("button", { name: "Fast mode" });
@@ -751,7 +751,7 @@ describe("WorkspaceShell", () => {
     const get = vi.spyOn(preferencesApi, "getConversationAgentPreferencesV4").mockResolvedValue({ delegation_enabled: true, auto_review: true, memory_enabled: true, fast_mode: null });
     const save = vi.spyOn(preferencesApi, "saveConversationAgentPreferencesV4").mockImplementation(async (_projectId, _conversationId, preferences) => preferences);
     const unsupportedProfile = { ...fastProfile, base_url: "https://gateway.example/v1", fast_mode: true as const };
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} activeConversationId="conversation-a" activeModelProfile={unsupportedProfile} />);
+    render(<WorkspaceShell project={project} locale="en-US" activeConversationId="conversation-a" activeModelProfile={unsupportedProfile} />);
 
     await waitFor(() => expect(get).toHaveBeenCalled());
     const fastToggle = screen.getByRole("button", { name: "Fast mode" });
@@ -772,7 +772,7 @@ describe("WorkspaceShell", () => {
     const request = deferred<{ delegation_enabled: boolean; auto_review: boolean; memory_enabled: boolean; fast_mode: boolean }>();
     vi.spyOn(preferencesApi, "getConversationAgentPreferencesV4").mockResolvedValue({ delegation_enabled: true, auto_review: true, memory_enabled: true, fast_mode: null });
     vi.spyOn(preferencesApi, "saveConversationAgentPreferencesV4").mockReturnValue(request.promise);
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} activeConversationId="conversation-a" activeModelProfile={fastProfile} onSend={vi.fn()} computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
+    render(<WorkspaceShell project={project} locale="en-US" activeConversationId="conversation-a" activeModelProfile={fastProfile} onSend={vi.fn()} computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Fast mode" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Fast mode" }));
@@ -785,7 +785,7 @@ describe("WorkspaceShell", () => {
   it("keeps an unconfirmed preference save blocked and offers reconciliation without repeating the write", async () => {
     const get = vi.spyOn(preferencesApi, "getConversationAgentPreferencesV4").mockResolvedValue({ delegation_enabled: true, auto_review: true, memory_enabled: true });
     const save = vi.spyOn(preferencesApi, "saveConversationAgentPreferencesV4").mockRejectedValueOnce(new Error("private transport details")).mockResolvedValueOnce({ delegation_enabled: false, auto_review: true, memory_enabled: true });
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} activeConversationId="conversation-a" onSend={vi.fn().mockResolvedValue(true)} />);
+    render(<WorkspaceShell project={project} locale="en-US" activeConversationId="conversation-a" onSend={vi.fn().mockResolvedValue(true)} />);
     await waitFor(() => expect(get).toHaveBeenCalled());
     fireEvent.click(screen.getByRole("button", { name: "Agent permissions" }));
     const delegation = screen.getByRole("menuitemcheckbox", { name: /Delegation/ });
@@ -804,7 +804,7 @@ describe("WorkspaceShell", () => {
       .mockRejectedValueOnce(new Error("private load details"))
       .mockResolvedValueOnce({ delegation_enabled: true, auto_review: true, memory_enabled: true });
     const onSend = vi.fn();
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} activeConversationId="conversation-a" onSend={onSend} computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
+    render(<WorkspaceShell project={project} locale="zh-CN" activeConversationId="conversation-a" onSend={onSend} computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
     fireEvent.change(screen.getByRole("textbox", { name: /描述研究目标/ }), { target: { value: "检查矩阵" } });
 
     expect(await screen.findByRole("alert")).toHaveTextContent("会话偏好加载失败");
@@ -820,7 +820,7 @@ describe("WorkspaceShell", () => {
     vi.spyOn(preferencesApi, "getConversationAgentPreferencesV4").mockResolvedValue({ delegation_enabled: true, auto_review: true, memory_enabled: true });
     vi.spyOn(preferencesApi, "saveConversationAgentPreferencesV4").mockReturnValue(request.promise);
     const onSend = vi.fn();
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} activeConversationId="conversation-a" onSend={onSend} computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
+    render(<WorkspaceShell project={project} locale="en-US" activeConversationId="conversation-a" onSend={onSend} computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
     fireEvent.change(screen.getByRole("textbox", { name: /Describe a research goal/ }), { target: { value: "Inspect the matrix" } });
     await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Agent permissions" }));
@@ -836,7 +836,7 @@ describe("WorkspaceShell", () => {
   });
   it("keeps ordinary questions in chat until the user explicitly selects Plan mode from Agent controls", async () => {
     const onSend = vi.fn().mockResolvedValue(true);
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={onSend}
+    render(<WorkspaceShell project={project} locale="zh-CN" onSend={onSend}
       computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
 
     fireEvent.change(screen.getByRole("textbox", { name: /描述研究目标/ }), { target: { value: "这个文件是什么格式？" } });
@@ -853,7 +853,7 @@ describe("WorkspaceShell", () => {
     await waitFor(() => expect(onSend).toHaveBeenLastCalledWith("执行完整 QC", "plan"));
   });
   it("keeps projects, scientific conversation, and context visible together", () => {
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} />);
+    render(<WorkspaceShell project={project} locale="zh-CN" />);
 
     expect(screen.getByRole("navigation", { name: "项目与会话" })).toBeInTheDocument();
     expect(screen.getByRole("main", { name: "科研对话" })).toBeInTheDocument();
@@ -863,7 +863,7 @@ describe("WorkspaceShell", () => {
   });
 
   it("shows an honest empty artifact catalog", () => {
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} />);
+    render(<WorkspaceShell project={project} locale="zh-CN" />);
 
     if (!screen.queryByRole("complementary")) fireEvent.click(screen.getByRole("button", { name: "展开侧栏" }));
     if (!screen.queryByRole("menu", { name: "侧栏内容" })) fireEvent.click(screen.getByRole("button", { name: "添加侧栏标签" }));
@@ -875,7 +875,7 @@ describe("WorkspaceShell", () => {
 
   it("loads the selected remote image into the preview", async () => {
     const onPreviewImage = vi.fn().mockResolvedValue({ relative_path: "results/umap.png", mime_type: "image/png", size_bytes: 1024, sha256: "a".repeat(64), data_url: "data:image/png;base64,iVBORw0KGgo=" });
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} remoteFiles={[{ relative_path: "results/umap.png", directory: false, size_bytes: 1024, modified_unix_seconds: 0 }, { relative_path: "results/markers.csv", directory: false, size_bytes: 20, modified_unix_seconds: 0 }]} onPreviewImage={onPreviewImage} />);
+    render(<WorkspaceShell project={project} locale="en-US" remoteFiles={[{ relative_path: "results/umap.png", directory: false, size_bytes: 1024, modified_unix_seconds: 0 }, { relative_path: "results/markers.csv", directory: false, size_bytes: 20, modified_unix_seconds: 0 }]} onPreviewImage={onPreviewImage} />);
 
     if (!screen.queryByRole("complementary")) fireEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
     if (!screen.queryByRole("menu", { name: "Sidebar sections" })) fireEvent.click(screen.getByRole("button", { name: "Add sidebar tab" }));
@@ -888,7 +888,7 @@ describe("WorkspaceShell", () => {
   });
 
   it("renders English copy from the shared locale resource", () => {
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} />);
+    render(<WorkspaceShell project={project} locale="en-US" />);
 
     expect(screen.getByRole("main", { name: "Research conversation" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
@@ -897,7 +897,7 @@ describe("WorkspaceShell", () => {
   });
 
   it("sends an ordinary message without exposing a Plan tab", () => {
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} />);
+    render(<WorkspaceShell project={project} locale="zh-CN" />);
     fireEvent.change(screen.getByRole("textbox", { name: /描述研究目标/ }), { target: { value: "先检查双细胞率" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
     expect(screen.getByText("先检查双细胞率")).toBeInTheDocument();
@@ -907,7 +907,7 @@ describe("WorkspaceShell", () => {
   it.each(["local", "ssh"] as const)("sends an ordinary research request with unverified %s compute", async (kind) => {
     const onSend = vi.fn(() => true);
     const backendId = kind === "ssh" ? "ssh:offline" : "local";
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} agentMode="agent" onSend={onSend}
+    render(<WorkspaceShell project={project} locale="zh-CN" agentMode="agent" onSend={onSend}
       computeBackendId={backendId} computeBackends={[{ descriptor: { schema_version: 4, backend_id: backendId, kind, isolation: "process", available: false, supports_python: true, supports_r: true, supports_network_policy: false }, selectable: true, reason: null, python_status: "unverified", r_status: "unverified", resolved_image_id: null }]} />);
     fireEvent.change(screen.getByRole("textbox", { name: /描述研究目标/ }), { target: { value: "寻找肝癌单细胞文献" } });
     expect(screen.getByRole("button", { name: "发送" })).toBeEnabled();
@@ -919,14 +919,14 @@ describe("WorkspaceShell", () => {
     let finish!: (value: boolean) => void;
     const onSend = vi.fn(() => new Promise<boolean>((resolve) => { finish = resolve; }));
     const backend = { descriptor: { schema_version: 4 as const, backend_id: "local", kind: "local" as const, isolation: "process" as const, available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available" as const, r_status: "unavailable" as const, resolved_image_id: null };
-    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={onSend} computeBackendId="local" computeBackends={[backend]} />);
+    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" onSend={onSend} computeBackendId="local" computeBackends={[backend]} />);
 
     expect(screen.queryByText("65%")).not.toBeInTheDocument();
     fireEvent.change(screen.getByRole("textbox", { name: /描述研究目标/ }), { target: { value: "检查 hg19 数据" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
     expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toHaveValue("检查 hg19 数据");
 
-    rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={onSend} computeBackendId="local" computeBackends={[backend]} agentBusy agentNotice="503 model_not_found" />);
+    rerender(<WorkspaceShell project={project} locale="zh-CN" onSend={onSend} computeBackendId="local" computeBackends={[backend]} agentBusy agentNotice="503 model_not_found" />);
     expect(screen.getByRole("status")).toHaveTextContent("正在等待模型响应");
     expect(screen.getByRole("alert")).toHaveTextContent("503 model_not_found");
     finish(true);
@@ -935,7 +935,7 @@ describe("WorkspaceShell", () => {
 
   it("keeps the composer available with a long multiline assistant response", () => {
     const markdown = Array.from({ length: 80 }, (_, index) => `步骤 ${index + 1}\n\`gene_${index}\``).join("\n");
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={() => true} messages={[{ id: "assistant-long", role: "assistant", markdown }]} />);
+    render(<WorkspaceShell project={project} locale="zh-CN" onSend={() => true} messages={[{ id: "assistant-long", role: "assistant", markdown }]} />);
 
     expect(screen.getByText(/步骤 80/)).toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toBeInTheDocument();
@@ -945,7 +945,7 @@ describe("WorkspaceShell", () => {
   it("requires an explicit decision for a pending V4 tool approval", () => {
     const decide = vi.fn();
     const request = { approval_id: "approval-1", call: { call_id: "call-1", tool_id: "runtime.execute", arguments: { code: "print(1)" } }, effect: "runtime" as const, reason: "首次代码执行需要批准", call_hash: "c".repeat(64) };
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-approval" onCancelRun={vi.fn()} onDecideToolApprovalV4={decide} agentRunEventsV4={[{
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-approval" onCancelRun={vi.fn()} onDecideToolApprovalV4={decide} agentRunEventsV4={[{
       schema_version: 4, run_id: "run-approval", project_id: project.id, conversation_id: "conversation-1", sequence: 1, occurred_at: "2026-08-17T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "tool_approval_requested", request },
     }]} />);
     expect(screen.getByText(/等待工具审批 · 0 个步骤/)).toBeInTheDocument();
@@ -961,7 +961,7 @@ describe("WorkspaceShell", () => {
     const resume = vi.fn();
     const base = { schema_version: 4 as const, run_id: "run-browser", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
     const request = { approval_id: "approval-browser", call: { call_id: "call-browser", tool_id: "web_open_tab", arguments: { session: "workspace", url: "https://example.org/paper" } }, effect: "network" as const, reason: "需要访问独立来源", call_hash: "d".repeat(64) };
-    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-browser" onDecideToolApprovalV4={decide} onResumeAgentRunV4={resume} agentRunEventsV4={[
+    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-browser" onDecideToolApprovalV4={decide} onResumeAgentRunV4={resume} agentRunEventsV4={[
       { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "tool_approval_requested" as const, request } },
     ]} />);
     fireEvent.change(screen.getByRole("combobox", { name: "浏览器授权范围" }), { target: { value: "project" } });
@@ -971,12 +971,12 @@ describe("WorkspaceShell", () => {
     const disconnected = [
       { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "browser_connection_required" as const, session: "workspace" as const, protocol_version: 1, message: "connect the extension" } },
     ];
-    rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-browser" onResumeAgentRunV4={resume} agentRunEventsV4={disconnected} />);
+    rerender(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-browser" onResumeAgentRunV4={resume} agentRunEventsV4={disconnected} />);
     expect(screen.getByText(/等待连接浏览器 · 0 个步骤/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "已连接，继续" }));
     expect(resume).toHaveBeenCalledWith("run-browser");
 
-    rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-browser" onResumeAgentRunV4={resume} agentRunEventsV4={[...disconnected,
+    rerender(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-browser" onResumeAgentRunV4={resume} agentRunEventsV4={[...disconnected,
       { ...base, sequence: 3, occurred_at: "2026-08-17T00:00:02Z", event: { kind: "tool_finished" as const, outcome: { call_id: "call-search", tool_id: "web_search", succeeded: true, model_content: "searched", data: { tab_id: 10 }, provenance: [] } } },
     ]} />);
     expect(screen.getByText(/运行中 · 1 个步骤/)).toBeInTheDocument();
@@ -986,7 +986,7 @@ describe("WorkspaceShell", () => {
   it("keeps a terminal status when a tab-cleanup prompt follows it", () => {
     const closeTabs = vi.fn();
     const base = { schema_version: 4 as const, run_id: "run-cleanup", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-cleanup" onCloseBrowserRunTabsV4={closeTabs} agentRunEventsV4={[
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-cleanup" onCloseBrowserRunTabsV4={closeTabs} agentRunEventsV4={[
       { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "run_completed" as const } },
       { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "browser_tab_cleanup_required" as const, sessions: ["workspace" as const], tabs: [{ session: "workspace" as const, tab_id: 10, run_id: "run-cleanup", title: "Paper", origin: "https://example.org", created_by_run: true }], message: "close run tabs" } },
     ]} />);
@@ -997,7 +997,7 @@ describe("WorkspaceShell", () => {
 
   it("pauses the same run for CAPTCHA intervention without claiming it was solved", () => {
     const resume = vi.fn();
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-captcha" onResumeAgentRunV4={resume} agentRunEventsV4={[{
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-captcha" onResumeAgentRunV4={resume} agentRunEventsV4={[{
       schema_version: 4, run_id: "run-captcha", project_id: project.id, conversation_id: "conversation-1", sequence: 1, occurred_at: "2026-08-17T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "browser_human_intervention_required", session: "workspace", reason: "captcha_detected", message: "CAPTCHA detected" },
     }]} />);
     expect(screen.getByText(/等待人工处理浏览器 · 0 个步骤/)).toBeInTheDocument();
@@ -1008,7 +1008,7 @@ describe("WorkspaceShell", () => {
 
   it("shows runtime uncertainty as a failure without requiring an evidence dialog", () => {
     const resolve = vi.fn();
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-uncertain" onResolveUncertainV4={resolve} agentRunEventsV4={[{
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-uncertain" onResolveUncertainV4={resolve} agentRunEventsV4={[{
       schema_version: 4, run_id: "run-uncertain", project_id: project.id, conversation_id: "conversation-1", sequence: 1, occurred_at: "2026-08-17T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "tool_dispatch_uncertain", call_id: "call-1", tool_id: "runtime.execute" },
     }]} />);
     expect(screen.queryByRole("textbox", { name: "核验证据" })).not.toBeInTheDocument();
@@ -1019,7 +1019,7 @@ describe("WorkspaceShell", () => {
   });
 
   it("shows the actual MCP tool and query in the trace summary", () => {
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} agentRunEventsV4={[{
+    render(<WorkspaceShell project={project} locale="zh-CN" agentRunEventsV4={[{
       schema_version: 4, run_id: "mcp", project_id: project.id, conversation_id: "conversation-1", sequence: 1, occurred_at: "2026-08-17T00:00:00Z", previous_hash: "", event_hash: "hash",
       event: { kind: "tool_requested", call: { call_id: "search", tool_id: "use_mcp_tool", arguments: { server_id: "server", tool: "pubmed_search", arguments: { query: "Hi-C 3D genome" } } } },
     }]} />);
@@ -1029,7 +1029,7 @@ describe("WorkspaceShell", () => {
   });
 
   it("shows the iteration-limit status summary without a completion claim or resume banner", () => {
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onResumeAgentRunV4={vi.fn()} agentRunEventsV4={[{
+    render(<WorkspaceShell project={project} locale="zh-CN" onResumeAgentRunV4={vi.fn()} agentRunEventsV4={[{
       schema_version: 4, run_id: "limit", project_id: project.id, conversation_id: "conversation-1", sequence: 1, occurred_at: "2026-08-17T00:00:00Z", previous_hash: "", event_hash: "hash",
       event: { kind: "run_needs_attention", message: "max_iterations (100). 已获得文献列表，全文核验尚未完成。" },
     }]} />);
@@ -1040,7 +1040,7 @@ describe("WorkspaceShell", () => {
 
   it("keeps context budget diagnostics without a resume banner", () => {
     const resume = vi.fn();
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-context" onResumeAgentRunV4={resume} agentRunEventsV4={[{
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-context" onResumeAgentRunV4={resume} agentRunEventsV4={[{
       schema_version: 4, run_id: "run-context", project_id: project.id, conversation_id: "conversation-1", sequence: 1, occurred_at: "2026-08-17T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "run_needs_attention", message: "run needs attention: model context exceeds byte budget (268851 > 262144); original run and evidence retained" },
     }]} />);
     expect(screen.queryByRole("button", { name: "继续运行" })).not.toBeInTheDocument();
@@ -1048,7 +1048,7 @@ describe("WorkspaceShell", () => {
   });
 
   it("shows legacy MCP uncertainty as failure without a side-effect form", () => {
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-mcp-error" onResolveUncertainV4={vi.fn()} agentRunEventsV4={[{
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-mcp-error" onResolveUncertainV4={vi.fn()} agentRunEventsV4={[{
       schema_version: 4, run_id: "run-mcp-error", project_id: project.id, conversation_id: "conversation-1", sequence: 1, occurred_at: "2026-08-17T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "tool_dispatch_uncertain", call_id: "call-1", tool_id: "use_mcp_tool" },
     }, { schema_version: 4, run_id: "run-mcp-error", project_id: project.id, conversation_id: "conversation-1", sequence: 2, occurred_at: "2026-08-17T00:00:01Z", previous_hash: "hash", event_hash: "hash2", event: { kind: "run_needs_attention", message: "MCP error: -32602: query exceeds limit" } }]} />);
     expect(screen.queryByRole("textbox", { name: "核验证据" })).not.toBeInTheDocument();
@@ -1058,7 +1058,7 @@ describe("WorkspaceShell", () => {
   });
 
   it("renders user and assistant messages as safe GFM markdown", () => {
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} messages={[
+    render(<WorkspaceShell project={project} locale="en-US" messages={[
       { id: "user-md", role: "user", markdown: "**检查**矩阵" },
       { id: "assistant-md", role: "assistant", markdown: "## Results\n\n| gene | status |\n| --- | --- |\n| CD3D | pass |" },
     ]} />);
@@ -1069,7 +1069,7 @@ describe("WorkspaceShell", () => {
 
   it("opens the active trajectory while omitting persistence placeholder text", () => {
     const base = { schema_version: 4 as const, run_id: "run-technical", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
-    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-technical" onLocaleChange={() => undefined} agentRunEventsV4={[
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-technical" agentRunEventsV4={[
       { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "run_spec_frozen" as const, approval_hash: "a", spec_hash: "b" } },
       { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "tool_dispatch_started" as const, call_id: "call-1", tool_id: "runtime.execute", effect: "runtime", idempotency_key: "key" } },
     ]} />);
@@ -1079,7 +1079,7 @@ describe("WorkspaceShell", () => {
 
   it("keeps agent.complete internal and shows a clean verification status", () => {
     const base = { schema_version: 4 as const, run_id: "run-completing", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
-    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-completing" onLocaleChange={() => undefined} agentRunEventsV4={[
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-completing" agentRunEventsV4={[
       { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "tool_requested" as const, call: { call_id: "complete-1", tool_id: "agent.complete", arguments: { schema_version: 4, summary: "done", answer_markdown: "## 不应显示在工具卡片中", criteria: [] } } } },
     ]} />);
     expect(screen.getByText("正在核验最终结果…")).toBeInTheDocument();
@@ -1090,7 +1090,7 @@ describe("WorkspaceShell", () => {
 
   it("renders tool calls as human-readable collapsed steps", () => {
     const base = { schema_version: 4 as const, run_id: "run-readable-tool", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
-    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-readable-tool" onLocaleChange={() => undefined} agentRunEventsV4={[
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-readable-tool" agentRunEventsV4={[
       { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "tool_requested" as const, call: { call_id: "read-1", tool_id: "project.read", arguments: { path: "results/audit.md" } } } },
       { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "tool_finished" as const, outcome: { call_id: "read-1", tool_id: "project.read", succeeded: true, model_content: "large internal report", data: null, provenance: [] } } },
     ]} />);
@@ -1103,7 +1103,7 @@ describe("WorkspaceShell", () => {
 
   it("merges tool request, dispatch, finish, and reuse events into one detail", () => {
     const base = { schema_version: 4 as const, run_id: "run-tools", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
-    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-tools" onLocaleChange={() => undefined} agentRunEventsV4={[
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-tools" agentRunEventsV4={[
       { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "tool_requested" as const, call: { call_id: "call-1", tool_id: "runtime.execute", arguments: { code: "print(1)", secret: "hidden" } } } },
       { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "tool_dispatch_started" as const, call_id: "call-1", tool_id: "runtime.execute", effect: "runtime", idempotency_key: "key" } },
       { ...base, sequence: 3, occurred_at: "2026-08-17T00:00:02Z", event: { kind: "tool_finished" as const, outcome: { call_id: "call-1", tool_id: "runtime.execute", succeeded: true, model_content: "QC complete", data: null, provenance: [] } } },
@@ -1128,7 +1128,7 @@ describe("WorkspaceShell", () => {
 
   it("does not keep increasing an unfinished tool duration after cancellation", () => {
     const base = { schema_version: 4 as const, run_id: "run-cancelled-tool", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} activeRunId="run-cancelled-tool" agentRunEventsV4={[
+    render(<WorkspaceShell project={project} locale="en-US" activeRunId="run-cancelled-tool" agentRunEventsV4={[
       { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "tool_requested" as const, call: { call_id: "old-call", tool_id: "project.read", arguments: { path: "old.txt" } } } },
       { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "run_cancelled" as const } },
     ]} />);
@@ -1141,7 +1141,7 @@ describe("WorkspaceShell", () => {
   it("auto-expands blocked runs while keeping the interaction card available", () => {
     const base = { schema_version: 4 as const, run_id: "run-blocked", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
     const request = { approval_id: "approval-blocked", call: { call_id: "call-1", tool_id: "runtime.execute", arguments: {} }, effect: "runtime" as const, reason: "需要批准", call_hash: "c".repeat(64) };
-    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-blocked" onLocaleChange={() => undefined} onDecideToolApprovalV4={vi.fn()} agentRunEventsV4={[{ ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "tool_approval_requested" as const, request } }]} />);
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-blocked" onDecideToolApprovalV4={vi.fn()} agentRunEventsV4={[{ ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "tool_approval_requested" as const, request } }]} />);
     expect(screen.getByText("执行过程").closest("details")).toHaveAttribute("open");
     expect(screen.getByRole("button", { name: "批准并继续" })).toBeEnabled();
   });
@@ -1149,7 +1149,7 @@ describe("WorkspaceShell", () => {
   it("disables the composer for an active run but leaves approval controls enabled", () => {
     const base = { schema_version: 4 as const, run_id: "run-composer-lock", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
     const request = { approval_id: "approval-composer", call: { call_id: "call-1", tool_id: "runtime.execute", arguments: {} }, effect: "runtime" as const, reason: "需要批准", call_hash: "c".repeat(64) };
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={vi.fn()} runStarted activeRunId="run-composer-lock" agentRunEventsV4={[{ ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "tool_approval_requested" as const, request } }]} onDecideToolApprovalV4={vi.fn()} />);
+    render(<WorkspaceShell project={project} locale="zh-CN" onSend={vi.fn()} runStarted activeRunId="run-composer-lock" agentRunEventsV4={[{ ...base, sequence: 1, occurred_at: "2026-08-17T00:00:00Z", event: { kind: "tool_approval_requested" as const, request } }]} onDecideToolApprovalV4={vi.fn()} />);
     expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toBeDisabled();
     expect(screen.getByRole("button", { name: "执行中…" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "批准并继续" })).toBeEnabled();
@@ -1158,7 +1158,7 @@ describe("WorkspaceShell", () => {
   it("does not submit the composer twice while the first request is pending", async () => {
     let release!: (accepted: boolean) => void;
     const onSend = vi.fn(() => new Promise<boolean>((resolve) => { release = resolve; }));
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={onSend}
+    render(<WorkspaceShell project={project} locale="zh-CN" onSend={onSend}
       computeBackendId="local" computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
     const composer = screen.getByRole("textbox", { name: /描述研究目标/ });
     fireEvent.change(composer, { target: { value: "检查矩阵" } });
@@ -1174,7 +1174,7 @@ describe("WorkspaceShell", () => {
     let releaseApproval!: () => void;
     const onApprovePlan = vi.fn(() => new Promise<void>((resolve) => { releaseApproval = resolve; }));
     const plan = { schema_version: 4 as const, objective: "执行 QC", steps: ["检查输入"], completion_criteria: ["报告完成"], requested_capabilities: [] };
-    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined}
+    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN"
       v4Plan={{ run_id: "run-plan-guard", status: "awaiting_approval", plan, plan_hash: "plan", compute_selection: null, approval_hash: "approval" }} onApprovePlan={onApprovePlan} />);
     const approve = screen.getByRole("button", { name: "批准并运行" });
     fireEvent.click(approve);
@@ -1188,7 +1188,7 @@ describe("WorkspaceShell", () => {
     const onResume = vi.fn(() => new Promise<void>((resolve) => { releaseResume = resolve; }));
     const base = { schema_version: 4 as const, run_id: "run-resume-guard", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
     const failed = [{ ...base, sequence: 1, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "run_created" as const, mode: "execute" as const } }, { ...base, sequence: 2, occurred_at: "2026-08-17T00:00:02Z", event: { kind: "browser_connection_required" as const, session: "workspace" as const, protocol_version: 1, message: "connect the extension" } }];
-    rerender(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} agentRunEventsV4={failed} onResumeAgentRunV4={onResume} />);
+    rerender(<WorkspaceShell project={project} locale="zh-CN" agentRunEventsV4={failed} onResumeAgentRunV4={onResume} />);
     const resume = screen.getByRole("button", { name: "已连接，继续" });
     fireEvent.click(resume);
     fireEvent.click(resume);
@@ -1201,7 +1201,7 @@ describe("WorkspaceShell", () => {
   it("locks a pending Plan conversation even before execution starts", () => {
     const plan = { schema_version: 4 as const, objective: "审核 QC", steps: ["检查输入"], completion_criteria: ["报告完成"], requested_capabilities: [] };
     const revision = { id: "revision-pending", project_id: project.id, conversation_id: "conversation-1", run_id: "run-pending", revision: 4, plan, markdown: "# 审核 QC", plan_hash: "plan-hash", status: "pending" as const, feedback: null, created_at: "2026-08-20T00:00:00Z", updated_at: "2026-08-20T00:00:00Z" };
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={vi.fn()}
+    render(<WorkspaceShell project={project} locale="zh-CN" onSend={vi.fn()}
       agentMode="plan" conversationLocked latestPlanRevision={revision}
       v4Plan={{ run_id: revision.run_id, status: "awaiting_approval", plan, plan_hash: revision.plan_hash, compute_selection: null, approval_hash: "approval", plan_revision: 4, session_mode: "plan" }}
       onApprovePlan={vi.fn()} onRequestPlanRevision={vi.fn()} onCancelRun={vi.fn()} />);
@@ -1217,7 +1217,7 @@ describe("WorkspaceShell", () => {
     const requestRevision = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
     const plan = { schema_version: 4 as const, objective: "修改 QC", steps: ["检查输入"], completion_criteria: ["报告完成"], requested_capabilities: [] };
     const revision = { id: "revision-feedback", project_id: project.id, conversation_id: "conversation-1", run_id: "run-feedback", revision: 5, plan, markdown: "# 修改 QC", plan_hash: "plan-hash", status: "pending" as const, feedback: null, created_at: "2026-08-20T00:00:00Z", updated_at: "2026-08-20T00:00:00Z" };
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined}
+    render(<WorkspaceShell project={project} locale="zh-CN"
       agentMode="plan" conversationLocked latestPlanRevision={revision}
       v4Plan={{ run_id: revision.run_id, status: "awaiting_approval", plan, plan_hash: revision.plan_hash, compute_selection: null, approval_hash: "approval", plan_revision: 5, session_mode: "plan" }}
       onApprovePlan={vi.fn()} onRequestPlanRevision={requestRevision} onCancelRun={vi.fn()} />);
@@ -1242,7 +1242,7 @@ describe("WorkspaceShell", () => {
     const onAnswer = vi.fn(() => new Promise<void>((resolve) => { releaseAnswer = resolve; }));
     const base = { schema_version: 4 as const, run_id: "run-input-guard", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash" };
     const requested = { ...base, sequence: 1, occurred_at: "2026-08-17T00:00:01Z", event: { kind: "input_requested" as const, question_id: "species", question: "物种？" } };
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId="run-input-guard" agentRunEventsV4={[requested]} onAnswerAgentQuestionV4={onAnswer} />);
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-input-guard" agentRunEventsV4={[requested]} onAnswerAgentQuestionV4={onAnswer} />);
     fireEvent.change(screen.getByRole("textbox", { name: "回答 V4 问题" }), { target: { value: "人" } });
     const answer = screen.getByRole("button", { name: "回答并恢复" });
     fireEvent.click(answer);
@@ -1256,7 +1256,7 @@ describe("WorkspaceShell", () => {
 });
 
 it("updates one live progress row then replaces it with the committed message", () => {
-  const props = { project, locale: "en-US" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: "live" };
+  const props = { project, locale: "en-US" as const, runStarted: true, activeRunId: "live" };
   const base = { schema_version: 4 as const, run_id: "live", project_id: project.id, conversation_id: "c", previous_hash: "", event_hash: "h", occurred_at: "2026-09-11T00:00:00Z" };
   const events: import("../../types").AgentRunEventV4[] = [{ ...base, sequence: 1, event: { kind: "run_created", mode: "execute" } }];
   const { rerender } = render(<WorkspaceShell {...props} agentRunEventsV4={events} agentTextPreview={{ run_id: "live", text: "Searching" }} />);
@@ -1280,7 +1280,7 @@ it("keeps the run duration in the process header while showing a separate reques
     { ...base, sequence: 1, occurred_at: "2026-09-22T11:59:00Z", event: { kind: "run_created", mode: "execute" } },
     { ...base, sequence: 2, occurred_at: "2026-09-22T12:00:00Z", event: { kind: "model_request_started", request: modelRequest("attempt-1") } },
   ];
-  const props = { project, locale: "en-US" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: base.run_id };
+  const props = { project, locale: "en-US" as const, runStarted: true, activeRunId: base.run_id };
   const { rerender, unmount } = render(<WorkspaceShell {...props} agentRunEventsV4={events} />);
 
   expect(screen.getByText(/Waiting for model · 0 steps · 3m 13s/)).toBeInTheDocument();
@@ -1308,7 +1308,7 @@ it("tracks only the latest model attempt and clears waiting at durable boundarie
   const requestTwo = event(2, 10, { kind: "model_request_started", request: modelRequest("attempt-2") });
   const staleFinal = event(3, 11, { kind: "model_usage_observed", observation: modelUsage("attempt-1", "final") });
   const partial = event(4, 12, { kind: "model_usage_observed", observation: modelUsage("attempt-2", "partial") });
-  const props = { project, locale: "en-US" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: base.run_id };
+  const props = { project, locale: "en-US" as const, runStarted: true, activeRunId: base.run_id };
   const { rerender } = render(<WorkspaceShell {...props} agentRunEventsV4={[requestOne, requestTwo, staleFinal, partial]} />);
 
   expect(screen.getByText(/Waiting for model · 0 steps · 30s/)).toBeInTheDocument();
@@ -1351,7 +1351,7 @@ it("tracks only the latest model attempt and clears waiting at durable boundarie
   rerender(<WorkspaceShell {...props} agentRunEventsV4={[requestFour, terminal]} />);
   expect(screen.queryByText(/Waiting for model/)).not.toBeInTheDocument();
 
-  rerender(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} agentRunEventsV4={[requestFour]} />);
+  rerender(<WorkspaceShell project={project} locale="en-US" agentRunEventsV4={[requestFour]} />);
   expect(screen.queryByText(/Waiting for model/)).not.toBeInTheDocument();
 });
 
@@ -1380,7 +1380,7 @@ describe("Session follow-up wiring", () => {
     const questions = ["How should I validate these results?", "Which dataset should I compare next?", "Can you explain the remaining limitations?"];
     const suggest = vi.fn().mockResolvedValue(questions);
     const send = vi.fn();
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined}
+    render(<WorkspaceShell project={project} locale="en-US"
       activeConversationId="session-1" activeRunId={base.run_id} onSend={send} onSuggestFollowUps={suggest}
       agentRunEventsV4={[{ ...base, sequence: 1, event: { kind: "run_completed" } }]} />);
     const region = await screen.findByRole("region", { name: "Suggested follow-up questions" });
@@ -1394,7 +1394,7 @@ describe("Session follow-up wiring", () => {
 
   it.each(["run_needs_attention", "run_failed"] as const)("does not generate suggestions after %s", async (kind) => {
     const suggest = vi.fn().mockResolvedValue(["First?", "Second?", "Third?"]);
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined}
+    render(<WorkspaceShell project={project} locale="en-US"
       activeConversationId="session-1" activeRunId={base.run_id} onSend={vi.fn()} onSuggestFollowUps={suggest}
       agentRunEventsV4={[{ ...base, sequence: 1, event: { kind, message: "Review required" } }]} />);
     expect(screen.queryByRole("region", { name: "Suggested follow-up questions" })).not.toBeInTheDocument();
@@ -1404,7 +1404,7 @@ describe("Session follow-up wiring", () => {
 
 it("collapses a finished failure while keeping its reason and final answer visible", () => {
   const base = { schema_version: 4 as const, run_id: "failed-compact", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "h", occurred_at: "2026-09-14T00:00:00Z" };
-  render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId={base.run_id} messages={[{ id: "answer", role: "assistant", markdown: "已核验的部分结果" }]} agentRunEventsV4={[
+  render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId={base.run_id} messages={[{ id: "answer", role: "assistant", markdown: "已核验的部分结果" }]} agentRunEventsV4={[
     { ...base, sequence: 1, event: { kind: "model_text", text: "正在检索。\n\n更详细的检索范围。" } },
     { ...base, sequence: 2, event: { kind: "run_failed", message: "检索服务暂不可用" } },
   ]} />);
@@ -1415,7 +1415,7 @@ it("collapses a finished failure while keeping its reason and final answer visib
 
 it("shows a first-line progress snippet by default and preserves manual expansion across streamed updates", () => {
   const base = { schema_version: 4 as const, run_id: "progress-compact", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "h", occurred_at: "2026-09-14T00:00:00Z" };
-  const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: base.run_id, agentRunEventsV4: [{ ...base, sequence: 1, event: { kind: "model_text" as const, text: "正在检索。\n\n## 检索范围\n\nHi-C 与染色质结构。" } }] };
+  const props = { project, locale: "zh-CN" as const, runStarted: true, activeRunId: base.run_id, agentRunEventsV4: [{ ...base, sequence: 1, event: { kind: "model_text" as const, text: "正在检索。\n\n## 检索范围\n\nHi-C 与染色质结构。" } }] };
   const { rerender } = render(<WorkspaceShell {...props} />);
   expect(screen.queryByRole("heading", { name: "检索范围" })).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: /PROGRESS.*正在检索/ })).toHaveAttribute("aria-expanded", "false");
@@ -1434,7 +1434,7 @@ it("shows a first-line progress snippet by default and preserves manual expansio
 it("uses the frozen skill name while keeping its ID in the tool evidence", () => {
   const base = { schema_version: 4 as const, run_id: "skill-readable", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "h", occurred_at: "2026-09-14T00:00:00Z" };
   const skillId = "f99c620a-e92e-470c-b52d-aa64734665e4";
-  render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId={base.run_id} agentRunEventsV4={[
+  render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId={base.run_id} agentRunEventsV4={[
     { ...base, sequence: 1, event: { kind: "tool_requested", call: { call_id: "skill", tool_id: "use_skill", arguments: { skill_id: skillId } } } },
     { ...base, sequence: 2, event: { kind: "tool_finished", outcome: { call_id: "skill", tool_id: "use_skill", succeeded: true, model_content: JSON.stringify({ skill_id: skillId, name: "文献综述" }), data: { skill_id: skillId, name: "文献综述" }, provenance: [] } } },
   ]} />);
@@ -1446,7 +1446,7 @@ it("uses the frozen skill name while keeping its ID in the tool evidence", () =>
 
 it("keeps unnamed skills readable without substituting an unrelated result name", () => {
   const base = { schema_version: 4 as const, run_id: "skill-legacy", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "h", occurred_at: "2026-09-14T00:00:00Z" };
-  render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} runStarted activeRunId={base.run_id} agentRunEventsV4={[
+  render(<WorkspaceShell project={project} locale="en-US" runStarted activeRunId={base.run_id} agentRunEventsV4={[
     { ...base, sequence: 1, event: { kind: "tool_requested", call: { call_id: "skill", tool_id: "use_skill", arguments: { skill_id: "original-id" } } } },
     { ...base, sequence: 2, event: { kind: "tool_finished", outcome: { call_id: "skill", tool_id: "use_skill", succeeded: true, model_content: JSON.stringify({ skill_id: "different-id", name: "Wrong skill" }), data: null, provenance: [] } } },
   ]} />);
@@ -1457,7 +1457,7 @@ it("keeps unnamed skills readable without substituting an unrelated result name"
 });
 
 it("provides a keyboard accessible scroll region for wide answer tables", () => {
-  render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} messages={[{ id: "wide", role: "assistant", markdown: "## 文献比较\n\n| 论文 | 结论 |\n| --- | --- |\n| Hi-C | 染色质结构 |\n\n[原文](https://example.org/paper)\n\n<script>alert(1)</script>" }]} />);
+  render(<WorkspaceShell project={project} locale="zh-CN" messages={[{ id: "wide", role: "assistant", markdown: "## 文献比较\n\n| 论文 | 结论 |\n| --- | --- |\n| Hi-C | 染色质结构 |\n\n[原文](https://example.org/paper)\n\n<script>alert(1)</script>" }]} />);
   const table = screen.getByRole("table");
   expect(table.parentElement).toHaveAttribute("tabindex", "0");
   expect(table.parentElement).toHaveAttribute("role", "region");
@@ -1467,7 +1467,7 @@ it("provides a keyboard accessible scroll region for wide answer tables", () => 
 
 it("labels the final response with only its persisted timestamp and preserves the answer content", () => {
   const createdAt = "2026-09-25T09:41:00Z";
-  render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} messages={[
+  render(<WorkspaceShell project={project} locale="zh-CN" messages={[
     { id: "dated-answer", role: "assistant", markdown: "> 证据摘要\n\n1. **核对** `counts.tsv`\n\n[查看来源](https://example.org/source)", created_at: createdAt },
     { id: "undated-answer", role: "assistant", markdown: "仍需核验的结果" },
   ]} />);
@@ -1480,7 +1480,7 @@ it("labels the final response with only its persisted timestamp and preserves th
 
 it("keeps live Markdown visible when execution details are collapsed", () => {
   const base = { schema_version: 4 as const, run_id: "live-markdown", project_id: project.id, conversation_id: "c", previous_hash: "", event_hash: "h", occurred_at: "2026-09-15T00:00:00Z" };
-  render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} runStarted activeRunId={base.run_id} agentRunEventsV4={[{ ...base, sequence: 1, event: { kind: "run_created", mode: "execute" } }]} agentTextPreview={{ run_id: base.run_id, text: "## 正在核对文献\n\n- **检查来源**\n- 对比研究方法" }} />);
+  render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId={base.run_id} agentRunEventsV4={[{ ...base, sequence: 1, event: { kind: "run_created", mode: "execute" } }]} agentTextPreview={{ run_id: base.run_id, text: "## 正在核对文献\n\n- **检查来源**\n- 对比研究方法" }} />);
   const live = screen.getByRole("article", { name: "模型实时输出" });
   expect(live.closest("details")).toBeNull();
   expect(within(live).getByRole("heading", { name: "正在核对文献" })).toBeVisible();
@@ -1492,7 +1492,7 @@ it("keeps live Markdown visible when execution details are collapsed", () => {
 it("folds earlier activity in a long run without discarding its evidence", () => {
   const base = { schema_version: 4 as const, run_id: "long-activity", project_id: project.id, conversation_id: "c", previous_hash: "", event_hash: "h", occurred_at: "2026-09-15T00:00:00Z" };
   const events = Array.from({ length: 9 }, (_, i) => ({ ...base, sequence: i + 1, event: { kind: "tool_requested" as const, call: { call_id: `call-${i}`, tool_id: "project.read", arguments: { path: `file-${i}.md` } } } }));
-  const props = { project, locale: "zh-CN" as const, onLocaleChange: () => undefined, runStarted: true, activeRunId: base.run_id };
+  const props = { project, locale: "zh-CN" as const, runStarted: true, activeRunId: base.run_id };
   const { rerender } = render(<WorkspaceShell {...props} agentRunEventsV4={events} />);
   expect(screen.getByText("file-0.md")).not.toBeVisible();
   expect(screen.getByText("file-8.md")).toBeVisible();
@@ -1508,7 +1508,7 @@ it("omits empty assistant replies and copies the original answer Markdown", asyn
   const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
   Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
   try {
-    render(<WorkspaceShell project={project} locale="zh-CN" onLocaleChange={() => undefined} onSend={vi.fn()} messages={[{ id: "empty", role: "assistant", markdown: "  \n " }, { id: "answer", role: "assistant", markdown: "## 结果\n\n**已核验**的内容" }]} />);
+    render(<WorkspaceShell project={project} locale="zh-CN" onSend={vi.fn()} messages={[{ id: "empty", role: "assistant", markdown: "  \n " }, { id: "answer", role: "assistant", markdown: "## 结果\n\n**已核验**的内容" }]} />);
     expect(document.querySelector('[data-message-id="empty"]')).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "复制回复" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "已复制" })).toBeVisible());
@@ -1523,7 +1523,7 @@ it("reports a clipboard failure without removing the answer", async () => {
   const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
   Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: vi.fn().mockRejectedValue(new Error("denied")) } });
   try {
-    render(<WorkspaceShell project={project} locale="en-US" onLocaleChange={() => undefined} onSend={vi.fn()} messages={[{ id: "answer", role: "assistant", markdown: "Verified answer" }]} />);
+    render(<WorkspaceShell project={project} locale="en-US" onSend={vi.fn()} messages={[{ id: "answer", role: "assistant", markdown: "Verified answer" }]} />);
     fireEvent.click(screen.getByRole("button", { name: "Copy response" }));
     expect(await screen.findByRole("status")).toHaveTextContent("Copy failed");
     expect(screen.getByText("Verified answer")).toBeVisible();

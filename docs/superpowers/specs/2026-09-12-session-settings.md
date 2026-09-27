@@ -69,8 +69,8 @@ Windows Credential Manager/keyring 路径，不写入 SQLite。项目导出会�
 
 DesktopApp 通过 `usePersistentLocale` 统一管理语言偏好，专用 localStorage 键为
 `omicsops.locale`，只接受 `zh-CN` 和 `en-US`。键缺失、值非法或读取异常时回退
-简体中文；写入失败不阻止当前界面立即切换。项目主页和工作区已有语言入口继续
-使用同一个 setter。
+简体中文；写入失败不阻止当前界面立即切换。界面语言统一从“设置 → 常规”更改，
+项目主页顶栏和项目侧栏底部不再显示快捷切换按钮。
 
 设置新增“常规”页面，语言选择无需保存并立即作用于整个应用。关闭设置后重开
 仍显示当前语言，应用重挂载则恢复已持久化值。独立渲染 SettingsPanel 且没有

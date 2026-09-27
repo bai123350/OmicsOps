@@ -3,7 +3,7 @@ import { expect, it, vi } from "vitest";
 import { WorkspaceShell } from "./WorkspaceShell";
 
 vi.mock("./WorkspaceResearchPages", () => ({ WorkspaceResearchPages: ({ page, onInsert }: { page: string; onInsert: (text: string) => void }) => <section aria-label="Research page"><h2>{page}</h2><button onClick={() => onInsert("saved snippet")}>Insert saved snippet</button></section> }));
-const props = { project: { id: "p", name: "Research", status: "ready" as const, template: "blank" as const }, locale: "en-US" as const, onLocaleChange: () => undefined };
+const props = { project: { id: "p", name: "Research", status: "ready" as const, template: "blank" as const }, locale: "en-US" as const };
 
 it("retains the composer draft across navigation and appends a saved snippet without sending", async () => {
   const send = vi.fn();

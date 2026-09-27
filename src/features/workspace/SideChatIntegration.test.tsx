@@ -4,7 +4,7 @@ import * as attachmentApi from "../../composer-attachment-api";
 import type { ComposerQueueItemV4 } from "../../types";
 import { WorkspaceShell } from "./WorkspaceShell";
 import type { SideChatController } from "./useSideChat";
-const base = { project: { id: "p", name: "test", status: "ready" as const, template: "blank" as const }, locale: "en-US" as const, onLocaleChange: vi.fn(), activeConversationId: "c" };
+const base = { project: { id: "p", name: "test", status: "ready" as const, template: "blank" as const }, locale: "en-US" as const, activeConversationId: "c" };
 function controller(): SideChatController {
   return { records: [], loading: false, ready: true, busy: false, pending: false, error: false, modelId: "model", setModelId: vi.fn(), draft: "", setDraft: vi.fn(), originalQuestion: undefined, send: vi.fn().mockResolvedValue(true), retry: vi.fn().mockResolvedValue(true), refresh: vi.fn(), hasMore: false, loadingOlder: false, loadOlder: vi.fn() };
 }

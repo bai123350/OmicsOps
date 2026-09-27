@@ -8,7 +8,7 @@ import type { ComposerCatalogItem, ComputeBackendAvailabilityV4 } from "../../ty
 afterEach(() => vi.restoreAllMocks());
 const project = { id: "file-project", name: "File project", status: "ready" as const, template: "blank" as const, connection_id: "connection-a" };
 const backend: ComputeBackendAvailabilityV4 = { descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null };
-const props = { project, activeConversationId: "conversation", locale: "en-US" as const, onLocaleChange: vi.fn(), computeBackends: [backend], computeBackendId: "local" };
+const props = { project, activeConversationId: "conversation", locale: "en-US" as const, computeBackends: [backend], computeBackendId: "local" };
 const entry = { relative_path: "counts.csv", directory: false, size_bytes: 12, modified_unix_seconds: 0 };
 const fileReference = { kind: "workspace_file" as const, project_id: project.id, backend_id: "ssh:connection-a", relative_path: entry.relative_path };
 

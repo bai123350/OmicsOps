@@ -5,7 +5,7 @@ import * as api from "../../conversation-branch-api";
 vi.mock("../../conversation-branch-api", () => ({ getConversationBranch: vi.fn(), conversationBranchCheckpoint: vi.fn(), createConversationBranch: vi.fn() }));
 const checkpoint = { source_message_id: "u1", source_sequence: 1, source_head_sequence: 2, checkpoint_kind: "after_response" as const, boundary_hash: "hash" };
 const branch = { ...checkpoint, request_id: "q", branch_conversation_id: "b1", project_id: "p1", source_conversation_id: "c1", request_hash: "request-hash", state: "active" as const, created_at: "now", updated_at: "now" };
-const base = { project: { id: "p1", name: "test", status: "ready" as const, template: "blank" as const }, locale: "en-US" as const, onLocaleChange: vi.fn(), activeConversationId: "c1", messages: [{ id: "u1", role: "user" as const, markdown: "First task" }, { id: "a1", role: "assistant" as const, markdown: "First response" }] };
+const base = { project: { id: "p1", name: "test", status: "ready" as const, template: "blank" as const }, locale: "en-US" as const, activeConversationId: "c1", messages: [{ id: "u1", role: "user" as const, markdown: "First task" }, { id: "a1", role: "assistant" as const, markdown: "First response" }] };
 beforeEach(() => { vi.clearAllMocks(); vi.mocked(api.getConversationBranch).mockResolvedValue(null); vi.mocked(api.conversationBranchCheckpoint).mockResolvedValue(checkpoint); vi.mocked(api.createConversationBranch).mockResolvedValue(branch); });
 it("uses composer text only as the branch title without sending it", async () => {
   const send = vi.fn(); const open = vi.fn().mockResolvedValue(true);

@@ -2,7 +2,7 @@ import type { ComposerQueueItemV4 } from "../../types";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { expect, it, vi } from "vitest";
 import { WorkspaceShell } from "./WorkspaceShell";
-const base = { project: { id: "p", name: "test", status: "ready" as const, template: "blank" as const }, locale: "en-US" as const, onLocaleChange: vi.fn(), activeConversationId: "c", computeBackendId: "local", computeBackends: [{ descriptor: { schema_version: 4 as const, backend_id: "local", kind: "local" as const, isolation: "process" as const, available: true, supports_python: true, supports_r: true, supports_network_policy: false }, selectable: true, reason: null, python_status: "available" as const, r_status: "available" as const, resolved_image_id: null }] };
+const base = { project: { id: "p", name: "test", status: "ready" as const, template: "blank" as const }, locale: "en-US" as const, activeConversationId: "c", computeBackendId: "local", computeBackends: [{ descriptor: { schema_version: 4 as const, backend_id: "local", kind: "local" as const, isolation: "process" as const, available: true, supports_python: true, supports_r: true, supports_network_policy: false }, selectable: true, reason: null, python_status: "available" as const, r_status: "available" as const, resolved_image_id: null }] };
 it("queues a busy send while keeping an independent Stop action", async () => {
   const send = vi.fn(); const queue = vi.fn().mockResolvedValue(true); const stop = vi.fn();
   render(<WorkspaceShell {...base} onSend={send} onQueue={queue} onCancelRun={stop} agentBusy runStarted activeRunId="run" />);

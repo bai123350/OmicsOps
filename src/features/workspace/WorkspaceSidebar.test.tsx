@@ -2,7 +2,7 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { WorkspaceShell } from "./WorkspaceShell";
 
-const props = { project: { id: "p", name: "Research", status: "ready" as const, template: "blank" as const }, locale: "en-US" as const, onLocaleChange: () => undefined };
+const props = { project: { id: "p", name: "Research", status: "ready" as const, template: "blank" as const }, locale: "en-US" as const };
 function openMenu() { fireEvent.click(screen.getByRole("button", { name: "Add sidebar tab" })); }
 describe("reference workspace sidebar", () => {
   it("marks all open tabs, opens without duplicates, and selects a neighbor on close", () => {

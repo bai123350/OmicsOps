@@ -1,5 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { BookOpen, ChevronRight, Dna, FilePlus2, FlaskConical, FolderOpen, HardDrive, Languages, Library, Plus, Search, Server, Settings, Sparkles, Trash2, X } from "lucide-react";
+import { BookOpen, ChevronRight, Dna, FilePlus2, FlaskConical, FolderOpen, HardDrive, Library, Plus, Search, Server, Settings, Sparkles, Trash2, X } from "lucide-react";
 import type { ConnectionProfile, WorkspaceProject, WorkspaceTemplate } from "../../types";
 import type { Locale } from "../workspace/copy";
 import { useWindowEscapeLayer } from "../settings/BrowserSettings";
@@ -19,7 +19,6 @@ interface Props {
   projects: WorkspaceProject[];
   connections?: ConnectionProfile[];
   locale: Locale;
-  onLocaleChange: (locale: Locale) => void;
   onChooseLocalRoot: () => Promise<ProjectDirectoryChoice>;
   onCreate: (options: CreateProjectOptions) => Promise<void>;
   onOpen: (project: WorkspaceProject) => void;
@@ -37,7 +36,7 @@ const templates = [
   { id: "blank", zh: "空白研究项目", en: "Blank research project", zhDescription: "从自由对话、文件和远端环境开始", enDescription: "Start from conversation, files, and remote compute", icon: FilePlus2 },
 ] satisfies Array<{ id: WorkspaceTemplate; zh: string; en: string; zhDescription: string; enDescription: string; icon: typeof Dna }>;
 
-export function ProjectLibrary({ projects, connections = [], locale, onLocaleChange, onChooseLocalRoot, onCreate, onOpen, onDelete, onSettings, onOpenSearch, createRequestKey, onCreateRequestHandled }: Props) {
+export function ProjectLibrary({ projects, connections = [], locale, onChooseLocalRoot, onCreate, onOpen, onDelete, onSettings, onOpenSearch, createRequestKey, onCreateRequestHandled }: Props) {
   const zh = locale === "zh-CN";
   const projectDescriptionPrefix = useId();
   const trustedConnections = useMemo(() => connections.filter((connection) => connection.host_key_fingerprint), [connections]);
@@ -105,7 +104,6 @@ export function ProjectLibrary({ projects, connections = [], locale, onLocaleCha
         </div>
         <nav className="library-actions" aria-label={zh ? "首页操作" : "Home actions"}>
           {onOpenSearch && <button type="button" className="library-search-action" aria-label={zh ? "搜索工作区" : "Search workspace"} onClick={onOpenSearch}><Search size={15} /><span>{zh ? "搜索工作区" : "Search workspace"}</span><kbd>Ctrl+K</kbd></button>}
-          <button type="button" aria-label={zh ? "切换为 English" : "Switch to 简体中文"} onClick={() => onLocaleChange(zh ? "en-US" : "zh-CN")}><Languages size={15} /><span>{zh ? "English" : "简体中文"}</span></button>
           <button type="button" onClick={onSettings}><Settings size={15} /><span>{zh ? "设置" : "Settings"}</span></button>
         </nav>
       </div>
