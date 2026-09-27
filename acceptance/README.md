@@ -372,3 +372,29 @@ no new execution occurred. Changing project, backend, root or trusted host key m
 refuse the old identity. Do not resubmit to recover an unknown job. Agent Stop and
 run cancellation do not cancel detached computation. R/Micromamba require separate
 live environment acceptance; Windows/macOS client tests do not imply those passed.
+
+## 2026-09-27 approval and MCP directory regression
+
+After narrowing the runtime path-metadata approval check and reducing MCP directory
+model views, deterministic checks passed: `cargo test --workspace` (1,372 passed,
+12 ignored, 0 failed), `npm test` (944 frontend and 22 bridge tests),
+`npm run build`, `npm run build:desktop`, and `cargo fmt --all -- --check`.
+The desktop executable was rebuilt successfully; the previous locked-file build
+failure is no longer the latest build result.
+
+The exact ignored OpenCode nonce/read-tool test documented above was explicitly
+executed with the saved `deepseek-v4.1-flash` profile and unchanged `max` effort.
+It passed 1/1 in 129.61 seconds, using a disposable project and a read-only profile
+lookup. No user project, user database, or credential was changed. This verifies
+the small production model/tool loop, not the original miRNA research workflow,
+real MCP performance, SSH, or a native UI smoke test. Deterministic directory
+tests compare the same 247-tool fixture: 34,219 bytes/7 pages for the former
+description preview and 6,346 bytes/2 pages for the new name index.
+
+For manual smoke, start the newly built app and a new RiskBased run. A script
+using explicit `os.path.join/getsize` with proven project-relative paths should
+not request approval solely for `import os`; opaque paths, aliases, and dangerous
+operations still require approval. Existing pending exact-call approvals retain
+their recorded semantics. Search the MCP directory, refine or clear its query,
+retrieve one exact schema, and confirm compaction preserves the same signed
+directory reference. These native UI and original-workflow checks remain unrun.
