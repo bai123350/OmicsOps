@@ -53,9 +53,9 @@
 ### Task 3: 全量验证和交付
 
 - [x] `cargo fmt --all -- --check`；仅格式失败则 `cargo fmt --all` 并单独提交（`4d8869f`，复查通过）。
-- [ ] `cargo test --workspace`、`npm test`、`npm run build`、`npm run build:desktop`。
-- [ ] 确定性检查后按 acceptance/README.md 显式执行临时 nonce 真实模型读文件验收；不代替真实删除/SSH/科研端到端验收。
-- [ ] 记录原生 UI smoke 实际是否执行、新 exe 元数据、最终提交及工作区状态；提交验证记录。
+- [x] `cargo test --workspace`、`npm test`、`npm run build`、`npm run build:desktop`。
+- [x] 确定性检查后按 acceptance/README.md 显式执行临时 nonce 真实模型读文件验收；不代替真实删除/SSH/科研端到端验收。
+- [x] 记录原生 UI smoke 实际是否执行、新 exe 元数据、最终提交及工作区状态；提交验证记录。
 
 ## 已完成的确定性验证
 
@@ -65,3 +65,25 @@
 - `npm test`：108 个测试文件、957 项前端测试以及 22 项浏览器桥接测试通过。
 - `npm run build`：通过；保留现有大 chunk 提示，无新增依赖。
 - 后端与前端任务分别由 Astra high 独立复核通过；Sol high 编写实现，Luna max 负责读取和路径查找。
+
+## 整体验证与使用边界
+
+前端提交 `a5b0413` 后，由新的 Astra high 审查实例检查整个策略变更，未发现新的可操作回归，之前的审查问题全部关闭。
+
+确定性检查通过后，按 `acceptance/README.md` 显式执行：
+
+```powershell
+cargo test -p omicsops-desktop agent_v4::go_live_acceptance_tests::live_opencode_go_agent_reads_file_and_returns_nonce -- --ignored --exact --nocapture
+```
+
+使用现有 `deepseek-v4.1-flash` 配置和系统凭据引用，临时 Store/项目，真实模型读取随机 nonce：1/1 通过，测试耗时 8.95 秒（不含 2 分 35 秒编译），退出码 0。没有修改原项目或用户数据库，没有输出凭据或推理正文。这仅验证模型 → 文件读取 → 模型结果，不证明本地删除拦截、MCP、SSH 或科研流程的真实端到端行为，也不是延迟保证。
+
+新策略需要运行本次构建，并在“帮我批准”下新发送任务。历史待审批运行、已冻结队列和已批准计划保持原策略；若旧运行仍等待审批，应结束该运行后重新发送，而不是恢复原审批绑定。动态或第三方工具内部的间接删除可能无法识别。
+
+原生 Windows UI smoke、真实 MCP 删除、SSH、R/Micromamba 和科研流程验收未执行。待执行的原生 smoke：在一次性项目打开权限菜单核对说明，发送无删除的 runtime 请求确认不出现审批卡；对一次性路径的直接删除请求核对审批卡并拒绝；重新打开历史运行核对仍显示原风险审批；打开菜单/运行环境面板后不移动焦点直接按 Escape，确认仅关闭顶层。不得对真实样本执行删除验收。
+
+`npm run build:desktop` 退出码 0，release 编译耗时 4 分 18 秒，默认 NSIS 构建结束；仅完成本地构建，没有安装、分发、创建 Release 或 tag。保留现有大 chunk 提示和 Windows linker 创建库提示。
+
+本次程序：`E:\Project\OmicsOps\target\release\omicsops-desktop.exe`，79,660,544 字节，修改时间 `2026-09-29 03:24:33 +08:00`，SHA-256 `ba32c7366554023dbdb803e30db904c79c0a2ab33e340a4b47b1785f2dc6571b`。构建产物未纳入 Git。
+
+提交序列：设计 `c257c79`、后端策略 `4376e4c`、纯格式 `4d8869f`、前端与使用说明 `a5b0413`，随后提交本验证记录。最终仅保留用户原有未跟踪 `website/`，未修改其内容。默认完整检查和真实 nonce 验收日志位于被忽略的 `target/auto-approve-local-deletion-*.log`。
