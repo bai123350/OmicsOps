@@ -7263,6 +7263,12 @@ impl DesktopToolExecutorV4 {
 
 #[async_trait]
 impl ToolExecutorV4 for DesktopToolExecutorV4 {
+    fn risk_based_approval_reason(&self, call: &ToolCallV4) -> Option<String> {
+        (call.tool_id == "runtime.execute")
+            .then(|| crate::runtime_approval::ordinary_runtime_call_approval_reason(&call.arguments))
+            .flatten()
+    }
+
     async fn conversation_target_approved(&self, call: &ToolCallV4) -> bool {
         self.conversation_mcp_approved(call).await.unwrap_or(false)
     }
@@ -8998,6 +9004,15 @@ mod tests {
             ..ordinary
         };
         assert!(!executor.risk_based_target_approved(&risky).await);
+        let uncertain_path = ToolCallV4 {
+            call_id: "diagnose-project-path".into(),
+            tool_id: "runtime.execute".into(),
+            arguments: json!({"language":"python","code":"import os\nos.makedirs('results/PRIVATE_SENTINEL', exist_ok=True)\np = 'results/PRIVATE_SENTINEL_%s.json' % unknown\nprint(os.path.getsize(p))"}),
+        };
+        let reason = executor.risk_based_approval_reason(&uncertain_path).unwrap();
+        assert!(reason.contains("Unsupported OS operation"));
+        assert!(!reason.contains("Project path cannot be proven"));
+        assert!(!reason.contains("PRIVATE_SENTINEL"));
         assert!(
             executor
                 .prepare_call(&resource_call("project.list"))

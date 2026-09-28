@@ -466,6 +466,10 @@ pub trait ToolPortV4: Send + Sync {
     async fn risk_based_target_approved(&self, _call: &ToolCallV4) -> bool {
         false
     }
+    /// Fixed host diagnostics for a RiskBased approval card; never grants authority.
+    fn risk_based_approval_reason(&self, _call: &ToolCallV4) -> Option<String> {
+        None
+    }
     /// Authorize one Plan-mode call after the caller has supplied its
     /// arguments. Implementations may perform a dynamic host check here (for
     /// example, re-reading a configured MCP profile and its live catalog).
@@ -4077,6 +4081,23 @@ impl AgentCoreV4<'_> {
             "批准后，本对话中同一 MCP 服务器、同一工具目录的后续调用将复用授权；目录或服务器授权变化后需重新确认。"
         } else if is_browser_tool_id(&call.tool_id) {
             "This call controls the user's real browser. Choose once, conversation, project, or global authorization; the grant remains bound to the exact capability, target host, browser session, and extension protocol version. Compute Full Access never bypasses this authorization."
+        } else if call.tool_id == "runtime.execute"
+            && spec.compute_selection.as_ref().is_some_and(|selection| {
+                selection.approval_policy == ApprovalPolicyV4::RiskBased
+            })
+        {
+            // The host reason only explains a request already required by the
+            // approval policy; it does not participate in that decision.
+            return ToolApprovalRequestV4::new(
+                spec.run_id,
+                &spec_hash,
+                call.clone(),
+                effect,
+                self.tools
+                    .risk_based_approval_reason(&call)
+                    .unwrap_or_else(|| approval_reason(effect).to_owned()),
+            )
+            .map_err(|error| AgentCoreErrorV4::Store(error.to_string()));
         } else {
             approval_reason(effect)
         };
@@ -6362,6 +6383,10 @@ mod tests {
     struct FakeTools;
     #[async_trait]
     impl ToolPortV4 for FakeTools {
+        fn risk_based_approval_reason(&self, call: &ToolCallV4) -> Option<String> {
+            (call.arguments.get("fixture_runtime_reason") == Some(&json!(true)))
+                .then(|| "Project path cannot be proven from this code".into())
+        }
         async fn risk_based_target_approved(&self, call: &ToolCallV4) -> bool {
             (call.tool_id == "use_mcp_tool"
                 && call.arguments.get("fixture_approved") == Some(&json!(true)))
@@ -8740,6 +8765,43 @@ mod tests {
                     .unwrap()
             );
         }
+    }
+
+    #[test]
+    fn risk_based_runtime_request_uses_bounded_host_reason_only_for_that_policy() {
+        let store = MemoryStore::default();
+        let model = ScriptedModel(Mutex::new(vec![]));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let call = ToolCallV4 {
+            call_id: "reason".into(),
+            tool_id: "runtime.execute".into(),
+            arguments: json!({"language":"python","code":"print('PRIVATE_SENTINEL')","fixture_runtime_reason":true}),
+        };
+        let risk_spec = supervised_execution_spec(
+            Uuid::new_v4(),
+            ApprovalPolicyV4::RiskBased,
+            ComputeBackendKindV4::Local,
+        );
+        let risk_request = core
+            .approval_request(&risk_spec, call.clone(), ToolEffectV4::Runtime)
+            .unwrap();
+        assert_eq!(risk_request.reason, "Project path cannot be proven from this code");
+        assert!(!risk_request.reason.contains("PRIVATE_SENTINEL"));
+
+        let request_spec = supervised_execution_spec(
+            Uuid::new_v4(),
+            ApprovalPolicyV4::RequestApproval,
+            ComputeBackendKindV4::Local,
+        );
+        let request = core
+            .approval_request(&request_spec, call, ToolEffectV4::Runtime)
+            .unwrap();
+        assert_eq!(request.reason, approval_reason(ToolEffectV4::Runtime));
     }
 
     #[test]

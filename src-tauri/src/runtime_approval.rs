@@ -44,6 +44,149 @@ pub(crate) fn ordinary_runtime_call_is_low_risk(arguments: &Value) -> bool {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApprovalReason {
+    UnsupportedInput,
+    BackgroundOrCapture,
+    UnparseableCode,
+    DangerousOperation,
+    OutsideProject,
+    UnsupportedOsOperation,
+    UnprovenProjectPath,
+    UnclassifiedCode,
+}
+
+impl ApprovalReason {
+    fn message(self) -> &'static str {
+        match self {
+            Self::UnsupportedInput => "Runtime language or code is unsupported for automatic approval",
+            Self::BackgroundOrCapture => "Background execution or capture paths require approval",
+            Self::UnparseableCode => "Code could not be classified safely",
+            Self::DangerousOperation => "Code contains an operation that requires approval",
+            Self::OutsideProject => "Code references an external or protected path",
+            Self::UnsupportedOsOperation => "Unsupported OS operation requires approval",
+            Self::UnprovenProjectPath => "Project path cannot be proven from this code",
+            Self::UnclassifiedCode => "Runtime code is outside the ordinary approval pattern",
+        }
+    }
+}
+
+fn add_reason(reasons: &mut Vec<ApprovalReason>, reason: ApprovalReason) {
+    if reasons.len() < 4 && !reasons.contains(&reason) {
+        reasons.push(reason);
+    }
+}
+
+pub(crate) fn ordinary_runtime_call_approval_reason(arguments: &Value) -> Option<String> {
+    if ordinary_runtime_call_is_low_risk(arguments) {
+        return None;
+    }
+    let mut reasons = Vec::new();
+    if arguments.get("background").is_some_and(|value| value != false)
+        || arguments.get("capture_paths").is_some_and(|value| {
+            !value.is_array()
+                || value
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|path| path.as_str().is_none_or(unsafe_project_path))
+        })
+    {
+        add_reason(&mut reasons, ApprovalReason::BackgroundOrCapture);
+    }
+    let language = arguments.get("language").and_then(Value::as_str);
+    let code = arguments.get("code").and_then(Value::as_str);
+    if !matches!(language, Some("python" | "r"))
+        || code.is_none_or(|code| code.trim().is_empty() || code.len() > 256 * 1024)
+    {
+        add_reason(&mut reasons, ApprovalReason::UnsupportedInput);
+    } else if let (Some(language), Some(code)) = (language, code) {
+        if let Some(tokens) = lex(code, language == "r", 0) {
+            // The OS proof is global. When a distinct unsupported operation
+            // exists, it cannot identify which path argument failed.
+            let unsupported_os = tokens.iter().enumerate().any(|(i, token)| {
+                is_word(Some(token), "os")
+                    && is_mark(tokens.get(i + 1), b'.')
+                    && !(is_word(tokens.get(i + 2), "path")
+                        && is_mark(tokens.get(i + 3), b'.')
+                        && ["join", "getsize", "exists"]
+                            .iter()
+                            .any(|method| is_word(tokens.get(i + 4), method)))
+            });
+            let os_proof_failed = language == "python"
+                && !unsupported_os
+                && !safe_os_path_uses(&tokens);
+            for (i, token) in tokens.iter().enumerate() {
+                if let Token::String(value) = token {
+                    let path_argument = is_mark(tokens.get(i.wrapping_sub(1)), b'/')
+                        || (is_mark(tokens.get(i.wrapping_sub(1)), b'(')
+                            && ["Path", "open"]
+                                .iter()
+                                .any(|name| is_word(tokens.get(i.wrapping_sub(2)), name)));
+                    if unmistakable_outside_path(value)
+                        || (path_argument && unsafe_project_path(value))
+                    {
+                        add_reason(&mut reasons, ApprovalReason::OutsideProject);
+                    }
+                }
+                if let Token::Word(word) = token {
+                    if language == "python"
+                        && (["subprocess", "socket", "ctypes", "shutil", "keyring", "winreg", "eval", "exec"].contains(&word.as_str())
+                            || (["remove", "unlink", "rmtree", "rename", "chmod", "chown", "symlink", "system", "popen"].contains(&word.as_str())
+                                && is_mark(tokens.get(i + 1), b'(')))
+                    {
+                        add_reason(&mut reasons, ApprovalReason::DangerousOperation);
+                    }
+                    if language == "r"
+                        && ["system", "system2", "shell", "unlink", "eval", "parse", "source"].contains(&word.as_str())
+                        && is_mark(tokens.get(i + 1), b'(')
+                    {
+                        add_reason(&mut reasons, ApprovalReason::DangerousOperation);
+                    }
+                    if language == "python"
+                        && word == "os"
+                        && is_mark(tokens.get(i + 1), b'.')
+                    {
+                        if is_word(tokens.get(i + 2), "path")
+                            && is_mark(tokens.get(i + 3), b'.')
+                        {
+                            if !["join", "getsize", "exists"].iter().any(|method| is_word(tokens.get(i + 4), method)) {
+                                add_reason(&mut reasons, ApprovalReason::UnsupportedOsOperation);
+                            } else if os_proof_failed {
+                                if let Some(Token::String(path)) = tokens.get(i + 6) {
+                                    if unsafe_project_path(path) {
+                                        add_reason(&mut reasons, ApprovalReason::OutsideProject);
+                                    }
+                                } else if let Some(Token::Word(name)) = tokens.get(i + 6)
+                                    && !tokens.windows(2).any(|pair| {
+                                        is_word(pair.first(), name) && is_mark(pair.get(1), b'=')
+                                    })
+                                {
+                                    add_reason(&mut reasons, ApprovalReason::UnprovenProjectPath);
+                                }
+                            }
+                        } else {
+                            add_reason(&mut reasons, ApprovalReason::UnsupportedOsOperation);
+                        }
+                    }
+                }
+            }
+        } else {
+            add_reason(&mut reasons, ApprovalReason::UnparseableCode);
+        }
+    }
+    if reasons.is_empty() {
+        add_reason(&mut reasons, ApprovalReason::UnclassifiedCode);
+    }
+    Some(
+        reasons
+            .iter()
+            .map(|reason| reason.message())
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
 fn unsafe_project_path(path: &str) -> bool {
     let path = path.replace('\\', "/");
     let trimmed = path.trim();
@@ -837,6 +980,56 @@ print(json.dumps({"rows": len(rows), "bytes": size}))
         ] {
             assert!(ordinary_runtime_call_is_low_risk(&python(code)), "{code}");
         }
+    }
+
+    #[test]
+    fn approval_reason_does_not_guess_which_path_failed() {
+        let code = "import os\nos.makedirs('results/PRIVATE_SENTINEL', exist_ok=True)\nout = 'results/PRIVATE_SENTINEL_%s.json' % unknown\nprint(os.path.getsize(out))";
+        let args = python(code);
+        assert!(!ordinary_runtime_call_is_low_risk(&args));
+        let reason = ordinary_runtime_call_approval_reason(&args).unwrap();
+        assert!(reason.contains("Unsupported OS operation"), "{reason}");
+        assert!(!reason.contains("Project path cannot be proven"), "{reason}");
+        assert!(!reason.contains("PRIVATE_SENTINEL"));
+        assert!(reason.split("; ").count() <= 4);
+    }
+
+    #[test]
+    fn unknown_os_path_has_a_specific_fixed_reason() {
+        let args = python("import os\nprint(os.path.getsize(unknown))");
+        let reason = ordinary_runtime_call_approval_reason(&args).unwrap();
+        assert!(reason.contains("Project path cannot be proven"), "{reason}");
+    }
+
+    #[test]
+    fn approval_reason_is_absent_for_existing_low_risk_code() {
+        let args = python("import os\nprint(os.path.exists('results/report.json'))");
+        assert!(ordinary_runtime_call_is_low_risk(&args));
+        assert_eq!(ordinary_runtime_call_approval_reason(&args), None);
+    }
+
+    #[test]
+    fn unrelated_os_operation_does_not_mislabel_a_proven_path() {
+        let args = python("import os\np = 'results/a.txt'\nos.makedirs('results')\nprint(os.path.getsize(p))");
+        let reason = ordinary_runtime_call_approval_reason(&args).unwrap();
+        assert!(reason.contains("Unsupported OS operation"));
+        assert!(!reason.contains("Project path cannot be proven"), "{reason}");
+    }
+
+    #[test]
+    fn ordinary_variable_name_is_not_reported_as_a_dangerous_call() {
+        let args = python("rename = 1\nimport os\nos.makedirs('results')");
+        let reason = ordinary_runtime_call_approval_reason(&args).unwrap();
+        assert!(reason.contains("Unsupported OS operation"));
+        assert!(!reason.contains("operation that requires approval"), "{reason}");
+    }
+
+    #[test]
+    fn protected_open_path_has_a_specific_fixed_reason() {
+        let args = python("open('.git/PRIVATE_SENTINEL', 'r')");
+        let reason = ordinary_runtime_call_approval_reason(&args).unwrap();
+        assert!(reason.contains("external or protected path"), "{reason}");
+        assert!(!reason.contains("PRIVATE_SENTINEL"));
     }
 
     #[test]

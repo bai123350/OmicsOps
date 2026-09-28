@@ -30,6 +30,10 @@ pub trait ToolExecutorV4: Send + Sync {
     async fn risk_based_target_approved(&self, _call: &ToolCallV4) -> bool {
         false
     }
+    /// Fixed host diagnostics only; this must not decide approval.
+    fn risk_based_approval_reason(&self, _call: &ToolCallV4) -> Option<String> {
+        None
+    }
     /// Dynamic authority for the generic MCP wrapper in Plan mode. Ordinary
     /// executors do not expose Network tools to planning; the desktop
     /// executor overrides this only after checking the concrete target.
@@ -258,6 +262,11 @@ impl ToolPortV4 for ToolRegistryV4 {
     async fn risk_based_target_approved(&self, call: &ToolCallV4) -> bool {
         self.validate(RunModeV4::Execute, call).is_ok()
             && self.executor.risk_based_target_approved(call).await
+    }
+    fn risk_based_approval_reason(&self, call: &ToolCallV4) -> Option<String> {
+        self.validate(RunModeV4::Execute, call)
+            .ok()
+            .and_then(|_| self.executor.risk_based_approval_reason(call))
     }
 
     async fn authorize_plan_call(
@@ -788,6 +797,9 @@ mod tests {
     }
     #[async_trait]
     impl ToolExecutorV4 for Noop {
+        fn risk_based_approval_reason(&self, _call: &ToolCallV4) -> Option<String> {
+            Some("fixed host diagnostic".into())
+        }
         async fn execute(&self, call: &ToolCallV4) -> Result<ToolOutcomeV4, String> {
             Ok(ToolOutcomeV4 {
                 call_id: call.call_id.clone(),
@@ -798,6 +810,34 @@ mod tests {
                 provenance: vec![],
             })
         }
+    }
+
+    #[test]
+    fn risk_based_reason_is_forwarded_only_for_valid_enabled_calls() {
+        let call = ToolCallV4 {
+            call_id: "reason".into(),
+            tool_id: "runtime.execute".into(),
+            arguments: json!({"language":"python","code":"print(1)"}),
+        };
+        let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap();
+        assert_eq!(
+            registry.risk_based_approval_reason(&call).as_deref(),
+            Some("fixed host diagnostic")
+        );
+        let denied = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop))
+            .unwrap()
+            .with_execute_capabilities(BTreeSet::new());
+        assert_eq!(denied.risk_based_approval_reason(&call), None);
+        let invalid = ToolCallV4 {
+            arguments: json!({"language":"python"}),
+            ..call.clone()
+        };
+        assert_eq!(registry.risk_based_approval_reason(&invalid), None);
+        let unknown = ToolCallV4 {
+            tool_id: "unknown".into(),
+            ..call
+        };
+        assert_eq!(registry.risk_based_approval_reason(&unknown), None);
     }
 
     struct DynamicPlanExecutor {
