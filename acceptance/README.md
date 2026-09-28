@@ -431,3 +431,38 @@ injected into this live run. The original miRNA task, SSH, and native UI manual
 acceptance were not run. The 70.11 seconds is not a before/after literature-task
 speed comparison; the original run's event analysis is recorded in
 `docs/superpowers/specs/2026-09-28-approval-and-tool-identity.md`.
+
+## 2026-09-28 follow-up approval diagnostics and execution status
+
+The follow-up screenshot's stored and frozen compute selections both deserialize
+to RiskBased. Static analysis of the exact runtime arguments found two remaining
+rejection points: directory creation and the date-derived output path. Expanding
+automatic approval for these patterns remains pending explicit risk-aware user
+authorization after automatic review rejected the production changes. No such
+expansion was applied, and no historical approval was changed.
+
+The delivered changes distinguish model waiting, requested tools, running tools,
+and delegated execution progress, and add bounded, non-sensitive host approval
+reasons. The existing approval classifier and authorization results are unchanged.
+Final deterministic checks passed: `cargo test --workspace` (1,389 passed,
+12 ignored), `npm test` (953 frontend and 22 bridge tests), `npm run build`,
+`npm run build:desktop`, and `cargo fmt --all -- --check`. Formatting has its own
+commit. Native compilation and local NSIS bundling succeeded; nothing was
+published or distributed.
+
+After these checks, the exact desktop-only ignored OpenCode command shown above
+passed 1/1 (exit 0) in 12.86 seconds of test execution with the existing
+`deepseek-v4.1-flash` profile and keyring reference. It used a disposable nonce
+project and read-only profile lookup. Two attempts produced content; all 121
+nonempty reasoning snapshots preceded the corresponding result. Only metadata
+was printed. This is a small model/read-tool/completion acceptance, not a timing
+comparison or acceptance of runtime auto-approval, SSH, native UI, or the original
+miRNA research workflow. The original script was not rerun.
+
+The actual research input uses serial queries, a 90-second network timeout and
+up to four attempts; Python output is buffered until execution finishes. The UI
+fix therefore reports unknown tool progress without claiming the computation
+is stuck or faster. Detailed evidence, remaining authorization, and unexecuted
+manual smoke steps are recorded in
+`docs/superpowers/specs/2026-09-28-runtime-approval-paths.md` and
+`docs/superpowers/plans/2026-09-28-runtime-approval-paths.md`.

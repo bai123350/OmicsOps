@@ -30,6 +30,8 @@
 
 ### Task 1: 有类型路径证明覆盖完整研究代码形态
 
+**状态：待用户知情授权，未实现。** 旧生产分类器下代表性正例 RED、危险反例检查通过；生产改写与收窄替代均遭自动审批审查拒绝，已停止扩大自动通过范围，并将未交付测试差异保存在忽略的本地 scratch。Task 2 可独立推进，但必须保持当前授权判定不变。
+
 **Files:** Modify/test `src-tauri/src/runtime_approval.rs`。不另拆模块。
 
 **Interfaces:** 保留 `ordinary_runtime_call_is_low_risk(&Value) -> bool`；内部值状态至少区分已知相对路径、日期对象、安全文件名片段。生产入口继续不执行代码。
@@ -44,23 +46,34 @@
 
 ### Task 2: 固定分类原因进入已有审批请求
 
-**Files:** Modify/test `src-tauri/src/runtime_approval.rs`、`src-tauri/src/agent_v4.rs`、`crates/omicsops-agent-core/src/lib.rs`。
+**Files:** Modify/test `src-tauri/src/runtime_approval.rs`、`src-tauri/src/agent_v4.rs`、`crates/omicsops-agent-core/src/lib.rs`、`crates/omicsops-tools/src/lib.rs`。宿主 executor 的默认 hook 必须由授权过滤后的 registry 转发到 `ToolPortV4`。
 
-**Interfaces:** classifier 增加 crate 内分析结果与有限原因枚举，bool 由该结果派生；`ToolPortV4::risk_based_approval_reason(&self, call: &ToolCallV4) -> Option<String>` 默认 None。具体 enum/type 名由实现者统一命名，无跨 crate DTO。
+**Interfaces:** classifier 保留现有 bool 判定，诊断入口先检查该 bool 再生成有限固定原因，不反向改变批准结果；`ToolPortV4::risk_based_approval_reason(&self, call: &ToolCallV4) -> Option<String>` 默认 None。具体 enum/type 名由实现者统一命名，无跨 crate DTO。
 
-- [ ] 添加 classifier 固定原因断言：unsupported OS operation 与 unproven project path 可同时出现，去重且最多四个；明确危险/解析失败保持拒绝，消息不包含输入原文。
-- [ ] 添加 core mock host hook 测试：RiskBased runtime 审批保存 host 原因；None 回退；Request 和 Plan 不被 runtime 原因覆盖。调用参数放入可识别的敏感测试标记，断言原因不包含标记。
-- [ ] 运行对应 focused 测试确认新增行为尚未实现。
-- [ ] 实现统一分析结果、默认 hook、desktop runtime hook 与 core reason 接线，保留 MCP/浏览器文案优先级；原因不参与授权判断。
-- [ ] 运行 `cargo test -p omicsops-desktop --lib runtime_approval`、`cargo test -p omicsops-agent-core risk_based` 和新增 reason 测试；Local/SSH 判定同样输入结果一致。
-- [ ] Commit: `fix: explain runtime approval classification`。
+- [x] 添加 classifier 固定原因断言：只输出可确认的原因或诚实总括，去重且最多四个；不以删除调用后重新分类的方式推断原因；不承诺一次枚举所有根因；明确危险/解析失败保持拒绝，消息不包含输入原文。
+- [x] 添加 core mock host hook 测试：RiskBased runtime 审批保存 host 原因；None 回退；Request 保持原文案，Plan 仍走独立请求分支。调用参数放入可识别的敏感测试标记，断言原因不包含标记。
+- [x] 运行对应 focused 测试确认新增行为尚未实现。
+- [x] 保留批准布尔判定，增加独立诊断入口、默认 hook、desktop runtime hook 与 core reason 接线，保留 MCP/浏览器文案优先级；原因不参与授权判断。
+- [x] 运行 `cargo test -p omicsops-desktop --lib runtime_approval`、`cargo test -p omicsops-agent-core risk_based_runtime` 和新增 registry reason 测试。诊断只读取工具参数，无 Local/SSH 分支；未执行真实 SSH。
+- [x] Commit: `a19a853 fix: explain runtime approval classification`。
 
 ### Task 3: 全量验证与交付记录
 
 **Files:** 本计划追加实际验证记录；需要时更新本 spec 的实际已交付边界。
 
-- [ ] 执行 `cargo fmt --all -- --check`；若只有格式偏差，运行 `cargo fmt --all` 并把纯格式变化单独提交。
-- [ ] 执行 `cargo test --workspace`、`npm test`、`npm run build`、`npm run build:desktop`，记录实际结果。锁文件未变不强制重装。
-- [ ] root 对完整真实脚本进行最终生产分类，并确认同形危险改写仍被拒绝；随后清理 TEMP 诊断文件。不得执行仍可能远端运行的研究调用，不把停止等待视为取消计算。
-- [ ] 记录未执行真实模型/SSH 端到端验收；手工 smoke 为重启新构建后新发起安全项目输出调用、确认无新审批，再检查危险调用显示具体原因，不能编辑旧审批事件模拟通过。
-- [ ] Commit: `docs: record runtime path approval validation`。
+- [x] 执行 `cargo fmt --all -- --check`；首次仅格式失败，已运行 `cargo fmt --all`，复查通过；纯格式提交 `add131a`。
+- [x] 最终 `cargo test --workspace`：1,389 通过、12 忽略；此前未包含最后一个回归的首轮为 1,388 通过、12 忽略。
+- [x] `npm test`：953 前端、22 浏览器桥接测试通过；`npm run build` 通过。锁文件未变。
+- [x] `npm run build:desktop` 通过（exit 0），原生 release 编译和 NSIS 本地打包完成；未发布或分发。可执行文件 `target/release/omicsops-desktop.exe` 为 75,761,152 字节，本地修改时间 2026-09-28 18:35:51。
+- [x] 实现者使用完整真实参数仅调用生产 bool/reason，确认仍为 false 且诊断不泄露输入；临时 ignored 测试已移除。九个辅助 TEMP probe/变体按已核实的精确路径清理。原参数和忽略的 Task1 测试 patch 保留用于授权后继续，未执行研究调用。
+- [x] 确定性检查全部结束后按 `acceptance/README.md` 显式执行一次临时项目的模型读文件 ignored 验收，1/1 通过（12.86 秒）；不代替审批规则、SSH 或 miRNA 流程验收。
+- [x] 已记录当前手工 smoke 步骤，尚未执行原生 UI 手工 smoke：重启新构建后，在 RiskBased 中新发起仍超出现有规则的调用，检查固定原因且不能直接执行；Request 模式仍按原策略审批。工具派发后超过 90 秒无结果时应说明工具进度未知，委派节点进度与恢复事件应重置对应静默计时。历史审批不回填。Task1 的免审批 smoke 要待授权并实现后再做。
+- [x] Commit: `docs: record runtime path approval validation`。
+
+## 定向验证记录
+
+`cargo test -p omicsops-desktop --lib runtime_approval` 最终 15/15；新增变量名回归先 RED 后 GREEN。`cargo test -p omicsops-desktop --lib lazy_interpreter_probe_is_language_specific_and_never_reserves_a_job_on_failure` 1/1；`cargo test -p omicsops-agent-core risk_based_runtime` 2/2；`cargo test -p omicsops-tools risk_based_reason_is_forwarded_only_for_valid_enabled_calls` 1/1。上述检查不需要真实 SSH、样本数据或模型凭据。
+
+独立 Astra 审查覆盖 UI 与诊断四个 Rust 文件，具体发现的委派阶段、恢复计时、路径原因误报和变量名误报均已修复。Task1 的生产补丁未获准，不能将这些测试结果描述为自动审批误判已解决。
+
+真实模型命令为 `cargo test -p omicsops-desktop agent_v4::go_live_acceptance_tests::live_opencode_go_agent_reads_file_and_returns_nonce -- --ignored --exact --nocapture`，按 README 在子进程环境中选择既有 OpenCode Go DeepSeek profile，凭据仍从系统 keyring 读取。1/1 通过（exit 0，测试执行 12.86 秒，不含编译），临时 nonce 被读取并返回。仅打印元数据：121 次非空推理快照均先于对应结果，2 次有内容的模型请求。未修改用户数据库、模型配置或原研究目录；未执行原生 UI、真实 SSH 或 miRNA 端到端验收，未证明原工作流提速。
