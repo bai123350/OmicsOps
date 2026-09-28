@@ -4082,9 +4082,10 @@ impl AgentCoreV4<'_> {
         } else if is_browser_tool_id(&call.tool_id) {
             "This call controls the user's real browser. Choose once, conversation, project, or global authorization; the grant remains bound to the exact capability, target host, browser session, and extension protocol version. Compute Full Access never bypasses this authorization."
         } else if call.tool_id == "runtime.execute"
-            && spec.compute_selection.as_ref().is_some_and(|selection| {
-                selection.approval_policy == ApprovalPolicyV4::RiskBased
-            })
+            && spec
+                .compute_selection
+                .as_ref()
+                .is_some_and(|selection| selection.approval_policy == ApprovalPolicyV4::RiskBased)
         {
             // The host reason only explains a request already required by the
             // approval policy; it does not participate in that decision.
@@ -8790,7 +8791,10 @@ mod tests {
         let risk_request = core
             .approval_request(&risk_spec, call.clone(), ToolEffectV4::Runtime)
             .unwrap();
-        assert_eq!(risk_request.reason, "Project path cannot be proven from this code");
+        assert_eq!(
+            risk_request.reason,
+            "Project path cannot be proven from this code"
+        );
         assert!(!risk_request.reason.contains("PRIVATE_SENTINEL"));
 
         let request_spec = supervised_execution_spec(
