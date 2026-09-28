@@ -8934,6 +8934,72 @@ mod tests {
         assert_eq!(factory.attempts.load(Ordering::SeqCst), 2);
     }
 
+    struct OneApprovalToolModel(ToolCallV4);
+    #[async_trait]
+    impl ModelPortV4 for OneApprovalToolModel {
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            Ok(ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![self.0.clone()],
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct ApprovalRunEvents(std::sync::Mutex<Vec<AgentEventV4>>);
+    #[async_trait]
+    impl EventStoreV4 for ApprovalRunEvents {
+        async fn append(&self, event: &AgentEventV4) -> Result<(), String> {
+            self.0.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+        async fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String> {
+            Ok(self.0.lock().unwrap().iter().filter(|event| event.run_id == run_id).cloned().collect())
+        }
+        async fn archive_context(
+            &self,
+            _: Uuid,
+            transcript: &str,
+            checkpoint: &ContextCheckpointV4,
+        ) -> Result<ContextArchiveV4, String> {
+            Ok(ContextArchiveV4 {
+                archive_id: Uuid::new_v4(),
+                through_sequence: checkpoint.through_sequence,
+                size_bytes: transcript.len() as u64,
+                sha256: "fixture".into(),
+            })
+        }
+    }
+
+    struct RecordingApprovalExecutor {
+        desktop: Arc<DesktopToolExecutorV4>,
+        dispatched: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl ToolExecutorV4 for RecordingApprovalExecutor {
+        async fn risk_based_target_approved(&self, call: &ToolCallV4) -> bool {
+            ToolExecutorV4::risk_based_target_approved(self.desktop.as_ref(), call).await
+        }
+        fn risk_based_approval_reason(&self, call: &ToolCallV4) -> Option<String> {
+            ToolExecutorV4::risk_based_approval_reason(self.desktop.as_ref(), call)
+        }
+        async fn execute(&self, call: &ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            self.dispatched.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutcomeV4 {
+                call_id: call.call_id.clone(),
+                tool_id: call.tool_id.clone(),
+                succeeded: true,
+                model_content: "recorded without executing Python".into(),
+                data: json!({"operation_dispatched":true}),
+                provenance: vec![],
+            })
+        }
+    }
+
     struct MissingInterpreter(std::sync::atomic::AtomicUsize);
     #[async_trait]
     impl RuntimeEnvironmentPortV4 for MissingInterpreter {
@@ -9001,6 +9067,13 @@ mod tests {
             arguments: json!({"language":"python","code":"from pathlib import Path\nPath('results/summary.txt').write_text('ok')"}),
         };
         assert!(executor.risk_based_target_approved(&ordinary).await);
+        let dated = ToolCallV4 {
+            call_id: "dated-project-path".into(),
+            arguments: json!({"language":"python","code":"import datetime, os\nnow = datetime.datetime.now(datetime.timezone.utc)\ntoday = now.strftime('%Y-%m-%d')\nos.makedirs('results/literature', exist_ok=True)\nout_path = 'results/literature/review_%s.json' % today.replace('-', '')\nwith open(out_path, 'w') as handle:\n    handle.write('ok')\nprint(os.path.getsize(out_path))"}),
+            ..ordinary.clone()
+        };
+        assert!(executor.risk_based_target_approved(&dated).await);
+        assert_eq!(executor.risk_based_approval_reason(&dated), None);
         let risky = ToolCallV4 {
             arguments: json!({"language":"python","code":"import subprocess\nsubprocess.run(['echo', 'x'])"}),
             ..ordinary
@@ -9014,8 +9087,8 @@ mod tests {
         let reason = executor
             .risk_based_approval_reason(&uncertain_path)
             .unwrap();
-        assert!(reason.contains("Unsupported OS operation"));
-        assert!(!reason.contains("Project path cannot be proven"));
+        assert!(reason.contains("Project path cannot be proven"));
+        assert!(!reason.contains("Unsupported OS operation"));
         assert!(!reason.contains("PRIVATE_SENTINEL"));
         assert!(
             executor
@@ -9043,6 +9116,79 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+
+        // Drive the actual Agent Core policy through the desktop classifier and
+        // registry. The recorder never starts Python or reserves a runtime job.
+        let desktop = Arc::new(executor);
+        for (policy, tool_call, expected_dispatch) in [
+            (ApprovalPolicyV4::RiskBased, dated.clone(), 1),
+            (ApprovalPolicyV4::RiskBased, risky.clone(), 0),
+            (ApprovalPolicyV4::RiskBased, uncertain_path.clone(), 0),
+            (ApprovalPolicyV4::RequestApproval, dated.clone(), 0),
+        ] {
+            let call_id = tool_call.call_id.clone();
+            let run_id = Uuid::new_v4();
+            let project_id = Uuid::new_v4();
+            let conversation_id = Uuid::new_v4();
+            let model_profile_id = Uuid::new_v4();
+            let mut selection = desktop.selection.clone();
+            selection.approval_policy = policy;
+            let plan = direct_execution_plan(
+                "classify the project output",
+                "[]",
+                BTreeSet::from(["runtime.execute".into()]),
+            );
+            let approval_hash = RunSpecV4::approval_hash_for(
+                run_id, project_id, conversation_id, model_profile_id, &plan, &selection,
+            )
+            .unwrap();
+            let spec = RunSpecV4::freeze_ordinary_agent_with_compute(
+                run_id, project_id, conversation_id, model_profile_id, plan, selection,
+                &approval_hash, Utc::now(),
+            )
+            .unwrap();
+            let recorder = Arc::new(RecordingApprovalExecutor {
+                desktop: desktop.clone(),
+                dispatched: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), recorder.clone())
+                .unwrap()
+                .with_execute_capabilities(BTreeSet::from(["runtime.execute".into()]));
+            let model = OneApprovalToolModel(tool_call);
+            let events = ApprovalRunEvents::default();
+            events.0.lock().unwrap().push(AgentEventV4::first(
+                run_id,
+                project_id,
+                conversation_id,
+                Utc::now(),
+                AgentEventKindV4::RunCreated { mode: RunModeV4::Execute },
+            ));
+            let run_result = AgentCoreV4 {
+                model: &model,
+                tools: &registry,
+                events: &events,
+                science: None,
+            }
+            .execute(&spec, 1)
+            .await;
+            if expected_dispatch == 0 {
+                assert!(matches!(run_result, Err(AgentCoreErrorV4::WaitingForApproval)));
+            } else {
+                assert!(matches!(run_result, Err(AgentCoreErrorV4::NeedsAttention(_))));
+            }
+            assert_eq!(recorder.dispatched.load(Ordering::SeqCst), expected_dispatch);
+            let events = events.0.lock().unwrap();
+            let approval_requested = events.iter().any(|event| {
+                matches!(event.event, AgentEventKindV4::ToolApprovalRequested { .. })
+            });
+            assert_eq!(approval_requested, expected_dispatch == 0);
+            assert_eq!(events.iter().filter(|event| {
+                matches!(&event.event, AgentEventKindV4::ToolDispatchStarted { call_id: started, .. } if started == &call_id)
+            }).count(), expected_dispatch);
+            assert_eq!(events.iter().filter(|event| {
+                matches!(&event.event, AgentEventKindV4::ToolFinished { outcome } if outcome.call_id == call_id && outcome.succeeded)
+            }).count(), expected_dispatch);
+        }
     }
 
     #[tokio::test]

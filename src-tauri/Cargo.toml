@@ -31,6 +31,8 @@ omicsops-browser = { path = "../crates/omicsops-browser" }
 omicsops-process = { path = "../crates/omicsops-process" }
 omicsops-tools = { path = "../crates/omicsops-tools" }
 reqwest.workspace = true
+rustpython-parser.workspace = true
+rustpython-ast.workspace = true
 regex.workspace = true
 rmcp.workspace = true
 quick-xml.workspace = true

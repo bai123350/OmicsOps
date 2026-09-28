@@ -47,6 +47,7 @@ mod remote_jobs_v4;
 pub mod research_commands;
 mod run_ownership;
 mod runtime_approval;
+mod runtime_approval_ast;
 mod runtime_boundary_v4;
 mod runtime_jobs_v4;
 pub mod session_reviews;

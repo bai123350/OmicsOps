@@ -38,7 +38,7 @@ pub(crate) fn ordinary_runtime_call_is_low_risk(arguments: &Value) -> bool {
         return false;
     };
     match language {
-        "python" => python_is_low_risk(&tokens),
+        "python" => python_is_low_risk(&tokens, code),
         "r" => r_is_low_risk(&tokens),
         _ => false,
     }
@@ -111,14 +111,17 @@ pub(crate) fn ordinary_runtime_call_approval_reason(arguments: &Value) -> Option
             let unsupported_os = tokens.iter().enumerate().any(|(i, token)| {
                 is_word(Some(token), "os")
                     && is_mark(tokens.get(i + 1), b'.')
+                    && !is_word(tokens.get(i + 2), "makedirs")
                     && !(is_word(tokens.get(i + 2), "path")
                         && is_mark(tokens.get(i + 3), b'.')
                         && ["join", "getsize", "exists"]
                             .iter()
                             .any(|method| is_word(tokens.get(i + 4), method)))
             });
-            let os_proof_failed =
-                language == "python" && !unsupported_os && !safe_os_path_uses(&tokens);
+            let os_proof_failed = language == "python"
+                && !unsupported_os
+                && tokens.iter().any(|token| is_word(Some(token), "os"))
+                && !super::runtime_approval_ast::safe_os_path_uses(code);
             for (i, token) in tokens.iter().enumerate() {
                 if let Token::String(value) = token {
                     let path_argument = is_mark(tokens.get(i.wrapping_sub(1)), b'/')
@@ -183,11 +186,14 @@ pub(crate) fn ordinary_runtime_call_approval_reason(arguments: &Value) -> Option
                                     add_reason(&mut reasons, ApprovalReason::UnprovenProjectPath);
                                 }
                             }
-                        } else {
+                        } else if !is_word(tokens.get(i + 2), "makedirs") {
                             add_reason(&mut reasons, ApprovalReason::UnsupportedOsOperation);
                         }
                     }
                 }
+            }
+            if os_proof_failed {
+                add_reason(&mut reasons, ApprovalReason::UnprovenProjectPath);
             }
         } else {
             add_reason(&mut reasons, ApprovalReason::UnparseableCode);
@@ -205,7 +211,7 @@ pub(crate) fn ordinary_runtime_call_approval_reason(arguments: &Value) -> Option
     )
 }
 
-fn unsafe_project_path(path: &str) -> bool {
+pub(super) fn unsafe_project_path(path: &str) -> bool {
     let path = path.replace('\\', "/");
     let trimmed = path.trim();
     if trimmed.is_empty()
@@ -417,184 +423,7 @@ fn call_named(tokens: &[Token], i: usize, name: &str) -> bool {
     is_word(tokens.get(i), name) && is_mark(tokens.get(i + 1), b'(')
 }
 
-// This is deliberately a small proof for the common metadata workflow, not a
-// Python evaluator. Unproved syntax keeps the existing approval route.
-fn safe_os_path_uses(tokens: &[Token]) -> bool {
-    let mut names = std::collections::HashSet::new();
-    let mut imported = false;
-    for line in tokens.split(|token| is_mark(Some(token), b'\n')) {
-        // A semicolon can continue a conditional or indented suite after the
-        // first segment. No segment on that line may establish a path proof.
-        let simple_line = !line.iter().any(|token| is_mark(Some(token), b';'));
-        for statement in line.split(|token| is_mark(Some(token), b';')) {
-            if statement.is_empty() {
-                continue;
-            }
-            let mut import_positions = std::collections::HashSet::new();
-            if is_word(statement.first(), "import") {
-                for i in 1..statement.len() {
-                    if is_word(statement.get(i), "os") {
-                        if !(is_word(statement.get(i.wrapping_sub(1)), "import")
-                            || is_mark(statement.get(i.wrapping_sub(1)), b','))
-                            || !(i + 1 == statement.len() || is_mark(statement.get(i + 1), b','))
-                        {
-                            return false;
-                        }
-                        import_positions.insert(i);
-                        imported = true;
-                    }
-                }
-            }
-
-            // A later assignment invalidates a path name, even when its new value
-            // cannot be proved. Only a whole simple statement can establish one.
-            let complex_binding = statement.iter().any(|token| {
-                ["def", "lambda", "for", "case", "class", "import", "del"]
-                    .iter()
-                    .any(|keyword| is_word(Some(token), keyword))
-            });
-            let binding_start = statement
-                .iter()
-                .position(|token| is_word(Some(token), "for") || is_word(Some(token), "as"));
-            let binding_end = binding_start.and_then(|start| {
-                if is_word(statement.get(start), "for") {
-                    statement
-                        .iter()
-                        .enumerate()
-                        .skip(start + 1)
-                        .find(|(_, token)| is_word(Some(token), "in"))
-                        .map(|(i, _)| i)
-                } else {
-                    statement
-                        .iter()
-                        .enumerate()
-                        .skip(start + 1)
-                        .find(|(_, token)| is_mark(Some(token), b':'))
-                        .map(|(i, _)| i)
-                        .or(Some(statement.len()))
-                }
-            });
-            let mut nesting = 0;
-            let mut first_assignment = None;
-            for (i, token) in statement.iter().enumerate() {
-                match token {
-                    Token::Mark(b'(' | b'[' | b'{') => nesting += 1,
-                    Token::Mark(b')' | b']' | b'}') => nesting -= 1,
-                    Token::Mark(b'=') if nesting == 0 => {
-                        first_assignment = Some(i);
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            for i in 0..statement.len() {
-                if let Token::Word(name) = &statement[i] {
-                    let next_is_assignment = is_mark(statement.get(i + 1), b'=')
-                        || (matches!(
-                            statement.get(i + 1),
-                            Some(Token::Mark(
-                                b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b':' | b'@'
-                            ))
-                        ) && is_mark(statement.get(i + 2), b'='));
-                    if next_is_assignment
-                        || is_word(statement.get(i.wrapping_sub(1)), "for")
-                        || is_word(statement.get(i.wrapping_sub(1)), "as")
-                        || binding_start
-                            .zip(binding_end)
-                            .is_some_and(|(start, end)| i > start && i < end)
-                        || first_assignment.is_some_and(|assignment| i < assignment)
-                        || complex_binding
-                    {
-                        names.remove(name);
-                    }
-                }
-            }
-            for (i, token) in statement.iter().enumerate() {
-                if is_word(Some(token), "os") && !import_positions.contains(&i) {
-                    if !imported || safe_os_path_call(statement, i, &names, 0).is_none() {
-                        return false;
-                    }
-                }
-            }
-            if simple_line {
-                if let (Some(Token::Word(name)), Some(Token::Mark(b'='))) =
-                    (statement.first(), statement.get(1))
-                {
-                    if safe_relative_path_expr(statement, 2, &names, 0) == Some(statement.len()) {
-                        names.insert(name.clone());
-                    }
-                }
-            }
-        }
-    }
-    true
-}
-
-fn safe_relative_path_expr(
-    tokens: &[Token],
-    start: usize,
-    names: &std::collections::HashSet<String>,
-    depth: usize,
-) -> Option<usize> {
-    if depth > 4 {
-        return None;
-    }
-    match tokens.get(start)? {
-        Token::String(value) if !value.contains('\\') && !unsafe_project_path(value) => {
-            Some(start + 1)
-        }
-        Token::Word(name) if names.contains(name) => Some(start + 1),
-        Token::Word(name) if name == "os" => {
-            let (method, end) = safe_os_path_call(tokens, start, names, depth + 1)?;
-            (method == "join").then_some(end)
-        }
-        _ => None,
-    }
-}
-
-fn safe_os_path_call<'a>(
-    tokens: &'a [Token],
-    start: usize,
-    names: &std::collections::HashSet<String>,
-    depth: usize,
-) -> Option<(&'a str, usize)> {
-    if depth > 4
-        || !is_word(tokens.get(start), "os")
-        || !is_mark(tokens.get(start + 1), b'.')
-        || !is_word(tokens.get(start + 2), "path")
-        || !is_mark(tokens.get(start + 3), b'.')
-        || !is_mark(tokens.get(start + 5), b'(')
-    {
-        return None;
-    }
-    let Token::Word(method) = tokens.get(start + 4)? else {
-        return None;
-    };
-    if method != "join" && method != "getsize" && method != "exists" {
-        return None;
-    }
-    let mut cursor = start + 6;
-    let mut arguments = 0;
-    loop {
-        cursor = safe_relative_path_expr(tokens, cursor, names, depth + 1)?;
-        arguments += 1;
-        if is_mark(tokens.get(cursor), b')') {
-            break;
-        }
-        if !is_mark(tokens.get(cursor), b',') {
-            return None;
-        }
-        cursor += 1;
-    }
-    if ((method == "getsize" || method == "exists") && arguments != 1)
-        || (method == "join" && arguments < 2)
-    {
-        return None;
-    }
-    Some((method, cursor + 1))
-}
-
-fn python_is_low_risk(tokens: &[Token]) -> bool {
+fn python_is_low_risk(tokens: &[Token], code: &str) -> bool {
     const RISKY_IMPORTS: &[&str] = &[
         "subprocess",
         "socket",
@@ -640,7 +469,8 @@ fn python_is_low_risk(tokens: &[Token]) -> bool {
         "chdir",
     ];
     const MUTATING_HTTP: &[&str] = &["post", "put", "patch", "delete"];
-    if !safe_os_path_uses(tokens) {
+    if tokens.iter().any(|token| is_word(Some(token), "os"))
+        && !super::runtime_approval_ast::safe_os_path_uses(code) {
         return false;
     }
     let mut path_names = std::collections::HashSet::new();
@@ -968,7 +798,7 @@ L = [f"| {r['title'].replace('|', '\\|')} |" for r in data.get("resultList", {})
 (OUT / "raw.json").write_text(json.dumps(data), encoding="utf-8")
 "#;
         let tokens = lex(code, false, 0).expect("representative Python tokenizes");
-        assert!(python_is_low_risk(&tokens), "{tokens:?}");
+        assert!(python_is_low_risk(&tokens, code), "{tokens:?}");
         assert!(ordinary_runtime_call_is_low_risk(&python(code)));
     }
 
@@ -1001,14 +831,145 @@ print(json.dumps({"rows": len(rows), "bytes": size}))
     }
 
     #[test]
-    fn approval_reason_does_not_guess_which_path_failed() {
+    fn project_date_named_output_is_ordinary() {
+        let code = r#"
+import csv, datetime, json, os, urllib.request
+now = datetime.datetime.now(datetime.timezone.utc)
+today = now.strftime('%Y-%m-%d')
+out_dir = 'results/literature'
+os.makedirs(out_dir, exist_ok=True)
+out_path = 'results/literature/review_%s.json' % today.replace('-', '')
+request = urllib.request.Request('https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=mirna', headers={'Accept': 'application/json'})
+with urllib.request.urlopen(request, timeout=60) as response:
+    papers = json.load(response)
+with open(out_path, 'w', encoding='utf-8') as handle:
+    json.dump(papers, handle)
+print(os.path.getsize(out_path))
+"#;
+        let args = python(code);
+        assert!(ordinary_runtime_call_is_low_risk(&args));
+        assert_eq!(ordinary_runtime_call_approval_reason(&args), None);
+    }
+
+    #[test]
+    fn proven_project_directories_and_date_parts_are_ordinary() {
+        for code in [
+            "import os\nos.makedirs('results/review')",
+            "import os\nos.makedirs(os.path.join('.', 'results'), exist_ok=True)",
+            "import os\nos.makedirs(os.path.join('results', 'review'), exist_ok=False)",
+            "import os\nroot = 'results/review'\nos.makedirs(root, exist_ok=True)",
+            "import os, datetime\nstamp = datetime.datetime.now().strftime('%Y%m%d')\np = 'results/review/report_%s.json' % stamp\nprint(os.path.exists(p))",
+            "import datetime, os\nclock = datetime.datetime.now(datetime.timezone.utc)\npart = clock.strftime('batch_%Y-%m-%d').replace('-', '_')\np = 'results/review/%s.json' % part\nprint(os.path.getsize(p))",
+            "import os, datetime\ninstant = datetime.datetime.now()\na = instant.strftime('%Y%m%d')\nb = instant.strftime('%H%M%S')\np = 'results/review/%s_%s.json' % (a, b)\nprint(os.path.getsize(p))",
+            "import os, datetime\ninstant = datetime.datetime.now()\npart = instant.strftime('%Y%m%d')\np = os.path.join(os.path.join('results', 'review'), part)\nprint(os.path.exists(p))",
+        ] {
+            assert!(ordinary_runtime_call_is_low_risk(&python(code)), "{code}");
+        }
+    }
+
+    #[test]
+    fn unproved_date_paths_and_directory_options_require_approval() {
+        for code in [
+            "import os\nos.makedirs('../outside', exist_ok=True)",
+            "import os\nos.makedirs('C:/outside', exist_ok=True)",
+            "import os\nos.makedirs('.git/hooks', exist_ok=True)",
+            "import os\nos.makedirs('results', mode=0o777)",
+            "import os\nos.makedirs('results', extra=True)",
+            "import os\nos.makedirs('results', exist_ok=flag)",
+            "import os\nos.makedirs('results', True)",
+            "import os\nos.makedirs('results', exist_ok=True, exist_ok=False)",
+            "import os\nos.makedirs('results', *arguments)",
+            "import os\nos.makedirs('results', **options)",
+            "import os\nos.makedirs(os.path.getsize('results/a'))",
+            "import os\nos.makedirs(os.path.exists('results/a'))",
+            "import os\nos.remove('results/a')",
+            "from os import makedirs as mk\nmk('../outside')",
+            "import os, datetime\nnow = datetime.datetime.now(datetime.timezone.utc)\nd = now.strftime('%Y/%m/%d')\np = 'results/%s.json' % d\nprint(os.path.getsize(p))",
+            "import os, datetime\nnow = datetime.datetime.now()\nd = now.strftime('secrets')\np = 'results/%s/file' % d\nprint(os.path.exists(p))",
+            "import os, datetime\nnow = datetime.datetime.now()\nd = now.strftime('%Y').replace('2026', 'secrets')\np = os.path.join('results', d, 'file')\nprint(os.path.exists(p))",
+            "import os, datetime\nnow = datetime.datetime.now(datetime.timezone.utc)\nd = now.strftime('%Y-%m-%d')\np = '%s.json' % d\nprint(os.path.getsize(p))",
+            "import os, datetime\nnow = datetime.datetime.now(datetime.timezone.utc)\nd = now.strftime('%Y-%m-%d')\np = 'results/%s.json' % d\np = unknown\nprint(os.path.getsize(p))",
+            "import os, datetime\nnow = datetime.datetime.now(datetime.timezone.utc)\nd = now.strftime('%Y-%m-%d')\np = 'results/%s.json' % d\nprint(os.path.getsize(p))\nos.remove(p)",
+            "import os\npart = response['name']\np = 'results/%s.json' % part\nprint(os.path.getsize(p))",
+            "import os\npart = config['path'].replace('/', '')\np = 'results/%s.json' % part\nprint(os.path.getsize(p))",
+            "import os\np = f'results/{response[\"name\"]}.json'\nprint(os.path.getsize(p))",
+            "open(f'/tmp/{response[\"name\"]}.json', 'w')",
+            "import os\np = os.path.getsize('results/a.json')\nprint(os.path.getsize(p))",
+            "import os, datetime\nnow = datetime.datetime.now(1)\nd = now.strftime('%Y%m%d')\np = 'results/%s.json' % d\nprint(os.path.exists(p))",
+            "import os, datetime\nnow = datetime.datetime.now(datetime.timezone.utc, 1)\nd = now.strftime('%Y%m%d')\np = 'results/%s.json' % d\nprint(os.path.exists(p))",
+            "import os, datetime\nnow = datetime.datetime.now()\nd = now.strftime('%Y%m%d')\np = 'results/%s.json' % (1,)\nprint(os.path.exists(p))",
+            "import os, datetime\nnow = datetime.datetime.now()\nd = now.strftime('%Y%m%d')\np = 'results/%s%s.json' % d\nprint(os.path.exists(p))",
+            "import os, datetime\nnow = datetime.datetime.now()\nd = now.strftime('%Y%m%d')\np = 'results/%02s.json' % d\nprint(os.path.exists(p))",
+            "import os, datetime\nnow = datetime.datetime.now()\nd = now.strftime('%Y%m%d')\np = 'results/%s.json' % (d, unknown)\nprint(os.path.exists(p))",
+            "import os, datetime\nnow = datetime.datetime.now()\nd = now.strftime('%Y%m%d')\np = 'results/%s.json' % d\ndatetime = unknown\nprint(os.path.exists(p))",
+            "import os, datetime\nnow = datetime.datetime.now()\ndatetime.datetime = unknown\nd = now.strftime('%Y%m%d')\np = 'results/%s.json' % d\nprint(os.path.exists(p))",
+            "import os, datetime\ndatetime.datetime = custom\nimport datetime\nnow = datetime.datetime.now()\nd = now.strftime('%Y%m%d')\np = 'results/%s.json' % d\nprint(os.path.exists(p))",
+            "import os, datetime\nnow = datetime.datetime.now(datetime.timezone.utc)\ndatetime.timezone.utc = unknown\nd = now.strftime('%Y%m%d')\np = 'results/%s.json' % d\nprint(os.path.exists(p))",
+            "import os, datetime\nnow = datetime.datetime.now()\nnow.strftime = unknown\nd = now.strftime('%Y%m%d')\np = 'results/%s.json' % d\nprint(os.path.exists(p))",
+            "import os, datetime\nnow = datetime.datetime.now()\nd = now.strftime('%Y%m%d')\nd.replace = unknown\np = 'results/%s.json' % d.replace('-', '')\nprint(os.path.exists(p))",
+            "import os, datetime\nnow = datetime.datetime.now()\nd = now.strftime('%Y%m%d')\nif condition:\n    p = 'results/%s.json' % d\nprint(os.path.exists(p))",
+            "import os, datetime\nnow = datetime.datetime.now()\nfor now in values:\n    pass\nd = now.strftime('%Y%m%d')\np = 'results/%s.json' % d\nprint(os.path.exists(p))",
+            "import os, datetime\nnow = datetime.datetime.now()\ndef f(now):\n    d = now.strftime('%Y%m%d')\n    p = 'results/%s.json' % d\n    return os.path.exists(p)",
+            "import os, datetime\nnow = datetime.datetime.now()\ndef f(datetime):\n    d = datetime.datetime.now().strftime('%Y%m%d')\n    p = 'results/%s.json' % d\n    return os.path.exists(p)",
+            "import os, datetime\nnow = datetime.datetime.now()\nwith source as datetime:\n    p = 'results/%s.json' % now.strftime('%Y%m%d')\n    print(os.path.exists(p))",
+            "import os, datetime\nnow = datetime.datetime.now()\nsink(datetime)\nd = now.strftime('%Y%m%d')\np = 'results/%s.json' % d\nprint(os.path.exists(p))",
+            "import os, datetime\nnow = datetime.datetime.now()\nd = now.strftime('%Y%m%d')\np = 'results/%s.json' % d\nos = unknown\nprint(os.path.exists(p))",
+            "import os, datetime\nnow = datetime.datetime.now()\nd = now.strftime('%Y%m%d')\np = 'results/%s.json' % d\nos.path.exists = unknown\nprint(os.path.exists(p))",
+            "import os\nos.makedirs(p)\np = 'results/safe'",
+            "os.makedirs('results/safe')\nimport os",
+            "import os, datetime\nd = now.strftime('%Y%m%d')\nnow = datetime.datetime.now()\np = 'results/%s.json' % d\nprint(os.path.exists(p))",
+            "import os\nos.makedirs('.git /hooks')",
+            "import os\nos.makedirs('credentials./x')",
+            "import os, datetime\nd = datetime.datetime.now().strftime('%Y%m%d')\np = 'results/%s/credentials./x' % d\nprint(os.path.exists(p))",
+            "import os, datetime\nd = datetime.datetime.now().strftime('%Y%m%d')\np = os.path.join('results', d, '.git /hooks')\nprint(os.path.exists(p))",
+            "import os, datetime, sys\nsys.modules['datetime'].datetime = factory\nd = datetime.datetime.now().strftime('%Y%m%d')\np = 'results/%s.json' % d\nprint(os.path.exists(p))",
+            "import os, datetime, sys\nsys.modules['os'].makedirs = factory\nos.makedirs('results/safe')",
+            "import os, datetime\nfrom sys import modules as m\nm['datetime'].datetime = factory\nd = datetime.datetime.now().strftime('%Y%m%d')\np = 'results/%s.json' % d\nprint(os.path.exists(p))",
+            "import os, datetime, sys\nvars(sys)['modules']['datetime'].datetime = factory\nd = datetime.datetime.now().strftime('%Y%m%d')\np = 'results/%s.json' % d\nprint(os.path.exists(p))",
+            "import os\np = 'results/safe'\ndef f[p]():\n    return os.path.exists(p)",
+            "import os\np = 'results/safe'\nimport p.child\nprint(os.path.exists(p))",
+        ] {
+            assert!(!ordinary_runtime_call_is_low_risk(&python(code)), "{code}");
+        }
+    }
+
+    #[test]
+    fn date_replace_expansion_stays_within_proof_budget() {
+        let large = "a".repeat(1000);
+        let code = format!(
+            "import os, datetime\nd = datetime.datetime.now().strftime('%Ya').replace('a', '{large}')\ne = d.replace('a', '{large}')\np = 'results/%s.json' % e\nprint(os.path.exists(p))"
+        );
+        assert!(!ordinary_runtime_call_is_low_risk(&python(&code)));
+    }
+
+    #[test]
+    fn ast_path_proof_rejects_oversized_or_deep_inputs() {
+        let oversized = format!("import os\n{}os.makedirs('results')", "pass\n".repeat(6600));
+        let nested = format!(
+            "import os\nos.makedirs({}'results'{})",
+            "(".repeat(65),
+            ")".repeat(65)
+        );
+        let long_expression = format!(
+            "import os\nx = 1{}\nos.makedirs('results')",
+            "**1".repeat(270)
+        );
+        for code in [&oversized, &nested, &long_expression] {
+            assert!(!ordinary_runtime_call_is_low_risk(&python(code)));
+        }
+    }
+
+
+
+    #[test]
+    fn approval_reason_for_unproven_path_keeps_source_private() {
         let code = "import os\nos.makedirs('results/PRIVATE_SENTINEL', exist_ok=True)\nout = 'results/PRIVATE_SENTINEL_%s.json' % unknown\nprint(os.path.getsize(out))";
         let args = python(code);
         assert!(!ordinary_runtime_call_is_low_risk(&args));
         let reason = ordinary_runtime_call_approval_reason(&args).unwrap();
-        assert!(reason.contains("Unsupported OS operation"), "{reason}");
+        assert!(reason.contains("Project path cannot be proven"), "{reason}");
         assert!(
-            !reason.contains("Project path cannot be proven"),
+            !reason.contains("Unsupported OS operation"),
             "{reason}"
         );
         assert!(!reason.contains("PRIVATE_SENTINEL"));
@@ -1032,7 +993,7 @@ print(json.dumps({"rows": len(rows), "bytes": size}))
     #[test]
     fn unrelated_os_operation_does_not_mislabel_a_proven_path() {
         let args = python(
-            "import os\np = 'results/a.txt'\nos.makedirs('results')\nprint(os.path.getsize(p))",
+            "import os\np = 'results/a.txt'\nos.listdir('results')\nprint(os.path.getsize(p))",
         );
         let reason = ordinary_runtime_call_approval_reason(&args).unwrap();
         assert!(reason.contains("Unsupported OS operation"));
@@ -1044,7 +1005,7 @@ print(json.dumps({"rows": len(rows), "bytes": size}))
 
     #[test]
     fn ordinary_variable_name_is_not_reported_as_a_dangerous_call() {
-        let args = python("rename = 1\nimport os\nos.makedirs('results')");
+        let args = python("rename = 1\nimport os\nos.listdir('results')");
         let reason = ordinary_runtime_call_approval_reason(&args).unwrap();
         assert!(reason.contains("Unsupported OS operation"));
         assert!(
