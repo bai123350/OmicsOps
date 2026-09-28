@@ -471,10 +471,17 @@ export function WorkspaceShell({ project, locale, onOpenSettings, onBackToProjec
   const pendingActiveModel = pendingModelRequest(activeRunEventsV4);
   const currentModelActivity = agentModelActivity?.run_id === effectiveActiveRunId
     && agentModelActivity.attempt_id === pendingActiveModel?.attemptId ? agentModelActivity : null;
+  const activeRunTool = mergeV4ToolCalls(activeRunEventsV4).filter((tool) => tool.status === "requested" || tool.status === "running").at(-1);
   const persistedActivityMs = activeRunLastActivityAt ? Date.parse(activeRunLastActivityAt) : Number.NaN;
+  const latestEventMs = Date.parse(activeRunEventsV4.at(-1)?.occurred_at ?? "");
   const transientActivityMs = currentModelActivity ? Date.parse(currentModelActivity.received_at) : Number.NaN;
-  const lastActivityMs = Number.isFinite(transientActivityMs) ? Math.max(persistedActivityMs || 0, transientActivityMs) : persistedActivityMs;
-  const runStalled = runActive && Number.isFinite(lastActivityMs) && watchdogNow - lastActivityMs > AGENT_STALL_THRESHOLD_MS;
+  const lastActivityMs = Math.max(...[persistedActivityMs, latestEventMs, transientActivityMs].filter(Number.isFinite));
+  const toolActivityMs = activeRunTool ? Math.max(...[
+    Date.parse(activeRunTool.startedAt ?? ""),
+    activeRunTool.toolId === "agent.delegate" ? Date.parse(activeRunTool.lastProgressAt ?? "") : Number.NaN,
+  ].filter(Number.isFinite)) : Number.NaN;
+  const stalledTool = runActive && !pendingActiveModel && Number.isFinite(toolActivityMs) && watchdogNow - toolActivityMs > AGENT_STALL_THRESHOLD_MS ? activeRunTool : null;
+  const runStalled = runActive && (Boolean(stalledTool) || (Number.isFinite(lastActivityMs) && watchdogNow - lastActivityMs > AGENT_STALL_THRESHOLD_MS));
   // A paused run still owns the conversation sequence. Keep the composer
   // locked while approval/input cards remain usable inside the run trace.
   const existingComposerDisabled = fileReferenceBusy || composerBusy || conversationHydrating || sendBusy || agentBusy || conversationLocked || (runStarted && !runFinished);
@@ -721,13 +728,13 @@ export function WorkspaceShell({ project, locale, onOpenSettings, onBackToProjec
   }, [searchRequest, project.id, activeConversationId, composerDisabled, selectedReferences, zh, onSearchRequestHandled]);
   useEffect(() => { if (showPlanPanel) openSidebarSection("plan", false); }, [showPlanPanel]);
   useEffect(() => {
-    if (!runActive || !activeRunLastActivityAt) {
+    if (!runActive || !Number.isFinite(lastActivityMs)) {
       setWatchdogNow(Date.now());
       return;
     }
     const timer = window.setInterval(() => setWatchdogNow(Date.now()), 1_000);
     return () => window.clearInterval(timer);
-  }, [runActive, activeRunLastActivityAt]);
+  }, [runActive, lastActivityMs]);
 
   useEffect(() => {
     const stream = messageStreamRef.current;
@@ -1064,7 +1071,13 @@ export function WorkspaceShell({ project, locale, onOpenSettings, onBackToProjec
         {visibleActiveRunEventsV4.length > 0 && <V4RunTrace locale={locale} events={visibleActiveRunEventsV4} onOpenRuntime={openRunRuntime} previewText={agentTextPreview?.run_id === effectiveActiveRunId ? agentTextPreview.text : null} reasoningPreview={agentReasoningPreview?.run_id === effectiveActiveRunId ? agentReasoningPreview : null} modelActivity={currentModelActivity} onAnswer={onAnswerAgentQuestionV4} onDecideApproval={onDecideToolApprovalV4} onResolveUncertain={onResolveUncertainV4} onResume={onResumeAgentRunV4} onCancelRecovery={onCancelRuntimeRecoveryV4} onCloseBrowserTabs={onCloseBrowserRunTabsV4} />}
         {!composerDisabled && effectiveActiveRunId && onSuggestFollowUps && effectiveTerminalAgentEventV4(activeRunEventsV4)?.event.kind === "run_completed" && <FollowUpQuestions key={`${project.id}:${activeConversationId}:${effectiveActiveRunId}`} runId={effectiveActiveRunId} generate={onSuggestFollowUps} onChoose={(question) => { setDraft(question); }} locale={locale} />}
         {runStarted && agentRunEventsV4.length === 0 && <article className="message assistant-message agent-pending" role="status"><div className="assistant-avatar"><Bot size={17} /></div><div><strong>OmicsOps Agent</strong><p>{zh ? "V4 运行正在启动…" : "Starting the V4 run…"}</p></div></article>}
-        {runStalled && <div className="agent-retry-notice" role="status"><span>{zh ? "超过 90 秒未收到模型数据或 Agent 事件，任务可能卡住；仍可终止运行。" : "No model data or Agent event has arrived for 90 seconds; the run may be stuck. You can still stop it."}</span></div>}
+        {runStalled && <div className="agent-retry-notice" role="status"><span>{stalledTool?.status === "running"
+          ? (zh ? `工具 ${stalledTool.toolId} 已运行超过 90 秒，仍未返回结果或中间进度；无法确认计算进度。可请求终止运行，远端计算是否停止需核实。` : `Tool ${stalledTool.toolId} has run for over 90 seconds without a result or intermediate progress; computation progress is unknown. You can request to stop the run; verify whether remote computation has stopped.`)
+          : stalledTool
+            ? (zh ? `工具 ${stalledTool.toolId} 请求已等待超过 90 秒，尚未收到派发或结果事件；无法确认执行是否开始。可请求终止运行，远端计算是否停止需核实。` : `Tool ${stalledTool.toolId} has been requested for over 90 seconds without a dispatch or result event; execution start is unconfirmed. You can request to stop the run; verify whether remote computation has stopped.`)
+          : pendingActiveModel
+            ? (zh ? "超过 90 秒未收到模型数据或 Agent 事件，模型响应可能停滞；仍可终止运行。" : "No model data or Agent event has arrived for 90 seconds; the model response may be stalled. You can still stop the run.")
+            : (zh ? "超过 90 秒未收到模型数据或 Agent 事件，任务可能卡住；仍可终止运行。" : "No model data or Agent event has arrived for 90 seconds; the run may be stuck. You can still stop it.")}</span></div>}
         {!onSend && <article className="task-card"><div className="task-icon"><Activity size={18} /></div><div className="task-body"><div><strong>{t.task}</strong><span>65%</span></div><p>{zh ? "远端 Linux · 8 CPU · 32 GiB · 低风险" : "Remote Linux · 8 CPU · 32 GiB · low risk"}</p><div className="task-progress"><i /></div><div className="task-actions"><button>{zh ? "查看日志" : "View logs"}</button><button>{zh ? "查看计划" : "View plan"}</button></div></div></article>}
       {!followingLatest && <button className="back-to-latest" onClick={() => {
         const stream = messageStreamRef.current;
@@ -1266,7 +1279,7 @@ function V4RunTrace({ locale, events, previewText, reasoningPreview, modelActivi
   const duration = Number.isFinite(runStartedAtMs) && Number.isFinite(runEndedAtMs)
     ? formatDuration(Math.max(0, runEndedAtMs - runStartedAtMs)) : "";
   const unresolvedDispatchFailure = (!terminal || terminal.event.kind === "run_needs_attention" || terminal.event.kind === "run_failed") && events.some(({ event }) => event.kind === "tool_dispatch_uncertain" && !isV4UncertainResolved(events, event.call_id));
-  const status = unresolvedDispatchFailure ? (zh ? "失败" : "Failed") : terminal?.event.kind === "run_completed" ? (zh ? "已完成" : "Completed") : terminal?.event.kind === "run_cancelled" ? (zh ? "已终止" : "Cancelled") : terminal?.event.kind === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention") : terminal?.event.kind === "run_failed" ? (zh ? "失败" : "Failed") : pauseReason === "approval" ? (zh ? "等待工具审批" : "Waiting for approval") : pauseReason === "input" ? (zh ? "等待回答" : "Waiting for input") : pauseReason === "browser_connection" ? (zh ? "等待连接浏览器" : "Waiting for browser") : pauseReason === "browser_human" ? (zh ? "等待人工处理浏览器" : "Waiting for browser intervention") : pauseReason === "runtime_recovery" ? (zh ? "结果待恢复" : "Results ready to resume") : pendingModel && previewText ? (zh ? "正在生成回复" : "Generating response") : recentActivity === "reasoning" ? (zh ? "模型正在推理" : "Model reasoning") : recentActivity === "tool_call" ? (zh ? "模型正在准备工具" : "Preparing tools") : recentActivity === "retrying" ? (zh ? "模型正在重试" : "Retrying model") : pendingModel && reasoningText ? (zh ? "等待模型继续输出" : "Waiting for more model output") : pendingModel ? (zh ? "等待模型响应" : "Waiting for model") : (zh ? "运行中" : "Running");
+  const status = unresolvedDispatchFailure ? (zh ? "失败" : "Failed") : terminal?.event.kind === "run_completed" ? (zh ? "已完成" : "Completed") : terminal?.event.kind === "run_cancelled" ? (zh ? "已终止" : "Cancelled") : terminal?.event.kind === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention") : terminal?.event.kind === "run_failed" ? (zh ? "失败" : "Failed") : pauseReason === "approval" ? (zh ? "等待工具审批" : "Waiting for approval") : pauseReason === "input" ? (zh ? "等待回答" : "Waiting for input") : pauseReason === "browser_connection" ? (zh ? "等待连接浏览器" : "Waiting for browser") : pauseReason === "browser_human" ? (zh ? "等待人工处理浏览器" : "Waiting for browser intervention") : pauseReason === "runtime_recovery" ? (zh ? "结果待恢复" : "Results ready to resume") : pendingModel && previewText ? (zh ? "正在生成回复" : "Generating response") : recentActivity === "reasoning" ? (zh ? "模型正在推理" : "Model reasoning") : recentActivity === "tool_call" ? (zh ? "模型正在准备工具" : "Preparing tools") : recentActivity === "retrying" ? (zh ? "模型正在重试" : "Retrying model") : pendingModel && reasoningText ? (zh ? "等待模型继续输出" : "Waiting for more model output") : pendingModel ? (zh ? "等待模型响应" : "Waiting for model") : activeTool?.status === "running" ? (zh ? "正在运行工具" : "Running tool") : activeTool ? (zh ? "准备执行工具" : "Preparing tool") : (zh ? "运行中" : "Running");
   const shouldExpand = !historical && !terminal;
   async function resumeRun() {
     if (!onResume || !events[0] || resumeBusyRef.current) return;
@@ -1295,7 +1308,7 @@ function V4RunTrace({ locale, events, previewText, reasoningPreview, modelActivi
     <section className="v4-conversation-run" aria-label={zh ? "分析对话" : "Analysis conversation"}>
     {onOpenRuntime && events[0] && <button type="button" className="v4-run-runtime-button" onClick={() => onOpenRuntime(events[0].run_id)}>{zh ? "运行环境" : "Run environment"}</button>}
     {pendingModel && <div className="v4-live-activity" role="status" aria-label={zh ? "当前模型活动" : "Current model activity"}><span className="agent-working"><i />{status}</span><small role="timer" aria-live="off">{zh ? "本次请求" : "This request"} {modelWaitDuration}</small></div>}
-    {!pendingModel && activeTool && <div className="v4-live-activity" role="status" aria-label={zh ? "当前工具活动" : "Current tool activity"}><span className="agent-working"><i />{zh ? "正在运行工具" : "Running tool"} · {activeTool.toolId === "use_skill" ? skillDisplayName(activeTool, zh) : compactToolLabel(activeTool.toolId)}</span>{toolWaitDuration && <small role="timer" aria-live="off">{toolWaitDuration}</small>}</div>}
+    {!pendingModel && activeTool && <div className="v4-live-activity" role="status" aria-label={zh ? "当前工具活动" : "Current tool activity"}><span className="agent-working"><i />{activeTool.status === "running" ? (zh ? "正在运行工具" : "Running tool") : (zh ? "准备执行工具" : "Preparing tool")} · {activeTool.toolId === "use_skill" ? skillDisplayName(activeTool, zh) : compactToolLabel(activeTool.toolId)}</span>{toolWaitDuration && <small role="timer" aria-live="off">{toolWaitDuration}</small>}</div>}
     <details className={`agent-run-fold agent-v4-run ${historical ? "" : "is-active"}`} open={shouldExpand}>
       <summary><span className="agent-run-fold-title"><span className="v4-process-mark" aria-hidden="true" /><span><b>{zh ? "执行过程" : terminal ? "Processed" : "Processing"}</b><small>{terminal ? (zh ? "工具调用与验证记录" : "Tool calls and verification") : (zh ? "Agent 正在处理任务" : "Agent is working")}</small></span></span><span>{status} · {tools.length} {zh ? "个步骤" : tools.length === 1 ? "step" : "steps"}{duration && ` · ${duration}`}</span></summary>
       <div className="agent-run-fold-body">
@@ -1474,6 +1487,7 @@ type MergedV4ToolCall = {
   lastSequence: number;
   outcome?: string;
   startedAt?: string;
+  lastProgressAt?: string;
   finishedAt?: string;
   subject?: string;
   status: "requested" | "running" | "succeeded" | "failed" | "reused";
@@ -1500,15 +1514,19 @@ function mergeV4ToolCalls(events: AgentRunEventV4[]): MergedV4ToolCall[] {
     const event = item.event;
     if (event.kind === "tool_requested") update(event.call.call_id, item.sequence, event.call.tool_id, event.call.arguments, "requested");
     else if (event.kind === "tool_dispatch_started") update(event.call_id, item.sequence, event.tool_id, undefined, "running");
+    else if (event.kind === "delegation_graph_started") update(event.call_id, item.sequence, "agent.delegate", undefined, "running");
     else if (event.kind === "tool_dispatch_uncertain") update(event.call_id, item.sequence, event.tool_id, undefined, "failed", "Tool call failed; see diagnostic details. Automatic retry disabled.");
     else if (event.kind === "tool_finished") update(event.outcome.call_id, item.sequence, event.outcome.tool_id, undefined, event.outcome.succeeded ? "succeeded" : "failed", formatToolOutput(event.outcome.model_content));
     else if (event.kind === "tool_outcome_reused") update(event.outcome.call_id, item.sequence, event.outcome.tool_id, undefined, "reused", formatToolOutput(event.outcome.model_content));
   }
   for (const item of events) {
     const event = item.event;
-    if (event.kind === "tool_requested" || event.kind === "tool_dispatch_started") {
+    if (event.kind === "tool_requested" || event.kind === "tool_dispatch_started" || event.kind === "delegation_graph_started") {
       const tool = byCall.get(event.kind === "tool_requested" ? event.call.call_id : event.call_id);
-      if (tool && (event.kind === "tool_dispatch_started" || !tool.startedAt)) tool.startedAt = item.occurred_at;
+      if (tool && (event.kind !== "tool_requested" || !tool.startedAt)) tool.startedAt = item.occurred_at;
+    } else if (event.kind === "delegation_node_finished" || event.kind === "delegation_graph_finished") {
+      const tool = byCall.get(event.call_id);
+      if (tool?.toolId === "agent.delegate") tool.lastProgressAt = item.occurred_at;
     } else if (event.kind === "tool_finished") {
       const tool = byCall.get(event.outcome.call_id);
       if (tool) tool.finishedAt = item.occurred_at;

@@ -494,6 +494,106 @@ describe("WorkspaceShell", () => {
     expect(screen.getByRole("status")).toHaveTextContent("超过 90 秒未收到模型数据或 Agent 事件");
     expect(screen.getByRole("button", { name: "终止运行" })).toBeInTheDocument();
   });
+  it("identifies a silent runtime tool as an unconfirmed execution rather than a stalled model", () => {
+    const lastActivity = new Date(Date.now() - 151_000).toISOString();
+    const base = { schema_version: 4 as const, run_id: "run-long-tool", project_id: project.id, conversation_id: "conversation-1", occurred_at: lastActivity, previous_hash: "", event_hash: "a".repeat(64) };
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId={base.run_id} activeRunLastActivityAt={lastActivity} onCancelRun={vi.fn()} agentRunEventsV4={[
+      { ...base, sequence: 1, event: { kind: "tool_requested" as const, call: { call_id: "cell-1", tool_id: "runtime.execute", arguments: { language: "python", code: "print(1)" } } } },
+      { ...base, sequence: 2, event: { kind: "tool_dispatch_started" as const, call_id: "cell-1", tool_id: "runtime.execute", effect: "runtime", idempotency_key: "cell-1" } },
+    ]} />);
+
+    expect(screen.getByText("执行过程").closest("summary")).toHaveTextContent("正在运行工具");
+    expect(screen.getByRole("status", { name: "当前工具活动" })).toHaveTextContent("execute");
+    expect(screen.getByText(/工具 runtime.execute 已运行超过 90 秒/)).toHaveTextContent("无法确认计算进度");
+    expect(screen.getByText(/工具 runtime.execute 已运行超过 90 秒/)).toHaveTextContent("远端计算是否停止需核实");
+    expect(screen.queryByText(/未收到模型数据或 Agent 事件/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "终止运行" })).toBeInTheDocument();
+  });
+  it("keeps a recent runtime dispatch in the tool phase without a silence warning", () => {
+    const started = new Date(Date.now() - 30_000).toISOString();
+    render(<WorkspaceShell project={project} locale="en-US" runStarted activeRunId="run-recent-tool" activeRunLastActivityAt={started} agentRunEventsV4={[
+      { schema_version: 4, run_id: "run-recent-tool", project_id: project.id, conversation_id: "conversation-1", sequence: 1, occurred_at: started, previous_hash: "", event_hash: "a".repeat(64), event: { kind: "tool_dispatch_started", call_id: "cell-1", tool_id: "runtime.execute", effect: "runtime", idempotency_key: "cell-1" } },
+    ]} />);
+
+    expect(screen.getByText("Processing").closest("summary")).toHaveTextContent("Running tool");
+    expect(screen.queryByText(/has run for over 90 seconds/)).not.toBeInTheDocument();
+  });
+  it("shows a requested tool as pending dispatch until execution starts", () => {
+    const now = new Date().toISOString();
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-requested-tool" activeRunLastActivityAt={now} agentRunEventsV4={[
+      { schema_version: 4, run_id: "run-requested-tool", project_id: project.id, conversation_id: "conversation-1", sequence: 1, occurred_at: now, previous_hash: "", event_hash: "a".repeat(64), event: { kind: "tool_requested", call: { call_id: "cell-1", tool_id: "runtime.execute", arguments: { language: "python", code: "print(1)" } } } },
+    ]} />);
+    expect(screen.getByText("执行过程").closest("summary")).toHaveTextContent("准备执行工具");
+    expect(screen.getByRole("status", { name: "当前工具活动" })).toHaveTextContent("准备执行工具");
+  });
+  it("does not claim a silent requested tool was dispatched", () => {
+    const old = new Date(Date.now() - 100_000).toISOString();
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId="run-request-pending" activeRunLastActivityAt={old} agentRunEventsV4={[
+      { schema_version: 4, run_id: "run-request-pending", project_id: project.id, conversation_id: "conversation-1", sequence: 1, occurred_at: old, previous_hash: "", event_hash: "a".repeat(64), event: { kind: "tool_requested", call: { call_id: "cell-1", tool_id: "runtime.execute", arguments: { language: "python", code: "print(1)" } } } },
+    ]} />);
+    expect(screen.getByText(/工具 runtime.execute 请求已等待超过 90 秒/)).toHaveTextContent("尚未收到派发或结果事件");
+    expect(screen.queryByText(/工具 runtime.execute 已运行超过/)).not.toBeInTheDocument();
+  });
+  it("recognizes delegation graph start and recent node completion as active tool progress", () => {
+    const requestedAt = new Date(Date.now() - 100_000).toISOString();
+    const graphStartedAt = new Date(Date.now() - 99_000).toISOString();
+    const nodeFinishedAt = new Date(Date.now() - 1_000).toISOString();
+    const base = { schema_version: 4 as const, run_id: "run-delegation", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "a".repeat(64) };
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId={base.run_id} activeRunLastActivityAt={nodeFinishedAt} agentRunEventsV4={[
+      { ...base, sequence: 1, occurred_at: requestedAt, event: { kind: "tool_requested" as const, call: { call_id: "delegate-1", tool_id: "agent.delegate", arguments: { graph: {} } } } },
+      { ...base, sequence: 2, occurred_at: graphStartedAt, event: { kind: "delegation_graph_started" as const, call_id: "delegate-1", graph: {} } },
+      { ...base, sequence: 3, occurred_at: nodeFinishedAt, event: { kind: "delegation_node_finished" as const, call_id: "delegate-1", outcome: {} } },
+    ]} />);
+
+    expect(screen.getByText("执行过程").closest("summary")).toHaveTextContent("正在运行工具");
+    expect(screen.getByRole("status", { name: "当前工具活动" })).toHaveTextContent("agent");
+    expect(screen.queryByText(/超过 90 秒/)).not.toBeInTheDocument();
+  });
+  it("uses a restarted delegation graph after an older node result for silence timing", () => {
+    const requestedAt = new Date(Date.now() - 200_000).toISOString();
+    const firstGraphAt = new Date(Date.now() - 150_000).toISOString();
+    const oldNodeAt = new Date(Date.now() - 100_000).toISOString();
+    const resumedGraphAt = new Date(Date.now() - 1_000).toISOString();
+    const base = { schema_version: 4 as const, run_id: "run-resumed-delegation", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "a".repeat(64) };
+    render(<WorkspaceShell project={project} locale="zh-CN" runStarted activeRunId={base.run_id} activeRunLastActivityAt={resumedGraphAt} agentRunEventsV4={[
+      { ...base, sequence: 1, occurred_at: requestedAt, event: { kind: "tool_requested" as const, call: { call_id: "delegate-resumed", tool_id: "agent.delegate", arguments: { graph: {} } } } },
+      { ...base, sequence: 2, occurred_at: firstGraphAt, event: { kind: "delegation_graph_started" as const, call_id: "delegate-resumed", graph: {} } },
+      { ...base, sequence: 3, occurred_at: oldNodeAt, event: { kind: "delegation_node_finished" as const, call_id: "delegate-resumed", outcome: {} } },
+      { ...base, sequence: 4, occurred_at: resumedGraphAt, event: { kind: "delegation_graph_started" as const, call_id: "delegate-resumed", graph: {} } },
+    ]} />);
+
+    expect(screen.getByText("执行过程").closest("summary")).toHaveTextContent("正在运行工具");
+    expect(screen.queryByText(/超过 90 秒/)).not.toBeInTheDocument();
+  });
+  it("attributes silence to a pending model request after the tool has finished", () => {
+    const old = new Date(Date.now() - 180_000).toISOString();
+    const recent = new Date(Date.now() - 30_000).toISOString();
+    const base = { schema_version: 4 as const, run_id: "run-phase-change", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "a".repeat(64) };
+    const events = [
+      { ...base, sequence: 1, occurred_at: old, event: { kind: "tool_dispatch_started" as const, call_id: "cell-1", tool_id: "runtime.execute", effect: "runtime", idempotency_key: "cell-1" } },
+      { ...base, sequence: 2, occurred_at: old, event: { kind: "tool_finished" as const, outcome: { call_id: "cell-1", tool_id: "runtime.execute", succeeded: true, model_content: "done", data: null, provenance: [] } } },
+      { ...base, sequence: 3, occurred_at: recent, event: { kind: "model_request_started" as const, request: modelRequest("after-tool") } },
+    ];
+    const props = { project, locale: "zh-CN" as const, runStarted: true, activeRunId: base.run_id, activeRunLastActivityAt: old };
+    const { rerender } = render(<WorkspaceShell {...props} agentRunEventsV4={events} />);
+    expect(screen.getByRole("status", { name: "当前模型活动" })).toHaveTextContent("等待模型响应");
+    expect(screen.queryByText(/超过 90 秒/)).not.toBeInTheDocument();
+
+    const stale = new Date(Date.now() - 91_000).toISOString();
+    rerender(<WorkspaceShell {...props} agentRunEventsV4={[...events.slice(0, 2), { ...events[2], occurred_at: stale }]} />);
+    expect(screen.getByText(/超过 90 秒未收到模型数据/)).toBeInTheDocument();
+    expect(screen.queryByText(/工具 runtime.execute 已运行超过/)).not.toBeInTheDocument();
+  });
+  it("does not treat a historical tool dispatch as the active run phase", () => {
+    const old = new Date(Date.now() - 100_000).toISOString();
+    const base = { schema_version: 4 as const, project_id: project.id, conversation_id: "conversation-1", sequence: 1, occurred_at: old, previous_hash: "", event_hash: "a".repeat(64) };
+    render(<WorkspaceShell project={project} locale="en-US" runStarted activeRunId="current" activeRunLastActivityAt={old} agentRunEventsV4={[
+      { ...base, run_id: "historical", event: { kind: "tool_dispatch_started", call_id: "old-cell", tool_id: "runtime.execute", effect: "runtime", idempotency_key: "old-cell" } },
+      { ...base, run_id: "current", event: { kind: "model_request_started", request: modelRequest("current-model") } },
+    ]} />);
+    expect(screen.getByText(/No model data or Agent event/)).toBeInTheDocument();
+    expect(screen.queryByText(/runtime.execute has run for over/)).not.toBeInTheDocument();
+  });
   it("keeps progress and running tool details folded in chronological execution rows", () => {
     const base = { schema_version: 4 as const, run_id: "run-live-steps", project_id: project.id, conversation_id: "conversation-1", previous_hash: "", event_hash: "hash", occurred_at: "2026-08-17T00:00:00Z" };
     const progress = { ...base, sequence: 1, event: { kind: "model_text" as const, text: "## Checking input\n\n- Source verified" } };
