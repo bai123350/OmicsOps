@@ -30,7 +30,7 @@
 
 ### Task 1: 有类型路径证明覆盖完整研究代码形态
 
-**状态：2026-09-29 继续实施。** 用户在上一轮风险说明和受限方案确认后，再次明确要求修复自动批准。本轮 token 解析器修改再次被自动审查拒绝，没有落盘或通过其他工具重试。Astra 复核后采用实质不同的完整 AST 方案，消除旧 lexer 对数字和 f-string 的信息丢失，仍保持既定能力范围。上一轮保留的 RED/危险反例 patch 仅供核对；在当前已交付诊断的基础上重新运行测试、实施并独立复审。本节只有验证通过后才能标为完成；此前 Task2 结果不能代替本项。
+**状态：2026-09-29 已实施并提交。** 用户在上一轮风险说明和受限方案确认后，再次明确要求修复自动批准。本轮 token 解析器修改再次被自动审查拒绝，没有落盘或通过其他工具重试。Astra 复核后采用实质不同的完整 AST 方案，消除旧 lexer 对数字和 f-string 的信息丢失，仍保持既定能力范围。上一轮保留的 RED/危险反例 patch 仅供核对；在当前已交付诊断的基础上重新运行测试、实施并独立复审。本项已通过定向与全量确定性检查；桌面构建和真实模型验收结果单独记录于末节，此前 Task2 结果不能代替本项。
 
 **Files:** Modify/test `src-tauri/src/runtime_approval.rs`、`src-tauri/src/agent_v4.rs`；新增 `src-tauri/src/runtime_approval_ast.rs` 并在桌面组合中声明模块；更新根目录与桌面 `Cargo.toml`、`Cargo.lock`。独立语法解析与绑定审计构成明确职责边界，不按文件长度重构。
 
@@ -43,7 +43,7 @@
 - [x] 增加反例矩阵：未知插值、日期格式含路径字符、模板/参数不匹配、数字额外实参、日期/模块/属性重绑及修改后重新 import、条件/def/循环/except/match/walrus 污染、OS危险调用、外部路径、布尔/大小结果、f-string 动态表达式，全部断言 false。补充模块表、Win32 特殊路径、前向引用及预算边界，旧绑定测试仍通过。
 - [x] 最终 `cargo test --offline -p omicsops-desktop runtime_approval::tests --lib`：20/20；完整原始参数和七个危险变体经生产 bool/reason 静态分类符合预期。原始参数哈希再次核对一致；临时环境测试已移除，原文未入库，未执行研究代码。
 - [x] `cargo test --offline -p omicsops-desktop lazy_interpreter_probe_is_language_specific_and_never_reserves_a_job_on_failure --lib`：1/1，增加真实 Desktop 审批入口、ToolRegistry、AgentCore 的四场景单步回归；独立 Astra 实际代码审查无剩余阻塞问题。
-- [ ] Commit: `fix: recognize proven date-named project outputs`。
+- [x] Commit: `82cd5cd fix: auto-approve proven project runtime paths`。
 
 ### Task 2: 固定分类原因进入已有审批请求
 
@@ -89,9 +89,11 @@
 - [x] `npm test`：953 前端与 22 浏览器桥接测试通过。
 - [x] `npm run build`：通过，保留既有 bundle 大小提示。
 - [x] `cargo test --workspace`：1,394 通过，0 失败，12 忽略；exit 0。忽略项不计为真实环境验收通过。
-- [ ] `cargo fmt --all -- --check`；如仅格式差异失败，格式修正单独提交。
-- [ ] `npm run build:desktop`。
-- [ ] 确定性检查后按 acceptance/README.md 显式执行临时 nonce 的真实模型读文件验收。
-- [ ] 最终提交和工作区检查；保留用户的未跟踪 website。
+- [x] `cargo fmt --all -- --check`：首次仅格式差异失败，运行 `cargo fmt --all` 后复查通过；纯格式提交 `9d0b9c6 style: format runtime approval AST checks`。`git diff --check` 同时通过。
+- [x] `npm run build:desktop`：exit 0，release 编译 4 分 20 秒，NSIS 本地构建完成；未发布、安装或分发。`target/release/omicsops-desktop.exe` 为 79,586,304 字节，本地修改时间 2026-09-29 01:37:09，SHA-256 `3871331ad3432964eb98740d957333b40b9fec436fd6c684b34d696742e8a282`。
+- [x] 确定性检查后按 `acceptance/README.md` 显式执行临时 nonce 的真实模型读文件验收：`cargo test -p omicsops-desktop agent_v4::go_live_acceptance_tests::live_opencode_go_agent_reads_file_and_returns_nonce -- --ignored --exact --nocapture`，1/1 通过、exit 0，测试耗时 274.11 秒（不含 2 分 46 秒编译）。沿用既有 OpenCode Go `deepseek-v4.1-flash` profile 与系统 keyring，在一次性项目中读取并返回 nonce。只输出观测元数据：3 次有内容的模型尝试，3,343 次非空快照全部早于对应结果，首末快照分别为 1,958/270,698 ms。未输出推理文本或凭据，未修改原会话或数据库；此项不代表运行时代码、SSH、miRNA 科研端到端验收或工作流提速。
+- [x] 功能提交 `82cd5cd`、纯格式提交 `9d0b9c6`；本轮完整结果随 `docs: record runtime approval AST validation` 提交。最终检查保留用户的未跟踪 `website/`，不加入本次提交。
 
 原生 UI 手工 smoke 尚未执行：关闭旧程序并启动新构建后，用新的普通调用验证 RiskBased 不出现审批卡片，未知路径与 RequestApproval 仍出现卡片。历史 pending/denied 记录不追溯自动批准；不得据此自动重跑可能已派发的原研究作业。
+
+最终静态复核结束后，已核实并按精确路径清理 TEMP 中的原始参数及八场景变体两个文件。真实原文未写入 Git，未执行原研究代码；忽略目录中的测试日志保留用于核对。
