@@ -470,7 +470,8 @@ fn python_is_low_risk(tokens: &[Token], code: &str) -> bool {
     ];
     const MUTATING_HTTP: &[&str] = &["post", "put", "patch", "delete"];
     if tokens.iter().any(|token| is_word(Some(token), "os"))
-        && !super::runtime_approval_ast::safe_os_path_uses(code) {
+        && !super::runtime_approval_ast::safe_os_path_uses(code)
+    {
         return false;
     }
     let mut path_names = std::collections::HashSet::new();
@@ -959,8 +960,6 @@ print(os.path.getsize(out_path))
         }
     }
 
-
-
     #[test]
     fn approval_reason_for_unproven_path_keeps_source_private() {
         let code = "import os\nos.makedirs('results/PRIVATE_SENTINEL', exist_ok=True)\nout = 'results/PRIVATE_SENTINEL_%s.json' % unknown\nprint(os.path.getsize(out))";
@@ -968,10 +967,7 @@ print(os.path.getsize(out_path))
         assert!(!ordinary_runtime_call_is_low_risk(&args));
         let reason = ordinary_runtime_call_approval_reason(&args).unwrap();
         assert!(reason.contains("Project path cannot be proven"), "{reason}");
-        assert!(
-            !reason.contains("Unsupported OS operation"),
-            "{reason}"
-        );
+        assert!(!reason.contains("Unsupported OS operation"), "{reason}");
         assert!(!reason.contains("PRIVATE_SENTINEL"));
         assert!(reason.split("; ").count() <= 4);
     }

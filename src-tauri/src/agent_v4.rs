@@ -8958,7 +8958,14 @@ mod tests {
             Ok(())
         }
         async fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String> {
-            Ok(self.0.lock().unwrap().iter().filter(|event| event.run_id == run_id).cloned().collect())
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.run_id == run_id)
+                .cloned()
+                .collect())
         }
         async fn archive_context(
             &self,
@@ -9139,12 +9146,23 @@ mod tests {
                 BTreeSet::from(["runtime.execute".into()]),
             );
             let approval_hash = RunSpecV4::approval_hash_for(
-                run_id, project_id, conversation_id, model_profile_id, &plan, &selection,
+                run_id,
+                project_id,
+                conversation_id,
+                model_profile_id,
+                &plan,
+                &selection,
             )
             .unwrap();
             let spec = RunSpecV4::freeze_ordinary_agent_with_compute(
-                run_id, project_id, conversation_id, model_profile_id, plan, selection,
-                &approval_hash, Utc::now(),
+                run_id,
+                project_id,
+                conversation_id,
+                model_profile_id,
+                plan,
+                selection,
+                &approval_hash,
+                Utc::now(),
             )
             .unwrap();
             let recorder = Arc::new(RecordingApprovalExecutor {
@@ -9161,7 +9179,9 @@ mod tests {
                 project_id,
                 conversation_id,
                 Utc::now(),
-                AgentEventKindV4::RunCreated { mode: RunModeV4::Execute },
+                AgentEventKindV4::RunCreated {
+                    mode: RunModeV4::Execute,
+                },
             ));
             let run_result = AgentCoreV4 {
                 model: &model,
@@ -9172,15 +9192,24 @@ mod tests {
             .execute(&spec, 1)
             .await;
             if expected_dispatch == 0 {
-                assert!(matches!(run_result, Err(AgentCoreErrorV4::WaitingForApproval)));
+                assert!(matches!(
+                    run_result,
+                    Err(AgentCoreErrorV4::WaitingForApproval)
+                ));
             } else {
-                assert!(matches!(run_result, Err(AgentCoreErrorV4::NeedsAttention(_))));
+                assert!(matches!(
+                    run_result,
+                    Err(AgentCoreErrorV4::NeedsAttention(_))
+                ));
             }
-            assert_eq!(recorder.dispatched.load(Ordering::SeqCst), expected_dispatch);
+            assert_eq!(
+                recorder.dispatched.load(Ordering::SeqCst),
+                expected_dispatch
+            );
             let events = events.0.lock().unwrap();
-            let approval_requested = events.iter().any(|event| {
-                matches!(event.event, AgentEventKindV4::ToolApprovalRequested { .. })
-            });
+            let approval_requested = events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::ToolApprovalRequested { .. }));
             assert_eq!(approval_requested, expected_dispatch == 0);
             assert_eq!(events.iter().filter(|event| {
                 matches!(&event.event, AgentEventKindV4::ToolDispatchStarted { call_id: started, .. } if started == &call_id)
