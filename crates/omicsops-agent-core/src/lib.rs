@@ -3188,18 +3188,23 @@ impl AgentCoreV4<'_> {
                 }
                 Err(error)
                     if error.class == omicsops_protocol::ModelErrorClassV4::InvalidResponse
-                        && error.message.contains("returned malformed JSON arguments:")
+                        && (error.message.contains("returned malformed JSON arguments:")
+                            || error.message.contains("unknown_provider_tool:"))
                         && !output_repair_attempted
                         && persist_text =>
                 {
                     output_repair_attempted = true;
-                    request.system.push_str("\nThe previous model response was discarded because its tool arguments were malformed JSON. No tool calls from that response executed. Continue from the existing evidence with at most ONE complete tool call, minimal arguments, and a brief public update in the user's language. Do not repeat discovery already completed. Split large writes into smaller operations. Generate strict JSON objects matching the tool schema; escape quotes and newlines inside strings. Do not use Markdown fences, comments, or trailing commas in arguments. For structured array items, provide objects with the required fields rather than prose strings.");
+                    if error.message.contains("unknown_provider_tool:") {
+                        request.system.push_str("\nThe previous model response was discarded because it named a tool absent from this request. No tool calls from that response executed. Continue from existing verified evidence. Use only a tool exactly listed in the current request schema, with at most ONE complete tool call and strict JSON object arguments. Do not guess old aliases or rediscover tools already discovered. Give a brief public update in the user's language.");
+                    } else {
+                        request.system.push_str("\nThe previous model response was discarded because its tool arguments were malformed JSON. No tool calls from that response executed. Continue from the existing evidence with at most ONE complete tool call, minimal arguments, and a brief public update in the user's language. Do not repeat discovery already completed. Split large writes into smaller operations. Generate strict JSON objects matching the tool schema; escape quotes and newlines inside strings. Do not use Markdown fences, comments, or trailing commas in arguments. For structured array items, provide objects with the required fields rather than prose strings.");
+                    }
                     self.model
                         .validate_request(&request)
                         .map_err(|error| AgentCoreErrorV4::NeedsAttention(error.message))?;
                     self.push(run_id, AgentEventKindV4::ModelRetrying {
                         attempt: 1, class: error.class,
-                        message: "Model output could not be parsed completely; retrying once with one concise tool call and strict JSON arguments. No call from the rejected response was dispatched.".into(),
+                        message: "Model response contained an invalid tool call; retrying once with a currently available tool and strict JSON arguments. No call from the rejected response was dispatched.".into(),
                     }).await?;
                 }
                 Err(error) if error.retryable && attempt < max_retries => {
@@ -16283,6 +16288,7 @@ mod tests {
     }
     struct TruncatedModel {
         failure_message: &'static str,
+        second_failure_message: Option<&'static str>,
         attempts: AtomicUsize,
         always_fail: bool,
     }
@@ -16294,16 +16300,19 @@ mod tests {
             on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
         ) -> Result<ModelTurnV4, ModelFailureV4> {
             let attempt = self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
-            if attempt == 0 || self.always_fail {
+            if attempt == 0 || self.always_fail || self.second_failure_message.is_some() {
                 on_event(ModelStreamEventV4::TextDelta(
                     "discard partial response".into(),
                 ));
                 return Err(ModelFailureV4::permanent(
                     omicsops_protocol::ModelErrorClassV4::InvalidResponse,
-                    self.failure_message,
+                    if attempt == 0 { self.failure_message } else { self.second_failure_message.unwrap_or(self.failure_message) },
                 ));
             }
             assert!(request.system.contains("at most ONE complete tool call"));
+            if self.failure_message.contains("unknown_provider_tool:") {
+                assert!(request.system.contains("Use only a tool exactly listed in the current request schema"));
+            }
             assert_eq!(request.context, "verified evidence");
             Ok(ModelTurnV4 {
                 public_text: "Recovered".into(),
@@ -16313,20 +16322,26 @@ mod tests {
     }
     #[tokio::test]
     async fn malformed_arguments_retry_once_but_default_truncation_does_not_retry() {
-        for (always_fail, failure_message) in [
-            (false, "truncated_output: output allowance"),
-            (true, "truncated_output: output allowance"),
+        for (always_fail, failure_message, second_failure_message) in [
+            (false, "truncated_output: output allowance", None),
+            (true, "truncated_output: output allowance", None),
             (
                 false,
                 "tool call c1 returned malformed JSON arguments: expected comma",
+                None,
             ),
             (
                 true,
                 "tool call c1 returned malformed JSON arguments: expected comma",
+                None,
             ),
+            (false, "unknown_provider_tool: response used a tool absent from the current request", None),
+            (true, "unknown_provider_tool: response used a tool absent from the current request", None),
+            (false, "unknown_provider_tool: response used a tool absent from the current request", Some("tool call c1 returned malformed JSON arguments: expected comma")),
         ] {
             let model = TruncatedModel {
                 failure_message,
+                second_failure_message,
                 attempts: AtomicUsize::new(0),
                 always_fail,
             };
@@ -16365,7 +16380,7 @@ mod tests {
                 .await;
             assert_eq!(
                 result.is_err(),
-                always_fail || failure_message.contains("truncated_output:")
+                always_fail || second_failure_message.is_some() || failure_message.contains("truncated_output:")
             );
             let previews = store.previews.lock().unwrap();
             assert!(

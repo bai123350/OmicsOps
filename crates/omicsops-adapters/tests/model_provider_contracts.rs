@@ -399,6 +399,109 @@ fn provider_aliases_round_trip_to_canonical_tool_ids() {
 }
 
 #[test]
+fn provider_alias_is_stable_when_earlier_tool_is_removed_or_tools_reordered() {
+    let mut before = request();
+    before.tools.insert(0, ProviderToolSpec { id: "agent.delegate".into(), description: "Delegate".into(), input_schema: json!({"type":"object"}) });
+    let after = request();
+    let name = |request: &ProviderRequest| {
+        let built = build_provider_request_with_tools(ProviderProtocol::OpenAiCompatible, Url::parse("https://example.test/v1").unwrap(), "model", request).unwrap();
+        built.body["tools"].as_array().unwrap().iter().find(|tool| tool["function"]["description"].as_str().unwrap().contains("remote.list")).unwrap()["function"]["name"].as_str().unwrap().to_owned()
+    };
+    let original = name(&before);
+    assert_eq!(original, name(&after));
+    let mut reversed = after.clone();
+    reversed.tools.reverse();
+    assert_eq!(original, name(&reversed));
+    assert!(original.len() <= 64);
+    assert!(original.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')));
+}
+
+#[test]
+fn generated_tool_name_cannot_collide_with_valid_reserved_prefix() {
+    let mut request = request();
+    request.tools.push(ProviderToolSpec { id: "omicsops_tool_0".into(), description: "Reserved".into(), input_schema: json!({"type":"object"}) });
+    request.tools.push(ProviderToolSpec { id: "project_list".into(), description: "Valid".into(), input_schema: json!({"type":"object"}) });
+    let built = build_provider_request_with_tools(ProviderProtocol::OpenAiCompatible, Url::parse("https://example.test/v1").unwrap(), "model", &request).unwrap();
+    let names = built.body["tools"].as_array().unwrap().iter().map(|tool| tool["function"]["name"].as_str().unwrap()).collect::<Vec<_>>();
+    assert_eq!(names[3], "project_list");
+    assert_ne!(names[2], "omicsops_tool_0");
+    assert_eq!(names.iter().collect::<std::collections::BTreeSet<_>>().len(), names.len());
+}
+
+#[test]
+fn request_rejects_canonical_id_that_equals_another_tool_alias() {
+    let mut request = request();
+    let first = build_provider_request_with_tools(ProviderProtocol::OpenAiCompatible, Url::parse("https://example.test/v1").unwrap(), "model", &request).unwrap();
+    let alias = first.body["tools"][0]["function"]["name"].as_str().unwrap();
+    request.tools.push(ProviderToolSpec { id: alias.into(), description: "Ambiguous".into(), input_schema: json!({"type":"object"}) });
+    assert!(build_provider_request_with_tools(ProviderProtocol::OpenAiCompatible, Url::parse("https://example.test/v1").unwrap(), "model", &request).is_err());
+}
+
+#[test]
+fn request_scoped_nonstream_rejects_unknown_and_removed_tools_without_leaking_names() {
+    let current = request();
+    for protocol in [ProviderProtocol::OpenAiCompatible, ProviderProtocol::Anthropic, ProviderProtocol::Ollama] {
+        for unknown in ["omicsops_tool_18", "removed.secret.timeout.429"] {
+            let value = match protocol {
+                ProviderProtocol::OpenAiCompatible => json!({"choices":[{"message":{"tool_calls":[{"id":"good","function":{"name":"remote.list","arguments":"{}"}},{"id":"bad","function":{"name":unknown,"arguments":"{}"}}]}}]}),
+                ProviderProtocol::Anthropic => json!({"content":[{"type":"tool_use","id":"good","name":"remote.list","input":{}},{"type":"tool_use","id":"bad","name":unknown,"input":{}}]}),
+                ProviderProtocol::Ollama => json!({"message":{"tool_calls":[{"id":"good","function":{"name":"remote.list","arguments":{}}},{"id":"bad","function":{"name":unknown,"arguments":{}}}]}}),
+            };
+            let error = parse_provider_tool_response_for_request(protocol, &value, &current).unwrap_err().to_string();
+            assert!(error.contains("unknown_provider_tool:"), "{error}");
+            assert!(!error.contains(unknown), "{error}");
+        }
+    }
+}
+
+#[test]
+fn request_scoped_stream_rejects_unknown_tool_after_valid_call() {
+    let request = request();
+    let cases = [
+        (ProviderProtocol::OpenAiCompatible, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"good\",\"function\":{\"name\":\"remote.list\",\"arguments\":\"{}\"}},{\"index\":1,\"id\":\"bad\",\"function\":{\"name\":\"omicsops_tool_18\",\"arguments\":\"{}\"}}]}}]}\n\n"),
+        (ProviderProtocol::Anthropic, "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"bad\",\"name\":\"omicsops_tool_18\"}}\n\n"),
+        (ProviderProtocol::Ollama, "{\"message\":{\"tool_calls\":[{\"id\":\"good\",\"function\":{\"name\":\"remote.list\",\"arguments\":{}}},{\"id\":\"bad\",\"function\":{\"name\":\"omicsops_tool_18\",\"arguments\":{}}}]}}\n"),
+    ];
+    for (protocol, payload) in cases {
+        let mut decoder = ProviderToolStreamDecoder::for_request(protocol, &request);
+        let split = payload.len() / 2;
+        assert!(decoder.push(&payload.as_bytes()[..split]).unwrap().is_empty());
+        let error = decoder.push(&payload.as_bytes()[split..]).unwrap_err().to_string();
+        assert!(error.contains("unknown_provider_tool:"), "{error}");
+        assert!(!error.contains("omicsops_tool_18"));
+    }
+}
+
+#[test]
+fn all_provider_protocols_decode_current_alias_and_exact_canonical_name() {
+    let request = request();
+    for protocol in [ProviderProtocol::OpenAiCompatible, ProviderProtocol::Anthropic, ProviderProtocol::Ollama] {
+        let built = build_provider_request_with_tools(protocol, Url::parse("https://example.test/v1").unwrap(), "model", &request).unwrap();
+        let alias = if protocol == ProviderProtocol::Anthropic { built.body["tools"][0]["name"].as_str().unwrap() } else { built.body["tools"][0]["function"]["name"].as_str().unwrap() };
+        for name in [alias, "remote.list"] {
+            let response = match protocol {
+                ProviderProtocol::OpenAiCompatible => json!({"choices":[{"message":{"tool_calls":[{"id":"c1","function":{"name":name,"arguments":"{}"}}]}}]}),
+                ProviderProtocol::Anthropic => json!({"content":[{"type":"tool_use","id":"c1","name":name,"input":{}}]}),
+                ProviderProtocol::Ollama => json!({"message":{"tool_calls":[{"id":"c1","function":{"name":name,"arguments":{}}}]}}),
+            };
+            let events = parse_provider_tool_response_for_request(protocol, &response, &request).unwrap();
+            assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::ToolCallStarted { tool_id, .. } if tool_id == "remote.list")));
+            let stream = match protocol {
+                ProviderProtocol::OpenAiCompatible => format!("data: {}\n\ndata: [DONE]\n\n", json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":name,"arguments":"{}"}}]}}]})),
+                ProviderProtocol::Anthropic => format!("data: {}\n\ndata: {}\n\ndata: {{\"type\":\"message_stop\"}}\n\n", json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"c1","name":name}}), json!({"type":"content_block_delta","index":0,"delta":{"partial_json":"{}"}})),
+                ProviderProtocol::Ollama => format!("{}\n", json!({"message":{"tool_calls":[{"id":"c1","function":{"name":name,"arguments":{}}}]},"done":true})),
+            };
+            let mut decoder = ProviderToolStreamDecoder::for_request(protocol, &request);
+            let mut events = Vec::new();
+            for chunk in stream.as_bytes().chunks(7) { events.extend(decoder.push(chunk).unwrap()); }
+            events.extend(decoder.finish().unwrap());
+            assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::ToolCallStarted { tool_id, .. } if tool_id == "remote.list")));
+            assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::ToolArgumentsDelta { arguments, .. } if arguments == "{}")));
+        }
+    }
+}
+
+#[test]
 fn streaming_decoder_preserves_utf8_split_across_network_chunks() {
     let mut decoder = ProviderToolStreamDecoder::new(ProviderProtocol::OpenAiCompatible);
     let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"我会检索肝癌文献。\"}}]}\n\n";

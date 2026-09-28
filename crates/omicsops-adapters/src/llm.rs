@@ -8,6 +8,7 @@ use omicsops_agent::{AgentError, AgentResult, ModelContentPart, ModelMessageCont
 use schemars::{JsonSchema, schema_for};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 use url::Url;
@@ -1005,6 +1006,10 @@ fn build_provider_request_with_optional_budget(
         .map(|message| provider_message(protocol, &message.role, &message.content))
         .collect::<AdapterResult<Vec<_>>>()?;
     let tool_aliases = provider_tool_aliases(request);
+    if tool_aliases.iter().map(|(name, _)| name).collect::<BTreeSet<_>>().len() != tool_aliases.len()
+        || tool_aliases.iter().any(|(alias, id)| request.tools.iter().any(|tool| tool.id == *alias && tool.id != *id)) {
+        return Err(AdapterError::Llm("provider tool names collide in this request".into()));
+    }
     let openai_tools = request
         .tools
         .iter()
@@ -1197,25 +1202,16 @@ fn provider_message(
 }
 
 fn provider_tool_aliases(request: &ProviderModelRequest) -> Vec<(String, String)> {
-    let mut occupied = request
-        .tools
-        .iter()
-        .filter(|tool| provider_tool_name_is_valid(&tool.id))
-        .map(|tool| tool.id.clone())
-        .collect::<BTreeSet<_>>();
     request
         .tools
         .iter()
-        .enumerate()
-        .map(|(index, tool)| {
-            if provider_tool_name_is_valid(&tool.id) {
+        .map(|tool| {
+            if provider_tool_name_is_valid(&tool.id) && !tool.id.starts_with("omicsops_tool_") {
                 return (tool.id.clone(), tool.id.clone());
             }
-            let mut alias = format!("omicsops_tool_{index}");
-            while occupied.contains(&alias) {
-                alias.push('_');
-            }
-            occupied.insert(alias.clone());
+            let slug = tool.id.bytes().filter(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')).take(24).map(char::from).collect::<String>();
+            let digest = hex::encode(sha2::Sha256::digest(tool.id.as_bytes()));
+            let alias = format!("omicsops_tool_{slug}_{}", &digest[..24]);
             (alias, tool.id.clone())
         })
         .collect()
@@ -1244,18 +1240,21 @@ fn provider_tool_alias_map(request: &ProviderModelRequest) -> BTreeMap<String, S
     provider_tool_aliases(request).into_iter().collect()
 }
 
-fn canonical_tool_id(aliases: &BTreeMap<String, String>, provider_name: &str) -> String {
-    aliases
-        .get(provider_name)
-        .cloned()
-        .unwrap_or_else(|| provider_name.to_owned())
+fn canonical_tool_id(aliases: &BTreeMap<String, String>, provider_name: &str, request_scoped: bool) -> AdapterResult<String> {
+    if let Some(id) = aliases.get(provider_name) {
+        return Ok(id.clone());
+    }
+    if !request_scoped || aliases.values().any(|id| id == provider_name) {
+        return Ok(provider_name.to_owned());
+    }
+    Err(AdapterError::Llm("unknown_provider_tool: response used a tool absent from the current request".into()))
 }
 
 pub fn parse_provider_tool_response(
     protocol: ProviderProtocol,
     value: &Value,
 ) -> AdapterResult<Vec<ProviderStreamEvent>> {
-    parse_provider_tool_response_with_aliases(protocol, value, &BTreeMap::new())
+    parse_provider_tool_response_with_aliases(protocol, value, &BTreeMap::new(), false)
 }
 
 pub fn parse_provider_tool_response_for_request(
@@ -1263,13 +1262,14 @@ pub fn parse_provider_tool_response_for_request(
     value: &Value,
     request: &ProviderModelRequest,
 ) -> AdapterResult<Vec<ProviderStreamEvent>> {
-    parse_provider_tool_response_with_aliases(protocol, value, &provider_tool_alias_map(request))
+    parse_provider_tool_response_with_aliases(protocol, value, &provider_tool_alias_map(request), true)
 }
 
 fn parse_provider_tool_response_with_aliases(
     protocol: ProviderProtocol,
     value: &Value,
     aliases: &BTreeMap<String, String>,
+    request_scoped: bool,
 ) -> AdapterResult<Vec<ProviderStreamEvent>> {
     validate_response_end(protocol, value)?;
     let mut events = Vec::new();
@@ -1352,7 +1352,7 @@ fn parse_provider_tool_response_with_aliases(
         events.push(ProviderStreamEvent::ToolCallStarted {
             call_id: call_id.clone(),
             index,
-            tool_id: canonical_tool_id(aliases, tool_id),
+            tool_id: canonical_tool_id(aliases, tool_id, request_scoped)?,
         });
         if let Some(arguments) = arguments {
             events.push(ProviderStreamEvent::ToolArgumentsDelta {
@@ -1735,6 +1735,7 @@ pub struct ProviderToolStreamDecoder {
     pending: Vec<u8>,
     active_calls: BTreeMap<u32, (String, String)>,
     tool_aliases: BTreeMap<String, String>,
+    request_scoped: bool,
     next_usage_sample_index: u32,
     saw_completion: bool,
 }
@@ -1746,6 +1747,7 @@ impl ProviderToolStreamDecoder {
             pending: Vec::new(),
             active_calls: BTreeMap::new(),
             tool_aliases: BTreeMap::new(),
+            request_scoped: false,
             next_usage_sample_index: 0,
             saw_completion: false,
         }
@@ -1757,6 +1759,7 @@ impl ProviderToolStreamDecoder {
             pending: Vec::new(),
             active_calls: BTreeMap::new(),
             tool_aliases: provider_tool_alias_map(request),
+            request_scoped: true,
             next_usage_sample_index: 0,
             saw_completion: false,
         }
@@ -1911,12 +1914,10 @@ impl ProviderToolStreamDecoder {
                     .map(str::to_owned)
                     .or_else(|| prior.as_ref().map(|entry| entry.0.clone()))
                     .unwrap_or_else(|| format!("openai-{index}"));
-                let tool_id = call
-                    .pointer("/function/name")
-                    .and_then(Value::as_str)
-                    .map(|name| canonical_tool_id(&self.tool_aliases, name))
-                    .or_else(|| prior.as_ref().map(|entry| entry.1.clone()))
-                    .unwrap_or_default();
+                let tool_id = match call.pointer("/function/name").and_then(Value::as_str) {
+                    Some(name) => canonical_tool_id(&self.tool_aliases, name, self.request_scoped)?,
+                    None => prior.as_ref().map(|entry| entry.1.clone()).unwrap_or_default(),
+                };
                 if prior.is_none() && !tool_id.is_empty() {
                     events.push(ProviderStreamEvent::ToolCallStarted {
                         call_id: call_id.clone(),
@@ -1974,7 +1975,7 @@ impl ProviderToolStreamDecoder {
                     .pointer("/content_block/name")
                     .and_then(Value::as_str)
                     .ok_or_else(|| AdapterError::Llm("Anthropic tool block has no name".into()))?;
-                let tool_id = canonical_tool_id(&self.tool_aliases, provider_name);
+                let tool_id = canonical_tool_id(&self.tool_aliases, provider_name, self.request_scoped)?;
                 self.active_calls
                     .insert(index, (call_id.clone(), tool_id.clone()));
                 events.push(ProviderStreamEvent::ToolCallStarted {
@@ -2061,7 +2062,7 @@ impl ProviderToolStreamDecoder {
                     .pointer("/function/name")
                     .and_then(Value::as_str)
                     .ok_or_else(|| AdapterError::Llm("Ollama tool call has no name".into()))?;
-                let tool_id = canonical_tool_id(&self.tool_aliases, provider_name);
+                let tool_id = canonical_tool_id(&self.tool_aliases, provider_name, self.request_scoped)?;
                 if !self.active_calls.contains_key(&index) {
                     events.push(ProviderStreamEvent::ToolCallStarted {
                         call_id: call_id.clone(),

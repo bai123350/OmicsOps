@@ -5611,7 +5611,9 @@ fn verified_model_image(
 
 fn classify_model_failure(message: &str) -> ModelFailureV4 {
     let lower = message.to_ascii_lowercase();
-    if lower.contains("context_length_exceeded") || lower.contains("context_window_exceeded") {
+    if lower.contains("unknown_provider_tool:") {
+        ModelFailureV4::permanent(ModelErrorClassV4::InvalidResponse, message)
+    } else if lower.contains("context_length_exceeded") || lower.contains("context_window_exceeded") {
         ModelFailureV4::permanent(ModelErrorClassV4::ContextOverflow, message)
     } else if lower.contains("429") || lower.contains("rate limit") {
         ModelFailureV4::transient(ModelErrorClassV4::RateLimited, message)
@@ -10973,6 +10975,11 @@ mod tests {
             ModelErrorClassV4::Timeout
         );
         assert!(!classify_model_failure("401 unauthorized").retryable);
+        for message in ["unknown_provider_tool: 429 timeout", "model endpoint failed: unknown_provider_tool: 500"] {
+            let failure = classify_model_failure(message);
+            assert_eq!(failure.class, ModelErrorClassV4::InvalidResponse);
+            assert!(!failure.retryable);
+        }
     }
 
     #[test]
@@ -11007,7 +11014,7 @@ mod tests {
             Url::parse(&format!("http://{}/v1", listener.local_addr().unwrap())).unwrap();
         let server = std::thread::spawn(move || {
             let mut requests = Vec::new();
-            for answer in ["discarded", "accepted"] {
+            for answer in ["discarded", "accepted", "invalid"] {
                 let (mut socket, _) = listener.accept().unwrap();
                 socket
                     .set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -11048,7 +11055,10 @@ mod tests {
                     "function":{"name":"read","arguments":json!({"value":answer}).to_string()}
                 }]}}]});
                 let mut body = format!("data: {delta}\n\n");
-                if answer == "accepted" {
+                if answer == "invalid" {
+                    body.push_str(&format!("data: {}\n\n", json!({"choices":[{"delta":{"tool_calls":[{"index":1,"id":"bad-call","type":"function","function":{"name":"omicsops_tool_18","arguments":"{}"}}]}}]})));
+                }
+                if answer != "discarded" {
                     body.push_str(
                         "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
                     );
@@ -11099,12 +11109,15 @@ mod tests {
         assert_eq!(first.class, ModelErrorClassV4::Transport);
         assert!(first.retryable);
 
-        let second = model.stream(request, &mut |_| {}).await.unwrap();
+        let second = model.stream(request.clone(), &mut |_| {}).await.unwrap();
         assert_eq!(second.tool_calls.len(), 1);
         assert_eq!(second.tool_calls[0].call_id, "same-call");
         assert_eq!(second.tool_calls[0].arguments, json!({"value":"accepted"}));
+        let rejected = model.stream(request, &mut |_| {}).await.unwrap_err();
+        assert_eq!(rejected.class, ModelErrorClassV4::InvalidResponse);
+        assert!(!rejected.retryable);
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert_eq!(requests[0], requests[1]);
         assert!(requests[1].to_string().contains("original request"));
         assert!(!requests[1].to_string().contains("discarded"));
