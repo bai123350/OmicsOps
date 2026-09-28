@@ -4081,9 +4081,9 @@ impl AgentCoreV4<'_> {
             .map(Ok)
             .unwrap_or_else(|| spec.calculate_spec_hash())
             .map_err(|error| AgentCoreErrorV4::Store(error.to_string()))?;
-        if spec.compute_selection.as_ref().is_some_and(|selection|
-            selection.approval_policy == ApprovalPolicyV4::AutoApproveExceptLocalDeletion)
-            && let Some(reason) = self.tools.local_deletion_approval_reason(&call)
+        if spec.compute_selection.as_ref().is_some_and(|selection| {
+            selection.approval_policy == ApprovalPolicyV4::AutoApproveExceptLocalDeletion
+        }) && let Some(reason) = self.tools.local_deletion_approval_reason(&call)
         {
             return ToolApprovalRequestV4::new(spec.run_id, &spec_hash, call, effect, reason)
                 .map_err(|error| AgentCoreErrorV4::Store(error.to_string()));
@@ -4189,16 +4189,17 @@ impl AgentCoreV4<'_> {
         effect: ToolEffectV4,
         events: &[AgentEventV4],
     ) -> Result<bool, AgentCoreErrorV4> {
-        if spec.compute_selection.as_ref().is_some_and(|selection|
-            selection.approval_policy == ApprovalPolicyV4::AutoApproveExceptLocalDeletion)
-        {
+        if spec.compute_selection.as_ref().is_some_and(|selection| {
+            selection.approval_policy == ApprovalPolicyV4::AutoApproveExceptLocalDeletion
+        }) {
             // Frozen exact-call requests keep their original decision path on resume.
-            if events.iter().any(|event| matches!(&event.event,
+            if events.iter().any(|event| {
+                matches!(&event.event,
                 AgentEventKindV4::ToolApprovalRequested { request }
                     if request.mode == RunModeV4::Execute
                         && request.scope_hash.is_none()
-                        && request.call.call_id == call.call_id))
-            {
+                        && request.call.call_id == call.call_id)
+            }) {
                 return Ok(true);
             }
             return Ok(self.tools.local_deletion_approval_reason(call).is_some());
@@ -8642,7 +8643,12 @@ mod tests {
     async fn auto_approve_policy_asks_only_for_host_detected_local_deletion() {
         let store = MemoryStore::default();
         let model = ScriptedModel(Mutex::new(vec![]));
-        let core = AgentCoreV4 { model: &model, tools: &FakeTools, events: &store, science: None };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
         let spec = supervised_execution_spec(
             Uuid::new_v4(),
             ApprovalPolicyV4::AutoApproveExceptLocalDeletion,
@@ -8654,15 +8660,50 @@ mod tests {
             ("save_memory", ToolEffectV4::Mutating),
             ("web_search", ToolEffectV4::Network),
         ] {
-            let call = ToolCallV4 { call_id: tool_id.into(), tool_id: tool_id.into(), arguments: json!({"code":"unknown or dangerous"}) };
-            assert!(!core.tool_requires_approval(&spec, &call, effect, &[]).await.unwrap(), "{tool_id}");
+            let call = ToolCallV4 {
+                call_id: tool_id.into(),
+                tool_id: tool_id.into(),
+                arguments: json!({"code":"unknown or dangerous"}),
+            };
+            assert!(
+                !core
+                    .tool_requires_approval(&spec, &call, effect, &[])
+                    .await
+                    .unwrap(),
+                "{tool_id}"
+            );
         }
-        let deletion = ToolCallV4 { call_id: "delete".into(), tool_id: "runtime.execute".into(), arguments: json!({"fixture_local_deletion":true}) };
-        assert!(core.tool_requires_approval(&spec, &deletion, ToolEffectV4::ReadOnly, &[]).await.unwrap());
-        let request = core.approval_request(&spec, deletion.clone(), ToolEffectV4::ReadOnly).unwrap();
-        assert_eq!(request.reason, "This call may delete a local file or directory.");
-        let requested = AgentEventV4::first(spec.run_id, spec.project_id, spec.conversation_id, Utc::now(), AgentEventKindV4::ToolApprovalRequested { request: request.clone() });
-        assert!(core.tool_requires_approval(&spec, &deletion, ToolEffectV4::Runtime, &[requested]).await.unwrap());
+        let deletion = ToolCallV4 {
+            call_id: "delete".into(),
+            tool_id: "runtime.execute".into(),
+            arguments: json!({"fixture_local_deletion":true}),
+        };
+        assert!(
+            core.tool_requires_approval(&spec, &deletion, ToolEffectV4::ReadOnly, &[])
+                .await
+                .unwrap()
+        );
+        let request = core
+            .approval_request(&spec, deletion.clone(), ToolEffectV4::ReadOnly)
+            .unwrap();
+        assert_eq!(
+            request.reason,
+            "This call may delete a local file or directory."
+        );
+        let requested = AgentEventV4::first(
+            spec.run_id,
+            spec.project_id,
+            spec.conversation_id,
+            Utc::now(),
+            AgentEventKindV4::ToolApprovalRequested {
+                request: request.clone(),
+            },
+        );
+        assert!(
+            core.tool_requires_approval(&spec, &deletion, ToolEffectV4::Runtime, &[requested])
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

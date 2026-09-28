@@ -2397,12 +2397,22 @@ mod tests {
         };
         let legacy = serde_json::to_value(&selection).unwrap();
         assert!(legacy.get("approval_policy").is_none());
-        assert_eq!(serde_json::from_value::<ComputeSelectionV4>(legacy).unwrap(), selection);
+        assert_eq!(
+            serde_json::from_value::<ComputeSelectionV4>(legacy).unwrap(),
+            selection
+        );
         let legacy_hash = selection.canonical_hash().unwrap();
-        selection.approval_policy = serde_json::from_str("\"auto_approve_except_local_deletion\"").unwrap();
+        selection.approval_policy =
+            serde_json::from_str("\"auto_approve_except_local_deletion\"").unwrap();
         let encoded = serde_json::to_value(&selection).unwrap();
-        assert_eq!(encoded["approval_policy"], "auto_approve_except_local_deletion");
-        assert_eq!(serde_json::from_value::<ComputeSelectionV4>(encoded).unwrap(), selection);
+        assert_eq!(
+            encoded["approval_policy"],
+            "auto_approve_except_local_deletion"
+        );
+        assert_eq!(
+            serde_json::from_value::<ComputeSelectionV4>(encoded).unwrap(),
+            selection
+        );
         assert_ne!(selection.canonical_hash().unwrap(), legacy_hash);
     }
 

@@ -853,14 +853,29 @@ mod tests {
 
     #[test]
     fn local_deletion_reason_is_forwarded_only_for_valid_enabled_calls() {
-        let call = ToolCallV4 { call_id: "delete".into(), tool_id: "runtime.execute".into(), arguments: json!({"language":"python","code":"print(1)"}) };
+        let call = ToolCallV4 {
+            call_id: "delete".into(),
+            tool_id: "runtime.execute".into(),
+            arguments: json!({"language":"python","code":"print(1)"}),
+        };
         let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap();
-        assert_eq!(registry.local_deletion_approval_reason(&call).as_deref(), Some("local deletion"));
-        let denied = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap().with_execute_capabilities(BTreeSet::new());
+        assert_eq!(
+            registry.local_deletion_approval_reason(&call).as_deref(),
+            Some("local deletion")
+        );
+        let denied = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop))
+            .unwrap()
+            .with_execute_capabilities(BTreeSet::new());
         assert_eq!(denied.local_deletion_approval_reason(&call), None);
-        let invalid = ToolCallV4 { arguments: json!({"language":"python"}), ..call.clone() };
+        let invalid = ToolCallV4 {
+            arguments: json!({"language":"python"}),
+            ..call.clone()
+        };
         assert_eq!(registry.local_deletion_approval_reason(&invalid), None);
-        let unknown = ToolCallV4 { tool_id: "unknown".into(), ..call };
+        let unknown = ToolCallV4 {
+            tool_id: "unknown".into(),
+            ..call
+        };
         assert_eq!(registry.local_deletion_approval_reason(&unknown), None);
     }
 
