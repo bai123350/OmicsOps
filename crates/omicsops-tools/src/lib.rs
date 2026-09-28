@@ -34,6 +34,9 @@ pub trait ToolExecutorV4: Send + Sync {
     fn risk_based_approval_reason(&self, _call: &ToolCallV4) -> Option<String> {
         None
     }
+    fn local_deletion_approval_reason(&self, _call: &ToolCallV4) -> Option<String> {
+        None
+    }
     /// Dynamic authority for the generic MCP wrapper in Plan mode. Ordinary
     /// executors do not expose Network tools to planning; the desktop
     /// executor overrides this only after checking the concrete target.
@@ -267,6 +270,11 @@ impl ToolPortV4 for ToolRegistryV4 {
         self.validate(RunModeV4::Execute, call)
             .ok()
             .and_then(|_| self.executor.risk_based_approval_reason(call))
+    }
+    fn local_deletion_approval_reason(&self, call: &ToolCallV4) -> Option<String> {
+        self.validate(RunModeV4::Execute, call)
+            .ok()
+            .and_then(|_| self.executor.local_deletion_approval_reason(call))
     }
 
     async fn authorize_plan_call(
@@ -797,6 +805,9 @@ mod tests {
     }
     #[async_trait]
     impl ToolExecutorV4 for Noop {
+        fn local_deletion_approval_reason(&self, _call: &ToolCallV4) -> Option<String> {
+            Some("local deletion".into())
+        }
         fn risk_based_approval_reason(&self, _call: &ToolCallV4) -> Option<String> {
             Some("fixed host diagnostic".into())
         }
@@ -838,6 +849,19 @@ mod tests {
             ..call
         };
         assert_eq!(registry.risk_based_approval_reason(&unknown), None);
+    }
+
+    #[test]
+    fn local_deletion_reason_is_forwarded_only_for_valid_enabled_calls() {
+        let call = ToolCallV4 { call_id: "delete".into(), tool_id: "runtime.execute".into(), arguments: json!({"language":"python","code":"print(1)"}) };
+        let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap();
+        assert_eq!(registry.local_deletion_approval_reason(&call).as_deref(), Some("local deletion"));
+        let denied = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap().with_execute_capabilities(BTreeSet::new());
+        assert_eq!(denied.local_deletion_approval_reason(&call), None);
+        let invalid = ToolCallV4 { arguments: json!({"language":"python"}), ..call.clone() };
+        assert_eq!(registry.local_deletion_approval_reason(&invalid), None);
+        let unknown = ToolCallV4 { tool_id: "unknown".into(), ..call };
+        assert_eq!(registry.local_deletion_approval_reason(&unknown), None);
     }
 
     struct DynamicPlanExecutor {

@@ -83,6 +83,7 @@ pub(crate) fn format_runtime_boundary(view: &RuntimeBoundaryViewV4) -> String {
     let approval = match view.compute_selection.approval_policy {
         ApprovalPolicyV4::RequestApproval => "request_approval",
         ApprovalPolicyV4::RiskBased => "risk_based",
+        ApprovalPolicyV4::AutoApproveExceptLocalDeletion => "auto_approve_except_local_deletion",
         ApprovalPolicyV4::FullAccess => "full_access",
     };
     let network = match view.compute_selection.network_policy {

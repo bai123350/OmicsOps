@@ -470,6 +470,10 @@ pub trait ToolPortV4: Send + Sync {
     fn risk_based_approval_reason(&self, _call: &ToolCallV4) -> Option<String> {
         None
     }
+    /// Fixed host reason for a detected local deletion. Never return source or paths.
+    fn local_deletion_approval_reason(&self, _call: &ToolCallV4) -> Option<String> {
+        None
+    }
     /// Authorize one Plan-mode call after the caller has supplied its
     /// arguments. Implementations may perform a dynamic host check here (for
     /// example, re-reading a configured MCP profile and its live catalog).
@@ -4077,6 +4081,13 @@ impl AgentCoreV4<'_> {
             .map(Ok)
             .unwrap_or_else(|| spec.calculate_spec_hash())
             .map_err(|error| AgentCoreErrorV4::Store(error.to_string()))?;
+        if spec.compute_selection.as_ref().is_some_and(|selection|
+            selection.approval_policy == ApprovalPolicyV4::AutoApproveExceptLocalDeletion)
+            && let Some(reason) = self.tools.local_deletion_approval_reason(&call)
+        {
+            return ToolApprovalRequestV4::new(spec.run_id, &spec_hash, call, effect, reason)
+                .map_err(|error| AgentCoreErrorV4::Store(error.to_string()));
+        }
         let reason = if call.tool_id == "use_mcp_tool" {
             "批准后，本对话中同一 MCP 服务器、同一工具目录的后续调用将复用授权；目录或服务器授权变化后需重新确认。"
         } else if is_browser_tool_id(&call.tool_id) {
@@ -4178,6 +4189,20 @@ impl AgentCoreV4<'_> {
         effect: ToolEffectV4,
         events: &[AgentEventV4],
     ) -> Result<bool, AgentCoreErrorV4> {
+        if spec.compute_selection.as_ref().is_some_and(|selection|
+            selection.approval_policy == ApprovalPolicyV4::AutoApproveExceptLocalDeletion)
+        {
+            // Frozen exact-call requests keep their original decision path on resume.
+            if events.iter().any(|event| matches!(&event.event,
+                AgentEventKindV4::ToolApprovalRequested { request }
+                    if request.mode == RunModeV4::Execute
+                        && request.scope_hash.is_none()
+                        && request.call.call_id == call.call_id))
+            {
+                return Ok(true);
+            }
+            return Ok(self.tools.local_deletion_approval_reason(call).is_some());
+        }
         if call.tool_id == "agent.complete" || effect == ToolEffectV4::ReadOnly {
             return Ok(false);
         }
@@ -4196,6 +4221,7 @@ impl AgentCoreV4<'_> {
         match selection.approval_policy {
             ApprovalPolicyV4::FullAccess => Ok(false),
             ApprovalPolicyV4::RequestApproval => Ok(true),
+            ApprovalPolicyV4::AutoApproveExceptLocalDeletion => unreachable!(),
             ApprovalPolicyV4::RiskBased => {
                 if call.tool_id == "runtime.execute" {
                     // A request already recorded for this call must still follow its
@@ -6384,6 +6410,10 @@ mod tests {
     struct FakeTools;
     #[async_trait]
     impl ToolPortV4 for FakeTools {
+        fn local_deletion_approval_reason(&self, call: &ToolCallV4) -> Option<String> {
+            (call.arguments.get("fixture_local_deletion") == Some(&json!(true)))
+                .then(|| "This call may delete a local file or directory.".into())
+        }
         fn risk_based_approval_reason(&self, call: &ToolCallV4) -> Option<String> {
             (call.arguments.get("fixture_runtime_reason") == Some(&json!(true)))
                 .then(|| "Project path cannot be proven from this code".into())
@@ -8606,6 +8636,33 @@ mod tests {
                 .unwrap(),
             "compute Full Access must not bypass host browser authorization"
         );
+    }
+
+    #[tokio::test]
+    async fn auto_approve_policy_asks_only_for_host_detected_local_deletion() {
+        let store = MemoryStore::default();
+        let model = ScriptedModel(Mutex::new(vec![]));
+        let core = AgentCoreV4 { model: &model, tools: &FakeTools, events: &store, science: None };
+        let spec = supervised_execution_spec(
+            Uuid::new_v4(),
+            ApprovalPolicyV4::AutoApproveExceptLocalDeletion,
+            ComputeBackendKindV4::Local,
+        );
+        for (tool_id, effect) in [
+            ("runtime.execute", ToolEffectV4::Runtime),
+            ("use_mcp_tool", ToolEffectV4::Network),
+            ("save_memory", ToolEffectV4::Mutating),
+            ("web_search", ToolEffectV4::Network),
+        ] {
+            let call = ToolCallV4 { call_id: tool_id.into(), tool_id: tool_id.into(), arguments: json!({"code":"unknown or dangerous"}) };
+            assert!(!core.tool_requires_approval(&spec, &call, effect, &[]).await.unwrap(), "{tool_id}");
+        }
+        let deletion = ToolCallV4 { call_id: "delete".into(), tool_id: "runtime.execute".into(), arguments: json!({"fixture_local_deletion":true}) };
+        assert!(core.tool_requires_approval(&spec, &deletion, ToolEffectV4::ReadOnly, &[]).await.unwrap());
+        let request = core.approval_request(&spec, deletion.clone(), ToolEffectV4::ReadOnly).unwrap();
+        assert_eq!(request.reason, "This call may delete a local file or directory.");
+        let requested = AgentEventV4::first(spec.run_id, spec.project_id, spec.conversation_id, Utc::now(), AgentEventKindV4::ToolApprovalRequested { request: request.clone() });
+        assert!(core.tool_requires_approval(&spec, &deletion, ToolEffectV4::Runtime, &[requested]).await.unwrap());
     }
 
     #[tokio::test]

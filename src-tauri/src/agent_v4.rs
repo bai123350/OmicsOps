@@ -6114,6 +6114,29 @@ fn same_mcp_conversation_target(approved: &ToolCallV4, call: &ToolCallV4) -> boo
         })
 }
 
+fn conversation_mcp_grant_from_run(
+    source_policy: ApprovalPolicyV4,
+    events: &[AgentEventV4],
+    approved_call: &ToolCallV4,
+    candidate_call: &ToolCallV4,
+    spec_hash: Option<&str>,
+    run_id: Uuid,
+) -> Result<bool, String> {
+    if source_policy == ApprovalPolicyV4::AutoApproveExceptLocalDeletion
+        || !same_mcp_conversation_target(approved_call, candidate_call)
+    {
+        return Ok(false);
+    }
+    run_has_approved_tool_call(
+        events,
+        approved_call,
+        omicsops_protocol::RunModeV4::Execute,
+        spec_hash,
+        None,
+        run_id,
+    )
+}
+
 fn mcp_result_failed(data: &Value) -> bool {
     data.get("result")
         .and_then(|result| result.get("isError"))
@@ -6138,6 +6161,31 @@ fn approved_read_only_mcp_target(entry: &McpToolIndexV4, call: &ToolCallV4) -> b
                         authorize_mcp_read_only_target(entry, catalog, schema, true).is_ok()
                     })
             })
+}
+
+fn auto_policy_mcp_grant(
+    entry: &McpToolIndexV4,
+    call: &ToolCallV4,
+    exact_run_approval: bool,
+) -> Result<(), String> {
+    if call.arguments.get("server_id") != Some(&json!(entry.server_id))
+        || call.arguments.get("tool").and_then(Value::as_str) != Some(entry.tool_name.as_str())
+    {
+        return Err("MCP target does not match the indexed tool".into());
+    }
+    if crate::local_deletion_approval::local_deletion_approval_reason(
+        call,
+        ComputeBackendKindV4::Local,
+    ).is_some() && !exact_run_approval {
+        return Err("Local file deletion requires approval for this exact call".into());
+    }
+    let mut authorized = entry.clone();
+    authorized.tool_approved = true;
+    authorize_mcp_use(
+        &authorized,
+        call.arguments.get("catalog_sha256").and_then(Value::as_str).unwrap_or(""),
+        call.arguments.get("schema_sha256").and_then(Value::as_str).unwrap_or(""),
+    ).map_err(|error| error.to_string())
 }
 
 impl DesktopToolExecutorV4 {
@@ -6318,6 +6366,10 @@ impl DesktopToolExecutorV4 {
                 continue;
             }
             let record = load_record(&self.repository, event.run_id).await?;
+            let source_policy = record.spec.as_ref()
+                .and_then(|spec| spec.compute_selection.as_ref())
+                .or(record.compute_selection.as_ref())
+                .map_or(ApprovalPolicyV4::RiskBased, |selection| selection.approval_policy);
             let hash = record
                 .spec
                 .as_ref()
@@ -6327,12 +6379,12 @@ impl DesktopToolExecutorV4 {
                 .filter(|item| item.run_id == event.run_id)
                 .cloned()
                 .collect();
-            if run_has_approved_tool_call(
+            if conversation_mcp_grant_from_run(
+                source_policy,
                 &run_events,
                 &request.call,
-                omicsops_protocol::RunModeV4::Execute,
+                call,
                 hash,
-                None,
                 event.run_id,
             )? {
                 return Ok(true);
@@ -6472,7 +6524,10 @@ impl DesktopToolExecutorV4 {
         } else {
             false
         };
-        if authorization.is_none() && !exact_run_approval {
+        if authorization.is_none()
+            && !exact_run_approval
+            && self.selection.approval_policy != ApprovalPolicyV4::AutoApproveExceptLocalDeletion
+        {
             return Ok(ToolOutcomeV4 {
                 call_id: call.call_id.clone(),
                 tool_id: call.tool_id.clone(),
@@ -6976,11 +7031,21 @@ impl DesktopToolExecutorV4 {
                 let policy_approved = !require_read_only_hint
                     && self.selection.approval_policy == ApprovalPolicyV4::RiskBased
                     && approved_read_only_mcp_target(&indexed, call);
-                let schema_bound_run_approved = if require_read_only_hint {
+                let exact_run_approval = if require_read_only_hint {
                     self.run_approved_plan_tool_call(call).await?
                 } else {
                     self.run_approved_tool_call(call).await?
-                        || policy_approved
+                };
+                let auto_policy_approved = !require_read_only_hint
+                    && self.selection.approval_policy
+                        == ApprovalPolicyV4::AutoApproveExceptLocalDeletion;
+                if auto_policy_approved {
+                    auto_policy_mcp_grant(&indexed, call, exact_run_approval)?;
+                }
+                let schema_bound_run_approved = if require_read_only_hint {
+                    exact_run_approval
+                } else {
+                    exact_run_approval || auto_policy_approved || policy_approved
                         || self.conversation_mcp_approved(call).await?
                 };
                 if !indexed.tool_approved && schema_bound_run_approved {
@@ -7263,6 +7328,13 @@ impl DesktopToolExecutorV4 {
 
 #[async_trait]
 impl ToolExecutorV4 for DesktopToolExecutorV4 {
+    fn local_deletion_approval_reason(&self, call: &ToolCallV4) -> Option<String> {
+        crate::local_deletion_approval::local_deletion_approval_reason(
+            call,
+            self.selection.backend_kind,
+        )
+    }
+
     fn risk_based_approval_reason(&self, call: &ToolCallV4) -> Option<String> {
         (call.tool_id == "runtime.execute")
             .then(|| {
@@ -8511,7 +8583,7 @@ fn project_rules_layer(agents: &str, override_rules: &str) -> String {
     }
 }
 
-fn parse_language(value: &str) -> Result<KernelLanguageV4, String> {
+pub(crate) fn parse_language(value: &str) -> Result<KernelLanguageV4, String> {
     match value.to_ascii_lowercase().as_str() {
         "python" | "py" => Ok(KernelLanguageV4::Python),
         "r" => Ok(KernelLanguageV4::R),
@@ -8988,6 +9060,9 @@ mod tests {
     }
     #[async_trait]
     impl ToolExecutorV4 for RecordingApprovalExecutor {
+        fn local_deletion_approval_reason(&self, call: &ToolCallV4) -> Option<String> {
+            ToolExecutorV4::local_deletion_approval_reason(self.desktop.as_ref(), call)
+        }
         async fn risk_based_target_approved(&self, call: &ToolCallV4) -> bool {
             ToolExecutorV4::risk_based_target_approved(self.desktop.as_ref(), call).await
         }
@@ -9085,6 +9160,20 @@ mod tests {
             arguments: json!({"language":"python","code":"import subprocess\nsubprocess.run(['echo', 'x'])"}),
             ..ordinary
         };
+        let deletion = ToolCallV4 {
+            call_id: "local-deletion".into(),
+            tool_id: "runtime.execute".into(),
+            arguments: json!({"language":"python","code":"import os\nos.remove('results/PRIVATE_SENTINEL')"}),
+        };
+        let alias_deletions = [
+            ("Python", "os.remove('results/PRIVATE_SENTINEL')"),
+            ("py", "os.remove('results/PRIVATE_SENTINEL')"),
+            ("R", "unlink('results/PRIVATE_SENTINEL')"),
+        ].map(|(language, code)| ToolCallV4 {
+            call_id: format!("delete-{language}"),
+            tool_id: "runtime.execute".into(),
+            arguments: json!({"language":language,"code":code}),
+        });
         assert!(!executor.risk_based_target_approved(&risky).await);
         let uncertain_path = ToolCallV4 {
             call_id: "diagnose-project-path".into(),
@@ -9127,11 +9216,18 @@ mod tests {
         // Drive the actual Agent Core policy through the desktop classifier and
         // registry. The recorder never starts Python or reserves a runtime job.
         let desktop = Arc::new(executor);
-        for (policy, tool_call, expected_dispatch) in [
-            (ApprovalPolicyV4::RiskBased, dated.clone(), 1),
-            (ApprovalPolicyV4::RiskBased, risky.clone(), 0),
-            (ApprovalPolicyV4::RiskBased, uncertain_path.clone(), 0),
-            (ApprovalPolicyV4::RequestApproval, dated.clone(), 0),
+        for (policy, tool_call, expected_dispatch, resume_decision) in [
+            (ApprovalPolicyV4::RiskBased, dated.clone(), 1, None),
+            (ApprovalPolicyV4::RiskBased, risky.clone(), 0, None),
+            (ApprovalPolicyV4::RiskBased, uncertain_path.clone(), 0, None),
+            (ApprovalPolicyV4::RequestApproval, dated.clone(), 0, None),
+            (ApprovalPolicyV4::AutoApproveExceptLocalDeletion, risky.clone(), 1, None),
+            (ApprovalPolicyV4::AutoApproveExceptLocalDeletion, uncertain_path.clone(), 1, None),
+            (ApprovalPolicyV4::AutoApproveExceptLocalDeletion, deletion.clone(), 0, Some(ToolApprovalDecisionV4::Approved)),
+            (ApprovalPolicyV4::AutoApproveExceptLocalDeletion, deletion.clone(), 0, Some(ToolApprovalDecisionV4::Denied)),
+            (ApprovalPolicyV4::AutoApproveExceptLocalDeletion, alias_deletions[0].clone(), 0, None),
+            (ApprovalPolicyV4::AutoApproveExceptLocalDeletion, alias_deletions[1].clone(), 0, None),
+            (ApprovalPolicyV4::AutoApproveExceptLocalDeletion, alias_deletions[2].clone(), 0, None),
         ] {
             let call_id = tool_call.call_id.clone();
             let run_id = Uuid::new_v4();
@@ -9183,14 +9279,13 @@ mod tests {
                     mode: RunModeV4::Execute,
                 },
             ));
-            let run_result = AgentCoreV4 {
+            let core = AgentCoreV4 {
                 model: &model,
                 tools: &registry,
                 events: &events,
                 science: None,
-            }
-            .execute(&spec, 1)
-            .await;
+            };
+            let run_result = core.execute(&spec, 1).await;
             if expected_dispatch == 0 {
                 assert!(matches!(
                     run_result,
@@ -9206,17 +9301,38 @@ mod tests {
                 recorder.dispatched.load(Ordering::SeqCst),
                 expected_dispatch
             );
-            let events = events.0.lock().unwrap();
-            let approval_requested = events
+            let recorded = events.0.lock().unwrap();
+            let approval_requested = recorded
                 .iter()
                 .any(|event| matches!(event.event, AgentEventKindV4::ToolApprovalRequested { .. }));
             assert_eq!(approval_requested, expected_dispatch == 0);
-            assert_eq!(events.iter().filter(|event| {
+            assert_eq!(recorded.iter().filter(|event| {
                 matches!(&event.event, AgentEventKindV4::ToolDispatchStarted { call_id: started, .. } if started == &call_id)
             }).count(), expected_dispatch);
-            assert_eq!(events.iter().filter(|event| {
+            assert_eq!(recorded.iter().filter(|event| {
                 matches!(&event.event, AgentEventKindV4::ToolFinished { outcome } if outcome.call_id == call_id && outcome.succeeded)
             }).count(), expected_dispatch);
+            if let Some(decision) = resume_decision {
+                let request = recorded.iter().find_map(|event| match &event.event {
+                    AgentEventKindV4::ToolApprovalRequested { request } => Some(request.clone()),
+                    _ => None,
+                }).unwrap();
+                let decided = AgentEventV4::next(recorded.last().unwrap(), Utc::now(),
+                    AgentEventKindV4::ToolApprovalDecided {
+                        approval_id: request.approval_id,
+                        call_hash: request.call_hash,
+                        decision,
+                    });
+                drop(recorded);
+                events.0.lock().unwrap().push(decided);
+                let _ = core.execute(&spec, 1).await;
+                let dispatches = usize::from(decision == ToolApprovalDecisionV4::Approved);
+                assert_eq!(recorder.dispatched.load(Ordering::SeqCst), dispatches);
+                let recorded = events.0.lock().unwrap();
+                assert_eq!(recorded.iter().filter(|event| {
+                    matches!(&event.event, AgentEventKindV4::ToolDispatchStarted { call_id: started, .. } if started == &call_id)
+                }).count(), dispatches);
+            }
         }
     }
 
@@ -12167,6 +12283,29 @@ mod tests {
     }
 
     #[test]
+    fn auto_policy_mcp_grant_requires_exact_decision_for_deletion_and_valid_target() {
+        let mut entry = McpToolIndexV4 {
+            server_id: Uuid::new_v4(), server_name: "files".into(), tool_name: "write_file".into(),
+            description: "files".into(), input_schema: json!({"type":"object"}),
+            tool_catalog_sha256: "catalog".into(), schema_sha256: "schema".into(),
+            read_only_hint: Some(false), configured: true, enabled: true,
+            launch_approved: true, tool_approved: false, updated_at: chrono::Utc::now(),
+        };
+        let mut call = ToolCallV4 { call_id: "mcp".into(), tool_id: "use_mcp_tool".into(),
+            arguments: json!({"server_id":entry.server_id,"tool":"write_file","catalog_sha256":"catalog","schema_sha256":"schema","arguments":{"path":"PRIVATE_PATH","content":"new"}}) };
+        assert!(auto_policy_mcp_grant(&entry, &call, false).is_ok());
+        entry.tool_name = "delete_file".into();
+        call.arguments["tool"] = json!("delete_file");
+        assert!(auto_policy_mcp_grant(&entry, &call, false).is_err());
+        assert!(auto_policy_mcp_grant(&entry, &call, true).is_ok());
+        entry.launch_approved = false;
+        assert!(auto_policy_mcp_grant(&entry, &call, true).is_err());
+        entry.launch_approved = true;
+        call.arguments["schema_sha256"] = json!("stale");
+        assert!(auto_policy_mcp_grant(&entry, &call, true).is_err());
+    }
+
+    #[test]
     fn mcp_protocol_errors_are_failed_outcomes() {
         assert!(mcp_result_failed(
             &json!({"result":{"isError":true,"content":[{"type":"text","text":"HTTP 400"}]}})
@@ -12193,6 +12332,34 @@ mod tests {
         }
         next.tool_id = "runtime.execute".into();
         assert!(!same_mcp_conversation_target(&prior, &next));
+    }
+
+    #[test]
+    fn new_policy_one_call_mcp_approval_never_becomes_later_conversation_grant() {
+        let source_run = Uuid::new_v4();
+        let prior = ToolCallV4 {
+            call_id: "delete-a".into(), tool_id: "use_mcp_tool".into(),
+            arguments: json!({"server_id":"server","catalog_sha256":"catalog","schema_sha256":"schema","tool":"delete_file","arguments":{"path":"A"}}),
+        };
+        let later = ToolCallV4 {
+            call_id: "delete-b".into(),
+            arguments: json!({"server_id":"server","catalog_sha256":"catalog","schema_sha256":"schema","tool":"delete_file","arguments":{"path":"B"}}),
+            ..prior.clone()
+        };
+        let request = ToolApprovalRequestV4::new(source_run, "frozen-spec", prior.clone(), ToolEffectV4::Network, "local deletion").unwrap();
+        let requested = AgentEventV4::first(source_run, Uuid::new_v4(), Uuid::new_v4(), Utc::now(),
+            AgentEventKindV4::ToolApprovalRequested { request: request.clone() });
+        let decided = AgentEventV4::next(&requested, Utc::now(), AgentEventKindV4::ToolApprovalDecided {
+            approval_id: request.approval_id, call_hash: request.call_hash,
+            decision: ToolApprovalDecisionV4::Approved,
+        });
+        let events = [requested, decided];
+        assert!(!conversation_mcp_grant_from_run(ApprovalPolicyV4::AutoApproveExceptLocalDeletion,
+            &events, &prior, &later, Some("frozen-spec"), source_run).unwrap());
+        for legacy in [ApprovalPolicyV4::RiskBased, ApprovalPolicyV4::RequestApproval] {
+            assert!(conversation_mcp_grant_from_run(legacy, &events, &prior, &later,
+                Some("frozen-spec"), source_run).unwrap());
+        }
     }
 
     #[test]

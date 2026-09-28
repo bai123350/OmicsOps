@@ -843,6 +843,7 @@ pub enum ApprovalPolicyV4 {
     RequestApproval,
     #[default]
     RiskBased,
+    AutoApproveExceptLocalDeletion,
     FullAccess,
 }
 
@@ -2380,6 +2381,29 @@ mod tests {
         let mut mismatched_container = podman;
         mismatched_container.approval_policy = ApprovalPolicyV4::RiskBased;
         assert!(mismatched_container.validate().is_err());
+    }
+
+    #[test]
+    fn explicit_local_deletion_policy_preserves_legacy_default_and_hash() {
+        let mut selection = ComputeSelectionV4 {
+            schema_version: 4,
+            backend_id: "local".into(),
+            backend_kind: ComputeBackendKindV4::Local,
+            autonomy_mode: AutonomyModeV4::Supervised,
+            approval_policy: ApprovalPolicyV4::RiskBased,
+            environment: "system".into(),
+            network_policy: NetworkPolicyV4::HostInherited,
+            container_image: None,
+        };
+        let legacy = serde_json::to_value(&selection).unwrap();
+        assert!(legacy.get("approval_policy").is_none());
+        assert_eq!(serde_json::from_value::<ComputeSelectionV4>(legacy).unwrap(), selection);
+        let legacy_hash = selection.canonical_hash().unwrap();
+        selection.approval_policy = serde_json::from_str("\"auto_approve_except_local_deletion\"").unwrap();
+        let encoded = serde_json::to_value(&selection).unwrap();
+        assert_eq!(encoded["approval_policy"], "auto_approve_except_local_deletion");
+        assert_eq!(serde_json::from_value::<ComputeSelectionV4>(encoded).unwrap(), selection);
+        assert_ne!(selection.canonical_hash().unwrap(), legacy_hash);
     }
 
     #[test]
