@@ -184,6 +184,16 @@ describe("RuntimeDialog", () => {
     expect(onPrepare).not.toHaveBeenCalled();
   });
 
+  it("distinguishes the new local deletion policy from a frozen historical risk policy", () => {
+    const { rerender } = renderDialog({ zh: true, boundary: { ...localBoundary, compute_selection: { ...localBoundary.compute_selection, approval_policy: "auto_approve_except_local_deletion" } } });
+    expect(screen.getByRole("dialog")).toHaveTextContent("自动批准操作，仅检测到本地删除时询问");
+    rerender(<RuntimeDialog zh language="python" onLanguageChange={vi.fn()} environment="system" onClose={vi.fn()}
+      boundary={{ ...localBoundary, source: { kind: "frozen_run", run_id: "historical" }, compute_selection: { ...localBoundary.compute_selection, approval_policy: "risk_based" } }}
+      boundaryLoading={false} boundaryError="" onRetryBoundary={vi.fn()} />);
+    expect(screen.getByRole("dialog")).toHaveTextContent("基于风险的审批");
+    expect(screen.getByRole("dialog")).not.toHaveTextContent("自动批准操作，仅检测到本地删除时询问");
+  });
+
   it("shows incomplete, loading and retryable errors without making boundary claims", () => {
     const onRetryBoundary = vi.fn();
     const { rerender } = renderDialog({ boundary: null, onRetryBoundary });

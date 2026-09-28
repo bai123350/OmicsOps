@@ -794,6 +794,30 @@ describe("WorkspaceShell", () => {
     expect(onAutonomyModeChange).toHaveBeenCalledWith("full_auto");
   });
 
+  it("defaults the composer to local deletion approval and preserves request approval choice", () => {
+    const onApprovalPolicyChange = vi.fn();
+    render(<WorkspaceShell project={project} locale="zh-CN" onApprovalPolicyChange={onApprovalPolicyChange} computeBackendId="local"
+      computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
+    fireEvent.click(screen.getByRole("button", { name: "Agent 权限" }));
+    const assist = screen.getByRole("menuitemradio", { name: /^帮我批准/ });
+    expect(assist).toHaveAttribute("aria-checked", "true");
+    expect(assist).toHaveTextContent("自动批准操作，仅检测到本地删除时询问");
+    expect(assist).toHaveTextContent("动态代码或第三方工具中的间接删除可能无法识别");
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /^请求批准/ }));
+    expect(onApprovalPolicyChange).toHaveBeenCalledWith("request_approval");
+    fireEvent.click(screen.getByRole("button", { name: "Agent 权限" }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /^帮我批准/ }));
+    expect(onApprovalPolicyChange).toHaveBeenLastCalledWith("auto_approve_except_local_deletion");
+  });
+
+  it("labels historical risk based selection without presenting it as the new policy", () => {
+    render(<WorkspaceShell project={project} locale="zh-CN" approvalPolicy="risk_based" computeBackendId="local"
+      computeBackends={[{ descriptor: { schema_version: 4, backend_id: "local", kind: "local", isolation: "process", available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available", r_status: "unavailable", resolved_image_id: null }]} />);
+    expect(screen.getByText(/Agent 模式：LOCAL · 风险审批/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Agent 权限" }));
+    expect(screen.getByRole("menuitemradio", { name: /^帮我批准/ })).toHaveAttribute("aria-checked", "false");
+  });
+
   it("hydrates conversation preferences and sends each switch with the active scope", async () => {
     const loaded = { delegation_enabled: false, auto_review: true, memory_enabled: false };
     const saved = { delegation_enabled: true, auto_review: true, memory_enabled: false };

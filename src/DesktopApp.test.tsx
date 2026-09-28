@@ -731,7 +731,7 @@ describe("DesktopApp", () => {
     fireEvent.change(composer, { target: { value: "先解释一下这个矩阵格式" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
 
-    await waitFor(() => expect(startDirect).toHaveBeenCalledWith(expect.objectContaining({ objective: "先解释一下这个矩阵格式" })));
+    await waitFor(() => expect(startDirect).toHaveBeenCalledWith(expect.objectContaining({ objective: "先解释一下这个矩阵格式", compute_selection: expect.objectContaining({ approval_policy: "auto_approve_except_local_deletion" }) })));
     expect(startPlanning).not.toHaveBeenCalled();
     expect(await screen.findByRole("button", { name: "添加上下文或选择模式" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "终止运行" }));
@@ -1049,7 +1049,7 @@ describe("DesktopApp", () => {
     fireEvent.change(screen.getByRole("textbox", { name: /描述研究目标/ }), { target: { value: "执行完整 QC" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
 
-    await waitFor(() => expect(startPlanning).toHaveBeenCalledWith(expect.objectContaining({ objective: "执行完整 QC", compute_selection: selection })));
+    await waitFor(() => expect(startPlanning).toHaveBeenCalledWith(expect.objectContaining({ objective: "执行完整 QC", compute_selection: { ...selection, approval_policy: "auto_approve_except_local_deletion" } })));
     fireEvent.click(await screen.findByRole("button", { name: "批准并运行" }));
     await waitFor(() => expect(approvePlan).toHaveBeenCalledWith("run-v4", "approval-hash", 1));
     expect(await screen.findByText(/Agent 模式：LOCAL/)).toBeInTheDocument();
@@ -1649,6 +1649,23 @@ describe("DesktopApp", () => {
     expect(screen.getByRole("combobox", { name: "Interface language" })).toHaveValue("en-US");
   });
 
+  it("falls back to local deletion approval when leaving full access for a local backend", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    const docker = { ...stateBackend, descriptor: { ...stateBackend.descriptor, backend_id: "docker", kind: "docker" as const, isolation: "container" as const, supports_network_policy: true }, python_status: "unverified" as const, resolved_image_id: "sha256:test" };
+    vi.mocked(api.agentV4ComputeBackends).mockResolvedValue([stateBackend, docker]);
+    render(<DesktopApp />);
+    await screen.findByText(/Agent 模式：LOCAL/);
+    fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
+    fireEvent.click(screen.getByRole("radio", { name: /DOCKER/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Agent 权限" }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /^完全访问权限/ }));
+    expect(screen.getByText(/Agent 模式：DOCKER · 完全访问/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
+    fireEvent.click(screen.getByRole("radio", { name: /LOCAL/ }));
+    expect(await screen.findByText(/Agent 模式：LOCAL · 仅本地删除询问/)).toBeInTheDocument();
+  });
+
   it("applies General language changes immediately and keeps them after Settings closes and reopens", async () => {
     vi.spyOn(api, "listProjects").mockResolvedValue([]);
     render(<DesktopApp />);
@@ -2016,6 +2033,7 @@ it("routes native idle sends through the durable queue and recovers the committe
     await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
     fireEvent.keyDown(input, { key: "Enter" });
     await waitFor(() => expect(enqueue).toHaveBeenCalledTimes(1));
+    expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({ compute_selection: expect.objectContaining({ approval_policy: "auto_approve_except_local_deletion" }) }));
     expect(submit).not.toHaveBeenCalled(); expect(start).not.toHaveBeenCalled();
     await waitFor(() => expect(input).toHaveValue(""));
     await waitFor(() => expect(screen.getAllByText("原子提交的研究任务")).toHaveLength(1));

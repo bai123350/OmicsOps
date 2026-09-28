@@ -170,7 +170,7 @@ export interface ExecutionPlanV4 {
 
 export type ComputeBackendKindV4 = "ssh" | "local" | "docker" | "podman";
 export type AutonomyModeV4 = "supervised" | "full_auto";
-export type ApprovalPolicyV4 = "request_approval" | "risk_based" | "full_access";
+export type ApprovalPolicyV4 = "request_approval" | "risk_based" | "auto_approve_except_local_deletion" | "full_access";
 export type NetworkPolicyV4 = "host_inherited" | "none";
 
 export interface ComputeSelectionV4 {

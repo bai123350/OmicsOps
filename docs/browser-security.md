@@ -107,6 +107,8 @@ Host 的 target host 计算必须保持可审计：
 approval、Origin/handshake、scope、URL、tab、CAPTCHA、脚本、路径、SHA 或
 同 run 恢复门禁。浏览器授权与 compute approval 是两个独立的审计域。
 
+`auto_approve_except_local_deletion` 是独立的新策略：Execute 阶段由 Host 对当前合法调用自动作出批准决定，检测到本地删除时仍询问。它不新增或扩大上述持久授权记录，目标、会话、协议、连接及工具合法性检查仍需通过；已有精确调用的批准或拒绝决定继续有效。Plan 的门禁和当前浏览器功能开关不因此改变。
+
 事件链的业务终态仍不可恢复或追加普通工作。唯一例外是终态后最多一个
 `BrowserTabCleanupRequired` 管理事件，用于确认仅关闭本 run 创建的标签；该
 事件不携带网页正文、不改变终态，重复或其他终态后事件均拒绝。

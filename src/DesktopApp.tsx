@@ -125,7 +125,7 @@ export default function DesktopApp() {
   const [computeBackendId, setComputeBackendId] = useState("local");
   const [containerImage, setContainerImage] = useState("");
   const [autonomyMode, setAutonomyMode] = useState<AutonomyModeV4>("supervised");
-  const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicyV4>("risk_based");
+  const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicyV4>("auto_approve_except_local_deletion");
   const [computeEnvironment, setComputeEnvironment] = useState("system");
   const [computeBusy, setComputeBusy] = useState(false);
   const [planLoading, setPlanLoading] = useState(false);
@@ -438,7 +438,7 @@ export default function DesktopApp() {
     if (backend.descriptor.kind !== "ssh") setComputeEnvironment("system");
     if (backend.descriptor.isolation !== "container") {
       setAutonomyMode("supervised");
-      setApprovalPolicy((current) => current === "full_access" ? "risk_based" : current);
+      setApprovalPolicy((current) => current === "full_access" ? "auto_approve_except_local_deletion" : current);
     }
   }, [computeBackendId, computeBackends]);
   useEffect(() => {
@@ -831,7 +831,7 @@ export default function DesktopApp() {
       backend_id: backend.descriptor.backend_id,
       backend_kind: backend.descriptor.kind,
       autonomy_mode: container && approvalPolicy === "full_access" ? "full_auto" : "supervised",
-      approval_policy: approvalPolicy,
+      approval_policy: approvalPolicy === "risk_based" ? "auto_approve_except_local_deletion" : approvalPolicy,
       environment: backend.descriptor.kind === "ssh" ? (computeEnvironment.trim() || "system") : "system",
       network_policy: container ? "none" : "host_inherited",
       container_image: container ? { reference: containerImage.trim(), image_id: backend.resolved_image_id! } : null,
