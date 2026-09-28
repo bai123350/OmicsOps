@@ -5613,7 +5613,8 @@ fn classify_model_failure(message: &str) -> ModelFailureV4 {
     let lower = message.to_ascii_lowercase();
     if lower.contains("unknown_provider_tool:") {
         ModelFailureV4::permanent(ModelErrorClassV4::InvalidResponse, message)
-    } else if lower.contains("context_length_exceeded") || lower.contains("context_window_exceeded") {
+    } else if lower.contains("context_length_exceeded") || lower.contains("context_window_exceeded")
+    {
         ModelFailureV4::permanent(ModelErrorClassV4::ContextOverflow, message)
     } else if lower.contains("429") || lower.contains("rate limit") {
         ModelFailureV4::transient(ModelErrorClassV4::RateLimited, message)
@@ -10975,7 +10976,10 @@ mod tests {
             ModelErrorClassV4::Timeout
         );
         assert!(!classify_model_failure("401 unauthorized").retryable);
-        for message in ["unknown_provider_tool: 429 timeout", "model endpoint failed: unknown_provider_tool: 500"] {
+        for message in [
+            "unknown_provider_tool: 429 timeout",
+            "model endpoint failed: unknown_provider_tool: 500",
+        ] {
             let failure = classify_model_failure(message);
             assert_eq!(failure.class, ModelErrorClassV4::InvalidResponse);
             assert!(!failure.retryable);

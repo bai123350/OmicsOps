@@ -16306,12 +16306,20 @@ mod tests {
                 ));
                 return Err(ModelFailureV4::permanent(
                     omicsops_protocol::ModelErrorClassV4::InvalidResponse,
-                    if attempt == 0 { self.failure_message } else { self.second_failure_message.unwrap_or(self.failure_message) },
+                    if attempt == 0 {
+                        self.failure_message
+                    } else {
+                        self.second_failure_message.unwrap_or(self.failure_message)
+                    },
                 ));
             }
             assert!(request.system.contains("at most ONE complete tool call"));
             if self.failure_message.contains("unknown_provider_tool:") {
-                assert!(request.system.contains("Use only a tool exactly listed in the current request schema"));
+                assert!(
+                    request
+                        .system
+                        .contains("Use only a tool exactly listed in the current request schema")
+                );
             }
             assert_eq!(request.context, "verified evidence");
             Ok(ModelTurnV4 {
@@ -16335,9 +16343,21 @@ mod tests {
                 "tool call c1 returned malformed JSON arguments: expected comma",
                 None,
             ),
-            (false, "unknown_provider_tool: response used a tool absent from the current request", None),
-            (true, "unknown_provider_tool: response used a tool absent from the current request", None),
-            (false, "unknown_provider_tool: response used a tool absent from the current request", Some("tool call c1 returned malformed JSON arguments: expected comma")),
+            (
+                false,
+                "unknown_provider_tool: response used a tool absent from the current request",
+                None,
+            ),
+            (
+                true,
+                "unknown_provider_tool: response used a tool absent from the current request",
+                None,
+            ),
+            (
+                false,
+                "unknown_provider_tool: response used a tool absent from the current request",
+                Some("tool call c1 returned malformed JSON arguments: expected comma"),
+            ),
         ] {
             let model = TruncatedModel {
                 failure_message,
@@ -16380,7 +16400,9 @@ mod tests {
                 .await;
             assert_eq!(
                 result.is_err(),
-                always_fail || second_failure_message.is_some() || failure_message.contains("truncated_output:")
+                always_fail
+                    || second_failure_message.is_some()
+                    || failure_message.contains("truncated_output:")
             );
             let previews = store.previews.lock().unwrap();
             assert!(
