@@ -409,7 +409,7 @@ fn safe_os_path_call<'a>(
     let Token::Word(method) = tokens.get(start + 4)? else {
         return None;
     };
-    if method != "join" && method != "getsize" {
+    if method != "join" && method != "getsize" && method != "exists" {
         return None;
     }
     let mut cursor = start + 6;
@@ -425,7 +425,9 @@ fn safe_os_path_call<'a>(
         }
         cursor += 1;
     }
-    if (method == "getsize" && arguments != 1) || (method == "join" && arguments < 2) {
+    if ((method == "getsize" || method == "exists") && arguments != 1)
+        || (method == "join" && arguments < 2)
+    {
         return None;
     }
     Some((method, cursor + 1))
@@ -824,6 +826,59 @@ print(json.dumps({"rows": len(rows), "bytes": size}))
         assert!(ordinary_runtime_call_is_low_risk(&python(
             "import os\nprint(os.path.getsize(os.path.join('results', 'report.tsv')))"
         )));
+    }
+
+    #[test]
+    fn project_relative_exists_checks_are_ordinary() {
+        for code in [
+            "import os\nprint(os.path.exists('results/review.csv'))",
+            "import os\np = 'results/review.csv'\nif os.path.exists(p):\n    print('present')",
+            "import os\nprint(os.path.exists(os.path.join('results', 'review.csv')))",
+        ] {
+            assert!(ordinary_runtime_call_is_low_risk(&python(code)), "{code}");
+        }
+    }
+
+    #[test]
+    fn project_relative_exists_allows_literature_read_and_csv_review() {
+        let code = r#"
+import csv, json, os, urllib.request
+name = 'results/review.csv'
+if os.path.exists(name):
+    with open(name, encoding='utf-8') as handle:
+        rows = list(csv.DictReader(handle))
+else:
+    rows = []
+request = urllib.request.Request('https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=PBMC', headers={'Accept': 'application/json'})
+with urllib.request.urlopen(request, timeout=60) as response:
+    papers = json.load(response)
+print(len(rows), len(papers.get('resultList', {}).get('result', [])))
+"#;
+        assert!(ordinary_runtime_call_is_low_risk(&python(code)));
+    }
+
+    #[test]
+    fn unsafe_exists_checks_still_require_approval() {
+        for code in [
+            "import os\nprint(os.path.exists(unknown))",
+            "import os\nprint(os.path.exists('/tmp/outside'))",
+            "import os\nprint(os.path.exists('C:/outside'))",
+            "import os\nprint(os.path.exists('../outside'))",
+            "import os\nprint(os.path.exists('results/../outside'))",
+            "import os\nprint(os.path.exists('.git/config'))",
+            "import os\np = 'results/review.csv'\np = unknown\nprint(os.path.exists(p))",
+            "import os\nif condition:\n    p = 'results/review.csv'\nprint(os.path.exists(p))",
+            "import os as operating\nprint(operating.path.exists('results/review.csv'))",
+            "from os import path\nprint(path.exists('results/review.csv'))",
+            "import os\ncheck = os.path.exists\nprint(check('results/review.csv'))",
+            "import os\nprint(os.path.exists)",
+            "import os\nprint(os.path.exists())",
+            "import os\nprint(os.path.exists('results/review.csv', 'results/other.csv'))",
+            "import os\nprint(os.path.exists(path='results/review.csv'))",
+            "import os\nexists_result = os.path.exists('results/review.csv')\nprint(os.path.getsize(exists_result))",
+        ] {
+            assert!(!ordinary_runtime_call_is_low_risk(&python(code)), "{code}");
+        }
     }
 
     #[test]

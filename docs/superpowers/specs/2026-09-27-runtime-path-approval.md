@@ -5,13 +5,14 @@
 ## 用户问题与行为
 
 普通 Agent 使用 `runtime.execute` 整理项目内文献结果时，脚本常用
-`import os`、`os.path.join` 和 `os.path.getsize` 读取相对路径的文件大小。
+`import os`、`os.path.join`、`os.path.getsize` 和 `os.path.exists` 检查相对路径的文件大小或是否存在。
 此前审批预检把所有 `os` 导入都判为需要批准，使这类可核验的元数据读取反复等待审批。
 
 RiskBased 模式下，预检现在仅对可静态证明的这一种用法给出低风险建议：
-显式 `import os`，直接调用 `os.path.join` 或 `os.path.getsize`；路径参数为
+显式 `import os`，直接调用 `os.path.join`、`os.path.getsize` 或 `os.path.exists`；路径参数为
 安全的相对字面量、顶层简单赋值建立的相对路径名，或由这些参数组成的
 `os.path.join` 结果。支持先把 `join` 结果赋给名称，再用于 `getsize`。
+`exists` 与 `getsize` 一样只接受一个已证明的路径参数；其布尔返回值不能作为路径证明。
 路径名被重新赋值、循环变量或参数绑定覆盖时撤销证明；缩进代码块中的赋值
 不建立证明。带分号的逻辑行不建立证明；遇到 `def`、`lambda`、`for`、`case`、
 `class`、`import`、`del`
@@ -29,7 +30,7 @@ RiskBased 模式下，预检现在仅对可静态证明的这一种用法给出�
 Host 参数检查、项目隔离、单次调用审批、执行后证据与审计继续生效。
 不改变数据库、协议、持久化、SSH 作业恢复或凭据处理。
 
-自动化测试覆盖正常项目相对路径流程、嵌套直接调用、别名和裸对象引用、
+自动化测试覆盖正常项目相对路径流程、嵌套直接调用、`exists` 后的 CSV 读取与公开 GET、别名和裸对象引用、
 路径逃逸、转义字面量、不确定路径、重新绑定及条件代码块。确定性检查使用
 `cargo test -p omicsops-desktop --lib runtime_approval`；真实模型和 SSH 验收
 仍按 `acceptance/README.md` 单独执行，不能由此项单元测试代替。
