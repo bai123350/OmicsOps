@@ -398,3 +398,36 @@ operations still require approval. Existing pending exact-call approvals retain
 their recorded semantics. Search the MCP directory, refine or clear its query,
 retrieve one exact schema, and confirm compaction preserves the same signed
 directory reference. These native UI and original-workflow checks remain unrun.
+
+## 2026-09-28 approval and provider tool identity validation
+
+Deterministic checks passed: `cargo test --workspace` (1,381 passed, 12 ignored),
+`npm test` (945 frontend and 22 bridge tests), `npm run build`, and
+`npm run build:desktop`. Formatting was applied in a separate commit;
+`cargo fmt --all -- --check` then passed. The new local Windows executable
+contains the project-relative `os.path.exists` approval correction and stable
+provider tool names with one bounded invalid-call repair attempt.
+
+The first live-test invocation used the workspace filter and failed before any
+model request: the Windows linker returned exit 1 while linking an adapters
+unit-test target. No live acceptance pass is claimed for that invocation.
+The documented desktop-only command was then run explicitly:
+
+```text
+cargo test -p omicsops-desktop agent_v4::go_live_acceptance_tests::live_opencode_go_agent_reads_file_and_returns_nonce -- --ignored --exact --nocapture
+```
+
+It passed 1/1 (exit 0) in 70.11 seconds with the saved `deepseek-v4.1-flash`
+profile, using read-only profile selection, its existing keyring credential,
+and a disposable project. Two attempts produced content; 1,104 nonempty transient
+reasoning observations arrived before their result. Only observation metadata was
+printed, never reasoning text or credentials. The production Agent read the
+random nonce file and returned its contents successfully.
+
+This validates the real provider/tool/completion path with the changed tool
+identity mapping. Unknown-name recovery, whole-response non-dispatch, shared
+repair budget and risky path rejection were tested deterministically, not
+injected into this live run. The original miRNA task, SSH, and native UI manual
+acceptance were not run. The 70.11 seconds is not a before/after literature-task
+speed comparison; the original run's event analysis is recorded in
+`docs/superpowers/specs/2026-09-28-approval-and-tool-identity.md`.
