@@ -529,6 +529,14 @@ pub struct ResponsesHttpStream {
 }
 #[async_trait]
 pub trait ResponsesTransport: Send + Sync {
+    async fn get(
+        &self,
+        _endpoint: Url,
+        _headers: HeaderMap,
+        _timeout: Duration,
+    ) -> AdapterResult<ResponsesHttpStream> {
+        Err(invalid("responses_discovery_unavailable"))
+    }
     async fn post(
         &self,
         endpoint: Url,
@@ -542,6 +550,28 @@ struct ReqwestTransport {
 }
 #[async_trait]
 impl ResponsesTransport for ReqwestTransport {
+    async fn get(
+        &self,
+        endpoint: Url,
+        headers: HeaderMap,
+        timeout: Duration,
+    ) -> AdapterResult<ResponsesHttpStream> {
+        let response = self
+            .client
+            .get(endpoint)
+            .headers(headers)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|_| invalid("responses_discovery_network_failed"))?;
+        Ok(ResponsesHttpStream {
+            status: response.status().as_u16(),
+            body: Box::pin(response.bytes_stream().map(|r| {
+                r.map(|b| b.to_vec())
+                    .map_err(|_| invalid("responses_discovery_network_failed"))
+            })),
+        })
+    }
     async fn post(
         &self,
         endpoint: Url,
@@ -579,6 +609,82 @@ pub struct ResponsesHttpClient {
     effort: Option<String>,
 }
 impl ResponsesHttpClient {
+    pub fn with_session_id(mut self, id: Uuid) -> Self {
+        self.session_id = id;
+        self
+    }
+    pub fn with_request_budget(mut self, budget: RequestBudget) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+    pub fn request_budget(&self) -> Option<RequestBudget> {
+        self.budget
+    }
+    pub async fn list_go_models(
+        &self,
+        authorization: ResponsesAuthorization,
+    ) -> AdapterResult<Vec<String>> {
+        if self.kind != ResponsesEndpointKind::OpenCodeGo || authorization.account_id.is_some() {
+            return Err(invalid("responses_discovery_not_allowed"));
+        }
+        responses_endpoint(self.kind, &self.base)?;
+        let endpoint = Url::parse("https://opencode.ai/zen/go/v1/models")
+            .map_err(|_| invalid("responses_endpoint_invalid"))?;
+        let mut headers = HeaderMap::new();
+        let mut bearer = HeaderValue::from_str(&format!("Bearer {}", authorization.token))
+            .map_err(|_| invalid("responses_authorization_invalid"))?;
+        bearer.set_sensitive(true);
+        headers.insert("authorization", bearer);
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static(concat!("OmicsOps/", env!("CARGO_PKG_VERSION"))),
+        );
+        headers.insert(
+            "x-opencode-session",
+            HeaderValue::from_str(&self.session_id.to_string())
+                .map_err(|_| invalid("go_session_invalid"))?,
+        );
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut response = self
+                .transport
+                .get(endpoint, headers, Duration::from_secs(15))
+                .await?;
+            if response.status != 200 {
+                return Err(invalid(&format!(
+                    "responses_discovery_http_{}",
+                    response.status
+                )));
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.body.next().await {
+                let chunk = chunk?;
+                if bytes.len().saturating_add(chunk.len()) > MAX_LINE {
+                    return Err(invalid("responses_discovery_too_large"));
+                }
+                bytes.extend(chunk);
+            }
+            let value: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| invalid("responses_discovery_invalid"))?;
+            let entries = value
+                .get("data")
+                .and_then(Value::as_array)
+                .ok_or_else(|| invalid("responses_discovery_invalid"))?;
+            let mut models = Vec::new();
+            for entry in entries {
+                let id = entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty() && id.len() <= 256)
+                    .ok_or_else(|| invalid("responses_discovery_invalid"))?;
+                models.push(id.to_owned());
+            }
+            models.sort();
+            models.dedup();
+            Ok(models)
+        })
+        .await
+        .map_err(|_| invalid("responses_discovery_timeout"))?
+    }
     pub fn new(
         kind: ResponsesEndpointKind,
         base: Url,

@@ -4,6 +4,7 @@ pub mod credentials;
 pub mod document;
 pub mod kernel;
 pub mod llm;
+pub mod model_client;
 pub mod research;
 pub mod responses;
 pub mod skills;

@@ -371,6 +371,7 @@ pub struct ClaudeCodeClient {
     identity: Arc<tokio::sync::Mutex<Option<ClaudePreflight>>>,
     timeout: Duration,
     budget: Option<crate::llm::RequestBudget>,
+    fast_mode: Option<bool>,
 }
 impl ClaudeCodeClient {
     pub fn new(
@@ -391,6 +392,7 @@ impl ClaudeCodeClient {
             identity: Default::default(),
             timeout: Duration::from_secs(900),
             budget: None,
+            fast_mode: None,
         })
     }
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
@@ -406,6 +408,10 @@ impl ClaudeCodeClient {
     }
     pub fn configured_model(&self) -> &str {
         &self.model
+    }
+    pub fn with_fast_mode(mut self, fast: Option<bool>) -> Self {
+        self.fast_mode = fast;
+        self
     }
     pub fn build_invocation(&self, request: &ProviderRequest) -> AdapterResult<ClaudeInvocation> {
         self.build_in(
@@ -428,6 +434,9 @@ impl ClaudeCodeClient {
         })
     }
     fn build_in(&self, request: &ProviderRequest, cwd: PathBuf) -> AdapterResult<ClaudeInvocation> {
+        if self.fast_mode == Some(true) {
+            return Err(error("subscription_fast_mode_unsupported"));
+        }
         for message in &request.messages {
             if !matches!(message.role.as_str(), "user" | "assistant") {
                 return Err(error("claude_message_role_invalid"));

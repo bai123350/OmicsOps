@@ -3553,6 +3553,7 @@ dependencies = [
  "keyring",
  "omicsops-agent",
  "omicsops-core",
+ "omicsops-dto",
  "omicsops-process",
  "omicsops-protocol",
  "omicsops-science",

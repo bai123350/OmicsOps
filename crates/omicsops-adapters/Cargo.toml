@@ -17,6 +17,7 @@ futures-util.workspace = true
 hex.workspace = true
 keyring.workspace = true
 omicsops-core = { path = "../omicsops-core" }
+omicsops-dto = { path = "../omicsops-dto" }
 pdf-extract.workspace = true
 quick-xml.workspace = true
 regex.workspace = true

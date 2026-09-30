@@ -225,13 +225,13 @@ CLI 预检无法满足设计时，保留明确错误与已完成增量，修订�
 - Async: `stream_with_provider(&self, request: ProviderRequest, on_event: impl FnMut(ProviderStreamEvent) + Send) -> AdapterResult<()>`、`stream_with_provider_v4` 与 `stream_with_provider_once` 使用同一签名；`probe(&self) -> AdapterResult<ModelProbeResult>`、`list_models(&self) -> AdapterResult<Vec<String>>`、`discover_models(&self) -> AdapterResult<ModelDiscoveryResult>`。
 - once 不允许生成 401 刷新后重发或非流 fallback；在派发前可以刷新已过期凭据，派发后仅返回明确错误。CLI 不伪造服务可用模型列表，返回 ConfiguredOnly/can_refresh=false。
 
-- [ ] 写 `model_client_routes_without_credential_or_protocol_inference`：三旧 provider 仍构造旧 HTTP client；新字段只选择对应 backend；图像和未支持 Fast/effort 拒绝；validate/measure 无 HTTP/process 派发。 关键断言：`assert_eq!(validation_http_calls, 0); assert_eq!(measurement_process_calls, 0); assert!(unsupported_image.is_err());`
-- [ ] 写 `model_client_once_does_not_retry_accepted_request`：mock 服务已接收后连接关闭或 401，生成计数=1；过期 credential 的前置刷新不算重复生成；无 paid fallback。 关键断言：`assert_eq!(accepted_then_disconnected_generation_count, 1); assert_eq!(generation_401_count, 1); assert_eq!(paid_fallback_count, 0);`
-- [ ] 写 `model_client_probe_and_discovery_preserve_source_and_unknown_usage`：探测成功不代表工具回合；CLI 发现来源为 ConfiguredOnly；服务错误不伪造成列表；旧 Vec 包装兼容。 关键断言：`assert_eq!(cli_discovery.source, ModelDiscoverySource::ConfiguredOnly); assert!(!cli_discovery.can_refresh);`
-- [ ] 运行 `cargo test -p omicsops-adapters --test model_client_contracts`，观察失败。
-- [ ] 实现门面和 scoped services；默认预算与真实 payload measurement 一致，token/原始CLI output 不进入 Debug。新 backend 每个 callback 保留 session/attempt 边界。
-- [ ] 重跑门面测试与 adapter 全部测试，应通过。
-- [ ] 提交 `feat: unify subscription and API model client routing`。
+- [x] 写 `model_client_routes_without_credential_or_protocol_inference`：三旧 provider 仍构造旧 HTTP client；新字段只选择对应 backend；图像和未支持 Fast/effort 拒绝；validate/measure 无 HTTP/process 派发。 关键断言：`assert_eq!(validation_http_calls, 0); assert_eq!(measurement_process_calls, 0); assert!(unsupported_image.is_err());`
+- [x] 写 `model_client_once_does_not_retry_accepted_request`：mock 服务已接收后连接关闭或 401，生成计数=1；过期 credential 的前置刷新不算重复生成；无 paid fallback。 关键断言：`assert_eq!(accepted_then_disconnected_generation_count, 1); assert_eq!(generation_401_count, 1); assert_eq!(paid_fallback_count, 0);`
+- [x] 写 `model_client_probe_and_discovery_preserve_source_and_unknown_usage`：探测成功不代表工具回合；CLI 发现来源为 ConfiguredOnly；服务错误不伪造成列表；旧 Vec 包装兼容。 关键断言：`assert_eq!(cli_discovery.source, ModelDiscoverySource::ConfiguredOnly); assert!(!cli_discovery.can_refresh);`
+- [x] 运行 `cargo test -p omicsops-adapters --test model_client_contracts`，观察失败。
+- [x] 实现门面和 scoped services；默认预算与真实 payload measurement 一致，token/原始CLI output 不进入 Debug。新 backend 每个 callback 保留 session/attempt 边界。
+- [x] 重跑门面测试与 adapter 全部测试，应通过。
+- [x] 提交 `feat: unify subscription and API model client routing`。
 
 ## Task 9: 桌面 V4、辅助调用、恢复与审批接线
 
@@ -370,3 +370,4 @@ Task 6：Windows suspended spawn / Job Object / handle-list / owned handle reape
 
 Task 7：Claude stdin 调用、严格单回合 envelope 与 NDJSON 解析已实现。预算边界和 stderr 管道阻塞均先复现失败再修复；完整 Rust 回归 1450 通过/12 忽略，最终 Claude 合约 9 通过，fmt 通过。取消与进程树由 Task 6 的 Windows 测试覆盖；成功与身份变更使用隔离测试进程。未调用真实 CLI/订阅模型，生产策略门禁仍有效。
 
+Task 8：显式 ModelClient 门面与共享凭据协调器已实现；旧 HTTP provider 保留原请求逻辑，新 provider 不按模型名推断或付费 fallback。门面 5 个合约通过，adapters 全部测试通过（真实 SSH 测试忽略），fmt 通过。Go 发现请求独立限时/限流且禁止重定向；Codex/Claude 仅返回 ConfiguredOnly。单次派发遇到 401/断流不重发，普通 Codex 最多一次无输出的 401 刷新重试。
