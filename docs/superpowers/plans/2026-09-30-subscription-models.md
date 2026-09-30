@@ -161,14 +161,14 @@ CLI 预检无法满足设计时，保留明确错误与已完成增量，修订�
 - 后台 poll 消费服务间隔；UI poll 只查询状态，不触发重复 HTTP。保存先 keyring 后 Store，编辑失败恢复旧秘密；账户变化建立另一 profile，不借 finish 改写活动配置。
 - disconnect 复用活动引用保护，清除此 profile 的 vault bundle/账户引用，保留未认证配置；Store 失败恢复旧秘密，恢复失败明确报告。操作不调用官方 Codex/Claude CLI logout。
 
-- [ ] 写 `subscription_login_cancel_wins_over_late_authorization`：取消终态、过期、重复完成、应用 manager drop；第九个 pending 明确拒绝；释放临时凭据。 关键断言：`assert_eq!(final_state, CodexLoginState::Cancelled); assert_eq!(vault_writes_after_cancel, 0); assert!(ninth_pending_login.is_err());`
-- [ ] 写 `subscription_login_cannot_cross_profile_or_replace_active_account`：login A/finish B 拒绝；旧绑定可重新登录同账号；账号改变产生新的 profile_id/account_ref，旧活动 run 不被重绑。 关键断言：`assert!(finish_other_profile.is_err()); assert_ne!(changed_account_profile.id, old_profile.id); assert_eq!(active_run_binding_after, active_run_binding_before);`
-- [ ] 写 `subscription_save_compensates_keyring_database_failures`：新 row 失败清理新秘密；旧 row 失败恢复旧秘密；恢复失败如实报告；不能产生 credential 到 SQLite 的 fixture 命中。 关键断言：`assert_eq!(vault_after_failed_edit, vault_before_edit); assert_eq!(new_secret_count_after_failed_insert, 0);`
-- [ ] 写 `subscription_login_disconnect_is_scoped_and_guarded`：活动引用拒绝退出；成功只清除该 profile 绑定及秘密；其它 profile/CLI 登录不变；Store 失败恢复原 bundle。 关键断言：`assert!(active_disconnect.is_err()); assert_eq!(other_profile_secret_after, other_profile_secret_before); assert_eq!(cli_logout_calls, 0);`
-- [ ] 运行 `cargo test -p omicsops-desktop --lib subscription_login`、`cargo test -p omicsops-desktop --lib subscription_save`，观察失败。
-- [ ] 实现状态机、注册命令和 profile 保存 helper；活动引用保护同时用于退出/删除，CLI profile 删除不退出独立 CLI。普通 key 表单无法往 Codex bundle 写入裸 API key。
-- [ ] 重跑上述命令及 `cargo test -p omicsops-desktop --lib dto_contract_tests`，应通过。
-- [ ] 提交 `feat: expose isolated subscription login lifecycle`。
+- [x] 写 `subscription_login_cancel_wins_over_late_authorization`：取消终态、过期、重复完成、应用 manager drop；第九个 pending 明确拒绝；释放临时凭据。 关键断言：`assert_eq!(final_state, CodexLoginState::Cancelled); assert_eq!(vault_writes_after_cancel, 0); assert!(ninth_pending_login.is_err());`
+- [x] 写 `subscription_login_cannot_cross_profile_or_replace_active_account`：login A/finish B 拒绝；旧绑定可重新登录同账号；账号改变产生新的 profile_id/account_ref，旧活动 run 不被重绑。 关键断言：`assert!(finish_other_profile.is_err()); assert_ne!(changed_account_profile.id, old_profile.id); assert_eq!(active_run_binding_after, active_run_binding_before);`
+- [x] 写 `subscription_save_compensates_keyring_database_failures`：新 row 失败清理新秘密；旧 row 失败恢复旧秘密；恢复失败如实报告；不能产生 credential 到 SQLite 的 fixture 命中。 关键断言：`assert_eq!(vault_after_failed_edit, vault_before_edit); assert_eq!(new_secret_count_after_failed_insert, 0);`
+- [x] 写 `subscription_login_disconnect_is_scoped_and_guarded`：活动引用拒绝退出；成功只清除该 profile 绑定及秘密；其它 profile/CLI 登录不变；Store 失败恢复原 bundle。 关键断言：`assert!(active_disconnect.is_err()); assert_eq!(other_profile_secret_after, other_profile_secret_before); assert_eq!(cli_logout_calls, 0);`
+- [x] 运行 `cargo test -p omicsops-desktop --lib subscription_login`、`cargo test -p omicsops-desktop --lib subscription_save`，观察失败。
+- [x] 实现状态机、注册命令和 profile 保存 helper；活动引用保护同时用于退出/删除，CLI profile 删除不退出独立 CLI。普通 key 表单无法往 Codex bundle 写入裸 API key。
+- [x] 重跑上述命令及 `cargo test -p omicsops-desktop --lib dto_contract_tests`，应通过。
+- [x] 提交 `feat: expose isolated subscription login lifecycle`。
 
 ## Task 6: Claude 执行资格与 Windows 子进程回收
 
@@ -363,3 +363,5 @@ cargo check --workspace --all-targets、cargo fmt --all -- --check 均通过。
 Task 3：Responses 请求、固定端点、SSE 与单次 HTTP 传输完成；4 个新增契约测试通过，cargo test --workspace 1423 通过/12 ignored，provider_usage/model_provider_contracts 通过，fmt check 通过。以实际序列化 input（含 opaque reasoning）计量；1 MiB 行/8 MiB 流/256 KiB 参数/16 调用限额；无重定向、图片、内置执行工具或协议 fallback。
 
 Task 4：固定设备登录、私有 vault bundle、共享刷新锁完成；6 个新增认证契约测试通过。完整 Rust 1429 通过/12 ignored，fmt check 通过。401 刷新代次避免相同 token 的重复刷新；网络等待后复查 vault，已退出的凭据不恢复；不确定轮换/写入失败要求重新登录。
+
+Task 5：设备登录后台状态机与六个 Tauri 命令完成；8 个新增行为测试、10 个 subscription 定向测试通过。完整 Rust 1437 通过/12 ignored；共享 credential mutation lock 防止刷新覆盖退出；守卫提取供保存/删除共用，同账户 token 更新不改变冻结身份。数据库失败恢复新/旧秘密，恢复失败明确要求重新登录；退出数据库失败也恢复秘密。

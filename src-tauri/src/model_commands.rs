@@ -153,7 +153,7 @@ pub fn model_profile_from_request(
 }
 
 /// A catalog update must never mutate the runtime contract of an existing profile.
-fn merge_existing_profile(
+pub(crate) fn merge_existing_profile(
     profile: &mut ModelProfile,
     existing: Option<&ModelProfile>,
     preserve_binding: bool,
@@ -196,7 +196,7 @@ fn merge_existing_profile(
     }
 }
 
-fn validate_profile_capabilities(profile: &ModelProfile) -> Result<(), String> {
+pub(crate) fn validate_profile_capabilities(profile: &ModelProfile) -> Result<(), String> {
     omicsops_core::workspace::validate_reasoning_effort(
         profile.provider,
         profile.reasoning_effort.as_deref(),
@@ -230,6 +230,20 @@ fn validate_profile_capabilities(profile: &ModelProfile) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_subscription_provider_edit(
+    existing: Option<&ModelProfile>,
+    profile: &ModelProfile,
+) -> Result<(), String> {
+    if existing.is_some_and(|old| {
+        old.provider != profile.provider
+            && (old.provider == ModelProviderKind::OpenAiCodex
+                || profile.provider == ModelProviderKind::OpenAiCodex)
+    }) {
+        return Err("create a separate profile to change the Codex subscription provider".into());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn list_model_profiles(state: State<'_, AppState>) -> Result<Vec<ModelProfile>, String> {
     state
@@ -259,6 +273,7 @@ pub async fn save_model_profile(
         .get_model_profile(profile.id)
         .await
         .map_err(|error| error.to_string())?;
+    validate_subscription_provider_edit(existing.as_ref(), &profile)?;
     merge_existing_profile(
         &mut profile,
         existing.as_ref(),
@@ -364,6 +379,21 @@ async fn client_for_profile(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn subscription_login_plain_form_cannot_replace_bundle_with_api_key() {
+        let codex = super::model_profile_from_request(request(
+            "open_ai_codex",
+            "https://chatgpt.com/backend-api",
+            "gpt-5.5",
+        ))
+        .unwrap();
+        let mut api = codex.clone();
+        api.provider = omicsops_core::workspace::ModelProviderKind::OpenAiCompatible;
+        api.base_url = "https://api.openai.com/v1".into();
+        assert!(super::validate_subscription_provider_edit(Some(&codex), &api).is_err());
+        assert!(super::validate_subscription_provider_edit(Some(&api), &codex).is_err());
+        assert!(super::validate_subscription_provider_edit(Some(&codex), &codex).is_ok());
+    }
     use super::*;
     use omicsops_adapters::credentials::MemoryCredentialVault;
 

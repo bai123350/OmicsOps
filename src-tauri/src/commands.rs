@@ -28,6 +28,7 @@ use crate::inspection::{ServerInspection, inspection_command, parse_server_inspe
 pub struct AppState {
     pub repository: Store,
     pub credentials: SystemCredentialVault,
+    pub subscription_models: Arc<crate::subscription_models::SubscriptionLoginManager>,
     pub mcp_sessions: McpSessionManager,
     pub active_runs: Arc<Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
     pub skills_root: PathBuf,

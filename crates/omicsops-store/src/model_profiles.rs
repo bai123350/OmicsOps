@@ -8,6 +8,46 @@ use crate::{Store, StoreError, timestamp};
 const REVIEWER_SETTINGS_KEY: &str = "reviewer_settings_v4";
 
 impl Store {
+    /// Hold the same frozen-reference guard as deletion while updating an execution identity.
+    /// The caller compensates its vault mutation if this transaction fails.
+    pub async fn save_model_profile_guarded_with<F>(
+        &self,
+        profile: &ModelProfile,
+        expected_hash: Option<&str>,
+        active_run_ids: &[Uuid],
+        mutate_credential: F,
+    ) -> Result<(), StoreError>
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let raw =
+            sqlx::query_scalar::<_, String>("SELECT value_json FROM model_profiles WHERE id=?1")
+                .bind(profile.id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+        let current = raw
+            .as_deref()
+            .map(serde_json::from_str::<ModelProfile>)
+            .transpose()?;
+        if current
+            .as_ref()
+            .map(|p| p.execution_configuration_hash())
+            .as_deref()
+            != expected_hash
+        {
+            return Err(StoreError::InvalidInput(
+                "model profile changed during subscription save".into(),
+            ));
+        }
+        if expected_hash != Some(profile.execution_configuration_hash().as_str()) {
+            ensure_profile_not_frozen(&mut tx, profile.id, active_run_ids).await?;
+        }
+        mutate_credential().map_err(StoreError::Credential)?;
+        sqlx::query("INSERT INTO model_profiles(id,value_json) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET value_json=excluded.value_json").bind(profile.id.to_string()).bind(serde_json::to_string(profile)?).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
     pub async fn delete_model_profile_with<F>(
         &self,
         profile_id: Uuid,
@@ -28,75 +68,7 @@ impl Store {
         };
         let profile: ModelProfile = serde_json::from_str(row.try_get::<String, _>(0)?.as_str())?;
 
-        let run_rows = sqlx::query("SELECT run_id,status,value_json FROM agent_runs_v4")
-            .fetch_all(&mut *tx)
-            .await?;
-        for row in run_rows {
-            let run_id = row.try_get::<String, _>(0)?;
-            let status = row.try_get::<String, _>(1)?;
-            let in_memory_active = active_run_ids
-                .iter()
-                .any(|candidate| candidate.to_string() == run_id);
-            if !in_memory_active && is_terminal_run_status(&status) {
-                continue;
-            }
-            let value: serde_json::Value =
-                serde_json::from_str(row.try_get::<String, _>(2)?.as_str())?;
-            if frozen_value_references_profile(&value, profile_id) {
-                return Err(StoreError::InvalidInput(format!(
-                    "model profile is frozen into active agent run {run_id}"
-                )));
-            }
-        }
-
-        let queue_rows = sqlx::query(
-            "SELECT request_id,frozen_json FROM composer_queue_v4
-             WHERE status IN ('pending','dispatching','running','uncertain')",
-        )
-        .fetch_all(&mut *tx)
-        .await?;
-        for row in queue_rows {
-            let value: serde_json::Value =
-                serde_json::from_str(row.try_get::<String, _>(1)?.as_str())?;
-            if frozen_value_references_profile(&value, profile_id) {
-                return Err(StoreError::InvalidInput(format!(
-                    "model profile is frozen into active composer queue item {}",
-                    row.try_get::<String, _>(0)?
-                )));
-            }
-        }
-
-        let side_chat_rows = sqlx::query(
-            "SELECT request_id,value_json FROM side_chat_turns_v4
-             WHERE status IN ('queued','running')",
-        )
-        .fetch_all(&mut *tx)
-        .await?;
-        for row in side_chat_rows {
-            let value: serde_json::Value =
-                serde_json::from_str(row.try_get::<String, _>(1)?.as_str())?;
-            if json_pointer_matches(&value, "/model_profile_id", profile_id) {
-                return Err(StoreError::InvalidInput(format!(
-                    "model profile is frozen into active side chat {}",
-                    row.try_get::<String, _>(0)?
-                )));
-            }
-        }
-
-        let review_rows =
-            sqlx::query("SELECT id,value_json FROM session_reviews WHERE status='running'")
-                .fetch_all(&mut *tx)
-                .await?;
-        for row in review_rows {
-            let value: serde_json::Value =
-                serde_json::from_str(row.try_get::<String, _>(1)?.as_str())?;
-            if json_pointer_matches(&value, "/reviewer_profile_id", profile_id) {
-                return Err(StoreError::InvalidInput(format!(
-                    "model profile is frozen into running session review {}",
-                    row.try_get::<String, _>(0)?
-                )));
-            }
-        }
+        ensure_profile_not_frozen(&mut tx, profile_id, active_run_ids).await?;
 
         let credential_reference = profile.credential_reference.clone();
 
@@ -180,6 +152,80 @@ impl Store {
         }
         Ok(true)
     }
+}
+
+async fn ensure_profile_not_frozen(
+    connection: &mut sqlx::SqliteConnection,
+    profile_id: Uuid,
+    active_run_ids: &[Uuid],
+) -> Result<(), StoreError> {
+    let run_rows = sqlx::query("SELECT run_id,status,value_json FROM agent_runs_v4")
+        .fetch_all(&mut *connection)
+        .await?;
+    for row in run_rows {
+        let run_id = row.try_get::<String, _>(0)?;
+        let status = row.try_get::<String, _>(1)?;
+        let in_memory_active = active_run_ids
+            .iter()
+            .any(|candidate| candidate.to_string() == run_id);
+        if !in_memory_active && is_terminal_run_status(&status) {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(row.try_get::<String, _>(2)?.as_str())?;
+        if frozen_value_references_profile(&value, profile_id) {
+            return Err(StoreError::InvalidInput(format!(
+                "model profile is frozen into active agent run {run_id}"
+            )));
+        }
+    }
+
+    let queue_rows = sqlx::query(
+        "SELECT request_id,frozen_json FROM composer_queue_v4
+             WHERE status IN ('pending','dispatching','running','uncertain')",
+    )
+    .fetch_all(&mut *connection)
+    .await?;
+    for row in queue_rows {
+        let value: serde_json::Value = serde_json::from_str(row.try_get::<String, _>(1)?.as_str())?;
+        if frozen_value_references_profile(&value, profile_id) {
+            return Err(StoreError::InvalidInput(format!(
+                "model profile is frozen into active composer queue item {}",
+                row.try_get::<String, _>(0)?
+            )));
+        }
+    }
+
+    let side_chat_rows = sqlx::query(
+        "SELECT request_id,value_json FROM side_chat_turns_v4
+             WHERE status IN ('queued','running')",
+    )
+    .fetch_all(&mut *connection)
+    .await?;
+    for row in side_chat_rows {
+        let value: serde_json::Value = serde_json::from_str(row.try_get::<String, _>(1)?.as_str())?;
+        if json_pointer_matches(&value, "/model_profile_id", profile_id) {
+            return Err(StoreError::InvalidInput(format!(
+                "model profile is frozen into active side chat {}",
+                row.try_get::<String, _>(0)?
+            )));
+        }
+    }
+
+    let review_rows =
+        sqlx::query("SELECT id,value_json FROM session_reviews WHERE status='running'")
+            .fetch_all(&mut *connection)
+            .await?;
+    for row in review_rows {
+        let value: serde_json::Value = serde_json::from_str(row.try_get::<String, _>(1)?.as_str())?;
+        if json_pointer_matches(&value, "/reviewer_profile_id", profile_id) {
+            return Err(StoreError::InvalidInput(format!(
+                "model profile is frozen into running session review {}",
+                row.try_get::<String, _>(0)?
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn is_terminal_run_status(status: &str) -> bool {

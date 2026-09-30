@@ -9444,6 +9444,10 @@ mod tests {
         let state = AppState {
             repository: repository.clone(),
             credentials: SystemCredentialVault,
+            subscription_models: Arc::new(
+                crate::subscription_models::SubscriptionLoginManager::system(Default::default())
+                    .unwrap(),
+            ),
             mcp_sessions: McpSessionManager::new(),
             active_runs: Default::default(),
             skills_root: dir.path().join("skills"),

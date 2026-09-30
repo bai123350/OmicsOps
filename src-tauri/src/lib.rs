@@ -56,6 +56,7 @@ pub mod side_chat;
 pub mod skill_commands;
 pub mod skill_settings;
 pub mod storage_settings;
+pub mod subscription_models;
 pub mod sync_commands;
 pub mod usage_settings;
 pub mod workspace_commands;
@@ -170,9 +171,17 @@ pub fn run() {
                 Ok::<_, String>(repository)
             })
             .map_err(std::io::Error::other)?;
+            let credential_mutations = credential_settings::CredentialMutationState::default();
+            let subscription_models = Arc::new(
+                subscription_models::SubscriptionLoginManager::system(
+                    credential_mutations.lock.clone(),
+                )
+                .map_err(std::io::Error::other)?,
+            );
             app.manage(AppState {
                 repository,
                 credentials: SystemCredentialVault,
+                subscription_models,
                 mcp_sessions: omicsops_mcp::McpSessionManager::new(),
                 active_runs: Arc::new(Mutex::new(HashMap::new())),
                 skills_root,
@@ -183,7 +192,7 @@ pub fn run() {
                 sync_controls: Arc::new(Mutex::new(HashMap::new())),
                 browser,
             });
-            app.manage(credential_settings::CredentialMutationState::default());
+            app.manage(credential_mutations);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -339,6 +348,12 @@ pub fn run() {
             agent_commands::submit_message,
             model_commands::list_model_profiles,
             model_commands::save_model_profile,
+            subscription_models::subscription_begin_codex_login,
+            subscription_models::subscription_poll_codex_login,
+            subscription_models::subscription_cancel_codex_login,
+            subscription_models::subscription_finish_codex_login,
+            subscription_models::subscription_model_status,
+            subscription_models::subscription_disconnect_codex,
             model_deletion::delete_model_profile,
             model_commands::probe_model_profile,
             model_commands::list_model_profile_models,

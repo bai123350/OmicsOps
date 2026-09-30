@@ -329,6 +329,9 @@ async fn run_live_go_agent_acceptance() -> Result<(), String> {
     let state = AppState {
         repository: repository.clone(),
         credentials: SystemCredentialVault,
+        subscription_models: std::sync::Arc::new(
+            crate::subscription_models::SubscriptionLoginManager::system(Default::default())?,
+        ),
         mcp_sessions: omicsops_mcp::McpSessionManager::new(),
         active_runs: Default::default(),
         skills_root: directory.path().join("skills"),

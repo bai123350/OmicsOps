@@ -24,7 +24,7 @@ const MAX_SECRET_BYTES: usize = 64 * 1024;
 
 #[derive(Default)]
 pub struct CredentialMutationState {
-    pub(crate) lock: tokio::sync::Mutex<()>,
+    pub(crate) lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone)]
