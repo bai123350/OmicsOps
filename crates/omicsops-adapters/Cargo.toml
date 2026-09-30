@@ -8,6 +8,8 @@ license.workspace = true
 omicsops-agent = { path = "../omicsops-agent" }
 omicsops-protocol = { path = "../omicsops-protocol" }
 omicsops-science = { path = "../omicsops-science" }
+omicsops-process = { path = "../omicsops-process" }
+tempfile = "3"
 async-trait.workspace = true
 base64.workspace = true
 chrono.workspace = true

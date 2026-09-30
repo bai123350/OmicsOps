@@ -1,3 +1,4 @@
+pub mod claude_code;
 pub mod codex_auth;
 pub mod credentials;
 pub mod document;

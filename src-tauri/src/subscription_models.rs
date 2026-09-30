@@ -430,7 +430,36 @@ impl SubscriptionLoginManager {
                 }
             }
             ModelProviderKind::ClaudeCode => {
-                status.error_code = Some("claude_transport_not_connected_yet".into())
+                use omicsops_adapters::claude_code::{
+                    ClaudeAuthKind, ClaudeProcessRunner, SystemClaudeProcessRunner,
+                    resolve_claude_executable,
+                };
+                match resolve_claude_executable(profile.cli_executable.as_deref()) {
+                    Ok(path) => match tokio::time::timeout(
+                        Duration::from_secs(15),
+                        SystemClaudeProcessRunner.inspect(&path),
+                    )
+                    .await
+                    {
+                        Ok(Ok(preflight)) => {
+                            status.authenticated =
+                                preflight.auth_kind == ClaudeAuthKind::Subscription;
+                            status.cli_version = Some(preflight.version);
+                            status.error_code = Some(
+                                if !status.authenticated {
+                                    "claude_subscription_login_required"
+                                } else {
+                                    "claude_policy_unverifiable"
+                                }
+                                .into(),
+                            );
+                        }
+                        _ => status.error_code = Some("claude_preflight_failed".into()),
+                    },
+                    Err(_) => {
+                        status.error_code = Some("claude_native_executable_unavailable".into())
+                    }
+                }
             }
             _ => {
                 status.authenticated = profile

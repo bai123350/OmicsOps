@@ -5,6 +5,7 @@
 //! an MCP server. All background children must be created through this module.
 
 use std::ffi::OsStr;
+pub mod managed_child;
 
 use tokio::process::Command;
 

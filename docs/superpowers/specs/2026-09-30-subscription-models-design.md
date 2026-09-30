@@ -350,3 +350,8 @@ Codex 订阅接口、登录可用性与 Go 模型路由可能变化；拒绝保�
 的 CLI 限制和 managed hooks 有生成前拒绝条件；envelope 与资源上限明确；
 新增目录遵循精确匹配；完整检查和真实验收分开记录。用户于 2026-09-30
 确认此文件，现进入[书面实施计划](../plans/2026-09-30-subscription-models.md)评审与执行方式选择。
+
+## 实施核对：Claude 执行资格（2026-10-01）
+
+已核对 [CLI reference](https://code.claude.com/docs/en/cli-reference)、[hooks-guide](https://code.claude.com/docs/en/hooks-guide) 和 [managed-settings](https://code.claude.com/docs/en/managed-settings)。普通 settings 的 disableAllHooks 不能禁用 managed hooks；现有来源确认依赖会话内 /status。当前原生 runner 无法在 SessionStart 前完整验证有效策略，因此状态展示版本/订阅认证结果，同时返回 claude_policy_unverifiable，生产生成保持拒绝。不会修改组织策略、读取 CLI 凭据或将 mock runner 验证当作真实 CLI 验收。要启用生产生成，需要可核对的官方只读策略快照及相应真实验收。
+

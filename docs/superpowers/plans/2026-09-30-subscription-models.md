@@ -184,13 +184,13 @@ CLI 预检无法满足设计时，保留明确错误与已完成增量，修订�
 - Produces: `async inspect_claude_preflight(executable: &Path, runner: &dyn ClaudeProcessRunner) -> AdapterResult<ClaudePreflight>`；策略来源枚举失败、managed hooks 生效、未知 CLI 格式拒绝生成。
 - 必须在任何生成 SessionStart 之前完成有效策略预检；仅检查启动事件太晚。缓存不能跨 executable 内容/策略变化，生成时重检；不修改组织策略或认证存储。
 
-- [ ] 写 `claude_preflight_rejects_unverifiable_policy_and_non_subscription_auth`：.cmd/.bat/命令字符串、未知版本输出、Api/Unknown/未登录、managed hooks 和来源枚举失败；全都断言 generator spawn 次数为 0。 关键断言：`assert!(unknown_policy_preflight.is_err()); assert_eq!(generator_spawn_count, 0);`
-- [ ] 写 `claude_preflight_invalidates_changed_binary_and_policy`：相同路径替换文件、CLI 更新、只读策略变化后旧检查失效；fingerprint 不包含 raw account/token。 关键断言：`assert_ne!(new_fingerprint, old_fingerprint); assert!(changed_policy_generation.is_err());`
-- [ ] 写 `managed_child_terminates_entire_tree_without_console`：使用 Rust 测试可执行文件的受控 helper 模式生成父/孙进程，取消后全退出；不依赖 Python/Claude/SSH；Windows 无可见 console；另测父进程先退出、drop、重复终止和 PID 重用防护。 关键断言：`assert_eq!(remaining_owned_processes, 0); assert_eq!(visible_console_windows, 0);`
-- [ ] 运行 `cargo test -p omicsops-process --test managed_child` 和 `cargo test -p omicsops-adapters --test claude_code_contracts preflight`，观察预期失败。
-- [ ] 实现进程生命周期与 fail-closed preflight。有效 managed 来源无法通过已核对的只读方式确认时返回可说明错误，不能把“文件不存在”当作不存在服务端/注册表策略；不要为了通过测试删掉此条件。
-- [ ] 重跑上述命令与现有 process tests；记录 Windows 行为，检查无系统全局 env/安装/登录变化。
-- [ ] 提交 `feat: constrain Claude subscription execution and child lifecycle`。
+- [x] 写 `claude_preflight_rejects_unverifiable_policy_and_non_subscription_auth`：.cmd/.bat/命令字符串、未知版本输出、Api/Unknown/未登录、managed hooks 和来源枚举失败；全都断言 generator spawn 次数为 0。 关键断言：`assert!(unknown_policy_preflight.is_err()); assert_eq!(generator_spawn_count, 0);`
+- [x] 写 `claude_preflight_invalidates_changed_binary_and_policy`：相同路径替换文件、CLI 更新、只读策略变化后旧检查失效；fingerprint 不包含 raw account/token。 关键断言：`assert_ne!(new_fingerprint, old_fingerprint); assert!(changed_policy_generation.is_err());`
+- [x] 写 `managed_child_terminates_entire_tree_without_console`：使用 Rust 测试可执行文件的受控 helper 模式生成父/孙进程，取消后全退出；不依赖 Python/Claude/SSH；Windows 无可见 console；另测父进程先退出、drop、重复终止和 PID 重用防护。 关键断言：`assert_eq!(remaining_owned_processes, 0); assert_eq!(visible_console_windows, 0);`
+- [x] 运行 `cargo test -p omicsops-process --test managed_child` 和 `cargo test -p omicsops-adapters --test claude_code_contracts preflight`，观察预期失败。
+- [x] 实现进程生命周期与 fail-closed preflight。有效 managed 来源无法通过已核对的只读方式确认时返回可说明错误，不能把“文件不存在”当作不存在服务端/注册表策略；不要为了通过测试删掉此条件。
+- [x] 重跑上述命令与现有 process tests；记录 Windows 行为，检查无系统全局 env/安装/登录变化。
+- [x] 提交 `feat: constrain Claude subscription execution and child lifecycle`。
 
 ## Task 7: Claude stdin、stream-json 与宿主 envelope
 
@@ -365,3 +365,5 @@ Task 3：Responses 请求、固定端点、SSE 与单次 HTTP 传输完成；4 �
 Task 4：固定设备登录、私有 vault bundle、共享刷新锁完成；6 个新增认证契约测试通过。完整 Rust 1429 通过/12 ignored，fmt check 通过。401 刷新代次避免相同 token 的重复刷新；网络等待后复查 vault，已退出的凭据不恢复；不确定轮换/写入失败要求重新登录。
 
 Task 5：设备登录后台状态机与六个 Tauri 命令完成；8 个新增行为测试、10 个 subscription 定向测试通过。完整 Rust 1437 通过/12 ignored；共享 credential mutation lock 防止刷新覆盖退出；守卫提取供保存/删除共用，同账户 token 更新不改变冻结身份。数据库失败恢复新/旧秘密，恢复失败明确要求重新登录；退出数据库失败也恢复秘密。
+
+Task 6：Windows suspended spawn / Job Object / handle-list / owned handle reaper 与 Claude 预检完成；完整 Rust 1445 通过/12 ignored，fmt check 通过。生产 CLI 有版本/订阅状态检查，但不能完整确认 managed policy，restrictions_verified=false 且生成 runner 拒绝启动。该限制不等于 Claude 生产端到端通过；后续 envelope 测试只使用受控 runner。官方 CLI 文档与 hooks-guide 明确 managed hooks 不能被普通 disableAllHooks 覆盖，managed-settings 仅提供会话内 /status 来源确认；未调用实际用户 CLI。
