@@ -121,13 +121,13 @@ CLI 预检无法满足设计时，保留明确错误与已完成增量，修订�
 - Produces: `ResponsesHttpClient::new(kind: ResponsesEndpointKind, base: Url, model: String, budget: Option<RequestBudget>, session_id: Uuid) -> AdapterResult<Self>`；`async stream_once(&self, request: ProviderRequest, authorization: ResponsesAuthorization, on_event: impl FnMut(ProviderStreamEvent) + Send) -> AdapterResult<()>` 只有一个生成派发。此任务不依赖尚未实现的 OAuth 类型；普通 attempt 编排由任务 8 门面接入现有策略。
 - 采用既有 tool alias 规则并检测冲突；完成后按原工具 ID 回传。续接只含审核的 opaque reasoning 与必要输出项，不保留原始响应。
 
-- [ ] 写 `responses_shapes_native_tool_history_and_exact_endpoints`：instructions、input、function schema、call_id/results 顺序；Codex store=false/stream 参数受限；Go 自身会话头；伪造域名/端口/query/redirect 拒绝。 关键断言：`assert_eq!(codex_body["store"], false); assert_eq!(wire_call_id, host_call_id); assert!(foreign_endpoint.is_err());`
-- [ ] 写 `responses_requires_completed_terminal_and_complete_arguments`：逐字节 UTF-8、交错函数 index、重复 call_id、非法/截断参数、incomplete/error、无合法 completed 的 EOF/[DONE] 均不得成功。 关键断言：`assert!(truncated.finish().is_err()); assert_eq!(completed_tool_calls.len(), 1); assert_eq!(duplicate_execution_calls, 0);`
-- [ ] 写 `responses_preserves_usage_and_attempt_boundaries`：真实 usage 不重复相加；必要续接回放后预算增大；中断后的片段不拼入下次 attempt；once 不使用非流 fallback。 关键断言：`assert_eq!(merged.output_tokens, Some(17)); assert_eq!(once_generation_count, 1);`
-- [ ] 运行 `cargo test -p omicsops-adapters --test responses_contracts`，确认预期失败。
-- [ ] 实现请求/解码/固定端点 HTTP client；对本地 mock server 显式注入测试 transport，不能开放生产固定端点的任意 URL 例外。新传输不发送图片，不注册供应商内置工具，不重试其它协议。
-- [ ] 重跑契约测试和 `cargo test -p omicsops-adapters --test provider_usage --test model_provider_contracts`，应全部通过。
-- [ ] 提交 `feat: add bounded Responses model transport`。
+- [x] 写 `responses_shapes_native_tool_history_and_exact_endpoints`：instructions、input、function schema、call_id/results 顺序；Codex store=false/stream 参数受限；Go 自身会话头；伪造域名/端口/query/redirect 拒绝。 关键断言：`assert_eq!(codex_body["store"], false); assert_eq!(wire_call_id, host_call_id); assert!(foreign_endpoint.is_err());`
+- [x] 写 `responses_requires_completed_terminal_and_complete_arguments`：逐字节 UTF-8、交错函数 index、重复 call_id、非法/截断参数、incomplete/error、无合法 completed 的 EOF/[DONE] 均不得成功。 关键断言：`assert!(truncated.finish().is_err()); assert_eq!(completed_tool_calls.len(), 1); assert_eq!(duplicate_execution_calls, 0);`
+- [x] 写 `responses_preserves_usage_and_attempt_boundaries`：真实 usage 不重复相加；必要续接回放后预算增大；中断后的片段不拼入下次 attempt；once 不使用非流 fallback。 关键断言：`assert_eq!(merged.output_tokens, Some(17)); assert_eq!(once_generation_count, 1);`
+- [x] 运行 `cargo test -p omicsops-adapters --test responses_contracts`，确认预期失败。
+- [x] 实现请求/解码/固定端点 HTTP client；对本地 mock server 显式注入测试 transport，不能开放生产固定端点的任意 URL 例外。新传输不发送图片，不注册供应商内置工具，不重试其它协议。
+- [x] 重跑契约测试和 `cargo test -p omicsops-adapters --test provider_usage --test model_provider_contracts`，应全部通过。
+- [x] 提交 `feat: add bounded Responses model transport`。
 
 ## Task 4: Codex device auth 与并发刷新
 
@@ -359,3 +359,6 @@ cargo test --workspace（1418 passed，12 ignored），额外 Store 回放测试
 cargo check --workspace --all-targets、cargo fmt --all -- --check 均通过。
 此增量仅准备契约；真实 wire 密文预算在任务 3 验证，持久化发送接线在任务 9。
 任务 3–12 未完成。
+
+Task 3：Responses 请求、固定端点、SSE 与单次 HTTP 传输完成；4 个新增契约测试通过，cargo test --workspace 1423 通过/12 ignored，provider_usage/model_provider_contracts 通过，fmt check 通过。以实际序列化 input（含 opaque reasoning）计量；1 MiB 行/8 MiB 流/256 KiB 参数/16 调用限额；无重定向、图片、内置执行工具或协议 fallback。
+

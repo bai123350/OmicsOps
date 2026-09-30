@@ -3,6 +3,7 @@ pub mod document;
 pub mod kernel;
 pub mod llm;
 pub mod research;
+pub mod responses;
 pub mod skills;
 pub mod ssh;
 

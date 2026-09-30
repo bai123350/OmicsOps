@@ -1214,7 +1214,7 @@ fn provider_message(
     }
 }
 
-fn provider_tool_aliases(request: &ProviderModelRequest) -> Vec<(String, String)> {
+pub(crate) fn provider_tool_aliases(request: &ProviderModelRequest) -> Vec<(String, String)> {
     request
         .tools
         .iter()
