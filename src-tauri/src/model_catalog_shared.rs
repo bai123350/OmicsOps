@@ -105,6 +105,15 @@ pub(crate) fn exact_model_supports_vision(
     base_url: &Url,
     model_id: &str,
 ) -> bool {
+    // Advertised vision capability has no reviewed estimator in these transports.
+    if matches!(
+        provider,
+        ModelProviderKind::OpenAiResponses
+            | ModelProviderKind::OpenAiCodex
+            | ModelProviderKind::ClaudeCode
+    ) {
+        return false;
+    }
     if let Some(row) = exact_model_capabilities(provider, base_url, model_id) {
         return row.supports_vision;
     }
@@ -120,6 +129,55 @@ pub(crate) fn exact_model_supports_vision(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn subscription_catalog_never_inherits_api_or_cli_alias_capabilities() {
+        let go = Url::parse("https://opencode.ai/zen/go/v1").unwrap();
+        let row =
+            exact_model_capabilities(ModelProviderKind::OpenAiResponses, &go, "grok-4.7").unwrap();
+        assert_eq!(
+            row.capabilities.source_sha256,
+            "664e5052595cb2464666cbe71b26917f6b903d967ce9bd0d39e347a3c5aa84bc"
+        );
+        for (kind, url, id) in [
+            (
+                ModelProviderKind::OpenAiCodex,
+                "https://chatgpt.com/backend-api",
+                "gpt-6-luna",
+            ),
+            (
+                ModelProviderKind::ClaudeCode,
+                "claude-code://local",
+                "sonnet",
+            ),
+            (
+                ModelProviderKind::OpenAiResponses,
+                "https://gateway.example/v1",
+                "grok-4.7",
+            ),
+            (
+                ModelProviderKind::OpenAiResponses,
+                "https://opencode.ai:8443/zen/go/v1",
+                "grok-4.7",
+            ),
+            (
+                ModelProviderKind::OpenAiResponses,
+                "https://opencode.ai/zen/go/v10",
+                "grok-4.7",
+            ),
+            (
+                ModelProviderKind::OpenAiResponses,
+                "https://opencode.ai/zen/go/v1",
+                "grok-4.7-sibling",
+            ),
+        ] {
+            assert!(exact_model_capabilities(kind, &Url::parse(url).unwrap(), id).is_none());
+        }
+        assert!(!exact_model_supports_vision(
+            ModelProviderKind::OpenAiResponses,
+            &go,
+            "grok-4.7"
+        ));
+    }
     #[test]
     fn compiled_catalog_has_valid_unique_exact_keys() {
         let mut keys = std::collections::HashSet::new();

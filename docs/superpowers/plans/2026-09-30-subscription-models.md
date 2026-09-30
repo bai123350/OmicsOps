@@ -261,12 +261,12 @@ CLI 预检无法满足设计时，保留明确错误与已完成增量，修订�
 - `exact_model_capabilities` 继续按显式 provider、HTTPS host/port、完整 ID 和 Go path 匹配；Codex 无可信独立条目时返回 None，不复制 OpenAI 普通 API 行。
 - 已存在的 Go Chat/Messages 配置不改写；旧协议保存 Responses-only ID 拒绝，显式新 provider 才允许。reasoning/Fast 仅采用已审核 wire 字段。
 
-- [ ] 写 `test_go_responses_uses_exact_reviewed_ids_and_source_limits`：源 fixture 含官方完整 ID 与同前缀 sibling，前者生成对应协议行，后者不获路由；source_sha256 为实际 raw source 哈希，重跑确定性相同。 关键断言：`self.assertEqual(actual_source_hash, hashlib.sha256(raw_source).hexdigest()); self.assertNotIn(unreviewed_sibling_id, responses_ids)`
-- [ ] 写 `subscription_catalog_never_inherits_api_or_cli_alias_capabilities`：Codex 同名 ID/未知 host/额外端口/CLI alias 无目录行时 None；新 Go 行精确匹配，不更新已有 profile 的能力 snapshot/hash。 关键断言：`assert_eq!(codex_unmatched_capabilities, None); assert_eq!(unknown_gateway_capabilities, None); assert_eq!(saved_snapshot_after, saved_snapshot_before);`
-- [ ] 运行 `python -m unittest discover -s scripts -p test_import_model_catalog.py` 与 `cargo test -p omicsops-desktop --lib subscription_catalog`，观察失败。
-- [ ] 按实现时再次核对的官方路由和 models.dev 源生成目录；不要手编能力数值或改旧条目的来源哈希。没有审计源则保守未知并记录，保留手填完整模型 ID。
-- [ ] 重跑 Python 测试与 desktop 的目录/profile 协议测试，应通过；检查 Go 请求的 UA/session/header/redirect 矩阵。
-- [ ] 提交 `feat: enable exact OpenCode Go Responses model routing`。
+- [x] 写 `test_go_responses_uses_exact_reviewed_ids_and_source_limits`：源 fixture 含官方完整 ID 与同前缀 sibling，前者生成对应协议行，后者不获路由；source_sha256 为实际 raw source 哈希，重跑确定性相同。 关键断言：`self.assertEqual(actual_source_hash, hashlib.sha256(raw_source).hexdigest()); self.assertNotIn(unreviewed_sibling_id, responses_ids)`
+- [x] 写 `subscription_catalog_never_inherits_api_or_cli_alias_capabilities`：Codex 同名 ID/未知 host/额外端口/CLI alias 无目录行时 None；新 Go 行精确匹配，不更新已有 profile 的能力 snapshot/hash。 关键断言：`assert_eq!(codex_unmatched_capabilities, None); assert_eq!(unknown_gateway_capabilities, None); assert_eq!(saved_snapshot_after, saved_snapshot_before);`
+- [x] 运行 `python -m unittest discover -s scripts -p test_import_model_catalog.py` 与 `cargo test -p omicsops-desktop --lib subscription_catalog`，观察失败。
+- [x] 按实现时再次核对的官方路由和 models.dev 源生成目录；不要手编能力数值或改旧条目的来源哈希。没有审计源则保守未知并记录，保留手填完整模型 ID。
+- [x] 重跑 Python 测试与 desktop 的目录/profile 协议测试，应通过；检查 Go 请求的 UA/session/header/redirect 矩阵。
+- [x] 提交 `feat: enable exact OpenCode Go Responses model routing`。
 
 ## Task 11: 订阅设置与现有聊天模型选择器
 
@@ -374,3 +374,5 @@ Task 8：显式 ModelClient 门面与共享凭据协调器已实现；旧 HTTP p
 
 Task 9：主对话、Plan、总结、旁聊、委派、reviewer、压缩与澄清入口均接入 ModelClient；新模型发现命令保留来源。完整 Rust 回归 1462 通过/12 忽略；最终桌面 subscription 合约 3 通过，core 续接/闲置合约 3 通过，Responses 合约 5 通过，fmt/diff check 通过。三 backend 的临时 nonce 读取/删除拒绝/恢复测试使用 HTTP 替身或隔离 Windows 测试进程，非真实订阅验收。停止 HTTP 请求后，真实临时 Store 中已派发远端 job 的运行状态保持不变；未连接 SSH。
 续接仅投影当前 run 的完整验证事件链；其它运行的对话历史仍作为有界文本证据。临时委派节点独立保存调用内续接，主运行只保存已验证节点结果。MCP 请求只允许依据同一已验证事件链中的冻结目录补齐宿主绑定字段；其它参数差异拒绝。心跳/usage/空片段不推进 idle；opaque reasoning 不进入普通上下文。
+
+Task 10: Six exact Go Responses IDs appended from models.dev source SHA 664e5052595cb2464666cbe71b26917f6b903d967ce9bd0d39e347a3c5aa84bc; old rows and top source SHA remain unchanged. Missing catalog/protocol tests observed RED then GREEN. Python 4 passed; desktop model_ 38 passed/1 ignored; facade 5 and Responses 6 passed; fmt/diff check passed. Effort is validated per exact ID, unknown IDs keep options unset. Source-advertised vision remains in catalog but host subscription image transport remains unsupported. No real subscription generation executed.

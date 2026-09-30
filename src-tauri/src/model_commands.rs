@@ -3,7 +3,7 @@ use omicsops_adapters::{
     llm::{MODEL_PROBE_OUTPUT_TOKENS, ModelProbeResult, RequestBudget},
     model_client::ModelClient,
 };
-use omicsops_core::workspace::{ModelProfile, ModelProviderKind};
+use omicsops_core::workspace::{ModelProfile, ModelProviderKind, OPENCODE_GO_RESPONSES_MODELS};
 use tauri::State;
 use url::Url;
 use uuid::Uuid;
@@ -41,12 +41,6 @@ const OPENCODE_GO_MESSAGES_MODELS: &[&str] = &[
     "qwen3.7-plus",
     "qwen3.6-plus",
 ];
-const OPENCODE_GO_RESPONSES_MODELS: &[&str] = &[
-    "grok-4.6",
-    "gpt-5.6-luna",
-    "muse-spark-1.3-contributor",
-    "muse-spark-1.2-contributor",
-];
 
 fn is_opencode_go_base_url(url: &Url) -> bool {
     url.scheme() == "https"
@@ -67,8 +61,10 @@ fn validate_opencode_go_protocol(
     if !is_opencode_go_base_url(base_url) {
         return Ok(());
     }
-    if OPENCODE_GO_RESPONSES_MODELS.contains(&model) {
-        return Err("this OpenCode Go model requires the unsupported Responses API".into());
+    if OPENCODE_GO_RESPONSES_MODELS.contains(&model)
+        && provider != ModelProviderKind::OpenAiResponses
+    {
+        return Err("this OpenCode Go model requires the explicit Responses API provider".into());
     }
     if OPENCODE_GO_CHAT_MODELS.contains(&model) && provider != ModelProviderKind::OpenAiCompatible {
         return Err("this OpenCode Go model requires the Chat Completions protocol".into());
@@ -198,6 +194,7 @@ pub(crate) fn merge_existing_profile(
 }
 
 pub(crate) fn validate_profile_capabilities(profile: &ModelProfile) -> Result<(), String> {
+    omicsops_core::workspace::validate_subscription_profile_fields(profile)?;
     omicsops_core::workspace::validate_reasoning_effort(
         profile.provider,
         profile.reasoning_effort.as_deref(),
@@ -396,6 +393,59 @@ async fn client_for_profile(state: &AppState, profile_id: Uuid) -> Result<ModelC
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn subscription_catalog_accepts_only_explicit_responses_and_reviewed_efforts() {
+        for id in [
+            "grok-4.7",
+            "grok-4.6",
+            "gpt-6-luna",
+            "gpt-5.6-luna",
+            "muse-spark-1.3-contributor",
+            "muse-spark-1.2-contributor",
+        ] {
+            let saved = super::model_profile_from_request(request(
+                "open_ai_responses",
+                "https://opencode.ai/zen/go/v1",
+                id,
+            ))
+            .unwrap();
+            assert!(saved.catalog_capabilities.is_some());
+            assert!(!saved.supports_vision);
+            for provider in ["anthropic", "open_ai_compatible"] {
+                assert!(
+                    super::model_profile_from_request(request(
+                        provider,
+                        "https://opencode.ai/zen/go/v1",
+                        id
+                    ))
+                    .is_err()
+                );
+            }
+        }
+        for (id, effort, allowed) in [
+            ("grok-4.7", "none", false),
+            ("grok-4.7", "xhigh", true),
+            ("gpt-6-luna", "max", true),
+            ("muse-spark-1.3-contributor", "minimal", true),
+            ("muse-spark-1.3-contributor", "none", false),
+            ("unreviewed", "high", false),
+        ] {
+            let mut payload = request("open_ai_responses", "https://opencode.ai/zen/go/v1", id);
+            payload.reasoning_effort = Some(Some(effort.into()));
+            assert_eq!(
+                super::model_profile_from_request(payload).is_ok(),
+                allowed,
+                "{id} {effort}"
+            );
+        }
+        let saved = super::model_profile_from_request(request(
+            "open_ai_responses",
+            "https://opencode.ai/zen/go/v1",
+            "unreviewed-complete-id",
+        ))
+        .unwrap();
+        assert!(saved.catalog_capabilities.is_none());
+    }
     #[test]
     fn subscription_login_plain_form_cannot_replace_bundle_with_api_key() {
         let codex = super::model_profile_from_request(request(

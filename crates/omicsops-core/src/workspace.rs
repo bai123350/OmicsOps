@@ -462,6 +462,49 @@ pub fn validate_subscription_profile_fields(profile: &ModelProfile) -> Result<()
             );
         }
     }
+    validate_subscription_reasoning_effort(
+        profile.provider,
+        &profile.model,
+        profile.reasoning_effort.as_deref(),
+    )
+    .map_err(str::to_owned)
+}
+
+pub const OPENCODE_GO_RESPONSES_MODELS: &[&str] = &[
+    "grok-4.7",
+    "grok-4.6",
+    "gpt-6-luna",
+    "gpt-5.6-luna",
+    "muse-spark-1.3-contributor",
+    "muse-spark-1.2-contributor",
+];
+
+/// Reviewed wire options for exact Go IDs; unknown models keep options unset.
+pub fn reviewed_go_responses_efforts(model: &str) -> Option<&'static [&'static str]> {
+    match model {
+        "grok-4.7" | "grok-4.6" => Some(&["low", "medium", "high", "xhigh"]),
+        "gpt-6-luna" | "gpt-5.6-luna" => Some(&["none", "low", "medium", "high", "xhigh", "max"]),
+        "muse-spark-1.3-contributor" | "muse-spark-1.2-contributor" => {
+            Some(&["minimal", "low", "medium", "high", "xhigh"])
+        }
+        _ => None,
+    }
+}
+
+pub fn validate_subscription_reasoning_effort(
+    provider: ModelProviderKind,
+    model: &str,
+    effort: Option<&str>,
+) -> Result<(), &'static str> {
+    validate_reasoning_effort(provider, effort)?;
+    if provider == ModelProviderKind::OpenAiResponses {
+        if let Some(effort) = effort {
+            if !reviewed_go_responses_efforts(model).is_some_and(|values| values.contains(&effort))
+            {
+                return Err("reasoning effort is not reviewed for this exact Go model");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -502,13 +545,22 @@ pub fn validate_reasoning_effort(
     let Some(effort) = effort else {
         return Ok(());
     };
-    if provider != ModelProviderKind::OpenAiCompatible {
-        return Err("explicit reasoning effort currently requires an OpenAI-compatible provider");
-    }
-    if !matches!(
-        effort,
-        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
-    ) {
+    let supported = match provider {
+        ModelProviderKind::OpenAiCompatible => matches!(
+            effort,
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+        ),
+        ModelProviderKind::OpenAiCodex => matches!(
+            effort,
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+        ),
+        ModelProviderKind::OpenAiResponses => matches!(
+            effort,
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        ),
+        _ => false,
+    };
+    if !supported {
         return Err("unsupported reasoning effort value");
     }
     Ok(())

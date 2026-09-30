@@ -23,8 +23,12 @@ PROVIDERS = {
 
 # OpenCode Go exposes multiple wire protocols at one exact API endpoint. Only
 # models reviewed against the provider's published routing table are compiled;
-# Responses API models remain unsupported by OmicsOps.
+# Responses models require their own explicit provider; no automatic upgrades.
 OPENCODE_GO_MODEL_PROTOCOLS = {
+    **{model: "open_ai_responses" for model in (
+        "grok-4.7", "grok-4.6", "gpt-6-luna", "gpt-5.6-luna",
+        "muse-spark-1.3-contributor", "muse-spark-1.2-contributor",
+    )},
     **{model: "open_ai_compatible" for model in (
         "glm-5.3-flash", "glm-5.3", "glm-5.2", "glm-5.1", "kimi-k3",
         "kimi-k2.7-code", "kimi-k2.6", "longcat-2.0", "deepseek-v4.1-flash",

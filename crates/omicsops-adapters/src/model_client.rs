@@ -179,11 +179,21 @@ impl ModelClient {
             }
             Self::Claude(_) => {}
             Self::Codex(c) => {
-                validate_responses_effort(effort.as_deref())?;
+                omicsops_core::workspace::validate_subscription_reasoning_effort(
+                    c.profile.provider,
+                    &c.profile.model,
+                    effort.as_deref(),
+                )
+                .map_err(error)?;
                 c.transport = c.transport.clone().with_reasoning_effort(effort);
             }
             Self::Responses(c) => {
-                validate_responses_effort(effort.as_deref())?;
+                omicsops_core::workspace::validate_subscription_reasoning_effort(
+                    c.profile.provider,
+                    &c.profile.model,
+                    effort.as_deref(),
+                )
+                .map_err(error)?;
                 c.transport = c.transport.clone().with_reasoning_effort(effort);
             }
         }
@@ -400,14 +410,6 @@ impl ModelClient {
             can_refresh,
         })
     }
-}
-fn validate_responses_effort(effort: Option<&str>) -> AdapterResult<()> {
-    if effort
-        .is_some_and(|e| !matches!(e, "none" | "minimal" | "low" | "medium" | "high" | "xhigh"))
-    {
-        return Err(error("responses_effort_invalid"));
-    }
-    Ok(())
 }
 fn response_transport(client: &ResponsesHttpClient, v4: bool) -> ResponsesHttpClient {
     if v4 {

@@ -140,12 +140,20 @@ pub fn build_responses_request(
     let tools:Vec<_> = request.tools.iter().map(|tool|json!({"type":"function","name":reverse[&tool.id],"description":tool.description,"parameters":tool.input_schema})).collect();
     let mut body = json!({"model":model,"instructions":request.system,"input":input,"tools":tools,"tool_choice":"auto","store":false,"stream":true,"include":["reasoning.encrypted_content"]});
     if let Some(effort) = effort {
-        if !matches!(
-            effort,
-            "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
-        ) {
-            return Err(invalid("responses_effort_invalid"));
-        }
+        let provider = match kind {
+            ResponsesEndpointKind::CodexSubscription => {
+                omicsops_core::workspace::ModelProviderKind::OpenAiCodex
+            }
+            ResponsesEndpointKind::OpenCodeGo => {
+                omicsops_core::workspace::ModelProviderKind::OpenAiResponses
+            }
+        };
+        omicsops_core::workspace::validate_subscription_reasoning_effort(
+            provider,
+            model,
+            Some(effort),
+        )
+        .map_err(invalid)?;
         body["reasoning"] = json!({"effort":effort});
     }
     if let Some(budget) = budget {

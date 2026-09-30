@@ -59,6 +59,43 @@ fn alias() -> String {
 }
 
 #[test]
+fn go_reasoning_options_require_exact_reviewed_model_and_protocol() {
+    let go = Url::parse("https://opencode.ai/zen/go/v1").unwrap();
+    for (model, effort, allowed) in [
+        ("grok-4.7", "none", false),
+        ("grok-4.7", "high", true),
+        ("gpt-6-luna", "max", true),
+        ("gpt-6-luna", "minimal", false),
+        ("muse-spark-1.3-contributor", "minimal", true),
+        ("grok-4.7-sibling", "high", false),
+    ] {
+        let shaped = build_responses_request(
+            ResponsesEndpointKind::OpenCodeGo,
+            &go,
+            model,
+            &request(),
+            None,
+            Some(effort),
+        );
+        assert_eq!(shaped.is_ok(), allowed);
+        if let Ok(wire) = shaped {
+            assert_eq!(wire.body["reasoning"]["effort"], effort);
+        }
+    }
+    assert!(
+        build_responses_request(
+            ResponsesEndpointKind::CodexSubscription,
+            &Url::parse("https://chatgpt.com/backend-api").unwrap(),
+            "gpt-6-luna",
+            &request(),
+            None,
+            Some("max")
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn responses_shapes_native_tool_history_and_exact_endpoints() {
     let mut r = request();
     r.replay = vec![
