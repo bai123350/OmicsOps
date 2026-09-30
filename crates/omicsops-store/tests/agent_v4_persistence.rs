@@ -48,6 +48,53 @@ fn completion_proposal(summary: &str, answer_markdown: &str) -> CompletionPropos
 }
 
 #[tokio::test]
+async fn model_replay_persistence_preserves_legacy_head_and_opaque_continuation() {
+    use omicsops_protocol::{
+        ModelProviderContinuationV4, ModelReplayBindingV4, ModelReplayItemV4, ModelReplayRecordedV4,
+    };
+    let (store, project, conversation) = fixture().await;
+    let run = Uuid::new_v4();
+    save_run(&store, run, project.id, conversation.id).await;
+    let head = AgentEventV4::first(
+        run,
+        project.id,
+        conversation.id,
+        Utc::now(),
+        AgentEventKindV4::RunCreated {
+            mode: RunModeV4::Plan,
+        },
+    );
+    let old_hash = head.event_hash.clone();
+    let next = AgentEventV4::next(
+        &head,
+        Utc::now(),
+        AgentEventKindV4::ModelReplayRecorded {
+            replay: ModelReplayRecordedV4 {
+                logical_request_id: Uuid::new_v4(),
+                attempt_id: Uuid::new_v4(),
+                binding: ModelReplayBindingV4 {
+                    model_profile_id: Uuid::new_v4(),
+                    configuration_hash: "fixture".into(),
+                },
+                continuation: ModelProviderContinuationV4 {
+                    items: vec![ModelReplayItemV4::ResponsesReasoning {
+                        id: "rs_1".into(),
+                        encrypted_content: "OPAQUE_FIXTURE".into(),
+                    }],
+                },
+            },
+        },
+    );
+    store.append_agent_event_v4(&head).await.unwrap();
+    store.append_agent_event_v4(&next).await.unwrap();
+    store.append_agent_event_v4(&next).await.unwrap();
+    let reloaded = store.agent_events_v4(run).await.unwrap();
+    assert_eq!(reloaded, vec![head, next]);
+    assert_eq!(reloaded[0].event_hash, old_hash);
+    assert!(reloaded.iter().all(|event| event.verify().is_ok()));
+}
+
+#[tokio::test]
 async fn v4_run_and_hash_chained_events_round_trip_independently() {
     let (store, project, conversation) = fixture().await;
     let run = Uuid::new_v4();

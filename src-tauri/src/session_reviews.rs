@@ -489,6 +489,7 @@ fn review_request(sources: &[SessionReviewSourceV4], source_message_count: u64) 
         messages: vec![ModelMessage { role: "user".into(), content: source_payload(sources, source_message_count).to_string().into() }],
         tools: vec![],
         require_strict_json_fallback: false,
+        replay: Vec::new(),
     }
 }
 

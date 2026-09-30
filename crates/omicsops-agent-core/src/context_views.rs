@@ -154,6 +154,12 @@ pub(crate) fn bounded_text(text: &str) -> String {
 
 pub(crate) fn event_view(event: &AgentEventV4) -> Value {
     let mut view = serde_json::to_value(event).expect("serializable event");
+    if let AgentEventKindV4::ModelReplayRecorded { replay } = &event.event {
+        // Continuations belong only to the matching transport, never general
+        // model context, summaries, or private reasoning previews.
+        view["event"]["replay"]["continuation"] =
+            json!({"item_count":replay.continuation.items.len(), "omitted_from_model_view":true});
+    }
     // The containing context is already scoped to one run. Keep the event's
     // stable lookup identity, but do not repeat run identity and hash-chain
     // fields in every model-only entry.

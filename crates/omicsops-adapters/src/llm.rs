@@ -3080,6 +3080,7 @@ mod reasoning_effort_tests {
             messages: vec![],
             tools: vec![],
             require_strict_json_fallback: false,
+            replay: Vec::new(),
         }
     }
 
@@ -3211,6 +3212,7 @@ mod fast_mode_tests {
             messages: vec![],
             tools: vec![],
             require_strict_json_fallback: false,
+            replay: Vec::new(),
         }
     }
 
@@ -3319,6 +3321,7 @@ mod local_openai_auth_tests {
                     messages: vec![],
                     tools: vec![],
                     require_strict_json_fallback: false,
+                    replay: Vec::new(),
                 },
             )
             .unwrap();
@@ -3544,6 +3547,7 @@ mod image_budget_tests {
             }],
             tools: vec![],
             require_strict_json_fallback: false,
+            replay: Vec::new(),
         }
     }
 
@@ -3553,6 +3557,7 @@ mod image_budget_tests {
             messages: vec![],
             tools: vec![],
             require_strict_json_fallback: false,
+            replay: Vec::new(),
         }
     }
 

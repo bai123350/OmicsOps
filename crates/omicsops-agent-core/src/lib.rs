@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 mod context_views;
+pub mod model_replay;
 mod progress;
 use chrono::Utc;
 use futures_util::{
@@ -138,6 +139,8 @@ pub struct ModelRequestV4 {
     pub tools: Vec<ToolDescriptorV4>,
     #[serde(default)]
     pub image_refs: Vec<ModelImageRefV4>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replay: Vec<omicsops_protocol::ModelReplayItemV4>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +155,8 @@ pub struct ModelImageRefV4 {
 pub struct ModelTurnV4 {
     pub public_text: String,
     pub tool_calls: Vec<ToolCallV4>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_continuation: Option<omicsops_protocol::ModelProviderContinuationV4>,
 }
 
 /// Re-export the protocol-owned scope/hash helpers for callers that already
@@ -873,6 +878,7 @@ impl AgentCoreV4<'_> {
                         context,
                         tools: self.tools.descriptors(RunModeV4::Plan),
                         image_refs: vec![],
+                        replay: Vec::new(),
                     },
                     AgentLimitsV4::default().max_model_retries,
                     AgentLimitsV4::default().model_attempt_timeout,
@@ -2628,6 +2634,7 @@ impl AgentCoreV4<'_> {
                 context: context.to_string(),
                 tools: descriptors.clone(),
                 image_refs: vec![],
+                replay: Vec::new(),
             };
             // Bound all child input, including schema and tool descriptions. Do
             // not silently discard evidence or alter the required output schema.
@@ -4466,6 +4473,7 @@ impl AgentCoreV4<'_> {
                 })
                 .collect(),
             image_refs: screenshot_image_refs(events),
+            replay: Vec::new(),
         }
     }
 
@@ -6236,6 +6244,7 @@ mod tests {
                     tool_id: "agent.propose_plan".into(),
                     arguments: serde_json::to_value(&self.plan).unwrap(),
                 }],
+                provider_continuation: None,
             })
         }
     }
@@ -6255,6 +6264,7 @@ mod tests {
             Ok(ModelTurnV4 {
                 public_text: "我先检查输入目录。".into(),
                 tool_calls: vec![],
+                provider_continuation: None,
             })
         }
 
@@ -6335,14 +6345,17 @@ mod tests {
                 UsageScriptMode::RetryOnce => Ok(ModelTurnV4 {
                     public_text: "done".into(),
                     tool_calls: vec![],
+                    provider_continuation: None,
                 }),
                 UsageScriptMode::ProviderRetryEvent => Ok(ModelTurnV4 {
                     public_text: "done after provider retry".into(),
                     tool_calls: vec![],
+                    provider_continuation: None,
                 }),
                 UsageScriptMode::NoUsage => Ok(ModelTurnV4 {
                     public_text: "done without usage".into(),
                     tool_calls: vec![],
+                    provider_continuation: None,
                 }),
             }
         }
@@ -6842,6 +6855,7 @@ mod tests {
                 context: String::new(),
                 tools: vec![],
                 image_refs: vec![],
+                replay: Vec::new(),
             },
             0,
             Duration::from_secs(1),
@@ -6895,6 +6909,7 @@ mod tests {
             Ok(ModelTurnV4 {
                 public_text: String::new(),
                 tool_calls: vec![],
+                provider_continuation: None,
             })
         }
     }
@@ -6921,6 +6936,7 @@ mod tests {
             Ok(ModelTurnV4 {
                 public_text: String::new(),
                 tool_calls: vec![],
+                provider_continuation: None,
             })
         }
     }
@@ -6940,6 +6956,7 @@ mod tests {
             context: String::new(),
             tools: vec![],
             image_refs: vec![],
+            replay: Vec::new(),
         };
         let mut turn = Box::pin(core.model_turn(run_id, request, 0, Duration::from_secs(1), None));
         tokio::select! {
@@ -7018,6 +7035,7 @@ mod tests {
             context: String::new(),
             tools: vec![],
             image_refs: vec![],
+            replay: Vec::new(),
         };
         let mut turn =
             Box::pin(core.model_turn(run_id, request, 0, Duration::from_secs(2), Some(&cancelled)));
@@ -7064,6 +7082,7 @@ mod tests {
                 context: String::new(),
                 tools: vec![],
                 image_refs: vec![],
+                replay: Vec::new(),
             },
             0,
             None,
@@ -7120,6 +7139,7 @@ mod tests {
                 context: String::new(),
                 tools: vec![],
                 image_refs: vec![],
+                replay: Vec::new(),
             },
             1,
             Duration::from_secs(1),
@@ -7203,6 +7223,7 @@ mod tests {
                     context: "original request".into(),
                     tools: vec![],
                     image_refs: vec![],
+                    replay: Vec::new(),
                 },
                 1,
                 Duration::from_secs(1),
@@ -7251,6 +7272,7 @@ mod tests {
                 context: String::new(),
                 tools: vec![],
                 image_refs: vec![],
+                replay: Vec::new(),
             },
             0,
             Duration::from_secs(1),
@@ -7312,6 +7334,7 @@ mod tests {
                     context: String::new(),
                     tools: vec![],
                     image_refs: vec![],
+                    replay: Vec::new(),
                 },
                 0,
                 Duration::from_secs(1),
@@ -7353,6 +7376,7 @@ mod tests {
                 context: String::new(),
                 tools: vec![],
                 image_refs: vec![],
+                replay: Vec::new(),
             },
             0,
             Duration::from_secs(1),
@@ -7409,6 +7433,7 @@ mod tests {
                 context: String::new(),
                 tools: vec![],
                 image_refs: vec![],
+                replay: Vec::new(),
             },
             0,
             Duration::from_secs(1),
@@ -7467,6 +7492,7 @@ mod tests {
                     context: String::new(),
                     tools: vec![],
                     image_refs: vec![],
+                    replay: Vec::new(),
                 },
                 0,
                 Duration::from_secs(1),
@@ -7501,6 +7527,7 @@ mod tests {
                     tool_id: "project.list".into(),
                     arguments: json!({}),
                 }],
+                provider_continuation: None,
             },
             ModelTurnV4 {
                 public_text: String::new(),
@@ -7509,6 +7536,7 @@ mod tests {
                     tool_id: "agent.propose_plan".into(),
                     arguments: plan,
                 }],
+                provider_continuation: None,
             },
         ]));
         let store = MemoryStore::default();
@@ -7543,6 +7571,7 @@ mod tests {
         let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
             public_text: String::new(),
             tool_calls: vec![call],
+            provider_continuation: None,
         }]));
         let store = MemoryStore::default();
         let execute_count = Arc::new(AtomicUsize::new(0));
@@ -7591,6 +7620,7 @@ mod tests {
         let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
             public_text: String::new(),
             tool_calls: vec![call],
+            provider_continuation: None,
         }]));
         let store = MemoryStore::default();
         let execute_count = Arc::new(AtomicUsize::new(0));
@@ -7719,6 +7749,7 @@ mod tests {
             ModelTurnV4 {
                 public_text: String::new(),
                 tool_calls: vec![call.clone()],
+                provider_continuation: None,
             },
             ModelTurnV4 {
                 public_text: String::new(),
@@ -7727,6 +7758,7 @@ mod tests {
                     tool_id: "agent.propose_plan".into(),
                     arguments: serde_json::to_value(proposal.clone()).unwrap(),
                 }],
+                provider_continuation: None,
             },
         ]));
         let store = MemoryStore::default();
@@ -7799,12 +7831,14 @@ mod tests {
             ModelTurnV4 {
                 public_text: String::new(),
                 tool_calls: vec![call.clone()],
+                provider_continuation: None,
             },
             // The model repeats the exact approved call in the same revision.
             // The durable outcome must be reused rather than dispatched again.
             ModelTurnV4 {
                 public_text: String::new(),
                 tool_calls: vec![call.clone()],
+                provider_continuation: None,
             },
             ModelTurnV4 {
                 public_text: String::new(),
@@ -7813,6 +7847,7 @@ mod tests {
                     tool_id: "agent.propose_plan".into(),
                     arguments: serde_json::to_value(proposal.clone()).unwrap(),
                 }],
+                provider_continuation: None,
             },
         ]));
         let store = MemoryStore::default();
@@ -7891,6 +7926,7 @@ mod tests {
         let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
             public_text: String::new(),
             tool_calls: vec![call.clone()],
+            provider_continuation: None,
         }]));
         let store = MemoryStore::default();
         let execute_count = Arc::new(AtomicUsize::new(0));
@@ -8034,6 +8070,7 @@ mod tests {
             ModelTurnV4 {
                 public_text: String::new(),
                 tool_calls: vec![call.clone()],
+                provider_continuation: None,
             },
             ModelTurnV4 {
                 public_text: String::new(),
@@ -8042,6 +8079,7 @@ mod tests {
                     tool_id: "agent.propose_plan".into(),
                     arguments: serde_json::to_value(proposal.clone()).unwrap(),
                 }],
+                provider_continuation: None,
             },
         ]));
         let store = MemoryStore::default();
@@ -8107,6 +8145,7 @@ mod tests {
         let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
             public_text: String::new(),
             tool_calls: vec![call],
+            provider_continuation: None,
         }]));
         let store = MemoryStore::default();
         let execute_count = Arc::new(AtomicUsize::new(0));
@@ -8158,6 +8197,7 @@ mod tests {
         let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
             public_text: String::new(),
             tool_calls: vec![call],
+            provider_continuation: None,
         }]));
         let store = MemoryStore::default();
         let execute_count = Arc::new(AtomicUsize::new(0));
@@ -8206,6 +8246,7 @@ mod tests {
         let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
             public_text: String::new(),
             tool_calls: vec![call.clone()],
+            provider_continuation: None,
         }]));
         let store = MemoryStore::default();
         let initial_execute_count = Arc::new(AtomicUsize::new(0));
@@ -8273,6 +8314,7 @@ mod tests {
         let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
             public_text: String::new(),
             tool_calls: vec![call.clone()],
+            provider_continuation: None,
         }]));
         let store = MemoryStore::default();
         let execute_count = Arc::new(AtomicUsize::new(0));
@@ -9228,6 +9270,7 @@ mod tests {
                     }),
                 },
             ],
+            provider_continuation: None,
         }]));
 
         AgentCoreV4 {
@@ -9289,10 +9332,12 @@ mod tests {
                         ]
                     }),
                 }],
+                provider_continuation: None,
             },
             ModelTurnV4 {
                 public_text: "Iteration limit reached; work remains.".into(),
                 tool_calls: vec![],
+                provider_continuation: None,
             },
         ]));
 
@@ -9494,6 +9539,7 @@ mod tests {
                     "criteria": []
                 }),
             }],
+            provider_continuation: None,
         }]));
         let tools = RuntimeTools {
             calls: AtomicUsize::new(0),
@@ -9617,6 +9663,7 @@ mod tests {
                     tool_id: "runtime.execute".into(),
                     arguments: json!({"language":"python","code":"raise Exception()"}),
                 }],
+                provider_continuation: None,
             },
             ModelTurnV4 {
                 public_text: "repaired".into(),
@@ -9625,6 +9672,7 @@ mod tests {
                     tool_id: "runtime.execute".into(),
                     arguments: json!({"language":"python","code":"print('repaired')"}),
                 }],
+                provider_continuation: None,
             },
             ModelTurnV4 {
                 public_text: String::new(),
@@ -9633,6 +9681,7 @@ mod tests {
                     tool_id: "agent.complete".into(),
                     arguments: json!({"schema_version":4,"summary":"repaired execution completed","answer_markdown":"## Result\n\nThe execution was repaired and completed.","criteria":[{"criterion":"verified output","evidence":[{"kind":"event","sequence":13}]}]}),
                 }],
+                provider_continuation: None,
             },
         ]));
         let tools = RuntimeTools {
@@ -9715,6 +9764,7 @@ mod tests {
                 tool_id: "project.read".into(),
                 arguments: json!({"path":"results/missing-report.md"}),
             }],
+            provider_continuation: None,
         }]));
         let tools = RecoverableExecutorErrorTools {
             calls: AtomicUsize::new(0),
@@ -9793,6 +9843,7 @@ mod tests {
                 tool_id: "runtime.execute".into(),
                 arguments: json!({"code":"write_output()"}),
             }],
+            provider_continuation: None,
         }]));
 
         let error = AgentCoreV4 {
@@ -9826,6 +9877,7 @@ mod tests {
                     tool_id: "runtime.execute".into(),
                     arguments: json!({"language":"python","code":"print(1)"}),
                 }],
+                provider_continuation: None,
             },
             ModelTurnV4 {
                 public_text: String::new(),
@@ -9834,6 +9886,7 @@ mod tests {
                     tool_id: "agent.complete".into(),
                     arguments: json!({"schema_version":4,"summary":"analysis completed","answer_markdown":"## Result\n\nThe analysis completed successfully.","criteria":[{"criterion":"verified output","evidence":[{"kind":"event","sequence":8}]}]}),
                 }],
+                provider_continuation: None,
             },
         ]));
         let tools = RuntimeTools {
@@ -9888,6 +9941,7 @@ mod tests {
                     tool_id: "agent.propose_plan".into(),
                     arguments: json!({"schema_version":4,"objective":"x","steps":["a"],"completion_criteria":["b"],"requested_capabilities":[]}),
                 }],
+                provider_continuation: None,
             })
         }
     }
@@ -9932,6 +9986,7 @@ mod tests {
                     tool_id: "runtime.execute".into(),
                     arguments: json!({"language":"python","code":"x=1"}),
                 }],
+                provider_continuation: None,
             })
             .collect();
         let model = ScriptedModel(Mutex::new(turns));
@@ -10181,6 +10236,7 @@ mod tests {
                 tool_id: "runtime.execute".into(),
                 arguments: json!({"language":"python","code":"sleep(60)"}),
             }],
+            provider_continuation: None,
         }]));
         let tools = RuntimeTools {
             calls: AtomicUsize::new(0),
@@ -10396,6 +10452,7 @@ mod tests {
                 tool_id: "runtime.execute".into(),
                 arguments: json!({"language":"python","code":"write_output()"}),
             }],
+            provider_continuation: None,
         }]));
         let entered = Arc::new(tokio::sync::Notify::new());
         let future_dropped = Arc::new(AtomicBool::new(false));
@@ -10478,6 +10535,7 @@ mod tests {
                 tool_id: "runtime.execute".into(),
                 arguments: json!({"language":"python","code":"write_output()"}),
             }],
+            provider_continuation: None,
         }]));
         let tools = ControlledCancellationTools {
             tool_id: "runtime.execute",
@@ -10552,6 +10610,7 @@ mod tests {
                 tool_id: "project.list".into(),
                 arguments: json!({"path":"."}),
             }],
+            provider_continuation: None,
         }]));
         let tools = ControlledCancellationTools {
             tool_id: "project.list",
@@ -10631,6 +10690,7 @@ mod tests {
                     arguments: json!({}),
                 },
             ],
+            provider_continuation: None,
         }]));
         let tools = MixedCancellationTools {
             entered: Arc::new(tokio::sync::Notify::new()),
@@ -10717,6 +10777,7 @@ mod tests {
             Ok(ModelTurnV4 {
                 public_text: String::new(),
                 tool_calls: vec![],
+                provider_continuation: None,
             })
         }
     }
@@ -10735,6 +10796,7 @@ mod tests {
             Ok(ModelTurnV4 {
                 public_text: "completed".into(),
                 tool_calls: vec![],
+                provider_continuation: None,
             })
         }
     }
@@ -10787,6 +10849,7 @@ mod tests {
                     context: "context".into(),
                     tools: vec![],
                     image_refs: vec![],
+                    replay: Vec::new(),
                 },
                 0,
                 AgentLimitsV4::default().model_attempt_timeout,
@@ -10820,6 +10883,7 @@ mod tests {
                     context: "context".into(),
                     tools: vec![],
                     image_refs: vec![],
+                    replay: Vec::new(),
                 },
                 0,
                 AgentLimitsV4::default().model_attempt_timeout,
@@ -10854,6 +10918,7 @@ mod tests {
             Ok(ModelTurnV4 {
                 public_text: "complete".into(),
                 tool_calls: vec![],
+                provider_continuation: None,
             })
         }
     }
@@ -10881,6 +10946,7 @@ mod tests {
                     context: "context".into(),
                     tools: vec![],
                     image_refs: vec![],
+                    replay: Vec::new(),
                 },
                 0,
                 None,
@@ -11142,6 +11208,7 @@ mod tests {
                     context: "context".into(),
                     tools: vec![],
                     image_refs: vec![],
+                    replay: Vec::new(),
                 },
                 0,
                 Some(cancelled.as_ref()),
@@ -11296,6 +11363,7 @@ mod tests {
                 tool_id: "agent.complete".into(),
                 arguments: json!({"schema_version":4,"summary":"verified uncertain dispatch","answer_markdown":"## Result\n\nThe dispatch was verified and the output is complete.","criteria":[{"criterion":"verified output","evidence":[{"kind":"event","sequence":6}]}]}),
             }],
+            provider_continuation: None,
         }]));
         AgentCoreV4 {
             model: &completion,
@@ -11431,6 +11499,7 @@ mod tests {
             Ok(ModelTurnV4 {
                 public_text: "updated approach".into(),
                 tool_calls: vec![],
+                provider_continuation: None,
             })
         }
     }
@@ -11555,6 +11624,7 @@ mod tests {
                         context: String::new(),
                         tools: vec![],
                         image_refs: vec![],
+                        replay: Vec::new(),
                     },
                     0,
                     Duration::from_secs(1),
@@ -12206,6 +12276,7 @@ mod tests {
                 Ok(ModelTurnV4 {
                     public_text: "recovered".into(),
                     tool_calls: vec![],
+                    provider_continuation: None,
                 })
             }
         }
@@ -13713,6 +13784,7 @@ mod tests {
                     context: "目标".into(),
                     tools: vec![],
                     image_refs: vec![],
+                    replay: Vec::new(),
                 },
                 3,
                 Duration::from_secs(1),
@@ -14106,6 +14178,7 @@ mod tests {
                     arguments: json!("malformed search arguments"),
                 },
             ],
+            provider_continuation: None,
         }]));
         let tools = OptionalCapabilityTools {
             execute_calls: AtomicUsize::new(0),
@@ -14159,6 +14232,7 @@ mod tests {
                     tool_id: "agent.complete".into(),
                     arguments: completion_arguments(evidence_sequence),
                 }],
+                provider_continuation: None,
             }]),
             reviews: Mutex::new(vec![]),
         };
@@ -14211,6 +14285,7 @@ mod tests {
                         "criteria":[{"criterion":"verified output","evidence":[]}]
                     }),
                 }],
+                provider_continuation: None,
             }]),
             reviews: Mutex::new(vec![]),
         };
@@ -14340,6 +14415,7 @@ mod tests {
                     tool_id: "agent.complete".into(),
                     arguments: completion_arguments(evidence_sequence),
                 }],
+                provider_continuation: None,
             })
             .collect();
         let model = ReviewingModel {
@@ -14399,6 +14475,7 @@ mod tests {
                     tool_id: "agent.complete".into(),
                     arguments: completion_arguments(evidence_sequence),
                 }],
+                provider_continuation: None,
             }]),
             reviews: Mutex::new(vec![review(VerificationSeverityV4::Warn)]),
         };
@@ -14498,6 +14575,7 @@ mod tests {
                 tool_id: "agent.submit_delegated_result".into(),
                 arguments: json!({"output": output}),
             }],
+            provider_continuation: None,
         }
     }
 
@@ -14747,6 +14825,7 @@ mod tests {
                             tool_id: "read".into(),
                             arguments: json!({}),
                         }],
+                        provider_continuation: None,
                     },
                     delegated_submission(json!({"value":"handled error"})),
                 ])),
@@ -14941,6 +15020,7 @@ mod tests {
                     tool_id: "agent.submit_delegated_result".into(),
                     arguments: json!({"output":output}),
                 }],
+                provider_continuation: None,
             })
         }
     }
@@ -15142,6 +15222,7 @@ mod tests {
                             arguments: json!({}),
                         })
                         .collect(),
+                    provider_continuation: None,
                 }),
                 "wait" => {
                     self.entered.notify_one();
@@ -15413,6 +15494,7 @@ mod tests {
                         tool_id: "read".into(),
                         arguments: json!({}),
                     }],
+                    provider_continuation: None,
                 }])
             } else {
                 Default::default()
@@ -15502,6 +15584,7 @@ mod tests {
                         tool_id: "agent.submit_delegated_result".into(),
                         arguments: json!({"output":{"value":"checked"}}),
                     }],
+                    provider_continuation: None,
                 });
             }
             let turn = self.0.fetch_add(1, AtomicOrdering::SeqCst);
@@ -15517,6 +15600,7 @@ mod tests {
                         })
                         .unwrap(),
                     }],
+                    provider_continuation: None,
                 })
             } else {
                 let context: Value = serde_json::from_str(&request.context).unwrap();
@@ -15538,6 +15622,7 @@ mod tests {
                         tool_id: "agent.complete".into(),
                         arguments: completion_arguments(sequence),
                     }],
+                    provider_continuation: None,
                 })
             }
         }
@@ -15818,6 +15903,7 @@ mod tests {
             Ok(ModelTurnV4 {
                 public_text: String::new(),
                 tool_calls: vec![call],
+                provider_continuation: None,
             })
         }
         async fn review(
@@ -15879,10 +15965,12 @@ mod tests {
                 ModelTurnV4 {
                     public_text: "inspect data".into(),
                     tool_calls: vec![call.clone()],
+                    provider_continuation: None,
                 },
                 ModelTurnV4 {
                     public_text: "Iteration limit reached; work remains.".into(),
                     tool_calls: vec![],
+                    provider_continuation: None,
                 },
             ]));
             let tools = PreparingTools {
@@ -15940,6 +16028,7 @@ mod tests {
                 tool_id: "use_mcp_tool".into(),
                 arguments: json!({}),
             }],
+            provider_continuation: None,
         }]));
         let tools = PreparingTools {
             attempts: AtomicUsize::new(0),
@@ -16489,6 +16578,7 @@ mod tests {
             Ok(ModelTurnV4 {
                 public_text: "Recovered".into(),
                 tool_calls: vec![],
+                provider_continuation: None,
             })
         }
     }
@@ -16556,6 +16646,7 @@ mod tests {
                         context: "verified evidence".into(),
                         tools: vec![],
                         image_refs: vec![],
+                        replay: Vec::new(),
                     },
                     3,
                     Duration::from_secs(1),
@@ -16647,6 +16738,7 @@ mod tests {
                     tool_id: "project.list".into(),
                     arguments: json!({"path": format!("folder-{attempt}")}),
                 }],
+                provider_continuation: None,
             })
         }
     }
@@ -17054,6 +17146,7 @@ mod tests {
                     tool_id: tool_id.into(),
                     arguments,
                 }],
+                provider_continuation: None,
             })
         }
         async fn review(&self, _: ReviewerRequestV4) -> Result<ReviewerReportV4, ModelFailureV4> {
@@ -17157,6 +17250,7 @@ mod tests {
                         tool_id: "agent.complete".into(),
                         arguments: completion_arguments(self.evidence),
                     }],
+                    provider_continuation: None,
                 });
             }
             Ok(ModelTurnV4 {
@@ -17168,6 +17262,7 @@ mod tests {
                         arguments: json!({"path":format!("{round}-{index}")}),
                     })
                     .collect(),
+                provider_continuation: None,
             })
         }
         async fn review(&self, _: ReviewerRequestV4) -> Result<ReviewerReportV4, ModelFailureV4> {
@@ -17186,6 +17281,7 @@ mod tests {
             summary: ModelTurnV4 {
                 public_text: "Found files; analysis remains unverified.".into(),
                 tool_calls: vec![],
+                provider_continuation: None,
             },
             complete_after: None,
             evidence: 0,
@@ -17239,6 +17335,7 @@ mod tests {
             ModelTurnV4 {
                 public_text: " ".into(),
                 tool_calls: vec![],
+                provider_continuation: None,
             },
             ModelTurnV4 {
                 public_text: "Invalid summary should not persist".into(),
@@ -17247,6 +17344,7 @@ mod tests {
                     tool_id: "agent.complete".into(),
                     arguments: json!({}),
                 }],
+                provider_continuation: None,
             },
         ] {
             let mut spec = execution_spec(Uuid::new_v4());
@@ -17312,6 +17410,7 @@ mod tests {
             summary: ModelTurnV4 {
                 public_text: "Unexpected summary".into(),
                 tool_calls: vec![],
+                provider_continuation: None,
             },
             complete_after: Some(2),
             evidence,
@@ -17356,6 +17455,7 @@ mod tests {
                 return Ok(ModelTurnV4 {
                     public_text: "Cancelled summary".into(),
                     tool_calls: vec![],
+                    provider_continuation: None,
                 });
             }
             Err(ModelFailureV4::permanent(
@@ -17423,6 +17523,7 @@ mod tests {
                         tool_id: "project.list".into(),
                         arguments: json!({}),
                     }],
+                    provider_continuation: None,
                 })
                 .collect(),
         ));

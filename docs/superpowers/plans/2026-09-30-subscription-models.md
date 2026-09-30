@@ -101,13 +101,13 @@ CLI 预检无法满足设计时，保留明确错误与已完成增量，修订�
 - `ProviderStreamEvent` 新增 `Continuation { continuation: ModelProviderContinuationV4 }` 与 `ContentProgress { bytes: u32 }`；续接仅在合法成功终态发出，进展只代表非空 assistant 内容。
 - 每个续接最多 16 个 items、累计 1 MiB，单个 encrypted_content 至多 256 KiB；正文 reasoning/未知字段不持久化。
 
-- [ ] 写 `model_replay_rejects_orphans_and_wrong_bindings`：相同 call_id 的跨 profile/attempt/project 数据不能关联；无 ToolRequested 的结果不能回放；已拒绝调用只采用宿主记录的拒绝结果，不伪造执行。 关键断言：`assert!(cross_project_replay.is_err()); assert!(orphan_replay.is_err()); assert_eq!(denied_execution_calls, 0);`
-- [ ] 写 `model_replay_survives_restart_without_reexecuting_tools`：旧事件链哈希保持；新事件重载后按顺序回放；工具执行器调用计数不增加；结构截断不能留下孤立 result。 关键断言：`assert_eq!(reloaded_replay, saved_replay); assert_eq!(executor_calls_after, executor_calls_before);`
-- [ ] 写 `model_replay_drops_plaintext_reasoning_and_measures_ciphertext`：拒绝未知/过大 item；模型通用 context view 不含 opaque continuation 正文；请求预算仍计入密文。 关键断言：`assert!(!context.contains("PRIVATE_REASONING_SENTINEL")); assert!(with_ciphertext.serialized_request_bytes > without_ciphertext.serialized_request_bytes);`
-- [ ] 运行 `cargo test -p omicsops-agent-core model_replay`、`cargo test -p omicsops-agent --test provider_replay`、`cargo test -p omicsops-protocol model_replay`，观察预期失败。
-- [ ] 实现类型/投影；仅给拥有匹配已冻结 binding 的新传输回放，旧 HTTP 请求不新增 wire 字段。机械更新所有 `ModelRequestV4`/`ModelTurnV4` 初始化器，空值保持旧行为。
-- [ ] 重跑以上测试及 `cargo test -p omicsops-store model_replay`，应通过；核对旧事件签名与未知 enum 的明确失败。
-- [ ] 提交 `feat: preserve validated model tool replay and continuation`。
+- [x] 写 `model_replay_rejects_orphans_and_wrong_bindings`：相同 call_id 的跨 profile/attempt/project 数据不能关联；无 ToolRequested 的结果不能回放；已拒绝调用只采用宿主记录的拒绝结果，不伪造执行。 关键断言：`assert!(cross_project_replay.is_err()); assert!(orphan_replay.is_err()); assert_eq!(denied_execution_calls, 0);`
+- [x] 写 `model_replay_survives_restart_without_reexecuting_tools`：旧事件链哈希保持；新事件重载后按顺序回放；工具执行器调用计数不增加；结构截断不能留下孤立 result。 关键断言：`assert_eq!(reloaded_replay, saved_replay); assert_eq!(executor_calls_after, executor_calls_before);`
+- [x] 写 `model_replay_drops_plaintext_reasoning_and_measures_ciphertext`：拒绝未知/过大 item；模型通用 context view 不含 opaque continuation 正文；请求预算仍计入密文。 关键断言：`assert!(!context.contains("PRIVATE_REASONING_SENTINEL")); assert!(with_ciphertext.serialized_request_bytes > without_ciphertext.serialized_request_bytes);`
+- [x] 运行 `cargo test -p omicsops-agent-core model_replay`、`cargo test -p omicsops-agent --test provider_replay`、`cargo test -p omicsops-protocol model_replay`，观察预期失败。
+- [x] 实现类型/投影；仅给拥有匹配已冻结 binding 的新传输回放，旧 HTTP 请求不新增 wire 字段。机械更新所有 `ModelRequestV4`/`ModelTurnV4` 初始化器，空值保持旧行为。
+- [x] 重跑以上测试及 `cargo test -p omicsops-store model_replay`，应通过；核对旧事件签名与未知 enum 的明确失败。
+- [x] 提交 `feat: preserve validated model tool replay and continuation`。
 
 ## Task 3: Responses 塑形、SSE 与 HTTP 执行
 
@@ -349,4 +349,13 @@ run/queue/side-chat/review 保护测试并增加 Claude 无凭据 fixture。
 确定性检查：cargo test --workspace（1412 passed，12 ignored），npm test
 （957 Vitest + 22 browser tests），npm run build，cargo fmt --all -- --check 均通过。
 基线首次 SkillDetails Escape 测试失败，未改其源码；后续完整前端回归通过。
-真实模型、CLI登录、SSH、GUI smoke 和桌面打包尚未执行。任务 2–12 未完成。
+真实模型、CLI登录、SSH、GUI smoke 和桌面打包尚未执行。
+
+Task 2（2026-10-01）：加入共享类型、宿主事件回放投影、provider 续接/活动事件；
+旧请求的空字段省略。校验完整链、project/conversation/profile/hash/attempt、
+宿主 call/result 一致性和续接大小；通用 context view 隐去续接。孤立结果测试
+先失败后修复；SQLite 重载保持原 head/hash、重复 append 幂等。
+cargo test --workspace（1418 passed，12 ignored），额外 Store 回放测试、
+cargo check --workspace --all-targets、cargo fmt --all -- --check 均通过。
+此增量仅准备契约；真实 wire 密文预算在任务 3 验证，持久化发送接线在任务 9。
+任务 3–12 未完成。

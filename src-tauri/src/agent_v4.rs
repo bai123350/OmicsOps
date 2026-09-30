@@ -5339,6 +5339,7 @@ impl DesktopModelPortV4 {
             }],
             tools,
             require_strict_json_fallback: true,
+            replay: Vec::new(),
         })
     }
 }
@@ -5491,6 +5492,7 @@ impl ModelPortV4 for DesktopModelPortV4 {
         Ok(ModelTurnV4 {
             public_text: text,
             tool_calls,
+            provider_continuation: None,
         })
     }
 
@@ -5531,6 +5533,7 @@ impl ModelPortV4 for DesktopModelPortV4 {
                     context,
                     tools: vec![submit],
                     image_refs: vec![],
+                    replay: Vec::new(),
                 },
                 &mut |_| {},
             )
@@ -9034,6 +9037,7 @@ mod tests {
             Ok(ModelTurnV4 {
                 public_text: String::new(),
                 tool_calls: vec![self.0.clone()],
+                provider_continuation: None,
             })
         }
     }
@@ -9677,6 +9681,7 @@ mod tests {
             context: "research request".into(),
             tools: vec![],
             image_refs: vec![],
+            replay: Vec::new(),
         };
         let probe = budget_test_model(false, 100_000);
         let prepared = probe.prepare_request(request.clone(), false).unwrap();
@@ -10044,6 +10049,7 @@ mod tests {
             context: "large".repeat(500),
             tools: vec![],
             image_refs: vec![],
+            replay: Vec::new(),
         };
         assert!(child_port.validate_request(&request).is_err());
         assert!(parent_port.validate_request(&request).is_ok());
@@ -10068,6 +10074,7 @@ mod tests {
                 size_bytes: 1,
                 sha256: "unused".into(),
             }],
+            replay: Vec::new(),
         };
         let preview = model.prepare_request(request.clone(), false).unwrap();
         let actual = model.prepare_request(request.clone(), true).unwrap();
@@ -10131,6 +10138,7 @@ mod tests {
             context: "Answer a small synthetic research request using the available tools.".into(),
             tools: builtin_tool_definitions_v4(),
             image_refs: vec![],
+            replay: Vec::new(),
         };
         let model = model_for(&profile);
         let prepared = model.prepare_request(request.clone(), false).unwrap();
@@ -10195,6 +10203,7 @@ mod tests {
             context: "Find one article".into(),
             tools: builtin_tool_definitions_v4(),
             image_refs: vec![],
+            replay: Vec::new(),
         };
         let prepared = model.prepare_request(request.clone(), false).unwrap();
         let wire = omicsops_adapters::llm::build_provider_request_with_tools_and_budget(
@@ -10236,6 +10245,7 @@ mod tests {
             context: "context".into(),
             tools: vec![],
             image_refs: vec![image],
+            replay: Vec::new(),
         };
         let encoded =
             serde_json::to_string(&model.prepare_request(request.clone(), true).unwrap()).unwrap();
@@ -10400,6 +10410,7 @@ mod tests {
                 size_bytes: 1,
                 sha256: "unused".into(),
             }],
+            replay: Vec::new(),
         };
         let preflight = model.validate_request(&request).unwrap_err();
         assert!(preflight.message.to_ascii_lowercase().contains("image"));
@@ -11478,6 +11489,7 @@ mod tests {
                 effect: ToolEffectV4::ReadOnly,
             }],
             image_refs: vec![],
+            replay: Vec::new(),
         };
         let first = model
             .stream(request.clone(), &mut |_| {})
@@ -11871,6 +11883,7 @@ mod tests {
                         effect: ToolEffectV4::ReadOnly,
                     }],
                     image_refs: vec![],
+                    replay: Vec::new(),
                 },
                 &mut |event| {
                     if let ModelStreamEventV4::TextDelta(delta) = event {

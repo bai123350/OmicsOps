@@ -22,6 +22,8 @@ pub struct ProviderRequest {
     pub tools: Vec<ProviderToolSpec>,
     #[serde(default)]
     pub require_strict_json_fallback: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replay: Vec<omicsops_protocol::ModelReplayItemV4>,
 }
 
 /// How a provider reports the numeric values in one usage sample.
@@ -231,6 +233,12 @@ fn add_delta_counters(merged: &mut ProviderUsageSample, sample: &ProviderUsageSa
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderStreamEvent {
+    Continuation {
+        continuation: omicsops_protocol::ModelProviderContinuationV4,
+    },
+    ContentProgress {
+        bytes: u32,
+    },
     /// Provider-supplied reasoning. Hosts may show a redacted, bounded,
     /// transient preview; this must never enter the public/audit transcript.
     ReasoningDelta {

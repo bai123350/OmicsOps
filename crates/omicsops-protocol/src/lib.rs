@@ -14,8 +14,25 @@ mod context_usage;
 pub use context_usage::*;
 mod session_reviews;
 pub use session_reviews::*;
+mod model_replay;
+pub use model_replay::*;
 
 pub const AGENT_RUNTIME_V4: &str = "omicsops.agent-runtime@4.0.0";
+
+#[cfg(test)]
+mod model_replay_contract_tests {
+    use super::*;
+    #[test]
+    fn model_replay_records_typed_identity_without_plaintext_reasoning() {
+        let value = serde_json::json!({"kind":"model_replay_recorded","replay":{
+            "logical_request_id":Uuid::from_u128(1),"attempt_id":Uuid::from_u128(2),
+            "binding":{"model_profile_id":Uuid::from_u128(3),"configuration_hash":"fixture"},
+            "continuation":{"items":[{"kind":"responses_reasoning","id":"rs_1","encrypted_content":"CIPHERTEXT_FIXTURE"}]}
+        }});
+        let event: AgentEventKindV4 = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(event).unwrap(), value);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -1215,6 +1232,9 @@ pub enum AgentEventKindV4 {
     /// AgentCore. Raw provider payloads are intentionally excluded.
     ModelUsageObserved {
         observation: ModelUsageObservationV4,
+    },
+    ModelReplayRecorded {
+        replay: ModelReplayRecordedV4,
     },
     ToolRequested {
         call: ToolCallV4,

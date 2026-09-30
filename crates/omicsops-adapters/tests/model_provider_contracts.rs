@@ -31,6 +31,7 @@ fn request() -> ProviderRequest {
             },
         ],
         require_strict_json_fallback: true,
+        replay: Vec::new(),
     }
 }
 
