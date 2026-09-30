@@ -181,9 +181,9 @@ function CredentialRow({ entry, zh, busy, onOpenOwner, onReplace, onDelete }: { 
   const status = entry.presence === "present" ? (zh ? "已保存" : "Present") : entry.presence === "missing" ? (zh ? "缺失" : "Missing") : (zh ? "状态不可用" : "Unavailable");
   return <article className="credential-row">
     <header><span><b>{entry.label}</b><code>{entry.reference}</code></span><em className={`credential-presence ${entry.presence}`}>{status}</em></header>
-    <small>{entry.presence === "missing" ? (zh ? "配置仍引用此账户，但 keyring 中没有秘密。可替换后重试。" : "A configuration still references this account, but no secret exists in the keyring. Replace it before retrying.") : entry.presence === "unavailable" ? (zh ? "系统 keyring 当前无法确认状态；这不表示秘密缺失。" : "The system keyring cannot confirm status right now; this does not mean the secret is missing.") : valueKindLabel(entry.value_kind, zh)}</small>
+    <small>{entry.value_kind === "subscription_session" ? valueKindLabel(entry.value_kind, zh) : entry.presence === "missing" ? (zh ? "配置仍引用此账户，但 keyring 中没有秘密。可替换后重试。" : "A configuration still references this account, but no secret exists in the keyring. Replace it before retrying.") : entry.presence === "unavailable" ? (zh ? "系统 keyring 当前无法确认状态；这不表示秘密缺失。" : "The system keyring cannot confirm status right now; this does not mean the secret is missing.") : valueKindLabel(entry.value_kind, zh)}</small>
     {entry.consumers.length > 0 && <div className="credential-consumers"><b>{zh ? "用途" : "Used by"}</b>{entry.consumers.map((consumer, index) => <span key={`${consumer.kind}-${consumer.id}-${consumer.binding_name ?? index}`}>{consumerLabel(consumer, zh)}</span>)}</div>}
-    {!entry.can_replace && <small className="credentials-warning">{zh ? "引用缺少规范 owner 或存在类型冲突；请在来源页面修复。" : "This reference lacks a canonical owner or has a type conflict. Repair it on its owner page."}</small>}
+    {!entry.can_replace && <small className="credentials-warning">{entry.value_kind === "subscription_session" ? (zh ? "请在模型设置中登录或退出，以更新此会话。" : "Use sign-in on the model settings page to update or disconnect this session.") : zh ? "引用缺少规范 owner 或存在类型冲突；请在来源页面修复。" : "This reference lacks a canonical owner or has a type conflict. Repair it on its owner page."}</small>}
     <footer>{owner && <button disabled={busy} onClick={() => onOpenOwner(owner)}>{ownerLabel(owner, zh)}</button>}<button disabled={busy || !entry.can_replace} onClick={onReplace}>{zh ? "替换" : "Replace"}</button>{entry.target.kind === "managed" && (entry.can_delete ? <button disabled={busy} onClick={onDelete}>{zh ? "删除" : "Delete"}</button> : entry.consumers.length > 0 && <button disabled={busy} onClick={() => onOpenOwner("connections")}>{zh ? "查看连接" : "View connections"}</button>)}</footer>
   </article>;
 }
@@ -206,6 +206,7 @@ function ownerLabel(owner: OwnerPage, zh: boolean) {
 }
 
 function valueKindLabel(kind: CredentialEntry["value_kind"], zh: boolean) {
+  if (kind === "subscription_session") return zh ? "订阅会话（只读）" : "Subscription session (read-only)";
   if (kind === "ssh_private_key") return zh ? "SSH 私钥路径与可选口令" : "SSH private-key path and optional passphrase";
   if (kind === "password") return zh ? "密码" : "Password";
   return "API key / token";

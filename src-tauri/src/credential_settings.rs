@@ -59,7 +59,13 @@ pub async fn list_credentials(
         item.owners.push(Owner {
             target: CredentialTarget::Model { id: profile.id },
             label: profile.label.clone(),
-            value_kind: CredentialValueKind::ApiKey,
+            value_kind: if profile.provider
+                == omicsops_core::workspace::ModelProviderKind::OpenAiCodex
+            {
+                CredentialValueKind::SubscriptionSession
+            } else {
+                CredentialValueKind::ApiKey
+            },
             priority: 0,
         });
         item.consumers.push(CredentialConsumer {
@@ -163,7 +169,11 @@ pub async fn list_credentials(
             && (reference.starts_with("ssh/")
                 || reference.starts_with("model/")
                 || reference.starts_with("settings/"));
-        let can_replace = !incompatible && !orphaned_owner_reference;
+        let subscription_owned = item
+            .owners
+            .iter()
+            .any(|owner| owner.value_kind == CredentialValueKind::SubscriptionSession);
+        let can_replace = !incompatible && !orphaned_owner_reference && !subscription_owned;
         let presence = match vault.get(&reference) {
             Ok(Some(_)) => CredentialPresence::Present,
             Ok(None) => CredentialPresence::Missing,
@@ -265,6 +275,9 @@ pub async fn replace_credential(
                 .map_err(|_| "Password credential is invalid".to_string())?;
         }
         CredentialValueKind::ApiKey => {}
+        CredentialValueKind::SubscriptionSession => {
+            return Err("manage subscription sign-in from model settings".into());
+        }
     }
     vault
         .set(&resolved, &request.secret)
@@ -492,6 +505,89 @@ mod tests {
     use omicsops_mcp::McpEnvBinding;
 
     use super::*;
+
+    #[tokio::test]
+    async fn codex_subscription_session_cannot_be_replaced_as_a_generic_credential() {
+        let store = Store::open_in_memory().await.unwrap();
+        let id = Uuid::new_v4();
+        let profile = omicsops_core::workspace::ModelProfile {
+            id,
+            label: "Codex subscription".into(),
+            provider: omicsops_core::workspace::ModelProviderKind::OpenAiCodex,
+            base_url: "https://chatgpt.com/backend-api".into(),
+            model: "full-model-id".into(),
+            credential_reference: Some(credential_account("model", id)),
+            supports_tools: true,
+            supports_vision: false,
+            context_window_tokens: None,
+            catalog_capabilities: None,
+            reasoning_effort: None,
+            fast_mode: None,
+            delegated_model_profile_id: None,
+            cli_executable: None,
+            subscription_account_ref: Some(Uuid::new_v4()),
+        };
+        store.save_model_profile(&profile).await.unwrap();
+        let reference = profile.credential_reference.clone().unwrap();
+        let vault = TestVault::default();
+        vault
+            .set(&reference, "TEST_PRIVATE_SESSION_BUNDLE")
+            .unwrap();
+        vault.set_calls.lock().unwrap().clear();
+        let entry = list_credentials(&store, &vault).await.unwrap().remove(0);
+        assert_eq!(entry.value_kind, CredentialValueKind::SubscriptionSession);
+        assert!(!entry.can_replace);
+        assert!(!entry.can_delete);
+        let replace = ReplaceCredentialRequest {
+            target: entry.target,
+            expected_reference: reference.clone(),
+            expected_value_kind: entry.value_kind,
+            secret: "TEST_API_KEY_REPLACEMENT".into(),
+        };
+        assert!(replace_credential(&store, &vault, replace).await.is_err());
+        let server_id = Uuid::new_v4();
+        store
+            .put_json(
+                MCP_SERVER_KIND,
+                &server_id.to_string(),
+                &mcp(
+                    server_id,
+                    "legacy alias",
+                    vec![binding("TOKEN", &reference)],
+                ),
+            )
+            .await
+            .unwrap();
+        let alias = ReplaceCredentialRequest {
+            target: CredentialTarget::McpBinding {
+                server_id,
+                name: "TOKEN".into(),
+            },
+            expected_reference: reference.clone(),
+            expected_value_kind: entry.value_kind,
+            secret: "TEST_API_KEY_REPLACEMENT".into(),
+        };
+        assert!(replace_credential(&store, &vault, alias).await.is_err());
+        assert!(vault.set_calls.lock().unwrap().is_empty());
+        assert_eq!(
+            vault.get(&reference).unwrap().as_deref(),
+            Some("TEST_PRIVATE_SESSION_BUNDLE")
+        );
+        assert_eq!(
+            store
+                .get_model_profile(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .execution_configuration_hash(),
+            profile.execution_configuration_hash()
+        );
+        assert!(
+            !serde_json::to_string(&list_credentials(&store, &vault).await.unwrap())
+                .unwrap()
+                .contains("TEST_PRIVATE_SESSION_BUNDLE")
+        );
+    }
 
     #[derive(Clone, Default)]
     struct TestVault {

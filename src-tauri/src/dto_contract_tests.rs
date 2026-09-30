@@ -901,6 +901,10 @@ fn credential_settings_contract_uses_entity_targets_without_secret_outputs() {
         CredentialValueKind, ReplaceCredentialRequest,
     };
     let id = Uuid::from_u128(91);
+    assert_eq!(
+        serde_json::to_value(CredentialValueKind::SubscriptionSession).unwrap(),
+        "subscription_session"
+    );
     let entry = CredentialEntry {
         target: CredentialTarget::Ssh { id },
         reference: format!("ssh/{id}"),

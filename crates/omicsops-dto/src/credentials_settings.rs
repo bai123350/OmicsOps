@@ -23,6 +23,7 @@ pub enum CredentialPresence {
 #[serde(rename_all = "snake_case")]
 pub enum CredentialValueKind {
     ApiKey,
+    SubscriptionSession,
     Password,
     SshPrivateKey,
 }

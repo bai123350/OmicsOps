@@ -1060,7 +1060,7 @@ export type CredentialTarget =
   | { kind: "managed"; id: string };
 
 export type CredentialPresence = "present" | "missing" | "unavailable";
-export type CredentialValueKind = "api_key" | "password" | "ssh_private_key";
+export type CredentialValueKind = "api_key" | "password" | "ssh_private_key" | "subscription_session";
 
 export interface CredentialConsumer {
   kind: "model" | "ssh" | "mcp" | string;

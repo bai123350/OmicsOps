@@ -41,6 +41,17 @@ const ssh: CredentialEntry = {
 };
 
 describe("CredentialsSettings", () => {
+  it("shows subscription sessions as read-only and routes reauthentication to models", async () => {
+    mocks.listCredentials.mockResolvedValue([{ ...managed, target: { kind: "model", id: "codex" }, label: "Codex account", reference: "model/codex", value_kind: "subscription_session", can_replace: false, can_delete: false, presence: "present" }]);
+    const openOwner=vi.fn();
+    render(<CredentialsSettings locale="en-US" onOpenOwner={openOwner} />);
+    await screen.findByText("Codex account");
+    expect(screen.getByText(/subscription session/i)).toBeVisible();
+    expect(screen.getByRole("button",{name:"Replace"})).toBeDisabled();
+    fireEvent.click(screen.getByRole("button",{name:/model/i}));
+    expect(openOwner).toHaveBeenCalledWith("models");
+    expect(screen.queryByRole("textbox",{name:/secret/i})).not.toBeInTheDocument();
+  });
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.listCredentials.mockResolvedValue([managed, ssh]);
