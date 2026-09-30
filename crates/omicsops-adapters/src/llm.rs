@@ -622,7 +622,7 @@ impl RequestBudget {
         self.validate_estimated_input(estimated_input)
     }
 
-    fn validate_estimated_input(&self, estimated_input: u64) -> AdapterResult<()> {
+    pub(crate) fn validate_estimated_input(&self, estimated_input: u64) -> AdapterResult<()> {
         let required = estimated_input
             .saturating_add(u64::from(self.reserved_output_tokens))
             .saturating_add(u64::from(self.safety_margin_tokens));

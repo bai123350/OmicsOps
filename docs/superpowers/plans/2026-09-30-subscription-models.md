@@ -205,14 +205,14 @@ CLI 预检无法满足设计时，保留明确错误与已完成增量，修订�
 - env 从白名单构造，去除 API/token/helper/替代端点、cloud 与插件/debug 注入；固定系统提示说明输入 ProviderRequest 的 system 权威与历史为数据。动态上下文/工具 schema 只走 stdin。
 - envelope 为 spec 的 tagged final/tool_calls；不得执行 CLI 原生工具；单次调用没有静默 repair/fallback 重派发，普通 V4 的显式 attempt 策略由宿主控制。
 
-- [ ] 写 `claude_invocation_is_tool_free_subscription_only_and_stdin_only`：空 argv 真的为空；JSON schema 不进 argv；引用/换行/中文/反引号/`$()` 原样进入 stdin；不会成为 shell 代码；恶意父 env 被移除。 关键断言：`assert_eq!(tools_argv_value, ""); assert!(invocation.stdin.windows(3).any(|w| w == b"$()")); assert!(!argv_has_dynamic_prompt); assert!(!invocation.launch.env.contains_key(OsStr::new("ANTHROPIC_API_KEY")));`
-- [ ] 写 `claude_stream_rejects_invalid_final_and_native_execution`：合法 final/calls 转换；未知/重复工具、extra fields、混合/空 calls、is_error、非零退出、缺 result、工具执行事件拒绝；原始协议 JSON 不出现在最终正文。 关键断言：`assert!(native_tool_event_result.is_err()); assert!(extra_field_envelope.is_err()); assert_eq!(host_execution_count, 0);`
-- [ ] 写 `claude_stream_bounds_io_and_counts_only_content_progress`：分别越过 8 MiB/1 MiB/8 MiB/64 KiB/16 calls 边界；system/usage/空 fragment 不产生 ContentProgress，真实非空内容才产生；预算测量不 spawn。 关键断言：`assert!(stdin_8_mib_plus_one.is_err()); assert!(stdout_line_1_mib_plus_one.is_err()); assert!(stderr_64_kib_plus_one.is_err()); assert_eq!(keepalive_content_events, 0);`
-- [ ] 写 `claude_stop_and_identity_change_cannot_produce_success`：await 被取消仍回收进程树；auth 检查超 15 秒拒绝；账户指纹变化失败；无稳定身份时公开限定恢复保证；usage 缺项保持 unknown。 关键断言：`assert_eq!(processes_after_cancel, 0); assert!(changed_identity_result.is_err()); assert_eq!(missing_usage.output_tokens, None);`
-- [ ] 运行 `cargo test -p omicsops-adapters --test claude_code_contracts`，观察失败。
-- [ ] 实现调用/NDJSON parser/envelope/bounds；最终校验后才发工具调用/正文，记录真实 usage，绝不写完整 stdout/stderr 或凭据。CLI 输出预留只用于预算，不宣称服务端 max_output_tokens 已设置。
-- [ ] 重跑完整 CLI contracts 与 process tree tests，应通过；审查禁止参数/环境矩阵。
-- [ ] 提交 `feat: adapt Claude subscription output to host model events`。
+- [x] 写 `claude_invocation_is_tool_free_subscription_only_and_stdin_only`：空 argv 真的为空；JSON schema 不进 argv；引用/换行/中文/反引号/`$()` 原样进入 stdin；不会成为 shell 代码；恶意父 env 被移除。 关键断言：`assert_eq!(tools_argv_value, ""); assert!(invocation.stdin.windows(3).any(|w| w == b"$()")); assert!(!argv_has_dynamic_prompt); assert!(!invocation.launch.env.contains_key(OsStr::new("ANTHROPIC_API_KEY")));`
+- [x] 写 `claude_stream_rejects_invalid_final_and_native_execution`：合法 final/calls 转换；未知/重复工具、extra fields、混合/空 calls、is_error、非零退出、缺 result、工具执行事件拒绝；原始协议 JSON 不出现在最终正文。 关键断言：`assert!(native_tool_event_result.is_err()); assert!(extra_field_envelope.is_err()); assert_eq!(host_execution_count, 0);`
+- [x] 写 `claude_stream_bounds_io_and_counts_only_content_progress`：分别越过 8 MiB/1 MiB/8 MiB/64 KiB/16 calls 边界；system/usage/空 fragment 不产生 ContentProgress，真实非空内容才产生；预算测量不 spawn。 关键断言：`assert!(stdin_8_mib_plus_one.is_err()); assert!(stdout_line_1_mib_plus_one.is_err()); assert!(stderr_64_kib_plus_one.is_err()); assert_eq!(keepalive_content_events, 0);`
+- [x] 写 `claude_stop_and_identity_change_cannot_produce_success`：await 被取消仍回收进程树；auth 检查超 15 秒拒绝；账户指纹变化失败；无稳定身份时公开限定恢复保证；usage 缺项保持 unknown。 关键断言：`assert_eq!(processes_after_cancel, 0); assert!(changed_identity_result.is_err()); assert_eq!(missing_usage.output_tokens, None);`
+- [x] 运行 `cargo test -p omicsops-adapters --test claude_code_contracts`，观察失败。
+- [x] 实现调用/NDJSON parser/envelope/bounds；最终校验后才发工具调用/正文，记录真实 usage，绝不写完整 stdout/stderr 或凭据。CLI 输出预留只用于预算，不宣称服务端 max_output_tokens 已设置。
+- [x] 重跑完整 CLI contracts 与 process tree tests，应通过；审查禁止参数/环境矩阵。
+- [x] 提交 `feat: adapt Claude subscription output to host model events`。
 
 ## Task 8: 可替换 ModelClient 门面与单次派发
 
@@ -367,3 +367,6 @@ Task 4：固定设备登录、私有 vault bundle、共享刷新锁完成；6 �
 Task 5：设备登录后台状态机与六个 Tauri 命令完成；8 个新增行为测试、10 个 subscription 定向测试通过。完整 Rust 1437 通过/12 ignored；共享 credential mutation lock 防止刷新覆盖退出；守卫提取供保存/删除共用，同账户 token 更新不改变冻结身份。数据库失败恢复新/旧秘密，恢复失败明确要求重新登录；退出数据库失败也恢复秘密。
 
 Task 6：Windows suspended spawn / Job Object / handle-list / owned handle reaper 与 Claude 预检完成；完整 Rust 1445 通过/12 ignored，fmt check 通过。生产 CLI 有版本/订阅状态检查，但不能完整确认 managed policy，restrictions_verified=false 且生成 runner 拒绝启动。该限制不等于 Claude 生产端到端通过；后续 envelope 测试只使用受控 runner。官方 CLI 文档与 hooks-guide 明确 managed hooks 不能被普通 disableAllHooks 覆盖，managed-settings 仅提供会话内 /status 来源确认；未调用实际用户 CLI。
+
+Task 7：Claude stdin 调用、严格单回合 envelope 与 NDJSON 解析已实现。预算边界和 stderr 管道阻塞均先复现失败再修复；完整 Rust 回归 1450 通过/12 忽略，最终 Claude 合约 9 通过，fmt 通过。取消与进程树由 Task 6 的 Windows 测试覆盖；成功与身份变更使用隔离测试进程。未调用真实 CLI/订阅模型，生产策略门禁仍有效。
+
