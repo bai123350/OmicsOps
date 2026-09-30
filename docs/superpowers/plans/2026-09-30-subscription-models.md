@@ -243,14 +243,14 @@ CLI 预检无法满足设计时，保留明确错误与已完成增量，修订�
 - core 仅在成功完整 model turn 且工具建议合法后，将续接与当前 logical_request_id/attempt_id/binding 绑定并持久化；取消/失败 attempt 不产生可回放副作用。后续 request 从通过事件链哈希校验的记录投影，不能解析旧 context 文本来制造原生 call_id；原 context 中同一工具回合不再重复伪装为普通消息输入。
 - 新增 Tauri `list_model_profile_model_discovery(profile_id: Uuid) -> ModelDiscoveryResult`，保留原 `list_model_profile_models` 的 Vec 返回值。
 
-- [ ] 写 `subscription_v4_uses_selected_backend_for_every_model_role`：ordinary/plan/summary/side-chat/delegated/reviewer/compaction/clarification 采用冻结选择，独立 profile 不共享 Claude invocation 或 Codex 账户；无默认模型 fallback。 关键断言：`assert_eq!(observed_profile_ids, expected_frozen_profile_ids); assert_eq!(default_fallback_calls, 0);`
-- [ ] 写 `subscription_v4_replay_is_durable_only_after_validated_turn`：failed/cancelled/越权调用不写 continuation；重启恢复不重复 ToolFinished；配置/账户引用/CLI 路径变化拒绝，标签/token 刷新允许。 关键断言：`assert_eq!(failed_attempt_continuation_count, 0); assert_eq!(recovered_tool_execution_count, 0);`
-- [ ] 写 `subscription_v4_local_delete_requires_host_approval`：三 backend 的 read nonce 通过宿主；删除临时文件建议进入现有 approval，拒绝后文件仍存在、执行器计数=0；计划模式不获得写权限。 关键断言：`assert!(temporary_file.exists()); assert_eq!(denied_delete_execution_count, 0); assert_eq!(nonce_read_execution_count, 1);`
-- [ ] 写 `subscription_v4_stop_does_not_cancel_remote_job_or_extend_on_keepalive`：CLI/HTTP 请求停止且冻结远端 job 状态不变；仅真实非空内容推进 idle，system/usage/retry 不无限延长；旁聊生成计数=1。 关键断言：`assert_eq!(remote_job_after_stop, remote_job_before_stop); assert_eq!(side_chat_generation_count, 1); assert_eq!(keepalive_deadline_extensions, 0);`
-- [ ] 运行 `cargo test -p omicsops-desktop --lib subscription_contract_tests` 和 `cargo test -p omicsops-agent-core model_replay`，确认预期失败。
-- [ ] 实现工厂/辅助调用/请求历史/event 接线；复用工具 registry、删除判定、plan approval 与 run/job 生命周期，不新增 CLI 直连项目能力。
-- [ ] 重跑上述命令，以及 desktop 的 `model_`、`side_chat`、`session_review`、`local_deletion` 过滤回归，应通过；逐项核对各模型调用的 retry/deadline。
-- [ ] 提交 `feat: integrate subscription models with host Agent V4`。
+- [x] 写 `subscription_v4_uses_selected_backend_for_every_model_role`：ordinary/plan/summary/side-chat/delegated/reviewer/compaction/clarification 采用冻结选择，独立 profile 不共享 Claude invocation 或 Codex 账户；无默认模型 fallback。 关键断言：`assert_eq!(observed_profile_ids, expected_frozen_profile_ids); assert_eq!(default_fallback_calls, 0);`
+- [x] 写 `subscription_v4_replay_is_durable_only_after_validated_turn`：failed/cancelled/越权调用不写 continuation；重启恢复不重复 ToolFinished；配置/账户引用/CLI 路径变化拒绝，标签/token 刷新允许。 关键断言：`assert_eq!(failed_attempt_continuation_count, 0); assert_eq!(recovered_tool_execution_count, 0);`
+- [x] 写 `subscription_v4_local_delete_requires_host_approval`：三 backend 的 read nonce 通过宿主；删除临时文件建议进入现有 approval，拒绝后文件仍存在、执行器计数=0；计划模式不获得写权限。 关键断言：`assert!(temporary_file.exists()); assert_eq!(denied_delete_execution_count, 0); assert_eq!(nonce_read_execution_count, 1);`
+- [x] 写 `subscription_v4_stop_does_not_cancel_remote_job_or_extend_on_keepalive`：CLI/HTTP 请求停止且冻结远端 job 状态不变；仅真实非空内容推进 idle，system/usage/retry 不无限延长；旁聊生成计数=1。 关键断言：`assert_eq!(remote_job_after_stop, remote_job_before_stop); assert_eq!(side_chat_generation_count, 1); assert_eq!(keepalive_deadline_extensions, 0);`
+- [x] 运行 `cargo test -p omicsops-desktop --lib subscription_contract_tests` 和 `cargo test -p omicsops-agent-core model_replay`，确认预期失败。
+- [x] 实现工厂/辅助调用/请求历史/event 接线；复用工具 registry、删除判定、plan approval 与 run/job 生命周期，不新增 CLI 直连项目能力。
+- [x] 重跑上述命令，以及 desktop 的 `model_`、`side_chat`、`session_review`、`local_deletion` 过滤回归，应通过；逐项核对各模型调用的 retry/deadline。
+- [x] 提交 `feat: integrate subscription models with host Agent V4`。
 
 ## Task 10: Go 精确 Responses 路由与目录导入
 
@@ -371,3 +371,6 @@ Task 6：Windows suspended spawn / Job Object / handle-list / owned handle reape
 Task 7：Claude stdin 调用、严格单回合 envelope 与 NDJSON 解析已实现。预算边界和 stderr 管道阻塞均先复现失败再修复；完整 Rust 回归 1450 通过/12 忽略，最终 Claude 合约 9 通过，fmt 通过。取消与进程树由 Task 6 的 Windows 测试覆盖；成功与身份变更使用隔离测试进程。未调用真实 CLI/订阅模型，生产策略门禁仍有效。
 
 Task 8：显式 ModelClient 门面与共享凭据协调器已实现；旧 HTTP provider 保留原请求逻辑，新 provider 不按模型名推断或付费 fallback。门面 5 个合约通过，adapters 全部测试通过（真实 SSH 测试忽略），fmt 通过。Go 发现请求独立限时/限流且禁止重定向；Codex/Claude 仅返回 ConfiguredOnly。单次派发遇到 401/断流不重发，普通 Codex 最多一次无输出的 401 刷新重试。
+
+Task 9：主对话、Plan、总结、旁聊、委派、reviewer、压缩与澄清入口均接入 ModelClient；新模型发现命令保留来源。完整 Rust 回归 1462 通过/12 忽略；最终桌面 subscription 合约 3 通过，core 续接/闲置合约 3 通过，Responses 合约 5 通过，fmt/diff check 通过。三 backend 的临时 nonce 读取/删除拒绝/恢复测试使用 HTTP 替身或隔离 Windows 测试进程，非真实订阅验收。停止 HTTP 请求后，真实临时 Store 中已派发远端 job 的运行状态保持不变；未连接 SSH。
+续接仅投影当前 run 的完整验证事件链；其它运行的对话历史仍作为有界文本证据。临时委派节点独立保存调用内续接，主运行只保存已验证节点结果。MCP 请求只允许依据同一已验证事件链中的冻结目录补齐宿主绑定字段；其它参数差异拒绝。心跳/usage/空片段不推进 idle；opaque reasoning 不进入普通上下文。

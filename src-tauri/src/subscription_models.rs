@@ -42,6 +42,15 @@ pub struct SubscriptionLoginManager {
     pub(crate) coordinator: Arc<CodexCredentialCoordinator>,
 }
 impl SubscriptionLoginManager {
+    pub(crate) fn model_services(
+        &self,
+    ) -> Arc<omicsops_adapters::model_client::ModelClientServices> {
+        Arc::new(omicsops_adapters::model_client::ModelClientServices {
+            vault: self.vault.clone(),
+            codex: self.coordinator.clone(),
+            claude: Arc::new(omicsops_adapters::claude_code::SystemClaudeProcessRunner),
+        })
+    }
     pub fn new(
         vault: Arc<dyn CredentialVault>,
         auth: Arc<dyn CodexAuthTransport>,

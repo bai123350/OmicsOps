@@ -184,6 +184,9 @@ pub enum ModelStreamEventV4 {
     TextDelta(String),
     ReasoningDelta(String),
     Activity(ModelActivityPhaseV4),
+    ContentProgress {
+        bytes: u32,
+    },
     ProviderRetrying {
         attempt: u8,
         delay_ms: u64,
@@ -347,6 +350,9 @@ pub trait ModelPortV4: Send + Sync {
 
     fn prompt_layers(&self) -> PromptLayersV4 {
         PromptLayersV4::default()
+    }
+    fn supports_native_replay(&self) -> bool {
+        false
     }
 
     /// Validate the complete, provider-shaped request before dispatch. Ports
@@ -867,8 +873,13 @@ impl AgentCoreV4<'_> {
                     .map_err(|e| AgentCoreErrorV4::Science(e.to_string()))?,
                 serde_json::to_string(&self.tools.descriptors(RunModeV4::Execute))
                     .map_err(|e| AgentCoreErrorV4::Store(e.to_string()))?,
-                serde_json::to_string(&prior)
-                    .map_err(|e| AgentCoreErrorV4::Store(e.to_string()))?
+                serde_json::to_string(
+                    &prior
+                        .iter()
+                        .map(context_views::event_view)
+                        .collect::<Vec<_>>()
+                )
+                .map_err(|e| AgentCoreErrorV4::Store(e.to_string()))?
             );
             let turn = self
                 .model_turn(
@@ -2606,6 +2617,7 @@ impl AgentCoreV4<'_> {
     ) -> DelegationNodeOutcomeV4 {
         let mut tool_outcomes = Vec::new();
         let mut feedback = Vec::<String>::new();
+        let mut native_replay = Vec::new();
         let mut tool_call_count = 0_u16;
         let mut descriptors = self
             .tools
@@ -2634,7 +2646,7 @@ impl AgentCoreV4<'_> {
                 context: context.to_string(),
                 tools: descriptors.clone(),
                 image_refs: vec![],
-                replay: Vec::new(),
+                replay: native_replay.clone(),
             };
             // Bound all child input, including schema and tool descriptions. Do
             // not silently discard evidence or alter the required output schema.
@@ -2655,7 +2667,7 @@ impl AgentCoreV4<'_> {
             if let Err(error) = model.validate_request(&request) {
                 return failed_delegation_node(node, error.message, tool_outcomes);
             }
-            let mut pending = Box::pin(model.stream(request, &mut ignore));
+            let mut pending = Box::pin(model.stream(request.clone(), &mut ignore));
             let deadline = tokio::time::sleep(limits.model_attempt_timeout);
             tokio::pin!(deadline);
             let model_result = loop {
@@ -2684,6 +2696,12 @@ impl AgentCoreV4<'_> {
                     );
                 }
             };
+            if model.supports_native_replay() {
+                match model_replay::validated_continuation(&request, &turn) {
+                    Ok(continuation) => native_replay.extend(continuation.items.clone()),
+                    Err(error) => return failed_delegation_node(node, error, tool_outcomes),
+                }
+            }
             for call in turn.tool_calls {
                 if let Some(reason) = self.delegated_stop_reason(cancelled, guidance_run_id).await {
                     return failed_delegation_node(node, reason, tool_outcomes);
@@ -2696,6 +2714,13 @@ impl AgentCoreV4<'_> {
                         > limits.delegated_output_max_bytes
                     {
                         feedback.push("output budget exceeded; submit a concise result with evidence references".into());
+                        if model.supports_native_replay() {
+                            native_replay.push(omicsops_protocol::ModelReplayItemV4::ToolResult {
+                                call_id: call.call_id.clone(),
+                                output: "Host rejected delegated result: output budget exceeded"
+                                    .into(),
+                            });
+                        }
                         continue;
                     }
                     match validate_json_schema_subset(&node.output_schema, &output, "$") {
@@ -2710,6 +2735,14 @@ impl AgentCoreV4<'_> {
                         }
                         Err(error) => {
                             feedback.push(format!("output schema rejected the result: {error}"));
+                            if model.supports_native_replay() {
+                                native_replay.push(
+                                    omicsops_protocol::ModelReplayItemV4::ToolResult {
+                                        call_id: call.call_id.clone(),
+                                        output: format!("Host rejected delegated result: {error}"),
+                                    },
+                                );
+                            }
                             continue;
                         }
                     }
@@ -2774,7 +2807,15 @@ impl AgentCoreV4<'_> {
                         },
                     }
                 };
-                feedback.push(serde_json::to_string(&outcome).expect("serializable tool result"));
+                if model.supports_native_replay() {
+                    native_replay.push(omicsops_protocol::ModelReplayItemV4::ToolResult {
+                        call_id: outcome.call_id.clone(),
+                        output: serde_json::to_string(&outcome).expect("serializable tool result"),
+                    });
+                } else {
+                    feedback
+                        .push(serde_json::to_string(&outcome).expect("serializable tool result"));
+                }
                 tool_outcomes.push(outcome);
                 if let Some(reason) = stop_after_tool {
                     return failed_delegation_node(node, reason, tool_outcomes);
@@ -2866,11 +2907,43 @@ impl AgentCoreV4<'_> {
         context_max_bytes: usize,
         timeout_policy: ModelTurnTimeoutPolicy,
     ) -> Result<ModelTurnV4, AgentCoreErrorV4> {
+        let usage_metadata = self.model.usage_metadata();
+        if self.model.supports_native_replay() && persist_text {
+            let events = self
+                .events
+                .load(run_id)
+                .await
+                .map_err(AgentCoreErrorV4::Store)?;
+            let source = events
+                .first()
+                .ok_or_else(|| AgentCoreErrorV4::Store("model replay has no run origin".into()))?;
+            let binding = omicsops_protocol::ModelReplayBindingV4 {
+                model_profile_id: usage_metadata.model_profile_id,
+                configuration_hash: usage_metadata.model_configuration_hash.clone().ok_or_else(
+                    || {
+                        AgentCoreErrorV4::NeedsAttention(
+                            "native replay requires frozen model identity".into(),
+                        )
+                    },
+                )?,
+            };
+            request.replay = model_replay::project_model_replay(
+                source.project_id,
+                source.conversation_id,
+                &binding,
+                &events,
+            )
+            .map_err(AgentCoreErrorV4::NeedsAttention)?;
+            request.context = model_replay::remove_replayed_context_events(
+                &request.context,
+                &request.replay,
+                &events,
+            );
+        }
         self.model
             .validate_request(&request)
             .map_err(|error| AgentCoreErrorV4::NeedsAttention(error.message))?;
         let logical_request_id = Uuid::new_v4();
-        let usage_metadata = self.model.usage_metadata();
         let mut attempt = 0_u8;
         let mut output_repair_attempted = false;
         loop {
@@ -2932,6 +3005,7 @@ impl AgentCoreV4<'_> {
                 ) || matches!(
                     event,
                     ModelStreamEventV4::Activity(ModelActivityPhaseV4::ToolCall)
+                        | ModelStreamEventV4::ContentProgress { bytes: 1.. }
                 ) {
                     progress_tx.send_replace(tokio::time::Instant::now());
                 }
@@ -2971,6 +3045,9 @@ impl AgentCoreV4<'_> {
                         Some(ModelActivityPhaseV4::Reasoning)
                     }
                     ModelStreamEventV4::Activity(phase) => Some(phase),
+                    ModelStreamEventV4::ContentProgress { bytes } => {
+                        (bytes > 0).then_some(ModelActivityPhaseV4::Responding)
+                    }
                     ModelStreamEventV4::ProviderRetrying {
                         attempt,
                         delay_ms,
@@ -3154,6 +3231,39 @@ impl AgentCoreV4<'_> {
             };
             match result {
                 Ok(mut turn) => {
+                    if self.model.supports_native_replay() && persist_text {
+                        if cancelled.is_some_and(|token| token.load(Ordering::SeqCst)) {
+                            if let Some(token) = cancelled {
+                                self.stop_if_cancelled(run_id, token).await?;
+                            }
+                            return Err(AgentCoreErrorV4::Cancelled);
+                        }
+                        let continuation = model_replay::validated_continuation(&request, &turn)
+                            .map_err(AgentCoreErrorV4::Model)?;
+                        self.push(
+                            run_id,
+                            AgentEventKindV4::ModelReplayRecorded {
+                                replay: omicsops_protocol::ModelReplayRecordedV4 {
+                                    logical_request_id,
+                                    attempt_id: current_attempt_id,
+                                    binding: omicsops_protocol::ModelReplayBindingV4 {
+                                        model_profile_id: usage_metadata.model_profile_id,
+                                        configuration_hash: usage_metadata
+                                            .model_configuration_hash
+                                            .clone()
+                                            .ok_or_else(|| {
+                                                AgentCoreErrorV4::Model(
+                                                    "native replay requires frozen model identity"
+                                                        .into(),
+                                                )
+                                            })?,
+                                    },
+                                    continuation: continuation.clone(),
+                                },
+                            },
+                        )
+                        .await?;
+                    }
                     let completed_text = if turn.public_text.is_empty() {
                         streamed_text
                     } else {
@@ -4542,11 +4652,12 @@ impl AgentCoreV4<'_> {
         } else {
             events.clone()
         };
-        let use_views = self
-            .tools
-            .descriptors(RunModeV4::Execute)
-            .iter()
-            .any(|tool| tool.id == context_views::READ_RESULT_TOOL);
+        let use_views = self.model.supports_native_replay()
+            || self
+                .tools
+                .descriptors(RunModeV4::Execute)
+                .iter()
+                .any(|tool| tool.id == context_views::READ_RESULT_TOOL);
         let want_code_view = limits.auto_compact
             && use_views
             && context_views::scientific_code_bytes(&scientific_value)
@@ -6758,6 +6869,284 @@ mod tests {
                 },
             ))
             .unwrap();
+    }
+    struct SubscriptionReplayModel {
+        calls: AtomicUsize,
+        invalid: bool,
+        cancel: Option<Arc<AtomicBool>>,
+        requests: Mutex<Vec<ModelRequestV4>>,
+        delegated: bool,
+    }
+    #[async_trait]
+    impl ModelPortV4 for SubscriptionReplayModel {
+        fn supports_native_replay(&self) -> bool {
+            true
+        }
+        fn usage_metadata(&self) -> ModelUsageMetadataV4 {
+            ModelUsageMetadataV4 {
+                model_profile_id: Uuid::from_u128(77),
+                model_configuration_hash: Some("fixture".into()),
+                ..Default::default()
+            }
+        }
+        async fn stream(
+            &self,
+            request: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            self.requests.lock().unwrap().push(request);
+            let n = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if let Some(cancel) = &self.cancel {
+                cancel.store(true, AtomicOrdering::SeqCst);
+            }
+            let call = ToolCallV4 {
+                call_id: "native-call".into(),
+                tool_id: if self.invalid {
+                    "not_granted"
+                } else {
+                    "project.list"
+                }
+                .into(),
+                arguments: json!({}),
+            };
+            let (public_text, tool_calls, items) = if n == 0 {
+                (
+                    String::new(),
+                    vec![call.clone()],
+                    vec![omicsops_protocol::ModelReplayItemV4::ToolCall { call }],
+                )
+            } else if self.delegated {
+                let call = ToolCallV4 {
+                    call_id: "child-result".into(),
+                    tool_id: "agent.submit_delegated_result".into(),
+                    arguments: json!({"output":{"value":"files"}}),
+                };
+                (
+                    String::new(),
+                    vec![call.clone()],
+                    vec![omicsops_protocol::ModelReplayItemV4::ToolCall { call }],
+                )
+            } else {
+                (
+                    "done".into(),
+                    vec![],
+                    vec![omicsops_protocol::ModelReplayItemV4::AssistantText {
+                        text: "done".into(),
+                    }],
+                )
+            };
+            Ok(ModelTurnV4 {
+                public_text,
+                tool_calls,
+                provider_continuation: Some(omicsops_protocol::ModelProviderContinuationV4 {
+                    items,
+                }),
+            })
+        }
+    }
+    fn subscription_request() -> ModelRequestV4 {
+        ModelRequestV4 {
+            system: "host".into(),
+            context: "{}".into(),
+            tools: FakeTools.descriptors(RunModeV4::Execute),
+            image_refs: vec![],
+            replay: vec![],
+        }
+    }
+    #[tokio::test]
+    async fn subscription_model_replay_is_durable_only_after_validated_turn() {
+        for (invalid, cancelled) in [(true, false), (false, true)] {
+            let store = MemoryStore::default();
+            let run_id = Uuid::new_v4();
+            seed_model_turn(&store, run_id);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let model = SubscriptionReplayModel {
+                calls: AtomicUsize::new(0),
+                invalid,
+                cancel: cancelled.then(|| cancel.clone()),
+                requests: Mutex::new(vec![]),
+                delegated: false,
+            };
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &FakeTools,
+                events: &store,
+                science: None,
+            };
+            assert!(
+                core.model_turn(
+                    run_id,
+                    subscription_request(),
+                    0,
+                    Duration::from_secs(1),
+                    Some(&cancel)
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                !store
+                    .load_direct(run_id)
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(
+                        event.event,
+                        AgentEventKindV4::ModelReplayRecorded { .. }
+                    ))
+            );
+        }
+        let store = MemoryStore::default();
+        let run_id = Uuid::new_v4();
+        seed_model_turn(&store, run_id);
+        let model = SubscriptionReplayModel {
+            calls: AtomicUsize::new(0),
+            invalid: false,
+            cancel: None,
+            requests: Mutex::new(vec![]),
+            delegated: false,
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let first = core
+            .model_turn(
+                run_id,
+                subscription_request(),
+                0,
+                Duration::from_secs(1),
+                None,
+            )
+            .await
+            .unwrap();
+        let call = first.tool_calls[0].clone();
+        core.push(
+            run_id,
+            AgentEventKindV4::ToolRequested { call: call.clone() },
+        )
+        .await
+        .unwrap();
+        let outcome = ToolOutcomeV4 {
+            call_id: call.call_id,
+            tool_id: call.tool_id,
+            succeeded: true,
+            model_content: "nonce-evidence".into(),
+            data: json!({}),
+            provenance: vec![],
+        };
+        core.push(run_id, AgentEventKindV4::ToolFinished { outcome })
+            .await
+            .unwrap();
+        let events = store.load_direct(run_id).unwrap();
+        let mut request = subscription_request();
+        request.context=json!({"objective":"continue","recent_events":events.iter().map(crate::context_views::event_view).collect::<Vec<_>>(),"scientific_state":{}}).to_string();
+        core.model_turn(run_id, request, 0, Duration::from_secs(1), None)
+            .await
+            .unwrap();
+        let requests = model.requests.lock().unwrap();
+        assert!(requests[1].replay.iter().any(|item| matches!(item,omicsops_protocol::ModelReplayItemV4::ToolResult {output,..} if output.contains("nonce-evidence"))));
+        assert!(!requests[1].context.contains("nonce-evidence"));
+        let events = store.load_direct(run_id).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, AgentEventKindV4::ToolFinished { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, AgentEventKindV4::ModelReplayRecorded { .. }))
+                .count(),
+            2
+        );
+    }
+    #[tokio::test]
+    async fn subscription_model_replay_keeps_delegated_history_isolated() {
+        let store = MemoryStore::default();
+        let model = SubscriptionReplayModel {
+            calls: AtomicUsize::new(0),
+            invalid: false,
+            cancel: None,
+            requests: Mutex::new(vec![]),
+            delegated: true,
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let mut node = delegated_node("read-node", vec![], 2);
+        node.capabilities.insert("project.list".into());
+        node.budget.max_tool_calls = 1;
+        let outcome = core
+            .execute_delegated_node(
+                &node,
+                BTreeMap::new(),
+                AgentLimitsV4::default(),
+                &AtomicBool::new(false),
+            )
+            .await;
+        assert_eq!(outcome.status, DelegationNodeStatusV4::Succeeded);
+        let requests = model.requests.lock().unwrap();
+        assert!(requests[1].replay.iter().any(|item|matches!(item,omicsops_protocol::ModelReplayItemV4::ToolResult {output,..} if output.contains("files"))));
+        assert!(store.events.lock().unwrap().is_empty());
+        assert_eq!(outcome.tool_outcomes.len(), 1);
+    }
+    struct SubscriptionProgressModel(u32);
+    #[async_trait]
+    impl ModelPortV4 for SubscriptionProgressModel {
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            for _ in 0..3 {
+                tokio::time::sleep(Duration::from_secs(20)).await;
+                on_event(ModelStreamEventV4::ContentProgress { bytes: self.0 });
+            }
+            Ok(ModelTurnV4 {
+                public_text: "done".into(),
+                tool_calls: vec![],
+                provider_continuation: None,
+            })
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn subscription_model_content_progress_advances_idle_only_for_nonempty_content() {
+        for bytes in [0, 1] {
+            let store = MemoryStore::default();
+            let run_id = Uuid::new_v4();
+            seed_model_turn(&store, run_id);
+            let model = SubscriptionProgressModel(bytes);
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &FakeTools,
+                events: &store,
+                science: None,
+            };
+            let mut continuation = 0;
+            let result = core
+                .model_turn_with_policy(
+                    run_id,
+                    subscription_request(),
+                    0,
+                    None,
+                    false,
+                    &mut continuation,
+                    32768,
+                    ModelTurnTimeoutPolicy::Stream {
+                        idle: Duration::from_secs(30),
+                        total: Duration::from_secs(180),
+                    },
+                )
+                .await;
+            assert_eq!(result.is_ok(), bytes > 0);
+        }
     }
     #[derive(Default)]
     struct MemoryStore {

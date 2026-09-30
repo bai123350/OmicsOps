@@ -53,6 +53,7 @@ zip.workspace = true
 tempfile = "3"
 
 [dev-dependencies]
+futures-util.workspace = true
 sqlx.workspace = true
 
 [target.'cfg(windows)'.dependencies]

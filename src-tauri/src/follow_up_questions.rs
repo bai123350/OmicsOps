@@ -178,7 +178,7 @@ pub async fn agent_v4_suggest_follow_up_questions(
                 .await
                 .map_err(|error| error.to_string())?
                 .ok_or("run model profile not found")?;
-            let client = crate::commands::unified_model_client_for_profile(&state, &profile)?
+            let client = crate::commands::model_client_for_profile(&state, &profile)?
                 .with_session_id(conversation_id)
                 .with_request_budget(RequestBudget {
                     context_window_tokens: profile.effective_context_window_tokens(),

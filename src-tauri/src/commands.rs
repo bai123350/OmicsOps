@@ -9,7 +9,7 @@ use std::{
 
 use omicsops_adapters::{
     credentials::{CredentialVault, SystemCredentialVault, credential_account},
-    llm::{ProviderProtocol, UnifiedModelClient},
+    model_client::{ModelClient, ModelClientServices},
     ssh::{SshAuthentication, SshSession},
 };
 use omicsops_core::{
@@ -20,7 +20,6 @@ use omicsops_mcp::McpSessionManager;
 use omicsops_store::Store;
 use serde::{Deserialize, Serialize};
 use tauri::State;
-use url::Url;
 use uuid::Uuid;
 
 use crate::inspection::{ServerInspection, inspection_command, parse_server_inspection};
@@ -341,44 +340,16 @@ pub(crate) async fn connect_profile(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn unified_model_client_for_profile(
+pub(crate) fn model_client_for_profile(
     state: &AppState,
     profile: &omicsops_core::workspace::ModelProfile,
-) -> Result<UnifiedModelClient, String> {
-    unified_model_client_for_profile_with_vault(&state.credentials, profile)
+) -> Result<ModelClient, String> {
+    model_client_for_profile_with_services(profile, state.subscription_models.model_services())
 }
 
-pub(crate) fn unified_model_client_for_profile_with_vault(
-    credentials: &dyn CredentialVault,
+pub(crate) fn model_client_for_profile_with_services(
     profile: &omicsops_core::workspace::ModelProfile,
-) -> Result<UnifiedModelClient, String> {
-    if profile.fast_mode == Some(true) && !profile.supports_fast_mode() {
-        return Err(
-            "explicit Fast mode requires an exact supported OpenAI endpoint and model".into(),
-        );
-    }
-    let credential = match &profile.credential_reference {
-        Some(reference) => credentials
-            .get(reference)
-            .map_err(|error| error.to_string())?,
-        None => None,
-    };
-    let protocol = match profile.provider {
-        omicsops_core::workspace::ModelProviderKind::Anthropic => ProviderProtocol::Anthropic,
-        omicsops_core::workspace::ModelProviderKind::OpenAiCompatible => {
-            ProviderProtocol::OpenAiCompatible
-        }
-        omicsops_core::workspace::ModelProviderKind::Ollama => ProviderProtocol::Ollama,
-        _ => return Err("subscription transport is not connected yet".into()),
-    };
-    UnifiedModelClient::new(
-        profile.id,
-        protocol,
-        Url::parse(&profile.base_url).map_err(|error| error.to_string())?,
-        profile.model.clone(),
-        credential,
-    )
-    .and_then(|client| client.with_reasoning_effort(profile.reasoning_effort.clone()))
-    .map(|client| client.with_fast_mode(profile.fast_mode))
-    .map_err(|error| error.to_string())
+    services: Arc<ModelClientServices>,
+) -> Result<ModelClient, String> {
+    ModelClient::from_profile(profile, services).map_err(|error| error.to_string())
 }

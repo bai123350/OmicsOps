@@ -357,6 +357,7 @@ pub fn run() {
             model_deletion::delete_model_profile,
             model_commands::probe_model_profile,
             model_commands::list_model_profile_models,
+            model_commands::list_model_profile_model_discovery,
             skill_commands::list_skill_packages,
             skill_commands::import_skill_directory,
             skill_commands::set_skill_enabled,

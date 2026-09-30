@@ -614,7 +614,7 @@ pub async fn side_chat_send_v4(
         .await;
     }
     let provider_request = side_request(&turn.question_markdown, &turn.sources, images);
-    let client = crate::commands::unified_model_client_for_profile(&state, &profile)
+    let client = crate::commands::model_client_for_profile(&state, &profile)
         .map_err(|_| rejection(None))?
         .with_session_id(request.conversation_id)
         .with_request_budget(omicsops_adapters::llm::RequestBudget {

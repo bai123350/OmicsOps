@@ -121,7 +121,7 @@ pub fn build_responses_request(
             ModelReplayItemV4::AssistantText{text} => json!({"role":"assistant","content":text}),
             ModelReplayItemV4::ToolCall{call} => {
                 if call.call_id.is_empty() || call.call_id.len()>256 || !call.arguments.is_object() || !calls.insert(&call.call_id) { return Err(invalid("responses_replay_call_invalid")); }
-                let name = reverse.get(&call.tool_id).ok_or_else(||invalid("responses_replay_tool_not_granted"))?;
+                let name = llm::provider_tool_alias(&call.tool_id);
                 json!({"type":"function_call","call_id":call.call_id,"name":name,"arguments":call.arguments.to_string()})
             },
             ModelReplayItemV4::ToolResult{call_id,output} => {
@@ -316,17 +316,19 @@ impl ResponsesStreamDecoder {
                     return Err(invalid("responses_item_changed"));
                 }
                 if value["type"] == "response.function_call_arguments.delta" {
-                    call.arguments
-                        .push_str(&required_allow_empty(&value, "delta")?);
+                    let delta = required_allow_empty(&value, "delta")?;
+                    if !delta.is_empty() {
+                        events.push(ProviderStreamEvent::ContentProgress {
+                            bytes: delta.len().min(u32::MAX as usize) as u32,
+                        });
+                    }
+                    call.arguments.push_str(&delta);
                 } else if call.arguments != required_allow_empty(&value, "arguments")? {
                     return Err(invalid("responses_arguments_changed"));
                 }
                 if call.arguments.len() > MAX_ARGUMENTS {
                     return Err(invalid("responses_arguments_too_large"));
                 }
-                events.push(ProviderStreamEvent::ContentProgress {
-                    bytes: data.len().min(u32::MAX as usize) as u32,
-                });
             }
             "response.completed" => return self.complete(&value["response"]),
             "response.failed" | "response.incomplete" | "error" => {
@@ -339,12 +341,16 @@ impl ResponsesStreamDecoder {
             | "response.output_text.done"
             | "response.reasoning_summary_part.added"
             | "response.reasoning_summary_part.done"
-            | "response.reasoning_summary_text.delta"
             | "response.reasoning_summary_text.done"
-            | "response.reasoning_text.delta"
-            | "response.reasoning_text.done" => events.push(ProviderStreamEvent::ContentProgress {
-                bytes: data.len().min(u32::MAX as usize) as u32,
-            }),
+            | "response.reasoning_text.done" => {}
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                let delta = required_allow_empty(&value, "delta")?;
+                if !delta.is_empty() {
+                    events.push(ProviderStreamEvent::ContentProgress {
+                        bytes: delta.len().min(u32::MAX as usize) as u32,
+                    });
+                }
+            }
             _ => return Err(invalid("responses_event_unsupported")),
         }
         Ok(events)

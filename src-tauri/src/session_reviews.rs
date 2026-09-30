@@ -316,7 +316,7 @@ async fn session_start_review_inner(
         updated_at: now,
     };
     let provider_request = review_request(&record.sources, record.source_message_count);
-    let client = crate::commands::unified_model_client_for_profile(&state, &profile)?
+    let client = crate::commands::model_client_for_profile(&state, &profile)?
         .with_session_id(request.conversation_id)
         .with_fast_mode(service_tier.fast_mode)
         .with_request_budget(omicsops_adapters::llm::RequestBudget {

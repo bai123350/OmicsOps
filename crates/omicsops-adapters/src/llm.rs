@@ -1218,22 +1218,21 @@ pub(crate) fn provider_tool_aliases(request: &ProviderModelRequest) -> Vec<(Stri
     request
         .tools
         .iter()
-        .map(|tool| {
-            if provider_tool_name_is_valid(&tool.id) && !tool.id.starts_with("omicsops_tool_") {
-                return (tool.id.clone(), tool.id.clone());
-            }
-            let slug = tool
-                .id
-                .bytes()
-                .filter(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-                .take(24)
-                .map(char::from)
-                .collect::<String>();
-            let digest = hex::encode(sha2::Sha256::digest(tool.id.as_bytes()));
-            let alias = format!("omicsops_tool_{slug}_{}", &digest[..24]);
-            (alias, tool.id.clone())
-        })
+        .map(|tool| (provider_tool_alias(&tool.id), tool.id.clone()))
         .collect()
+}
+pub(crate) fn provider_tool_alias(id: &str) -> String {
+    if provider_tool_name_is_valid(id) && !id.starts_with("omicsops_tool_") {
+        return id.to_owned();
+    }
+    let slug = id
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        .take(24)
+        .map(char::from)
+        .collect::<String>();
+    let digest = hex::encode(sha2::Sha256::digest(id.as_bytes()));
+    format!("omicsops_tool_{slug}_{}", &digest[..24])
 }
 
 fn provider_tool_name_is_valid(name: &str) -> bool {

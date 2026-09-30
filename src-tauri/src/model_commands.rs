@@ -1,6 +1,7 @@
 use omicsops_adapters::{
     credentials::{CredentialVault, credential_account},
-    llm::{MODEL_PROBE_OUTPUT_TOKENS, ModelProbeResult, RequestBudget, UnifiedModelClient},
+    llm::{MODEL_PROBE_OUTPUT_TOKENS, ModelProbeResult, RequestBudget},
+    model_client::ModelClient,
 };
 use omicsops_core::workspace::{ModelProfile, ModelProviderKind};
 use tauri::State;
@@ -322,7 +323,15 @@ pub async fn probe_model_profile(
     match client.probe().await {
         Ok(result) => Ok(result),
         Err(error) => {
-            let available = client.list_models().await.unwrap_or_default();
+            let available = client
+                .discover_models()
+                .await
+                .ok()
+                .filter(|discovery| {
+                    discovery.source == omicsops_dto::ModelDiscoverySource::Provider
+                })
+                .map(|discovery| discovery.models)
+                .unwrap_or_default();
             if available.is_empty() {
                 Err(error.to_string())
             } else {
@@ -348,6 +357,17 @@ pub async fn list_model_profile_models(
         .await
         .map_err(|error| error.to_string())
 }
+#[tauri::command]
+pub async fn list_model_profile_model_discovery(
+    state: State<'_, AppState>,
+    profile_id: Uuid,
+) -> Result<omicsops_dto::ModelDiscoveryResult, String> {
+    client_for_profile(&state, profile_id)
+        .await?
+        .discover_models()
+        .await
+        .map_err(|error| error.to_string())
+}
 
 fn catalog_probe_budget(profile: &ModelProfile) -> Option<RequestBudget> {
     profile
@@ -360,10 +380,7 @@ fn catalog_probe_budget(profile: &ModelProfile) -> Option<RequestBudget> {
         })
 }
 
-async fn client_for_profile(
-    state: &AppState,
-    profile_id: Uuid,
-) -> Result<UnifiedModelClient, String> {
+async fn client_for_profile(state: &AppState, profile_id: Uuid) -> Result<ModelClient, String> {
     let profile = state
         .repository
         .get_model_profile(profile_id)
@@ -371,7 +388,7 @@ async fn client_for_profile(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "model profile not found".to_string())?;
     let budget = catalog_probe_budget(&profile);
-    crate::commands::unified_model_client_for_profile(state, &profile).map(|client| match budget {
+    crate::commands::model_client_for_profile(state, &profile).map(|client| match budget {
         Some(budget) => client.with_request_budget(budget),
         None => client,
     })
@@ -460,7 +477,16 @@ mod tests {
 
     #[test]
     fn saved_local_profile_with_empty_keyring_reference_reaches_runtime_client() {
-        let vault = MemoryCredentialVault::default();
+        let vault = std::sync::Arc::new(MemoryCredentialVault::default());
+        let clock = std::sync::Arc::new(omicsops_adapters::codex_auth::SystemCodexAuthClock);
+        let manager = crate::subscription_models::SubscriptionLoginManager::new(
+            vault,
+            std::sync::Arc::new(
+                omicsops_adapters::codex_auth::CodexDeviceAuth::new(clock.clone()).unwrap(),
+            ),
+            clock,
+            std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        );
         let local = model_profile_from_request(request(
             "open_ai_compatible",
             "http://127.0.0.1:1234/v1",
@@ -469,7 +495,11 @@ mod tests {
         .unwrap();
         assert!(local.credential_reference.is_some());
         assert!(
-            crate::commands::unified_model_client_for_profile_with_vault(&vault, &local).is_ok()
+            crate::commands::model_client_for_profile_with_services(
+                &local,
+                manager.model_services()
+            )
+            .is_ok()
         );
 
         let remote = model_profile_from_request(request(
@@ -479,7 +509,11 @@ mod tests {
         ))
         .unwrap();
         assert!(
-            crate::commands::unified_model_client_for_profile_with_vault(&vault, &remote).is_err()
+            crate::commands::model_client_for_profile_with_services(
+                &remote,
+                manager.model_services()
+            )
+            .is_err()
         );
     }
 

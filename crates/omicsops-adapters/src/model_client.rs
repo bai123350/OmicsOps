@@ -55,7 +55,15 @@ pub enum ModelClient {
     Responses(OpenCodeGoModelClient),
     Claude(ClaudeCodeClient),
 }
+impl From<UnifiedModelClient> for ModelClient {
+    fn from(client: UnifiedModelClient) -> Self {
+        Self::Http(client)
+    }
+}
 impl ModelClient {
+    pub fn supports_native_replay(&self) -> bool {
+        !matches!(self, Self::Http(_))
+    }
     pub fn from_profile(
         profile: &ModelProfile,
         services: Arc<ModelClientServices>,

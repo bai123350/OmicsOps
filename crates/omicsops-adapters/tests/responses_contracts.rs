@@ -156,6 +156,52 @@ fn responses_shapes_native_tool_history_and_exact_endpoints() {
 }
 
 #[test]
+fn responses_keepalive_does_not_advance_content_and_historical_tools_are_not_regranted() {
+    let r = request();
+    let mut decoder = ResponsesStreamDecoder::for_request(&r);
+    for kind in [
+        "response.in_progress",
+        "response.output_item.done",
+        "response.content_part.done",
+        "response.output_text.done",
+    ] {
+        let bytes = format!("data: {}\n\n", json!({"type":kind})).into_bytes();
+        assert!(
+            !decoder
+                .push(&bytes)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, ProviderStreamEvent::ContentProgress { .. }))
+        );
+    }
+    let mut history = r;
+    history.replay = vec![
+        ModelReplayItemV4::ToolCall {
+            call: ToolCallV4 {
+                call_id: "prior".into(),
+                tool_id: "previous.page_tool".into(),
+                arguments: json!({}),
+            },
+        },
+        ModelReplayItemV4::ToolResult {
+            call_id: "prior".into(),
+            output: "host evidence".into(),
+        },
+    ];
+    let wire = build_responses_request(
+        ResponsesEndpointKind::CodexSubscription,
+        &Url::parse("https://chatgpt.com/backend-api").unwrap(),
+        "fixture",
+        &history,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(wire.body["tools"].as_array().unwrap().len(), 1);
+    assert_ne!(wire.body["input"][1]["name"], wire.body["tools"][0]["name"]);
+}
+
+#[test]
 fn responses_requires_completed_terminal_and_complete_arguments() {
     let name = alias();
     let mut wire = frame(

@@ -12,10 +12,13 @@ use std::{
 use async_trait::async_trait;
 use base64::Engine as _;
 use chrono::Utc;
+#[cfg(test)]
+use omicsops_adapters::llm::UnifiedModelClient;
 use omicsops_adapters::{
     credentials::{CredentialVault, SystemCredentialVault},
     kernel::{kernel_driver, validate_capture_paths, validate_kernel_code},
-    llm::{ProviderProtocol, RequestBudget, RequestBudgetMetrics, UnifiedModelClient},
+    llm::{ProviderProtocol, RequestBudget, RequestBudgetMetrics},
+    model_client::ModelClient,
     ssh::{SshJsonlProcess, SshSession},
 };
 use omicsops_agent::provider::{
@@ -5108,7 +5111,7 @@ async fn compose(
         Some((
             binding.clone(),
             Box::new(DesktopModelPortV4 {
-                client: crate::commands::unified_model_client_for_profile(state, &child)?
+                client: crate::commands::model_client_for_profile(state, &child)?
                     .with_session_id(conversation_id)
                     .with_request_budget(RequestBudget {
                         context_window_tokens: child.effective_context_window_tokens(),
@@ -5128,7 +5131,7 @@ async fn compose(
     } else {
         None
     };
-    let mut main_client = crate::commands::unified_model_client_for_profile(state, &model_profile)?;
+    let mut main_client = crate::commands::model_client_for_profile(state, &model_profile)?;
     if let Some(tier) = service_tier {
         if tier.fast_mode == Some(true) && !model_profile.supports_fast_mode() {
             return Err("The frozen Fast mode is unavailable for this model profile".into());
@@ -5137,7 +5140,7 @@ async fn compose(
     }
     let reviewer = match (reviewer_profile, reviewer_binding) {
         (Some(profile), Some(binding)) => Some(Box::new(DesktopModelPortV4 {
-            client: crate::commands::unified_model_client_for_profile(state, &profile)?
+            client: crate::commands::model_client_for_profile(state, &profile)?
                 .with_session_id(conversation_id)
                 .with_fast_mode(binding.service_tier.fast_mode)
                 .with_request_budget(RequestBudget {
@@ -5272,7 +5275,7 @@ fn model_usage_request_metadata(metrics: RequestBudgetMetrics) -> ModelUsageRequ
 }
 
 struct DesktopModelPortV4 {
-    client: UnifiedModelClient,
+    client: ModelClient,
     prompt: PromptLayersV4,
     usage_metadata: ModelUsageMetadataV4,
     resources: Option<Arc<ExecutionResourcesSlotV4>>,
@@ -5339,13 +5342,16 @@ impl DesktopModelPortV4 {
             }],
             tools,
             require_strict_json_fallback: true,
-            replay: Vec::new(),
+            replay: request.replay,
         })
     }
 }
 
 #[async_trait]
 impl ModelPortV4 for DesktopModelPortV4 {
+    fn supports_native_replay(&self) -> bool {
+        self.client.supports_native_replay()
+    }
     fn delegated_model(
         &self,
         binding: Option<&omicsops_protocol::DelegatedModelBindingV4>,
@@ -5406,8 +5412,24 @@ impl ModelPortV4 for DesktopModelPortV4 {
         let mut calls = ProviderToolCallAccumulator::default();
         let mut provider_error = None;
         let mut accumulator_error = None;
+        let mut continuation = None;
         self.client
             .stream_with_provider_v4(provider_request, |event| match event {
+                ProviderStreamEvent::Continuation {
+                    continuation: value,
+                } => {
+                    if continuation.replace(value).is_some() {
+                        accumulator_error = Some(ModelFailureV4::permanent(
+                            ModelErrorClassV4::InvalidResponse,
+                            "duplicate provider continuation",
+                        ));
+                    }
+                }
+                ProviderStreamEvent::ContentProgress { bytes } => {
+                    if bytes > 0 {
+                        on_event(ModelStreamEventV4::ContentProgress { bytes });
+                    }
+                }
                 ProviderStreamEvent::ReasoningDelta { text } => {
                     on_event(ModelStreamEventV4::ReasoningDelta(text));
                 }
@@ -5492,7 +5514,7 @@ impl ModelPortV4 for DesktopModelPortV4 {
         Ok(ModelTurnV4 {
             public_text: text,
             tool_calls,
-            provider_continuation: None,
+            provider_continuation: continuation,
         })
     }
 
@@ -8688,6 +8710,8 @@ fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
 
 #[cfg(test)]
 mod go_live_acceptance_tests;
+#[cfg(test)]
+mod subscription_contract_tests;
 
 #[cfg(test)]
 mod tests {
@@ -9548,7 +9572,8 @@ mod tests {
                 context_window_tokens: window,
                 reserved_output_tokens: 100,
                 safety_margin_tokens: 10,
-            }),
+            })
+            .into(),
             prompt: PromptLayersV4::default(),
             usage_metadata: ModelUsageMetadataV4::default(),
             resources: None,
@@ -10127,7 +10152,8 @@ mod tests {
                 context_window_tokens: profile.effective_context_window_tokens(),
                 reserved_output_tokens: profile.effective_output_tokens(),
                 safety_margin_tokens: 1024,
-            }),
+            })
+            .into(),
             prompt: PromptLayersV4::default(),
             usage_metadata: usage_metadata_for_profile(profile),
             resources: None,
@@ -10192,7 +10218,8 @@ mod tests {
                 Some("test-only-credential".into()),
             )
             .unwrap()
-            .with_request_budget(budget),
+            .with_request_budget(budget)
+            .into(),
             prompt: PromptLayersV4::default(),
             usage_metadata: usage_metadata_for_profile(&profile),
             resources: None,
@@ -11473,7 +11500,8 @@ mod tests {
                 "fixture-model",
                 Some("test-only".into()),
             )
-            .unwrap(),
+            .unwrap()
+            .into(),
             prompt: PromptLayersV4::default(),
             usage_metadata: ModelUsageMetadataV4::default(),
             resources: None,
@@ -11864,7 +11892,8 @@ mod tests {
                 std::env::var("OMICSOPS_LIVE_MODEL_NAME").expect("model name"),
                 std::env::var("OMICSOPS_LIVE_MODEL_CREDENTIAL").ok(),
             )
-            .unwrap(),
+            .unwrap()
+            .into(),
             prompt: PromptLayersV4::default(),
             usage_metadata: ModelUsageMetadataV4::default(),
             resources: None,
