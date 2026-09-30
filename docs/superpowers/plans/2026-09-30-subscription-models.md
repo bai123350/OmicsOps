@@ -141,13 +141,13 @@ CLI 预检无法满足设计时，保留明确错误与已完成增量，修订�
 - Produces: `CodexCredentialCoordinator::new(vault: Arc<dyn CredentialVault>, transport: Arc<dyn CodexAuthTransport>, clock: Arc<dyn CodexAuthClock>) -> Self`；clock 只读时间，等待由 Tokio 负责，测试用暂停时钟推进。
 - 生产构造器固定已核对 auth endpoint 与 client 配置、拒绝重定向；测试构造器只用于 mock transport。网络错误返回安全 code，不输出响应正文。
 
-- [ ] 写 `codex_device_poll_obeys_interval_expiry_and_cancel`：pending/slow-down、15 分钟上限、乱序响应、取消后无 token exchange；授权码和 verifier 不进状态 DTO。 关键断言：`assert!(expires_at_ms - started_at_ms <= 15 * 60 * 1000); assert_eq!(exchanges_after_cancel, 0);`
-- [ ] 写 `codex_refresh_is_serialized_and_keeps_account_binding`：并发两个访问只刷新一次；第二次先重读新 token；五分钟阈值、keyring 写失败、账号改变和 invalid_grant 明确失败。 关键断言：`assert_eq!(concurrent_refresh_count, 1); assert_eq!(refreshed.account_ref, original.account_ref); assert!(changed_account.is_err());`
-- [ ] 写 `codex_auth_unknown_exchange_is_not_replayed`：token exchange/旋转 refresh 网络结果不确定后，重读 vault，未发现已写入新秘密则标记重新登录，后续等待者不重复交换；明确生成 401 最多一次刷新；敏感 fixture sentinel 不出现在 error/Debug/序列化 UI 字段。 关键断言：`assert_eq!(uncertain_exchange_count, 1); assert!(!safe_error.contains("SECRET_TOKEN_SENTINEL"));`
-- [ ] 运行 `cargo test -p omicsops-adapters --test codex_auth_contracts`，确认预期失败。
-- [ ] 实现上述接口与秘密边界；锁共享到所有模型门面实例，不因每次工厂创建而重建独立锁。不要读取实际用户 keyring 或 CLI auth.json 作为测试前提。
-- [ ] 重跑 auth 测试、任务 3 的认证/端点测试，应通过。
-- [ ] 提交 `feat: manage Codex subscription device auth and refresh`。
+- [x] 写 `codex_device_poll_obeys_interval_expiry_and_cancel`：pending/slow-down、15 分钟上限、乱序响应、取消后无 token exchange；授权码和 verifier 不进状态 DTO。 关键断言：`assert!(expires_at_ms - started_at_ms <= 15 * 60 * 1000); assert_eq!(exchanges_after_cancel, 0);`
+- [x] 写 `codex_refresh_is_serialized_and_keeps_account_binding`：并发两个访问只刷新一次；第二次先重读新 token；五分钟阈值、keyring 写失败、账号改变和 invalid_grant 明确失败。 关键断言：`assert_eq!(concurrent_refresh_count, 1); assert_eq!(refreshed.account_ref, original.account_ref); assert!(changed_account.is_err());`
+- [x] 写 `codex_auth_unknown_exchange_is_not_replayed`：token exchange/旋转 refresh 网络结果不确定后，重读 vault，未发现已写入新秘密则标记重新登录，后续等待者不重复交换；明确生成 401 最多一次刷新；敏感 fixture sentinel 不出现在 error/Debug/序列化 UI 字段。 关键断言：`assert_eq!(uncertain_exchange_count, 1); assert!(!safe_error.contains("SECRET_TOKEN_SENTINEL"));`
+- [x] 运行 `cargo test -p omicsops-adapters --test codex_auth_contracts`，确认预期失败。
+- [x] 实现上述接口与秘密边界；锁共享到所有模型门面实例，不因每次工厂创建而重建独立锁。不要读取实际用户 keyring 或 CLI auth.json 作为测试前提。
+- [x] 重跑 auth 测试、任务 3 的认证/端点测试，应通过。
+- [x] 提交 `feat: manage Codex subscription device auth and refresh`。
 
 ## Task 5: 原生登录状态机与 profile 保存事务边界
 
@@ -362,3 +362,4 @@ cargo check --workspace --all-targets、cargo fmt --all -- --check 均通过。
 
 Task 3：Responses 请求、固定端点、SSE 与单次 HTTP 传输完成；4 个新增契约测试通过，cargo test --workspace 1423 通过/12 ignored，provider_usage/model_provider_contracts 通过，fmt check 通过。以实际序列化 input（含 opaque reasoning）计量；1 MiB 行/8 MiB 流/256 KiB 参数/16 调用限额；无重定向、图片、内置执行工具或协议 fallback。
 
+Task 4：固定设备登录、私有 vault bundle、共享刷新锁完成；6 个新增认证契约测试通过。完整 Rust 1429 通过/12 ignored，fmt check 通过。401 刷新代次避免相同 token 的重复刷新；网络等待后复查 vault，已退出的凭据不恢复；不确定轮换/写入失败要求重新登录。
