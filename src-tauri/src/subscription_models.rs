@@ -574,6 +574,78 @@ pub async fn subscription_begin_codex_login(
     }
     state.subscription_models.begin(profile_id).await
 }
+
+fn open_subscription_resource_with(
+    resource: omicsops_dto::SubscriptionResource,
+    open: impl FnOnce(&'static str) -> Result<(), String>,
+) -> Result<(), String> {
+    use omicsops_dto::SubscriptionResource;
+    open(match resource {
+        SubscriptionResource::CodexLogin => "https://auth.openai.com/codex/device",
+        SubscriptionResource::ClaudeSetup => "https://code.claude.com/docs/en/setup",
+        SubscriptionResource::GoPrivacy => "https://opencode.ai/docs/go/#privacy",
+    })
+}
+
+#[cfg(windows)]
+fn open_fixed_subscription_page(url: &'static str) -> Result<(), String> {
+    use windows_sys::Win32::{
+        System::Com::{
+            COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
+        },
+        UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+    };
+    let initialized = unsafe {
+        CoInitializeEx(
+            std::ptr::null(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+        )
+    };
+    if initialized < 0 {
+        return Err("subscription_browser_unavailable".into());
+    }
+    struct Apartment;
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            unsafe {
+                CoUninitialize();
+            }
+        }
+    }
+    let _apartment = Apartment;
+    let verb: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+    let page: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
+    // Only compile-time URLs reach the opener; no argv or elevated verb.
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            page.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    } as isize;
+    if result > 32 {
+        Ok(())
+    } else {
+        Err("subscription_browser_unavailable".into())
+    }
+}
+#[cfg(not(windows))]
+fn open_fixed_subscription_page(_: &'static str) -> Result<(), String> {
+    Err("subscription_manual_browser_open_required".into())
+}
+#[tauri::command]
+pub async fn subscription_open_resource(
+    resource: omicsops_dto::SubscriptionResource,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        open_subscription_resource_with(resource, open_fixed_subscription_page)
+    })
+    .await
+    .map_err(|_| "subscription_browser_unavailable".to_string())?
+}
 #[tauri::command]
 pub async fn subscription_poll_codex_login(
     state: State<'_, AppState>,

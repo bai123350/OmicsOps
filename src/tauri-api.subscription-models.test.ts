@@ -11,6 +11,7 @@ it("passes the subscription lifecycle through narrow native commands", async () 
   await api.beginCodexLogin("profile"); await api.pollCodexLogin("login"); await api.cancelCodexLogin("login");
   await api.finishCodexLogin({ login_id: "login", profile }); await api.subscriptionModelStatus("profile"); await api.disconnectCodex("profile");
   await api.listModelProfileModelDiscovery("profile");
+  await api.openSubscriptionResource("codex_login");
   expect(vi.mocked(invoke).mock.calls).toEqual([
     ["subscription_begin_codex_login", { profileId: "profile" }],
     ["subscription_poll_codex_login", { loginId: "login" }],
@@ -19,6 +20,7 @@ it("passes the subscription lifecycle through narrow native commands", async () 
     ["subscription_model_status", { profileId: "profile" }],
     ["subscription_disconnect_codex", { profileId: "profile" }],
     ["list_model_profile_model_discovery", { profileId: "profile" }],
+    ["subscription_open_resource", { resource: "codex_login" }],
   ]);
 });
 it("does not simulate successful subscription authentication in a browser", async () => {

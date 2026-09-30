@@ -1,3 +1,4 @@
+import { SubscriptionResourceLink } from "../settings/SubscriptionResourceLink";
 import { useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, RefreshCw, Settings } from "lucide-react";
 import type { ModelProfile } from "../../types";
@@ -111,7 +112,7 @@ export function ApiModelPicker({ zh, profiles, activeProfileId, disabled, onProf
       {profiles.length > 1 && <label className="api-model-provider">{zh ? "模型来源" : "Model source"}<select aria-label={subscription ? (zh ? "选择模型来源" : "Choose model source") : (zh ? "选择 API" : "Choose API")} value={activeProfileId ?? ""} disabled={disabled || saving} onChange={(event) => onProfileChange(event.target.value)}>{profiles.map((item) => <option key={item.id} value={item.id}>{item.label} · {modelBackendLabel(item, zh)}</option>)}</select></label>}
       {profile && <>
         <p>{modelBackendLabel(profile, zh)}</p>
-        {profile.provider === "open_ai_responses" && profile.model.startsWith("muse-spark-") && <p>{zh ? "Muse Spark Contributor 的提示词和回复可能用于模型训练。" : "Muse Spark Contributor prompts and completions may be used for model training."} <a href="https://opencode.ai/docs/go/#privacy" target="_blank" rel="noreferrer">{zh ? "隐私说明" : "Privacy details"}</a></p>}
+        {profile.provider === "open_ai_responses" && profile.model.startsWith("muse-spark-") && <p>{zh ? "Muse Spark Contributor 的提示词和回复可能用于模型训练。" : "Muse Spark Contributor prompts and completions may be used for model training."} <SubscriptionResourceLink resource="go_privacy" zh={zh}>{zh ? "隐私说明" : "Privacy details"}</SubscriptionResourceLink></p>}
         <div className="api-model-search"><input aria-label={subscription ? (zh ? "完整模型 ID" : "Full model ID") : (zh ? "搜索 API 模型" : "Search API models")} placeholder={zh ? "搜索或输入完整模型 ID…" : "Search or enter full model ID…"} value={query} onChange={(event) => setQuery(event.target.value)} /><button aria-label={zh ? "刷新模型列表" : "Refresh models"} disabled={loading || saving || disabled || discovery?.can_refresh === false} onClick={() => setRevision((value) => value + 1)}><RefreshCw size={14} /></button></div>
         {query.trim() && !options.includes(query.trim()) && <button disabled={disabled || saving} onClick={() => void choose(query.trim())}>{zh ? "使用完整模型 ID" : "Use full model ID"}</button>}
         {discovery?.source === "configured_only" && <p role="status">{zh ? "仅显示已配置模型；可手填完整 ID。" : "Configured models only; enter a full ID manually."}</p>}

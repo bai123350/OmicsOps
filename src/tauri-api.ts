@@ -181,6 +181,12 @@ export async function listModelProfileModels(profileId: string): Promise<string[
 function requireSubscriptionDesktop() {
   if (!isTauri()) throw new Error("Subscription authentication requires the desktop app.");
 }
+export async function openSubscriptionResource(resource: import("./types").SubscriptionResource): Promise<void> {
+  if (isTauri()) { await invoke("subscription_open_resource", { resource }); return; }
+  const url = resource === "codex_login" ? "https://auth.openai.com/codex/device" : resource === "claude_setup" ? "https://code.claude.com/docs/en/setup" : resource === "go_privacy" ? "https://opencode.ai/docs/go/#privacy" : null;
+  if (!url) throw new Error("Unknown subscription resource.");
+  window.open(url, "_blank", "noopener,noreferrer");
+}
 export async function beginCodexLogin(profileId?: string): Promise<import("./types").BeginCodexLoginResponse> {
   requireSubscriptionDesktop(); return invoke("subscription_begin_codex_login", { profileId: profileId ?? null });
 }

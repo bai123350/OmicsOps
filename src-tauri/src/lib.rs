@@ -354,6 +354,7 @@ pub fn run() {
             subscription_models::subscription_finish_codex_login,
             subscription_models::subscription_model_status,
             subscription_models::subscription_disconnect_codex,
+            subscription_models::subscription_open_resource,
             model_deletion::delete_model_profile,
             model_commands::probe_model_profile,
             model_commands::list_model_profile_models,

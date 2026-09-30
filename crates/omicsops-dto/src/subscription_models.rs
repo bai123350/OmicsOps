@@ -4,6 +4,14 @@ use uuid::Uuid;
 
 use crate::SaveModelProfileRequest;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionResource {
+    CodexLogin,
+    ClaudeSetup,
+    GoPrivacy,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BeginCodexLoginResponse {

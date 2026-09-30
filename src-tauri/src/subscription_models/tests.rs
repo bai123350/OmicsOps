@@ -4,6 +4,35 @@ use omicsops_adapters::{AdapterResult, credentials::MemoryCredentialVault};
 use omicsops_dto::SaveModelProfileRequest;
 use serde_json::json;
 use std::sync::atomic::AtomicI64;
+#[test]
+fn subscription_resource_opening_accepts_only_fixed_official_pages() {
+    for (resource, expected) in [
+        ("codex_login", "https://auth.openai.com/codex/device"),
+        ("claude_setup", "https://code.claude.com/docs/en/setup"),
+        ("go_privacy", "https://opencode.ai/docs/go/#privacy"),
+    ] {
+        let parsed: omicsops_dto::SubscriptionResource =
+            serde_json::from_value(json!(resource)).unwrap();
+        let mut opened = vec![];
+        open_subscription_resource_with(parsed, |url| {
+            opened.push(url);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(opened, vec![expected]);
+        assert!(open_subscription_resource_with(parsed, |_| Err("open_failed".into())).is_err());
+    }
+    for invalid in [
+        "https://malicious.test",
+        "file:///secret",
+        "cmd.exe",
+        "codex_login?token=secret",
+    ] {
+        assert!(
+            serde_json::from_value::<omicsops_dto::SubscriptionResource>(json!(invalid)).is_err()
+        );
+    }
+}
 struct Clock(AtomicI64);
 impl CodexAuthClock for Clock {
     fn now_ms(&self) -> i64 {

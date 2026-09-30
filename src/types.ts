@@ -197,6 +197,7 @@ export interface SubscriptionModelStatus {
   error_code: string | null;
 }
 export interface ModelDiscoveryResult { models: string[]; source: "provider" | "configured_only"; can_refresh: boolean }
+export type SubscriptionResource = "codex_login" | "claude_setup" | "go_privacy";
 
 export interface ExecutionPlanV4 {
   schema_version: 4;

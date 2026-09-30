@@ -1,3 +1,4 @@
+import { SubscriptionResourceLink } from "./SubscriptionResourceLink";
 import { SubscriptionModelForm } from "./SubscriptionModelForm";
 import { isOpenCodeGo, openCodeGoModels, openCodeGoProtocol, reviewedGoEfforts, modelBackendLabel } from "../../subscription-models";
 import type { ModelDiscoveryResult, SaveModelProfileRequest } from "../../types";
@@ -245,7 +246,7 @@ export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection
               {form.delegated_model_profile_id && !modelProfiles.some((profile) => profile.id === form.delegated_model_profile_id && profile.supports_tools) && <option value={form.delegated_model_profile_id}>{zh ? "配置不可用，请重新选择" : "Profile unavailable; select again"}</option>}
             </select><small>{zh ? "用于新建普通 Agent 任务的只读委派；运行中任务保留原配置。" : "Used for read-only delegation in new ordinary Agent runs; existing runs keep their configuration."}</small></label>
           </div>
-          {isOpenCodeGo(form) && form.model.startsWith("muse-spark-") && <p role="status">{zh ? "Muse Spark Contributor 的提示词和回复可能用于模型训练。" : "Muse Spark Contributor prompts and completions may be used for model training."} <a href="https://opencode.ai/docs/go/#privacy" target="_blank" rel="noreferrer">{zh ? "服务方隐私说明" : "Provider privacy details"}</a></p>}
+          {isOpenCodeGo(form) && form.model.startsWith("muse-spark-") && <p role="status">{zh ? "Muse Spark Contributor 的提示词和回复可能用于模型训练。" : "Muse Spark Contributor prompts and completions may be used for model training."} <SubscriptionResourceLink resource="go_privacy" zh={zh}>{zh ? "服务方隐私说明" : "Provider privacy details"}</SubscriptionResourceLink></p>}
           {modelSaveError && <p role="alert">{modelSaveError}</p>}
           <div className="model-form-actions"><button onClick={() => setForm(null)}>{zh ? "取消" : "Cancel"}</button><button className="primary" disabled={saving || Boolean(budgetError) || !form.label.trim() || !form.model.trim()} onClick={saveProvider}>{zh ? "保存提供方" : "Save provider"}</button></div>
         </section>}

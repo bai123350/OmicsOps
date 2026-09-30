@@ -1237,3 +1237,32 @@ fn integration_package_contract_is_declarative_and_exposes_recovery_state() {
     );
     assert!(value.get("cleanup_path").is_none());
 }
+
+#[test]
+fn subscription_resource_dto_accepts_only_symbolic_official_pages() {
+    use omicsops_dto::SubscriptionResource;
+    assert_eq!(
+        serde_json::to_value(SubscriptionResource::CodexLogin).unwrap(),
+        "codex_login"
+    );
+    assert_eq!(
+        serde_json::to_value(SubscriptionResource::ClaudeSetup).unwrap(),
+        "claude_setup"
+    );
+    assert_eq!(
+        serde_json::to_value(SubscriptionResource::GoPrivacy).unwrap(),
+        "go_privacy"
+    );
+    assert!(
+        serde_json::from_value::<SubscriptionResource>(
+            serde_json::json!({"url":"https://example.test"})
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<SubscriptionResource>(serde_json::json!(
+            "https://auth.openai.com/codex/device"
+        ))
+        .is_err()
+    );
+}
