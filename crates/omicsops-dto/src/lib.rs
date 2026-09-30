@@ -23,6 +23,8 @@ pub use omicsops_protocol::{
 use omicsops_protocol::{ComputeSelectionV4, ExecutionPlanV4};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+mod subscription_models;
+pub use subscription_models::*;
 
 mod workspace_navigation;
 pub use workspace_navigation::*;
@@ -175,6 +177,7 @@ pub struct GuidanceRecordV4 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SaveModelProfileRequest {
     pub id: Option<Uuid>,
     pub label: String,
@@ -208,6 +211,43 @@ pub struct SaveModelProfileRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub delegated_model_profile_id: Option<Option<Uuid>>,
+    #[serde(
+        default,
+        deserialize_with = "explicit_nullable_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cli_executable: Option<Option<String>>,
+}
+
+#[cfg(test)]
+mod subscription_request_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn payload() -> serde_json::Value {
+        json!({"label":"fixture","provider":"claude_code","base_url":"claude-code://local","model":"sonnet"})
+    }
+
+    #[test]
+    fn subscription_dto_omitted_null_and_binding_are_explicit() {
+        let mut null = payload();
+        null["cli_executable"] = serde_json::Value::Null;
+        let parsed: SaveModelProfileRequest = serde_json::from_value(null).unwrap();
+        assert_eq!(
+            serde_json::to_value(parsed).unwrap()["cli_executable"],
+            serde_json::Value::Null
+        );
+        let absent: SaveModelProfileRequest = serde_json::from_value(payload()).unwrap();
+        assert!(
+            serde_json::to_value(absent)
+                .unwrap()
+                .get("cli_executable")
+                .is_none()
+        );
+        let mut forged = payload();
+        forged["subscription_account_ref"] = json!(Uuid::from_u128(7));
+        assert!(serde_json::from_value::<SaveModelProfileRequest>(forged).is_err());
+    }
 }
 
 fn explicit_nullable_string<'de, D: serde::Deserializer<'de>>(

@@ -1112,6 +1112,7 @@ fn validate_attachment_profile(
             ProviderProtocol::OpenAiCompatible
         }
         omicsops_core::workspace::ModelProviderKind::Ollama => ProviderProtocol::Ollama,
+        _ => return Err("this subscription transport has no verified image budget".into()),
     };
     // Capability validation never needs to load credentials or call the provider.
     let base_url = url::Url::parse(&profile.base_url).map_err(|error| error.to_string())?;
@@ -10095,6 +10096,7 @@ mod tests {
                 reasoning_effort: None,
                 fast_mode: None,
                 delegated_model_profile_id: None,
+                cli_executable: None,
             },
         )
         .unwrap();
@@ -10160,6 +10162,7 @@ mod tests {
                 reasoning_effort: Some(Some("max".into())),
                 fast_mode: None,
                 delegated_model_profile_id: None,
+                cli_executable: None,
             },
         )
         .unwrap();

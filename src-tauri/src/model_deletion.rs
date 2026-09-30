@@ -79,6 +79,8 @@ mod tests {
             reasoning_effort: None,
             fast_mode: None,
             delegated_model_profile_id: None,
+            cli_executable: None,
+            subscription_account_ref: None,
         }
     }
 

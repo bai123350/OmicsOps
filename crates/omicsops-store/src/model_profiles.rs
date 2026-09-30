@@ -221,6 +221,60 @@ mod tests {
 
     use crate::Store;
 
+    #[tokio::test]
+    async fn subscription_profile_delete_respects_frozen_references() {
+        let store = Store::open_in_memory().await.unwrap();
+        let id = Uuid::new_v4();
+        let mut cli = profile(id, None);
+        cli.provider = ModelProviderKind::ClaudeCode;
+        cli.base_url = "claude-code://local".into();
+        cli.credential_reference = None;
+        store.save_model_profile(&cli).await.unwrap();
+        let (project_id, conversation_id) = context(&store, id).await;
+        let run_id = Uuid::new_v4();
+        store
+            .save_agent_run_v4(
+                run_id,
+                project_id,
+                conversation_id,
+                "running",
+                &serde_json::json!({"model_profile_id":id}),
+            )
+            .await
+            .unwrap();
+        let mut vault_calls = 0;
+        assert!(
+            store
+                .delete_model_profile_with(id, &[], |_| {
+                    vault_calls += 1;
+                    Ok(())
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(vault_calls, 0);
+        store
+            .save_agent_run_v4(
+                run_id,
+                project_id,
+                conversation_id,
+                "completed",
+                &serde_json::json!({"model_profile_id":id}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .delete_model_profile_with(id, &[], |_| {
+                    vault_calls += 1;
+                    Ok(())
+                })
+                .await
+                .unwrap()
+        );
+        assert_eq!(vault_calls, 0);
+    }
+
     fn profile(id: Uuid, delegated_model_profile_id: Option<Uuid>) -> ModelProfile {
         ModelProfile {
             id,
@@ -236,6 +290,8 @@ mod tests {
             reasoning_effort: None,
             fast_mode: None,
             delegated_model_profile_id,
+            cli_executable: None,
+            subscription_account_ref: None,
         }
     }
 

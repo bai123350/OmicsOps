@@ -85,15 +85,25 @@ pub fn model_profile_from_request(
         return Err("model label and model name are required".into());
     }
     let base_url = Url::parse(request.base_url.trim()).map_err(|error| error.to_string())?;
-    if !matches!(base_url.scheme(), "http" | "https") {
-        return Err("model base URL must use http or https".into());
-    }
     let provider = match request.provider.as_str() {
         "anthropic" => ModelProviderKind::Anthropic,
         "open_ai_compatible" => ModelProviderKind::OpenAiCompatible,
         "ollama" => ModelProviderKind::Ollama,
+        "open_ai_responses" => ModelProviderKind::OpenAiResponses,
+        "open_ai_codex" => ModelProviderKind::OpenAiCodex,
+        "claude_code" => ModelProviderKind::ClaudeCode,
         other => return Err(format!("unsupported model provider: {other}")),
     };
+    if provider != ModelProviderKind::ClaudeCode && !matches!(base_url.scheme(), "http" | "https") {
+        return Err("model base URL must use http or https".into());
+    }
+    if matches!(
+        provider,
+        ModelProviderKind::OpenAiCodex | ModelProviderKind::ClaudeCode
+    ) && request.credential.is_some()
+    {
+        return Err("this subscription provider does not accept an API key".into());
+    }
     let id = request.id.unwrap_or_else(Uuid::new_v4);
     if request.delegated_model_profile_id.flatten() == Some(id) {
         return Err("choose another delegated profile or inherit the main model".into());
@@ -115,14 +125,17 @@ pub fn model_profile_from_request(
     if request.refresh_catalog && catalog.is_none() {
         return Err("no exact entry in the bundled catalog for this model endpoint".into());
     }
-    Ok(ModelProfile {
+    let profile = ModelProfile {
         id,
         label: request.label.trim().into(),
         provider,
         base_url: base_url.to_string(),
         model,
-        credential_reference: (provider != ModelProviderKind::Ollama)
-            .then(|| credential_account("model", id)),
+        credential_reference: (!matches!(
+            provider,
+            ModelProviderKind::Ollama | ModelProviderKind::ClaudeCode
+        ))
+        .then(|| credential_account("model", id)),
         supports_tools: catalog.map_or(true, |row| row.supports_tools),
         supports_vision,
         context_window_tokens: request
@@ -132,7 +145,11 @@ pub fn model_profile_from_request(
         reasoning_effort,
         fast_mode,
         delegated_model_profile_id: request.delegated_model_profile_id.flatten(),
-    })
+        cli_executable: request.cli_executable.flatten(),
+        subscription_account_ref: None,
+    };
+    omicsops_core::workspace::validate_subscription_profile_fields(&profile)?;
+    Ok(profile)
 }
 
 /// A catalog update must never mutate the runtime contract of an existing profile.
@@ -144,12 +161,19 @@ fn merge_existing_profile(
     preserve_effort: bool,
     preserve_fast_mode: bool,
     refresh_catalog: bool,
+    preserve_cli: bool,
 ) {
     let Some(existing) = existing else {
         return;
     };
     if preserve_binding {
         profile.delegated_model_profile_id = existing.delegated_model_profile_id;
+    }
+    if profile.provider == existing.provider {
+        if preserve_cli {
+            profile.cli_executable = existing.cli_executable.clone();
+        }
+        profile.subscription_account_ref = existing.subscription_account_ref;
     }
     let same_identity = profile.provider == existing.provider
         && profile.model == existing.model
@@ -228,6 +252,7 @@ pub async fn save_model_profile(
     let preserve_window = request.context_window_tokens.is_none();
     let preserve_effort = request.reasoning_effort.is_none();
     let preserve_fast_mode = request.fast_mode.is_none();
+    let preserve_cli = request.cli_executable.is_none();
     let mut profile = model_profile_from_request(request)?;
     let existing = state
         .repository
@@ -242,7 +267,9 @@ pub async fn save_model_profile(
         preserve_effort,
         preserve_fast_mode,
         refresh_catalog,
+        preserve_cli,
     );
+    omicsops_core::workspace::validate_subscription_profile_fields(&profile)?;
     validate_profile_capabilities(&profile)?;
     if let Some(child_id) = profile.delegated_model_profile_id {
         let child = state
@@ -340,6 +367,50 @@ mod tests {
     use super::*;
     use omicsops_adapters::credentials::MemoryCredentialVault;
 
+    #[test]
+    fn subscription_profile_validation_preserves_omitted_cli_and_rejects_wrong_fields() {
+        let mut value = request("claude_code", "claude-code://local", "sonnet");
+        value.cli_executable = Some(Some("C:\\Tools\\claude.exe".into()));
+        let saved = model_profile_from_request(value.clone()).unwrap();
+        assert_eq!(saved.credential_reference, None);
+        let mut omitted =
+            model_profile_from_request(request("claude_code", "claude-code://local", "sonnet"))
+                .unwrap();
+        merge_existing_profile(
+            &mut omitted,
+            Some(&saved),
+            true,
+            true,
+            true,
+            true,
+            false,
+            true,
+        );
+        assert_eq!(omitted.cli_executable, saved.cli_executable);
+        assert_eq!(
+            saved.cli_executable.as_deref(),
+            Some("C:\\Tools\\claude.exe")
+        );
+        value.cli_executable = Some(Some("C:\\Tools\\claude.cmd".into()));
+        assert!(model_profile_from_request(value).is_err());
+        let mut codex = request(
+            "open_ai_codex",
+            "https://chatgpt.com/backend-api",
+            "fixture",
+        );
+        assert!(model_profile_from_request(codex.clone()).is_ok());
+        codex.credential = Some("API_KEY_SENTINEL".into());
+        assert!(model_profile_from_request(codex).is_err());
+        assert!(
+            model_profile_from_request(request(
+                "open_ai_codex",
+                "https://chatgpt.com:444/backend-api",
+                "fixture"
+            ))
+            .is_err()
+        );
+    }
+
     fn request(provider: &str, base_url: &str, model: &str) -> SaveModelProfileRequest {
         SaveModelProfileRequest {
             id: None,
@@ -353,6 +424,7 @@ mod tests {
             reasoning_effort: None,
             fast_mode: None,
             delegated_model_profile_id: None,
+            cli_executable: None,
         }
     }
 
@@ -470,7 +542,16 @@ mod tests {
         input.id = Some(saved.id);
         input.refresh_catalog = true;
         let mut refreshed = model_profile_from_request(input.clone()).unwrap();
-        merge_existing_profile(&mut refreshed, Some(&saved), true, true, true, true, true);
+        merge_existing_profile(
+            &mut refreshed,
+            Some(&saved),
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
         validate_profile_capabilities(&refreshed).unwrap();
         assert!(refreshed.catalog_capabilities.is_some());
         assert_eq!(refreshed.context_window_tokens, Some(1050000));
@@ -489,6 +570,7 @@ mod tests {
             true,
             true,
             true,
+            true,
         );
         assert_eq!(
             repeated.execution_configuration_hash(),
@@ -496,7 +578,16 @@ mod tests {
         );
         input.context_window_tokens = Some(64000);
         let mut custom = model_profile_from_request(input).unwrap();
-        merge_existing_profile(&mut custom, Some(&saved), true, false, true, true, true);
+        merge_existing_profile(
+            &mut custom,
+            Some(&saved),
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+        );
         assert_eq!(custom.context_window_tokens, Some(64000));
     }
 
@@ -519,13 +610,31 @@ mod tests {
         input.id = Some(legacy.id);
         input.refresh_catalog = true;
         let mut refreshed = model_profile_from_request(input.clone()).unwrap();
-        merge_existing_profile(&mut refreshed, Some(&legacy), true, true, true, true, true);
+        merge_existing_profile(
+            &mut refreshed,
+            Some(&legacy),
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
         assert_eq!(refreshed.context_window_tokens, Some(1_000_000));
         assert_eq!(refreshed.effective_context_window_tokens(), 1_000_000);
 
         input.context_window_tokens = Some(64_000);
         let mut bounded = model_profile_from_request(input).unwrap();
-        merge_existing_profile(&mut bounded, Some(&legacy), true, false, true, true, true);
+        merge_existing_profile(
+            &mut bounded,
+            Some(&legacy),
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+        );
         assert_eq!(bounded.context_window_tokens, Some(64_000));
         assert_eq!(bounded.effective_context_window_tokens(), 64_000);
     }
@@ -541,7 +650,16 @@ mod tests {
         legacy.reasoning_effort = Some("max".into());
         input.refresh_catalog = true;
         let mut refreshed = model_profile_from_request(input).unwrap();
-        merge_existing_profile(&mut refreshed, Some(&legacy), true, true, true, true, true);
+        merge_existing_profile(
+            &mut refreshed,
+            Some(&legacy),
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
         assert!(validate_profile_capabilities(&refreshed).is_err());
         refreshed.reasoning_effort = None;
         assert!(validate_profile_capabilities(&refreshed).is_ok());
@@ -636,7 +754,7 @@ mod tests {
         .unwrap();
         edited.id = old.id;
         edited.label = "Renamed".into();
-        merge_existing_profile(&mut edited, Some(&old), true, true, true, true, false);
+        merge_existing_profile(&mut edited, Some(&old), true, true, true, true, false, true);
         assert_eq!(edited.execution_configuration_hash(), hash);
         assert!(edited.catalog_capabilities.is_none());
         assert_eq!(edited.effective_context_window_tokens(), 32768);
@@ -648,7 +766,16 @@ mod tests {
         ))
         .unwrap();
         replacement.id = old.id;
-        merge_existing_profile(&mut replacement, Some(&old), true, true, true, true, false);
+        merge_existing_profile(
+            &mut replacement,
+            Some(&old),
+            true,
+            true,
+            true,
+            true,
+            false,
+            true,
+        );
         assert!(replacement.catalog_capabilities.is_some());
         assert_ne!(replacement.execution_configuration_hash(), hash);
     }
@@ -676,7 +803,16 @@ mod tests {
         ))
         .unwrap();
         edited.id = saved.id;
-        merge_existing_profile(&mut edited, Some(&saved), true, true, true, true, false);
+        merge_existing_profile(
+            &mut edited,
+            Some(&saved),
+            true,
+            true,
+            true,
+            true,
+            false,
+            true,
+        );
         assert_eq!(edited.catalog_capabilities, saved.catalog_capabilities);
         assert_eq!(
             edited.execution_configuration_hash(),
@@ -778,12 +914,30 @@ mod tests {
         saved_request.id = Some(saved.id);
         saved_request.fast_mode = None;
         let mut omitted = model_profile_from_request(saved_request.clone()).unwrap();
-        merge_existing_profile(&mut omitted, Some(&saved), true, true, true, true, false);
+        merge_existing_profile(
+            &mut omitted,
+            Some(&saved),
+            true,
+            true,
+            true,
+            true,
+            false,
+            true,
+        );
         assert_eq!(omitted.fast_mode, Some(true));
 
         saved_request.fast_mode = Some(None);
         let mut cleared = model_profile_from_request(saved_request).unwrap();
-        merge_existing_profile(&mut cleared, Some(&saved), true, true, true, false, false);
+        merge_existing_profile(
+            &mut cleared,
+            Some(&saved),
+            true,
+            true,
+            true,
+            false,
+            false,
+            true,
+        );
         assert_eq!(cleared.fast_mode, None);
 
         saved.fast_mode = Some(false);

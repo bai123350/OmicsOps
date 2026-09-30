@@ -368,6 +368,7 @@ pub(crate) fn unified_model_client_for_profile_with_vault(
             ProviderProtocol::OpenAiCompatible
         }
         omicsops_core::workspace::ModelProviderKind::Ollama => ProviderProtocol::Ollama,
+        _ => return Err("subscription transport is not connected yet".into()),
     };
     UnifiedModelClient::new(
         profile.id,

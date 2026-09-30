@@ -6,6 +6,33 @@ use crate::dto::{
 use serde_json::json;
 
 #[test]
+fn subscription_dto_has_only_public_device_state_and_explicit_discovery_source() {
+    use omicsops_dto::*;
+    let status = CodexLoginStateResponse {
+        login_id: uuid::Uuid::from_u128(7),
+        state: CodexLoginState::Cancelled,
+        expires_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+        error_code: None,
+    };
+    assert_eq!(
+        serde_json::to_value(status).unwrap(),
+        json!({"login_id":uuid::Uuid::from_u128(7),
+        "state":"cancelled","expires_at":"1970-01-01T00:00:00Z","error_code":null})
+    );
+    let discovery = ModelDiscoveryResult {
+        models: vec!["sonnet".into()],
+        source: ModelDiscoverySource::ConfiguredOnly,
+        can_refresh: false,
+    };
+    assert_eq!(
+        serde_json::to_value(discovery).unwrap(),
+        json!({"models":["sonnet"],"source":"configured_only","can_refresh":false})
+    );
+    assert!(serde_json::from_value::<CodexLoginStateResponse>(json!({"login_id":uuid::Uuid::from_u128(7),
+        "state":"authorized","expires_at":"1970-01-01T00:00:00Z","error_code":null,"access_token":"SENTINEL"})).is_err());
+}
+
+#[test]
 fn runtime_boundary_request_rejects_frozen_selection_override() {
     use omicsops_dto::RuntimeBoundaryRequestV4;
     let request = json!({

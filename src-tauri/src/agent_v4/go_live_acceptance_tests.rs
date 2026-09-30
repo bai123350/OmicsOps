@@ -243,6 +243,7 @@ fn refreshed_go_profile(source: &ModelProfile) -> Result<ModelProfile, String> {
             reasoning_effort: Some(source.reasoning_effort.clone()),
             fast_mode: Some(source.fast_mode),
             delegated_model_profile_id: Some(None),
+            cli_executable: None,
         })?;
     refreshed.credential_reference = source.credential_reference.clone();
     let capabilities = refreshed

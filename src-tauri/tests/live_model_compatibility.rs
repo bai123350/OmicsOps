@@ -37,6 +37,11 @@ async fn configured_desktop_model_accepts_a_minimal_chat_probe() {
         ModelProviderKind::Anthropic => ProviderProtocol::Anthropic,
         ModelProviderKind::OpenAiCompatible => ProviderProtocol::OpenAiCompatible,
         ModelProviderKind::Ollama => ProviderProtocol::Ollama,
+        ModelProviderKind::OpenAiResponses
+        | ModelProviderKind::OpenAiCodex
+        | ModelProviderKind::ClaudeCode => {
+            panic!("subscription profiles require the dedicated subscription acceptance tests")
+        }
     };
     let model = std::env::var("OMICSOPS_LIVE_MODEL_OVERRIDE").unwrap_or(profile.model);
     let client = UnifiedModelClient::new(

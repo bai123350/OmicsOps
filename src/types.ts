@@ -138,7 +138,7 @@ export interface StorageUsageSnapshotV4 {
 export interface ModelProfile {
   id: string;
   label: string;
-  provider: "anthropic" | "open_ai_compatible" | "ollama";
+  provider: "anthropic" | "open_ai_compatible" | "ollama" | "open_ai_responses" | "open_ai_codex" | "claude_code";
   base_url: string;
   model: string;
   credential_reference: string | null;
@@ -158,6 +158,8 @@ export interface ModelProfile {
   /** Null or omission uses the provider/profile default; true requests Fast. */
   fast_mode?: boolean | null;
   delegated_model_profile_id?: string | null;
+  cli_executable?: string | null;
+  subscription_account_ref?: string | null;
 }
 
 export interface ExecutionPlanV4 {

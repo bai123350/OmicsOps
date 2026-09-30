@@ -232,6 +232,8 @@ async fn branch_send_retry_rejects_a_queue_row_with_same_reserved_ids_but_other_
         reasoning_effort: None,
         fast_mode: None,
         delegated_model_profile_id: None,
+        cli_executable: None,
+        subscription_account_ref: None,
     };
     fixture.store.save_model_profile(&profile).await.unwrap();
     let branch = fixture

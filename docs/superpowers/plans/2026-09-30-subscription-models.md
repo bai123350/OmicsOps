@@ -10,7 +10,7 @@
 
 **Spec:** [订阅模型接入设计](../specs/2026-09-30-subscription-models-design.md)，用户于 2026-09-30 确认书面设计。参考 Wisp 固定提交 `ade254989da5d395c6334c893637f32c3ef61ba7`。
 
-状态：实施计划待用户评审与执行方式选择。所有勾选框均未执行；本文件不是产品测试结果。
+状态：用户已授权实施与逐功能提交，当前采用 Native 执行；勾选框与文末记录跟踪实际进度。
 
 ## Global Constraints
 
@@ -81,13 +81,13 @@ CLI 预检无法满足设计时，保留明确错误与已完成增量，修订�
 - Produces DTO: `ModelDiscoverySource::{Provider, ConfiguredOnly}`；`ModelDiscoveryResult { models: Vec<String>, source: ModelDiscoverySource, can_refresh: bool }`。保留原有 Vec 模型查询命令，任务 9 新增有来源的查询命令。
 - `SaveModelProfileRequest.cli_executable` 用 `Option<Option<String>>` 延续 omitted/null 语义；三个旧 provider 的未知新增配置拒绝，不让 HTTP 保存误写订阅字段。
 
-- [ ] 写失败测试 `subscription_profiles_preserve_legacy_hash_and_json`：旧 fixture 哈希逐字相同；新字段缺省不会出现；CLI 路径/Codex 账户引用改变新哈希，标签不改变。 关键断言：`assert_eq!(legacy_hash_after, legacy_hash_before); assert_ne!(cli_path_changed_hash, cli_hash); assert_eq!(label_changed_hash, legacy_hash_before);`
-- [ ] 写失败测试 `subscription_dto_omitted_null_and_binding_are_explicit`：CLI omitted 保留/null 清空；普通请求携带账户引用不能绕过后端绑定；DTO 只允许登录所需 user_code，不含 token/authorization_code/verifier/原账户 ID。 关键断言：`assert_eq!(omitted.cli_executable, old.cli_executable); assert_eq!(cleared.cli_executable, None); assert!(!dto_json.contains("refresh_token"));`
-- [ ] 写失败测试 `subscription_profile_delete_respects_frozen_references`：活动 run/queue/side chat/review 引用仍阻止删除；Claude 无 credential_reference，删除不调用 CLI logout。 关键断言：`assert!(active_delete.is_err()); assert_eq!(cli_logout_calls, 0);`
-- [ ] 运行 `cargo test -p omicsops-core subscription_`、`cargo test -p omicsops-dto subscription_` 和 `cargo test -p omicsops-store subscription_`，确认失败来自新增要求；先记录原有基线异常。
-- [ ] 实现上述类型、合法矩阵和哈希；为现有 exhaustive matches 增加显式暂不可派发分支。编译所需初始化器机械补 `None`，不要在本任务提前启用协议或登录。
-- [ ] 重跑局部命令及 `cargo test -p omicsops-desktop --lib subscription_`，应全部通过；检查旧 DTO/profile tests。
-- [ ] 审查并只暂存本任务文件，提交 `feat: define subscription model profiles and contracts`。
+- [x] 写失败测试 `subscription_profiles_preserve_legacy_hash_and_json`：旧 fixture 哈希逐字相同；新字段缺省不会出现；CLI 路径/Codex 账户引用改变新哈希，标签不改变。 关键断言：`assert_eq!(legacy_hash_after, legacy_hash_before); assert_ne!(cli_path_changed_hash, cli_hash); assert_eq!(label_changed_hash, legacy_hash_before);`
+- [x] 写失败测试 `subscription_dto_omitted_null_and_binding_are_explicit`：CLI omitted 保留/null 清空；普通请求携带账户引用不能绕过后端绑定；DTO 只允许登录所需 user_code，不含 token/authorization_code/verifier/原账户 ID。 关键断言：`assert_eq!(omitted.cli_executable, old.cli_executable); assert_eq!(cleared.cli_executable, None); assert!(!dto_json.contains("refresh_token"));`
+- [x] 写失败测试 `subscription_profile_delete_respects_frozen_references`：活动 run/queue/side chat/review 引用仍阻止删除；Claude 无 credential_reference，删除不调用 CLI logout。 关键断言：`assert!(active_delete.is_err()); assert_eq!(cli_logout_calls, 0);`
+- [x] 运行 `cargo test -p omicsops-core subscription_`、`cargo test -p omicsops-dto subscription_` 和 `cargo test -p omicsops-store subscription_`，确认失败来自新增要求；先记录原有基线异常。
+- [x] 实现上述类型、合法矩阵和哈希；为现有 exhaustive matches 增加显式暂不可派发分支。编译所需初始化器机械补 `None`，不要在本任务提前启用协议或登录。
+- [x] 重跑局部命令及 `cargo test -p omicsops-desktop --lib subscription_`，应全部通过；检查旧 DTO/profile tests。
+- [x] 审查并只暂存本任务文件，提交 `feat: define subscription model profiles and contracts`。
 
 ## Task 2: 结构化历史和可验证的续接来源
 
@@ -337,4 +337,16 @@ cargo test -p omicsops-desktop --lib agent_v4::subscription_live_acceptance_test
 2. Subagent-driven：每任务由独立实现代理与独立评审代理完成后进入下一任务，
    最后审查整个分支；上下文与评审开销更大。
 
-只有用户明确选择后才开始执行。当前计划编写与自检没有派发子代理。
+用户于 2026-09-30 授权实施代码并要求每完成一个功能提交一次；本会话采用 Native。
+实施与实际检查记录逐步补充，未执行真实订阅/SSH/GUI 验收前不宣称验收通过。
+
+## Execution Record
+
+Task 1：新增 provider、可选 CLI/账户执行身份、纯 DTO 与保存合法矩阵；旧 JSON/哈希
+保持，编辑 omission 保留 CLI，null 清除；Claude 删除复用现有活动引用保护且不动 CLI 登录。
+核心/provider/DTO/CLI编辑测试先失败后通过。Store 删除逻辑未改变，复用已有
+run/queue/side-chat/review 保护测试并增加 Claude 无凭据 fixture。
+确定性检查：cargo test --workspace（1412 passed，12 ignored），npm test
+（957 Vitest + 22 browser tests），npm run build，cargo fmt --all -- --check 均通过。
+基线首次 SkillDetails Escape 测试失败，未改其源码；后续完整前端回归通过。
+真实模型、CLI登录、SSH、GUI smoke 和桌面打包尚未执行。任务 2–12 未完成。

@@ -234,6 +234,64 @@ pub enum ModelProviderKind {
     Anthropic,
     OpenAiCompatible,
     Ollama,
+    OpenAiResponses,
+    OpenAiCodex,
+    ClaudeCode,
+}
+
+#[cfg(test)]
+mod subscription_profile_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn legacy() -> serde_json::Value {
+        json!({"id":Uuid::from_u128(42),"label":"fixture","provider":"open_ai_compatible",
+            "base_url":"https://api.openai.com/v1","model":"fixture-model",
+            "credential_reference":null,"supports_tools":true,"supports_vision":false,
+            "context_window_tokens":null})
+    }
+
+    #[test]
+    fn subscription_profiles_preserve_legacy_hash_and_json() {
+        let profile: ModelProfile = serde_json::from_value(legacy()).unwrap();
+        let old_hash = profile.execution_configuration_hash();
+        assert_eq!(
+            old_hash,
+            "4be111aea099a767f0b86b5271ed1586e16b0dacaeffdd16f4e8801aa366252e"
+        );
+        assert_eq!(serde_json::to_value(&profile).unwrap(), legacy());
+        let mut value = legacy();
+        value["cli_executable"] = json!("C:\\Tools\\claude.exe");
+        let configured: ModelProfile = serde_json::from_value(value).unwrap();
+        assert_ne!(configured.execution_configuration_hash(), old_hash);
+        let mut renamed = profile.clone();
+        renamed.label = "renamed".into();
+        assert_eq!(renamed.execution_configuration_hash(), old_hash);
+    }
+
+    #[test]
+    fn subscription_profiles_have_explicit_provider_and_identity() {
+        for (provider, base) in [
+            ("open_ai_codex", "https://chatgpt.com/backend-api"),
+            ("claude_code", "claude-code://local"),
+            ("open_ai_responses", "https://opencode.ai/zen/go/v1"),
+        ] {
+            let mut value = legacy();
+            value["provider"] = json!(provider);
+            value["base_url"] = json!(base);
+            let profile: ModelProfile = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(&profile).unwrap()["provider"],
+                provider
+            );
+            value["subscription_account_ref"] = json!(Uuid::from_u128(9));
+            let bound: ModelProfile = serde_json::from_value(value).unwrap();
+            assert_ne!(
+                bound.execution_configuration_hash(),
+                profile.execution_configuration_hash()
+            );
+        }
+    }
 }
 
 /// Catalog data captured when a profile is created; never refreshed implicitly.
@@ -273,6 +331,10 @@ pub struct ModelProfile {
     /// Optional profile for read-only delegation in newly created ordinary runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegated_model_profile_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_executable: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_account_ref: Option<Uuid>,
 }
 
 impl ModelProfile {
@@ -292,6 +354,12 @@ impl ModelProfile {
         // Preserve hashes of legacy profiles that never selected a Fast mode.
         if let Some(fast_mode) = self.fast_mode {
             value["fast_mode"] = serde_json::json!(fast_mode);
+        }
+        if let Some(executable) = &self.cli_executable {
+            value["cli_executable"] = serde_json::json!(executable);
+        }
+        if let Some(account) = self.subscription_account_ref {
+            value["subscription_account_ref"] = serde_json::json!(account);
         }
         if self.effective_output_tokens() != 4096 {
             value["reserved_output_tokens"] = serde_json::json!(self.effective_output_tokens());
@@ -338,6 +406,63 @@ impl ModelProfile {
     pub fn supports_fast_mode(&self) -> bool {
         supports_fast_mode(self.provider, &self.base_url, &self.model)
     }
+}
+
+pub fn validate_subscription_profile_fields(profile: &ModelProfile) -> Result<(), String> {
+    let url = url::Url::parse(&profile.base_url).map_err(|_| "invalid model endpoint")?;
+    let clean = url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none();
+    let valid = match profile.provider {
+        ModelProviderKind::OpenAiCodex => {
+            clean
+                && url.scheme() == "https"
+                && url.host_str() == Some("chatgpt.com")
+                && url.port_or_known_default() == Some(443)
+                && url.path().trim_end_matches('/') == "/backend-api"
+        }
+        ModelProviderKind::OpenAiResponses => {
+            clean
+                && url.scheme() == "https"
+                && url.host_str() == Some("opencode.ai")
+                && url.port_or_known_default() == Some(443)
+                && url.path().trim_end_matches('/') == "/zen/go/v1"
+        }
+        ModelProviderKind::ClaudeCode => {
+            clean
+                && url.scheme() == "claude-code"
+                && url.host_str() == Some("local")
+                && url.port().is_none()
+                && matches!(url.path(), "" | "/")
+                && profile.credential_reference.is_none()
+        }
+        _ => true,
+    };
+    if !valid {
+        return Err("invalid endpoint or credential for selected subscription provider".into());
+    }
+    if profile.cli_executable.is_some() && profile.provider != ModelProviderKind::ClaudeCode {
+        return Err("CLI executable is only valid for Claude Code".into());
+    }
+    if profile.subscription_account_ref.is_some()
+        && profile.provider != ModelProviderKind::OpenAiCodex
+    {
+        return Err("subscription account binding is only valid for Codex".into());
+    }
+    if let Some(executable) = &profile.cli_executable {
+        let path = std::path::Path::new(executable);
+        if !path.is_absolute()
+            || !path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("claude.exe"))
+        {
+            return Err(
+                "choose an absolute path to the native claude.exe without arguments".into(),
+            );
+        }
+    }
+    Ok(())
 }
 
 const FAST_MODELS: [&str; 4] = [
