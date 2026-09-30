@@ -579,7 +579,7 @@ describe("DesktopApp", () => {
     stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
     const profile = { ...stateModel, reasoning_effort: "high" as const };
     vi.mocked(api.listModelProfiles).mockResolvedValue([profile]);
-    vi.spyOn(api, "listModelProfileModels").mockResolvedValue([profile.model]);
+    vi.spyOn(api, "listModelProfileModelDiscovery").mockResolvedValue({ models: [profile.model], source: "provider", can_refresh: true });
     const saved = deferred<Awaited<ReturnType<typeof api.saveModelProfile>>>();
     const save = vi.spyOn(api, "saveModelProfile").mockReturnValue(saved.promise);
     render(<DesktopApp />);
@@ -605,7 +605,7 @@ describe("DesktopApp", () => {
     stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
     const profile = { ...stateModel, reasoning_effort: "high" as const };
     vi.mocked(api.listModelProfiles).mockResolvedValue([profile]);
-    vi.spyOn(api, "listModelProfileModels").mockResolvedValue([profile.model]);
+    vi.spyOn(api, "listModelProfileModelDiscovery").mockResolvedValue({ models: [profile.model], source: "provider", can_refresh: true });
     const saved = deferred<Awaited<ReturnType<typeof api.saveModelProfile>>>();
     const save = vi.spyOn(api, "saveModelProfile").mockReturnValue(saved.promise);
     render(<DesktopApp />);
@@ -658,7 +658,7 @@ describe("DesktopApp", () => {
     stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
     const profile = { ...stateModel, label: "OpenAI-compatible", model: "research-model-a" };
     vi.mocked(api.listModelProfiles).mockResolvedValue([profile]);
-    const listModels = vi.spyOn(api, "listModelProfileModels").mockResolvedValue(["research-model-a", "research-model-b"]);
+    const listModels = vi.spyOn(api, "listModelProfileModelDiscovery").mockResolvedValue({ models: ["research-model-a", "research-model-b"], source: "provider", can_refresh: true });
     const saved = deferred<Awaited<ReturnType<typeof api.saveModelProfile>>>();
     const save = vi.spyOn(api, "saveModelProfile").mockReturnValue(saved.promise);
     render(<DesktopApp />);
@@ -680,7 +680,7 @@ describe("DesktopApp", () => {
   it("keeps the current model and unlocks the composer when saving an API model fails", async () => {
     const { stateSpy } = setupConversationStateHarness();
     stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
-    vi.spyOn(api, "listModelProfileModels").mockResolvedValue([stateModel.model, "other-api-model"]);
+    vi.spyOn(api, "listModelProfileModelDiscovery").mockResolvedValue({ models: [stateModel.model, "other-api-model"], source: "provider", can_refresh: true });
     vi.spyOn(api, "saveModelProfile").mockRejectedValue(new Error("sensitive transport detail"));
     render(<DesktopApp />);
     await screen.findByText(/Agent 模式：LOCAL/);

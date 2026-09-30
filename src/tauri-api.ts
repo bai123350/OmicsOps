@@ -159,7 +159,8 @@ export async function listModelProfiles(): Promise<ModelProfile[]> {
   return isTauri() ? invoke("list_model_profiles") : [];
 }
 
-export async function saveModelProfile(request: { id?: string; label: string; provider: ModelProfile["provider"]; base_url: string; model: string; credential?: string; context_window_tokens?: number; refresh_catalog?: boolean; reasoning_effort?: ModelProfile["reasoning_effort"]; fast_mode?: ModelProfile["fast_mode"]; delegated_model_profile_id?: string | null }): Promise<ModelProfile> {
+export async function saveModelProfile(request: import("./types").SaveModelProfileRequest): Promise<ModelProfile> {
+  if (request.provider === "open_ai_codex" || request.provider === "claude_code") requireSubscriptionDesktop();
   if (!isTauri()) return { id: request.id ?? crypto.randomUUID(), label: request.label, provider: request.provider, base_url: request.base_url, model: request.model, credential_reference: request.provider === "ollama" ? null : "model/demo", supports_tools: true, supports_vision: false, context_window_tokens: request.context_window_tokens, fast_mode: request.fast_mode };
   return invoke("save_model_profile", { request });
 }
@@ -175,6 +176,31 @@ export async function probeModelProfile(profileId: string): Promise<ModelProbeRe
 
 export async function listModelProfileModels(profileId: string): Promise<string[]> {
   return isTauri() ? invoke("list_model_profile_models", { profileId }) : ["demo-model"];
+}
+
+function requireSubscriptionDesktop() {
+  if (!isTauri()) throw new Error("Subscription authentication requires the desktop app.");
+}
+export async function beginCodexLogin(profileId?: string): Promise<import("./types").BeginCodexLoginResponse> {
+  requireSubscriptionDesktop(); return invoke("subscription_begin_codex_login", { profileId: profileId ?? null });
+}
+export async function pollCodexLogin(loginId: string): Promise<import("./types").CodexLoginStateResponse> {
+  requireSubscriptionDesktop(); return invoke("subscription_poll_codex_login", { loginId });
+}
+export async function cancelCodexLogin(loginId: string): Promise<import("./types").CodexLoginStateResponse> {
+  requireSubscriptionDesktop(); return invoke("subscription_cancel_codex_login", { loginId });
+}
+export async function finishCodexLogin(request: import("./types").FinishCodexLoginRequest): Promise<ModelProfile> {
+  requireSubscriptionDesktop(); return invoke("subscription_finish_codex_login", { request });
+}
+export async function subscriptionModelStatus(profileId: string): Promise<import("./types").SubscriptionModelStatus> {
+  requireSubscriptionDesktop(); return invoke("subscription_model_status", { profileId });
+}
+export async function disconnectCodex(profileId: string): Promise<ModelProfile> {
+  requireSubscriptionDesktop(); return invoke("subscription_disconnect_codex", { profileId });
+}
+export async function listModelProfileModelDiscovery(profileId: string): Promise<import("./types").ModelDiscoveryResult> {
+  return isTauri() ? invoke("list_model_profile_model_discovery", { profileId }) : { models: ["demo-model"], source: "provider", can_refresh: true };
 }
 
 export async function onConversationEvent(callback: (event: { project_id: string; conversation_id: string; message: WorkspaceMessage }) => void): Promise<UnlistenFn> {

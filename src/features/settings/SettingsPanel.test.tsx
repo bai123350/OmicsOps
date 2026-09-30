@@ -95,7 +95,7 @@ describe("SettingsPanel model providers", () => {
     expect(screen.getByLabelText("Read-only subagent model")).toHaveValue("");
   });
 
-  it("configures OpenCode Go with exact protocol routing and blocks Responses-only models", async () => {
+  it("configures OpenCode Go with exact Chat, Messages and Responses protocols", async () => {
     const save = vi.fn().mockResolvedValue(undefined);
     render(<SettingsPanel locale="en-US" onClose={() => undefined} onSaveModel={save} />);
 
@@ -122,8 +122,8 @@ describe("SettingsPanel model providers", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Configure OpenCode Go" }));
     fireEvent.change(screen.getByLabelText("Model"), { target: { value: "grok-4.6" } });
-    expect(screen.getByRole("alert")).toHaveTextContent("Responses API");
-    expect(screen.getByRole("button", { name: "Save provider" })).toBeDisabled();
+    expect(screen.getByLabelText("API protocol")).toHaveValue("open_ai_responses");
+    expect(screen.getByRole("button", { name: "Save provider" })).toBeEnabled();
 
     fireEvent.change(screen.getByLabelText("Model"), { target: { value: "custom-go-model" } });
     expect(screen.getByLabelText("API protocol")).toBeEnabled();
@@ -144,7 +144,7 @@ describe("SettingsPanel model providers", () => {
     expect(screen.queryByLabelText("Requested reasoning effort")).not.toBeInTheDocument();
   });
 
-  it("preserves OpenCode Go protocol while editing and disables unsupported discovered models", async () => {
+  it("preserves OpenCode Go protocol while editing and selects explicit discovered protocols", async () => {
     const profile = { id: "go", label: "Go messages", provider: "anthropic" as const, base_url: "https://opencode.ai:443/zen/go/v1/", model: "minimax-m2.7", credential_reference: "model/go", supports_tools: true, supports_vision: false };
     const list = vi.fn().mockResolvedValue(["minimax-m2.7", "gpt-5.6-luna", "future-custom"]);
     render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[profile]} onListModels={list} />);
@@ -156,8 +156,10 @@ describe("SettingsPanel model providers", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
 
     fireEvent.click(screen.getByRole("button", { name: "Models" }));
-    await screen.findByRole("button", { name: /gpt-5.6-luna.*unsupported/i });
-    expect(screen.getByRole("button", { name: /gpt-5.6-luna.*unsupported/i })).toBeDisabled();
+    await screen.findByRole("button", { name: "gpt-5.6-luna" });
+    fireEvent.click(screen.getByRole("button", { name: "gpt-5.6-luna" }));
+    expect(screen.getByLabelText("API protocol")).toHaveValue("open_ai_responses");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     fireEvent.click(screen.getByRole("button", { name: "future-custom" }));
     expect(screen.getByLabelText("Model")).toHaveValue("future-custom");
     expect(screen.getByLabelText("API protocol")).toHaveValue("anthropic");

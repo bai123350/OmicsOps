@@ -1,12 +1,13 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, beforeEach, vi } from "vitest";
 
-import { listModelProfileModels } from "../../tauri-api";
+import { listModelProfileModels, listModelProfileModelDiscovery } from "../../tauri-api";
 import type { ModelProfile } from "../../types";
 import { ApiModelPicker } from "./ApiModelPicker";
 
 vi.mock("../../tauri-api", () => ({
   listModelProfileModels: vi.fn(),
+  listModelProfileModelDiscovery: vi.fn(),
 }));
 
 const profile = (overrides: Partial<ModelProfile> = {}): ModelProfile => ({
@@ -52,6 +53,22 @@ function deferred<T>() {
 describe("ApiModelPicker", () => {
   beforeEach(() => {
     vi.mocked(listModelProfileModels).mockReset();
+    vi.mocked(listModelProfileModelDiscovery).mockReset();
+    vi.mocked(listModelProfileModelDiscovery).mockImplementation(async id => ({ models: await listModelProfileModels(id), source: "provider", can_refresh: true }));
+  });
+
+  it("subscription_picker_retains_selected_profile_and_discovery_source", async () => {
+    vi.mocked(listModelProfileModels).mockResolvedValue([]);
+    vi.mocked(listModelProfileModelDiscovery).mockResolvedValue({ models: ["full-id"], source: "configured_only", can_refresh: false });
+    const selected = profile({ provider: "open_ai_codex", model: "full-id", base_url: "https://chatgpt.com/backend-api" });
+    const choose = vi.fn().mockResolvedValue(undefined);
+    renderPicker({ profiles: [selected], onModelSelect: choose }); openPicker();
+    await screen.findByText(/configured models only/i);
+    expect(screen.getByRole("button", { name: "Refresh models" })).toBeDisabled();
+    expect(screen.getByRole("menuitemradio", { name: "full-id" })).toHaveAttribute("aria-checked", "true");
+    fireEvent.change(screen.getByLabelText("Full model ID"), { target: { value: "manual-complete-id" } });
+    fireEvent.click(screen.getByRole("button", { name: "Use full model ID" }));
+    await waitFor(() => expect(choose).toHaveBeenCalledWith(selected, "manual-complete-id"));
   });
 
   it("renders every API model and filters the complete list", async () => {

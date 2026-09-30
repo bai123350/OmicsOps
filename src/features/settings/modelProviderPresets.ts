@@ -13,6 +13,8 @@ export interface ModelProviderPreset {
 }
 
 export const modelProviderPresets: readonly ModelProviderPreset[] = [
+  { id: "codex-subscription", label: "Codex subscription", provider: "open_ai_codex", base_url: "https://chatgpt.com/backend-api", detailZh: "ChatGPT 订阅 · 官方设备登录", detailEn: "ChatGPT subscription · official device sign-in" },
+  { id: "claude-subscription", label: "Claude Code subscription", provider: "claude_code", base_url: "claude-code://local", detailZh: "Windows 原生 CLI · 生成暂禁用", detailEn: "Native Windows CLI · generation disabled" },
   { id: "anthropic", label: "Anthropic", provider: "anthropic", base_url: "https://api.anthropic.com/", detailZh: "Messages API · 工具调用", detailEn: "Messages API · tool use" },
   { id: "openai", label: "OpenAI", provider: "open_ai_compatible", base_url: "https://api.openai.com/v1", detailZh: "官方 API · Chat Completions", detailEn: "Official API · Chat Completions" },
   { id: "deepseek", label: "DeepSeek", provider: "open_ai_compatible", base_url: "https://api.deepseek.com/v1", detailZh: "官方 API · Flash / Pro", detailEn: "Official API · Flash / Pro" },
@@ -27,7 +29,7 @@ export const modelProviderPresets: readonly ModelProviderPreset[] = [
   { id: "ollama", label: "Ollama", provider: "ollama", base_url: "http://127.0.0.1:11434/", detailZh: "本地模型 · Ollama API", detailEn: "Local models · Ollama API" },
   { id: "lm-studio", label: "LM Studio", provider: "open_ai_compatible", base_url: "http://127.0.0.1:1234/v1", detailZh: "本地模型 · 可选密钥", detailEn: "Local models · optional key" },
   { id: "openrouter", label: "OpenRouter", provider: "open_ai_compatible", base_url: "https://openrouter.ai/api/v1", detailZh: "模型路由 · 完整模型 ID", detailEn: "Model routing · full model ID" },
-  { id: "opencode-go", label: "OpenCode Go", provider: "open_ai_compatible", base_url: "https://opencode.ai/zen/go/v1", detailZh: "官方端点 · Chat / Messages", detailEn: "Official endpoint · Chat / Messages" },
+  { id: "opencode-go", label: "OpenCode Go", provider: "open_ai_compatible", base_url: "https://opencode.ai/zen/go/v1", detailZh: "官方端点 · Chat / Messages", detailEn: "Official endpoint · Chat / Messages / Responses" },
   { id: "custom", label: "OpenAI-compatible", provider: "open_ai_compatible", base_url: "https://api.openai.com/", detailZh: "Chat Completions · 自定义 Base URL", detailEn: "Chat Completions · custom Base URL" },
 ];
 
@@ -54,7 +56,7 @@ export function matchesModelProviderPreset(profile: EndpointProfile, preset: Mod
   if (preset.id === "custom") return false;
   if (preset.id === "lm-studio") return isLocalLmStudioEndpoint(profile);
   if (preset.id === "opencode-go") {
-    if (profile.provider !== "anthropic" && profile.provider !== "open_ai_compatible") return false;
+    if (!["anthropic", "open_ai_compatible", "open_ai_responses"].includes(profile.provider)) return false;
   } else if (profile.provider !== preset.provider) return false;
   const actual = parsedEndpoint(profile.base_url);
   const expected = parsedEndpoint(preset.base_url);

@@ -277,13 +277,13 @@ CLI 预检无法满足设计时，保留明确错误与已完成增量，修订�
 - `SubscriptionModelForm` props：`provider: "open_ai_codex" | "claude_code"`、`profile: ModelProfile | null`、`onSaved(profile: ModelProfile): void`、`onCancel(): void`、`zh: boolean`；复用现有设置状态，不新增独立 Agent binding。
 - picker 使用有来源的 discovery API；既有 Vec wrapper 留给未迁移调用。CLI 非 API 标签，configured-only 不假装服务发现失败；完整 ID 手填始终可用。
 
-- [ ] 写 `subscription_form_saves_provider_specific_payloads_without_secrets`：Codex begin/authorized/finish/disconnect 正确；Claude 无 key 框，只读 auth 状态；Go 三协议准确 payload；opaque binding 不由表单输入。 关键断言：`expect(savedPayload).not.toHaveProperty("subscription_account_ref"); expect(savedPayload).not.toHaveProperty("refresh_token"); expect(claudeKeyInput).toBeNull();`
-- [ ] 写 `subscription_form_escape_cancels_only_top_layer`：打开后立即 window Escape，不聚焦内部；只关闭顶层、父设置仍开；cancel 只调用一次；late authorized/result 不保存/重开。 关键断言：`expect(parentSettings).toBeVisible(); expect(cancelLogin).toHaveBeenCalledTimes(1); expect(finishLogin).not.toHaveBeenCalled();`
-- [ ] 写 `subscription_picker_retains_selected_profile_and_discovery_source`：错误/空/ConfiguredOnly 区分；手填 ID、重启加载、禁用不支持 effort/Fast；换 Go ID 明确换协议；旧 profile ordinary edit 不刷新能力。 关键断言：`expect(selectedProfileIdAfterRestart).toBe(selectedProfileIdBefore); expect(configuredOnlyRefresh).toBeDisabled();`
-- [ ] 运行 `npm test -- src/features/settings/SubscriptionModelForm.test.tsx src/features/settings/SettingsPanel.test.tsx src/features/workspace/ApiModelPicker.test.tsx src/tauri-api.subscription-models.test.ts`，确认预期失败。
-- [ ] 实现内嵌表单/原生调用/列表刷新；需要覆盖层时用现有窗口 Escape stack，cleanup 取消轮询。显示订阅登录/CLI安装与模型服务传输说明，不泄露 scheduler、tool alias 或原始协议。
-- [ ] 重跑局部前端测试、`src/tauri-api.model.test.ts` 和 `npm run build`，应通过；现有平台入口和旧保存 payload 不变。
-- [ ] 提交 `feat: add subscription model settings and chat selection`。
+- [x] 写 `subscription_form_saves_provider_specific_payloads_without_secrets`：Codex begin/authorized/finish/disconnect 正确；Claude 无 key 框，只读 auth 状态；Go 三协议准确 payload；opaque binding 不由表单输入。 关键断言：`expect(savedPayload).not.toHaveProperty("subscription_account_ref"); expect(savedPayload).not.toHaveProperty("refresh_token"); expect(claudeKeyInput).toBeNull();`
+- [x] 写 `subscription_form_escape_cancels_only_top_layer`：打开后立即 window Escape，不聚焦内部；只关闭顶层、父设置仍开；cancel 只调用一次；late authorized/result 不保存/重开。 关键断言：`expect(parentSettings).toBeVisible(); expect(cancelLogin).toHaveBeenCalledTimes(1); expect(finishLogin).not.toHaveBeenCalled();`
+- [x] 写 `subscription_picker_retains_selected_profile_and_discovery_source`：错误/空/ConfiguredOnly 区分；手填 ID、重启加载、禁用不支持 effort/Fast；换 Go ID 明确换协议；旧 profile ordinary edit 不刷新能力。 关键断言：`expect(selectedProfileIdAfterRestart).toBe(selectedProfileIdBefore); expect(configuredOnlyRefresh).toBeDisabled();`
+- [x] 运行 `npm test -- src/features/settings/SubscriptionModelForm.test.tsx src/features/settings/SettingsPanel.test.tsx src/features/workspace/ApiModelPicker.test.tsx src/tauri-api.subscription-models.test.ts`，确认预期失败。
+- [x] 实现内嵌表单/原生调用/列表刷新；需要覆盖层时用现有窗口 Escape stack，cleanup 取消轮询。显示订阅登录/CLI安装与模型服务传输说明，不泄露 scheduler、tool alias 或原始协议。
+- [x] 重跑局部前端测试、`src/tauri-api.model.test.ts` 和 `npm run build`，应通过；现有平台入口和旧保存 payload 不变。
+- [x] 提交 `feat: add subscription model settings and chat selection`。
 
 ## Task 12: 完整回归、真实 opt-in 验收与交付记录
 
@@ -376,3 +376,5 @@ Task 9：主对话、Plan、总结、旁聊、委派、reviewer、压缩与澄�
 续接仅投影当前 run 的完整验证事件链；其它运行的对话历史仍作为有界文本证据。临时委派节点独立保存调用内续接，主运行只保存已验证节点结果。MCP 请求只允许依据同一已验证事件链中的冻结目录补齐宿主绑定字段；其它参数差异拒绝。心跳/usage/空片段不推进 idle；opaque reasoning 不进入普通上下文。
 
 Task 10: Six exact Go Responses IDs appended from models.dev source SHA 664e5052595cb2464666cbe71b26917f6b903d967ce9bd0d39e347a3c5aa84bc; old rows and top source SHA remain unchanged. Missing catalog/protocol tests observed RED then GREEN. Python 4 passed; desktop model_ 38 passed/1 ignored; facade 5 and Responses 6 passed; fmt/diff check passed. Effort is validated per exact ID, unknown IDs keep options unset. Source-advertised vision remains in catalog but host subscription image transport remains unsupported. No real subscription generation executed.
+
+Task 11: Subscription settings and existing chat picker are connected. Codex device sign-in requires explicit Save after authorization; cleanup cancels each challenge once, including late begin/poll results. Claude has native executable setup, read-only saved-profile status and visible production policy gate; no key input. Go switches all three exact protocols and displays Muse training disclosure. Discovery retains its source; ConfiguredOnly cannot refresh and full-ID input remains available. Ordinary edits omit catalog refresh, account bindings and untouched budget/effort/delegation fields. Settings 87, desktop application 95, final subscription form 6, picker 9, preset 2, API wrappers 5 and routing 1 tests passed in their targeted runs; final Web build passed. No GUI or actual subscription sign-in executed.

@@ -162,6 +162,42 @@ export interface ModelProfile {
   subscription_account_ref?: string | null;
 }
 
+export interface SaveModelProfileRequest {
+  id?: string;
+  label: string;
+  provider: ModelProfile["provider"];
+  base_url: string;
+  model: string;
+  credential?: string;
+  context_window_tokens?: number;
+  refresh_catalog?: boolean;
+  reasoning_effort?: ModelProfile["reasoning_effort"];
+  fast_mode?: ModelProfile["fast_mode"];
+  delegated_model_profile_id?: string | null;
+  cli_executable?: string | null;
+}
+export interface BeginCodexLoginResponse {
+  login_id: string;
+  verification_uri: string;
+  user_code: string;
+  expires_at: string;
+}
+export interface CodexLoginStateResponse {
+  login_id: string;
+  state: "pending" | "authorized" | "saved" | "cancelled" | "expired" | "failed";
+  expires_at: string;
+  error_code: string | null;
+}
+export interface FinishCodexLoginRequest { login_id: string; profile: SaveModelProfileRequest }
+export interface SubscriptionModelStatus {
+  provider: string;
+  authenticated: boolean;
+  masked_account_label: string | null;
+  cli_version: string | null;
+  error_code: string | null;
+}
+export interface ModelDiscoveryResult { models: string[]; source: "provider" | "configured_only"; can_refresh: boolean }
+
 export interface ExecutionPlanV4 {
   schema_version: 4;
   objective: string;
