@@ -292,6 +292,93 @@ struct MockTransport {
     wire: String,
 }
 #[test]
+fn responses_failure_codes_are_sanitized_and_preserve_recovery_categories() {
+    for (event, expected) in [
+        (
+            json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}),
+            "truncated_output:",
+        ),
+        (
+            json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}),
+            "responses_content_filter",
+        ),
+        (
+            json!({"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"SENTINEL"}}}),
+            "responses_http_429",
+        ),
+        (
+            json!({"type":"error","code":"context_length_exceeded","message":"SENTINEL"}),
+            "context_length_exceeded",
+        ),
+        (
+            json!({"type":"error","code":"insufficient_quota","message":"SENTINEL"}),
+            "responses_quota_exhausted",
+        ),
+        (
+            json!({"type":"error","code":"permission_denied","message":"SENTINEL"}),
+            "responses_http_403",
+        ),
+        (
+            json!({"type":"error","code":"server_error","message":"SENTINEL"}),
+            "responses_http_503",
+        ),
+        (
+            json!({"type":"error","code":"UNKNOWN_SENTINEL","message":"SENTINEL"}),
+            "responses_generation_failed",
+        ),
+    ] {
+        let mut decoder = ResponsesStreamDecoder::for_request(&request());
+        let error = decoder
+            .push(frame(event).as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{error}");
+        assert!(!error.contains("SENTINEL"));
+        assert!(decoder.finish().is_err());
+    }
+}
+#[tokio::test]
+async fn responses_http_error_details_are_bounded_allowlisted_and_single_dispatch() {
+    for (body, expected) in [
+        (
+            json!({"error":{"type":"insufficient_quota","message":"SENTINEL"}}).to_string(),
+            "responses_quota_exhausted",
+        ),
+        (
+            json!({"error":{"code":"context_length_exceeded","message":"SENTINEL"}}).to_string(),
+            "context_length_exceeded",
+        ),
+        ("SENTINEL".repeat(150_000), "responses_http_429"),
+    ] {
+        let transport = Arc::new(MockTransport {
+            calls: AtomicUsize::new(0),
+            status: 429,
+            wire: body,
+        });
+        let client = ResponsesHttpClient::new(
+            ResponsesEndpointKind::OpenCodeGo,
+            Url::parse("https://opencode.ai/zen/go/v1").unwrap(),
+            "fixture".into(),
+            None,
+            Uuid::new_v4(),
+        )
+        .unwrap()
+        .with_transport(transport.clone());
+        let error = client
+            .stream_once(
+                request(),
+                ResponsesAuthorization::bearer("fixture-token".into(), None),
+                |_| {},
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{error}");
+        assert!(!error.contains("SENTINEL"));
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+    }
+}
+#[test]
 fn responses_interleaved_calls_keep_item_identity_and_reject_native_tools() {
     let name = alias();
     let added = |index: u32, id: &str| {

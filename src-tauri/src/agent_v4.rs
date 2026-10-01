@@ -5639,6 +5639,10 @@ fn classify_model_failure(message: &str) -> ModelFailureV4 {
     let lower = message.to_ascii_lowercase();
     if lower.contains("unknown_provider_tool:") {
         ModelFailureV4::permanent(ModelErrorClassV4::InvalidResponse, message)
+    } else if lower.contains("responses_quota_exhausted")
+        || lower.contains("responses_content_filter")
+    {
+        ModelFailureV4::permanent(ModelErrorClassV4::InvalidRequest, message)
     } else if lower.contains("context_length_exceeded") || lower.contains("context_window_exceeded")
     {
         ModelFailureV4::permanent(ModelErrorClassV4::ContextOverflow, message)
@@ -5658,6 +5662,9 @@ fn classify_model_failure(message: &str) -> ModelFailureV4 {
         || lower.contains("unexpected eof")
         || lower.contains("stream ended")
         || lower.contains("incomplete message")
+        || lower.contains("responses_network_failed")
+        || lower.contains("responses_stream_network_failed")
+        || lower.contains("responses_terminal_missing")
         || lower
             == "model endpoint failed: incomplete model stream: no terminal provider event; tool calls were not dispatched"
     {

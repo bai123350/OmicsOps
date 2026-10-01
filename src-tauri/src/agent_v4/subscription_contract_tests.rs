@@ -181,7 +181,11 @@ fn services(profile: &ModelProfile) -> Arc<ModelClientServices> {
         claude: Arc::new(ClaudeRunner::default()),
     })
 }
-fn model(profile: &ModelProfile, root: &Path, transport: Arc<Transport>) -> DesktopModelPortV4 {
+fn model(
+    profile: &ModelProfile,
+    root: &Path,
+    transport: Arc<dyn ResponsesTransport>,
+) -> DesktopModelPortV4 {
     DesktopModelPortV4 {
         client: crate::commands::model_client_for_profile_with_services(profile, services(profile))
             .unwrap()
@@ -195,6 +199,230 @@ fn model(profile: &ModelProfile, root: &Path, transport: Arc<Transport>) -> Desk
         reviewer: None,
         delegated: None,
     }
+}
+struct FailureTransport {
+    requests: StdMutex<Vec<Value>>,
+    first: String,
+}
+#[async_trait]
+impl ResponsesTransport for FailureTransport {
+    async fn post(
+        &self,
+        _: url::Url,
+        _: reqwest::header::HeaderMap,
+        body: Value,
+        _: Duration,
+    ) -> AdapterResult<ResponsesHttpStream> {
+        let mut requests = self.requests.lock().unwrap();
+        let first = requests.is_empty();
+        requests.push(body);
+        let body = if first {
+            self.first.clone()
+        } else {
+            format!(
+                "data: {}\n\n",
+                json!({"type":"response.completed","response":{"id":format!("response_{}",requests.len()),"status":"completed","output":[{"type":"message","id":"msg","role":"assistant","content":[{"type":"output_text","text":"fresh_result"}]}]}})
+            )
+        };
+        Ok(ResponsesHttpStream {
+            status: 200,
+            body: Box::pin(stream::iter(vec![Ok(body.into_bytes())])),
+        })
+    }
+}
+#[test]
+fn subscription_responses_errors_reach_the_host_classifier() {
+    for (wire, class, retryable, marker) in [
+        (
+            json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}),
+            ModelErrorClassV4::InvalidResponse,
+            false,
+            "truncated_output:",
+        ),
+        (
+            json!({"type":"error","code":"rate_limit_exceeded","message":"SENTINEL"}),
+            ModelErrorClassV4::RateLimited,
+            true,
+            "responses_http_429",
+        ),
+        (
+            json!({"type":"error","code":"context_length_exceeded","message":"SENTINEL"}),
+            ModelErrorClassV4::ContextOverflow,
+            false,
+            "context_length_exceeded",
+        ),
+        (
+            json!({"type":"error","code":"insufficient_quota","message":"SENTINEL"}),
+            ModelErrorClassV4::InvalidRequest,
+            false,
+            "responses_quota_exhausted",
+        ),
+        (
+            json!({"type":"error","code":"permission_denied","message":"SENTINEL"}),
+            ModelErrorClassV4::Authentication,
+            false,
+            "responses_http_403",
+        ),
+    ] {
+        let error =
+            omicsops_adapters::responses::ResponsesStreamDecoder::for_request(&ProviderRequest {
+                system: String::new(),
+                messages: vec![],
+                tools: vec![],
+                require_strict_json_fallback: false,
+                replay: vec![],
+            })
+            .push(format!("data: {wire}\n\n").as_bytes())
+            .unwrap_err()
+            .to_string();
+        let failure = classify_model_failure(&error);
+        assert_eq!(failure.class, class, "{error}");
+        assert_eq!(failure.retryable, retryable);
+        assert!(failure.message.contains(marker));
+        assert!(!failure.message.contains("SENTINEL"));
+    }
+    for code in [
+        "responses_network_failed",
+        "responses_stream_network_failed",
+        "responses_terminal_missing",
+    ] {
+        let failure = classify_model_failure(&format!("model endpoint failed: {code}"));
+        assert_eq!(failure.class, ModelErrorClassV4::Transport);
+        assert!(failure.retryable);
+    }
+}
+#[tokio::test]
+async fn subscription_responses_output_limit_replaces_partial_attempt_without_side_chat_resend() {
+    let root = tempfile::tempdir().unwrap();
+    let profile = profile(ModelProviderKind::OpenAiResponses);
+    let first = format!(
+        "data: {}\n\ndata: {}\n\n",
+        json!({"type":"response.output_text.delta","delta":"discarded_partial"}),
+        json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}})
+    );
+    let transport = Arc::new(FailureTransport {
+        requests: StdMutex::new(vec![]),
+        first: first.clone(),
+    });
+    let model = model(&profile, root.path(), transport.clone());
+    let selection = ComputeSelectionV4 {
+        schema_version: 4,
+        backend_id: "local".into(),
+        backend_kind: ComputeBackendKindV4::Local,
+        autonomy_mode: AutonomyModeV4::Supervised,
+        approval_policy: ApprovalPolicyV4::RiskBased,
+        environment: "system".into(),
+        network_policy: NetworkPolicyV4::HostInherited,
+        container_image: None,
+    };
+    let plan = ExecutionPlanV4 {
+        schema_version: 4,
+        objective: "fixture status".into(),
+        steps: vec!["answer".into()],
+        completion_criteria: vec!["verified answer".into()],
+        requested_capabilities: Default::default(),
+    };
+    let (run, project, conversation) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let hash =
+        RunSpecV4::approval_hash_for(run, project, conversation, profile.id, &plan, &selection)
+            .unwrap();
+    let spec = RunSpecV4::freeze_ordinary_agent_with_compute(
+        run,
+        project,
+        conversation,
+        profile.id,
+        plan,
+        selection,
+        &hash,
+        Utc::now(),
+    )
+    .unwrap();
+    let events = Events::default();
+    events
+        .append(&AgentEventV4::first(
+            run,
+            project,
+            conversation,
+            Utc::now(),
+            AgentEventKindV4::RunCreated {
+                mode: omicsops_protocol::RunModeV4::Execute,
+            },
+        ))
+        .await
+        .unwrap();
+    let host = Arc::new(Host {
+        root: root.path().to_owned(),
+        reads: AtomicUsize::new(0),
+        deletes: AtomicUsize::new(0),
+    });
+    let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), host.clone()).unwrap();
+    let result = AgentCoreV4 {
+        model: &model,
+        tools: &registry,
+        events: &events,
+        science: None,
+    }
+    .execute_with_limits(
+        &spec,
+        AgentLimitsV4 {
+            max_turns: 1,
+            max_model_retries: 0,
+            auto_continue: true,
+            auto_continue_limit: 1,
+            ..Default::default()
+        },
+        &AtomicBool::new(false),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(omicsops_agent_core::AgentCoreErrorV4::NeedsAttention(_))
+        ),
+        "{result:?}"
+    );
+    let requests = transport.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests[1]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("previous response reached its output limit")
+    );
+    let stored = events.load(run).await.unwrap();
+    assert!(
+        stored
+            .iter()
+            .any(|e| matches!(&e.event,AgentEventKindV4::ModelText {text} if text=="fresh_result"))
+    );
+    assert!(!stored.iter().any(|e|matches!(&e.event,AgentEventKindV4::ModelText {text} if text.contains("discarded_partial"))));
+    assert_eq!(host.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(host.deletes.load(Ordering::SeqCst), 0);
+    drop(requests);
+    let single = Arc::new(FailureTransport {
+        requests: StdMutex::new(vec![]),
+        first,
+    });
+    let client =
+        crate::commands::model_client_for_profile_with_services(&profile, services(&profile))
+            .unwrap()
+            .with_responses_transport(single.clone());
+    assert!(
+        client
+            .stream_with_provider_once(
+                ProviderRequest {
+                    system: "fixture".into(),
+                    messages: vec![],
+                    tools: vec![],
+                    require_strict_json_fallback: false,
+                    replay: vec![]
+                },
+                |_| {}
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(single.requests.lock().unwrap().len(), 1);
 }
 #[tokio::test]
 async fn subscription_v4_model_roles_preserve_selected_profile_and_frozen_identity() {

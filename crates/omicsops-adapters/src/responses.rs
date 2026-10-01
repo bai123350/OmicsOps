@@ -31,6 +31,56 @@ fn invalid(code: &str) -> AdapterError {
     AdapterError::Llm(code.into())
 }
 
+// Only reviewed codes cross the host boundary. Provider messages/parameters,
+// response bodies and unknown codes can contain secrets or prompt fragments.
+fn provider_failure(error: &Value, fallback: &str) -> AdapterError {
+    for field in ["code", "type"] {
+        let code = match error[field].as_str() {
+            Some("context_length_exceeded" | "context_window_exceeded") => {
+                "context_length_exceeded: responses"
+            }
+            Some("rate_limit_exceeded") => "responses_http_429_rate_limit",
+            Some(
+                "insufficient_quota"
+                | "organization_usage_limit_exceeded"
+                | "organization_spend_limit_exceeded"
+                | "project_spend_limit_exceeded"
+                | "billing_not_active"
+                | "billing_hard_limit_reached",
+            ) => "responses_quota_exhausted",
+            Some("invalid_api_key" | "authentication_error") => "responses_http_401",
+            Some("permission_denied" | "permission_error" | "insufficient_permissions") => {
+                "responses_http_403"
+            }
+            Some("server_error" | "server_is_overloaded" | "service_unavailable_error") => {
+                "responses_http_503"
+            }
+            Some("content_filter") => "responses_content_filter",
+            _ => continue,
+        };
+        return invalid(code);
+    }
+    invalid(fallback)
+}
+
+async fn http_failure(response: &mut ResponsesHttpStream) -> AdapterError {
+    let fallback = format!("responses_http_{}", response.status);
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.body.next().await {
+        let Ok(chunk) = chunk else {
+            return invalid(&fallback);
+        };
+        if bytes.len().saturating_add(chunk.len()) > MAX_LINE {
+            return invalid(&fallback);
+        }
+        bytes.extend(chunk);
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return invalid(&fallback);
+    };
+    provider_failure(&value["error"], &fallback)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponsesEndpointKind {
     CodexSubscription,
@@ -339,8 +389,26 @@ impl ResponsesStreamDecoder {
                 }
             }
             "response.completed" => return self.complete(&value["response"]),
-            "response.failed" | "response.incomplete" | "error" => {
-                return Err(invalid("responses_generation_failed"));
+            "response.incomplete" => {
+                return Err(invalid(
+                    match value["response"]["incomplete_details"]["reason"].as_str() {
+                        Some("max_output_tokens") => "truncated_output: responses_output_limit",
+                        Some("content_filter") => "responses_content_filter",
+                        _ => "responses_incomplete_unknown",
+                    },
+                ));
+            }
+            "response.failed" => {
+                return Err(provider_failure(
+                    &value["response"]["error"],
+                    "responses_generation_failed",
+                ));
+            }
+            "error" => {
+                return Err(provider_failure(
+                    value.get("error").unwrap_or(&value),
+                    "responses_generation_failed",
+                ));
             }
             "response.in_progress"
             | "response.output_item.done"
@@ -788,7 +856,7 @@ impl ResponsesHttpClient {
                 .post(wire.endpoint, headers, wire.body, timeout)
                 .await?;
             if response.status != 200 {
-                return Err(invalid(&format!("responses_http_{}", response.status)));
+                return Err(http_failure(&mut response).await);
             }
             let mut decoder = ResponsesStreamDecoder::for_request(&request);
             while let Some(chunk) = response.body.next().await {
