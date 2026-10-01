@@ -188,6 +188,32 @@ async fn codex_device_poll_rejects_real_denials_without_mistaking_them_for_pendi
     }
 }
 #[tokio::test]
+async fn codex_device_poll_keeps_oauth_slow_down_even_on_http_429() {
+    for body in [
+        br#"{"error":"slow_down"}"#.to_vec(),
+        br#"{"error":{"code":"slow_down"}}"#.to_vec(),
+    ] {
+        let auth = device_auth(vec![
+            (
+                "/api/accounts/deviceauth/usercode",
+                begin_request(),
+                200,
+                br#"{"device_auth_id":"dev","user_code":"ABCD-1234","interval":"5"}"#.to_vec(),
+            ),
+            (
+                "/api/accounts/deviceauth/token",
+                json!({"device_auth_id":"dev","user_code":"ABCD-1234"}),
+                429,
+                body,
+            ),
+        ]);
+        let challenge = auth.begin_device().await.unwrap();
+        assert!(
+            matches!(auth.poll_device(&challenge, Arc::new(AtomicBool::new(false))).await.expect("OAuth slow_down must keep login pending"), CodexDevicePoll::Pending { next_poll_after } if next_poll_after == Duration::from_secs(10))
+        );
+    }
+}
+#[tokio::test]
 async fn codex_device_wire_preserves_pending_and_exchanges_the_granted_code_once() {
     use base64::Engine;
     let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(

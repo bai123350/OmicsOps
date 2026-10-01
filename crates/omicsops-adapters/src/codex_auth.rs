@@ -321,7 +321,10 @@ impl CodexAuthTransport for CodexDeviceAuth {
         check_login(challenge, &cancelled, self.clock.now_ms())?;
         let response=self.post("/api/accounts/deviceauth/token",CodexAuthHttpBody::Json(json!({"device_auth_id":challenge.device_auth_id,"user_code":challenge.user_code}))).await?;
         check_login(challenge, &cancelled, self.clock.now_ms())?;
-        if let Some(code) = response_error_code(&response) {
+        let response_error = response_error_code(&response);
+        // An explicit OAuth slow_down/pending response takes precedence over a
+        // generic 429 category; keep the owned login alive at the new interval.
+        if let Some(code) = response_error.filter(|code| *code != "codex_device_rate_limited") {
             return Err(error(code));
         }
         if response.status == 200 {
@@ -357,6 +360,9 @@ impl CodexAuthTransport for CodexDeviceAuth {
                 challenge.interval
             }
             Some("slow_down") => challenge.interval.saturating_add(Duration::from_secs(5)),
+            _ if response_error == Some("codex_device_rate_limited") => {
+                return Err(error("codex_device_rate_limited"));
+            }
             None if matches!(response.status, 403 | 404) && value.get("error").is_none() => {
                 challenge.interval
             }

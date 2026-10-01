@@ -440,3 +440,8 @@ OpenAI 官方 codex-rs/login/src/device_code_auth.rs。既有 client ID、三个
 HTML 页面与限流类别。完整 HTTP 请求/响应替身校验 begin、pending 和一次授权
 码交换；别名与错误分类测试观察到 RED 后 GREEN，auth 10 项和依赖解析 1 项通过。
 不迁移 Wisp 当前 main 的另一套浏览器授权协议，不导入 CLI 凭据。
+
+独立审查指出新增的通用 429 分类不能覆盖 OAuth slow_down；该响应应继续等待。
+两种 JSON 形态的 429 slow_down 回归先失败后通过，未知 429 仍返回脱敏限流错误。
+最终 auth 11 项和依赖解析 1 项通过。另将 HTML 提示改为检查应用网络/系统代理，
+不承诺完成浏览器验证会修复原生请求；对应界面回归先失败后通过。
