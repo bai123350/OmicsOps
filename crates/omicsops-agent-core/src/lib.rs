@@ -3238,6 +3238,16 @@ impl AgentCoreV4<'_> {
                             }
                             return Err(AgentCoreErrorV4::Cancelled);
                         }
+                        // Apply the same host guard used before ToolRequested. An
+                        // unsafe response is discarded whole; opaque state must
+                        // never retain arguments rejected by the host.
+                        for call in &turn.tool_calls {
+                            if is_browser_tool_id(&call.tool_id) {
+                                self.tools.validate(RunModeV4::Execute, call).map_err(|_| {
+                                    AgentCoreErrorV4::Model("host rejected unsafe browser model response before recording or dispatch".into())
+                                })?;
+                            }
+                        }
                         let continuation = model_replay::validated_continuation(&request, &turn)
                             .map_err(AgentCoreErrorV4::Model)?;
                         self.push(
@@ -6869,6 +6879,118 @@ mod tests {
                 },
             ))
             .unwrap();
+    }
+    struct NativeDecisionModel {
+        turns: Mutex<Vec<Vec<ToolCallV4>>>,
+        requests: Mutex<Vec<ModelRequestV4>>,
+        profile_id: Uuid,
+        reviews: Mutex<Vec<ReviewerReportV4>>,
+    }
+    #[async_trait]
+    impl ModelPortV4 for NativeDecisionModel {
+        fn supports_native_replay(&self) -> bool {
+            true
+        }
+        fn usage_metadata(&self) -> ModelUsageMetadataV4 {
+            ModelUsageMetadataV4 {
+                model_profile_id: self.profile_id,
+                model_configuration_hash: Some("fixture".into()),
+                ..Default::default()
+            }
+        }
+        async fn stream(
+            &self,
+            request: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            self.requests.lock().unwrap().push(request);
+            let calls = self.turns.lock().unwrap().remove(0);
+            let public_text = if calls.is_empty() {
+                "done".into()
+            } else {
+                String::new()
+            };
+            let items = if calls.is_empty() {
+                vec![omicsops_protocol::ModelReplayItemV4::AssistantText {
+                    text: public_text.clone(),
+                }]
+            } else {
+                calls
+                    .iter()
+                    .cloned()
+                    .map(|call| omicsops_protocol::ModelReplayItemV4::ToolCall { call })
+                    .collect()
+            };
+            Ok(ModelTurnV4 {
+                public_text,
+                tool_calls: calls,
+                provider_continuation: Some(omicsops_protocol::ModelProviderContinuationV4 {
+                    items,
+                }),
+            })
+        }
+        async fn review(&self, _: ReviewerRequestV4) -> Result<ReviewerReportV4, ModelFailureV4> {
+            Ok(self.reviews.lock().unwrap().remove(0))
+        }
+    }
+    struct SensitiveBrowserTools;
+    #[async_trait]
+    impl ToolPortV4 for SensitiveBrowserTools {
+        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
+            vec![ToolDescriptorV4 {
+                id: "web_open_tab".into(),
+                description: "open".into(),
+                input_schema: json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}),
+                effect: ToolEffectV4::ReadOnly,
+            }]
+        }
+        fn effect(&self, _: &str) -> Option<ToolEffectV4> {
+            Some(ToolEffectV4::ReadOnly)
+        }
+        fn validate(&self, _: RunModeV4, _: &ToolCallV4) -> Result<(), String> {
+            Err("credential-bearing URL is forbidden".into())
+        }
+        async fn execute(&self, _: RunModeV4, _: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            panic!("unsafe browser call must never dispatch")
+        }
+    }
+    #[tokio::test]
+    async fn subscription_sensitive_arguments_never_reach_replay_or_published_events() {
+        let store = MemoryStore::default();
+        let run_id = Uuid::new_v4();
+        seed_model_turn(&store, run_id);
+        let model = NativeDecisionModel {
+            turns: Mutex::new(vec![vec![ToolCallV4 {
+                call_id: "unsafe-url".into(),
+                tool_id: "web_open_tab".into(),
+                arguments: json!({"url":"https://example.com/?access_token=SENTINEL"}),
+            }]]),
+            requests: Mutex::new(vec![]),
+            profile_id: Uuid::from_u128(77),
+            reviews: Mutex::new(vec![]),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &SensitiveBrowserTools,
+            events: &store,
+            science: None,
+        };
+        let request = ModelRequestV4 {
+            tools: SensitiveBrowserTools.descriptors(RunModeV4::Execute),
+            ..subscription_request()
+        };
+        let result = core
+            .model_turn(run_id, request, 0, Duration::from_secs(1), None)
+            .await;
+        let events = store.load_direct(run_id).unwrap();
+        assert!(!serde_json::to_string(&events).unwrap().contains("SENTINEL"));
+        assert!(!format!("{:?}", store.previews.lock().unwrap()).contains("SENTINEL"));
+        assert!(result.is_err());
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e.event, AgentEventKindV4::ModelReplayRecorded { .. }))
+        );
     }
     struct SubscriptionReplayModel {
         calls: AtomicUsize,

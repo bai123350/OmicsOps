@@ -385,3 +385,5 @@ Task 5 follow-up: Generic credential inventory now identifies Codex keyring refe
 
 Task 12（2026-10-01）：一次性订阅 nonce/Windows stop 的四个 ignored 测试已加入；配置预检测试先失败后通过，原数据库只读且临时 fixture 字节保持不变。未提供显式一次性配置，因此四项真实订阅验收及 Windows GUI/macOS/SSH/PBMC 均未执行；Claude 两项仍会在策略门禁拒绝。临时 nonce 不是科研端到端验收。
 最终确定性检查（包含原生链接和只读凭据修复）：cargo test --workspace 退出 0（1471 通过、16 ignored）；npm test 退出 0（970 Vitest、22 browser bridge）；npm run build、npm run build:desktop、cargo fmt --all -- --check 均通过。桌面构建完成 Windows x64 NSIS 打包，仅作为构建检查，未发布或分发。Python 使用 python -B -m unittest discover -s scripts -p test_import_model_catalog.py，4 项通过；git diff --check 通过。npm 锁文件未改变，无需 npm ci；Cargo 锁依正常 workspace 检查。现有 Web chunk-size 和 Windows linker 提示不影响成功结果。最终独立代码审查及其修复记录待补充。
+
+Final review fix 1: Native continuation now applies the existing host browser guard before persistence. A prohibited response is rejected whole without rewriting opaque state. Sentinel persistence test observed RED (sensitive URL stored) then GREEN; no rejected arguments in durable/published events or replay. Full regression after the complete correction pass remains required.
