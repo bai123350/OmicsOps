@@ -103,6 +103,11 @@ Responses 请求/解码是独立责任模块，可被 Go 和 Codex 共用；既�
 账号关闭 device 登录、工作区限制或服务拒绝，不任意追加 OAuth scopes。
 浏览器 PKCE、已有 CLI 凭据导入和多账户池留到单独的后续设计。
 
+共享 HTTP 客户端必须编译启用 reqwest 的 `system-proxy`；Windows 系统代理是
+默认网络路径的组成部分，环境代理仍按库的优先级生效。不能在关闭默认依赖
+功能时意外退化为直连。本次不新增独立代理配置，固定 HTTPS 端点、证书校验与
+拒绝重定向仍然生效；macOS 的依赖支持不表示已经完成该平台的实际登录验证。
+
 状态机为 `pending -> authorized -> saved`，另有 `cancelled / expired / failed`。
 发起登录返回有界的 `login_id`、固定验证地址、用户码和到期时间；前端只取得
 这些显示字段与状态。后端按服务给定的间隔查询，处理 pending/slow-down，最多

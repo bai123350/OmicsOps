@@ -34,7 +34,7 @@ keyring = { version = "3", features = ["windows-native"] }
 pdf-extract = "0.10"
 quick-xml = "0.38"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "system-proxy"] }
 rustpython-parser = { version = "=0.4.0", default-features = false, features = ["num-bigint"] }
 rustpython-ast = { version = "=0.4.0", default-features = false, features = ["num-bigint", "visitor"] }
 rmcp = { version = "3.0.1", default-features = false, features = ["client", "server", "macros", "schemars", "transport-child-process", "transport-io"] }

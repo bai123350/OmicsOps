@@ -418,3 +418,18 @@ Final review fix 3: Responses incomplete reasons and allowlisted SSE/HTTP error 
 修复后的最终完整验证：cargo test --workspace 退出 0（1480 passed、0 failed、16 ignored）；npm test 退出 0（112 files / 970 Vitest、22 browser bridge）；npm run build、npm run build:desktop（Windows x64 NSIS）、cargo fmt --all -- --check 均退出 0；Python importer 4 passed、git diff --check 通过。现有 Web chunk-size、Windows linker 提示不影响成功结果。原生配置/静态资源实现已构建，但安装、GUI、四项真实订阅 ignored、macOS、SSH、GPU/SLURM 与 PBMC 未执行。Claude 生产生成仍禁用。没有延期 Minor；三项审查发现均以 RED-to-GREEN 和完整回归验证修复。
 
 本分支保留全部逐功能提交；仅清理本计划自有的 ignored scratch，不改 website/，不提交打包产物、用户数据库、日志或秘密。
+
+## Codex 登录故障修复（2026-10-01）
+
+用户截图中的设备登录启动失败已在相同 Windows 主机复现。只申请公开设备码，
+不进行账户授权、不读取个人凭据、不记录设备码：Windows 系统请求返回 200，
+应用实际 CodexDeviceAuth 返回 403；进一步仅识别固定错误码，确认是
+unsupported_country_region_territory。原因是关闭 reqwest 默认功能时遗漏了
+system-proxy，HTTP(S)_PROXY 均未设置时应用没有采用已配置的 Windows 系统代理。
+参考 Wisp ade254989da5d395c6334c893637f32c3ef61ba7 的 Cargo.toml 明确启用了该功能。
+
+新增对实际 Cargo 依赖解析的离线回归检查，验证 adapters/desktop 共用的客户端
+包含 Windows 系统代理能力；原实现观察到 RED，补启功能后 GREEN。使用原封不动
+的 CodexDeviceAuth 再次申请设备码返回成功（设备码存在、间隔 5 秒），证明启动
+失败已修复。依赖锁新增对应平台包；没有放宽 TLS、端点或重定向规则。设备码
+申请成功不等于完成账户登录或模型生成，这两项真实验收仍未执行。
