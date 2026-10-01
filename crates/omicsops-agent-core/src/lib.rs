@@ -2909,7 +2909,7 @@ impl AgentCoreV4<'_> {
     ) -> Result<ModelTurnV4, AgentCoreErrorV4> {
         let usage_metadata = self.model.usage_metadata();
         if self.model.supports_native_replay() && persist_text {
-            let events = self
+            let mut events = self
                 .events
                 .load(run_id)
                 .await
@@ -2917,6 +2917,7 @@ impl AgentCoreV4<'_> {
             let source = events
                 .first()
                 .ok_or_else(|| AgentCoreErrorV4::Store("model replay has no run origin".into()))?;
+            let (project_id, conversation_id) = (source.project_id, source.conversation_id);
             let binding = omicsops_protocol::ModelReplayBindingV4 {
                 model_profile_id: usage_metadata.model_profile_id,
                 configuration_hash: usage_metadata.model_configuration_hash.clone().ok_or_else(
@@ -2927,13 +2928,27 @@ impl AgentCoreV4<'_> {
                     },
                 )?,
             };
-            request.replay = model_replay::project_model_replay(
-                source.project_id,
-                source.conversation_id,
+            let closures = model_replay::pending_replay_closures(
+                project_id,
+                conversation_id,
                 &binding,
                 &events,
             )
             .map_err(AgentCoreErrorV4::NeedsAttention)?;
+            if !closures.is_empty() {
+                for outcome in closures {
+                    self.push(run_id, AgentEventKindV4::ToolFinished { outcome })
+                        .await?;
+                }
+                events = self
+                    .events
+                    .load(run_id)
+                    .await
+                    .map_err(AgentCoreErrorV4::Store)?;
+            }
+            request.replay =
+                model_replay::project_model_replay(project_id, conversation_id, &binding, &events)
+                    .map_err(AgentCoreErrorV4::NeedsAttention)?;
             request.context = model_replay::remove_replayed_context_events(
                 &request.context,
                 &request.replay,
@@ -6991,6 +7006,309 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e.event, AgentEventKindV4::ModelReplayRecorded { .. }))
         );
+    }
+    struct NativeDecisionTools;
+    #[async_trait]
+    impl ToolPortV4 for NativeDecisionTools {
+        fn descriptors(&self, mode: RunModeV4) -> Vec<ToolDescriptorV4> {
+            let mut tools = FakeTools.descriptors(mode);
+            for id in ["agent.request_input", "agent.complete", "project.delete"] {
+                tools.push(ToolDescriptorV4 {
+                    id: id.into(),
+                    description: "fixture".into(),
+                    input_schema: json!({}),
+                    effect: if id == "project.delete" {
+                        ToolEffectV4::Mutating
+                    } else {
+                        ToolEffectV4::ReadOnly
+                    },
+                });
+            }
+            tools
+        }
+        fn effect(&self, id: &str) -> Option<ToolEffectV4> {
+            if id == "project.delete" {
+                Some(ToolEffectV4::Mutating)
+            } else {
+                FakeTools.effect(id)
+            }
+        }
+        fn local_deletion_approval_reason(&self, call: &ToolCallV4) -> Option<String> {
+            FakeTools.local_deletion_approval_reason(call)
+        }
+        async fn execute(
+            &self,
+            mode: RunModeV4,
+            call: ToolCallV4,
+        ) -> Result<ToolOutcomeV4, String> {
+            FakeTools.execute(mode, call).await
+        }
+    }
+    fn native_decision_model(profile_id: Uuid, turns: Vec<Vec<ToolCallV4>>) -> NativeDecisionModel {
+        NativeDecisionModel {
+            turns: Mutex::new(turns),
+            requests: Mutex::new(vec![]),
+            profile_id,
+            reviews: Mutex::new(vec![]),
+        }
+    }
+    fn native_call(id: &str, tool: &str, arguments: serde_json::Value) -> ToolCallV4 {
+        ToolCallV4 {
+            call_id: id.into(),
+            tool_id: tool.into(),
+            arguments,
+        }
+    }
+    #[tokio::test]
+    async fn subscription_clarification_answer_resumes_after_store_reload() {
+        let spec = ordinary_execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = native_decision_model(
+            spec.model_profile_id,
+            vec![vec![native_call(
+                "question",
+                "agent.request_input",
+                json!({"question":"Which sample?"}),
+            )]],
+        );
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &NativeDecisionTools,
+            events: &store,
+            science: None,
+        };
+        let result = core.execute(&spec, 1).await;
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::WaitingForInput)),
+            "{result:?}"
+        );
+        core.push(
+            spec.run_id,
+            AgentEventKindV4::UserInputAnswered {
+                question_id: "question".into(),
+                answer: "sample-A".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let reloaded = MemoryStore::default();
+        *reloaded.events.lock().unwrap() = serde_json::from_str(
+            &serde_json::to_string(&store.load_direct(spec.run_id).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let resumed = native_decision_model(spec.model_profile_id, vec![vec![]]);
+        let core = AgentCoreV4 {
+            model: &resumed,
+            tools: &NativeDecisionTools,
+            events: &reloaded,
+            science: None,
+        };
+        core.model_turn(
+            spec.run_id,
+            subscription_request(),
+            0,
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(resumed.requests.lock().unwrap()[0].replay.iter().any(|item|matches!(item,omicsops_protocol::ModelReplayItemV4::ToolResult {call_id,output} if call_id=="question" && output.contains("sample-A"))));
+    }
+    #[tokio::test]
+    async fn subscription_completion_failure_and_reviewer_corrections_remain_replayable() {
+        for review_fails in [false, true] {
+            let spec = execution_spec(Uuid::new_v4());
+            let store = MemoryStore::default();
+            let evidence = if review_fails {
+                seed_success_evidence(&store, &spec)
+            } else {
+                seed_execution(&store, &spec);
+                99
+            };
+            let model = native_decision_model(
+                spec.model_profile_id,
+                vec![
+                    vec![native_call(
+                        "complete-1",
+                        "agent.complete",
+                        completion_arguments(evidence),
+                    )],
+                    vec![native_call(
+                        "complete-2",
+                        "agent.complete",
+                        completion_arguments(evidence),
+                    )],
+                ],
+            );
+            if review_fails {
+                *model.reviews.lock().unwrap() = vec![
+                    review(VerificationSeverityV4::Error),
+                    review(VerificationSeverityV4::Ok),
+                ];
+            }
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &NativeDecisionTools,
+                events: &store,
+                science: None,
+            };
+            let result = core
+                .execute_with_limits(
+                    &spec,
+                    AgentLimitsV4 {
+                        max_turns: 2,
+                        ..Default::default()
+                    },
+                    &AtomicBool::new(false),
+                )
+                .await;
+            if review_fails {
+                result.unwrap();
+            } else {
+                assert!(
+                    matches!(result, Err(AgentCoreErrorV4::MissingCompletion)),
+                    "{result:?}"
+                );
+            }
+            assert_eq!(model.requests.lock().unwrap().len(), 2);
+            assert!(model.requests.lock().unwrap()[1].replay.iter().any(|item|matches!(item,omicsops_protocol::ModelReplayItemV4::ToolResult {call_id,output} if call_id=="complete-1" && output.contains("completion_decision"))));
+        }
+    }
+    #[tokio::test]
+    async fn subscription_parallel_approval_resume_closes_only_undispatched_proposals() {
+        let spec = ordinary_execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = native_decision_model(
+            spec.model_profile_id,
+            vec![
+                vec![
+                    native_call(
+                        "approval-first",
+                        "project.delete",
+                        json!({"fixture_local_deletion":true}),
+                    ),
+                    native_call("never-requested", "project.list", json!({})),
+                ],
+                vec![],
+            ],
+        );
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &NativeDecisionTools,
+            events: &store,
+            science: None,
+        };
+        let result = core.execute(&spec, 1).await;
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::WaitingForApproval)),
+            "{result:?}"
+        );
+        let approval = store
+            .load_direct(spec.run_id)
+            .unwrap()
+            .into_iter()
+            .find_map(|e| match e.event {
+                AgentEventKindV4::ToolApprovalRequested { request } => Some(request),
+                _ => None,
+            })
+            .unwrap();
+        core.push(
+            spec.run_id,
+            AgentEventKindV4::ToolApprovalDecided {
+                approval_id: approval.approval_id,
+                call_hash: approval.call_hash,
+                decision: ToolApprovalDecisionV4::Denied,
+            },
+        )
+        .await
+        .unwrap();
+        core.recover_interrupted_dispatches(
+            &spec,
+            AgentLimitsV4::default(),
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        core.model_turn(
+            spec.run_id,
+            subscription_request(),
+            0,
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .unwrap();
+        let events = store.load_direct(spec.run_id).unwrap();
+        assert!(!events.iter().any(|e|matches!(&e.event,AgentEventKindV4::ToolDispatchStarted {call_id,..} if call_id=="never-requested")));
+        assert!(model.requests.lock().unwrap()[1].replay.iter().any(|item|matches!(item,omicsops_protocol::ModelReplayItemV4::ToolResult {call_id,output} if call_id=="never-requested" && output.contains("proposal_not_dispatched") && output.contains("false"))));
+    }
+    #[tokio::test]
+    async fn subscription_crash_before_dispatch_closes_proposals_but_uncertain_dispatch_stays_fenced()
+     {
+        for dispatched in [false, true] {
+            let store = MemoryStore::default();
+            let run = Uuid::new_v4();
+            seed_model_turn(&store, run);
+            let model = native_decision_model(
+                Uuid::from_u128(77),
+                vec![
+                    vec![native_call("crash-call", "project.list", json!({}))],
+                    vec![],
+                ],
+            );
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &NativeDecisionTools,
+                events: &store,
+                science: None,
+            };
+            let first = core
+                .model_turn(run, subscription_request(), 0, Duration::from_secs(1), None)
+                .await
+                .unwrap();
+            if dispatched {
+                core.push(
+                    run,
+                    AgentEventKindV4::ToolRequested {
+                        call: first.tool_calls[0].clone(),
+                    },
+                )
+                .await
+                .unwrap();
+                core.push(
+                    run,
+                    AgentEventKindV4::ToolDispatchStarted {
+                        call_id: "crash-call".into(),
+                        tool_id: "project.list".into(),
+                        effect: ToolEffectV4::ReadOnly,
+                        idempotency_key: "crash-call".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            let reloaded = MemoryStore::default();
+            *reloaded.events.lock().unwrap() = store.load_direct(run).unwrap();
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &NativeDecisionTools,
+                events: &reloaded,
+                science: None,
+            };
+            let result = core
+                .model_turn(run, subscription_request(), 0, Duration::from_secs(1), None)
+                .await;
+            assert_eq!(result.is_ok(), !dispatched);
+            assert_eq!(
+                model.requests.lock().unwrap().len(),
+                if dispatched { 1 } else { 2 }
+            );
+            assert!(!reloaded.load_direct(run).unwrap().iter().any(
+                |e| matches!(&e.event,AgentEventKindV4::ToolFinished {outcome} if outcome.succeeded)
+            ));
+        }
     }
     struct SubscriptionReplayModel {
         calls: AtomicUsize,

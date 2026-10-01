@@ -51,10 +51,20 @@ pub fn project_model_replay(
     binding: &ModelReplayBindingV4,
     events: &[AgentEventV4],
 ) -> Result<Vec<ModelReplayItemV4>, String> {
+    project_replay(project_id, conversation_id, binding, events, true)
+}
+
+fn project_replay(
+    project_id: Uuid,
+    conversation_id: Uuid,
+    binding: &ModelReplayBindingV4,
+    events: &[AgentEventV4],
+    require_finished: bool,
+) -> Result<Vec<ModelReplayItemV4>, String> {
     let mut previous: BTreeMap<Uuid, &AgentEventV4> = BTreeMap::new();
     let mut starts: BTreeMap<Uuid, &ModelRequestStartedV4> = BTreeMap::new();
     let mut recorded = BTreeSet::new();
-    let mut proposed: BTreeMap<String, (Uuid, ToolCallV4)> = BTreeMap::new();
+    let mut proposed: BTreeMap<String, (Uuid, ToolCallV4, String)> = BTreeMap::new();
     let mut requested = BTreeSet::new();
     let mut finished = BTreeSet::new();
     let mut output = Vec::new();
@@ -94,7 +104,10 @@ pub fn project_model_replay(
                 for item in &replay.continuation.items {
                     if let ModelReplayItemV4::ToolCall { call } = item {
                         if proposed
-                            .insert(call.call_id.clone(), (event.run_id, call.clone()))
+                            .insert(
+                                call.call_id.clone(),
+                                (event.run_id, call.clone(), event.event_hash.clone()),
+                            )
                             .is_some()
                         {
                             return Err("model replay has an ambiguous call identity".into());
@@ -104,7 +117,7 @@ pub fn project_model_replay(
                 }
             }
             AgentEventKindV4::ToolRequested { call } => {
-                if let Some((origin_run, proposal)) = proposed.get(&call.call_id) {
+                if let Some((origin_run, proposal, _)) = proposed.get(&call.call_id) {
                     let mut normalized = proposal.clone();
                     crate::bind_mcp_directory(&mut normalized, &events[..event_index]);
                     if *origin_run != event.run_id
@@ -125,10 +138,23 @@ pub fn project_model_replay(
             }
             AgentEventKindV4::ToolFinished { outcome }
             | AgentEventKindV4::ToolOutcomeReused { outcome, .. } => {
-                if let Some((origin_run, proposal)) = proposed.get(&outcome.call_id) {
+                if let Some((origin_run, proposal, record_hash)) = proposed.get(&outcome.call_id) {
+                    let no_dispatch = !events.iter().any(|candidate| candidate.run_id == event.run_id && matches!(&candidate.event, AgentEventKindV4::ToolDispatchStarted { call_id, .. } if call_id == &outcome.call_id));
+                    let closed_without_request = !outcome.succeeded
+                        && no_dispatch
+                        && outcome.data["error_kind"] == "model_replay_closure"
+                        && outcome.data["closure"] == "proposal_not_dispatched"
+                        && outcome.data["operation_dispatched"] == false
+                        && outcome.data["source_event_hash"].as_str() == Some(record_hash.as_str());
+                    let browser_rejected = !outcome.succeeded
+                        && no_dispatch
+                        && crate::is_browser_tool_id(&proposal.tool_id)
+                        && outcome.data["error_kind"] == "browser_validation";
                     if *origin_run != event.run_id
                         || proposal.tool_id != outcome.tool_id
-                        || !requested.contains(&outcome.call_id)
+                        || (!requested.contains(&outcome.call_id)
+                            && !closed_without_request
+                            && !browser_rejected)
                         || !finished.insert(outcome.call_id.clone())
                     {
                         return Err(
@@ -151,10 +177,94 @@ pub fn project_model_replay(
             _ => {}
         }
     }
-    if finished.len() != proposed.len() {
+    if require_finished && finished.len() != proposed.len() {
         return Err("model replay contains unfinished host tool calls".into());
     }
     Ok(output)
+}
+
+/// Persist host decisions from their verified source events before the next
+/// request. Missing requests mean no dispatch; missing results after a recorded
+/// request remain unresolved and must be reconciled by normal tool recovery.
+pub(crate) fn pending_replay_closures(
+    project_id: Uuid,
+    conversation_id: Uuid,
+    binding: &ModelReplayBindingV4,
+    events: &[AgentEventV4],
+) -> Result<Vec<ToolOutcomeV4>, String> {
+    let replay = project_replay(project_id, conversation_id, binding, events, false)?;
+    let finished: BTreeSet<_> = replay
+        .iter()
+        .filter_map(|item| match item {
+            ModelReplayItemV4::ToolResult { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut outcomes = Vec::new();
+    for (origin_index, origin) in events.iter().enumerate() {
+        let AgentEventKindV4::ModelReplayRecorded { replay } = &origin.event else {
+            continue;
+        };
+        for item in &replay.continuation.items {
+            let ModelReplayItemV4::ToolCall { call } = item else {
+                continue;
+            };
+            if finished.contains(call.call_id.as_str()) {
+                continue;
+            }
+            let tail = &events[origin_index + 1..];
+            let requested = tail.iter().position(|e| e.run_id == origin.run_id && matches!(&e.event, AgentEventKindV4::ToolRequested { call: actual } if actual.call_id == call.call_id));
+            let dispatched = tail.iter().any(|e| e.run_id == origin.run_id && matches!(&e.event, AgentEventKindV4::ToolDispatchStarted { call_id, .. } if call_id == &call.call_id));
+            if dispatched {
+                continue;
+            }
+            let mut source = origin;
+            let mut closure = "proposal_not_dispatched";
+            let mut succeeded = false;
+            if let Some(request_index) = requested {
+                let decision_events: Vec<_> = tail[request_index + 1..]
+                    .iter()
+                    .filter(|e| e.run_id == origin.run_id)
+                    .take_while(|e| {
+                        !matches!(e.event, AgentEventKindV4::ModelRequestStarted { .. })
+                    })
+                    .collect();
+                match call.tool_id.as_str() {
+                    "agent.request_input" => {
+                        let Some(input_index) = decision_events.iter().position(|e| matches!(&e.event, AgentEventKindV4::InputRequested {question_id,question,..} if question_id == &call.call_id && call.arguments["question"].as_str() == Some(question.as_str()))) else {continue};
+                        let answers: Vec<_> = decision_events[input_index+1..].iter().filter(|e| matches!(&e.event, AgentEventKindV4::UserInputAnswered {question_id,answer} if question_id == &call.call_id && !answer.trim().is_empty())).collect();
+                        if answers.len() > 1 {
+                            return Err("model replay has duplicate clarification answers".into());
+                        }
+                        let Some(answer) = answers.first() else {
+                            continue;
+                        };
+                        source = answer;
+                        closure = "user_input_answered";
+                        succeeded = true;
+                    }
+                    "agent.complete" => {
+                        let proposal: CompletionProposalV4 =
+                            serde_json::from_value(call.arguments.clone())
+                                .map_err(|_| "invalid replay completion proposal")?;
+                        if let Some(submitted) = decision_events.iter().position(|e| matches!(&e.event, AgentEventKindV4::CompletionProposalSubmitted {proposal: actual} if actual == &proposal)) {
+                            let Some(decision) = decision_events[submitted+1..].iter().rev().find(|e| matches!(e.event, AgentEventKindV4::DeterministicVerificationFinished { .. } | AgentEventKindV4::ReviewerFinished { .. } | AgentEventKindV4::ReviewerCorrectionRequested { .. })) else {continue};
+                            source = decision;
+                            closure = "completion_decision";
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+            outcomes.push(ToolOutcomeV4 {
+                call_id: call.call_id.clone(), tool_id:call.tool_id.clone(), succeeded,
+                model_content: if closure == "proposal_not_dispatched" {"Host did not dispatch this proposal. No execution result exists; decide whether a new proposal is still needed.".into()} else {"Host coordinator decision; this is not scientific execution evidence.".into()},
+                data: serde_json::json!({"error_kind":"model_replay_closure","closure":closure,"operation_dispatched":false,"recoverable":true,"source_event_hash":source.event_hash,"source":crate::context_views::event_view(source)}),
+                provenance:vec![],
+            });
+        }
+    }
+    Ok(outcomes)
 }
 
 /// Filter only verified host event hashes represented in typed replay. Never derive
