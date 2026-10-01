@@ -361,3 +361,5 @@ Codex 订阅接口、登录可用性与 Go 模型路由可能变化；拒绝保�
 Codex 设备登录/keyring 协调器、固定 Responses 传输、Go 精确路由及现有聊天接线已实现；工具、审批、冻结配置和事件证据仍由 OmicsOps 宿主裁决。Claude 配置/只读状态/受控进程及 envelope 已实现，生产生成继续拒绝，尚未达到三类订阅全部可用的目标。
 
 完整确定性检查已通过：1471 Rust、970 Vitest、22 browser bridge、4 Python；Web/Windows 桌面构建与格式检查通过。新增四项真实订阅 ignored 测试、Windows GUI、macOS、SSH 与 PBMC 未执行。实际命令及逐功能提交见[实施记录](../plans/2026-09-30-subscription-models.md)；不将测试替身、打包成功或被忽略测试视为真实端到端验收。
+
+最终审查修复后，完整确定性检查为 1480 Rust（16 ignored）、970 Vitest、22 browser bridge、4 Python；Web/Windows 桌面构建、格式和 diff 检查通过。独立审查发现的敏感参数持久化、续接闭合和错误分类问题已分别修复并提交，新增回归均先失败后通过。真实订阅与 GUI/其它执行环境验收未执行，Claude 生产限制保持。完整裁决、风险和审查范围见实施记录；分支保留本地，未发布。

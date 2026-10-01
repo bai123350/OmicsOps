@@ -308,7 +308,7 @@ cargo test -p omicsops-desktop --lib agent_v4::subscription_live_acceptance_test
 ```
 
 - [x] 记录 Windows GUI smoke：device登录/取消/保存、Claude原生登录状态、Go协议切换、重启选择、read回合、删除拒绝、立即 Escape 与停止。未执行的 GUI/macOS/SSH/PBMC 明确标记；不把 nonce 当科研流程验收。
-- [ ] 检查全分支秘密/日志/配置边界、git diff whitespace、无 website/产物暂存；按用户选择的执行方法做最终代码审查并处理实际问题，更新文档，提交 `test: verify subscription model integration and acceptance boundaries`。
+- [x] 检查全分支秘密/日志/配置边界、git diff whitespace、无 website/产物暂存；按用户选择的执行方法做最终代码审查并处理实际问题，更新文档，提交 `test: verify subscription model integration and acceptance boundaries`。
 
 ## Coverage and Execution Handoff
 
@@ -391,3 +391,30 @@ Final review fix 1: Native continuation now applies the existing host browser gu
 Final review fix 2: Before a native replay request, the complete verified event chain is reconciled into durable host ToolFinished decisions tied to the original call and source hash. Clarification uses the actual InputRequested/UserInputAnswered pair; completion uses its submitted proposal and actual verification/reviewer decision. A proposal without ToolRequested or ToolDispatchStarted receives an explicit failed proposal_not_dispatched closure and is not executed. Requested ordinary calls still require normal recovery; uncertain dispatch remains fenced. Four new deterministic regressions observed RED-to-GREEN, including Store reload, failed verification/reviewer correction, parallel approval denial and crash boundaries. All agent-core tests pass; full workspace after the correction pass remains required. This reuses existing protocol outcomes without new SQLite schema.
 
 Final review fix 3: Responses incomplete reasons and allowlisted SSE/HTTP error codes now retain output-limit, context, rate-limit, authentication/permission, quota/filter and transport distinctions. HTTP error body is bounded to 1 MiB; raw messages, parameters and unknown codes are discarded. Quota/filter are permanent; actual network and missing-terminal failures reach Transport. Four new adapter/desktop regressions observed RED-to-GREEN; actual Agent V4 replaces truncated output without appending partial text or dispatching its tools, while side chat remains one request. Adapter Responses8 and desktop subscription21 passed/4ignored. An immediate desktop relink failed LNK1104 while the prior test executable was being released; after confirming no active test process, the same check passed. No user application was killed. Error schema sources: https://github.com/openai/openai-node/blob/master/src/resources/responses/responses.ts and https://developers.openai.com/api/docs/guides/error-codes . Unknown incomplete reasons remain a visible rejection.
+
+## 最终独立审查与实施裁决
+
+独立只读审查使用 gpt-6-astra，范围为 6d099c7..28daca0；审查未修改文件、运行真实服务或读取用户凭据。发现一项 Critical（浏览器敏感参数先持久化）和两项 Important（协调工具/未派发提案缺少闭合、Responses 错误分类丢失），没有 Minor。三项均进入同一轮作者修复，分别提交 18e2be2、a7608b8、de59e4c；新增测试均观察到针对问题的失败再通过，未另派第二轮 reviewer。原审查结论为需修复，不能写作原 reviewer 已批准修复后的代码。
+
+实施裁决与判断错误的代价，按发生顺序记录：
+
+1. 沿用已有干净功能分支，不新建 worktree，保留 website/；代价：外部并发修改需要重新核对。
+2. Bash 辅助脚本遇 Git ownership 限制，改用原生 PowerShell 等价账本/评审包；代价：人工账本可能失步，已由提交与测试日志交叉核对。
+3. 定向前端检查使用 Vitest，完整检查使用 npm test；代价：仅定向测试可能漏检，完整回归补足。
+4. 测试传输可注入，生产端点固定 HTTPS；Codex 输出额度由宿主预算保留，不发送不支持的 max_output_tokens；代价：Codex 服务端输出仍依赖官方行为及本地流上限。
+5. Go 发现使用有界独立 GET；Codex/Claude 仅提供配置来源，普通 Codex 仅在无输出的 401 刷新一次，旁聊不重发且不按量 fallback；代价：服务格式/资格变更可能拒绝调用。
+6. 续接限当前运行完整链，委派历史隔离；MCP 补绑定只取已验证目录；代价：不能保留跨运行 native continuation，历史仍有界展示。
+7. 订阅外链使用固定资源标识与 native opener；代价：其它平台/失败时需手工复制 URL，GUI 实际打开尚未验证。
+8. Codex keyring 共享引用不可经通用凭据替换，包括 MCP 别名；代价：复用该引用的旧 MCP 配置需另绑自己的凭据。
+9. 续接闭合复用现有宿主 ToolFinished 与原始事件哈希，不新增表或另一套事件；代价：无派发判断依赖宿主先记请求/派发再执行的现有不变量，违反它会错误判断；崩溃与不确定派发测试保留阻止行为。
+10. Reviewer 未判断真实 Codex/Go 资格和工具回合，维持未执行；代价：真实服务兼容仍可能失败。
+11. Reviewer 未判断 Claude 成功生成，保留批准的 fail-closed 策略；代价：Claude 生产生成仍不可用。
+12. Reviewer 未判断 GUI 与真实 CLI 后代进程终止，受控 Windows 测试成立，真实验收未执行；代价：机器环境相关集成仍可能失败。
+13. Reviewer 未执行 macOS/SSH/GPU/SLURM/PBMC，维持未验证；代价：其它执行环境与科研流程不作保证。
+14. Reviewer 对跨运行 native continuation 的延期维持原裁决；代价：该能力不可用，只有有界历史证据。
+
+15. 用户要求新建分支并逐功能提交，收尾选择保留本地 codex/subscription-models，不增加合并/发布操作；代价：后续集成与真实部署仍需另行验证。
+
+修复后的最终完整验证：cargo test --workspace 退出 0（1480 passed、0 failed、16 ignored）；npm test 退出 0（112 files / 970 Vitest、22 browser bridge）；npm run build、npm run build:desktop（Windows x64 NSIS）、cargo fmt --all -- --check 均退出 0；Python importer 4 passed、git diff --check 通过。现有 Web chunk-size、Windows linker 提示不影响成功结果。原生配置/静态资源实现已构建，但安装、GUI、四项真实订阅 ignored、macOS、SSH、GPU/SLURM 与 PBMC 未执行。Claude 生产生成仍禁用。没有延期 Minor；三项审查发现均以 RED-to-GREEN 和完整回归验证修复。
+
+本分支保留全部逐功能提交；仅清理本计划自有的 ignored scratch，不改 website/，不提交打包产物、用户数据库、日志或秘密。
