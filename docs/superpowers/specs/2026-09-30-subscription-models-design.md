@@ -355,3 +355,9 @@ Codex 订阅接口、登录可用性与 Go 模型路由可能变化；拒绝保�
 
 已核对 [CLI reference](https://code.claude.com/docs/en/cli-reference)、[hooks-guide](https://code.claude.com/docs/en/hooks-guide) 和 [managed-settings](https://code.claude.com/docs/en/managed-settings)。普通 settings 的 disableAllHooks 不能禁用 managed hooks；现有来源确认依赖会话内 /status。当前原生 runner 无法在 SessionStart 前完整验证有效策略，因此状态展示版本/订阅认证结果，同时返回 claude_policy_unverifiable，生产生成保持拒绝。不会修改组织策略、读取 CLI 凭据或将 mock runner 验证当作真实 CLI 验收。要启用生产生成，需要可核对的官方只读策略快照及相应真实验收。
 
+
+## 实施与验证状态（2026-10-01）
+
+Codex 设备登录/keyring 协调器、固定 Responses 传输、Go 精确路由及现有聊天接线已实现；工具、审批、冻结配置和事件证据仍由 OmicsOps 宿主裁决。Claude 配置/只读状态/受控进程及 envelope 已实现，生产生成继续拒绝，尚未达到三类订阅全部可用的目标。
+
+完整确定性检查已通过：1471 Rust、970 Vitest、22 browser bridge、4 Python；Web/Windows 桌面构建与格式检查通过。新增四项真实订阅 ignored 测试、Windows GUI、macOS、SSH 与 PBMC 未执行。实际命令及逐功能提交见[实施记录](../plans/2026-09-30-subscription-models.md)；不将测试替身、打包成功或被忽略测试视为真实端到端验收。

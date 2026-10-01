@@ -8712,6 +8712,8 @@ fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
 mod go_live_acceptance_tests;
 #[cfg(test)]
 mod subscription_contract_tests;
+#[cfg(test)]
+mod subscription_live_acceptance_tests;
 
 #[cfg(test)]
 mod tests {

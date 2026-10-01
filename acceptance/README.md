@@ -1,5 +1,64 @@
 # OmicsOps acceptance workflows
 
+## Subscription model acceptance (Windows, opt-in)
+
+Run the deterministic workspace, frontend and build checks first. The new tests
+are ignored by default and require both `OMICSOPS_LIVE_SUBSCRIPTION_DISPOSABLE=1`
+and `OMICSOPS_LIVE_SUBSCRIPTION_PROFILE_ID`, the UUID of **one** explicitly chosen
+saved subscription profile. Run each provider separately; do not automatically
+enumerate or reuse every account. No additional credential environment variables
+or auth-file imports are supported.
+
+The selected row is read from `%APPDATA%/io.omicsops.desktop/omicsops.db` through
+a read-only SQLite connection. Its existing keyring reference and, for Codex,
+host-owned account binding are retained in an in-memory temporary Store. Codex
+authentication may refresh/rotate the selected credential through the existing
+keyring coordinator; it never writes tokens to SQLite. Claude authentication
+remains owned by the official native CLI. No existing project is opened or changed.
+
+The preflight requires the precise provider/endpoint pair: `open_ai_codex` at
+`https://chatgpt.com/backend-api`, `claude_code` at `claude-code://local`, or
+`open_ai_responses` at `https://opencode.ai/zen/go/v1`. Go additionally requires
+one of the six reviewed complete Responses IDs. A missing binding/credential,
+wrong provider, nonempty/foreign project root, or unverified Claude policy fails
+before model generation. Profiles retain their saved budgets and options; unknown
+capabilities remain conservative and can reject an oversized request before send.
+
+Each nonce test creates its own empty temporary directory, then adds one random
+nonce file. The prompt names that file without the nonce. Production Agent V4 must
+execute `project.read` once, return the nonce with host evidence, and persist
+`RunCompleted`. Delegation, auto-review, memory and model retries are disabled for
+this bounded fixture. No SSH or scientific workflow is exercised.
+
+```powershell
+cargo test -p omicsops-desktop --lib agent_v4::subscription_live_acceptance_tests::live_codex_subscription_reads_nonce -- --ignored --exact --nocapture
+cargo test -p omicsops-desktop --lib agent_v4::subscription_live_acceptance_tests::live_claude_subscription_reads_nonce -- --ignored --exact --nocapture
+cargo test -p omicsops-desktop --lib agent_v4::subscription_live_acceptance_tests::live_go_responses_reads_nonce -- --ignored --exact --nocapture
+cargo test -p omicsops-desktop --lib agent_v4::subscription_live_acceptance_tests::live_claude_subscription_windows_stop -- --ignored --exact --nocapture
+```
+
+**Claude production generation remains disabled.** Official read-only version and
+subscription status checks cannot establish all effective managed hooks before
+session startup. The two Claude live tests currently fail preflight if explicitly
+run; compilation or an ignored result is not acceptance. The stop test requires
+an eligible, active official generation before aborting its request; descendant
+termination is separately covered by deterministic Windows Job Object fixtures.
+Do not bypass the policy gate to obtain a live test pass.
+
+As of 2026-10-01, all four new live tests and native GUI smoke are **not executed**;
+no disposable subscription configuration was supplied. Record actual commands,
+exit codes and elapsed time here after any explicit live run, without credentials,
+raw reasoning, account identity or sensitive host output.
+
+Native Windows smoke steps (not yet executed): configure/sign in to Codex, cancel
+before authorization, explicitly save after authorization, edit a saved Claude
+native executable and inspect its status/gate, switch Go across all three
+protocols, restart and verify the selected profile, complete one read-tool round,
+deny deletion of a temporary file and confirm it remains, press Escape immediately
+after opening each layer, then stop generation. A stopped Agent does not cancel an
+already dispatched SSH job. macOS, SSH, PBMC and scientific provenance acceptance
+are also not executed for this change.
+
 `bulk-rnaseq.json` freezes the six-sample yeast comparison from
 `nf-core/test-datasets` at commit `72a702d346833d5523bc40d032323ea548603b00`.
 The paired FASTQ files live under `testdata/GSE110004/{accession}_{1,2}.fastq.gz`.
@@ -29,6 +88,9 @@ OMICSOPS_LIVE_MODEL_CREDENTIAL         # omitted only for Ollama
 ```
 
 ## OpenCode Go ordinary Agent acceptance (Windows, opt-in)
+
+The separate subscription checks below cover Codex and Go Responses. The older
+Go Chat acceptance in this section does not validate those transports.
 
 This ignored test validates a real production `model -> project.read -> model`
 exchange, rather than the smaller connection probe. Run the deterministic suite

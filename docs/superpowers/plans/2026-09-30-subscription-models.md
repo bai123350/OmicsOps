@@ -294,11 +294,11 @@ CLI 预检无法满足设计时，保留明确错误与已完成增量，修订�
 - 显式使用 `OMICSOPS_LIVE_SUBSCRIPTION_PROFILE_ID`；按测试分别验证精确 provider/base，keyring 从当前用户 session 读取；Claude CLI 使用用户已自行登录的官方原生程序，不打印身份或秘密。
 - 另写 deterministic 删除拒绝测试并在真实 GUI smoke 中用临时文件手工确认；nonce 不在 prompt，主机执行一次 `project.read`，最终回答有 nonce 和事件证据。
 
-- [ ] 写 `subscription_acceptance_preflight_rejects_unsafe_or_missing_configuration`：未设置 profile_id、不匹配 provider、非空原项目目录、无 keyring/CLI登录均在生成前拒绝；检查用例只触及临时数据。关键断言：`assert!(missing_config.is_err()); assert!(non_temporary_project.is_err()); assert_eq!(preflight_generation_count, 0); assert_eq!(original_db_after, original_db_before);`
-- [ ] 运行 `cargo test -p omicsops-desktop --lib subscription_acceptance_preflight`，确认预期失败；实现 harness，并重跑至通过。ignored 的编译/被忽略状态不算真实通过。
-- [ ] 按顺序执行 `cargo test --workspace`、`npm test`、`npm run build`、`npm run build:desktop`、`cargo fmt --all -- --check`，记录退出码与实际 counts；依赖锁文件变化额外 `npm ci`，Rust 锁文件按正常 Cargo 验证。
-- [ ] fmt 仅因格式偏差失败时运行 `cargo fmt --all`，将纯格式变化单独提交。桌面可执行文件被正在运行应用占用时记录阻塞，不强杀用户应用。
-- [ ] 确定性检查通过且操作者已显式提供一次性验收配置后，分别执行下方精确 ignored 命令，逐项保存通过/失败/未执行及 elapsed；缺少配置时保留未执行。不得自动复用全部既有用户账户或修改用户数据库。
+- [x] 写 `subscription_acceptance_preflight_rejects_unsafe_or_missing_configuration`：未设置 profile_id、不匹配 provider、非空原项目目录、无 keyring/CLI登录均在生成前拒绝；检查用例只触及临时数据。关键断言：`assert!(missing_config.is_err()); assert!(non_temporary_project.is_err()); assert_eq!(preflight_generation_count, 0); assert_eq!(original_db_after, original_db_before);`
+- [x] 运行 `cargo test -p omicsops-desktop --lib subscription_acceptance_preflight`，确认预期失败；实现 harness，并重跑至通过。ignored 的编译/被忽略状态不算真实通过。
+- [x] 按顺序执行 `cargo test --workspace`、`npm test`、`npm run build`、`npm run build:desktop`、`cargo fmt --all -- --check`，记录退出码与实际 counts；依赖锁文件变化额外 `npm ci`，Rust 锁文件按正常 Cargo 验证。
+- [x] fmt 仅因格式偏差失败时运行 `cargo fmt --all`，将纯格式变化单独提交。桌面可执行文件被正在运行应用占用时记录阻塞，不强杀用户应用。
+- [x] 确定性检查通过且操作者已显式提供一次性验收配置后，分别执行下方精确 ignored 命令，逐项保存通过/失败/未执行及 elapsed；缺少配置时保留未执行。不得自动复用全部既有用户账户或修改用户数据库。
 
 ```powershell
 cargo test -p omicsops-desktop --lib agent_v4::subscription_live_acceptance_tests::live_codex_subscription_reads_nonce -- --ignored --exact --nocapture
@@ -307,7 +307,7 @@ cargo test -p omicsops-desktop --lib agent_v4::subscription_live_acceptance_test
 cargo test -p omicsops-desktop --lib agent_v4::subscription_live_acceptance_tests::live_claude_subscription_windows_stop -- --ignored --exact --nocapture
 ```
 
-- [ ] 记录 Windows GUI smoke：device登录/取消/保存、Claude原生登录状态、Go协议切换、重启选择、read回合、删除拒绝、立即 Escape 与停止。未执行的 GUI/macOS/SSH/PBMC 明确标记；不把 nonce 当科研流程验收。
+- [x] 记录 Windows GUI smoke：device登录/取消/保存、Claude原生登录状态、Go协议切换、重启选择、read回合、删除拒绝、立即 Escape 与停止。未执行的 GUI/macOS/SSH/PBMC 明确标记；不把 nonce 当科研流程验收。
 - [ ] 检查全分支秘密/日志/配置边界、git diff whitespace、无 website/产物暂存；按用户选择的执行方法做最终代码审查并处理实际问题，更新文档，提交 `test: verify subscription model integration and acceptance boundaries`。
 
 ## Coverage and Execution Handoff
@@ -382,3 +382,6 @@ Task 11: Subscription settings and existing chat picker are connected. Codex dev
 Task 11 follow-up: Native subscription links now invoke a narrow symbolic-resource command for exactly the Codex device page, Claude official setup and Go privacy page. Windows uses a balanced COM apartment and ShellExecuteW open verb, without shell argv or arbitrary URLs. Other platforms and opener failures show a copyable fixed URL; native GUI opening is unexecuted. Wire/native tests observed RED then GREEN; frontend resource/lifecycle wrappers 10 passed. No new npm dependency or lock change. Implementation follows the Windows ShellExecuteW API contract (https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shellexecutew). Complete checks are being repeated after this correction.
 
 Task 5 follow-up: Generic credential inventory now identifies Codex keyring references as read-only subscription_session values. Replacement is refused even through a legacy MCP alias to the same reference; login/refresh/disconnect remain the only application mutation paths. Native overwrite test and frontend labeling test observed RED then GREEN; 12 credential/DTO and 8 frontend credential tests passed. This response-only enum addition has no SQLite migration or profile hash impact. Final complete checks are repeated after this correction.
+
+Task 12（2026-10-01）：一次性订阅 nonce/Windows stop 的四个 ignored 测试已加入；配置预检测试先失败后通过，原数据库只读且临时 fixture 字节保持不变。未提供显式一次性配置，因此四项真实订阅验收及 Windows GUI/macOS/SSH/PBMC 均未执行；Claude 两项仍会在策略门禁拒绝。临时 nonce 不是科研端到端验收。
+最终确定性检查（包含原生链接和只读凭据修复）：cargo test --workspace 退出 0（1471 通过、16 ignored）；npm test 退出 0（970 Vitest、22 browser bridge）；npm run build、npm run build:desktop、cargo fmt --all -- --check 均通过。桌面构建完成 Windows x64 NSIS 打包，仅作为构建检查，未发布或分发。Python 使用 python -B -m unittest discover -s scripts -p test_import_model_catalog.py，4 项通过；git diff --check 通过。npm 锁文件未改变，无需 npm ci；Cargo 锁依正常 workspace 检查。现有 Web chunk-size 和 Windows linker 提示不影响成功结果。最终独立代码审查及其修复记录待补充。
