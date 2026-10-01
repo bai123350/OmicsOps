@@ -433,3 +433,10 @@ system-proxy，HTTP(S)_PROXY 均未设置时应用没有采用已配置的 Windo
 的 CodexDeviceAuth 再次申请设备码返回成功（设备码存在、间隔 5 秒），证明启动
 失败已修复。依赖锁新增对应平台包；没有放宽 TLS、端点或重定向规则。设备码
 申请成功不等于完成账户登录或模型生成，这两项真实验收仍未执行。
+
+参考源码补查包含 Wisp 的 codex_auth.rs、原生 codex_login.rs、network.rs，以及
+OpenAI 官方 codex-rs/login/src/device_code_auth.rs。既有 client ID、三个认证端点
+和交换表单均相符；补兼容官方 usercode 别名，并区分固定地区拒绝、访问拒绝、
+HTML 页面与限流类别。完整 HTTP 请求/响应替身校验 begin、pending 和一次授权
+码交换；别名与错误分类测试观察到 RED 后 GREEN，auth 10 项和依赖解析 1 项通过。
+不迁移 Wisp 当前 main 的另一套浏览器授权协议，不导入 CLI 凭据。

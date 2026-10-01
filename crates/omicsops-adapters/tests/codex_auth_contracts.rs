@@ -6,6 +6,7 @@ use omicsops_adapters::{
 };
 use serde_json::json;
 use std::{
+    collections::VecDeque,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -19,6 +20,203 @@ impl CodexAuthClock for Clock {
     fn now_ms(&self) -> i64 {
         1000
     }
+}
+
+// Complete wire fixtures: requests are checked against the official device flow,
+// rather than accepting any body as the earlier HTTP fake did.
+struct DeviceWire {
+    replies: std::sync::Mutex<VecDeque<(&'static str, serde_json::Value, u16, Vec<u8>)>>,
+}
+#[async_trait]
+impl CodexAuthHttpTransport for DeviceWire {
+    async fn post(
+        &self,
+        url: url::Url,
+        body: CodexAuthHttpBody,
+    ) -> AdapterResult<CodexAuthHttpResponse> {
+        let (path, expected, status, bytes) = self.replies.lock().unwrap().pop_front().unwrap();
+        assert_eq!(url.as_str(), format!("https://auth.openai.com{path}"));
+        let actual = match body {
+            CodexAuthHttpBody::Json(value) => value,
+            CodexAuthHttpBody::Form(pairs) => serde_json::to_value(
+                pairs
+                    .into_iter()
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )
+            .unwrap(),
+        };
+        assert_eq!(actual, expected);
+        Ok(CodexAuthHttpResponse {
+            status,
+            body: bytes,
+        })
+    }
+}
+fn device_auth(replies: Vec<(&'static str, serde_json::Value, u16, Vec<u8>)>) -> CodexDeviceAuth {
+    CodexDeviceAuth::new(Arc::new(Clock))
+        .unwrap()
+        .with_http_transport(Arc::new(DeviceWire {
+            replies: std::sync::Mutex::new(replies.into()),
+        }))
+}
+fn begin_request() -> serde_json::Value {
+    json!({"client_id":"app_EMoamEEZ73f0CkXaXp7hrann"})
+}
+#[tokio::test]
+async fn codex_device_login_accepts_the_official_usercode_alias() {
+    let auth = device_auth(vec![(
+        "/api/accounts/deviceauth/usercode",
+        begin_request(),
+        200,
+        br#"{"device_auth_id":"dev","usercode":"ABCD-1234","interval":"5"}"#.to_vec(),
+    )]);
+    let challenge = auth
+        .begin_device()
+        .await
+        .expect("official alias must yield a usable challenge");
+    assert_eq!(challenge.user_code, "ABCD-1234");
+    assert_eq!(challenge.interval, Duration::from_secs(5));
+}
+#[tokio::test]
+async fn codex_device_login_preserves_only_safe_http_failure_categories() {
+    for (status, body, expected) in [
+        (
+            403,
+            r#"{"error":{"code":"unsupported_country_region_territory","message":"SECRET_TOKEN_SENTINEL"}}"#,
+            "codex_device_region_unsupported",
+        ),
+        (
+            403,
+            r#"{"error":"unsupported_country_region_territory","access_token":"SECRET_TOKEN_SENTINEL"}"#,
+            "codex_device_region_unsupported",
+        ),
+        (
+            403,
+            "<html><head>SECRET_TOKEN_SENTINEL</head></html>",
+            "codex_device_web_verification_required",
+        ),
+        (
+            200,
+            "<!DOCTYPE html><html>SECRET_TOKEN_SENTINEL</html>",
+            "codex_device_web_verification_required",
+        ),
+        (
+            401,
+            r#"{"error":{"code":"SECRET_TOKEN_SENTINEL"}}"#,
+            "codex_device_access_denied",
+        ),
+        (
+            429,
+            r#"{"detail":"SECRET_TOKEN_SENTINEL"}"#,
+            "codex_device_rate_limited",
+        ),
+        (
+            404,
+            r#"{"detail":"SECRET_TOKEN_SENTINEL"}"#,
+            "codex_device_login_unavailable",
+        ),
+        (
+            503,
+            "SECRET_TOKEN_SENTINEL",
+            "codex_device_login_unavailable",
+        ),
+        (200, "SECRET_TOKEN_SENTINEL", "codex_auth_response_invalid"),
+    ] {
+        let auth = device_auth(vec![(
+            "/api/accounts/deviceauth/usercode",
+            begin_request(),
+            status,
+            body.as_bytes().to_vec(),
+        )]);
+        let failure = auth.begin_device().await.err().expect("must fail safely");
+        assert!(
+            matches!(failure, AdapterError::Llm(ref code) if code == expected),
+            "wrong safe category: {failure}"
+        );
+        assert!(!failure.to_string().contains("SECRET_TOKEN_SENTINEL"));
+    }
+}
+#[tokio::test]
+async fn codex_device_poll_rejects_real_denials_without_mistaking_them_for_pending() {
+    for (status, body, expected) in [
+        (
+            403,
+            r#"{"error":{"code":"unsupported_country_region_territory","message":"SECRET_TOKEN_SENTINEL"}}"#,
+            "codex_device_region_unsupported",
+        ),
+        (
+            403,
+            "<html><head>SECRET_TOKEN_SENTINEL</head></html>",
+            "codex_device_web_verification_required",
+        ),
+        (
+            429,
+            r#"{"error":"SECRET_TOKEN_SENTINEL"}"#,
+            "codex_device_rate_limited",
+        ),
+        (
+            403,
+            r#"{"error":"access_denied","message":"SECRET_TOKEN_SENTINEL"}"#,
+            "codex_device_access_denied",
+        ),
+    ] {
+        let auth = device_auth(vec![
+            (
+                "/api/accounts/deviceauth/usercode",
+                begin_request(),
+                200,
+                br#"{"device_auth_id":"dev","user_code":"ABCD-1234","interval":"5"}"#.to_vec(),
+            ),
+            (
+                "/api/accounts/deviceauth/token",
+                json!({"device_auth_id":"dev","user_code":"ABCD-1234"}),
+                status,
+                body.as_bytes().to_vec(),
+            ),
+        ]);
+        let challenge = auth.begin_device().await.unwrap();
+        let failure = auth
+            .poll_device(&challenge, Arc::new(AtomicBool::new(false)))
+            .await
+            .err()
+            .expect("must fail safely");
+        assert!(
+            matches!(failure, AdapterError::Llm(ref code) if code == expected),
+            "wrong safe category: {failure}"
+        );
+        assert!(!failure.to_string().contains("SECRET_TOKEN_SENTINEL"));
+    }
+}
+#[tokio::test]
+async fn codex_device_wire_preserves_pending_and_exchanges_the_granted_code_once() {
+    use base64::Engine;
+    let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        r#"{"exp":7200,"https://api.openai.com/auth":{"chatgpt_account_id":"acct-fixture"}}"#,
+    );
+    let auth = device_auth(vec![
+        ("/api/accounts/deviceauth/usercode", begin_request(), 200, br#"{"device_auth_id":"dev","user_code":"ABCD-1234","interval":"5"}"#.to_vec()),
+        ("/api/accounts/deviceauth/token", json!({"device_auth_id":"dev","user_code":"ABCD-1234"}), 404, vec![]),
+        ("/api/accounts/deviceauth/token", json!({"device_auth_id":"dev","user_code":"ABCD-1234"}), 403, br#"{"detail":"Authorization pending"}"#.to_vec()),
+        ("/api/accounts/deviceauth/token", json!({"device_auth_id":"dev","user_code":"ABCD-1234"}), 200, br#"{"authorization_code":"fixture-code","code_verifier":"fixture-verifier"}"#.to_vec()),
+        ("/oauth/token", json!({"grant_type":"authorization_code","client_id":"app_EMoamEEZ73f0CkXaXp7hrann","code":"fixture-code","code_verifier":"fixture-verifier","redirect_uri":"https://auth.openai.com/deviceauth/callback"}), 200, json!({"access_token":format!("e30.{claims}.sig"),"refresh_token":"fixture-refresh","expires_in":3600}).to_string().into_bytes()),
+    ]);
+    let challenge = auth.begin_device().await.unwrap();
+    for _ in 0..2 {
+        assert!(
+            matches!(auth.poll_device(&challenge, Arc::new(AtomicBool::new(false))).await.unwrap(), CodexDevicePoll::Pending { next_poll_after } if next_poll_after == Duration::from_secs(5))
+        );
+    }
+    let CodexDevicePoll::Authorized { bundle } = auth
+        .poll_device(&challenge, Arc::new(AtomicBool::new(false)))
+        .await
+        .unwrap()
+    else {
+        panic!("must authorize")
+    };
+    assert!(!bundle.account_ref().is_nil());
+    let saved: serde_json::Value = serde_json::from_str(&bundle.to_vault_json().unwrap()).unwrap();
+    assert_eq!(saved["account_id"], "acct-fixture");
+    assert_eq!(saved["expires_at_ms"], 3_601_000);
 }
 
 struct WriteFailVault {

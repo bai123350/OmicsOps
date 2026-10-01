@@ -193,15 +193,12 @@ impl CodexAuthHttpTransport for Http {
             CodexAuthHttpBody::Json(value) => request.json(&value),
             CodexAuthHttpBody::Form(pairs) => request.form(&pairs),
         };
-        let response = request
-            .send()
-            .await
-            .map_err(|_| error("codex_auth_network_uncertain"))?;
+        let response = request.send().await.map_err(transport_error)?;
         let status = response.status().as_u16();
         let mut stream = response.bytes_stream();
         let mut body = vec![];
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| error("codex_auth_network_uncertain"))?;
+            let chunk = chunk.map_err(transport_error)?;
             if body.len() + chunk.len() > 64 * 1024 {
                 return Err(error("codex_auth_response_too_large"));
             }
@@ -252,9 +249,14 @@ impl CodexDeviceAuth {
         let response = self
             .post("/oauth/token", CodexAuthHttpBody::Form(pairs))
             .await?;
+        if let Some(code) = response_error_code(&response) {
+            return Err(error(code));
+        }
         if response.status != 200 {
             return Err(error(if response.status == 400 || response.status == 401 {
                 "codex_reauthentication_required"
+            } else if response.status == 403 {
+                "codex_device_access_denied"
             } else {
                 "codex_token_exchange_failed"
             }));
@@ -272,8 +274,15 @@ impl CodexAuthTransport for CodexDeviceAuth {
                 CodexAuthHttpBody::Json(json!({"client_id":CLIENT_ID})),
             )
             .await?;
+        if let Some(code) = response_error_code(&response) {
+            return Err(error(code));
+        }
         if response.status != 200 {
-            return Err(error("codex_device_login_unavailable"));
+            return Err(error(if matches!(response.status, 401 | 403) {
+                "codex_device_access_denied"
+            } else {
+                "codex_device_login_unavailable"
+            }));
         }
         let value = json_body(&response.body)?;
         let interval = value["interval"]
@@ -290,7 +299,14 @@ impl CodexAuthTransport for CodexDeviceAuth {
             .min(900);
         Ok(CodexDeviceChallenge {
             device_auth_id: field(&value, "device_auth_id")?,
-            user_code: field(&value, "user_code")?,
+            user_code: field(
+                &value,
+                if value.get("user_code").is_some() {
+                    "user_code"
+                } else {
+                    "usercode"
+                },
+            )?,
             verification_uri: Url::parse("https://auth.openai.com/codex/device")
                 .map_err(|_| error("codex_auth_endpoint_invalid"))?,
             interval: Duration::from_secs(interval),
@@ -305,6 +321,9 @@ impl CodexAuthTransport for CodexDeviceAuth {
         check_login(challenge, &cancelled, self.clock.now_ms())?;
         let response=self.post("/api/accounts/deviceauth/token",CodexAuthHttpBody::Json(json!({"device_auth_id":challenge.device_auth_id,"user_code":challenge.user_code}))).await?;
         check_login(challenge, &cancelled, self.clock.now_ms())?;
+        if let Some(code) = response_error_code(&response) {
+            return Err(error(code));
+        }
         if response.status == 200 {
             let value = json_body(&response.body)?;
             let code = field(&value, "authorization_code")?;
@@ -341,6 +360,9 @@ impl CodexAuthTransport for CodexDeviceAuth {
             None if matches!(response.status, 403 | 404) && value.get("error").is_none() => {
                 challenge.interval
             }
+            _ if matches!(response.status, 401 | 403) => {
+                return Err(error("codex_device_access_denied"));
+            }
             _ => return Err(error("codex_device_authorization_failed")),
         };
         Ok(CodexDevicePoll::Pending {
@@ -361,6 +383,36 @@ impl CodexAuthTransport for CodexDeviceAuth {
         )
         .await
     }
+}
+fn transport_error(cause: reqwest::Error) -> AdapterError {
+    error(if cause.is_timeout() {
+        "codex_auth_timeout"
+    } else if cause.is_connect() {
+        "codex_auth_connection_failed"
+    } else {
+        "codex_auth_network_uncertain"
+    })
+}
+// Recognize fixed categories only. OAuth bodies, arbitrary provider messages,
+// proxy addresses and HTML never cross this boundary.
+fn response_error_code(response: &CodexAuthHttpResponse) -> Option<&'static str> {
+    let prefix = String::from_utf8_lossy(&response.body[..response.body.len().min(256)])
+        .trim_start()
+        .to_ascii_lowercase();
+    if prefix.starts_with("<!doctype html")
+        || prefix.starts_with("<html")
+        || prefix.contains("<head>")
+    {
+        return Some("codex_device_web_verification_required");
+    }
+    let value: Option<Value> = serde_json::from_slice(&response.body).ok();
+    if value.as_ref().is_some_and(|v| {
+        v["error"]["code"].as_str().or_else(|| v["error"].as_str())
+            == Some("unsupported_country_region_territory")
+    }) {
+        return Some("codex_device_region_unsupported");
+    }
+    (response.status == 429).then_some("codex_device_rate_limited")
 }
 fn check_login(
     challenge: &CodexDeviceChallenge,
