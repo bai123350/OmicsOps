@@ -97,6 +97,161 @@ fn manager() -> (
         mutation,
     )
 }
+
+struct FailingAuth {
+    clock: Arc<Clock>,
+    code: String,
+    fail_begin: bool,
+    llm_error: bool,
+}
+impl FailingAuth {
+    fn error(&self) -> omicsops_adapters::AdapterError {
+        if self.llm_error {
+            omicsops_adapters::AdapterError::Llm(self.code.clone())
+        } else {
+            omicsops_adapters::AdapterError::Credential(self.code.clone())
+        }
+    }
+}
+#[async_trait]
+impl CodexAuthTransport for FailingAuth {
+    async fn begin_device(&self) -> AdapterResult<CodexDeviceChallenge> {
+        if self.fail_begin {
+            return Err(self.error());
+        }
+        Ok(CodexDeviceChallenge {
+            device_auth_id: "device-fixture".into(),
+            user_code: "ABCD-1234".into(),
+            verification_uri: url::Url::parse("https://auth.openai.com/codex/device").unwrap(),
+            interval: Duration::from_millis(1),
+            expires_at_ms: self.clock.now_ms() + 900_000,
+        })
+    }
+    async fn poll_device(
+        &self,
+        _: &CodexDeviceChallenge,
+        _: Arc<AtomicBool>,
+    ) -> AdapterResult<CodexDevicePoll> {
+        Err(self.error())
+    }
+    async fn refresh(&self, _: &CodexCredentialBundle) -> AdapterResult<CodexCredentialBundle> {
+        unreachable!()
+    }
+}
+fn failing_manager(code: &str, fail_begin: bool, llm_error: bool) -> Arc<SubscriptionLoginManager> {
+    let clock = Arc::new(Clock(AtomicI64::new(1000)));
+    Arc::new(SubscriptionLoginManager::new(
+        Arc::new(MemoryCredentialVault::default()),
+        Arc::new(FailingAuth {
+            clock: clock.clone(),
+            code: code.into(),
+            fail_begin,
+            llm_error,
+        }),
+        clock,
+        Default::default(),
+    ))
+}
+#[tokio::test]
+async fn subscription_login_begin_preserves_only_exact_allowlisted_auth_errors() {
+    for code in [
+        "codex_auth_network_uncertain",
+        "codex_auth_timeout",
+        "codex_auth_connection_failed",
+        "codex_device_region_unsupported",
+        "codex_device_access_denied",
+        "codex_device_web_verification_required",
+        "codex_device_rate_limited",
+        "codex_device_login_unavailable",
+        "codex_auth_response_invalid",
+        "codex_auth_field_invalid",
+        "codex_device_interval_invalid",
+        "codex_device_authorization_failed",
+        "codex_token_exchange_failed",
+        "codex_reauthentication_required",
+        "codex_login_expired",
+    ] {
+        let m = failing_manager(code, true, true);
+        assert_eq!(m.begin(None).await.unwrap_err(), code);
+        let entries = m.entries.lock().await;
+        let login = entries.values().next().unwrap();
+        assert_eq!(login.state, CodexLoginState::Failed);
+        assert_eq!(login.error_code.as_deref(), Some(code));
+        assert!(login.bundle.is_none());
+    }
+    for (code, llm_error) in [
+        ("SECRET_AUTH_BODY_SENTINEL", true),
+        (
+            "codex_device_region_unsupported SECRET_AUTH_BODY_SENTINEL",
+            true,
+        ),
+        ("codex_device_region_unsupported", false),
+    ] {
+        let m = failing_manager(code, true, llm_error);
+        assert_eq!(
+            m.begin(None).await.unwrap_err(),
+            "codex_device_login_failed"
+        );
+        let entries = m.entries.lock().await;
+        assert_eq!(
+            entries.values().next().unwrap().error_code.as_deref(),
+            Some("codex_device_login_failed")
+        );
+    }
+}
+#[tokio::test]
+async fn subscription_login_poll_exposes_safe_errors_without_transport_payloads() {
+    for (code, llm_error, expected) in [
+        ("codex_auth_timeout", true, "codex_auth_timeout"),
+        (
+            "codex_device_access_denied",
+            true,
+            "codex_device_access_denied",
+        ),
+        (
+            "codex_token_exchange_failed",
+            true,
+            "codex_token_exchange_failed",
+        ),
+        ("codex_login_expired", true, "codex_login_expired"),
+        (
+            "SECRET_AUTH_BODY_SENTINEL",
+            true,
+            "codex_device_authorization_failed",
+        ),
+        (
+            "codex_auth_timeout",
+            false,
+            "codex_device_authorization_failed",
+        ),
+    ] {
+        let m = failing_manager(code, false, llm_error);
+        let challenge = m.begin(None).await.unwrap();
+        let state = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state = m.poll(challenge.login_id).await.unwrap();
+                if state.state != CodexLoginState::Pending {
+                    break state;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("owned poller must finish the login");
+        assert_eq!(state.state, CodexLoginState::Failed);
+        assert_eq!(state.error_code.as_deref(), Some(expected));
+        assert!(!serde_json::to_string(&state).unwrap().contains("SECRET_"));
+    }
+}
+#[tokio::test]
+async fn subscription_login_expiration_has_an_explicit_retry_code() {
+    let (m, _, clock, _) = manager();
+    let challenge = m.begin(None).await.unwrap();
+    clock.0.store(901_000, Ordering::SeqCst);
+    let state = m.poll(challenge.login_id).await.unwrap();
+    assert_eq!(state.state, CodexLoginState::Expired);
+    assert_eq!(state.error_code.as_deref(), Some("codex_login_expired"));
+}
 #[tokio::test]
 async fn subscription_login_rejects_an_expired_challenge() {
     let clock = Arc::new(Clock(AtomicI64::new(1000)));

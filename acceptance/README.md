@@ -59,6 +59,22 @@ after opening each layer, then stop generation. A stopped Agent does not cancel 
 already dispatched SSH job. macOS, SSH, PBMC and scientific provenance acceptance
 are also not executed for this change.
 
+Codex login regression (2026-10-01): a public device-code start was diagnosed on
+Windows, without account authorization or credential reads/writes. The old
+native client returned HTTP 403 / the fixed unsupported-region category while a
+system-network request succeeded. Enabling reqwest system-proxy made the same
+CodexDeviceAuth begin call succeed. This verifies device-code acquisition only;
+GUI login, token exchange with a real account and model generation remain
+unexecuted. Deterministic wire fixtures cover authorization exchange separately.
+
+For the GUI smoke, restart the rebuilt app after changing a Windows system proxy.
+With HTTP(S)_PROXY unset and a configured system proxy, open a new Codex profile
+and start login while the model field is still blank: the official link and code
+should appear. Authorize only the disposable account selected for acceptance,
+fill its full model ID, then explicitly Save. Also verify failed/expired state
+guidance and retry, immediate Escape cancellation, and that no raw provider body
+or HTML appears. Do not record the real device code or credential material.
+
 `bulk-rnaseq.json` freezes the six-sample yeast comparison from
 `nf-core/test-datasets` at commit `72a702d346833d5523bc40d032323ea548603b00`.
 The paired FASTQ files live under `testdata/GSE110004/{accession}_{1,2}.fastq.gz`.

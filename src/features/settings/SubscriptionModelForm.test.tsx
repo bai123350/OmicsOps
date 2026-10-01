@@ -94,3 +94,86 @@ it("keeps a submitted profile mutation visible until the native result arrives",
   expect(payload).not.toHaveProperty("context_window_tokens"); expect(payload).not.toHaveProperty("refresh_catalog"); expect(payload).not.toHaveProperty("reasoning_effort"); expect(payload).not.toHaveProperty("delegated_model_profile_id"); expect(payload).not.toHaveProperty("subscription_account_ref");
   await act(async () => finish(profile)); expect(saved).toHaveBeenCalledWith(profile);
 });
+
+it.each([
+  ["codex_device_region_unsupported", /network region.*supported.*Windows system proxy/i],
+  ["codex_auth_connection_failed", /internet connection.*Windows system proxy/i],
+  ["codex_auth_network_uncertain", /internet connection.*Windows system proxy/i],
+  ["codex_auth_timeout", /timed out.*retry/i],
+  ["codex_device_web_verification_required", /web access or verification page.*Windows system proxy/i],
+  ["codex_device_access_denied", /denied.*device.*sign-in/i],
+  ["codex_device_rate_limited", /too many sign-in requests.*later/i],
+  ["codex_device_login_unavailable", /sign-in.*unavailable.*later/i],
+  ["codex_auth_response_invalid", /unexpected sign-in response.*retry/i],
+  ["codex_auth_field_invalid", /unexpected sign-in response.*retry/i],
+  ["codex_device_interval_invalid", /unexpected sign-in response.*retry/i],
+  ["codex_token_exchange_failed", /finish authorization.*sign in again/i],
+  ["codex_reauthentication_required", /sign in again/i],
+])("shows actionable Codex begin guidance for exact safe code %s", async (code, message) => {
+  vi.spyOn(api, "beginCodexLogin").mockRejectedValue(code);
+  render(<SubscriptionModelForm provider="open_ai_codex" profile={null} onSaved={vi.fn()} onCancel={vi.fn()} zh={false} />);
+  fireEvent.click(screen.getByRole("button", { name: "Sign in to Codex" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent(message);
+  expect(screen.getByRole("button", { name: "Sign in to Codex" })).toBeEnabled();
+  fireEvent.change(screen.getByLabelText("Model"), { target: { value: "full-id" } });
+  expect(screen.getByRole("alert")).toHaveTextContent(message);
+});
+
+it("localizes safe Error.message sign-in failures and clears them on an explicit retry", async () => {
+  const begin = vi.spyOn(api, "beginCodexLogin").mockRejectedValueOnce(new Error("codex_device_region_unsupported")).mockResolvedValueOnce(challenge);
+  vi.spyOn(api, "pollCodexLogin").mockResolvedValue({ login_id: "login", state: "authorized", expires_at: challenge.expires_at, error_code: null });
+  vi.spyOn(api, "cancelCodexLogin").mockResolvedValue({ login_id: "login", state: "cancelled", expires_at: challenge.expires_at, error_code: null });
+  render(<SubscriptionModelForm provider="open_ai_codex" profile={null} onSaved={vi.fn()} onCancel={vi.fn()} zh />);
+  fireEvent.click(screen.getByRole("button", { name: "登录 Codex 订阅" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent(/网络地区.*支持.*Windows 系统代理/);
+  fireEvent.click(screen.getByRole("button", { name: "登录 Codex 订阅" }));
+  expect(await screen.findByText("TEST-CODE")).toBeVisible();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(begin).toHaveBeenCalledTimes(2);
+});
+
+it.each([
+  "codex_device_region_unsupported SECRET_AUTH_BODY_SENTINEL",
+  new Error("SECRET_AUTH_BODY_SENTINEL"),
+  { code: "codex_device_region_unsupported", body: "SECRET_AUTH_BODY_SENTINEL" },
+])("never renders unknown or payload-bearing sign-in errors %#", async (failure) => {
+  vi.spyOn(api, "beginCodexLogin").mockRejectedValue(failure);
+  render(<SubscriptionModelForm provider="open_ai_codex" profile={null} onSaved={vi.fn()} onCancel={vi.fn()} zh={false} />);
+  fireEvent.click(screen.getByRole("button", { name: "Sign in to Codex" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Operation failed. Check sign-in or configuration and retry.");
+  expect(document.body).not.toHaveTextContent("SECRET_AUTH_BODY_SENTINEL");
+  expect(document.body).not.toHaveTextContent("network region");
+});
+
+it.each([
+  ["failed", "codex_device_access_denied", /denied.*device.*sign-in/i],
+  ["expired", null, /sign-in expired.*sign in again/i],
+  ["failed", "SECRET_AUTH_BODY_SENTINEL", /operation failed/i],
+] as const)("renders terminal Codex polling state %s and safe guidance", async (state, code, message) => {
+  vi.spyOn(api, "beginCodexLogin").mockResolvedValue(challenge);
+  vi.spyOn(api, "pollCodexLogin").mockResolvedValue({ login_id: "login", state, expires_at: challenge.expires_at, error_code: code });
+  vi.spyOn(api, "cancelCodexLogin").mockResolvedValue({ login_id: "login", state: "cancelled", expires_at: challenge.expires_at, error_code: null });
+  render(<SubscriptionModelForm provider="open_ai_codex" profile={null} onSaved={vi.fn()} onCancel={vi.fn()} zh={false} />);
+  fireEvent.click(screen.getByRole("button", { name: "Sign in to Codex" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent(message);
+  expect(screen.getByRole("button", { name: "Save profile" })).toBeDisabled();
+  expect(document.body).not.toHaveTextContent("SECRET_AUTH_BODY_SENTINEL");
+});
+
+it("handles safe poll rejections without losing sign-in retry", async () => {
+  vi.spyOn(api, "beginCodexLogin").mockResolvedValue(challenge);
+  vi.spyOn(api, "pollCodexLogin").mockRejectedValue(new Error("codex_auth_timeout"));
+  vi.spyOn(api, "cancelCodexLogin").mockResolvedValue({ login_id: "login", state: "cancelled", expires_at: challenge.expires_at, error_code: null });
+  render(<SubscriptionModelForm provider="open_ai_codex" profile={null} onSaved={vi.fn()} onCancel={vi.fn()} zh={false} />);
+  fireEvent.click(screen.getByRole("button", { name: "Sign in to Codex" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent(/timed out.*retry/i);
+  expect(screen.getByRole("button", { name: "Sign in to Codex" })).toBeEnabled();
+});
+
+it("keeps profile save failures generic even for a recognizable sign-in code", async () => {
+  vi.spyOn(api, "subscriptionModelStatus").mockResolvedValue({ provider: "open_ai_codex", authenticated: true, masked_account_label: null, cli_version: null, error_code: null });
+  vi.spyOn(api, "saveModelProfile").mockRejectedValue(new Error("codex_device_region_unsupported"));
+  render(<SubscriptionModelForm provider="open_ai_codex" profile={profile} onSaved={vi.fn()} onCancel={vi.fn()} zh={false} />);
+  fireEvent.click(screen.getByRole("button", { name: "Save profile" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Operation failed. Check sign-in or configuration and retry.");
+});

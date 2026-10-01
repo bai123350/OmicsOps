@@ -13,6 +13,40 @@ interface Props {
   modelProfiles?: ModelProfile[];
 }
 
+const networkLoginError = [
+  "Unable to reach OpenAI. Check your internet connection and Windows system proxy, then retry.",
+  "无法连接 OpenAI。请检查网络连接和 Windows 系统代理后重试。",
+] as const;
+const protocolLoginError = [
+  "OpenAI returned an unexpected sign-in response. Retry; if this continues, update OmicsOps or report the issue.",
+  "OpenAI 返回了无法识别的登录响应。请重试；若问题持续，请更新 OmicsOps 或反馈此问题。",
+] as const;
+const codexLoginErrors = {
+  operation_failed: ["Operation failed. Check sign-in or configuration and retry.", "操作失败，请检查登录或配置后重试。"],
+  codex_auth_network_uncertain: networkLoginError,
+  codex_auth_connection_failed: networkLoginError,
+  codex_auth_timeout: ["OpenAI sign-in timed out. Check your network connection and retry.", "OpenAI 登录请求超时。请检查网络连接后重试。"],
+  codex_device_region_unsupported: ["OpenAI rejected sign-in from this network region. Check that your network location is supported and review your Windows system proxy before retrying.", "OpenAI 拒绝了当前网络地区的登录请求。请确认网络位置处于 OpenAI 支持的地区，检查 Windows 系统代理后重试。"],
+  codex_device_access_denied: ["OpenAI denied device sign-in. Check that your account allows device-code sign-in, then retry.", "OpenAI 拒绝了设备登录。请确认账户允许设备代码登录后重试。"],
+  codex_device_web_verification_required: ["OpenAI returned a web access or verification page. Check the network route used by OmicsOps and your Windows system proxy, then retry.", "OpenAI 返回了网页访问或验证页面。请检查 OmicsOps 使用的网络连接和 Windows 系统代理后重试。"],
+  codex_device_rate_limited: ["Too many sign-in requests. Wait a little and retry later.", "登录请求过于频繁。请稍候再重试。"],
+  codex_device_login_unavailable: ["OpenAI device sign-in is temporarily unavailable. Retry later.", "OpenAI 设备登录暂时不可用。请稍后重试。"],
+  codex_auth_response_invalid: protocolLoginError,
+  codex_auth_field_invalid: protocolLoginError,
+  codex_device_interval_invalid: protocolLoginError,
+  codex_device_challenge_invalid: protocolLoginError,
+  codex_device_login_failed: networkLoginError,
+  codex_device_authorization_failed: ["Codex authorization failed. Sign in again.", "Codex 授权失败。请重新登录。"],
+  codex_token_exchange_failed: ["OpenAI could not finish authorization. Sign in again.", "OpenAI 未能完成授权。请重新登录。"],
+  codex_reauthentication_required: ["Codex needs renewed authorization. Sign in again.", "Codex 需要重新授权。请重新登录。"],
+  codex_login_expired: ["Codex sign-in expired. Sign in again to get a new code.", "Codex 登录已过期。请重新登录以获取新代码。"],
+} as const;
+type FormError = keyof typeof codexLoginErrors;
+function safeCodexLoginError(error: unknown): FormError {
+  const code = typeof error === "string" ? error : error instanceof Error ? error.message : null;
+  return code && Object.prototype.hasOwnProperty.call(codexLoginErrors, code) ? code as FormError : "operation_failed";
+}
+
 export function SubscriptionModelForm({ provider, profile, onSaved, onCancel, zh, modelProfiles = [] }: Props) {
   const codex = provider === "open_ai_codex";
   const [label, setLabel] = useState(profile?.label ?? (codex ? "Codex subscription" : "Claude Code subscription"));
@@ -28,7 +62,7 @@ export function SubscriptionModelForm({ provider, profile, onSaved, onCancel, zh
   const [loginState, setLoginState] = useState<CodexLoginStateResponse["state"] | null>(null);
   const [status, setStatus] = useState<SubscriptionModelStatus | null>(null);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState(false);
+  const [error, setError] = useState<FormError | null>(null);
   const lifecycle = useRef(0);
   const currentLogin = useRef<string | null>(null);
   const cancelled = useRef(new Set<string>());
@@ -48,7 +82,7 @@ export function SubscriptionModelForm({ provider, profile, onSaved, onCancel, zh
   useEffect(() => {
     if (!profile) return;
     let active = true;
-    void api.subscriptionModelStatus(profile.id).then(value => { if (active) setStatus(value); }).catch(() => { if (active) setError(true); });
+    void api.subscriptionModelStatus(profile.id).then(value => { if (active) setStatus(value); }).catch(() => { if (active) setError("operation_failed"); });
     return () => { active = false; };
   }, [profile]);
   useEffect(() => {
@@ -61,14 +95,17 @@ export function SubscriptionModelForm({ provider, profile, onSaved, onCancel, zh
         if (!active) return;
         setLoginState(value.state);
         if (value.state === "pending") timer = setTimeout(() => void poll(), 1000);
-      } catch { if (active) { setError(true); setLoginState("failed"); } }
+        else if (value.state === "failed" || value.state === "expired") {
+          setError(safeCodexLoginError(value.state === "expired" ? "codex_login_expired" : value.error_code));
+        }
+      } catch (failure) { if (active) { setError(safeCodexLoginError(failure)); setLoginState("failed"); } }
     }
     void poll();
     return () => { active = false; clearTimeout(timer); };
   }, [challenge]);
   async function begin() {
     if (busyRef.current) return;
-    busyRef.current = true; setBusy(true); setError(false);
+    busyRef.current = true; setBusy(true); setError(null);
     const generation = lifecycle.current;
     try {
       if (currentLogin.current) cancelOnce(currentLogin.current);
@@ -76,7 +113,7 @@ export function SubscriptionModelForm({ provider, profile, onSaved, onCancel, zh
       const value = await api.beginCodexLogin(profile?.id);
       if (lifecycle.current !== generation) { cancelOnce(value.login_id); return; }
       currentLogin.current = value.login_id; setChallenge(value); setLoginState("pending");
-    } catch { if (lifecycle.current === generation) setError(true); }
+    } catch (failure) { if (lifecycle.current === generation) setError(safeCodexLoginError(failure)); }
     finally { busyRef.current = false; if (lifecycle.current === generation) setBusy(false); }
   }
   const windowValid = !windowDirty || !windowDraft.trim() || (/^[1-9]\d*$/.test(windowDraft.trim()) && Number(windowDraft) <= 4_294_967_295);
@@ -84,7 +121,7 @@ export function SubscriptionModelForm({ provider, profile, onSaved, onCancel, zh
   async function save() {
     if (!canSave || busyRef.current) return;
     mutationRef.current = true;
-    busyRef.current = true; setBusy(true); setError(false);
+    busyRef.current = true; setBusy(true); setError(null);
     const generation = lifecycle.current;
     const request: SaveModelProfileRequest = {
       ...(profile ? { id: profile.id } : {}), label: label.trim(), provider,
@@ -100,16 +137,16 @@ export function SubscriptionModelForm({ provider, profile, onSaved, onCancel, zh
         : await api.saveModelProfile(request);
       savedLogin.current = true;
       if (lifecycle.current === generation) onSaved(value);
-    } catch { if (lifecycle.current === generation) setError(true); }
+    } catch { if (lifecycle.current === generation) setError("operation_failed"); }
     finally { mutationRef.current = false; busyRef.current = false; if (lifecycle.current === generation) setBusy(false); }
   }
   async function disconnect() {
     if (!profile || busyRef.current) return;
     mutationRef.current = true;
-    busyRef.current = true; setBusy(true); setError(false);
+    busyRef.current = true; setBusy(true); setError(null);
     const generation = lifecycle.current;
     try { const value = await api.disconnectCodex(profile.id); if (lifecycle.current === generation) onSaved(value); }
-    catch { if (lifecycle.current === generation) setError(true); }
+    catch { if (lifecycle.current === generation) setError("operation_failed"); }
     finally { mutationRef.current = false; busyRef.current = false; if (lifecycle.current === generation) setBusy(false); }
   }
   return <section className="model-form" aria-label={zh ? "订阅模型配置" : "Subscription model configuration"}>
@@ -133,7 +170,7 @@ export function SubscriptionModelForm({ provider, profile, onSaved, onCancel, zh
       {status && <p className="wide" role="status">{status.authenticated ? (zh ? "已登录" : "Signed in") : (zh ? "未登录" : "Not signed in")}{status.masked_account_label ? ` · ${status.masked_account_label}` : ""}{status.cli_version ? ` · ${status.cli_version}` : ""}</p>}
       <label className="wide">{zh ? "只读子 Agent 模型" : "Read-only subagent model"}<select aria-label="Read-only subagent model" value={delegated} onChange={e => { setDelegated(e.target.value); setDelegatedDirty(true); }}><option value="">{zh ? "沿用主模型" : "Inherit main model"}</option>{modelProfiles.filter(p => p.id !== profile?.id && p.supports_tools).map(p => <option key={p.id} value={p.id}>{p.label} · {p.model}</option>)}{delegated && !modelProfiles.some(p => p.id === delegated) && <option value={delegated}>{zh ? "保留当前绑定" : "Keep current binding"}</option>}</select></label>
     </div>
-    {error && <p role="alert">{zh ? "操作失败，请检查登录或配置后重试。" : "Operation failed. Check sign-in or configuration and retry."}</p>}
+    {error && <p role="alert">{codexLoginErrors[error][zh ? 1 : 0]}</p>}
     <div className="model-form-actions"><button disabled={busy && mutationRef.current} onClick={onCancel}>{zh ? "取消" : "Cancel"}</button><button className="primary" disabled={!canSave} onClick={() => void save()}>{zh ? "保存配置" : "Save profile"}</button></div>
   </section>;
 }

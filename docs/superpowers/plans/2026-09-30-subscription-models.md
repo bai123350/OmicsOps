@@ -445,3 +445,27 @@ HTML 页面与限流类别。完整 HTTP 请求/响应替身校验 begin、pendi
 两种 JSON 形态的 429 slow_down 回归先失败后通过，未知 429 仍返回脱敏限流错误。
 最终 auth 11 项和依赖解析 1 项通过。另将 HTML 提示改为检查应用网络/系统代理，
 不承诺完成浏览器验证会修复原生请求；对应界面回归先失败后通过。
+
+原生/界面错误链路修复：仅精确白名单代码跨越原生 UI 边界；失败/过期轮询显示
+明确提示，显式重试清除旧提示，保存和退出失败仍保持通用脱敏。原生 3 个新增
+回归先失败后通过，subscription_models 11 项通过；界面 28 项通过，Escape、
+取消和迟到结果保护保留。无 DTO 结构、数据库迁移或审批行为变化。
+
+公开设备码诊断实际执行 `cargo run -p omicsops-adapters --example codex_login_diagnostic --quiet`：
+补代理功能前输出固定失败类别（HTTP 403 / 已知地区拒绝）；补功能后输出
+production_begin=ok、user_code_present=true、interval_secs=5，均退出 0。
+此一次性诊断不打印真实设备码，不做 token 交换，自有临时代码已移除。
+
+本次完整确定性检查：`cargo test --workspace` 退出 0（1489 passed、0 failed、
+16 ignored）；`npm test` 完整重跑退出 0（112 files / 992 Vitest、22 browser bridge）；
+`npm run build`、`cargo fmt --all -- --check`、`git diff --check` 均通过。
+首次并行检查中 `WorkflowLibraryDialog > lists persisted workflows and opens their ordered steps for editing`
+在数据仍为 Loading workflows 时立即断言 QC recipe，npm test 退出 1（991 passed / 1 failed）；
+该测试未被本次改动，单文件重跑 17/17 通过，等待 Rust 编译完成后完整重跑通过。
+没有修改工作流生产代码或弱化测试，保留此异步时序失败记录。npm 锁未改变。
+
+`npm run build:desktop` 退出 0：release 编译 5m18s，Windows x64 程序及 NSIS
+构建完成，仅作为构建检查，未安装、发布或分发安装包。现有 Web chunk-size、
+Windows linker stdout 提示不影响成功结果。新增行凭据特征扫描为 0，未改动
+website/，未提交临时诊断、日志、数据库、打包产物或凭据。真实账户授权、模型
+生成、GUI、macOS、SSH 与科研工作流验收仍未执行。

@@ -5,6 +5,7 @@ use crate::{
     model_commands::{merge_existing_profile, model_profile_from_request},
 };
 use omicsops_adapters::{
+    AdapterError,
     codex_auth::*,
     credentials::{CredentialVault, SystemCredentialVault, credential_account},
 };
@@ -92,6 +93,7 @@ impl SubscriptionLoginManager {
                 entry.state = CodexLoginState::Expired;
                 entry.cancel.store(true, Ordering::SeqCst);
                 entry.bundle = None;
+                entry.error_code = Some("codex_login_expired".into());
             }
         }
         entries.retain(|_, entry| now < entry.expires_at_ms.saturating_add(900_000));
@@ -134,9 +136,10 @@ impl SubscriptionLoginManager {
         }
         let mut challenge = match self.auth.begin_device().await {
             Ok(c) => c,
-            Err(_) => {
-                self.fail(login_id, "codex_device_login_failed").await;
-                return Err("codex_device_login_failed".into());
+            Err(error) => {
+                let code = safe_codex_login_error(error, "codex_device_login_failed");
+                self.fail(login_id, &code).await;
+                return Err(code);
             }
         };
         if challenge.verification_uri.as_str() != "https://auth.openai.com/codex/device"
@@ -180,11 +183,11 @@ impl SubscriptionLoginManager {
                         }
                         break;
                     }
-                    Err(_) => {
+                    Err(error) => {
                         if let Some(manager) = weak.upgrade() {
-                            manager
-                                .fail(login_id, "codex_device_authorization_failed")
-                                .await;
+                            let code =
+                                safe_codex_login_error(error, "codex_device_authorization_failed");
+                            manager.fail(login_id, &code).await;
                         }
                         break;
                     }
@@ -492,6 +495,32 @@ impl Drop for SubscriptionLoginManager {
 }
 fn date(ms: i64) -> Result<chrono::DateTime<chrono::Utc>, String> {
     chrono::DateTime::from_timestamp_millis(ms).ok_or_else(|| "codex_login_expiry_invalid".into())
+}
+// Transport payloads may contain authorization material. Only exact fixed codes cross to UI.
+fn safe_codex_login_error(error: AdapterError, fallback: &str) -> String {
+    if let AdapterError::Llm(code) = error {
+        if matches!(
+            code.as_str(),
+            "codex_auth_network_uncertain"
+                | "codex_auth_timeout"
+                | "codex_auth_connection_failed"
+                | "codex_device_region_unsupported"
+                | "codex_device_access_denied"
+                | "codex_device_web_verification_required"
+                | "codex_device_rate_limited"
+                | "codex_device_login_unavailable"
+                | "codex_auth_response_invalid"
+                | "codex_auth_field_invalid"
+                | "codex_device_interval_invalid"
+                | "codex_device_authorization_failed"
+                | "codex_token_exchange_failed"
+                | "codex_reauthentication_required"
+                | "codex_login_expired"
+        ) {
+            return code;
+        }
+    }
+    fallback.into()
 }
 fn state_response(id: Uuid, entry: &Login) -> Result<CodexLoginStateResponse, String> {
     Ok(CodexLoginStateResponse {
