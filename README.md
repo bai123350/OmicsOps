@@ -80,7 +80,7 @@ OpenAI-compatible 配置提供 **Requested reasoning effort**：选择明确值�
 
 获得 `agent.read_tool_result` 能力的运行可接收有界的大工具结果视图，原始结果保留在事件存储中，并可通过运行范围内的序号/哈希引用分页读取。此工具在 Plan 模式不可用。无进展检测同时比较调用和结果，作业状态变化算作进展；重复且不变的观察会让运行暂停等待处理。
 
-供应商用量事件只保留白名单中的非负整数计数。OpenAI-compatible 可保留服务报告的 reasoning/cache 明细，缺失字段保持缺失；Ollama 不复制响应正文、消息或上下文 ID。当前未新增 V4 用量持久化、部分用量聚合或历史记录重写。更多目录供应商、价格展示、准确图片成本和实际推理档位报告仍待完善；目录离线生成方式见 [scripts/README.md](scripts/README.md)。
+供应商用量事件只保留白名单中的非负整数计数。OpenAI-compatible 可保留服务报告的 reasoning/cache 明细，缺失字段保持缺失；Ollama 不复制响应正文、消息或上下文 ID。V4 请求与用量观察已持久化到运行事件，Usage 设置按稳定快照分页汇总项目、模型、日期、工具和会话，缺失或不完整观察保持明确标记，不补写虚构的历史用量。更多目录供应商、价格展示、准确图片成本和实际推理档位报告仍待完善；目录离线生成方式见 [scripts/README.md](scripts/README.md)。
 
 ### 只读子 Agent 与运行指导
 
@@ -135,5 +135,6 @@ npm run build:desktop
 - [普通 Agent Guided Loop](docs/superpowers/specs/ordinary-agent-guided-loop.md)
 - [V4 Agent Harness 设计](docs/superpowers/specs/2026-08-16-agent-harness-v3-design.md)
 - [参考 Agent Loop 设计及后续增量](docs/superpowers/specs/2026-09-08-wisp-inspired-agent-loop.md)
+- [Wisp Science 可借鉴改进清单与优先级](docs/superpowers/specs/2026-10-04-wisp-science-improvement-backlog.md)
 - [最初批准设计（历史背景）](docs/superpowers/specs/2026-07-29-omicsops-agent-design.md)
 - [真实环境验收流程](acceptance/README.md)
