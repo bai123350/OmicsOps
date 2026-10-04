@@ -312,6 +312,51 @@ pub(crate) fn remove_replayed_context_events(
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|hash| hashes.contains(hash))
             });
+            if let Some(steps) = value
+                .get_mut("checkpoint")
+                .and_then(|checkpoint| checkpoint.get_mut("recent_steps"))
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                steps.retain(|step| {
+                    let Some(projection) = step
+                        .as_str()
+                        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                    else {
+                        return true;
+                    };
+                    let Some(hash) = projection
+                        .get("event_hash")
+                        .and_then(serde_json::Value::as_str)
+                    else {
+                        return true;
+                    };
+                    let Some(source) = events
+                        .iter()
+                        .find(|event| event.event_hash == hash && event.verify().is_ok())
+                    else {
+                        return true;
+                    };
+                    // A copied hash or narrative match is insufficient. Keep
+                    // legacy/changed checkpoint views unless they are exactly
+                    // the signed source's current model projection.
+                    if crate::context_views::event_view(source) != projection {
+                        return true;
+                    }
+                    match &source.event {
+                        AgentEventKindV4::ToolFinished { outcome }
+                        | AgentEventKindV4::ToolOutcomeReused { outcome, .. } => {
+                            let serialized = projection.to_string();
+                            !replay.iter().any(|item| {
+                                matches!(item,
+                                ModelReplayItemV4::ToolResult { call_id, output }
+                                    if call_id == &outcome.call_id && output == &serialized)
+                            })
+                        }
+                        AgentEventKindV4::ModelText { text } => !texts.contains(text.as_str()),
+                        _ => true,
+                    }
+                });
+            }
             return value.to_string();
         }
     }
@@ -431,6 +476,190 @@ mod tests {
                 &events[..3]
             )
             .is_err()
+        );
+    }
+    #[test]
+    fn model_replay_removes_checkpoint_copies_without_changing_durable_evidence() {
+        let template = chain();
+        let mut events = vec![template[0].clone()];
+        let mut recorded = template[1].event.clone();
+        if let AgentEventKindV4::ModelReplayRecorded { replay } = &mut recorded {
+            replay
+                .continuation
+                .items
+                .push(ModelReplayItemV4::AssistantText {
+                    text: "checkpoint-public-progress".into(),
+                });
+        }
+        let mut outcome = match &template[3].event {
+            AgentEventKindV4::ToolFinished { outcome } => outcome.clone(),
+            _ => unreachable!(),
+        };
+        outcome.data = json!({"finding":"checkpoint-verified-finding", "detail":"x".repeat(4_096)});
+        outcome.model_content = outcome.data.to_string();
+        for kind in [
+            recorded,
+            AgentEventKindV4::ModelText {
+                text: "checkpoint-public-progress".into(),
+            },
+            template[2].event.clone(),
+            AgentEventKindV4::ToolFinished { outcome },
+            AgentEventKindV4::UserInputAnswered {
+                question_id: "unreplayed-question".into(),
+                answer: "retain this clarification".into(),
+            },
+            AgentEventKindV4::DelegationNodeFinished {
+                call_id: "unreplayed-delegation".into(),
+                outcome: DelegationNodeOutcomeV4 {
+                    node_id: "reader".into(),
+                    status: DelegationNodeStatusV4::Succeeded,
+                    output: Some(json!({"finding":"retain delegated conclusion"})),
+                    error: None,
+                    tool_outcomes: vec![],
+                },
+            },
+        ] {
+            events.push(AgentEventV4::next(events.last().unwrap(), Utc::now(), kind));
+        }
+        let text = crate::context_views::event_view(&events[2]).to_string();
+        let result = crate::context_views::event_view(&events[4]).to_string();
+        let input = crate::context_views::event_view(&events[5]).to_string();
+        let delegation = crate::context_views::event_view(&events[6]).to_string();
+        let legacy = "tool project.read: legacy narrative remains".to_owned();
+        let checkpoint = ContextCheckpointV4 {
+            schema_version: 4,
+            through_sequence: events.last().unwrap().sequence,
+            completion_criteria: vec!["report the verified finding".into()],
+            unresolved_errors: vec!["active correction must remain".into()],
+            recent_steps: vec![
+                text,
+                result,
+                input.clone(),
+                delegation.clone(),
+                legacy.clone(),
+            ],
+            scientific_state: json!({"project_id":Uuid::from_u128(1), "evidence":"current-science"}),
+            task_shape: None,
+            phase: None,
+            task_revision: None,
+            tasks: vec![],
+            cycle_id: None,
+        };
+        events.push(AgentEventV4::next(
+            events.last().unwrap(),
+            Utc::now(),
+            AgentEventKindV4::ContextCheckpointed {
+                checkpoint: checkpoint.clone(),
+            },
+        ));
+        let durable_before = serde_json::to_vec(&events).unwrap();
+        let replay =
+            project_model_replay(Uuid::from_u128(1), Uuid::from_u128(2), &binding(), &events)
+                .unwrap();
+        let context = json!({
+            "frozen_plan":{"objective":"continue"},
+            "compute_selection":{"environment":"system"},
+            "checkpoint":crate::context_views::checkpoint_view(&checkpoint),
+            "recent_events":[],
+            "scientific_state":checkpoint.scientific_state,
+            "active_guidance":[{"markdown":"preserve the source"}],
+        });
+        let filtered = remove_replayed_context_events(&context.to_string(), &replay, &events);
+        let filtered_value: serde_json::Value = serde_json::from_str(&filtered).unwrap();
+        assert_eq!(
+            filtered_value["checkpoint"]["recent_steps"],
+            json!([input, delegation, legacy])
+        );
+        assert!(!filtered.contains("checkpoint-verified-finding"));
+        assert!(!filtered.contains("checkpoint-public-progress"));
+        assert!(replay.iter().any(|item| matches!(item, ModelReplayItemV4::ToolResult { output, .. } if output.contains("checkpoint-verified-finding"))));
+        assert!(replay.iter().any(|item| matches!(item, ModelReplayItemV4::AssistantText { text } if text == "checkpoint-public-progress")));
+        for field in [
+            "frozen_plan",
+            "compute_selection",
+            "scientific_state",
+            "active_guidance",
+        ] {
+            assert_eq!(filtered_value[field], context[field]);
+        }
+        assert_eq!(
+            filtered_value["checkpoint"]["unresolved_errors"],
+            json!(["active correction must remain"])
+        );
+        assert_eq!(serde_json::to_vec(&events).unwrap(), durable_before);
+        for event in &events {
+            event.verify().unwrap();
+        }
+        assert!(context.to_string().len() - filtered.len() > 4_096);
+        eprintln!(
+            "checkpoint replay fixture: context {} -> {} bytes; removed {} bytes",
+            context.to_string().len(),
+            filtered.len(),
+            context.to_string().len() - filtered.len()
+        );
+    }
+    #[test]
+    fn checkpoint_replay_dedup_preserves_unrepresented_or_changed_projections() {
+        let mut events = chain();
+        let replay =
+            project_model_replay(Uuid::from_u128(1), Uuid::from_u128(2), &binding(), &events)
+                .unwrap();
+        let result = crate::context_views::event_view(&events[3]);
+        let mut changed = result.clone();
+        changed["event"]["outcome"]["model_content"] = json!("separate checkpoint annotation");
+        let foreign = AgentEventV4::first(
+            Uuid::from_u128(7),
+            Uuid::from_u128(1),
+            Uuid::from_u128(2),
+            Utc::now(),
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: "call_1".into(),
+                    tool_id: "project.read".into(),
+                    succeeded: true,
+                    model_content: "foreign-run-finding".into(),
+                    data: json!({}),
+                    provenance: vec![],
+                },
+            },
+        );
+        events.push(foreign.clone());
+        let steps = json!([
+            changed.to_string(),
+            crate::context_views::event_view(&foreign).to_string(),
+            "plain legacy step",
+            "{malformed json",
+            json!({"event_hash":"unknown"}).to_string(),
+        ]);
+        let context = json!({"recent_events":[], "checkpoint":{"recent_steps":steps}});
+        let filtered = remove_replayed_context_events(&context.to_string(), &replay, &events);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&filtered).unwrap(),
+            context
+        );
+
+        let partial_replay: Vec<_> = replay
+            .iter()
+            .filter(|item| !matches!(item, ModelReplayItemV4::ToolResult { .. }))
+            .cloned()
+            .collect();
+        let context =
+            json!({"recent_events":[], "checkpoint":{"recent_steps":[result.to_string()]}});
+        let filtered =
+            remove_replayed_context_events(&context.to_string(), &partial_replay, &events);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&filtered).unwrap(),
+            context
+        );
+
+        if let AgentEventKindV4::ToolFinished { outcome } = &mut events[3].event {
+            outcome.data = json!({"changed_without_resigning":true});
+        }
+        assert!(events[3].verify().is_err());
+        let filtered = remove_replayed_context_events(&context.to_string(), &replay, &events);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&filtered).unwrap(),
+            context
         );
     }
     #[test]
