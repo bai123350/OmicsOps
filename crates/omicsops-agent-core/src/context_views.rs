@@ -254,6 +254,13 @@ pub(crate) fn event_view(event: &AgentEventV4) -> Value {
     let data_bytes = serde_json::to_vec(&outcome.data)
         .expect("serializable data")
         .len();
+    if outcome.tool_id == "runtime.execute"
+        && outcome.succeeded
+        && (data_bytes > VIEW_BYTES || outcome.model_content.len() > VIEW_BYTES)
+        && let Some(runtime_view) = runtime_execute_view(&view, event, outcome, data_bytes)
+    {
+        return runtime_view;
+    }
     // Desktop MCP outcomes wrap the exact result with host audit metadata.
     // Keep that complete wrapper, including its original result, inline.
     let model_content_duplicates_data = serde_json::to_string(&outcome.data)
@@ -288,6 +295,129 @@ pub(crate) fn event_view(event: &AgentEventV4) -> Value {
             "read_field": "data", "bytes": data_bytes});
     }
     view
+}
+
+/// Keep runtime evidence metadata available even when output excerpts dominate
+/// the result. Only the model projection changes; signed data remains readable.
+fn runtime_execute_view(
+    source_view: &Value,
+    event: &AgentEventV4,
+    outcome: &ToolOutcomeV4,
+    data_bytes: usize,
+) -> Option<Value> {
+    let fields = outcome.data.as_object()?;
+    // Unknown legacy shapes can carry additional diagnostics. Leave them on the
+    // existing generic path rather than reinterpreting them as runtime success.
+    if fields.keys().any(|field| {
+        !matches!(
+            field.as_str(),
+            "request_id"
+                | "session_id"
+                | "process_identity"
+                | "stdout"
+                | "stderr"
+                | "stdout_capture"
+                | "stderr_capture"
+                | "succeeded"
+                | "artifacts"
+                | "software_versions"
+        )
+    }) {
+        return None;
+    }
+    let result =
+        serde_json::from_value::<omicsops_protocol::RuntimeResultV4>(outcome.data.clone()).ok()?;
+    if !result.succeeded
+        || result
+            .stdout_capture
+            .as_ref()
+            .is_some_and(|capture| capture.excerpt != result.stdout)
+        || result
+            .stderr_capture
+            .as_ref()
+            .is_some_and(|capture| capture.excerpt != result.stderr)
+    {
+        return None;
+    }
+    let artifacts = fields.get("artifacts")?.as_array()?;
+
+    let mut view = source_view.clone();
+    attach_reference(&mut view, event, "data");
+    view["result_reference"]["model_content_bytes"] = json!(outcome.model_content.len());
+    view["result_reference"]["data_bytes"] = json!(data_bytes);
+    let mut metadata = outcome.data.clone();
+    let object = metadata.as_object_mut()?;
+    object.remove("stdout");
+    object.remove("stderr");
+    for field in ["stdout_capture", "stderr_capture"] {
+        if let Some(capture) = object.get_mut(field).and_then(Value::as_object_mut) {
+            capture.remove("excerpt");
+        }
+    }
+    metadata["output_text_field"] = json!("model_content");
+    metadata["artifact_count"] = json!(result.artifacts.len());
+    let mut kept_artifacts = result.artifacts.len().min(32);
+    loop {
+        metadata["artifacts"] = json!(artifacts[..kept_artifacts]);
+        metadata["omitted_artifact_count"] = json!(result.artifacts.len() - kept_artifacts);
+        view["event"]["outcome"]["data"] = metadata.clone();
+        // Reserve useful output space before choosing the artifact directory.
+        // The final text search includes its actual JSON escaping overhead.
+        view["event"]["outcome"]["model_content"] = json!("x".repeat(1_024));
+        if view.to_string().len() <= VIEW_BYTES {
+            break;
+        }
+        if kept_artifacts == 0 {
+            view["event"]["outcome"]["data"] = json!({
+                "omitted_from_model_view": true, "read_field": "data", "bytes": data_bytes,
+                "request_id": result.request_id, "session_id": result.session_id,
+                "succeeded": result.succeeded, "artifact_count": result.artifacts.len(),
+                "omitted_artifact_count": result.artifacts.len(),
+                "note": "Runtime metadata exceeds the model view; read the signed data for process identity, capture metadata and artifacts.",
+            });
+            break;
+        }
+        kept_artifacts /= 2;
+    }
+
+    view["event"]["outcome"]["model_content"] = json!("");
+    if view.to_string().len() > VIEW_BYTES {
+        return None;
+    }
+    let mut lower = 0;
+    let mut upper = outcome.model_content.len().min(VIEW_BYTES);
+    while lower < upper {
+        let candidate = lower + (upper - lower).div_ceil(2);
+        view["event"]["outcome"]["model_content"] =
+            json!(runtime_output_text(&outcome.model_content, candidate));
+        if view.to_string().len() <= VIEW_BYTES {
+            lower = candidate;
+        } else {
+            upper = candidate - 1;
+        }
+    }
+    view["event"]["outcome"]["model_content"] =
+        json!(runtime_output_text(&outcome.model_content, lower));
+    Some(view)
+}
+
+fn runtime_output_text(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let marker = "\n[model view shortened; read original model_content using result_reference]\n";
+    if limit <= marker.len() {
+        return String::new();
+    }
+    let mut head = (limit - marker.len()) / 2;
+    let mut tail = text.len() - (limit - marker.len() - head);
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}{marker}{}", &text[..head], &text[tail..])
 }
 
 fn attach_reference(view: &mut Value, event: &AgentEventV4, field: &str) {
@@ -779,6 +909,284 @@ mod tests {
                 },
             },
         )
+    }
+
+    fn runtime_result_event(
+        spec: &RunSpecV4,
+        stdout: &str,
+        stderr: &str,
+        artifacts: usize,
+    ) -> AgentEventV4 {
+        let artifact_records: Vec<_> = (0..artifacts)
+            .map(|index| {
+                json!({"relative_path": format!("results/literature/paper-{index}.tsv"),
+                    "size_bytes": 100 + index, "sha256": format!("{index:064x}")})
+            })
+            .collect();
+        let data = json!({
+            "request_id": "00000000-0000-0000-0000-000000000001",
+            "session_id": "00000000-0000-0000-0000-000000000002",
+            "process_identity": "local-python:1234", "stdout": stdout, "stderr": stderr,
+            "stdout_capture": {"excerpt": stdout, "total_bytes": 500_000,
+                "sha256": "a".repeat(64), "archive_path": "results/.runtime/stdout.txt", "truncated": true},
+            "stderr_capture": {"excerpt": stderr, "total_bytes": stderr.len(),
+                "sha256": "b".repeat(64), "archive_path": "results/.runtime/stderr.txt", "truncated": false},
+            "succeeded": true, "artifacts": artifact_records, "software_versions": {"python":"3.12"},
+        });
+        AgentEventV4::first(
+            spec.run_id,
+            spec.project_id,
+            spec.conversation_id,
+            Utc::now(),
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: "runtime-1".into(),
+                    tool_id: "runtime.execute".into(),
+                    succeeded: true,
+                    model_content: format!(
+                        "session=00000000-0000-0000-0000-000000000002 process=local-python:1234 request=00000000-0000-0000-0000-000000000001\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                    ),
+                    data,
+                    provenance: vec!["kernel-session:00000000-0000-0000-0000-000000000002".into()],
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn runtime_result_projection_keeps_captured_artifacts_without_repeating_output() {
+        let spec = spec();
+        let stdout = format!(
+            "{}\nfinal statistics: 42 papers",
+            "paper record\n".repeat(1_000)
+        );
+        let event = runtime_result_event(&spec, &stdout, "warning: one paper unavailable", 4);
+        let original = event.clone();
+
+        let view = event_view(&event);
+        let data = &view["event"]["outcome"]["data"];
+
+        assert_eq!(data["succeeded"], true);
+        assert_eq!(data["request_id"], "00000000-0000-0000-0000-000000000001");
+        assert_eq!(data["session_id"], "00000000-0000-0000-0000-000000000002");
+        assert_eq!(data["process_identity"], "local-python:1234");
+        assert_eq!(data["artifacts"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            data["artifacts"][3]["relative_path"],
+            "results/literature/paper-3.tsv"
+        );
+        assert_eq!(data["artifacts"][3]["size_bytes"], 103);
+        assert_eq!(data["artifacts"][3]["sha256"], format!("{:064x}", 3));
+        assert_eq!(data["stdout_capture"]["total_bytes"], 500_000);
+        assert_eq!(data["stdout_capture"]["sha256"], "a".repeat(64));
+        assert_eq!(
+            data["stdout_capture"]["archive_path"],
+            "results/.runtime/stdout.txt"
+        );
+        assert_eq!(data["stdout_capture"]["truncated"], true);
+        assert!(data.get("stdout").is_none());
+        assert!(data.get("stderr").is_none());
+        assert!(data["stdout_capture"].get("excerpt").is_none());
+        assert!(data["stderr_capture"].get("excerpt").is_none());
+        let content = view["event"]["outcome"]["model_content"].as_str().unwrap();
+        assert!(content.contains("final statistics: 42 papers"));
+        assert!(content.contains("warning: one paper unavailable"));
+        assert!(view.to_string().len() <= VIEW_BYTES);
+        assert_eq!(view["result_reference"]["event_hash"], event.event_hash);
+        assert_eq!(event, original);
+        event.verify().unwrap();
+
+        for field in ["data", "model_content"] {
+            let mut restored = String::new();
+            let mut offset = 0_u64;
+            loop {
+                let page = read_outcome(
+                    &spec,
+                    std::slice::from_ref(&event),
+                    ToolCallV4 {
+                        call_id: "read-original-runtime-result".into(),
+                        tool_id: READ_RESULT_TOOL.into(),
+                        arguments: json!({"sequence": event.sequence, "event_hash": event.event_hash,
+                            "field": field, "offset": offset, "limit": 8192}),
+                    },
+                );
+                assert!(page.succeeded);
+                restored.push_str(page.data["content"].as_str().unwrap());
+                let Some(next) = page.data["next_offset"].as_u64() else {
+                    break;
+                };
+                assert!(next > offset);
+                offset = next;
+            }
+            let AgentEventKindV4::ToolFinished { outcome } = &event.event else {
+                unreachable!()
+            };
+            let expected = if field == "data" {
+                outcome.data.to_string()
+            } else {
+                outcome.model_content.clone()
+            };
+            assert_eq!(restored, expected);
+        }
+    }
+
+    #[test]
+    fn runtime_result_projection_bounds_artifact_metadata_and_escaped_utf8_output() {
+        let spec = spec();
+        let stdout = format!(
+            "{}\nlatest result: 数据🧬",
+            "quoted \\\" slash\\ line\n\t数据🧬".repeat(1_000)
+        );
+        let event = runtime_result_event(&spec, &stdout, "stderr tail", 200);
+
+        let view = event_view(&event);
+        let data = &view["event"]["outcome"]["data"];
+        let kept = data["artifacts"].as_array().unwrap().len();
+
+        assert!(kept > 0 && kept < 200);
+        assert_eq!(data["omitted_artifact_count"], 200 - kept);
+        assert_eq!(
+            data["artifacts"][0]["relative_path"],
+            "results/literature/paper-0.tsv"
+        );
+        assert!(
+            view["event"]["outcome"]["model_content"]
+                .as_str()
+                .unwrap()
+                .contains("latest result: 数据🧬")
+        );
+        assert!(view.to_string().len() <= VIEW_BYTES);
+        assert_eq!(view["result_reference"]["field"], "data");
+    }
+
+    #[test]
+    fn runtime_result_projection_falls_back_when_metadata_alone_is_oversized() {
+        let spec = spec();
+        let mut event = runtime_result_event(&spec, &"record\n".repeat(2_000), "stderr tail", 4);
+        let AgentEventKindV4::ToolFinished { outcome } = &mut event.event else {
+            unreachable!()
+        };
+        outcome.data["process_identity"] = json!("identity".repeat(3_000));
+        outcome.data["stdout_capture"]["archive_path"] = json!("huge-path".repeat(3_000));
+        let event = AgentEventV4::first(
+            spec.run_id,
+            spec.project_id,
+            spec.conversation_id,
+            event.occurred_at,
+            event.event,
+        );
+
+        let view = event_view(&event);
+
+        assert_eq!(
+            view["event"]["outcome"]["data"]["omitted_from_model_view"],
+            true
+        );
+        assert_eq!(view["event"]["outcome"]["data"]["succeeded"], true);
+        assert!(view.to_string().len() <= VIEW_BYTES);
+        assert!(
+            view["event"]["outcome"]["model_content"]
+                .as_str()
+                .unwrap()
+                .ends_with("stderr tail")
+        );
+        event.verify().unwrap();
+    }
+
+    #[test]
+    fn runtime_result_projection_preserves_failures_and_unknown_shapes() {
+        let spec = spec();
+        for (succeeded, data) in [
+            (
+                false,
+                json!({"succeeded": false, "error": "interpreter crashed"}),
+            ),
+            (true, json!({"legacy_result": "not a RuntimeResultV4"})),
+        ] {
+            let event = AgentEventV4::first(
+                spec.run_id,
+                spec.project_id,
+                spec.conversation_id,
+                Utc::now(),
+                AgentEventKindV4::ToolFinished {
+                    outcome: ToolOutcomeV4 {
+                        call_id: "legacy-runtime".into(),
+                        tool_id: "runtime.execute".into(),
+                        succeeded,
+                        model_content: "original diagnostic".into(),
+                        data: data.clone(),
+                        provenance: vec![],
+                    },
+                },
+            );
+            let view = event_view(&event);
+            assert_eq!(view["event"]["outcome"]["data"], data);
+            assert_eq!(
+                view["event"]["outcome"]["model_content"],
+                "original diagnostic"
+            );
+            assert!(view.get("result_reference").is_none());
+        }
+    }
+
+    #[test]
+    fn runtime_result_projection_keeps_distinct_capture_text_on_the_legacy_path() {
+        let spec = spec();
+        let mut event = runtime_result_event(&spec, &"output\n".repeat(2_000), "stderr", 1);
+        let AgentEventKindV4::ToolFinished { outcome } = &mut event.event else {
+            unreachable!()
+        };
+        outcome.data["stdout_capture"]["excerpt"] = json!("distinct capture diagnostic");
+        let event = AgentEventV4::first(
+            spec.run_id,
+            spec.project_id,
+            spec.conversation_id,
+            event.occurred_at,
+            event.event,
+        );
+
+        let view = event_view(&event);
+
+        assert_eq!(
+            view["event"]["outcome"]["data"]["omitted_from_model_view"],
+            true
+        );
+        assert!(view["event"]["outcome"]["data"].get("request_id").is_none());
+        event.verify().unwrap();
+    }
+
+    #[test]
+    fn runtime_result_projection_preserves_extra_artifact_metadata() {
+        let spec = spec();
+        let mut event = runtime_result_event(&spec, &"paper\n".repeat(2_000), "stderr", 1);
+        let AgentEventKindV4::ToolFinished { outcome } = &mut event.event else {
+            unreachable!()
+        };
+        outcome.data["artifacts"][0]["media_metadata"] =
+            json!({"type":"text/tsv", "columns":["doi", "title"]});
+        outcome.data["stdout_capture"]["capture_metadata"] = json!({"backend":"local"});
+        let event = AgentEventV4::first(
+            spec.run_id,
+            spec.project_id,
+            spec.conversation_id,
+            event.occurred_at,
+            event.event,
+        );
+
+        let view = event_view(&event);
+        let data = &view["event"]["outcome"]["data"];
+
+        assert_eq!(
+            data["artifacts"][0]["media_metadata"],
+            json!({"type":"text/tsv", "columns":["doi", "title"]})
+        );
+        assert_eq!(
+            data["stdout_capture"]["capture_metadata"],
+            json!({"backend":"local"})
+        );
+        assert_eq!(data["omitted_artifact_count"], 0);
+        assert!(view.to_string().len() <= VIEW_BYTES);
+        event.verify().unwrap();
     }
 
     #[test]

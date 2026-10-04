@@ -531,9 +531,9 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "runtime.execute",
-            "Execute code in a persistent kernel, or background=true for a detached one-shot SSH job. Background jobs survive disconnects and Agent Stop; they do not share kernel variables. Query runtime.remote_job_status after restart. Never resubmit to reconnect.",
+            "Execute code in a persistent kernel, or background=true for a detached one-shot SSH job. Successful captured files are re-read by the Host and returned in artifacts with relative_path, size_bytes and sha256. Reuse those facts for the captured content; re-verify after content changes or when required facts are missing. Background jobs survive disconnects and Agent Stop; they do not share kernel variables. Query runtime.remote_job_status after restart. Never resubmit to reconnect.",
             ToolEffectV4::Runtime,
-            json!({"type":"object","required":["language","code"],"properties":{"language":{"type":"string"},"environment":{"type":"string","default":"system"},"code":{"type":"string"},"background":{"type":"boolean","default":false},"capture_paths":{"type":"array"},"analysis":{"type":"object","required":["analysis_type","input_dataset_ids","sample_ids","method","parameters"],"properties":{"analysis_type":{"type":"string"},"input_dataset_ids":{"type":"array"},"sample_ids":{"type":"array"},"method":{"type":"string"},"parameters":{"type":"object"},"software_requirements":{"type":"array","items":{"type":"string"},"description":"Provide bare installed Python distribution or R package names, one per item (for example numpy, pandas, or Seurat). Omit version constraints, combined strings, standard-library modules, and the Python/R interpreter; the Host records the interpreter automatically. Use [] for standard-library-only code."},"database_versions":{"type":"object"},"random_seed":{"type":["integer","null"]}}}}}),
+            json!({"type":"object","required":["language","code"],"properties":{"language":{"type":"string"},"environment":{"type":"string","default":"system"},"code":{"type":"string"},"background":{"type":"boolean","default":false},"capture_paths":{"type":"array","description":"Project-relative files to capture. Returned artifact facts include Host-verified size_bytes and sha256 for this captured content; capture does not guarantee the file stays unchanged."},"analysis":{"type":"object","required":["analysis_type","input_dataset_ids","sample_ids","method","parameters"],"properties":{"analysis_type":{"type":"string"},"input_dataset_ids":{"type":"array"},"sample_ids":{"type":"array"},"method":{"type":"string"},"parameters":{"type":"object"},"software_requirements":{"type":"array","items":{"type":"string"},"description":"Provide bare installed Python distribution or R package names, one per item (for example numpy, pandas, or Seurat). Omit version constraints, combined strings, standard-library modules, and the Python/R interpreter; the Host records the interpreter automatically. Use [] for standard-library-only code."},"database_versions":{"type":"object"},"random_seed":{"type":["integer","null"]}}}}}),
         ),
         descriptor(
             "runtime.remote_job_status",
@@ -581,7 +581,7 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "artifact.verify",
-            "Verify a project-relative artifact",
+            "Verify a project-relative artifact by re-reading its size and SHA-256. Use when Host-verified capture facts are missing, the file content has changed since capture, or the task explicitly requires re-verification. Reuse existing capture facts for the same content when they already satisfy the requested check.",
             ToolEffectV4::ReadOnly,
             json!({"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}),
         ),
