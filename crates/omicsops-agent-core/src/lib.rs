@@ -6143,11 +6143,26 @@ fn materialize_verified_evidence(
     state: &ScientificStateV4,
 ) -> Result<Vec<ReviewerEvidenceV4>, AgentCoreErrorV4> {
     let mut materialized = Vec::new();
+    let mut seen_events = BTreeSet::new();
+    let mut seen_artifacts = BTreeSet::new();
+    let mut seen_evidence = BTreeSet::new();
     for reference in proposal
         .criteria
         .iter()
         .flat_map(|criterion| criterion.evidence.iter())
     {
+        // A source may support several criteria. Keep those criterion bindings
+        // in the proposal, but transmit each full evidence payload only once.
+        let first_occurrence = match reference {
+            CompletionEvidenceRefV4::Event { sequence } => seen_events.insert(*sequence),
+            CompletionEvidenceRefV4::Artifact { artifact_id } => {
+                seen_artifacts.insert(*artifact_id)
+            }
+            CompletionEvidenceRefV4::Evidence { evidence_id } => seen_evidence.insert(*evidence_id),
+        };
+        if !first_occurrence {
+            continue;
+        }
         let payload = match reference {
             CompletionEvidenceRefV4::Event { sequence } => events
                 .iter()
@@ -14778,6 +14793,148 @@ mod tests {
                 .findings
                 .iter()
                 .any(|finding| finding.code == "criterion_without_evidence")
+        );
+    }
+
+    #[test]
+    fn reviewer_materialization_deduplicates_exact_refs_preserving_criteria_and_order() {
+        let project_id = Uuid::new_v4();
+        let mut state = large_science(project_id, 2_000);
+        let record_id = *state.evidence.keys().next().unwrap();
+        // Artifact and evidence IDs can coincide; their reference kinds must
+        // remain distinct even when their UUID values are identical.
+        state.artifacts.insert(
+            record_id,
+            omicsops_science::ArtifactRecordV4 {
+                schema_version: 4,
+                id: record_id,
+                project_id,
+                artifact_type: "report".into(),
+                relative_path: "results/literature.md".into(),
+                producer_analysis_id: Uuid::new_v4(),
+                size_bytes: 42,
+                sha256: "verified-report-hash".into(),
+                preview: None,
+                metadata: json!({"source":"synthetic-fixture"}),
+                valid: true,
+                created_at: Utc::now(),
+            },
+        );
+        let event = AgentEventV4::first(
+            Uuid::new_v4(),
+            project_id,
+            Uuid::new_v4(),
+            Utc::now(),
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: "papers".into(),
+                    tool_id: "use_mcp_tool".into(),
+                    succeeded: true,
+                    model_content: "verified paper".into(),
+                    data: json!({"pmid":"123", "abstract":"verified text ".repeat(300)}),
+                    provenance: vec!["synthetic-fixture".into()],
+                },
+            },
+        );
+        let event_ref = CompletionEvidenceRefV4::Event {
+            sequence: event.sequence,
+        };
+        let artifact_ref = CompletionEvidenceRefV4::Artifact {
+            artifact_id: record_id,
+        };
+        let evidence_ref = CompletionEvidenceRefV4::Evidence {
+            evidence_id: record_id,
+        };
+        let refs = vec![
+            artifact_ref.clone(),
+            event_ref.clone(),
+            evidence_ref.clone(),
+        ];
+        let proposal = CompletionProposalV4 {
+            schema_version: 4,
+            summary: "review shared sources".into(),
+            answer_markdown: "Synthetic literature summary".into(),
+            criteria: vec![
+                CompletionCriterionEvidenceV4 {
+                    criterion: "collect sources".into(),
+                    evidence: refs.clone(),
+                },
+                CompletionCriterionEvidenceV4 {
+                    criterion: "summarize findings".into(),
+                    evidence: vec![event_ref.clone(), artifact_ref.clone(), event_ref],
+                },
+                CompletionCriterionEvidenceV4 {
+                    criterion: "record limitations".into(),
+                    evidence: vec![evidence_ref, artifact_ref],
+                },
+            ],
+        };
+        let original_proposal = proposal.clone();
+        let original_state = state.clone();
+        let original_event = event.clone();
+        let materialized =
+            materialize_verified_evidence(&proposal, std::slice::from_ref(&event), &state).unwrap();
+
+        assert_eq!(
+            materialized.len(),
+            3,
+            "each shared source must be sent to the reviewer once"
+        );
+        assert_eq!(
+            materialized
+                .iter()
+                .map(|item| item.reference.clone())
+                .collect::<Vec<_>>(),
+            refs
+        );
+        assert_eq!(materialized[0].payload["sha256"], "verified-report-hash");
+        assert_eq!(materialized[1].payload["outcome"]["data"]["pmid"], "123");
+        assert_eq!(
+            materialized[2].payload["claim"],
+            original_state.evidence[&record_id].claim
+        );
+        assert_eq!(proposal, original_proposal);
+        assert_eq!(state, original_state);
+        assert_eq!(event, original_event);
+        event.verify().unwrap();
+    }
+
+    #[test]
+    fn reviewer_materialization_does_not_turn_missing_refs_into_evidence() {
+        let spec = execution_spec(Uuid::new_v4());
+        let state = ScientificStateV4::new(spec.project_id);
+        let missing = vec![
+            CompletionEvidenceRefV4::Event { sequence: 99 },
+            CompletionEvidenceRefV4::Artifact {
+                artifact_id: Uuid::new_v4(),
+            },
+            CompletionEvidenceRefV4::Evidence {
+                evidence_id: Uuid::new_v4(),
+            },
+        ];
+        let proposal = CompletionProposalV4 {
+            schema_version: 4,
+            summary: "missing".into(),
+            answer_markdown: "unverified".into(),
+            criteria: vec![CompletionCriterionEvidenceV4 {
+                criterion: "verified output".into(),
+                evidence: missing.iter().chain(&missing).cloned().collect(),
+            }],
+        };
+        assert!(
+            materialize_verified_evidence(&proposal, &[], &state)
+                .unwrap()
+                .is_empty()
+        );
+        let report = verify_completion_v4(&spec, &state, &[], &proposal);
+        assert!(!report.passed);
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|finding| finding.code == "invalid_evidence_reference")
+                .count(),
+            6
         );
     }
 
