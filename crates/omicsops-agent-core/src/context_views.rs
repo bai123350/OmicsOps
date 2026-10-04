@@ -254,8 +254,14 @@ pub(crate) fn event_view(event: &AgentEventV4) -> Value {
     let data_bytes = serde_json::to_vec(&outcome.data)
         .expect("serializable data")
         .len();
-    let model_content_duplicates_data =
-        serde_json::to_string(&outcome.data).is_ok_and(|data| data == outcome.model_content);
+    // Desktop MCP outcomes wrap the exact result with host audit metadata.
+    // Keep that complete wrapper, including its original result, inline.
+    let model_content_duplicates_data = serde_json::to_string(&outcome.data)
+        .is_ok_and(|data| data == outcome.model_content)
+        || (outcome.tool_id == "use_mcp_tool"
+            && outcome.data.get("result").is_some_and(|result| {
+                serde_json::to_string(result).is_ok_and(|result| result == outcome.model_content)
+            }));
     if outcome.succeeded && data_bytes <= VIEW_BYTES && model_content_duplicates_data {
         view["event"]["outcome"]
             .as_object_mut()
@@ -741,6 +747,225 @@ mod tests {
             Utc::now(),
         )
         .unwrap()
+    }
+
+    fn mcp_result_event(
+        spec: &RunSpecV4,
+        tool_id: &str,
+        succeeded: bool,
+        model_content: String,
+        result: serde_json::Value,
+    ) -> AgentEventV4 {
+        AgentEventV4::first(
+            spec.run_id,
+            spec.project_id,
+            spec.conversation_id,
+            Utc::now(),
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: "paper-result".into(),
+                    tool_id: tool_id.into(),
+                    succeeded,
+                    model_content,
+                    data: json!({
+                        "server_id": "00000000-0000-0000-0000-000000000001",
+                        "tool": "fetch_paper",
+                        "catalog_sha256": "catalog-sha256",
+                        "schema_sha256": "schema-sha256",
+                        "audit_id": "00000000-0000-0000-0000-000000000002",
+                        "result": result,
+                    }),
+                    provenance: vec!["mcp-audit:00000000-0000-0000-0000-000000000002".into()],
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn mcp_result_projection_keeps_one_complete_result_with_audit_metadata() {
+        let spec = spec();
+        let result = json!({
+            "content": [{"type": "text", "text": "Paper evidence 数据🧬; ".repeat(96)}],
+            "isError": false,
+        });
+        let original_model_content = result.to_string();
+        let event = mcp_result_event(
+            &spec,
+            "use_mcp_tool",
+            true,
+            original_model_content.clone(),
+            result.clone(),
+        );
+        let original_event = event.clone();
+
+        let view = event_view(&event);
+        let outcome = &view["event"]["outcome"];
+
+        assert!(outcome.get("model_content").is_none());
+        assert_eq!(outcome["data"]["result"], result);
+        assert_eq!(
+            outcome["data"]["server_id"],
+            "00000000-0000-0000-0000-000000000001"
+        );
+        assert_eq!(outcome["data"]["tool"], "fetch_paper");
+        assert_eq!(outcome["data"]["catalog_sha256"], "catalog-sha256");
+        assert_eq!(outcome["data"]["schema_sha256"], "schema-sha256");
+        assert_eq!(
+            outcome["data"]["audit_id"],
+            "00000000-0000-0000-0000-000000000002"
+        );
+        assert_eq!(
+            outcome["provenance"],
+            json!(["mcp-audit:00000000-0000-0000-0000-000000000002"])
+        );
+        assert!(view.get("result_reference").is_none());
+        assert_eq!(view["sequence"], event.sequence);
+        assert_eq!(view["event_hash"], event.event_hash);
+        assert_eq!(event, original_event);
+        event.verify().unwrap();
+
+        let original = read_outcome(
+            &spec,
+            std::slice::from_ref(&event),
+            ToolCallV4 {
+                call_id: "read-original-mcp-result".into(),
+                tool_id: READ_RESULT_TOOL.into(),
+                arguments: json!({
+                    "sequence": event.sequence,
+                    "event_hash": event.event_hash,
+                    "field": "model_content",
+                    "offset": 0,
+                    "limit": 8192,
+                }),
+            },
+        );
+        assert!(original.succeeded);
+        assert_eq!(original.data["content"], original_model_content);
+        assert!(original.data["next_offset"].is_null());
+
+        let mut duplicate_view = view.clone();
+        duplicate_view["event"]["outcome"]["model_content"] = json!(original_model_content);
+        eprintln!(
+            "MCP fixture projection bytes: duplicate={}, deduplicated={}, saved={}",
+            duplicate_view.to_string().len(),
+            view.to_string().len(),
+            duplicate_view.to_string().len() - view.to_string().len()
+        );
+    }
+
+    #[test]
+    fn mcp_result_projection_preserves_failures_distinct_summaries_and_other_tools() {
+        let spec = spec();
+        let result = json!({"content": [{"type": "text", "text": "actual paper"}]});
+        let exact = result.to_string();
+        for (tool_id, succeeded, model_content) in [
+            ("use_mcp_tool", false, exact.as_str()),
+            ("use_mcp_tool", true, "One paper was retrieved."),
+            ("another_tool", true, exact.as_str()),
+            (
+                "use_mcp_tool",
+                true,
+                r#"{ "content": [{"type":"text","text":"actual paper"}] }"#,
+            ),
+        ] {
+            let event = mcp_result_event(
+                &spec,
+                tool_id,
+                succeeded,
+                model_content.into(),
+                result.clone(),
+            );
+
+            let view = event_view(&event);
+
+            assert_eq!(view["event"]["outcome"]["model_content"], model_content);
+            assert_eq!(view["event"]["outcome"]["data"]["result"], result);
+        }
+    }
+
+    #[test]
+    fn mcp_result_projection_checks_the_complete_wrapper_budget_before_deduplicating() {
+        let spec = spec();
+        let result = json!({
+            "content": [{"type": "text", "text": "x".repeat(VIEW_BYTES - 128)}],
+        });
+        let original_model_content = result.to_string();
+        assert!(original_model_content.len() <= VIEW_BYTES);
+        let event = mcp_result_event(
+            &spec,
+            "use_mcp_tool",
+            true,
+            original_model_content.clone(),
+            result,
+        );
+
+        let view = event_view(&event);
+
+        assert_eq!(
+            view["event"]["outcome"]["model_content"],
+            original_model_content
+        );
+        assert_eq!(
+            view["event"]["outcome"]["data"]["omitted_from_model_view"],
+            true
+        );
+        assert!(view["result_reference"]["data_bytes"].as_u64().unwrap() > VIEW_BYTES as u64);
+    }
+
+    #[test]
+    fn mcp_result_projection_keeps_oversized_results_recoverable_by_signed_pages() {
+        let spec = spec();
+        let result = json!({
+            "content": [{"type": "text", "text": "Paper evidence 数据🧬; ".repeat(700)}],
+            "isError": false,
+        });
+        let original_model_content = result.to_string();
+        let event = mcp_result_event(
+            &spec,
+            "use_mcp_tool",
+            true,
+            original_model_content.clone(),
+            result,
+        );
+
+        let view = event_view(&event);
+
+        assert_eq!(
+            view["event"]["outcome"]["data"]["omitted_from_model_view"],
+            true
+        );
+        assert!(view["event"]["outcome"]["model_content"].is_string());
+        assert_eq!(view["result_reference"]["sequence"], event.sequence);
+        assert_eq!(view["result_reference"]["event_hash"], event.event_hash);
+        event.verify().unwrap();
+
+        let mut restored = String::new();
+        let mut offset = 0_u64;
+        loop {
+            let page = read_outcome(
+                &spec,
+                std::slice::from_ref(&event),
+                ToolCallV4 {
+                    call_id: "read-large-mcp-result".into(),
+                    tool_id: READ_RESULT_TOOL.into(),
+                    arguments: json!({
+                        "sequence": event.sequence,
+                        "event_hash": event.event_hash,
+                        "field": "model_content",
+                        "offset": offset,
+                        "limit": 8192,
+                    }),
+                },
+            );
+            assert!(page.succeeded);
+            restored.push_str(page.data["content"].as_str().unwrap());
+            let Some(next_offset) = page.data["next_offset"].as_u64() else {
+                break;
+            };
+            assert!(next_offset > offset);
+            offset = next_offset;
+        }
+        assert_eq!(restored, original_model_content);
     }
 
     #[test]
