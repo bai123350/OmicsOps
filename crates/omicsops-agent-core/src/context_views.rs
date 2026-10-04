@@ -8,6 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const READ_RESULT_TOOL: &str = "agent.read_tool_result";
 const VIEW_BYTES: usize = 8_192;
+// Keep a complete small schema selection in the first directory page, including
+// JSON escaping, so loading a schema does not require another model roundtrip.
+const INLINE_MCP_DIRECTORY_BYTES: usize = 4_096;
 pub(crate) const SCIENTIFIC_CODE_VIEW_MIN_BYTES: usize = 16_384;
 
 fn scientific_digest(value: &Value) -> Option<String> {
@@ -254,27 +257,14 @@ pub(crate) fn event_view(event: &AgentEventV4) -> Value {
     let model_content_duplicates_data =
         serde_json::to_string(&outcome.data).is_ok_and(|data| data == outcome.model_content);
     if outcome.succeeded && data_bytes <= VIEW_BYTES && model_content_duplicates_data {
-        let original_bytes = serde_json::to_vec(&view)
-            .expect("serializable model view")
-            .len();
-        let mut deduplicated = view.clone();
-        deduplicated["event"]["outcome"]
+        view["event"]["outcome"]
             .as_object_mut()
             .expect("outcome object")
             .remove("model_content");
-        // A result page already carries the complete page and continuation
-        // metadata in data. Pointing it back at its own duplicate model_content
-        // invites recursive reads without making any information recoverable.
-        if outcome.tool_id != READ_RESULT_TOOL {
-            attach_reference(&mut deduplicated, event, "model_content");
-        }
-        if serde_json::to_vec(&deduplicated)
-            .expect("serializable model view")
-            .len()
-            < original_bytes
-        {
-            return deduplicated;
-        }
+        // Nothing is missing: the complete structured data is already inline.
+        // A reference to its identical string invites a redundant read. The
+        // original signed event remains readable by sequence/hash if needed.
+        return view;
     }
     if outcome.model_content.len() <= VIEW_BYTES && data_bytes <= VIEW_BYTES {
         return view;
@@ -632,6 +622,7 @@ fn mcp_directory_text(
         .collect();
     let mut selected_server_exists = false;
     let mut matched_tools = 0;
+    let mut inline_tools = Vec::new();
     for entry in mcp_tools(data)? {
         let server = entry
             .get("server_id")
@@ -665,6 +656,7 @@ fn mcp_directory_text(
             }
         }
         matched_tools += 1;
+        inline_tools.push(entry);
         servers
             .entry(server)
             .or_insert_with(|| (server_name, Vec::new()))
@@ -678,10 +670,19 @@ fn mcp_directory_text(
         .into_iter()
         .map(|(id, (name, tools))| json!({"server_id":id,"server_name":name,"tools":tools}))
         .collect();
-    Ok(
-        json!({"servers":groups,"total_tools":identities.len(),"matched_tools":matched_tools})
-            .to_string(),
-    )
+    let mut directory =
+        json!({"servers":groups,"total_tools":identities.len(),"matched_tools":matched_tools});
+    if !inline_tools.is_empty() {
+        directory["inline_tools"] = json!(inline_tools);
+        let text = directory.to_string();
+        // Count the escaped content that will be nested in the page envelope.
+        // Inline all matched entries or none; never publish a partial schema.
+        if json!(text).to_string().len() <= INLINE_MCP_DIRECTORY_BYTES {
+            return Ok(text);
+        }
+        directory.as_object_mut().unwrap().remove("inline_tools");
+    }
+    Ok(directory.to_string())
 }
 
 pub(crate) fn read_outcome(
@@ -874,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_query_finds_full_description_but_projects_one_compact_name() {
+    fn mcp_query_finds_full_description_and_inlines_complete_matching_schema() {
         let spec = spec();
         let (_, mut original) = large_directory(&spec);
         original["query"] = json!("rare_marker");
@@ -912,7 +913,8 @@ mod tests {
             compact["servers"][0]["tools"],
             json!([{"tool_name":"tool_123"}])
         );
-        assert!(page["total_bytes"].as_u64().unwrap() < 300);
+        assert_eq!(compact["inline_tools"], json!([original["tools"][123]]));
+        assert!(view.to_string().len() <= VIEW_BYTES);
 
         let exact = read_outcome(
             &spec,
@@ -983,6 +985,7 @@ mod tests {
             serde_json::from_str(other_server.data["content"].as_str().unwrap()).unwrap();
         assert_eq!(no_match["total_tools"], 247);
         assert_eq!(no_match["matched_tools"], 0);
+        assert!(no_match.get("inline_tools").is_none());
 
         let cleared = read_outcome(
             &spec,
@@ -994,6 +997,64 @@ mod tests {
             cleared.data["total_bytes"],
             event_view(&event)["event"]["outcome"]["data"]["total_bytes"]
         );
+    }
+
+    #[test]
+    fn oversized_matching_schema_keeps_directory_compact_and_original_retrievable() {
+        let spec = spec();
+        let (_, mut original) = large_directory(&spec);
+        original["query"] = json!("rare_marker");
+        original["tools"][123]["input_schema"]["properties"]["query"]["description"] =
+            json!("quoted \" schema 数据🧬 ".repeat(600));
+        let event = AgentEventV4::first(
+            spec.run_id,
+            spec.project_id,
+            spec.conversation_id,
+            Utc::now(),
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: "oversized-directory".into(),
+                    tool_id: "search_mcp_tools".into(),
+                    succeeded: true,
+                    model_content: original.to_string(),
+                    data: original.clone(),
+                    provenance: vec![],
+                },
+            },
+        );
+        let view = event_view(&event);
+        assert!(view.to_string().len() <= VIEW_BYTES);
+        let page = &view["event"]["outcome"]["data"];
+        let directory: serde_json::Value =
+            serde_json::from_str(page["content"].as_str().unwrap()).unwrap();
+        assert_eq!(directory["matched_tools"], 1);
+        assert!(directory.get("inline_tools").is_none());
+        assert!(page["next_offset"].is_null());
+
+        let mut call = directory_call(
+            &event,
+            json!({"view":"tool","server_id":"server-b","tool_name":"tool_123"}),
+            0,
+        );
+        let mut restored = String::new();
+        let mut pages = 0;
+        loop {
+            let outcome = read_outcome(&spec, std::slice::from_ref(&event), call.clone());
+            assert!(outcome.succeeded);
+            assert!(outcome.model_content.len() <= VIEW_BYTES);
+            restored.push_str(outcome.data["content"].as_str().unwrap());
+            pages += 1;
+            let Some(offset) = outcome.data["next_offset"].as_u64() else {
+                break;
+            };
+            call.arguments["offset"] = json!(offset);
+        }
+        assert!(pages > 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&restored).unwrap(),
+            original["tools"][123]
+        );
+        event.verify().unwrap();
     }
 
     #[test]

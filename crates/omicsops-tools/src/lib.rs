@@ -430,9 +430,9 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "search_mcp_tools",
-            "Search stored MCP tool descriptions without launching a server",
+            "Discover the complete enabled MCP tool directory once per run without launching a server. Query filters the model view, not which tools exist. Small matching schemas are included as inline_tools; use them directly. Read the stored directory only for missing schemas or pages, and do not repeat discovery. This returns tool metadata, not research evidence",
             ToolEffectV4::ReadOnly,
-            json!({"type":"object","required":["query"],"properties":{"query":{"type":"string"},"limit":{"type":"integer"}}}),
+            json!({"type":"object","required":["query"],"properties":{"query":{"type":"string","description":"Terms matching server, tool name or full description; use an empty string to browse all enabled tools."},"limit":{"type":"integer","description":"Legacy hint; discovery still records the complete enabled directory."}}}),
         ),
         descriptor(
             "use_mcp_tool",
