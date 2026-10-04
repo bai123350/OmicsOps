@@ -544,3 +544,38 @@ is stuck or faster. Detailed evidence, remaining authorization, and unexecuted
 manual smoke steps are recorded in
 `docs/superpowers/specs/2026-09-28-runtime-approval-paths.md` and
 `docs/superpowers/plans/2026-09-28-runtime-approval-paths.md`.
+
+## 2026-10-04 Go DeepSeek low and context efficiency
+
+Deterministic checks passed (exit 0): `cargo test --workspace` (1,509 passed,
+0 failed, 16 ignored), `npm test` (992 frontend and 22 bridge tests),
+`npm run build`, `npm run build:desktop`, `cargo fmt --all -- --check`, and
+`git diff --check`. The Windows release and local NSIS bundle were built;
+no application was installed or distributed. Regression fixtures cover MCP
+input-shape preflight, recoverable local argument errors versus server failures,
+and bounded Runtime projections with retained artifact facts and exact signed
+result recovery.
+
+After those checks, the exact desktop-only command was explicitly run:
+
+```text
+cargo test -p omicsops-desktop agent_v4::go_live_acceptance_tests::live_opencode_go_agent_reads_file_and_returns_nonce -- --ignored --exact --nocapture
+```
+
+The selected existing `deepseek-v4.1-flash` / Go Chat profile retained the
+user-authorized saved `low` effort, confirmed again through a read-only lookup.
+The test used its existing Windows keyring reference, a temporary project, and
+an in-memory Store. It passed 1/1 (exit 0) in 6.79 seconds of test execution;
+test-target recompilation took an additional 1m 46s. Two model attempts surrounded
+exactly one successful `project.read`; the final answer returned the random nonce
+and the production loop recorded `RunCompleted`. All 12 nonempty transient
+reasoning observations preceded their result, with a largest preview of 251 bytes
+and first/last observations at 2,405/6,016 milliseconds after the first request.
+Only metadata was printed, never reasoning text or credential contents.
+
+This bounded nonce acceptance confirms the real low provider/tool/completion
+path. It is not a paired timing comparison of the original literature task and
+does not exercise the new MCP or Runtime behavior with scientific data. SSH,
+scientific provenance and native UI research acceptance remain unexecuted.
+The read-only historical diagnosis and the remaining manual smoke steps are in
+`docs/superpowers/specs/2026-10-04-go-agent-latency-diagnosis.md`.
