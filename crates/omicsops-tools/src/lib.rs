@@ -492,13 +492,13 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
     vec![
         descriptor(
             "project.list",
-            "List project-relative files",
+            "List project-relative files. Use an empty path or '.' for the project root, then use the returned relative paths for project.read. Exact '/' or '\\' also means the project root, never a host disk root; all other paths must be project-relative.",
             ToolEffectV4::ReadOnly,
-            json!({"type":"object","properties":{"path":{"type":"string"}}}),
+            json!({"type":"object","properties":{"path":{"type":"string","default":"","description":"Project-relative directory. Omit or use an empty string or '.' for the project root. Exact '/' or '\\' is a project-root alias only; '/subdir', absolute paths and parent traversal are forbidden. Use relative paths returned by this listing for subsequent reads."}}}),
         ),
         descriptor(
             "project.read",
-            "Read a project-relative text file",
+            "Read a project-relative text file. Use a relative path, such as one returned by project.list; absolute paths and parent traversal are forbidden.",
             ToolEffectV4::ReadOnly,
             json!({"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}),
         ),

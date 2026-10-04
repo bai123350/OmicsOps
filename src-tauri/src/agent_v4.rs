@@ -5726,8 +5726,13 @@ impl LocalProjectFilesystemV4 {
     }
 
     fn resolve_existing(&self, relative: &str) -> Result<PathBuf, String> {
-        if Path::new(relative).is_absolute() {
-            return Err("project path must be relative".into());
+        // Windows drive-relative and rooted paths can replace join's base
+        // without being absolute. Reject both separator styles before I/O.
+        if relative.starts_with(['/', '\\'])
+            || relative.as_bytes().get(1) == Some(&b':')
+            || relative.split(['/', '\\']).any(|part| part == "..")
+        {
+            return Err("project path must be relative and cannot contain parent traversal".into());
         }
         let candidate = self.root.join(relative);
         let candidate_metadata =
@@ -6803,6 +6808,19 @@ fn run_has_approved_tool_call(
     Ok(decision == Some(ToolApprovalDecisionV4::Approved))
 }
 impl DesktopToolExecutorV4 {
+    fn failed_project_file_query(call: &ToolCallV4) -> ToolOutcomeV4 {
+        // Only the host's built-in read-only file queries use this outcome.
+        // Raw OS/SSH errors can contain host paths or sensitive output.
+        ToolOutcomeV4 {
+            call_id: call.call_id.clone(),
+            tool_id: call.tool_id.clone(),
+            succeeded: false,
+            model_content: "Project file query failed: the target is unavailable, has the wrong file type, or is outside the selected project. Use project-relative paths without parent traversal. To discover files, call project.list with path=\"\"; use a returned relative path for reading or verification.".into(),
+            data: json!({"error_kind":"project_filesystem","recoverable":true}),
+            provenance: vec![],
+        }
+    }
+
     async fn authorize_plan_target(
         &self,
         call: &ToolCallV4,
@@ -6915,17 +6933,31 @@ impl DesktopToolExecutorV4 {
                     .arguments
                     .get("path")
                     .and_then(Value::as_str)
-                    .unwrap_or(".");
+                    .unwrap_or("");
+                // A bare separator is a project-root alias for this listing
+                // tool only, shared by Local and SSH. Never strip rooted prefixes.
+                let path = match path {
+                    "/" | "\\" => "",
+                    path => path,
+                };
+                let listing = match self.resources.get()?.filesystem.list(path).await {
+                    Ok(listing) => listing,
+                    Err(_) => return Ok(Self::failed_project_file_query(call)),
+                };
                 (
-                    self.resources.get()?.filesystem.list(path).await?,
+                    listing,
                     json!({"path":path}),
                     vec![format!("project:{path}")],
                 )
             }
             "project.read" => {
                 let path = required(&call.arguments, "path")?;
+                let content = match self.resources.get()?.filesystem.read(path).await {
+                    Ok(content) => content,
+                    Err(_) => return Ok(Self::failed_project_file_query(call)),
+                };
                 (
-                    self.resources.get()?.filesystem.read(path).await?,
+                    content,
                     json!({"path":path}),
                     vec![format!("project:{path}")],
                 )
@@ -7348,7 +7380,10 @@ impl DesktopToolExecutorV4 {
             ),
             "artifact.verify" => {
                 let path = required(&call.arguments, "path")?;
-                let verified = self.resources.get()?.filesystem.verify_file(path).await?;
+                let verified = match self.resources.get()?.filesystem.verify_file(path).await {
+                    Ok(verified) => verified,
+                    Err(_) => return Ok(Self::failed_project_file_query(call)),
+                };
                 let size = verified.size_bytes;
                 let hash = verified.sha256;
                 (
@@ -11391,6 +11426,15 @@ mod tests {
         );
         assert!(project_path("/srv/project", "../secret").is_err());
         assert!(project_path("/srv/project", "/etc/passwd").is_err());
+        for path in [
+            "/subdir",
+            "\\subdir",
+            "subdir/../secret",
+            "subdir\\..\\secret",
+        ] {
+            assert!(project_path("/srv/project", path).is_err(), "{path}");
+        }
+        assert_eq!(project_path("/srv/project", "").unwrap(), "/srv/project");
     }
 
     #[test]
@@ -11729,6 +11773,306 @@ mod tests {
         assert_eq!(fact.size_bytes, b"metric\tvalue\nrows\t1\n".len() as u64);
         assert_eq!(fact.sha256.len(), 64);
         assert!(filesystem.read("../outside.txt").await.is_err());
+    }
+
+    async fn project_filesystem_executor(root: &Path) -> DesktopToolExecutorV4 {
+        let (_, factory) = mock_resource_slot(root, false, false);
+        DesktopToolExecutorV4 {
+            repository: Store::open_in_memory().await.unwrap(),
+            mcp_sessions: McpSessionManager::new(),
+            credentials: SystemCredentialVault,
+            resources: test_ready_resources(factory.initialize().await.unwrap()),
+            selection: ComputeSelectionV4 {
+                schema_version: 4,
+                backend_id: "local".into(),
+                backend_kind: ComputeBackendKindV4::Local,
+                autonomy_mode: AutonomyModeV4::Supervised,
+                approval_policy: ApprovalPolicyV4::RiskBased,
+                environment: "system".into(),
+                network_policy: NetworkPolicyV4::HostInherited,
+                container_image: None,
+            },
+            project_id: Uuid::new_v4(),
+            run_id: Uuid::new_v4(),
+            conversation_id: Uuid::new_v4(),
+            backend_id: "local".into(),
+            browser: omicsops_browser::BrowserRuntime::new(
+                root.join("browser"),
+                root.join("extension"),
+            ),
+            local_project_root: root.to_owned(),
+            skills_gate: Default::default(),
+            browser_authorizations: Default::default(),
+            forced_route: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn project_filesystem_root_aliases_list_only_the_selected_project() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("project")).unwrap();
+        let root = directory.path().join("project");
+        std::fs::write(root.join("inside.txt"), "inside").unwrap();
+        std::fs::write(directory.path().join("outside.txt"), "outside").unwrap();
+        let executor = project_filesystem_executor(&root).await;
+        for arguments in [
+            json!({}),
+            json!({"path":""}),
+            json!({"path":"."}),
+            json!({"path":"/"}),
+            json!({"path":"\\"}),
+        ] {
+            let call = ToolCallV4 {
+                call_id: "root-list".into(),
+                tool_id: "project.list".into(),
+                arguments,
+            };
+            for outcome in [
+                executor.execute(&call).await,
+                executor.execute_plan(&call).await,
+            ] {
+                let outcome = outcome.unwrap();
+                assert!(outcome.succeeded, "{outcome:?}");
+                assert!(outcome.model_content.contains("inside.txt"));
+                assert!(!outcome.model_content.contains("outside.txt"));
+                assert_ne!(outcome.data["path"], "/");
+                assert_ne!(outcome.data["path"], "\\");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn project_filesystem_rejections_are_failed_outcomes_in_execute_and_plan() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("inside.txt"), "inside").unwrap();
+        std::fs::write(directory.path().join("outside.txt"), "outside").unwrap();
+        let executor = project_filesystem_executor(&root).await;
+        for (tool, path) in [
+            ("project.list", ".."),
+            ("project.list", "/subdir"),
+            ("project.list", "missing"),
+            ("project.list", "inside.txt"),
+            ("project.read", "../outside.txt"),
+            ("project.read", "missing.txt"),
+            ("project.read", "."),
+            ("artifact.verify", "../outside.txt"),
+            ("artifact.verify", "missing.txt"),
+        ] {
+            let call = ToolCallV4 {
+                call_id: "invalid-file-query".into(),
+                tool_id: tool.into(),
+                arguments: json!({"path":path}),
+            };
+            for result in [
+                executor.execute(&call).await,
+                executor.execute_plan(&call).await,
+            ] {
+                let outcome = result.expect("explicit file-query failure must be a tool result");
+                assert!(!outcome.succeeded, "{tool} {path}");
+                assert_eq!(outcome.call_id, call.call_id);
+                assert_eq!(outcome.tool_id, tool);
+                assert_eq!(outcome.data["error_kind"], "project_filesystem");
+                assert_eq!(outcome.data["recoverable"], true);
+                assert!(outcome.model_content.contains("project-relative"));
+                assert!(
+                    !outcome
+                        .model_content
+                        .contains(&directory.path().display().to_string())
+                );
+                assert!(!outcome.model_content.contains("outside.txt"));
+                assert!(outcome.provenance.is_empty());
+            }
+        }
+        let read = executor
+            .execute(&ToolCallV4 {
+                call_id: "corrected-file-query".into(),
+                tool_id: "project.read".into(),
+                arguments: json!({"path":"inside.txt"}),
+            })
+            .await
+            .unwrap();
+        assert!(read.succeeded);
+        assert_eq!(read.model_content, "inside");
+        let verified = executor
+            .execute(&ToolCallV4 {
+                call_id: "corrected-verification".into(),
+                tool_id: "artifact.verify".into(),
+                arguments: json!({"path":"inside.txt"}),
+            })
+            .await
+            .unwrap();
+        assert!(verified.succeeded);
+        assert_eq!(verified.data["size_bytes"], 6);
+        assert_eq!(verified.data["sha256"].as_str().unwrap().len(), 64);
+        assert!(!verified.provenance.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_filesystem_rejects_rooted_prefixed_and_traversal_paths_before_io() {
+        let directory = tempfile::tempdir().unwrap();
+        let filesystem = LocalProjectFilesystemV4::new(directory.path()).unwrap();
+        for path in [
+            "/subdir",
+            "\\subdir",
+            "C:subdir",
+            "C:\\subdir",
+            "\\\\server\\share",
+            "..",
+            "subdir/../inside.txt",
+            "subdir\\..\\inside.txt",
+        ] {
+            assert_eq!(
+                filesystem.resolve_existing(path).unwrap_err(),
+                "project path must be relative and cannot contain parent traversal",
+                "{path}"
+            );
+        }
+    }
+
+    struct FailedProjectFilesystem;
+    #[async_trait]
+    impl ProjectFilesystemPortV4 for FailedProjectFilesystem {
+        async fn list(&self, _: &str) -> Result<String, String> {
+            Err("SSH/OS PRIVATE_SENTINEL at /private/host/path".into())
+        }
+        async fn read(&self, _: &str) -> Result<String, String> {
+            Err("SSH/OS PRIVATE_SENTINEL at /private/host/path".into())
+        }
+        async fn verify_file(&self, _: &str) -> Result<VerifiedProjectFileV4, String> {
+            Err("SSH/OS PRIVATE_SENTINEL at /private/host/path".into())
+        }
+        async fn prompt_layers(&self, _: &str) -> Result<PromptLayersV4, String> {
+            Ok(PromptLayersV4::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn project_filesystem_failed_outcomes_never_include_raw_backend_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut executor = project_filesystem_executor(directory.path()).await;
+        let (_, factory) = mock_resource_slot(directory.path(), false, false);
+        let mut resources = factory.initialize().await.unwrap();
+        resources.filesystem = Arc::new(FailedProjectFilesystem);
+        executor.resources = test_ready_resources(resources);
+        for tool in ["project.list", "project.read", "artifact.verify"] {
+            let outcome = executor
+                .execute(&ToolCallV4 {
+                    call_id: "backend-error".into(),
+                    tool_id: tool.into(),
+                    arguments: json!({"path":"inside.txt"}),
+                })
+                .await
+                .unwrap();
+            assert!(!outcome.succeeded);
+            let serialized = serde_json::to_string(&outcome).unwrap();
+            assert!(!serialized.contains("PRIVATE_SENTINEL"));
+            assert!(!serialized.contains("/private/host/path"));
+        }
+    }
+
+    struct ProjectFileRepairModel(std::sync::Mutex<Vec<ToolCallV4>>);
+    #[async_trait]
+    impl ModelPortV4 for ProjectFileRepairModel {
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            let mut calls = self.0.lock().unwrap();
+            // The bounded ordinary loop requests a text summary after the
+            // two tool turns; that summary must not dispatch another query.
+            let (public_text, tool_calls) = if calls.is_empty() {
+                (
+                    "Inspected project files after correcting the path.".into(),
+                    vec![],
+                )
+            } else {
+                (String::new(), vec![calls.remove(0)])
+            };
+            Ok(ModelTurnV4 {
+                public_text,
+                tool_calls,
+                provider_continuation: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn project_filesystem_failure_allows_the_ordinary_agent_to_correct_the_path() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("inside.txt"), "inside").unwrap();
+        let desktop = Arc::new(project_filesystem_executor(directory.path()).await);
+        let capabilities = BTreeSet::from(["project.list".into()]);
+        let plan = direct_execution_plan("inspect project files", "[]", capabilities.clone());
+        let model_profile_id = Uuid::new_v4();
+        let hash = RunSpecV4::approval_hash_for(
+            desktop.run_id,
+            desktop.project_id,
+            desktop.conversation_id,
+            model_profile_id,
+            &plan,
+            &desktop.selection,
+        )
+        .unwrap();
+        let spec = RunSpecV4::freeze_ordinary_agent_with_compute(
+            desktop.run_id,
+            desktop.project_id,
+            desktop.conversation_id,
+            model_profile_id,
+            plan,
+            desktop.selection.clone(),
+            &hash,
+            Utc::now(),
+        )
+        .unwrap();
+        let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), desktop.clone())
+            .unwrap()
+            .with_execute_capabilities(capabilities);
+        let model = ProjectFileRepairModel(std::sync::Mutex::new(vec![
+            ToolCallV4 {
+                call_id: "invalid-list".into(),
+                tool_id: "project.list".into(),
+                arguments: json!({"path":"../outside"}),
+            },
+            ToolCallV4 {
+                call_id: "corrected-list".into(),
+                tool_id: "project.list".into(),
+                arguments: json!({"path":"/"}),
+            },
+        ]));
+        let events = ApprovalRunEvents::default();
+        events.0.lock().unwrap().push(AgentEventV4::first(
+            desktop.run_id,
+            desktop.project_id,
+            desktop.conversation_id,
+            Utc::now(),
+            AgentEventKindV4::RunCreated {
+                mode: RunModeV4::Execute,
+            },
+        ));
+        let result = AgentCoreV4 {
+            model: &model,
+            tools: &registry,
+            events: &events,
+            science: None,
+        }
+        .execute(&spec, 2)
+        .await;
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::NeedsAttention(_))),
+            "bounded fixture stops after two model turns: {result:?}"
+        );
+        let recorded = events.0.lock().unwrap();
+        assert!(recorded.iter().any(|event| matches!(&event.event, AgentEventKindV4::ToolFinished { outcome } if outcome.call_id == "invalid-list" && !outcome.succeeded)));
+        assert!(recorded.iter().any(|event| matches!(&event.event, AgentEventKindV4::ToolFinished { outcome } if outcome.call_id == "corrected-list" && outcome.succeeded && outcome.model_content.contains("inside.txt"))));
+        assert!(
+            !recorded.iter().any(|event| matches!(
+                &event.event,
+                AgentEventKindV4::ToolDispatchUncertain { .. }
+            ))
+        );
     }
 
     #[test]
