@@ -89,10 +89,20 @@ impl BioMcpServer {
     }
 
     async fn invoke(&self, name: &str, arguments: Value) -> CallToolResult {
-        if !self.tools.iter().any(|tool| tool.name == name) {
+        let Some(tool) = self.tools.iter().find(|tool| tool.name == name) else {
             return CallToolResult::error(vec![ContentBlock::text(
                 "tool is not available in this science MCP domain",
             )]);
+        };
+        if let Err(error) = omicsops_tools::validate_mcp_argument_shape(
+            &Value::Object((*tool.input_schema).clone()),
+            &arguments,
+        ) {
+            let mut result = CallToolResult::error(vec![ContentBlock::text(error)]);
+            result.structured_content = Some(
+                serde_json::json!({"error_kind":"mcp_arguments","operation_dispatched":false,"recoverable":true}),
+            );
+            return result;
         }
         match self.client.call(name, &arguments).await {
             Ok(mut value) => {
@@ -234,6 +244,24 @@ mod tests {
             ("search_articles", json!({"query": 42})),
         ] {
             assert_eq!(server.invoke(name, args).await.is_error, Some(true));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_science_arguments_report_no_scientific_dispatch() {
+        let server = BioMcpServer::new("pubmed", &[]).unwrap();
+        for args in [
+            Value::Null,
+            json!({"server_id":"wrapper","tool":"search_articles","arguments":{"query":"epigenome"}}),
+            json!({"query":42}),
+        ] {
+            let result = server.invoke("search_articles", args).await;
+            assert_eq!(result.is_error, Some(true));
+            let metadata = result
+                .structured_content
+                .expect("local validation failure must be distinguished from an upstream failure");
+            assert_eq!(metadata["operation_dispatched"], false);
+            assert_eq!(metadata["error_kind"], "mcp_arguments");
         }
     }
 

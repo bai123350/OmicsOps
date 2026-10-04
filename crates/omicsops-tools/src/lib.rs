@@ -390,6 +390,104 @@ fn display_path(path: &str) -> &str {
     if path.is_empty() { "arguments" } else { path }
 }
 
+/// Reject only obvious root input-shape errors against a frozen MCP schema.
+/// This is not a JSON Schema validator: references, composition, patterns and
+/// unions remain the server's responsibility, and no external schema is loaded.
+pub fn validate_mcp_argument_shape(schema: &Value, arguments: &Value) -> Result<(), String> {
+    let object = arguments
+        .as_object()
+        .ok_or("arguments must be a JSON object")?;
+    let Some(schema) = schema.as_object() else {
+        return Ok(());
+    };
+    let opaque = |schema: &serde_json::Map<String, Value>| {
+        [
+            "$ref",
+            "$dynamicRef",
+            "$recursiveRef",
+            "allOf",
+            "anyOf",
+            "oneOf",
+            "not",
+            "if",
+            "then",
+            "else",
+        ]
+        .iter()
+        .any(|key| schema.contains_key(*key))
+            || schema.get("type").is_some_and(Value::is_array)
+    };
+    if opaque(schema)
+        || object.len() > 128
+        || schema
+            .get("type")
+            .is_some_and(|value| value.as_str() != Some("object"))
+    {
+        return Ok(());
+    }
+    let required = schema.get("required").and_then(Value::as_array);
+    let properties = schema.get("properties").and_then(Value::as_object);
+    if required
+        .is_some_and(|fields| fields.len() > 128 || fields.iter().any(|field| !field.is_string()))
+        || properties.is_some_and(|fields| fields.len() > 128)
+        || schema
+            .get("properties")
+            .is_some_and(|value| !value.is_object())
+    {
+        return Ok(());
+    }
+    let field_label = |name: &str| name.chars().take(64).collect::<String>();
+    for field in required.into_iter().flatten().filter_map(Value::as_str) {
+        if !object.contains_key(field) {
+            return Err(format!(
+                "arguments is missing required field {}",
+                field_label(field)
+            ));
+        }
+    }
+    if schema.get("additionalProperties") == Some(&Value::Bool(false))
+        && !schema.contains_key("patternProperties")
+    {
+        for field in object.keys() {
+            if properties.is_none_or(|properties| !properties.contains_key(field)) {
+                return Err(format!(
+                    "arguments contains an unsupported field {}",
+                    field_label(field)
+                ));
+            }
+        }
+    }
+    for (field, value) in object {
+        let Some(property) = properties
+            .and_then(|properties| properties.get(field))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        if opaque(property) {
+            continue;
+        }
+        let valid = match property.get("type").and_then(Value::as_str) {
+            Some("string") => value.is_string(),
+            Some("object") => value.is_object(),
+            Some("array") => value.is_array(),
+            Some("boolean") => value.is_boolean(),
+            Some("null") => value.is_null(),
+            // Fraction/range checks need full JSON number semantics; leave
+            // those to the server rather than rounding arbitrary precision.
+            Some("number" | "integer") => value.is_number(),
+            _ => true,
+        };
+        if !valid {
+            return Err(format!(
+                "arguments field {} has the wrong JSON type",
+                field_label(field)
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
     vec![
         descriptor(
@@ -436,12 +534,12 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "use_mcp_tool",
-            "Call one configured, enabled, launch-approved MCP stdio tool. Select the exact server_id and tool from the discovered directory; the Host binds its catalog and schema hashes before recording and approval, so you may omit hashes. A persistently approved tool is callable immediately; otherwise the Host can require explicit schema-bound approval for this run",
+            "Call one configured, enabled, launch-approved MCP stdio tool. Select the exact server_id and tool from the discovered directory; the Host binds its catalog and schema hashes before recording and approval, so you may omit hashes. The arguments object must contain only the selected tool's input_schema parameters, for example {query:...}; never put another use_mcp_tool wrapper, server_id, tool or host hashes inside arguments unless the original tool schema explicitly defines those fields. A persistently approved tool is callable immediately; otherwise the Host can require explicit schema-bound approval for this run",
             ToolEffectV4::Network,
             // `catalog_sha256` is required by the dynamic Plan gate, but it
             // remains optional at the shared descriptor boundary so legacy
             // Execute calls (which predate catalog binding) stay readable.
-            json!({"type":"object","required":["server_id","tool","arguments"],"properties":{"server_id":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"},"catalog_sha256":{"type":"string","minLength":1},"schema_sha256":{"type":"string","minLength":1}}}),
+            json!({"type":"object","required":["server_id","tool","arguments"],"properties":{"server_id":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object","description":"Only the original MCP tool's input_schema parameters. Do not nest the routing wrapper or host hashes here."},"catalog_sha256":{"type":"string","minLength":1},"schema_sha256":{"type":"string","minLength":1}}}),
         ),
         descriptor(
             "agent.route_request",
@@ -749,6 +847,61 @@ fn sensitive_browser_query_key(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mcp_argument_shape_preserves_legal_and_uninterpreted_inputs() {
+        let strict = json!({"type":"object","required":["query"],"additionalProperties":false,"properties":{"query":{"type":"string"}}});
+        assert!(validate_mcp_argument_shape(&strict, &json!({"query":"epigenome"})).is_ok());
+        assert!(
+            validate_mcp_argument_shape(
+                &strict,
+                &json!({"query":"epigenome","server_id":"nested"})
+            )
+            .is_err()
+        );
+        assert!(validate_mcp_argument_shape(&strict, &json!({"query":42})).is_err());
+        assert!(
+            validate_mcp_argument_shape(&strict, &json!({"arguments":{"query":"epigenome"}}))
+                .is_err()
+        );
+        for schema in [
+            json!({"type":"object","properties":{"query":{"type":"string"}}}),
+            json!({"type":"object","additionalProperties":true}),
+            json!({"type":"object","additionalProperties":false,"patternProperties":{".*":{}}}),
+            json!({"$ref":"https://example.invalid/schema","additionalProperties":false}),
+            json!({"allOf":[{"properties":{"query":{}}}],"additionalProperties":false}),
+            json!({"anyOf":[{"type":"object"}],"required":["missing"]}),
+            json!({"oneOf":[{"type":"object"}],"required":["missing"]}),
+            json!({"type":["object","null"],"required":["missing"]}),
+            json!({"properties":"uninterpretable","additionalProperties":false}),
+            json!({"required":[42],"additionalProperties":false}),
+            json!(true),
+        ] {
+            assert!(
+                validate_mcp_argument_shape(
+                    &schema,
+                    &json!({"query":"epigenome","extension":true})
+                )
+                .is_ok(),
+                "{schema}"
+            );
+        }
+        for schema in [
+            json!({"properties":{"query":{"type":["string","null"]}}}),
+            json!({"properties":{"query":{"$ref":"#/$defs/query","type":"string"}}}),
+            json!({"properties":{"query":{"oneOf":[{"type":"string"},{"type":"null"}],"type":"string"}}}),
+        ] {
+            assert!(validate_mcp_argument_shape(&schema, &json!({"query":null})).is_ok());
+        }
+        let fields: serde_json::Map<String, Value> =
+            (0..129).map(|n| (n.to_string(), json!({}))).collect();
+        assert!(
+            validate_mcp_argument_shape(
+                &json!({"required":["missing"],"properties":fields}),
+                &json!({})
+            )
+            .is_ok()
+        );
+    }
     #[test]
     fn evidence_sources_advertise_the_required_tagged_objects() {
         let tool = builtin_tool_definitions_v4()

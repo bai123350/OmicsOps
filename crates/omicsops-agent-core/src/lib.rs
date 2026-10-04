@@ -75,6 +75,16 @@ pub fn failed_mcp_servers(events: &[AgentEventV4]) -> std::collections::BTreeSet
                             .pointer("/result/operation_dispatched")
                             .and_then(serde_json::Value::as_bool)
                             != Some(false)
+                        && !(outcome
+                            .data
+                            .pointer("/result/structuredContent/error_kind")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("mcp_arguments")
+                            && outcome
+                                .data
+                                .pointer("/result/structuredContent/operation_dispatched")
+                                .and_then(serde_json::Value::as_bool)
+                                == Some(false))
                     {
                         *failures.entry(server.clone()).or_default() += 1;
                     }
@@ -18643,6 +18653,67 @@ mod tests {
                 },
             ));
             assert_eq!(failed_mcp_servers(&events).contains("server"), n == 2);
+        }
+    }
+
+    #[test]
+    fn bundled_mcp_argument_failures_do_not_exhaust_a_working_server() {
+        let mut events = Vec::new();
+        for n in 0..4 {
+            let call = ToolCallV4 {
+                call_id: n.to_string(),
+                tool_id: "use_mcp_tool".into(),
+                arguments: json!({"server_id":"server"}),
+            };
+            events.push(AgentEventV4::first(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Utc::now(),
+                AgentEventKindV4::ToolRequested { call: call.clone() },
+            ));
+            events.push(AgentEventV4::next(events.last().unwrap(), Utc::now(), AgentEventKindV4::ToolFinished {outcome:ToolOutcomeV4 {call_id:call.call_id, tool_id:call.tool_id, succeeded:false, model_content:"argument validation".into(), data:json!({"result":{"isError":true,"structuredContent":{"error_kind":"mcp_arguments","operation_dispatched":false}}}), provenance:vec![]}}));
+        }
+        assert!(failed_mcp_servers(&events).is_empty());
+    }
+
+    #[test]
+    fn mcp_unclassified_structured_errors_still_exhaust_server_retries() {
+        for metadata in [
+            json!({"operation_dispatched":false}),
+            json!({"error_kind":"upstream_failure","operation_dispatched":false}),
+            json!({"error_kind":"mcp_arguments","operation_dispatched":true}),
+        ] {
+            let mut events = Vec::new();
+            for n in 0..2 {
+                let call = ToolCallV4 {
+                    call_id: n.to_string(),
+                    tool_id: "use_mcp_tool".into(),
+                    arguments: json!({"server_id":"server"}),
+                };
+                events.push(AgentEventV4::first(
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    Utc::now(),
+                    AgentEventKindV4::ToolRequested { call: call.clone() },
+                ));
+                events.push(AgentEventV4::next(
+                    events.last().unwrap(),
+                    Utc::now(),
+                    AgentEventKindV4::ToolFinished {
+                        outcome: ToolOutcomeV4 {
+                            call_id: call.call_id,
+                            tool_id: call.tool_id,
+                            succeeded: false,
+                            model_content: "business error".into(),
+                            data: json!({"result":{"isError":true,"structuredContent":metadata}}),
+                            provenance: vec![],
+                        },
+                    },
+                ));
+            }
+            assert!(failed_mcp_servers(&events).contains("server"));
         }
     }
 }

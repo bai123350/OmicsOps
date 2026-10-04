@@ -7462,6 +7462,21 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                         provenance: vec![],
                     }));
                 }
+                if let Err(error) = omicsops_tools::validate_mcp_argument_shape(
+                    &entry.input_schema,
+                    call.arguments.get("arguments").unwrap_or(&Value::Null),
+                ) {
+                    return Ok(Some(ToolOutcomeV4 {
+                        call_id: call.call_id.clone(),
+                        tool_id: call.tool_id.clone(),
+                        succeeded: false,
+                        model_content: format!(
+                            "MCP arguments rejected before dispatch: {error}. Put only the selected tool's input_schema parameters inside arguments; keep routing fields outside it. Correct the arguments and retry this target; this is not a server outage."
+                        ),
+                        data: json!({"error_kind":"mcp_arguments","operation_dispatched":false,"recoverable":true,"input_schema":entry.input_schema}),
+                        provenance: vec![],
+                    }));
+                }
             } else {
                 return Ok(Some(ToolOutcomeV4 {
                     call_id: call.call_id.clone(),
@@ -12441,6 +12456,119 @@ mod tests {
         ));
         assert!(!mcp_result_failed(&json!({"result":{"isError":false}})));
         assert!(!mcp_result_failed(&json!({"result":{"content":[]}})));
+    }
+
+    #[tokio::test]
+    async fn mcp_argument_preflight_rejects_nested_wrapper_without_server_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repository = Store::open_in_memory().await.unwrap();
+        let mut profile = crate::bundled_mcp_commands::register_preset(
+            &repository,
+            "pubmed",
+            &dir.path().join("server-must-not-launch.exe"),
+        )
+        .await
+        .unwrap();
+        profile.enabled = true;
+        profile.launch_approved = true;
+        repository
+            .put_json("mcp_server", &profile.id.to_string(), &profile)
+            .await
+            .unwrap();
+        let schema = profile
+            .tools
+            .iter()
+            .find(|tool| tool["name"] == "search_articles")
+            .unwrap()["inputSchema"]
+            .clone();
+        let (resources, factory) = mock_resource_slot(dir.path(), false, false);
+        let executor = DesktopToolExecutorV4 {
+            repository,
+            mcp_sessions: McpSessionManager::new(),
+            credentials: SystemCredentialVault,
+            resources,
+            selection: ComputeSelectionV4 {
+                schema_version: 4,
+                backend_id: "local".into(),
+                backend_kind: ComputeBackendKindV4::Local,
+                autonomy_mode: AutonomyModeV4::Supervised,
+                approval_policy: ApprovalPolicyV4::RiskBased,
+                environment: "system".into(),
+                network_policy: NetworkPolicyV4::HostInherited,
+                container_image: None,
+            },
+            project_id: Uuid::new_v4(),
+            run_id: Uuid::new_v4(),
+            conversation_id: Uuid::new_v4(),
+            backend_id: "local".into(),
+            browser: omicsops_browser::BrowserRuntime::new(
+                dir.path().join("browser"),
+                dir.path().join("extension"),
+            ),
+            local_project_root: dir.path().to_owned(),
+            skills_gate: Default::default(),
+            browser_authorizations: Default::default(),
+            forced_route: None,
+        };
+        let valid = ToolCallV4 {
+            call_id: "valid-search".into(),
+            tool_id: "use_mcp_tool".into(),
+            arguments: json!({"server_id":profile.id,"tool":"search_articles","catalog_sha256":profile.tool_catalog_sha256,"schema_sha256":schema_digest(&schema),"arguments":{"query":"epigenome"}}),
+        };
+        let mut events = Vec::new();
+        for (index, arguments) in [
+            valid.arguments.clone(),
+            json!({}),
+            json!({"query":"epigenome","server_id":profile.id}),
+            json!({"query":42}),
+            Value::Null,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut call = valid.clone();
+            call.call_id = format!("invalid-{index}");
+            call.arguments["arguments"] = arguments;
+            let outcome = executor
+                .prepare_call(&call)
+                .await
+                .unwrap()
+                .expect("invalid MCP input must be rejected before the server is called");
+            assert!(!outcome.succeeded);
+            assert_eq!(outcome.data["error_kind"], "mcp_arguments");
+            assert_eq!(outcome.data["operation_dispatched"], false);
+            assert_eq!(outcome.data["recoverable"], true);
+            assert_eq!(outcome.data["input_schema"], schema);
+            events.push(AgentEventV4::first(
+                executor.run_id,
+                executor.project_id,
+                executor.conversation_id,
+                Utc::now(),
+                AgentEventKindV4::ToolRequested { call },
+            ));
+            events.push(AgentEventV4::next(
+                events.last().unwrap(),
+                Utc::now(),
+                AgentEventKindV4::ToolFinished { outcome },
+            ));
+        }
+        assert!(omicsops_agent_core::failed_mcp_servers(&events).is_empty());
+        assert!(executor.prepare_call(&valid).await.unwrap().is_none());
+        assert_eq!(factory.attempts.load(Ordering::SeqCst), 0);
+        assert!(
+            executor
+                .repository
+                .list_json::<Value>("mcp_audit")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut stale = valid.clone();
+        stale.arguments["schema_sha256"] = json!("stale");
+        assert_eq!(
+            executor.prepare_call(&stale).await.unwrap().unwrap().data["error_kind"],
+            "mcp_preflight"
+        );
     }
     #[test]
     fn conversation_mcp_grant_covers_changed_queries_but_not_other_catalogs() {
