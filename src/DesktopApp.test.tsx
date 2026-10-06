@@ -5,6 +5,7 @@ import { act, fireEvent, render as testingRender, screen, waitFor, within } from
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import DesktopApp, { samePendingSubmission } from "./DesktopApp";
+import { ComposerDraftStore } from "./features/workspace/composerDrafts";
 import { AppearanceProvider } from "./use-appearance";
 import * as api from "./tauri-api";
 import * as referenceApi from "./composer-reference-api";
@@ -1597,6 +1598,40 @@ describe("DesktopApp", () => {
 
     await waitFor(() => expect(deleteProject).toHaveBeenCalledWith(project.id));
     await waitFor(() => expect(screen.queryByText("待删除项目")).not.toBeInTheDocument());
+  });
+
+  it.each(["success", "failure"] as const)("purges project drafts only after confirmed project deletion: %s", async (result) => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    const otherProject = { ...stateProject, id: "other-project", name: "保留项目" };
+    vi.mocked(api.listProjects).mockResolvedValue([stateProject, otherProject]);
+    const deletion = deferred<void>();
+    vi.spyOn(api, "deleteProject").mockReturnValue(deletion.promise);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    // Observe the real app-owned store through a call-through subscription spy.
+    const subscribe = vi.spyOn(ComposerDraftStore.prototype, "subscribe");
+    render(<DesktopApp />);
+    const input = await screen.findByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(input).toBeEnabled());
+    const store = subscribe.mock.contexts[0] as ComposerDraftStore;
+    const deletedScopes = [null, stateConversations[0].id, stateConversations[1].id].map((conversationId) => ({ projectId: stateProject.id, conversationId }));
+    const retainedScopes = [null, stateConversations[0].id].map((conversationId) => ({ projectId: otherProject.id, conversationId }));
+    act(() => {
+      for (const scope of deletedScopes) store.update(scope, "Deleted project notes");
+      for (const scope of retainedScopes) store.update(scope, "Retained project notes");
+    });
+    fireEvent.click(screen.getByRole("button", { name: "返回项目主页" }));
+    fireEvent.click(await screen.findByRole("button", { name: `删除项目：${stateProject.name}` }));
+    for (const scope of deletedScopes) expect(store.read(scope).text).toBe("Deleted project notes");
+    await act(async () => {
+      if (result === "success") deletion.resolve();
+      else deletion.reject(new Error("Project deletion failed"));
+    });
+    if (result === "success") expect(screen.queryByRole("button", { name: `打开项目：${stateProject.name}` })).not.toBeInTheDocument();
+    else expect(screen.getByRole("button", { name: `打开项目：${stateProject.name}` })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: `打开项目：${otherProject.name}` })).toBeInTheDocument();
+    for (const scope of deletedScopes) expect(store.read(scope).text).toBe(result === "success" ? "" : "Deleted project notes");
+    for (const scope of retainedScopes) expect(store.read(scope).text).toBe("Retained project notes");
   });
 
   it("opens ordinary Settings on General and resets there after a capability page", async () => {
