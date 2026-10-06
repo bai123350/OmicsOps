@@ -1,6 +1,6 @@
 # Wisp 改进设计：草稿、表格与远端作业
 
-日期：2026-10-04。状态：待用户审阅；本文件定义 W01–W03 的首次实现，不表示已实施。总范围见 [总设计](2026-10-04-wisp-improvements-design.md)，来源见 [源码对照清单](2026-10-04-wisp-science-improvement-backlog.md)。
+日期：2026-10-04。状态：用户已确认设计，实施计划待审阅；本文件定义 W01–W03 的首次实现，不表示已实施。总范围见 [总设计](2026-10-04-wisp-improvements-design.md)，来源见 [源码对照清单](2026-10-04-wisp-science-improvement-backlog.md)。
 
 ## 用户目标与方案选择
 

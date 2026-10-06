@@ -1,6 +1,6 @@
 # Wisp 首次交付设计：轨迹诊断、离线示例与 Skill helper 回归
 
-日期：2026-10-04。状态：待设计审阅，尚未实现。
+日期：2026-10-04。状态：用户已确认设计，实施计划待审阅，尚未实现。
 
 本文细化 [Wisp 改进 backlog](2026-10-04-wisp-science-improvement-backlog.md) 中 W06、W07 与 W08 的 Python helper/CI 部分。三个章节各自可交付；本文是行为和接口设计，不是实施计划。W08 的 V4 场景 manifest、runner 和报告契约由 [Runtime 设计](2026-10-04-wisp-runtime-design.md) 定义，本文只规定两种离线检查的 CI 边界。
 

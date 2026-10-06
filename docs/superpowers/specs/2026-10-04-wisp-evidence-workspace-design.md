@@ -1,6 +1,6 @@
 # Wisp 借鉴：证据与工作区首范围设计（W09–W12）
 
-日期：2026-10-04。状态：待设计评审；本文件只定义行为与边界，没有实现产品代码，也不是实施计划。
+日期：2026-10-04。状态：用户已确认设计，实施计划待审阅；本文件只定义行为与边界，没有实现产品代码，也不是实施计划。
 
 本文件承接 [Wisp Science 改进清单](2026-10-04-wisp-science-improvement-backlog.md) 中已经获准设计的四项首范围。W09 包含只读准备度报告和 reference-only 证据包；W10 包含显式选中小文件的基线保存与差异；W11 只包含可选择迁移清单预览；W12 包含持久、可逆的会话收起与恢复，以及导航、搜索和 `#` 的发现过滤。四章可独立交付。真实模型、Python/R、SSH、SLURM 和复现执行均不属于这些首范围。
 
@@ -549,6 +549,9 @@ pub async fn workspace_list_conversation_visibility(
 pub async fn workspace_set_conversation_visibility(
     state: State<'_, AppState>, request: SetConversationVisibilityRequestV1,
 ) -> Result<ConversationVisibilityReceiptV1, ConversationVisibilityErrorV1>;
+pub async fn workspace_get_conversation_visibility(
+    state: State<'_, AppState>, project_id: Uuid, conversation_id: Uuid,
+) -> Result<ConversationVisibilityRecordV1, ConversationVisibilityErrorV1>;
 pub async fn workspace_get_conversation(
     state: State<'_, AppState>, project_id: Uuid, conversation_id: Uuid,
 ) -> Result<Conversation, String>;
@@ -608,7 +611,7 @@ pub struct ConversationVisibilityErrorV1 {
 
 list item 是特定用途投影，不复制model_profile_id或core对象；`conversation_status` 由 core enum序列化的现有值产生，TypeScript使用现有 `WorkspaceConversation["status"]` 校验，不另起状态枚举。直接打开返回现有 `Conversation`；它不进行模型/运行恢复，也不改变visibility。page `query` 最多200字符/1KiB，只搜公开标题；limit=1..100、offset<=10,000，默认UI50条。按 conversation updated_at DESC、id稳定排序，SQL先project/visibility/query过滤再分页；不拉一页后在React剔除。offset分页不承诺并发收起下的稳定快照；操作后重置到第一页并刷新。
 
-Store 新增 `workspace_conversations_for_presentation(&self,project_id:Uuid)->Result<Vec<Conversation>,StoreError>`（Visible，与旧展示形状一致）、`workspace_latest_visible_conversation(&self,project_id:Uuid)->Result<Option<Conversation>,StoreError>`、`workspace_list_conversation_visibility(&self,request:&ConversationVisibilityListRequestV1)->Result<ConversationVisibilityPageV1,StoreError>`、`workspace_set_conversation_visibility(&self,request:&SetConversationVisibilityRequestV1)->Result<ConversationVisibilityReceiptV1,StoreError>`。精确打开复用现有 `workspace_source_conversation(project,id)`，不通过Visible列表判断对象是否存在。
+Store 新增 `workspace_conversations_for_presentation(&self,project_id:Uuid)->Result<Vec<Conversation>,StoreError>`（Visible，与旧展示形状一致）、`workspace_latest_visible_conversation(&self,project_id:Uuid)->Result<Option<Conversation>,StoreError>`、`workspace_list_conversation_visibility(&self,request:&ConversationVisibilityListRequestV1)->Result<ConversationVisibilityPageV1,StoreError>`、`workspace_set_conversation_visibility(&self,request:&SetConversationVisibilityRequestV1)->Result<ConversationVisibilityReceiptV1,StoreError>`，以及 `workspace_get_conversation_visibility(&self,project_id:Uuid,conversation_id:Uuid)->Result<ConversationVisibilityRecordV1,StoreError>`。后者先验证同项目会话存在，再读取可见性；缺行返回 Visible/revision0，异项目或已删除会话拒绝，不能把查不到行都视为默认可见。它供精确来源打开后的横幅和恢复操作读取当前 revision，不能靠标题或分页集合猜测状态。精确打开复用现有 `workspace_source_conversation(project,id)`，不通过Visible列表判断对象是否存在。
 
 ### 幂等迁移、请求与失败语义
 
@@ -674,4 +677,4 @@ W12独立于W09/W10/W11；与W01草稿共享project/conversation身份但不改�
 
 本设计从当前源码确认了保存revision、公开来源快照、科学有效性/provenance、项目绑定、request ledger和对话查询接缝。新模块、新DTO、读context、新表、blob存储、UI入口和测试均是提案，没有实现或执行。已读取的上游参考事实保留在积压清单中；本设计没有重新联网读取上游，也不将上游允许scripts与same-origin的HTML做法带入产品。
 
-首范围无需再选择真实主机、样本、模型或导入目的地。每章的预算和恢复边界已经给出确定默认值，可在设计评审中调整；实施前仍须通过评审。实施后的确定性验证依照AGENTS.md运行最近测试及默认完整检查；此文档阶段未运行产品/运行时验收，没有独立复现已执行的主张。
+首范围无需再选择真实主机、样本、模型或导入目的地。每章的预算和恢复边界已获用户确认，逐项计划见[实施总计划](../plans/2026-10-04-wisp-improvements.md)，待计划审阅及选择执行方式。实施后的确定性验证依照AGENTS.md运行最近测试及默认完整检查；此文档阶段未运行产品/运行时验收，没有独立复现已执行的主张。
