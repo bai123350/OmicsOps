@@ -6,6 +6,8 @@ import * as projectTemplatesApi from "../../project-templates-api";
 import * as workflowApi from "../../composer-workflow-api";
 import * as guidanceApi from "../../tauri-api";
 import { WorkspaceShell } from "./WorkspaceShell";
+import { ComposerDraftStore } from "./composerDrafts";
+import * as branchApi from "../../conversation-branch-api";
 import { SettingsPanel } from "../settings/SettingsPanel";
 import { setComposerSendPreference } from "../settings/useComposerSendPreference";
 import { setSelectionActionsEnabled } from "../../use-general-preferences";
@@ -67,6 +69,31 @@ function deferred<T>() {
 }
 
 describe("WorkspaceShell", () => {
+  it.each(["empty", "edited", "edited then emptied", "existing", "not opened"] as const)("seeds branch text only into an unchanged empty target: %s", async (targetState) => {
+    const store = new ComposerDraftStore();
+    const source = { projectId: project.id, conversationId: "source" };
+    const target = { projectId: project.id, conversationId: "branch" };
+    store.update(source, "Source draft");
+    if (targetState === "existing") store.update(target, "Existing target");
+    const checkpoint = { source_message_id: "u1", source_sequence: 1, source_head_sequence: 1, checkpoint_kind: "before_user" as const, boundary_hash: "boundary" };
+    vi.spyOn(branchApi, "conversationBranchCheckpoint").mockResolvedValue(checkpoint);
+    vi.spyOn(branchApi, "createConversationBranch").mockResolvedValue({ ...checkpoint, request_id: "branch-request", branch_conversation_id: "branch", project_id: project.id, source_conversation_id: "source", request_hash: "request-hash", state: "active", created_at: "", updated_at: "" });
+    const pending = deferred<boolean>();
+    const onOpenBranch = vi.fn().mockReturnValue(pending.promise);
+    const view = render(<WorkspaceShell project={project} locale="en-US" activeConversationId="source" composerDraftStore={store} onOpenBranch={onOpenBranch} messages={[{ id: "u1", role: "user", markdown: "Original user text" }]} />);
+    fireEvent.click(screen.getByRole("button", { name: "Branch before this message" }));
+    await waitFor(() => expect(onOpenBranch).toHaveBeenCalled());
+    view.rerender(<WorkspaceShell project={project} locale="en-US" activeConversationId="branch" composerDraftStore={store} onOpenBranch={onOpenBranch} />);
+    const input = screen.getByRole("textbox", { name: /Describe a research goal/ });
+    if (targetState === "edited" || targetState === "edited then emptied") {
+      fireEvent.change(input, { target: { value: "New target draft" } });
+      if (targetState === "edited then emptied") fireEvent.change(input, { target: { value: "" } });
+    }
+    await act(async () => pending.resolve(targetState !== "not opened"));
+    expect(input).toHaveValue(targetState === "empty" ? "Original user text" : targetState === "edited" ? "New target draft" : targetState === "existing" ? "Existing target" : "");
+    expect(store.read(source).text).toBe("Source draft");
+  });
+
   it("inserts a Quick Action as an existing workflow reference without sending or running", async () => {
     const workflow = { id: "workflow-1", project_id: project.id, name: "QC workflow", description: "Inspect counts", steps: ["Inspect counts"], enabled: true };
     vi.spyOn(projectTemplatesApi, "listQuickActions").mockResolvedValue([{ id: "action-1", project_id: project.id, name: "Review QC", description: "Insert workflow", workflow_id: workflow.id, enabled: true }]);

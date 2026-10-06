@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ComputeBackendAvailabilityV4, RuntimeBoundaryViewV4 } from "../../types";
 import { WorkspaceShell } from "./WorkspaceShell";
+import { ComposerDraftStore } from "./composerDrafts";
 import * as referenceApi from "../../composer-reference-api";
 import * as api from "../../tauri-api";
 import type { SideChatController } from "./useSideChat";
@@ -54,6 +55,62 @@ function sideController(send = vi.fn().mockResolvedValue(true)): SideChatControl
 }
 
 describe("WorkspaceShell composer integration", () => {
+  it("restores a project draft after the workspace unmounts", () => {
+    const store = new ComposerDraftStore();
+    store.update({ projectId: project.id, conversationId: "a" }, "A notes");
+    const view = renderShell({ activeConversationId: "a", composerDraftStore: store });
+    view.unmount();
+    renderShell({ activeConversationId: "a", composerDraftStore: store });
+    expect(screen.getByRole("textbox", { name: /Describe a research goal/ })).toHaveValue("A notes");
+  });
+
+  it("restores only text after a conversation round trip", () => {
+    const item = { reference: { kind: "artifact" as const, project_id: project.id, id: "qc" }, label: "QC", description: "" };
+    const view = renderShell({ activeConversationId: "a", searchRequest: { key: "draft-ref", kind: "attach", projectId: project.id, conversationId: "a", item } });
+    const input = screen.getByRole("textbox", { name: /Describe a research goal/ });
+    fireEvent.change(input, { target: { value: "A notes" } });
+    expect(screen.getByRole("button", { name: "Remove reference: QC" })).toBeInTheDocument();
+    view.rerender(<WorkspaceShell project={project} locale="en-US" activeConversationId="b" />);
+    expect(input).toHaveValue("");
+    fireEvent.change(input, { target: { value: "B notes" } });
+    view.rerender(<WorkspaceShell project={project} locale="en-US" activeConversationId="a" />);
+    expect(input).toHaveValue("A notes");
+    expect(screen.queryByRole("button", { name: "Remove reference: QC" })).not.toBeInTheDocument();
+    view.rerender(<WorkspaceShell project={project} locale="en-US" activeConversationId="b" />);
+    expect(input).toHaveValue("B notes");
+  });
+
+  it("keeps same-named conversations in different projects separate", () => {
+    const view = renderShell({ activeConversationId: "same" });
+    const input = screen.getByRole("textbox", { name: /Describe a research goal/ });
+    fireEvent.change(input, { target: { value: "First project" } });
+    view.rerender(<WorkspaceShell project={{ ...project, id: "other" }} locale="en-US" activeConversationId="same" />);
+    expect(input).toHaveValue("");
+    fireEvent.change(input, { target: { value: "Other project" } });
+    view.rerender(<WorkspaceShell project={project} locale="en-US" activeConversationId="same" />);
+    expect(input).toHaveValue("First project");
+  });
+
+  it("does not adopt unassigned text during ordinary conversation navigation", () => {
+    const view = renderShell();
+    const input = screen.getByRole("textbox", { name: /Describe a research goal/ });
+    fireEvent.change(input, { target: { value: "Unassigned notes" } });
+    view.rerender(<WorkspaceShell project={project} locale="en-US" activeConversationId="saved" />);
+    expect(input).toHaveValue("");
+    view.rerender(<WorkspaceShell project={project} locale="en-US" />);
+    expect(input).toHaveValue("Unassigned notes");
+  });
+
+  it("keeps text when the workspace navigation is collapsed", () => {
+    renderShell({ activeConversationId: "a" });
+    const input = screen.getByRole("textbox", { name: /Describe a research goal/ });
+    fireEvent.change(input, { target: { value: "Keep while collapsed" } });
+    fireEvent.click(screen.getByRole("button", { name: "Collapse workspace navigation" }));
+    expect(input).toHaveValue("Keep while collapsed");
+    fireEvent.click(screen.getByRole("button", { name: "Expand workspace navigation" }));
+    expect(input).toHaveValue("Keep while collapsed");
+  });
+
   it("attaches a search result to the current draft without switching sessions", () => {
     const onSelectConversation = vi.fn();
     const view = renderShell({ activeConversationId: "current", onSelectConversation });

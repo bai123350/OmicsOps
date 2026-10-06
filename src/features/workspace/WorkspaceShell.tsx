@@ -23,6 +23,8 @@ import { useSessionReviews } from "./useSessionReviews";
 import { supportsFastMode } from "../../fast-mode";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { WorkspaceNavigation, type WorkspacePage } from "./WorkspaceNavigation";
+import { ComposerDraftStore } from "./composerDrafts";
+import { useScopedComposerDraft } from "./useScopedComposerDraft";
 import { WorkspaceResearchPages } from "./WorkspaceResearchPages";
 import { CollectSourceButton } from "./CollectSourceButton";
 import { messageLibrarySource } from "./librarySources";
@@ -72,6 +74,7 @@ export interface WorkspaceProject {
 }
 interface Props {
   project: WorkspaceProject;
+  composerDraftStore?: ComposerDraftStore;
   locale: Locale;
   onOpenSettings?: (section?: "models" | "remote" | "skills") => void;
   onBackToProjects?: () => void;
@@ -215,7 +218,7 @@ function parseComposerCommand(text: string): ComposerCommandInvocation | null {
   return { id: match[1].toLowerCase(), args: match[2] ?? "", raw };
 }
 
-export function WorkspaceShell({ project, locale, onOpenSettings, onBackToProjects, onOpenSourceConversation, onRegisterNavigationGuard, conversations = [], activeConversationId, capabilitySummary, capabilitiesLoading, capabilitiesError, onRefreshCapabilities, onSelectConversation, onNewConversation, onDeleteConversation, onOpenBranch, onBranchSend, branchSendOriginalMarkdown, branchSendBusy = false, branchSendPending = false, branchSendError = false, onRetryBranchSend, onSend, onQueue, replacement, sideChat, contextUsage = null, contextUsageError = false, queueItems = [], queueError = false, queueLoading = false, onQueueRefresh, referenceCatalog, workflowCatalogVersion = 0, onOpenSearch, searchRequest, onSearchRequestHandled, onSuggestFollowUps, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", conversationLoadError = "", onRetryConversationLoad, agentRetryNotice = "", modelLabel, activeModelProfile, modelProfiles = [], modelPicker, composerBusy = false, modelOptions = [], modelId, onModelChange, agentMode, onAgentModeChange, conversationLocked = false, conversationHydrating = false, planActionBusy = false, v4Plan, latestPlanRevision, computeBackends = [], runtimeDraftSelection = null, computeBackendId = "", containerImage = "", autonomyMode = "supervised", approvalPolicy = "auto_approve_except_local_deletion", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onApprovalPolicyChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onRequestPlanRevision, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, activeRunLastActivityAt, agentRunEventsV4 = [], agentTextPreview, agentReasoningPreview, agentModelActivity, guidanceAvailable = false, onAnswerAgentQuestionV4, onDecideToolApprovalV4, onResolveUncertainV4, onResumeAgentRunV4, onCancelRuntimeRecoveryV4, onCloseBrowserRunTabsV4, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
+export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSettings, onBackToProjects, onOpenSourceConversation, onRegisterNavigationGuard, conversations = [], activeConversationId, capabilitySummary, capabilitiesLoading, capabilitiesError, onRefreshCapabilities, onSelectConversation, onNewConversation, onDeleteConversation, onOpenBranch, onBranchSend, branchSendOriginalMarkdown, branchSendBusy = false, branchSendPending = false, branchSendError = false, onRetryBranchSend, onSend, onQueue, replacement, sideChat, contextUsage = null, contextUsageError = false, queueItems = [], queueError = false, queueLoading = false, onQueueRefresh, referenceCatalog, workflowCatalogVersion = 0, onOpenSearch, searchRequest, onSearchRequestHandled, onSuggestFollowUps, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", conversationLoadError = "", onRetryConversationLoad, agentRetryNotice = "", modelLabel, activeModelProfile, modelProfiles = [], modelPicker, composerBusy = false, modelOptions = [], modelId, onModelChange, agentMode, onAgentModeChange, conversationLocked = false, conversationHydrating = false, planActionBusy = false, v4Plan, latestPlanRevision, computeBackends = [], runtimeDraftSelection = null, computeBackendId = "", containerImage = "", autonomyMode = "supervised", approvalPolicy = "auto_approve_except_local_deletion", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onApprovalPolicyChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onRequestPlanRevision, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, activeRunLastActivityAt, agentRunEventsV4 = [], agentTextPreview, agentReasoningPreview, agentModelActivity, guidanceAvailable = false, onAnswerAgentQuestionV4, onDecideToolApprovalV4, onResolveUncertainV4, onResumeAgentRunV4, onCancelRuntimeRecoveryV4, onCloseBrowserRunTabsV4, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
   const t = copy[locale];
   const zh = locale === "zh-CN";
   const { selectionActionsEnabled } = useGeneralPreferences();
@@ -273,11 +276,22 @@ export function WorkspaceShell({ project, locale, onOpenSettings, onBackToProjec
   useWindowEscapeLayer(sidebarOpen && workspacePage === "conversation", closeSidebar);
   useWindowEscapeLayer(sidebarOpen && workspacePage === "conversation" && sectionMenuOpen, () => setSectionMenuOpen(false));
   const [expanded, setExpanded] = useState(false);
-  const [draft, setDraft] = useState("");
+  const standaloneDraftStore = useRef<ComposerDraftStore | null>(null);
+  if (!composerDraftStore && !standaloneDraftStore.current) standaloneDraftStore.current = new ComposerDraftStore();
+  const draftStore = composerDraftStore ?? standaloneDraftStore.current!;
+  const { draft, setDraft } = useScopedComposerDraft(draftStore, { projectId: project.id, conversationId: activeConversationId ?? null });
   const branchDrafts = useRef(new Map<string, string>());
   const branching = useConversationBranch(project.id, activeConversationId, locale, onOpenBranch ? async (branch) => {
+    const key = JSON.stringify([branch.project_id, branch.source_conversation_id]);
+    const sourceDraft = branchDrafts.current.get(key);
+    const target = { projectId: branch.project_id, conversationId: branch.branch_conversation_id };
+    const targetBeforeOpen = draftStore.capture(target);
     const opened = await onOpenBranch(branch);
-    if (opened) { const key = `${branch.project_id}:${branch.source_conversation_id}`; const sourceDraft = branchDrafts.current.get(key); if (sourceDraft !== undefined) { branchDrafts.current.delete(key); setDraft(sourceDraft); } }
+    if (opened && sourceDraft !== undefined) {
+      branchDrafts.current.delete(key);
+      const current = draftStore.read(target);
+      if (!current.text && current.revision === targetBeforeOpen.revision) draftStore.update(target, sourceDraft);
+    }
     return opened;
   } : undefined);
   const branchDisabled = branchSendBusy || branchSendPending || !onOpenBranch || agentBusy || conversationLocked || conversationHydrating || composerBusy || branching.busy || branching.retryAvailable;
@@ -304,7 +318,7 @@ export function WorkspaceShell({ project, locale, onOpenSettings, onBackToProjec
       }
     }
     const sourceText = title === undefined ? messages.find((message) => message.id === sourceMessageId && message.role === "user")?.markdown : undefined;
-    if (sourceText !== undefined) branchDrafts.current.set(`${project.id}:${activeConversationId}`, sourceText);
+    if (sourceText !== undefined) branchDrafts.current.set(JSON.stringify([project.id, activeConversationId]), sourceText);
     return branching.start(sourceMessageId, kind, title?.trim() || (zh ? "会话分支" : "Conversation branch"));
   }
   const draftRef = useRef<HTMLTextAreaElement>(null);

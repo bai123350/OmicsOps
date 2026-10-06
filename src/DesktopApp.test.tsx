@@ -88,6 +88,81 @@ function setupConversationStateHarness() {
 }
 
 describe("DesktopApp", () => {
+  it("restores composer text after leaving and reopening a project", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    render(<DesktopApp />);
+    const input = await screen.findByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "Persistent window notes" } });
+    fireEvent.click(screen.getByRole("button", { name: "返回项目主页" }));
+    fireEvent.click(await screen.findByRole("button", { name: `打开项目：${stateProject.name}` }));
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toHaveValue("Persistent window notes");
+  });
+
+  it.each(["create", "restore"] as const)("adopts unassigned notes only after confirmed creation, not %s navigation", async (path) => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    vi.mocked(api.listConversations).mockRejectedValueOnce(new Error("Load failed"));
+    vi.mocked(api.latestUsedConversation).mockResolvedValue(path === "create" ? null : stateConversations[0]);
+    vi.spyOn(api, "createConversation").mockResolvedValue({ ...stateConversations[0], id: "created", title: "Created session" });
+    render(<DesktopApp />);
+    await screen.findByRole("button", { name: "重试会话恢复" });
+    const input = screen.getByRole("textbox", { name: /描述研究目标/ });
+    // Seed the unassigned draft state; this host disables editing without a session.
+    fireEvent.change(input, { target: { value: "Unassigned goal" } });
+    fireEvent.click(screen.getByRole("button", { name: "重试会话恢复" }));
+    await screen.findByRole("heading", { name: path === "create" ? "Created session" : stateConversations[0].title });
+    expect(input).toHaveValue(path === "create" ? "Unassigned goal" : "");
+    if (path === "restore") {
+      vi.mocked(api.listConversations).mockRejectedValueOnce(new Error("Load failed again"));
+      fireEvent.click(screen.getByRole("button", { name: "返回项目主页" }));
+      fireEvent.click(await screen.findByRole("button", { name: `打开项目：${stateProject.name}` }));
+      await screen.findByRole("button", { name: "重试会话恢复" });
+      expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toHaveValue("Unassigned goal");
+    }
+  });
+
+  it("creates an empty composer from an active conversation and restores the original", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    vi.spyOn(api, "createConversation").mockResolvedValue({ ...stateConversations[0], id: "new", title: "New session" });
+    render(<DesktopApp />);
+    const input = await screen.findByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "Original goal" } });
+    fireEvent.click(screen.getByRole("button", { name: "新建会话" }));
+    await screen.findByRole("heading", { name: "New session" });
+    expect(input).toHaveValue("");
+    fireEvent.click(screen.getByRole("button", { name: stateConversations[0].title }));
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    expect(input).toHaveValue("Original goal");
+  });
+
+  it.each(["success", "failure"] as const)("purges only a confirmed deletion after switching away: %s", async (result) => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    const deletion = deferred<void>();
+    vi.spyOn(api, "deleteConversation").mockReturnValue(deletion.promise);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<DesktopApp />);
+    const input = await screen.findByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "Delete source notes" } });
+    fireEvent.click(screen.getByRole("button", { name: "删除会话：Agent 会话" }));
+    fireEvent.click(screen.getByRole("button", { name: stateConversations[1].title }));
+    await screen.findByRole("heading", { name: stateConversations[1].title });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "Keep target notes" } });
+    await act(async () => { if (result === "success") deletion.resolve(); else deletion.reject(new Error("Delete failed")); });
+    expect(input).toHaveValue("Keep target notes");
+    // The existing UI generation guard keeps the old list until refresh.
+    fireEvent.click(screen.getByRole("button", { name: stateConversations[0].title }));
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    expect(input).toHaveValue(result === "success" ? "" : "Delete source notes");
+  });
+
   it("does not describe a container until its current project and image response resolves", async () => {
     const { stateSpy } = setupConversationStateHarness();
     stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));

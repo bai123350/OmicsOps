@@ -14,6 +14,7 @@ import * as api from "./tauri-api";
 import type { AgentModelActivityReceiptV4, AgentReasoningPreviewV4, AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendAvailabilityV4, ComputeSelectionV4, ConnectionProfile, ConversationAgentStateV4, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, ProjectArtifact, ProposedPlanRevisionV4, RemoteFileEntry, RunSummaryV4, SessionAgentModeV4, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
 import { WorkspaceShell } from "./features/workspace/WorkspaceShell";
+import { ComposerDraftStore } from "./features/workspace/composerDrafts";
 import { ApiModelPicker } from "./features/workspace/ApiModelPicker";
 import { SettingsPanel, type SettingsSection } from "./features/settings/SettingsPanel";
 import { usePersistentLocale } from "./use-persistent-locale";
@@ -59,6 +60,9 @@ export function samePendingSubmission(
 }
 
 export default function DesktopApp() {
+  const composerDraftStoreRef = useRef<ComposerDraftStore | null>(null);
+  if (!composerDraftStoreRef.current) composerDraftStoreRef.current = new ComposerDraftStore();
+  const composerDraftStore = composerDraftStoreRef.current;
   const workspaceNavigationGuard = useRef<(next: () => void, onCancel?: () => void) => void>((next) => next());
   const registerWorkspaceNavigationGuard = useCallback((guard: (next: () => void, onCancel?: () => void) => void) => { workspaceNavigationGuard.current = guard; }, []);
   const [projects, setProjects] = useState<WorkspaceProject[]>([]);
@@ -269,7 +273,10 @@ export default function DesktopApp() {
   function createBlankConversation(projectId: string): Promise<WorkspaceConversation> {
     const existing = blankConversationRequests.current.get(projectId);
     if (existing) return existing;
-    const request = api.createConversation(projectId);
+    const request = api.createConversation(projectId).then((created) => {
+      composerDraftStore.adoptUnassigned(projectId, created.id);
+      return created;
+    });
     blankConversationRequests.current.set(projectId, request);
     void request.then(
       () => undefined,
@@ -1045,6 +1052,7 @@ export default function DesktopApp() {
     setAgentNotice("");
     try {
       const created = await api.createConversation(generation.projectId!);
+      if (generation.conversationId === null) composerDraftStore.adoptUnassigned(generation.projectId!, created.id);
       if (!isCurrentConversationGeneration(generation)) return;
       setConversations((current) => [created, ...current]);
       ++conversationRequestToken.current;
@@ -1064,6 +1072,7 @@ export default function DesktopApp() {
     setAgentNotice("");
     try {
       await api.deleteConversation(generation.projectId!, conversationId);
+      composerDraftStore.removeConversation({ projectId: generation.projectId!, conversationId });
       if (!isCurrentConversationGeneration(generation)) return;
       const remaining = conversations.filter((item) => item.id !== conversationId);
       if (conversation?.id !== conversationId) {
@@ -1431,6 +1440,7 @@ export default function DesktopApp() {
   }
   const currentConversationAction = captureConversationAction();
   return <div className="desktop-frame">{applicationMenu}<div className="desktop-frame-content"><WorkspaceShell
+    composerDraftStore={composerDraftStore}
     onOpenSearch={openWorkspaceSearch} searchRequest={searchRequest}
     onRegisterNavigationGuard={registerWorkspaceNavigationGuard} onOpenSourceConversation={openWorkspaceSourceConversation}
     onSearchRequestHandled={(key) => setSearchRequest((current) => current?.key === key ? null : current)}
