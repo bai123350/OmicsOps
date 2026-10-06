@@ -65,10 +65,11 @@ export class ComposerDraftStore {
   adoptUnassigned(projectId: string, conversationId: string): boolean {
     const source = { projectId, conversationId: null };
     const target = { projectId, conversationId };
-    const text = this.read(source).text;
-    if (!text || this.read(target).text) return false;
-    this.update(target, text);
-    this.update(source, "");
+    const receipt = this.capture(source);
+    if (!receipt.text || this.read(target).text) return false;
+    this.update(target, receipt.text);
+    // Target subscribers can edit the source while receiving the transfer.
+    this.clearAccepted(receipt);
     return true;
   }
 

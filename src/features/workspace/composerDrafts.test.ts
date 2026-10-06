@@ -124,6 +124,19 @@ describe("ComposerDraftStore", () => {
     expect(store.read(a)).toBe(target);
   });
 
+  it("preserves reentrant unassigned edits while adopting the captured text", () => {
+    const store = new ComposerDraftStore();
+    store.update(unassigned, "original draft");
+    store.subscribe(a, () => {
+      store.update(unassigned, "newer edit during notification");
+    });
+    expect(store.adoptUnassigned("p", "a")).toBe(true);
+    expect(store.read(a)).toEqual({ text: "original draft", revision: 1 });
+    expect(store.read(unassigned)).toEqual({
+      text: "newer edit during notification", revision: 2,
+    });
+  });
+
   it("advances empty target versions during adoption to reject old receipts", () => {
     const store = new ComposerDraftStore();
     const old = store.capture(a);
