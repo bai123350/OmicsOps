@@ -8,7 +8,7 @@
 
 **Tech Stack:** React 19、TypeScript、useSyncExternalStore、Vitest/RTL；无新依赖。
 
-**Spec:** [W01 设计](../specs/2026-10-04-wisp-composer-files-jobs-design.md#w01会话文字草稿)、[共同约束](../specs/2026-10-04-wisp-improvements-design.md)。用户已于 2026-10-04 确认设计；本计划待审阅，未实施。
+**Spec:** [W01 设计](../specs/2026-10-04-wisp-composer-files-jobs-design.md#w01会话文字草稿)、[共同约束](../specs/2026-10-04-wisp-improvements-design.md)。设计已确认；用户于2026-10-06确认计划并选择子Agent逐项实施与审阅。Task1已通过独立审阅，Task2–3待实施。
 
 ## Global Constraints
 
@@ -34,7 +34,7 @@
 
 **Interfaces:** Produces `DraftScope={projectId:string;conversationId:string|null}`、`DraftSnapshot={text:string;revision:number}`、`DraftReceipt=DraftSnapshot & {scope:DraftScope}`；`ComposerDraftStore.read(scope):DraftSnapshot`、`subscribe(scope,listener:()=>void):()=>void`、`update(scope,updater:string|((text:string)=>string)):DraftSnapshot`、`capture(scope):DraftReceipt`、`clearAccepted(receipt):boolean`、`adoptUnassigned(projectId:string,conversationId:string):boolean`、`removeConversation(scope):void`、`removeProject(projectId:string):void`。Hook 为 `useScopedComposerDraft(store:ComposerDraftStore,scope:DraftScope):{draft:string;setDraft:Dispatch<SetStateAction<string>>;capture:()=>DraftReceipt}`。
 
-- [ ] **RED: 新增版本与订阅行为断言**；同一空 snapshot 引用稳定、仅本作用域通知、unsubscribe、不同 store 隔离、adoption 不覆盖目标、真实删除清空正文并推进版本均覆盖。
+- [x] **RED: 新增版本与订阅行为断言**；同一空 snapshot 引用稳定、仅本作用域通知、unsubscribe、不同 store 隔离、adoption 不覆盖目标、真实删除清空正文并推进版本均覆盖。
 
 ```ts
 it("keeps edited same-text drafts when the old receipt arrives", () => {
@@ -47,10 +47,10 @@ it("keeps edited same-text drafts when the old receipt arrives", () => {
 });
 ```
 
-- [ ] **Run RED:** `npx vitest run src/features/workspace/composerDrafts.test.ts src/features/workspace/useScopedComposerDraft.test.tsx`；当前缺少模块/Hook，应失败。
-- [ ] **Implement:** 在上述文件实现 Interfaces。键用 JSON tuple；snapshot 不可变且 read 不新建相同版本对象；Hook 用 useSyncExternalStore，setter 绑定 render 的 scope。clear/delete 推进 revision，保留无正文版本标记，避免旧回执复用。无会话 adoption 仅移交已有文字给无文字目标。
-- [ ] **Run GREEN:** 同一命令全部通过；增加 Hook rerender 至另一 scope 时立即显示新值的断言。
-- [ ] **Commit:** `feat: isolate composer drafts by conversation`；仅暂存本任务四文件。
+- [x] **Run RED:** `npx vitest run src/features/workspace/composerDrafts.test.ts src/features/workspace/useScopedComposerDraft.test.tsx`；实际missing-module失败；初次sandbox EPERM另记录，不作为RED。
+- [x] **Implement:** 在上述文件实现 Interfaces。键用 JSON tuple；snapshot 不可变且 read 不新建相同版本对象；Hook 用 useSyncExternalStore，setter 绑定 render 的 scope。clear/delete 推进 revision，保留无正文版本标记，避免旧回执复用。无会话 adoption 仅移交已有文字给无文字目标。
+- [x] **Run GREEN:** 同命令19/19通过，tsc通过。独立审阅发现adoption重入回调丢失新源文字；先增加失败回归，再以捕获revision条件clear修复；复审通过。
+- [x] **Commit:** `afb1af3 feat: isolate composer drafts by conversation`；`ff8595b fix: preserve reentrant edits during draft adoption`。仅任务文件，无未解决审阅发现。
 
 ### Task 2: 应用生命期、导航与分支起始草稿
 

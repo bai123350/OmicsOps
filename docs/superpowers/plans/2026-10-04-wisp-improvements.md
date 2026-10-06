@@ -8,7 +8,7 @@
 
 **Tech Stack:** Windows-first Tauri 2、Rust/sqlx/SQLite、React 19/TypeScript/Vitest、Python 3.12 stdlib unittest、现有SSH/SFTP和V4运行时。
 
-**Spec:** [已确认总设计](../specs/2026-10-04-wisp-improvements-design.md)、[源码对照和首次范围](../specs/2026-10-04-wisp-science-improvement-backlog.md)。设计基线为 `161199f`；本总计划及13份子计划供实施前审阅，当前全部功能状态为待实施。
+**Spec:** [已确认总设计](../specs/2026-10-04-wisp-improvements-design.md)、[源码对照和首次范围](../specs/2026-10-04-wisp-science-improvement-backlog.md)。设计基线为 `161199f`；用户于2026-10-06确认 `8515da8` 全部计划并选择子Agent逐项实施与审阅。逐任务推进，完成审阅后才勾选；子计划中描述写计划阶段的待审阅文字以此执行授权为准。
 
 ## Global Constraints
 
@@ -38,7 +38,7 @@
 
 | 功能 | 计划 | 任务数 | 交付可观察行为 | 当前状态 |
 | --- | --- | --- | --- | --- |
-| W01 | [文字草稿](2026-10-04-wisp-w01-composer-drafts.md) | 3 | 跨项目/会话恢复文字，旧回执只清理原revision | 待实施 |
+| W01 | [文字草稿](2026-10-04-wisp-w01-composer-drafts.md) | 3 | 跨项目/会话恢复文字，旧回执只清理原revision | 实施中：Task1通过审阅 |
 | W02 | [表格预览](2026-10-04-wisp-w02-table-preview.md) | 4 | 本地/SSH CSV/TSV有界逻辑记录、来源/hash/truncation | 待实施 |
 | W03 | [远端作业](2026-10-04-wisp-w03-remote-jobs.md) | 4 | metadata列表、手动status与明确启用的有限退避 | 待实施 |
 | W04 | [内核观察](2026-10-04-wisp-w04-kernel-inspection.md) | 5 | 活着的Python/R metadata，不隐式启动或执行对象方法 | 待实施 |
@@ -115,4 +115,4 @@ Windows合成数据smoke覆盖：导航/延迟发送、CSV/BOM/截断、jobs默�
 
 2026-10-06检查工作区时另有未提交的local runtime failure recovery/reviewer regeneration改动，涉及core、agent_v4、acceptance及其独立设计/测试；不是本计划任务的实现。它们保持原样，计划提交只stage此组Wisp文档。开始实施前重新读取这些共享文件的最新状态，保留新增错误/科学状态行为；尤其W05纯prepare/W06只读诊断/W09只读报告不调用会进行reconciliation写入的science snapshot路径。本计划源基线是身份参考，不作为恢复旧文件内容的指令。
 
-建议 **Subagent-driven**：12项跨文件读取、冻结运行、原子压缩和持久化，逐任务独立审阅能及早发现边界错误；代价是每任务实施/审阅的新上下文。可选 **Native**：主实施者在本聊天执行全部任务，最后做一次独立全分支审阅，成本较低但中途无独立review。请审阅本总计划和需关注的子计划，确认范围并选择执行方法；之后继续全部12项，不重复范围确认。
+用户已选 **Subagent-driven**：12项跨文件读取、冻结运行、原子压缩和持久化，每任务由子Agent实施及独立审阅，最后全分支审阅。继续全部12项，不重复范围或执行方式确认。W01 Task1提交 `afb1af3`/`ff8595b`，19个定向测试及tsc通过，复审无未解决发现；完整功能仍需Task2–3导航与回执集成。
