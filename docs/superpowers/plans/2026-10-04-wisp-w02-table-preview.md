@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust、已有 windows-sys/sha2/tempfile、现有 SFTP、Tauri 2、React 19/TypeScript/Vitest；无新增解析器或前端依赖。
 
-**Spec:** [W02 设计](../specs/2026-10-04-wisp-composer-files-jobs-design.md#w02有界-csvtsv-表格预览)、[共同约束](../specs/2026-10-04-wisp-improvements-design.md)。设计已确认；实施计划待审阅，未实现。
+**Spec:** [W02 设计](../specs/2026-10-04-wisp-composer-files-jobs-design.md#w02有界-csvtsv-表格预览)、[共同约束](../specs/2026-10-04-wisp-improvements-design.md)。用户已确认设计及8515da8实施计划。Task1共享读取、Task2 parser/DTO已实现并独立审阅通过；Task3 source/command与Task4界面待实施。
 
 ## Global Constraints
 
@@ -37,7 +37,7 @@
 
 **Interfaces:** Produces `ValidatedProjectFile::open(project:&Project,relative_path:&str)->Result<Self,FileReadError>`、`metadata(&self)->PublicFileMetadata`、`read_prefix(&mut self,max_bytes:usize)->Result<BoundedFileRead,FileReadError>`、`read_complete(&mut self,max_bytes:usize)->Result<BoundedFileRead,FileReadError>`。`PublicFileMetadata {size_bytes:u64,modified_at:Option<String>}`；`BoundedFileRead {bytes:Vec<u8>,size_bytes:u64,read_bytes:u64,eof:bool,sha256:String,hash_scope:FileHashScope}`；`FileHashScope::{Full,Prefix}`；`FileReadError::{InvalidPath,UnsafeFile,NotRegular,Unavailable,TooLarge,SourceChanged}`。这些仅为宿主内部类型，不是 DTO。
 
-- [ ] **RED:** 同 handle prefix/full、probe exclusion、超限 complete、所有非法路径、目录/内部文件、读取变化、final path containment 和 Windows reparse 判定测试。把 Win32 属性判定提为小纯函数用于注入 `FILE_ATTRIBUTE_REPARSE_POINT`；真实 symlink/junction 不成为测试运行前提。
+- [x] **RED:** 同 handle prefix/full、probe exclusion、超限 complete、所有非法路径、目录/内部文件、读取变化、final path containment 和 Windows reparse 判定测试。把 Win32 属性判定提为小纯函数用于注入 `FILE_ATTRIBUTE_REPARSE_POINT`；真实 symlink/junction 不成为测试运行前提。
 
 ```rust
 #[test]
@@ -56,10 +56,10 @@ fn project_file_read_prefix_excludes_probe_byte() {
 }
 ```
 
-- [ ] **Run RED:** `cargo test -p omicsops-desktop --lib project_file_read`；新模块注册且有非零测试，当前缺类型/方法应 FAIL。
-- [ ] **Implement:** 实现上述签名。复用 path normalization；逐 ancestor 检查 lstat/reparse，canonical root containment；Windows 以 `GetFinalPathNameByHandleW` 与 `GetFileInformationByHandle` 核对打开对象，统一拒绝非普通对象。metadata 为打开时安全观察值；read 前后同 handle 核对身份/长度/mtime。prefix 恰好预算且无 probe 是 EOF；complete 超预算固定 TooLarge。不要返回 raw OS error。
-- [ ] **Run GREEN:** 同命令 PASS；`cargo test -p omicsops-desktop --lib composer_files::tests` 保持 quote 原行为。确认 Windows cfg 编译及纯注入 reparse 分支有断言。
-- [ ] **Commit:** `feat: add bounded validated project file reads`；只暂存该任务文件。
+- [x] **Run RED:** `cargo test -p omicsops-desktop --lib project_file_read`；新模块注册且有非零测试，当前缺类型/方法应 FAIL。
+- [x] **Implement:** 实现上述签名。复用 path normalization；逐 ancestor 检查 lstat/reparse，canonical root containment；Windows 以 `GetFinalPathNameByHandleW` 与 `GetFileInformationByHandle` 核对打开对象，统一拒绝非普通对象。metadata 为打开时安全观察值；read 前后同 handle 核对身份/长度/mtime。prefix 恰好预算且无 probe 是 EOF；complete 超预算固定 TooLarge。不要返回 raw OS error。
+- [x] **Run GREEN:** 同命令 PASS；`cargo test -p omicsops-desktop --lib composer_files::tests` 保持 quote 原行为。确认 Windows cfg 编译及纯注入 reparse 分支有断言。
+- [x] **Commit:** `feat: add bounded validated project file reads`；只暂存该任务文件。
 
 ### Task 2: DTO 与逻辑记录解析器
 
@@ -69,7 +69,7 @@ fn project_file_read_prefix_excludes_probe_byte() {
 
 Host-only `TableDelimiter::{Csv,Tsv}`、`ParsedProjectTable {headers:Vec<String>,rows:Vec<Vec<String>>,parsed_bytes:u64,truncation_reasons:Vec<TablePreviewTruncation>}`；`parse_project_table(bytes:&[u8],delimiter:TableDelimiter,eof:bool)->Result<ParsedProjectTable,TablePreviewErrorCode>`。Raw parsed strings remain bounded by input；公开脱敏/4KiB limit 在 Task 3 projection。
 
-- [ ] **RED:** BOM/中文/CRLF、字段内换行/分隔符、escaped quote、empty/header-only、末行无换行、EOF未闭引号/宽度不符、prefix部分记录/半字符、中间非法UTF8、64/65列、200/201行、4KiB展示预算测试。提供 parser 已停止的 RowLimit 标记，不验证未观察尾部。
+- [x] **RED:** BOM/中文/CRLF、字段内换行/分隔符、escaped quote、empty/header-only、末行无换行、EOF未闭引号/宽度不符、prefix部分记录/半字符、中间非法UTF8、64/65列、200/201行、超过4KiB的原始字段保留测试（公开展示预算由Task3 projection验证）。提供 parser 已停止的 RowLimit 标记，不验证未观察尾部。
 
 ```rust
 #[test]
@@ -83,10 +83,10 @@ fn table_preview_record_boundaries() {
 }
 ```
 
-- [ ] **Run RED:** `cargo test -p omicsops-desktop --lib project_table::tests`、`cargo test -p omicsops-desktop --lib dto_contract_tests::project_table`；缺 parser/DTO 应 FAIL。先核对 fixture byte count，再记录实际失败。
-- [ ] **Implement:** 实现逻辑字段状态机及固定预算，UTF8仅允许 prefix末尾缺失；不按 lines() 分割。返回 complete record 的 raw byte offset，EOF最后无换行仍完整，非EOF末尾记录丢弃。添加稳定字段名/nullable/unknown-field 合同，hash 不在 parser 重算或按显示文本计算。
-- [ ] **Run GREEN:** 同两个命令 PASS；`cargo test -p omicsops-dto` PASS。
-- [ ] **Commit:** `feat: parse bounded CSV and TSV preview records`。
+- [x] **Run RED:** `cargo test -p omicsops-desktop --lib project_table::tests`、`cargo test -p omicsops-desktop --lib dto_contract_tests::project_table`；缺 parser/DTO 应 FAIL。先核对 fixture byte count，再记录实际失败。
+- [x] **Implement:** 实现逻辑字段状态机及固定预算，UTF8仅允许 prefix末尾缺失；不按 lines() 分割。返回 complete record 的 raw byte offset，EOF最后无换行仍完整，非EOF末尾记录丢弃。添加稳定字段名/nullable/unknown-field 合同，hash 不在 parser 重算或按显示文本计算。
+- [x] **Run GREEN:** 同两个命令 PASS；`cargo test -p omicsops-dto` PASS。
+- [x] **Commit:** `feat: parse bounded CSV and TSV preview records`。
 
 ### Task 3: 本地/SSH source 与统一宿主命令
 
@@ -94,7 +94,7 @@ fn table_preview_record_boundaries() {
 
 **Interfaces:** Consumes Tasks 1–2及现有 `FileBackend`。Adapter produces `RemoteFilePrefix {bytes:Vec<u8>,size_bytes:Option<u64>,eof:bool,metadata_stable:bool}` 和 `SshSession::read_file_prefix(&self,remote_path:&str,max_bytes:u64)->AdapterResult<RemoteFilePrefix>`，不修改 `read_file_limited`。Host-only `TableSourceRead {bytes:Vec<u8>,size_bytes:Option<u64>,eof:bool,stable:bool}`；async injectable `ProjectTableSource::read_prefix(&self,project:&Project,backend:&FileBackend,relative_path:&str,max_bytes:usize)->Result<TableSourceRead,TablePreviewErrorCode>`；`preview_project_table_with_source(store:&Store,source:&dyn ProjectTableSource,request:ProjectTablePreviewRequest)->Result<ProjectTablePreview,String>`；Tauri `preview_project_table(state:State<'_,AppState>,request:ProjectTablePreviewRequest)->Result<ProjectTablePreview,String>`。String errors 固定 enum code，不带 OS/SSH 输出。
 
-- [ ] **RED:** fake source 捕获预算与绑定；foreign backend/path在调用前拒绝，257KiB伪结果拒绝；probe/full/prefix/unknown stability；大小变化；慢 connect/root 整条20秒 timeout；失败时 disconnect；固定 safe error不泄漏sentinel。adapter 注入 reader 测试 max+1 与前后metadata，不连接SSH。
+- [ ] **RED:** fake source 捕获预算与绑定；foreign backend/path在调用前拒绝，257KiB伪结果拒绝；probe/full/prefix/unknown stability；大小变化；public_text后4KiB UTF-8展示预算与CellLimit；慢 connect/root 整条20秒 timeout；失败时 disconnect；固定 safe error不泄漏sentinel。adapter 注入 reader 测试 max+1 与前后metadata，不连接SSH。
 
 ```rust
 assert_eq!(fake_source.last_budget(), Some(256 * 1024));
@@ -130,6 +130,10 @@ expect(document.querySelector("script[data-cell]")).toBeNull();
 - [ ] **Implement:** 增 typed boundary 与只读React文本表格；按 tuple+generation guard旧响应，window escape stack及原focus trap；不缓存原始科学bytes。显示首行作为header、读取仅前缀、unknown stability和每个固定截断原因；安全错误可重试。
 - [ ] **Run GREEN:** 同命令 PASS；`cargo fmt --all -- --check`、`cargo test --workspace`、`npm test`、`npm run build`、`npm run build:desktop`、`git diff --check`。锁变更先 npm ci；纯fmt另commit。手工 Windows小CSV/BOM/长字段和SSH fake展示，真实SSH未执行单独说明。
 - [ ] **Commit:** `feat: show bounded table previews in workspace files`；根据实际验证更新总清单。
+
+## 当前实施证据
+
+2026-10-07：Task1提交7258149/7439276，Task2提交69886e4，均经独立审阅通过，无阻断发现。Task1最终reader16/composer10；Task2 parser12/DTO合同3/DTO crate31。Task2最终workspace1564通过、17 ignored；前端1138+22、Web/桌面构建和格式检查通过。Task2初始RED为71个总编译错误（包含缺接口与受限环境OUT_DIR错误），不是已执行断言失败；授权GREEN运行实际断言。真实模型/SSH及GUI手工验收未执行，安装包只构建未运行。Task3/4未实现，尚不代表表格功能交付。
 
 ## Plan Self-Review
 

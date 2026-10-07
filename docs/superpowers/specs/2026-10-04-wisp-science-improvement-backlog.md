@@ -58,6 +58,8 @@ P0 表示优先解决可能影响操作正确性的问题；P1 表示直接改�
 
 ## W02 科学产物预览
 
+**实施状态：**共享本地 handle 读取与纯 CSV/TSV parser/DTO 已实现并独立审阅通过（7258149/7439276、69886e4）；source/command 和真实预览界面待实施，尚不代表 W02 功能交付。实际确定性检查见[W02计划](../plans/2026-10-04-wisp-w02-table-preview.md)。
+
 **参考事实：**上游[格式路由与显示边界][w-previews]支持表格、Notebook、PDF 和 Office；[PDF 前端回归][w-pdf-tests]覆盖翻页、缩放和损坏文件。OmicsOps 的[文字预览](../../../src/features/workspace/ComposerFilePreviewDialog.tsx)和[SSH 图片预览](../../../src-tauri/src/sync_commands.rs)已绑定来源、大小及校验信息，通用表格/PDF 预览尚缺。
 
 **建议切片：**先实现 CSV/TSV 的只读、有界表格视图，沿用项目/backend/相对路径身份。区分读取的前缀、展示行数和完整文件；SSH 大文件保持远端，显式读取有界内容。PDF、静态 Notebook/HTML、Office 分别后续交付，不一次引入所有解析器。
