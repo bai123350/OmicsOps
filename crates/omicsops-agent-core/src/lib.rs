@@ -2956,8 +2956,14 @@ impl AgentCoreV4<'_> {
                     .await
                     .map_err(AgentCoreErrorV4::Store)?;
             }
-            model_replay::shape_request(&mut request, project_id, conversation_id, &binding, &events)
-                .map_err(AgentCoreErrorV4::NeedsAttention)?;
+            model_replay::shape_request(
+                &mut request,
+                project_id,
+                conversation_id,
+                &binding,
+                &events,
+            )
+            .map_err(AgentCoreErrorV4::NeedsAttention)?;
         }
         self.model
             .validate_request(&request)
@@ -5051,7 +5057,11 @@ impl AgentCoreV4<'_> {
                 .cloned()
                 .collect::<Vec<_>>()
         } else {
-            events.iter().filter(|event| !context_views::is_context_management(event)).cloned().collect()
+            events
+                .iter()
+                .filter(|event| !context_views::is_context_management(event))
+                .cloned()
+                .collect()
         };
         let use_views = self.model.supports_native_replay()
             || self
@@ -5153,7 +5163,13 @@ impl AgentCoreV4<'_> {
         }
         let transcript =
             serde_json::to_string(&events).map_err(|e| AgentCoreErrorV4::Store(e.to_string()))?;
-        let mut checkpoint = build_model_checkpoint(spec, &events, limits.checkpoint_recent_events, scientific_value.clone(), use_views);
+        let mut checkpoint = build_model_checkpoint(
+            spec,
+            &events,
+            limits.checkpoint_recent_events,
+            scientific_value.clone(),
+            use_views,
+        );
         // A fixed number of recent steps is not a byte budget: tool JSON can
         // expand again when embedded in checkpoint strings. Fit the actual
         // serialized request, keeping the newest steps and immutable state.
