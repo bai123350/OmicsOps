@@ -9,6 +9,7 @@ from pathlib import Path
 import socket
 import sys
 import time
+import traceback
 import types
 import unittest
 import urllib.error
@@ -87,6 +88,20 @@ def load_bundled_helper(skill_name: str) -> dict[str, object]:
     with offline_helper_call():
         exec(compile(source, str(path), "exec"), namespace)
     return namespace
+
+
+class FakeHttpResponse:
+    def __init__(self, payload: bytes, status: int = 200):
+        self.payload, self.status = payload, status
+
+    def read(self):
+        return self.payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        return False
 
 
 class FakeBbox:
@@ -249,6 +264,222 @@ class PaperNarrativeTests(unittest.TestCase):
         self.namespace["_paper_figure_claims_json"] = lambda figures: json.dumps(wrong_rows)
         with self.assertRaises(AssertionError):
             self.assert_claim_contract(self.namespace)
+
+
+class LiteratureReviewTests(unittest.TestCase):
+    def setUp(self):
+        self.namespace = load_bundled_helper("literature-review")
+
+    def assert_safe_failure(self, call, http, reason=None):
+        try:
+            call()
+        except RuntimeError as error:
+            rendered = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+            request_url = http.call_args.args[0].full_url
+            for private in ("FIXTURE_SECRET", FAKE_ENV["WISP_LITERATURE_CONTACT_EMAIL"],
+                            request_url, "FIXTURE_ORIGINAL_EXCEPTION"):
+                self.assertNotIn(private, rendered)
+            if reason is not None:
+                self.assertIn(reason, str(error))
+        else:
+            self.fail("failed retrieval must raise RuntimeError rather than return results")
+
+    def test_search_success_empty_and_populated_maps_selected_rows(self):
+        work = {"doi": "https://doi.org/10.1234/fixture", "title": "科学 fixture",
+                "publication_year": 2024, "cited_by_count": 7,
+                "primary_location": {"source": {"display_name": "Fixture Journal"}},
+                "open_access": {"oa_url": "https://example.invalid/paper"}}
+        with offline_helper_call(), patch("urllib.request.urlopen", side_effect=[
+                FakeHttpResponse(b'{"results": []}'),
+                FakeHttpResponse(json.dumps({"results": [work, {}]}).encode("utf-8")),
+        ]) as http:
+            self.assertEqual(self.namespace["search_openalex"]("zero hits"), [])
+            self.assertEqual(self.namespace["search_openalex"]("science 中文", n=1, filters="type:article"), [
+                {"doi": "10.1234/fixture", "title": "科学 fixture", "year": 2024, "cited_by": 7,
+                 "venue": "Fixture Journal", "oa_url": "https://example.invalid/paper"},
+            ])
+            request = http.call_args.args[0]
+            self.assertEqual(urllib.parse.urlsplit(request.full_url).netloc, "api.openalex.org")
+            params = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
+            self.assertEqual(params["search"], ["science 中文"])
+            self.assertEqual(params["per-page"], ["1"])
+            self.assertEqual(params["filter"], ["type:article"])
+            self.assertEqual(params["sort"], ["cited_by_count:desc"])
+            self.assertEqual(params["api_key"], [FAKE_ENV["OPENALEX_API_KEY"]])
+            self.assertEqual(params["mailto"], [FAKE_ENV["WISP_LITERATURE_CONTACT_EMAIL"]])
+            self.assertEqual(http.call_args.kwargs, {"timeout": 15})
+
+    def test_search_http_failures_are_safe_errors_not_empty_results(self):
+        url = "https://api.openalex.org/works?api_key=FIXTURE_SECRET_OPENALEX"
+        for status in (401, 404, 500):
+            with self.subTest(status=status), offline_helper_call(), \
+                    patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError(
+                        url, status, "FIXTURE_ORIGINAL_EXCEPTION", {}, None)) as http, \
+                    patch("time.sleep") as sleep:
+                self.assert_safe_failure(lambda: self.namespace["search_openalex"]("x"), http, f"HTTP {status}")
+                self.assertEqual(http.call_count, 1)
+                sleep.assert_not_called()
+
+    def test_search_connection_and_decoding_failures_hide_full_error_chain(self):
+        url = "https://api.openalex.org/works?api_key=FIXTURE_SECRET_OPENALEX"
+        failures = (
+            ("timeout", TimeoutError("FIXTURE_ORIGINAL_EXCEPTION " + url), "connection failed or timed out"),
+            ("url", urllib.error.URLError("FIXTURE_ORIGINAL_EXCEPTION " + url), "connection failed or timed out"),
+            ("utf8", FakeHttpResponse(b"\xff"), "invalid JSON response"),
+            ("json", FakeHttpResponse(b"FIXTURE_ORIGINAL_EXCEPTION"), "invalid JSON response"),
+        )
+        for label, failure, reason in failures:
+            with self.subTest(failure=label), offline_helper_call(), \
+                    patch("urllib.request.urlopen", side_effect=[failure]) as http, patch("time.sleep") as sleep:
+                self.assert_safe_failure(lambda: self.namespace["search_openalex"]("x"), http, reason)
+                self.assertEqual(http.call_count, 1)
+                sleep.assert_not_called()
+
+    def test_search_rejects_invalid_results_and_work_records(self):
+        for payload in (None, [], {}, {"results": None}, {"results": {}}, {"results": [None]},
+                        {"results": ["FIXTURE_SECRET_OPENALEX"]}):
+            with self.subTest(payload_type=type(payload).__name__), offline_helper_call(), \
+                    patch("urllib.request.urlopen", return_value=FakeHttpResponse(json.dumps(payload).encode())) as http:
+                self.assert_safe_failure(lambda: self.namespace["search_openalex"]("x"), http)
+
+    def test_429_retries_exactly_once_and_sleeps_once(self):
+        url = "https://api.openalex.org/works?api_key=FIXTURE_SECRET_OPENALEX"
+        for recovered in (True, False):
+            error = urllib.error.HTTPError(url, 429, "FIXTURE_ORIGINAL_EXCEPTION", {}, None)
+            second = FakeHttpResponse(b'{"results": []}') if recovered else error
+            with self.subTest(recovered=recovered), offline_helper_call(), \
+                    patch("urllib.request.urlopen", side_effect=[error, second]) as http, patch("time.sleep") as sleep:
+                if recovered:
+                    self.assertEqual(self.namespace["search_openalex"]("x"), [])
+                else:
+                    self.assert_safe_failure(lambda: self.namespace["search_openalex"]("x"), http, "HTTP 429")
+                self.assertEqual(http.call_count, 2)
+                self.assertEqual(http.call_args_list[0].args[0].full_url, http.call_args_list[1].args[0].full_url)
+                sleep.assert_called_once_with(2)
+
+    def test_get_json_tolerant_failure_remains_unknown(self):
+        with offline_helper_call(), patch("urllib.request.urlopen", side_effect=urllib.error.URLError(
+                "FIXTURE_ORIGINAL_EXCEPTION")) as http:
+            self.assertIsNone(self.namespace["_get_json"]("https://example.invalid/fixture", timeout=3))
+            self.assertEqual(http.call_args.kwargs, {"timeout": 3})
+
+    def test_citation_expansion_preserves_backward_and_forward_directions(self):
+        responses = [FakeHttpResponse(b'{"id": "https://openalex.org/W123"}'),
+                     FakeHttpResponse(b'{"results": [{"doi": "https://doi.org/10.1234/back", "title": "Reference", "publication_year": 2020, "cited_by_count": 5}]}'),
+                     FakeHttpResponse(b'{"results": [{"doi": "https://doi.org/10.1234/forward", "title": "Citing work", "publication_year": 2025, "cited_by_count": 2}]}')]
+        with offline_helper_call(), patch("urllib.request.urlopen", side_effect=responses) as http:
+            self.assertEqual(self.namespace["expand_citations"]("10.1234/source", n_backward=120, n_forward=4), {
+                "references": [{"doi": "10.1234/back", "title": "Reference", "year": 2020, "cited_by": 5}],
+                "cited_by": [{"doi": "10.1234/forward", "title": "Citing work", "year": 2025, "cited_by": 2}],
+            })
+            requests = [call.args[0] for call in http.call_args_list]
+            self.assertEqual(urllib.parse.urlsplit(requests[0].full_url).path, "/works/doi:10.1234/source")
+            for request, direction, limit in zip(requests[1:], ("cited_by:W123", "cites:W123"), ("100", "4")):
+                params = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
+                self.assertEqual(params["filter"], [direction])
+                self.assertEqual(params["per-page"], [limit])
+            for request in requests:
+                params = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
+                self.assertEqual(params["api_key"], [FAKE_ENV["OPENALEX_API_KEY"]])
+
+    def test_citation_expansion_empty_requires_two_successful_directions(self):
+        with offline_helper_call(), patch("urllib.request.urlopen", side_effect=[
+                FakeHttpResponse(b'{"id": "https://openalex.org/W123"}'),
+                FakeHttpResponse(b'{"results": []}'), FakeHttpResponse(b'{"results": []}'),
+        ]) as http:
+            self.assertEqual(self.namespace["expand_citations"]("10.1234/source"), {"references": [], "cited_by": []})
+            self.assertEqual(http.call_count, 3)
+
+    def test_citation_expansion_failure_never_returns_partial_graph(self):
+        url = "https://api.openalex.org/works?api_key=FIXTURE_SECRET_OPENALEX"
+        for failed_request in (0, 1, 2):
+            responses = [FakeHttpResponse(b'{"id": "https://openalex.org/W123"}'),
+                         FakeHttpResponse(b'{"results": [{"title": "Existing reference"}]}'),
+                         FakeHttpResponse(b'{"results": []}')]
+            responses[failed_request] = urllib.error.HTTPError(url, 500, "FIXTURE_ORIGINAL_EXCEPTION", {}, None)
+            with self.subTest(failed_request=failed_request), offline_helper_call(), \
+                    patch("urllib.request.urlopen", side_effect=responses) as http:
+                self.assert_safe_failure(lambda: self.namespace["expand_citations"]("10.1234/source"), http, "HTTP 500")
+                self.assertEqual(http.call_count, failed_request + 1)
+
+    def test_doi_crossref_miss_and_unavailable_head_remain_unknown(self):
+        doi = "10.1234/unknown"
+        for head_failure in (TimeoutError("fixture timeout"), urllib.error.URLError("fixture unavailable"),
+                             urllib.error.HTTPError("https://doi.org/fixture", 500, "fixture failure", {}, None)):
+            opener = types.SimpleNamespace(open=Mock(side_effect=head_failure))
+            with self.subTest(failure=type(head_failure).__name__), offline_helper_call(), \
+                    patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError(
+                        "https://api.crossref.org/works/fixture", 404, "fixture miss", {}, None)) as http, \
+                    patch("urllib.request.build_opener", return_value=opener), patch("time.sleep") as sleep:
+                verified = self.namespace["verify_dois"]([doi])
+                self.assertEqual(verified, {doi: {"ok": None, "error": "unverified (network)", "retracted": None}})
+                self.assertEqual(http.call_count, 1)
+                self.assertEqual(opener.open.call_args.args[0].get_method(), "HEAD")
+                sleep.assert_called_once_with(0.06)
+
+    def test_doi_registry_status_and_credentials_stay_service_specific(self):
+        doi = "10.1234/status"
+        for status, expected in ((200, True), (204, True), (302, True), (399, True), (404, False)):
+            head = (urllib.error.HTTPError("https://doi.org/fixture", status, "fixture status", {}, None)
+                    if status >= 300 else FakeHttpResponse(b"", status))
+            opener = types.SimpleNamespace(open=Mock(side_effect=[head]))
+            with self.subTest(status=status), offline_helper_call(), \
+                    patch("urllib.request.urlopen", return_value=FakeHttpResponse(b"{}")) as http, \
+                    patch("urllib.request.build_opener", return_value=opener), patch("time.sleep") as sleep:
+                result = self.namespace["verify_dois"]([doi])[doi]
+                self.assertIs(result["ok"], expected)
+                if expected:
+                    self.assertEqual(result, {"ok": True, "registry": "non-crossref", "retracted": None})
+                for request, host in ((http.call_args.args[0], "api.crossref.org"),
+                                      (opener.open.call_args.args[0], "doi.org")):
+                    self.assertEqual(urllib.parse.urlsplit(request.full_url).netloc, host)
+                    self.assertNotIn(FAKE_ENV["OPENALEX_API_KEY"], request.full_url)
+                    self.assertNotIn(FAKE_ENV["OPENALEX_API_KEY"], str(request.headers))
+                    self.assertNotIn("api_key", request.full_url)
+                self.assertEqual(opener.open.call_args.kwargs, {"timeout": 10})
+                sleep.assert_called_once_with(0.06)
+
+    def test_contract_rejects_namespace_local_swallowed_http_error_and_restores(self):
+        original = self.namespace["search_openalex"]
+
+        def swallowed_error(query):
+            try:
+                return original(query)
+            except RuntimeError:
+                return []
+
+        try:
+            self.namespace["search_openalex"] = swallowed_error
+            with offline_helper_call(), patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError(
+                    "https://api.openalex.org/fixture", 500, "fixture failure", {}, None)) as http:
+                with self.assertRaises(AssertionError):
+                    self.assert_safe_failure(lambda: self.namespace["search_openalex"]("x"), http)
+        finally:
+            self.namespace["search_openalex"] = original
+        self.assertIs(self.namespace["search_openalex"], original)
+        with offline_helper_call(), patch("urllib.request.urlopen", return_value=FakeHttpResponse(b'{"results": []}')):
+            self.assertEqual(self.namespace["search_openalex"]("x"), [])
+
+    def test_http_fixtures_restore_globals_after_success_and_failure(self):
+        environment, modules = dict(os.environ), dict(sys.modules)
+        original_urlopen, original_build_opener = urllib.request.urlopen, urllib.request.build_opener
+        original_opener_open, original_sleep = urllib.request.OpenerDirector.open, time.sleep
+        for failure in (False, True):
+            response = (urllib.error.URLError("fixture unavailable") if failure
+                        else FakeHttpResponse(b'{"results": []}'))
+            with self.subTest(failure=failure), offline_helper_call(), \
+                    patch("urllib.request.urlopen", side_effect=[response]) as http, \
+                    patch("urllib.request.build_opener"), patch("time.sleep"):
+                if failure:
+                    self.assert_safe_failure(lambda: self.namespace["search_openalex"]("x"), http)
+                else:
+                    self.assertEqual(self.namespace["search_openalex"]("x"), [])
+            self.assertTrue(dict(os.environ) == environment, "environment was not restored")
+            self.assertTrue(dict(sys.modules) == modules, "modules were not restored")
+            self.assertIs(urllib.request.urlopen, original_urlopen)
+            self.assertIs(urllib.request.build_opener, original_build_opener)
+            self.assertIs(urllib.request.OpenerDirector.open, original_opener_open)
+            self.assertIs(time.sleep, original_sleep)
 
 
 class FigureStyleTests(unittest.TestCase):
