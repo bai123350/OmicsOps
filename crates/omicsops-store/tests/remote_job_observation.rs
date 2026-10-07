@@ -181,6 +181,167 @@ async fn snapshot(store: &Store) -> Vec<(String, String)> {
 }
 
 #[tokio::test]
+async fn malformed_job_metadata_is_typed_integrity_error_without_mutation() {
+    let store = Store::open_in_memory().await.unwrap();
+    let spec = fixture(&store, None).await;
+    let (job, _) = reserve(&store, &spec, "corrupt", true).await;
+    sqlx::query("UPDATE runtime_jobs_v4 SET value_json='{' WHERE job_id=?1")
+        .bind(job.job_id.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let before = snapshot(&store).await;
+    assert!(matches!(
+        store
+            .remote_job_metadata_v4(spec.project_id, Some(spec.conversation_id))
+            .await
+            .unwrap_err(),
+        StoreError::InvalidInput(_) | StoreError::Json(_)
+    ));
+    assert_eq!(snapshot(&store).await, before);
+}
+
+#[tokio::test]
+async fn malformed_selected_job_is_typed_integrity_error_without_mutation() {
+    let store = Store::open_in_memory().await.unwrap();
+    let spec = fixture(&store, None).await;
+    let (job, _) = reserve(&store, &spec, "corrupt", true).await;
+    sqlx::query("UPDATE runtime_jobs_v4 SET value_json='{' WHERE job_id=?1")
+        .bind(job.job_id.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let before = snapshot(&store).await;
+    assert!(matches!(
+        store
+            .remote_job_record_v4(spec.project_id, job.job_id)
+            .await
+            .unwrap_err(),
+        StoreError::InvalidInput(_) | StoreError::Json(_)
+    ));
+    assert_eq!(snapshot(&store).await, before);
+}
+
+#[tokio::test]
+async fn malformed_shared_filtered_job_is_typed_integrity_error_without_mutation() {
+    let store = Store::open_in_memory().await.unwrap();
+    let spec = fixture(&store, None).await;
+    let (job, _) = reserve(&store, &spec, "corrupt", true).await;
+    sqlx::query("UPDATE runtime_jobs_v4 SET value_json='{' WHERE job_id=?1")
+        .bind(job.job_id.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let before = snapshot(&store).await;
+    assert!(matches!(
+        store
+            .remote_runtime_jobs_v4(
+                spec.project_id,
+                &job.context.backend_id,
+                "/project",
+                Some(job.job_id),
+                "host-key"
+            )
+            .await
+            .unwrap_err(),
+        StoreError::InvalidInput(_) | StoreError::Json(_)
+    ));
+    assert_eq!(snapshot(&store).await, before);
+}
+
+#[tokio::test]
+async fn malformed_rows_do_not_escape_relational_scope_or_hide_legacy_exclusion() {
+    let store = Store::open_in_memory().await.unwrap();
+    let owner = fixture(&store, None).await;
+    let (original, _) = reserve(&store, &owner, "original", true).await;
+    let (legacy, _) = reserve(&store, &owner, "interactive", false).await;
+    let other_conversation = fixture(&store, Some(owner.project_id)).await;
+    let foreign = fixture(&store, None).await;
+    for spec in [&other_conversation, &foreign] {
+        let (job, _) = reserve(&store, spec, "corrupt", true).await;
+        sqlx::query("UPDATE runtime_jobs_v4 SET value_json='{' WHERE job_id=?1")
+            .bind(job.job_id.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+    let before = snapshot(&store).await;
+    let jobs = store
+        .remote_job_metadata_v4(owner.project_id, Some(owner.conversation_id))
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].job, original);
+    assert!(
+        store
+            .remote_job_record_v4(owner.project_id, legacy.job_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .remote_job_record_v4(owner.project_id, original.job_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .job,
+        original
+    );
+    assert_eq!(
+        store
+            .remote_runtime_jobs_v4(
+                owner.project_id,
+                &original.context.backend_id,
+                original.remote_root.as_deref().unwrap(),
+                Some(original.job_id),
+                original.remote_host_key.as_deref().unwrap()
+            )
+            .await
+            .unwrap(),
+        vec![original]
+    );
+    assert_eq!(snapshot(&store).await, before);
+}
+
+#[tokio::test]
+async fn malformed_other_selected_job_does_not_affect_original_record_or_status_filter() {
+    let store = Store::open_in_memory().await.unwrap();
+    let owner = fixture(&store, None).await;
+    let (original, _) = reserve(&store, &owner, "original", true).await;
+    let (other, _) = reserve(&store, &owner, "other", true).await;
+    sqlx::query("UPDATE runtime_jobs_v4 SET value_json='{' WHERE job_id=?1")
+        .bind(other.job_id.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let before = snapshot(&store).await;
+    assert_eq!(
+        store
+            .remote_job_record_v4(owner.project_id, original.job_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .job,
+        original
+    );
+    assert_eq!(
+        store
+            .remote_runtime_jobs_v4(
+                owner.project_id,
+                &original.context.backend_id,
+                original.remote_root.as_deref().unwrap(),
+                Some(original.job_id),
+                original.remote_host_key.as_deref().unwrap()
+            )
+            .await
+            .unwrap(),
+        vec![original]
+    );
+    assert_eq!(snapshot(&store).await, before);
+}
+
+#[tokio::test]
 async fn metadata_receipt_presence_tracks_retirement_without_loading_body() {
     let store = Store::open_in_memory().await.unwrap();
     let spec = fixture(&store, None).await;

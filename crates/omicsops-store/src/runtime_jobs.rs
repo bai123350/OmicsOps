@@ -23,6 +23,10 @@ pub struct StoredRemoteJobV4 {
     pub result: Option<RuntimeResultV4>,
 }
 
+// SQL JSON predicates use guarded CASE expressions: malformed rows within the
+// relational owner/selection scope must reach typed serde rejection, rather than
+// SQLite json_extract turning identity corruption into a generic Database error.
+// Valid non-detached rows retain their existing exclusion before the limit.
 fn remote_job_integrity_error() -> StoreError {
     StoreError::InvalidInput("remote job record integrity mismatch".into())
 }
@@ -71,7 +75,7 @@ impl Store {
         project_id: Uuid,
         conversation_id: Option<Uuid>,
     ) -> Result<Vec<RemoteJobMetadataV4>, StoreError> {
-        let rows = sqlx::query("SELECT j.job_id,j.run_id,j.call_id,j.value_json AS job_json,r.conversation_id,EXISTS(SELECT 1 FROM runtime_job_results_v4 receipt WHERE receipt.job_id=j.job_id) AS has_receipt FROM runtime_jobs_v4 j JOIN agent_runs_v4 r ON r.run_id=j.run_id WHERE r.project_id=?1 AND (?2 IS NULL OR r.conversation_id=?2) AND json_extract(j.value_json,'$.remote_root') IS NOT NULL AND json_extract(j.value_json,'$.remote_host_key') IS NOT NULL ORDER BY j.rowid DESC LIMIT 100")
+        let rows = sqlx::query("SELECT j.job_id,j.run_id,j.call_id,j.value_json AS job_json,r.conversation_id,EXISTS(SELECT 1 FROM runtime_job_results_v4 receipt WHERE receipt.job_id=j.job_id) AS has_receipt FROM runtime_jobs_v4 j JOIN agent_runs_v4 r ON r.run_id=j.run_id WHERE r.project_id=?1 AND (?2 IS NULL OR r.conversation_id=?2) AND CASE WHEN json_valid(j.value_json) THEN json_extract(j.value_json,'$.remote_root') IS NOT NULL AND json_extract(j.value_json,'$.remote_host_key') IS NOT NULL ELSE 1 END ORDER BY j.rowid DESC LIMIT 100")
             .bind(project_id.to_string()).bind(conversation_id.map(|id| id.to_string())).fetch_all(&self.pool).await?;
         rows.iter()
             .map(|row| remote_job_from_row(row, project_id))
@@ -87,7 +91,7 @@ impl Store {
         job_id: Uuid,
     ) -> Result<Option<StoredRemoteJobV4>, StoreError> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT j.job_id,j.run_id,j.call_id,j.value_json AS job_json,r.conversation_id,r.value_json AS run_json,EXISTS(SELECT 1 FROM runtime_job_results_v4 receipt WHERE receipt.job_id=j.job_id) AS has_receipt FROM runtime_jobs_v4 j JOIN agent_runs_v4 r ON r.run_id=j.run_id WHERE r.project_id=?1 AND j.job_id=?2 AND json_extract(j.value_json,'$.remote_root') IS NOT NULL AND json_extract(j.value_json,'$.remote_host_key') IS NOT NULL")
+        let row = sqlx::query("SELECT j.job_id,j.run_id,j.call_id,j.value_json AS job_json,r.conversation_id,r.value_json AS run_json,EXISTS(SELECT 1 FROM runtime_job_results_v4 receipt WHERE receipt.job_id=j.job_id) AS has_receipt FROM runtime_jobs_v4 j JOIN agent_runs_v4 r ON r.run_id=j.run_id WHERE r.project_id=?1 AND j.job_id=?2 AND CASE WHEN json_valid(j.value_json) THEN json_extract(j.value_json,'$.remote_root') IS NOT NULL AND json_extract(j.value_json,'$.remote_host_key') IS NOT NULL ELSE 1 END")
             .bind(project_id.to_string()).bind(job_id.to_string()).fetch_optional(&mut *tx).await?;
         let Some(row) = row else {
             return Ok(None);
@@ -413,7 +417,7 @@ impl Store {
         job_id: Option<Uuid>,
         host_key: &str,
     ) -> Result<Vec<RuntimeJobV4>, StoreError> {
-        let rows: Vec<String> = sqlx::query_scalar("SELECT j.value_json FROM runtime_jobs_v4 j JOIN agent_runs_v4 r ON r.run_id=j.run_id WHERE r.project_id=?1 AND json_extract(j.value_json,'$.context.backend_id')=?2 AND json_extract(j.value_json,'$.remote_root')=?3 AND (?4 IS NULL OR j.job_id=?4) AND json_extract(j.value_json,'$.remote_host_key')=?5 ORDER BY j.rowid DESC LIMIT 100")
+        let rows: Vec<String> = sqlx::query_scalar("SELECT j.value_json FROM runtime_jobs_v4 j JOIN agent_runs_v4 r ON r.run_id=j.run_id WHERE r.project_id=?1 AND (?4 IS NULL OR j.job_id=?4) AND CASE WHEN json_valid(j.value_json) THEN json_extract(j.value_json,'$.context.backend_id')=?2 AND json_extract(j.value_json,'$.remote_root')=?3 AND json_extract(j.value_json,'$.remote_host_key')=?5 ELSE 1 END ORDER BY j.rowid DESC LIMIT 100")
             .bind(project_id.to_string()).bind(backend_id).bind(root).bind(job_id.map(|id| id.to_string())).bind(host_key)
             .fetch_all(&self.pool).await?;
         rows.into_iter()

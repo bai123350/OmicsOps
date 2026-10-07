@@ -663,6 +663,54 @@ mod tests {
         assert_eq!(connector.connects.load(Ordering::SeqCst), 0);
     }
     #[tokio::test]
+    async fn malformed_job_json_rejects_all_reads_without_connect_status_or_writes() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (project, job) = fixture(&store).await;
+        sqlx::query("UPDATE runtime_jobs_v4 SET value_json='{' WHERE job_id=?1")
+            .bind(job.job_id.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let before: Vec<(String, String)> = sqlx::query_as("SELECT 'job',value_json FROM runtime_jobs_v4 UNION ALL SELECT 'run',value_json FROM agent_runs_v4 UNION ALL SELECT 'event',value_json FROM agent_events_v4 UNION ALL SELECT 'receipt',result_json FROM runtime_job_results_v4 ORDER BY 1,2").fetch_all(store.pool()).await.unwrap();
+        let connector = connector();
+        assert_eq!(
+            list_remote_jobs_with_store(
+                &store,
+                ListRemoteJobsV4Request {
+                    project_id: project.id,
+                    conversation_id: None
+                }
+            )
+            .await
+            .unwrap_err(),
+            REJECTED
+        );
+        assert_eq!(
+            refresh_remote_job_with_connector(&store, &connector, request(&project, &job))
+                .await
+                .unwrap_err(),
+            REJECTED
+        );
+        assert_eq!(
+            remote_jobs_v4::query_with_store_error_mapper(
+                &store,
+                &connector.transport,
+                project.id,
+                &job.context.backend_id,
+                "/project",
+                Some(job.job_id),
+                store_error_code
+            )
+            .await
+            .unwrap_err(),
+            REJECTED
+        );
+        assert_eq!(connector.connects.load(Ordering::SeqCst), 0);
+        assert!(connector.transport.calls.lock().unwrap().is_empty());
+        let after: Vec<(String, String)> = sqlx::query_as("SELECT 'job',value_json FROM runtime_jobs_v4 UNION ALL SELECT 'run',value_json FROM agent_runs_v4 UNION ALL SELECT 'event',value_json FROM agent_events_v4 UNION ALL SELECT 'receipt',result_json FROM runtime_job_results_v4 ORDER BY 1,2").fetch_all(store.pool()).await.unwrap();
+        assert_eq!(after, before);
+    }
+    #[tokio::test]
     async fn typed_profile_read_preserves_unavailable_and_rejects_corrupt_json() {
         let store = Store::open_in_memory().await.unwrap();
         let (project, job) = fixture(&store).await;
