@@ -10,6 +10,8 @@ use uuid::Uuid;
 
 mod runtime_job;
 pub use runtime_job::*;
+mod kernel_inspection;
+pub use kernel_inspection::*;
 mod context_usage;
 pub use context_usage::*;
 mod session_reviews;
@@ -18,6 +20,131 @@ mod model_replay;
 pub use model_replay::*;
 
 pub const AGENT_RUNTIME_V4: &str = "omicsops.agent-runtime@4.0.0";
+
+#[cfg(test)]
+mod inspection_contract_tests {
+    use super::*;
+
+    fn object() -> KernelObjectMetadataV4 {
+        KernelObjectMetadataV4 {
+            name: "items".into(),
+            type_label: "list".into(),
+            dimensions: Some(vec![42]),
+            element_count: Some(42),
+            summary: "list, 42 elements".into(),
+        }
+    }
+
+    #[test]
+    fn inspection_contract_is_bounded() {
+        let mut payload = KernelInspectionPayloadV4 {
+            objects: vec![object(); 64],
+            truncated: false,
+        };
+        assert_eq!(validate_inspection_payload(&payload), Ok(()));
+        payload.objects.push(object());
+        assert_eq!(
+            validate_inspection_payload(&payload),
+            Err(KernelInspectionValidationErrorV4::TooManyObjects)
+        );
+        payload.objects = vec![object()];
+        payload.objects[0].name = "界".repeat(86);
+        assert_eq!(
+            validate_inspection_payload(&payload),
+            Err(KernelInspectionValidationErrorV4::InvalidText)
+        );
+        payload.objects[0] = object();
+        payload.objects[0].summary = "x".repeat(129);
+        assert_eq!(
+            validate_inspection_payload(&payload),
+            Err(KernelInspectionValidationErrorV4::InvalidText)
+        );
+        payload.objects[0] = object();
+        payload.objects[0].type_label = "x".repeat(129);
+        assert_eq!(
+            validate_inspection_payload(&payload),
+            Err(KernelInspectionValidationErrorV4::InvalidText)
+        );
+        payload.objects[0] = object();
+        payload.objects[0].name = "line\nbreak".into();
+        assert_eq!(
+            validate_inspection_payload(&payload),
+            Err(KernelInspectionValidationErrorV4::InvalidText)
+        );
+        payload.objects[0] = object();
+        payload.objects[0].dimensions = Some(vec![0; 8]);
+        assert_eq!(validate_inspection_payload(&payload), Ok(()));
+        payload.objects[0].dimensions = Some(vec![0; 9]);
+        assert_eq!(
+            validate_inspection_payload(&payload),
+            Err(KernelInspectionValidationErrorV4::InvalidDimension)
+        );
+        payload.objects = vec![object(); 64];
+        for object in &mut payload.objects {
+            object.name = "x".repeat(256);
+        }
+        assert_eq!(
+            validate_inspection_payload(&payload),
+            Err(KernelInspectionValidationErrorV4::TooLarge)
+        );
+    }
+
+    #[test]
+    fn inspection_deserialization_rejects_unknown_fields_and_invalid_budgets() {
+        let payload = KernelInspectionPayloadV4 {
+            objects: vec![object()],
+            truncated: false,
+        };
+        let value = serde_json::to_value(&payload).unwrap();
+        assert!(serde_json::from_value::<KernelInspectionPayloadV4>(value.clone()).is_ok());
+        let mut invalid = value.clone();
+        invalid["objects"][0]["value"] = serde_json::json!("secret");
+        assert!(serde_json::from_value::<KernelInspectionPayloadV4>(invalid).is_err());
+        let mut invalid = value.clone();
+        invalid["objects"][0]["name"] = serde_json::json!("x".repeat(257));
+        assert!(serde_json::from_value::<KernelInspectionPayloadV4>(invalid).is_err());
+        let mut invalid = value;
+        invalid["objects"][0]["dimensions"] = serde_json::json!([-1]);
+        assert!(serde_json::from_value::<KernelInspectionPayloadV4>(invalid).is_err());
+    }
+
+    #[test]
+    fn inspection_full_response_enforces_exact_byte_boundary() {
+        let mut response = KernelInspectionV4 {
+            project_id: Uuid::from_u128(1),
+            conversation_id: Uuid::from_u128(2),
+            run_id: Uuid::from_u128(3),
+            language: KernelLanguageV4::Python,
+            session_id: Some(Uuid::from_u128(4)),
+            status: KernelInspectionStatusV4::Ready,
+            objects: vec![object(); 64],
+            truncated: false,
+        };
+        let mut remaining = 16_384 - serde_json::to_vec(&response).unwrap().len();
+        for object in &mut response.objects {
+            let count = remaining.min(256 - object.name.len());
+            object.name.push_str(&"x".repeat(count));
+            remaining -= count;
+        }
+        assert_eq!(remaining, 0);
+        assert_eq!(serde_json::to_vec(&response).unwrap().len(), 16_384);
+        assert!(
+            serde_json::from_value::<KernelInspectionV4>(serde_json::to_value(&response).unwrap())
+                .is_ok()
+        );
+        response.objects.last_mut().unwrap().name.push('x');
+        assert_eq!(serde_json::to_vec(&response).unwrap().len(), 16_385);
+        let payload = KernelInspectionPayloadV4 {
+            objects: response.objects.clone(),
+            truncated: false,
+        };
+        assert!(validate_inspection_payload(&payload).is_ok());
+        assert!(
+            serde_json::from_value::<KernelInspectionV4>(serde_json::to_value(response).unwrap())
+                .is_err()
+        );
+    }
+}
 
 #[cfg(test)]
 mod model_replay_contract_tests {

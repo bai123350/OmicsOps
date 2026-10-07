@@ -8,10 +8,28 @@ use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use omicsops_protocol::{
-    AutonomyModeV4, ComputeBackendDescriptorV4, ExecutionContextKeyV4, RuntimeResultV4,
+    AutonomyModeV4, ComputeBackendDescriptorV4, ExecutionContextKeyV4,
+    KERNEL_INSPECTION_TIMEOUT_SECONDS, KernelInspectionPayloadV4, KernelInspectionStatusV4,
+    RuntimeResultV4, validate_inspection_payload,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+/// Closed errors: inspection never returns worker text or user object content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelInspectionErrorV4 {
+    Unsupported,
+    Busy,
+    Unavailable,
+    Protocol,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelInspectionResultV4 {
+    pub status: KernelInspectionStatusV4,
+    pub session_id: Option<Uuid>,
+    pub payload: Option<KernelInspectionPayloadV4>,
+}
 
 #[async_trait]
 pub trait KernelProcessV4: Send + Sync {
@@ -23,6 +41,9 @@ pub trait KernelProcessV4: Send + Sync {
     /// replaying the failed cell.
     fn is_healthy(&self) -> bool {
         true
+    }
+    async fn inspect(&self) -> Result<KernelInspectionPayloadV4, KernelInspectionErrorV4> {
+        Err(KernelInspectionErrorV4::Unsupported)
     }
     async fn execute(
         &self,
@@ -115,6 +136,64 @@ impl RuntimeManagerV4 {
 
     pub fn backend_descriptor(&self) -> ComputeBackendDescriptorV4 {
         self.backend.descriptor()
+    }
+
+    /// Observe only the existing session. Never acquires, replaces, or interrupts it.
+    pub async fn inspect_existing(
+        &self,
+        key: &ExecutionContextKeyV4,
+        expected_session_id: Option<Uuid>,
+    ) -> KernelInspectionResultV4 {
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(KERNEL_INSPECTION_TIMEOUT_SECONDS);
+        let unavailable = |status, session_id| KernelInspectionResultV4 {
+            status,
+            session_id,
+            payload: None,
+        };
+        let session = match tokio::time::timeout_at(deadline, self.sessions.lock()).await {
+            Ok(sessions) => sessions.get(key).cloned(),
+            Err(_) => return unavailable(KernelInspectionStatusV4::Busy, None),
+        };
+        let Some(session) = session else {
+            return unavailable(KernelInspectionStatusV4::NotStarted, None);
+        };
+        let id = session.session_id();
+        if expected_session_id.is_some_and(|expected| expected != id) {
+            return unavailable(KernelInspectionStatusV4::StaleSession, Some(id));
+        }
+        if !session.is_healthy() {
+            return unavailable(KernelInspectionStatusV4::Unavailable, Some(id));
+        }
+        let inspection = tokio::time::timeout_at(deadline, session.inspect()).await;
+        let sessions = match tokio::time::timeout_at(deadline, self.sessions.lock()).await {
+            Ok(sessions) => sessions,
+            Err(_) => return unavailable(KernelInspectionStatusV4::Unavailable, Some(id)),
+        };
+        let current = sessions.get(key);
+        if !current
+            .is_some_and(|current| Arc::ptr_eq(current, &session) && current.session_id() == id)
+        {
+            return unavailable(
+                KernelInspectionStatusV4::StaleSession,
+                current.map(|current| current.session_id()),
+            );
+        }
+        match inspection {
+            Ok(Ok(payload))
+                if session.is_healthy() && validate_inspection_payload(&payload).is_ok() =>
+            {
+                KernelInspectionResultV4 {
+                    status: KernelInspectionStatusV4::Ready,
+                    session_id: Some(id),
+                    payload: Some(payload),
+                }
+            }
+            Ok(Err(KernelInspectionErrorV4::Busy)) => {
+                unavailable(KernelInspectionStatusV4::Busy, Some(id))
+            }
+            _ => unavailable(KernelInspectionStatusV4::Unavailable, Some(id)),
+        }
     }
 
     pub async fn acquire(
@@ -241,6 +320,247 @@ mod tests {
     use super::*;
     use omicsops_protocol::{ComputeBackendKindV4, IsolationStrengthV4, KernelLanguageV4};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn inspection_key() -> ExecutionContextKeyV4 {
+        ExecutionContextKeyV4 {
+            project_id: Uuid::new_v4(),
+            run_id: Uuid::new_v4(),
+            backend_id: "fake".into(),
+            language: KernelLanguageV4::Python,
+            environment: "system".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn inspect_existing_never_acquires() {
+        let backend = Arc::new(FakeBackend(AtomicUsize::new(0)));
+        let manager = RuntimeManagerV4::new(backend.clone());
+        let key = inspection_key();
+        let result = manager.inspect_existing(&key, None).await;
+        assert_eq!(result.status, KernelInspectionStatusV4::NotStarted);
+        assert!(result.payload.is_none());
+        assert!(result.session_id.is_none());
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0);
+        assert!(manager.sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inspect_rejects_replaced_session() {
+        let backend = Arc::new(FakeBackend(AtomicUsize::new(0)));
+        let manager = RuntimeManagerV4::new(backend.clone());
+        let key = inspection_key();
+        let old = manager.acquire(&key).await.unwrap().session_id();
+        let current = manager.rebuild(&key).await.unwrap().session_id();
+        assert_ne!(old, current);
+        let result = manager.inspect_existing(&key, Some(old)).await;
+        assert_eq!(result.status, KernelInspectionStatusV4::StaleSession);
+        assert_eq!(result.session_id, Some(current));
+        assert!(result.payload.is_none());
+        let result = manager.inspect_existing(&key, Some(current)).await;
+        assert_eq!(result.status, KernelInspectionStatusV4::Unavailable);
+        assert!(result.payload.is_none());
+        assert_eq!(backend.0.load(Ordering::SeqCst), 2);
+    }
+
+    struct InspectionProcess {
+        id: Uuid,
+        result: Result<KernelInspectionPayloadV4, KernelInspectionErrorV4>,
+        started: Option<Arc<tokio::sync::Notify>>,
+        resume: Option<Arc<tokio::sync::Notify>>,
+        healthy: bool,
+    }
+    #[async_trait]
+    impl KernelProcessV4 for InspectionProcess {
+        fn session_id(&self) -> Uuid {
+            self.id
+        }
+        fn process_identity(&self) -> &str {
+            "inspection-fixture"
+        }
+        fn is_healthy(&self) -> bool {
+            self.healthy
+        }
+        async fn inspect(&self) -> Result<KernelInspectionPayloadV4, KernelInspectionErrorV4> {
+            if let Some(started) = &self.started {
+                started.notify_one();
+            }
+            if let Some(resume) = &self.resume {
+                resume.notified().await;
+            }
+            self.result.clone()
+        }
+        async fn execute(&self, _: String, _: Vec<String>) -> Result<RuntimeResultV4, String> {
+            panic!("inspection must never execute user code")
+        }
+        async fn interrupt(&self) -> Result<(), String> {
+            panic!("inspection must never interrupt")
+        }
+    }
+
+    #[tokio::test]
+    async fn inspect_rechecks_session_after_await() {
+        let backend = Arc::new(FakeBackend(AtomicUsize::new(0)));
+        let manager = Arc::new(RuntimeManagerV4::new(backend.clone()));
+        let key = inspection_key();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let process = Arc::new(InspectionProcess {
+            id: Uuid::new_v4(),
+            result: Ok(KernelInspectionPayloadV4 {
+                objects: vec![],
+                truncated: false,
+            }),
+            started: Some(started.clone()),
+            resume: Some(resume.clone()),
+            healthy: true,
+        });
+        manager
+            .sessions
+            .lock()
+            .await
+            .insert(key.clone(), process.clone());
+        let task = {
+            let manager = manager.clone();
+            let key = key.clone();
+            tokio::spawn(async move { manager.inspect_existing(&key, None).await })
+        };
+        started.notified().await;
+        manager.sessions.lock().await.insert(
+            key.clone(),
+            Arc::new(InspectionProcess {
+                id: process.id,
+                result: Ok(KernelInspectionPayloadV4 {
+                    objects: vec![],
+                    truncated: false,
+                }),
+                started: None,
+                resume: None,
+                healthy: true,
+            }),
+        );
+        resume.notify_one();
+        let result = task.await.unwrap();
+        assert_eq!(result.status, KernelInspectionStatusV4::StaleSession);
+        assert!(result.payload.is_none());
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn inspect_deadline_bounds_an_unresponsive_process_without_interrupting() {
+        let backend = Arc::new(FakeBackend(AtomicUsize::new(0)));
+        let manager = RuntimeManagerV4::new(backend.clone());
+        let key = inspection_key();
+        let id = Uuid::new_v4();
+        manager.sessions.lock().await.insert(
+            key.clone(),
+            Arc::new(InspectionProcess {
+                id,
+                result: Ok(KernelInspectionPayloadV4 {
+                    objects: vec![],
+                    truncated: false,
+                }),
+                started: None,
+                resume: Some(Arc::new(tokio::sync::Notify::new())),
+                healthy: true,
+            }),
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            manager.inspect_existing(&key, None),
+        )
+        .await
+        .expect("fixed inspection deadline");
+        assert_eq!(result.status, KernelInspectionStatusV4::Unavailable);
+        assert!(result.payload.is_none());
+        assert_eq!(
+            manager
+                .sessions
+                .lock()
+                .await
+                .get(&key)
+                .unwrap()
+                .session_id(),
+            id
+        );
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn inspect_maps_safe_errors_and_rejects_invalid_payload() {
+        let backend = Arc::new(FakeBackend(AtomicUsize::new(0)));
+        let manager = RuntimeManagerV4::new(backend.clone());
+        let key = inspection_key();
+        for (response, healthy, expected) in [
+            (
+                Ok(KernelInspectionPayloadV4 {
+                    objects: vec![],
+                    truncated: true,
+                }),
+                true,
+                KernelInspectionStatusV4::Ready,
+            ),
+            (
+                Err(KernelInspectionErrorV4::Busy),
+                true,
+                KernelInspectionStatusV4::Busy,
+            ),
+            (
+                Err(KernelInspectionErrorV4::Unsupported),
+                true,
+                KernelInspectionStatusV4::Unavailable,
+            ),
+            (
+                Err(KernelInspectionErrorV4::Protocol),
+                true,
+                KernelInspectionStatusV4::Unavailable,
+            ),
+            (
+                Err(KernelInspectionErrorV4::Unavailable),
+                true,
+                KernelInspectionStatusV4::Unavailable,
+            ),
+            (
+                Ok(KernelInspectionPayloadV4 {
+                    objects: vec![],
+                    truncated: false,
+                }),
+                false,
+                KernelInspectionStatusV4::Unavailable,
+            ),
+            (
+                Ok(KernelInspectionPayloadV4 {
+                    objects: vec![omicsops_protocol::KernelObjectMetadataV4 {
+                        name: "x".repeat(257),
+                        type_label: "list".into(),
+                        dimensions: None,
+                        element_count: None,
+                        summary: "opaque".into(),
+                    }],
+                    truncated: false,
+                }),
+                true,
+                KernelInspectionStatusV4::Unavailable,
+            ),
+        ] {
+            manager.sessions.lock().await.insert(
+                key.clone(),
+                Arc::new(InspectionProcess {
+                    id: Uuid::new_v4(),
+                    result: response,
+                    started: None,
+                    resume: None,
+                    healthy,
+                }),
+            );
+            let result = manager.inspect_existing(&key, None).await;
+            assert_eq!(result.status, expected);
+            assert_eq!(
+                result.payload.is_some(),
+                expected == KernelInspectionStatusV4::Ready
+            );
+        }
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0);
+    }
     struct FakeBackend(AtomicUsize);
     struct DescribedBackend(ComputeBackendDescriptorV4);
     struct FakeProcess {

@@ -21,6 +21,10 @@ pub use omicsops_protocol::{
     session_review_source_snapshot_value,
 };
 use omicsops_protocol::{ComputeSelectionV4, ExecutionPlanV4};
+pub use omicsops_protocol::{
+    InspectKernelRequestV4, KernelInspectionPayloadV4, KernelInspectionStatusV4,
+    KernelInspectionV4, KernelObjectMetadataV4,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 mod subscription_models;

@@ -6,6 +6,39 @@ use crate::dto::{
 use serde_json::json;
 
 #[test]
+fn kernel_inspection_request_is_scope_only_and_response_has_no_values() {
+    use omicsops_dto::{InspectKernelRequestV4, KernelInspectionV4};
+    let request = json!({"project_id":uuid::Uuid::from_u128(1),
+        "conversation_id":uuid::Uuid::from_u128(2),"run_id":uuid::Uuid::from_u128(3),
+        "language":"python","expected_session_id":null});
+    let parsed: InspectKernelRequestV4 = serde_json::from_value(request.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+    for field in [
+        "backend_id",
+        "environment",
+        "code",
+        "max_objects",
+        "timeout",
+    ] {
+        let mut invalid = request.clone();
+        invalid[field] = json!("injected");
+        assert!(serde_json::from_value::<InspectKernelRequestV4>(invalid).is_err());
+    }
+    let response = json!({"project_id":uuid::Uuid::from_u128(1),
+        "conversation_id":uuid::Uuid::from_u128(2),"run_id":uuid::Uuid::from_u128(3),
+        "language":"python","session_id":uuid::Uuid::from_u128(4),"status":"ready",
+        "objects":[{"name":"items","type_label":"list","dimensions":[42],
+            "element_count":42,"summary":"list, 42 elements"}],"truncated":false});
+    let parsed: KernelInspectionV4 = serde_json::from_value(response.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), response);
+    for field in ["value", "repr", "error"] {
+        let mut invalid = response.clone();
+        invalid["objects"][0][field] = json!("secret");
+        assert!(serde_json::from_value::<KernelInspectionV4>(invalid).is_err());
+    }
+}
+
+#[test]
 fn remote_jobs_requests_reject_ui_launch_parameters() {
     use omicsops_dto::{ListRemoteJobsV4Request, RefreshRemoteJobV4Request};
     let project = uuid::Uuid::from_u128(1);
