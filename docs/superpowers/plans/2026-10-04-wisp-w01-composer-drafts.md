@@ -1,6 +1,6 @@
 # W01 Composer Draft Isolation Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** 切项目/会话恢复各自文字，接受回执只清理原作用域已提交的版本。
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** React 19、TypeScript、useSyncExternalStore、Vitest/RTL；无新依赖。
 
-**Spec:** [W01 设计](../specs/2026-10-04-wisp-composer-files-jobs-design.md#w01会话文字草稿)、[共同约束](../specs/2026-10-04-wisp-improvements-design.md)。设计已确认；用户于2026-10-06确认计划并选择子Agent逐项实施与审阅。Task1已通过独立审阅，Task2–3待实施。
+**Spec:** [W01 设计](../specs/2026-10-04-wisp-composer-files-jobs-design.md#w01会话文字草稿)、[共同约束](../specs/2026-10-04-wisp-improvements-design.md)。设计已确认；用户于2026-10-06确认计划并选择子Agent逐项实施与审阅。全部3个任务已实现并通过独立审阅及修复复审。最终前端1,138、扩展22个测试和Web构建通过。
 
 ## Global Constraints
 
@@ -58,7 +58,7 @@ it("keeps edited same-text drafts when the old receipt arrives", () => {
 
 **Interfaces:** Consumes Task 1；WorkspaceShell Props 新增 `composerDraftStore?:ComposerDraftStore`（独立示例默认实例仍只在该组件生命期）；DesktopApp 用稳定 ref 创建并注入。branch 回执使用已有 `ConversationBranchV4.project_id/branch_conversation_id`，不能使用 source ID 作为目标。
 
-- [ ] **RED: 导航、卸载与新建断言**；跨项目相同 conversation 字符串不混用；无会话明确新建 adoption，普通导航不 adoption；活跃 A 新建 B 空白；删除失败保留、成功清理；收起保留。
+- [x] **RED: 导航、卸载与新建断言**；跨项目相同 conversation 字符串不混用；无会话明确新建 adoption，普通导航不 adoption；活跃 A 新建 B 空白；删除失败保留、成功清理；收起保留。
 
 ```tsx
 it("restores a project draft after the workspace unmounts", () => {
@@ -70,10 +70,10 @@ it("restores a project draft after the workspace unmounts", () => {
 });
 ```
 
-- [ ] **Run RED:** `npx vitest run src/DesktopApp.test.tsx src/features/workspace/WorkspaceShell.test.tsx src/features/workspace/ComposerIntegration.test.tsx`；新 Props/恢复测试应失败，已有测试失败单独判断。
-- [ ] **Implement:** 将所有文字 setter 接入 Hook；DesktopApp 仅在确认新建来源后 adoption，真实删除成功后 purge。branch cache seed 写明确目标，只在目标仍为空且 revision 与打开前一致时写入；其他命令/引用插入保留原行为。不改变附件或引用持久化。
-- [ ] **Run GREEN:** 上述两文件及 `npx vitest run src/features/workspace/ComposerIntegration.test.tsx` 通过；分支 pending 时编辑目标后完成旧 callback，目标保留新文字。
-- [ ] **Commit:** `feat: restore workspace drafts across navigation`；暂存本任务四文件与必要合同改动。
+- [x] **Run RED:** `npx vitest run src/DesktopApp.test.tsx src/features/workspace/WorkspaceShell.test.tsx src/features/workspace/ComposerIntegration.test.tsx`；新 Props/恢复测试应失败，已有测试失败单独判断。
+- [x] **Implement:** 将所有文字 setter 接入 Hook；DesktopApp 仅在确认新建来源后 adoption，真实删除成功后 purge。branch cache seed 写明确目标，只在目标仍为空且 revision 与打开前一致时写入；其他命令/引用插入保留原行为。不改变附件或引用持久化。
+- [x] **Run GREEN:** 上述两文件及 `npx vitest run src/features/workspace/ComposerIntegration.test.tsx` 通过；分支 pending 时编辑目标后完成旧 callback，目标保留新文字。
+- [x] **Commit:** `feat: restore workspace drafts across navigation`；暂存本任务四文件与必要合同改动。
 
 ### Task 3: 全部发送入口的 scope/revision 回执
 
@@ -81,7 +81,7 @@ it("restores a project draft after the workspace unmounts", () => {
 
 **Interfaces:** Consumes `capture/clearAccepted`。普通 send/queue、replacement/retry、side-chat/retry、branch-send 每次 attempt 记录不可变 `DraftReceipt`；重试保留原凭据，不捕获新文字。
 
-- [ ] **RED: 异步接受矩阵**；用现有 RTL fixtures 和 deferred Promise，覆盖上述入口 accepted/rejected/thrown/pending、切作用域与同文字新 revision。附件/引用只在原 generation/已接受 ID 下清理。
+- [x] **RED: 异步接受矩阵**；用现有 RTL fixtures 和 deferred Promise，覆盖上述入口 accepted/rejected/thrown/pending、切作用域与同文字新 revision。附件/引用只在原 generation/已接受 ID 下清理。
 
 ```tsx
 it("clears only the accepted offscreen version", async () => {
@@ -104,7 +104,7 @@ it("clears only the accepted offscreen version", async () => {
 });
 ```
 
-- [ ] **Run RED:** `npx vitest run src/features/workspace/ComposerIntegration.test.tsx src/features/workspace/WorkspaceShell.test.tsx src/features/workspace/useComposerAttachments.test.ts`；旧仅比较 draft 文本/generation 的清理不能通过新矩阵。
-- [ ] **Implement:** 接受后始终按捕获凭据尝试清理原文字版本；reference/attachment UI 清理继续受 generation 与原 selection/ID 限制。异步回执不修改另一 attempt 的重试状态；纯浏览器无宿主 demo 发送也用同一凭据，保留既有 accepted=false 语义。
-- [ ] **Run GREEN:** 同一矩阵及 `npm test`、`npm run build` 通过。纯前端改动无需单独 desktop build；全任务最终 Rust/desktop 检查见总计划。
-- [ ] **Commit:** `fix: bind composer receipt cleanup to draft revisions`；记录验证结果，标记 W01 实现完成后才更新总清单。
+- [x] **Run RED:** `npx vitest run src/features/workspace/ComposerIntegration.test.tsx src/features/workspace/WorkspaceShell.test.tsx src/features/workspace/useComposerAttachments.test.ts`；旧仅比较 draft 文本/generation 的清理不能通过新矩阵。
+- [x] **Implement:** 接受后始终按捕获凭据尝试清理原文字版本；reference/attachment UI 清理继续受 generation 与原 selection/ID 限制。异步回执不修改另一 attempt 的重试状态；纯浏览器无宿主 demo 发送也用同一凭据，保留既有 accepted=false 语义。
+- [x] **Run GREEN:** 同一矩阵及 `npm test`、`npm run build` 通过。纯前端改动无需单独 desktop build；全任务最终 Rust/desktop 检查见总计划。
+- [x] **Commit:** `fix: bind composer receipt cleanup to draft revisions`；记录验证结果，标记 W01 实现完成后才更新总清单。

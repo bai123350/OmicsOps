@@ -38,7 +38,7 @@
 
 | 功能 | 计划 | 任务数 | 交付可观察行为 | 当前状态 |
 | --- | --- | --- | --- | --- |
-| W01 | [文字草稿](2026-10-04-wisp-w01-composer-drafts.md) | 3 | 跨项目/会话恢复文字，旧回执只清理原revision | 实施中：Task1通过审阅 |
+| W01 | [文字草稿](2026-10-04-wisp-w01-composer-drafts.md) | 3 | 跨项目/会话恢复文字，旧回执只清理原revision | 已实现、3任务审阅通过 |
 | W02 | [表格预览](2026-10-04-wisp-w02-table-preview.md) | 4 | 本地/SSH CSV/TSV有界逻辑记录、来源/hash/truncation | 待实施 |
 | W03 | [远端作业](2026-10-04-wisp-w03-remote-jobs.md) | 4 | metadata列表、手动status与明确启用的有限退避 | 待实施 |
 | W04 | [内核观察](2026-10-04-wisp-w04-kernel-inspection.md) | 5 | 活着的Python/R metadata，不隐式启动或执行对象方法 | 待实施 |
@@ -72,7 +72,7 @@ W07只需W02 Task1叶子，不需要table/SSH界面；W10/W11只需W09 Task1的�
 
 审阅批准本总计划时，选定执行方法一次；实施中不逐项再向用户询问已授权功能。按所选执行技能执行各任务与review，不在共享入口同时派发多个写任务；可以并行做不冲突的只读查证与验证。
 
-- [ ] 1. W01 Task1–3：版本草稿、应用导航、全发送回执。
+- [x] 1. W01 Task1–3：版本草稿、应用导航、全发送回执。
 - [ ] 2. W02 Task1–4：共享handle、parser/DTO、source/command、真实表格UI。
 - [ ] 3. W03 Task1–4：metadata、身份status、退避panel、Runtime入口/边界说明。
 - [ ] 4. W08b Task1–3：helper正确行为基线、错误传播、统一Python CI。
@@ -115,4 +115,6 @@ Windows合成数据smoke覆盖：导航/延迟发送、CSV/BOM/截断、jobs默�
 
 2026-10-06检查工作区时另有未提交的local runtime failure recovery/reviewer regeneration改动，涉及core、agent_v4、acceptance及其独立设计/测试；不是本计划任务的实现。它们保持原样，计划提交只stage此组Wisp文档。开始实施前重新读取这些共享文件的最新状态，保留新增错误/科学状态行为；尤其W05纯prepare/W06只读诊断/W09只读报告不调用会进行reconciliation写入的science snapshot路径。本计划源基线是身份参考，不作为恢复旧文件内容的指令。
 
-用户已选 **Subagent-driven**：12项跨文件读取、冻结运行、原子压缩和持久化，每任务由子Agent实施及独立审阅，最后全分支审阅。继续全部12项，不重复范围或执行方式确认。W01 Task1提交 `afb1af3`/`ff8595b`，19个定向测试及tsc通过，复审无未解决发现；完整功能仍需Task2–3导航与回执集成。
+用户已选 **Subagent-driven**：12项跨文件读取、冻结运行、原子压缩和持久化，每任务由子Agent实施及独立审阅，最后全分支审阅。继续全部12项，不重复范围或执行方式确认。
+
+W01已实现：`afb1af3`/`ff8595b` 存储与Hook，`ae439c7`/`6312f60` 导航和删除清理，`9295ab2`/`bb3bbc7` 回执及真实调用方接受语义。3个任务均完成独立审阅及必要复审，无未解决发现。最终 `npm test` 为114文件/1,138前端与22扩展测试通过，`npm run build`通过（既有大chunk提示）；Rust/desktop及全分支最终审阅仍待后续整合。真实模型/SSH与Windows native smoke未执行。
