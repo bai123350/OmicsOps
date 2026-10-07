@@ -8,6 +8,8 @@ use omicsops_protocol::{ExecutionContextKeyV4, RuntimeJobStateV4, RuntimeJobV4, 
 pub struct RemoteJobMetadataV4 {
     pub job: RuntimeJobV4,
     pub conversation_id: Uuid,
+    /// Body presence only; never implies its integrity or safety was checked.
+    pub has_receipt: bool,
 }
 
 /// A selected job and its original inputs, loaded from one SQLite snapshot.
@@ -57,6 +59,7 @@ fn remote_job_from_row(
     Ok(RemoteJobMetadataV4 {
         job,
         conversation_id,
+        has_receipt: row.try_get("has_receipt")?,
     })
 }
 
@@ -68,7 +71,7 @@ impl Store {
         project_id: Uuid,
         conversation_id: Option<Uuid>,
     ) -> Result<Vec<RemoteJobMetadataV4>, StoreError> {
-        let rows = sqlx::query("SELECT j.job_id,j.run_id,j.call_id,j.value_json AS job_json,r.conversation_id FROM runtime_jobs_v4 j JOIN agent_runs_v4 r ON r.run_id=j.run_id WHERE r.project_id=?1 AND (?2 IS NULL OR r.conversation_id=?2) AND json_extract(j.value_json,'$.remote_root') IS NOT NULL AND json_extract(j.value_json,'$.remote_host_key') IS NOT NULL ORDER BY j.rowid DESC LIMIT 100")
+        let rows = sqlx::query("SELECT j.job_id,j.run_id,j.call_id,j.value_json AS job_json,r.conversation_id,EXISTS(SELECT 1 FROM runtime_job_results_v4 receipt WHERE receipt.job_id=j.job_id) AS has_receipt FROM runtime_jobs_v4 j JOIN agent_runs_v4 r ON r.run_id=j.run_id WHERE r.project_id=?1 AND (?2 IS NULL OR r.conversation_id=?2) AND json_extract(j.value_json,'$.remote_root') IS NOT NULL AND json_extract(j.value_json,'$.remote_host_key') IS NOT NULL ORDER BY j.rowid DESC LIMIT 100")
             .bind(project_id.to_string()).bind(conversation_id.map(|id| id.to_string())).fetch_all(&self.pool).await?;
         rows.iter()
             .map(|row| remote_job_from_row(row, project_id))
@@ -84,7 +87,7 @@ impl Store {
         job_id: Uuid,
     ) -> Result<Option<StoredRemoteJobV4>, StoreError> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT j.job_id,j.run_id,j.call_id,j.value_json AS job_json,r.conversation_id,r.value_json AS run_json FROM runtime_jobs_v4 j JOIN agent_runs_v4 r ON r.run_id=j.run_id WHERE r.project_id=?1 AND j.job_id=?2 AND json_extract(j.value_json,'$.remote_root') IS NOT NULL AND json_extract(j.value_json,'$.remote_host_key') IS NOT NULL")
+        let row = sqlx::query("SELECT j.job_id,j.run_id,j.call_id,j.value_json AS job_json,r.conversation_id,r.value_json AS run_json,EXISTS(SELECT 1 FROM runtime_job_results_v4 receipt WHERE receipt.job_id=j.job_id) AS has_receipt FROM runtime_jobs_v4 j JOIN agent_runs_v4 r ON r.run_id=j.run_id WHERE r.project_id=?1 AND j.job_id=?2 AND json_extract(j.value_json,'$.remote_root') IS NOT NULL AND json_extract(j.value_json,'$.remote_host_key') IS NOT NULL")
             .bind(project_id.to_string()).bind(job_id.to_string()).fetch_optional(&mut *tx).await?;
         let Some(row) = row else {
             return Ok(None);
@@ -92,6 +95,7 @@ impl Store {
         let RemoteJobMetadataV4 {
             job,
             conversation_id,
+            ..
         } = remote_job_from_row(&row, project_id)?;
         let run_json: String = row.try_get("run_json")?;
         let run: Value =

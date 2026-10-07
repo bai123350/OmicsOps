@@ -181,6 +181,45 @@ async fn snapshot(store: &Store) -> Vec<(String, String)> {
 }
 
 #[tokio::test]
+async fn metadata_receipt_presence_tracks_retirement_without_loading_body() {
+    let store = Store::open_in_memory().await.unwrap();
+    let spec = fixture(&store, None).await;
+    let (job, _) = reserve(&store, &spec, "presence", true).await;
+    assert!(
+        !store
+            .remote_job_metadata_v4(spec.project_id, None)
+            .await
+            .unwrap()[0]
+            .has_receipt
+    );
+    let terminal_job = terminal(&store, &job).await;
+    // Presence is not body validity: the metadata query must not decode output.
+    sqlx::query("UPDATE runtime_job_results_v4 SET result_json='invalid receipt' WHERE job_id=?1")
+        .bind(job.job_id.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let metadata = store
+        .remote_job_metadata_v4(spec.project_id, None)
+        .await
+        .unwrap();
+    assert!(metadata[0].has_receipt);
+    assert_eq!(metadata[0].job, terminal_job);
+    sqlx::query("DELETE FROM runtime_job_results_v4 WHERE job_id=?1")
+        .bind(job.job_id.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .remote_job_metadata_v4(spec.project_id, None)
+            .await
+            .unwrap()[0]
+            .has_receipt
+    );
+}
+
+#[tokio::test]
 async fn metadata_filters_project_and_conversation_before_limit_and_keeps_old_bindings() {
     let temp = tempfile::tempdir().unwrap();
     let store = Store::open(&temp.path().join("jobs.sqlite")).await.unwrap();

@@ -45,7 +45,7 @@ impl Transport for SshTransport {
     }
 }
 
-fn identity(job: &RuntimeJobV4) -> Value {
+pub(crate) fn identity(job: &RuntimeJobV4) -> Value {
     json!({"job_id":job.job_id,"context":job.context,"request_sha256":job.request_sha256,"remote_root":job.remote_root,"remote_host_key":job.remote_host_key})
 }
 
@@ -128,41 +128,124 @@ fn validate_observation(
                     .ok_or("remote receipt missing")?,
             )
             .map_err(|_| "invalid remote receipt")?;
-            if result.request_id != job.job_id
-                || result.session_id != job.job_id
-                || result.process_identity != format!("ssh-detached:{}", job.job_id)
-                || result.stdout.len() > 65536
-                || result.stderr.len() > 65536
-                || result.artifacts.len() > 128
-            {
-                return Err("remote receipt identity or size mismatch".into());
-            }
-            let root = job.remote_root.as_deref().ok_or("job is not detached")?;
-            for (stream, capture, text) in [
-                ("stdout", &result.stdout_capture, &result.stdout),
-                ("stderr", &result.stderr_capture, &result.stderr),
-            ] {
-                let capture = capture.as_ref().ok_or("remote output capture missing")?;
-                if capture.archive_path
-                    != format!("{root}/.omicsops/remote-jobs/{}/{stream}.txt", job.job_id)
-                    || capture.excerpt != *text
-                    || !valid_hash(&capture.sha256)
-                {
-                    return Err("remote output capture mismatch".into());
-                }
-            }
-            let paths = result
-                .artifacts
-                .iter()
-                .map(|a| a.relative_path.clone())
-                .collect::<Vec<_>>();
-            omicsops_adapters::kernel::validate_capture_paths(&paths).map_err(|e| e.to_string())?;
-            if result.artifacts.iter().any(|a| !valid_hash(&a.sha256)) {
-                return Err("invalid artifact digest".into());
-            }
+            validate_recorded_result(job, &result)?;
             Ok(Some(result))
         }
         _ => Err("invalid remote job status".into()),
+    }
+}
+
+pub(crate) fn validate_recorded_result(
+    job: &RuntimeJobV4,
+    result: &RuntimeResultV4,
+) -> Result<(), String> {
+    if result.request_id != job.job_id
+        || result.session_id != job.job_id
+        || result.process_identity != format!("ssh-detached:{}", job.job_id)
+        || result.stdout.len() > 65536
+        || result.stderr.len() > 65536
+        || result.artifacts.len() > 128
+        || result.software_versions.len() > 128
+        || result
+            .software_versions
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum::<usize>()
+            > 65536
+    {
+        return Err("remote receipt identity or size mismatch".into());
+    }
+    let root = job.remote_root.as_deref().ok_or("job is not detached")?;
+    for (stream, capture, text) in [
+        ("stdout", &result.stdout_capture, &result.stdout),
+        ("stderr", &result.stderr_capture, &result.stderr),
+    ] {
+        let capture = capture.as_ref().ok_or("remote output capture missing")?;
+        if capture.archive_path
+            != format!("{root}/.omicsops/remote-jobs/{}/{stream}.txt", job.job_id)
+            || capture.excerpt != *text
+            || !valid_hash(&capture.sha256)
+            || !capture_metadata_consistent(capture)
+        {
+            return Err("remote output capture mismatch".into());
+        }
+    }
+    if result
+        .artifacts
+        .iter()
+        .any(|a| !valid_hash(&a.sha256) || !safe_relative_reference(&a.relative_path))
+    {
+        return Err("invalid remote artifact".into());
+    }
+    // Reject before query hashes/commits a receipt; never rewrite text
+    // under an existing stream checksum or result digest. This covers
+    // known patterns, not arbitrary unlabeled secret detection.
+    let safe_text = |text: &str| crate::composer_references::public_text(text) == text;
+    if !safe_text(&result.process_identity)
+        || !safe_text(&result.stdout)
+        || !safe_text(&result.stderr)
+        || [&result.stdout_capture, &result.stderr_capture]
+            .into_iter()
+            .flatten()
+            .any(|capture| !safe_text(&capture.excerpt) || !safe_text(&capture.archive_path))
+        || result
+            .artifacts
+            .iter()
+            .any(|artifact| !safe_text(&artifact.relative_path))
+        || result
+            .software_versions
+            .iter()
+            .any(|(key, value)| sensitive_label(key) || !safe_text(key) || !safe_text(value))
+    {
+        return Err("unsafe remote receipt".into());
+    }
+    Ok(())
+}
+fn sensitive_label(label: &str) -> bool {
+    let normalized = label
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, '_' | '-' | ' '))
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "apikey"
+            | "authorization"
+            | "accesstoken"
+            | "refreshtoken"
+            | "password"
+            | "passphrase"
+            | "token"
+            | "privatekey"
+            | "clientsecret"
+    )
+}
+fn safe_relative_reference(path: &str) -> bool {
+    if path.is_empty()
+        || path.len() > 4096
+        || path.starts_with(['/', '\\'])
+        || path.contains(':')
+        || path.chars().any(char::is_control)
+    {
+        return false;
+    }
+    path.split(['/', '\\']).all(|part| {
+        !part.is_empty() && !matches!(part, "." | "..") && !part.eq_ignore_ascii_case(".omicsops")
+    })
+}
+fn capture_metadata_consistent(capture: &omicsops_protocol::OutputCaptureV4) -> bool {
+    // The Python bridge decodes raw bytes with errors=replace. A replacement
+    // character may represent one byte even though its UTF-8 encoding has three.
+    // Full stream hashes remain opaque raw-byte hashes and are never recomputed.
+    let minimum_raw = capture
+        .excerpt
+        .chars()
+        .map(|ch| if ch == '\u{fffd}' { 1 } else { ch.len_utf8() })
+        .sum::<usize>() as u64;
+    if capture.truncated {
+        capture.total_bytes > minimum_raw && !capture.excerpt.is_empty()
+    } else {
+        capture.total_bytes >= minimum_raw && capture.total_bytes <= capture.excerpt.len() as u64
     }
 }
 fn valid_hash(value: &str) -> bool {
@@ -366,6 +449,38 @@ mod tests {
     fn receipt(job: &RuntimeJobV4) -> Value {
         let capture = |stream: &str| json!({"excerpt":"42","total_bytes":2,"sha256":"a".repeat(64),"archive_path":format!("{}/.omicsops/remote-jobs/{}/{stream}.txt",job.remote_root.as_deref().unwrap(),job.job_id),"truncated":false});
         json!({"identity":identity(job),"status":"completed","result":{"request_id":job.job_id,"session_id":job.job_id,"process_identity":format!("ssh-detached:{}",job.job_id),"stdout":"42","stderr":"42","stdout_capture":capture("stdout"),"stderr_capture":capture("stderr"),"succeeded":true,"artifacts":[],"software_versions":{}}})
+    }
+
+    #[tokio::test]
+    async fn remote_job_commands_shared_gate_rejects_persisted_sensitive_text() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (key, call) = fixture(&store).await;
+        let transport = FakeTransport {
+            submissions: AtomicUsize::new(0),
+            observation: Mutex::new(None),
+            lose_ack: false,
+            host_key: "test-host",
+        };
+        submit(&store, &transport, "/project", &key, &call)
+            .await
+            .unwrap();
+        let job = store
+            .remote_runtime_jobs_v4(
+                key.project_id,
+                &key.backend_id,
+                "/project",
+                None,
+                "test-host",
+            )
+            .await
+            .unwrap()
+            .remove(0);
+        let mut value = receipt(&job);
+        value["result"]["software_versions"] = json!({"password":"secret-sentinel"});
+        assert!(
+            validate_observation(&job, &value).is_err(),
+            "structured sensitive label must be rejected before query persistence"
+        );
     }
 
     #[tokio::test]

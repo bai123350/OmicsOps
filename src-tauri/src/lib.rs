@@ -47,6 +47,7 @@ mod project_table;
 mod project_table_commands;
 pub mod project_templates;
 pub mod pubmed_mcp;
+pub mod remote_job_commands;
 mod remote_jobs_v4;
 pub mod research_commands;
 mod run_ownership;
@@ -312,6 +313,8 @@ pub fn run() {
             workspace_commands::create_project,
             workspace_commands::delete_project,
             workspace_commands::update_project_remote,
+            remote_job_commands::list_remote_jobs_v4,
+            remote_job_commands::refresh_remote_job_v4,
             composer_queue::composer_queue_list,
             composer_queue::composer_queue_enqueue,
             composer_queue::composer_queue_replace,
