@@ -37,7 +37,7 @@
 - Consumes: 本地现有 `_paper_figure_claims_json(figures)`、`paper_brief_task(abstract_text, figure_claims)`、`figure_style_self_check()`、`panel_crops(fig, dpi=None, pad_px=6, bbox_inches=None, pad_inches=None)`。
 - Produces: 仅测试内 `load_bundled_helper(skill_name: str) -> dict[str, object]`（固定三名字映射）；`make_panel_fixture(shared_axis: str, same_slot: bool) -> tuple[types.SimpleNamespace, dict[str, object]]` 返回 fake fig/可注入 matplotlib modules。小型 unittest fixture 足够，不新增多层 runner/插件框架。
 
-- [ ] **测试 — 写 `BundledHelperLoadTests`、`PaperNarrativeTests`、`FigureStyleTests`。** loader 新接缝缺失时是真 RED；helper 直接断言包括输入 deep-copy 不变、显式 null/缺失path、Unicode/引号/Windows 路径 round-trip，load 在 __main__ 下无 heavy import/rcParams/backend/stdout/网络/sleep/写入。stub 已安装 matplotlib 时也不改变 backend；显式 self_check 才应用样式。panel 坐标验证顶部原点、边界 clamp、同排 shared-y/同列 shared-x 合并、不同 row/column 不合并。
+- [x] **测试 — 写 `BundledHelperLoadTests`、`PaperNarrativeTests`、`FigureStyleTests`。** loader 新接缝缺失时是真 RED；helper 直接断言包括输入 deep-copy 不变、显式 null/缺失path、Unicode/引号/Windows 路径 round-trip，load 在 __main__ 下无 heavy import/rcParams/backend/stdout/网络/sleep/写入。stub 已安装 matplotlib 时也不改变 backend；显式 self_check 才应用样式。panel 坐标验证顶部原点、边界 clamp、同排 shared-y/同列 shared-x 合并、不同 row/column 不合并。
 
   ```python
   rows = json.loads(namespace["_paper_figure_claims_json"](figures))
@@ -49,10 +49,10 @@
   blocked_write.assert_not_called()
   ```
 
-- [ ] **RED/基线 — 运行并记录实际输出。** `python -B -m unittest discover -s scripts -p "test_bundled_skill_helpers.py" -v`；新 loader 未实现预期 FAIL/NameError。若直接 helper 合同已 PASS 则记录 PASS，不虚称修复缺陷、不改 helper 制造失败。
-- [ ] **实现必要测试签名/替身。** 源先由固定 Path 读入，再以 compile/exec 在新 namespace 载入；拦截仅不允许的网络/写/可选库，允许 stdlib imports。用 unittest.mock patch.dict 清空 env 与恢复 sys.modules，fake Bbox/axes/render 只实现现有 helper 用到的几何接口。无图像/科学依赖安装。
-- [ ] **GREEN — 同命令 PASS。** 再用测试 namespace 中一次错配 claim/path 或 load-side-effect mutation 验证直接 contract assertion 产生预期失败，由外层测试断言捕获；源文件不变，不增加故障注入运行时框架。缺 helper 直接失败，无 skip。所有临时测试文件在 tempdir，`-B` 不写 pyc。
-- [ ] **Commit —** `git add -- scripts/test_bundled_skill_helpers.py`；`git commit -m "test: cover bundled claim and figure helper contracts"`。
+- [x] **RED/基线 — 运行并记录实际输出。** `python -B -m unittest discover -s scripts -p "test_bundled_skill_helpers.py" -v`；新 loader 未实现预期 FAIL/NameError。若直接 helper 合同已 PASS 则记录 PASS，不虚称修复缺陷、不改 helper 制造失败。
+- [x] **实现必要测试签名/替身。** 源先由固定 Path 读入，再以 compile/exec 在新 namespace 载入；拦截仅不允许的网络/写/可选库，允许 stdlib imports。用 unittest.mock patch.dict 清空 env 与恢复 sys.modules，fake Bbox/axes/render 只实现现有 helper 用到的几何接口。无图像/科学依赖安装。
+- [x] **GREEN — 同命令 PASS。** 再用测试 namespace 中一次错配 claim/path 或 load-side-effect mutation 验证直接 contract assertion 产生预期失败，由外层测试断言捕获；源文件不变，不增加故障注入运行时框架。缺 helper 直接失败，无 skip。所有临时测试文件在 tempdir，`-B` 不写 pyc。
+- [x] **Commit —** `git add -- scripts/test_bundled_skill_helpers.py`；`git commit -m "test: cover bundled claim and figure helper contracts"`。
 
 ### Task 2: 文献检索/引文/DOI 错误与秘密回归
 
@@ -100,4 +100,6 @@
 - [ ] **GREEN — discovery PASS，默认完整检查 PASS。** `cargo test --workspace`、`npm test`、`npm run build`、`git diff --check`；纯测试/CI变化无桌面打包必要，若整合时改宿主资源则按 master 跑桌面检查。用 stdlib环境运行，记录 case数量/零skip；确认三个 runtime.py/SOURCE hash未变。CI实际执行状态未发生时注明“本地通过，CI未执行”，不把修改YAML当已通过CI。
 - [ ] **Commit —** `git add -- scripts/test_bundled_skill_helpers.py .github/workflows/ci.yml scripts/README.md docs/bundled-science.md acceptance/README.md`；`git commit -m "ci: run deterministic bundled skill helper regressions"`。
 
-本轮只保存计划；没有修改 helper、产品或测试源码，没有执行 checkbox。场景 report/upload 的最终 CI 编辑顺序与执行方式由 master 下一阶段统一确认。
+## 当前实施证据
+
+2026-10-08：Task1提交74e8fa4独立spec/quality审阅通过，无open finding。仅新增307行标准库测试；固定loader与claim/path、figure几何合同focused14通过，完整Python discovery23通过。实际loader缺接缝RED为1个NameError；首轮helper11通过/1个Windows platform fixture失败，stub后原helper合同baseline PASS，没有修改helper制造缺陷。两次sandbox discovery均保留5个既有RemoteJobBridge WinError5，原命令授权重跑后23通过。runtime.py/SOURCE/hash/freeze不变；外部未提交工作完整保留。实际本地Python3.10，计划CI3.12未执行；本leaf未重复Rust/npm/Web/native。Task2文献矩阵与Task3discovery/CI/完整交付待实施；W08场景report/upload仍由另一子计划之后拥有，整个W08尚未完成。
