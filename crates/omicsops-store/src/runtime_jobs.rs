@@ -167,6 +167,18 @@ impl Store {
         {
             return Err(remote_job_integrity_error());
         }
+        // ToolFinished retires the receipt, not its terminal identity metadata.
+        // Validate that identity even when there are no receipt bytes to load.
+        if matches!(
+            job.state,
+            RuntimeJobStateV4::Succeeded | RuntimeJobStateV4::Failed
+        ) && (job.result_request_id != Some(job_id)
+            || !job.result_sha256.as_ref().is_some_and(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }))
+        {
+            return Err(remote_job_integrity_error());
+        }
         let serialized: Option<String> =
             sqlx::query_scalar("SELECT result_json FROM runtime_job_results_v4 WHERE job_id=?1")
                 .bind(job_id.to_string())

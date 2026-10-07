@@ -443,6 +443,98 @@ async fn receipt_hash_uses_stored_bytes_and_rejects_present_corruption_or_identi
 }
 
 #[tokio::test]
+async fn retired_terminal_receipt_preserves_required_request_identity_and_digest() {
+    for succeeded in [true, false] {
+        let store = Store::open_in_memory().await.unwrap();
+        let spec = fixture(&store, None).await;
+        let (job, _) = reserve(&store, &spec, "original", true).await;
+        let running = store
+            .advance_runtime_job_v4(&job, RuntimeJobStateV4::Running, Some(job.job_id), None)
+            .await
+            .unwrap();
+        let result = RuntimeResultV4 {
+            request_id: job.job_id,
+            session_id: job.job_id,
+            process_identity: format!("ssh-detached:{}", job.job_id),
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_capture: None,
+            stderr_capture: None,
+            succeeded,
+            artifacts: vec![],
+            software_versions: Default::default(),
+        };
+        let state = if succeeded {
+            RuntimeJobStateV4::Succeeded
+        } else {
+            RuntimeJobStateV4::Failed
+        };
+        let terminal = store
+            .advance_runtime_job_v4(&running, state, None, Some(&result))
+            .await
+            .unwrap();
+        append(
+            &store,
+            spec.run_id,
+            AgentEventKindV4::ToolFinished {
+                outcome: ToolOutcomeV4 {
+                    call_id: job.call_id.clone(),
+                    tool_id: "runtime.execute".into(),
+                    succeeded,
+                    model_content: "recorded".into(),
+                    data: json!({}),
+                    provenance: vec![],
+                },
+            },
+        )
+        .await;
+        let before = snapshot(&store).await;
+        let loaded = store
+            .remote_job_record_v4(spec.project_id, job.job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.job, terminal);
+        assert!(loaded.result.is_none());
+        assert_eq!(snapshot(&store).await, before);
+        let original = serde_json::to_value(&terminal).unwrap();
+        for (field, replacement) in [
+            ("result_request_id", Value::Null),
+            ("result_sha256", Value::Null),
+            ("result_sha256", json!("a".repeat(63))),
+            ("result_sha256", json!("g".repeat(64))),
+        ] {
+            let mut invalid = original.clone();
+            invalid[field] = replacement;
+            set_job(&store, job.job_id, &invalid).await;
+            let before = snapshot(&store).await;
+            assert_eq!(
+                store
+                    .remote_job_record_v4(spec.project_id, job.job_id)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "invalid input: remote job record integrity mismatch",
+                "{state:?} {field}"
+            );
+            assert_eq!(snapshot(&store).await, before);
+        }
+        set_job(&store, job.job_id, &original).await;
+        let before = snapshot(&store).await;
+        assert!(
+            store
+                .remote_job_record_v4(spec.project_id, job.job_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .result
+                .is_none()
+        );
+        assert_eq!(snapshot(&store).await, before);
+    }
+}
+
+#[tokio::test]
 async fn selected_record_checks_detached_session_identity_even_without_a_receipt() {
     let store = Store::open_in_memory().await.unwrap();
     let spec = fixture(&store, None).await;
