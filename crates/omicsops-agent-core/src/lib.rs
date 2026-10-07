@@ -4664,19 +4664,14 @@ impl AgentCoreV4<'_> {
         Ok(request)
     }
 
-    /// One replay-aware projection for both preparation and reads of its
-    /// verified durable checkpoint. The auto-compaction setting controls new
-    /// automatic archives, not reuse of an explicitly requested manual view.
-    fn fit_checkpoint_execution_context(
+    /// Pure request preflight for checkpoint fitting. This checks frozen
+    /// identity and replay integrity without validating the original context.
+    fn checkpoint_projection_request(
         &self,
         spec: &RunSpecV4,
-        checkpoint: &ContextCheckpointV4,
-        source: &AgentEventV4,
-        science: &Value,
+        context: String,
         events: &[AgentEventV4],
-        limits: AgentLimitsV4,
-        prospective: bool,
-    ) -> Result<String, AgentCoreErrorV4> {
+    ) -> Result<ModelRequestV4, AgentCoreErrorV4> {
         let metadata = self.model.usage_metadata();
         let configuration_hash = metadata.model_configuration_hash.clone().ok_or_else(|| {
             AgentCoreErrorV4::NeedsAttention(
@@ -4694,6 +4689,36 @@ impl AgentCoreV4<'_> {
                 "checkpoint projection binding or budget changed".into(),
             ));
         }
+        let mut request = self.execution_request(spec, context, events);
+        if self.model.supports_native_replay() {
+            model_replay::shape_request_for_budget(
+                &mut request,
+                spec.project_id,
+                spec.conversation_id,
+                &omicsops_protocol::ModelReplayBindingV4 {
+                    model_profile_id: metadata.model_profile_id,
+                    configuration_hash: configuration_hash.clone(),
+                },
+                events,
+            )
+            .map_err(AgentCoreErrorV4::NeedsAttention)?;
+        }
+        Ok(request)
+    }
+
+    /// One replay-aware projection for both preparation and reads of its
+    /// verified durable checkpoint. The auto-compaction setting controls new
+    /// automatic archives, not reuse of an explicitly requested manual view.
+    fn fit_checkpoint_execution_context(
+        &self,
+        spec: &RunSpecV4,
+        checkpoint: &ContextCheckpointV4,
+        source: &AgentEventV4,
+        science: &Value,
+        events: &[AgentEventV4],
+        limits: AgentLimitsV4,
+        prospective: bool,
+    ) -> Result<String, AgentCoreErrorV4> {
         let use_views = self.model.supports_native_replay()
             || self
                 .tools
@@ -4725,20 +4750,7 @@ impl AgentCoreV4<'_> {
                         "checkpoint projection exceeds context byte budget".into(),
                     ));
                 }
-                let mut request = self.execution_request(spec, context.clone(), events);
-                if self.model.supports_native_replay() {
-                    model_replay::shape_request_for_budget(
-                        &mut request,
-                        spec.project_id,
-                        spec.conversation_id,
-                        &omicsops_protocol::ModelReplayBindingV4 {
-                            model_profile_id: metadata.model_profile_id,
-                            configuration_hash: configuration_hash.clone(),
-                        },
-                        events,
-                    )
-                    .map_err(AgentCoreErrorV4::NeedsAttention)?;
-                }
+                let request = self.checkpoint_projection_request(spec, context.clone(), events)?;
                 self.model
                     .validate_request(&request)
                     .map_err(|error| AgentCoreErrorV4::NeedsAttention(error.message))?;
@@ -5128,7 +5140,7 @@ impl AgentCoreV4<'_> {
                     source,
                     &events,
                 ) {
-                    return self.fit_checkpoint_execution_context(
+                    match self.fit_checkpoint_execution_context(
                         spec,
                         latest_checkpoint.as_ref().expect("checkpoint source"),
                         source,
@@ -5136,7 +5148,21 @@ impl AgentCoreV4<'_> {
                         &events,
                         limits,
                         false,
-                    );
+                    ) {
+                        Ok(context) => return Ok(context),
+                        Err(error) if !limits.auto_compact => return Err(error),
+                        Err(_) => {
+                            // Later ordinary events can outgrow this view. Before
+                            // falling through to the existing automatic rebuild,
+                            // reject invalid identity/replay or unshrinkable
+                            // system/tool/image/replay overhead without writes.
+                            let minimum =
+                                self.checkpoint_projection_request(spec, String::new(), &events)?;
+                            self.model
+                                .validate_request(&minimum)
+                                .map_err(|error| AgentCoreErrorV4::NeedsAttention(error.message))?;
+                        }
+                    }
                 }
             }
         }
@@ -14895,6 +14921,160 @@ mod tests {
     #[tokio::test]
     async fn manual_prepare_durable_projection_remains_usable_with_auto_compact_disabled() {
         assert_manual_postappend_budget(false, 22).await;
+    }
+
+    async fn assert_manual_checkpoint_after_growth(auto_compact: bool) {
+        let (spec, store, model) = manual_fixture(false, 70_000);
+        let state = ScientificStateV4::new(spec.project_id);
+        let science = SnapshotScience(Mutex::new(state.clone()));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: Some(&science),
+        };
+        let limits = AgentLimitsV4 {
+            auto_compact,
+            ..Default::default()
+        };
+        let prepared = core
+            .prepare_context_compaction(&manual_snapshot(&store, &spec, state), limits)
+            .unwrap();
+        for event in &prepared.planned_events {
+            store.append_direct(event).unwrap();
+        }
+        let initial = store.load_direct(spec.run_id).unwrap();
+        let context = core.context_for(&spec, limits).await.unwrap();
+        assert!(
+            model
+                .validate_request(
+                    &core
+                        .shape_final_execution_request(&spec, context, &initial)
+                        .unwrap()
+                )
+                .is_ok()
+        );
+        assert_eq!(store.load_direct(spec.run_id).unwrap(), initial);
+        assert!(store.archives.lock().unwrap().is_empty());
+        for _ in 0..10 {
+            append_test_event(
+                &store,
+                spec.run_id,
+                AgentEventKindV4::ModelText {
+                    text: "follow-up narrative ".repeat(632),
+                },
+            );
+        }
+        let grown = store.load_direct(spec.run_id).unwrap();
+        let result = core.context_for(&spec, limits).await;
+        if auto_compact {
+            let context = result
+                .expect("enabled automatic compaction must refresh a grown manual checkpoint");
+            let admitted = model.inner.requests.lock().unwrap().last().unwrap().clone();
+            let events = store.load_direct(spec.run_id).unwrap();
+            let actual = core
+                .shape_final_execution_request(&spec, context, &events)
+                .unwrap();
+            assert_eq!(actual, admitted);
+            assert!(model.validate_request(&actual).is_ok());
+            assert_eq!(store.archives.lock().unwrap().len(), 1);
+            assert!(events.starts_with(&grown));
+        } else {
+            assert!(result.is_err());
+            assert_eq!(store.load_direct(spec.run_id).unwrap(), grown);
+            assert!(store.archives.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_checkpoint_growth_refreshes_when_auto_compact_is_enabled() {
+        assert_manual_checkpoint_after_growth(true).await;
+    }
+
+    #[tokio::test]
+    async fn manual_checkpoint_growth_rejects_without_writes_when_auto_compact_is_disabled() {
+        assert_manual_checkpoint_after_growth(false).await;
+    }
+
+    #[tokio::test]
+    async fn manual_checkpoint_growth_fallback_preserves_preflight_failures() {
+        for mutation in 0..4 {
+            let (spec, store, mut model) = manual_fixture(true, 70_000);
+            let state = ScientificStateV4::new(spec.project_id);
+            let science = SnapshotScience(Mutex::new(state.clone()));
+            let prepared = AgentCoreV4 {
+                model: &model,
+                tools: &ResultReadTools,
+                events: &store,
+                science: Some(&science),
+            }
+            .prepare_context_compaction(
+                &manual_snapshot(&store, &spec, state),
+                AgentLimitsV4::default(),
+            )
+            .unwrap();
+            for event in &prepared.planned_events {
+                store.append_direct(event).unwrap();
+            }
+            for _ in 0..10 {
+                append_test_event(
+                    &store,
+                    spec.run_id,
+                    AgentEventKindV4::ModelText {
+                        text: "follow-up narrative ".repeat(632),
+                    },
+                );
+            }
+            match mutation {
+                0 => model.profile = Uuid::new_v4(),
+                1 => model.known_budget = false,
+                2 => {
+                    let replay = store
+                        .load_direct(spec.run_id)
+                        .unwrap()
+                        .iter()
+                        .find_map(|event| match &event.event {
+                            AgentEventKindV4::ModelReplayRecorded { replay } => {
+                                Some(replay.clone())
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    // Hash-valid envelope, invalid duplicate provider attempt.
+                    append_test_event(
+                        &store,
+                        spec.run_id,
+                        AgentEventKindV4::ModelReplayRecorded { replay },
+                    );
+                }
+                _ => model.inner.request_limit = 1,
+            }
+            let before = store.load_direct(spec.run_id).unwrap();
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &ResultReadTools,
+                events: &store,
+                science: Some(&science),
+            };
+            assert!(
+                core.context_for(&spec, AgentLimitsV4::default())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(store.load_direct(spec.run_id).unwrap(), before);
+            assert!(store.archives.lock().unwrap().is_empty());
+            if mutation == 3 {
+                let requests = model.inner.requests.lock().unwrap();
+                let minimum = requests.last().unwrap();
+                assert!(
+                    minimum.context.is_empty(),
+                    "the lower-bound validator failure is preserved"
+                );
+                assert!(!minimum.system.is_empty());
+                assert!(!minimum.tools.is_empty());
+                assert!(!minimum.replay.is_empty());
+            }
+        }
     }
 
     #[tokio::test]
