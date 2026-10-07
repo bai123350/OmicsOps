@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust/sqlx/Tokio、现有 remote_jobs_v4 Transport与SshSession、Tauri 2、React 19/TypeScript/Vitest；无新表或依赖。
 
-**Spec:** [W03 设计](../specs/2026-10-04-wisp-composer-files-jobs-design.md#w03ssh-后台作业列表与查询)、[共同约束](../specs/2026-10-04-wisp-improvements-design.md)。设计及8515da8实施计划已确认；Task1 Store/DTO已独立审阅与fix复审通过，Task2–4待实施。
+**Spec:** [W03 设计](../specs/2026-10-04-wisp-composer-files-jobs-design.md#w03ssh-后台作业列表与查询)、[共同约束](../specs/2026-10-04-wisp-improvements-design.md)。设计及8515da8实施计划已确认；Task1 Store/DTO、Task2 host status已独立审阅/必要fix复审通过，Task3–4待实施。
 
 ## Global Constraints
 
@@ -57,11 +57,11 @@ assert!(!serialized_summary.contains("remote_root"));
 
 ### Task 2: 状态命令与全路径 timeout/身份核对
 
-**Files:** Create `src-tauri/src/remote_job_commands.rs`（service/tests）；Modify `src-tauri/src/remote_jobs_v4.rs`、`src-tauri/src/lib.rs`。复用existing sync_commands canonical root、connection profile信任与SshSession；不改原Agent调用授权流程。
+**Files:** Create `src-tauri/src/remote_job_commands.rs`（service/tests）；Modify `src-tauri/src/remote_jobs_v4.rs`、`src-tauri/src/lib.rs`；窄幅 Modify `crates/omicsops-store/src/runtime_jobs.rs` / `tests/remote_job_observation.rs`（internal metadata has_receipt bool/owned-job EXISTS与presence/retirement测试，不读取body/code）。复用existing sync_commands canonical root、connection profile信任与SshSession；不改原Agent调用授权流程。
 
-**Interfaces:** `list_remote_jobs_v4(state:State<'_,AppState>,request:ListRemoteJobsV4Request)->Result<RemoteJobsPageV4,String>`；`refresh_remote_job_v4(state:State<'_,AppState>,request:RefreshRemoteJobV4Request)->Result<RemoteJobObservationV4,String>`。Host injectable async `RemoteJobConnector::connect(&self,project:&Project,job:&RuntimeJobV4)->Result<BoundRemoteJobTransport,RemoteJobObservationStatusV4>`；`BoundRemoteJobTransport {transport:Box<dyn remote_jobs_v4::Transport>,canonical_root:String}`；`refresh_remote_job_with_connector(store:&Store,connector:&dyn RemoteJobConnector,request:RefreshRemoteJobV4Request)->Result<RemoteJobObservationV4,String>`。Connector owns cleanup; transport.host_key来自实际连接，service再次精确核对原root/key。local terminal validation抽取 `remote_jobs_v4::validate_recorded_result(job:&RuntimeJobV4,result:&RuntimeResultV4)->Result<(),String>` 并在现有validate_observation复用。
+**Interfaces:** `list_remote_jobs_v4(state:State<'_,AppState>,request:ListRemoteJobsV4Request)->Result<RemoteJobsPageV4,String>`；`refresh_remote_job_v4(state:State<'_,AppState>,request:RefreshRemoteJobV4Request)->Result<RemoteJobObservationV4,String>`。Host injectable async `RemoteJobConnector::connect(&self,project:&Project,job:&RuntimeJobV4)->Result<BoundRemoteJobTransport,RemoteJobObservationStatusV4>`；`BoundRemoteJobTransport {transport:Box<dyn remote_jobs_v4::Transport>,canonical_root:String}`；`refresh_remote_job_with_connector(store:&Store,connector:&dyn RemoteJobConnector,request:RefreshRemoteJobV4Request)->Result<RemoteJobObservationV4,String>`。Connector owns cleanup; transport.host_key来自实际连接，service再次精确核对原root/key。metadata.has_receipt仅表示行存在，终态回执在绑定改变时仍可尝试离线校验；不是已验证正文。全20秒约束所有remote connector/trust/root/guard/status，成功有界status后的SQLite CAS原子提交不被timeout中途取消，可能另有DB等待；不称为包含DBcommit的公开总时延。local terminal validation抽取 `remote_jobs_v4::validate_recorded_result(job:&RuntimeJobV4,result:&RuntimeResultV4)->Result<(),String>` 并在现有validate_observation复用。
 
-- [ ] **RED:** fakeConnector明确记录connect/root/status且生产路径零submit；当前profile/backend/key/root不符拒绝、metadata零connection、terminal零connection；ACKlost后的status、Store reopen、unknown、并发一致/不一致terminal、原receipt byte hash错/伪session/request/artifact拒绝；safeprojection secret+64KiB logs；敏感样式出现在4KiB之后或software map敏感键/值时，拒绝发生在CAS/receipt INSERT之前，旧job不变；safe结果字节/hash保持原值。fake time connect/root耗尽20秒仍不会invoke。
+- [x] **RED:** fakeConnector明确记录connect/root/status且生产路径零submit；当前profile/backend/key/root不符拒绝、metadata零connection、terminal零connection；ACKlost后的status、Store reopen、unknown、并发一致/不一致terminal、原receipt byte hash错/伪session/request/artifact拒绝；safeprojection secret+64KiB logs；敏感样式出现在4KiB之后或software map敏感键/值时，拒绝发生在CAS/receipt INSERT之前，旧job不变；safe结果字节/hash保持原值。fake time connect/root耗尽20秒仍不会invoke。
 
 ```rust
 assert_eq!(fake_transport.actions(), vec!["status"]);
@@ -73,10 +73,10 @@ assert!(!serde_json::to_string(&observation).unwrap().contains("secret-sentinel"
 assert_eq!(stored_after_timeout.state, stored_before_timeout.state);
 ```
 
-- [ ] **Run RED:** `cargo test -p omicsops-desktop --lib remote_job_commands`；Expected FAIL，缺commands/service/helper或identity/no-connect/whole-timeout断言失败。
-- [ ] **Implement:** 首先Store精确owner record；有validated terminal receipt直接public投影；其它路径读取当前project/profile并核对binding和trust，用20秒包connector+canonicalroot+status全链，status前重验当前绑定；已发出的只读请求不声称可原子撤回。共享validate_recorded_result在validate_observation返回typed结果前实施身份/限额/安全引用及敏感样式拒绝，覆盖所有持久化文本及结构敏感标签，固定error；不改原可接受结果字节/hash。复用remote_jobs_v4::query固定Some(job_id)、原backend/root及实际key；验证返回原job和结果，CAS沿原逻辑。timeout/unavailable安全观察不修改job；binding/identity失效固定拒绝。safe errors无底层字符串；projection将远端capture绝对archive路径只投影已验证job目录内相对引用。
-- [ ] **Run GREEN:** 上述及 `cargo test -p omicsops-desktop --lib remote_jobs_v4::tests` PASS；ignored live test数量明确记录。未运行真实SSH。
-- [ ] **Commit:** `feat: observe detached jobs with frozen identity checks`。
+- [x] **Run RED:** `cargo test -p omicsops-desktop --lib remote_job_commands`；Expected FAIL，缺commands/service/helper或identity/no-connect/whole-timeout断言失败。
+- [x] **Implement:** 首先Store精确owner record；有validated terminal receipt直接public投影；其它路径读取当前project/profile并核对binding和trust，用20秒包connector+canonicalroot+status全链，status前重验当前绑定；已发出的只读请求不声称可原子撤回。共享validate_recorded_result在validate_observation返回typed结果前实施身份/限额/安全引用及敏感样式拒绝，覆盖所有持久化文本及结构敏感标签，固定error；不改原可接受结果字节/hash。复用remote_jobs_v4::query固定Some(job_id)、原backend/root及实际key；验证返回原job和结果，CAS沿原逻辑。timeout/unavailable安全观察不修改job；binding/identity失效固定拒绝。safe errors无底层字符串；projection将远端capture绝对archive路径只投影已验证job目录内相对引用。
+- [x] **Run GREEN:** 上述及 `cargo test -p omicsops-desktop --lib remote_jobs_v4::tests` PASS；ignored live test数量明确记录。未运行真实SSH。
+- [x] **Commit:** `feat: observe detached jobs with frozen identity checks`。
 
 ### Task 3: 单项串行退避与独立列表面板
 
@@ -125,7 +125,7 @@ expect(screen.queryByRole("button", { name: /Cancel remote job/ })).not.toBeInTh
 
 ## 当前实施证据
 
-2026-10-07：Task1提交9d415c6/bad6feb经独立full/scoped审阅通过，无open finding。最终Store observation6/runtime_jobs12、先前desktop DTO3/DTO --lib22通过，fmt/diff通过。DTO初RED27为26缺类型+OUT_DIR基础设施，总数未误称纯缺接口；新增terminal退休metadata RED实际0pass/1fail→6pass。正常nonterminal None与retired body None保留；旧writer历史兼容性从committed blobs核对。Task2 host status、Task3 panel和Task4实际入口未实施；不得把leaf检查当完整W03交付或live验收。
+2026-10-07：Task1提交9d415c6/bad6feb经独立full/scoped审阅通过，无open finding。最终Store observation6/runtime_jobs12、先前desktop DTO3/DTO --lib22通过，fmt/diff通过。DTO初RED27为26缺类型+OUT_DIR基础设施，总数未误称纯缺接口；新增terminal退休metadata RED实际0pass/1fail→6pass。正常nonterminal None与retired body None保留；旧writer历史兼容性从committed blobs核对。Task2提交6e7519d已由独立审阅通过：service/gate14、remote3+1 ignored live、Store7/host1/fmt通过；before-CAS敏感gate与首次identity race均有实际RED，clock挂起partial结果未计PASS。Metadata EXISTS仅presence；remote20秒不含之后SQLite atomic commit等待。Task3 panel和Task4实际入口未实施；不得把leaf检查当完整W03交付或live验收。
 
 ## Plan Self-Review
 
