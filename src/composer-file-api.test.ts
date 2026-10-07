@@ -1,9 +1,20 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { parseClipboardFilePaths, parseWorkspaceFileDrag, resolveComposerClipboardPaths, listLocalComposerFiles, previewComposerFileText, createComposerQuote } from "./composer-file-api";
+import { previewProjectTable } from "./composer-file-api";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 afterEach(() => { Reflect.deleteProperty(window, "__TAURI_INTERNALS__"); vi.resetAllMocks(); });
+
+it("sends table preview as a nested source request without quote or conversation authority", async () => {
+  const reference = { kind: "workspace_file" as const, project_id: "p", backend_id: "ssh:c", relative_path: "data.CSV" };
+  await expect(previewProjectTable(reference)).rejects.toThrow("desktop");
+  expect(invoke).not.toHaveBeenCalled();
+  Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+  await previewProjectTable(reference);
+  expect(invoke).toHaveBeenCalledTimes(1);
+  expect(invoke).toHaveBeenCalledWith("preview_project_table", { request: { project_id: "p", backend_id: "ssh:c", relative_path: "data.CSV" } });
+});
 
 it("sends source-bound preview and quote requests without pretending to read in a browser", async () => {
   const reference = { kind: "workspace_file" as const, project_id: "p", backend_id: "local", relative_path: "notes.md" };

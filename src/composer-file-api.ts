@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { ComposerCatalogItem, ComposerReference, RemoteFileEntry, ComposerTextPreview, CreateComposerQuoteRequest } from "./types";
+import type { ProjectTablePreview, ProjectTablePreviewRequest } from "./types";
 
 export const WORKSPACE_FILE_DRAG_TYPE = "application/x-omicsops-workspace-file";
 export type WorkspaceFileReference = Extract<ComposerReference, { kind: "workspace_file" }>;
@@ -43,6 +44,12 @@ export async function resolveComposerClipboardPaths(projectId: string, paths: st
 export async function previewComposerFileText(reference: WorkspaceFileReference): Promise<ComposerTextPreview> {
   if (!("__TAURI_INTERNALS__" in window)) throw new Error("File previews require the desktop app.");
   return invoke("preview_composer_file_text", { projectId: reference.project_id, backendId: reference.backend_id, relativePath: reference.relative_path });
+}
+
+export async function previewProjectTable(reference: WorkspaceFileReference): Promise<ProjectTablePreview> {
+  if (!("__TAURI_INTERNALS__" in window)) throw new Error("File previews require the desktop app.");
+  const request: ProjectTablePreviewRequest = { project_id: reference.project_id, backend_id: reference.backend_id, relative_path: reference.relative_path };
+  return invoke("preview_project_table", { request });
 }
 
 export async function createComposerQuote(request: CreateComposerQuoteRequest): Promise<ComposerCatalogItem> {

@@ -1,0 +1,20 @@
+.table-preview-backdrop { position: fixed; inset: 0; z-index: 1080; background: #0008; display: grid; place-items: center; padding: 24px; }
+.table-preview-dialog { width: min(1100px, 100%); max-height: calc(100vh - 48px); overflow: auto; padding: 24px; background: var(--bg-panel, #fff); color: var(--text, #242424); border-radius: 14px; box-shadow: 0 16px 60px #0004; }
+.table-preview-dialog header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
+.table-preview-dialog h2 { margin: 0; }
+.table-preview-dialog p { line-height: 1.5; }
+.table-preview-dialog button { cursor: pointer; padding: 8px; border: 1px solid var(--border, #ddd); border-radius: 6px; background: var(--bg-panel, #fff); color: inherit; }
+.table-preview-source { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.table-preview-source code, .table-preview-hash code { overflow-wrap: anywhere; }
+.table-preview-source small { flex-basis: 100%; }
+.table-preview-accounting { display: flex; flex-wrap: wrap; gap: 16px 28px; font-size: 13px; }
+.table-preview-accounting dt { font-weight: 600; }
+.table-preview-accounting dd { margin: 4px 0 0; }
+.table-preview-hash { width: 100%; }
+.table-preview-hash small { display: block; margin-top: 5px; }
+.table-preview-limits, .table-preview-error { padding: 12px 12px 12px 28px; background: var(--bg-subtle, #f5f3ed); font-size: 13px; line-height: 1.6; }
+.table-preview-scroll { overflow: auto; max-height: 48vh; border: 1px solid var(--border, #ddd); }
+.table-preview-scroll table { border-collapse: collapse; min-width: 100%; font-size: 13px; }
+.table-preview-scroll th, .table-preview-scroll td { padding: 8px 12px; border: 1px solid var(--border, #ddd); white-space: pre-wrap; overflow-wrap: anywhere; min-width: 100px; max-width: 360px; vertical-align: top; }
+.table-preview-scroll th { position: sticky; top: 0; text-align: left; background: var(--bg-panel, #fff); }
+@media (max-width: 600px) { .table-preview-backdrop { padding: 8px; } .table-preview-dialog { padding: 16px; max-height: calc(100vh - 16px); } }

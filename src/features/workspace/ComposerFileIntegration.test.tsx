@@ -71,21 +71,23 @@ it("rejects cross-project internal drops without clearing the draft", () => {
 });
 
 it("previews explicitly and submits a stable quote while preserving the research draft", async () => {
-  const preview = vi.spyOn(fileApi, "previewComposerFileText").mockResolvedValue({ project_id: project.id, backend_id: fileReference.backend_id, relative_path: entry.relative_path, sha256: "a".repeat(64), text: "Selected evidence\nOther text" });
-  const quote: ComposerCatalogItem = { reference: { kind: "quote", project_id: project.id, id: "quote-a" }, label: "SSH counts.csv", description: "Selected evidence" };
+  const textEntry = { ...entry, relative_path: "notes.md" };
+  const textReference = { ...fileReference, relative_path: textEntry.relative_path };
+  const preview = vi.spyOn(fileApi, "previewComposerFileText").mockResolvedValue({ project_id: project.id, backend_id: textReference.backend_id, relative_path: textEntry.relative_path, sha256: "a".repeat(64), text: "Selected evidence\nOther text" });
+  const quote: ComposerCatalogItem = { reference: { kind: "quote", project_id: project.id, id: "quote-a" }, label: "SSH notes.md", description: "Selected evidence" };
   const create = vi.spyOn(fileApi, "createComposerQuote").mockResolvedValue(quote);
   const onSend = vi.fn().mockResolvedValue(true);
-  render(<WorkspaceShell {...props} remoteFiles={[entry]} onSend={onSend} />);
+  render(<WorkspaceShell {...props} remoteFiles={[textEntry]} onSend={onSend} />);
   fireEvent.change(input(), { target: { value: "Assess evidence" } });
   openFiles();
   expect(preview).not.toHaveBeenCalled();
-  fireEvent.click(screen.getByRole("button", { name: "Preview text counts.csv" }));
+  fireEvent.click(screen.getByRole("button", { name: "Preview text notes.md" }));
   const text = await screen.findByRole("textbox", { name: "File text" });
   (text as HTMLTextAreaElement).setSelectionRange(0, 17);
   fireEvent.select(text);
   fireEvent.click(screen.getByRole("button", { name: "Quote selected text" }));
-  await waitFor(() => expect(create).toHaveBeenCalledWith({ project_id: project.id, conversation_id: props.activeConversationId, backend_id: fileReference.backend_id, relative_path: entry.relative_path, sha256: "a".repeat(64), text: "Selected evidence" }));
-  await screen.findByRole("button", { name: "Remove reference: SSH counts.csv" });
+  await waitFor(() => expect(create).toHaveBeenCalledWith({ project_id: project.id, conversation_id: props.activeConversationId, backend_id: textReference.backend_id, relative_path: textEntry.relative_path, sha256: "a".repeat(64), text: "Selected evidence" }));
+  await screen.findByRole("button", { name: "Remove reference: SSH notes.md" });
   expect(input()).toHaveValue("Assess evidence");
   fireEvent.click(screen.getByRole("button", { name: "Send" }));
   await waitFor(() => expect(onSend).toHaveBeenCalledWith("Assess evidence", "chat", [quote.reference]));

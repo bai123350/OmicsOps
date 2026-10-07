@@ -10,6 +10,25 @@ const files = [
   { relative_path: "README.md", directory: false, size_bytes: 512, modified_unix_seconds: 0 },
 ];
 
+it("routes only CSV and TSV preview actions to the table while keeping text, attachment and drag separate", () => {
+  const onPreviewTable = vi.fn(); const onPreviewText = vi.fn(); const onAttach = vi.fn();
+  const reference = { kind: "workspace_file" as const, project_id: "p", backend_id: "ssh:c", relative_path: "data/A.CSV" };
+  render(<RemoteFileTree locale="en-US" remoteFiles={[...files, ...["data/A.CSV", "data/B.tSv", "data/C.xlsx"].map((relative_path) => ({ relative_path, directory: false, size_bytes: 9, modified_unix_seconds: 0 }))]} busy={false} onPreviewTable={onPreviewTable} onPreviewText={onPreviewText} onAttach={onAttach} dragReference={() => reference} />);
+  fireEvent.click(screen.getByRole("treeitem", { name: "Expand folder：data" }));
+  fireEvent.click(screen.getByRole("button", { name: "Preview table data/A.CSV" }));
+  fireEvent.click(screen.getByRole("button", { name: "Preview table data/B.tSv" }));
+  expect(onPreviewTable.mock.calls).toEqual([["data/A.CSV"], ["data/B.tSv"]]);
+  expect(onPreviewText).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Preview text data/C.xlsx" }));
+  expect(onPreviewText).toHaveBeenCalledWith("data/C.xlsx");
+  fireEvent.click(screen.getByRole("button", { name: "Attach reference data/A.CSV" }));
+  expect(onAttach).toHaveBeenCalledWith("data/A.CSV");
+  const setData = vi.fn();
+  fireEvent.dragStart(screen.getByText("A.CSV").closest('[role="treeitem"]')!, { dataTransfer: { setData } });
+  expect(setData).toHaveBeenCalledWith("application/x-omicsops-workspace-file", JSON.stringify(reference));
+  expect(screen.queryByRole("button", { name: "Preview text data/A.CSV" })).not.toBeInTheDocument();
+});
+
 describe("RemoteFileTree", () => {
   it("renders remote paths as a collapsed explorer hierarchy", () => {
     render(<RemoteFileTree locale="zh-CN" remoteFiles={files} busy={false} />);

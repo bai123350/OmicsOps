@@ -7,6 +7,7 @@ import { ComposerDraftStore } from "./composerDrafts";
 import * as referenceApi from "../../composer-reference-api";
 import * as api from "../../tauri-api";
 import * as attachmentApi from "../../composer-attachment-api";
+import * as fileApi from "../../composer-file-api";
 import type { SideChatController } from "./useSideChat";
 
 afterEach(() => vi.restoreAllMocks());
@@ -61,6 +62,57 @@ function deferred<T>() {
   const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 }
+
+it.each(["local", "ssh:c"])("opens readonly tables from actual %s tree without conversation or send authority", async (backend_id) => {
+  const table = vi.spyOn(fileApi, "previewProjectTable").mockResolvedValue({ project_id: project.id, backend_id, relative_path: "data.CSV", size_bytes: 8, read_bytes: 8, parsed_bytes: 8, sha256: "hash", hash_scope: "full", headers: ["gene"], rows: [["A"]], displayed_rows: 1, truncation_reasons: [], source_stability: "checked" });
+  const text = vi.spyOn(fileApi, "previewComposerFileText"); const quote = vi.spyOn(fileApi, "createComposerQuote"); const send = vi.fn();
+  const files = [{ relative_path: "data.CSV", directory: false, size_bytes: 8, modified_unix_seconds: 0 }, { relative_path: "notes.md", directory: false, size_bytes: 8, modified_unix_seconds: 0 }];
+  vi.spyOn(fileApi, "listLocalComposerFiles").mockResolvedValue(files);
+  renderShell({ project: { ...project, connection_id: backend_id === "local" ? null : "c" }, remoteFiles: files, conversationLocked: true, onSend: send });
+  fireEvent.click(screen.getByRole("button", { name: "Add context or choose mode" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: /Your files/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "Preview table data.CSV" }));
+  expect(await screen.findByRole("table")).toBeInTheDocument();
+  expect(table).toHaveBeenCalledWith({ kind: "workspace_file", project_id: project.id, backend_id, relative_path: "data.CSV" });
+  expect(text).not.toHaveBeenCalled(); expect(quote).not.toHaveBeenCalled(); expect(send).not.toHaveBeenCalled();
+  fireEvent.keyDown(window, { key: "Escape" });
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(screen.getByRole("tab", { name: "Files" })).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Preview text notes.md" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Attach reference data.CSV" })).not.toBeInTheDocument();
+});
+
+it.each(["project", "backend", "source"])("invalidates an open table when its %s changes", async (change) => {
+  const pending = deferred<import("../../types").ProjectTablePreview>();
+  vi.spyOn(fileApi, "previewProjectTable").mockReturnValue(pending.promise);
+  const files = [{ relative_path: "data.csv", directory: false, size_bytes: 8, modified_unix_seconds: 0 }];
+  const props = { project: { ...project, connection_id: "c" }, remoteFiles: files };
+  const view = renderShell(props);
+  fireEvent.click(screen.getByRole("button", { name: "Add context or choose mode" })); fireEvent.click(screen.getByRole("menuitem", { name: /Your files/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "Preview table data.csv" }));
+  expect(screen.getByRole("dialog")).toBeInTheDocument();
+  if (change === "source") fireEvent.click(screen.getByRole("button", { name: "Local" }));
+  else view.rerender(<WorkspaceShell locale="en-US" {...props} project={{ ...project, id: change === "project" ? "p2" : project.id, connection_id: change === "backend" ? "other" : "c" }} />);
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  await act(async () => pending.resolve({ project_id: project.id, backend_id: "ssh:c", relative_path: "data.csv", size_bytes: 8, read_bytes: 8, parsed_bytes: 8, sha256: "hash", hash_scope: "full", headers: ["OLD"], rows: [], displayed_rows: 0, truncation_reasons: [], source_stability: "checked" }));
+  expect(screen.queryByText("OLD")).not.toBeInTheDocument();
+});
+
+it("keeps non-table file previews on the full-text quote workflow", async () => {
+  const files = [{ relative_path: "notes.md", directory: false, size_bytes: 8, modified_unix_seconds: 0 }];
+  vi.spyOn(fileApi, "listLocalComposerFiles").mockResolvedValue(files);
+  const text = vi.spyOn(fileApi, "previewComposerFileText").mockResolvedValue({ project_id: project.id, backend_id: "local", relative_path: "notes.md", sha256: "complete-hash", text: "Complete source" });
+  const table = vi.spyOn(fileApi, "previewProjectTable");
+  const quote = vi.spyOn(fileApi, "createComposerQuote").mockResolvedValue({ reference: { kind: "quote", project_id: project.id, id: "q" }, label: "Selected quote", description: "From notes.md" });
+  renderShell({ activeConversationId: "conversation" });
+  fireEvent.click(screen.getByRole("button", { name: "Add context or choose mode" })); fireEvent.click(screen.getByRole("menuitem", { name: /Your files/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "Preview text notes.md" }));
+  const textarea = await screen.findByRole("textbox", { name: "File text" });
+  (textarea as HTMLTextAreaElement).setSelectionRange(0, 8); fireEvent.select(textarea);
+  fireEvent.click(screen.getByRole("button", { name: "Quote selected text" }));
+  await waitFor(() => expect(quote).toHaveBeenCalledWith({ project_id: project.id, conversation_id: "conversation", backend_id: "local", relative_path: "notes.md", sha256: "complete-hash", text: "Complete" }));
+  expect(text).toHaveBeenCalledTimes(1); expect(table).not.toHaveBeenCalled();
+});
 
 type ReceiptRoute = "send" | "queue" | "replacement" | "side" | "branch" | "fork";
 function receiptFixture(route: ReceiptRoute, submit: ReturnType<typeof vi.fn>, retry = vi.fn().mockResolvedValue(true)) {

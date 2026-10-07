@@ -729,6 +729,24 @@ export type ComposerReference =
   | { kind: "skill"; id: string };
 export type ComposerCatalogItem = { reference: ComposerReference; label: string; description: string };
 export interface ComposerTextPreview { project_id: string; backend_id: string; relative_path: string; sha256: string; text: string }
+
+export type TablePreviewHashScope = "full" | "prefix";
+export type TablePreviewStability = "checked" | "unknown";
+export type TablePreviewTruncation = "byte_limit" | "row_limit" | "cell_limit" | "incomplete_record" | "incomplete_utf8";
+export type TablePreviewErrorCode = "invalid_path" | "unsupported_format" | "invalid_utf8" | "malformed_table" | "column_limit" | "source_changed" | "read_failed" | "timeout" | "unavailable_backend";
+export interface ProjectTablePreviewRequest { project_id: string; backend_id: string; relative_path: string }
+export interface ProjectTablePreview extends ProjectTablePreviewRequest {
+  size_bytes: number | null;
+  read_bytes: number;
+  parsed_bytes: number;
+  sha256: string;
+  hash_scope: TablePreviewHashScope;
+  headers: string[];
+  rows: string[][];
+  displayed_rows: number;
+  truncation_reasons: TablePreviewTruncation[];
+  source_stability: TablePreviewStability;
+}
 export interface CreateComposerQuoteRequest { project_id: string; conversation_id: string; backend_id: string; relative_path: string; sha256: string; text: string }
 export interface ComposerAttachmentReceipt {
   id: string;
