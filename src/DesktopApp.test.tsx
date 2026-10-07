@@ -12,6 +12,7 @@ import * as referenceApi from "./composer-reference-api";
 import * as attachmentApi from "./composer-attachment-api";
 import * as usageApi from "./usage-settings-api";
 import * as navigationApi from "./workspace-navigation-api";
+import * as remoteJobsPanel from "./features/workspace/RemoteJobsPanel";
 import type { AgentRunEventV4, ComposerReference, ConversationAgentStateV4, ExecutionPlanV4, KernelEvent, ProposedPlanRevisionV4, RunSummaryV4, StopRunReceiptV4, SyncEntry, WorkspaceMessage } from "./types";
 
 const render = (ui: ReactNode) => testingRender(ui, { wrapper: AppearanceProvider });
@@ -89,6 +90,29 @@ function setupConversationStateHarness() {
 }
 
 describe("DesktopApp", () => {
+  it("passes the current project binding to remote job observation on load and settings update", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    const connection = { id: "connection-jobs", label: "Trusted cluster", host: "compute.example.org", port: 22, username: "scientist", authentication: "password" as const, authentication_reference: "ssh/connection-jobs", host_key_fingerprint: "SHA256:trusted" };
+    const nextConnection = { ...connection, id: "connection-jobs-next", label: "Next trusted cluster" };
+    const boundProject = { ...stateProject, connection_id: connection.id, remote_root: "/srv/original" };
+    vi.mocked(api.listProjects).mockResolvedValue([boundProject]);
+    vi.spyOn(api, "listConnections").mockResolvedValue([connection, nextConnection]);
+    vi.spyOn(api, "updateProjectRemote").mockResolvedValue({ ...boundProject, connection_id: nextConnection.id, remote_root: "/srv/changed" });
+    const panel = vi.spyOn(remoteJobsPanel, "RemoteJobsPanel").mockImplementation(({ bindingVersion }) => <output aria-label="Observation binding">{bindingVersion}</output>);
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    await waitFor(() => expect(screen.getByRole("textbox", { name: /描述研究目标/ })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Python 环境" }));
+    fireEvent.click(screen.getByRole("button", { name: "远端作业" }));
+    expect(screen.getByLabelText("Observation binding")).toHaveTextContent(JSON.stringify([connection.id, "/srv/original"]));
+    expect(panel.mock.calls.at(-1)?.[0]).toMatchObject({ projectId: stateProject.id, conversationId: stateConversations[0].id });
+    fireEvent.click(screen.getByRole("button", { name: "设置" })); fireEvent.click(screen.getByRole("button", { name: "环境" }));
+    fireEvent.change(screen.getByLabelText("Project SSH connection"), { target: { value: nextConnection.id } });
+    fireEvent.change(screen.getByLabelText("Remote project root"), { target: { value: "/srv/changed" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存项目绑定" }));
+    await waitFor(() => expect(screen.getByLabelText("Observation binding")).toHaveTextContent(JSON.stringify([nextConnection.id, "/srv/changed"])));
+  });
   it("restores composer text after leaving and reopening a project", async () => {
     const { stateSpy } = setupConversationStateHarness();
     stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));

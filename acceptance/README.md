@@ -421,6 +421,30 @@ these configurations; live model inference is a separate opt-in acceptance test.
 
 ## Detached remote job reconnection (opt-in Linux SSH)
 
+Windows deterministic UI observation regressions (mocked native commands, fake
+timers; no SSH, model, environment probe or Agent start):
+
+```text
+npx vitest run src/features/workspace/RuntimeDialog.test.tsx src/features/workspace/WorkspaceShell.test.tsx src/features/workspace/ResearchOverlays.test.tsx src/features/workspace/useRemoteJobs.test.tsx src/features/workspace/RemoteJobsPanel.test.tsx
+```
+
+Optional Windows desktop smoke with an existing disposable Linux SSH job: open
+Python/R environment -> Remote jobs. Confirm current conversation metadata and
+All project jobs use only the local list; unsupported backends safely show an
+empty list when no records exist. A frozen run still exposes this read-only entry
+without changing its compute selection. Immediately press Escape: only Remote
+jobs closes; a second Escape closes Runtimes. Select one original job and manually
+refresh. Explicitly enable automatic queries to check serial 2/4/8/16/30-second
+backoff and at most 10 attempts; close, switch project/conversation/binding, or
+reach a terminal state and confirm no subsequent query. Reopening or restarting
+must not restore the window. Stop local queries never cancels remote compute,
+resubmits code or resumes the Agent. Unknown/timeout/unavailable is not proof of
+remote failure. Retained receipt verification is local and corrupt receipts must
+reject without SSH fallback. Excerpts (4 KiB per stream) and safe references
+(at most 128) are bounded observations, not complete scientific evidence.
+These manual steps and the optional live test below are not established by a
+build or fake tests; record them as not executed unless actually performed.
+
 The deterministic tests reopen a temporary SQLite store, use a fresh mocked
 transport and Python subprocess stubs, and verify no resubmission. Run them with:
 

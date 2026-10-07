@@ -16,6 +16,19 @@ beforeEach(() => { vi.useFakeTimers(); vi.resetAllMocks(); vi.mocked(api.listRem
 afterEach(() => { cleanup(); expect(vi.getTimerCount()).toBe(0); vi.useRealTimers(); });
 
 describe("finite serial remote job observation", () => {
+  it.each(["remote_job_unavailable", "remote_job_timeout"])("continues thrown %s only to ten attempts", async (error) => {
+    vi.mocked(api.refreshRemoteJobV4).mockRejectedValue(error);
+    const { result } = await setup(); act(() => result.current.startPolling()); await tick(2000);
+    expect(result.current.error).toBe(error); expect(result.current.polling).toBe(true);
+    await tick(4000); expect(api.refreshRemoteJobV4).toHaveBeenCalledTimes(2);
+    await tick(900000); expect(api.refreshRemoteJobV4).toHaveBeenCalledTimes(10); expect(result.current.polling).toBe(false);
+  });
+  it.each(["remote_job_rejected", "remote_job_not_found"])("stops on thrown %s before a second request", async (error) => {
+    vi.mocked(api.refreshRemoteJobV4).mockRejectedValue(error);
+    const { result } = await setup(); act(() => result.current.startPolling()); await tick(2000);
+    expect(result.current.error).toBe(error); expect(result.current.polling).toBe(false);
+    await tick(900000); expect(api.refreshRemoteJobV4).toHaveBeenCalledTimes(1);
+  });
   it("lists metadata without refresh and ignores recreated scalar-equivalent scopes", async () => {
     const hook = await setup(); hook.rerender(); await tick(1000000);
     expect(api.listRemoteJobsV4).toHaveBeenCalledTimes(1);

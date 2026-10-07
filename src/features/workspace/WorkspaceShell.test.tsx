@@ -5,6 +5,7 @@ import * as preferencesApi from "../../conversation-preferences-api";
 import * as projectTemplatesApi from "../../project-templates-api";
 import * as workflowApi from "../../composer-workflow-api";
 import * as guidanceApi from "../../tauri-api";
+import * as remoteJobApi from "../../remote-job-api";
 import { WorkspaceShell } from "./WorkspaceShell";
 import { ComposerDraftStore } from "./composerDrafts";
 import * as branchApi from "../../conversation-branch-api";
@@ -69,6 +70,68 @@ function deferred<T>() {
 }
 
 describe("WorkspaceShell", () => {
+  it("opens metadata for the current owner without probing or starting compute and immediately escapes child then parent", async () => {
+    const list = vi.spyOn(remoteJobApi, "listRemoteJobsV4").mockResolvedValue({ jobs: [], limit: 100, remote_liveness_checked: false });
+    const refresh = vi.spyOn(remoteJobApi, "refreshRemoteJobV4");
+    const probe = vi.spyOn(guidanceApi, "agentV4ComputeBackends");
+    const onSend = vi.fn(); const onStartRun = vi.fn(); const onComputeBackendChange = vi.fn();
+    render(<WorkspaceShell project={project} locale="en-US" activeConversationId="current" onSend={onSend} onStartRun={onStartRun} onComputeBackendChange={onComputeBackendChange} />);
+    fireEvent.click(screen.getByRole("button", { name: "Python environment" }));
+    const entry = screen.getByRole("button", { name: "Remote jobs" }); entry.focus();
+    fireEvent.click(entry);
+    expect(screen.getByRole("dialog", { name: "Remote background jobs" })).toBeVisible();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Remote background jobs" })).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Runtimes" })).toBeVisible(); expect(entry).toHaveFocus();
+    expect(list).toHaveBeenCalledWith({ project_id: project.id, conversation_id: "current" });
+    expect(refresh).not.toHaveBeenCalled(); expect(probe).not.toHaveBeenCalled();
+    expect(onSend).not.toHaveBeenCalled(); expect(onStartRun).not.toHaveBeenCalled(); expect(onComputeBackendChange).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: /Cancel remote job/ })).not.toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" }); expect(screen.queryByRole("dialog", { name: "Runtimes" })).not.toBeInTheDocument();
+  });
+  it.each(["close", "project", "conversation", "connection", "root"])("stops the real child query window when owner %s changes", async (change) => {
+    vi.useFakeTimers();
+    const job = { project_id: project.id, conversation_id: "current", job_id: "job", run_id: "run", call_id: "call", backend_id: "ssh:one", language: "python", environment: "system", request_sha256: "hash", recorded_state: "running" as const, query_eligibility: "needs_root_check" as const, recorded_at: null };
+    vi.spyOn(remoteJobApi, "listRemoteJobsV4").mockResolvedValue({ jobs: [job], limit: 100, remote_liveness_checked: false });
+    const refresh = vi.spyOn(remoteJobApi, "refreshRemoteJobV4");
+    const owner = { ...project, connection_id: "one", remote_root: "/one" };
+    const view = render(<WorkspaceShell project={owner} locale="en-US" activeConversationId="current" />);
+    fireEvent.click(screen.getByRole("button", { name: "Python environment" })); fireEvent.click(screen.getByRole("button", { name: "Remote jobs" }));
+    await act(async () => { await Promise.resolve(); });
+    fireEvent.click(screen.getByRole("button", { name: "All project jobs" })); await act(async () => { await Promise.resolve(); });
+    fireEvent.click(screen.getByRole("button", { name: /job · python/ })); fireEvent.click(screen.getByRole("button", { name: "Start automatic queries" }));
+    if (change === "close") fireEvent.click(screen.getByRole("button", { name: "Close remote jobs" }));
+    view.rerender(<WorkspaceShell project={{ ...owner, ...(change === "project" ? { id: "other" } : change === "connection" ? { connection_id: "two" } : change === "root" ? { remote_root: "/two" } : {}) }} locale="en-US" activeConversationId={change === "conversation" ? "other" : "current"} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(900000); });
+    expect(refresh).not.toHaveBeenCalled();
+    view.unmount(); expect(vi.getTimerCount()).toBe(0);
+  });
+  it("opens jobs from a frozen run without changing the recorded boundary or execution controls", async () => {
+    const list = vi.spyOn(remoteJobApi, "listRemoteJobsV4").mockResolvedValue({ jobs: [], limit: 100, remote_liveness_checked: false });
+    const boundary = { project_id: project.id, source: { kind: "frozen_run" as const, run_id: "old-run" }, compute_selection: { schema_version: 4 as const, backend_id: "ssh:old", backend_kind: "ssh" as const, autonomy_mode: "supervised" as const, environment: "old-env", network_policy: "host_inherited" as const }, execution_location: "ssh_host" as const, isolation: "process" as const, limits: ["same_user_permissions" as const], interactive_lifecycle: "run_scoped_no_restart_reconnect" as const, detached_job_lifecycle: "ssh_linux_only" as const, verification: "not_checked_by_this_view" as const };
+    const readBoundary = vi.spyOn(guidanceApi, "agentV4RuntimeBoundary").mockResolvedValue(boundary);
+    const onStartRun = vi.fn(); const onSend = vi.fn(); const onComputeBackendChange = vi.fn(); const onComputeEnvironmentChange = vi.fn();
+    render(<WorkspaceShell project={{ ...project, connection_id: "current" }} locale="en-US" activeConversationId="current" onStartRun={onStartRun} onSend={onSend} onComputeBackendChange={onComputeBackendChange} onComputeEnvironmentChange={onComputeEnvironmentChange} agentRunEventsV4={[{ schema_version: 4, run_id: "old-run", project_id: project.id, conversation_id: "current", sequence: 1, occurred_at: "2026-10-07T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "run_spec_frozen", approval_hash: "a", spec_hash: "b" } }]} />);
+    fireEvent.click(screen.getByRole("button", { name: "Run environment" }));
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "Runtimes" })).toHaveTextContent("old-env"));
+    fireEvent.click(screen.getByRole("button", { name: "Remote jobs" }));
+    expect(list).toHaveBeenCalledWith({ project_id: project.id, conversation_id: "current" });
+    expect(readBoundary).toHaveBeenCalledTimes(1);
+    expect(readBoundary).toHaveBeenCalledWith({ source: "frozen_run", project_id: project.id, run_id: "old-run" });
+    expect(onStartRun).not.toHaveBeenCalled(); expect(onSend).not.toHaveBeenCalled(); expect(onComputeBackendChange).not.toHaveBeenCalled(); expect(onComputeEnvironmentChange).not.toHaveBeenCalled();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByRole("dialog", { name: "Runtimes" })).toHaveTextContent("old-env");
+    expect(screen.queryByRole("button", { name: "Ask Agent to prepare environment" })).not.toBeInTheDocument();
+  });
+  it("shows an empty metadata state on an unsupported local backend without querying status", async () => {
+    vi.spyOn(remoteJobApi, "listRemoteJobsV4").mockResolvedValue({ jobs: [], limit: 100, remote_liveness_checked: false });
+    const refresh = vi.spyOn(remoteJobApi, "refreshRemoteJobV4");
+    render(<WorkspaceShell project={project} locale="en-US" />);
+    fireEvent.click(screen.getByRole("button", { name: "Python environment" })); fireEvent.click(screen.getByRole("button", { name: "Remote jobs" }));
+    expect(await screen.findByText("No job records in this scope.")).toBeVisible();
+    expect(remoteJobApi.listRemoteJobsV4).toHaveBeenCalledWith({ project_id: project.id, conversation_id: null });
+    expect(refresh).not.toHaveBeenCalled();
+  });
   it.each(["empty", "edited", "edited then emptied", "existing", "not opened"] as const)("seeds branch text only into an unchanged empty target: %s", async (targetState) => {
     const store = new ComposerDraftStore();
     const source = { projectId: project.id, conversationId: "source" };

@@ -1449,7 +1449,7 @@ export default function DesktopApp() {
     onSuggestFollowUps={api.agentV4SuggestFollowUps}
     capabilitySummary={capabilities.summary} capabilitiesLoading={capabilities.loading}
     capabilitiesError={capabilities.error} onRefreshCapabilities={capabilities.refresh}
-    project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template }}
+    project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template, connection_id: selected.connection_id, remote_root: selected.remote_root }}
     workflowCatalogVersion={workflowCatalogVersion}
     locale={locale} onOpenSettings={(section = "models") => { setSettingsSection(section); setSettingsOpen(true); }} onBackToProjects={() => setSelected(null)}
     conversations={conversations} activeConversationId={conversation?.id} onSelectConversation={selectConversation} onNewConversation={newConversation} onOpenBranch={openCreatedBranch} onDeleteConversation={deleteConversation}

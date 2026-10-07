@@ -6,7 +6,7 @@ use omicsops_adapters::ssh::SshSession;
 use omicsops_core::{domain::ConnectionProfile, workspace::Project};
 use omicsops_dto::*;
 use omicsops_protocol::{RuntimeJobStateV4, RuntimeJobV4, RuntimeResultV4};
-use omicsops_store::Store;
+use omicsops_store::{Store, StoreError};
 use serde_json::Value;
 use std::{sync::Arc, time::Duration};
 use tauri::State;
@@ -14,7 +14,7 @@ use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
 use crate::{
-    commands::{AppState, connect_profile, find_profile, require_trusted_host},
+    commands::{AppState, connect_profile, require_trusted_host},
     composer_references::public_text,
     remote_jobs_v4::{self, Transport},
 };
@@ -23,6 +23,22 @@ const REJECTED: &str = "remote_job_rejected";
 const UNAVAILABLE: &str = "remote_job_unavailable";
 const TIMEOUT: &str = "remote_job_timeout";
 const NOT_FOUND: &str = "remote_job_not_found";
+
+// Keep typed recoverable reads separate from invalid persisted identities.
+// JSON/InvalidInput must fail closed; no error-message parsing or SSH fallback.
+fn store_error_code(error: StoreError) -> String {
+    match error {
+        StoreError::Database(_) | StoreError::Io(_) => UNAVAILABLE.into(),
+        _ => REJECTED.into(),
+    }
+}
+fn profile_error_status(error: String) -> RemoteJobObservationStatusV4 {
+    if error == UNAVAILABLE {
+        RemoteJobObservationStatusV4::Unavailable
+    } else {
+        RemoteJobObservationStatusV4::Rejected
+    }
+}
 
 pub(crate) struct BoundRemoteJobTransport {
     pub transport: Box<dyn Transport>,
@@ -84,7 +100,7 @@ impl RemoteJobConnector for DesktopConnector<'_> {
     ) -> Result<BoundRemoteJobTransport, RemoteJobObservationStatusV4> {
         let profile = current_profile(&self.state.repository, project, job)
             .await
-            .map_err(|_| RemoteJobObservationStatusV4::Rejected)?;
+            .map_err(profile_error_status)?;
         let session = connect_profile(self.state, &profile)
             .await
             .map_err(|_| RemoteJobObservationStatusV4::Unavailable)?;
@@ -177,12 +193,12 @@ pub(crate) async fn list_remote_jobs_with_store(
     let project = store
         .get_project(request.project_id)
         .await
-        .map_err(|_| UNAVAILABLE)?
+        .map_err(store_error_code)?
         .ok_or(NOT_FOUND)?;
     let rows = store
         .remote_job_metadata_v4(request.project_id, request.conversation_id)
         .await
-        .map_err(|_| REJECTED)?;
+        .map_err(store_error_code)?;
     Ok(RemoteJobsPageV4 {
         jobs: rows
             .into_iter()
@@ -213,9 +229,13 @@ async fn current_profile(
     {
         return Err(REJECTED.into());
     }
-    let profile = find_profile(store, connection_id)
+    let profile = store
+        .list_connections()
         .await
-        .map_err(|_| REJECTED)?;
+        .map_err(store_error_code)?
+        .into_iter()
+        .find(|profile| profile.id == connection_id)
+        .ok_or(REJECTED)?;
     require_trusted_host(&profile).map_err(|_| REJECTED)?;
     if profile.host_key_fingerprint.as_deref() != job.remote_host_key.as_deref()
         || profile
@@ -247,7 +267,7 @@ impl Transport for GuardedStatusTransport<'_> {
                 .store
                 .get_project(self.project.id)
                 .await
-                .map_err(|_| UNAVAILABLE)?
+                .map_err(store_error_code)?
                 .ok_or(REJECTED)?;
             if project.connection_id != self.project.connection_id
                 || project.remote_root != self.project.remote_root
@@ -346,7 +366,7 @@ pub(crate) async fn refresh_remote_job_with_connector(
     let recorded = store
         .remote_job_record_v4(request.project_id, request.job_id)
         .await
-        .map_err(|_| REJECTED)?
+        .map_err(store_error_code)?
         .ok_or(NOT_FOUND)?;
     if let Some(result) = &recorded.result {
         remote_jobs_v4::validate_recorded_result(&recorded.job, result).map_err(|_| REJECTED)?;
@@ -361,11 +381,11 @@ pub(crate) async fn refresh_remote_job_with_connector(
         let project = store
             .get_project(request.project_id)
             .await
-            .map_err(|_| RemoteJobObservationStatusV4::Unavailable)?
+            .map_err(|error| profile_error_status(store_error_code(error)))?
             .ok_or(RemoteJobObservationStatusV4::Rejected)?;
         let profile = current_profile(store, &project, &recorded.job)
             .await
-            .map_err(|_| RemoteJobObservationStatusV4::Rejected)?;
+            .map_err(profile_error_status)?;
         let bound = connector.connect(&project, &recorded.job).await?;
         if bound.canonical_root.as_str()
             != recorded
@@ -414,13 +434,14 @@ pub(crate) async fn refresh_remote_job_with_connector(
     };
     // Only the guarded remote status is deadline-bound. After a valid receipt,
     // query's existing SQLite CAS must finish atomically without cancellation.
-    let value = match remote_jobs_v4::query(
+    let value = match remote_jobs_v4::query_with_store_error_mapper(
         store,
         &transport,
         request.project_id,
         &recorded.job.context.backend_id,
         &bound.canonical_root,
         Some(request.job_id),
+        store_error_code,
     )
     .await
     {
@@ -524,6 +545,7 @@ mod tests {
             Arc<Mutex<Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>>>,
         )>,
         barrier: Option<Arc<tokio::sync::Barrier>>,
+        close_store: Option<Store>,
     }
     #[async_trait]
     impl crate::remote_jobs_v4::Transport for FakeTransport {
@@ -541,6 +563,9 @@ mod tests {
             }
             if self.fail {
                 return Err("password=secret-sentinel".into());
+            }
+            if let Some(store) = &self.close_store {
+                store.pool().close().await;
             }
             if let Some((store, slot)) = &self.hold_connection {
                 *slot.lock().unwrap() = Some(store.pool().acquire().await.unwrap());
@@ -611,6 +636,7 @@ mod tests {
                 fail: false,
                 hold_connection: None,
                 barrier: None,
+                close_store: None,
             },
             connects: Arc::new(AtomicUsize::new(0)),
             root: "/project".into(),
@@ -621,6 +647,129 @@ mod tests {
             profile_change: None,
             job_change: None,
         }
+    }
+    #[tokio::test]
+    async fn unavailable_record_read_does_not_reject_identity_or_connect() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (project, job) = fixture(&store).await;
+        store.pool().close().await;
+        let connector = connector();
+        assert_eq!(
+            refresh_remote_job_with_connector(&store, &connector, request(&project, &job))
+                .await
+                .unwrap_err(),
+            UNAVAILABLE
+        );
+        assert_eq!(connector.connects.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn typed_profile_read_preserves_unavailable_and_rejects_corrupt_json() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (project, job) = fixture(&store).await;
+        sqlx::query("UPDATE connections SET profile_json='{' WHERE id=?1")
+            .bind(project.connection_id.unwrap().to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            current_profile(&store, &project, &job).await.unwrap_err(),
+            REJECTED
+        );
+        let connector = connector();
+        assert_eq!(
+            refresh_remote_job_with_connector(&store, &connector, request(&project, &job))
+                .await
+                .unwrap_err(),
+            REJECTED
+        );
+        assert_eq!(connector.connects.load(Ordering::SeqCst), 0);
+        store.pool().close().await;
+        assert_eq!(
+            current_profile(&store, &project, &job).await.unwrap_err(),
+            UNAVAILABLE
+        );
+    }
+    #[test]
+    fn typed_store_classifier_retries_only_storage_failures() {
+        assert_eq!(
+            store_error_code(StoreError::Database(sqlx::Error::PoolClosed)),
+            UNAVAILABLE
+        );
+        assert_eq!(
+            store_error_code(StoreError::Io(std::io::Error::from(
+                std::io::ErrorKind::Interrupted
+            ))),
+            UNAVAILABLE
+        );
+        assert_eq!(
+            store_error_code(StoreError::InvalidInput("identity".into())),
+            REJECTED
+        );
+        assert_eq!(
+            store_error_code(StoreError::Json(
+                serde_json::from_str::<Value>("{").unwrap_err()
+            )),
+            REJECTED
+        );
+        assert_eq!(
+            profile_error_status(UNAVAILABLE.into()),
+            RemoteJobObservationStatusV4::Unavailable
+        );
+    }
+    #[tokio::test]
+    async fn shared_query_mapper_preserves_initial_read_failure_and_agent_diagnostic() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (project, job) = fixture(&store).await;
+        let connector = connector();
+        store.pool().close().await;
+        assert_eq!(
+            remote_jobs_v4::query_with_store_error_mapper(
+                &store,
+                &connector.transport,
+                project.id,
+                &job.context.backend_id,
+                "/project",
+                Some(job.job_id),
+                store_error_code
+            )
+            .await
+            .unwrap_err(),
+            UNAVAILABLE
+        );
+        assert_ne!(
+            remote_jobs_v4::query(
+                &store,
+                &connector.transport,
+                project.id,
+                &job.context.backend_id,
+                "/project",
+                Some(job.job_id)
+            )
+            .await
+            .unwrap_err(),
+            UNAVAILABLE
+        );
+        assert!(connector.transport.calls.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn shared_query_cas_and_reread_storage_failure_remains_unavailable() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (project, job) = fixture(&store).await;
+        let mut connector = connector();
+        connector.transport.close_store = Some(store.clone());
+        *connector.transport.response.lock().unwrap() = Some(receipt(&job));
+        let observed =
+            refresh_remote_job_with_connector(&store, &connector, request(&project, &job))
+                .await
+                .unwrap();
+        assert_eq!(observed.status, RemoteJobObservationStatusV4::Unavailable);
+        assert!(!observed.resubmitted);
+        assert!(observed.stdout_excerpt.is_empty());
+        assert_eq!(connector.transport.calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            connector.transport.calls.lock().unwrap()[0]["action"],
+            "status"
+        );
     }
     async fn fixture(store: &Store) -> (Project, RuntimeJobV4) {
         let profile = ConnectionProfile {

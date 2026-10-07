@@ -260,10 +260,33 @@ pub(crate) async fn query(
     root: &str,
     job_id: Option<Uuid>,
 ) -> Result<Value, String> {
+    query_with_store_error_mapper(
+        store,
+        transport,
+        project_id,
+        backend,
+        root,
+        job_id,
+        |error| error.to_string(),
+    )
+    .await
+}
+
+/// The desktop observation boundary preserves typed storage failures while the
+/// Agent wrapper retains its existing diagnostic contract.
+pub(crate) async fn query_with_store_error_mapper(
+    store: &Store,
+    transport: &dyn Transport,
+    project_id: Uuid,
+    backend: &str,
+    root: &str,
+    job_id: Option<Uuid>,
+    store_error: fn(omicsops_store::StoreError) -> String,
+) -> Result<Value, String> {
     let jobs = store
         .remote_runtime_jobs_v4(project_id, backend, root, job_id, transport.host_key())
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(store_error)?;
     if job_id.is_none() {
         return Ok(json!({"jobs":jobs,"limit":100,"remote_liveness_checked":false}));
     }
@@ -305,12 +328,12 @@ pub(crate) async fn query(
                             transport.host_key(),
                         )
                         .await
-                        .map_err(|e| e.to_string())?
+                        .map_err(store_error)?
                         .into_iter()
                         .next()
                         .ok_or("job disappeared")?;
                     if current.result_sha256.as_deref() != Some(&digest) {
-                        return Err(error.to_string());
+                        return Err(store_error(error));
                     }
                     current
                 }

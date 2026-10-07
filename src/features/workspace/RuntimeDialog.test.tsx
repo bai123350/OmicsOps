@@ -56,6 +56,13 @@ function renderDialog(overrides: Partial<React.ComponentProps<typeof RuntimeDial
 }
 
 describe("RuntimeDialog", () => {
+  it.each([false, true])("opens read-only remote jobs even when frozen=%s without preparing or changing language", (frozen) => {
+    const onOpenRemoteJobs = vi.fn(); const onPrepare = vi.fn(); const onLanguageChange = vi.fn();
+    renderDialog({ frozen, onOpenRemoteJobs, onPrepare, onLanguageChange });
+    fireEvent.click(screen.getByRole("button", { name: "Remote jobs" }));
+    expect(onOpenRemoteJobs).toHaveBeenCalledOnce();
+    expect(onPrepare).not.toHaveBeenCalled(); expect(onLanguageChange).not.toHaveBeenCalled();
+  });
   it("does not infer a probe when none is provided and states that variable inspection is unavailable", () => {
     renderDialog({ backend: undefined });
 

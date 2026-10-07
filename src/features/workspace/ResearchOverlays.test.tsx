@@ -3,10 +3,13 @@ import { beforeEach, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { WorkspaceResearchPages } from "./WorkspaceResearchPages";
 import { WorkspaceSearchDialog } from "./WorkspaceSearchDialog";
+import { WorkspaceShell } from "./WorkspaceShell";
 
 const { readFileSync } = await vi.importActual<{ readFileSync: (path: string, encoding: "utf8") => string }>("node:fs");
 const researchStyles = readFileSync("src/features/workspace/workspace-research-pages.css", "utf8");
 const searchStyles = readFileSync("src/features/workspace/workspace-search.css", "utf8");
+const runtimeStyles = readFileSync("src/features/workspace/runtime-dialog.css", "utf8");
+const remoteJobStyles = readFileSync("src/features/workspace/remote-jobs.css", "utf8");
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const source = { project_id: "p1", kind: "artifact", id: "a1", conversation_id: "c1", run_id: "r1", sequence: null, event_hash: null, content_sha256: null, start: null, end: null };
@@ -20,7 +23,20 @@ beforeEach(() => {
     if (command === "workspace_journey") return { entries: [{ source, title: "QC report", status: "unverified", occurred_at: "2026-09-22T01:00:00Z", summary: "Quality control" }], next_offset: null };
     if (command === "workspace_source_detail") return { source, title: "QC report", text: "Metadata", sha256: "hash", status: "unverified", metadata: {}, availability: "available" };
     if (command === "workspace_list_publications") return [];
+    if (command === "list_remote_jobs_v4") return { jobs: [], limit: 100, remote_liveness_checked: false };
   });
+});
+
+it("shows remote jobs visually above its runtime parent and escapes only the child", () => {
+  render(<><style>{runtimeStyles}{remoteJobStyles}</style><WorkspaceShell project={{ id: "p1", name: "Project", status: "ready", template: "blank" }} locale="en-US" /></>);
+  fireEvent.click(screen.getByRole("button", { name: "Python environment" }));
+  const runtime = screen.getByRole("dialog", { name: "Runtimes" });
+  fireEvent.click(screen.getByRole("button", { name: "Remote jobs" }));
+  const jobs = screen.getByRole("dialog", { name: "Remote background jobs" });
+  expect(zIndex(jobs)).toBeGreaterThan(zIndex(runtime));
+  fireEvent.keyDown(window, { key: "Escape" });
+  expect(jobs).not.toBeInTheDocument(); expect(runtime).toBeVisible();
+  fireEvent.keyDown(window, { key: "Escape" }); expect(runtime).not.toBeInTheDocument();
 });
 
 it("shows a later search above source details and immediately escapes only search", async () => {
