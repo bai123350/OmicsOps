@@ -9,6 +9,30 @@ const ready = (patch: Partial<KernelInspectionV4> = {}): KernelInspectionV4 => (
 function deferred() { let resolve!: (v: KernelInspectionV4) => void; const promise = new Promise<KernelInspectionV4>((r) => { resolve = r; }); return { resolve, promise }; }
 afterEach(() => vi.restoreAllMocks());
 describe("useKernelInspection", () => {
+  it.each(["reopen", "owner", "remount"])("keeps the uncancelled old native request visibly busy across %s without queueing", async (change) => {
+    const old = deferred(); const next = deferred();
+    const inspect = vi.spyOn(api, "inspectKernelV4").mockReturnValueOnce(old.promise).mockReturnValueOnce(next.promise);
+    const hook = renderHook(({ owner, enabled }) => useKernelInspection(owner, enabled), { initialProps: { owner: scope, enabled: true } });
+    let oldRequest!: Promise<void>; act(() => { oldRequest = hook.result.current.refresh(); });
+    const owner = change === "owner" ? { ...scope, runId: "next" } : scope;
+    if (change === "reopen") { hook.rerender({ owner, enabled: false }); hook.rerender({ owner, enabled: true }); }
+    if (change === "owner") hook.rerender({ owner, enabled: true });
+    if (change === "remount") hook.unmount();
+    const fresh = change === "remount" ? renderHook(() => useKernelInspection(owner, true)) : hook;
+    // Always settle the original Promise, including RED, so no gate leaks into later tests.
+    const busyWhileOldPending = fresh.result.current.loading;
+    await act(async () => { await fresh.result.current.refresh(); });
+    const callsWhileOldPending = inspect.mock.calls.length;
+    await act(async () => { old.resolve(ready()); await oldRequest; });
+    expect(busyWhileOldPending).toBe(true);
+    expect(callsWhileOldPending).toBe(1);
+    expect(fresh.result.current.loading).toBe(false); expect(fresh.result.current.value).toBeNull(); expect(inspect).toHaveBeenCalledTimes(1);
+    let nextRequest!: Promise<void>; act(() => { nextRequest = fresh.result.current.refresh(); });
+    expect(fresh.result.current.loading).toBe(true); expect(inspect).toHaveBeenCalledTimes(2);
+    await act(async () => { await fresh.result.current.refresh(); }); expect(inspect).toHaveBeenCalledTimes(2);
+    await act(async () => { next.resolve(ready({ run_id: owner.runId, session_id: "new", objects: [] })); await nextRequest; });
+    expect(fresh.result.current.value?.session_id).toBe("new"); expect(fresh.result.current.loading).toBe(false);
+  });
   it("inspection_refresh_is_manual_and_scope_bound", async () => {
     const inspect = vi.spyOn(api, "inspectKernelV4").mockResolvedValue(ready());
     const hook = renderHook(() => useKernelInspection(scope, true));

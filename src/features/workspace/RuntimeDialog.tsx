@@ -25,6 +25,7 @@ export interface RuntimeDialogProps {
   kernelInspectionOpen?: boolean;
   onOpenKernelInspection?: () => void;
   onCloseKernelInspection?: () => void;
+  focusActive?: boolean;
   frozen?: boolean;
 }
 
@@ -51,13 +52,14 @@ function probeStatus(language: KernelLanguage, backend?: ComputeBackendAvailabil
   return zh ? "尚未探测" : "Not detected";
 }
 
-function useDialogFocus() {
+function useDialogFocus(active: boolean) {
   const dialogRef = useRef<HTMLElement>(null); const closeRef = useRef<HTMLButtonElement>(null);
+  const activeRef = useRef(active); activeRef.current = active;
   useLayoutEffect(() => {
     const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const dialog = dialogRef.current; closeRef.current?.focus();
+    const dialog = dialogRef.current; if (activeRef.current) closeRef.current?.focus();
     function trap(event: KeyboardEvent) {
-      if (event.key !== "Tab" || Array.from(document.querySelectorAll('[role="dialog"]')).at(-1) !== dialog) return;
+      if (event.key !== "Tab" || !activeRef.current) return;
       const elements = Array.from(dialog?.querySelectorAll<HTMLElement>('button:not([disabled]), summary, [tabindex="0"]') ?? []).filter((item) => !item.hidden && window.getComputedStyle(item).display !== "none" && window.getComputedStyle(item).visibility !== "hidden");
       event.preventDefault(); event.stopImmediatePropagation();
       const index = elements.indexOf(document.activeElement as HTMLElement);
@@ -68,7 +70,7 @@ function useDialogFocus() {
   }, []);
   // A focused control can disappear when a boundary finishes loading.
   useLayoutEffect(() => {
-    if (Array.from(document.querySelectorAll('[role="dialog"]')).at(-1) !== dialogRef.current) return;
+    if (!activeRef.current) return;
     const active = document.activeElement;
     if (active === document.body || (active instanceof HTMLButtonElement && active.disabled && dialogRef.current?.contains(active))) closeRef.current?.focus();
   });
@@ -79,7 +81,7 @@ const inspectionLabels: Record<KernelInspectionStatusV4, [string, string]> = {
   ready: ["可观察 · 内存快照", "Ready · memory snapshot"], not_started: ["未启动 / 当前不可观察", "Not started / currently unobservable"], busy: ["忙碌，请稍后手动刷新", "Busy; refresh manually later"], stale_session: ["会话已改变，请手动刷新", "Stale session; refresh manually"], unavailable: ["当前不可观察", "Unavailable"],
 };
 function KernelInspectionDialog({ zh, language, value, loading, error, refresh, close }: { zh: boolean; language: KernelLanguage; value: KernelInspectionV4 | null; loading: boolean; error: boolean; refresh?: () => void; close: () => void }) {
-  const { dialogRef, closeRef } = useDialogFocus(); useWindowEscapeLayer(true, close);
+  const { dialogRef, closeRef } = useDialogFocus(true); useWindowEscapeLayer(true, close);
   const unknown = zh ? "未知" : "Unknown";
   return <div className="runtime-dialog-backdrop" style={{ zIndex: 130 }}>
     <section ref={dialogRef} className="runtime-dialog" style={{ height: "auto", maxHeight: "85vh", overflow: "auto" }} role="dialog" aria-modal="true" aria-labelledby="kernel-inspection-title">
@@ -87,7 +89,7 @@ function KernelInspectionDialog({ zh, language, value, loading, error, refresh, 
       <div className="runtime-details">
         <p>{zh ? "仅查看本次运行仍存活的内核。不会启动内核，也不保证暂停后仍可观察。仅手动刷新，无自动查询。" : "Observe an existing live kernel for this run. Viewing does not start a kernel or keep it alive while paused. Manual refresh only."}</p>
         {value && <small>{zh ? "来源" : "Source"}: {value.run_id} · {value.language}{value.session_id ? ` · ${value.session_id}` : ""}</small>}
-        <p role={error ? "alert" : "status"}>{error ? (zh ? "无法读取内核元数据，请手动重试。" : "Kernel metadata unavailable; retry manually.") : loading ? (zh ? "正在读取元数据…" : "Reading metadata…") : value ? inspectionLabels[value.status][zh ? 0 : 1] : (zh ? "尚未查看，请手动刷新。" : "Not viewed; refresh manually.")}</p>
+        <p role={error ? "alert" : "status"}>{error ? (zh ? "无法读取内核元数据，请手动重试。" : "Kernel metadata unavailable; retry manually.") : loading ? (zh ? "内核观察请求尚未结束；请在结束后手动刷新。关闭视图不会取消请求。" : "An inspection request is still pending; refresh manually when it finishes. Closing the view does not cancel the request.") : value ? inspectionLabels[value.status][zh ? 0 : 1] : (zh ? "尚未查看，请手动刷新。" : "Not viewed; refresh manually.")}</p>
         {!loading && !error && value?.status === "ready" && <>
           <p>{value.objects.length} {zh ? "个对象（最多 64 个）" : "objects (at most 64)"}{value.truncated ? ` · ${zh ? "结果已截断" : "Truncated"}` : ""}</p>
           <div style={{ overflowX: "auto" }}><table style={{ width: "100%", textAlign: "left", overflowWrap: "anywhere" }}><thead><tr>{(zh ? ["名称", "类型", "维度", "元素数", "摘要"] : ["Name", "Type", "Dimensions", "Elements", "Summary"]).map((label) => <th key={label}>{label}</th>)}</tr></thead><tbody>{value.objects.map((object, index) => <tr key={index}><td>{object.name}</td><td>{object.type_label}</td><td>{object.dimensions === null ? unknown : object.dimensions.length ? object.dimensions.join(" × ") : (zh ? "标量" : "Scalar")}</td><td>{object.element_count ?? unknown}</td><td>{object.summary}</td></tr>)}</tbody></table></div>
@@ -99,8 +101,10 @@ function KernelInspectionDialog({ zh, language, value, loading, error, refresh, 
   </div>;
 }
 
-export function RuntimeDialog({ zh, language, onLanguageChange, backend, boundary, boundaryLoading, boundaryError, onRetryBoundary, onClose, onSettings, onPrepare, onOpenRemoteJobs, kernelInspection = null, kernelInspectionLoading = false, kernelInspectionError = false, onRefreshKernelInspection, kernelInspectionOpen = false, onOpenKernelInspection, onCloseKernelInspection, frozen = false }: RuntimeDialogProps) {
-  const { dialogRef, closeRef } = useDialogFocus();
+export function RuntimeDialog({ zh, language, onLanguageChange, backend, boundary, boundaryLoading, boundaryError, onRetryBoundary, onClose, onSettings, onPrepare, onOpenRemoteJobs, kernelInspection = null, kernelInspectionLoading = false, kernelInspectionError = false, onRefreshKernelInspection, kernelInspectionOpen = false, onOpenKernelInspection, onCloseKernelInspection, focusActive = true, frozen = false }: RuntimeDialogProps) {
+  // Runtime covers the lower trajectory regardless of sibling DOM order;
+  // only its own child or the independent remote-jobs panel owns focus above it.
+  const { dialogRef, closeRef } = useDialogFocus(focusActive && !kernelInspectionOpen);
   const isFrozen = frozen || boundary?.source.kind === "frozen_run";
   const selection = boundary?.compute_selection;
   const matchingProbe = !isFrozen && boundary?.source.kind === "draft_selection" && backend !== undefined && selection !== undefined

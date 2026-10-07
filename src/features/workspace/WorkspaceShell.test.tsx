@@ -70,6 +70,55 @@ function deferred<T>() {
 }
 
 describe("WorkspaceShell", () => {
+  it("keeps an uncancelled inspection visibly pending after reopening, then requires an explicit fresh query", async () => {
+    const old = deferred<import("../../types").KernelInspectionV4>();
+    const metadata = { project_id: project.id, conversation_id: "current", run_id: "old-run", language: "python" as const, session_id: "old", status: "ready" as const, objects: [], truncated: false };
+    const inspect = vi.spyOn(guidanceApi, "inspectKernelV4").mockReturnValueOnce(old.promise).mockResolvedValueOnce({ ...metadata, session_id: "new" });
+    render(<WorkspaceShell project={project} locale="en-US" activeConversationId="current" agentRunEventsV4={[{ schema_version: 4, run_id: "old-run", project_id: project.id, conversation_id: "current", sequence: 1, occurred_at: "2026-10-07T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "run_spec_frozen", approval_hash: "a", spec_hash: "b" } }]} />);
+    fireEvent.click(screen.getByRole("button", { name: "Run environment" })); fireEvent.click(screen.getByRole("button", { name: "View kernel metadata" })); fireEvent.click(screen.getByRole("button", { name: "Refresh metadata" }));
+    fireEvent.keyDown(window, { key: "Escape" }); fireEvent.click(screen.getByRole("button", { name: "View kernel metadata" }));
+    const refresh = screen.getByRole("button", { name: "Refresh metadata" }); const disabledWhileOldPending = refresh.hasAttribute("disabled");
+    const pendingText = screen.getByRole("dialog", { name: "Kernel metadata" }).textContent;
+    fireEvent.click(refresh); expect(inspect).toHaveBeenCalledTimes(1);
+    await act(async () => { old.resolve({ ...metadata, objects: [{ name: "old_session_object", type_label: "opaque", dimensions: null, element_count: null, summary: "opaque" }] }); });
+    expect(disabledWhileOldPending).toBe(true); expect(pendingText).toMatch(/request.*pending/i);
+    expect(screen.queryByText("old_session_object")).not.toBeInTheDocument(); expect(inspect).toHaveBeenCalledTimes(1); expect(refresh).toBeEnabled();
+    fireEvent.click(refresh); await waitFor(() => expect(screen.getByRole("dialog", { name: "Kernel metadata" })).toHaveTextContent("new")); expect(inspect).toHaveBeenCalledTimes(2);
+  });
+  it("trajectory remains lower and later in DOM while Runtime and metadata own focus and Escape", async () => {
+    const pending = deferred<import("../../types").KernelInspectionV4>();
+    const retryBoundary = deferred<import("../../types").RuntimeBoundaryViewV4>();
+    vi.spyOn(guidanceApi, "agentV4RuntimeBoundary").mockRejectedValueOnce("unavailable").mockReturnValueOnce(retryBoundary.promise);
+    const inspect = vi.spyOn(guidanceApi, "inspectKernelV4").mockReturnValue(pending.promise);
+    render(<WorkspaceShell project={project} locale="en-US" activeConversationId="current" agentRunEventsV4={[{ schema_version: 4, run_id: "old-run", project_id: project.id, conversation_id: "current", sequence: 1, occurred_at: "2026-10-07T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "run_spec_frozen", approval_hash: "a", spec_hash: "b" } }]} />);
+    fireEvent.change(screen.getByRole("textbox", { name: /Describe a research goal/ }), { target: { value: "/trajectory" } });
+    fireEvent.click(screen.getByRole("option", { name: /\/trajectory/ }));
+    const trajectory = screen.getByRole("dialog", { name: "Run trajectory" });
+    const runEntry = within(trajectory).getByRole("button", { name: "Run environment" }); runEntry.focus(); fireEvent.click(runEntry);
+    const runtime = screen.getByRole("dialog", { name: "Runtimes" });
+    const retry = await within(runtime).findByRole("button", { name: "Retry boundary" }); retry.focus(); fireEvent.click(retry);
+    const parentClose = within(runtime).getByRole("button", { name: "Close runtimes" }); const focusedAfterControlRemoved = document.activeElement;
+    parentClose.blur(); const parentTab = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true }); window.dispatchEvent(parentTab);
+    const parentConsumedBodyTab = parentTab.defaultPrevented; const parentFocusedAfterTab = document.activeElement;
+    const entry = screen.getByRole("button", { name: "View kernel metadata" }); entry.focus(); fireEvent.click(entry);
+    const child = screen.getByRole("dialog", { name: "Kernel metadata" }); const close = within(child).getByRole("button", { name: "Close kernel metadata" });
+    expect(Array.from(document.querySelectorAll('[role="dialog"]')).at(-1)).toBe(trajectory);
+    close.blur(); const tab = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true }); window.dispatchEvent(tab);
+    const consumedBodyTab = tab.defaultPrevented; const focusedAfterBodyTab = document.activeElement;
+    fireEvent.click(within(child).getByRole("button", { name: "Refresh metadata" }));
+    const closeFocusedWhileLoading = document.activeElement === close;
+    close.blur(); fireEvent.click(screen.getByRole("tab", { name: "R" })); const recoveredAfterScopeReset = document.activeElement === close;
+    await act(async () => {
+      pending.resolve({ project_id: project.id, conversation_id: "current", run_id: "old-run", language: "python", session_id: "old", status: "ready", objects: [], truncated: false });
+      retryBoundary.resolve({ project_id: project.id, source: { kind: "frozen_run", run_id: "old-run" }, compute_selection: { schema_version: 4, backend_id: "local", backend_kind: "local", autonomy_mode: "supervised", environment: "system", network_policy: "host_inherited" }, execution_location: "local_host", isolation: "process", limits: ["same_user_permissions"], interactive_lifecycle: "run_scoped_no_restart_reconnect", detached_job_lifecycle: "unsupported", verification: "not_checked_by_this_view" });
+    });
+    expect(focusedAfterControlRemoved).toBe(parentClose); expect(parentConsumedBodyTab).toBe(true); expect(parentFocusedAfterTab).toBe(parentClose);
+    expect(consumedBodyTab).toBe(true); expect(focusedAfterBodyTab).toBe(close); expect(closeFocusedWhileLoading).toBe(true); expect(recoveredAfterScopeReset).toBe(true);
+    close.blur(); fireEvent.keyDown(window, { key: "Tab", shiftKey: true }); expect(within(child).getByRole("button", { name: "Refresh metadata" })).toHaveFocus();
+    fireEvent.keyDown(document.body, { key: "Escape" }); expect(entry).toHaveFocus(); expect(runtime).toBeVisible(); expect(trajectory).toBeVisible();
+    fireEvent.keyDown(window, { key: "Escape" }); expect(screen.queryByRole("dialog", { name: "Runtimes" })).not.toBeInTheDocument(); expect(runEntry).toHaveFocus(); expect(trajectory).toBeVisible();
+    expect(inspect).toHaveBeenCalledTimes(1);
+  });
   it.each(["close", "project", "conversation", "language", "run"])("real live-run inspection discards late objects after %s", async (change) => {
     const pending = deferred<import("../../types").KernelInspectionV4>();
     const inspect = vi.spyOn(guidanceApi, "inspectKernelV4").mockReturnValue(pending.promise);
