@@ -40,7 +40,7 @@
 | --- | --- | --- | --- | --- |
 | W01 | [文字草稿](2026-10-04-wisp-w01-composer-drafts.md) | 3 | 跨项目/会话恢复文字，旧回执只清理原revision | 已实现、3任务审阅通过 |
 | W02 | [表格预览](2026-10-04-wisp-w02-table-preview.md) | 4 | 本地/SSH CSV/TSV有界逻辑记录、来源/hash/truncation | 已实现、4任务审阅通过 |
-| W03 | [远端作业](2026-10-04-wisp-w03-remote-jobs.md) | 4 | metadata列表、手动status与明确启用的有限退避 | 进行中，3/4任务审阅通过 |
+| W03 | [远端作业](2026-10-04-wisp-w03-remote-jobs.md) | 4 | metadata列表、手动status与明确启用的有限退避 | 已实现、4任务审阅通过 |
 | W04 | [内核观察](2026-10-04-wisp-w04-kernel-inspection.md) | 5 | 活着的Python/R metadata，不隐式启动或执行对象方法 | 待实施 |
 | W05 | [手动压缩](2026-10-04-wisp-w05-context-compaction.md) | 5 | 暂停ordinary run真正原子保存可恢复checkpoint | 待实施 |
 | W06 | [运行诊断](2026-10-04-wisp-w06-run-diagnostics.md) | 4 | run/tool/失败筛选、精确来源定位、脱敏HTML/JSON | 待实施 |
@@ -74,7 +74,7 @@ W07只需W02 Task1叶子，不需要table/SSH界面；W10/W11只需W09 Task1的�
 
 - [x] 1. W01 Task1–3：版本草稿、应用导航、全发送回执。
 - [x] 2. W02 Task1–4：共享handle、parser/DTO、source/command、真实表格UI。
-- [ ] 3. W03 Task1–4：metadata、身份status、退避panel、Runtime入口/边界说明。
+- [x] 3. W03 Task1–4：metadata、身份status、退避panel、Runtime入口/边界说明。
 - [ ] 4. W08b Task1–3：helper正确行为基线、错误传播、统一Python CI。
 - [ ] 5. W04 Task1–5：非启动contract、两套worker、weak registry、Runtime观察UI。
 - [ ] 6. W05 Task1–5：旧hash兼容、candidate/final准入、atomicStore、宿主租约、UI/恢复。

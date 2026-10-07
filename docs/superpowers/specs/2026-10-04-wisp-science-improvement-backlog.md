@@ -70,7 +70,9 @@ P0 表示优先解决可能影响操作正确性的问题；P1 表示直接改�
 
 ## W03 SSH 后台作业面板
 
-**参考事实：**上游[作业卡片][w-jobs-ui]与[退避查询][w-jobs-poll]展示日志、状态和作业操作。OmicsOps 的[remote_jobs_v4.rs](../../../src-tauri/src/remote_jobs_v4.rs)已实现按原 job 身份重连查询，RuntimeDialog 明确当前无自动轮询和取消。
+**实施状态：**metadata列表、原身份只读status、明确启用的有限10次退避与真实执行环境入口已实现，四任务独立审阅及必要复审通过（9d415c6/bad6feb、6e7519d、1aaafca、0c4be6e/e8fe4ec）。2026-10-08最终Rust1613通过/17 ignored、frontend1220+22、Web/native/fmt/diff通过；存储临时不可用继续有限窗口，结构损坏永久拒绝，均有真实RED/GREEN。GUI/安装/liveSSH/模型/Node22 CI及最终clean HEAD验证未执行，不冒称生产端到端通过。实际证据与保守腐败记录拒绝代价见[W03计划](../plans/2026-10-04-wisp-w03-remote-jobs.md)。
+
+**对照基线事实：**上游[作业卡片][w-jobs-ui]与[退避查询][w-jobs-poll]展示日志、状态和作业操作。原OmicsOps的[remote_jobs_v4.rs](../../../src-tauri/src/remote_jobs_v4.rs)已有按原 job 身份重连查询，RuntimeDialog当时无自动轮询和取消；当前新增手动默认/明确开启的有限窗口，仍无远端取消。
 
 **建议切片：**先复用现有 Store 和查询契约提供项目作业列表、手动刷新、有界日志、完成产物引用。自动查询作为后续受控开关，仅查询已授权且身份核验通过的绑定；切项目、解绑、终态或关闭面板停止查询，失败退避。
 

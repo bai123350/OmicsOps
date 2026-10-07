@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust/sqlx/Tokio、现有 remote_jobs_v4 Transport与SshSession、Tauri 2、React 19/TypeScript/Vitest；无新表或依赖。
 
-**Spec:** [W03 设计](../specs/2026-10-04-wisp-composer-files-jobs-design.md#w03ssh-后台作业列表与查询)、[共同约束](../specs/2026-10-04-wisp-improvements-design.md)。设计及8515da8实施计划已确认；Task1–3已独立审阅/必要fix复审通过；Task4实际入口/full gate及跨task读错误分类followup待实施。
+**Spec:** [W03 设计](../specs/2026-10-04-wisp-composer-files-jobs-design.md#w03ssh-后台作业列表与查询)、[共同约束](../specs/2026-10-04-wisp-improvements-design.md)。设计及8515da8实施计划已确认；四任务均已独立审阅及必要fix复审通过。真实GUI/SSH/模型验收与最终clean committed HEAD验证尚未执行。
 
 ## Global Constraints
 
@@ -103,11 +103,11 @@ expect(maxConcurrentRefreshes).toBe(1);
 
 ### Task 4: 执行环境入口与准确边界文档
 
-**Files:** Modify `src/features/workspace/RuntimeDialog.tsx`、`RuntimeDialog.test.tsx`、`WorkspaceShell.tsx`、`WorkspaceShell.test.tsx`、`ResearchOverlays.test.tsx`、`README.md`、`AGENTS.md`、`acceptance/README.md`；窄幅 `src-tauri/src/remote_job_commands.rs`（typed recoverable read→Unavailable、真正integrity/identity/trust/receipt→Rejected）与 `useRemoteJobs.test.tsx`（thrown错误继续/停止合同，client配置不改）。
+**Files:** Modify `src/features/workspace/RuntimeDialog.tsx`、`RuntimeDialog.test.tsx`、`WorkspaceShell.tsx`、`WorkspaceShell.test.tsx`、`ResearchOverlays.test.tsx`、`README.md`、`AGENTS.md`、`acceptance/README.md`；窄幅 `src-tauri/src/remote_job_commands.rs`（typed recoverable read→Unavailable、真正integrity/identity/trust/receipt→Rejected）与 `useRemoteJobs.test.tsx`（thrown错误继续/停止合同，client配置不改）；窄幅 `src-tauri/src/remote_jobs_v4.rs` 共享 typed-store-error mapper helper，原query wrapper/Agent语义保留，避免initial read/CAS/reread错误擦除后字符串猜测；窄幅 `src/DesktopApp.tsx` / `DesktopApp.test.tsx`（真实WorkspaceShell project props透传selected.connection_id/remote_root及initial/Settings更新回归，仅现有字段）。
 
-**Interfaces:** RuntimeDialog Props加 `onOpenRemoteJobs?:()=>void`；WorkspaceShell持RemoteJobsPanel状态，project/conversation/current binding变化影响UI generation；共享RuntimeDialog与W04内核观察入口按总计划串行集成。readonlyjob入口不因FrozenRun而改选执行环境，不启动Agent。
+**Interfaces:** RuntimeDialog Props加 `onOpenRemoteJobs?:()=>void`；WorkspaceShell持RemoteJobsPanel状态，project/conversation/current binding变化影响UI generation；共享RuntimeDialog与W04内核观察入口按总计划串行集成。readonlyjob入口不因FrozenRun而改选执行环境，不启动Agent。审阅发现 Store `json_extract` 可先于 serde 将损坏 job JSON 转成通用 Database 错误；Task4窄幅扩展 `crates/omicsops-store/src/runtime_jobs.rs` 及最近 Store/native 回归，以 guarded `json_valid` 谓词让关系作用域内损坏记录进入既有 typed integrity 拒绝。合法 detached/binding 筛选、ownership/conversation/selected-job、limit及旧 non-detached 排除保持；真正 Database/Io 仍 recoverable，不按底层字符串猜错，也不新增 status fallback。
 
-- [ ] **RED:** host typed-read-error安全分类与hook thrown unavailable/timeout有限继续、rejected/not_found停止；DB读失败不得伪称identity失败，结构完整性仍fail closed/no fallback。RuntimeDialog有效入口显示project/current conversation jobs、FrozenRun仍只读、列表不触环境probe/Agent；父RuntimeDialog打开子Panel立即Escape只关子，第二次才关父；close/scope stop schedule；无支持后端安全空态。W04入口和两者window堆栈同时回归。
+- [x] **RED:** host typed-read-error安全分类与hook thrown unavailable/timeout有限继续、rejected/not_found停止；DB读失败不得伪称identity失败，结构完整性仍fail closed/no fallback。RuntimeDialog有效入口显示project/current conversation jobs、FrozenRun仍只读、列表不触环境probe/Agent；父RuntimeDialog打开子Panel立即Escape只关子，第二次才关父；close/scope stop schedule；无支持后端安全空态。W04入口和两者window堆栈同时回归。
 
 ```tsx
 fireEvent.click(screen.getByRole("button", { name: "Remote jobs" }));
@@ -118,14 +118,16 @@ expect(startAgent).not.toHaveBeenCalled();
 expect(screen.queryByRole("button", { name: /Cancel remote job/ })).not.toBeInTheDocument();
 ```
 
-- [ ] **Run RED:** `npx vitest run src/features/workspace/RuntimeDialog.test.tsx src/features/workspace/WorkspaceShell.test.tsx src/features/workspace/ResearchOverlays.test.tsx`；缺入口/stack/stop断言应FAIL。
-- [ ] **Implement:** 加入口并接入应用级/局部清理的window Escape层。README/AGENTS当前“没有自动轮询/面板”替换为“手动默认、面板明确启用有限10次窗口”；仍无job cancel/跨重启自动轮询/交互kernel重连，停止Agent仍不终止独立后台作业。acceptance写Windows fake操作及可选一次性Linux SSH真实smoke，不能宣称已运行。
-- [ ] **Run GREEN:** 同命令，继而 `cargo fmt --all -- --check`、`cargo test --workspace`、`npm test`、`npm run build`、`npm run build:desktop`、`git diff --check`。记录非零/ignored/未执行，锁变化npm ci，pure fmt独立提交。
-- [ ] **Commit:** `feat: expose remote job observation in runtime workspace`；仅验证实际通过后更新清单。
+- [x] **Run RED:** `npx vitest run src/features/workspace/RuntimeDialog.test.tsx src/features/workspace/WorkspaceShell.test.tsx src/features/workspace/ResearchOverlays.test.tsx`；缺入口/stack/stop断言应FAIL。
+- [x] **Implement:** 加入口并接入应用级/局部清理的window Escape层。README/AGENTS当前“没有自动轮询/面板”替换为“手动默认、面板明确启用有限10次窗口”；仍无job cancel/跨重启自动轮询/交互kernel重连，停止Agent仍不终止独立后台作业。acceptance写Windows fake操作及可选一次性Linux SSH真实smoke，不能宣称已运行。
+- [x] **Run GREEN:** 同命令，继而 `cargo fmt --all -- --check`、`cargo test --workspace`、`npm test`、`npm run build`、`npm run build:desktop`、`git diff --check`。记录非零/ignored/未执行，锁变化npm ci，pure fmt独立提交。
+- [x] **Commit:** `feat: expose remote job observation in runtime workspace`；仅验证实际通过后更新清单。
 
 ## 当前实施证据
 
-2026-10-07：Task1提交9d415c6/bad6feb经独立full/scoped审阅通过，无open finding。最终Store observation6/runtime_jobs12、先前desktop DTO3/DTO --lib22通过，fmt/diff通过。DTO初RED27为26缺类型+OUT_DIR基础设施，总数未误称纯缺接口；新增terminal退休metadata RED实际0pass/1fail→6pass。正常nonterminal None与retired body None保留；旧writer历史兼容性从committed blobs核对。Task2提交6e7519d已由独立审阅通过：service/gate14、remote3+1 ignored live、Store7/host1/fmt通过；before-CAS敏感gate与首次identity race均有实际RED，clock挂起partial结果未计PASS。Metadata EXISTS仅presence；remote20秒不含之后SQLite atomic commit等待。Task3提交1aaafca独立frontend review通过；focused33/type+Web2036通过，app-window gate/AllProject owner lifetime/focus均有真实RED。Cross-task Minor：native把所有读错误映射rejected，Task4必须区分recoverable unavailable并补host/hook错误合同测试，尚未关闭。Task4实际入口与完整W03交付/live验收未执行。
+2026-10-07：Task1提交9d415c6/bad6feb经独立full/scoped审阅通过，无open finding。最终Store observation6/runtime_jobs12、先前desktop DTO3/DTO --lib22通过，fmt/diff通过。DTO初RED27为26缺类型+OUT_DIR基础设施，总数未误称纯缺接口；新增terminal退休metadata RED实际0pass/1fail→6pass。正常nonterminal None与retired body None保留；旧writer历史兼容性从committed blobs核对。Task2提交6e7519d已由独立审阅通过：service/gate14、remote3+1 ignored live、Store7/host1/fmt通过；before-CAS敏感gate与首次identity race均有实际RED，clock挂起partial结果未计PASS。Metadata EXISTS仅presence；remote20秒不含之后SQLite atomic commit等待。Task3提交1aaafca独立frontend review通过；focused33/type+Web2036通过，app-window gate/AllProject owner lifetime/focus均有真实RED。其cross-task读错误分类Minor由Task4后续实现及复审关闭。
+
+2026-10-08：Task4提交0c4be6e/e8fe4ec经full及scoped独立审阅通过。真实Runtime入口、Desktop初始/Settings绑定透传、立即Escape顶层/焦点恢复和scope停止均有回归；typed mapper在initial read/CAS/reread保留临时存储不可用，损坏job/receipt与身份拒绝永久停止，不猜底层字符串。审阅I1的实际RED为Store4失败/native1失败；guarded json_valid让关系作用域内损坏JSON进入typed拒绝，foreign project/conversation/selected-job腐败不影响当前请求，合法legacy及filter-before-limit保持。此保守策略可能阻止损坏项目记录的观察，不扩大授权或回退SSH。最终closest Store24/native29+1 ignored/hook23；完整Rust1613通过/17 ignored、frontend1220+extension22、TypeScript/Web2039模块、fmt/diff和Windows native构建通过（release2m37s，NSIS仅生成）。此前Desktop fixture真实1219通过/1失败与所有RED/挂起日志保留，条件ready修正后通过，不提高timeout。Python bridge先前5通过；原生GUI/安装、真实SSH/模型/R/Micromamba/GPU、Node22 CI和W04双入口集成未执行。检查使用含外部未提交工作树，最终clean HEAD隔离验证另行执行；外部acceptance/core/agent工作完整保留且未暂存。仍有既存Vite大chunk/native linker/dead-code/incremental warnings，非此项blocking finding。
 
 ## Plan Self-Review
 
