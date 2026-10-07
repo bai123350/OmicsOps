@@ -32,3 +32,38 @@ editing in Settings to adopt new data. Recreating a profile also adopts it.
 API host matching follows the application's provider contract; model IDs are
 case sensitive and gateway prefixes are significant. A model listing is capability
 metadata, not proof that an account can access that model.
+
+# Offline Python regressions
+
+From the repository root, run the bundled helper suite first, then all script
+regressions through standard-library unittest discovery:
+
+```text
+python -B -m unittest discover -s scripts -p "test_bundled_skill_helpers.py" -v
+python -B -m unittest discover -s scripts -p "test_*.py" -v
+```
+
+The unified command includes model catalog, remote job bridge, kernel inspection
+and bundled helper tests. Windows CI uses Python 3.12 after `npm ci` and before
+`cargo test --workspace`, followed by `npm test` and `npm run build` on Node 22.
+The Python tests use the standard library; no pip install, real credentials,
+network, SSH, GPU or R is required. `-B` avoids generating `.pyc` files.
+
+`test_bundled_skill_helpers.py` loads only the fixed bundled `paper-narrative`,
+`literature-review` and `figure-style` runtime sources into fresh `__main__`
+namespaces. It checks claim/path pairing, literature success versus failure,
+unknown DOI verification, safe errors, load side effects and crop coordinates
+with isolated environment, HTTP and plotting fixtures. `panel_crops` returns
+coordinates only; these tests never crop or write images. Discovery requires all
+three nonempty behavior groups. A local deliberately failing case must yield an
+unsuccessful `TestResult`; it is excluded from normal discovery.
+
+Bundle/hash checks establish packaged source identity. Helper PASS establishes
+behavior under controlled inputs. Scripted V4 PASS establishes only the runtime
+contracts exercised by its own fixtures; helper output is not part of V4 model
+call counts or suite hashes. The W08 V4 scenario manifest/runner/report work is
+still pending independently of this helper CI increment. Local PASS does not
+mean the updated GitHub CI has run or that all 26 Skills, scientific dependencies
+or scientific conclusions have been validated. Real model/SSH/R/PBMC acceptance
+remains opt-in and unexecuted for this increment; follow
+[`acceptance/README.md`](../acceptance/README.md) separately.

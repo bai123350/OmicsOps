@@ -117,6 +117,36 @@ Skills 的原始文件哈希见 `skills/wisp-science/SOURCE.json`，原许可与
 不依赖真实 SSH、模型或公共数据库。构建与工具发现成功不代表所有公网端点、
 可选依赖或科研工作流已通过端到端验收。实际检查结果记录在实施计划末尾。
 
+## 自动回归的证据范围
+
+从仓库根目录运行三个已捆绑 helper 的近端检查，再运行统一 Python discovery：
+
+```text
+python -B -m unittest discover -s scripts -p "test_bundled_skill_helpers.py" -v
+python -B -m unittest discover -s scripts -p "test_*.py" -v
+```
+
+这些标准库测试只加载固定的 `paper-narrative`、`literature-review` 和
+`figure-style` 源文件，隔离环境与 mock，检查 claim/path 配对、检索失败与零结果
+的区别、DOI unknown、错误脱敏和加载副作用。图形替身只验证 `panel_crops`
+返回的像素坐标，不安装 matplotlib/Pillow，不裁切或写入图片；不使用真实凭据、
+网络、SSH、GPU 或 R。三组行为测试必须均可发现且非空，正常失败通过 unittest
+结果与退出码传播。
+
+| 检查 | PASS 能证明的范围 |
+| --- | --- |
+| bundle/hash | 捆绑资源完整、来源哈希与冻结内容匹配，不证明脚本可执行。 |
+| helper unittest | 三个固定 helper 在受控输入与替身下的行为，不证明全部 26 个 Skills 或科学依赖可用。 |
+| scripted V4 | 已执行的脚本模型/工具 fixture 所覆盖的运行时契约，不证明真实 provider 或科学结论。 |
+| live acceptance | 仅实际显式执行的真实模型、SSH 或科研流程；未执行/被忽略不算通过。 |
+
+本 helper 增量的本地测试通过与 GitHub CI 实际通过分别记录；CI 配置为 Windows、
+Python 3.12 与 Node 22，修改配置本身不是 CI 运行证据。helper 输出不汇入 V4
+模型调用计数或 suite hash。W08 的 V4 场景 manifest、runner 和报告仍待独立交付，
+整个 W08 尚未完成。本增量未执行真实模型、SSH、R、GPU、PBMC 或原生 UI 验收，
+也不修改 Skills 源码、SOURCE pin、哈希或冻结规则。真实验收另见
+[acceptance/README.md](../acceptance/README.md)。
+
 ## 项目文件记忆
 
 保存、检索、计数统一使用 `<项目目录>/.omicsops/memory/` 第一层 UTF-8 Markdown

@@ -534,5 +534,36 @@ class FigureStyleTests(unittest.TestCase):
                              {"a": (10, 20, 60, 80)})
 
 
+class HelperDiscoveryTests(unittest.TestCase):
+    def test_all_three_helper_behavior_groups_are_discoverable_and_nonempty(self):
+        self.assertTrue(Path(__file__).is_file())
+        loader = unittest.TestLoader()
+        for skill_name, class_name in (
+                ("paper-narrative", "PaperNarrativeTests"),
+                ("literature-review", "LiteratureReviewTests"),
+                ("figure-style", "FigureStyleTests")):
+            with self.subTest(skill=skill_name):
+                self.assertTrue(_HELPERS[skill_name].is_file())
+                discovered = loader.loadTestsFromName(class_name, sys.modules[__name__])
+                self.assertEqual(loader.errors, [])
+                self.assertGreater(discovered.countTestCases(), 0)
+                for case in discovered:
+                    self.assertEqual(type(case).__name__, class_name)
+
+    def test_independent_failure_is_recorded_as_unsuccessful(self):
+        # Local to this test: normal discovery must never run this failing case.
+        class DeliberatelyFailingCase(unittest.TestCase):
+            def test_failure(self):
+                self.assertEqual(1, 2, "controlled unittest failure")
+
+        result = unittest.TestResult()
+        unittest.TestLoader().loadTestsFromTestCase(DeliberatelyFailingCase).run(result)
+        self.assertEqual(result.testsRun, 1)
+        self.assertFalse(result.wasSuccessful())
+        self.assertEqual(len(result.failures), 1)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.skipped, [])
+
+
 if __name__ == "__main__":
     unittest.main()

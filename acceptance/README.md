@@ -1,5 +1,38 @@
 # OmicsOps acceptance workflows
 
+## Bundled helper regressions and evidence boundaries
+
+Run these deterministic standard-library checks from the repository root:
+
+```text
+python -B -m unittest discover -s scripts -p "test_bundled_skill_helpers.py" -v
+python -B -m unittest discover -s scripts -p "test_*.py" -v
+```
+
+The unified discovery includes bundled helpers, model catalog, remote job bridge
+and kernel inspection. The helper suite loads only the three fixed bundled
+runtime sources (`paper-narrative`, `literature-review`, `figure-style`), using
+isolated namespaces, fake credentials and HTTP/plotting fixtures. It requires
+all three nonempty behavior groups and checks that a controlled local failure
+produces an unsuccessful unittest result. No pip install, network, real key,
+SSH, R or GPU is needed; crop tests return coordinates without writing images.
+
+Bundle/hash PASS proves packaged source identity and integrity. Helper PASS
+proves behavior under controlled inputs. Scripted V4 PASS proves only the runtime
+contracts covered by the executed model/tool fixtures. None establishes live
+provider access, all 26 Skills' dependencies or scientific validity. Helper
+results do not enter V4 model call counts or suite hashes. The W08 V4 scenario
+manifest/runner/report work remains pending; this helper increment does not
+complete W08.
+
+Local checks and the updated GitHub CI must be reported separately. CI targets
+Windows, Python 3.12 and Node 22; editing the workflow is not a CI pass. For this
+helper increment, live model/SSH/R/GPU/PBMC and native UI acceptance are not
+executed. Existing historical live results below retain their original scope.
+Run opt-in live tests only with the explicitly configured disposable environment,
+after the default workspace, frontend and build checks. Record actual PASS,
+FAIL and not executed/ignored separately; ignored tests are not live acceptance.
+
 ## Subscription model acceptance (Windows, opt-in)
 
 Run the deterministic workspace, frontend and build checks first. The new tests
