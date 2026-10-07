@@ -525,7 +525,7 @@ export type AgentEventKindV4 =
   | { kind: "context_archived"; archive: { archive_id: string; through_sequence: number; size_bytes: number; sha256: string } }
   | { kind: "context_compaction_started"; request_id: string; source_through_sequence: number; source_head_hash: string; frozen_spec_hash?: string | null }
   | { kind: "context_compaction_not_needed"; request_id: string; before_bytes: number }
-  | { kind: "context_compaction_completed"; request_id: string; archive: { archive_id: string; through_sequence: number; size_bytes: number; sha256: string }; checkpoint_through_sequence: number; checkpoint_sha256: string; before_bytes: number; after_bytes: number }
+  | { kind: "context_compaction_completed"; request_id: string; archive: { archive_id: string; through_sequence: number; size_bytes: number; sha256: string }; checkpoint_through_sequence: number; checkpoint_sha256: string; before_bytes: number; after_bytes: number; admission?: { configuration_hash: string; prompt_sha256: string; provider_request_bytes?: number | null } | null }
   | { kind: "context_compaction_attention"; request_id: string; message: string }
   | { kind: "context_checkpointed"; checkpoint: { schema_version: 4; through_sequence: number; completion_criteria: string[]; unresolved_errors: string[]; recent_steps: string[]; scientific_state: unknown; task_shape?: AgentV4TaskShape | null; phase?: AgentV4Phase | null; task_revision?: number | null; tasks?: AgentV4Task[]; cycle_id?: number | null } }
   | { kind: "scientific_state_changed"; revision: number; state_sha256: string; changes: string[] }
@@ -1060,6 +1060,7 @@ export interface CompactContextRequestV4 {
 export interface ContextCompactionReceiptV4 extends CompactContextRequestV4 {
   status: "not_needed" | "completed" | "attention";
   source_through_sequence: number; source_head_hash: string; before_bytes: number;
+  provider_request_bytes?: number | null; admission_configuration_hash?: string | null;
   after_bytes?: number | null;
   archive?: { archive_id: string; through_sequence: number; size_bytes: number; sha256: string } | null;
   checkpoint_through_sequence?: number | null; checkpoint_sha256?: string | null;

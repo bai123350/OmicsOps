@@ -156,6 +156,11 @@ pub struct ContextCompactionReceiptV4 {
     pub source_through_sequence: u64,
     pub source_head_hash: String,
     pub before_bytes: u64,
+    /// Complete provider payload bytes when measured; independent of archived context bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_request_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_configuration_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

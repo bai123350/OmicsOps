@@ -157,6 +157,7 @@ impl Store {
                     checkpoint_sha256,
                     before_bytes,
                     after_bytes,
+                    ..
                 } if *request_id == row.request_id => Some((
                     archive.clone(),
                     *checkpoint_through_sequence,
@@ -370,6 +371,8 @@ async fn completed_run_not_needed_in_tx(
             .map_or_else(String::new, |event| event.event_hash.clone()),
         before_bytes,
         after_bytes: Some(before_bytes),
+        provider_request_bytes: None,
+        admission_configuration_hash: None,
         archive: None,
         checkpoint_through_sequence: None,
         checkpoint_sha256: None,
@@ -565,6 +568,8 @@ async fn compact_new_in_tx(
         source_head_hash: source_head_hash.clone(),
         before_bytes,
         after_bytes: Some(after_bytes),
+        provider_request_bytes: None,
+        admission_configuration_hash: None,
         archive: None,
         checkpoint_through_sequence: None,
         checkpoint_sha256: None,
@@ -665,6 +670,7 @@ async fn compact_new_in_tx(
             checkpoint_sha256: checkpoint_sha256.clone(),
             before_bytes,
             after_bytes,
+            admission: None,
         },
     )
     .await?;
@@ -885,6 +891,8 @@ fn receipt_from_row(row: ReceiptRow) -> Result<ContextCompactionReceiptV4, Store
         source_head_hash: row.source_head_hash,
         before_bytes: row.before_bytes,
         after_bytes: row.after_bytes,
+        provider_request_bytes: None,
+        admission_configuration_hash: None,
         archive: row.archive,
         checkpoint_through_sequence: row.checkpoint_through_sequence,
         checkpoint_sha256: row.checkpoint_sha256,

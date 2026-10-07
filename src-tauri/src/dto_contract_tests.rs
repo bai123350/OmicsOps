@@ -6,6 +6,31 @@ use crate::dto::{
 use serde_json::json;
 
 #[test]
+fn context_compaction_receipt_exposes_optional_admission_without_private_preparation() {
+    use omicsops_dto::ContextCompactionReceiptV4;
+    let legacy = json!({
+        "request_id": "00000000-0000-0000-0000-000000000001",
+        "project_id": "00000000-0000-0000-0000-000000000004",
+        "conversation_id": "00000000-0000-0000-0000-000000000005",
+        "run_id": "00000000-0000-0000-0000-000000000003",
+        "status": "not_needed", "source_through_sequence": 1,
+        "source_head_hash": "head", "before_bytes": 12,
+        "created_at": "2026-10-04T00:00:00Z", "updated_at": "2026-10-04T00:00:00Z"
+    });
+    let receipt: ContextCompactionReceiptV4 = serde_json::from_value(legacy).unwrap();
+    assert_eq!(receipt.provider_request_bytes, None);
+    assert_eq!(receipt.admission_configuration_hash, None);
+    let mut with_admission = receipt;
+    with_admission.provider_request_bytes = Some(4096);
+    with_admission.admission_configuration_hash = Some("config".into());
+    let public_json = serde_json::to_value(with_admission).unwrap();
+    assert_eq!(public_json["provider_request_bytes"], 4096);
+    assert_eq!(public_json["admission_configuration_hash"], "config");
+    assert!(public_json.get("candidate_context").is_none());
+    assert!(public_json.get("transcript").is_none());
+}
+
+#[test]
 fn kernel_inspection_request_is_scope_only_and_response_has_no_values() {
     use omicsops_dto::{InspectKernelRequestV4, KernelInspectionV4};
     let request = json!({"project_id":uuid::Uuid::from_u128(1),
