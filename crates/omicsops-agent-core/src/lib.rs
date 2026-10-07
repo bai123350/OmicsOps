@@ -4689,15 +4689,33 @@ impl AgentCoreV4<'_> {
                 "checkpoint projection binding or budget changed".into(),
             ));
         }
+        self.budget_execution_request(spec, context, events)
+    }
+
+    /// Complete transport shape used only for pure fitting and admission.
+    /// Missing host closures remain private budget projections; the async
+    /// model path still persists and reloads real closures before sending.
+    fn budget_execution_request(
+        &self,
+        spec: &RunSpecV4,
+        context: String,
+        events: &[AgentEventV4],
+    ) -> Result<ModelRequestV4, AgentCoreErrorV4> {
         let mut request = self.execution_request(spec, context, events);
         if self.model.supports_native_replay() {
+            let metadata = self.model.usage_metadata();
+            let configuration_hash = metadata.model_configuration_hash.ok_or_else(|| {
+                AgentCoreErrorV4::NeedsAttention(
+                    "native replay requires frozen model identity".into(),
+                )
+            })?;
             model_replay::shape_request_for_budget(
                 &mut request,
                 spec.project_id,
                 spec.conversation_id,
                 &omicsops_protocol::ModelReplayBindingV4 {
                     model_profile_id: metadata.model_profile_id,
-                    configuration_hash: configuration_hash.clone(),
+                    configuration_hash,
                 },
                 events,
             )
@@ -5098,7 +5116,7 @@ impl AgentCoreV4<'_> {
             )));
         }
         self.model
-            .validate_request(&self.execution_request(spec, context.to_owned(), events))
+            .validate_request(&self.budget_execution_request(spec, context.to_owned(), events)?)
             .map_err(|error| AgentCoreErrorV4::NeedsAttention(error.message))
     }
 
@@ -5287,13 +5305,42 @@ impl AgentCoreV4<'_> {
             scientific_value.clone(),
             use_views,
         );
+        // Preflight the complete future request before writing an archive.
+        // Management UUIDs/timestamps are absent from the model view. Only
+        // the checkpoint's exact sequence and fixed-width SHA256 appear in
+        // its reference. These private prospective references never escape.
+        let previous = events
+            .last()
+            .ok_or_else(|| AgentCoreErrorV4::Store("run has no first event".into()))?;
+        let archived = AgentEventV4::next(
+            previous,
+            previous.occurred_at,
+            AgentEventKindV4::ContextArchived {
+                archive: ContextArchiveV4 {
+                    archive_id: Uuid::nil(),
+                    through_sequence: checkpoint.through_sequence,
+                    size_bytes: transcript.len() as u64,
+                    sha256: "0".repeat(64),
+                },
+            },
+        );
+        let checkpointed = AgentEventV4::next(
+            &archived,
+            previous.occurred_at,
+            AgentEventKindV4::ContextCheckpointed {
+                checkpoint: checkpoint.clone(),
+            },
+        );
+        let mut prospective = events.clone();
+        prospective.extend([archived, checkpointed]);
         // A fixed number of recent steps is not a byte budget: tool JSON can
         // expand again when embedded in checkpoint strings. Fit the actual
         // serialized request, keeping the newest steps and immutable state.
         let original_recent_steps = checkpoint.recent_steps.clone();
         let (mut compacted, mut validation) = loop {
             let compacted = render_context(Some(&checkpoint), &[], &scientific_value)?;
-            let validation = self.validate_execution_context(spec, &compacted, &events, limits);
+            let validation =
+                self.validate_execution_context(spec, &compacted, &prospective, limits);
             if validation.is_ok() || checkpoint.recent_steps.is_empty() {
                 break (compacted, validation);
             }
@@ -5305,6 +5352,39 @@ impl AgentCoreV4<'_> {
             // fit their model view against the actual bounded scientific view.
             checkpoint.recent_steps = original_recent_steps;
         }
+        let needs_projection = (validation.is_err() || want_code_view) && use_views;
+        let fit_archived_projection = |request_events: &[AgentEventV4]| {
+            if want_code_view {
+                if let Some(view) = request_events.iter().rev().find_map(|event| {
+                    context_views::scientific_code_view(spec, &scientific_value, event)
+                }) {
+                    if let Ok(projected) =
+                        fit_scientific_view(&checkpoint, &[], &view, request_events)
+                    {
+                        return Ok(projected);
+                    }
+                }
+            }
+            let view = request_events
+                .iter()
+                .rev()
+                .find_map(|event| {
+                    context_views::scientific_state_view(spec, &scientific_value, event)
+                })
+                .ok_or_else(|| {
+                    AgentCoreErrorV4::NeedsAttention(
+                        "no verified scientific checkpoint projection".into(),
+                    )
+                })?;
+            fit_scientific_view(&checkpoint, &[], &view, request_events)
+        };
+        if needs_projection {
+            fit_archived_projection(&prospective)?;
+            validation = Ok(());
+        }
+        // Predictable failures, including fixed guidance/system/replay overhead,
+        // must not create an archive merely to discover that no view fits.
+        validation?;
         let archive = match self
             .events
             .archive_context(spec.run_id, &transcript, &checkpoint)
@@ -5323,35 +5403,17 @@ impl AgentCoreV4<'_> {
             },
         )
         .await?;
-        if (validation.is_err() || want_code_view) && use_views {
+        if needs_projection {
             let persisted = self
                 .events
                 .load(spec.run_id)
                 .await
                 .map_err(AgentCoreErrorV4::Store)?;
-            if want_code_view {
-                if let Some(view) = persisted.iter().rev().find_map(|event| {
-                    context_views::scientific_code_view(spec, &scientific_value, event)
-                }) {
-                    if let Ok(projected) = fit_scientific_view(&checkpoint, &[], &view, &persisted)
-                    {
-                        return Ok(projected);
-                    }
-                }
-            }
-            if let Some(view) = persisted.iter().rev().find_map(|event| {
-                context_views::scientific_state_view(spec, &scientific_value, event)
-            }) {
-                match fit_scientific_view(&checkpoint, &[], &view, &persisted) {
-                    Ok(projected) => {
-                        compacted = projected;
-                        validation = Ok(());
-                    }
-                    Err(error) => validation = Err(error),
-                }
-            }
+            // Admit again with real durable references. Unexpected Store races
+            // or semantic Port failures may retain the archive, but no rejected
+            // request or prospective reference is returned to the model path.
+            compacted = fit_archived_projection(&persisted)?;
         }
-        validation?;
         Ok(compacted)
     }
 
@@ -14168,7 +14230,7 @@ mod tests {
             over_budget
                 .context_for(&spec, AgentLimitsV4::default())
                 .await,
-            Err(AgentCoreErrorV4::Store(_))
+            Err(AgentCoreErrorV4::NeedsAttention(_))
         ));
         assert_eq!(*store.0.events.lock().unwrap(), original);
     }
@@ -14408,10 +14470,8 @@ mod tests {
             core.context_for(&spec, AgentLimitsV4::default()).await,
             Err(AgentCoreErrorV4::NeedsAttention(_))
         ));
-        assert_eq!(
-            &store.events.lock().unwrap()[..original.len()],
-            original.as_slice()
-        );
+        assert_eq!(*store.events.lock().unwrap(), original);
+        assert!(store.archives.lock().unwrap().is_empty());
         let failed = ArchiveFailureStore(MemoryStore::default());
         seed_execution(&failed.0, &spec);
         let original = failed.0.events.lock().unwrap().clone();
@@ -14440,10 +14500,18 @@ mod tests {
             core.context_for(&spec, limits).await,
             Err(AgentCoreErrorV4::NeedsAttention(_))
         ));
+        let requests = model.requests.lock().unwrap();
         assert!(
-            model.requests.lock().unwrap().is_empty(),
-            "oversized candidates must not cross the model boundary"
+            !requests.is_empty(),
+            "prospective admission must precede archive"
         );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.context.len() <= AgentLimitsV4::default().context_max_bytes)
+        );
+        // These requests were only validated; BudgetOnlyModel rejects dispatch.
+        assert_eq!(*failed.0.events.lock().unwrap(), original);
     }
 
     #[tokio::test]
@@ -14923,9 +14991,33 @@ mod tests {
         assert_manual_postappend_budget(false, 22).await;
     }
 
-    async fn assert_manual_checkpoint_after_growth(auto_compact: bool) {
-        let (spec, store, model) = manual_fixture(false, 70_000);
-        let state = ScientificStateV4::new(spec.project_id);
+    async fn assert_manual_checkpoint_after_growth(
+        auto_compact: bool,
+        native: bool,
+        unfit: bool,
+        science_bytes: usize,
+    ) {
+        let (spec, store, model) = manual_fixture(native, 70_000);
+        if native {
+            let mut history = store.load_direct(spec.run_id).unwrap();
+            for index in 1..history.len() {
+                let mut kind = history[index].event.clone();
+                if let AgentEventKindV4::ModelReplayRecorded { replay } = &mut kind {
+                    replay.continuation.items =
+                        vec![omicsops_protocol::ModelReplayItemV4::AssistantText {
+                            text: "r".repeat(55_000),
+                        }];
+                }
+                history[index] =
+                    AgentEventV4::next(&history[index - 1], history[index].occurred_at, kind);
+            }
+            *store.events.lock().unwrap() = history;
+        }
+        let state = if science_bytes == 0 {
+            ScientificStateV4::new(spec.project_id)
+        } else {
+            large_science(spec.project_id, science_bytes)
+        };
         let science = SnapshotScience(Mutex::new(state.clone()));
         let core = AgentCoreV4 {
             model: &model,
@@ -14965,9 +15057,19 @@ mod tests {
                 },
             );
         }
+        if unfit {
+            append_test_event(
+                &store,
+                spec.run_id,
+                AgentEventKindV4::GuidanceConsumed {
+                    message_id: Uuid::new_v4(),
+                    markdown: "nontrimmable guidance ".repeat(5_000),
+                },
+            );
+        }
         let grown = store.load_direct(spec.run_id).unwrap();
         let result = core.context_for(&spec, limits).await;
-        if auto_compact {
+        if auto_compact && !unfit {
             let context = result
                 .expect("enabled automatic compaction must refresh a grown manual checkpoint");
             let admitted = model.inner.requests.lock().unwrap().last().unwrap().clone();
@@ -14976,6 +15078,55 @@ mod tests {
                 .shape_final_execution_request(&spec, context, &events)
                 .unwrap();
             assert_eq!(actual, admitted);
+            if science_bytes > 0 {
+                let requests = model.inner.requests.lock().unwrap();
+                let prewrite = requests
+                    .iter()
+                    .rev()
+                    .skip(1)
+                    .find(|request| serde_json::to_vec(request).unwrap().len() <= 70_000)
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_vec(prewrite).unwrap().len(),
+                    serde_json::to_vec(&actual).unwrap().len()
+                );
+                assert_eq!(
+                    model.usage_request_metadata(prewrite),
+                    model.usage_request_metadata(&actual)
+                );
+                assert_eq!(prewrite.system, actual.system);
+                assert_eq!(prewrite.tools, actual.tools);
+                assert_eq!(prewrite.image_refs, actual.image_refs);
+                assert_eq!(prewrite.replay, actual.replay);
+                let mut expected: Value = serde_json::from_str(&prewrite.context).unwrap();
+                let actual_context: Value = serde_json::from_str(&actual.context).unwrap();
+                // Only the Store-generated checkpoint hash changes; its width
+                // and exact sequence keep the complete provider byte shape.
+                let prospective_hash =
+                    expected["scientific_state"]["result_reference"]["event_hash"]
+                        .as_str()
+                        .unwrap();
+                let actual_reference = &actual_context["scientific_state"]["result_reference"];
+                assert_eq!(
+                    actual_reference["event_hash"],
+                    events.last().unwrap().event_hash
+                );
+                assert_eq!(
+                    actual_reference["sequence"],
+                    events.last().unwrap().sequence
+                );
+                assert_ne!(actual_reference["event_hash"], prospective_hash);
+                assert!(!actual.context.contains(prospective_hash));
+                assert!(
+                    model
+                        .usage_request_metadata(&actual)
+                        .serialized_request_bytes
+                        .is_some()
+                );
+                expected["scientific_state"]["result_reference"]["event_hash"] =
+                    actual_context["scientific_state"]["result_reference"]["event_hash"].clone();
+                assert_eq!(expected, actual_context);
+            }
             assert!(model.validate_request(&actual).is_ok());
             assert_eq!(store.archives.lock().unwrap().len(), 1);
             assert!(events.starts_with(&grown));
@@ -14988,12 +15139,32 @@ mod tests {
 
     #[tokio::test]
     async fn manual_checkpoint_growth_refreshes_when_auto_compact_is_enabled() {
-        assert_manual_checkpoint_after_growth(true).await;
+        assert_manual_checkpoint_after_growth(true, false, false, 0).await;
     }
 
     #[tokio::test]
     async fn manual_checkpoint_growth_rejects_without_writes_when_auto_compact_is_disabled() {
-        assert_manual_checkpoint_after_growth(false).await;
+        assert_manual_checkpoint_after_growth(false, false, false, 0).await;
+    }
+
+    #[tokio::test]
+    async fn manual_checkpoint_native_growth_admits_actual_refresh_request() {
+        assert_manual_checkpoint_after_growth(true, true, false, 0).await;
+    }
+
+    #[tokio::test]
+    async fn manual_checkpoint_native_growth_false_auto_preserves_source() {
+        assert_manual_checkpoint_after_growth(false, true, false, 0).await;
+    }
+
+    #[tokio::test]
+    async fn manual_checkpoint_native_growth_inadmissible_request_never_archives() {
+        assert_manual_checkpoint_after_growth(true, true, true, 0).await;
+    }
+
+    #[tokio::test]
+    async fn manual_checkpoint_native_growth_projected_science_keeps_byte_shape() {
+        assert_manual_checkpoint_after_growth(true, true, false, 300_000).await;
     }
 
     #[tokio::test]
@@ -15704,9 +15875,9 @@ mod tests {
                 Err(AgentCoreErrorV4::NeedsAttention(_))
             ));
         }
-        assert_eq!(store.archives.lock().unwrap().len(), 1);
+        assert!(store.archives.lock().unwrap().is_empty());
         let events = store.events.lock().unwrap();
-        assert_eq!(&events[..original.len()], original.as_slice());
+        assert_eq!(*events, original);
         assert!(events.iter().all(|event| event.run_id == spec.run_id));
         assert!(!events.iter().any(|event| matches!(
             event.event,
@@ -15960,6 +16131,7 @@ mod tests {
                 },
             },
         );
+        let original = store.load_direct(spec.run_id).unwrap();
         let model = BudgetOnlyModel {
             request_limit: 30_000,
             requests: Mutex::new(vec![]),
@@ -15977,15 +16149,12 @@ mod tests {
             ));
         }
         let events = store.load_direct(spec.run_id).unwrap();
-        let AgentEventKindV4::ContextCheckpointed { checkpoint } = &events.last().unwrap().event
-        else {
-            panic!("expected durable checkpoint");
+        assert_eq!(events, original);
+        let AgentEventKindV4::ToolFinished { outcome } = &events.last().unwrap().event else {
+            panic!("original failed tool evidence must be retained");
         };
-        assert_eq!(
-            checkpoint.unresolved_errors,
-            vec![format!("read: {raw_error}")]
-        );
-        assert_eq!(store.archives.lock().unwrap().len(), 1);
+        assert_eq!(outcome.model_content, raw_error);
+        assert!(store.archives.lock().unwrap().is_empty());
         assert!(model.requests.lock().unwrap().is_empty());
     }
 
@@ -15994,6 +16163,7 @@ mod tests {
         let spec = execution_spec(Uuid::new_v4());
         let store = MemoryStore::default();
         seed_execution(&store, &spec);
+        let original = store.load_direct(spec.run_id).unwrap();
         let model = ScriptedModel(Mutex::new(vec![]));
         let core = AgentCoreV4 {
             model: &model,
@@ -16012,7 +16182,8 @@ mod tests {
             .await,
             Err(AgentCoreErrorV4::NeedsAttention(_))
         ));
-        assert_eq!(store.archives.lock().unwrap().len(), 1);
+        assert!(store.archives.lock().unwrap().is_empty());
+        assert_eq!(store.load_direct(spec.run_id).unwrap(), original);
     }
 
     struct ArchiveFailureStore(MemoryStore);
@@ -16040,9 +16211,18 @@ mod tests {
         let spec = execution_spec(Uuid::new_v4());
         let store = ArchiveFailureStore(MemoryStore::default());
         seed_execution(&store.0, &spec);
+        for _ in 0..10 {
+            append_test_event(
+                &store.0,
+                spec.run_id,
+                AgentEventKindV4::ModelText {
+                    text: "shrinkable historical narrative ".repeat(500),
+                },
+            );
+        }
         let original = store.0.events.lock().unwrap().clone();
         let model = BudgetOnlyModel {
-            request_limit: 1,
+            request_limit: 70_000,
             requests: Mutex::new(vec![]),
         };
         let core = AgentCoreV4 {
@@ -16053,11 +16233,14 @@ mod tests {
         };
         assert!(matches!(
             core.context_for(&spec, AgentLimitsV4::default()).await,
-            Err(AgentCoreErrorV4::Store(_))
+            Err(AgentCoreErrorV4::Store(error)) if error == "archive unavailable"
         ));
         assert_eq!(*store.0.events.lock().unwrap(), original);
-        // Both candidates are validated locally; no model request is dispatched.
-        assert_eq!(model.requests.lock().unwrap().len(), 2);
+        // This candidate fits before the Store rejects the archive write.
+        // BudgetOnlyModel panics if any request is dispatched.
+        let requests = model.requests.lock().unwrap();
+        assert!(serde_json::to_vec(requests.first().unwrap()).unwrap().len() > 70_000);
+        assert!(serde_json::to_vec(requests.last().unwrap()).unwrap().len() <= 70_000);
     }
 
     #[tokio::test]
