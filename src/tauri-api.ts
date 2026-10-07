@@ -1,5 +1,9 @@
 import type { ComposerReference } from "./types";
 import { invoke } from "@tauri-apps/api/core";
+
+export function inspectKernelV4(request: import("./types").InspectKernelRequestV4): Promise<import("./types").KernelInspectionV4> {
+  return invoke("agent_v4_inspect_kernel", { request });
+}
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { chooseProjectDirectoryStartingAt, settingsGeneralPreferences, type ProjectDirectoryChoice } from "./general-settings-api";

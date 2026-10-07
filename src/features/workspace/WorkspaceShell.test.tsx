@@ -70,6 +70,44 @@ function deferred<T>() {
 }
 
 describe("WorkspaceShell", () => {
+  it.each(["close", "project", "conversation", "language", "run"])("real live-run inspection discards late objects after %s", async (change) => {
+    const pending = deferred<import("../../types").KernelInspectionV4>();
+    const inspect = vi.spyOn(guidanceApi, "inspectKernelV4").mockReturnValue(pending.promise);
+    const event: import("../../types").AgentRunEventV4 = { schema_version: 4, run_id: "live-run", project_id: project.id, conversation_id: "current", sequence: 1, occurred_at: "2026-10-07T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "run_spec_frozen", approval_hash: "a", spec_hash: "b" } };
+    const props = { project, locale: "en-US" as const, activeConversationId: "current", activeRunId: "live-run", runStarted: true, agentRunEventsV4: [event] };
+    const view = render(<WorkspaceShell {...props} />);
+    fireEvent.click(screen.getByRole("button", { name: "Run environment" })); fireEvent.click(screen.getByRole("button", { name: "View kernel metadata" }));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh metadata" })); expect(inspect).toHaveBeenCalledTimes(1);
+    const close = screen.getByRole("button", { name: "Close kernel metadata" }); expect(close).toHaveFocus();
+    // Even if focus is outside, the top dialog owns Tab and immediately Escape.
+    close.blur(); expect(document.activeElement).toBe(document.body);
+    fireEvent.keyDown(window, { key: "Tab", shiftKey: true }); expect(close).toHaveFocus();
+    if (change === "close") fireEvent.keyDown(document.body, { key: "Escape" });
+    if (change === "language") fireEvent.click(screen.getByRole("tab", { name: "R" }));
+    view.rerender(<WorkspaceShell {...props} project={change === "project" ? { ...project, id: "other" } : project} activeConversationId={change === "conversation" ? "other" : "current"} activeRunId={change === "run" ? "new-run" : "live-run"} agentRunEventsV4={change === "run" ? [{ ...event, run_id: "new-run" }] : [event]} />);
+    if (change === "run") fireEvent.click(screen.getByRole("button", { name: "Run environment" }));
+    await act(async () => { pending.resolve({ project_id: project.id, conversation_id: "current", run_id: "live-run", language: "python", session_id: "old", status: "ready", objects: [{ name: "old_session_object", type_label: "opaque", dimensions: null, element_count: null, summary: "opaque" }], truncated: false }); });
+    expect(screen.queryByText("old_session_object")).not.toBeInTheDocument(); expect(inspect).toHaveBeenCalledTimes(1);
+    view.unmount();
+  });
+  it("runtime_escape_closes_only_top_overlay; frozen inspection and remote jobs have independent manual lifecycles", async () => {
+    const inspect = vi.spyOn(guidanceApi, "inspectKernelV4").mockResolvedValue({ project_id: project.id, conversation_id: "current", run_id: "old-run", language: "python", session_id: null, status: "not_started", objects: [], truncated: false });
+    const list = vi.spyOn(remoteJobApi, "listRemoteJobsV4").mockResolvedValue({ jobs: [], limit: 100, remote_liveness_checked: false });
+    const probe = vi.spyOn(guidanceApi, "agentV4ComputeBackends"); const onSend = vi.fn(); const onStartRun = vi.fn(); const onComputeBackendChange = vi.fn();
+    render(<WorkspaceShell project={project} locale="en-US" activeConversationId="current" onSend={onSend} onStartRun={onStartRun} onComputeBackendChange={onComputeBackendChange} agentRunEventsV4={[{ schema_version: 4, run_id: "old-run", project_id: project.id, conversation_id: "current", sequence: 1, occurred_at: "2026-10-07T00:00:00Z", previous_hash: "", event_hash: "hash", event: { kind: "run_spec_frozen", approval_hash: "a", spec_hash: "b" } }]} />);
+    fireEvent.click(screen.getByRole("button", { name: "Run environment" }));
+    const entry = screen.getByRole("button", { name: "View kernel metadata" }); entry.focus(); fireEvent.click(entry);
+    expect(screen.getByRole("dialog", { name: "Kernel metadata" })).toBeVisible(); expect(inspect).not.toHaveBeenCalled();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Kernel metadata" })).not.toBeInTheDocument(); expect(entry).toHaveFocus(); expect(screen.getByRole("dialog", { name: "Runtimes" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Remote jobs" })); fireEvent.keyDown(window, { key: "Escape" }); expect(list).toHaveBeenCalledTimes(1);
+    fireEvent.click(entry); fireEvent.click(screen.getByRole("button", { name: "Refresh metadata" }));
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "Kernel metadata" })).toHaveTextContent("Not started"));
+    expect(inspect).toHaveBeenCalledTimes(1); expect(inspect).toHaveBeenCalledWith({ project_id: project.id, conversation_id: "current", run_id: "old-run", language: "python", expected_session_id: null });
+    expect(probe).not.toHaveBeenCalled(); expect(onSend).not.toHaveBeenCalled(); expect(onStartRun).not.toHaveBeenCalled(); expect(onComputeBackendChange).not.toHaveBeenCalled();
+    fireEvent.keyDown(document.body, { key: "Escape" }); expect(screen.getByRole("dialog", { name: "Runtimes" })).toBeVisible();
+    fireEvent.keyDown(window, { key: "Escape" }); expect(screen.queryByRole("dialog", { name: "Runtimes" })).not.toBeInTheDocument();
+  });
   it("opens metadata for the current owner without probing or starting compute and immediately escapes child then parent", async () => {
     const list = vi.spyOn(remoteJobApi, "listRemoteJobsV4").mockResolvedValue({ jobs: [], limit: 100, remote_liveness_checked: false });
     const refresh = vi.spyOn(remoteJobApi, "refreshRemoteJobV4");
@@ -104,7 +142,10 @@ describe("WorkspaceShell", () => {
     view.rerender(<WorkspaceShell project={{ ...owner, ...(change === "project" ? { id: "other" } : change === "connection" ? { connection_id: "two" } : change === "root" ? { remote_root: "/two" } : {}) }} locale="en-US" activeConversationId={change === "conversation" ? "other" : "current"} />);
     await act(async () => { await vi.advanceTimersByTimeAsync(900000); });
     expect(refresh).not.toHaveBeenCalled();
-    view.unmount(); expect(vi.getTimerCount()).toBe(0);
+    view.unmount();
+    // jsdom queues selectionchange at 0 ms when restoring parent focus.
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(vi.getTimerCount()).toBe(0);
   });
   it("opens jobs from a frozen run without changing the recorded boundary or execution controls", async () => {
     const list = vi.spyOn(remoteJobApi, "listRemoteJobsV4").mockResolvedValue({ jobs: [], limit: 100, remote_liveness_checked: false });

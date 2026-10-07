@@ -56,6 +56,31 @@ function renderDialog(overrides: Partial<React.ComponentProps<typeof RuntimeDial
 }
 
 describe("RuntimeDialog", () => {
+  it("keeps parent focus owned when a loading transition removes controls and traps Tab from body", () => {
+    const { rerender } = renderDialog();
+    const prepare = screen.getByRole("button", { name: "Ask Agent to prepare environment" }); prepare.focus();
+    rerender(<RuntimeDialog zh={false} language="python" onLanguageChange={vi.fn()} environment="system" boundary={null} boundaryLoading boundaryError="" onRetryBoundary={vi.fn()} onClose={vi.fn()} />);
+    const close = screen.getByRole("button", { name: "Close runtimes" }); expect(close).toHaveFocus();
+    close.blur(); expect(document.activeElement).toBe(document.body); fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
+    expect(screen.getByRole("tab", { name: "R" })).toHaveFocus();
+    fireEvent.keyDown(window, { key: "Tab" }); expect(close).toHaveFocus();
+  });
+  it("inspection_busy_is_not_ready and metadata is content-free with unknown sizes", () => {
+    const refresh = vi.fn();
+    const inspection = { project_id: "project-1", conversation_id: "c", run_id: "run-1", language: "python" as const, session_id: "s", status: "busy" as const, objects: [], truncated: false };
+    const view = renderDialog({ kernelInspectionOpen: true, kernelInspection: inspection, onRefreshKernelInspection: refresh, onCloseKernelInspection: vi.fn() });
+    const child = screen.getByRole("dialog", { name: "Kernel metadata" });
+    expect(child).toHaveTextContent("Busy"); expect(child).not.toHaveTextContent("Ready");
+    expect(refresh).not.toHaveBeenCalled(); fireEvent.click(screen.getByRole("button", { name: "Refresh metadata" })); expect(refresh).toHaveBeenCalledOnce();
+    view.rerender(<RuntimeDialog zh={false} language="python" onLanguageChange={vi.fn()} environment="system" boundary={localBoundary} boundaryLoading={false} boundaryError="" onRetryBoundary={vi.fn()} onClose={vi.fn()} kernelInspectionOpen kernelInspection={{ ...inspection, status: "ready", objects: [{ name: "table", type_label: "opaque", dimensions: null, element_count: null, summary: "opaque" }], truncated: true }} onCloseKernelInspection={vi.fn()} onRefreshKernelInspection={refresh} />);
+    expect(child).toHaveTextContent("Unknown"); expect(child).toHaveTextContent("Truncated"); expect(child).toHaveTextContent("Memory snapshot"); expect(child).toHaveTextContent("not research evidence");
+    expect(screen.getByRole("columnheader", { name: "Dimensions" })).toBeVisible();
+  });
+  it.each(["not_started", "stale_session", "unavailable"] as const)("shows %s without old objects", (status) => {
+    renderDialog({ kernelInspectionOpen: true, kernelInspection: { project_id: "p", conversation_id: "c", run_id: "run", language: "python", session_id: null, status, objects: [{ name: "old_session_object", type_label: "opaque", dimensions: null, element_count: null, summary: "opaque" }], truncated: false }, onCloseKernelInspection: vi.fn(), onRefreshKernelInspection: vi.fn() });
+    expect(screen.queryByText("old_session_object")).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Kernel metadata" })).toHaveTextContent(status === "not_started" ? "Not started" : status === "stale_session" ? "Stale session" : "Unavailable");
+  });
   it.each([false, true])("opens read-only remote jobs even when frozen=%s without preparing or changing language", (frozen) => {
     const onOpenRemoteJobs = vi.fn(); const onPrepare = vi.fn(); const onLanguageChange = vi.fn();
     renderDialog({ frozen, onOpenRemoteJobs, onPrepare, onLanguageChange });
@@ -63,14 +88,14 @@ describe("RuntimeDialog", () => {
     expect(onOpenRemoteJobs).toHaveBeenCalledOnce();
     expect(onPrepare).not.toHaveBeenCalled(); expect(onLanguageChange).not.toHaveBeenCalled();
   });
-  it("does not infer a probe when none is provided and states that variable inspection is unavailable", () => {
+  it("does not infer a probe and directs read-only metadata viewing through a run", () => {
     renderDialog({ backend: undefined });
 
     expect(screen.getByRole("dialog", { name: "Runtimes" })).toBeInTheDocument();
     expect(screen.queryByText("Available · interpreter found")).not.toBeInTheDocument();
     expect(screen.getByText("Local host process")).toBeInTheDocument();
-    expect(screen.getByText("Not available", { exact: true })).toBeInTheDocument();
-    expect(screen.getByText(/Variable inspection is not available here yet/i)).toBeInTheDocument();
+    expect(screen.getByText(/Read-only observation of safe metadata/i)).toBeInTheDocument();
+    expect(screen.getByText(/Open from a run record/i)).toBeInTheDocument();
     expect(screen.queryByText(/^Running$/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/x\s*=\s*1/i)).not.toBeInTheDocument();
   });

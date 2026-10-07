@@ -28,6 +28,33 @@ export interface ProjectSpec {
   allowed_network_domains: string[];
 }
 
+/** Ephemeral DTO reexported by Rust from omicsops-protocol. */
+export interface InspectKernelRequestV4 {
+  project_id: string;
+  conversation_id: string;
+  run_id: string;
+  language: KernelLanguage;
+  expected_session_id: string | null;
+}
+export type KernelInspectionStatusV4 = "ready" | "not_started" | "busy" | "stale_session" | "unavailable";
+export interface KernelObjectMetadataV4 {
+  name: string;
+  type_label: string;
+  dimensions: number[] | null;
+  element_count: number | null;
+  summary: string;
+}
+export interface KernelInspectionV4 {
+  project_id: string;
+  conversation_id: string;
+  run_id: string;
+  language: KernelLanguage;
+  session_id: string | null;
+  status: KernelInspectionStatusV4;
+  objects: KernelObjectMetadataV4[];
+  truncated: boolean;
+}
+
 export interface ServerInspection {
   os: string;
   cpuCores: number;

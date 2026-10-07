@@ -639,6 +639,44 @@ The read-only historical diagnosis and the remaining manual smoke steps are in
 
 ## W04：一次性本地 R 内核对象检查（显式 opt-in）
 
+### UI 确定性回归与手工 smoke
+
+```powershell
+npx vitest run src/features/workspace/RuntimeDialog.test.tsx src/features/workspace/useKernelInspection.test.tsx src/features/workspace/WorkspaceShell.test.tsx
+python -B -m unittest discover -s scripts -p "test_*.py"
+cargo test --workspace
+npm test
+npm run build
+npm run build:desktop
+cargo fmt --all -- --check
+git diff --check
+```
+
+UI 使用模拟命令验证实际 WorkspaceShell → RuntimeDialog 链路：从当前或历史运行的
+“运行环境”进入“查看内核元数据”，打开本身不查询，点击“刷新元数据”才调用只读
+`agent_v4_inspect_kernel({ request })`。请求只有 project/conversation/run/language/
+expected_session_id；不探测环境、调用模型、准备计算或更改冻结配置。W03 远端作业
+保留独立来源与查询生命周期，不把作业状态当内核存活证明。
+
+Windows 原生 UI smoke 尚未执行：在一次性项目的存活 V4 Python/R 运行中打开上述
+入口并手动刷新，检查名称、受控类型、维度、元素数、摘要、来源及截断标记；未知
+尺寸保持未知，不显示值或 repr。执行占锁时应显示 Busy，历史/未初始化内核显示
+未启动/当前不可观察，不启动解释器或新 SSH。切换语言、运行、项目、会话或关闭
+后，延迟的旧对象不能出现；重建 session 后旧响应应拒绝，下一次刷新仍需手动。
+打开后立即从 window/body 按 Escape 只关闭顶层元数据面板并恢复父级入口焦点，
+第二次关闭 Runtime。Tab/Shift+Tab 保持在顶层，刷新禁用按钮时焦点仍有归属。
+同时验证远端作业入口可独立打开与关闭，冻结运行不出现准备环境操作。
+
+Ready 是临时内存元数据快照，不是科研证据；结果不写事件、日志、SQLite、模型
+上下文、Artifact 或导出，也不增加暂停保活。观察不会取消/重跑计算。Windows
+编译、确定性 native pipe 测试及 NSIS 构建不代表安装、真实 GUI 或 Runtime
+端到端验收；本轮不运行或分发安装包。Linux/macOS native readiness 分支未编译、
+未执行，不作平台保证。readiness 只检查当下可观察 queued 数据，不能保证拦截
+检查后任意新帧。真实 R fixture（以下命令）、SSH、模型、容器和科学数据验收
+均未执行，默认 ignored 不算通过。此项完成仍需独立审阅；W08 后续场景尚待完成。
+
+### 一次性 R worker
+
 先完成默认确定性检查，准备独立的一次性本地目录与已安装 `Rscript`、`jsonlite` 的环境。此 ignored fixture 使用临时目录启动一个本地 SSH typed worker 脚本，检查 active binding、delayedAssign、基础矩阵及 S3/S4 对象；不连接 SSH，不读取真实项目，不安装依赖。
 
 ```powershell
