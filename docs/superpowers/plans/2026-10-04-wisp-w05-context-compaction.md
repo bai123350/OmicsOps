@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust/serde/Tokio，现有 AgentCore V4、ModelPort 和 SQLite/sqlx；Tauri 2、React 19/Vitest。
 
-**Spec:** [W05 Runtime 设计](../specs/2026-10-04-wisp-runtime-design.md#w05为暂停普通-run-手动压缩工作上下文)，已审阅设计提交 `161199f`。当前只写计划；实施须等待计划审阅。
+**Spec:** [W05 Runtime 设计](../specs/2026-10-04-wisp-runtime-design.md#w05为暂停普通-run-手动压缩工作上下文)，已审阅设计提交 `161199f`；用户已确认 `8515da8` 全部实施计划。Task1契约已独立审阅及必要复审通过，Task2–5继续实施。
 
 ## Global Constraints
 
@@ -44,7 +44,7 @@
 - Produces：`PreparedContextCompactionV4::validate_structure(&self) -> Result<(), ContextCompactionValidationErrorV4>`；错误固定 InvalidScope/InvalidStatus/InvalidArchive/InvalidEventChain，验证纯数据一致性，Store 仍另核验当前 DB 状态。
 - pure snapshot/prepared 不重导出为 UI DTO；protocol 不依赖 core/store/science，科学状态传 JSON Value。
 
-- [ ] **RED 写契约测试**：`legacy_compaction_event_hash_is_unchanged`、`legacy_receipt_admission_is_unknown`、`prepared_compaction_scope_and_status_are_consistent`。使用保存的旧 JSON fixture，而非用新 struct 反向生成“旧”输入。
+- [x] **RED 写契约测试**：`legacy_compaction_event_hash_is_unchanged`、`legacy_receipt_admission_is_unknown`、`prepared_compaction_scope_and_status_are_consistent`。使用保存的旧 JSON fixture，而非用新 struct 反向生成“旧”输入。
 
 ```rust
 assert!(legacy_event.verify().is_ok());
@@ -52,10 +52,10 @@ assert_eq!(legacy_receipt.provider_request_bytes, None);
 assert!(!serde_json::to_string(&legacy_event).unwrap().contains("admission"));
 ```
 
-- [ ] **RED 运行**：`cargo test -p omicsops-protocol compaction`；`cargo test -p omicsops-desktop --lib dto_contract_tests`。预期缺失字段/契约接口失败。
-- [ ] **实现接口**：新增 bounded optional metadata，旧字段和请求不变；修正现有 exhaustive 构造/匹配，不改旧事件 payload。记录准备数据的 Completed/NotNeeded 一致性规则，拒绝 Attention prepared。
-- [ ] **GREEN**：重复 RED，`cargo test -p omicsops-dto`；预期旧 event hash 和 DTO 序列化均通过。
-- [ ] **Commit**：只暂存本任务文件，`git commit -m "feat(protocol): define manual compaction preparation and admission"`。
+- [x] **RED 运行**：`cargo test -p omicsops-protocol compaction`；`cargo test -p omicsops-desktop --lib dto_contract_tests`。预期缺失字段/契约接口失败。
+- [x] **实现接口**：新增 bounded optional metadata，旧字段和请求不变；修正现有 exhaustive 构造/匹配，不改旧事件 payload。记录准备数据的 Completed/NotNeeded 一致性规则，拒绝 Attention prepared。
+- [x] **GREEN**：重复 RED，`cargo test -p omicsops-dto`；预期旧 event hash 和 DTO 序列化均通过。
+- [x] **Commit**：只暂存本任务文件，`git commit -m "feat(protocol): define manual compaction preparation and admission"`。
 
 ### Task 2: core 纯候选与 final native replay 准入
 
@@ -156,4 +156,8 @@ expect(newConversationReceipt).toBeNull();
 
 ## Plan Self-Review
 
-契约/纯 full-request 准备/Store 原子性/宿主 gate/UI 分别绑定 Task 1–5；Review Focus 每项已有测试。无 migration、摘要模型、审批修改或 unknown 收口；签名不漂移，private composition 不暴露到 DTO。代码片段仅断言，步骤为 RED/实现/GREEN/commit；所有步骤仍未执行。
+契约/纯 full-request 准备/Store 原子性/宿主 gate/UI 分别绑定 Task 1–5；Review Focus 每项已有测试。无 migration、摘要模型、审批修改或 unknown 收口；签名不漂移，private composition 不暴露到 DTO。代码片段仅断言，步骤为 RED/实现/GREEN/commit；Task1已执行并审阅，Task2–5未执行。
+
+## 当前实施证据
+
+2026-10-08：Task1提交c125a71及修复2a191c8，独立full/scoped审阅通过。旧Completed事件的固定JSON/hash保持可读，公开receipt新增可缺省admission字段，snapshot/prepared留在纯protocol内部；无migration或Store原子提交。实际初RED缺契约字段，desktop同次含OUT_DIR沙箱失败并分开记录；修复前补充bounded-admission RED。最终protocol33单元+10集成、DTO crate、Store压缩6、desktop DTO52、Web构建及fmt/diff通过，沙箱失败按原命令授权重试。审阅发现hash一致的非V4新计划事件/checkpoint可通过结构校验，修复用重算哈希的0/2 RED→2/2 GREEN证明V4拒绝，未改变旧事件verify或可选字段hash。全workspace、npm测试、native打包及真实模型/SSH尚未为此叶子重跑；Task2–5和最终分支检查仍待执行。
