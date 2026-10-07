@@ -4664,6 +4664,109 @@ impl AgentCoreV4<'_> {
         Ok(request)
     }
 
+    /// One replay-aware projection for both preparation and reads of its
+    /// verified durable checkpoint. The auto-compaction setting controls new
+    /// automatic archives, not reuse of an explicitly requested manual view.
+    fn fit_checkpoint_execution_context(
+        &self,
+        spec: &RunSpecV4,
+        checkpoint: &ContextCheckpointV4,
+        source: &AgentEventV4,
+        science: &Value,
+        events: &[AgentEventV4],
+        limits: AgentLimitsV4,
+        prospective: bool,
+    ) -> Result<String, AgentCoreErrorV4> {
+        let metadata = self.model.usage_metadata();
+        let configuration_hash = metadata.model_configuration_hash.clone().ok_or_else(|| {
+            AgentCoreErrorV4::NeedsAttention(
+                "checkpoint projection requires frozen model identity".into(),
+            )
+        })?;
+        if spec.validate_integrity().is_err()
+            || spec.spec_hash.is_none()
+            || spec.execution_kind != RunExecutionKindV4::OrdinaryAgent
+            || metadata.model_profile_id != spec.model_profile_id
+            || spec.model_configuration_hash.as_deref() != Some(configuration_hash.as_str())
+            || metadata.context_limit_tokens.is_none_or(|limit| limit == 0)
+        {
+            return Err(AgentCoreErrorV4::NeedsAttention(
+                "checkpoint projection binding or budget changed".into(),
+            ));
+        }
+        let use_views = self.model.supports_native_replay()
+            || self
+                .tools
+                .descriptors(RunModeV4::Execute)
+                .iter()
+                .any(|tool| tool.id == context_views::READ_RESULT_TOOL);
+        let guidance = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEventKindV4::GuidanceConsumed {
+                    message_id,
+                    markdown,
+                } => Some(json!({"message_id":message_id,"markdown":markdown})),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let recent = context_recent_views(events, Some(checkpoint), use_views);
+        let render_fit = |state: &Value| {
+            context_views::fit_checkpoint(&mut checkpoint.clone(), |checkpoint| {
+                let context = context_views::render_context(
+                    spec,
+                    Some(checkpoint),
+                    &recent,
+                    state,
+                    &guidance,
+                )?;
+                if context.len() > limits.context_max_bytes {
+                    return Err(AgentCoreErrorV4::NeedsAttention(
+                        "checkpoint projection exceeds context byte budget".into(),
+                    ));
+                }
+                let mut request = self.execution_request(spec, context.clone(), events);
+                if self.model.supports_native_replay() {
+                    model_replay::shape_request_for_budget(
+                        &mut request,
+                        spec.project_id,
+                        spec.conversation_id,
+                        &omicsops_protocol::ModelReplayBindingV4 {
+                            model_profile_id: metadata.model_profile_id,
+                            configuration_hash: configuration_hash.clone(),
+                        },
+                        events,
+                    )
+                    .map_err(AgentCoreErrorV4::NeedsAttention)?;
+                }
+                self.model
+                    .validate_request(&request)
+                    .map_err(|error| AgentCoreErrorV4::NeedsAttention(error.message))?;
+                Ok(context)
+            })
+        };
+        if limits.auto_compact && use_views {
+            if let Some(view) = context_views::scientific_code_view(spec, science, source) {
+                if let Ok(context) = render_fit(&view) {
+                    return Ok(context);
+                }
+            }
+        }
+        match render_fit(science) {
+            Ok(context) => Ok(context),
+            Err(error) if !use_views => Err(error),
+            Err(error) => {
+                let view = if prospective {
+                    context_views::prospective_scientific_state_view(spec, science, source)
+                } else {
+                    context_views::scientific_state_view(spec, science, source)
+                }
+                .ok_or(error)?;
+                render_fit(&view)
+            }
+        }
+    }
+
     /// Prepare only: prospective references must not escape to a model or UI
     /// until the host atomically commits the exact planned chain.
     pub fn prepare_context_compaction(
@@ -4765,7 +4868,7 @@ impl AgentCoreV4<'_> {
         };
         // As in automatic compaction, persist the fitted recent summaries when
         // full science fits. Retain the original summaries only when a bounded
-        // scientific view is needed; that view is fitted after its signed
+        // scientific view is needed; that view is fitted after its hash-verified
         // checkpoint identity has been preallocated.
         let original_steps = checkpoint.recent_steps.clone();
         let recent = context_recent_views(events, Some(&checkpoint), use_views);
@@ -4794,53 +4897,15 @@ impl AgentCoreV4<'_> {
                    source: &AgentEventV4,
                    request_events: &[AgentEventV4],
                    prospective: bool| {
-            let recent = context_recent_views(request_events, Some(checkpoint), use_views);
-            let mut model_checkpoint = checkpoint.clone();
-            let render_fit = |model_checkpoint: &mut ContextCheckpointV4, state: &Value| {
-                context_views::fit_checkpoint(model_checkpoint, |checkpoint| {
-                    let context = context_views::render_context(
-                        spec,
-                        Some(checkpoint),
-                        &recent,
-                        state,
-                        &guidance,
-                    )?;
-                    validate(context.clone(), request_events)?;
-                    Ok(context)
-                })
-            };
-            // Match the normal durable renderer's preferred code-only view,
-            // retaining all other scientific fields before using a directory.
-            if limits.auto_compact && use_views {
-                if let Some(view) =
-                    context_views::scientific_code_view(spec, &snapshot.scientific_state, source)
-                {
-                    if let Ok(context) = render_fit(&mut checkpoint.clone(), &view) {
-                        return Ok(context);
-                    }
-                }
-            }
-            match render_fit(&mut model_checkpoint, &snapshot.scientific_state) {
-                Ok(context) => Ok(context),
-                Err(error) if !use_views => Err(error),
-                Err(error) => {
-                    let view = if prospective {
-                        context_views::prospective_scientific_state_view(
-                            spec,
-                            &snapshot.scientific_state,
-                            source,
-                        )
-                    } else {
-                        context_views::scientific_state_view(
-                            spec,
-                            &snapshot.scientific_state,
-                            source,
-                        )
-                    }
-                    .ok_or(error)?;
-                    render_fit(&mut checkpoint.clone(), &view)
-                }
-            }
+            self.fit_checkpoint_execution_context(
+                spec,
+                checkpoint,
+                source,
+                &snapshot.scientific_state,
+                request_events,
+                limits,
+                prospective,
+            )
         };
         let timestamp = Utc::now();
         let started = AgentEventV4::next(
@@ -4873,6 +4938,12 @@ impl AgentCoreV4<'_> {
                 let mut comparable = checkpoint.clone();
                 comparable.through_sequence = existing.through_sequence;
                 if &comparable == existing
+                    && context_views::verified_manual_checkpoint(
+                        spec,
+                        &snapshot.scientific_state,
+                        existing_source,
+                        events,
+                    )
                     && events
                         .iter()
                         .filter(|event| event.sequence > existing_source.sequence)
@@ -5049,6 +5120,26 @@ impl AgentCoreV4<'_> {
             AgentEventKindV4::ContextCheckpointed { checkpoint } => Some(checkpoint.clone()),
             _ => None,
         });
+        if !force_compaction {
+            if let Some(source) = latest_checkpoint_event {
+                if context_views::verified_manual_checkpoint(
+                    spec,
+                    &scientific_value,
+                    source,
+                    &events,
+                ) {
+                    return self.fit_checkpoint_execution_context(
+                        spec,
+                        latest_checkpoint.as_ref().expect("checkpoint source"),
+                        source,
+                        &scientific_value,
+                        &events,
+                        limits,
+                        false,
+                    );
+                }
+            }
+        }
         let recent = if let Some(checkpoint) = &latest_checkpoint {
             events
                 .iter()
@@ -14382,6 +14473,7 @@ mod tests {
         native: bool,
         known_budget: bool,
         measure: bool,
+        streamed: Option<Mutex<Vec<ModelRequestV4>>>,
     }
 
     #[async_trait]
@@ -14410,9 +14502,21 @@ mod tests {
         }
         async fn stream(
             &self,
-            _: ModelRequestV4,
+            request: ModelRequestV4,
             _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
         ) -> Result<ModelTurnV4, ModelFailureV4> {
+            if let Some(streamed) = &self.streamed {
+                streamed.lock().unwrap().push(request);
+                return Ok(ModelTurnV4 {
+                    public_text: "done".into(),
+                    tool_calls: vec![],
+                    provider_continuation: Some(omicsops_protocol::ModelProviderContinuationV4 {
+                        items: vec![omicsops_protocol::ModelReplayItemV4::AssistantText {
+                            text: "done".into(),
+                        }],
+                    }),
+                });
+            }
             panic!("manual prepare must not stream")
         }
     }
@@ -14497,6 +14601,7 @@ mod tests {
             native,
             known_budget: true,
             measure: true,
+            streamed: None,
             inner: BudgetOnlyModel {
                 request_limit: budget,
                 requests: Mutex::new(vec![]),
@@ -14723,6 +14828,314 @@ mod tests {
             assert_eq!(repeated.candidate_context, prepared.candidate_context);
             repeated.validate_structure().unwrap();
         }
+    }
+
+    async fn assert_manual_postappend_budget(auto_compact: bool, replay_bytes: usize) {
+        let (spec, store, model) = manual_fixture(true, 70_000);
+        let mut history = store.load_direct(spec.run_id).unwrap();
+        for index in 1..history.len() {
+            let mut kind = history[index].event.clone();
+            if let AgentEventKindV4::ModelText { text } = &mut kind {
+                *text = "unreplayed summary ".repeat(632);
+            }
+            if let AgentEventKindV4::ModelReplayRecorded { replay } = &mut kind {
+                replay.continuation.items =
+                    vec![omicsops_protocol::ModelReplayItemV4::AssistantText {
+                        text: "r".repeat(replay_bytes),
+                    }];
+            }
+            history[index] =
+                AgentEventV4::next(&history[index - 1], history[index].occurred_at, kind);
+        }
+        *store.events.lock().unwrap() = history;
+        let state = large_science(spec.project_id, 300_000);
+        let science = SnapshotScience(Mutex::new(state.clone()));
+        let snapshot = manual_snapshot(&store, &spec, state);
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: Some(&science),
+        };
+        let limits = AgentLimitsV4 {
+            auto_compact,
+            ..Default::default()
+        };
+        let prepared = core.prepare_context_compaction(&snapshot, limits).unwrap();
+        let admitted = model.inner.requests.lock().unwrap().last().unwrap().clone();
+        assert_eq!(store.load_direct(spec.run_id).unwrap(), snapshot.events);
+        for event in &prepared.planned_events {
+            store.append_direct(event).unwrap();
+        }
+        let durable_events = store.load_direct(spec.run_id).unwrap();
+        let context = core.context_for(&spec, limits).await.unwrap();
+        let actual = core
+            .shape_final_execution_request(&spec, context, &durable_events)
+            .unwrap();
+        assert!(
+            model.validate_request(&actual).is_ok(),
+            "actual post-append request exceeds 70,000 bytes: {}",
+            serde_json::to_vec(&actual).unwrap().len()
+        );
+        assert!(
+            actual == admitted,
+            "actual post-append request differs: admitted={} actual={}",
+            serde_json::to_vec(&admitted).unwrap().len(),
+            serde_json::to_vec(&actual).unwrap().len()
+        );
+        assert_eq!(store.load_direct(spec.run_id).unwrap(), durable_events);
+        assert!(store.archives.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_prepare_durable_fit_includes_large_native_replay() {
+        assert_manual_postappend_budget(true, 55_000).await;
+    }
+
+    #[tokio::test]
+    async fn manual_prepare_durable_projection_remains_usable_with_auto_compact_disabled() {
+        assert_manual_postappend_budget(false, 22).await;
+    }
+
+    #[tokio::test]
+    async fn manual_prepare_legacy_checkpoint_needs_completed_upgrade() {
+        let (spec, store, model) = manual_fixture(false, 70_000);
+        let state = large_science(spec.project_id, 300_000);
+        let science = SnapshotScience(Mutex::new(state.clone()));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: Some(&science),
+        };
+        let limits = AgentLimitsV4 {
+            auto_compact: false,
+            ..Default::default()
+        };
+        let snapshot = manual_snapshot(&store, &spec, state.clone());
+        let prepared = core.prepare_context_compaction(&snapshot, limits).unwrap();
+        // A legacy/automatic checkpoint has no manual Started/Completed proof.
+        for event in &prepared.planned_events[1..3] {
+            append_test_event(&store, spec.run_id, event.event.clone());
+        }
+        let legacy = store.load_direct(spec.run_id).unwrap();
+        assert!(core.context_for(&spec, limits).await.is_err());
+        assert_eq!(store.load_direct(spec.run_id).unwrap(), legacy);
+        let upgraded = core
+            .prepare_context_compaction(&manual_snapshot(&store, &spec, state), limits)
+            .unwrap();
+        assert_eq!(
+            upgraded.status,
+            omicsops_protocol::ContextCompactionStatusV4::Completed
+        );
+        for event in &upgraded.planned_events {
+            store.append_direct(event).unwrap();
+        }
+        let events = store.load_direct(spec.run_id).unwrap();
+        let context = core.context_for(&spec, limits).await.unwrap();
+        assert!(
+            model
+                .validate_request(
+                    &core
+                        .shape_final_execution_request(&spec, context, &events)
+                        .unwrap()
+                )
+                .is_ok()
+        );
+        assert_eq!(store.load_direct(spec.run_id).unwrap(), events);
+        assert!(store.archives.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_checkpoint_projection_rejects_changed_or_unverified_sources() {
+        for mutation in 0..6 {
+            let (spec, store, model) = manual_fixture(false, 70_000);
+            let state = large_science(spec.project_id, 300_000);
+            let science = SnapshotScience(Mutex::new(state.clone()));
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &ResultReadTools,
+                events: &store,
+                science: Some(&science),
+            };
+            let limits = AgentLimitsV4 {
+                auto_compact: false,
+                ..Default::default()
+            };
+            let prepared = core
+                .prepare_context_compaction(&manual_snapshot(&store, &spec, state), limits)
+                .unwrap();
+            for event in &prepared.planned_events {
+                store.append_direct(event).unwrap();
+            }
+            let mut history = store.load_direct(spec.run_id).unwrap();
+            let last = history.len() - 1;
+            match mutation {
+                0 => history[last].event_hash = "tampered".into(),
+                1 => science.0.lock().unwrap().revision += 1,
+                2 => {
+                    if let AgentEventKindV4::ContextCompactionCompleted {
+                        checkpoint_sha256, ..
+                    } = &mut history[last].event
+                    {
+                        *checkpoint_sha256 = "0".repeat(64);
+                    }
+                    history[last] = AgentEventV4::next(
+                        &history[last - 1],
+                        history[last].occurred_at,
+                        history[last].event.clone(),
+                    );
+                }
+                3 => {
+                    if let AgentEventKindV4::ContextCompactionCompleted { admission, .. } =
+                        &mut history[last].event
+                    {
+                        *admission = None;
+                    }
+                    history[last] = AgentEventV4::next(
+                        &history[last - 1],
+                        history[last].occurred_at,
+                        history[last].event.clone(),
+                    );
+                }
+                4 => {
+                    if let AgentEventKindV4::ContextCompactionStarted {
+                        frozen_spec_hash, ..
+                    } = &mut history[last - 3].event
+                    {
+                        *frozen_spec_hash = Some("0".repeat(64));
+                    }
+                    for index in last - 3..=last {
+                        history[index] = AgentEventV4::next(
+                            &history[index - 1],
+                            history[index].occurred_at,
+                            history[index].event.clone(),
+                        );
+                    }
+                }
+                _ => {
+                    history.remove(0);
+                }
+            }
+            *store.events.lock().unwrap() = history.clone();
+            assert!(
+                core.context_for(&spec, limits).await.is_err(),
+                "unverified source mutation {mutation} accepted"
+            );
+            assert_eq!(store.load_direct(spec.run_id).unwrap(), history);
+            assert!(store.archives.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_checkpoint_budget_closures_stay_private_until_async_recovery() {
+        let (spec, store, mut model) = manual_fixture(true, 70_000);
+        model.streamed = Some(Mutex::new(vec![]));
+        let state = large_science(spec.project_id, 300_000);
+        let science = SnapshotScience(Mutex::new(state.clone()));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: Some(&science),
+        };
+        let limits = AgentLimitsV4 {
+            auto_compact: false,
+            ..Default::default()
+        };
+        let prepared = core
+            .prepare_context_compaction(&manual_snapshot(&store, &spec, state.clone()), limits)
+            .unwrap();
+        for event in &prepared.planned_events {
+            store.append_direct(event).unwrap();
+        }
+        let logical_request_id = Uuid::new_v4();
+        let attempt_id = Uuid::new_v4();
+        append_test_event(&store, spec.run_id, AgentEventKindV4::ModelRequestStarted {
+            request:serde_json::from_value(json!({"logical_request_id":logical_request_id,"attempt_id":attempt_id,"model_profile_id":spec.model_profile_id,"model_configuration_hash":"a".repeat(64),"context_limit_source":{"kind":"unknown"}})).unwrap(),
+        });
+        append_test_event(
+            &store,
+            spec.run_id,
+            AgentEventKindV4::ModelReplayRecorded {
+                replay: omicsops_protocol::ModelReplayRecordedV4 {
+                    logical_request_id,
+                    attempt_id,
+                    binding: omicsops_protocol::ModelReplayBindingV4 {
+                        model_profile_id: spec.model_profile_id,
+                        configuration_hash: "a".repeat(64),
+                    },
+                    continuation: omicsops_protocol::ModelProviderContinuationV4 {
+                        items: vec![omicsops_protocol::ModelReplayItemV4::ToolCall {
+                            call: ToolCallV4 {
+                                call_id: "not-dispatched-after-manual".into(),
+                                tool_id: "project.read".into(),
+                                arguments: json!({"path":"evidence"}),
+                            },
+                        }],
+                    },
+                },
+            },
+        );
+        let before = store.load_direct(spec.run_id).unwrap();
+        assert!(
+            core.prepare_context_compaction(&manual_snapshot(&store, &spec, state), limits)
+                .is_err()
+        );
+        let context = core.context_for(&spec, limits).await.unwrap();
+        assert_eq!(store.load_direct(spec.run_id).unwrap(), before);
+        assert!(model.streamed.as_ref().unwrap().lock().unwrap().is_empty());
+        assert!(store.archives.lock().unwrap().is_empty());
+        let budget_request = model.inner.requests.lock().unwrap().last().unwrap().clone();
+        let projected = budget_request
+            .replay
+            .iter()
+            .find_map(|item| match item {
+                omicsops_protocol::ModelReplayItemV4::ToolResult { call_id, output }
+                    if call_id == "not-dispatched-after-manual" =>
+                {
+                    Some(serde_json::from_str::<Value>(output).unwrap())
+                }
+                _ => None,
+            })
+            .expect("budget includes pending host decision");
+        assert!(!context.contains(projected["event_hash"].as_str().unwrap()));
+        core.model_turn_with_policy(
+            spec.run_id,
+            core.execution_request(&spec, context, &before),
+            0,
+            None,
+            true,
+            &mut 1,
+            limits.context_max_bytes,
+            ModelTurnTimeoutPolicy::Absolute(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+        let after = store.load_direct(spec.run_id).unwrap();
+        let closures = after.iter().filter(|event| matches!(&event.event, AgentEventKindV4::ToolFinished {outcome} if outcome.call_id == "not-dispatched-after-manual")).collect::<Vec<_>>();
+        assert_eq!(closures.len(), 1);
+        assert!(closures[0].verify().is_ok());
+        assert_ne!(projected["event_hash"], closures[0].event_hash);
+        let sent = model.streamed.as_ref().unwrap().lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let actual = sent[0]
+            .replay
+            .iter()
+            .find_map(|item| match item {
+                omicsops_protocol::ModelReplayItemV4::ToolResult { call_id, output }
+                    if call_id == "not-dispatched-after-manual" =>
+                {
+                    Some(serde_json::from_str::<Value>(output).unwrap())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(actual["event_hash"], closures[0].event_hash);
+        assert_eq!(
+            serde_json::to_vec(&budget_request).unwrap().len(),
+            serde_json::to_vec(&sent[0]).unwrap().len()
+        );
     }
 
     #[test]

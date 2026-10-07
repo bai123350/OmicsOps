@@ -136,7 +136,7 @@ pub(crate) fn scientific_state_view(
     Some(view)
 }
 
-/// Preparation-only reference to a signed, preallocated checkpoint. The caller
+/// Preparation-only reference to a hash-verified, preallocated checkpoint. The caller
 /// must keep the resulting request private until the whole event chain commits.
 pub(crate) fn prospective_scientific_state_view(
     spec: &RunSpecV4,
@@ -144,6 +144,91 @@ pub(crate) fn prospective_scientific_state_view(
     source: &AgentEventV4,
 ) -> Option<Value> {
     scientific_state_view(spec, state, source)
+}
+
+/// Only the complete, verified manual operation permits bounded reuse when
+/// automatic compaction is disabled. Ordinary/legacy checkpoints retain their
+/// existing policy. A changed scientific snapshot cannot reuse old references.
+pub(crate) fn verified_manual_checkpoint(
+    spec: &RunSpecV4,
+    state: &Value,
+    source: &AgentEventV4,
+    events: &[AgentEventV4],
+) -> bool {
+    use omicsops_protocol::RunExecutionKindV4;
+    use sha2::{Digest, Sha256};
+    let Some(checkpoint) = checkpoint_for_state(spec, state, source) else {
+        return false;
+    };
+    if spec.execution_kind != RunExecutionKindV4::OrdinaryAgent
+        || spec.spec_hash.is_none()
+        || spec.validate_integrity().is_err()
+        || checkpoint.schema_version != 4
+    {
+        return false;
+    }
+    let mut previous_hash = "";
+    for (index, event) in events.iter().enumerate() {
+        if event.schema_version != 4
+            || event.run_id != spec.run_id
+            || event.project_id != spec.project_id
+            || event.conversation_id != spec.conversation_id
+            || event.sequence != index as u64 + 1
+            || event.previous_hash != previous_hash
+            || event.verify().is_err()
+        {
+            return false;
+        }
+        previous_hash = &event.event_hash;
+    }
+    let Some(index) = events.iter().position(|event| event == source) else {
+        return false;
+    };
+    if index < 2 || index + 1 >= events.len() {
+        return false;
+    }
+    let [started, archived, _, completed] = &events[index - 2..=index + 1] else {
+        return false;
+    };
+    let AgentEventKindV4::ContextCompactionStarted {
+        request_id,
+        source_through_sequence,
+        source_head_hash,
+        frozen_spec_hash,
+    } = &started.event
+    else {
+        return false;
+    };
+    let AgentEventKindV4::ContextArchived { archive } = &archived.event else {
+        return false;
+    };
+    let AgentEventKindV4::ContextCompactionCompleted {
+        request_id: completed_id,
+        archive: completed_archive,
+        checkpoint_through_sequence,
+        checkpoint_sha256,
+        before_bytes,
+        admission: Some(admission),
+        ..
+    } = &completed.event
+    else {
+        return false;
+    };
+    let Ok(checkpoint_bytes) = serde_json::to_vec(checkpoint) else {
+        return false;
+    };
+    !request_id.is_nil()
+        && request_id == completed_id
+        && frozen_spec_hash == &spec.spec_hash
+        && *source_through_sequence == checkpoint.through_sequence
+        && started.sequence.checked_sub(1) == Some(*source_through_sequence)
+        && source_head_hash == &started.previous_hash
+        && archive == completed_archive
+        && archive.through_sequence == checkpoint.through_sequence
+        && archive.size_bytes == *before_bytes
+        && *checkpoint_through_sequence == checkpoint.through_sequence
+        && checkpoint_sha256 == &format!("{:x}", Sha256::digest(checkpoint_bytes))
+        && spec.model_configuration_hash.as_deref() == Some(admission.configuration_hash.as_str())
 }
 
 pub(crate) fn is_context_management(event: &AgentEventV4) -> bool {

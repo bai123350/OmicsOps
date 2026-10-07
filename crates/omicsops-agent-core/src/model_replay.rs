@@ -68,6 +68,35 @@ pub(crate) fn shape_request(
     Ok(())
 }
 
+/// Budget-only projection of host decisions awaiting durable replay closure.
+/// The synthetic envelopes never leave fitting/validation. Actual model turns
+/// still append and reload their real closures before shaping a sent request.
+pub(crate) fn shape_request_for_budget(
+    request: &mut crate::ModelRequestV4,
+    project_id: Uuid,
+    conversation_id: Uuid,
+    binding: &ModelReplayBindingV4,
+    events: &[AgentEventV4],
+) -> Result<(), String> {
+    let closures = pending_replay_closures(project_id, conversation_id, binding, events)?;
+    if closures.is_empty() {
+        return shape_request(request, project_id, conversation_id, binding, events);
+    }
+    let mut projected = events.to_vec();
+    for outcome in closures {
+        let previous = projected.last().ok_or("model replay has no run origin")?;
+        // event_view omits timestamps. The eventual real envelope's SHA256 has
+        // the same width; its identity is never claimed by the returned context.
+        let event = AgentEventV4::next(
+            previous,
+            previous.occurred_at,
+            AgentEventKindV4::ToolFinished { outcome },
+        );
+        projected.push(event);
+    }
+    shape_request(request, project_id, conversation_id, binding, &projected)
+}
+
 fn project_replay(
     project_id: Uuid,
     conversation_id: Uuid,
