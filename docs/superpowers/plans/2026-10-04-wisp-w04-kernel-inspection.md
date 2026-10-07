@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust/async-trait/Tokio/serde，Tauri 2，React 19/TypeScript/Vitest，Python stdlib unittest；真实 R 仅显式 ignored 验收。
 
-**Spec:** [W04 Runtime 设计](../specs/2026-10-04-wisp-runtime-design.md#w04观察当前内核中的对象)，设计及8515da8全部实施计划已确认。Task1–3协议/manager及Local/SSH worker已独立审阅/必要复审通过；Task4–5宿主/UI与完整交付仍待实施，真实worker/live验收未执行。
+**Spec:** [W04 Runtime 设计](../specs/2026-10-04-wisp-runtime-design.md#w04观察当前内核中的对象)，设计及8515da8全部实施计划已确认。Task1–4协议/manager、Local/SSH worker及宿主已独立审阅/必要复审通过；Task5实际UI与完整交付仍待实施，真实worker/live验收未执行。
 
 ## Global Constraints
 
@@ -111,14 +111,14 @@ assert_eq!(r_binding_side_effect_count, 0); // 仅 opt-in R 测试
 
 ### Task 4: 宿主 weak live registry 和只读命令
 
-**Files:** Modify `src-tauri/src/agent_v4.rs:compose/ExecutionResourcesSlotV4`、`src-tauri/src/commands.rs:AppState`、`src-tauri/src/lib.rs`；Create `src-tauri/src/kernel_inspection_v4.rs`；Test 新模块及 agent_v4 existing mock resources。
+**Files:** Modify `src-tauri/src/agent_v4.rs:compose/ExecutionResourcesSlotV4`、`src-tauri/src/commands.rs:AppState`、`src-tauri/src/lib.rs`；Create `src-tauri/src/kernel_inspection_v4.rs`；Test 新模块及 agent_v4 existing mock resources。新AppState字段要求窄幅同步 `agent_v4/subscription_live_acceptance_tests.rs` 和 `agent_v4/go_live_acceptance_tests.rs`，每文件仅增加default空registry initializer；后者preexisting dirty工作以RAW/HEAD及candidate-only proof保留，不执行ignored/live验收。增加窄幅 `crates/omicsops-runtime/src/lib.rs` producer：host最后Store await之后的non-starting session验证，opaque Weak保存本次实际inspected Arc身份；try_lock区分Current/Stale/Busy/Unavailable，同Arc+UUID+health而非只依赖UUID唯一性，不引入strong keepalive/DTO/pointer或再次inspect。
 
 **Interfaces:**
 - Consumes：Task 1 manager；Task 3 SSH trait；现有 frozen Run/compute scope 验证、`ExecutionResourcesSlotV4.ready.get()`。
 - Produces：`pub(crate) struct LiveRuntimeRegistryV4`，键 `LiveRuntimeScopeV4 = (Uuid, Uuid, Uuid)`，值弱 slot+registration generation；`LiveRuntimeRegistryV4::register(&self, scope: LiveRuntimeScopeV4, slot: &Arc<ExecutionResourcesSlotV4>) -> LiveRuntimeRegistrationV4`，Drop 仅清自己代次。guard 字段为 `ComposedToolsV4._runtime_registration: Option<LiveRuntimeRegistrationV4>`，compose默认None；实际execution driver所有权注册/取消重验后赋Some。guard或整个tools显式移入async driver并持有至结束，避免Rust仅捕获tools.registry导致其他字段提前drop；guard不持slot强引用。planning不执行持久内核，无须为其伪造可观察session。
 - Produces：`pub(crate) async fn inspect_live_kernel_v4(state: &AppState, request: &InspectKernelRequestV4) -> Result<KernelInspectionV4, String>`（agent_v4 内部）；`pub async fn agent_v4_inspect_kernel(state: State<'_, AppState>, request: InspectKernelRequestV4) -> Result<KernelInspectionV4, String>`（新命令）。
 
-- [ ] **RED 写测试**：`inspection_host_rejects_foreign_scope_and_override`、`inspection_host_never_initializes_resources`、`inspection_registry_old_guard_cannot_remove_new_slot`、`inspection_host_redacts_ephemeral_metadata`，以及 `inspection_driver_guard_survives_spawn`（真实异步driver期间条目存在、结束后移除）、`inspection_dry_compose_is_unregistered`（干式组合不会覆盖live slot）。
+- [x] **RED 写测试**：`inspection_host_rejects_foreign_scope_and_override`、`inspection_host_never_initializes_resources`、`inspection_registry_old_guard_cannot_remove_new_slot`、`inspection_host_redacts_ephemeral_metadata`，以及 `inspection_driver_guard_survives_spawn`（真实异步driver期间条目存在、结束后移除）、`inspection_dry_compose_is_unregistered`（干式组合不会覆盖live slot）。
 
 ```rust
 assert_eq!((factory.initializations(), backend.launches()), (0, 0));
@@ -128,10 +128,10 @@ assert_eq!(persisted_event_count_after, persisted_event_count_before);
 assert!(!serde_json::to_string(&response).unwrap().contains(secret_sentinel));
 ```
 
-- [ ] **RED 运行**：`cargo test -p omicsops-desktop --lib inspection_host`；`cargo test -p omicsops-desktop --lib inspection_registry`。预期注册表/命令缺失或断言失败。
-- [ ] **实现接口**：compose不登记；实际execution driver通过ownership/cancel gate后注册已创建slot（从model.resources取得），显式将guard或整个tools移入driver；W05 manual/目录等干式组合保持None，不促发initialize。scope从Store frozen run验证，前端不提供backend/environment。升级weak后只ready.get；结果再核验session/generation，固定原因映射，用户元数据不记录日志/事件。补齐scope并脱敏后调用 `KernelInspectionV4::validate()` 再返回，不能仅核验worker payload而漏计完整response字节；增加near-limit envelope保守拒绝测试。AppState初始化和现有测试fixtures同步补默认registry。
-- [ ] **GREEN**：重复 RED；`cargo test -p omicsops-desktop --lib dto_contract_tests`；预期越权拒绝、默认 lazy compute 回归通过。
-- [ ] **Commit**：仅暂存本任务文件，`git commit -m "feat(desktop): expose live kernel metadata inspection"`。
+- [x] **RED 运行**：`cargo test -p omicsops-desktop --lib inspection_host`；`cargo test -p omicsops-desktop --lib inspection_registry`。预期注册表/命令缺失或断言失败。
+- [x] **实现接口**：compose不登记；实际execution driver通过ownership/cancel gate后注册已创建slot（从model.resources取得），显式将guard或整个tools移入driver；W05 manual/目录等干式组合保持None，不促发initialize。scope从Store frozen run验证，前端不提供backend/environment。升级weak后只ready.get；结果再核验session/generation，固定原因映射，用户元数据不记录日志/事件。补齐scope并脱敏后调用 `KernelInspectionV4::validate()` 再返回，不能仅核验worker payload而漏计完整response字节；增加near-limit envelope保守拒绝测试。AppState初始化和现有测试fixtures同步补默认registry。
+- [x] **GREEN**：重复 RED；`cargo test -p omicsops-desktop --lib dto_contract_tests`；预期越权拒绝、默认 lazy compute 回归通过。
+- [x] **Commit**：仅暂存本任务文件，`git commit -m "feat(desktop): expose live kernel metadata inspection"`。
 
 ### Task 5: Runtime UI、完整验证与 smoke 记录
 
@@ -158,7 +158,7 @@ expect(parentOverlay).toBeVisible(); // 打开立即 Escape 后
 
 ## Plan Self-Review
 
-已将设计的非启动、双协议、安全元数据、失败健康语义、ephemeral宿主和UI分别绑定Task1–5；每项有具名测试，未新增CLI/DB/权限路径。Task1–3已实现并审阅，Task4–5未完成，不把协议/helper/mock通过记为真实worker或完整功能交付。
+已将设计的非启动、双协议、安全元数据、失败健康语义、ephemeral宿主和UI分别绑定Task1–5；每项有具名测试，未新增CLI/DB/权限路径。Task1–4已实现并审阅，Task5未完成，不把协议/helper/mock通过记为真实worker或完整功能交付。
 
 ## 当前实施证据
 
@@ -167,3 +167,7 @@ expect(parentOverlay).toBeVisible(); // 打开立即 Escape 后
 Task2提交45dd6db/91964e3经full/scoped独立审阅通过，无open blocking finding。Python exact builtin/opaque/no-method helper4通过；原Rust14及preserved13是fix前证据。队列执行race真实13通过/1失败→post-lock健康guard后14通过，仍无kill/rebuild/重试/计算取消承诺。审阅I1真实duplex边界16测试15通过/1失败证明8192/16384 dirty terminal接受/health true；next-write及Windows acknowledged queued pre-send各1真实失败。旧execute取消后healthy true的1失败也保留，补sent至verified terminal的drop guard后阻断native入口。最终Windows inspect20/preserved process_backend19通过/0 ignored，fmt/diff通过，unique8192/live empty/EOF/queued及healthy artifacts/capture/failed-code同session实际核验；未复跑未变Python，不把4通过称新fix结果。ABI/Tokio completed-buffer与取消析构顺序经独立复审支持quiescent-read invariant；native peek无无条件nonblocking保证，Linux/macOS未编译/执行，后到帧限制明确。Mock Python协议进程与helper单测不等于真实worker/science验收；实际R/容器/SSH/模型/GUI、CI版本与全产品交付仍未执行，Task5/最终gate负责。
 
 Task3提交f644d0c/ef7da02经full/scoped独立审阅通过。Typed Inspector、bounded receive与wake-aware russh queue、sent/partial/execute-read取消guards和真实mutex queued拒绝有回归；旧execute/shutdown wire、正常stdout/stderr/artifact/failed-code保持。实际初RED agent2/adapter1/Python8中4SSH缺helper，取消4中2失败，parser2通过/1失败；临时移除新queued guard的1失败是controlled assertion-sensitivity，不冒称原BASE缺陷。审阅I1复制policy由canonical Python/R唯一源修复，10 Python tests的8 adversarial通过/2 missing-provenance失败后10通过；四assembled worker bytes与fix BASE完全一致，编译后inclusion/definition一次。MinorM2新增0/2999 Pending healthy、EXACT3000 Ready Unavailable/health false/无后续send，生产deadline未改且原正确baseline PASS。最终Local20/adapters5 unit+3 integration/1 R ignored、protocol3、desktop7、Python10、fmt/diff通过；已保存OUT_DIR/OS5重跑及一次model capacity同writer恢复记录。Shared agent/acceptance candidate-only staging、forward/reverse及raw outside proofs由独立审阅核验；原agent390行/acceptance18行仍未暂存，其他298/299 Rust raw文件未变。Real R fixture虽已写且编译，仍ignored/未执行；不能称R no-side-effect、真实SSH/科学/GUI/CI验收通过。Cache warnings保留非blocking，full W04/default/native/clean HEAD由Task5/最终gate执行；宿主weak registry、redaction及完整公开response validate尚待Task4。
+
+Task4提交a0fbedc独立spec/quality审阅通过，无Critical/Important。Weak registry/实际driver-only guard跨future完成及abort、干式同scope compose不覆盖、Store冻结所有权/语言/compute/代次重验、host脱敏及完整16KiB validate、最后Store await后同Arc+UUID Weak identity无新await均已验证。最终host6/registry2/spawn1/abort1/dry1/DTO51/lazy5/ownership3/duplicate-active1/Runtime34/fmt通过；一次0测试filter未计PASS，已改实际driverfilters。证据更正：两份RED各16总诊断实为15缺接口+1 OUT_DIR，不是16缺接口且无infra；原日志、fixture错误与原命令授权重跑均保留，不重造证据。Near-envelope fixture先错误预期Ready，修正为valid MAX-20后完整response拒绝；immutable owner fixture被Store正确拒绝，修正outer compute mismatch，不改保护。
+
+Task4 shared staging除原external patch外留下一个明示兼容增量：agent_v4 external-only223行fixture不在HEAD，唯一default registry initializer留未暂存，不能把整段外部测试提交。Anchor为 `detached_remote_jobs_catalog_matches_the_frozen_backend_without_initialization`，当时working line10015；candidate scratch只扣除此行，移除feature及compat可恢复原RAW exact。Go_live candidate只含一个允许initializer，混合EOL原bytes保留；新测试用owned `inspection_selection`，不依赖dirty-only helper。两份candidate/raw/inverse证明由独立审阅支持，index empty；最终clean HEAD archive必须排除外部工作及此compat residue验证独立编译。环境warnings保持非blocking，full/default/native/UI、CI/live/GUI仍由Task5/最终gate执行；没有初始化/launch/新SSH/保活/科研证据副作用。
