@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust/sqlx/Tokio、现有 remote_jobs_v4 Transport与SshSession、Tauri 2、React 19/TypeScript/Vitest；无新表或依赖。
 
-**Spec:** [W03 设计](../specs/2026-10-04-wisp-composer-files-jobs-design.md#w03ssh-后台作业列表与查询)、[共同约束](../specs/2026-10-04-wisp-improvements-design.md)。设计已确认；本计划待审阅，未实施。
+**Spec:** [W03 设计](../specs/2026-10-04-wisp-composer-files-jobs-design.md#w03ssh-后台作业列表与查询)、[共同约束](../specs/2026-10-04-wisp-improvements-design.md)。设计及8515da8实施计划已确认；Task1 Store/DTO已独立审阅与fix复审通过，Task2–4待实施。
 
 ## Global Constraints
 
@@ -39,7 +39,7 @@
 
 DTO request `ListRemoteJobsV4Request {project_id:Uuid,conversation_id:Option<Uuid>}`、`RefreshRemoteJobV4Request {project_id:Uuid,job_id:Uuid}`；enum `RemoteJobRecordedStateV4::{Reserved,Running,Unknown,Succeeded,Failed}`、`RemoteJobQueryEligibilityV4::{NeedsRootCheck,BindingChanged,Unsupported,IntegrityMismatch,RecordedReceipt}`、`RemoteJobObservationStatusV4::{Running,Unknown,Completed,Timeout,Unavailable,Rejected}`；`RemoteJobSummaryV4 {project_id:Uuid,conversation_id:Uuid,job_id:Uuid,run_id:Uuid,call_id:String,backend_id:String,language:String,environment:String,request_sha256:String,recorded_state:RemoteJobRecordedStateV4,query_eligibility:RemoteJobQueryEligibilityV4,recorded_at:Option<String>}`；`RemoteJobsPageV4 {jobs:Vec<RemoteJobSummaryV4>,limit:u32,remote_liveness_checked:bool}`；`RemoteJobCaptureReferenceV4 {relative_path:String,sha256:String,size_bytes:Option<u64>}`；`RemoteJobObservationV4 {job:RemoteJobSummaryV4,status:RemoteJobObservationStatusV4,observed_at:String,stdout_excerpt:String,stderr_excerpt:String,captures:Vec<RemoteJobCaptureReferenceV4>,resubmitted:bool}`。serde snake_case/deny_unknown_fields，旧job recorded_at=None。
 
-- [ ] **RED:** tempStore真实frozen run/job构造，project/会话ownership与filter-before-limit；其它project ID拒绝、非detached排除、旧绑定保留；record加载验证spec integrity/context/run/request/canonical original ToolRequested hash和已存result原serialized字节hash。损坏返回安全错误，不默默供重新提交。
+- [x] **RED:** tempStore真实frozen run/job构造，project/会话ownership与filter-before-limit；其它project ID拒绝、非detached排除、旧绑定保留；record加载验证spec integrity/context/run/request/canonical original ToolRequested hash和已存result原serialized字节hash。损坏返回安全错误，不默默供重新提交。
 
 ```rust
 assert_eq!(metadata.iter().filter(|item| item.conversation_id == conversation_a).count(), metadata.len());
@@ -50,10 +50,10 @@ assert!(!serialized_summary.contains("remote_host_key"));
 assert!(!serialized_summary.contains("remote_root"));
 ```
 
-- [ ] **Run RED:** `cargo test -p omicsops-store --test remote_job_observation`、`cargo test -p omicsops-desktop --lib dto_contract_tests::remote_jobs`；缺接缝/DTO应FAIL。
-- [ ] **Implement:** join agent_runs ownership，校验project/context/run相符；list不加载输出/code，只有限metadata，固定safe eligibility。Selected record在只读事务内加载冻结spec、validated event chain原call和result，验证原identity/hash；boundedJSON不暴露。DTO中语言映射已有协议值，绝不复制protocol执行结构进入公共DTO；list真实limit=100、remote_liveness_checked=false。
-- [ ] **Run GREEN:** 同命令PASS；`cargo test -p omicsops-store --test runtime_jobs` 保持reserve/CAS原语义。
-- [ ] **Commit:** `feat: list project-owned detached job metadata`。
+- [x] **Run RED:** `cargo test -p omicsops-store --test remote_job_observation`、`cargo test -p omicsops-desktop --lib dto_contract_tests::remote_jobs`；缺接缝/DTO应FAIL。
+- [x] **Implement:** join agent_runs ownership，校验project/context/run相符；list不加载输出/code，只有限metadata，固定safe eligibility。Selected record在只读事务内加载冻结spec、validated event chain原call和result，验证原identity/hash；boundedJSON不暴露。DTO中语言映射已有协议值，绝不复制protocol执行结构进入公共DTO；list真实limit=100、remote_liveness_checked=false。
+- [x] **Run GREEN:** 同命令PASS；`cargo test -p omicsops-store --test runtime_jobs` 保持reserve/CAS原语义。
+- [x] **Commit:** `feat: list project-owned detached job metadata`。
 
 ### Task 2: 状态命令与全路径 timeout/身份核对
 
@@ -122,6 +122,10 @@ expect(screen.queryByRole("button", { name: /Cancel remote job/ })).not.toBeInTh
 - [ ] **Implement:** 加入口并接入应用级/局部清理的window Escape层。README/AGENTS当前“没有自动轮询/面板”替换为“手动默认、面板明确启用有限10次窗口”；仍无job cancel/跨重启自动轮询/交互kernel重连，停止Agent仍不终止独立后台作业。acceptance写Windows fake操作及可选一次性Linux SSH真实smoke，不能宣称已运行。
 - [ ] **Run GREEN:** 同命令，继而 `cargo fmt --all -- --check`、`cargo test --workspace`、`npm test`、`npm run build`、`npm run build:desktop`、`git diff --check`。记录非零/ignored/未执行，锁变化npm ci，pure fmt独立提交。
 - [ ] **Commit:** `feat: expose remote job observation in runtime workspace`；仅验证实际通过后更新清单。
+
+## 当前实施证据
+
+2026-10-07：Task1提交9d415c6/bad6feb经独立full/scoped审阅通过，无open finding。最终Store observation6/runtime_jobs12、先前desktop DTO3/DTO --lib22通过，fmt/diff通过。DTO初RED27为26缺类型+OUT_DIR基础设施，总数未误称纯缺接口；新增terminal退休metadata RED实际0pass/1fail→6pass。正常nonterminal None与retired body None保留；旧writer历史兼容性从committed blobs核对。Task2 host status、Task3 panel和Task4实际入口未实施；不得把leaf检查当完整W03交付或live验收。
 
 ## Plan Self-Review
 
