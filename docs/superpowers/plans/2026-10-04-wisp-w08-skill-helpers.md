@@ -62,7 +62,7 @@
 - Consumes: Task 1 loader；本地 `search_openalex(query, n=10, filters="")`、`expand_citations(doi, n_backward=50, n_forward=15)`、`verify_dois(dois)`、`_get_json(url, timeout=15, strict=False)`。
 - Produces: 测试内 `FakeHttpResponse(payload: bytes, status: int = 200)`，只提供 read/context-manager/status；HTTPError/URLError 用 stdlib 对象，urlopen/build_opener/open/time.sleep 直接 patch。不增加产品 helper 或独立 report。
 
-- [ ] **测试 — 写文献行为矩阵。** success-empty/populated、HTTP 401/404/429/500、超时/URL error、坏 UTF-8/JSON、results 非list/row非dict；429 重试一次。expand 验证 references 用 cited_by、cited_by 用 cites，两方向均成功才允许 empty，任一失败不返回 partial。CrossRef miss/doi HEAD unavailable 返回 ok=None，404返回False、2xx/3xx返回True；假 OPENALEX key 只到该服务。
+- [x] **测试 — 写文献行为矩阵。** success-empty/populated、HTTP 401/404/429/500、超时/URL error、坏 UTF-8/JSON、results 非list/row非dict；429 重试一次。expand 验证 references 用 cited_by、cited_by 用 cites，两方向均成功才允许 empty，任一失败不返回 partial。CrossRef miss/doi HEAD unavailable 返回 ok=None，404返回False、2xx/3xx返回True；假 OPENALEX key 只到该服务。
 
   ```python
   self.assertEqual(search_openalex("x"), [])  # fake 成功零结果
@@ -74,10 +74,10 @@
   self.assertIsNone(verified[doi]["ok"])
   ```
 
-- [ ] **RED/基线 — 运行实际结果。** `python -B -m unittest discover -s scripts -p "test_bundled_skill_helpers.py" -v`；必要的新 FakeHttpResponse 未实现时 FAIL；现有 helper 正确分支可能已经 PASS，如实记录。
-- [ ] **实现最小 HTTP fixture 与直接断言。** response/exceptions 在 patch side_effect 声明，未 mocked network 一律会失败；fake key/contact 在 clear=True 环境下，assert 原异常/请求 URL/secret 未进入完整 traceback。把吞 HTTP error 返回 [] 的假函数仅放入局部 namespace，确认合同 assertion 拒绝，再恢复原函数。无需修改已正确的 runtime.py。
-- [ ] **GREEN — 同命令 PASS。** 所有矩阵无真实等待/网络，mock退出后 environment/urlopen/sys.modules恢复；失败可见，不靠 broad except/skip 将断言吞掉。运行现有安装/完整 hash 两测试 `cargo test -p omicsops-desktop --lib wisp_snapshot`，记录实际通过数，不得称零测试通过。
-- [ ] **Commit —** `git add -- scripts/test_bundled_skill_helpers.py`；`git commit -m "test: distinguish literature retrieval failures from empty results"`。
+- [x] **RED/基线 — 运行实际结果。** `python -B -m unittest discover -s scripts -p "test_bundled_skill_helpers.py" -v`；必要的新 FakeHttpResponse 未实现时 FAIL；现有 helper 正确分支可能已经 PASS，如实记录。
+- [x] **实现最小 HTTP fixture 与直接断言。** response/exceptions 在 patch side_effect 声明，未 mocked network 一律会失败；fake key/contact 在 clear=True 环境下，assert 原异常/请求 URL/secret 未进入完整 traceback。把吞 HTTP error 返回 [] 的假函数仅放入局部 namespace，确认合同 assertion 拒绝，再恢复原函数。无需修改已正确的 runtime.py。
+- [x] **GREEN — 同命令 PASS。** 所有矩阵无真实等待/网络，mock退出后 environment/urlopen/sys.modules恢复；失败可见，不靠 broad except/skip 将断言吞掉。运行现有安装/完整 hash 两测试 `cargo test -p omicsops-desktop --lib wisp_snapshot`，记录实际通过数，不得称零测试通过。
+- [x] **Commit —** `git add -- scripts/test_bundled_skill_helpers.py`；`git commit -m "test: distinguish literature retrieval failures from empty results"`。
 
 ### Task 3: 统一 Python discovery、CI 与证据说明
 
@@ -102,4 +102,6 @@
 
 ## 当前实施证据
 
-2026-10-08：Task1提交74e8fa4独立spec/quality审阅通过，无open finding。仅新增307行标准库测试；固定loader与claim/path、figure几何合同focused14通过，完整Python discovery23通过。实际loader缺接缝RED为1个NameError；首轮helper11通过/1个Windows platform fixture失败，stub后原helper合同baseline PASS，没有修改helper制造缺陷。两次sandbox discovery均保留5个既有RemoteJobBridge WinError5，原命令授权重跑后23通过。runtime.py/SOURCE/hash/freeze不变；外部未提交工作完整保留。实际本地Python3.10，计划CI3.12未执行；本leaf未重复Rust/npm/Web/native。Task2文献矩阵与Task3discovery/CI/完整交付待实施；W08场景report/upload仍由另一子计划之后拥有，整个W08尚未完成。
+2026-10-08：Task1提交74e8fa4独立spec/quality审阅通过，无open finding。仅新增307行标准库测试；固定loader与claim/path、figure几何合同focused14通过，完整Python discovery23通过。实际loader缺接缝RED为1个NameError；首轮helper11通过/1个Windows platform fixture失败，stub后原helper合同baseline PASS，没有修改helper制造缺陷。两次sandbox discovery均保留5个既有RemoteJobBridge WinError5，原命令授权重跑后23通过。runtime.py/SOURCE/hash/freeze不变；外部未提交工作完整保留。实际本地Python3.10，计划CI3.12未执行；本leaf未重复Rust/npm/Web/native。Task3discovery/CI/完整交付待实施；W08场景report/upload仍由另一子计划之后拥有，整个W08尚未完成。
+
+Task2提交d6a71bd独立spec/quality审阅通过，无Critical/Important。新增13项LiteratureReviewTests，最终focused27通过；既有wisp_snapshot2通过/0 ignored，原OUT_DIR沙箱失败日志保留，原命令授权重跑。真实fixture RED为26测试/15个缺FakeHttpResponse NameError记录；中间7个traceback fixture断言失败保留，改为核对真实captured Request.full_url后通过。原helper正确分支保持baseline PASS，未改runtime.py/SOURCE/hash/freeze。Mock网络/等待/环境均恢复，完整traceback不含实际请求URL/假key/原异常；两方向失败不误记empty，DOI未知保持None。既存incremental hard-link warning非blocking；本leaf未执行全产品检查，Task3完整交付及CI仍待完成。
