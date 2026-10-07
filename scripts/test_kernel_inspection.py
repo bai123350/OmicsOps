@@ -6,10 +6,35 @@ import re
 import unittest
 
 
-def load_helper(source_path="crates/omicsops-runtime/src/process_backend.rs"):
-    source = (pathlib.Path(__file__).resolve().parents[1] /
-              source_path).read_text(encoding="utf-8")
-    worker = re.search(r'const PYTHON_DRIVER: &str = r#"(.*?)"#;', source, re.S).group(1)
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+WORKERS = ("crates/omicsops-runtime/src/process_backend.rs",
+           "crates/omicsops-adapters/src/kernel.rs")
+
+
+def load_worker(source_path, language="PYTHON"):
+    """Read the literal/include_str concat used by the compiled worker."""
+    source_file = ROOT / source_path
+    source = source_file.read_text(encoding="utf-8")
+    literal = re.search(r'const ' + language + r'_DRIVER: &str = r#"(.*?)"#;', source, re.S)
+    if literal:
+        return literal.group(1)
+    assembly = re.search(r'const ' + language + r'_DRIVER: &str = concat!\((.*?)\n\);', source, re.S)
+    assert assembly is not None, "worker compile-time assembly is missing"
+    remaining = assembly.group(1).strip()
+    fragments = []
+    token = re.compile(r'\s*(?:r#"(.*?)"#|include_str!\("([^"]+)"\))\s*(?:,|$)', re.S)
+    while remaining:
+        match = token.match(remaining)
+        assert match is not None, "unrecognized worker assembly expression"
+        literal, included = match.groups()
+        fragments.append(literal if literal is not None else
+                         (source_file.parent / included).read_text(encoding="utf-8"))
+        remaining = remaining[match.end():].strip()
+    return "".join(fragments)
+
+
+def load_helper(source_path=WORKERS[0]):
+    worker = load_worker(source_path)
     tree = ast.parse(worker)
     allowed_functions = {"inspect_objects", "_inspect_name", "_inspect_metadata"}
     nodes = []
@@ -145,6 +170,41 @@ class KernelInspectionTests(unittest.TestCase):
 
 class SshKernelInspectionTests(KernelInspectionTests):
     source_path = "crates/omicsops-adapters/src/kernel.rs"
+
+
+class WorkerAssemblyTests(unittest.TestCase):
+    def test_actual_python_workers_use_one_canonical_policy(self):
+        canonical_path = ROOT / "scripts/kernel_inspection_helpers.py"
+        self.assertTrue(canonical_path.is_file(), "canonical Python metadata policy is missing")
+        canonical = canonical_path.read_text(encoding="utf-8")
+        for node in ast.parse(canonical).body:
+            self.assertTrue(isinstance(node, (ast.FunctionDef, ast.Assign)),
+                            "canonical policy may contain only definitions and captures")
+        for source_path in WORKERS:
+            source = (ROOT / source_path).read_text(encoding="utf-8")
+            self.assertIn('include_str!("../../../scripts/kernel_inspection_helpers.py")', source)
+            self.assertNotIn("def inspect_objects(", source)
+            self.assertNotIn("_INSPECT_TYPE =", source)
+            worker = load_worker(source_path)
+            self.assertEqual(worker.count(canonical), 1)
+            self.assertEqual(worker.count("def inspect_objects("), 1)
+            self.assertLess(worker.index("import contextlib"), worker.index("_INSPECT_TYPE ="))
+            self.assertLess(worker.index("def inspect_objects("), worker.index("for raw in sys.stdin:"))
+            ast.parse(worker)
+
+    def test_actual_r_workers_use_one_canonical_policy(self):
+        canonical_path = ROOT / "scripts/kernel_inspection_helpers.R"
+        self.assertTrue(canonical_path.is_file(), "canonical R metadata policy is missing")
+        canonical = canonical_path.read_text(encoding="utf-8")
+        for source_path in WORKERS:
+            source = (ROOT / source_path).read_text(encoding="utf-8")
+            self.assertIn('include_str!("../../../scripts/kernel_inspection_helpers.R")', source)
+            self.assertNotIn("inspect_bindings <- function", source)
+            worker = load_worker(source_path, "R")
+            self.assertEqual(worker.count(canonical), 1)
+            self.assertEqual(worker.count("inspect_bindings <- function"), 1)
+            self.assertLess(worker.index("library(jsonlite)"), worker.index("inspect_bindings <- function"))
+            self.assertLess(worker.index("inspect_bindings <- function"), worker.index("repeat {"))
 
 
 if __name__ == "__main__":

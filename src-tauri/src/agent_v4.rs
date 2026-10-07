@@ -8193,6 +8193,54 @@ mod ssh_inspect_tests {
             }
         }
     }
+    #[tokio::test(start_paused = true)]
+    async fn ssh_inspect_fixed_three_second_expiry_invalidates_without_next_send() {
+        use omicsops_runtime::KernelInspectionErrorV4 as E;
+        assert_eq!(omicsops_protocol::KERNEL_INSPECTION_TIMEOUT_SECONDS, 3);
+        let (p, s) = (Uuid::new_v4(), Uuid::new_v4());
+        let healthy = AtomicBool::new(true);
+        let mut transport = fake();
+        let mut inspection = Box::pin(ssh_inspect_exchange_v4(&mut transport, &healthy, p, s));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                inspection.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        tokio::time::advance(std::time::Duration::from_millis(2999)).await;
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                inspection.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        assert!(healthy.load(Ordering::SeqCst));
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        let expired =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(inspection.as_mut().poll(cx))).await;
+        assert_eq!(expired, std::task::Poll::Ready(Err(E::Unavailable)));
+        drop(inspection);
+        assert!(!healthy.load(Ordering::SeqCst));
+        assert_eq!(transport.sends.len(), 1);
+        assert_eq!(
+            ssh_inspect_exchange_v4(&mut transport, &healthy, p, s).await,
+            Err(E::Unavailable)
+        );
+        assert!(
+            ssh_execute_exchange_v4(
+                &mut transport,
+                &healthy,
+                p,
+                s,
+                Uuid::new_v4(),
+                "x=1".into(),
+                vec![]
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(transport.sends.len(), 1);
+    }
     #[tokio::test]
     async fn ssh_inspect_does_not_execute_or_reconnect() {
         let (p, s) = (Uuid::new_v4(), Uuid::new_v4());
