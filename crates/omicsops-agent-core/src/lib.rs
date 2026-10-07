@@ -2956,14 +2956,8 @@ impl AgentCoreV4<'_> {
                     .await
                     .map_err(AgentCoreErrorV4::Store)?;
             }
-            request.replay =
-                model_replay::project_model_replay(project_id, conversation_id, &binding, &events)
-                    .map_err(AgentCoreErrorV4::NeedsAttention)?;
-            request.context = model_replay::remove_replayed_context_events(
-                &request.context,
-                &request.replay,
-                &events,
-            );
+            model_replay::shape_request(&mut request, project_id, conversation_id, &binding, &events)
+                .map_err(AgentCoreErrorV4::NeedsAttention)?;
         }
         self.model
             .validate_request(&request)
@@ -4623,6 +4617,383 @@ impl AgentCoreV4<'_> {
         }
     }
 
+    fn shape_final_execution_request(
+        &self,
+        spec: &RunSpecV4,
+        context: String,
+        events: &[AgentEventV4],
+    ) -> Result<ModelRequestV4, AgentCoreErrorV4> {
+        let mut request = self.execution_request(spec, context, events);
+        if self.model.supports_native_replay() {
+            let metadata = self.model.usage_metadata();
+            let binding = omicsops_protocol::ModelReplayBindingV4 {
+                model_profile_id: metadata.model_profile_id,
+                configuration_hash: metadata.model_configuration_hash.ok_or_else(|| {
+                    AgentCoreErrorV4::NeedsAttention(
+                        "native replay requires frozen model identity".into(),
+                    )
+                })?,
+            };
+            let closures = model_replay::pending_replay_closures(
+                spec.project_id,
+                spec.conversation_id,
+                &binding,
+                events,
+            )
+            .map_err(AgentCoreErrorV4::NeedsAttention)?;
+            if !closures.is_empty() {
+                return Err(AgentCoreErrorV4::NeedsAttention(
+                    "manual compaction requires resolved replay closures".into(),
+                ));
+            }
+            model_replay::shape_request(
+                &mut request,
+                spec.project_id,
+                spec.conversation_id,
+                &binding,
+                events,
+            )
+            .map_err(AgentCoreErrorV4::NeedsAttention)?;
+        }
+        Ok(request)
+    }
+
+    /// Prepare only: prospective references must not escape to a model or UI
+    /// until the host atomically commits the exact planned chain.
+    pub fn prepare_context_compaction(
+        &self,
+        snapshot: &omicsops_protocol::ContextCompactionSnapshotV4,
+        limits: AgentLimitsV4,
+    ) -> Result<omicsops_protocol::PreparedContextCompactionV4, AgentCoreErrorV4> {
+        use omicsops_protocol::{
+            ContextCompactionAdmissionV4, ContextCompactionStatusV4, PreparedContextCompactionV4,
+        };
+        use sha2::{Digest, Sha256};
+        let invalid = || {
+            AgentCoreErrorV4::NeedsAttention(
+                "invalid manual compaction source or frozen binding".into(),
+            )
+        };
+        let spec = &snapshot.spec;
+        spec.validate_integrity().map_err(|_| invalid())?;
+        let frozen_spec_hash = spec.spec_hash.clone().ok_or_else(invalid)?;
+        let events = &snapshot.events;
+        let source = events.last().ok_or_else(invalid)?;
+        let science: ScientificStateV4 =
+            serde_json::from_value(snapshot.scientific_state.clone()).map_err(|_| invalid())?;
+        if spec.execution_kind != RunExecutionKindV4::OrdinaryAgent
+            || snapshot.request.run_id != spec.run_id
+            || snapshot.request.project_id != spec.project_id
+            || snapshot.request.conversation_id != spec.conversation_id
+            || source.sequence != snapshot.source_through_sequence
+            || source.event_hash != snapshot.source_head_hash
+            || science.project_id != spec.project_id
+            || science.revision != snapshot.scientific_revision
+            || science.digest() != snapshot.scientific_sha256
+        {
+            return Err(invalid());
+        }
+        let mut previous_hash = "";
+        for (index, event) in events.iter().enumerate() {
+            if event.run_id != spec.run_id
+                || event.project_id != spec.project_id
+                || event.conversation_id != spec.conversation_id
+                || event.sequence != index as u64 + 1
+                || event.previous_hash != previous_hash
+                || event.verify().is_err()
+            {
+                return Err(invalid());
+            }
+            previous_hash = &event.event_hash;
+        }
+        let metadata = self.model.usage_metadata();
+        let configuration_hash = metadata
+            .model_configuration_hash
+            .clone()
+            .ok_or_else(invalid)?;
+        if metadata.model_profile_id != spec.model_profile_id
+            || spec.model_configuration_hash.as_deref() != Some(configuration_hash.as_str())
+            || metadata.context_limit_tokens.is_none_or(|limit| limit == 0)
+        {
+            return Err(invalid());
+        }
+        // Check replay recovery before building any prospective event. An
+        // unfinished native tool proposal cannot be silently repaired here.
+        self.shape_final_execution_request(spec, String::new(), events)?;
+        let use_views = self.model.supports_native_replay()
+            || self
+                .tools
+                .descriptors(RunModeV4::Execute)
+                .iter()
+                .any(|tool| tool.id == context_views::READ_RESULT_TOOL);
+        let guidance = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEventKindV4::GuidanceConsumed {
+                    message_id,
+                    markdown,
+                } => Some(json!({"message_id":message_id,"markdown":markdown})),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let transcript = serde_json::to_string(events).map_err(|_| invalid())?;
+        let before_bytes = transcript.len() as u64;
+        let mut checkpoint = build_model_checkpoint(
+            spec,
+            events,
+            limits.checkpoint_recent_events,
+            snapshot.scientific_state.clone(),
+            use_views,
+        );
+        let validate = |context: String, request_events: &[AgentEventV4]| {
+            if context.len() > limits.context_max_bytes {
+                return Err(AgentCoreErrorV4::NeedsAttention(
+                    "manual compaction context exceeds byte budget".into(),
+                ));
+            }
+            let request = self.shape_final_execution_request(spec, context, request_events)?;
+            self.model
+                .validate_request(&request)
+                .map_err(|error| AgentCoreErrorV4::NeedsAttention(error.message))?;
+            Ok(request)
+        };
+        // As in automatic compaction, persist the fitted recent summaries when
+        // full science fits. Retain the original summaries only when a bounded
+        // scientific view is needed; that view is fitted after its signed
+        // checkpoint identity has been preallocated.
+        let original_steps = checkpoint.recent_steps.clone();
+        let recent = context_recent_views(events, Some(&checkpoint), use_views);
+        let full_fit = context_views::fit_checkpoint(&mut checkpoint, |checkpoint| {
+            let context = context_views::render_context(
+                spec,
+                Some(checkpoint),
+                &recent,
+                &snapshot.scientific_state,
+                &guidance,
+            )?;
+            validate(context.clone(), events)?;
+            Ok(context)
+        });
+        if use_views
+            && (full_fit.is_err()
+                || (limits.auto_compact
+                    && context_views::scientific_code_bytes(&snapshot.scientific_state)
+                        > context_views::SCIENTIFIC_CODE_VIEW_MIN_BYTES))
+        {
+            checkpoint.recent_steps = original_steps;
+        } else {
+            full_fit?;
+        }
+        let fit = |checkpoint: &ContextCheckpointV4,
+                   source: &AgentEventV4,
+                   request_events: &[AgentEventV4],
+                   prospective: bool| {
+            let recent = context_recent_views(request_events, Some(checkpoint), use_views);
+            let mut model_checkpoint = checkpoint.clone();
+            let render_fit = |model_checkpoint: &mut ContextCheckpointV4, state: &Value| {
+                context_views::fit_checkpoint(model_checkpoint, |checkpoint| {
+                    let context = context_views::render_context(
+                        spec,
+                        Some(checkpoint),
+                        &recent,
+                        state,
+                        &guidance,
+                    )?;
+                    validate(context.clone(), request_events)?;
+                    Ok(context)
+                })
+            };
+            // Match the normal durable renderer's preferred code-only view,
+            // retaining all other scientific fields before using a directory.
+            if limits.auto_compact && use_views {
+                if let Some(view) =
+                    context_views::scientific_code_view(spec, &snapshot.scientific_state, source)
+                {
+                    if let Ok(context) = render_fit(&mut checkpoint.clone(), &view) {
+                        return Ok(context);
+                    }
+                }
+            }
+            match render_fit(&mut model_checkpoint, &snapshot.scientific_state) {
+                Ok(context) => Ok(context),
+                Err(error) if !use_views => Err(error),
+                Err(error) => {
+                    let view = if prospective {
+                        context_views::prospective_scientific_state_view(
+                            spec,
+                            &snapshot.scientific_state,
+                            source,
+                        )
+                    } else {
+                        context_views::scientific_state_view(
+                            spec,
+                            &snapshot.scientific_state,
+                            source,
+                        )
+                    }
+                    .ok_or(error)?;
+                    render_fit(&mut checkpoint.clone(), &view)
+                }
+            }
+        };
+        let timestamp = Utc::now();
+        let started = AgentEventV4::next(
+            source,
+            timestamp,
+            AgentEventKindV4::ContextCompactionStarted {
+                request_id: snapshot.request.request_id,
+                source_through_sequence: source.sequence,
+                source_head_hash: source.event_hash.clone(),
+                frozen_spec_hash: Some(frozen_spec_hash.clone()),
+            },
+        );
+        let mut status = ContextCompactionStatusV4::Completed;
+        let mut planned_events;
+        let mut prepared_archive = None;
+        let mut prepared_checkpoint = None;
+        let mut candidate_context = None;
+        // Only a semantically unchanged existing checkpoint can be a no-op.
+        // Through-sequence changes caused solely by management events do not
+        // change the model working set or grant new evidence references.
+        if let Some(existing_source) = events
+            .iter()
+            .rev()
+            .find(|event| matches!(event.event, AgentEventKindV4::ContextCheckpointed { .. }))
+        {
+            if let AgentEventKindV4::ContextCheckpointed {
+                checkpoint: existing,
+            } = &existing_source.event
+            {
+                let mut comparable = checkpoint.clone();
+                comparable.through_sequence = existing.through_sequence;
+                if &comparable == existing
+                    && events
+                        .iter()
+                        .filter(|event| event.sequence > existing_source.sequence)
+                        .all(context_views::is_context_management)
+                {
+                    candidate_context = Some(fit(existing, existing_source, events, false)?);
+                    status = ContextCompactionStatusV4::NotNeeded;
+                }
+            }
+        }
+        if status == ContextCompactionStatusV4::NotNeeded {
+            planned_events = vec![AgentEventV4::next(
+                source,
+                timestamp,
+                AgentEventKindV4::ContextCompactionNotNeeded {
+                    request_id: snapshot.request.request_id,
+                    before_bytes,
+                },
+            )];
+        } else {
+            let archive = ContextArchiveV4 {
+                archive_id: Uuid::new_v4(),
+                through_sequence: source.sequence,
+                size_bytes: before_bytes,
+                sha256: format!("{:x}", Sha256::digest(transcript.as_bytes())),
+            };
+            let archived = AgentEventV4::next(
+                &started,
+                timestamp,
+                AgentEventKindV4::ContextArchived {
+                    archive: archive.clone(),
+                },
+            );
+            let checkpointed = AgentEventV4::next(
+                &archived,
+                timestamp,
+                AgentEventKindV4::ContextCheckpointed {
+                    checkpoint: checkpoint.clone(),
+                },
+            );
+            planned_events = vec![started, archived, checkpointed];
+            let mut prospective = events.clone();
+            prospective.extend(planned_events.clone());
+            candidate_context = Some(fit(&checkpoint, &planned_events[2], &prospective, true)?);
+            prepared_archive = Some(archive);
+            prepared_checkpoint = Some(checkpoint);
+        }
+        let candidate_context = candidate_context.expect("candidate was prepared");
+        let after_bytes = candidate_context.len() as u64;
+        let mut prospective = events.clone();
+        prospective.extend(planned_events.clone());
+        let admitted = validate(candidate_context.clone(), &prospective)?;
+        let admission = ContextCompactionAdmissionV4 {
+            configuration_hash,
+            prompt_sha256: format!("{:x}", Sha256::digest(admitted.system.as_bytes())),
+            // The port measures the actual provider payload, including verified
+            // local image bytes; an unavailable measurement stays unknown.
+            provider_request_bytes: self
+                .model
+                .usage_request_metadata(&admitted)
+                .serialized_request_bytes,
+        };
+        if let (Some(archive), Some(checkpoint)) = (&prepared_archive, &prepared_checkpoint) {
+            planned_events.push(AgentEventV4::next(
+                planned_events.last().unwrap(),
+                timestamp,
+                AgentEventKindV4::ContextCompactionCompleted {
+                    request_id: snapshot.request.request_id,
+                    archive: archive.clone(),
+                    checkpoint_through_sequence: checkpoint.through_sequence,
+                    checkpoint_sha256: format!(
+                        "{:x}",
+                        Sha256::digest(serde_json::to_vec(checkpoint).map_err(|_| invalid())?)
+                    ),
+                    before_bytes,
+                    after_bytes,
+                    admission: Some(admission.clone()),
+                },
+            ));
+        }
+        // Validate the complete, immutable final chain. Management metadata is
+        // deliberately absent from recent_events, so admission cannot feed back
+        // into the model context or recursively change its own hash/size.
+        let mut final_events = events.clone();
+        final_events.extend(planned_events.clone());
+        let checkpoint_source = final_events
+            .iter()
+            .rev()
+            .find(|event| matches!(event.event, AgentEventKindV4::ContextCheckpointed { .. }))
+            .ok_or_else(invalid)?;
+        let AgentEventKindV4::ContextCheckpointed {
+            checkpoint: final_checkpoint,
+        } = &checkpoint_source.event
+        else {
+            unreachable!()
+        };
+        let final_context = fit(
+            final_checkpoint,
+            checkpoint_source,
+            &final_events,
+            status == ContextCompactionStatusV4::Completed,
+        )?;
+        let final_request = validate(final_context, &final_events)?;
+        if final_request != admitted || self.model.usage_metadata() != metadata {
+            return Err(invalid());
+        }
+        let prepared = PreparedContextCompactionV4 {
+            request: snapshot.request,
+            source_through_sequence: source.sequence,
+            source_head_hash: source.event_hash.clone(),
+            frozen_spec_hash,
+            scientific_revision: snapshot.scientific_revision,
+            scientific_sha256: snapshot.scientific_sha256.clone(),
+            transcript,
+            candidate_context,
+            checkpoint: prepared_checkpoint,
+            archive: prepared_archive,
+            planned_events,
+            status,
+            before_bytes,
+            after_bytes,
+            admission,
+        };
+        prepared.validate_structure().map_err(|_| invalid())?;
+        Ok(prepared)
+    }
+
     fn validate_execution_context(
         &self,
         spec: &RunSpecV4,
@@ -4676,17 +5047,11 @@ impl AgentCoreV4<'_> {
             events
                 .iter()
                 .filter(|event| event.sequence > checkpoint.through_sequence)
-                .filter(|event| {
-                    !matches!(
-                        event.event,
-                        AgentEventKindV4::ContextArchived { .. }
-                            | AgentEventKindV4::ContextCheckpointed { .. }
-                    )
-                })
+                .filter(|event| !context_views::is_context_management(event))
                 .cloned()
                 .collect::<Vec<_>>()
         } else {
-            events.clone()
+            events.iter().filter(|event| !context_views::is_context_management(event)).cloned().collect()
         };
         let use_views = self.model.supports_native_replay()
             || self
@@ -4708,28 +5073,10 @@ impl AgentCoreV4<'_> {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let recent_views = recent
-            .iter()
-            .filter(|event| !matches!(event.event, AgentEventKindV4::GuidanceConsumed { .. }))
-            .map(|event| {
-                if use_views {
-                    context_views::event_view(event)
-                } else {
-                    serde_json::to_value(event).expect("serializable event")
-                }
-            })
-            .collect::<Vec<_>>();
+        let recent_views = context_recent_views(&events, latest_checkpoint.as_ref(), use_views);
         let render_context =
             |checkpoint: Option<&ContextCheckpointV4>, recent: &[Value], science: &Value| {
-                serde_json::to_string(&json!({
-                    "frozen_plan": spec.plan,
-                    "compute_selection": spec.compute_selection,
-                    "checkpoint": checkpoint.map(context_views::checkpoint_view),
-                    "recent_events": recent,
-                    "scientific_state": science,
-                    "active_guidance": active_guidance,
-                }))
-                .map_err(|e| AgentCoreErrorV4::Store(e.to_string()))
+                context_views::render_context(spec, checkpoint, recent, science, &active_guidance)
             };
         let fit_scientific_view =
             |checkpoint: &ContextCheckpointV4,
@@ -4737,18 +5084,11 @@ impl AgentCoreV4<'_> {
              view: &Value,
              request_events: &[AgentEventV4]| {
                 let mut model_checkpoint = checkpoint.clone();
-                loop {
-                    let context = render_context(Some(&model_checkpoint), recent, view)?;
-                    match self.validate_execution_context(spec, &context, request_events, limits) {
-                        Ok(()) => return Ok(context),
-                        Err(error) if model_checkpoint.recent_steps.is_empty() => {
-                            return Err(error);
-                        }
-                        Err(_) => {
-                            model_checkpoint.recent_steps.remove(0);
-                        }
-                    }
-                }
+                context_views::fit_checkpoint(&mut model_checkpoint, |checkpoint| {
+                    let context = render_context(Some(checkpoint), recent, view)?;
+                    self.validate_execution_context(spec, &context, request_events, limits)?;
+                    Ok(context)
+                })
             };
         let candidate =
             render_context(latest_checkpoint.as_ref(), &recent_views, &scientific_value)?;
@@ -4813,35 +5153,7 @@ impl AgentCoreV4<'_> {
         }
         let transcript =
             serde_json::to_string(&events).map_err(|e| AgentCoreErrorV4::Store(e.to_string()))?;
-        let mut checkpoint = build_checkpoint(
-            spec,
-            &events,
-            limits.checkpoint_recent_events,
-            scientific_value.clone(),
-        );
-        if use_views {
-            checkpoint.unresolved_errors = checkpoint_unresolved_errors(&events, true);
-            checkpoint.recent_steps = events
-                .iter()
-                .rev()
-                .filter(|event| {
-                    matches!(
-                        event.event,
-                        AgentEventKindV4::ToolFinished { .. }
-                            | AgentEventKindV4::ToolOutcomeReused { .. }
-                            | AgentEventKindV4::DelegationNodeFinished { .. }
-                            | AgentEventKindV4::DelegationGraphFinished { .. }
-                            | AgentEventKindV4::ModelText { .. }
-                            | AgentEventKindV4::UserInputAnswered { .. }
-                    )
-                })
-                .take(limits.checkpoint_recent_events)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .map(|event| context_views::event_view(event).to_string())
-                .collect();
-        }
+        let mut checkpoint = build_model_checkpoint(spec, &events, limits.checkpoint_recent_events, scientific_value.clone(), use_views);
         // A fixed number of recent steps is not a byte budget: tool JSON can
         // expand again when embedded in checkpoint strings. Fit the actual
         // serialized request, keeping the newest steps and immutable state.
@@ -6265,6 +6577,60 @@ fn verification_finding(
         message: message.into(),
         evidence,
     }
+}
+
+fn context_recent_views(
+    events: &[AgentEventV4],
+    checkpoint: Option<&ContextCheckpointV4>,
+    use_views: bool,
+) -> Vec<Value> {
+    let answered = events
+        .iter()
+        .filter_map(|event| match &event.event {
+            AgentEventKindV4::UserInputAnswered { question_id, .. } => Some(question_id.as_str()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    events.iter().filter(|event| {
+        !context_views::is_context_management(event)
+            && !matches!(event.event, AgentEventKindV4::GuidanceConsumed {..})
+            && (checkpoint.is_none_or(|checkpoint| event.sequence > checkpoint.through_sequence)
+                || matches!(&event.event, AgentEventKindV4::InputRequested {question_id, ..} if !answered.contains(question_id.as_str())))
+    }).map(|event| if use_views {context_views::event_view(event)} else {serde_json::to_value(event).expect("serializable event")}).collect()
+}
+
+fn build_model_checkpoint(
+    spec: &RunSpecV4,
+    events: &[AgentEventV4],
+    recent_limit: usize,
+    scientific_value: Value,
+    use_views: bool,
+) -> ContextCheckpointV4 {
+    let mut checkpoint = build_checkpoint(spec, events, recent_limit, scientific_value);
+    if use_views {
+        checkpoint.unresolved_errors = checkpoint_unresolved_errors(&events, true);
+        checkpoint.recent_steps = events
+            .iter()
+            .rev()
+            .filter(|event| {
+                matches!(
+                    event.event,
+                    AgentEventKindV4::ToolFinished { .. }
+                        | AgentEventKindV4::ToolOutcomeReused { .. }
+                        | AgentEventKindV4::DelegationNodeFinished { .. }
+                        | AgentEventKindV4::DelegationGraphFinished { .. }
+                        | AgentEventKindV4::ModelText { .. }
+                        | AgentEventKindV4::UserInputAnswered { .. }
+                )
+            })
+            .take(recent_limit)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|event| context_views::event_view(event).to_string())
+            .collect();
+    }
+    checkpoint
 }
 
 fn build_checkpoint(
@@ -13992,6 +14358,469 @@ mod tests {
         assert!(requests[1].context.len() < requests[0].context.len());
         assert_eq!(requests[1].context, context);
         assert_eq!(store.archives.lock().unwrap().len(), 1);
+    }
+
+    struct ManualBudgetModel {
+        inner: BudgetOnlyModel,
+        profile: Uuid,
+        native: bool,
+        known_budget: bool,
+        measure: bool,
+    }
+
+    #[async_trait]
+    impl ModelPortV4 for ManualBudgetModel {
+        fn supports_native_replay(&self) -> bool {
+            self.native
+        }
+        fn usage_metadata(&self) -> ModelUsageMetadataV4 {
+            ModelUsageMetadataV4 {
+                model_profile_id: self.profile,
+                model_configuration_hash: Some("a".repeat(64)),
+                context_limit_tokens: self.known_budget.then_some(32_000),
+                context_limit_source: ContextLimitSourceV4::Unknown,
+            }
+        }
+        fn usage_request_metadata(&self, request: &ModelRequestV4) -> ModelUsageRequestMetadataV4 {
+            ModelUsageRequestMetadataV4 {
+                serialized_request_bytes: self
+                    .measure
+                    .then(|| serde_json::to_vec(request).unwrap().len() as u64),
+                ..Default::default()
+            }
+        }
+        fn validate_request(&self, request: &ModelRequestV4) -> Result<(), ModelFailureV4> {
+            self.inner.validate_request(request)
+        }
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            panic!("manual prepare must not stream")
+        }
+    }
+
+    fn manual_snapshot(
+        store: &MemoryStore,
+        spec: &RunSpecV4,
+        state: ScientificStateV4,
+    ) -> omicsops_protocol::ContextCompactionSnapshotV4 {
+        let events = store.load_direct(spec.run_id).unwrap();
+        let source = events.last().unwrap();
+        omicsops_protocol::ContextCompactionSnapshotV4 {
+            request: omicsops_protocol::CompactContextRequestV4 {
+                request_id: Uuid::new_v4(),
+                project_id: spec.project_id,
+                conversation_id: spec.conversation_id,
+                run_id: spec.run_id,
+            },
+            spec: spec.clone(),
+            source_through_sequence: source.sequence,
+            source_head_hash: source.event_hash.clone(),
+            scientific_revision: state.revision,
+            scientific_sha256: state.digest(),
+            scientific_state: serde_json::to_value(state).unwrap(),
+            events,
+        }
+    }
+
+    fn manual_fixture(native: bool, budget: usize) -> (RunSpecV4, MemoryStore, ManualBudgetModel) {
+        let mut spec = ordinary_execution_spec(Uuid::new_v4());
+        spec.model_configuration_hash = Some("a".repeat(64));
+        spec.spec_hash = Some(spec.calculate_spec_hash().unwrap());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        append_test_event(
+            &store,
+            spec.run_id,
+            AgentEventKindV4::ModelText {
+                text: "original evidence ".repeat(20_000),
+            },
+        );
+        if native {
+            let logical = Uuid::new_v4();
+            let attempt = Uuid::new_v4();
+            let request = serde_json::from_value(json!({"logical_request_id":logical,"attempt_id":attempt,"model_profile_id":spec.model_profile_id,"model_configuration_hash":"a".repeat(64),"context_limit_source":{"kind":"unknown"}})).unwrap();
+            append_test_event(
+                &store,
+                spec.run_id,
+                AgentEventKindV4::ModelRequestStarted { request },
+            );
+            append_test_event(
+                &store,
+                spec.run_id,
+                AgentEventKindV4::ModelReplayRecorded {
+                    replay: omicsops_protocol::ModelReplayRecordedV4 {
+                        logical_request_id: logical,
+                        attempt_id: attempt,
+                        binding: omicsops_protocol::ModelReplayBindingV4 {
+                            model_profile_id: spec.model_profile_id,
+                            configuration_hash: "a".repeat(64),
+                        },
+                        continuation: omicsops_protocol::ModelProviderContinuationV4 {
+                            items: vec![omicsops_protocol::ModelReplayItemV4::AssistantText {
+                                text: "native replay evidence".into(),
+                            }],
+                        },
+                    },
+                },
+            );
+        }
+        append_test_event(
+            &store,
+            spec.run_id,
+            AgentEventKindV4::InputRequested {
+                question_id: "pending-choice".into(),
+                question: "Which next evidence?".into(),
+                reason: AgentInputReasonV4::Decision,
+            },
+        );
+        let model = ManualBudgetModel {
+            profile: spec.model_profile_id,
+            native,
+            known_budget: true,
+            measure: true,
+            inner: BudgetOnlyModel {
+                request_limit: budget,
+                requests: Mutex::new(vec![]),
+            },
+        };
+        (spec, store, model)
+    }
+
+    #[test]
+    fn manual_prepare_full_request_admits_candidate_and_final() {
+        let (spec, store, model) = manual_fixture(false, 40_000);
+        let snapshot = manual_snapshot(&store, &spec, ScientificStateV4::new(spec.project_id));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: None,
+        };
+        let original = core.execution_request(
+            &spec,
+            snapshot
+                .events
+                .iter()
+                .map(|event| serde_json::to_string(event).unwrap())
+                .collect(),
+            &snapshot.events,
+        );
+        assert!(model.validate_request(&original).is_err());
+        model.inner.requests.lock().unwrap().clear();
+        let prepared = core
+            .prepare_context_compaction(&snapshot, AgentLimitsV4::default())
+            .unwrap();
+        prepared.validate_structure().unwrap();
+        assert_eq!(
+            prepared.status,
+            omicsops_protocol::ContextCompactionStatusV4::Completed
+        );
+        let requests = model.inner.requests.lock().unwrap();
+        assert!(requests.len() >= 2);
+        assert!(
+            requests
+                .iter()
+                .rev()
+                .take(2)
+                .all(|r| serde_json::to_vec(r).unwrap().len() <= 40_000)
+        );
+        assert_eq!(
+            prepared.admission.provider_request_bytes,
+            Some(serde_json::to_vec(requests.last().unwrap()).unwrap().len() as u64)
+        );
+        assert_eq!(store.load_direct(spec.run_id).unwrap(), snapshot.events);
+        assert!(store.archives.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn manual_prepare_native_replay_is_budgeted_without_closures() {
+        let (spec, store, model) = manual_fixture(true, 40_000);
+        let snapshot = manual_snapshot(&store, &spec, ScientificStateV4::new(spec.project_id));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: None,
+        };
+        let prepared = core
+            .prepare_context_compaction(&snapshot, AgentLimitsV4::default())
+            .unwrap();
+        prepared.validate_structure().unwrap();
+        let requests = model.inner.requests.lock().unwrap();
+        assert!(requests.len() >= 2);
+        assert!(requests.iter().all(|r| !r.replay.is_empty()));
+        assert!(serde_json::to_vec(requests.last().unwrap()).unwrap().len() <= 40_000);
+        assert_eq!(store.load_direct(spec.run_id).unwrap(), snapshot.events);
+        assert!(store.archives.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn manual_prepare_preserves_guidance_science_task_and_sources() {
+        let (spec, store, model) = manual_fixture(false, 70_000);
+        let guidance = "preserve the full user instruction ".repeat(500);
+        append_test_event(
+            &store,
+            spec.run_id,
+            AgentEventKindV4::GuidanceConsumed {
+                message_id: Uuid::new_v4(),
+                markdown: guidance.clone(),
+            },
+        );
+        append_test_event(
+            &store,
+            spec.run_id,
+            AgentEventKindV4::TaskShapeSelected {
+                task_shape: AgentTaskShapeV4::MultiStep,
+                source: AgentTaskShapeSourceV4::Host,
+                reason: "analysis requires verification".into(),
+            },
+        );
+        append_test_event(
+            &store,
+            spec.run_id,
+            AgentEventKindV4::PhaseChanged {
+                phase: AgentPhaseV4::Verifying,
+            },
+        );
+        append_test_event(
+            &store,
+            spec.run_id,
+            AgentEventKindV4::CycleStarted { cycle_id: 7 },
+        );
+        let tasks = vec![AgentTaskV4 {
+            id: "verify-evidence".into(),
+            title: "Check source provenance".into(),
+            status: AgentTaskStatusV4::InProgress,
+            blocked_reason: None,
+        }];
+        append_test_event(
+            &store,
+            spec.run_id,
+            AgentEventKindV4::TaskListUpdated {
+                revision: 3,
+                change_summary: "verify output".into(),
+                tasks: tasks.clone(),
+            },
+        );
+        let state = large_science(spec.project_id, 300_000);
+        let snapshot = manual_snapshot(&store, &spec, state);
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: None,
+        };
+        let prepared = core
+            .prepare_context_compaction(&snapshot, AgentLimitsV4::default())
+            .unwrap();
+        let context: Value = serde_json::from_str(&prepared.candidate_context).unwrap();
+        assert_eq!(context["active_guidance"][0]["markdown"], guidance);
+        assert_eq!(
+            context["frozen_plan"],
+            serde_json::to_value(&spec.plan).unwrap()
+        );
+        assert_eq!(
+            prepared.checkpoint.as_ref().unwrap().scientific_state,
+            snapshot.scientific_state
+        );
+        let checkpoint = prepared.checkpoint.as_ref().unwrap();
+        assert_eq!(checkpoint.tasks, tasks);
+        assert_eq!(checkpoint.task_revision, Some(3));
+        assert_eq!(checkpoint.phase, Some(AgentPhaseV4::Verifying));
+        assert_eq!(checkpoint.task_shape, Some(AgentTaskShapeV4::MultiStep));
+        assert_eq!(checkpoint.cycle_id, Some(7));
+        assert_eq!(
+            serde_json::from_str::<Vec<AgentEventV4>>(&prepared.transcript).unwrap(),
+            snapshot.events
+        );
+        let reference = &context["scientific_state"]["result_reference"];
+        assert!(reference["event_hash"].as_str().is_some());
+        assert_eq!(
+            reference["event_hash"],
+            prepared.planned_events[2].event_hash
+        );
+        assert!(prepared.candidate_context.contains("pending-choice"));
+        assert_eq!(store.load_direct(spec.run_id).unwrap(), snapshot.events);
+        assert!(store.archives.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn manual_prepare_unshrinkable_is_read_only() {
+        let (spec, store, model) = manual_fixture(false, 1);
+        let snapshot = manual_snapshot(&store, &spec, ScientificStateV4::new(spec.project_id));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: None,
+        };
+        assert!(
+            core.prepare_context_compaction(&snapshot, AgentLimitsV4::default())
+                .is_err()
+        );
+        assert_eq!(store.load_direct(spec.run_id).unwrap(), snapshot.events);
+        assert!(store.archives.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_prepare_final_matches_durable_projection_and_repeated_prepare_is_not_needed() {
+        for state_kind in 0..3 {
+            let (spec, store, model) = manual_fixture(true, 70_000);
+            let state = match state_kind {
+                0 => ScientificStateV4::new(spec.project_id),
+                1 => science_with_code(spec.project_id, "source code ".repeat(30_000)),
+                _ => large_science(spec.project_id, 300_000),
+            };
+            let science = SnapshotScience(Mutex::new(state.clone()));
+            let snapshot = manual_snapshot(&store, &spec, state);
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &ResultReadTools,
+                events: &store,
+                science: Some(&science),
+            };
+            let limits = AgentLimitsV4::default();
+            let prepared = core.prepare_context_compaction(&snapshot, limits).unwrap();
+            let admitted = model.inner.requests.lock().unwrap().last().unwrap().clone();
+            assert_eq!(store.load_direct(spec.run_id).unwrap(), snapshot.events);
+            for event in &prepared.planned_events {
+                store.append_direct(event).unwrap();
+            }
+            let before_resume = store.load_direct(spec.run_id).unwrap();
+            let actual_context = core.context_for(&spec, limits).await.unwrap();
+            let actual = core
+                .shape_final_execution_request(&spec, actual_context, &before_resume)
+                .unwrap();
+            assert_eq!(actual, admitted);
+            assert_eq!(store.load_direct(spec.run_id).unwrap(), before_resume);
+            let next = manual_snapshot(&store, &spec, science.0.lock().unwrap().clone());
+            let repeated = core.prepare_context_compaction(&next, limits).unwrap();
+            assert_eq!(
+                repeated.status,
+                omicsops_protocol::ContextCompactionStatusV4::NotNeeded
+            );
+            assert!(repeated.archive.is_none());
+            assert!(repeated.checkpoint.is_none());
+            assert_eq!(repeated.candidate_context, prepared.candidate_context);
+            repeated.validate_structure().unwrap();
+        }
+    }
+
+    #[test]
+    fn manual_prepare_rejects_pending_replay_closures_and_oversized_native_payload() {
+        for pending in [false, true] {
+            let (spec, store, model) = manual_fixture(true, 40_000);
+            let mut history = store.load_direct(spec.run_id).unwrap();
+            let index = history
+                .iter()
+                .position(|event| {
+                    matches!(event.event, AgentEventKindV4::ModelReplayRecorded { .. })
+                })
+                .unwrap();
+            let mut kind = history[index].event.clone();
+            if let AgentEventKindV4::ModelReplayRecorded { replay } = &mut kind {
+                replay.continuation.items = if pending {
+                    vec![omicsops_protocol::ModelReplayItemV4::ToolCall {
+                        call: ToolCallV4 {
+                            call_id: "not-dispatched".into(),
+                            tool_id: "project.read".into(),
+                            arguments: json!({"path":"evidence"}),
+                        },
+                    }]
+                } else {
+                    vec![omicsops_protocol::ModelReplayItemV4::AssistantText {
+                        text: "unshrinkable native content".repeat(20_000),
+                    }]
+                };
+            }
+            history[index] =
+                AgentEventV4::next(&history[index - 1], history[index].occurred_at, kind);
+            for next in index + 1..history.len() {
+                history[next] = AgentEventV4::next(
+                    &history[next - 1],
+                    history[next].occurred_at,
+                    history[next].event.clone(),
+                );
+            }
+            *store.events.lock().unwrap() = history;
+            let snapshot = manual_snapshot(&store, &spec, ScientificStateV4::new(spec.project_id));
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &ResultReadTools,
+                events: &store,
+                science: None,
+            };
+            assert!(
+                core.prepare_context_compaction(&snapshot, AgentLimitsV4::default())
+                    .is_err()
+            );
+            assert_eq!(store.load_direct(spec.run_id).unwrap(), snapshot.events);
+            assert!(store.archives.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn manual_prepare_rejects_changed_source_science_and_model_identity() {
+        let (spec, store, model) = manual_fixture(false, 40_000);
+        let snapshot = manual_snapshot(&store, &spec, ScientificStateV4::new(spec.project_id));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: None,
+        };
+        for mutation in 0..5 {
+            let mut bad = snapshot.clone();
+            match mutation {
+                0 => bad.source_head_hash = "wrong".into(),
+                1 => bad.scientific_revision += 1,
+                2 => bad.spec.spec_hash = None,
+                3 => {
+                    bad.spec.model_configuration_hash = Some("b".repeat(64));
+                    bad.spec.spec_hash = Some(bad.spec.calculate_spec_hash().unwrap());
+                }
+                _ => bad.events[0].event_hash = "wrong".into(),
+            }
+            assert!(
+                core.prepare_context_compaction(&bad, AgentLimitsV4::default())
+                    .is_err()
+            );
+        }
+        assert_eq!(store.load_direct(spec.run_id).unwrap(), snapshot.events);
+        assert!(store.archives.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn manual_prepare_unknown_budget_rejects_and_unknown_payload_stays_unknown() {
+        let (spec, store, mut model) = manual_fixture(false, 40_000);
+        let snapshot = manual_snapshot(&store, &spec, ScientificStateV4::new(spec.project_id));
+        model.known_budget = false;
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: None,
+        };
+        assert!(
+            core.prepare_context_compaction(&snapshot, AgentLimitsV4::default())
+                .is_err()
+        );
+        model.known_budget = true;
+        model.measure = false;
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: None,
+        };
+        let prepared = core
+            .prepare_context_compaction(&snapshot, AgentLimitsV4::default())
+            .unwrap();
+        assert_eq!(prepared.admission.provider_request_bytes, None);
+        assert_eq!(store.load_direct(spec.run_id).unwrap(), snapshot.events);
     }
 
     struct BoundaryBudgetModel {

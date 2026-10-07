@@ -54,6 +54,20 @@ pub fn project_model_replay(
     project_replay(project_id, conversation_id, binding, events, true)
 }
 
+/// Shared final transport projection after any host recovery has completed.
+/// This function never persists missing closures.
+pub(crate) fn shape_request(
+    request: &mut crate::ModelRequestV4,
+    project_id: Uuid,
+    conversation_id: Uuid,
+    binding: &ModelReplayBindingV4,
+    events: &[AgentEventV4],
+) -> Result<(), String> {
+    request.replay = project_model_replay(project_id, conversation_id, binding, events)?;
+    request.context = remove_replayed_context_events(&request.context, &request.replay, events);
+    Ok(())
+}
+
 fn project_replay(
     project_id: Uuid,
     conversation_id: Uuid,

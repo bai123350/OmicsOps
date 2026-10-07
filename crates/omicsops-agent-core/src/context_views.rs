@@ -136,6 +136,63 @@ pub(crate) fn scientific_state_view(
     Some(view)
 }
 
+/// Preparation-only reference to a signed, preallocated checkpoint. The caller
+/// must keep the resulting request private until the whole event chain commits.
+pub(crate) fn prospective_scientific_state_view(
+    spec: &RunSpecV4,
+    state: &Value,
+    source: &AgentEventV4,
+) -> Option<Value> {
+    scientific_state_view(spec, state, source)
+}
+
+pub(crate) fn is_context_management(event: &AgentEventV4) -> bool {
+    matches!(
+        event.event,
+        AgentEventKindV4::ContextArchived { .. }
+            | AgentEventKindV4::ContextCheckpointed { .. }
+            | AgentEventKindV4::ContextCompactionStarted { .. }
+            | AgentEventKindV4::ContextCompactionCompleted { .. }
+            | AgentEventKindV4::ContextCompactionNotNeeded { .. }
+            | AgentEventKindV4::ContextCompactionAttention { .. }
+    )
+}
+
+pub(crate) fn render_context(
+    spec: &RunSpecV4,
+    checkpoint: Option<&ContextCheckpointV4>,
+    recent: &[Value],
+    science: &Value,
+    active_guidance: &[Value],
+) -> Result<String, crate::AgentCoreErrorV4> {
+    serde_json::to_string(&json!({
+        "frozen_plan": spec.plan,
+        "compute_selection": spec.compute_selection,
+        "checkpoint": checkpoint.map(checkpoint_view),
+        "recent_events": recent,
+        "scientific_state": science,
+        "active_guidance": active_guidance,
+    }))
+    .map_err(|error| crate::AgentCoreErrorV4::Store(error.to_string()))
+}
+
+/// Fit only disposable recent summaries. Frozen tasks, guidance and science
+/// remain intact; the validator sees each actual complete request.
+pub(crate) fn fit_checkpoint(
+    checkpoint: &mut ContextCheckpointV4,
+    mut render_and_validate: impl FnMut(&ContextCheckpointV4) -> Result<String, crate::AgentCoreErrorV4>,
+) -> Result<String, crate::AgentCoreErrorV4> {
+    loop {
+        match render_and_validate(checkpoint) {
+            Ok(context) => return Ok(context),
+            Err(error) if checkpoint.recent_steps.is_empty() => return Err(error),
+            Err(_) => {
+                checkpoint.recent_steps.remove(0);
+            }
+        }
+    }
+}
+
 pub(crate) fn bounded_text(text: &str) -> String {
     if text.len() <= VIEW_BYTES {
         return text.to_owned();
