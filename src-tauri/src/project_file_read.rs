@@ -208,6 +208,15 @@ fn validate_final_path(root: &Path, final_path: &Path) -> Result<(), FileReadErr
     if final_path == root || !final_path.starts_with(root) {
         return Err(FileReadError::UnsafeFile);
     }
+    // Filesystem aliases can resolve to protected long names. Apply the same
+    // project-relative policy to both canonical and opened-handle final paths.
+    let relative = final_path
+        .strip_prefix(root)
+        .map_err(|_| FileReadError::UnsafeFile)?;
+    crate::composer_files::normalize_workspace_relative_path(
+        relative.to_str().ok_or(FileReadError::UnsafeFile)?,
+    )
+    .map_err(|_| FileReadError::UnsafeFile)?;
     Ok(())
 }
 
@@ -568,6 +577,41 @@ mod tests {
             validate_final_path(&root, &root),
             Err(FileReadError::UnsafeFile)
         );
+    }
+
+    #[test]
+    fn resolved_internal_paths_are_rejected_even_when_supplied_alias_is_allowed() {
+        let root = PathBuf::from("workspace");
+        assert!(
+            crate::composer_files::normalize_workspace_relative_path("PROTEC~1/file.csv").is_ok()
+        );
+        // Inject resolved long names directly: real 8.3 alias creation is not
+        // required, and this check is shared by canonical and handle paths.
+        for relative in [
+            ".omicsops/file.csv",
+            ".git/file.csv",
+            ".hg/file.csv",
+            ".svn/file.csv",
+            "node_modules/file.csv",
+            "target/file.csv",
+            "data/.GIT/file.csv",
+            "data/.OmicsOps/file.csv",
+            "data/NODE_MODULES/file.csv",
+            "data/TARGET/file.csv",
+        ] {
+            assert_eq!(
+                validate_final_path(&root, &root.join(relative)),
+                Err(FileReadError::UnsafeFile),
+                "{relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_internal_policy_only_applies_below_the_project_root() {
+        let root = PathBuf::from("parent/target/project");
+        assert!(validate_final_path(&root, &root.join("data/table.csv")).is_ok());
+        assert!(validate_final_path(&root, &root.join("data/target-results.csv")).is_ok());
     }
 
     struct FakeSource {
