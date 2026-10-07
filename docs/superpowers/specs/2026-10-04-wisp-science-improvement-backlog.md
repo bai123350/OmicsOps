@@ -1,6 +1,6 @@
 # Wisp Science 可借鉴改进清单
 
-日期：2026-10-04。状态：用户已选择全部12项首次范围、确认具体设计及[实施总计划](../plans/2026-10-04-wisp-improvements.md)，并选择子Agent逐项实施与审阅。W01已实现并审阅通过，后续项继续实施；状态及实际检查见总计划。全部12项首次范围尚未交付。本文件保留源码对照，具体边界见[总设计](2026-10-04-wisp-improvements-design.md)。
+日期：2026-10-04。状态：用户已选择全部12项首次范围、确认具体设计及[实施总计划](../plans/2026-10-04-wisp-improvements.md)，并选择子Agent逐项实施与审阅。W01/W02已实现并审阅通过，后续项继续实施；状态及实际检查见总计划。全部12项首次范围尚未交付。本文件保留源码对照，具体边界见[总设计](2026-10-04-wisp-improvements-design.md)。
 
 本轮建议先补会话草稿隔离，再分别交付科学产物预览和 SSH 后台作业面板。这三项直接改善日常研究操作，并能复用现有组件与运行身份。其余候选按依赖分批推进，优先保留 OmicsOps 已有的科研证据、审批与恢复契约。
 
@@ -58,7 +58,7 @@ P0 表示优先解决可能影响操作正确性的问题；P1 表示直接改�
 
 ## W02 科学产物预览
 
-**实施状态：**共享本地 handle 读取、纯 CSV/TSV parser/DTO 和本地/SSH source/command 已实现并独立审阅通过（7258149/7439276、69886e4、bec43f1）；真实预览界面及完整功能交付检查待实施，尚不代表 W02 功能交付。实际确定性检查见[W02计划](../plans/2026-10-04-wisp-w02-table-preview.md)。
+**实施状态：**共享本地 handle 读取、纯 CSV/TSV parser/DTO、本地/SSH source/command 和真实只读界面已实现，四任务独立审阅及必要复审通过（7258149/7439276、69886e4、bec43f1、a8fa4a4/153a0ea）。最终前端1171+22/Web通过；Rust/native为焦点fix前证据，最终全分支native仍待执行；GUI/liveSSH/模型验收未执行，不能冒称生产端到端通过。实际确定性检查见[W02计划](../plans/2026-10-04-wisp-w02-table-preview.md)。
 
 **参考事实：**上游[格式路由与显示边界][w-previews]支持表格、Notebook、PDF 和 Office；[PDF 前端回归][w-pdf-tests]覆盖翻页、缩放和损坏文件。OmicsOps 的[文字预览](../../../src/features/workspace/ComposerFilePreviewDialog.tsx)和[SSH 图片预览](../../../src-tauri/src/sync_commands.rs)已绑定来源、大小及校验信息，通用表格/PDF 预览尚缺。
 

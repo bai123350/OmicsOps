@@ -1,6 +1,6 @@
 # Wisp 改进设计：草稿、表格与远端作业
 
-日期：2026-10-04。状态：用户已确认设计，实施计划待审阅；本文件定义 W01–W03 的首次实现，不表示已实施。总范围见 [总设计](2026-10-04-wisp-improvements-design.md)，来源见 [源码对照清单](2026-10-04-wisp-science-improvement-backlog.md)。
+日期：2026-10-04。状态：用户已确认设计及8515da8实施计划；W01/W02首次代码范围已实现并审阅通过，W03待实施。本文件仍定义首次行为边界，实际检查与未执行验收见总计划。总范围见 [总设计](2026-10-04-wisp-improvements-design.md)，来源见 [源码对照清单](2026-10-04-wisp-science-improvement-backlog.md)。
 
 ## 用户目标与方案选择
 
@@ -71,7 +71,7 @@ W10 完整小文件读取受同一预算控制。W11 大文件只读取 metadata
 
 验证当前项目连接、可信 fingerprint 和 canonical remote root/path，拒绝远端 symlink 祖先及逃逸。在 adapters SSH 中新增有界前缀读取能力，复用 SFTP，不能把现有 `read_file_limited` 的完整文本读取改为悄悄截断。远端 open 后读取最多预算+1；尽可能用同一远端 handle 的 metadata 在前后核对 size/mtime，不足以确认时报告 stability unknown。即使 EOF 已观察到，无法确认稳定性时也不能把摘要宣传为已校验的完整源文件摘要。
 
-提供可注入的 table source seam，模拟本地/SSH 读取和 metadata；自动测试不连接真实主机。整个远端预览路径（连接、根/文件检查、metadata、读取）固定最长等待 20 秒，关闭弹层或切作用域使响应失效；连接按现有规则关闭，不产生同步任务。
+提供可注入的 table source seam，模拟本地/SSH 读取和 metadata；自动测试不连接真实主机。整个远端预览路径（连接、根/文件检查、metadata、读取）固定最长等待 20 秒，关闭弹层或切作用域使响应失效；正常disconnect计入同一20秒deadline；超时返回后只做一次有界session disconnect，不延长公开等待，失败时真实关闭状态未知，不表示远端计算取消。不产生同步任务。
 
 ### 验收与文件地图
 

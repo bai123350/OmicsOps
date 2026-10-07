@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust、已有 windows-sys/sha2/tempfile、现有 SFTP、Tauri 2、React 19/TypeScript/Vitest；无新增解析器或前端依赖。
 
-**Spec:** [W02 设计](../specs/2026-10-04-wisp-composer-files-jobs-design.md#w02有界-csvtsv-表格预览)、[共同约束](../specs/2026-10-04-wisp-improvements-design.md)。用户已确认设计及8515da8实施计划。Task1共享读取、Task2 parser/DTO、Task3 source/command已实现并独立审阅通过；Task4界面与完整功能交付检查待实施。
+**Spec:** [W02 设计](../specs/2026-10-04-wisp-composer-files-jobs-design.md#w02有界-csvtsv-表格预览)、[共同约束](../specs/2026-10-04-wisp-improvements-design.md)。用户已确认设计及8515da8实施计划。四个任务已实现并经独立审阅/必要修复复审通过；实际检查和未执行边界见当前实施证据。
 
 ## Global Constraints
 
@@ -112,11 +112,11 @@ assert_eq!(rejected_source.call_count(), 0);
 
 ### Task 4: 只读文件树预览与有界来源展示
 
-**Files:** Modify `src/types.ts`、`src/composer-file-api.ts`、`src/composer-file-api.test.ts`、`src/features/workspace/RemoteFileTree.tsx`、`RemoteFileTree.test.tsx`、`WorkspaceShell.tsx`、`ComposerIntegration.test.tsx`；Create 同workspace目录 `TablePreviewDialog.tsx`、`table-preview.css`、`TablePreviewDialog.test.tsx`。
+**Files:** Modify `src/types.ts`、`src/composer-file-api.ts`、`src/composer-file-api.test.ts`、`src/features/workspace/RemoteFileTree.tsx`、`RemoteFileTree.test.tsx`、`WorkspaceShell.tsx`、`ComposerIntegration.test.tsx`；最近回归 `ComposerFileIntegration.test.tsx` 仅将完整文本引用场景改为非表格的 notes.md 局部fixture，保持全hash/quote/draft/send断言与原CSV drag/attach tests；Create 同workspace目录 `TablePreviewDialog.tsx`、`table-preview.css`、`TablePreviewDialog.test.tsx`。
 
 **Interfaces:** Consumes DTO和现有 `WorkspaceFileReference`；`previewProjectTable(reference:WorkspaceFileReference):Promise<ProjectTablePreview>` invokes `{request:{project_id,backend_id,relative_path}}`；`TablePreviewDialog(props:{reference:WorkspaceFileReference;locale:Locale;onClose:()=>void}):ReactNode`。CSV/TSV routing只更改preview action；drag/reference/其他类型textQuote独立保持。
 
-- [ ] **RED:** mock invoke核对payload；loading/error/retry、empty/header-only、来源size/read/parsed/hash scope、truncation中文/英文、XSS/formula作为文本、没有quote或模型调用；切文件/backend晚回包丢弃；打开立即Escape+父dialog只留父。
+- [x] **RED:** mock invoke核对payload；loading/error/retry、empty/header-only、来源size/read/parsed/hash scope、truncation中文/英文、XSS/formula作为文本、没有quote或模型调用；切文件/backend晚回包丢弃；打开立即Escape+父dialog只留父。
 
 ```tsx
 fireEvent.keyDown(window, { key: "Escape" });
@@ -126,15 +126,15 @@ expect(createComposerQuote).not.toHaveBeenCalled();
 expect(document.querySelector("script[data-cell]")).toBeNull();
 ```
 
-- [ ] **Run RED:** `npx vitest run src/composer-file-api.test.ts src/features/workspace/TablePreviewDialog.test.tsx src/features/workspace/RemoteFileTree.test.tsx src/features/workspace/ComposerIntegration.test.tsx`；缺API/dialog/routing应 FAIL。
-- [ ] **Implement:** 增 typed boundary 与只读React文本表格；按 tuple+generation guard旧响应，window escape stack及原focus trap；不缓存原始科学bytes。显示首行作为header、读取仅前缀、unknown stability和每个固定截断原因；安全错误可重试。
-- [ ] **Run GREEN:** 同命令 PASS；`cargo fmt --all -- --check`、`cargo test --workspace`、`npm test`、`npm run build`、`npm run build:desktop`、`git diff --check`。锁变更先 npm ci；纯fmt另commit。手工 Windows小CSV/BOM/长字段和SSH fake展示，真实SSH未执行单独说明。
-- [ ] **Commit:** `feat: show bounded table previews in workspace files`；根据实际验证更新总清单。
+- [x] **Run RED:** `npx vitest run src/composer-file-api.test.ts src/features/workspace/TablePreviewDialog.test.tsx src/features/workspace/RemoteFileTree.test.tsx src/features/workspace/ComposerIntegration.test.tsx`；缺API/dialog/routing应 FAIL。
+- [x] **Implement:** 增 typed boundary 与只读React文本表格；按 tuple+generation guard旧响应，window escape stack及原focus trap；不缓存原始科学bytes。显示首行作为header、读取仅前缀、unknown stability和每个固定截断原因；安全错误可重试。
+- [x] **Run GREEN:** 同命令 PASS；`cargo fmt --all -- --check`、`cargo test --workspace`、`npm test`、`npm run build`、`npm run build:desktop`、`git diff --check`。锁变更先 npm ci；纯fmt另commit。记录手工 Windows小CSV/BOM/长字段和SSH fake展示的执行或未执行状态；本会话native computer API不可用，GUI smoke未执行，真实SSH未执行单独说明。
+- [x] **Commit:** `feat: show bounded table previews in workspace files`；根据实际验证更新总清单。
 
 ## 当前实施证据
 
-2026-10-07：Task1提交7258149/7439276，Task2提交69886e4，均经独立审阅通过，无阻断发现。Task1最终reader16/composer10；Task2 parser12/DTO合同3/DTO crate31。Task2最终workspace1564通过、17 ignored；前端1138+22、Web/桌面构建和格式检查通过。Task2初始RED为71个总编译错误（包含缺接口与受限环境OUT_DIR错误），不是已执行断言失败；授权GREEN运行实际断言。真实模型/SSH及GUI手工验收未执行，安装包只构建未运行。Task3提交bec43f1已独立审阅通过：host11/adapter3/composer10/sync4/reader16/quote6均通过；一次frontend1138+22和fmt通过，Task3未启动额外workspace/Web/desktop交付检查。源读取/公开投影已接入宿主，Task4真实界面和最终完整交付检查待实施，尚不代表W02交付。
+2026-10-07：Task1提交7258149/7439276，Task2提交69886e4，均经独立审阅通过，无阻断发现。Task1最终reader16/composer10；Task2 parser12/DTO合同3/DTO crate31。Task2最终workspace1564通过、17 ignored；前端1138+22、Web/桌面构建和格式检查通过。Task2初始RED为71个总编译错误（包含缺接口与受限环境OUT_DIR错误），不是已执行断言失败；授权GREEN运行实际断言。真实模型/SSH及GUI手工验收未执行，安装包只构建未运行。Task3提交bec43f1已独立审阅通过：host11/adapter3/composer10/sync4/reader16/quote6均通过；一次frontend1138+22和fmt通过，Task3未启动额外workspace/Web/desktop交付检查。源读取/公开投影已接入宿主，Task4提交a8fa4a4/153a0ea已独立审阅及焦点fix复审通过；初始focused167、quote最近回归5，fix focused162（dialog25）和最终前端1171+22、Web2035通过。Rust workspace1578通过/17 ignored及native 4m24s构建对应a8fa4a4；未将旧native资产标为153a0ea焦点fix验证，最终全分支native将覆盖最终UI。真实GUI/liveSSH/模型smoke未执行。W02首次源代码范围已实现，四任务均review clear；不代表生产端到端验收通过。
 
 ## Plan Self-Review
 
-Task 1供下游唯一handle接口；Task 2覆盖logical-record/byte预算与serde；Task 3覆盖binding/trust/whole-timeout/原始hash；Task 4覆盖实际入口/readonly/source/Escape。五项Review Focus各有具体断言；新模块仅围绕本次责任，未拆无关文件，未新增持久化表。以上命令待实施阶段实际执行，不能把计划里的 Expected 当运行结果。
+Task 1供下游唯一handle接口；Task 2覆盖logical-record/byte预算与serde；Task 3覆盖binding/trust/whole-timeout/原始hash；Task 4覆盖实际入口/readonly/source/Escape。五项Review Focus各有具体断言；新模块仅围绕本次责任，未拆无关文件，未新增持久化表。计划起草时的Expected不算运行结果；当前实际提交/检查、fix前native资产与未执行验收边界见上一节。
