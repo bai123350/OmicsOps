@@ -30,10 +30,12 @@ export function useConversationBranchSend(projectId: string | undefined, convers
           const { sourceMessageId: _, ...payload } = saved.input;
           saved.request = { ...payload, queue_request_id: crypto.randomUUID(), queue_message_id: crypto.randomUUID(), queue_run_id: crypto.randomUUID(), branch: { request_id: crypto.randomUUID(), project_id: projectId, source_conversation_id: conversationId, source_message_id: checkpoint.source_message_id, checkpoint_kind: checkpoint.checkpoint_kind, expected_source_sequence: checkpoint.source_sequence, expected_head_sequence: checkpoint.source_head_sequence, expected_boundary_hash: checkpoint.boundary_hash, title: titleFor(payload.message_markdown) } };
         }
-        saved.receipt = await createConversationBranchAndSend(saved.request);
-        if (saved.receipt.branch.project_id !== projectId || saved.receipt.branch.source_conversation_id !== conversationId || saved.receipt.branch.request_id !== saved.request.branch.request_id || saved.receipt.queue.project_id !== projectId || saved.receipt.queue.message_id !== saved.request.queue_message_id || saved.receipt.queue.run_id !== saved.request.queue_run_id || saved.receipt.queue.request_id !== saved.request.queue_request_id || saved.receipt.queue.conversation_id !== saved.receipt.branch.branch_conversation_id) { saved.receipt = undefined; throw new Error("Invalid branch send receipt"); }
+        const receipt = await createConversationBranchAndSend(saved.request);
+        if (receipt.branch.project_id !== projectId || receipt.branch.source_conversation_id !== conversationId || receipt.branch.request_id !== saved.request.branch.request_id || receipt.queue.project_id !== projectId || receipt.queue.message_id !== saved.request.queue_message_id || receipt.queue.run_id !== saved.request.queue_run_id || receipt.queue.request_id !== saved.request.queue_request_id || receipt.queue.conversation_id !== receipt.branch.branch_conversation_id) throw new Error("Invalid branch send receipt");
+        saved.receipt = receipt;
       }
-      if (!mounted.current || current.current !== scope) return false;
+      // A validated durable ACK remains accepted even when navigation is no longer current.
+      if (!mounted.current || current.current !== scope) return true;
       if (!await open.current(saved.receipt.branch)) throw new Error("Branch navigation not confirmed");
       pending.current.delete(scope); return true;
     } catch {
@@ -41,7 +43,8 @@ export function useConversationBranchSend(projectId: string | undefined, convers
       // Preserve the complete original request and reconcile it on explicit retry.
       if (!saved.request) pending.current.delete(scope);
       if (mounted.current && current.current === scope) setErrorScope(scope);
-      return false;
+      // Opening a committed branch can fail independently of accepting its queued turn.
+      return Boolean(saved.receipt);
     } finally { saved.running = false; if (mounted.current) render((n) => n + 1); }
   }
   return { originalMarkdown: pending.current.get(scope)?.input.message_markdown, submit, retry: () => submit(), busy: Boolean(pending.current.get(scope)?.running), pending: pending.current.has(scope), error: errorScope === scope };

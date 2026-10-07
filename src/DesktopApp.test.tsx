@@ -1030,6 +1030,43 @@ describe("DesktopApp", () => {
     expect(start).toHaveBeenLastCalledWith(expect.objectContaining({ conversation_id: "conversation-plan", objective: "New session request" }));
   });
 
+  for (const mode of ["agent", "plan"] as const) {
+    it.each(["accepted", "same text", "unknown", "null", "invalid"] as const)(`preserves durable legacy ${mode} start acceptance across navigation: %s`, async (outcome) => {
+      const { stateSpy } = setupConversationStateHarness();
+      stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId, { mode }));
+      vi.spyOn(api, "submitMessage").mockImplementation(async (request) => ({ id: "accepted-message", project_id: request.project_id, conversation_id: request.conversation_id, sequence: 1, role: "user", markdown: request.markdown, created_at: "" }));
+      const pending = deferred<RunSummaryV4>();
+      const start = vi.spyOn(api, mode === "agent" ? "agentV4StartDirect" : "agentV4StartPlanning").mockReturnValue(pending.promise);
+      const subscribe = vi.spyOn(ComposerDraftStore.prototype, "subscribe");
+      render(<DesktopApp />);
+      const first = await screen.findByRole("textbox", { name: /描述研究目标/ });
+      await waitFor(() => expect(first).toBeEnabled());
+      const store = subscribe.mock.contexts[0] as ComposerDraftStore;
+      const a = { projectId: stateProject.id, conversationId: "conversation-agent" };
+      const b = { ...a, conversationId: "conversation-plan" };
+      fireEvent.change(first, { target: { value: "Original notes" } });
+      await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+      fireEvent.click(screen.getByRole("button", { name: "发送" }));
+      await waitFor(() => expect(start).toHaveBeenCalledOnce());
+      fireEvent.click(screen.getByRole("button", { name: "Plan 会话" }));
+      await screen.findByRole("heading", { name: "Plan 会话" });
+      const current = screen.getByRole("textbox", { name: /描述研究目标/ });
+      act(() => store.update(b, "Destination notes"));
+      expect(current).toHaveValue("Destination notes");
+      if (outcome === "same text") act(() => { store.update(a, "Changed notes"); store.update(a, "Original notes"); });
+      await act(async () => {
+        if (outcome === "unknown") pending.reject(new Error("unknown start"));
+        else if (outcome === "null") pending.resolve(null as unknown as RunSummaryV4);
+        else pending.resolve({ ...stateRun("accepted-original", mode === "agent" ? "running" : "awaiting_approval"), run_id: outcome === "invalid" ? "" : "accepted-original", session_mode: mode });
+      });
+      expect(store.read(a).text).toBe(outcome === "accepted" ? "" : "Original notes");
+      expect(store.read(b).text).toBe("Destination notes");
+      expect(current).toHaveValue("Destination notes");
+      expect(screen.queryByText("unknown start")).not.toBeInTheDocument();
+      expect(api.agentV4Events).not.toHaveBeenCalledWith("accepted-original");
+    });
+  }
+
   it("surfaces an Agent event subscription failure instead of silently waiting", async () => {
     vi.spyOn(api, "listProjects").mockResolvedValue([{ id: "project-1", name: "PBMC 图谱", description: "", local_root: "E:/Science/pbmc", remote_root: null, connection_id: null, template: "single_cell_rna_seq", status: "running", ollama_only: false, created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" }]);
     vi.spyOn(api, "onAgentV4Event").mockRejectedValue(new Error("listen unavailable"));

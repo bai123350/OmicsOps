@@ -865,6 +865,7 @@ export default function DesktopApp() {
       ...(attachments.length ? { attachments } : {}),
       compute_selection: currentComputeSelection(),
     });
+    if (typeof summary?.run_id !== "string" || !summary.run_id.trim() || typeof summary.status !== "string" || !summary.status.trim()) return null;
     if (!isCurrentConversation(projectId, conversationId, token)) return summary;
     setV4Plan(summary);
     setRunId(summary.run_id);
@@ -906,6 +907,7 @@ export default function DesktopApp() {
       ...(attachments.length ? { attachments } : {}),
       compute_selection: currentComputeSelection(),
     });
+    if (typeof summary?.run_id !== "string" || !summary.run_id.trim() || typeof summary.status !== "string" || !summary.status.trim()) return null;
     if (!isCurrentConversation(projectId, conversationId, token)) return summary;
     setV4Plan(summary);
     setRunId(summary.run_id);
@@ -1662,8 +1664,9 @@ export default function DesktopApp() {
           if (!reusableMessage) {
             pendingSubmissionRef.current = { projectId, conversationId, markdown, mode, references: [...references], attachments: [...attachments], message };
           }
-          await startV4Planning(markdown, token, references, attachments);
-          if (!isCurrentConversation(projectId, conversationId, token)) return false;
+          const accepted = await startV4Planning(markdown, token, references, attachments);
+          if (!accepted) return false;
+          if (!isCurrentConversation(projectId, conversationId, token)) return true;
           if (pendingSubmissionRef.current && samePendingSubmission(pendingSubmissionRef.current, projectId, conversationId, markdown, mode, references, attachments)) {
             pendingSubmissionRef.current = null;
           }
@@ -1701,8 +1704,9 @@ export default function DesktopApp() {
         if (!reusableMessage) {
           pendingSubmissionRef.current = { projectId, conversationId, markdown, mode, references: [...references], attachments: [...attachments], message };
         }
-        await startV4Direct(markdown, token, references, attachments);
-        if (!isCurrentConversation(projectId, conversationId, token)) return false;
+        const accepted = await startV4Direct(markdown, token, references, attachments);
+        if (!accepted) return false;
+        if (!isCurrentConversation(projectId, conversationId, token)) return true;
         if (pendingSubmissionRef.current && samePendingSubmission(pendingSubmissionRef.current, projectId, conversationId, markdown, mode, references, attachments)) {
           pendingSubmissionRef.current = null;
         }
