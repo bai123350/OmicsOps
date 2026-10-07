@@ -3,7 +3,210 @@
 use super::*;
 use omicsops_protocol::{ExecutionContextKeyV4, RuntimeJobStateV4, RuntimeJobV4, RuntimeResultV4};
 
+/// Internal metadata only; the desktop owns the bounded public projection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteJobMetadataV4 {
+    pub job: RuntimeJobV4,
+    pub conversation_id: Uuid,
+}
+
+/// A selected job and its original inputs, loaded from one SQLite snapshot.
+/// Receipt content requires the host's shared detached-result validator before
+/// presentation. This is never an execution or recovery authorization.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredRemoteJobV4 {
+    pub job: RuntimeJobV4,
+    pub conversation_id: Uuid,
+    pub frozen_spec: RunSpecV4,
+    pub result: Option<RuntimeResultV4>,
+}
+
+fn remote_job_integrity_error() -> StoreError {
+    StoreError::InvalidInput("remote job record integrity mismatch".into())
+}
+
+fn remote_job_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+    project_id: Uuid,
+) -> Result<RemoteJobMetadataV4, StoreError> {
+    let serialized: String = row.try_get("job_json")?;
+    if serialized.len() > 64 * 1024 {
+        return Err(remote_job_integrity_error());
+    }
+    let job: RuntimeJobV4 =
+        serde_json::from_str(&serialized).map_err(|_| remote_job_integrity_error())?;
+    let conversation: String = row.try_get("conversation_id")?;
+    let conversation_id =
+        Uuid::parse_str(&conversation).map_err(|_| remote_job_integrity_error())?;
+    if job.context.project_id != project_id
+        || job.context.run_id.to_string() != row.try_get::<String, _>("run_id")?
+        || job.job_id.to_string() != row.try_get::<String, _>("job_id")?
+        || job.call_id != row.try_get::<String, _>("call_id")?
+        || !job.context.backend_id.starts_with("ssh:")
+        || !job
+            .remote_root
+            .as_ref()
+            .is_some_and(|root| root.starts_with('/') && root != "/")
+        || !job
+            .remote_host_key
+            .as_ref()
+            .is_some_and(|key| !key.trim().is_empty())
+    {
+        return Err(remote_job_integrity_error());
+    }
+    Ok(RemoteJobMetadataV4 {
+        job,
+        conversation_id,
+    })
+}
+
 impl Store {
+    /// SQLite-only metadata, including detached jobs from previous bindings.
+    /// Ownership and optional conversation filters precede the fixed limit.
+    pub async fn remote_job_metadata_v4(
+        &self,
+        project_id: Uuid,
+        conversation_id: Option<Uuid>,
+    ) -> Result<Vec<RemoteJobMetadataV4>, StoreError> {
+        let rows = sqlx::query("SELECT j.job_id,j.run_id,j.call_id,j.value_json AS job_json,r.conversation_id FROM runtime_jobs_v4 j JOIN agent_runs_v4 r ON r.run_id=j.run_id WHERE r.project_id=?1 AND (?2 IS NULL OR r.conversation_id=?2) AND json_extract(j.value_json,'$.remote_root') IS NOT NULL AND json_extract(j.value_json,'$.remote_host_key') IS NOT NULL ORDER BY j.rowid DESC LIMIT 100")
+            .bind(project_id.to_string()).bind(conversation_id.map(|id| id.to_string())).fetch_all(&self.pool).await?;
+        rows.iter()
+            .map(|row| remote_job_from_row(row, project_id))
+            .collect()
+    }
+
+    /// Read original job, owner, frozen spec, verified request history and optional
+    /// receipt in a single deferred read transaction. Never dispatches, retires a
+    /// receipt, changes run/job state, or reconciles scientific results.
+    pub async fn remote_job_record_v4(
+        &self,
+        project_id: Uuid,
+        job_id: Uuid,
+    ) -> Result<Option<StoredRemoteJobV4>, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("SELECT j.job_id,j.run_id,j.call_id,j.value_json AS job_json,r.conversation_id,r.value_json AS run_json FROM runtime_jobs_v4 j JOIN agent_runs_v4 r ON r.run_id=j.run_id WHERE r.project_id=?1 AND j.job_id=?2 AND json_extract(j.value_json,'$.remote_root') IS NOT NULL AND json_extract(j.value_json,'$.remote_host_key') IS NOT NULL")
+            .bind(project_id.to_string()).bind(job_id.to_string()).fetch_optional(&mut *tx).await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let RemoteJobMetadataV4 {
+            job,
+            conversation_id,
+        } = remote_job_from_row(&row, project_id)?;
+        let run_json: String = row.try_get("run_json")?;
+        let run: Value =
+            serde_json::from_str(&run_json).map_err(|_| remote_job_integrity_error())?;
+        let frozen_spec: RunSpecV4 = serde_json::from_value(
+            run.get("spec")
+                .cloned()
+                .ok_or_else(remote_job_integrity_error)?,
+        )
+        .map_err(|_| remote_job_integrity_error())?;
+        frozen_spec
+            .validate_integrity()
+            .map_err(|_| remote_job_integrity_error())?;
+        if frozen_spec.project_id != project_id
+            || frozen_spec.run_id != job.context.run_id
+            || frozen_spec.conversation_id != conversation_id
+            || frozen_spec
+                .compute_selection
+                .as_ref()
+                .is_some_and(|selection| {
+                    selection.backend_id != job.context.backend_id
+                        || selection.environment != job.context.environment
+                })
+        {
+            return Err(remote_job_integrity_error());
+        }
+        let events = load_agent_events_in_tx(&mut tx, job.context.run_id)
+            .await
+            .map_err(|_| remote_job_integrity_error())?;
+        if events.iter().any(|event| {
+            event.project_id != project_id
+                || event.run_id != job.context.run_id
+                || event.conversation_id != conversation_id
+        }) {
+            return Err(remote_job_integrity_error());
+        }
+        let call = events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.event {
+                AgentEventKindV4::ToolRequested { call } if call.call_id == job.call_id => {
+                    Some(call)
+                }
+                _ => None,
+            })
+            .ok_or_else(remote_job_integrity_error)?;
+        if call.tool_id != "runtime.execute"
+            || job
+                .session_id
+                .is_some_and(|session_id| session_id != job_id)
+            || job
+                .result_request_id
+                .is_some_and(|request_id| request_id != job_id)
+            || (matches!(
+                job.state,
+                RuntimeJobStateV4::Running
+                    | RuntimeJobStateV4::Succeeded
+                    | RuntimeJobStateV4::Failed
+            ) && job.session_id.is_none())
+            || call.arguments.get("background").and_then(Value::as_bool) != Some(true)
+            || call.canonical_hash().ok().as_deref() != Some(job.request_sha256.as_str())
+            || call.arguments.get("language")
+                != Some(
+                    &serde_json::to_value(job.context.language)
+                        .map_err(|_| remote_job_integrity_error())?,
+                )
+            || call
+                .arguments
+                .get("environment")
+                .and_then(Value::as_str)
+                .unwrap_or("system")
+                != job.context.environment
+        {
+            return Err(remote_job_integrity_error());
+        }
+        let serialized: Option<String> =
+            sqlx::query_scalar("SELECT result_json FROM runtime_job_results_v4 WHERE job_id=?1")
+                .bind(job_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+        let result = match serialized {
+            None => None, // ToolFinished legitimately retires saved receipts.
+            Some(serialized) => {
+                // Hash the original stored bytes before decoding. Re-encoding a
+                // parsed value would lose whitespace/field ordering integrity.
+                if !matches!(
+                    job.state,
+                    RuntimeJobStateV4::Succeeded | RuntimeJobStateV4::Failed
+                ) || serialized.len() > 1024 * 1024
+                    || Some(hex::encode(Sha256::digest(serialized.as_bytes()))) != job.result_sha256
+                {
+                    return Err(remote_job_integrity_error());
+                }
+                let result: RuntimeResultV4 =
+                    serde_json::from_str(&serialized).map_err(|_| remote_job_integrity_error())?;
+                if Some(result.session_id) != job.session_id
+                    || Some(result.request_id) != job.result_request_id
+                    || result.session_id != job_id
+                    || result.request_id != job_id
+                    || result.succeeded != (job.state == RuntimeJobStateV4::Succeeded)
+                {
+                    return Err(remote_job_integrity_error());
+                }
+                Some(result)
+            }
+        };
+        tx.commit().await?;
+        Ok(Some(StoredRemoteJobV4 {
+            job,
+            conversation_id,
+            frozen_spec,
+            result,
+        }))
+    }
+
     /// End a paused saved-result recovery, under the desktop's driver slot.
     /// Receipts and job identities remain available for audit; nothing executes.
     pub async fn cancel_runtime_recovery_v4(

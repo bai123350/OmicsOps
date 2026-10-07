@@ -644,6 +644,13 @@ pub use side_chat::{
 mod run_stops;
 pub use run_stops::{StopRunReceiptV4, StopRunRequestV4, StopRunStatusV4};
 
+mod remote_jobs;
+pub use remote_jobs::{
+    ListRemoteJobsV4Request, RefreshRemoteJobV4Request, RemoteJobCaptureReferenceV4,
+    RemoteJobObservationStatusV4, RemoteJobObservationV4, RemoteJobQueryEligibilityV4,
+    RemoteJobRecordedStateV4, RemoteJobSummaryV4, RemoteJobsPageV4,
+};
+
 /// Distinguish a host preflight rejection from an unconfirmed dispatch result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

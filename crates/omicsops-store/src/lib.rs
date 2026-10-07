@@ -46,6 +46,7 @@ mod model_profiles;
 mod notification_receipts;
 pub(crate) mod run_stops;
 mod runtime_jobs;
+pub use runtime_jobs::{RemoteJobMetadataV4, StoredRemoteJobV4};
 mod session_reviews;
 mod side_chat;
 mod skill_removals;

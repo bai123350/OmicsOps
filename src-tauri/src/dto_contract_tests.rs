@@ -6,6 +6,134 @@ use crate::dto::{
 use serde_json::json;
 
 #[test]
+fn remote_jobs_requests_reject_ui_launch_parameters() {
+    use omicsops_dto::{ListRemoteJobsV4Request, RefreshRemoteJobV4Request};
+    let project = uuid::Uuid::from_u128(1);
+    let job = uuid::Uuid::from_u128(2);
+    let value = json!({"project_id":project,"job_id":job});
+    let request: RefreshRemoteJobV4Request = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(request).unwrap(), value);
+    for field in [
+        "backend_id",
+        "remote_root",
+        "remote_host_key",
+        "code",
+        "command",
+    ] {
+        let mut invalid = value.clone();
+        invalid[field] = json!("injected");
+        assert!(serde_json::from_value::<RefreshRemoteJobV4Request>(invalid).is_err());
+    }
+    let list = json!({"project_id":project,"conversation_id":null});
+    let request: ListRemoteJobsV4Request = serde_json::from_value(list.clone()).unwrap();
+    assert_eq!(serde_json::to_value(request).unwrap(), list);
+    let mut invalid = list;
+    invalid["limit"] = json!(1000);
+    assert!(serde_json::from_value::<ListRemoteJobsV4Request>(invalid).is_err());
+}
+
+#[test]
+fn remote_jobs_response_has_public_only_fields_and_explicit_old_timestamp() {
+    use omicsops_dto::*;
+    let summary = RemoteJobSummaryV4 {
+        project_id: uuid::Uuid::from_u128(1),
+        conversation_id: uuid::Uuid::from_u128(2),
+        job_id: uuid::Uuid::from_u128(3),
+        run_id: uuid::Uuid::from_u128(4),
+        call_id: "cell".into(),
+        backend_id: "ssh:old".into(),
+        language: "python".into(),
+        environment: "system".into(),
+        request_sha256: "a".repeat(64),
+        recorded_state: RemoteJobRecordedStateV4::Running,
+        query_eligibility: RemoteJobQueryEligibilityV4::NeedsRootCheck,
+        recorded_at: None,
+    };
+    assert_eq!(summary.recorded_at, None);
+    let serialized_summary = serde_json::to_string(&summary).unwrap();
+    assert!(!serialized_summary.contains("remote_host_key"));
+    assert!(!serialized_summary.contains("remote_root"));
+    let page = RemoteJobsPageV4 {
+        jobs: vec![summary.clone()],
+        limit: 100,
+        remote_liveness_checked: false,
+    };
+    let value = serde_json::to_value(&page).unwrap();
+    assert_eq!(value["limit"], 100);
+    assert_eq!(value["remote_liveness_checked"], false);
+    assert!(value["jobs"][0]["recorded_at"].is_null());
+    let observation = RemoteJobObservationV4 {
+        job: summary,
+        status: RemoteJobObservationStatusV4::Completed,
+        observed_at: "2026-10-07T00:00:00Z".into(),
+        stdout_excerpt: "done".into(),
+        stderr_excerpt: String::new(),
+        captures: vec![RemoteJobCaptureReferenceV4 {
+            relative_path: "results/output.txt".into(),
+            sha256: "b".repeat(64),
+            size_bytes: None,
+        }],
+        resubmitted: false,
+    };
+    let value = serde_json::to_value(&observation).unwrap();
+    assert_eq!(value["status"], "completed");
+    assert_eq!(value["resubmitted"], false);
+    assert!(value["captures"][0]["size_bytes"].is_null());
+    assert_eq!(
+        serde_json::from_value::<RemoteJobObservationV4>(value.clone()).unwrap(),
+        observation
+    );
+    let mut invalid = value;
+    invalid["result"] = json!({});
+    assert!(serde_json::from_value::<RemoteJobObservationV4>(invalid).is_err());
+}
+
+#[test]
+fn remote_jobs_enums_have_exact_snake_case_values() {
+    use omicsops_dto::*;
+    for (value, name) in [
+        (RemoteJobRecordedStateV4::Reserved, "reserved"),
+        (RemoteJobRecordedStateV4::Running, "running"),
+        (RemoteJobRecordedStateV4::Unknown, "unknown"),
+        (RemoteJobRecordedStateV4::Succeeded, "succeeded"),
+        (RemoteJobRecordedStateV4::Failed, "failed"),
+    ] {
+        assert_eq!(serde_json::to_value(value).unwrap(), name);
+    }
+    for (value, name) in [
+        (
+            RemoteJobQueryEligibilityV4::NeedsRootCheck,
+            "needs_root_check",
+        ),
+        (
+            RemoteJobQueryEligibilityV4::BindingChanged,
+            "binding_changed",
+        ),
+        (RemoteJobQueryEligibilityV4::Unsupported, "unsupported"),
+        (
+            RemoteJobQueryEligibilityV4::IntegrityMismatch,
+            "integrity_mismatch",
+        ),
+        (
+            RemoteJobQueryEligibilityV4::RecordedReceipt,
+            "recorded_receipt",
+        ),
+    ] {
+        assert_eq!(serde_json::to_value(value).unwrap(), name);
+    }
+    for (value, name) in [
+        (RemoteJobObservationStatusV4::Running, "running"),
+        (RemoteJobObservationStatusV4::Unknown, "unknown"),
+        (RemoteJobObservationStatusV4::Completed, "completed"),
+        (RemoteJobObservationStatusV4::Timeout, "timeout"),
+        (RemoteJobObservationStatusV4::Unavailable, "unavailable"),
+        (RemoteJobObservationStatusV4::Rejected, "rejected"),
+    ] {
+        assert_eq!(serde_json::to_value(value).unwrap(), name);
+    }
+}
+
+#[test]
 fn project_table_request_has_stable_fields_and_rejects_unknown_fields() {
     use omicsops_dto::ProjectTablePreviewRequest;
     let value = json!({"project_id":uuid::Uuid::from_u128(1),"backend_id":"local","relative_path":"data/a.csv"});
