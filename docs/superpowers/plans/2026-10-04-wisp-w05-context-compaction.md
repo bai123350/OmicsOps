@@ -19,6 +19,7 @@
 - “不为 admission 新增数据库列”；optional admission 存 Completed event 的既有 value_json，None 不序列化，旧事件 hash 必须保持。
 - “成功一次写入 receipt、archive、checkpoint 和关联事件；任一步失败全部 rollback。”不修改冻结 spec/审批/Run 状态、不消费 guidance、不解决 unknown dispatch。
 - no stream/no tool execute/no compute initialize/no SSH connect；prospective 引用不在 commit 前交模型/UI。预算未知不填零、不推断模型家族能力。
+- prepare不持久化/派发；既有sync `usage_request_metadata`可能核验并读取本地图片bytes，这是完整请求测量，不可用占位图片字节冒充。新暂停路径要求validated anchored `spec_hash:Some`并取其String；unanchored legacy仍可读历史/旧completed路径，但不授予新压缩提交。NotNeeded首次/回读optional admission字段均None，仅Completed从事件hydrate。
 - 新 UI 请求 capture scope/generation；所有关闭层遵守 Escape 栈。自动化使用临时 DB/fake，不要求网络或凭据。
 
 ## Review Focus

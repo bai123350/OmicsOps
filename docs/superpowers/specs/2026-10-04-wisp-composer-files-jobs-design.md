@@ -95,6 +95,8 @@ UI 测试覆盖 loading/error/retry、身份显示、截断提示、XSS 文本�
 
 复用 `remote_jobs_v4::query` 和既有 `Transport` seam，仅发送 `action: status` 与原 identity。保留原 receipt/result digest 校验、CAS 终态记录和 `resubmitted: false`。不调用 submit，不释放 job reservation，不因未知响应重跑，不直接恢复 Agent，不把观察结果升级为科研 evidence。
 
+共享completed-result校验须在Store CAS前拒绝敏感样式文本及不安全引用；现有query会先保存typed RuntimeResult，再返回给公开投影，不能仅脱敏UI。检查全部将持久化的字符串/结构敏感标签（不只4KiB片段），仍使用原始可接受结果及摘要；拒绝时保持旧状态/receipt，固定安全错误，不把改写后的结果挂在旧stream/result hash下。模式检测不声称能识别任意无标签秘密。
+
 整个远端刷新路径（SSH 连接、身份检查、根路径解析、状态查询）固定最长等待 20 秒，不能只给 `transport.invoke` 加 timeout；response 沿用已有字节/产物数预算。输出投影只返回脱敏 stdout/stderr 各最多 4 KiB 的观察片段、固定 status/error category、host observed_at 和有界捕获引用。断连、未知 receipt 或超时不改记为 failed/cancelled；保留旧记录并说明远端情况未知。已经终态且有已校验 result 的作业可从 ledger 查看，无需再次联系 SSH。
 
 不增加远端取消命令。停止查询只停止本地等待，不确认远端计算终止。UI 要分别显示 recorded_state 与 remote_observation，避免混淆。当前运行的冻结审批不因面板操作改变，已派发作业始终沿用原身份。

@@ -112,10 +112,10 @@ assert_eq!(r_binding_side_effect_count, 0); // 仅 opt-in R 测试
 
 **Interfaces:**
 - Consumes：Task 1 manager；Task 3 SSH trait；现有 frozen Run/compute scope 验证、`ExecutionResourcesSlotV4.ready.get()`。
-- Produces：`pub(crate) struct LiveRuntimeRegistryV4`，键 `LiveRuntimeScopeV4 = (Uuid, Uuid, Uuid)`，值弱 slot+registration generation；`LiveRuntimeRegistryV4::register(&self, scope: LiveRuntimeScopeV4, slot: &Arc<ExecutionResourcesSlotV4>) -> LiveRuntimeRegistrationV4`，Drop 仅清自己代次。guard 保存在 `ComposedToolsV4._runtime_registration: LiveRuntimeRegistrationV4`，覆盖实际组合对象生命周期，不能在 compose 返回前被局部变量丢弃；guard 不持 slot 强引用。
+- Produces：`pub(crate) struct LiveRuntimeRegistryV4`，键 `LiveRuntimeScopeV4 = (Uuid, Uuid, Uuid)`，值弱 slot+registration generation；`LiveRuntimeRegistryV4::register(&self, scope: LiveRuntimeScopeV4, slot: &Arc<ExecutionResourcesSlotV4>) -> LiveRuntimeRegistrationV4`，Drop 仅清自己代次。guard 字段为 `ComposedToolsV4._runtime_registration: Option<LiveRuntimeRegistrationV4>`，compose默认None；实际execution driver所有权注册/取消重验后赋Some。guard或整个tools显式移入async driver并持有至结束，避免Rust仅捕获tools.registry导致其他字段提前drop；guard不持slot强引用。planning不执行持久内核，无须为其伪造可观察session。
 - Produces：`pub(crate) async fn inspect_live_kernel_v4(state: &AppState, request: &InspectKernelRequestV4) -> Result<KernelInspectionV4, String>`（agent_v4 内部）；`pub async fn agent_v4_inspect_kernel(state: State<'_, AppState>, request: InspectKernelRequestV4) -> Result<KernelInspectionV4, String>`（新命令）。
 
-- [ ] **RED 写测试**：`inspection_host_rejects_foreign_scope_and_override`、`inspection_host_never_initializes_resources`、`inspection_registry_old_guard_cannot_remove_new_slot`、`inspection_host_redacts_ephemeral_metadata`。
+- [ ] **RED 写测试**：`inspection_host_rejects_foreign_scope_and_override`、`inspection_host_never_initializes_resources`、`inspection_registry_old_guard_cannot_remove_new_slot`、`inspection_host_redacts_ephemeral_metadata`，以及 `inspection_driver_guard_survives_spawn`（真实异步driver期间条目存在、结束后移除）、`inspection_dry_compose_is_unregistered`（干式组合不会覆盖live slot）。
 
 ```rust
 assert_eq!((factory.initializations(), backend.launches()), (0, 0));
@@ -126,7 +126,7 @@ assert!(!serde_json::to_string(&response).unwrap().contains(secret_sentinel));
 ```
 
 - [ ] **RED 运行**：`cargo test -p omicsops-desktop --lib inspection_host`；`cargo test -p omicsops-desktop --lib inspection_registry`。预期注册表/命令缺失或断言失败。
-- [ ] **实现接口**：compose 注册已创建 slot，不促发 initialize；scope 从 Store frozen run 验证，前端不提供 backend/environment。升级 weak 后只 ready.get；结果再核验 session/generation，固定原因映射，用户元数据不记录日志/事件。AppState 初始化和现有测试 fixtures 同步补默认 registry。
+- [ ] **实现接口**：compose不登记；实际execution driver通过ownership/cancel gate后注册已创建slot（从model.resources取得），显式将guard或整个tools移入driver；W05 manual/目录等干式组合保持None，不促发initialize。scope从Store frozen run验证，前端不提供backend/environment。升级weak后只ready.get；结果再核验session/generation，固定原因映射，用户元数据不记录日志/事件。AppState初始化和现有测试fixtures同步补默认registry。
 - [ ] **GREEN**：重复 RED；`cargo test -p omicsops-desktop --lib dto_contract_tests`；预期越权拒绝、默认 lazy compute 回归通过。
 - [ ] **Commit**：仅暂存本任务文件，`git commit -m "feat(desktop): expose live kernel metadata inspection"`。
 

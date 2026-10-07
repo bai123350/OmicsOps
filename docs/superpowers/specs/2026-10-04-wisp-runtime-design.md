@@ -60,7 +60,7 @@ pub struct KernelInspectionV4 {
 
 Runtime 层不持有 conversation 权限，新增内部 `KernelInspectionPayloadV4`，只含 objects/truncated；宿主负责补齐已核验的作用域。纯 metadata/request/response 数据放 protocol，DTO 只重新导出这些 protocol 数据；Runtime 的错误、manager 结果、进程句柄、锁和注册表均留在 Runtime/宿主，不让 DTO 依赖 runtime 或 async runtime。`KernelProcessV4` 增加 `async fn inspect(&self) -> Result<KernelInspectionPayloadV4, KernelInspectionErrorV4>`，默认实现返回 Unsupported，避免测试替身或其他 backend 被迫伪造实现。manager 增加 `async fn inspect_existing(&self, key: &ExecutionContextKeyV4, expected_session_id: Option<Uuid>) -> KernelInspectionResultV4`，返回当前 session 与结构化状态，绝不调用 `acquire/launch/rebuild`。
 
-宿主新增 `agent_v4_inspect_kernel(request)`。`AppState` 增加以 `(project_id, conversation_id, run_id)` 为键的弱引用注册表，指向当前 `ExecutionResourcesSlotV4`。`compose` 注册已经创建的 slot；命令只升级 weak 引用并使用 `ready.get()`，不能调用 `initialize()`。失效条目按读取清理；重复组合用注册代次区分，旧 guard 不删除新条目。此注册表不持久化，不获取 SSH 凭据。
+宿主新增 `agent_v4_inspect_kernel(request)`。`AppState` 增加以 `(project_id, conversation_id, run_id)` 为键的弱引用注册表，指向当前 `ExecutionResourcesSlotV4`。实际 execution driver 在所有权注册及取消重验后登记已组合的 slot；干式目录/预算组合不登记，避免覆盖真实运行。命令只升级 weak 引用并使用 `ready.get()`，不能调用 `initialize()`。失效条目按读取清理；重复 driver 登记用代次区分，旧 guard 不删除新条目。guard显式移入并保留在实际异步driver内，不能只新增struct字段后被Rust按字段捕获提前释放。此注册表不持久化，不获取 SSH 凭据，不增加内核保活。
 
 命令先核验 project/conversation/run 所有权、冻结 spec 完整性、语言及冻结 compute selection，再查注册表。未初始化返回 NotStarted；进程忙返回 Busy，UI 提供手动刷新。前端按作用域和 session 校验异步结果，切换 Run、关闭窗口、重建后丢弃旧响应。
 
