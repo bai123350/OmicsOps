@@ -18,6 +18,7 @@
 - 类别数组去重，空数组合法；默认类别均不选、文件为空，project基本metadata始终包含。description最多4 KiB、name最多800字节、每类别examples最多20条。
 - 文件最多32项，backend ID最多128字节、相对路径最多1,024字节；小文本单项512 KiB、总读取4 MiB，不递归、不输出正文、不hash超预算大文件。
 - local完整读取hash标FullFile；可信已有hash标RecordedFile；未知size/hash为None，unknown不算零。SSH只存储引用，不stat/download；expected_full_sha256必须实际完整核验，否则整次拒绝。
+- MCP/Skills rebind count仅为应用全局已登记配置/包的COUNT，固定文案明确不是project grant或启用/授权数；不读取profile JSON、SKILL.md或memory文件。其余绑定计数按project-owned关系读取。`mcp_server`固定kind与`skill_packages`表COUNT不暗示迁移权限。
 - preview_sha256不包括observed_at或hash自身；不成为批准token。DB事务与随后逐文件读取不称为原子项目快照。
 - 公开project/摘要和固定rebind/exclusions不含roots、服务器身份、profile密文/keyring定位、批准计划、权限或job恢复句柄；无Store/file写入、无模型/kernel/SSH/MCP/keyring调用。
 - DTO纯数据/deny_unknown_fields/snake_case/RFC3339 UTC，Windows-first；合成记录、temp目录、mock Tauri与外部接口零调用，立即Escape关顶层、选择/generation旧响应丢弃。

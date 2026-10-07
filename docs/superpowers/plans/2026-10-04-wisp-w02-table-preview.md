@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust、已有 windows-sys/sha2/tempfile、现有 SFTP、Tauri 2、React 19/TypeScript/Vitest；无新增解析器或前端依赖。
 
-**Spec:** [W02 设计](../specs/2026-10-04-wisp-composer-files-jobs-design.md#w02有界-csvtsv-表格预览)、[共同约束](../specs/2026-10-04-wisp-improvements-design.md)。用户已确认设计及8515da8实施计划。Task1共享读取、Task2 parser/DTO已实现并独立审阅通过；Task3 source/command与Task4界面待实施。
+**Spec:** [W02 设计](../specs/2026-10-04-wisp-composer-files-jobs-design.md#w02有界-csvtsv-表格预览)、[共同约束](../specs/2026-10-04-wisp-improvements-design.md)。用户已确认设计及8515da8实施计划。Task1共享读取、Task2 parser/DTO、Task3 source/command已实现并独立审阅通过；Task4界面与完整功能交付检查待实施。
 
 ## Global Constraints
 
@@ -90,11 +90,11 @@ fn table_preview_record_boundaries() {
 
 ### Task 3: 本地/SSH source 与统一宿主命令
 
-**Files:** Create `src-tauri/src/project_table_commands.rs`（command/seam/tests）；Modify `crates/omicsops-adapters/src/ssh.rs`、`src-tauri/src/lib.rs`；按必要复用 `src-tauri/src/composer_files.rs` 和 `sync_commands.rs` 的现有 binding/canonical helpers，不更改其完整读取语义。
+**Files:** Create `src-tauri/src/project_table_commands.rs`（command/seam/tests）；Modify `crates/omicsops-adapters/src/ssh.rs`、`src-tauri/src/lib.rs`；窄幅 Modify `src-tauri/src/project_file_read.rs`（仅既有 is_reserved_component 的 pub(crate) 可见性）与 `src-tauri/Cargo.toml`（仅 Tokio test-util dev feature，用于虚拟时间测试）；按必要复用 `src-tauri/src/composer_files.rs` 和 `sync_commands.rs` 的现有 binding/canonical helpers，不更改其完整读取语义。
 
-**Interfaces:** Consumes Tasks 1–2及现有 `FileBackend`。Adapter produces `RemoteFilePrefix {bytes:Vec<u8>,size_bytes:Option<u64>,eof:bool,metadata_stable:bool}` 和 `SshSession::read_file_prefix(&self,remote_path:&str,max_bytes:u64)->AdapterResult<RemoteFilePrefix>`，不修改 `read_file_limited`。Host-only `TableSourceRead {bytes:Vec<u8>,size_bytes:Option<u64>,eof:bool,stable:bool}`；async injectable `ProjectTableSource::read_prefix(&self,project:&Project,backend:&FileBackend,relative_path:&str,max_bytes:usize)->Result<TableSourceRead,TablePreviewErrorCode>`；`preview_project_table_with_source(store:&Store,source:&dyn ProjectTableSource,request:ProjectTablePreviewRequest)->Result<ProjectTablePreview,String>`；Tauri `preview_project_table(state:State<'_,AppState>,request:ProjectTablePreviewRequest)->Result<ProjectTablePreview,String>`。String errors 固定 enum code，不带 OS/SSH 输出。
+**Interfaces:** Consumes Tasks 1–2及现有 `FileBackend`。Adapter produces `RemoteFilePrefix {bytes:Vec<u8>,size_bytes:Option<u64>,eof:bool,metadata_stable:bool}` 和 `SshSession::read_file_prefix(&self,remote_path:&str,max_bytes:u64)->AdapterResult<RemoteFilePrefix>`，不修改 `read_file_limited`。Host-only `TableSourceRead {bytes:Vec<u8>,size_bytes:Option<u64>,eof:bool,stable:bool}`；async injectable `ProjectTableSource::read_prefix(&self,project:&Project,backend:&FileBackend,relative_path:&str,max_bytes:usize)->Result<TableSourceRead,TablePreviewErrorCode>`；`preview_project_table_with_source(store:&Store,source:&dyn ProjectTableSource,request:ProjectTablePreviewRequest)->Result<ProjectTablePreview,String>`；Tauri `preview_project_table(state:State<'_,AppState>,request:ProjectTablePreviewRequest)->Result<ProjectTablePreview,String>`。String errors 固定 enum code，不带 OS/SSH 输出。Adapter 以固定 REMOTE_FILE_PREFIX_CHANGED 分类标识已检测的变化，宿主仅精确映射为SourceChanged，其他底层错误不回显。连接会话保留在 timed read future 外；正常 disconnect 使用整条20秒的剩余预算，deadline 后至多一次有界 session disconnect 与 Timeout 返回分离，不延长公开等待、不声称取消远端计算。
 
-- [ ] **RED:** fake source 捕获预算与绑定；foreign backend/path在调用前拒绝，257KiB伪结果拒绝；probe/full/prefix/unknown stability；大小变化；public_text后4KiB UTF-8展示预算与CellLimit；慢 connect/root 整条20秒 timeout；失败时 disconnect；固定 safe error不泄漏sentinel。adapter 注入 reader 测试 max+1 与前后metadata，不连接SSH。
+- [x] **RED:** fake source 捕获预算与绑定；foreign backend/path在调用前拒绝，257KiB伪结果拒绝；probe/full/prefix/unknown stability；大小变化；public_text后4KiB UTF-8展示预算与CellLimit；慢 connect/root 整条20秒 timeout；失败时 disconnect；固定 safe error不泄漏sentinel。adapter 注入 reader 测试 max+1 与前后metadata，不连接SSH。
 
 ```rust
 assert_eq!(fake_source.last_budget(), Some(256 * 1024));
@@ -105,10 +105,10 @@ assert_eq!(unstable_preview.source_stability, TablePreviewStability::Unknown);
 assert_eq!(rejected_source.call_count(), 0);
 ```
 
-- [ ] **Run RED:** `cargo test -p omicsops-desktop --lib project_table_commands`、`cargo test -p omicsops-adapters ssh::tests::file_prefix`；先创建测试与 fixture，当前缺方法/command 应 FAIL。
-- [ ] **Implement:** Store加载project且验证backend/current profile；扩展名/path校验先于读。Local消费已验证handle；SSH source 内包含connect/trust/canonical root/path/lstat/read，用现有session cleanup规则并包整source async路径20秒。SFTP读取预算+1；同handle前后metadata不支持时unknown；不把source提供的摘要当可信。Host固定预算再验一次原bytes、原hash和parse结果，public_text之后utf8截断、标 CellLimit；注册命令。
-- [ ] **Run GREEN:** 同两命令 PASS；`cargo test -p omicsops-desktop --lib composer_files::tests`、`cargo test -p omicsops-desktop --lib sync_commands::tests` 确认既有路径/quote语义。无真实远端验收。
-- [ ] **Commit:** `feat: preview project tables from local and SSH sources`。
+- [x] **Run RED:** `cargo test -p omicsops-desktop --lib project_table_commands`、`cargo test -p omicsops-adapters ssh::tests::file_prefix`；先创建测试与 fixture，当前缺方法/command 应 FAIL。
+- [x] **Implement:** Store加载project且验证backend/current profile；扩展名/path校验先于读。Local消费已验证handle；SSH source 内包含connect/trust/canonical root/path/lstat/read，用现有session cleanup规则并包整source async路径20秒。SFTP读取预算+1；同handle前后metadata不支持时unknown；不把source提供的摘要当可信。Host固定预算再验一次原bytes、原hash和parse结果，public_text之后utf8截断、标 CellLimit；注册命令。
+- [x] **Run GREEN:** 同两命令 PASS；`cargo test -p omicsops-desktop --lib composer_files::tests`、`cargo test -p omicsops-desktop --lib sync_commands::tests` 确认既有路径/quote语义。无真实远端验收。
+- [x] **Commit:** `feat: preview project tables from local and SSH sources`。
 
 ### Task 4: 只读文件树预览与有界来源展示
 
@@ -133,7 +133,7 @@ expect(document.querySelector("script[data-cell]")).toBeNull();
 
 ## 当前实施证据
 
-2026-10-07：Task1提交7258149/7439276，Task2提交69886e4，均经独立审阅通过，无阻断发现。Task1最终reader16/composer10；Task2 parser12/DTO合同3/DTO crate31。Task2最终workspace1564通过、17 ignored；前端1138+22、Web/桌面构建和格式检查通过。Task2初始RED为71个总编译错误（包含缺接口与受限环境OUT_DIR错误），不是已执行断言失败；授权GREEN运行实际断言。真实模型/SSH及GUI手工验收未执行，安装包只构建未运行。Task3/4未实现，尚不代表表格功能交付。
+2026-10-07：Task1提交7258149/7439276，Task2提交69886e4，均经独立审阅通过，无阻断发现。Task1最终reader16/composer10；Task2 parser12/DTO合同3/DTO crate31。Task2最终workspace1564通过、17 ignored；前端1138+22、Web/桌面构建和格式检查通过。Task2初始RED为71个总编译错误（包含缺接口与受限环境OUT_DIR错误），不是已执行断言失败；授权GREEN运行实际断言。真实模型/SSH及GUI手工验收未执行，安装包只构建未运行。Task3提交bec43f1已独立审阅通过：host11/adapter3/composer10/sync4/reader16/quote6均通过；一次frontend1138+22和fmt通过，Task3未启动额外workspace/Web/desktop交付检查。源读取/公开投影已接入宿主，Task4真实界面和最终完整交付检查待实施，尚不代表W02交付。
 
 ## Plan Self-Review
 

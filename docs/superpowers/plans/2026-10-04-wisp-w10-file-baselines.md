@@ -74,7 +74,7 @@ git commit -m "feat: persist typed exploration file baselines"
 **Files:**
 
 - Create/Test: `src-tauri/src/workspace_file_baselines.rs`, `src-tauri/src/workspace_file_content.rs`（各自unit tests）。
-- Modify: `src-tauri/src/commands.rs`（app-scoped baseline storage/locks）、`src-tauri/src/lib.rs:62`, `:198`（storage初始化与注册）。
+- Modify: `src-tauri/src/commands.rs`（app-scoped baseline storage/locks）、`src-tauri/src/lib.rs:62`, `:198`（storage初始化与注册）、`src-tauri/src/workspace_commands.rs` 的既有 delete_project 入口（仅固定宿主 blob 清理接入与相邻测试）。
 - Consume only: `src-tauri/src/project_file_read.rs`（W02）。
 
 **Interfaces:**
@@ -83,7 +83,7 @@ git commit -m "feat: persist typed exploration file baselines"
 - Produces: `workspace_create_file_baseline(app: AppHandle, state: State<'_, AppState>, request: CreateFileBaselineRequestV1) -> Result<FileBaselineV1, FileBaselineErrorV1>`；`workspace_read_baseline_text(app: AppHandle, state: State<'_, AppState>, request: ReadBaselineTextRequestV1) -> Result<BaselineTextSnapshotV1, FileBaselineErrorV1>`。
 - Produces shared pure function: `inspect_small_workspace_text<'a>(relative_path: &str, bytes: &'a [u8]) -> Result<&'a str, SmallWorkspaceTextIssue>` in `workspace_file_content.rs`；内部enum只有 `TooLarge`、`UnsupportedContent`、`SensitiveContent`，W10映射到BaselineOmissionCodeV1、W11映射到MigrationFileStateV1，不依赖基线DTO/Store。只做UTF-8/extension/公开一致/敏感判断，不验证目录、开文件或读keyring。宿主 `FileBaselineStorage` app-scoped持有固定app-data根与project mutex，`FileBaselineStorage::new(app_data_root: PathBuf) -> Self`，初始化一次。
 
-- [ ] **Step 1: Write failing tests.** 前缀 `capture_`：安全小文本、32/512 KiB/4 MiB预算、unknown/recorded SSH引用、expected hash无法核验/冲突、invalid selection、sensitive/path null、retry不重读、file identity变化、坏/缺blob、temp/persist/DB故障、orphan物理预算、reparse app-data cleanup不触项目根。`saved_text_`：entry越界/reference-only拒绝、坏blob/UTF-8/再检查拒绝及root改变仍能查看历史正文。纯函数测试前缀 `small_text_`，使用假凭据sentinel。
+- [ ] **Step 1: Write failing tests.** 前缀 `capture_`：安全小文本、32/512 KiB/4 MiB预算、unknown/recorded SSH引用、expected hash无法核验/冲突、invalid selection、sensitive/path null、retry不重读、file identity变化、坏/缺blob、temp/persist/DB故障、orphan物理预算、reparse app-data cleanup不触项目根，以及实际 delete_project 成功后的专用清理 hook；DB 已提交删除与后续清理失败须如实区分，不假称回滚。`saved_text_`：entry越界/reference-only拒绝、坏blob/UTF-8/再检查拒绝及root改变仍能查看历史正文。纯函数测试前缀 `small_text_`，使用假凭据sentinel。
 
 ```rust
 assert_eq!(sensitive.entries[0].content_mode, WorkspaceContentModeV1::ReferenceOnly);
@@ -100,7 +100,7 @@ assert_eq!(ssh_call_count, 0);
 - [ ] **Step 5: Commit.**
 
 ```powershell
-git add src-tauri/src/workspace_file_baselines.rs src-tauri/src/workspace_file_content.rs src-tauri/src/commands.rs src-tauri/src/lib.rs
+git add src-tauri/src/workspace_file_baselines.rs src-tauri/src/workspace_file_content.rs src-tauri/src/commands.rs src-tauri/src/lib.rs src-tauri/src/workspace_commands.rs
 git commit -m "feat: capture safe bounded file baseline blobs"
 ```
 
