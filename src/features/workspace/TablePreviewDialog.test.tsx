@@ -110,3 +110,37 @@ it("closes only the top layer immediately on window Escape and restores focus", 
   expect(screen.getByRole("dialog", { name: "Parent" })).toBeInTheDocument();
   fireEvent.keyDown(window, { key: "Escape" }); expect(closeParent).toHaveBeenCalledTimes(1);
 });
+
+it("contains keyboard focus during pending retry and restores the opener without late completion stealing focus", async () => {
+  const retryRequest = pending<ProjectTablePreview>();
+  vi.spyOn(fileApi, "previewProjectTable").mockRejectedValueOnce("timeout").mockReturnValueOnce(retryRequest.promise);
+  const onClose = vi.fn(); const closeParent = vi.fn();
+  function Parent() {
+    const [open, setOpen] = useState(false);
+    useWindowEscapeLayer(true, closeParent);
+    return <div role="dialog" aria-label="Parent"><button onClick={() => setOpen(true)}>Open table</button>{open && <TablePreviewDialog reference={reference} locale="en-US" onClose={() => { onClose(); setOpen(false); }} />}</div>;
+  }
+  render(<Parent />);
+  const opener = screen.getByRole("button", { name: "Open table" }); opener.focus(); fireEvent.click(opener);
+  await screen.findByRole("alert");
+  const retry = screen.getByRole("button", { name: "Retry preview" }); retry.focus(); expect(retry).toHaveFocus();
+  fireEvent.click(retry);
+  expect(screen.getByRole("status")).toHaveTextContent("Loading table preview");
+  const dialog = screen.getByRole("dialog", { name: "Preview table" });
+  expect(dialog.contains(document.activeElement)).toBe(true);
+  const focused = document.activeElement!;
+  const tab = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+  fireEvent(focused, tab);
+  expect(tab.defaultPrevented).toBe(true);
+  expect(dialog.contains(document.activeElement)).toBe(true);
+  // jsdom does not execute browser default Tab navigation; cancellation and
+  // retained modal focus are the observable containment contract here.
+  fireEvent.keyDown(window, { key: "Escape" });
+  expect(onClose).toHaveBeenCalledTimes(1); expect(closeParent).not.toHaveBeenCalled();
+  expect(screen.queryByRole("dialog", { name: "Preview table" })).not.toBeInTheDocument();
+  expect(screen.getByRole("dialog", { name: "Parent" })).toBeInTheDocument();
+  expect(opener).toHaveFocus();
+  await act(async () => retryRequest.resolve(fixture()));
+  expect(opener).toHaveFocus();
+  expect(screen.queryByRole("table")).not.toBeInTheDocument();
+});
