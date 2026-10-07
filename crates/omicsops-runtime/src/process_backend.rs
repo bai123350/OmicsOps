@@ -12,19 +12,23 @@ use async_trait::async_trait;
 use omicsops_process::{background_command, configure_background_command};
 use omicsops_protocol::{
     ComputeBackendDescriptorV4, ComputeBackendKindV4, ExecutionContextKeyV4, IsolationStrengthV4,
-    KernelLanguageV4, OutputCaptureV4, RuntimeArtifactV4, RuntimeResultV4,
+    KERNEL_INSPECTION_MAX_RESPONSE_BYTES, KERNEL_INSPECTION_TIMEOUT_SECONDS,
+    KernelInspectionPayloadV4, KernelLanguageV4, OutputCaptureV4, RuntimeArtifactV4,
+    RuntimeResultV4, validate_inspection_payload,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::{
     fs,
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines},
+    io::{
+        AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines,
+    },
     process::{Child, ChildStdout, Command},
     sync::Mutex,
 };
 use uuid::Uuid;
 
-use crate::{KernelBackendV4, KernelProcessV4};
+use crate::{KernelBackendV4, KernelInspectionErrorV4, KernelProcessV4};
 
 pub struct LocalKernelBackendV4 {
     project_root: PathBuf,
@@ -290,6 +294,18 @@ impl KernelProcessV4 for ProcessKernelV4 {
         self.healthy.load(Ordering::SeqCst)
     }
 
+    async fn inspect(&self) -> Result<KernelInspectionPayloadV4, KernelInspectionErrorV4> {
+        let mut guard = self
+            .handle
+            .try_lock()
+            .map_err(|_| KernelInspectionErrorV4::Busy)?;
+        if !self.is_healthy() {
+            return Err(KernelInspectionErrorV4::Unavailable);
+        }
+        let handle = guard.as_mut().ok_or(KernelInspectionErrorV4::Unavailable)?;
+        inspect_jsonl(&mut handle.stdin, handle.lines.get_mut(), &self.healthy).await
+    }
+
     async fn execute(
         &self,
         code: String,
@@ -305,6 +321,11 @@ impl KernelProcessV4 for ProcessKernelV4 {
             let request_id = Uuid::new_v4();
             let request_id_text = request_id.to_string();
             let mut guard = self.handle.lock().await;
+            // acquire may have returned this healthy Arc while an inspection
+            // still held the handle. Recheck before sending after that wait.
+            if !self.is_healthy() {
+                return Err("kernel process is unavailable".into());
+            }
             let handle = guard.as_mut().ok_or("kernel process is stopped")?;
             let request = json!({
                 "action":"execute",
@@ -436,6 +457,95 @@ impl KernelProcessV4 for ProcessKernelV4 {
         }
         Ok(())
     }
+}
+
+/// Once a write may have begun, cancellation is as uncertain as an I/O error.
+/// Keep this guard outside the timed future so either deadline drops it safely.
+struct InspectionHealthGuard<'a> {
+    healthy: &'a AtomicBool,
+    verified: bool,
+}
+
+impl Drop for InspectionHealthGuard<'_> {
+    fn drop(&mut self) {
+        if !self.verified {
+            self.healthy.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+async fn inspect_jsonl(
+    writer: &mut (impl AsyncWrite + Unpin),
+    reader: &mut (impl AsyncBufRead + Unpin),
+    healthy: &AtomicBool,
+) -> Result<KernelInspectionPayloadV4, KernelInspectionErrorV4> {
+    let request_id = Uuid::new_v4().to_string();
+    let request = format!("{}\n", json!({"action":"inspect","request_id":request_id}));
+    let mut health = InspectionHealthGuard {
+        healthy,
+        verified: false,
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(KERNEL_INSPECTION_TIMEOUT_SECONDS),
+        async {
+            writer
+                .write_all(request.as_bytes())
+                .await
+                .map_err(|_| KernelInspectionErrorV4::Unavailable)?;
+            writer
+                .flush()
+                .await
+                .map_err(|_| KernelInspectionErrorV4::Unavailable)?;
+            let mut frame = Vec::new();
+            loop {
+                let available = reader
+                    .fill_buf()
+                    .await
+                    .map_err(|_| KernelInspectionErrorV4::Unavailable)?;
+                if available.is_empty() {
+                    return Err(KernelInspectionErrorV4::Protocol);
+                }
+                let newline = available.iter().position(|byte| *byte == b'\n');
+                let count = newline.map_or(available.len(), |index| index + 1);
+                if frame.len() + count > KERNEL_INSPECTION_MAX_RESPONSE_BYTES
+                    || newline.is_some_and(|_| count != available.len())
+                {
+                    return Err(KernelInspectionErrorV4::Protocol);
+                }
+                frame.extend_from_slice(&available[..count]);
+                reader.consume(count);
+                if newline.is_some() {
+                    break;
+                }
+            }
+            let mut event: Value =
+                serde_json::from_slice(&frame).map_err(|_| KernelInspectionErrorV4::Protocol)?;
+            let fields = event
+                .as_object_mut()
+                .ok_or(KernelInspectionErrorV4::Protocol)?;
+            if fields.len() != 4
+                || fields.get("kind").and_then(Value::as_str) != Some("inspection")
+                || fields.get("request_id").and_then(Value::as_str) != Some(request_id.as_str())
+            {
+                return Err(KernelInspectionErrorV4::Protocol);
+            }
+            fields.remove("kind");
+            fields.remove("request_id");
+            let payload: KernelInspectionPayloadV4 =
+                serde_json::from_value(event).map_err(|_| KernelInspectionErrorV4::Protocol)?;
+            validate_inspection_payload(&payload).map_err(|_| KernelInspectionErrorV4::Protocol)?;
+            if !healthy.load(Ordering::SeqCst) {
+                return Err(KernelInspectionErrorV4::Unavailable);
+            }
+            Ok(payload)
+        },
+    )
+    .await
+    .map_err(|_| KernelInspectionErrorV4::Unavailable)?;
+    if result.is_ok() {
+        health.verified = true;
+    }
+    result
 }
 
 async fn launch_process(
@@ -626,6 +736,95 @@ sys.stdin.reconfigure(encoding="utf-8")
 sys.stdout.reconfigure(encoding="utf-8")
 project = pathlib.Path(sys.argv[1]).resolve()
 scope = {"__name__": "__omicsops_kernel__"}
+_INSPECT_TYPE = type
+_INSPECT_DICT = dict
+_INSPECT_STR = str
+_INSPECT_LIST = list
+_INSPECT_TUPLE = tuple
+_INSPECT_SET = set
+_INSPECT_FROZENSET = frozenset
+_INSPECT_BYTES = bytes
+_INSPECT_BYTEARRAY = bytearray
+_INSPECT_INT = int
+_INSPECT_FLOAT = float
+_INSPECT_BOOL = bool
+_INSPECT_COMPLEX = complex
+_INSPECT_NONE = type(None)
+_INSPECT_ORD = ord
+_INSPECT_DUMPS = json.dumps
+_INSPECT_MAX_BINDINGS = 4096
+_INSPECT_MAX_OBJECTS = 64
+_INSPECT_MAX_NAME_BYTES = 256
+_INSPECT_PAYLOAD_BYTES = 12288
+def _inspect_name(name):
+    if _INSPECT_TYPE(name) is not _INSPECT_STR:
+        return None
+    if not name or _INSPECT_STR.__len__(name) > _INSPECT_MAX_NAME_BYTES:
+        return None
+    for char in name:
+        number = _INSPECT_ORD(char)
+        if number < 32 or 127 <= number <= 159 or 0xD800 <= number <= 0xDFFF:
+            return None
+    if _INSPECT_BYTES.__len__(_INSPECT_STR.encode(name, "utf-8")) > _INSPECT_MAX_NAME_BYTES:
+        return None
+    lower = _INSPECT_STR.lower(name)
+    if _INSPECT_STR.startswith(name, "_") or any(part in lower for part in (
+            "password", "passwd", "secret", "token", "credential", "private_key",
+            "api_key", "apikey", "access_key")):
+        return None
+    return name
+def _inspect_metadata(name, value):
+    kind = _INSPECT_TYPE(value)
+    label, count = "opaque", None
+    if kind is _INSPECT_LIST:
+        label, count = "list", _INSPECT_LIST.__len__(value)
+    elif kind is _INSPECT_TUPLE:
+        label, count = "tuple", _INSPECT_TUPLE.__len__(value)
+    elif kind is _INSPECT_DICT:
+        label, count = "dict", _INSPECT_DICT.__len__(value)
+    elif kind is _INSPECT_SET:
+        label, count = "set", _INSPECT_SET.__len__(value)
+    elif kind is _INSPECT_FROZENSET:
+        label, count = "frozenset", _INSPECT_FROZENSET.__len__(value)
+    elif kind is _INSPECT_STR:
+        label, count = "str", _INSPECT_STR.__len__(value)
+    elif kind is _INSPECT_BYTES:
+        label, count = "bytes", _INSPECT_BYTES.__len__(value)
+    elif kind is _INSPECT_BYTEARRAY:
+        label, count = "bytearray", _INSPECT_BYTEARRAY.__len__(value)
+    elif kind is _INSPECT_INT:
+        label = "int"
+    elif kind is _INSPECT_FLOAT:
+        label = "float"
+    elif kind is _INSPECT_BOOL:
+        label = "bool"
+    elif kind is _INSPECT_COMPLEX:
+        label = "complex"
+    elif kind is _INSPECT_NONE:
+        label = "NoneType"
+    return {"name": name, "type_label": label, "dimensions": None,
+            "element_count": count, "summary": label + ", metadata only"}
+def inspect_objects(scope: dict) -> dict:
+    objects, truncated, checked, budget = [], False, 0, 64
+    if _INSPECT_TYPE(scope) is not _INSPECT_DICT:
+        return {"objects": objects, "truncated": True}
+    for name, value in _INSPECT_DICT.items(scope):
+        if checked >= _INSPECT_MAX_BINDINGS or _INSPECT_LIST.__len__(objects) >= _INSPECT_MAX_OBJECTS:
+            truncated = True
+            break
+        checked += 1
+        safe_name = _inspect_name(name)
+        if safe_name is None:
+            truncated = True
+            continue
+        item = _inspect_metadata(safe_name, value)
+        size = _INSPECT_BYTES.__len__(_INSPECT_STR.encode(_INSPECT_DUMPS(item, ensure_ascii=False), "utf-8")) + 2
+        if budget + size > _INSPECT_PAYLOAD_BYTES:
+            truncated = True
+            break
+        objects.append(item)
+        budget += size
+    return {"objects": objects, "truncated": truncated}
 def emit(request_id, kind, **values):
     event = {"request_id": request_id, "kind": kind}
     event.update(values)
@@ -634,6 +833,12 @@ for raw in sys.stdin:
     request_id = "protocol"
     try:
         request = json.loads(raw); request_id = request.get("request_id", "protocol")
+        if request.get("action") == "inspect":
+            try:
+                emit(request_id, "inspection", **inspect_objects(scope))
+            except Exception:
+                emit(request_id, "failed", message="inspection unavailable")
+            continue
         emit(request_id, "started")
         stdout, stderr = io.StringIO(), io.StringIO()
         try:
@@ -660,14 +865,409 @@ for raw in sys.stdin:
 
 const R_DRIVER: &str = r#"suppressPackageStartupMessages(library(jsonlite))
 args <- commandArgs(trailingOnly=TRUE); project <- normalizePath(args[[1]], mustWork=TRUE); scope <- new.env(parent=globalenv())
+inspect_bindings <- function(scope) {
+    objects <- list(); truncated <- FALSE; budget <- 64L
+    if (!is.environment(scope) || is.object(scope) || isS4(scope) || length(scope) > 4096L) return(list(objects=objects,truncated=TRUE))
+    for (name in ls(envir=scope,all.names=TRUE,sorted=FALSE)) {
+        if (length(objects) >= 64L) { truncated <- TRUE; break }
+        if (nchar(name,type="chars") > 256L) { truncated <- TRUE; next }
+        name <- enc2utf8(name)
+        if (nchar(name,type="bytes") > 256L || grepl("[[:cntrl:]]",name) || startsWith(name,"_") ||
+            grepl("password|passwd|secret|token|credential|private_key|api_key|apikey|access_key",tolower(name))) {
+            truncated <- TRUE; next
+        }
+        if (bindingIsActive(name,scope)) { truncated <- TRUE; next }
+        # substitute returns the promise expression or already bound object;
+        # it never evaluates the expression or calls an active binding.
+        value <- do.call(substitute,list(as.name(name),scope))
+        label <- "opaque"; count <- NULL; dimensions <- NULL
+        kind <- typeof(value)
+        if (!is.object(value) && !isS4(value) &&
+            kind %in% c("NULL","logical","integer","double","complex","character","raw","list")) {
+            label <- kind; count <- length(value)
+            raw_dims <- attr(value,"dim",exact=TRUE)
+            if (!is.null(raw_dims) && !is.object(raw_dims) && !isS4(raw_dims) &&
+                typeof(raw_dims) %in% c("integer","double") && length(raw_dims) <= 8L &&
+                all(is.finite(raw_dims)) && all(raw_dims >= 0) && all(raw_dims == floor(raw_dims))) {
+                dimensions <- as.list(raw_dims)
+            }
+        }
+        item <- list(name=name,type_label=label,dimensions=dimensions,element_count=count,summary=paste0(label,", metadata only"))
+        size <- nchar(enc2utf8(toJSON(item,auto_unbox=TRUE,null="null")),type="bytes") + 2L
+        if (budget + size > 12288L) { truncated <- TRUE; break }
+        objects[[length(objects)+1L]] <- item; budget <- budget + size
+    }
+    list(objects=objects,truncated=truncated)
+}
 emit <- function(request_id, kind, values=list()) { event <- c(list(request_id=request_id,kind=kind),values); cat(toJSON(event,auto_unbox=TRUE,null="null"),"\n",sep=""); flush.console() }
 input <- file("stdin","r")
-repeat { raw <- readLines(input,n=1,warn=FALSE); if (!length(raw)) break; request <- fromJSON(raw,simplifyVector=FALSE); request_id <- request$request_id; emit(request_id,"started"); output <- character(); tryCatch({ output <- capture.output(eval(parse(text=request$code),envir=scope)); if(length(output)) emit(request_id,"stdout",list(payload=paste0(output,collapse="\n"))); if(length(request$capture_paths)) for(relative in request$capture_paths) { path <- normalizePath(file.path(project,relative),mustWork=TRUE); if(!startsWith(path,paste0(project,.Platform$file.sep)) || dir.exists(path)) stop("artifact escaped project root"); emit(request_id,"artifact",list(relative_path=relative)) }; emit(request_id,"completed") },error=function(e) emit(request_id,"failed",list(message=conditionMessage(e)))) }
+repeat { raw <- readLines(input,n=1,warn=FALSE); if (!length(raw)) break; request <- fromJSON(raw,simplifyVector=FALSE); request_id <- request$request_id
+    if (identical(request$action,"inspect")) {
+        tryCatch(emit(request_id,"inspection",inspect_bindings(scope)),error=function(e) emit(request_id,"failed",list(message="inspection unavailable")))
+        next
+    }
+    emit(request_id,"started"); output <- character(); tryCatch({ output <- capture.output(eval(parse(text=request$code),envir=scope)); if(length(output)) emit(request_id,"stdout",list(payload=paste0(output,collapse="\n"))); if(length(request$capture_paths)) for(relative in request$capture_paths) { path <- normalizePath(file.path(project,relative),mustWork=TRUE); if(!startsWith(path,paste0(project,.Platform$file.sep)) || dir.exists(path)) stop("artifact escaped project root"); emit(request_id,"artifact",list(relative_path=relative)) }; emit(request_id,"completed") },error=function(e) emit(request_id,"failed",list(message=conditionMessage(e)))) }
 "#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn inspection_kernel() -> ProcessKernelV4 {
+        ProcessKernelV4 {
+            id: Uuid::new_v4(),
+            identity: "fixture".into(),
+            project_root: PathBuf::new(),
+            output_dir: PathBuf::new(),
+            handle: Mutex::new(None),
+            healthy: AtomicBool::new(true),
+            container_cleanup: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn inspect_busy_preserves_health() {
+        let kernel = inspection_kernel();
+        let _held = kernel.handle.lock().await;
+        assert_eq!(
+            kernel.inspect().await,
+            Err(crate::KernelInspectionErrorV4::Busy)
+        );
+        assert!(kernel.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn inspect_stopped_before_send_preserves_health() {
+        let kernel = inspection_kernel();
+        assert_eq!(
+            kernel.inspect().await,
+            Err(crate::KernelInspectionErrorV4::Unavailable)
+        );
+        assert!(kernel.is_healthy());
+    }
+
+    async fn inspect_fixture_response(
+        frame: Vec<u8>,
+    ) -> (
+        Result<omicsops_protocol::KernelInspectionPayloadV4, crate::KernelInspectionErrorV4>,
+        bool,
+    ) {
+        let (host, worker) = tokio::io::duplex(32768);
+        let (output, mut input) = tokio::io::split(host);
+        let mut reader = BufReader::new(output);
+        let healthy = AtomicBool::new(true);
+        let worker = tokio::spawn(async move {
+            let (input, mut output) = tokio::io::split(worker);
+            let mut lines = BufReader::new(input).lines();
+            let request: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(request["action"], "inspect");
+            assert_eq!(request.as_object().unwrap().len(), 2);
+            let frame = String::from_utf8(frame)
+                .unwrap()
+                .replace("REQUEST_ID", request["request_id"].as_str().unwrap());
+            output.write_all(frame.as_bytes()).await.unwrap();
+        });
+        let result = inspect_jsonl(&mut input, &mut reader, &healthy).await;
+        worker.await.unwrap();
+        (result, healthy.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn inspect_frame_identity_and_budget() {
+        let (result, healthy) = inspect_fixture_response(
+            br#"{"kind":"inspection","request_id":"REQUEST_ID","objects":[],"truncated":false}
+"#
+            .to_vec(),
+        )
+        .await;
+        assert_eq!(result.unwrap().objects.len(), 0);
+        assert!(healthy);
+        for frame in [
+            br#"{"kind":"inspection","request_id":"wrong","objects":[],"truncated":false}
+"#.to_vec(),
+            br#"{"kind":"started","request_id":"REQUEST_ID","objects":[],"truncated":false}
+"#.to_vec(),
+            br#"{"kind":"inspection","request_id":"REQUEST_ID","objects":[],"truncated":false,"value":"forbidden"}
+"#.to_vec(),
+            br#"{"kind":"inspection","request_id":"REQUEST_ID","objects":[],"truncated":false}"#.to_vec(),
+            vec![b'x'; 16385],
+            br#"{"kind":"inspection","request_id":"REQUEST_ID","objects":[],"truncated":false}
+{"kind":"inspection"}
+"#.to_vec(),
+            format!("{{\"kind\":\"inspection\",\"request_id\":\"REQUEST_ID\",\"objects\":[{{\"name\":\"{}\",\"type_label\":\"list\",\"dimensions\":null,\"element_count\":0,\"summary\":\"\"}}],\"truncated\":false}}\n", "a".repeat(257)).into_bytes(),
+        ] {
+            let (result, healthy) = inspect_fixture_response(frame).await;
+            assert!(result.is_err());
+            assert!(!healthy);
+        }
+    }
+
+    #[tokio::test]
+    async fn inspect_frame_budget_counts_newline() {
+        let base =
+            br#"{"kind":"inspection","request_id":"REQUEST_ID","objects":[],"truncated":false}"#;
+        for (bytes, accepted) in [(16384, true), (16385, false)] {
+            let mut frame = base.to_vec();
+            // A UUID is 36 bytes; the placeholder replaced by the fixture is 10.
+            frame.resize(bytes - 26 - 1, b' ');
+            frame.push(b'\n');
+            let (result, healthy) = inspect_fixture_response(frame).await;
+            assert_eq!(result.is_ok(), accepted);
+            assert_eq!(healthy, accepted);
+        }
+    }
+
+    #[tokio::test]
+    async fn inspect_protocol_timeout_marks_unhealthy_without_interrupt() {
+        let (host, worker) = tokio::io::duplex(1024);
+        let (output, mut input) = tokio::io::split(host);
+        let mut reader = BufReader::new(output);
+        let healthy = AtomicBool::new(true);
+        let (sent, observed) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(async move {
+            let mut lines = BufReader::new(worker).lines();
+            let request: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(request["action"], "inspect");
+            sent.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let result = inspect_jsonl(&mut input, &mut reader, &healthy).await;
+        observed.await.unwrap();
+        assert_eq!(result, Err(crate::KernelInspectionErrorV4::Unavailable));
+        assert!(!healthy.load(Ordering::SeqCst));
+        assert!(!worker.is_finished()); // observing did not close/interrupt the transport
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn inspect_cancelled_sent_future_marks_unhealthy() {
+        let (host, worker) = tokio::io::duplex(1024);
+        let (output, mut input) = tokio::io::split(host);
+        let mut reader = BufReader::new(output);
+        let healthy = AtomicBool::new(true);
+        let mut worker = BufReader::new(worker).lines();
+        {
+            let future = inspect_jsonl(&mut input, &mut reader, &healthy);
+            tokio::pin!(future);
+            tokio::select! {
+                result = &mut future => panic!("inspection unexpectedly completed: {result:?}"),
+                request = worker.next_line() => {
+                    assert_eq!(serde_json::from_str::<Value>(&request.unwrap().unwrap()).unwrap()["action"], "inspect");
+                    assert!(healthy.load(Ordering::SeqCst));
+                }
+            }
+        }
+        assert!(!healthy.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn inspect_cancelled_partial_write_marks_unhealthy() {
+        let (host, mut worker) = tokio::io::duplex(1);
+        let (output, mut input) = tokio::io::split(host);
+        let mut reader = BufReader::new(output);
+        let healthy = AtomicBool::new(true);
+        {
+            let future = inspect_jsonl(&mut input, &mut reader, &healthy);
+            tokio::pin!(future);
+            let mut byte = [0];
+            tokio::select! {
+                result = &mut future => panic!("inspection unexpectedly completed: {result:?}"),
+                read = worker.read_exact(&mut byte) => { read.unwrap(); assert_eq!(byte[0], b'{'); }
+            }
+        }
+        assert!(!healthy.load(Ordering::SeqCst));
+    }
+
+    struct InspectionTransportFixture {
+        id: Uuid,
+        transport: Mutex<tokio::io::DuplexStream>,
+        healthy: AtomicBool,
+        executes: std::sync::atomic::AtomicUsize,
+        interrupts: std::sync::atomic::AtomicUsize,
+    }
+
+    struct InspectionBackendFixture {
+        local: LocalKernelBackendV4,
+        launches: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl KernelBackendV4 for InspectionBackendFixture {
+        fn descriptor(&self) -> ComputeBackendDescriptorV4 {
+            self.local.descriptor()
+        }
+        async fn launch(
+            &self,
+            _: &ExecutionContextKeyV4,
+        ) -> Result<Arc<dyn KernelProcessV4>, String> {
+            self.launches.fetch_add(1, Ordering::SeqCst);
+            Err("unexpected inspection launch".into())
+        }
+    }
+
+    #[async_trait]
+    impl KernelProcessV4 for InspectionTransportFixture {
+        fn session_id(&self) -> Uuid {
+            self.id
+        }
+        fn process_identity(&self) -> &str {
+            "inspection-duplex"
+        }
+        fn is_healthy(&self) -> bool {
+            self.healthy.load(Ordering::SeqCst)
+        }
+        async fn inspect(
+            &self,
+        ) -> Result<omicsops_protocol::KernelInspectionPayloadV4, crate::KernelInspectionErrorV4>
+        {
+            let mut transport = self.transport.lock().await;
+            let (reader, mut writer) = tokio::io::split(&mut *transport);
+            inspect_jsonl(&mut writer, &mut BufReader::new(reader), &self.healthy).await
+        }
+        async fn execute(&self, _: String, _: Vec<String>) -> Result<RuntimeResultV4, String> {
+            self.executes.fetch_add(1, Ordering::SeqCst);
+            Err("unexpected fixture execute".into())
+        }
+        async fn interrupt(&self) -> Result<(), String> {
+            self.interrupts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn inspect_manager_outer_deadline_cancels_sent_transport_without_interrupt() {
+        let project = tempfile::tempdir().unwrap();
+        let backend = Arc::new(InspectionBackendFixture {
+            local: LocalKernelBackendV4::new(project.path()).unwrap(),
+            launches: 0.into(),
+        });
+        let manager = Arc::new(crate::RuntimeManagerV4::new(backend.clone()));
+        let key = key("local", KernelLanguageV4::Python);
+        let (host, worker) = tokio::io::duplex(1024);
+        let process = Arc::new(InspectionTransportFixture {
+            id: Uuid::new_v4(),
+            transport: Mutex::new(host),
+            healthy: AtomicBool::new(true),
+            executes: 0.into(),
+            interrupts: 0.into(),
+        });
+        manager
+            .sessions
+            .lock()
+            .await
+            .insert(key.clone(), process.clone());
+        let lookup = manager.sessions.lock().await;
+        let inspection = tokio::spawn({
+            let manager = manager.clone();
+            let key = key.clone();
+            async move { manager.inspect_existing(&key, None).await }
+        });
+        // Consume part of the outer budget before the worker starts. Its inner
+        // timer is therefore still pending when the manager drops the future.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        drop(lookup);
+        let mut worker = BufReader::new(worker).lines();
+        let request: Value =
+            serde_json::from_str(&worker.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(request["action"], "inspect");
+        assert!(process.is_healthy());
+        let result = inspection.await.unwrap();
+        assert_eq!(
+            result.status,
+            omicsops_protocol::KernelInspectionStatusV4::Unavailable
+        );
+        assert!(!process.is_healthy());
+        assert_eq!(process.executes.load(Ordering::SeqCst), 0);
+        assert_eq!(process.interrupts.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 0);
+        assert!(!project.path().join(".omicsops").exists()); // no launch/archive
+        assert!(manager.sessions.lock().await.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn inspect_queued_execute_rejects_cancelled_inspection_transport() {
+        // Temporary protocol fixture only: no real scientific worker or user code.
+        let project = tempfile::tempdir().unwrap();
+        let mut command = background_command("python");
+        command.arg("-u").arg("-c").arg(r#"import sys, json
+for raw in sys.stdin:
+    request = json.loads(raw)
+    if request['action'] == 'inspect':
+        print('inspect sent', file=sys.stderr, flush=True)
+        continue
+    print('execute sent', file=sys.stderr, flush=True)
+    for kind, values in [('started', {}), ('stdout', {'payload': 'fixture executed'}), ('completed', {})]:
+        print(json.dumps(dict(request_id=request['request_id'], kind=kind, **values)), flush=True)
+"#).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut observed = BufReader::new(child.stderr.take().unwrap()).lines();
+        let kernel = Arc::new(ProcessKernelV4 {
+            id: Uuid::new_v4(),
+            identity: "temporary-protocol-fixture".into(),
+            project_root: project.path().to_path_buf(),
+            output_dir: project.path().join("outputs"),
+            handle: Mutex::new(Some(ProcessHandle {
+                child,
+                stdin,
+                lines: BufReader::new(stdout).lines(),
+            })),
+            healthy: AtomicBool::new(true),
+            container_cleanup: None,
+        });
+        let backend = Arc::new(InspectionBackendFixture {
+            local: LocalKernelBackendV4::new(project.path()).unwrap(),
+            launches: 0.into(),
+        });
+        let manager = crate::RuntimeManagerV4::new(backend.clone());
+        let key = key("local", KernelLanguageV4::Python);
+        manager
+            .sessions
+            .lock()
+            .await
+            .insert(key.clone(), kernel.clone());
+        let inspection = tokio::spawn({
+            let kernel = kernel.clone();
+            async move { kernel.inspect().await }
+        });
+        assert_eq!(
+            observed.next_line().await.unwrap().as_deref(),
+            Some("inspect sent")
+        );
+        assert!(kernel.is_healthy());
+        assert_eq!(kernel.inspect().await, Err(KernelInspectionErrorV4::Busy));
+        assert!(kernel.is_healthy());
+        let acquired = manager.acquire(&key).await.unwrap();
+        let expected: Arc<dyn KernelProcessV4> = kernel.clone();
+        assert!(Arc::ptr_eq(&acquired, &expected));
+        let execution = acquired.execute("fixed fixture request".into(), vec![]);
+        tokio::pin!(execution);
+        // Poll execute once while inspection owns the real process handle.
+        tokio::select! {
+            biased;
+            result = &mut execution => panic!("queued execute completed early: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
+        inspection.abort();
+        assert!(inspection.await.unwrap_err().is_cancelled());
+        assert!(!kernel.is_healthy());
+        let result = execution.await;
+        assert_eq!(result.unwrap_err(), "kernel process is unavailable");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), observed.next_line())
+                .await
+                .is_err()
+        );
+        assert!(!project.path().join("outputs").exists());
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 0);
+        // Fixture cleanup occurs only after the no-send/no-launch assertions.
+        let mut handle = kernel.handle.lock().await.take().unwrap();
+        handle.child.kill().await.unwrap();
+        handle.child.wait().await.unwrap();
+    }
 
     async fn run_python_driver(project: &Path, code: &str) -> Option<Vec<Value>> {
         if background_command("python")
