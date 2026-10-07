@@ -59,7 +59,7 @@ assert!(!serde_json::to_string(&legacy_event).unwrap().contains("admission"));
 
 ### Task 2: core 纯候选与 final native replay 准入
 
-**Files:** Modify `crates/omicsops-agent-core/src/lib.rs:execution_request/context_for_internal/model_turn_with_policy`、`context_views.rs`、`model_replay.rs`；Test 原 core 模块和 context_views/model_replay tests。
+**Files:** Modify `crates/omicsops-agent-core/src/lib.rs:execution_request/context_for_internal/model_turn_with_policy`、`context_views.rs`、`model_replay.rs`；Test 原 core 模块和 context_views/model_replay tests。为计算 transcript/checkpoint/prompt 的精确 SHA-256，仅在 `crates/omicsops-agent-core/Cargo.toml` 加现有 workspace `sha2` 依赖，并最小更新 `Cargo.lock` 中该 crate 的依赖列表；不新增 hash 实现或其他依赖。
 
 **Interfaces:**
 - Consumes：Task 1 snapshot/prepared；原 ModelPortV4::validate_request、usage_metadata、usage_request_metadata、supports_native_replay 与 AgentLimitsV4。
@@ -67,7 +67,7 @@ assert!(!serde_json::to_string(&legacy_event).unwrap().contains("admission"));
 - Produces：private `shape_final_execution_request(&self, spec: &RunSpecV4, context: String, events: &[AgentEventV4]) -> Result<ModelRequestV4, AgentCoreErrorV4>`；使用同 binding 的 project_model_replay/remove_replayed_context_events；pending closures 非空则拒绝 manual，不写其结果。
 - Produces：private `prospective_scientific_state_view(spec: &RunSpecV4, state: &Value, source: &AgentEventV4) -> Option<Value>`，仅 prepare 可用；现有 durable view 入口保持。render/checkpoint fitting 与自动路径共享纯逻辑，compaction 管理事件不进入模型 recent_events。
 
-- [ ] **RED 写测试**：`manual_prepare_full_request_admits_candidate_and_final`、`manual_prepare_native_replay_is_budgeted_without_closures`、`manual_prepare_preserves_guidance_science_task_and_sources`、`manual_prepare_unshrinkable_is_read_only`。录制 validator 收到的完整 requests，source 超限但候选可准入。
+- [x] **RED 写测试**：`manual_prepare_full_request_admits_candidate_and_final`、`manual_prepare_native_replay_is_budgeted_without_closures`、`manual_prepare_preserves_guidance_science_task_and_sources`、`manual_prepare_unshrinkable_is_read_only`。录制 validator 收到的完整 requests，source 超限但候选可准入。
 
 ```rust
 assert!(original_request_over_budget);
@@ -78,10 +78,12 @@ assert_eq!((streams, archives_written, guidance_consumed), (0, 0, 0));
 assert_eq!(checkpoint_guidance, original_guidance); // 不截断
 ```
 
-- [ ] **RED 运行**：`cargo test -p omicsops-agent-core manual_prepare`。预期 prepare/final shaping 缺失或预算/来源断言失败。
-- [ ] **实现接口**：捕获完整 transcript/science，构造固定预分配 archive 与 Started/Archived/Checkpointed/Completed 事件（NotNeeded 只有对应管理事件），固定 sequence/timestamp/hash；按 actual final replay/provider 预算拟合。只有已有 checkpoint 的模型投影与新投影相同且完整请求可准入才 NotNeeded；不能用 after_bytes 与归档 transcript bytes 大小比较代替判断。无法缩小且不能准入返回错误。final metadata 导致的管理事件不回填到模型工作集。旧 snapshot/state/source references 保留且 commit 前禁止使用。不调用自动 context_for_internal 的写入路径。
-- [ ] **GREEN**：重复 RED，再运行 `cargo test -p omicsops-agent-core full_request_budget`、`cargo test -p omicsops-agent-core same_run_checkpoint`、`cargo test -p omicsops-agent-core replay`。预期新纯路径和旧自动/恢复均通过。
-- [ ] **Commit**：仅暂存本任务文件，`git commit -m "feat(agent): prepare manual compaction with final request admission"`。
+- [x] **RED 运行**：`cargo test -p omicsops-agent-core manual_prepare`。预期 prepare/final shaping 缺失或预算/来源断言失败。
+- [x] **实现接口**：捕获完整 transcript/science，构造固定预分配 archive 与 Started/Archived/Checkpointed/Completed 事件（NotNeeded 只有对应管理事件），固定 sequence/timestamp/hash；按 actual final replay/provider 预算拟合。拟定事件追加后，正常上下文渲染与最终 native replay 请求须复用同一纯拟合/整形接缝，确保真正持久投影对应的完整请求仍可准入；大 replay 不得仅在临时 clone 中丢 recent steps。显式手动压缩在 `auto_compact=false` 时仍可使用本次明确手动操作产生、经哈希和事件链验证的 checkpoint 受控投影，不全局开启自动压缩。只有已有经核验的手动 Completed checkpoint 的模型投影与新投影相同且完整请求可准入才 NotNeeded；等价的旧版/自动 checkpoint 首次显式手动压缩仍作一次 Completed 升级，之后重复请求可 NotNeeded；不能用 after_bytes 与归档 transcript bytes 大小比较代替判断。无法缩小且不能准入返回错误。final metadata 导致的管理事件不回填到模型工作集。旧 snapshot/state/source references 保留且 commit 前禁止使用。不调用自动 context_for_internal 的写入路径。
+- [x] **GREEN**：重复 RED，再运行 `cargo test -p omicsops-agent-core full_request_budget`、`cargo test -p omicsops-agent-core same_run_checkpoint`、`cargo test -p omicsops-agent-core replay`。预期新纯路径和旧自动/恢复均通过。
+- [x] **Commit**：仅暂存本任务文件，`git commit -m "feat(agent): prepare manual compaction with final request admission"`。
+
+**实施证据（2026-10-08）**：Task 2 的 feature 5662c21、独立格式提交 621ca99 及四轮修复 8ffd455、76b3996、277f7f8、5559298 经完整任务审阅和各轮 scoped 复审清零。最终改动源上 core 222、protocol 43、manual 20、replay 21、full-request-budget 3、same-run-checkpoint 1 与 cargo fmt --all -- --check 通过；更早的 workspace/npm/Web 结果属于修复前源版本，交付前仍需完整 clean-HEAD 验证。手动 prepare 保持零写；自动归档采用完整回放请求的归档前准入与归档后真实事件复验。原自动归档在意外写后 Store/语义失败时仍非原子，不能借此降低 Task 3 手动提交的原子要求。证据和限制见 .superpowers/sdd/2026-10-04-wisp-w05-context-compaction/task-2-report.md 与各复审记录。
 
 ### Task 3: Store snapshot 和无 migration 的原子 commit
 

@@ -42,7 +42,7 @@
 | W02 | [表格预览](2026-10-04-wisp-w02-table-preview.md) | 4 | 本地/SSH CSV/TSV有界逻辑记录、来源/hash/truncation | 已实现、4任务审阅通过 |
 | W03 | [远端作业](2026-10-04-wisp-w03-remote-jobs.md) | 4 | metadata列表、手动status与明确启用的有限退避 | 已实现、4任务审阅通过 |
 | W04 | [内核观察](2026-10-04-wisp-w04-kernel-inspection.md) | 5 | 活着的Python/R metadata，不隐式启动或执行对象方法 | 已实现，5任务审阅通过；真实R/SSH/GUI未验收 |
-| W05 | [手动压缩](2026-10-04-wisp-w05-context-compaction.md) | 5 | 暂停ordinary run真正原子保存可恢复checkpoint | 进行中，1/5任务审阅通过 |
+| W05 | [手动压缩](2026-10-04-wisp-w05-context-compaction.md) | 5 | 暂停ordinary run真正原子保存可恢复checkpoint | 进行中，2/5任务审阅通过；Store原子提交待实施 |
 | W06 | [运行诊断](2026-10-04-wisp-w06-run-diagnostics.md) | 4 | run/tool/失败筛选、精确来源定位、脱敏HTML/JSON | 待实施 |
 | W07 | [离线示例](2026-10-04-wisp-w07-offline-example.md) | 4 | 双语合成工作区，重启/坏receipt仍隔离于生产Agent | 待实施 |
 | W08a | [V4场景](2026-10-04-wisp-w08-scenarios.md) | 3 | 五场景manifest/hash/实际调用计数和安全报告 | 待实施 |
