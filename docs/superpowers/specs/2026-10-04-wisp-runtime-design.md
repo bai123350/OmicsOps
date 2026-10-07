@@ -70,13 +70,13 @@ Local/容器简单协议增加 `action: inspect` 与 `kind: inspection` 终端�
 
 ### 安全元数据与失败语义
 
-宿主固定预算：最多返回 64 个对象，最多检查 4,096 个绑定，总响应不超过 16 KiB；名称不超过 256 UTF-8 字节、摘要 128 字节、维度最多 8 个。预算不由前端或模型增大。固定摘要只说明类型/尺寸，例如 `list, 42 elements`，不包含 scalar/string 内容、文件路径或对象 repr。
+宿主固定预算：最多返回 64 个对象，最多检查 4,096 个绑定，总响应不超过 16 KiB；名称不超过 256 UTF-8 字节、摘要与受控type_label各128字节、维度最多8个。16 KiB检查内部payload及包含scope/session/status的完整公开response；接近payload上限时须留出envelope空间。第一版仅exact builtin/opaque短标签，保守拒绝长标签，不把未知对象自定义类名当必要输出。预算不由前端或模型增大。固定摘要只说明类型/尺寸，例如 `list, 42 elements`，不包含 scalar/string 内容、文件路径或对象 repr。
 
 Python 只对 exact built-in 类型读取受控元数据，不调用任意 `repr/str/len` 或对象属性方法；未知、子类和第三方科学对象显示 opaque 类型与未知尺寸。第一版不主动 import NumPy/Pandas，不通过它们的 property 获取 shape。R 跳过 active binding，使用不强制求值的 `substitute` 取得绑定描述；未求值表达式和无法安全判定的对象保持 opaque。只对无自定义 class 的基础值读取 primitive 元数据及原始 dim 属性，不调用 `print/summary/str`、S3/S4 泛型或用户函数。不得用 `get` 强制 promise。R 的 delayedAssign/active binding 必须先由测试证明无副作用；无法证明的类型保留名称并省略其余元数据。
 
 worker 过滤内部/明显凭据绑定名，宿主再次应用既有脱敏规则。结果仅送本次 UI，不写事件、日志、SQLite、模型上下文、科研 Artifact 或导出；用户提供的对象名称和 worker 原始错误不能作为日志字符串。Ready 是内存元数据快照，不能当科研结论证据。
 
-Busy、StaleSession、NotStarted 不改变会话健康或计算状态。inspect 请求已经发出后若超时或协议失步，沿用现有不确定响应的保守处理：该会话标记不可继续复用，后续观察返回 Unavailable；本次查看不杀进程、不重建、不重试执行、不把未知作业记为 cancelled。传输上限和超时由固定宿主策略控制，错误 UI 只显示白名单原因。
+Busy、StaleSession、NotStarted 不改变会话健康或计算状态。inspect 请求已经发出后若超时或协议失步，沿用现有不确定响应的保守处理：该会话标记不可继续复用，后续观察返回 Unavailable；本次查看不杀进程、不重建、不重试执行、不把未知作业记为 cancelled。Manager有覆盖lookup/await/recheck的外层3秒deadline，worker写入可能已发送后的健康guard须在future被取消时仍标不可复用，不能依赖内层timeout分支一定执行。宿主补齐scope并脱敏后再次完整response验证，避免payload预算漏计envelope。传输上限和超时由固定宿主策略控制，错误UI只显示白名单原因。
 
 ### 自动验收与文件地图
 

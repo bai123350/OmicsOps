@@ -8,11 +8,11 @@
 
 **Tech Stack:** Rust/async-trait/Tokio/serde，Tauri 2，React 19/TypeScript/Vitest，Python stdlib unittest；真实 R 仅显式 ignored 验收。
 
-**Spec:** [W04 Runtime 设计](../specs/2026-10-04-wisp-runtime-design.md#w04观察当前内核中的对象)，已审阅设计提交 `161199f`。本文件只授权计划准备，产品实施须等待计划审阅。
+**Spec:** [W04 Runtime 设计](../specs/2026-10-04-wisp-runtime-design.md#w04观察当前内核中的对象)，设计及8515da8全部实施计划已确认。Task1纯协议/非启动manager已独立审阅通过；Task2–5实际worker/宿主/UI与完整交付仍待实施。
 
 ## Global Constraints
 
-- “最多返回 64 个对象，最多检查 4,096 个绑定，总响应不超过 16 KiB；名称不超过 256 UTF-8 字节、摘要 128 字节、维度最多 8 个。”inspect 固定 3 秒截止。
+- “最多返回 64 个对象，最多检查 4,096 个绑定，总响应不超过 16 KiB；名称不超过 256 UTF-8 字节、摘要 128 字节、维度最多 8 个。”inspect 固定 3 秒截止。type_label同摘要限制为128 UTF-8字节；16 KiB同时检查内部payload及包含scope/session/status的完整公开response，不能漏计envelope。长标签或接近payload上限的数据可能保守拒绝，后续adapter须提供受控短标签/留出envelope空间。
 - “查看不启动解释器、不连接新 SSH 会话、不安装库、不执行用户提供的代码。”不调用 acquire/initialize/launch/rebuild。
 - “结果仅送本次 UI，不写事件、日志、SQLite、模型上下文、科研 Artifact 或导出。”不得展示值、repr、原始错误或敏感绑定名。
 - “此项不会承诺暂停后仍能浏览内存，也不为了观察引入新的内核保活行为。”不复用 legacy active_kernels。
@@ -40,7 +40,7 @@
 - Produces：`KernelProcessV4::inspect(&self) -> Result<KernelInspectionPayloadV4, KernelInspectionErrorV4>` 为 async、默认 Unsupported；`RuntimeManagerV4::inspect_existing(&self, key: &ExecutionContextKeyV4, expected_session_id: Option<Uuid>) -> KernelInspectionResultV4` 为 async。
 - Produces：`validate_inspection_payload(payload: &KernelInspectionPayloadV4) -> Result<(), KernelInspectionValidationErrorV4>` 为 protocol 纯预算验证；错误为 TooManyObjects/TooLarge/InvalidDimension/InvalidText 固定枚举，常量来自 Global Constraints。
 
-- [ ] **RED 写测试**：`inspect_existing_never_acquires`、`inspect_rejects_replaced_session`、`inspection_contract_is_bounded`；fixture 使用现有 fake backend/process，观察前后核对计数，不先 acquire。
+- [x] **RED 写测试**：`inspect_existing_never_acquires`、`inspect_rejects_replaced_session`、`inspection_contract_is_bounded`；fixture 使用现有 fake backend/process，观察前后核对计数，不先 acquire。
 
 ```rust
 assert_eq!(result.status, KernelInspectionStatusV4::NotStarted);
@@ -49,10 +49,10 @@ assert_eq!(old_session_result.status, KernelInspectionStatusV4::StaleSession);
 assert!(validate_inspection_payload(&over_64_objects).is_err());
 ```
 
-- [ ] **RED 运行**：`cargo test -p omicsops-runtime inspect_`；`cargo test -p omicsops-protocol inspection_`。预期缺失接口/断言失败，记录实际原因。
-- [ ] **实现接口**：仅查 sessions，不创建或替换；调用进程后再次查同一 session。Ready 才带 payload，其余状态 payload=None；纯类型 serde unknown fields 拒绝，旧 DTO 可读。
-- [ ] **GREEN**：重复上述命令，再 `cargo test -p omicsops-desktop --lib dto_contract_tests`；预期全部通过，DTO 无 runtime 依赖。
-- [ ] **Commit**：仅暂存本任务文件，`git commit -m "feat(runtime): add non-starting kernel inspection contract"`。
+- [x] **RED 运行**：`cargo test -p omicsops-runtime inspect_`；`cargo test -p omicsops-protocol inspection_`。预期缺失接口/断言失败，记录实际原因。
+- [x] **实现接口**：仅查 sessions，不创建或替换；调用进程后再次查同一 session。Ready 才带 payload，其余状态 payload=None；纯类型 serde unknown fields 拒绝，旧 DTO 可读。
+- [x] **GREEN**：重复上述命令，再 `cargo test -p omicsops-desktop --lib dto_contract_tests`；预期全部通过，DTO 无 runtime 依赖。
+- [x] **Commit**：仅暂存本任务文件，`git commit -m "feat(runtime): add non-starting kernel inspection contract"`。
 
 ### Task 2: Local/容器 worker 与安全 Python metadata
 
@@ -80,7 +80,7 @@ self.assertNotIn(secret_sentinel, serialized_payload)
 ```
 
 - [ ] **RED 运行**：`cargo test -p omicsops-runtime inspect_`；`python -B -m unittest discover -s scripts -p "test_kernel_inspection.py"`。预期 inspect action/helper 缺失或断言失败。
-- [ ] **实现接口**：try_lock 同一 process handle；固定 3 秒/16 KiB 截止和 request ID 核验。sent 请求失步/超时才置 unhealthy，不中断/rebuild；Busy 不发帧。Python exact 内建类型使用受控 primitive 元数据；R 仅不求值描述/无 class 基础属性，无法安全确认则 opaque；无 `get` 强制求值。容器自然复用协议。
+- [ ] **实现接口**：try_lock 同一 process handle；固定 3 秒/16 KiB 截止和 request ID 核验。sent 请求失步/超时才置 unhealthy，不中断/rebuild；Busy 不发帧。Task1 manager有外层3秒deadline，worker须在写入可能已发送后持drop-safe健康guard：外层先取消future也置不可复用，不能只依赖内层timeout分支；新增取消后health回归，正常验证完成才解除guard。Python exact 内建类型使用受控 primitive 元数据；R 仅不求值描述/无 class 基础属性，无法安全确认则 opaque；无 `get` 强制求值。容器自然复用协议。
 - [ ] **GREEN**：重复 RED 命令；增加保留 execute/capture 回归，预期旧行为通过；无需安装科学库或 R。
 - [ ] **Commit**：仅暂存本任务文件，`git commit -m "feat(runtime): inspect local kernel metadata without execution"`。
 
@@ -102,7 +102,7 @@ assert_eq!(r_binding_side_effect_count, 0); // 仅 opt-in R 测试
 ```
 
 - [ ] **RED 运行**：`cargo test -p omicsops-agent inspection`；`cargo test -p omicsops-adapters kernel`；`cargo test -p omicsops-desktop --lib ssh_inspect`；Python discovery 同 Task 2。预期 typed inspect 接口缺失/行为失败。
-- [ ] **实现接口**：增 typed variant、双 worker inspect 分派，旧 execute/shutdown 原序列化不变；不以任意代码模拟 inspect。实现 SSH try_lock、3 秒截止、严格 ID/sequence、预算与健康语义。为所有现有 exhaustive match 增必要分支。ignored R 测试文档列命令及未执行语义。
+- [ ] **实现接口**：增 typed variant、双 worker inspect 分派，旧 execute/shutdown 原序列化不变；不以任意代码模拟 inspect。实现 SSH try_lock、3 秒截止、严格 ID/sequence、预算与健康语义；同Task2覆盖manager外层deadline取消sent future的drop-safe不可复用guard，不连接新SSH、不kill/rebuild。为所有现有 exhaustive match 增必要分支。ignored R 测试文档列命令及未执行语义。
 - [ ] **GREEN**：重复 RED 命令；真实 R 在完成默认确定性检查后按 acceptance 文档显式执行或记录未执行，不能把 ignored 当通过。
 - [ ] **Commit**：仅暂存本任务文件，`git commit -m "feat(runtime): add scoped SSH kernel inspection protocol"`。
 
@@ -126,7 +126,7 @@ assert!(!serde_json::to_string(&response).unwrap().contains(secret_sentinel));
 ```
 
 - [ ] **RED 运行**：`cargo test -p omicsops-desktop --lib inspection_host`；`cargo test -p omicsops-desktop --lib inspection_registry`。预期注册表/命令缺失或断言失败。
-- [ ] **实现接口**：compose不登记；实际execution driver通过ownership/cancel gate后注册已创建slot（从model.resources取得），显式将guard或整个tools移入driver；W05 manual/目录等干式组合保持None，不促发initialize。scope从Store frozen run验证，前端不提供backend/environment。升级weak后只ready.get；结果再核验session/generation，固定原因映射，用户元数据不记录日志/事件。AppState初始化和现有测试fixtures同步补默认registry。
+- [ ] **实现接口**：compose不登记；实际execution driver通过ownership/cancel gate后注册已创建slot（从model.resources取得），显式将guard或整个tools移入driver；W05 manual/目录等干式组合保持None，不促发initialize。scope从Store frozen run验证，前端不提供backend/environment。升级weak后只ready.get；结果再核验session/generation，固定原因映射，用户元数据不记录日志/事件。补齐scope并脱敏后调用 `KernelInspectionV4::validate()` 再返回，不能仅核验worker payload而漏计完整response字节；增加near-limit envelope保守拒绝测试。AppState初始化和现有测试fixtures同步补默认registry。
 - [ ] **GREEN**：重复 RED；`cargo test -p omicsops-desktop --lib dto_contract_tests`；预期越权拒绝、默认 lazy compute 回归通过。
 - [ ] **Commit**：仅暂存本任务文件，`git commit -m "feat(desktop): expose live kernel metadata inspection"`。
 
@@ -155,4 +155,8 @@ expect(parentOverlay).toBeVisible(); // 打开立即 Escape 后
 
 ## Plan Self-Review
 
-已将设计的非启动、双协议、安全元数据、失败健康语义、ephemeral 宿主和 UI 分别绑定 Task 1–5；Review Focus 每项有具名测试。consumes/produces 与设计原名一致，未新增 CLI/DB/权限路径。测试代码为断言片段，fixture 复用既有 fake；没有实现函数 body。实施尚未开始，本计划中的 RED/GREEN/commit 均未执行。
+已将设计的非启动、双协议、安全元数据、失败健康语义、ephemeral宿主和UI分别绑定Task1–5；每项有具名测试，未新增CLI/DB/权限路径。Task1已实现并审阅，其余任务未完成，不把纯协议通过记为真实worker或完整功能交付。
+
+## 当前实施证据
+
+2026-10-08：Task1提交a1a7467独立spec/quality审阅通过，无Critical/Important。实际RED runtime31/protocol19缺接口编译错误，中间方法误落测试模块的编译失败保留且已修正。最终runtime inspect5/protocol inspection3/desktop DTO51通过，fmt/diff通过；原OUT_DIR/fmtOS5沙箱日志与授权原命令重跑保留。五路径只含protocol/DTO/runtime契约及测试，external文件完整保留未暂存，既存canonicalization/cache warning非blocking Minor。检查证明零launch、旧session及相同UUID不同Arc拒绝、固定3秒截止、Ready才有payload、完整公开JSON16384/16385字节边界；type_label受控128字节。Manager外层deadline使Task2/3sent取消drop-safe健康guard为必需，Task4scope投影后必须完整validate；均未提前实现或宣称已通过。完整W04/default/native、真实Python/R/SSH/模型/GUI验收仍未执行，Task5及最终分支gate另行负责。
