@@ -1102,3 +1102,34 @@ export interface CreateManagedCredentialRequest { label: string; secret: string 
 export type CreateCredentialResult = { kind: "saved"; entry: CredentialEntry } | { kind: "secret_save_not_confirmed"; entry: CredentialEntry };
 export interface ReplaceCredentialRequest { target: CredentialTarget; expected_reference: string; expected_value_kind: CredentialValueKind; secret: string }
 export type DeleteCredentialResult = { kind: "deleted" } | { kind: "in_use"; consumers: CredentialConsumer[] };
+// Public detached-job metadata and observations. Execution inputs stay on the host.
+export interface ListRemoteJobsV4Request { project_id: string; conversation_id: string | null }
+export interface RefreshRemoteJobV4Request { project_id: string; job_id: string }
+export type RemoteJobRecordedStateV4 = "reserved" | "running" | "unknown" | "succeeded" | "failed";
+export type RemoteJobQueryEligibilityV4 = "needs_root_check" | "binding_changed" | "unsupported" | "integrity_mismatch" | "recorded_receipt";
+export type RemoteJobObservationStatusV4 = "running" | "unknown" | "completed" | "timeout" | "unavailable" | "rejected";
+export interface RemoteJobSummaryV4 {
+  project_id: string;
+  conversation_id: string;
+  job_id: string;
+  run_id: string;
+  call_id: string;
+  backend_id: string;
+  language: string;
+  environment: string;
+  request_sha256: string;
+  recorded_state: RemoteJobRecordedStateV4;
+  query_eligibility: RemoteJobQueryEligibilityV4;
+  recorded_at: string | null;
+}
+export interface RemoteJobsPageV4 { jobs: RemoteJobSummaryV4[]; limit: number; remote_liveness_checked: boolean }
+export interface RemoteJobCaptureReferenceV4 { relative_path: string; sha256: string; size_bytes: number | null }
+export interface RemoteJobObservationV4 {
+  job: RemoteJobSummaryV4;
+  status: RemoteJobObservationStatusV4;
+  observed_at: string;
+  stdout_excerpt: string;
+  stderr_excerpt: string;
+  captures: RemoteJobCaptureReferenceV4[];
+  resubmitted: boolean;
+}

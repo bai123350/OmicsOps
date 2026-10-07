@@ -1,0 +1,20 @@
+.remote-jobs-backdrop { position: fixed; inset: 0; z-index: 1080; display: grid; place-items: center; padding: 24px; background: rgb(0 0 0 / 35%); }
+.remote-jobs-panel { width: min(960px, 100%); max-height: min(850px, 92vh); overflow: auto; border: 1px solid var(--border, #ddd); border-radius: 16px; padding: 24px; background: var(--bg-panel, #fff); color: var(--text, #222); box-shadow: 0 24px 80px rgb(0 0 0 / 20%); }
+.remote-jobs-panel header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.remote-jobs-panel h2 { margin: 0; font-size: 22px; }
+.remote-jobs-panel p { line-height: 1.6; }
+.remote-jobs-panel button { padding: 8px 12px; border: 1px solid var(--border, #ddd); border-radius: 8px; background: transparent; color: inherit; cursor: pointer; }
+.remote-jobs-panel button:disabled { opacity: .5; cursor: default; }
+.remote-jobs-panel button:focus-visible { outline: 2px solid var(--accent, #4679c4); outline-offset: 2px; }
+.remote-jobs-panel button[aria-pressed="true"] { background: rgb(70 121 196 / 12%); border-color: var(--accent, #4679c4); }
+.remote-jobs-panel nav, .remote-job-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.remote-jobs-body { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(0, 2fr); gap: 20px; margin-top: 16px; }
+.remote-jobs-list { margin: 0; padding: 0; list-style: none; }
+.remote-jobs-list li + li { margin-top: 8px; }
+.remote-jobs-list button { width: 100%; text-align: left; overflow-wrap: anywhere; }
+.remote-job-detail { min-width: 0; overflow-wrap: anywhere; }
+.remote-job-detail dl { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; font-size: 12px; }
+.remote-job-detail dd { margin: 0; }
+.remote-job-observation pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; padding: 12px; border-radius: 8px; background: rgb(128 128 128 / 8%); }
+.remote-jobs-panel footer { margin-top: 20px; padding-top: 12px; border-top: 1px solid var(--border, #ddd); font-size: 12px; }
+@media (max-width: 650px) { .remote-jobs-body { grid-template-columns: 1fr; } .remote-jobs-panel { padding: 16px; } }
