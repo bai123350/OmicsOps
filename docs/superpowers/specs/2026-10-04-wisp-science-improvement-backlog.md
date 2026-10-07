@@ -118,6 +118,8 @@ P0 表示优先解决可能影响操作正确性的问题；P1 表示直接改�
 
 ## W08 场景评测和 Skill 行为回归
 
+**实施状态：**helper子计划三任务已实现并独立审阅通过（74e8fa4、d6a71bd、edfb23f）；捆绑runtime/SOURCE/hash/freeze未改动。2026-10-08本地helper29/完整Python38、Rust1613通过/17 ignored、frontend1220+22/Web/fmt通过，CI已配置Python3.12标准discovery但未执行（本地Python3.10/Node24）。实际fixture RED、正确旧helper baseline PASS及权限失败重跑均保留；不冒称科学端到端验收。场景manifest/runner/report子计划仍待实施，整个W08尚未完成。证据与外部共享文件保留证明见[helper计划](../plans/2026-10-04-wisp-w08-skill-helpers.md)。
+
 **参考事实：**上游[离线 suite][w-eval-suite]声明输入、脚本模型和工具断言，[runner 与报告][w-eval]在临时工作区运行；[Skill helper 测试][w-skill-tests]通过替身验证 OpenAlex 错误分类、claim/图路径绑定和加载无副作用。
 
 **本地基础：**Agent core 已有 ScriptedModel、恢复/审批/预算回归；Skill 测试已有资源完整性、哈希和启停覆盖。本轮核对的 analysis-workflow 指南、literature-review/runtime.py 和 paper-narrative/runtime.py，与固定上游内容在 CRLF 归一化后相同，应补测试覆盖而非重复导入。

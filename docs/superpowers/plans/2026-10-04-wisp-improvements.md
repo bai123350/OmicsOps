@@ -46,7 +46,7 @@
 | W06 | [运行诊断](2026-10-04-wisp-w06-run-diagnostics.md) | 4 | run/tool/失败筛选、精确来源定位、脱敏HTML/JSON | 待实施 |
 | W07 | [离线示例](2026-10-04-wisp-w07-offline-example.md) | 4 | 双语合成工作区，重启/坏receipt仍隔离于生产Agent | 待实施 |
 | W08a | [V4场景](2026-10-04-wisp-w08-scenarios.md) | 3 | 五场景manifest/hash/实际调用计数和安全报告 | 待实施 |
-| W08b | [Skill helpers](2026-10-04-wisp-w08-skill-helpers.md) | 3 | 固定本地helper离线行为回归与统一Python CI | 进行中，2/3任务审阅通过 |
+| W08b | [Skill helpers](2026-10-04-wisp-w08-skill-helpers.md) | 3 | 固定本地helper离线行为回归与统一Python CI | 已实现、3任务审阅通过；CI未执行 |
 | W09 | [稿件证据](2026-10-04-wisp-w09-publication-evidence.md) | 4 | 保存revision准备度与reference-only四entry证据ZIP | 待实施 |
 | W10 | [文件基线](2026-10-04-wisp-w10-file-baselines.md) | 4 | 显式安全小本地文本immutable snapshot/有界diff | 待实施 |
 | W11 | [迁移预览](2026-10-04-wisp-w11-migration-preview.md) | 3 | 空默认选择、类别COUNT、文件状态/hash与rebind/omissions | 待实施 |
@@ -75,7 +75,7 @@ W07只需W02 Task1叶子，不需要table/SSH界面；W10/W11只需W09 Task1的�
 - [x] 1. W01 Task1–3：版本草稿、应用导航、全发送回执。
 - [x] 2. W02 Task1–4：共享handle、parser/DTO、source/command、真实表格UI。
 - [x] 3. W03 Task1–4：metadata、身份status、退避panel、Runtime入口/边界说明。
-- [ ] 4. W08b Task1–3：helper正确行为基线、错误传播、统一Python CI。
+- [x] 4. W08b Task1–3：helper正确行为基线、错误传播、统一Python CI。
 - [ ] 5. W04 Task1–5：非启动contract、两套worker、weak registry、Runtime观察UI。
 - [ ] 6. W05 Task1–5：旧hash兼容、candidate/final准入、atomicStore、宿主租约、UI/恢复。
 - [ ] 7. W06 Task1–4：validated readonlychain、safeprojection、export、筛选/定位UI。

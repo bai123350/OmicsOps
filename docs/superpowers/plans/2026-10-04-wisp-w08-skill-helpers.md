@@ -87,7 +87,7 @@
 - Consumes: Tasks 1–2 的 unittest classes；现有 `scripts/test_import_model_catalog.py`、`test_remote_job_bridge.py`；W04 增加的 `scripts/test_kernel_inspection.py` 也由同一标准 discovery 自动纳入，不需该计划重复步骤。
 - Produces: CI `actions/setup-python@v5` / `python-version: '3.12'`，统一命令 `python -B -m unittest discover -s scripts -p "test_*.py"`；无 custom report、pip 或 npm test Python前提。CI 保留现有 required checks，其同文件合并按 master 顺序执行。
 
-- [ ] **测试 — 写 `HelperDiscoveryTests`。** 用 unittest TestLoader 从固定本地 tests 加载后断言三组 helper cases 可发现；本测试中的独立 TestCase 设置故意失败断言，以 TestResult 验证 failed>0，或受控 subprocess 对该临时 case 验证 exit nonzero，不运行产品/network，也不让正常 suite 故意失败。测试缺失文件/类不能以 empty suite 当成功。
+- [x] **测试 — 写 `HelperDiscoveryTests`。** 用 unittest TestLoader 从固定本地 tests 加载后断言三组 helper cases 可发现；本测试中的独立 TestCase 设置故意失败断言，以 TestResult 验证 failed>0，或受控 subprocess 对该临时 case 验证 exit nonzero，不运行产品/network，也不让正常 suite 故意失败。测试缺失文件/类不能以 empty suite 当成功。
 
   ```python
   self.assertGreater(discovered.countTestCases(), 0)
@@ -95,13 +95,15 @@
   self.assertEqual(len(injected_failure_result.failures), 1)
   ```
 
-- [ ] **RED/基线 — 运行并记录实际结果。** `python -B -m unittest discover -s scripts -p "test_*.py" -v`；新 smoke 未实现时记录 FAIL，已存在 unittest 正确行为首跑即 PASS 时记录事实；当前 CI 尚无 Python step 是待实现配置，不伪造运行失败。
-- [ ] **实现 CI 两个新增步骤和 smoke/docs。** 保留 npm ci→workspace→npm test→build 的顺序；Python discovery 置 npm ci 后、workspace 前，setup-python 在其前。step不加 continue-on-error 或 always-success；仅 runtime owner 管理 OMICSOPS_EVAL_REPORT_PATH 和 upload-artifact。docs 明确 bundle/hash、helper PASS、scripted V4 PASS 与 live acceptance 未执行各自证明什么。
-- [ ] **GREEN — discovery PASS，默认完整检查 PASS。** `cargo test --workspace`、`npm test`、`npm run build`、`git diff --check`；纯测试/CI变化无桌面打包必要，若整合时改宿主资源则按 master 跑桌面检查。用 stdlib环境运行，记录 case数量/零skip；确认三个 runtime.py/SOURCE hash未变。CI实际执行状态未发生时注明“本地通过，CI未执行”，不把修改YAML当已通过CI。
-- [ ] **Commit —** `git add -- scripts/test_bundled_skill_helpers.py .github/workflows/ci.yml scripts/README.md docs/bundled-science.md acceptance/README.md`；`git commit -m "ci: run deterministic bundled skill helper regressions"`。
+- [x] **RED/基线 — 运行并记录实际结果。** `python -B -m unittest discover -s scripts -p "test_*.py" -v`；新 smoke 未实现时记录 FAIL，已存在 unittest 正确行为首跑即 PASS 时记录事实；当前 CI 尚无 Python step 是待实现配置，不伪造运行失败。
+- [x] **实现 CI 两个新增步骤和 smoke/docs。** 保留 npm ci→workspace→npm test→build 的顺序；Python discovery 置 npm ci 后、workspace 前，setup-python 在其前。step不加 continue-on-error 或 always-success；仅 runtime owner 管理 OMICSOPS_EVAL_REPORT_PATH 和 upload-artifact。docs 明确 bundle/hash、helper PASS、scripted V4 PASS 与 live acceptance 未执行各自证明什么。
+- [x] **GREEN — discovery PASS，默认完整检查 PASS。** `cargo test --workspace`、`npm test`、`npm run build`、`git diff --check`；纯测试/CI变化无桌面打包必要，若整合时改宿主资源则按 master 跑桌面检查。用 stdlib环境运行，记录 case数量/零skip；确认三个 runtime.py/SOURCE hash未变。CI实际执行状态未发生时注明“本地通过，CI未执行”，不把修改YAML当已通过CI。
+- [x] **Commit —** `git add -- scripts/test_bundled_skill_helpers.py .github/workflows/ci.yml scripts/README.md docs/bundled-science.md acceptance/README.md`；`git commit -m "ci: run deterministic bundled skill helper regressions"`。
 
 ## 当前实施证据
 
-2026-10-08：Task1提交74e8fa4独立spec/quality审阅通过，无open finding。仅新增307行标准库测试；固定loader与claim/path、figure几何合同focused14通过，完整Python discovery23通过。实际loader缺接缝RED为1个NameError；首轮helper11通过/1个Windows platform fixture失败，stub后原helper合同baseline PASS，没有修改helper制造缺陷。两次sandbox discovery均保留5个既有RemoteJobBridge WinError5，原命令授权重跑后23通过。runtime.py/SOURCE/hash/freeze不变；外部未提交工作完整保留。实际本地Python3.10，计划CI3.12未执行；本leaf未重复Rust/npm/Web/native。Task3discovery/CI/完整交付待实施；W08场景report/upload仍由另一子计划之后拥有，整个W08尚未完成。
+2026-10-08：Task1提交74e8fa4独立spec/quality审阅通过，无open finding。仅新增307行标准库测试；固定loader与claim/path、figure几何合同focused14通过，完整Python discovery23通过。实际loader缺接缝RED为1个NameError；首轮helper11通过/1个Windows platform fixture失败，stub后原helper合同baseline PASS，没有修改helper制造缺陷。两次sandbox discovery均保留5个既有RemoteJobBridge WinError5，原命令授权重跑后23通过。runtime.py/SOURCE/hash/freeze不变；外部未提交工作完整保留。实际本地Python3.10，计划CI3.12未执行；本leaf未重复Rust/npm/Web/native。Task3discovery/CI/完整交付证据如下；W08场景report/upload仍由另一子计划之后拥有，整个W08尚未完成。
 
-Task2提交d6a71bd独立spec/quality审阅通过，无Critical/Important。新增13项LiteratureReviewTests，最终focused27通过；既有wisp_snapshot2通过/0 ignored，原OUT_DIR沙箱失败日志保留，原命令授权重跑。真实fixture RED为26测试/15个缺FakeHttpResponse NameError记录；中间7个traceback fixture断言失败保留，改为核对真实captured Request.full_url后通过。原helper正确分支保持baseline PASS，未改runtime.py/SOURCE/hash/freeze。Mock网络/等待/环境均恢复，完整traceback不含实际请求URL/假key/原异常；两方向失败不误记empty，DOI未知保持None。既存incremental hard-link warning非blocking；本leaf未执行全产品检查，Task3完整交付及CI仍待完成。
+Task2提交d6a71bd独立spec/quality审阅通过，无Critical/Important。新增13项LiteratureReviewTests，最终focused27通过；既有wisp_snapshot2通过/0 ignored，原OUT_DIR沙箱失败日志保留，原命令授权重跑。真实fixture RED为26测试/15个缺FakeHttpResponse NameError记录；中间7个traceback fixture断言失败保留，改为核对真实captured Request.full_url后通过。原helper正确分支保持baseline PASS，未改runtime.py/SOURCE/hash/freeze。Mock网络/等待/环境均恢复，完整traceback不含实际请求URL/假key/原异常；两方向失败不误记empty，DOI未知保持None。既存incremental hard-link warning非blocking；本leaf未执行全产品检查，Task3完整交付证据如下；CI未执行。
+
+Task3提交edfb23f独立spec/quality审阅通过，无Critical/Important，helper子计划3任务完成。新增2项discovery/nonzero smoke，正常suite无故意失败或skip；原unittest正确行为baseline38通过，没有伪造配置RED。最终focused29、完整Python38、Rust1613通过/17 ignored、frontend1220+bridge22、Web2039模块、fmt/diff通过。原Temp WinError5、OUT_DIR、前端118个EPERM启动错误、WebEPERM及fmt访问拒绝日志保留，原命令授权重跑通过，不称为产品断言失败。CI新增Python3.12 setup与标准discovery，保持Windows/Node22/npm ci/workspace/npm test/build顺序；未执行CI，本地Python3.10/Node24。Acceptance仅33行owned插入提交，原18行external保持未暂存；raw外部字节、candidate blob/reverse roundtrip及所有source/external哈希由独立审阅核验。捆绑runtime/SOURCE/锁不变，纯测试/CI/文档无需native重建；原生GUI/安装/live与最终clean HEAD仍未执行。既存Rust cache/unused-code和Web大chunk警告保留为非blocking Minor。W08整体须另一场景子计划完成后才算完成；未增加scenario report/upload步骤。
