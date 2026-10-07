@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust/async-trait/Tokio/serde，Tauri 2，React 19/TypeScript/Vitest，Python stdlib unittest；真实 R 仅显式 ignored 验收。
 
-**Spec:** [W04 Runtime 设计](../specs/2026-10-04-wisp-runtime-design.md#w04观察当前内核中的对象)，设计及8515da8全部实施计划已确认。Task1–4协议/manager、Local/SSH worker及宿主已独立审阅/必要复审通过；Task5实际UI与完整交付仍待实施，真实worker/live验收未执行。
+**Spec:** [W04 Runtime 设计](../specs/2026-10-04-wisp-runtime-design.md#w04观察当前内核中的对象)，设计及8515da8全部实施计划已确认。Task1–5协议/manager、Local/SSH worker、宿主及UI均已独立审阅/必要复审通过；真实worker/live验收未执行。
 
 ## Global Constraints
 
@@ -142,7 +142,7 @@ assert!(!serde_json::to_string(&response).unwrap().contains(secret_sentinel));
 - Produces：`inspectKernelV4(request: InspectKernelRequestV4): Promise<KernelInspectionV4>`；`useKernelInspection(scope: { projectId: string; conversationId: string; runId: string; language: KernelLanguage } | null, enabled: boolean)` 返回 `{ value: KernelInspectionV4 | null, loading: boolean, error: boolean, refresh: () => Promise<void> }`，前端语言复用现有 KernelLanguage，Rust DTO 仍是协议 enum。
 - Produces：RuntimeDialog Props 增 `kernelInspection?: KernelInspectionV4 | null`、`kernelInspectionLoading?: boolean`、`kernelInspectionError?: boolean`、`onRefreshKernelInspection?: () => void`；已冻结 Run 接入，不复用 legacy kernel sessions。
 
-- [ ] **RED 写 RTL 测试**：`inspection_refresh_is_manual_and_scope_bound`、`inspection_busy_is_not_ready`、`inspection_discards_rebuilt_session_and_closed_dialog_response`、`runtime_escape_closes_only_top_overlay`。
+- [x] **RED 写 RTL 测试**：`inspection_refresh_is_manual_and_scope_bound`、`inspection_busy_is_not_ready`、`inspection_discards_rebuilt_session_and_closed_dialog_response`、`runtime_escape_closes_only_top_overlay`。
 
 ```ts
 expect(inspectMock).toHaveBeenCalledTimes(1);
@@ -151,14 +151,14 @@ expect(screen.getByText(/未启动|Not started/)).toBeVisible();
 expect(parentOverlay).toBeVisible(); // 打开立即 Escape 后
 ```
 
-- [ ] **RED 运行**：`npx vitest run src/features/workspace/RuntimeDialog.test.tsx src/features/workspace/useKernelInspection.test.tsx src/features/workspace/WorkspaceShell.test.tsx`；预期入口/状态/作用域测试失败。
-- [ ] **实现接口**：固定来源、无内容元数据、NotStarted/Busy/Stale/Unavailable 与手动刷新；请求 capture scope/session/generation，切换/关闭丢弃旧响应，无自动轮询；按既有 Escape 栈接入。
-- [ ] **GREEN**：重复 RTL；Python discovery；`cargo test --workspace`、`npm test`、`npm run build`、`npm run build:desktop`、`cargo fmt --all -- --check`、`git diff --check`。记录真实 R/SSH/Windows GUI smoke 的执行或未执行；只允许一次性环境，mock/build 不代替端到端。
-- [ ] **Commit**：仅暂存 W04 UI/文档，`git commit -m "feat(ui): show bounded live kernel metadata"`；不得提交 target/dist/node_modules 或报告产物。
+- [x] **RED 运行**：`npx vitest run src/features/workspace/RuntimeDialog.test.tsx src/features/workspace/useKernelInspection.test.tsx src/features/workspace/WorkspaceShell.test.tsx`；预期入口/状态/作用域测试失败。
+- [x] **实现接口**：固定来源、无内容元数据、NotStarted/Busy/Stale/Unavailable 与手动刷新；请求 capture scope/session/generation，切换/关闭丢弃旧响应，无自动轮询；按既有 Escape 栈接入。
+- [x] **GREEN**：重复 RTL；Python discovery；`cargo test --workspace`、`npm test`、`npm run build`、`npm run build:desktop`、`cargo fmt --all -- --check`、`git diff --check`。记录真实 R/SSH/Windows GUI smoke 的执行或未执行；只允许一次性环境，mock/build 不代替端到端。
+- [x] **Commit**：仅暂存 W04 UI/文档，`git commit -m "feat(ui): show bounded live kernel metadata"`；不得提交 target/dist/node_modules 或报告产物。
 
 ## Plan Self-Review
 
-已将设计的非启动、双协议、安全元数据、失败健康语义、ephemeral宿主和UI分别绑定Task1–5；每项有具名测试，未新增CLI/DB/权限路径。Task1–4已实现并审阅，Task5未完成，不把协议/helper/mock通过记为真实worker或完整功能交付。
+已将设计的非启动、双协议、安全元数据、失败健康语义、ephemeral宿主和UI分别绑定Task1–5；每项有具名测试，未新增CLI/DB/权限路径。Task1–5已实现并审阅，不把协议/helper/mock通过记为真实worker端到端验收。
 
 ## 当前实施证据
 
@@ -171,3 +171,5 @@ Task3提交f644d0c/ef7da02经full/scoped独立审阅通过。Typed Inspector、b
 Task4提交a0fbedc独立spec/quality审阅通过，无Critical/Important。Weak registry/实际driver-only guard跨future完成及abort、干式同scope compose不覆盖、Store冻结所有权/语言/compute/代次重验、host脱敏及完整16KiB validate、最后Store await后同Arc+UUID Weak identity无新await均已验证。最终host6/registry2/spawn1/abort1/dry1/DTO51/lazy5/ownership3/duplicate-active1/Runtime34/fmt通过；一次0测试filter未计PASS，已改实际driverfilters。证据更正：两份RED各16总诊断实为15缺接口+1 OUT_DIR，不是16缺接口且无infra；原日志、fixture错误与原命令授权重跑均保留，不重造证据。Near-envelope fixture先错误预期Ready，修正为valid MAX-20后完整response拒绝；immutable owner fixture被Store正确拒绝，修正outer compute mismatch，不改保护。
 
 Task4 shared staging除原external patch外留下一个明示兼容增量：agent_v4 external-only223行fixture不在HEAD，唯一default registry initializer留未暂存，不能把整段外部测试提交。Anchor为 `detached_remote_jobs_catalog_matches_the_frozen_backend_without_initialization`，当时working line10015；candidate scratch只扣除此行，移除feature及compat可恢复原RAW exact。Go_live candidate只含一个允许initializer，混合EOL原bytes保留；新测试用owned `inspection_selection`，不依赖dirty-only helper。两份candidate/raw/inverse证明由独立审阅支持，index empty；最终clean HEAD archive必须排除外部工作及此compat residue验证独立编译。环境warnings保持非blocking，full/default/native/UI、CI/live/GUI仍由Task5/最终gate执行；没有初始化/launch/新SSH/保活/科研证据副作用。
+
+Task5提交db174a6及修复6609846，经full/scoped独立审阅通过，两个Important分别由可见的跨关闭/切scope忙碌门与明确的视觉顶层焦点所有权解决。最近三套UI测试174/174、最终完整前端1251/1251及扩展22/22、Web2040模块构建通过，修复前完整Rust1665通过/18 ignored、Python48通过、Windows NSIS构建通过；后者不作为修复后原生资源验证，最终全分支native检查仍待执行。真实R/SSH/模型、Windows GUI/安装、CI版本及干净提交HEAD验收未执行。修复只提交五个UI文件，外部脏改动及Task4兼容行仍在暂存区外；无自动查询、结果缓存、取消或新权限。
