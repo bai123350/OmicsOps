@@ -5337,12 +5337,12 @@ impl AgentCoreV4<'_> {
         // expand again when embedded in checkpoint strings. Fit the actual
         // serialized request, keeping the newest steps and immutable state.
         let original_recent_steps = checkpoint.recent_steps.clone();
-        let (mut compacted, mut validation) = loop {
+        let mut validation = loop {
             let compacted = render_context(Some(&checkpoint), &[], &scientific_value)?;
             let validation =
                 self.validate_execution_context(spec, &compacted, &prospective, limits);
             if validation.is_ok() || checkpoint.recent_steps.is_empty() {
-                break (compacted, validation);
+                break validation;
             }
             checkpoint.recent_steps.remove(0);
         };
@@ -5403,17 +5403,22 @@ impl AgentCoreV4<'_> {
             },
         )
         .await?;
-        if needs_projection {
-            let persisted = self
-                .events
-                .load(spec.run_id)
-                .await
-                .map_err(AgentCoreErrorV4::Store)?;
-            // Admit again with real durable references. Unexpected Store races
-            // or semantic Port failures may retain the archive, but no rejected
-            // request or prospective reference is returned to the model path.
-            compacted = fit_archived_projection(&persisted)?;
-        }
+        let persisted = self
+            .events
+            .load(spec.run_id)
+            .await
+            .map_err(AgentCoreErrorV4::Store)?;
+        // Admit every archive branch again with the durable event head: even
+        // full science can have native closures whose hashes changed on write.
+        // Unexpected Store races or semantic Port failures may retain the
+        // archive, but no rejected request is returned to the model path.
+        let compacted = if needs_projection {
+            fit_archived_projection(&persisted)?
+        } else {
+            let compacted = render_context(Some(&checkpoint), &[], &scientific_value)?;
+            self.validate_execution_context(spec, &compacted, &persisted, limits)?;
+            compacted
+        };
         Ok(compacted)
     }
 
@@ -14552,12 +14557,13 @@ mod tests {
             .await
             .unwrap();
         let requests = model.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert!(!requests[0].system.is_empty());
         assert!(!requests[0].tools.is_empty());
         assert!(requests[0].context.len() < AgentLimitsV4::default().context_max_bytes);
         assert!(requests[1].context.len() < requests[0].context.len());
         assert_eq!(requests[1].context, context);
+        assert_eq!(requests[2], requests[1]);
         assert_eq!(store.archives.lock().unwrap().len(), 1);
     }
 
@@ -15376,6 +15382,184 @@ mod tests {
             assert_eq!(store.load_direct(spec.run_id).unwrap(), history);
             assert!(store.archives.lock().unwrap().is_empty());
         }
+    }
+
+    fn pending_closure_reference(request: &ModelRequestV4) -> Value {
+        request
+            .replay
+            .iter()
+            .find_map(|item| match item {
+                omicsops_protocol::ModelReplayItemV4::ToolResult { call_id, output }
+                    if call_id == "automatic-pending-closure" =>
+                {
+                    Some(serde_json::from_str(output).unwrap())
+                }
+                _ => None,
+            })
+            .expect("complete request includes the pending host closure")
+    }
+
+    struct PostArchiveAdmissionModel {
+        inner: ManualBudgetModel,
+        prospective_hash: Mutex<Option<Value>>,
+        reject_changed_hash: bool,
+    }
+
+    #[async_trait]
+    impl ModelPortV4 for PostArchiveAdmissionModel {
+        fn supports_native_replay(&self) -> bool {
+            true
+        }
+        fn usage_metadata(&self) -> ModelUsageMetadataV4 {
+            self.inner.usage_metadata()
+        }
+        fn usage_request_metadata(&self, request: &ModelRequestV4) -> ModelUsageRequestMetadataV4 {
+            self.inner.usage_request_metadata(request)
+        }
+        fn validate_request(&self, request: &ModelRequestV4) -> Result<(), ModelFailureV4> {
+            self.inner.validate_request(request)?;
+            let hash = pending_closure_reference(request)["event_hash"].clone();
+            let mut prospective = self.prospective_hash.lock().unwrap();
+            if self.reject_changed_hash && prospective.as_ref().is_some_and(|first| *first != hash)
+            {
+                return Err(ModelFailureV4::permanent(
+                    omicsops_protocol::ModelErrorClassV4::InvalidRequest,
+                    "actual postarchive closure refused",
+                ));
+            }
+            prospective.get_or_insert(hash);
+            Ok(())
+        }
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            panic!("context admission must not dispatch a model request")
+        }
+    }
+
+    async fn assert_full_context_postarchive_admission(reject_changed_hash: bool) {
+        let (spec, store, inner) = manual_fixture(true, 70_000);
+        let model = PostArchiveAdmissionModel {
+            inner,
+            prospective_hash: Mutex::new(None),
+            reject_changed_hash,
+        };
+        let state = ScientificStateV4::new(spec.project_id);
+        let science = SnapshotScience(Mutex::new(state.clone()));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: Some(&science),
+        };
+        let logical_request_id = Uuid::new_v4();
+        let attempt_id = Uuid::new_v4();
+        append_test_event(
+            &store,
+            spec.run_id,
+            AgentEventKindV4::ModelRequestStarted {
+                request: serde_json::from_value(json!({
+                    "logical_request_id": logical_request_id,
+                    "attempt_id": attempt_id,
+                    "model_profile_id": spec.model_profile_id,
+                    "model_configuration_hash": "a".repeat(64),
+                    "context_limit_source": {"kind": "unknown"}
+                }))
+                .unwrap(),
+            },
+        );
+        append_test_event(
+            &store,
+            spec.run_id,
+            AgentEventKindV4::ModelReplayRecorded {
+                replay: omicsops_protocol::ModelReplayRecordedV4 {
+                    logical_request_id,
+                    attempt_id,
+                    binding: omicsops_protocol::ModelReplayBindingV4 {
+                        model_profile_id: spec.model_profile_id,
+                        configuration_hash: "a".repeat(64),
+                    },
+                    continuation: omicsops_protocol::ModelProviderContinuationV4 {
+                        items: vec![omicsops_protocol::ModelReplayItemV4::ToolCall {
+                            call: ToolCallV4 {
+                                call_id: "automatic-pending-closure".into(),
+                                tool_id: "project.read".into(),
+                                arguments: json!({"path": "evidence"}),
+                            },
+                        }],
+                    },
+                },
+            },
+        );
+        while store
+            .load_direct(spec.run_id)
+            .unwrap()
+            .last()
+            .unwrap()
+            .sequence
+            < 8
+        {
+            append_test_event(
+                &store,
+                spec.run_id,
+                AgentEventKindV4::ModelText {
+                    text: "sequence padding".into(),
+                },
+            );
+        }
+        let original = store.load_direct(spec.run_id).unwrap();
+        let result = core
+            .context_for_internal(&spec, AgentLimitsV4::default(), true)
+            .await;
+        if reject_changed_hash {
+            assert!(
+                matches!(&result, Err(AgentCoreErrorV4::NeedsAttention(message)) if message == "actual postarchive closure refused"),
+                "postarchive refusal must fail context admission before returning"
+            );
+        }
+        let persisted = store.load_direct(spec.run_id).unwrap();
+        assert_eq!(&persisted[..original.len()], original);
+        assert_eq!(persisted.len(), original.len() + 2);
+        assert_eq!(store.archives.lock().unwrap().len(), 1);
+        let requests = model.inner.inner.requests.lock().unwrap();
+        let prospective = requests.first().unwrap();
+        let actual = requests.last().unwrap();
+        let first_reference = pending_closure_reference(prospective);
+        let actual_reference = pending_closure_reference(actual);
+        assert_ne!(
+            actual_reference["event_hash"], first_reference["event_hash"],
+            "context admission must validate again against the persisted event head"
+        );
+        assert_eq!(first_reference["sequence"], 11);
+        assert_eq!(actual_reference["sequence"], 11);
+        assert_eq!(
+            model.usage_request_metadata(prospective),
+            model.usage_request_metadata(actual)
+        );
+        let actual_context: Value = serde_json::from_str(&actual.context).unwrap();
+        assert_eq!(actual_context["scientific_state"], json!(state));
+        assert_eq!(*science.0.lock().unwrap(), state);
+        if !reject_changed_hash {
+            let context = result.unwrap();
+            assert!(!context.contains(first_reference["event_hash"].as_str().unwrap()));
+            assert_eq!(
+                core.budget_execution_request(&spec, context, &persisted)
+                    .unwrap(),
+                *actual
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_full_context_postarchive_refusal_returns_error() {
+        assert_full_context_postarchive_admission(true).await;
+    }
+
+    #[tokio::test]
+    async fn automatic_full_context_postarchive_admits_actual_native_closure() {
+        assert_full_context_postarchive_admission(false).await;
     }
 
     #[tokio::test]
