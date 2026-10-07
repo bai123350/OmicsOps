@@ -6,9 +6,9 @@ import re
 import unittest
 
 
-def load_helper():
+def load_helper(source_path="crates/omicsops-runtime/src/process_backend.rs"):
     source = (pathlib.Path(__file__).resolve().parents[1] /
-              "crates/omicsops-runtime/src/process_backend.rs").read_text(encoding="utf-8")
+              source_path).read_text(encoding="utf-8")
     worker = re.search(r'const PYTHON_DRIVER: &str = r#"(.*?)"#;', source, re.S).group(1)
     tree = ast.parse(worker)
     allowed_functions = {"inspect_objects", "_inspect_name", "_inspect_metadata"}
@@ -27,8 +27,10 @@ def load_helper():
 
 
 class KernelInspectionTests(unittest.TestCase):
+    source_path = "crates/omicsops-runtime/src/process_backend.rs"
+
     def test_exact_builtins_and_opaque_methods(self):
-        inspect = load_helper()
+        inspect = load_helper(self.source_path)
         calls = []
 
         class Hostile:
@@ -78,7 +80,7 @@ class KernelInspectionTests(unittest.TestCase):
         self.assertNotIn("987654321", json.dumps(result))
 
     def test_object_and_utf8_budgets(self):
-        inspect = load_helper()
+        inspect = load_helper(self.source_path)
         result = inspect({"x" + str(i): [] for i in range(5000)})
         self.assertLessEqual(len(result["objects"]), 64)
         self.assertTrue(result["truncated"])
@@ -95,7 +97,7 @@ class KernelInspectionTests(unittest.TestCase):
             self.assertLessEqual(len(item["type_label"].encode("utf-8")), 128)
 
     def test_secret_names_have_no_values(self):
-        inspect = load_helper()
+        inspect = load_helper(self.source_path)
         sentinel = "sensitive_test_sentinel"
         result = inspect({"api_key": sentinel, "PASSWORD": sentinel,
                           "access_token": sentinel, "private_key": sentinel,
@@ -105,7 +107,7 @@ class KernelInspectionTests(unittest.TestCase):
         self.assertNotIn(sentinel, json.dumps(result))
 
     def test_binding_keys_and_binding_scan_do_not_call_user_code(self):
-        inspect = load_helper()
+        inspect = load_helper(self.source_path)
         calls = []
 
         class Name(str):
@@ -139,6 +141,10 @@ class KernelInspectionTests(unittest.TestCase):
 
         self.assertEqual(inspect(Scope(normal=[])), {"objects": [], "truncated": True})
         self.assertEqual(calls, [])
+
+
+class SshKernelInspectionTests(KernelInspectionTests):
+    source_path = "crates/omicsops-adapters/src/kernel.rs"
 
 
 if __name__ == "__main__":

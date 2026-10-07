@@ -70,8 +70,12 @@ pub enum KernelState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum KernelRequest {
+    Inspect {
+        session_id: Uuid,
+        request_id: Uuid,
+    },
     Execute {
         session_id: Uuid,
         request_id: Uuid,
@@ -85,8 +89,17 @@ pub enum KernelRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+#[serde(
+    tag = "kind",
+    content = "payload",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum KernelEventKind {
+    Inspection {
+        objects: Vec<omicsops_protocol::KernelObjectMetadataV4>,
+        truncated: bool,
+    },
     Started,
     Stdout(String),
     Stderr(String),
@@ -118,6 +131,7 @@ pub struct KernelEventDecoder {
     session_id: Uuid,
     request_id: Uuid,
     next_sequence: u64,
+    terminal: bool,
 }
 
 impl KernelEventDecoder {
@@ -127,10 +141,16 @@ impl KernelEventDecoder {
             session_id,
             request_id,
             next_sequence: 1,
+            terminal: false,
         }
     }
 
     pub fn accept(&mut self, event: KernelEvent) -> AgentResult<KernelEvent> {
+        if self.terminal {
+            return Err(AgentError::KernelProtocol(
+                "kernel event followed a terminal".into(),
+            ));
+        }
         if event.project_id != self.project_id
             || event.session_id != self.session_id
             || event.request_id != self.request_id
@@ -144,6 +164,22 @@ impl KernelEventDecoder {
                 "expected kernel sequence {}, received {}",
                 self.next_sequence, event.sequence
             )));
+        }
+        self.terminal = matches!(
+            event.event,
+            KernelEventKind::Inspection { .. }
+                | KernelEventKind::Completed
+                | KernelEventKind::Failed { .. }
+                | KernelEventKind::Stopped
+        );
+        if let KernelEventKind::Inspection { objects, truncated } = &event.event {
+            omicsops_protocol::validate_inspection_payload(
+                &omicsops_protocol::KernelInspectionPayloadV4 {
+                    objects: objects.clone(),
+                    truncated: *truncated,
+                },
+            )
+            .map_err(|_| AgentError::KernelProtocol("invalid kernel inspection".into()))?;
         }
         self.next_sequence += 1;
         Ok(event)
@@ -252,5 +288,90 @@ impl KernelSession {
             code: code.clone(),
             code_sha256: hex::encode(hasher.finalize()),
         })
+    }
+}
+
+#[cfg(test)]
+mod inspection_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn frame(project_id: Uuid, session_id: Uuid, request_id: Uuid, sequence: u64) -> KernelEvent {
+        serde_json::from_value(json!({"project_id":project_id,"session_id":session_id,"request_id":request_id, "sequence":sequence,"occurred_at":"2026-10-04T00:00:00Z", "event":{"kind":"inspection","payload":{"objects":[],"truncated":false}}})).unwrap()
+    }
+
+    #[test]
+    fn inspect_typed_events_reject_identity_sequence_and_duplicate_terminal() {
+        let (p, s, r) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut decoder = KernelEventDecoder::new(p, s, r);
+        assert!(decoder.accept(frame(p, Uuid::new_v4(), r, 1)).is_err());
+        assert!(decoder.accept(frame(p, s, Uuid::new_v4(), 1)).is_err());
+        assert!(decoder.accept(frame(p, s, r, 2)).is_err());
+        assert!(decoder.accept(frame(p, s, r, 1)).is_ok());
+        assert!(decoder.accept(frame(p, s, r, 2)).is_err());
+    }
+
+    #[test]
+    fn inspection_preserves_execute_shutdown_serialization() {
+        let s = Uuid::nil();
+        let r = Uuid::nil();
+        assert_eq!(
+            serde_json::to_value(KernelRequest::Execute {
+                session_id: s,
+                request_id: r,
+                code: "x=1".into(),
+                capture_paths: vec![]
+            })
+            .unwrap(),
+            json!({"action":"execute","session_id":s,"request_id":r,"code":"x=1","capture_paths":[]})
+        );
+        assert_eq!(
+            serde_json::to_value(KernelRequest::Shutdown {
+                session_id: s,
+                request_id: r
+            })
+            .unwrap(),
+            json!({"action":"shutdown","session_id":s,"request_id":r})
+        );
+        let request: KernelRequest =
+            serde_json::from_value(json!({"action":"inspect","session_id":s,"request_id":r}))
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            json!({"action":"inspect","session_id":s,"request_id":r})
+        );
+        assert!(
+            serde_json::from_value::<KernelRequest>(
+                json!({"action":"inspect","session_id":s,"request_id":r,"code":"secret"})
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn inspection_closed_payload_and_budget() {
+        let (p, s, r) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut value = serde_json::to_value(frame(p, s, r, 1)).unwrap();
+        value["event"]["payload"]["value"] = json!("SECRET_SENTINEL");
+        assert!(serde_json::from_value::<KernelEvent>(value).is_err());
+        let object = omicsops_protocol::KernelObjectMetadataV4 {
+            name: "x".into(),
+            type_label: "list".into(),
+            dimensions: None,
+            element_count: Some(0),
+            summary: "list, metadata only".into(),
+        };
+        let event = KernelEvent {
+            event: KernelEventKind::Inspection {
+                objects: vec![object; 65],
+                truncated: true,
+            },
+            ..frame(p, s, r, 1)
+        };
+        assert!(KernelEventDecoder::new(p, s, r).accept(event).is_err());
+        assert!(
+            KernelEventDecoder::new(p, s, r)
+                .accept(frame(Uuid::new_v4(), s, r, 1))
+                .is_err()
+        );
     }
 }

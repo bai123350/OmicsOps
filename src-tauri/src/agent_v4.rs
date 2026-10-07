@@ -7737,6 +7737,14 @@ impl KernelProcessV4 for SshKernelProcessV4 {
     fn is_healthy(&self) -> bool {
         self.healthy.load(Ordering::SeqCst)
     }
+    async fn inspect(
+        &self,
+    ) -> Result<
+        omicsops_protocol::KernelInspectionPayloadV4,
+        omicsops_runtime::KernelInspectionErrorV4,
+    > {
+        ssh_inspect_locked_v4(&self.process, &self.healthy, self.project_id, self.id).await
+    }
     async fn execute(
         &self,
         code: String,
@@ -7746,50 +7754,17 @@ impl KernelProcessV4 for SshKernelProcessV4 {
             let request_id = Uuid::new_v4();
             let mut guard = self.process.lock().await;
             let process = guard.as_mut().ok_or("kernel is stopped")?;
-            process
-                .send(&KernelRequest::Execute {
-                    session_id: self.id,
-                    request_id,
-                    code,
-                    capture_paths,
-                })
-                .await
-                .map_err(|e| e.to_string())?;
-            let mut decoder = KernelEventDecoder::new(self.project_id, self.id, request_id);
-            let mut stdout = String::new();
-            let mut stderr = String::new();
-            let mut artifacts = Vec::new();
-            let mut succeeded = false;
-            loop {
-                let event: KernelEvent = process
-                    .receive()
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .ok_or("kernel disconnected")?;
-                let event = decoder.accept(event).map_err(|e| e.to_string())?;
-                match event.event {
-                    KernelEventKind::Stdout(content) => stdout.push_str(&content),
-                    KernelEventKind::Stderr(content) => stderr.push_str(&content),
-                    KernelEventKind::Artifact {
-                        relative_path,
-                        size_bytes,
-                        sha256,
-                    } => artifacts.push(RuntimeArtifactV4 {
-                        relative_path,
-                        size_bytes,
-                        sha256,
-                    }),
-                    KernelEventKind::Completed => {
-                        succeeded = true;
-                        break;
-                    }
-                    KernelEventKind::Failed { message } => {
-                        stderr.push_str(&message);
-                        break;
-                    }
-                    _ => {}
-                }
-            }
+            let (stdout, stderr, artifacts, succeeded) = ssh_execute_exchange_v4(
+                process,
+                &self.healthy,
+                self.project_id,
+                self.id,
+                request_id,
+                code,
+                capture_paths,
+            )
+            .await
+            .map_err(|_| "kernel stream unavailable".to_owned())?;
             self.session
                 .execute_checked(&format!("mkdir -p {}", shell_quote(&self.output_dir)))
                 .await
@@ -7812,8 +7787,8 @@ impl KernelProcessV4 for SshKernelProcessV4 {
         .await;
         if result.is_err() {
             // An unconfirmed SSH transport/decoder result may leave unread
-            // events on the JSONL stream. The next cell must acquire a new
-            // remote process; the failed cell itself is never replayed.
+            // events on the JSONL stream. This process cannot be reused;
+            // the uncertain request is never replayed or called cancelled.
             self.healthy.store(false, Ordering::SeqCst);
         }
         result
@@ -7823,6 +7798,518 @@ impl KernelProcessV4 for SshKernelProcessV4 {
             process.shutdown().await.map_err(|e| e.to_string())?
         }
         Ok(())
+    }
+}
+
+#[async_trait]
+trait SshKernelTransportV4: Send {
+    fn ensure_clean(&mut self) -> Result<(), omicsops_runtime::KernelInspectionErrorV4>;
+    async fn send_request(
+        &mut self,
+        request: &KernelRequest,
+    ) -> Result<(), omicsops_runtime::KernelInspectionErrorV4>;
+    async fn receive_event(
+        &mut self,
+        limit: usize,
+    ) -> Result<Option<KernelEvent>, omicsops_runtime::KernelInspectionErrorV4>;
+}
+#[async_trait]
+impl SshKernelTransportV4 for SshJsonlProcess {
+    fn ensure_clean(&mut self) -> Result<(), omicsops_runtime::KernelInspectionErrorV4> {
+        SshJsonlProcess::ensure_clean(self)
+            .map_err(|_| omicsops_runtime::KernelInspectionErrorV4::Protocol)
+    }
+    async fn send_request(
+        &mut self,
+        request: &KernelRequest,
+    ) -> Result<(), omicsops_runtime::KernelInspectionErrorV4> {
+        self.send(request)
+            .await
+            .map_err(|_| omicsops_runtime::KernelInspectionErrorV4::Unavailable)
+    }
+    async fn receive_event(
+        &mut self,
+        limit: usize,
+    ) -> Result<Option<KernelEvent>, omicsops_runtime::KernelInspectionErrorV4> {
+        if limit == 1024 * 1024 {
+            self.receive().await
+        } else {
+            self.receive_bounded(limit).await
+        }
+        .map_err(|_| omicsops_runtime::KernelInspectionErrorV4::Protocol)
+    }
+}
+// Armed before write may begin, dropped before the enclosing process lock.
+// Cancelling local waiting does not cancel or replay remote computation.
+struct SshSentRequestHealthGuardV4<'a> {
+    healthy: &'a AtomicBool,
+    verified: bool,
+}
+impl Drop for SshSentRequestHealthGuardV4<'_> {
+    fn drop(&mut self) {
+        if !self.verified {
+            self.healthy.store(false, Ordering::SeqCst);
+        }
+    }
+}
+fn ssh_presend_v4(
+    transport: &mut impl SshKernelTransportV4,
+    healthy: &AtomicBool,
+) -> Result<(), omicsops_runtime::KernelInspectionErrorV4> {
+    if !healthy.load(Ordering::SeqCst) {
+        return Err(omicsops_runtime::KernelInspectionErrorV4::Unavailable);
+    }
+    if let Err(error) = transport.ensure_clean() {
+        healthy.store(false, Ordering::SeqCst);
+        return Err(error);
+    }
+    Ok(())
+}
+async fn ssh_inspect_locked_v4(
+    transport: &Mutex<Option<impl SshKernelTransportV4>>,
+    healthy: &AtomicBool,
+    project: Uuid,
+    session: Uuid,
+) -> Result<omicsops_protocol::KernelInspectionPayloadV4, omicsops_runtime::KernelInspectionErrorV4>
+{
+    use omicsops_runtime::KernelInspectionErrorV4 as E;
+    let mut guard = transport.try_lock().map_err(|_| E::Busy)?;
+    if !healthy.load(Ordering::SeqCst) {
+        return Err(E::Unavailable);
+    }
+    ssh_inspect_exchange_v4(
+        guard.as_mut().ok_or(E::Unavailable)?,
+        healthy,
+        project,
+        session,
+    )
+    .await
+}
+async fn ssh_inspect_exchange_v4(
+    transport: &mut impl SshKernelTransportV4,
+    healthy: &AtomicBool,
+    project: Uuid,
+    session: Uuid,
+) -> Result<omicsops_protocol::KernelInspectionPayloadV4, omicsops_runtime::KernelInspectionErrorV4>
+{
+    use omicsops_runtime::KernelInspectionErrorV4 as E;
+    ssh_presend_v4(transport, healthy)?;
+    let request = Uuid::new_v4();
+    let mut health = SshSentRequestHealthGuardV4 {
+        healthy,
+        verified: false,
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(omicsops_protocol::KERNEL_INSPECTION_TIMEOUT_SECONDS),
+        async {
+            transport
+                .send_request(&KernelRequest::Inspect {
+                    session_id: session,
+                    request_id: request,
+                })
+                .await?;
+            let event = transport
+                .receive_event(omicsops_protocol::KERNEL_INSPECTION_MAX_RESPONSE_BYTES)
+                .await?
+                .ok_or(E::Protocol)?;
+            let event = KernelEventDecoder::new(project, session, request)
+                .accept(event)
+                .map_err(|_| E::Protocol)?;
+            let KernelEventKind::Inspection { objects, truncated } = event.event else {
+                return Err(E::Protocol);
+            };
+            let payload = omicsops_protocol::KernelInspectionPayloadV4 { objects, truncated };
+            omicsops_protocol::validate_inspection_payload(&payload).map_err(|_| E::Protocol)?;
+            transport.ensure_clean()?;
+            Ok(payload)
+        },
+    )
+    .await
+    .map_err(|_| E::Unavailable)?;
+    if result.is_ok() {
+        health.verified = true;
+    }
+    result
+}
+async fn ssh_execute_exchange_v4(
+    transport: &mut impl SshKernelTransportV4,
+    healthy: &AtomicBool,
+    project: Uuid,
+    session: Uuid,
+    request: Uuid,
+    code: String,
+    capture_paths: Vec<String>,
+) -> Result<(String, String, Vec<RuntimeArtifactV4>, bool), omicsops_runtime::KernelInspectionErrorV4>
+{
+    use omicsops_runtime::KernelInspectionErrorV4 as E;
+    ssh_presend_v4(transport, healthy)?;
+    let mut health = SshSentRequestHealthGuardV4 {
+        healthy,
+        verified: false,
+    };
+    transport
+        .send_request(&KernelRequest::Execute {
+            session_id: session,
+            request_id: request,
+            code,
+            capture_paths,
+        })
+        .await?;
+    let mut decoder = KernelEventDecoder::new(project, session, request);
+    let (mut stdout, mut stderr, mut artifacts, mut succeeded) =
+        (String::new(), String::new(), vec![], false);
+    loop {
+        let event = transport
+            .receive_event(1024 * 1024)
+            .await?
+            .ok_or(E::Unavailable)?;
+        let event = decoder.accept(event).map_err(|_| E::Protocol)?;
+        match event.event {
+            KernelEventKind::Started => {}
+            KernelEventKind::Stdout(content) => stdout.push_str(&content),
+            KernelEventKind::Stderr(content) => stderr.push_str(&content),
+            KernelEventKind::Artifact {
+                relative_path,
+                size_bytes,
+                sha256,
+            } => artifacts.push(RuntimeArtifactV4 {
+                relative_path,
+                size_bytes,
+                sha256,
+            }),
+            KernelEventKind::Completed => {
+                succeeded = true;
+                break;
+            }
+            KernelEventKind::Failed { message } => {
+                stderr.push_str(&message);
+                break;
+            }
+            _ => return Err(E::Protocol),
+        }
+    }
+    transport.ensure_clean()?;
+    health.verified = true;
+    Ok((stdout, stderr, artifacts, succeeded))
+}
+
+#[cfg(test)]
+mod ssh_inspect_tests {
+    use super::*;
+    use omicsops_runtime::KernelInspectionErrorV4;
+    use std::collections::VecDeque;
+    struct Fake {
+        frames: VecDeque<KernelEvent>,
+        sends: Vec<KernelRequest>,
+        pending_send: bool,
+        dirty: bool,
+        dirty_after_receive: bool,
+        execute_frame: Option<KernelEvent>,
+    }
+    #[async_trait]
+    impl SshKernelTransportV4 for Fake {
+        fn ensure_clean(&mut self) -> Result<(), KernelInspectionErrorV4> {
+            if self.dirty {
+                Err(KernelInspectionErrorV4::Protocol)
+            } else {
+                Ok(())
+            }
+        }
+        async fn send_request(
+            &mut self,
+            request: &KernelRequest,
+        ) -> Result<(), KernelInspectionErrorV4> {
+            self.sends.push(request.clone());
+            if self.pending_send {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+        async fn receive_event(
+            &mut self,
+            _: usize,
+        ) -> Result<Option<KernelEvent>, KernelInspectionErrorV4> {
+            if matches!(self.sends.last(), Some(KernelRequest::Execute { .. })) {
+                if let Some(event) = self.execute_frame.take() {
+                    self.frames.push_back(event);
+                }
+            }
+            if let Some(mut event) = self.frames.pop_front() {
+                let request = self.sends.last().unwrap();
+                event.request_id = match request {
+                    KernelRequest::Inspect { request_id, .. }
+                    | KernelRequest::Execute { request_id, .. }
+                    | KernelRequest::Shutdown { request_id, .. } => *request_id,
+                };
+                self.dirty = self.dirty_after_receive;
+                return Ok(Some(event));
+            }
+            std::future::pending().await
+        }
+    }
+    fn fake() -> Fake {
+        Fake {
+            frames: VecDeque::new(),
+            sends: vec![],
+            pending_send: false,
+            dirty: false,
+            dirty_after_receive: false,
+            execute_frame: None,
+        }
+    }
+    fn terminal(p: Uuid, s: Uuid, event: KernelEventKind) -> KernelEvent {
+        KernelEvent {
+            project_id: p,
+            session_id: s,
+            request_id: Uuid::nil(),
+            sequence: 1,
+            occurred_at: Utc::now(),
+            event,
+        }
+    }
+    #[tokio::test]
+    async fn ssh_inspect_real_mutex_busy_and_queued_execute_after_cancellation() {
+        let (p, s) = (Uuid::new_v4(), Uuid::new_v4());
+        let healthy = AtomicBool::new(true);
+        let mut fake = fake();
+        fake.execute_frame = Some(terminal(p, s, KernelEventKind::Completed));
+        let transport = Mutex::new(Some(fake));
+        let mut inspection = Box::pin(ssh_inspect_locked_v4(&transport, &healthy, p, s));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                inspection.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        assert_eq!(
+            ssh_inspect_locked_v4(&transport, &healthy, p, s).await,
+            Err(omicsops_runtime::KernelInspectionErrorV4::Busy)
+        );
+        let mut queued = Box::pin(async {
+            let mut guard = transport.lock().await;
+            ssh_execute_exchange_v4(
+                guard.as_mut().unwrap(),
+                &healthy,
+                p,
+                s,
+                Uuid::new_v4(),
+                "x=1".into(),
+                vec![],
+            )
+            .await
+        });
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                queued.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        assert!(healthy.load(Ordering::SeqCst));
+        drop(inspection);
+        assert!(queued.await.is_err());
+        let guard = transport.lock().await;
+        assert_eq!(guard.as_ref().unwrap().sends.len(), 1);
+    }
+    #[tokio::test]
+    async fn ssh_inspect_strict_terminal_and_preserved_execute_results() {
+        let (p, s) = (Uuid::new_v4(), Uuid::new_v4());
+        for event in [
+            terminal(
+                p,
+                Uuid::new_v4(),
+                KernelEventKind::Inspection {
+                    objects: vec![],
+                    truncated: false,
+                },
+            ),
+            terminal(p, s, KernelEventKind::Completed),
+            KernelEvent {
+                sequence: 2,
+                ..terminal(
+                    p,
+                    s,
+                    KernelEventKind::Inspection {
+                        objects: vec![],
+                        truncated: false,
+                    },
+                )
+            },
+        ] {
+            let healthy = AtomicBool::new(true);
+            let mut t = fake();
+            t.frames.push_back(event);
+            assert!(
+                ssh_inspect_exchange_v4(&mut t, &healthy, p, s)
+                    .await
+                    .is_err()
+            );
+            assert!(!healthy.load(Ordering::SeqCst));
+        }
+        for terminal_kind in [
+            KernelEventKind::Completed,
+            KernelEventKind::Failed {
+                message: "expected code error".into(),
+            },
+        ] {
+            let healthy = AtomicBool::new(true);
+            let mut t = fake();
+            let kinds = vec![
+                KernelEventKind::Started,
+                KernelEventKind::Stdout("output".into()),
+                KernelEventKind::Stderr("warning".into()),
+                KernelEventKind::Artifact {
+                    relative_path: "a.txt".into(),
+                    size_bytes: 12,
+                    sha256: "a".repeat(64),
+                },
+                terminal_kind,
+            ];
+            for (i, kind) in kinds.into_iter().enumerate() {
+                t.frames.push_back(KernelEvent {
+                    sequence: (i + 1) as u64,
+                    ..terminal(p, s, kind)
+                });
+            }
+            let (stdout, stderr, artifacts, succeeded) = ssh_execute_exchange_v4(
+                &mut t,
+                &healthy,
+                p,
+                s,
+                Uuid::new_v4(),
+                "x=1".into(),
+                vec!["a.txt".into()],
+            )
+            .await
+            .unwrap();
+            assert_eq!(stdout, "output");
+            assert!(stderr.starts_with("warning"));
+            assert_eq!(artifacts.len(), 1);
+            assert_eq!(artifacts[0].relative_path, "a.txt");
+            assert!(healthy.load(Ordering::SeqCst));
+            if succeeded {
+                assert_eq!(stderr, "warning");
+            } else {
+                assert!(stderr.contains("expected code error"));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn ssh_inspect_does_not_execute_or_reconnect() {
+        let (p, s) = (Uuid::new_v4(), Uuid::new_v4());
+        let healthy = AtomicBool::new(true);
+        let mut t = fake();
+        t.frames.push_back(terminal(
+            p,
+            s,
+            KernelEventKind::Inspection {
+                objects: vec![],
+                truncated: false,
+            },
+        ));
+        assert!(
+            ssh_inspect_exchange_v4(&mut t, &healthy, p, s)
+                .await
+                .is_ok()
+        );
+        assert_eq!(t.sends.len(), 1);
+        assert!(matches!(t.sends[0], KernelRequest::Inspect { .. }));
+        assert!(healthy.load(Ordering::SeqCst));
+    }
+    #[tokio::test]
+    async fn ssh_inspect_sent_cancel_and_partial_write_invalidate_before_queued_execute() {
+        for partial in [false, true] {
+            let (p, s) = (Uuid::new_v4(), Uuid::new_v4());
+            let healthy = AtomicBool::new(true);
+            let mut t = fake();
+            t.pending_send = partial;
+            let mut inspect = Box::pin(ssh_inspect_exchange_v4(&mut t, &healthy, p, s));
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    inspect.as_mut().poll(cx).is_pending()
+                ))
+                .await
+            );
+            assert!(healthy.load(Ordering::SeqCst));
+            drop(inspect);
+            assert!(!healthy.load(Ordering::SeqCst));
+            let before = t.sends.len();
+            assert!(
+                ssh_execute_exchange_v4(
+                    &mut t,
+                    &healthy,
+                    p,
+                    s,
+                    Uuid::new_v4(),
+                    "x=1".into(),
+                    vec![]
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(t.sends.len(), before);
+        }
+    }
+    #[tokio::test]
+    async fn ssh_inspect_execute_read_cancel_blocks_reuse() {
+        let (p, s) = (Uuid::new_v4(), Uuid::new_v4());
+        let healthy = AtomicBool::new(true);
+        let mut t = fake();
+        let mut execute = Box::pin(ssh_execute_exchange_v4(
+            &mut t,
+            &healthy,
+            p,
+            s,
+            Uuid::new_v4(),
+            "x=1".into(),
+            vec![],
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                execute.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        assert!(healthy.load(Ordering::SeqCst));
+        drop(execute);
+        assert!(!healthy.load(Ordering::SeqCst));
+        assert!(
+            ssh_inspect_exchange_v4(&mut t, &healthy, p, s)
+                .await
+                .is_err()
+        );
+        assert_eq!(t.sends.len(), 1);
+    }
+    #[tokio::test]
+    async fn ssh_inspect_presend_and_postterminal_contamination_are_rejected() {
+        let (p, s) = (Uuid::new_v4(), Uuid::new_v4());
+        let healthy = AtomicBool::new(true);
+        let mut t = fake();
+        t.dirty = true;
+        assert!(
+            ssh_inspect_exchange_v4(&mut t, &healthy, p, s)
+                .await
+                .is_err()
+        );
+        assert!(t.sends.is_empty());
+        assert!(!healthy.load(Ordering::SeqCst));
+        let healthy = AtomicBool::new(true);
+        let mut t = fake();
+        t.dirty_after_receive = true;
+        t.frames.push_back(terminal(
+            p,
+            s,
+            KernelEventKind::Inspection {
+                objects: vec![],
+                truncated: false,
+            },
+        ));
+        assert!(
+            ssh_inspect_exchange_v4(&mut t, &healthy, p, s)
+                .await
+                .is_err()
+        );
+        assert_eq!(t.sends.len(), 1);
+        assert!(!healthy.load(Ordering::SeqCst));
     }
 }
 

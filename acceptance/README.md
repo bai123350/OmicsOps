@@ -636,3 +636,15 @@ does not exercise the new MCP or Runtime behavior with scientific data. SSH,
 scientific provenance and native UI research acceptance remain unexecuted.
 The read-only historical diagnosis and the remaining manual smoke steps are in
 `docs/superpowers/specs/2026-10-04-go-agent-latency-diagnosis.md`.
+
+## W04：一次性本地 R 内核对象检查（显式 opt-in）
+
+先完成默认确定性检查，准备独立的一次性本地目录与已安装 `Rscript`、`jsonlite` 的环境。此 ignored fixture 使用临时目录启动一个本地 SSH typed worker 脚本，检查 active binding、delayedAssign、基础矩阵及 S3/S4 对象；不连接 SSH，不读取真实项目，不安装依赖。
+
+```powershell
+$env:OMICSOPS_LIVE_R_INSPECTION_DISPOSABLE = '1'
+cargo test -p omicsops-adapters --lib kernel::kernel_inspection_tests::live_r_inspection_bindings_have_no_side_effects -- --ignored --exact
+Remove-Item Env:OMICSOPS_LIVE_R_INSPECTION_DISPOSABLE
+```
+
+必须记录实际命令和结果。默认测试中的 ignored 不代表通过；未显式执行时记录“未执行”。mock transport 和 Python AST helper 测试不证明真实 R 或 SSH 端到端验收。检查只返回基础元数据，不强制 promise 或调用用户方法；未求值表达式与 S3/S4 保守保持 opaque。SSH readiness 只检查当前 buffer/russh 可观测队列，不保证 clean 检查后任意网络帧不会到达。已派发检查/执行的等待被取消时会话不再复用，不表示远端计算已取消。

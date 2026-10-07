@@ -241,7 +241,97 @@ pub struct SshJsonlProcess {
     writer: WriteHalf<russh::ChannelStream<client::Msg>>,
 }
 
+// ChannelStream's ChannelRx polls its leftover buffer/mpsc receiver directly.
+// Control messages wake then return Pending: only an unwoken Pending means
+// the currently observable queue is empty. No network-in-flight guarantee.
+fn jsonl_ensure_clean(reader: &mut BufReader<impl AsyncRead + Unpin>) -> AdapterResult<()> {
+    use std::{
+        pin::Pin,
+        sync::atomic::{AtomicBool, Ordering},
+        task::{Context, Poll, Wake, Waker},
+    };
+    use tokio::io::AsyncBufRead;
+    struct Probe(AtomicBool);
+    impl Wake for Probe {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    if !reader.buffer().is_empty() {
+        return Err(AdapterError::InvalidInput(
+            "kernel stream contains queued data".into(),
+        ));
+    }
+    let probe = Arc::new(Probe(AtomicBool::new(false)));
+    let waker = Waker::from(probe.clone());
+    let mut context = Context::from_waker(&waker);
+    for _ in 0..4096 {
+        probe.0.store(false, Ordering::SeqCst);
+        match Pin::new(&mut *reader).poll_fill_buf(&mut context) {
+            Poll::Pending if !probe.0.load(Ordering::SeqCst) => return Ok(()),
+            Poll::Pending => {}
+            Poll::Ready(Ok(_)) => {
+                return Err(AdapterError::InvalidInput(
+                    "kernel stream is not clean".into(),
+                ));
+            }
+            Poll::Ready(Err(_)) => {
+                return Err(AdapterError::InvalidInput(
+                    "kernel stream unavailable".into(),
+                ));
+            }
+        }
+    }
+    Err(AdapterError::InvalidInput(
+        "kernel stream readiness limit".into(),
+    ))
+}
+
+async fn jsonl_receive_bounded<T: serde::de::DeserializeOwned>(
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+    limit: usize,
+) -> AdapterResult<Option<T>> {
+    let mut frame = Vec::new();
+    loop {
+        let bytes = reader.fill_buf().await?;
+        if bytes.is_empty() {
+            if frame.is_empty() {
+                return Ok(None);
+            }
+            return Err(AdapterError::InvalidInput(
+                "kernel frame lacks newline".into(),
+            ));
+        }
+        let newline = bytes.iter().position(|b| *b == b'\n');
+        let count = newline.map_or(bytes.len(), |i| i + 1);
+        if frame.len().saturating_add(count) > limit {
+            return Err(AdapterError::InvalidInput(
+                "kernel frame exceeds limit".into(),
+            ));
+        }
+        frame.extend_from_slice(&bytes[..count]);
+        reader.consume(count);
+        if newline.is_some() {
+            return Ok(Some(serde_json::from_slice(&frame)?));
+        }
+    }
+}
+
 impl SshJsonlProcess {
+    /// Only for this ChannelStream transport; no new reader or background I/O.
+    pub fn ensure_clean(&mut self) -> AdapterResult<()> {
+        jsonl_ensure_clean(&mut self.reader)
+    }
+    pub async fn receive_bounded<T: serde::de::DeserializeOwned>(
+        &mut self,
+        limit: usize,
+    ) -> AdapterResult<Option<T>> {
+        jsonl_receive_bounded(&mut self.reader, limit).await
+    }
+
     pub async fn send<T: Serialize>(&mut self, value: &T) -> AdapterResult<()> {
         let mut line = serde_json::to_vec(value)?;
         line.push(b'\n');
@@ -792,4 +882,132 @@ pub async fn write_verified_atomic<R: AsyncRead + Unpin>(
 
 fn ssh_error(error: russh::Error) -> AdapterError {
     AdapterError::Ssh(error.to_string())
+}
+
+#[cfg(test)]
+mod kernel_transport_tests {
+    use super::*;
+    use std::{
+        collections::VecDeque,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::ReadBuf;
+    enum Item {
+        Control,
+        Data(Vec<u8>),
+        Eof,
+        Error,
+    }
+    struct Queue(VecDeque<Item>);
+    impl AsyncRead for Queue {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            out: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            match self.0.pop_front() {
+                Some(Item::Control) => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Some(Item::Data(mut data)) => {
+                    let count = data.len().min(out.remaining());
+                    out.put_slice(&data[..count]);
+                    data.drain(..count);
+                    if !data.is_empty() {
+                        self.0.push_front(Item::Data(data));
+                    }
+                    Poll::Ready(Ok(()))
+                }
+                Some(Item::Eof) => Poll::Ready(Ok(())),
+                Some(Item::Error) => Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into())),
+                None => Poll::Pending,
+            }
+        }
+    }
+    #[test]
+    fn kernel_observable_queue_handles_control_pending() {
+        for items in [
+            vec![Item::Control, Item::Data(b"duplicate\n".to_vec())],
+            vec![Item::Eof],
+            vec![Item::Error],
+            (0..4096).map(|_| Item::Control).collect(),
+        ] {
+            assert!(jsonl_ensure_clean(&mut BufReader::new(Queue(items.into()))).is_err());
+        }
+        assert!(jsonl_ensure_clean(&mut BufReader::new(Queue(vec![Item::Control].into()))).is_ok());
+    }
+    #[tokio::test]
+    async fn kernel_bounded_receive_rejects_before_excess_allocation_and_checks_next_slice() {
+        let mut reader = BufReader::with_capacity(
+            8,
+            Queue(vec![Item::Data(b"{\"x\":1}\nnext".to_vec())].into()),
+        );
+        let value: Option<serde_json::Value> = jsonl_receive_bounded(&mut reader, 8).await.unwrap();
+        assert_eq!(value.unwrap()["x"], 1);
+        assert!(jsonl_ensure_clean(&mut reader).is_err());
+        let mut reader =
+            BufReader::with_capacity(8, Queue(vec![Item::Data(vec![b'x'; 17])].into()));
+        assert!(
+            jsonl_receive_bounded::<serde_json::Value>(&mut reader, 16)
+                .await
+                .is_err()
+        );
+        assert!(
+            jsonl_receive_bounded::<serde_json::Value>(
+                &mut BufReader::new(Queue(vec![Item::Eof].into())),
+                16
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+    }
+    #[tokio::test]
+    async fn kernel_bounded_receive_exact_limit_partial_and_duplicate_boundaries() {
+        for size in [8192, 16384] {
+            let mut frame = b"{}".to_vec();
+            frame.resize(size - 1, b' ');
+            frame.push(b'\n');
+            let mut unique =
+                BufReader::with_capacity(8192, Queue(vec![Item::Data(frame.clone())].into()));
+            assert!(
+                jsonl_receive_bounded::<serde_json::Value>(&mut unique, 16384)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(jsonl_ensure_clean(&mut unique).is_ok());
+            frame.extend_from_slice(b"{}\n");
+            let mut duplicate =
+                BufReader::with_capacity(8192, Queue(vec![Item::Data(frame)].into()));
+            assert!(
+                jsonl_receive_bounded::<serde_json::Value>(&mut duplicate, 16384)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(jsonl_ensure_clean(&mut duplicate).is_err());
+        }
+        let mut over = b"{}".to_vec();
+        over.resize(16384, b' ');
+        over.push(b'\n');
+        assert!(
+            jsonl_receive_bounded::<serde_json::Value>(
+                &mut BufReader::new(Queue(vec![Item::Data(over)].into())),
+                16384
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            jsonl_receive_bounded::<serde_json::Value>(
+                &mut BufReader::new(Queue(vec![Item::Data(b"{}".to_vec()), Item::Eof].into())),
+                16384
+            )
+            .await
+            .is_err()
+        );
+    }
 }
