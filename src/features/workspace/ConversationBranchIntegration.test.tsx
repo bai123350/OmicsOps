@@ -1,6 +1,8 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vitest";
 import { WorkspaceShell } from "./WorkspaceShell";
+import { ComposerDraftStore } from "./composerDrafts";
+import type { ConversationBranchV4 } from "../../types";
 import * as api from "../../conversation-branch-api";
 vi.mock("../../conversation-branch-api", () => ({ getConversationBranch: vi.fn(), conversationBranchCheckpoint: vi.fn(), createConversationBranch: vi.fn() }));
 const checkpoint = { source_message_id: "u1", source_sequence: 1, source_head_sequence: 2, checkpoint_kind: "after_response" as const, boundary_hash: "hash" };
@@ -51,10 +53,19 @@ it("sends the composer draft through branch-and-send when the native flow is ava
   expect(input).toHaveValue("");
 });
 
-it("restores the selected user turn as a draft after message-level branching", async () => {
-  render(<WorkspaceShell {...base} onOpenBranch={vi.fn().mockResolvedValue(true)} />);
+it("restores the selected user turn into the returned branch draft and preserves the source draft", async () => {
+  const store = new ComposerDraftStore();
+  store.update({ projectId: "p1", conversationId: "c1" }, "Source notes");
+  const open = vi.fn(async (created: ConversationBranchV4) => {
+    view.rerender(<WorkspaceShell {...base} composerDraftStore={store} activeConversationId={created.branch_conversation_id} onOpenBranch={open} />);
+    return true;
+  });
+  const view = render(<WorkspaceShell {...base} composerDraftStore={store} onOpenBranch={open} />);
   fireEvent.click(screen.getByRole("button", { name: "Branch before this message" }));
   await waitFor(() => expect(screen.getByRole("textbox", { name: /Describe/ })).toHaveValue("First task"));
+  expect(open).toHaveBeenCalledWith(branch);
+  expect(store.read({ projectId: "p1", conversationId: "c1" }).text).toBe("Source notes");
+  expect(store.read({ projectId: "p1", conversationId: "b1" }).text).toBe("First task");
 });
 
 it("preserves the new scope draft after a delayed branch-and-send receipt", async () => {

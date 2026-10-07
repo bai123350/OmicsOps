@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ComputeBackendAvailabilityV4, RuntimeBoundaryViewV4 } from "../../types";
@@ -6,6 +6,7 @@ import { WorkspaceShell } from "./WorkspaceShell";
 import { ComposerDraftStore } from "./composerDrafts";
 import * as referenceApi from "../../composer-reference-api";
 import * as api from "../../tauri-api";
+import * as attachmentApi from "../../composer-attachment-api";
 import type { SideChatController } from "./useSideChat";
 
 afterEach(() => vi.restoreAllMocks());
@@ -53,6 +54,228 @@ function renderShell(overrides: Partial<React.ComponentProps<typeof WorkspaceShe
 function sideController(send = vi.fn().mockResolvedValue(true)): SideChatController {
   return { records: [], loading: false, ready: true, busy: false, pending: false, error: false, modelId: "side-model", setModelId: vi.fn(), draft: "", setDraft: vi.fn(), originalQuestion: undefined, send, retry: vi.fn().mockResolvedValue(true), refresh: vi.fn(), hasMore: false, loadingOlder: false, loadOlder: vi.fn() };
 }
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+type ReceiptRoute = "send" | "queue" | "replacement" | "side" | "branch" | "fork";
+function receiptFixture(route: ReceiptRoute, submit: ReturnType<typeof vi.fn>, retry = vi.fn().mockResolvedValue(true)) {
+  const props: Partial<React.ComponentProps<typeof WorkspaceShell>> = {
+    activeConversationId: "a", messages: [{ id: "u1", role: "user", markdown: "First task" }],
+  };
+  if (route === "send") props.onSend = submit;
+  if (route === "queue") props.onQueue = submit;
+  if (route === "replacement") Object.assign(props, {
+    onQueue: vi.fn(), activeRunId: "run", agentBusy: true,
+    agentRunEventsV4: [{ schema_version: 4, run_id: "run", project_id: project.id, conversation_id: "a", sequence: 1, previous_hash: "", event_hash: "head", occurred_at: "", event: { kind: "run_created", mode: "execute" } }],
+    replacement: { busy: false, pending: false, error: false, send: submit, retry },
+  });
+  if (route === "side") props.sideChat = { ...sideController(submit), retry };
+  if (route === "branch" || route === "fork") Object.assign(props, { onOpenBranch: vi.fn(), onBranchSend: submit, onRetryBranchSend: retry });
+  return props;
+}
+
+async function launchReceiptRoute(route: ReceiptRoute) {
+  if (route === "send" || route === "queue" || route === "fork") {
+    const button = screen.getByRole("button", { name: "Send" });
+    await waitFor(() => expect(button).toBeEnabled());
+    fireEvent.click(button);
+  } else {
+    fireEvent.click(screen.getByRole("button", { name: "Send options" }));
+    const name = route === "replacement" ? /Interrupt and replace/ : route === "side" ? /Side chat/ : /Branch conversation/;
+    const item = screen.getByRole("menuitem", { name });
+    await waitFor(() => expect(item).toBeEnabled());
+    fireEvent.click(item);
+  }
+}
+
+describe("composer receipt routing", () => {
+  const routes: ReceiptRoute[] = ["send", "queue", "replacement", "side", "branch", "fork"];
+  for (const route of routes) {
+    it.each(["offscreen", "unmounted", "same text", "return and edit", "unchanged", "rejected", "thrown"] as const)(`${route} protects the submitted revision: %s`, async (scenario) => {
+      const pending = deferred<boolean>();
+      const submit = vi.fn().mockReturnValue(pending.promise);
+      const store = new ComposerDraftStore();
+      const a = { projectId: project.id, conversationId: "a" };
+      const b = { ...a, conversationId: "b" };
+      const text = route === "fork" ? "/fork A notes" : "A notes";
+      store.update(a, text);
+      const props = { ...receiptFixture(route, submit), composerDraftStore: store };
+      const view = renderShell(props);
+      let input = screen.getByRole("textbox", { name: /Describe a research goal/ });
+      await launchReceiptRoute(route);
+      expect(submit).toHaveBeenCalledOnce();
+      expect(store.read(a).text).toBe(text); // Pending is never acceptance.
+      if (scenario === "unmounted") {
+        view.unmount();
+        renderShell({ ...props, activeConversationId: "b" });
+        input = screen.getByRole("textbox", { name: /Describe a research goal/ });
+        fireEvent.change(input, { target: { value: "B notes" } });
+      } else if (scenario === "offscreen") {
+        view.rerender(<WorkspaceShell project={project} locale="en-US" computeBackends={[localBackend]} computeBackendId="local" runtimeDraftSelection={runtimeSelection} {...props} activeConversationId="b" />);
+        fireEvent.change(input, { target: { value: "B notes" } });
+      } else if (scenario === "return and edit") {
+        view.rerender(<WorkspaceShell project={project} locale="en-US" {...props} activeConversationId="b" />);
+        view.rerender(<WorkspaceShell project={project} locale="en-US" {...props} activeConversationId="a" />);
+        fireEvent.change(input, { target: { value: "New edit" } });
+        fireEvent.change(input, { target: { value: text } });
+      } else if (scenario === "same text") {
+        fireEvent.change(input, { target: { value: "New edit" } });
+        fireEvent.change(input, { target: { value: text } });
+      }
+      await act(async () => { if (scenario === "thrown") pending.reject(new Error("unknown receipt")); else pending.resolve(scenario !== "rejected"); });
+      const offscreen = scenario === "offscreen" || scenario === "unmounted";
+      expect(store.read(a).text).toBe(offscreen || scenario === "unchanged" ? "" : text);
+      expect(input).toHaveValue(offscreen ? "B notes" : scenario === "unchanged" ? "" : text);
+      if (offscreen) expect(store.read(b).text).toBe("B notes");
+    });
+  }
+
+  for (const route of ["replacement", "side", "branch"] as const) {
+    it.each(["unchanged", "same text", "offscreen", "rejected", "thrown"] as const)(`${route} retry retains the original receipt: %s`, async (scenario) => {
+      const pending = deferred<boolean>();
+      const retry = vi.fn().mockReturnValue(pending.promise);
+      const store = new ComposerDraftStore();
+      const a = { projectId: project.id, conversationId: "a" };
+      store.update(a, "A notes");
+      let props = { ...receiptFixture(route, vi.fn().mockResolvedValue(false), retry), composerDraftStore: store };
+      const view = renderShell(props);
+      const input = screen.getByRole("textbox", { name: /Describe a research goal/ });
+      await launchReceiptRoute(route);
+      await act(async () => {});
+      if (route === "replacement") props = { ...props, replacement: { ...props.replacement!, pending: true, error: true, originalMarkdown: "A notes" } };
+      if (route === "side") props = { ...props, sideChat: { ...props.sideChat!, pending: true, error: true, originalQuestion: "A notes" } };
+      if (route === "branch") props = { ...props, branchSendPending: true, branchSendError: true, branchSendOriginalMarkdown: "A notes" };
+      const rerender = (activeConversationId = "a") => view.rerender(<WorkspaceShell project={project} locale="en-US" computeBackends={[localBackend]} computeBackendId="local" runtimeDraftSelection={runtimeSelection} {...props} activeConversationId={activeConversationId} />);
+      rerender();
+      if (scenario === "same text") {
+        fireEvent.change(input, { target: { value: "New edit" } });
+        fireEvent.change(input, { target: { value: "A notes" } });
+      }
+      const retryName = route === "replacement" ? "Reconcile original replacement" : route === "side" ? "Reconcile original question" : "Retry original branch send";
+      fireEvent.click(screen.getByRole("button", { name: retryName }));
+      expect(retry).toHaveBeenCalledOnce();
+      if (scenario === "offscreen") { rerender("b"); fireEvent.change(input, { target: { value: "B notes" } }); }
+      expect(store.read(a).text).toBe("A notes");
+      await act(async () => { if (scenario === "thrown") pending.reject(new Error("unknown retry")); else pending.resolve(scenario !== "rejected"); });
+      expect(store.read(a).text).toBe(scenario === "unchanged" || scenario === "offscreen" ? "" : "A notes");
+      expect(input).toHaveValue(scenario === "offscreen" ? "B notes" : scenario === "unchanged" ? "" : "A notes");
+    });
+  }
+
+  for (const route of ["replacement", "side", "branch"] as const) {
+    it(`${route} late acceptance leaves a newer attempt's retry receipt intact`, async () => {
+      const first = deferred<boolean>();
+      const second = deferred<boolean>();
+      const submit = vi.fn().mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+      const retry = vi.fn().mockResolvedValue(true);
+      const store = new ComposerDraftStore();
+      const scope = { projectId: project.id, conversationId: "a" };
+      store.update(scope, "First notes");
+      let props = { ...receiptFixture(route, submit, retry), composerDraftStore: store };
+      const view = renderShell(props);
+      const input = screen.getByRole("textbox", { name: /Describe a research goal/ });
+      await launchReceiptRoute(route);
+      fireEvent.change(input, { target: { value: "Second notes" } });
+      await launchReceiptRoute(route);
+      await act(async () => { first.resolve(true); second.resolve(false); });
+      expect(input).toHaveValue("Second notes");
+      if (route === "replacement") props = { ...props, replacement: { ...props.replacement!, pending: true, error: true, originalMarkdown: "Second notes" } };
+      if (route === "side") props = { ...props, sideChat: { ...props.sideChat!, pending: true, error: true, originalQuestion: "Second notes" } };
+      if (route === "branch") props = { ...props, branchSendPending: true, branchSendOriginalMarkdown: "Second notes" };
+      view.rerender(<WorkspaceShell project={project} locale="en-US" computeBackends={[localBackend]} computeBackendId="local" runtimeDraftSelection={runtimeSelection} {...props} />);
+      fireEvent.click(screen.getByRole("button", { name: route === "replacement" ? "Reconcile original replacement" : route === "side" ? "Reconcile original question" : "Retry original branch send" }));
+      await waitFor(() => expect(input).toHaveValue(""));
+      expect(retry).toHaveBeenCalledOnce();
+      expect(store.read(scope).text).toBe("");
+    });
+  }
+
+  for (const route of routes) {
+    it.each(["accepted", "rejected", "offscreen"] as const)(`${route} respects material receipt and scope guards: %s`, async (scenario) => {
+      const pending = deferred<boolean>();
+      const submit = vi.fn().mockReturnValue(pending.promise);
+      const item = { reference: { kind: "artifact" as const, project_id: project.id, id: "qc" }, label: "QC", description: "" };
+      const props = receiptFixture(route, submit);
+      const view = renderShell({ ...props, searchRequest: { key: "a-ref", kind: "attach", projectId: project.id, conversationId: "a", item } });
+      const input = screen.getByRole("textbox", { name: /Describe a research goal/ });
+      await waitFor(() => expect(input).toBeEnabled());
+      const receipt = { id: "a-image", project_id: project.id, conversation_id: "a", name: "a.png", relative_path: ".omicsops/attachments/a-image/a.png", size_bytes: 5, sha256: "hash", media_type: "image/png" };
+      const stage = vi.spyOn(attachmentApi, "stageComposerAttachment").mockResolvedValueOnce(receipt);
+      const pasteImage = (name: string) => fireEvent.paste(input, { clipboardData: { files: [new File(["bytes"], name, { type: "image/png" })] } });
+      pasteImage("a.png");
+      await screen.findByRole("button", { name: "Remove a.png" });
+      fireEvent.change(input, { target: { value: route === "fork" ? "/fork A notes" : "A notes" } });
+      await launchReceiptRoute(route);
+      if (scenario === "offscreen") {
+        stage.mockResolvedValueOnce({ ...receipt, id: "b-image", conversation_id: "b", name: "b.png", relative_path: ".omicsops/attachments/b-image/b.png" });
+        view.rerender(<WorkspaceShell project={project} locale="en-US" computeBackends={[localBackend]} computeBackendId="local" runtimeDraftSelection={runtimeSelection} {...props} activeConversationId="b" />);
+        view.rerender(<WorkspaceShell project={project} locale="en-US" computeBackends={[localBackend]} computeBackendId="local" runtimeDraftSelection={runtimeSelection} {...props} activeConversationId="b" searchRequest={{ key: "b-ref", kind: "attach", projectId: project.id, conversationId: "b", item }} />);
+        expect(screen.getByRole("button", { name: "Remove reference: QC" })).toBeInTheDocument();
+        await waitFor(() => expect(input).toBeEnabled());
+        pasteImage("b.png");
+        await screen.findByRole("button", { name: "Remove b.png" });
+      }
+      await act(async () => pending.resolve(scenario !== "rejected"));
+      expect(screen.queryByRole("button", { name: "Remove reference: QC" }) !== null).toBe(scenario !== "accepted");
+      expect(screen.queryByRole("button", { name: scenario === "offscreen" ? "Remove b.png" : "Remove a.png" }) !== null).toBe(scenario !== "accepted");
+    });
+  }
+
+  it.each(["Ask", "Ask again"] as const)("keeps main composer text when reconciling a later panel-only side question from %s", async (action) => {
+    const send = vi.fn().mockResolvedValue(false);
+    const retry = vi.fn().mockResolvedValue(true);
+    const store = new ComposerDraftStore();
+    const scope = { projectId: project.id, conversationId: "a" };
+    store.update(scope, "Composer notes");
+    let props = { ...receiptFixture("side", send, retry), composerDraftStore: store };
+    const view = renderShell(props);
+    await launchReceiptRoute("side");
+    await act(async () => {});
+    props = { ...props, sideChat: { ...props.sideChat!, draft: "Panel question", records: action === "Ask" ? [] : [{ id: "failed", request_id: "failed", project_id: project.id, conversation_id: "a", model_profile_id: "side-model", model_label: "Side model", source_snapshot_sha256: "snapshot", source_watermark: { message_count: 0, event_count: 0, event_heads: [] }, question_markdown: "Panel question", references: [], attachments: [], sources: [], status: "failed", answer_markdown: null, cited_source_ids: [], created_at: "", updated_at: "" }] } };
+    view.rerender(<WorkspaceShell project={project} locale="en-US" {...props} />);
+    fireEvent.click(screen.getByRole("button", { name: action }));
+    await waitFor(() => expect(send).toHaveBeenCalledTimes(2));
+    await act(async () => {});
+    props = { ...props, sideChat: { ...props.sideChat!, pending: true, originalQuestion: "Panel question" } };
+    view.rerender(<WorkspaceShell project={project} locale="en-US" {...props} />);
+    fireEvent.click(screen.getByRole("button", { name: "Reconcile original question" }));
+    await waitFor(() => expect(retry).toHaveBeenCalledOnce());
+    await act(async () => {});
+    expect(screen.getByRole("textbox", { name: /Describe a research goal/ })).toHaveValue("Composer notes");
+    expect(store.read(scope).text).toBe("Composer notes");
+  });
+
+  it.each(["ready", "model", "busy", "pending"] as const)("keeps composer retry ownership if panel send is blocked by %s", async (gate) => {
+    const send = vi.fn().mockResolvedValue(false);
+    const retry = vi.fn().mockResolvedValue(true);
+    const store = new ComposerDraftStore();
+    store.update({ projectId: project.id, conversationId: "a" }, "Composer notes");
+    let props = { ...receiptFixture("side", send, retry), composerDraftStore: store };
+    const view = renderShell(props);
+    await launchReceiptRoute("side");
+    await act(async () => {});
+    props = { ...props, sideChat: { ...props.sideChat!, draft: "Panel question" } };
+    view.rerender(<WorkspaceShell project={project} locale="en-US" {...props} />);
+    // Simulate an admission change before the rendered panel button catches up.
+    if (gate === "ready") props.sideChat!.ready = false;
+    if (gate === "model") props.sideChat!.modelId = undefined;
+    if (gate === "busy") props.sideChat!.busy = true;
+    if (gate === "pending") props.sideChat!.pending = true;
+    fireEvent.click(screen.getByRole("button", { name: "Ask" }));
+    await act(async () => {});
+    expect(send).toHaveBeenCalledOnce();
+    props = { ...props, sideChat: { ...props.sideChat!, ready: true, modelId: "side-model", busy: false, pending: true, originalQuestion: "Composer notes" } };
+    view.rerender(<WorkspaceShell project={project} locale="en-US" {...props} />);
+    fireEvent.click(screen.getByRole("button", { name: "Reconcile original question" }));
+    await waitFor(() => expect(screen.getByRole("textbox", { name: /Describe a research goal/ })).toHaveValue(""));
+    expect(retry).toHaveBeenCalledOnce();
+  });
+});
 
 describe("WorkspaceShell composer integration", () => {
   it("restores a project draft after the workspace unmounts", () => {

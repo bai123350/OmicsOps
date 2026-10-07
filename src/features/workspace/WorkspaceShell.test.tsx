@@ -241,11 +241,12 @@ describe("WorkspaceShell", () => {
     expect(submit.mock.calls[1][0]).toEqual(original);
   });
 
-  it.each([false, true])("clears only the exact composer text accepted as guidance (edited=%s)", async (edited) => {
+  it.each([false, true, "same text"] as const)("clears only the exact composer text accepted as guidance (edited=%s)", async (edited) => {
     vi.spyOn(guidanceApi, "agentV4ListGuidance").mockResolvedValue([]);
     vi.spyOn(guidanceApi, "onAgentV4Event").mockResolvedValue(() => undefined);
     vi.spyOn(guidanceApi, "agentV4SubmitGuidance").mockImplementation(async (request) => ({ ...request, ordinal: 1, accepted_at: "2026-09-14T00:00:00Z", consumed_at: null }));
-    const props = { project, locale: "zh-CN" as const, guidanceAvailable: true, activeConversationId: "conversation" };
+    const store = new ComposerDraftStore();
+    const props = { project, locale: "zh-CN" as const, guidanceAvailable: true, activeConversationId: "conversation", composerDraftStore: store };
     const view = render(<WorkspaceShell {...props} />);
     const composer = screen.getByRole("textbox", { name: /描述研究目标/ });
     await waitFor(() => expect(composer).toBeEnabled());
@@ -253,7 +254,10 @@ describe("WorkspaceShell", () => {
     view.rerender(<WorkspaceShell {...props} activeRunId="run" runStarted />);
     fireEvent.click(screen.getByRole("button", { name: "发送选项" }));
     fireEvent.click(screen.getByRole("menuitem", { name: /追加指导/ }));
-    if (edited) fireEvent.change(screen.getByRole("textbox", { name: "追加指导" }), { target: { value: "另一个补充要求" } });
+    if (edited === true) fireEvent.change(screen.getByRole("textbox", { name: "追加指导" }), { target: { value: "另一个补充要求" } });
+    if (edited === "same text") {
+      act(() => { store.update({ projectId: project.id, conversationId: "conversation" }, "另一次编辑"); store.update({ projectId: project.id, conversationId: "conversation" }, "保留原始研究请求"); });
+    }
     fireEvent.click(screen.getByRole("button", { name: "发送指导" }));
     await waitFor(() => expect(guidanceApi.agentV4SubmitGuidance).toHaveBeenCalledOnce());
     await waitFor(() => expect(screen.getByRole("textbox", { name: "追加指导" })).toHaveValue(""));

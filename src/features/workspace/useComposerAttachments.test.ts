@@ -207,6 +207,16 @@ describe("useComposerAttachments", () => {
     expect(result.current.items).toHaveLength(1);
   });
 
+  it("keeps a re-added attachment when only its removed receipt was accepted", async () => {
+    vi.mocked(stageComposerAttachment).mockResolvedValueOnce(firstReceipt).mockResolvedValueOnce(secondReceipt);
+    const { result } = renderHook(() => useComposerAttachments("project-1", "conversation-1"));
+    await act(async () => { await result.current.addFiles([file("counts.csv")]); });
+    act(() => result.current.remove(result.current.items[0].key));
+    await act(async () => { await result.current.addFiles([file("counts.csv")]); });
+    act(() => result.current.clearAccepted([firstReceipt.id]));
+    expect(result.current.receipts).toEqual([secondReceipt]);
+  });
+
   it("prevents duplicate native picker calls and retries a failed picker", async () => {
     const pending = deferred<ComposerAttachmentReceipt[]>();
     vi.mocked(chooseComposerAttachments).mockReturnValueOnce(pending.promise).mockRejectedValueOnce(new Error("picker internals"));

@@ -1,6 +1,6 @@
 import { ContextUsagePanel, type ContextUsageView } from "./ContextUsagePanel";
 import { SideChatPanel } from "./SideChatPanel";
-import type { SideChatController } from "./useSideChat";
+import type { SideChatController, SideChatInput } from "./useSideChat";
 import { listLocalComposerFiles, parseClipboardFilePaths, parseWorkspaceFileDrag, resolveComposerClipboardPaths, WORKSPACE_FILE_DRAG_TYPE, type WorkspaceFileReference } from "../../composer-file-api";
 import type { WorkspaceSearchRequest } from "../../workspace-search";
 import type { ComposerPickerCommand } from "./ComposerReferences";
@@ -23,7 +23,7 @@ import { useSessionReviews } from "./useSessionReviews";
 import { supportsFastMode } from "../../fast-mode";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { WorkspaceNavigation, type WorkspacePage } from "./WorkspaceNavigation";
-import { ComposerDraftStore } from "./composerDrafts";
+import { ComposerDraftStore, type DraftReceipt } from "./composerDrafts";
 import { useScopedComposerDraft } from "./useScopedComposerDraft";
 import { WorkspaceResearchPages } from "./WorkspaceResearchPages";
 import { CollectSourceButton } from "./CollectSourceButton";
@@ -279,7 +279,21 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
   const standaloneDraftStore = useRef<ComposerDraftStore | null>(null);
   if (!composerDraftStore && !standaloneDraftStore.current) standaloneDraftStore.current = new ComposerDraftStore();
   const draftStore = composerDraftStore ?? standaloneDraftStore.current!;
-  const { draft, setDraft } = useScopedComposerDraft(draftStore, { projectId: project.id, conversationId: activeConversationId ?? null });
+  const draftScope = { projectId: project.id, conversationId: activeConversationId ?? null };
+  const composerScopeKey = JSON.stringify([draftScope.projectId, draftScope.conversationId]);
+  const { draft, setDraft } = useScopedComposerDraft(draftStore, draftScope);
+  type ComposerAttempt = { receipt: DraftReceipt; generation: number; references: ComposerCatalogItem[]; ids: string[] };
+  function captureComposerAttempt(): ComposerAttempt {
+    return { receipt: draftStore.capture(draftScope), generation: sendGenerationRef.current, references: selectedReferences, ids: attachments.receipts.map((receipt) => receipt.id) };
+  }
+  function clearAcceptedComposerAttempt(attempt: ComposerAttempt) {
+    // Text can settle offscreen; materials belong only to the original UI generation.
+    draftStore.clearAccepted(attempt.receipt);
+    if (attempt.generation !== sendGenerationRef.current) return;
+    setSelectedReferences((current) => current === attempt.references ? [] : current);
+    attachments.clearAccepted(attempt.ids);
+  }
+  const branchSendAttempts = useRef(new Map<string, ComposerAttempt>());
   const branchDrafts = useRef(new Map<string, string>());
   const branching = useConversationBranch(project.id, activeConversationId, locale, onOpenBranch ? async (branch) => {
     const key = JSON.stringify([branch.project_id, branch.source_conversation_id]);
@@ -300,26 +314,37 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
     if (branchDisabled) return false;
     setSendMenuOpen(false);
     if (title !== undefined && onBranchSend && (title.trim() || attachments.receipts.length)) {
-      const generation = sendGenerationRef.current;
+      const attempt = captureComposerAttempt();
       const text = title.trim() || (zh ? "请查看附件。" : "Please inspect the attached files.");
-      const references = selectedReferences;
-      const ids = attachments.receipts.map((receipt) => receipt.id);
       if (attachmentsBlocked || fileReferenceOperation.current || !computeReady) return false;
+      branchSendAttempts.current.set(composerScopeKey, attempt);
       try {
-        const accepted = await onBranchSend(sourceMessageId, text, planModeEnabled ? "plan" : "chat", references.map((item) => item.reference), ids);
-        if (!accepted || generation !== sendGenerationRef.current) return accepted;
-        setDraft((current) => current === title ? "" : current);
-        setSelectedReferences((current) => current === references ? [] : current);
-        attachments.clearAccepted(ids);
-        return true;
+        const accepted = await onBranchSend(sourceMessageId, text, planModeEnabled ? "plan" : "chat", attempt.references.map((item) => item.reference), attempt.ids);
+        if (accepted) {
+          clearAcceptedComposerAttempt(attempt);
+          if (branchSendAttempts.current.get(composerScopeKey) === attempt) branchSendAttempts.current.delete(composerScopeKey);
+        }
+        return accepted;
       } catch {
-        if (generation === sendGenerationRef.current) setSendError(true);
+        if (attempt.generation === sendGenerationRef.current) setSendError(true);
         return false;
       }
     }
     const sourceText = title === undefined ? messages.find((message) => message.id === sourceMessageId && message.role === "user")?.markdown : undefined;
     if (sourceText !== undefined) branchDrafts.current.set(JSON.stringify([project.id, activeConversationId]), sourceText);
     return branching.start(sourceMessageId, kind, title?.trim() || (zh ? "会话分支" : "Conversation branch"));
+  }
+  async function retryBranchSend() {
+    if (!onRetryBranchSend) return;
+    const attempt = branchSendAttempts.current.get(composerScopeKey);
+    try {
+      if (await onRetryBranchSend() && attempt) {
+        clearAcceptedComposerAttempt(attempt);
+        if (branchSendAttempts.current.get(composerScopeKey) === attempt) branchSendAttempts.current.delete(composerScopeKey);
+      }
+    } catch {
+      if (attempt?.generation === sendGenerationRef.current) setSendError(true);
+    }
   }
   const draftRef = useRef<HTMLTextAreaElement>(null);
   const handledSearchRequest = useRef<string | null>(null);
@@ -362,7 +387,7 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
   const [workflowLibraryOpen, setWorkflowLibraryOpen] = useState(false);
   const [projectTemplatePickerOpen, setProjectTemplatePickerOpen] = useState(false);
   const [guidanceDialogOpen, setGuidanceDialogOpen] = useState(false);
-  const guidanceDraftAtOpenRef = useRef<string | null>(null);
+  const guidanceDraftAtOpenRef = useRef<DraftReceipt | null>(null);
   const guidancePendingRequestsRef = useRef(new Map<string, { current: SubmitGuidanceV4Request | null }>());
   const [reviewDialogOpen, setReviewDialogOpen] = useState(false);
   const [reviewerSettingsOpen, setReviewerSettingsOpen] = useState(false);
@@ -637,7 +662,7 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
   function openGuidanceDialog() {
     if (!guidanceDialogAvailable) return;
     const hasComposerContext = attachments.items.length > 0 || attachments.receipts.length > 0 || selectedReferences.length > 0;
-    guidanceDraftAtOpenRef.current = !hasComposerContext && draft ? draft : null;
+    guidanceDraftAtOpenRef.current = !hasComposerContext && draft ? draftStore.capture(draftScope) : null;
     // The menu item is removed as the dialog mounts; focus the stable launch
     // control first so the dialog can restore to a connected element.
     sendOptionsRef.current?.focus();
@@ -650,10 +675,10 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
   }
   function handleGuidanceAccepted(markdown: string) {
     const openedDraft = guidanceDraftAtOpenRef.current;
-    if (openedDraft === null || openedDraft.trim() !== markdown) return;
+    if (openedDraft === null || openedDraft.text.trim() !== markdown) return;
     guidanceDraftAtOpenRef.current = null;
     if (attachments.items.length > 0 || attachments.receipts.length > 0 || selectedReferences.length > 0) return;
-    setDraft((current) => current === openedDraft ? "" : current);
+    draftStore.clearAccepted(openedDraft);
   }
   // Older hosts may return the ordinary run's internal contract. Only expose an actual Plan.
   const hasApprovalPlan = Boolean(v4Plan?.plan && (
@@ -789,31 +814,32 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
     setLocalMode(nextMode);
   }
 
-  const replacementDraft = useRef<{ generation: number; draft: string; references: typeof selectedReferences; attachments: string[] } | null>(null);
+  const replacementDrafts = useRef(new Map<string, ComposerAttempt>());
   const replacementHead = activeRunEventsV4.at(-1);
   const replacementDisabled = !replacement || replacement.busy || replacement.pending || composerDisabled || attachmentsBlocked || !computeReady || agentPreferences.blocked || runStopping || runFinished || !replacementHead || !activeRunId || (!draft.trim() && !attachments.receipts.length);
-  function clearReplacementDraft() {
-    const submitted = replacementDraft.current;
-    if (submitted && submitted.generation === sendGenerationRef.current) {
-      setDraft((current) => current === submitted.draft ? "" : current);
-      setSelectedReferences((current) => current === submitted.references ? [] : current);
-      attachments.clearAccepted(submitted.attachments);
-    }
-    replacementDraft.current = null;
+  function clearReplacementDraft(submitted: ComposerAttempt) {
+    clearAcceptedComposerAttempt(submitted);
+    if (replacementDrafts.current.get(composerScopeKey) === submitted) replacementDrafts.current.delete(composerScopeKey);
   }
   async function replaceCurrentTurn() {
     if (!replacement || replacementDisabled || !replacementHead || !activeRunId || fileReferenceOperation.current) return;
-    const submitted = { generation: sendGenerationRef.current, draft, references: selectedReferences, attachments: attachments.receipts.map((receipt) => receipt.id) };
-    replacementDraft.current = submitted;
+    const submitted = captureComposerAttempt();
+    replacementDrafts.current.set(composerScopeKey, submitted);
     setSendMenuOpen(false);
-    const accepted = await replacement.send(draft.trim() || (zh ? "请查看附件。" : "Please inspect the attached files."), planModeEnabled ? "plan" : "chat", { run_id: activeRunId, sequence: replacementHead.sequence, event_hash: replacementHead.event_hash }, selectedReferences.map((item) => item.reference), submitted.attachments);
-    if (accepted && replacementDraft.current === submitted) clearReplacementDraft();
+    try {
+      const accepted = await replacement.send(draft.trim() || (zh ? "请查看附件。" : "Please inspect the attached files."), planModeEnabled ? "plan" : "chat", { run_id: activeRunId, sequence: replacementHead.sequence, event_hash: replacementHead.event_hash }, submitted.references.map((item) => item.reference), submitted.ids);
+      if (accepted) clearReplacementDraft(submitted);
+    } catch {
+      if (submitted.generation === sendGenerationRef.current) setSendError(true);
+    }
   }
   async function retryReplacement() {
     if (!replacement) return;
-    const submitted = replacementDraft.current;
-    if (await replacement.retry()) {
-      if (replacementDraft.current === submitted) clearReplacementDraft();
+    const submitted = replacementDrafts.current.get(composerScopeKey);
+    try {
+      if (await replacement.retry() && submitted) clearReplacementDraft(submitted);
+    } catch {
+      if (submitted?.generation === sendGenerationRef.current) setSendError(true);
     }
   }
   async function send() {
@@ -822,6 +848,7 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
     if (typedComposerCommand) { typedComposerCommand.onSelect(); return; }
     if (!message || fileReferenceOperation.current || attachmentsBlocked || composerDisabled || (!onQueue && reviewBusy) || agentPreferences.blocked || (!onQueue && planLoading) || ((onSend || onQueue) && !computeReady) || sendBusyRef.current) return;
     const sendGeneration = sendGenerationRef.current;
+    const receipt = draftStore.capture(draftScope);
     sendBusyRef.current = true;
     setSendBusy(true);
     setSendError(false);
@@ -834,10 +861,10 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
         const accepted = attachmentIds.length
           ? await submit(message, mode, selectedReferences.map((item) => item.reference), attachmentIds)
           : selectedReferences.length ? await submit(message, mode, selectedReferences.map((item) => item.reference)) : await submit(message, mode);
+        if (accepted !== false) draftStore.clearAccepted(receipt);
         if (sendGeneration === sendGenerationRef.current) {
           if (accepted === false) setSendError(true);
           else {
-            setDraft((current) => current === submittedDraft ? "" : current);
             setSelectedReferences((current) => current.filter((item) => !selectedReferences.some((sent) => referenceKey(sent.reference) === referenceKey(item.reference))));
             setReferenceTrigger(null);
             attachments.clearAccepted(attachmentIds);
@@ -845,7 +872,7 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
         }
       } else {
         setSentMessages((current) => [...current, message]);
-        setDraft("");
+        draftStore.clearAccepted(receipt);
         setSelectedReferences([]);
         setReferenceTrigger(null);
       }
@@ -859,18 +886,13 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
     }
   }
 
-  const sideComposerAttempts = useRef(new Map<string, { draft: string; references: ComposerCatalogItem[]; ids: string[]; generation: number }>());
-  const sideScope = `${project.id}:${activeConversationId ?? ""}`;
-  function clearAcceptedSideDraft(scope: string) {
-    const attempt = sideComposerAttempts.current.get(scope);
-    sideComposerAttempts.current.delete(scope);
-    if (!attempt || attempt.generation !== sendGenerationRef.current) return;
-    setDraft((current) => current === attempt.draft ? "" : current);
-    // Only clear the submitted selection instance; edits can re-add the same reference.
-    setSelectedReferences((current) => current === attempt.references ? [] : current);
-    attachments.clearAccepted(attempt.ids);
+  const sideComposerAttempts = useRef(new Map<string, ComposerAttempt>());
+  function clearAcceptedSideDraft(attempt: ComposerAttempt) {
+    clearAcceptedComposerAttempt(attempt);
+    // A late response must not consume a newer request's retry receipt.
+    if (sideComposerAttempts.current.get(composerScopeKey) === attempt) sideComposerAttempts.current.delete(composerScopeKey);
   }
-  async function sendSideQuestion(question?: string, originalDraft = draft, fromCommand = false): Promise<boolean> {
+  async function sendSideQuestion(question?: string, fromCommand = false): Promise<boolean> {
     if (!sideChat || !activeConversationId) {
       if (fromCommand) setComposerCommandNotice(zh ? "独立旁聊需要桌面宿主。" : "Side chat requires the desktop host.");
       return false;
@@ -883,22 +905,31 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
       if (fromCommand) setComposerCommandNotice(zh ? "独立旁聊当前不可用，请稍后重试。" : "Side chat is unavailable right now. Retry in a moment.");
       return false;
     }
-    const attempt = { draft: originalDraft, references: selectedReferences, ids: attachments.receipts.map((receipt) => receipt.id), generation: sendGenerationRef.current };
-    sideComposerAttempts.current.set(sideScope, attempt);
+    const attempt = captureComposerAttempt();
+    sideComposerAttempts.current.set(composerScopeKey, attempt);
     try {
       const accepted = await sideChat.send({ question_markdown: requestedQuestion || (zh ? "请解释所选资料。" : "Please explain the selected material."), references: attempt.references.map((item) => item.reference), attachments: attempt.ids });
-      if (accepted) clearAcceptedSideDraft(sideScope);
+      if (accepted) clearAcceptedSideDraft(attempt);
       return accepted;
     } catch {
-      if (fromCommand) setComposerCommandNotice(zh ? "独立旁聊状态未能确认，原始命令已保留。请重试。" : "Side chat status could not be confirmed; the original command is preserved. Retry.");
+      if (fromCommand && attempt.generation === sendGenerationRef.current) setComposerCommandNotice(zh ? "独立旁聊状态未能确认，原始命令已保留。请重试。" : "Side chat status could not be confirmed; the original command is preserved. Retry.");
       return false;
     }
   }
   async function retrySideQuestion() {
     if (!sideChat) return false;
-    const accepted = await sideChat.retry();
-    if (accepted) clearAcceptedSideDraft(sideScope);
-    return accepted;
+    const attempt = sideComposerAttempts.current.get(composerScopeKey);
+    try {
+      const accepted = await sideChat.retry();
+      if (accepted && attempt) clearAcceptedSideDraft(attempt);
+      return accepted;
+    } catch { return false; }
+  }
+  function sendPanelSideQuestion(input: SideChatInput): Promise<boolean> {
+    if (!sideChat?.ready || !sideChat.modelId || sideChat.busy || sideChat.pending) return Promise.resolve(false);
+    // Panel-owned requests never own the main composer draft or its retry receipt.
+    sideComposerAttempts.current.delete(composerScopeKey);
+    return sideChat.send(input);
   }
   function revealSideChatSource(messageId: string) {
     if (!messages.some((message) => message.id === messageId)) return;
@@ -937,7 +968,6 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
     return true;
   }
   function runBtwCommand(invocation: ComposerCommandInvocation): boolean {
-    const originalDraft = draft;
     setComposerCommandNotice("");
     if (!invocation.args.trim()) {
       if (!sideChat || !activeConversationId) {
@@ -948,11 +978,10 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
       openSidebarSection("side-chat");
       return true;
     }
-    void sendSideQuestion(invocation.args, originalDraft, true);
+    void sendSideQuestion(invocation.args, true);
     return true;
   }
   function runForkCommand(invocation: ComposerCommandInvocation): boolean {
-    const originalDraft = draft;
     const request = invocation.args.trim();
     setComposerCommandNotice("");
     if (!request) {
@@ -975,11 +1004,8 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
       closeComposerMenus();
       return false;
     }
-    const generation = sendGenerationRef.current;
     closeComposerMenus();
-    void branchAt(lastBranchAnchor.id, "after_response", request).then((accepted) => {
-      if (accepted && generation === sendGenerationRef.current) setDraft((current) => current === originalDraft ? "" : current);
-    });
+    void branchAt(lastBranchAnchor.id, "after_response", request);
     return true;
   }
   const composerCommands: ComposerPickerCommand[] = [
@@ -1112,7 +1138,7 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
       } : undefined} />
       <footer className="composer">
         {branchSendError && <p role="alert">{zh ? "分支发送或打开未确认，原始消息和材料已保留。" : "Branch sending or opening was not confirmed; the original message and material are retained."}</p>}
-        {branchSendPending && onRetryBranchSend && <button type="button" disabled={branchSendBusy} onClick={() => { const original = branchSendOriginalMarkdown; void onRetryBranchSend().then((accepted) => { if (accepted && original) setDraft((current) => current.trim() === original ? "" : current); }); }}>{zh ? "重试原分支发送" : "Retry original branch send"}</button>}
+        {branchSendPending && onRetryBranchSend && <button type="button" disabled={branchSendBusy} onClick={() => void retryBranchSend()}>{zh ? "重试原分支发送" : "Retry original branch send"}</button>}
         {replacement?.error && <p role="alert" className="composer-error">{replacement.pending ? (zh ? "替换请求状态待核对，原草稿已保留。" : "Replacement status is unconfirmed; the original draft is retained.") : (zh ? "替换请求未接收，请刷新运行状态后重试。" : "Replacement was not accepted. Refresh the run before trying again.")}{replacement.pending && <><span>{replacement.originalMarkdown}</span><button type="button" disabled={replacement.busy || conversationHydrating} onClick={() => void retryReplacement()}>{zh ? "核对原替换请求" : "Reconcile original replacement"}</button></>}</p>}
          {queueError && <p role="alert" className="composer-error">{zh ? "队列状态未能确认，请刷新后重试。" : "Queue state could not be confirmed. Refresh and retry."}<button type="button" onClick={() => void onQueueRefresh?.()}>{zh ? "刷新队列" : "Refresh queue"}</button></p>}
          {sendError && <p role="alert" className="composer-error">{zh ? "消息未能发送，草稿已保留。请重试。" : "Your message could not be sent. The draft is preserved; please retry."}</p>}
@@ -1199,7 +1225,7 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
       setFileTextPreview(null); draftRef.current?.focus();
     }} />}
     {reviewDialogOpen && activeConversationId && <SessionReviewDialog key={`${project.id}:${activeConversationId}`} locale={locale} records={sessionReviews.records} loading={sessionReviews.loading} busy={sessionReviews.busy} startDisabled={!messages.some((message) => message.role !== "system" && message.markdown.trim()) || existingComposerDisabled || agentPreferences.blocked} startDisabledReason={!messages.some((message) => message.role !== "system" && message.markdown.trim()) ? (zh ? "先发送一条消息后再发起审核。" : "Send a message before requesting a review.") : undefined} error={sessionReviews.error} modelProfiles={modelProfiles} onStartReview={sessionReviews.startReview} onRetry={sessionReviews.retry} onOpenReviewerSettings={() => setReviewerSettingsOpen(true)} onClose={() => setReviewDialogOpen(false)} />}
-    {guidanceDialogOpen && guidanceDialogAvailable && activeConversationId && guidanceRunId && <GuidanceDialog key={`${project.id}:${activeConversationId}:${guidanceRunId}`} runId={guidanceRunId} projectId={project.id} conversationId={activeConversationId} enabled={guidanceEnabled} locale={locale} initialDraft={guidanceDraftAtOpenRef.current ?? undefined} pendingRequest={guidancePendingRequestForScope(guidanceRunId)} composerHasAttachments={attachments.items.length > 0 || attachments.receipts.length > 0} composerHasReferences={selectedReferences.length > 0} onAccepted={handleGuidanceAccepted} onClose={closeGuidanceDialog} />}
+    {guidanceDialogOpen && guidanceDialogAvailable && activeConversationId && guidanceRunId && <GuidanceDialog key={`${project.id}:${activeConversationId}:${guidanceRunId}`} runId={guidanceRunId} projectId={project.id} conversationId={activeConversationId} enabled={guidanceEnabled} locale={locale} initialDraft={guidanceDraftAtOpenRef.current?.text ?? undefined} pendingRequest={guidancePendingRequestForScope(guidanceRunId)} composerHasAttachments={attachments.items.length > 0 || attachments.receipts.length > 0} composerHasReferences={selectedReferences.length > 0} onAccepted={handleGuidanceAccepted} onClose={closeGuidanceDialog} />}
     {reviewerSettingsOpen && <ReviewerSettingsDialog zh={zh} modelProfiles={modelProfiles} onClose={() => setReviewerSettingsOpen(false)} />}
     {workflowLibraryOpen && <WorkflowLibraryDialog key={project.id} projectId={project.id} zh={zh} onClose={() => { setWorkflowLibraryOpen(false); draftRef.current?.focus(); }} onChanged={() => setLocalWorkflowCatalogVersion((value) => value + 1)} />}
     {projectTemplatePickerOpen && <ProjectTemplatePicker key={project.id} selectedProject={project} locale={locale} onSelectWorkflow={insertQuickActionWorkflow} onSelectSpecialist={insertSpecialistDraft} onClose={() => { setProjectTemplatePickerOpen(false); draftRef.current?.focus(); }} />}
@@ -1216,7 +1242,7 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
         <button className="sidebar-tab-add" aria-label={zh ? "添加侧栏标签" : "Add sidebar tab"} aria-haspopup="menu" aria-expanded={sectionMenuOpen} onClick={() => setSectionMenuOpen((open) => !open)}><Plus size={16} /></button>
         {sectionMenuOpen && <><button className="sidebar-menu-backdrop" aria-label={zh ? "关闭侧栏菜单" : "Close sidebar menu"} onClick={() => setSectionMenuOpen(false)} /><div className="sidebar-section-menu" role="menu" aria-label={zh ? "侧栏内容" : "Sidebar sections"}>{sidebarSections.map((section) => { const isOpen = openTabs.some((id) => id === section.id); return <button key={section.id} role="menuitemcheckbox" aria-checked={isOpen} disabled={Boolean(section.unavailable)} title={section.unavailable} onClick={() => { if (section.id !== "highlights") openSidebarSection(section.id); }}><span>{section.label}</span>{isOpen && <Check size={18} />}</button>; })}</div></>}
       </div>
-      <div className="context-content" id="sidebar-tab-content" role="tabpanel" aria-labelledby={`sidebar-tab-${tab}`}>{tab === "side-chat" && sideChat && activeConversationId && <SideChatPanel key={`${project.id}:${activeConversationId}`} projectId={project.id} conversationId={activeConversationId} locale={locale} records={sideChat.records} models={modelProfiles} modelId={sideChat.modelId} onModelChange={sideChat.setModelId} draftValue={sideChat.draft} onDraftChange={sideChat.setDraft} loading={sideChat.loading} disabled={!sideChat.ready} busy={sideChat.busy} pending={sideChat.pending} error={sideChat.error} originalQuestion={sideChat.originalQuestion} onSend={(question) => sideChat.send({ question_markdown: question, references: [], attachments: [] })} onRefresh={sideChat.refresh} hasMore={sideChat.hasMore} loadingOlder={sideChat.loadingOlder} onLoadOlder={sideChat.loadOlder} onRetry={retrySideQuestion} onRetryTurn={(turn) => sideChat.send({ question_markdown: turn.question_markdown, references: turn.references, attachments: turn.attachments, parent_request_id: turn.request_id })} onOpenSource={revealSideChatSource} />}{tab === "files" && <><div className="file-source-options" role="group" aria-label={zh ? "文件来源" : "File source"}><button aria-pressed={fileSource === "local"} onClick={() => setFileSource("local")}>{zh ? "本地" : "Local"}</button><button aria-pressed={fileSource === "remote"} disabled={!project.connection_id && !onRefreshFiles && !remoteFiles?.length} onClick={() => setFileSource("remote")}>SSH</button></div><RemoteFileTree locale={locale} source={fileSource} remoteFiles={fileSource === "local" ? localFiles : remoteFiles ?? []} busy={fileSource === "local" ? localFilesBusy : filesBusy} notice={fileSource === "local" ? localFilesError : fileNotice} onUpload={fileSource === "remote" ? onUploadFiles : undefined} onRefresh={() => setFileRefreshVersion((value) => value + 1)} onDownload={fileSource === "remote" ? onDownloadFile : undefined} onPreviewText={activeConversationId && !composerDisabled && fileBackendId ? (path) => setFileTextPreview(currentFileReference(path)) : undefined} onAttach={!composerDisabled && fileBackendId ? (path) => attachWorkspaceFile(currentFileReference(path)) : undefined} dragReference={!composerDisabled && fileBackendId ? currentFileReference : undefined} syncEntries={fileSource === "remote" ? syncEntries : []} onPauseSync={onPauseSync} onCancelSync={onCancelSync} onRetrySync={onRetrySync} /></>}{tab === "plan" && <V4PlanPanel locale={locale} active={showPlanPanel} planLoading={planLoading} v4Plan={visiblePlan} latestPlanRevision={latestPlanRevision} conversationLocked={conversationLocked} planActionBusy={effectivePlanActionBusy} planApproved={planApproved || approved || approvePlanBusy} runStarted={runStarted} events={activeRunEventsV4} onApprove={approvePlan} onRequestPlanRevision={onRequestPlanRevision} onCancel={onCancelRun} />}{tab === "artifacts" && <>{openedSearchArtifact?.reference.kind === "artifact" && openedSearchArtifact.reference.project_id === project.id && <section className="sidebar-data-card" aria-label={zh ? "选中的产物" : "Selected artifact"}><b>{openedSearchArtifact.label}</b><p>{openedSearchArtifact.description}</p><small>ID: {openedSearchArtifact.reference.id}</small><button onClick={() => setOpenedSearchArtifact(null)}>{zh ? "关闭详情" : "Close details"}</button></section>}<ArtifactCatalog artifacts={projectArtifacts} locale={locale} onSelect={(path) => { setSelectedImagePath(path); setExpanded(true); }} />{imageFiles.length > 0 && <><div className="context-toolbar"><span>{t.artifactPreview}</span><button aria-label={t.expand} onClick={() => setExpanded(true)}><Expand size={16} /></button></div>{preview}</>}</>}{tab === "notebook" && <CodeNotebook cells={notebookCells} locale={locale} collectionSource={activeConversationId ? async (cell) => { if (cell.toolSource) return cell.toolSource; const range = cell.messageRange; const message = messages.find((item) => item.id === range?.messageId); if (!range || !message) throw new Error("Source unavailable"); return messageLibrarySource(project.id, activeConversationId, message.id, message.markdown, range.start, range.end); } : undefined} />}{tab === "agents" && <DelegatedAgents tasks={delegatedTasks} locale={locale} />}{tab === "records" && <Notebook locale={locale} entries={notebookEntries} artifacts={projectArtifacts} facts={memoryFacts} onSearch={onSearchMemory} onExport={onExportNotebook} />}{tab === "environment" && <><EnvironmentContexts backends={computeBackends} selectedId={computeBackendId} environment={computeEnvironment} locale={locale} /><KernelPanel locale={locale} sessions={kernelSessions} events={kernelEvents} busy={kernelBusy} notice={kernelNotice} onStart={onStartKernel} onExecute={onExecuteKernel} onInterrupt={onInterruptKernel} onStop={onStopKernel} onPromote={onPromoteKernelCell} /></>}{tab === "provenance" && <ProvenancePanel rows={provenanceRows} locale={locale} />}</div>
+      <div className="context-content" id="sidebar-tab-content" role="tabpanel" aria-labelledby={`sidebar-tab-${tab}`}>{tab === "side-chat" && sideChat && activeConversationId && <SideChatPanel key={`${project.id}:${activeConversationId}`} projectId={project.id} conversationId={activeConversationId} locale={locale} records={sideChat.records} models={modelProfiles} modelId={sideChat.modelId} onModelChange={sideChat.setModelId} draftValue={sideChat.draft} onDraftChange={sideChat.setDraft} loading={sideChat.loading} disabled={!sideChat.ready} busy={sideChat.busy} pending={sideChat.pending} error={sideChat.error} originalQuestion={sideChat.originalQuestion} onSend={(question) => sendPanelSideQuestion({ question_markdown: question, references: [], attachments: [] })} onRefresh={sideChat.refresh} hasMore={sideChat.hasMore} loadingOlder={sideChat.loadingOlder} onLoadOlder={sideChat.loadOlder} onRetry={retrySideQuestion} onRetryTurn={(turn) => sendPanelSideQuestion({ question_markdown: turn.question_markdown, references: turn.references, attachments: turn.attachments, parent_request_id: turn.request_id })} onOpenSource={revealSideChatSource} />}{tab === "files" && <><div className="file-source-options" role="group" aria-label={zh ? "文件来源" : "File source"}><button aria-pressed={fileSource === "local"} onClick={() => setFileSource("local")}>{zh ? "本地" : "Local"}</button><button aria-pressed={fileSource === "remote"} disabled={!project.connection_id && !onRefreshFiles && !remoteFiles?.length} onClick={() => setFileSource("remote")}>SSH</button></div><RemoteFileTree locale={locale} source={fileSource} remoteFiles={fileSource === "local" ? localFiles : remoteFiles ?? []} busy={fileSource === "local" ? localFilesBusy : filesBusy} notice={fileSource === "local" ? localFilesError : fileNotice} onUpload={fileSource === "remote" ? onUploadFiles : undefined} onRefresh={() => setFileRefreshVersion((value) => value + 1)} onDownload={fileSource === "remote" ? onDownloadFile : undefined} onPreviewText={activeConversationId && !composerDisabled && fileBackendId ? (path) => setFileTextPreview(currentFileReference(path)) : undefined} onAttach={!composerDisabled && fileBackendId ? (path) => attachWorkspaceFile(currentFileReference(path)) : undefined} dragReference={!composerDisabled && fileBackendId ? currentFileReference : undefined} syncEntries={fileSource === "remote" ? syncEntries : []} onPauseSync={onPauseSync} onCancelSync={onCancelSync} onRetrySync={onRetrySync} /></>}{tab === "plan" && <V4PlanPanel locale={locale} active={showPlanPanel} planLoading={planLoading} v4Plan={visiblePlan} latestPlanRevision={latestPlanRevision} conversationLocked={conversationLocked} planActionBusy={effectivePlanActionBusy} planApproved={planApproved || approved || approvePlanBusy} runStarted={runStarted} events={activeRunEventsV4} onApprove={approvePlan} onRequestPlanRevision={onRequestPlanRevision} onCancel={onCancelRun} />}{tab === "artifacts" && <>{openedSearchArtifact?.reference.kind === "artifact" && openedSearchArtifact.reference.project_id === project.id && <section className="sidebar-data-card" aria-label={zh ? "选中的产物" : "Selected artifact"}><b>{openedSearchArtifact.label}</b><p>{openedSearchArtifact.description}</p><small>ID: {openedSearchArtifact.reference.id}</small><button onClick={() => setOpenedSearchArtifact(null)}>{zh ? "关闭详情" : "Close details"}</button></section>}<ArtifactCatalog artifacts={projectArtifacts} locale={locale} onSelect={(path) => { setSelectedImagePath(path); setExpanded(true); }} />{imageFiles.length > 0 && <><div className="context-toolbar"><span>{t.artifactPreview}</span><button aria-label={t.expand} onClick={() => setExpanded(true)}><Expand size={16} /></button></div>{preview}</>}</>}{tab === "notebook" && <CodeNotebook cells={notebookCells} locale={locale} collectionSource={activeConversationId ? async (cell) => { if (cell.toolSource) return cell.toolSource; const range = cell.messageRange; const message = messages.find((item) => item.id === range?.messageId); if (!range || !message) throw new Error("Source unavailable"); return messageLibrarySource(project.id, activeConversationId, message.id, message.markdown, range.start, range.end); } : undefined} />}{tab === "agents" && <DelegatedAgents tasks={delegatedTasks} locale={locale} />}{tab === "records" && <Notebook locale={locale} entries={notebookEntries} artifacts={projectArtifacts} facts={memoryFacts} onSearch={onSearchMemory} onExport={onExportNotebook} />}{tab === "environment" && <><EnvironmentContexts backends={computeBackends} selectedId={computeBackendId} environment={computeEnvironment} locale={locale} /><KernelPanel locale={locale} sessions={kernelSessions} events={kernelEvents} busy={kernelBusy} notice={kernelNotice} onStart={onStartKernel} onExecute={onExecuteKernel} onInterrupt={onInterruptKernel} onStop={onStopKernel} onPromote={onPromoteKernelCell} /></>}{tab === "provenance" && <ProvenancePanel rows={provenanceRows} locale={locale} />}</div>
     </aside>}
     {runtimeVisible && runtimeLanguage && <RuntimeDialog zh={zh} language={runtimeLanguage} onLanguageChange={setRuntimeLanguage} backend={runtimeContext?.runId ? undefined : selectedBackend} environment={computeEnvironment} boundary={runtimeBoundary.view} boundaryLoading={runtimeBoundary.loading} boundaryError={runtimeBoundary.error} onRetryBoundary={runtimeBoundary.refresh} frozen={Boolean(runtimeContext?.runId)} onClose={closeRuntime} onSettings={!runtimeContext?.runId && onOpenSettings ? () => { closeRuntime(); onOpenSettings("remote"); } : undefined} onPrepare={runtimeContext?.runId ? undefined : (language) => {
       const name = language === "python" ? "Python" : "R";
