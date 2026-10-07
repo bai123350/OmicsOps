@@ -29,6 +29,7 @@ pub struct AppState {
     pub credentials: SystemCredentialVault,
     pub subscription_models: Arc<crate::subscription_models::SubscriptionLoginManager>,
     pub mcp_sessions: McpSessionManager,
+    pub(crate) live_runtime_registry_v4: crate::agent_v4::LiveRuntimeRegistryV4,
     pub active_runs: Arc<Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
     pub skills_root: PathBuf,
     pub skills_gate: Arc<tokio::sync::RwLock<()>>,

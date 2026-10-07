@@ -33,6 +33,7 @@ pub mod general_settings;
 pub mod inspection;
 pub mod integration_packages;
 pub mod kernel_commands;
+pub mod kernel_inspection_v4;
 mod local_deletion_approval;
 mod model_catalog_shared;
 pub mod model_commands;
@@ -188,6 +189,7 @@ pub fn run() {
                 subscription_models,
                 mcp_sessions: omicsops_mcp::McpSessionManager::new(),
                 active_runs: Arc::new(Mutex::new(HashMap::new())),
+                live_runtime_registry_v4: Default::default(),
                 skills_root,
                 skills_gate: Arc::new(tokio::sync::RwLock::new(())),
                 research_last_request: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -252,6 +254,7 @@ pub fn run() {
             agent_v4::agent_v4_events_for_conversation,
             agent_v4::agent_v4_context_usage,
             context_compaction::agent_v4_compact_context,
+            kernel_inspection_v4::agent_v4_inspect_kernel,
             browser_commands::browser_get_settings,
             follow_up_questions::agent_v4_suggest_follow_up_questions,
             agent_settings::agent_get_iteration_settings,

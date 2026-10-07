@@ -334,6 +334,7 @@ async fn run_live_go_agent_acceptance() -> Result<(), String> {
         ),
         mcp_sessions: omicsops_mcp::McpSessionManager::new(),
         active_runs: Default::default(),
+        live_runtime_registry_v4: Default::default(),
         skills_root: directory.path().join("skills"),
         skills_gate: Default::default(),
         research_last_request: Default::default(),

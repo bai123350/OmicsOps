@@ -4142,7 +4142,7 @@ async fn spawn_execution(
     };
     let forced_route = (spec.execution_kind == RunExecutionKindV4::OrdinaryAgent)
         .then(|| classify_direct_request(&record.objective));
-    let (model, tools) = compose(
+    let (model, mut tools) = compose(
         state,
         &project,
         &selection,
@@ -4174,10 +4174,18 @@ async fn spawn_execution(
         remove_active_run(&state.active_runs, spec.run_id, &cancelled);
         return Err(error);
     }
+    if let Some(slot) = model.resources.as_ref() {
+        tools._runtime_registration = Some(
+            state
+                .live_runtime_registry_v4
+                .register((spec.project_id, spec.conversation_id, spec.run_id), slot),
+        );
+    }
+    let registration = tools._runtime_registration.take();
     let repository = state.repository.clone();
     let active = state.active_runs.clone();
     let browser = state.browser.clone();
-    tauri::async_runtime::spawn(async move {
+    spawn_execution_driver_v4(registration, async move {
         let _lease = lease;
         let execution = async {
             let store = RepositoryEventStoreV4 {
@@ -4633,9 +4641,206 @@ async fn wait_for_active_run_to_yield_with(
 }
 
 // Keeps V4 composition independent from Tauri internals; concrete credentials are resolved before spawning.
+
+/// Process-local observation only; this map never keeps execution resources alive.
+pub(crate) type LiveRuntimeScopeV4 = (Uuid, Uuid, Uuid);
+#[derive(Clone, Default)]
+pub(crate) struct LiveRuntimeRegistryV4 {
+    entries: Arc<std::sync::Mutex<HashMap<LiveRuntimeScopeV4, LiveRuntimeEntryV4>>>,
+}
+struct LiveRuntimeEntryV4 {
+    generation: Uuid,
+    slot: std::sync::Weak<ExecutionResourcesSlotV4>,
+}
+pub(crate) struct LiveRuntimeRegistrationV4 {
+    registry: LiveRuntimeRegistryV4,
+    scope: LiveRuntimeScopeV4,
+    generation: Uuid,
+}
+impl LiveRuntimeRegistryV4 {
+    pub(crate) fn register(
+        &self,
+        scope: LiveRuntimeScopeV4,
+        slot: &Arc<ExecutionResourcesSlotV4>,
+    ) -> LiveRuntimeRegistrationV4 {
+        let generation = Uuid::new_v4();
+        // A poisoned registry fails closed: it cannot expose any resources.
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.insert(
+                scope,
+                LiveRuntimeEntryV4 {
+                    generation,
+                    slot: Arc::downgrade(slot),
+                },
+            );
+        }
+        LiveRuntimeRegistrationV4 {
+            registry: self.clone(),
+            scope,
+            generation,
+        }
+    }
+    fn lookup(&self, scope: LiveRuntimeScopeV4) -> Option<(Uuid, Arc<ExecutionResourcesSlotV4>)> {
+        let mut entries = self.entries.lock().ok()?;
+        let entry = entries.get(&scope)?;
+        if let Some(slot) = entry.slot.upgrade() {
+            return Some((entry.generation, slot));
+        }
+        entries.remove(&scope);
+        None
+    }
+    fn is_current(&self, scope: LiveRuntimeScopeV4, generation: Uuid) -> bool {
+        self.entries.lock().ok().is_some_and(|entries| {
+            entries.get(&scope).is_some_and(|entry| {
+                entry.generation == generation && entry.slot.strong_count() > 0
+            })
+        })
+    }
+}
+impl Drop for LiveRuntimeRegistrationV4 {
+    fn drop(&mut self) {
+        if let Ok(mut entries) = self.registry.entries.lock() {
+            if entries
+                .get(&self.scope)
+                .is_some_and(|entry| entry.generation == self.generation)
+            {
+                entries.remove(&self.scope);
+            }
+        }
+    }
+}
+
+/// Moving the guard as a separate argument defeats disjoint-field capture of tools.registry.
+fn spawn_execution_driver_v4<F>(
+    registration: Option<LiveRuntimeRegistrationV4>,
+    execution: F,
+) -> tauri::async_runtime::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tauri::async_runtime::spawn(async move {
+        let _runtime_registration = registration;
+        execution.await
+    })
+}
+
+async fn inspection_frozen_spec_v4(
+    state: &AppState,
+    request: &omicsops_protocol::InspectKernelRequestV4,
+) -> Result<RunSpecV4, String> {
+    let record = load_record(&state.repository, request.run_id)
+        .await
+        .map_err(|_| "kernel_inspection_not_found")?;
+    if (record.project_id, record.conversation_id, record.run_id)
+        != (request.project_id, request.conversation_id, request.run_id)
+    {
+        return Err("kernel_inspection_scope_mismatch".into());
+    }
+    let project = workspace_project(&state.repository, request.project_id)
+        .await
+        .map_err(|_| "kernel_inspection_not_found")?;
+    let conversations = state
+        .repository
+        .conversations_for_project(request.project_id)
+        .await
+        .map_err(|_| "kernel_inspection_not_found")?;
+    if !conversations.iter().any(|conversation| {
+        conversation.id == request.conversation_id && conversation.project_id == request.project_id
+    }) {
+        return Err("kernel_inspection_scope_mismatch".into());
+    }
+    let spec = record.spec.ok_or("kernel_inspection_missing_frozen_spec")?;
+    if (spec.project_id, spec.conversation_id, spec.run_id)
+        != (request.project_id, request.conversation_id, request.run_id)
+    {
+        return Err("kernel_inspection_scope_mismatch".into());
+    }
+    validate_frozen_spec(&state.repository, &spec)
+        .await
+        .map_err(|_| "kernel_inspection_invalid_frozen_spec")?;
+    let selection = spec
+        .compute_selection
+        .as_ref()
+        .ok_or("kernel_inspection_missing_selection")?;
+    if record.compute_selection.as_ref() != Some(selection) {
+        return Err("kernel_inspection_selection_mismatch".into());
+    }
+    // Binding validation reads Store and paths only: never probe interpreters, engines or SSH.
+    validate_compute_binding(&state.repository, &project, selection)
+        .await
+        .map_err(|_| "kernel_inspection_invalid_selection")?;
+    Ok(spec)
+}
+
+pub(crate) async fn inspect_live_kernel_v4(
+    state: &AppState,
+    request: &omicsops_protocol::InspectKernelRequestV4,
+) -> Result<omicsops_protocol::KernelInspectionV4, String> {
+    use omicsops_protocol::KernelInspectionStatusV4 as Status;
+    let spec = inspection_frozen_spec_v4(state, request).await?;
+    let scope = (request.project_id, request.conversation_id, request.run_id);
+    let project_response = |status, session, objects, truncated| {
+        crate::kernel_inspection_v4::project_inspection_response(
+            request, status, session, objects, truncated,
+        )
+    };
+    let Some((generation, slot)) = state.live_runtime_registry_v4.lookup(scope) else {
+        return Ok(project_response(Status::NotStarted, None, vec![], false));
+    };
+    let Some(resources) = slot.ready.get() else {
+        return Ok(project_response(Status::NotStarted, None, vec![], false));
+    };
+    let selection = spec
+        .compute_selection
+        .as_ref()
+        .ok_or("kernel_inspection_missing_selection")?;
+    let key = ExecutionContextKeyV4 {
+        project_id: request.project_id,
+        run_id: request.run_id,
+        backend_id: selection.backend_id.clone(),
+        language: request.language,
+        environment: selection.environment.clone(),
+    };
+    let (result, identity) = resources
+        .runtime
+        .inspect_existing_with_identity(&key, request.expected_session_id)
+        .await;
+    // Metadata is never delivered if ownership or frozen authority changed while awaiting.
+    if inspection_frozen_spec_v4(state, request).await? != spec {
+        return Err("kernel_inspection_scope_changed".into());
+    }
+    if let Some(identity) = &identity {
+        use omicsops_runtime::KernelInspectionSessionCheckV4 as Check;
+        let status = match resources.runtime.check_inspection_session(&key, identity) {
+            Check::Current => None,
+            Check::Stale => Some(Status::StaleSession),
+            Check::Busy => Some(Status::Busy),
+            Check::Unavailable => Some(Status::Unavailable),
+        };
+        if let Some(status) = status {
+            return Ok(project_response(status, None, vec![], false));
+        }
+    }
+    if !state.live_runtime_registry_v4.is_current(scope, generation) {
+        return Ok(project_response(Status::StaleSession, None, vec![], false));
+    }
+    let (objects, truncated) = result
+        .payload
+        .map(|payload| (payload.objects, payload.truncated))
+        .unwrap_or_default();
+    Ok(project_response(
+        result.status,
+        result.session_id,
+        objects,
+        truncated,
+    ))
+}
+
 struct ComposedToolsV4 {
     run_id: Uuid,
     registry: Arc<ToolRegistryV4>,
+    _runtime_registration: Option<LiveRuntimeRegistrationV4>,
 }
 impl ComposedToolsV4 {
     fn run_id(&self) -> Uuid {
@@ -4846,7 +5051,7 @@ impl ExecutionResourceFactoryV4 for DesktopResourceFactoryV4 {
 }
 
 /// Only successful initialization is cached. No computation is dispatched here.
-struct ExecutionResourcesSlotV4 {
+pub(crate) struct ExecutionResourcesSlotV4 {
     factory: Arc<dyn ExecutionResourceFactoryV4>,
     ready: tokio::sync::OnceCell<ExecutionResourcesV4>,
     remote_context: bool,
@@ -5182,6 +5387,7 @@ async fn compose(
         ComposedToolsV4 {
             run_id,
             registry: Arc::new(registry),
+            _runtime_registration: None,
         },
     ))
 }
@@ -10068,6 +10274,7 @@ mod tests {
             ),
             mcp_sessions: McpSessionManager::new(),
             active_runs: Default::default(),
+            live_runtime_registry_v4: Default::default(),
             skills_root: dir.path().join("skills"),
             skills_gate: Default::default(),
             research_last_request: Default::default(),
@@ -13852,5 +14059,523 @@ mod tests {
         })
         .await;
         assert!(result.is_err());
+    }
+
+    fn inspection_selection() -> ComputeSelectionV4 {
+        serde_json::from_value(json!({
+            "schema_version":4,"backend_id":"local","backend_kind":"local",
+            "autonomy_mode":"supervised","environment":"system",
+            "network_policy":"host_inherited"
+        }))
+        .unwrap()
+    }
+
+    async fn inspection_fixture() -> (
+        tempfile::TempDir,
+        AppState,
+        omicsops_protocol::InspectKernelRequestV4,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let repository = Store::open_in_memory().await.unwrap();
+        let project = Project::new(
+            Uuid::new_v4(),
+            "inspection",
+            dir.path().to_str().unwrap(),
+            omicsops_core::workspace::ProjectTemplate::Blank,
+            Utc::now(),
+        );
+        repository.save_project(&project).await.unwrap();
+        let conversation = omicsops_core::workspace::Conversation::new(
+            Uuid::new_v4(),
+            project.id,
+            "inspection",
+            Utc::now(),
+        );
+        repository.save_conversation(&conversation).await.unwrap();
+        let run_id = Uuid::new_v4();
+        let request = StartDirectV4Request {
+            project_id: project.id,
+            conversation_id: conversation.id,
+            model_profile_id: Uuid::new_v4(),
+            objective: "inspect metadata".into(),
+            compute_selection: inspection_selection(),
+            references: vec![],
+            attachments: vec![],
+        };
+        let (record, spec) = prepare_direct_run_v4(
+            &request,
+            run_id,
+            "[]",
+            BTreeSet::from(["project.read".into()]),
+            DirectRunSnapshotV4 {
+                model_configuration_hash: "a".repeat(64),
+                conversation_preferences: Default::default(),
+                service_tier: omicsops_protocol::RunServiceTierV4 { fast_mode: None },
+                reviewer_model: None,
+                delegated_model: None,
+                reference_context: String::new(),
+                input_images: vec![],
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        save_record(&repository, &record).await.unwrap();
+        let first = AgentEventV4::first(
+            run_id,
+            project.id,
+            conversation.id,
+            Utc::now(),
+            AgentEventKindV4::RunCreated {
+                mode: RunModeV4::Execute,
+            },
+        );
+        repository.append_agent_event_v4(&first).await.unwrap();
+        repository
+            .append_agent_event_v4(&AgentEventV4::next(
+                &first,
+                Utc::now(),
+                AgentEventKindV4::RunSpecFrozen {
+                    approval_hash: spec.approval_hash.unwrap(),
+                    spec_hash: spec.spec_hash.unwrap(),
+                },
+            ))
+            .await
+            .unwrap();
+        let state = AppState {
+            repository,
+            credentials: SystemCredentialVault,
+            subscription_models: Arc::new(
+                crate::subscription_models::SubscriptionLoginManager::system(Default::default())
+                    .unwrap(),
+            ),
+            mcp_sessions: McpSessionManager::new(),
+            active_runs: Default::default(),
+            live_runtime_registry_v4: Default::default(),
+            skills_root: dir.path().join("skills"),
+            skills_gate: Default::default(),
+            research_last_request: Default::default(),
+            active_kernels: Default::default(),
+            project_kernel_queues: Default::default(),
+            sync_controls: Default::default(),
+            browser: omicsops_browser::BrowserRuntime::new(
+                dir.path().join("browser"),
+                dir.path().join("extension"),
+            ),
+        };
+        (
+            dir,
+            state,
+            omicsops_protocol::InspectKernelRequestV4 {
+                project_id: project.id,
+                conversation_id: conversation.id,
+                run_id,
+                language: KernelLanguageV4::Python,
+                expected_session_id: None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn inspection_host_rejects_foreign_scope_and_override() {
+        let (_dir, state, request) = inspection_fixture().await;
+        for field in ["project_id", "conversation_id", "run_id"] {
+            let mut value = serde_json::to_value(&request).unwrap();
+            value[field] = json!(Uuid::new_v4());
+            let foreign = serde_json::from_value(value).unwrap();
+            assert!(inspect_live_kernel_v4(&state, &foreign).await.is_err());
+        }
+        for field in ["backend_id", "environment", "budget", "code"] {
+            let mut value = serde_json::to_value(&request).unwrap();
+            value[field] = json!("forbidden");
+            assert!(
+                serde_json::from_value::<omicsops_protocol::InspectKernelRequestV4>(value).is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn inspection_host_never_initializes_resources() {
+        let (dir, state, request) = inspection_fixture().await;
+        let before = state
+            .repository
+            .agent_events_v4(request.run_id)
+            .await
+            .unwrap();
+        let record = state.repository.agent_run_v4(request.run_id).await.unwrap();
+        let scope = (request.project_id, request.conversation_id, request.run_id);
+        assert_eq!(
+            inspect_live_kernel_v4(&state, &request)
+                .await
+                .unwrap()
+                .status,
+            omicsops_protocol::KernelInspectionStatusV4::NotStarted
+        );
+        let (slot, factory) = mock_resource_slot(dir.path(), true, true);
+        let _guard = state.live_runtime_registry_v4.register(scope, &slot);
+        assert_eq!(
+            inspect_live_kernel_v4(&state, &request)
+                .await
+                .unwrap()
+                .status,
+            omicsops_protocol::KernelInspectionStatusV4::NotStarted
+        );
+        assert!(slot.ready.get().is_none());
+        assert_eq!(factory.attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state
+                .repository
+                .agent_events_v4(request.run_id)
+                .await
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            state.repository.agent_run_v4(request.run_id).await.unwrap(),
+            record
+        );
+    }
+
+    #[tokio::test]
+    async fn inspection_registry_old_guard_cannot_remove_new_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = LiveRuntimeRegistryV4::default();
+        let scope = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (old, _) = mock_resource_slot(dir.path(), false, false);
+        let (new, _) = mock_resource_slot(dir.path(), false, false);
+        let old_guard = registry.register(scope, &old);
+        let new_guard = registry.register(scope, &new);
+        drop(old_guard);
+        let (generation, current) = registry.lookup(scope).unwrap();
+        assert!(Arc::ptr_eq(&current, &new));
+        assert!(registry.is_current(scope, generation));
+        drop(new_guard);
+        assert!(registry.lookup(scope).is_none());
+    }
+
+    #[tokio::test]
+    async fn inspection_registry_weak_cleanup_and_scope_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = LiveRuntimeRegistryV4::default();
+        let scope = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (slot, _) = mock_resource_slot(dir.path(), false, false);
+        let weak = Arc::downgrade(&slot);
+        let _guard = registry.register(scope, &slot);
+        assert_eq!(Arc::strong_count(&slot), 1);
+        for other in [
+            (Uuid::new_v4(), scope.1, scope.2),
+            (scope.0, Uuid::new_v4(), scope.2),
+            (scope.0, scope.1, Uuid::new_v4()),
+        ] {
+            assert!(registry.lookup(other).is_none());
+        }
+        drop(slot);
+        assert!(weak.upgrade().is_none());
+        assert!(registry.lookup(scope).is_none());
+        assert!(registry.entries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inspection_driver_guard_survives_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = LiveRuntimeRegistryV4::default();
+        let scope = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (slot, _) = mock_resource_slot(dir.path(), false, false);
+        let guard = registry.register(scope, &slot);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let driver = spawn_execution_driver_v4(Some(guard), async move {
+            started_tx.send(()).unwrap();
+            finish_rx.await.unwrap();
+        });
+        started_rx.await.unwrap();
+        assert!(registry.lookup(scope).is_some());
+        finish_tx.send(()).unwrap();
+        driver.await.unwrap();
+        assert!(registry.lookup(scope).is_none());
+    }
+
+    #[tokio::test]
+    async fn inspection_dry_compose_is_unregistered() {
+        let (_dir, state, request) = inspection_fixture().await;
+        let project = workspace_project(&state.repository, request.project_id)
+            .await
+            .unwrap();
+        let profile: ModelProfile = serde_json::from_value(json!({"id":Uuid::new_v4(),"label":"test","provider":"ollama","base_url":"http://127.0.0.1:1","model":"not-contacted","supports_tools":true,"supports_vision":false})).unwrap();
+        state.repository.save_model_profile(&profile).await.unwrap();
+        let (slot, _) = mock_resource_slot(std::path::Path::new(&project.local_root), false, false);
+        let scope = (request.project_id, request.conversation_id, request.run_id);
+        let _guard = state.live_runtime_registry_v4.register(scope, &slot);
+        let (model, tools) = compose(
+            &state,
+            &project,
+            &inspection_selection(),
+            profile.id,
+            request.run_id,
+            request.conversation_id,
+            None,
+            None,
+            None,
+            None,
+            true,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(tools._runtime_registration.is_none());
+        assert!(model.resources.as_ref().unwrap().ready.get().is_none());
+        assert!(Arc::ptr_eq(
+            &state.live_runtime_registry_v4.lookup(scope).unwrap().1,
+            &slot
+        ));
+        drop((model, tools));
+        assert!(state.live_runtime_registry_v4.lookup(scope).is_some());
+    }
+
+    #[tokio::test]
+    async fn inspection_driver_guard_cleans_up_on_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = LiveRuntimeRegistryV4::default();
+        let scope = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (slot, _) = mock_resource_slot(dir.path(), false, false);
+        let guard = registry.register(scope, &slot);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let driver = spawn_execution_driver_v4(Some(guard), async move {
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        assert!(registry.lookup(scope).is_some());
+        driver.abort();
+        let _ = driver.await;
+        assert!(registry.lookup(scope).is_none());
+    }
+
+    struct HostInspectionProcess {
+        id: Uuid,
+        started: Option<Arc<tokio::sync::Notify>>,
+        release: Option<Arc<tokio::sync::Notify>>,
+        busy: bool,
+    }
+    #[async_trait]
+    impl KernelProcessV4 for HostInspectionProcess {
+        fn session_id(&self) -> Uuid {
+            self.id
+        }
+        fn process_identity(&self) -> &str {
+            "inspection-host-fixture"
+        }
+        async fn inspect(
+            &self,
+        ) -> Result<
+            omicsops_protocol::KernelInspectionPayloadV4,
+            omicsops_runtime::KernelInspectionErrorV4,
+        > {
+            if let Some(started) = &self.started {
+                started.notify_one();
+            }
+            if let Some(release) = &self.release {
+                release.notified().await;
+            }
+            if self.busy {
+                return Err(omicsops_runtime::KernelInspectionErrorV4::Busy);
+            }
+            Ok(omicsops_protocol::KernelInspectionPayloadV4 {
+                objects: vec![
+                    omicsops_protocol::KernelObjectMetadataV4 {
+                        name: "ordinary".into(),
+                        type_label: "int".into(),
+                        dimensions: None,
+                        element_count: Some(1),
+                        summary: "api_key=secret-sentinel".into(),
+                    },
+                    omicsops_protocol::KernelObjectMetadataV4 {
+                        name: "token_secret_sentinel".into(),
+                        type_label: "str".into(),
+                        dimensions: None,
+                        element_count: None,
+                        summary: "str".into(),
+                    },
+                ],
+                truncated: false,
+            })
+        }
+        async fn execute(&self, _: String, _: Vec<String>) -> Result<RuntimeResultV4, String> {
+            panic!("inspection cannot execute")
+        }
+        async fn interrupt(&self) -> Result<(), String> {
+            panic!("inspection cannot interrupt")
+        }
+    }
+    struct HostInspectionBackend {
+        process: Arc<HostInspectionProcess>,
+        launches: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl KernelBackendV4 for HostInspectionBackend {
+        fn descriptor(&self) -> ComputeBackendDescriptorV4 {
+            ComputeBackendDescriptorV4 {
+                schema_version: 4,
+                backend_id: "local".into(),
+                kind: ComputeBackendKindV4::Local,
+                isolation: IsolationStrengthV4::Process,
+                available: true,
+                supports_python: true,
+                supports_r: true,
+                supports_network_policy: false,
+            }
+        }
+        async fn launch(
+            &self,
+            _: &ExecutionContextKeyV4,
+        ) -> Result<Arc<dyn KernelProcessV4>, String> {
+            self.launches.fetch_add(1, Ordering::SeqCst);
+            Ok(self.process.clone())
+        }
+    }
+    async fn inspection_ready_slot(
+        dir: &std::path::Path,
+        request: &omicsops_protocol::InspectKernelRequestV4,
+        process: HostInspectionProcess,
+    ) -> (Arc<ExecutionResourcesSlotV4>, Arc<HostInspectionBackend>) {
+        let backend = Arc::new(HostInspectionBackend {
+            process: Arc::new(process),
+            launches: Default::default(),
+        });
+        let runtime = Arc::new(RuntimeManagerV4::new(backend.clone()));
+        let key = ExecutionContextKeyV4 {
+            project_id: request.project_id,
+            run_id: request.run_id,
+            backend_id: "local".into(),
+            language: request.language,
+            environment: "system".into(),
+        };
+        runtime.acquire(&key).await.unwrap();
+        let (slot, factory) = mock_resource_slot(dir, false, false);
+        let mut resources = factory.initialize().await.unwrap();
+        resources.runtime = runtime;
+        drop(slot);
+        (test_ready_resources(resources), backend)
+    }
+    #[tokio::test]
+    async fn inspection_host_ready_busy_and_stale_are_ephemeral_nonstarting() {
+        let (dir, state, mut request) = inspection_fixture().await;
+        let scope = (request.project_id, request.conversation_id, request.run_id);
+        let before_events = state
+            .repository
+            .agent_events_v4(request.run_id)
+            .await
+            .unwrap();
+        let before_run = state.repository.agent_run_v4(request.run_id).await.unwrap();
+        for busy in [false, true] {
+            let id = Uuid::new_v4();
+            let (slot, backend) = inspection_ready_slot(
+                dir.path(),
+                &request,
+                HostInspectionProcess {
+                    id,
+                    started: None,
+                    release: None,
+                    busy,
+                },
+            )
+            .await;
+            let _guard = state.live_runtime_registry_v4.register(scope, &slot);
+            let before = backend.launches.load(Ordering::SeqCst);
+            let response = inspect_live_kernel_v4(&state, &request).await.unwrap();
+            assert_eq!(
+                response.status,
+                if busy {
+                    omicsops_protocol::KernelInspectionStatusV4::Busy
+                } else {
+                    omicsops_protocol::KernelInspectionStatusV4::Ready
+                }
+            );
+            assert_eq!(response.session_id, Some(id));
+            if !busy {
+                assert_eq!(response.objects.len(), 1);
+                assert!(
+                    !serde_json::to_string(&response)
+                        .unwrap()
+                        .contains("secret-sentinel")
+                );
+            }
+            request.expected_session_id = Some(Uuid::new_v4());
+            let stale = inspect_live_kernel_v4(&state, &request).await.unwrap();
+            assert_eq!(
+                stale.status,
+                omicsops_protocol::KernelInspectionStatusV4::StaleSession
+            );
+            assert!(stale.objects.is_empty());
+            request.expected_session_id = None;
+            assert_eq!(backend.launches.load(Ordering::SeqCst), before);
+        }
+        assert_eq!(
+            state
+                .repository
+                .agent_events_v4(request.run_id)
+                .await
+                .unwrap(),
+            before_events
+        );
+        assert_eq!(
+            state.repository.agent_run_v4(request.run_id).await.unwrap(),
+            before_run
+        );
+    }
+    #[tokio::test]
+    async fn inspection_host_rechecks_generation_and_frozen_scope_after_await() {
+        for change_scope in [false, true] {
+            let (dir, state, request) = inspection_fixture().await;
+            let started = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let (slot, backend) = inspection_ready_slot(
+                dir.path(),
+                &request,
+                HostInspectionProcess {
+                    id: Uuid::new_v4(),
+                    started: Some(started.clone()),
+                    release: Some(release.clone()),
+                    busy: false,
+                },
+            )
+            .await;
+            let scope = (request.project_id, request.conversation_id, request.run_id);
+            let _guard = state.live_runtime_registry_v4.register(scope, &slot);
+            let observation = inspect_live_kernel_v4(&state, &request);
+            let replacement = async {
+                started.notified().await;
+                let mut replacement_guard = None;
+                if change_scope {
+                    let mut record = load_record(&state.repository, request.run_id)
+                        .await
+                        .unwrap();
+                    record.compute_selection.as_mut().unwrap().environment =
+                        "changed-after-inspect".into();
+                    save_record(&state.repository, &record).await.unwrap();
+                } else {
+                    replacement_guard = Some(state.live_runtime_registry_v4.register(scope, &slot));
+                }
+                release.notify_one();
+                replacement_guard
+            };
+            let (response, _replacement_guard) = tokio::join!(observation, replacement);
+            if change_scope {
+                assert_eq!(
+                    response.unwrap_err(),
+                    "kernel_inspection_selection_mismatch"
+                );
+            } else {
+                let response = response.unwrap();
+                assert_eq!(
+                    response.status,
+                    omicsops_protocol::KernelInspectionStatusV4::StaleSession
+                );
+                assert!(response.objects.is_empty());
+            }
+            assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+        }
     }
 }

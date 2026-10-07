@@ -119,6 +119,21 @@ impl ComputeBackendRegistryV4 {
     }
 }
 
+/// A non-waiting final host check; contention is not evidence of replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelInspectionSessionCheckV4 {
+    Current,
+    Stale,
+    Busy,
+    Unavailable,
+}
+
+/// Opaque, weak identity of the exact process inspected; never part of a UI DTO.
+pub struct KernelInspectionIdentityV4 {
+    session: std::sync::Weak<dyn KernelProcessV4>,
+    session_id: Uuid,
+}
+
 pub struct RuntimeManagerV4 {
     backend: Arc<dyn KernelBackendV4>,
     sessions: Mutex<HashMap<ExecutionContextKeyV4, Arc<dyn KernelProcessV4>>>,
@@ -134,6 +149,30 @@ impl RuntimeManagerV4 {
         }
     }
 
+    /// Recheck after host ownership awaits without launching, sending or retaining a process.
+    pub fn check_inspection_session(
+        &self,
+        key: &ExecutionContextKeyV4,
+        identity: &KernelInspectionIdentityV4,
+    ) -> KernelInspectionSessionCheckV4 {
+        use KernelInspectionSessionCheckV4 as Check;
+        let Ok(sessions) = self.sessions.try_lock() else {
+            return Check::Busy;
+        };
+        let Some(session) = sessions.get(key) else {
+            return Check::Stale;
+        };
+        if session.session_id() != identity.session_id
+            || !std::sync::Weak::ptr_eq(&Arc::downgrade(session), &identity.session)
+        {
+            return Check::Stale;
+        }
+        if !session.is_healthy() {
+            return Check::Unavailable;
+        }
+        Check::Current
+    }
+
     pub fn backend_descriptor(&self) -> ComputeBackendDescriptorV4 {
         self.backend.descriptor()
     }
@@ -144,12 +183,28 @@ impl RuntimeManagerV4 {
         key: &ExecutionContextKeyV4,
         expected_session_id: Option<Uuid>,
     ) -> KernelInspectionResultV4 {
+        self.inspect_existing_with_identity(key, expected_session_id)
+            .await
+            .0
+    }
+
+    /// The host can validate the same Arc and UUID after its final ownership await.
+    pub async fn inspect_existing_with_identity(
+        &self,
+        key: &ExecutionContextKeyV4,
+        expected_session_id: Option<Uuid>,
+    ) -> (KernelInspectionResultV4, Option<KernelInspectionIdentityV4>) {
         let deadline = tokio::time::Instant::now()
             + std::time::Duration::from_secs(KERNEL_INSPECTION_TIMEOUT_SECONDS);
-        let unavailable = |status, session_id| KernelInspectionResultV4 {
-            status,
-            session_id,
-            payload: None,
+        let unavailable = |status, session_id| {
+            (
+                KernelInspectionResultV4 {
+                    status,
+                    session_id,
+                    payload: None,
+                },
+                None,
+            )
         };
         let session = match tokio::time::timeout_at(deadline, self.sessions.lock()).await {
             Ok(sessions) => sessions.get(key).cloned(),
@@ -159,6 +214,21 @@ impl RuntimeManagerV4 {
             return unavailable(KernelInspectionStatusV4::NotStarted, None);
         };
         let id = session.session_id();
+        // Retain only weak identity for every session-bearing outcome, including Busy.
+        // The host may await Store ownership validation before projecting that outcome.
+        let unavailable = |status, session_id| {
+            (
+                KernelInspectionResultV4 {
+                    status,
+                    session_id,
+                    payload: None,
+                },
+                Some(KernelInspectionIdentityV4 {
+                    session: Arc::downgrade(&session),
+                    session_id: id,
+                }),
+            )
+        };
         if expected_session_id.is_some_and(|expected| expected != id) {
             return unavailable(KernelInspectionStatusV4::StaleSession, Some(id));
         }
@@ -183,11 +253,17 @@ impl RuntimeManagerV4 {
             Ok(Ok(payload))
                 if session.is_healthy() && validate_inspection_payload(&payload).is_ok() =>
             {
-                KernelInspectionResultV4 {
-                    status: KernelInspectionStatusV4::Ready,
-                    session_id: Some(id),
-                    payload: Some(payload),
-                }
+                (
+                    KernelInspectionResultV4 {
+                        status: KernelInspectionStatusV4::Ready,
+                        session_id: Some(id),
+                        payload: Some(payload),
+                    },
+                    Some(KernelInspectionIdentityV4 {
+                        session: Arc::downgrade(&session),
+                        session_id: id,
+                    }),
+                )
             }
             Ok(Err(KernelInspectionErrorV4::Busy)) => {
                 unavailable(KernelInspectionStatusV4::Busy, Some(id))
@@ -823,5 +899,92 @@ mod tests {
                 .unwrap_err()
                 .contains("duplicate")
         );
+    }
+
+    #[tokio::test]
+    async fn inspection_session_check_is_nonstarting_and_distinguishes_contention() {
+        use KernelInspectionSessionCheckV4 as Check;
+        let backend = Arc::new(FakeBackend(AtomicUsize::new(0)));
+        let manager = RuntimeManagerV4::new(backend.clone());
+        let key = inspection_key();
+        let process = Arc::new(InspectionProcess {
+            id: Uuid::new_v4(),
+            result: Ok(KernelInspectionPayloadV4 {
+                objects: vec![],
+                truncated: false,
+            }),
+            started: None,
+            resume: None,
+            healthy: true,
+        });
+        manager
+            .sessions
+            .lock()
+            .await
+            .insert(key.clone(), process.clone());
+        let absent_identity = KernelInspectionIdentityV4 {
+            session: Arc::downgrade(&(process.clone() as Arc<dyn KernelProcessV4>)),
+            session_id: process.id,
+        };
+        assert_eq!(
+            manager.check_inspection_session(&inspection_key(), &absent_identity),
+            Check::Stale
+        );
+        let (result, identity) = manager.inspect_existing_with_identity(&key, None).await;
+        let identity = identity.unwrap();
+        assert_eq!(result.status, KernelInspectionStatusV4::Ready);
+        assert_eq!(
+            manager.check_inspection_session(&key, &identity),
+            Check::Current
+        );
+        let lock = manager.sessions.lock().await;
+        assert_eq!(
+            manager.check_inspection_session(&key, &identity),
+            Check::Busy
+        );
+        drop(lock);
+        // Replacement reuses the same UUID: UUID equality alone must not admit old metadata.
+        manager.sessions.lock().await.insert(
+            key.clone(),
+            Arc::new(InspectionProcess {
+                id: process.id,
+                result: Ok(KernelInspectionPayloadV4 {
+                    objects: vec![],
+                    truncated: false,
+                }),
+                started: None,
+                resume: None,
+                healthy: true,
+            }),
+        );
+        assert_eq!(
+            manager.check_inspection_session(&key, &identity),
+            Check::Stale
+        );
+        manager.sessions.lock().await.insert(
+            key.clone(),
+            Arc::new(FakeProcess {
+                id: process.id,
+                identity: "same-id".into(),
+                values: Mutex::new(HashMap::new()),
+            }),
+        );
+        manager.interrupt(&key).await.unwrap();
+        assert_eq!(
+            manager.check_inspection_session(&key, &identity),
+            Check::Stale
+        );
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0);
+        let unhealthy: Arc<dyn KernelProcessV4> = Arc::new(FailingProcess);
+        let unhealthy_identity = KernelInspectionIdentityV4 {
+            session: Arc::downgrade(&unhealthy),
+            session_id: Uuid::nil(),
+        };
+        manager.sessions.lock().await.insert(key.clone(), unhealthy);
+        assert_eq!(
+            manager.check_inspection_session(&key, &unhealthy_identity),
+            Check::Unavailable
+        );
+        assert_eq!(Arc::strong_count(&process), 1);
     }
 }
