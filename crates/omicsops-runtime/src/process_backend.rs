@@ -327,12 +327,21 @@ impl KernelProcessV4 for ProcessKernelV4 {
                 return Err("kernel process is unavailable".into());
             }
             let handle = guard.as_mut().ok_or("kernel process is stopped")?;
+            handle
+                .lines
+                .get_mut()
+                .ensure_clean()
+                .map_err(|_| "kernel process is unavailable".to_string())?;
             let request = json!({
                 "action":"execute",
                 "request_id":request_id,
                 "code":code,
                 "capture_paths":capture_paths,
             });
+            let mut health = SentRequestHealthGuard {
+                healthy: &self.healthy,
+                verified: false,
+            };
             handle
                 .stdin
                 .write_all(format!("{request}\n").as_bytes())
@@ -398,6 +407,9 @@ impl KernelProcessV4 for ProcessKernelV4 {
                     _ => return Err("unknown kernel JSONL event".into()),
                 }
             };
+            // Terminal identity/framing is confirmed. Cancellation during
+            // ordinary archival no longer leaves an outstanding pipe read.
+            health.verified = true;
             fs::create_dir_all(&self.output_dir)
                 .await
                 .map_err(|error| error.to_string())?;
@@ -461,12 +473,104 @@ impl KernelProcessV4 for ProcessKernelV4 {
 
 /// Once a write may have begun, cancellation is as uncertain as an I/O error.
 /// Keep this guard outside the timed future so either deadline drops it safely.
-struct InspectionHealthGuard<'a> {
+struct SentRequestHealthGuard<'a> {
     healthy: &'a AtomicBool,
     verified: bool,
 }
 
-impl Drop for InspectionHealthGuard<'_> {
+/// An instantaneous check, not a guarantee against bytes arriving afterward.
+/// Never starts an asynchronous read to decide whether a child pipe is clean.
+trait InspectionReaderReadiness {
+    fn ensure_clean(&mut self) -> Result<(), KernelInspectionErrorV4>;
+}
+
+impl InspectionReaderReadiness for BufReader<ChildStdout> {
+    fn ensure_clean(&mut self) -> Result<(), KernelInspectionErrorV4> {
+        if !self.buffer().is_empty() || child_stdout_has_queued_data(self.get_ref())? {
+            return Err(KernelInspectionErrorV4::Protocol);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn child_stdout_has_queued_data(stdout: &ChildStdout) -> Result<bool, KernelInspectionErrorV4> {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn PeekNamedPipe(
+            pipe: *mut std::ffi::c_void,
+            buffer: *mut std::ffi::c_void,
+            buffer_size: u32,
+            bytes_read: *mut u32,
+            total_available: *mut u32,
+            bytes_left: *mut u32,
+        ) -> i32;
+    }
+    let mut available = 0;
+    // SAFETY: the locked handle owns this live pipe. No read is pending here:
+    // completed fill_buf reads copy the entire requested buffer from Tokio's
+    // Blocking reader (no read-ahead), and failed/cancelled inspections cannot
+    // pass the health gate (the same sent guard covers execute cancellation).
+    // Peek inspects byte count without consuming data or
+    // scheduling another blocking read. The sole output points to a live u32.
+    let success = unsafe {
+        PeekNamedPipe(
+            stdout.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if success == 0 {
+        return Err(KernelInspectionErrorV4::Unavailable);
+    }
+    Ok(available != 0)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn child_stdout_has_queued_data(stdout: &ChildStdout) -> Result<bool, KernelInspectionErrorV4> {
+    use std::os::fd::AsRawFd;
+    #[repr(C)]
+    struct PollFd {
+        fd: std::ffi::c_int,
+        events: std::ffi::c_short,
+        revents: std::ffi::c_short,
+    }
+    #[cfg(target_os = "linux")]
+    type Nfds = std::ffi::c_ulong;
+    #[cfg(target_os = "macos")]
+    type Nfds = std::ffi::c_uint;
+    unsafe extern "C" {
+        // Match Darwin's legacy 32-bit symbol, as in the local libc bindings.
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "poll$UNIX2003"
+        )]
+        fn poll(fds: *mut PollFd, count: Nfds, timeout: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    let mut descriptor = PollFd {
+        fd: stdout.as_raw_fd(),
+        events: 1,
+        revents: 0,
+    };
+    // SAFETY: one live C-layout pollfd; count=1 and timeout=0 never wait or read.
+    // Readable, closed and errored pipes are all unsafe for another dispatch.
+    let result = unsafe { poll(&mut descriptor, 1, 0) };
+    if result < 0 || descriptor.revents & (0x08 | 0x10 | 0x20) != 0 {
+        return Err(KernelInspectionErrorV4::Unavailable);
+    }
+    Ok(result != 0)
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn child_stdout_has_queued_data(_: &ChildStdout) -> Result<bool, KernelInspectionErrorV4> {
+    Err(KernelInspectionErrorV4::Unsupported)
+}
+
+impl Drop for SentRequestHealthGuard<'_> {
     fn drop(&mut self) {
         if !self.verified {
             self.healthy.store(false, Ordering::SeqCst);
@@ -476,12 +580,16 @@ impl Drop for InspectionHealthGuard<'_> {
 
 async fn inspect_jsonl(
     writer: &mut (impl AsyncWrite + Unpin),
-    reader: &mut (impl AsyncBufRead + Unpin),
+    reader: &mut (impl AsyncBufRead + InspectionReaderReadiness + Unpin),
     healthy: &AtomicBool,
 ) -> Result<KernelInspectionPayloadV4, KernelInspectionErrorV4> {
     let request_id = Uuid::new_v4().to_string();
     let request = format!("{}\n", json!({"action":"inspect","request_id":request_id}));
-    let mut health = InspectionHealthGuard {
+    if let Err(error) = reader.ensure_clean() {
+        healthy.store(false, Ordering::SeqCst);
+        return Err(error);
+    }
+    let mut health = SentRequestHealthGuard {
         healthy,
         verified: false,
     };
@@ -534,6 +642,7 @@ async fn inspect_jsonl(
             let payload: KernelInspectionPayloadV4 =
                 serde_json::from_value(event).map_err(|_| KernelInspectionErrorV4::Protocol)?;
             validate_inspection_payload(&payload).map_err(|_| KernelInspectionErrorV4::Protocol)?;
+            reader.ensure_clean()?;
             if !healthy.load(Ordering::SeqCst) {
                 return Err(KernelInspectionErrorV4::Unavailable);
             }
@@ -913,6 +1022,34 @@ repeat { raw <- readLines(input,n=1,warn=FALSE); if (!length(raw)) break; reques
 mod tests {
     use super::*;
 
+    fn duplex_ensure_clean(
+        reader: &mut (impl AsyncBufRead + Unpin),
+    ) -> Result<(), KernelInspectionErrorV4> {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll, Waker},
+        };
+        // DuplexStream reads its in-memory queue synchronously. Unlike Windows
+        // ChildStdout, this poll does not spawn a blocking read or read ahead.
+        match Pin::new(reader).poll_fill_buf(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(bytes)) if !bytes.is_empty() => Err(KernelInspectionErrorV4::Protocol),
+            Poll::Ready(Err(_)) => Err(KernelInspectionErrorV4::Unavailable),
+            _ => Ok(()),
+        }
+    }
+
+    impl InspectionReaderReadiness for BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>> {
+        fn ensure_clean(&mut self) -> Result<(), KernelInspectionErrorV4> {
+            duplex_ensure_clean(self)
+        }
+    }
+
+    impl InspectionReaderReadiness for BufReader<tokio::io::ReadHalf<&mut tokio::io::DuplexStream>> {
+        fn ensure_clean(&mut self) -> Result<(), KernelInspectionErrorV4> {
+            duplex_ensure_clean(self)
+        }
+    }
+
     fn inspection_kernel() -> ProcessKernelV4 {
         ProcessKernelV4 {
             id: Uuid::new_v4(),
@@ -1007,7 +1144,7 @@ mod tests {
     async fn inspect_frame_budget_counts_newline() {
         let base =
             br#"{"kind":"inspection","request_id":"REQUEST_ID","objects":[],"truncated":false}"#;
-        for (bytes, accepted) in [(16384, true), (16385, false)] {
+        for (bytes, accepted) in [(8192, true), (16384, true), (16385, false)] {
             let mut frame = base.to_vec();
             // A UUID is 36 bytes; the placeholder replaced by the fixture is 10.
             frame.resize(bytes - 26 - 1, b' ');
@@ -1016,6 +1153,390 @@ mod tests {
             assert_eq!(result.is_ok(), accepted);
             assert_eq!(healthy, accepted);
         }
+    }
+
+    #[tokio::test]
+    async fn inspect_boundary_duplicate_already_queued_is_rejected() {
+        let base =
+            br#"{"kind":"inspection","request_id":"REQUEST_ID","objects":[],"truncated":false}"#;
+        let duplicate =
+            br#"{"kind":"inspection","request_id":"REQUEST_ID","objects":[],"truncated":false}
+"#;
+        let mut rejected = true;
+        for boundary in [8192, 16384] {
+            let mut frame = base.to_vec();
+            frame.resize(boundary - 26 - 1, b' ');
+            frame.push(b'\n');
+            frame.extend_from_slice(duplicate);
+            let (host, worker) = tokio::io::duplex(32768);
+            let (output, mut input) = tokio::io::split(host);
+            let mut reader = BufReader::new(output);
+            let healthy = AtomicBool::new(true);
+            let worker = tokio::spawn(async move {
+                let (input, mut output) = tokio::io::split(worker);
+                let mut lines = BufReader::new(input).lines();
+                let request: Value =
+                    serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                let frame = String::from_utf8(frame)
+                    .unwrap()
+                    .replace("REQUEST_ID", request["request_id"].as_str().unwrap());
+                output.write_all(frame.as_bytes()).await.unwrap();
+                lines.next_line().await.unwrap()
+            });
+            let result = inspect_jsonl(&mut input, &mut reader, &healthy).await;
+            let inspection_health = healthy.load(Ordering::SeqCst);
+            let mut next_frame = None;
+            if result.is_ok() {
+                // This is the old execute ordering: write first, then reject
+                // the stale frame while reading. No science/user code is run.
+                input
+                    .write_all(b"{\"action\":\"execute\",\"request_id\":\"next-request\"}\n")
+                    .await
+                    .unwrap();
+                input.flush().await.unwrap();
+                let mut stale_line = String::new();
+                reader.read_line(&mut stale_line).await.unwrap();
+                let stale: Value = serde_json::from_str(&stale_line).unwrap();
+                assert_ne!(stale["request_id"], "next-request");
+                next_frame = worker.await.unwrap();
+            } else {
+                worker.abort();
+            }
+            eprintln!(
+                "duplex boundary={boundary} result={result:?} healthy={inspection_health} next_frame={next_frame:?}"
+            );
+            rejected &= result.is_err() && !inspection_health && next_frame.is_none();
+        }
+        assert!(
+            rejected,
+            "queued duplicate beyond the 8 KiB reader slice must invalidate inspection"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_child_boundary_duplicate_prevents_next_execute_frame() {
+        let mut rejected = true;
+        for boundary in [8192, 16384] {
+            let project = tempfile::tempdir().unwrap();
+            let mut command = background_command("python");
+            command.arg("-u").arg("-c").arg(r#"import sys, json
+boundary = int(sys.argv[1])
+request = json.loads(sys.stdin.readline())
+terminal = json.dumps(dict(kind='inspection', request_id=request['request_id'], objects=[], truncated=False))
+sys.stdout.write(terminal + ' ' * (boundary - len(terminal) - 1) + '\n' + terminal + '\n')
+sys.stdout.flush()
+print('duplicate queued', file=sys.stderr, flush=True)
+for raw in sys.stdin:
+    request = json.loads(raw)
+    print(request['action'] + ' sent', file=sys.stderr, flush=True)
+"#).arg(boundary.to_string()).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+            let mut child = command.spawn().unwrap();
+            let stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let mut observed = BufReader::new(child.stderr.take().unwrap()).lines();
+            let kernel = Arc::new(ProcessKernelV4 {
+                id: Uuid::new_v4(),
+                identity: "boundary-protocol-fixture".into(),
+                project_root: project.path().to_path_buf(),
+                output_dir: project.path().join("outputs"),
+                handle: Mutex::new(Some(ProcessHandle {
+                    child,
+                    stdin,
+                    lines: BufReader::new(stdout).lines(),
+                })),
+                healthy: AtomicBool::new(true),
+                container_cleanup: None,
+            });
+            let inspection = kernel.inspect().await;
+            assert_eq!(
+                observed.next_line().await.unwrap().as_deref(),
+                Some("duplicate queued")
+            );
+            let inspection_health = kernel.is_healthy();
+            let execution = kernel.execute("fixed fixture request".into(), vec![]).await;
+            let next_frame =
+                tokio::time::timeout(std::time::Duration::from_millis(100), observed.next_line())
+                    .await;
+            eprintln!(
+                "child boundary={boundary} inspection={inspection:?} inspection_health={inspection_health} execution={execution:?} next_frame={next_frame:?}"
+            );
+            rejected &= inspection.is_err() && !inspection_health && next_frame.is_err();
+            assert!(!project.path().join("outputs").exists());
+            let mut handle = kernel.handle.lock().await.take().unwrap();
+            handle.child.kill().await.unwrap();
+            handle.child.wait().await.unwrap();
+        }
+        assert!(
+            rejected,
+            "already queued duplicate must reject before any next execute frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_child_presend_rejects_observable_late_duplicate() {
+        let mut rejected = true;
+        for action in ["execute", "inspect"] {
+            let project = tempfile::tempdir().unwrap();
+            let release = project.path().join("release-duplicate");
+            let mut command = background_command("python");
+            command.arg("-u").arg("-c").arg(r#"import sys, json, os, time
+request = json.loads(sys.stdin.readline())
+terminal = json.dumps(dict(kind='inspection', request_id=request['request_id'], objects=[], truncated=False))
+print(terminal, flush=True)
+print('terminal sent', file=sys.stderr, flush=True)
+while not os.path.exists(sys.argv[1]):
+    time.sleep(0.001)
+print(terminal, flush=True)
+print('duplicate queued', file=sys.stderr, flush=True)
+for raw in sys.stdin:
+    request = json.loads(raw)
+    print(request['action'] + ' sent', file=sys.stderr, flush=True)
+"#).arg(&release).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+            let mut child = command.spawn().unwrap();
+            let stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let mut observed = BufReader::new(child.stderr.take().unwrap()).lines();
+            let kernel = ProcessKernelV4 {
+                id: Uuid::new_v4(),
+                identity: "late-duplicate-fixture".into(),
+                project_root: project.path().to_path_buf(),
+                output_dir: project.path().join("outputs"),
+                handle: Mutex::new(Some(ProcessHandle {
+                    child,
+                    stdin,
+                    lines: BufReader::new(stdout).lines(),
+                })),
+                healthy: AtomicBool::new(true),
+                container_cleanup: None,
+            };
+            assert!(kernel.inspect().await.is_ok());
+            assert!(kernel.is_healthy());
+            assert_eq!(
+                observed.next_line().await.unwrap().as_deref(),
+                Some("terminal sent")
+            );
+            fs::write(release, b"fixed fixture control").await.unwrap();
+            assert_eq!(
+                observed.next_line().await.unwrap().as_deref(),
+                Some("duplicate queued")
+            );
+            // The child has flushed the duplicate before this next operation.
+            let result = if action == "execute" {
+                kernel
+                    .execute("fixed fixture request".into(), vec![])
+                    .await
+                    .map(|_| ())
+            } else {
+                kernel
+                    .inspect()
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:?}"))
+            };
+            let next_frame =
+                tokio::time::timeout(std::time::Duration::from_millis(100), observed.next_line())
+                    .await;
+            eprintln!(
+                "child presend action={action} result={result:?} healthy={} next_frame={next_frame:?}",
+                kernel.is_healthy()
+            );
+            rejected &= result.is_err() && !kernel.is_healthy() && next_frame.is_err();
+            assert!(!project.path().join("outputs").exists());
+            let mut handle = kernel.handle.lock().await.take().unwrap();
+            handle.child.kill().await.unwrap();
+            handle.child.wait().await.unwrap();
+        }
+        assert!(
+            rejected,
+            "observable queued data must prevent both next execute and inspect writes"
+        );
+    }
+
+    fn native_probe_fixture(
+        script: &str,
+    ) -> (
+        tempfile::TempDir,
+        ProcessKernelV4,
+        Lines<BufReader<tokio::process::ChildStderr>>,
+    ) {
+        let project = tempfile::tempdir().unwrap();
+        let mut command = background_command("python");
+        command
+            .arg("-u")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let observed = BufReader::new(child.stderr.take().unwrap()).lines();
+        let kernel = ProcessKernelV4 {
+            id: Uuid::new_v4(),
+            identity: "native-readiness-fixture".into(),
+            project_root: project.path().to_path_buf(),
+            output_dir: project.path().join("outputs"),
+            handle: Mutex::new(Some(ProcessHandle {
+                child,
+                stdin,
+                lines: BufReader::new(stdout).lines(),
+            })),
+            healthy: AtomicBool::new(true),
+            container_cleanup: None,
+        };
+        (project, kernel, observed)
+    }
+
+    #[tokio::test]
+    async fn inspect_child_unique_boundary_and_live_empty_pipe_remain_usable() {
+        let (_project, kernel, mut observed) = native_probe_fixture(
+            r#"import sys, json
+print('live empty pipe', file=sys.stderr, flush=True)
+request = json.loads(sys.stdin.readline())
+terminal = json.dumps(dict(kind='inspection', request_id=request['request_id'], objects=[], truncated=False))
+sys.stdout.write(terminal + ' ' * (8192 - len(terminal) - 1) + '\n')
+sys.stdout.flush()
+print('unique terminal sent', file=sys.stderr, flush=True)
+for raw in sys.stdin:
+    request = json.loads(raw)
+    print('execute sent', file=sys.stderr, flush=True)
+    for kind, values in [('started', {}), ('stdout', {'payload': 'healthy fixture executed'}), ('completed', {})]:
+        print(json.dumps(dict(request_id=request['request_id'], kind=kind, **values)), flush=True)
+"#,
+        );
+        assert_eq!(
+            observed.next_line().await.unwrap().as_deref(),
+            Some("live empty pipe")
+        );
+        assert!(kernel.inspect().await.is_ok());
+        assert!(kernel.is_healthy());
+        assert_eq!(
+            observed.next_line().await.unwrap().as_deref(),
+            Some("unique terminal sent")
+        );
+        let execution = kernel
+            .execute("fixed fixture request".into(), vec![])
+            .await
+            .unwrap();
+        assert!(execution.succeeded);
+        assert_eq!(execution.stdout, "healthy fixture executed");
+        assert!(kernel.is_healthy());
+        assert_eq!(
+            observed.next_line().await.unwrap().as_deref(),
+            Some("execute sent")
+        );
+        let mut handle = kernel.handle.lock().await.take().unwrap();
+        handle.child.kill().await.unwrap();
+        handle.child.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn inspect_child_native_eof_is_fixed_unavailable_without_write() {
+        let (project, kernel, mut observed) = native_probe_fixture(
+            r#"import sys, json, os
+os.close(sys.stdout.fileno())
+print('stdout closed', file=sys.stderr, flush=True)
+for raw in sys.stdin:
+    request = json.loads(raw)
+    print(request['action'] + ' sent', file=sys.stderr, flush=True)
+"#,
+        );
+        assert_eq!(
+            observed.next_line().await.unwrap().as_deref(),
+            Some("stdout closed")
+        );
+        assert!(
+            kernel
+                .handle
+                .lock()
+                .await
+                .as_mut()
+                .unwrap()
+                .child
+                .try_wait()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            kernel.inspect().await,
+            Err(KernelInspectionErrorV4::Unavailable)
+        );
+        assert!(!kernel.is_healthy());
+        assert_eq!(
+            kernel
+                .execute("fixed fixture request".into(), vec![])
+                .await
+                .unwrap_err(),
+            "kernel process is unavailable"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), observed.next_line())
+                .await
+                .is_err()
+        );
+        assert!(!project.path().join("outputs").exists());
+        let mut handle = kernel.handle.lock().await.take().unwrap();
+        handle.child.kill().await.unwrap();
+        handle.child.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn inspect_presend_cannot_follow_cancelled_execute_read() {
+        let (project, kernel, mut observed) = native_probe_fixture(
+            r#"import sys, json
+for raw in sys.stdin:
+    request = json.loads(raw)
+    print(request['action'] + ' sent', file=sys.stderr, flush=True)
+"#,
+        );
+        let kernel = Arc::new(kernel);
+        let execution = tokio::spawn({
+            let kernel = kernel.clone();
+            async move { kernel.execute("fixed fixture request".into(), vec![]).await }
+        });
+        assert_eq!(
+            observed.next_line().await.unwrap().as_deref(),
+            Some("execute sent")
+        );
+        // No stdout is produced, so execute is waiting for a terminal read.
+        tokio::task::yield_now().await;
+        assert!(kernel.handle.try_lock().is_err());
+        assert!(kernel.is_healthy());
+        execution.abort();
+        assert!(execution.await.unwrap_err().is_cancelled());
+        let healthy_after_cancel = kernel.is_healthy();
+        let mut next_frame = None;
+        if !healthy_after_cancel {
+            assert_eq!(
+                kernel.inspect().await,
+                Err(KernelInspectionErrorV4::Unavailable)
+            );
+            assert_eq!(
+                kernel
+                    .execute("fixed next request".into(), vec![])
+                    .await
+                    .unwrap_err(),
+                "kernel process is unavailable"
+            );
+            next_frame =
+                tokio::time::timeout(std::time::Duration::from_millis(100), observed.next_line())
+                    .await
+                    .ok();
+        }
+        assert!(!project.path().join("outputs").exists());
+        let mut handle = kernel.handle.lock().await.take().unwrap();
+        assert!(handle.child.try_wait().unwrap().is_none());
+        // Cleanup releases the fixture's never-completing stdout ReadFile.
+        handle.child.kill().await.unwrap();
+        handle.child.wait().await.unwrap();
+        eprintln!("cancelled execute health={healthy_after_cancel} next_frame={next_frame:?}");
+        assert!(
+            !healthy_after_cancel,
+            "a cancelled execute read must not reach synchronous native preflight"
+        );
+        assert!(next_frame.is_none());
     }
 
     #[tokio::test]
@@ -1374,6 +1895,22 @@ for raw in sys.stdin:
         assert_eq!(first.process_identity, second.process_identity);
         assert_eq!(first.artifacts[0].size_bytes, 13);
         assert_eq!(first.artifacts[0].sha256.len(), 64);
+        let failed = manager
+            .execute(
+                &key,
+                "raise RuntimeError('fixed fixture failure')".into(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert!(!failed.succeeded);
+        let after_failed = manager
+            .execute(&key, "print(answer)".into(), vec![])
+            .await
+            .unwrap();
+        assert_eq!(after_failed.stdout.trim(), "42");
+        assert_eq!(failed.session_id, first.session_id);
+        assert_eq!(after_failed.session_id, first.session_id);
         manager.interrupt(&key).await.unwrap();
     }
 
