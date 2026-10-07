@@ -14,6 +14,145 @@ pub enum ControlledTransfer {
     Canceled(u64),
 }
 
+/// Raw bounded bytes for host projection; the EOF probe is never included.
+#[derive(Debug)]
+pub struct RemoteFilePrefix {
+    pub bytes: Vec<u8>,
+    pub size_bytes: Option<u64>,
+    pub eof: bool,
+    pub metadata_stable: bool,
+}
+
+type PrefixMetadata = Option<(Option<u64>, Option<u32>)>;
+pub const REMOTE_FILE_PREFIX_CHANGED: &str = "remote prefix source changed";
+
+#[async_trait::async_trait]
+trait PrefixReader: AsyncRead + Unpin + Send + Sync {
+    async fn prefix_metadata(&self) -> PrefixMetadata;
+}
+#[async_trait::async_trait]
+impl PrefixReader for russh_sftp::client::fs::File {
+    async fn prefix_metadata(&self) -> PrefixMetadata {
+        self.metadata()
+            .await
+            .ok()
+            .map(|metadata| (metadata.size, metadata.mtime))
+    }
+}
+async fn read_handle_prefix(
+    reader: &mut impl PrefixReader,
+    max_bytes: u64,
+) -> AdapterResult<RemoteFilePrefix> {
+    let before = reader.prefix_metadata().await;
+    let bytes = read_prefix_bytes(reader, max_bytes).await?;
+    let after = reader.prefix_metadata().await;
+    finish_file_prefix(bytes, max_bytes, before, after)
+}
+
+async fn read_prefix_bytes(
+    reader: &mut (impl AsyncRead + Unpin),
+    max_bytes: u64,
+) -> AdapterResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .await?;
+    Ok(bytes)
+}
+
+fn finish_file_prefix(
+    mut bytes: Vec<u8>,
+    max_bytes: u64,
+    before: PrefixMetadata,
+    after: PrefixMetadata,
+) -> AdapterResult<RemoteFilePrefix> {
+    if let (Some(before), Some(after)) = (before, after) {
+        if matches!((before.0, after.0), (Some(a), Some(b)) if a != b)
+            || matches!((before.1, after.1), (Some(a), Some(b)) if a != b)
+        {
+            return Err(AdapterError::Ssh(REMOTE_FILE_PREFIX_CHANGED.into()));
+        }
+    }
+    let eof = bytes.len() as u64 <= max_bytes;
+    bytes.truncate(usize::try_from(max_bytes).unwrap_or(usize::MAX));
+    let size_bytes = before.and_then(|metadata| metadata.0);
+    let metadata_stable = matches!((before, after), (Some((Some(a), Some(b))), Some((Some(c), Some(d)))) if a == c && b == d);
+    if size_bytes
+        .is_some_and(|size| size < bytes.len() as u64 || (eof && size != bytes.len() as u64))
+    {
+        return Err(AdapterError::Ssh(REMOTE_FILE_PREFIX_CHANGED.into()));
+    }
+    Ok(RemoteFilePrefix {
+        bytes,
+        size_bytes,
+        eof,
+        metadata_stable,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    #[tokio::test]
+    async fn file_prefix_probe_and_metadata() {
+        let mut reader = Cursor::new(b"abcd".to_vec());
+        let bytes = read_prefix_bytes(&mut reader, 3).await.unwrap();
+        let read = finish_file_prefix(bytes, 3, Some((Some(4), Some(1))), Some((Some(4), Some(1))))
+            .unwrap();
+        assert_eq!(read.bytes, b"abc");
+        assert!(!read.eof);
+        assert_eq!(reader.position(), 4);
+        assert!(read.metadata_stable);
+        assert_eq!(read.size_bytes, Some(4));
+        for metadata in [None, Some((None, Some(1))), Some((Some(4), None))] {
+            let read = finish_file_prefix(b"abcd".to_vec(), 4, metadata, metadata).unwrap();
+            assert!(read.eof);
+            assert!(!read.metadata_stable);
+            assert_eq!(read.size_bytes, metadata.and_then(|m| m.0));
+        }
+    }
+    #[test]
+    fn file_prefix_rejects_observed_changes() {
+        for after in [(Some(5), Some(1)), (Some(4), Some(2))] {
+            assert!(
+                finish_file_prefix(b"abc".to_vec(), 3, Some((Some(4), Some(1))), Some(after))
+                    .is_err()
+            );
+        }
+    }
+    struct Reader {
+        bytes: Cursor<Vec<u8>>,
+        metadata: Mutex<std::collections::VecDeque<PrefixMetadata>>,
+    }
+    impl AsyncRead for Reader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.bytes).poll_read(cx, buf)
+        }
+    }
+    #[async_trait::async_trait]
+    impl PrefixReader for Reader {
+        async fn prefix_metadata(&self) -> PrefixMetadata {
+            self.metadata.lock().unwrap().pop_front().unwrap()
+        }
+    }
+    #[tokio::test]
+    async fn file_prefix_same_reader_observes_metadata_before_and_after() {
+        let mut reader = Reader {
+            bytes: Cursor::new(b"abcd".to_vec()),
+            metadata: Mutex::new([Some((Some(4), Some(1))), Some((Some(5), Some(1)))].into()),
+        };
+        assert!(read_handle_prefix(&mut reader, 3).await.is_err());
+        assert_eq!(reader.bytes.position(), 4);
+        assert!(reader.metadata.lock().unwrap().is_empty());
+    }
+}
+
 use omicsops_core::domain::ConnectionProfile;
 use russh::{
     ChannelMsg, Disconnect, client,
@@ -557,6 +696,32 @@ impl SshSession {
             )));
         }
         Ok(bytes)
+    }
+
+    pub async fn read_file_prefix(
+        &self,
+        remote_path: &str,
+        max_bytes: u64,
+    ) -> AdapterResult<RemoteFilePrefix> {
+        let sftp = self.sftp().await?;
+        let metadata = sftp
+            .symlink_metadata(remote_path)
+            .await
+            .map_err(|error| AdapterError::Ssh(error.to_string()))?;
+        if metadata.permissions.is_some() && !metadata.is_regular() {
+            return Err(AdapterError::Ssh(
+                "remote prefix is not a regular file".into(),
+            ));
+        }
+        let mut remote = sftp
+            .open(remote_path)
+            .await
+            .map_err(|error| AdapterError::Ssh(error.to_string()))?;
+        // fstat observes this exact opened handle. Unsupported attributes
+        // stay unknown; absent sizes are never converted to zero.
+        let result = read_handle_prefix(&mut remote, max_bytes).await;
+        let closed = remote.shutdown().await.map_err(AdapterError::from);
+        result.and_then(|read| closed.map(|_| read))
     }
 
     pub async fn disconnect(self) -> AdapterResult<()> {

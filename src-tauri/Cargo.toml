@@ -53,6 +53,7 @@ zip.workspace = true
 tempfile = "3"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 futures-util.workspace = true
 sqlx.workspace = true
 

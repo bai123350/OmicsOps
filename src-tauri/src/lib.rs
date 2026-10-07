@@ -44,6 +44,7 @@ mod plan_revision_tests;
 mod project_file_read;
 pub mod project_memory;
 mod project_table;
+mod project_table_commands;
 pub mod project_templates;
 pub mod pubmed_mcp;
 mod remote_jobs_v4;
@@ -380,6 +381,7 @@ pub fn run() {
             sync_commands::upload_selected_files,
             sync_commands::download_project_file,
             sync_commands::preview_project_image,
+            project_table_commands::preview_project_table,
             sync_commands::list_sync_entries,
             sync_commands::pause_sync_transfer,
             sync_commands::cancel_sync_transfer,

@@ -155,7 +155,7 @@ impl ValidatedProjectFile {
     }
 }
 
-fn is_reserved_component(component: &str) -> bool {
+pub(crate) fn is_reserved_component(component: &str) -> bool {
     let base = component
         .split('.')
         .next()
