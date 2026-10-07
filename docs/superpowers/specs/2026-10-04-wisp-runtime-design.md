@@ -76,7 +76,9 @@ Python 只对 exact built-in 类型读取受控元数据，不调用任意 `repr
 
 worker 过滤内部/明显凭据绑定名，宿主再次应用既有脱敏规则。结果仅送本次 UI，不写事件、日志、SQLite、模型上下文、科研 Artifact 或导出；用户提供的对象名称和 worker 原始错误不能作为日志字符串。Ready 是内存元数据快照，不能当科研结论证据。
 
-Busy、StaleSession、NotStarted 不改变会话健康或计算状态。inspect 请求已经发出后若超时或协议失步，沿用现有不确定响应的保守处理：该会话标记不可继续复用，后续观察返回 Unavailable；本次查看不杀进程、不重建、不重试执行、不把未知作业记为 cancelled。Manager有覆盖lookup/await/recheck的外层3秒deadline，worker写入可能已发送后的健康guard须在future被取消时仍标不可复用，不能依赖内层timeout分支一定执行。宿主补齐scope并脱敏后再次完整response验证，避免payload预算漏计envelope。传输上限和超时由固定宿主策略控制，错误UI只显示白名单原因。
+Busy、StaleSession、NotStarted 不改变会话健康或计算状态。inspect 请求已经发出后若超时或协议失步，沿用现有不确定响应的保守处理：该会话标记不可继续复用，后续观察返回 Unavailable；本次查看不杀进程、不重建、不重试执行、不把未知作业记为 cancelled。Manager有覆盖lookup/await/recheck的外层3秒deadline，worker写入可能已发送后的健康guard须在future被取消时仍标不可复用，不能依赖内层timeout分支一定执行。正常pending时health保持true，既有execute拿进程锁后、写请求前须重验health，防止先取得Arc的排队执行复用后来失步的会话；只拒绝此不确定派发，健康协议/结果生命周期保持。宿主补齐scope并脱敏后再次完整response验证，避免payload预算漏计envelope。传输上限和超时由固定宿主策略控制，错误UI只显示白名单原因。
+
+Local/容器的终端验证后及下次写入前，检查buffer与当前descriptor已经排队的数据；buffer恰好耗尽不代表pipe clean。Windows使用read-only PeekNamedPipe，Linux/macOS使用poll(timeout0)，无wait/delay或第二读者。此实现依赖没有同句柄未决读：[Microsoft PeekNamedPipe主文档](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-peeknamedpipe)说明synchronous handle在多线程下可能阻塞。execute可能写入至已验证terminal的drop-health guard关闭被取消Blocking读仍healthy的入口；正常pending不改变health，terminal验证后/archival前解除，未知计算仍不能称为取消。Native错误固定映射且会话不可复用。Windows须实际编译并测试empty/EOF/queued；Linux/macOS本轮未编译/执行，不作支持保证。Readiness只是当下queued/pre-send可检测数据，不能保证阻止clean检查后任意新异步帧；后续失步仍拒绝复用、不重试未知派发。
 
 ### 自动验收与文件地图
 

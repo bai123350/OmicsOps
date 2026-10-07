@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust/async-trait/Tokio/serde，Tauri 2，React 19/TypeScript/Vitest，Python stdlib unittest；真实 R 仅显式 ignored 验收。
 
-**Spec:** [W04 Runtime 设计](../specs/2026-10-04-wisp-runtime-design.md#w04观察当前内核中的对象)，设计及8515da8全部实施计划已确认。Task1纯协议/非启动manager已独立审阅通过；Task2–5实际worker/宿主/UI与完整交付仍待实施。
+**Spec:** [W04 Runtime 设计](../specs/2026-10-04-wisp-runtime-design.md#w04观察当前内核中的对象)，设计及8515da8全部实施计划已确认。Task1–2纯协议/非启动manager及Local/容器worker已独立审阅/必要复审通过；Task3–5 SSH/宿主/UI与完整交付仍待实施。
 
 ## Global Constraints
 
@@ -63,7 +63,7 @@ assert!(validate_inspection_payload(&over_64_objects).is_err());
 - Produces：`ProcessKernelV4::inspect`；简单请求 `{ action: "inspect", request_id }`、单个终端 `{ kind: "inspection", request_id, objects, truncated }`，execute 原格式不变。
 - Produces：嵌入 Python 的 `inspect_objects(scope: dict) -> dict`，返回 objects/truncated；嵌入 R 的 `inspect_bindings(scope) -> list` 返回相同字段。worker 内 helper 不成为 Agent tool。
 
-- [ ] **RED 写测试**：`inspect_busy_preserves_health`、`inspect_protocol_timeout_marks_unhealthy_without_interrupt`、`inspect_frame_identity_and_budget`。Python unittest 从 Rust 嵌入源码 AST 白名单加载 metadata helper/常量，不运行主循环，测试 `test_exact_builtins_and_opaque_methods`、`test_object_and_utf8_budgets`、`test_secret_names_have_no_values`。
+- [x] **RED 写测试**：`inspect_busy_preserves_health`、`inspect_protocol_timeout_marks_unhealthy_without_interrupt`、`inspect_frame_identity_and_budget`。Python unittest 从 Rust 嵌入源码 AST 白名单加载 metadata helper/常量，不运行主循环，测试 `test_exact_builtins_and_opaque_methods`、`test_object_and_utf8_budgets`、`test_secret_names_have_no_values`。
 
 ```rust
 assert_eq!(busy, Err(KernelInspectionErrorV4::Busy));
@@ -79,10 +79,11 @@ self.assertLessEqual(len(payload["objects"]), 64)
 self.assertNotIn(secret_sentinel, serialized_payload)
 ```
 
-- [ ] **RED 运行**：`cargo test -p omicsops-runtime inspect_`；`python -B -m unittest discover -s scripts -p "test_kernel_inspection.py"`。预期 inspect action/helper 缺失或断言失败。
-- [ ] **实现接口**：try_lock 同一 process handle；固定 3 秒/16 KiB 截止和 request ID 核验。sent 请求失步/超时才置 unhealthy，不中断/rebuild；Busy 不发帧。Task1 manager有外层3秒deadline，worker须在写入可能已发送后持drop-safe健康guard：外层先取消future也置不可复用，不能只依赖内层timeout分支；新增取消后health回归，正常验证完成才解除guard。Python exact 内建类型使用受控 primitive 元数据；R 仅不求值描述/无 class 基础属性，无法安全确认则 opaque；无 `get` 强制求值。容器自然复用协议。
-- [ ] **GREEN**：重复 RED 命令；增加保留 execute/capture 回归，预期旧行为通过；无需安装科学库或 R。
-- [ ] **Commit**：仅暂存本任务文件，`git commit -m "feat(runtime): inspect local kernel metadata without execution"`。
+- [x] **RED 运行**：`cargo test -p omicsops-runtime inspect_`；`python -B -m unittest discover -s scripts -p "test_kernel_inspection.py"`。预期 inspect action/helper 缺失或断言失败。
+- [x] **实现接口**：try_lock 同一 process handle；固定 3 秒/16 KiB 截止和 request ID 核验。sent 请求失步/超时才置 unhealthy，不中断/rebuild；Busy 不发帧。Task1 manager有外层3秒deadline，worker须在写入可能已发送后持drop-safe健康guard：外层先取消future也置不可复用，不能只依赖内层timeout分支；新增取消后health回归，正常验证完成才解除guard。正常pending期间health保持true；已取得同一Arc的execute可能排队在进程锁后，故既有execute只增加拿锁后/写请求前health重验，拒绝已失步会话并覆盖真实queued regression，健康时wire/success/error生命周期保持。Python exact 内建类型使用受控 primitive 元数据；R 仅不求值描述/无 class 基础属性，无法安全确认则 opaque；无 `get` 强制求值。容器自然复用协议。
+- 审阅buffer边界finding：终端验证后及inspect/execute写请求前，还需检查当前buffer外已经排队的额外数据，不能把一次async poll的Pending当clean。采用private descriptor readiness：Windows PeekNamedPipe/Linux及macOS poll(timeout0)，无新增依赖、读者、协议或delay；Windows须验证live empty与EOF/error，Linux/macOS代码条件ABI只静态核对、未执行。Microsoft文档指出synchronous handle在多线程下可能阻塞，因此execute也须在可能写入至已验证terminal之间持drop-health guard，取消后先置不可复用，阻止旧Blocking读进入native probe；terminal后/archival前解除，正常pending保持healthy。公开拒绝不是计算取消。检查只是当下可检测的queued数据，不保证拦截clean检查后任意异步新帧。
+- [x] **GREEN**：重复 RED 命令；增加保留 execute/capture 回归，预期旧行为通过；无需安装科学库或 R。
+- [x] **Commit**：仅暂存本任务文件，`git commit -m "feat(runtime): inspect local kernel metadata without execution"`。
 
 ### Task 3: SSH typed worker 和隔离 R 验收入口
 
@@ -102,7 +103,7 @@ assert_eq!(r_binding_side_effect_count, 0); // 仅 opt-in R 测试
 ```
 
 - [ ] **RED 运行**：`cargo test -p omicsops-agent inspection`；`cargo test -p omicsops-adapters kernel`；`cargo test -p omicsops-desktop --lib ssh_inspect`；Python discovery 同 Task 2。预期 typed inspect 接口缺失/行为失败。
-- [ ] **实现接口**：增 typed variant、双 worker inspect 分派，旧 execute/shutdown 原序列化不变；不以任意代码模拟 inspect。实现 SSH try_lock、3 秒截止、严格 ID/sequence、预算与健康语义；同Task2覆盖manager外层deadline取消sent future的drop-safe不可复用guard，不连接新SSH、不kill/rebuild。为所有现有 exhaustive match 增必要分支。ignored R 测试文档列命令及未执行语义。
+- [ ] **实现接口**：增 typed variant、双 worker inspect 分派，旧 execute/shutdown 原序列化不变；不以任意代码模拟 inspect。实现 SSH try_lock、3 秒截止、严格 ID/sequence、预算与健康语义；同Task2覆盖manager外层deadline取消sent future的drop-safe不可复用guard，不连接新SSH、不kill/rebuild。检查SSH既有execute拿锁后健康重验、可能写入到verified terminal的取消guard与当前transport可检测queued/pre-send污染；不要假定一次Pending就是clean，不机械移植ChildStdout的native API。正常pending healthy、terminal后/ordinary结果处理前解除，未知派发不重试/不称计算取消；仍不保证clean检查之后任意异步帧。为所有现有 exhaustive match 增必要分支。ignored R 测试文档列命令及未执行语义。
 - [ ] **GREEN**：重复 RED 命令；真实 R 在完成默认确定性检查后按 acceptance 文档显式执行或记录未执行，不能把 ignored 当通过。
 - [ ] **Commit**：仅暂存本任务文件，`git commit -m "feat(runtime): add scoped SSH kernel inspection protocol"`。
 
@@ -155,8 +156,10 @@ expect(parentOverlay).toBeVisible(); // 打开立即 Escape 后
 
 ## Plan Self-Review
 
-已将设计的非启动、双协议、安全元数据、失败健康语义、ephemeral宿主和UI分别绑定Task1–5；每项有具名测试，未新增CLI/DB/权限路径。Task1已实现并审阅，其余任务未完成，不把纯协议通过记为真实worker或完整功能交付。
+已将设计的非启动、双协议、安全元数据、失败健康语义、ephemeral宿主和UI分别绑定Task1–5；每项有具名测试，未新增CLI/DB/权限路径。Task1–2已实现并审阅，Task3–5未完成，不把协议/helper/mock通过记为真实worker或完整功能交付。
 
 ## 当前实施证据
 
 2026-10-08：Task1提交a1a7467独立spec/quality审阅通过，无Critical/Important。实际RED runtime31/protocol19缺接口编译错误，中间方法误落测试模块的编译失败保留且已修正。最终runtime inspect5/protocol inspection3/desktop DTO51通过，fmt/diff通过；原OUT_DIR/fmtOS5沙箱日志与授权原命令重跑保留。五路径只含protocol/DTO/runtime契约及测试，external文件完整保留未暂存，既存canonicalization/cache warning非blocking Minor。检查证明零launch、旧session及相同UUID不同Arc拒绝、固定3秒截止、Ready才有payload、完整公开JSON16384/16385字节边界；type_label受控128字节。Manager外层deadline使Task2/3sent取消drop-safe健康guard为必需，Task4scope投影后必须完整validate；均未提前实现或宣称已通过。完整W04/default/native、真实Python/R/SSH/模型/GUI验收仍未执行，Task5及最终分支gate另行负责。
+
+Task2提交45dd6db/91964e3经full/scoped独立审阅通过，无open blocking finding。Python exact builtin/opaque/no-method helper4通过；原Rust14及preserved13是fix前证据。队列执行race真实13通过/1失败→post-lock健康guard后14通过，仍无kill/rebuild/重试/计算取消承诺。审阅I1真实duplex边界16测试15通过/1失败证明8192/16384 dirty terminal接受/health true；next-write及Windows acknowledged queued pre-send各1真实失败。旧execute取消后healthy true的1失败也保留，补sent至verified terminal的drop guard后阻断native入口。最终Windows inspect20/preserved process_backend19通过/0 ignored，fmt/diff通过，unique8192/live empty/EOF/queued及healthy artifacts/capture/failed-code同session实际核验；未复跑未变Python，不把4通过称新fix结果。ABI/Tokio completed-buffer与取消析构顺序经独立复审支持quiescent-read invariant；native peek无无条件nonblocking保证，Linux/macOS未编译/执行，后到帧限制明确。Mock Python协议进程与helper单测不等于真实worker/science验收；实际R/容器/SSH/模型/GUI、CI版本与全产品交付仍未执行，Task5/最终gate负责。
