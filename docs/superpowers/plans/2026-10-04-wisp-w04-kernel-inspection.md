@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust/async-trait/Tokio/serde，Tauri 2，React 19/TypeScript/Vitest，Python stdlib unittest；真实 R 仅显式 ignored 验收。
 
-**Spec:** [W04 Runtime 设计](../specs/2026-10-04-wisp-runtime-design.md#w04观察当前内核中的对象)，设计及8515da8全部实施计划已确认。Task1–2纯协议/非启动manager及Local/容器worker已独立审阅/必要复审通过；Task3–5 SSH/宿主/UI与完整交付仍待实施。
+**Spec:** [W04 Runtime 设计](../specs/2026-10-04-wisp-runtime-design.md#w04观察当前内核中的对象)，设计及8515da8全部实施计划已确认。Task1–3协议/manager及Local/SSH worker已独立审阅/必要复审通过；Task4–5宿主/UI与完整交付仍待实施，真实worker/live验收未执行。
 
 ## Global Constraints
 
@@ -87,14 +87,16 @@ self.assertNotIn(secret_sentinel, serialized_payload)
 
 ### Task 3: SSH typed worker 和隔离 R 验收入口
 
-**Files:** Modify `crates/omicsops-agent/src/lib.rs`、`crates/omicsops-adapters/src/kernel.rs`、`src-tauri/src/agent_v4.rs:SshKernelProcessV4`、`scripts/test_kernel_inspection.py`、`acceptance/README.md`。
+**Files:** Modify `crates/omicsops-agent/src/lib.rs`、`crates/omicsops-adapters/src/kernel.rs`、`src-tauri/src/agent_v4.rs:SshKernelProcessV4`、`scripts/test_kernel_inspection.py`、`acceptance/README.md`；窄幅增加 `crates/omicsops-adapters/src/ssh.rs` producer（inspection bounded receive/current queue readiness，既有receive/send/shutdown保留）。审阅fix增加canonical `scripts/kernel_inspection_helpers.py` / `scripts/kernel_inspection_helpers.R`，以及 `crates/omicsops-runtime/src/process_backend.rs` Local consumer；仅提取重复安全helper/固定预算，不改两个transport envelope/loop。
 
 **Interfaces:**
 - Consumes：Task 1 payload/validator；Task 2 helper 行为和测试加载接缝；现有 KernelEventDecoder identity/sequence 与 SSH process Mutex。
 - Produces：`KernelRequest::Inspect { session_id: Uuid, request_id: Uuid }`；`KernelEventKind::Inspection { objects: Vec<KernelObjectMetadataV4>, truncated: bool }`；`SshKernelProcessV4::inspect` 同 Task 1 trait。
+- Produces：SshJsonlProcess的inspection-only bounded receive与ensure_clean，由KernelConnection委派；fill_buf累积前限16 KiB，不用原read_line分配完整内容后才检查。Russh0.62.4控制消息会wake再Pending，故readiness仅在观察到wake时有限重试，最多4096次，未wake的Pending仅表示当前可观察队列为空，queued/EOF/error/超限保守拒绝，不保证network-in-flight或后到帧。无第二读者/新连接/依赖或delay。
+- Produces：每语言唯一canonical metadata定义/固定policy，经compile-time concat/include_str嵌入Local与SSH；不增加runtime文件加载、CLI/依赖，header/import/captured-builtin/helper/loop顺序保持。两种实际assembled worker的adversarial与provenance测试核验唯一policy inclusion/definition；原四worker字符串byte equality作为重构证据。补direct paused-time3秒 expiry与Unavailable/health false/无后续send，原deadline正确baseline PASS不虚称修复。
 - Produces：ignored `live_r_inspection_bindings_have_no_side_effects`，只执行一次性本地 R worker；显式 `OMICSOPS_LIVE_R_INSPECTION_DISPOSABLE=1`，不连接 SSH/真实项目。
 
-- [ ] **RED 写测试**：`inspect_typed_events_reject_identity_sequence_and_duplicate_terminal`、`ssh_inspect_does_not_execute_or_reconnect`、旧 execute/shutdown JSON snapshot；Python helper unittest 同时覆盖 SSH worker。ignored R fixture 放 active binding/delayedAssign 哨兵，核对 metadata 不触发。
+- [x] **RED 写测试**：`inspect_typed_events_reject_identity_sequence_and_duplicate_terminal`、`ssh_inspect_does_not_execute_or_reconnect`、旧 execute/shutdown JSON snapshot；Python helper unittest 同时覆盖 SSH worker。ignored R fixture 放 active binding/delayedAssign 哨兵，核对 metadata 不触发。
 
 ```rust
 assert!(decoder.accept(wrong_session_frame).is_err());
@@ -102,10 +104,10 @@ assert_eq!((fake_transport.connects(), fake_transport.executes()), (0, 0));
 assert_eq!(r_binding_side_effect_count, 0); // 仅 opt-in R 测试
 ```
 
-- [ ] **RED 运行**：`cargo test -p omicsops-agent inspection`；`cargo test -p omicsops-adapters kernel`；`cargo test -p omicsops-desktop --lib ssh_inspect`；Python discovery 同 Task 2。预期 typed inspect 接口缺失/行为失败。
-- [ ] **实现接口**：增 typed variant、双 worker inspect 分派，旧 execute/shutdown 原序列化不变；不以任意代码模拟 inspect。实现 SSH try_lock、3 秒截止、严格 ID/sequence、预算与健康语义；同Task2覆盖manager外层deadline取消sent future的drop-safe不可复用guard，不连接新SSH、不kill/rebuild。检查SSH既有execute拿锁后健康重验、可能写入到verified terminal的取消guard与当前transport可检测queued/pre-send污染；不要假定一次Pending就是clean，不机械移植ChildStdout的native API。正常pending healthy、terminal后/ordinary结果处理前解除，未知派发不重试/不称计算取消；仍不保证clean检查之后任意异步帧。为所有现有 exhaustive match 增必要分支。ignored R 测试文档列命令及未执行语义。
-- [ ] **GREEN**：重复 RED 命令；真实 R 在完成默认确定性检查后按 acceptance 文档显式执行或记录未执行，不能把 ignored 当通过。
-- [ ] **Commit**：仅暂存本任务文件，`git commit -m "feat(runtime): add scoped SSH kernel inspection protocol"`。
+- [x] **RED 运行**：`cargo test -p omicsops-agent inspection`；`cargo test -p omicsops-adapters kernel`；`cargo test -p omicsops-desktop --lib ssh_inspect`；Python discovery 同 Task 2。预期 typed inspect 接口缺失/行为失败。
+- [x] **实现接口**：增 typed variant、双 worker inspect 分派，旧 execute/shutdown 原序列化不变；不以任意代码模拟 inspect。实现 SSH try_lock、3 秒截止、严格 ID/sequence、预算与健康语义；同Task2覆盖manager外层deadline取消sent future的drop-safe不可复用guard，不连接新SSH、不kill/rebuild。检查SSH既有execute拿锁后健康重验、可能写入到verified terminal的取消guard与当前transport可检测queued/pre-send污染；不要假定一次Pending就是clean，不机械移植ChildStdout的native API。正常pending healthy、terminal后/ordinary结果处理前解除，未知派发不重试/不称计算取消；仍不保证clean检查之后任意异步帧。为所有现有 exhaustive match 增必要分支。ignored R 测试文档列命令及未执行语义。
+- [x] **GREEN**：重复 RED 命令；真实 R 在完成默认确定性检查后按 acceptance 文档显式执行或记录未执行，不能把 ignored 当通过。
+- [x] **Commit**：仅暂存本任务文件，`git commit -m "feat(runtime): add scoped SSH kernel inspection protocol"`。
 
 ### Task 4: 宿主 weak live registry 和只读命令
 
@@ -156,10 +158,12 @@ expect(parentOverlay).toBeVisible(); // 打开立即 Escape 后
 
 ## Plan Self-Review
 
-已将设计的非启动、双协议、安全元数据、失败健康语义、ephemeral宿主和UI分别绑定Task1–5；每项有具名测试，未新增CLI/DB/权限路径。Task1–2已实现并审阅，Task3–5未完成，不把协议/helper/mock通过记为真实worker或完整功能交付。
+已将设计的非启动、双协议、安全元数据、失败健康语义、ephemeral宿主和UI分别绑定Task1–5；每项有具名测试，未新增CLI/DB/权限路径。Task1–3已实现并审阅，Task4–5未完成，不把协议/helper/mock通过记为真实worker或完整功能交付。
 
 ## 当前实施证据
 
 2026-10-08：Task1提交a1a7467独立spec/quality审阅通过，无Critical/Important。实际RED runtime31/protocol19缺接口编译错误，中间方法误落测试模块的编译失败保留且已修正。最终runtime inspect5/protocol inspection3/desktop DTO51通过，fmt/diff通过；原OUT_DIR/fmtOS5沙箱日志与授权原命令重跑保留。五路径只含protocol/DTO/runtime契约及测试，external文件完整保留未暂存，既存canonicalization/cache warning非blocking Minor。检查证明零launch、旧session及相同UUID不同Arc拒绝、固定3秒截止、Ready才有payload、完整公开JSON16384/16385字节边界；type_label受控128字节。Manager外层deadline使Task2/3sent取消drop-safe健康guard为必需，Task4scope投影后必须完整validate；均未提前实现或宣称已通过。完整W04/default/native、真实Python/R/SSH/模型/GUI验收仍未执行，Task5及最终分支gate另行负责。
 
 Task2提交45dd6db/91964e3经full/scoped独立审阅通过，无open blocking finding。Python exact builtin/opaque/no-method helper4通过；原Rust14及preserved13是fix前证据。队列执行race真实13通过/1失败→post-lock健康guard后14通过，仍无kill/rebuild/重试/计算取消承诺。审阅I1真实duplex边界16测试15通过/1失败证明8192/16384 dirty terminal接受/health true；next-write及Windows acknowledged queued pre-send各1真实失败。旧execute取消后healthy true的1失败也保留，补sent至verified terminal的drop guard后阻断native入口。最终Windows inspect20/preserved process_backend19通过/0 ignored，fmt/diff通过，unique8192/live empty/EOF/queued及healthy artifacts/capture/failed-code同session实际核验；未复跑未变Python，不把4通过称新fix结果。ABI/Tokio completed-buffer与取消析构顺序经独立复审支持quiescent-read invariant；native peek无无条件nonblocking保证，Linux/macOS未编译/执行，后到帧限制明确。Mock Python协议进程与helper单测不等于真实worker/science验收；实际R/容器/SSH/模型/GUI、CI版本与全产品交付仍未执行，Task5/最终gate负责。
+
+Task3提交f644d0c/ef7da02经full/scoped独立审阅通过。Typed Inspector、bounded receive与wake-aware russh queue、sent/partial/execute-read取消guards和真实mutex queued拒绝有回归；旧execute/shutdown wire、正常stdout/stderr/artifact/failed-code保持。实际初RED agent2/adapter1/Python8中4SSH缺helper，取消4中2失败，parser2通过/1失败；临时移除新queued guard的1失败是controlled assertion-sensitivity，不冒称原BASE缺陷。审阅I1复制policy由canonical Python/R唯一源修复，10 Python tests的8 adversarial通过/2 missing-provenance失败后10通过；四assembled worker bytes与fix BASE完全一致，编译后inclusion/definition一次。MinorM2新增0/2999 Pending healthy、EXACT3000 Ready Unavailable/health false/无后续send，生产deadline未改且原正确baseline PASS。最终Local20/adapters5 unit+3 integration/1 R ignored、protocol3、desktop7、Python10、fmt/diff通过；已保存OUT_DIR/OS5重跑及一次model capacity同writer恢复记录。Shared agent/acceptance candidate-only staging、forward/reverse及raw outside proofs由独立审阅核验；原agent390行/acceptance18行仍未暂存，其他298/299 Rust raw文件未变。Real R fixture虽已写且编译，仍ignored/未执行；不能称R no-side-effect、真实SSH/科学/GUI/CI验收通过。Cache warnings保留非blocking，full W04/default/native/clean HEAD由Task5/最终gate执行；宿主weak registry、redaction及完整公开response validate尚待Task4。
