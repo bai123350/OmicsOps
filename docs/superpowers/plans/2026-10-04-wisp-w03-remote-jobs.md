@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust/sqlx/Tokio、现有 remote_jobs_v4 Transport与SshSession、Tauri 2、React 19/TypeScript/Vitest；无新表或依赖。
 
-**Spec:** [W03 设计](../specs/2026-10-04-wisp-composer-files-jobs-design.md#w03ssh-后台作业列表与查询)、[共同约束](../specs/2026-10-04-wisp-improvements-design.md)。设计及8515da8实施计划已确认；Task1 Store/DTO、Task2 host status已独立审阅/必要fix复审通过，Task3–4待实施。
+**Spec:** [W03 设计](../specs/2026-10-04-wisp-composer-files-jobs-design.md#w03ssh-后台作业列表与查询)、[共同约束](../specs/2026-10-04-wisp-improvements-design.md)。设计及8515da8实施计划已确认；Task1–3已独立审阅/必要fix复审通过；Task4实际入口/full gate及跨task读错误分类followup待实施。
 
 ## Global Constraints
 
@@ -84,7 +84,7 @@ assert_eq!(stored_after_timeout.state, stored_before_timeout.state);
 
 **Interfaces:** wrappers `listRemoteJobsV4(request:ListRemoteJobsV4Request):Promise<RemoteJobsPageV4>`、`refreshRemoteJobV4(request:RefreshRemoteJobV4Request):Promise<RemoteJobObservationV4>`，invoke `{request}`。Hook `useRemoteJobs(scope:{projectId:string;conversationId:string|null;bindingVersion:string},open:boolean):{jobs:RemoteJobSummaryV4[];selectedJobId:string|null;observation:RemoteJobObservationV4|null;loading:boolean;error:string;polling:boolean;attempts:number;selectJob:(id:string|null)=>void;reload:()=>Promise<void>;refresh:()=>Promise<void>;startPolling:()=>void;stopPolling:()=>void}`。Component `RemoteJobsPanel(props:{projectId:string;conversationId:string|null;bindingVersion:string;locale:Locale;onClose:()=>void}):ReactNode`；bindingVersion只是UI invalidation token，不能传宿主当授权。
 
-- [ ] **RED:** fakeTimers/deferredPromise证明默认零refresh；opt-in单项序列2/4/8/16/30（之后30）且10次封顶；计时从每次settled后开始，无重叠；错误继续有限backoff；manual同pending不叠加、manual启动新窗口前结束旧timer；terminal/close/scope/binding/endstop；latepromise/timer丢弃。Panel recorded_state vs observation区分、无cancel/resubmit/恢复Agent按钮、immediateEscape。
+- [x] **RED:** fakeTimers/deferredPromise证明默认零refresh；opt-in单项序列2/4/8/16/30（之后30）且10次封顶；计时从每次settled后开始，无重叠；错误继续有限backoff；manual同pending不叠加、manual启动新窗口前结束旧timer；terminal/close/scope/binding/endstop；latepromise/timer丢弃。Panel recorded_state vs observation区分、无cancel/resubmit/恢复Agent按钮、immediateEscape。
 
 ```ts
 expect(refreshRemoteJobV4).not.toHaveBeenCalled();
@@ -96,18 +96,18 @@ expect(refreshRemoteJobV4).toHaveBeenCalledTimes(1);
 expect(maxConcurrentRefreshes).toBe(1);
 ```
 
-- [ ] **Run RED:** `npx vitest run src/remote-job-api.test.ts src/features/workspace/useRemoteJobs.test.tsx src/features/workspace/RemoteJobsPanel.test.tsx`；缺Hook/API/panel应FAIL。
-- [ ] **Implement:** 明确start/stop与唯一inFlight gate，generation同时guardtimer/promise；selectedjob/scope变化清掉旧窗口；手动默认一次，自动窗口最多10次，避免infiniteeffect重建timer。自动查询已启用时手动刷新结束旧timer，以本次手动查询为新窗口第1次，settled后再按2秒起退避；同一inFlight期间忽略重复点击。panel可切current conversation/all project过滤、safe禁用原因、recorded timestamp unknown、terminallocalreceipt说明；window Escape/focus trap沿现有overlay机制。停止只影响本地调度。
-- [ ] **Run GREEN:** 同命令全部PASS；fakeTimers统一cleanup，无真实等待/SSH。
-- [ ] **Commit:** `feat: add bounded remote job polling panel`。
+- [x] **Run RED:** `npx vitest run src/remote-job-api.test.ts src/features/workspace/useRemoteJobs.test.tsx src/features/workspace/RemoteJobsPanel.test.tsx`；缺Hook/API/panel应FAIL。
+- [x] **Implement:** 明确start/stop与唯一app-window ephemeral inFlight gate（busy owner，不缓存identity/result），generation同时guardtimer/promise；关闭/卸载不释放未settled native Promise，重开busy明确可见且不自动排队，settled只释放busy、不投递旧结果；selectedjob/scope变化清掉旧窗口；手动默认一次，自动窗口最多10次，避免infiniteeffect重建timer。自动查询已启用时手动刷新结束旧timer，以本次手动查询为新窗口第1次，settled后再按2秒起退避；同一inFlight期间忽略重复点击。panel可切current conversation/all project过滤、safe禁用原因、recorded timestamp unknown、terminallocalreceipt说明；window Escape/focus trap沿现有overlay机制。停止只影响本地调度。
+- [x] **Run GREEN:** 同命令全部PASS；fakeTimers统一cleanup，无真实等待/SSH。
+- [x] **Commit:** `feat: add bounded remote job polling panel`。
 
 ### Task 4: 执行环境入口与准确边界文档
 
-**Files:** Modify `src/features/workspace/RuntimeDialog.tsx`、`RuntimeDialog.test.tsx`、`WorkspaceShell.tsx`、`WorkspaceShell.test.tsx`、`ResearchOverlays.test.tsx`、`README.md`、`AGENTS.md`、`acceptance/README.md`。
+**Files:** Modify `src/features/workspace/RuntimeDialog.tsx`、`RuntimeDialog.test.tsx`、`WorkspaceShell.tsx`、`WorkspaceShell.test.tsx`、`ResearchOverlays.test.tsx`、`README.md`、`AGENTS.md`、`acceptance/README.md`；窄幅 `src-tauri/src/remote_job_commands.rs`（typed recoverable read→Unavailable、真正integrity/identity/trust/receipt→Rejected）与 `useRemoteJobs.test.tsx`（thrown错误继续/停止合同，client配置不改）。
 
 **Interfaces:** RuntimeDialog Props加 `onOpenRemoteJobs?:()=>void`；WorkspaceShell持RemoteJobsPanel状态，project/conversation/current binding变化影响UI generation；共享RuntimeDialog与W04内核观察入口按总计划串行集成。readonlyjob入口不因FrozenRun而改选执行环境，不启动Agent。
 
-- [ ] **RED:** RuntimeDialog有效入口显示project/current conversation jobs、FrozenRun仍只读、列表不触环境probe/Agent；父RuntimeDialog打开子Panel立即Escape只关子，第二次才关父；close/scope stop schedule；无支持后端安全空态。W04入口和两者window堆栈同时回归。
+- [ ] **RED:** host typed-read-error安全分类与hook thrown unavailable/timeout有限继续、rejected/not_found停止；DB读失败不得伪称identity失败，结构完整性仍fail closed/no fallback。RuntimeDialog有效入口显示project/current conversation jobs、FrozenRun仍只读、列表不触环境probe/Agent；父RuntimeDialog打开子Panel立即Escape只关子，第二次才关父；close/scope stop schedule；无支持后端安全空态。W04入口和两者window堆栈同时回归。
 
 ```tsx
 fireEvent.click(screen.getByRole("button", { name: "Remote jobs" }));
@@ -125,7 +125,7 @@ expect(screen.queryByRole("button", { name: /Cancel remote job/ })).not.toBeInTh
 
 ## 当前实施证据
 
-2026-10-07：Task1提交9d415c6/bad6feb经独立full/scoped审阅通过，无open finding。最终Store observation6/runtime_jobs12、先前desktop DTO3/DTO --lib22通过，fmt/diff通过。DTO初RED27为26缺类型+OUT_DIR基础设施，总数未误称纯缺接口；新增terminal退休metadata RED实际0pass/1fail→6pass。正常nonterminal None与retired body None保留；旧writer历史兼容性从committed blobs核对。Task2提交6e7519d已由独立审阅通过：service/gate14、remote3+1 ignored live、Store7/host1/fmt通过；before-CAS敏感gate与首次identity race均有实际RED，clock挂起partial结果未计PASS。Metadata EXISTS仅presence；remote20秒不含之后SQLite atomic commit等待。Task3 panel和Task4实际入口未实施；不得把leaf检查当完整W03交付或live验收。
+2026-10-07：Task1提交9d415c6/bad6feb经独立full/scoped审阅通过，无open finding。最终Store observation6/runtime_jobs12、先前desktop DTO3/DTO --lib22通过，fmt/diff通过。DTO初RED27为26缺类型+OUT_DIR基础设施，总数未误称纯缺接口；新增terminal退休metadata RED实际0pass/1fail→6pass。正常nonterminal None与retired body None保留；旧writer历史兼容性从committed blobs核对。Task2提交6e7519d已由独立审阅通过：service/gate14、remote3+1 ignored live、Store7/host1/fmt通过；before-CAS敏感gate与首次identity race均有实际RED，clock挂起partial结果未计PASS。Metadata EXISTS仅presence；remote20秒不含之后SQLite atomic commit等待。Task3提交1aaafca独立frontend review通过；focused33/type+Web2036通过，app-window gate/AllProject owner lifetime/focus均有真实RED。Cross-task Minor：native把所有读错误映射rejected，Task4必须区分recoverable unavailable并补host/hook错误合同测试，尚未关闭。Task4实际入口与完整W03交付/live验收未执行。
 
 ## Plan Self-Review
 
