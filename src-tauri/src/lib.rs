@@ -43,6 +43,7 @@ pub mod p1_commands;
 mod plan_revision_tests;
 mod project_file_read;
 pub mod project_memory;
+mod project_table;
 pub mod project_templates;
 pub mod pubmed_mcp;
 mod remote_jobs_v4;

@@ -6,6 +6,98 @@ use crate::dto::{
 use serde_json::json;
 
 #[test]
+fn project_table_request_has_stable_fields_and_rejects_unknown_fields() {
+    use omicsops_dto::ProjectTablePreviewRequest;
+    let value = json!({"project_id":uuid::Uuid::from_u128(1),"backend_id":"local","relative_path":"data/a.csv"});
+    let request: ProjectTablePreviewRequest = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(request).unwrap(), value);
+    let mut invalid = value;
+    invalid["delimiter"] = json!("csv");
+    assert!(serde_json::from_value::<ProjectTablePreviewRequest>(invalid).is_err());
+}
+
+#[test]
+fn project_table_response_has_explicit_nullable_size_and_public_accounting() {
+    use omicsops_dto::*;
+    let preview = ProjectTablePreview {
+        project_id: uuid::Uuid::from_u128(1),
+        backend_id: "ssh-1".into(),
+        relative_path: "data/a.tsv".into(),
+        size_bytes: None,
+        read_bytes: 20,
+        parsed_bytes: 18,
+        sha256: "a".repeat(64),
+        hash_scope: TablePreviewHashScope::Prefix,
+        headers: vec!["id".into()],
+        rows: vec![vec!["1".into()]],
+        displayed_rows: 1,
+        truncation_reasons: vec![TablePreviewTruncation::IncompleteRecord],
+        source_stability: TablePreviewStability::Unknown,
+    };
+    let value = serde_json::to_value(preview).unwrap();
+    assert_eq!(
+        value,
+        json!({"project_id":uuid::Uuid::from_u128(1),"backend_id":"ssh-1","relative_path":"data/a.tsv",
+        "size_bytes":null,"read_bytes":20,"parsed_bytes":18,"sha256":"a".repeat(64),"hash_scope":"prefix",
+        "headers":["id"],"rows":[["1"]],"displayed_rows":1,"truncation_reasons":["incomplete_record"],"source_stability":"unknown"})
+    );
+    let roundtrip: ProjectTablePreview = serde_json::from_value(value).unwrap();
+    assert_eq!(roundtrip.size_bytes, None);
+}
+
+#[test]
+fn project_table_enums_have_exact_snake_case_contracts() {
+    use omicsops_dto::*;
+    for (variant, expected) in [
+        (TablePreviewHashScope::Full, "full"),
+        (TablePreviewHashScope::Prefix, "prefix"),
+    ] {
+        assert_eq!(serde_json::to_value(variant).unwrap(), expected);
+    }
+    for (variant, expected) in [
+        (TablePreviewStability::Checked, "checked"),
+        (TablePreviewStability::Unknown, "unknown"),
+    ] {
+        assert_eq!(serde_json::to_value(variant).unwrap(), expected);
+    }
+    for (variant, expected) in [
+        (TablePreviewTruncation::ByteLimit, "byte_limit"),
+        (TablePreviewTruncation::RowLimit, "row_limit"),
+        (TablePreviewTruncation::CellLimit, "cell_limit"),
+        (
+            TablePreviewTruncation::IncompleteRecord,
+            "incomplete_record",
+        ),
+        (TablePreviewTruncation::IncompleteUtf8, "incomplete_utf8"),
+    ] {
+        assert_eq!(serde_json::to_value(variant).unwrap(), expected);
+    }
+    for (variant, expected) in [
+        (TablePreviewErrorCode::InvalidPath, "invalid_path"),
+        (
+            TablePreviewErrorCode::UnsupportedFormat,
+            "unsupported_format",
+        ),
+        (TablePreviewErrorCode::InvalidUtf8, "invalid_utf8"),
+        (TablePreviewErrorCode::MalformedTable, "malformed_table"),
+        (TablePreviewErrorCode::ColumnLimit, "column_limit"),
+        (TablePreviewErrorCode::SourceChanged, "source_changed"),
+        (TablePreviewErrorCode::ReadFailed, "read_failed"),
+        (TablePreviewErrorCode::Timeout, "timeout"),
+        (
+            TablePreviewErrorCode::UnavailableBackend,
+            "unavailable_backend",
+        ),
+    ] {
+        assert_eq!(serde_json::to_value(variant).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_value::<TablePreviewErrorCode>(json!(expected)).unwrap(),
+            variant
+        );
+    }
+}
+
+#[test]
 fn subscription_dto_has_only_public_device_state_and_explicit_discovery_source() {
     use omicsops_dto::*;
     let status = CodexLoginStateResponse {
