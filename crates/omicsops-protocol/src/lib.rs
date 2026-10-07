@@ -2002,6 +2002,158 @@ mod tests {
         );
     }
 
+    fn completed_prepared_for_schema_test() -> PreparedContextCompactionV4 {
+        let request = CompactContextRequestV4 {
+            request_id: Uuid::from_u128(1),
+            project_id: Uuid::from_u128(4),
+            conversation_id: Uuid::from_u128(5),
+            run_id: Uuid::from_u128(3),
+        };
+        let at = DateTime::<Utc>::from_timestamp(1_728_000_000, 0).unwrap();
+        let source = AgentEventV4::first(
+            request.run_id,
+            request.project_id,
+            request.conversation_id,
+            at,
+            AgentEventKindV4::ContextCompactionNotNeeded {
+                request_id: Uuid::from_u128(99),
+                before_bytes: 6,
+            },
+        );
+        let checkpoint = ContextCheckpointV4 {
+            schema_version: 4,
+            through_sequence: source.sequence,
+            completion_criteria: vec![],
+            unresolved_errors: vec![],
+            recent_steps: vec![],
+            scientific_state: Value::Null,
+            task_shape: None,
+            phase: None,
+            task_revision: None,
+            tasks: vec![],
+            cycle_id: None,
+        };
+        let archive = ContextArchiveV4 {
+            archive_id: Uuid::from_u128(2),
+            through_sequence: source.sequence,
+            size_bytes: 6,
+            sha256: hex::encode(Sha256::digest(b"source")),
+        };
+        let started = AgentEventV4::next(
+            &source,
+            at,
+            AgentEventKindV4::ContextCompactionStarted {
+                request_id: request.request_id,
+                source_through_sequence: source.sequence,
+                source_head_hash: source.event_hash.clone(),
+                frozen_spec_hash: Some("spec".into()),
+            },
+        );
+        let archived = AgentEventV4::next(
+            &started,
+            at,
+            AgentEventKindV4::ContextArchived {
+                archive: archive.clone(),
+            },
+        );
+        let checkpointed = AgentEventV4::next(
+            &archived,
+            at,
+            AgentEventKindV4::ContextCheckpointed {
+                checkpoint: checkpoint.clone(),
+            },
+        );
+        let admission = ContextCompactionAdmissionV4 {
+            configuration_hash: "c".repeat(64),
+            prompt_sha256: "d".repeat(64),
+            provider_request_bytes: Some(4096),
+        };
+        let completed = AgentEventV4::next(
+            &checkpointed,
+            at,
+            AgentEventKindV4::ContextCompactionCompleted {
+                request_id: request.request_id,
+                archive: archive.clone(),
+                checkpoint_through_sequence: checkpoint.through_sequence,
+                checkpoint_sha256: hex::encode(Sha256::digest(
+                    serde_json::to_vec(&checkpoint).unwrap(),
+                )),
+                before_bytes: 6,
+                after_bytes: 5,
+                admission: Some(admission.clone()),
+            },
+        );
+        PreparedContextCompactionV4 {
+            request,
+            source_through_sequence: source.sequence,
+            source_head_hash: source.event_hash,
+            frozen_spec_hash: "spec".into(),
+            scientific_revision: 0,
+            scientific_sha256: "science".into(),
+            transcript: "source".into(),
+            candidate_context: "small".into(),
+            checkpoint: Some(checkpoint),
+            archive: Some(archive),
+            planned_events: vec![started, archived, checkpointed, completed],
+            status: ContextCompactionStatusV4::Completed,
+            before_bytes: 6,
+            after_bytes: 5,
+            admission,
+        }
+    }
+
+    fn rehash_planned_events(prepared: &mut PreparedContextCompactionV4) {
+        let mut previous_hash = prepared.source_head_hash.clone();
+        for event in &mut prepared.planned_events {
+            event.previous_hash = previous_hash;
+            event.event_hash = event.calculate_hash();
+            assert!(event.verify().is_ok());
+            previous_hash = event.event_hash.clone();
+        }
+    }
+
+    #[test]
+    fn prepared_compaction_rejects_hash_valid_non_v4_planned_event() {
+        let mut prepared = completed_prepared_for_schema_test();
+        assert_eq!(prepared.validate_structure(), Ok(()));
+        prepared.planned_events[0].schema_version = 3;
+        rehash_planned_events(&mut prepared);
+        assert_eq!(
+            prepared.validate_structure(),
+            Err(ContextCompactionValidationErrorV4::InvalidEventChain)
+        );
+    }
+
+    #[test]
+    fn prepared_compaction_rejects_hash_valid_non_v4_checkpoint() {
+        let mut prepared = completed_prepared_for_schema_test();
+        assert_eq!(prepared.validate_structure(), Ok(()));
+        let checkpoint = prepared.checkpoint.as_mut().unwrap();
+        checkpoint.schema_version = 3;
+        if let AgentEventKindV4::ContextCheckpointed {
+            checkpoint: event_checkpoint,
+        } = &mut prepared.planned_events[2].event
+        {
+            *event_checkpoint = checkpoint.clone();
+        } else {
+            panic!("expected checkpoint event");
+        }
+        if let AgentEventKindV4::ContextCompactionCompleted {
+            checkpoint_sha256, ..
+        } = &mut prepared.planned_events[3].event
+        {
+            *checkpoint_sha256 =
+                hex::encode(Sha256::digest(serde_json::to_vec(checkpoint).unwrap()));
+        } else {
+            panic!("expected completed event");
+        }
+        rehash_planned_events(&mut prepared);
+        assert_eq!(
+            prepared.validate_structure(),
+            Err(ContextCompactionValidationErrorV4::InvalidArchive)
+        );
+    }
+
     #[test]
     fn completion_proposal_old_json_defaults_answer_markdown() {
         let proposal: CompletionProposalV4 = serde_json::from_value(serde_json::json!({

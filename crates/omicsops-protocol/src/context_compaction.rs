@@ -107,7 +107,8 @@ impl PreparedContextCompactionV4 {
                 let (Some(archive), Some(checkpoint)) = (&self.archive, &self.checkpoint) else {
                     return Err(Error::InvalidArchive);
                 };
-                if archive.through_sequence != self.source_through_sequence
+                if checkpoint.schema_version != 4
+                    || archive.through_sequence != self.source_through_sequence
                     || checkpoint.through_sequence != self.source_through_sequence
                     || archive.size_bytes != self.before_bytes
                     || archive.sha256 != hex::encode(Sha256::digest(self.transcript.as_bytes()))
@@ -130,7 +131,8 @@ impl PreparedContextCompactionV4 {
         let mut sequence = self.source_through_sequence;
         for event in &self.planned_events {
             sequence = sequence.checked_add(1).ok_or(Error::InvalidEventChain)?;
-            if event.sequence != sequence
+            if event.schema_version != 4
+                || event.sequence != sequence
                 || event.previous_hash != previous_hash
                 || event.verify().is_err()
             {
