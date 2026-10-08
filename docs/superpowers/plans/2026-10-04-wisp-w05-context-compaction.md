@@ -137,6 +137,8 @@ assert!(!public_error.contains(secret_sentinel));
 - [ ] **GREEN**：重复 RED；`cargo test -p omicsops-desktop --lib dto_contract_tests`；既有 lazy resources、model budget/replay/profile tests。预期 Completed 实际有 archive/checkpoint，不以 NotNeeded 冒充实现。
 - [ ] **Commit**：仅暂存本任务文件，`git commit -m "feat(desktop): enable guarded manual context compaction"`。
 
+**实施证据（2026-10-08）**：Task 4 提交 `f6d9f13` 经独立完整任务审阅通过，无待修复发现。宿主持有真实 run lease 至原子提交并复查活动 driver；普通恢复与手动准备共用冻结配置组合，手动路径不派发模型、工具、计算或 SSH。实际图片字节和完整请求参与预算验证，未知图片成本保守拒绝；同请求 receipt 幂等且公开错误固定脱敏。最终源上宿主定向 8、desktop 581（11 ignored）、workspace 1714（18 ignored）、前端 1251 加扩展 22 通过，Web 与 Windows NSIS 构建、格式及 diff 检查通过。NSIS 仅构建，未安装或分发；测试包含工作区原有未提交改动，最终 clean committed-HEAD 与真实模型/SSH/GUI 验收仍待交付检查。证据见 `.superpowers/sdd/2026-10-04-wisp-w05-context-compaction/task-4-report.md` 与 `task-4-review.md`。
+
 ### Task 5: 接通 UI、真实恢复回归与交付记录
 
 **Files:** Modify `src/context-usage-api.ts`、`src/features/workspace/ContextUsagePanel.tsx`、`src/features/workspace/ContextUsagePanel.test.tsx`、`src/features/workspace/WorkspaceShell.tsx`、`src/features/workspace/WorkspaceShell.test.tsx`、`src/features/workspace/useContextUsage.ts`、`README.md`、`acceptance/README.md`；Create `src/features/workspace/useContextCompaction.ts`、`src/features/workspace/useContextCompaction.test.tsx`。
