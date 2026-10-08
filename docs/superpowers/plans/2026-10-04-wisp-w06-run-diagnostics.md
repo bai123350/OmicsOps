@@ -52,6 +52,8 @@
 - [ ] **GREEN — 同两命令 PASS。** 补 0 事件、精确上限、超过字节预算、未选中 run 损坏与窗口 scope 归属测试；无新表/写事件。`cargo fmt --all -- --check` 格式偏差按 AGENTS.md 独立处理。
 - [ ] **Commit —** 仅 stage 本 task 四个文件：`git add -- crates/omicsops-dto/src/run_diagnostics.rs crates/omicsops-dto/src/lib.rs crates/omicsops-store/src/lib.rs src-tauri/src/dto_contract_tests.rs`；`git commit -m "feat: add validated bounded run diagnostic reads"`。
 
+**实施证据（2026-10-08）**：Task 1 功能提交 `8296078` 与依 AGENTS.md 分离的纯格式提交 `bb47a89` 经独立完整审阅通过，无待修复问题。Store 在同一只读事务中验证对话归属、整个作用域的事件数与 UTF-8 原始 JSON 字节预算，读取含错绑索引的 run 并核对原 JSON hash 链、SQL 索引、事件 envelope 与持久化 run 归属；旧无限定 API 不变，无迁移或 reconciliation。最终定向 Store 3、desktop DTO 1、格式和 diff 检查通过；初次 desktop 沙箱 OUT_DIR 失败另行记录并原命令重试。固定 10,000/16 MiB 宿主调用、公开投影、导出、UI 和完整 W06 检查仍属于后续任务；真实模型/SSH 未验收。证据见 `.superpowers/sdd/2026-10-04-wisp-w06-run-diagnostics/task-1-report.md` 与 `task-1-review.md`。
+
 ### Task 2: 宿主公开投影与查询命令
 
 **Files:** Create `src-tauri/src/run_diagnostics.rs`; Modify `src-tauri/src/lib.rs`（module/invoke 注册）; Test 新模块 `#[cfg(test)]`。
