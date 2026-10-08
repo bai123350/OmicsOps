@@ -37,7 +37,7 @@
 - Consumes: core `Project`、Store `validate_project_input`/`insert_project`/现有 app_objects；全部跨 UI DTO 字段采用 Spec 表。
 - Produces: Store 内部 public `OfflineExampleProjectMarkerV1 {schema_version: u8, project_id: Uuid, request_id: Uuid, example_id: String, fixture_sha256: String, root_binding_sha256: String}`；`offline_example_root_binding(project: &Project) -> String`（hash project UUID 与创建时规范 final local_root 的确定序列化）；`Store::save_offline_example_project(&self, project: &Project, marker: &OfflineExampleProjectMarkerV1) -> Result<(), StoreError>`；`get_offline_example_project_marker(&self, project_id: Uuid) -> Result<Option<OfflineExampleProjectMarkerV1>, StoreError>`。delete_project 同事务清理固定 kind/id。跨 UI DTO 使用 `OfflineExampleAvailability {Available, Unavailable}` 与 `OfflineExampleFileAvailability {Available, Changed, Missing, Unavailable}` 两个 snake_case 枚举。
 
-- [ ] **RED — 写 `offline_example_marker_*` 和 `offline_example_dto_contract`。** 用临时 DB 的失败 trigger 验证 app_objects 写失败导致 Project 也 rollback；再测反向失败、相同身份 no-op、普通 ID/root 冲突、marker 字段归属/版本/hash 校验、删除后 marker 清理。
+- [x] **RED — 写 `offline_example_marker_*` 和 `offline_example_dto_contract`。** 用临时 DB 的失败 trigger 验证 app_objects 写失败导致 Project 也 rollback；再测反向失败、相同身份 no-op、普通 ID/root 冲突、marker 字段归属/版本/hash 校验、删除后 marker 清理。
 
   ```rust
   assert!(store.save_offline_example_project(&project, &marker).await.is_err());
@@ -46,10 +46,12 @@
   assert!(serde_json::from_value::<CreateOfflineExampleWorkspaceRequest>(extra_field).is_err());
   ```
 
-- [ ] **RED — 运行 FAIL。** `cargo test -p omicsops-store offline_example_marker -- --nocapture`、`cargo test -p omicsops-desktop --lib offline_example_dto_contract`；预期必要类型/方法不存在。
-- [ ] **实现上述签名/DTO。** BEGIN IMMEDIATE 先检查 ID/root/marker 冲突，再 insert_project 与固定 marker 插入，同成同败；相同记录保留用户 metadata。marker 不含文件正文、凭据、执行/科学状态。请求 deny_unknown_fields，availability/source/kind 枚举 snake_case。普通 save_project 不删除 marker。
-- [ ] **GREEN — 同命令 PASS。** 新开 Store 后 marker 稳定可读；已有普通项目不会因缺文件被写 marker，删除行为仍不删用户目录。
-- [ ] **Commit —** `git add -- crates/omicsops-dto/src/offline_example_workspace.rs crates/omicsops-dto/src/lib.rs crates/omicsops-store/src/lib.rs src-tauri/src/dto_contract_tests.rs`；`git commit -m "feat: persist isolated offline example identity"`。
+- [x] **RED — 运行 FAIL。** `cargo test -p omicsops-store offline_example_marker -- --nocapture`、`cargo test -p omicsops-desktop --lib offline_example_dto_contract`；预期必要类型/方法不存在。
+- [x] **实现上述签名/DTO。** BEGIN IMMEDIATE 先检查 ID/root/marker 冲突，再 insert_project 与固定 marker 插入，同成同败；相同记录保留用户 metadata。marker 不含文件正文、凭据、执行/科学状态。请求 deny_unknown_fields，availability/source/kind 枚举 snake_case。普通 save_project 不删除 marker。
+- [x] **GREEN — 同命令 PASS。** 新开 Store 后 marker 稳定可读；已有普通项目不会因缺文件被写 marker，删除行为仍不删用户目录。
+- [x] **Commit —** `git add -- crates/omicsops-dto/src/offline_example_workspace.rs crates/omicsops-dto/src/lib.rs crates/omicsops-store/src/lib.rs src-tauri/src/dto_contract_tests.rs`；`git commit -m "feat: persist isolated offline example identity"`。
+
+**实施证据（2026-10-08）**：Task1 功能 `7511538` 与独立格式 `26629be` 经独立完整审阅通过，无阻塞发现。纯 DTO 严格请求与 snake_case 合同、Project/marker 同 BEGIN IMMEDIATE 登记、失败回滚、相同身份保留用户元数据、普通 save 保留身份与同事务删除清理均有行为测试。Store regression316、最终 marker7/DTO1/fmt/diff通过；已知 Windows cache/CRLF 提示保留。根 binding 对宿主提供的规范最终根做确定 SHA256，Store不访问文件系统；路径验证/fixture/receipt/view/UI由后续任务负责。外部修改原始字节与任务独立stage证明保留。
 
 ### Task 2: 固定双语 fixture 与受限定创建/恢复
 
