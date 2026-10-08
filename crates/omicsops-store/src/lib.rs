@@ -70,7 +70,9 @@ fn validate_offline_example_marker(
 ) -> Result<(), StoreError> {
     let valid_hash = |value: &str| {
         value.len() == 64
-            && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     };
     if marker.schema_version != 1
         || marker.project_id != project_id
@@ -433,13 +435,12 @@ impl Store {
         .bind(project.id.to_string())
         .fetch_optional(&mut *tx)
         .await?;
-        let stored_marker: Option<String> = sqlx::query_scalar(
-            "SELECT value_json FROM app_objects WHERE kind=?1 AND id=?2",
-        )
-        .bind(OFFLINE_EXAMPLE_MARKER_KIND)
-        .bind(project.id.to_string())
-        .fetch_optional(&mut *tx)
-        .await?;
+        let stored_marker: Option<String> =
+            sqlx::query_scalar("SELECT value_json FROM app_objects WHERE kind=?1 AND id=?2")
+                .bind(OFFLINE_EXAMPLE_MARKER_KIND)
+                .bind(project.id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
         match (existing, stored_marker) {
             (None, None) => {
                 insert_project(&mut tx, project).await?;
@@ -487,8 +488,8 @@ impl Store {
                 other => other,
             })?;
         raw.map(|value| {
-            let marker = serde_json::from_value(value)
-                .map_err(|_| invalid_offline_example_marker())?;
+            let marker =
+                serde_json::from_value(value).map_err(|_| invalid_offline_example_marker())?;
             validate_offline_example_marker(&marker, project_id)?;
             Ok(marker)
         })
@@ -8040,7 +8041,13 @@ mod offline_example_marker_tests {
     use omicsops_core::workspace::{ProjectStatus, ProjectTemplate};
 
     fn fixture(root: &str) -> (Project, OfflineExampleProjectMarkerV1) {
-        let project = Project::new(Uuid::new_v4(), "example", root, ProjectTemplate::Blank, DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap());
+        let project = Project::new(
+            Uuid::new_v4(),
+            "example",
+            root,
+            ProjectTemplate::Blank,
+            DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap(),
+        );
         let marker = OfflineExampleProjectMarkerV1 {
             schema_version: 1,
             project_id: project.id,
@@ -8060,9 +8067,20 @@ mod offline_example_marker_tests {
             let (project, marker) = fixture("C:\\example");
             sqlx::query(&format!("CREATE TRIGGER fail_example BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT, 'injected'); END"))
                 .execute(&store.pool).await.unwrap();
-            assert!(store.save_offline_example_project(&project, &marker).await.is_err());
+            assert!(
+                store
+                    .save_offline_example_project(&project, &marker)
+                    .await
+                    .is_err()
+            );
             assert!(store.get_project(project.id).await.unwrap().is_none());
-            assert!(store.get_offline_example_project_marker(project.id).await.unwrap().is_none());
+            assert!(
+                store
+                    .get_offline_example_project_marker(project.id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 
@@ -8072,26 +8090,59 @@ mod offline_example_marker_tests {
         let path = dir.path().join("store.sqlite");
         let store = Store::open(&path).await.unwrap();
         let (project, marker) = fixture(&dir.path().join("missing-example").to_string_lossy());
-        store.save_offline_example_project(&project, &marker).await.unwrap();
+        store
+            .save_offline_example_project(&project, &marker)
+            .await
+            .unwrap();
         let mut edited = project.clone();
         edited.name = "user title".into();
         edited.description = "user notes".into();
         edited.ollama_only = true;
         edited.updated_at += chrono::Duration::seconds(5);
         store.save_project(&edited).await.unwrap();
-        store.save_offline_example_project(&project, &marker).await.unwrap();
-        assert_eq!(store.get_project(project.id).await.unwrap(), Some(edited.clone()));
+        store
+            .save_offline_example_project(&project, &marker)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_project(project.id).await.unwrap(),
+            Some(edited.clone())
+        );
         store.pool.close().await;
         let store = Store::open(&path).await.unwrap();
-        assert_eq!(store.get_offline_example_project_marker(project.id).await.unwrap(), Some(marker.clone()));
+        assert_eq!(
+            store
+                .get_offline_example_project_marker(project.id)
+                .await
+                .unwrap(),
+            Some(marker.clone())
+        );
         edited.local_root.push_str("-moved");
         store.save_project(&edited).await.unwrap();
-        assert_eq!(store.get_offline_example_project_marker(project.id).await.unwrap(), Some(marker.clone()));
-        assert!(store.save_offline_example_project(&project, &marker).await.is_err());
+        assert_eq!(
+            store
+                .get_offline_example_project_marker(project.id)
+                .await
+                .unwrap(),
+            Some(marker.clone())
+        );
+        assert!(
+            store
+                .save_offline_example_project(&project, &marker)
+                .await
+                .is_err()
+        );
         assert_eq!(store.get_project(project.id).await.unwrap(), Some(edited));
-        for table in ["conversation_records", "agent_runs_v4", "agent_events_v4", "scientific_evidence_v4"] {
+        for table in [
+            "conversation_records",
+            "agent_runs_v4",
+            "agent_events_v4",
+            "scientific_evidence_v4",
+        ] {
             let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-                .fetch_one(&store.pool).await.unwrap();
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
             assert_eq!(count, 0, "{table}");
         }
     }
@@ -8101,13 +8152,32 @@ mod offline_example_marker_tests {
         let store = Store::open_in_memory().await.unwrap();
         let (ordinary, ordinary_marker) = fixture("C:\\ordinary-missing");
         store.save_project(&ordinary).await.unwrap();
-        assert!(store.get_offline_example_project_marker(ordinary.id).await.unwrap().is_none());
-        assert!(store.save_offline_example_project(&ordinary, &ordinary_marker).await.is_err());
+        assert!(
+            store
+                .get_offline_example_project_marker(ordinary.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .save_offline_example_project(&ordinary, &ordinary_marker)
+                .await
+                .is_err()
+        );
         let (collision, marker) = fixture(&ordinary.local_root);
-        assert!(store.save_offline_example_project(&collision, &marker).await.is_err());
+        assert!(
+            store
+                .save_offline_example_project(&collision, &marker)
+                .await
+                .is_err()
+        );
         assert!(store.get_project(collision.id).await.unwrap().is_none());
         let (project, marker) = fixture("C:\\example");
-        store.save_offline_example_project(&project, &marker).await.unwrap();
+        store
+            .save_offline_example_project(&project, &marker)
+            .await
+            .unwrap();
         for field in ["request_id", "fixture_sha256", "root_binding_sha256"] {
             let mut changed = marker.clone();
             match field {
@@ -8115,12 +8185,35 @@ mod offline_example_marker_tests {
                 "fixture_sha256" => changed.fixture_sha256 = "b".repeat(64),
                 _ => changed.root_binding_sha256 = "b".repeat(64),
             }
-            assert!(store.save_offline_example_project(&project, &changed).await.is_err());
-            assert_eq!(store.get_offline_example_project_marker(project.id).await.unwrap(), Some(marker.clone()));
+            assert!(
+                store
+                    .save_offline_example_project(&project, &changed)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                store
+                    .get_offline_example_project_marker(project.id)
+                    .await
+                    .unwrap(),
+                Some(marker.clone())
+            );
         }
         let (other, other_marker) = fixture("C:\\orphan");
-        store.put_json("offline_example_workspace_v1", &other.id.to_string(), &other_marker).await.unwrap();
-        assert!(store.save_offline_example_project(&other, &other_marker).await.is_err());
+        store
+            .put_json(
+                "offline_example_workspace_v1",
+                &other.id.to_string(),
+                &other_marker,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .save_offline_example_project(&other, &other_marker)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -8138,14 +8231,49 @@ mod offline_example_marker_tests {
             let mut invalid = value.clone();
             invalid[field] = bad;
             let parsed = serde_json::from_value(invalid.clone()).unwrap();
-            assert!(store.save_offline_example_project(&project, &parsed).await.is_err());
-            store.put_json("offline_example_workspace_v1", &project.id.to_string(), &invalid).await.unwrap();
-            let error = store.get_offline_example_project_marker(project.id).await.unwrap_err();
-            assert_eq!(error.to_string(), "invalid input: offline_example_marker_invalid");
+            assert!(
+                store
+                    .save_offline_example_project(&project, &parsed)
+                    .await
+                    .is_err()
+            );
+            store
+                .put_json(
+                    "offline_example_workspace_v1",
+                    &project.id.to_string(),
+                    &invalid,
+                )
+                .await
+                .unwrap();
+            let error = store
+                .get_offline_example_project_marker(project.id)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "invalid input: offline_example_marker_invalid"
+            );
         }
-        for invalid in [serde_json::json!(null), serde_json::json!({"private":"do-not-echo"})] {
-            store.put_json("offline_example_workspace_v1", &project.id.to_string(), &invalid).await.unwrap();
-            assert_eq!(store.get_offline_example_project_marker(project.id).await.unwrap_err().to_string(), "invalid input: offline_example_marker_invalid");
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!({"private":"do-not-echo"}),
+        ] {
+            store
+                .put_json(
+                    "offline_example_workspace_v1",
+                    &project.id.to_string(),
+                    &invalid,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .get_offline_example_project_marker(project.id)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "invalid input: offline_example_marker_invalid"
+            );
         }
         assert!(store.get_project(project.id).await.unwrap().is_none());
     }
@@ -8161,7 +8289,12 @@ mod offline_example_marker_tests {
                 2 => project.template = ProjectTemplate::BulkRnaSeq,
                 _ => project.status = ProjectStatus::Running,
             }
-            assert!(store.save_offline_example_project(&project, &marker).await.is_err());
+            assert!(
+                store
+                    .save_offline_example_project(&project, &marker)
+                    .await
+                    .is_err()
+            );
             assert!(store.get_project(project.id).await.unwrap().is_none());
         }
     }
@@ -8173,24 +8306,53 @@ mod offline_example_marker_tests {
         fs::write(&user_file, "user bytes").unwrap();
         let store = Store::open_in_memory().await.unwrap();
         let (project, marker) = fixture(&dir.path().to_string_lossy());
-        store.save_offline_example_project(&project, &marker).await.unwrap();
-        store.put_json("unrelated", &project.id.to_string(), &true).await.unwrap();
+        store
+            .save_offline_example_project(&project, &marker)
+            .await
+            .unwrap();
+        store
+            .put_json("unrelated", &project.id.to_string(), &true)
+            .await
+            .unwrap();
         sqlx::query("CREATE TRIGGER fail_delete BEFORE DELETE ON app_objects WHEN OLD.kind='offline_example_workspace_v1' BEGIN SELECT RAISE(ABORT, 'injected'); END")
             .execute(&store.pool).await.unwrap();
         assert!(store.delete_project(project.id).await.is_err());
         assert!(store.get_project(project.id).await.unwrap().is_some());
-        assert_eq!(store.get_offline_example_project_marker(project.id).await.unwrap(), Some(marker));
-        sqlx::query("DROP TRIGGER fail_delete").execute(&store.pool).await.unwrap();
+        assert_eq!(
+            store
+                .get_offline_example_project_marker(project.id)
+                .await
+                .unwrap(),
+            Some(marker)
+        );
+        sqlx::query("DROP TRIGGER fail_delete")
+            .execute(&store.pool)
+            .await
+            .unwrap();
         assert!(store.delete_project(project.id).await.unwrap());
-        assert!(store.get_offline_example_project_marker(project.id).await.unwrap().is_none());
-        assert_eq!(store.get_json::<bool>("unrelated", &project.id.to_string()).await.unwrap(), Some(true));
+        assert!(
+            store
+                .get_offline_example_project_marker(project.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_json::<bool>("unrelated", &project.id.to_string())
+                .await
+                .unwrap(),
+            Some(true)
+        );
         assert_eq!(fs::read_to_string(user_file).unwrap(), "user bytes");
     }
 
     #[test]
     fn offline_example_marker_root_binding_is_deterministic_and_identity_bound() {
         let (project, _) = fixture("C:\\not-required-to-exist\\科研");
-        let expected = hex::encode(Sha256::digest(serde_json::to_vec(&(project.id, &project.local_root)).unwrap()));
+        let expected = hex::encode(Sha256::digest(
+            serde_json::to_vec(&(project.id, &project.local_root)).unwrap(),
+        ));
         assert_eq!(offline_example_root_binding(&project), expected);
         let mut changed = project.clone();
         changed.name = "renamed".into();
