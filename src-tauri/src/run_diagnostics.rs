@@ -61,7 +61,12 @@ fn tool_label(value: &str, request: &RunDiagnosticsRequestV4) -> String {
     let mut label = String::with_capacity(MAX_LABEL_BYTES);
     let mut cursor = 0;
     while cursor < original.len() && label.len() < MAX_LABEL_BYTES {
-        let next = cursor + original[cursor..].chars().next().expect("remaining text").len_utf8();
+        let next = cursor
+            + original[cursor..]
+                .chars()
+                .next()
+                .expect("remaining text")
+                .len_utf8();
         let mut covered_end = match_end(cursor);
         let piece = if covered_end > cursor {
             // Longest match at the leftmost position; merge every intersecting
@@ -71,7 +76,11 @@ fn tool_label(value: &str, request: &RunDiagnosticsRequestV4) -> String {
             let mut scan = next;
             while scan < covered_end {
                 covered_end = covered_end.max(match_end(scan));
-                scan += original[scan..].chars().next().expect("covered text").len_utf8();
+                scan += original[scan..]
+                    .chars()
+                    .next()
+                    .expect("covered text")
+                    .len_utf8();
             }
             "[REDACTED]"
         } else {
@@ -1122,26 +1131,44 @@ mod tests {
         // Keep this gate before the 32-keyword regression. The old recursive
         // implementation fails safely here after only two tiny replacements.
         let small = load_run_diagnostics(&store, &req).await.unwrap();
-        assert_eq!(small.filter_summary.tool_label.as_deref(), Some("[REDACTED]"));
+        assert_eq!(
+            small.filter_summary.tool_label.as_deref(),
+            Some("[REDACTED]")
+        );
 
         req.redaction_keywords = vec!["E".into(); 32];
         let empty = load_run_diagnostics(&store, &req).await.unwrap();
-        assert_eq!(empty.filter_summary.tool_label.as_deref(), Some("[REDACTED]"));
+        assert_eq!(
+            empty.filter_summary.tool_label.as_deref(),
+            Some("[REDACTED]")
+        );
         assert!(empty.events.is_empty());
-        assert!(!serde_json::to_string(&empty).unwrap().contains("redaction_keywords"));
+        assert!(
+            !serde_json::to_string(&empty)
+                .unwrap()
+                .contains("redaction_keywords")
+        );
 
         let events = chain(30, vec![(0, start("call", "E"))]);
         store.append_agent_event_v4(&events[0]).await.unwrap();
         let snapshot = load_run_diagnostics(&store, &req).await.unwrap();
         assert_eq!(snapshot.events[0].tool_label.as_deref(), Some("[REDACTED]"));
-        assert_eq!(snapshot.filter_summary.tool_label, snapshot.events[0].tool_label);
+        assert_eq!(
+            snapshot.filter_summary.tool_label,
+            snapshot.events[0].tool_label
+        );
     }
 
     #[test]
     fn run_diagnostics_projection_keywords_overlap_and_interact_only_with_original_text() {
         let mut req = request();
         req.filter.tool_id = Some("SECRET SECRETIVE E".into());
-        req.redaction_keywords = vec!["E".into(), "SECRET".into(), "SECRETIVE".into(), "[REDACTED]".into()];
+        req.redaction_keywords = vec![
+            "E".into(),
+            "SECRET".into(),
+            "SECRETIVE".into(),
+            "[REDACTED]".into(),
+        ];
         let events = chain(30, vec![(0, start("call", "SECRET SECRETIVE E"))]);
         let snapshot = project_run_diagnostics(&events, &req).unwrap();
         let expected = Some("[REDACTED] [REDACTED] [REDACTED]");
@@ -1155,8 +1182,14 @@ mod tests {
         req.redaction_keywords = vec!["abc".into(), "bcde".into(), "bcd".into()];
         let events = chain(30, vec![(0, start("call", "abcde abcd"))]);
         let snapshot = project_run_diagnostics(&events, &req).unwrap();
-        assert_eq!(snapshot.events[0].tool_label.as_deref(), Some("[REDACTED] [REDACTED]"));
-        assert_eq!(snapshot.filter_summary.tool_label, snapshot.events[0].tool_label);
+        assert_eq!(
+            snapshot.events[0].tool_label.as_deref(),
+            Some("[REDACTED] [REDACTED]")
+        );
+        assert_eq!(
+            snapshot.filter_summary.tool_label,
+            snapshot.events[0].tool_label
+        );
     }
 
     #[test]
@@ -1164,9 +1197,15 @@ mod tests {
         let mut req = request();
         req.redaction_keywords = vec!["PRIVATE_SENTINEL".into(), "界界".into(), "E".into()];
         let crossing = format!("{}PRIVATE_SENTINEL", "x".repeat(250));
-        let labels = [crossing, format!("{}界", "x".repeat(255)), "界界".repeat(100_000), "E".repeat(100_000)];
+        let labels = [
+            crossing,
+            format!("{}界", "x".repeat(255)),
+            "界界".repeat(100_000),
+            "E".repeat(100_000),
+        ];
         for (index, label) in labels.iter().enumerate() {
-            let snapshot = project_run_diagnostics(&chain(30, vec![(0, start("call", label))]), &req).unwrap();
+            let snapshot =
+                project_run_diagnostics(&chain(30, vec![(0, start("call", label))]), &req).unwrap();
             let actual = snapshot.events[0].tool_label.as_ref().unwrap();
             assert!(actual.len() <= 256);
             match index {
