@@ -89,13 +89,15 @@ assert_eq!(checkpoint_guidance, original_guidance); // 不截断
 
 **Files:** Modify `crates/omicsops-store/src/context_compaction.rs`、`crates/omicsops-store/src/lib.rs`（export）；Test `crates/omicsops-store/tests/context_compaction.rs` 与同模块临时 SQLite tests。不改 init.sql/schema。
 
+**批准的窄接口补充**：为在同一事务中重验快照后的项目计算绑定和宿主 run 输入，在 `crates/omicsops-protocol/src/context_compaction.rs` 的内部 Snapshot/Prepared 加入固定 64 位十六进制 `source_bindings_sha256`、`source_run_sha256`；`crates/omicsops-protocol/src/lib.rs` 只更新已有三个 Prepared 测试构造，`crates/omicsops-agent-core/src/lib.rs` 只复制并提前校验这两个字段。Store 在 snapshot 只读事务与 commit 的 `BEGIN IMMEDIATE` 中，用同一白名单算法比较有效本地根（含 workspace_dir fallback）、远端根、连接 ID 与非秘密连接身份/信任元数据，并分别比较原始 run value_json 的 UTF-8 SHA-256。它们不替代 spec、模型配置、science、event head 和暂停输入的独立重验；不读凭据、不输出原始值、不改 schema/UI/旧 event/receipt。绑定元数据变化或等价 JSON 字节重排会保守要求重新 snapshot/prepare。
+
 **Interfaces:**
 - Consumes：Task 1 pure types；Task 2 prepared。原 conversation/run ownership、paused validation、event chain、guidance/stop/unknown checks。
 - Produces：Store `CompactionSnapshotV4 { context: ContextCompactionSnapshotV4, run_value: Value }`；`context_compaction_snapshot_v4(&self, request: &CompactContextRequestV4) -> Result<CompactionSnapshotV4, StoreError>` async。
 - Produces：`commit_context_compaction_v4(&self, request: &CompactContextRequestV4, prepared: &PreparedContextCompactionV4) -> Result<ContextCompactionReceiptV4, StoreError>` async。
 - Produces：`context_compaction_receipt_v4(&self, request: &CompactContextRequestV4) -> Result<Option<ContextCompactionReceiptV4>, StoreError>` async，核验 request scope、hydrate 已核验 Completed event admission；旧 STARTED 仍走 reconciliation。
 
-- [ ] **RED 写测试**：`manual_compaction_commit_is_atomic_and_idempotent`、`manual_compaction_commit_rechecks_all_pause_inputs`、`manual_compaction_restart_preserves_refs_and_admission`、`manual_compaction_has_no_schema_change`。prepare 后逐项改变 head/science/profile/指导/答案/停止/审批/unknown；使用临时触发器在 archive/任一事件/receipt 写入时注入失败。
+- [x] **RED 写测试**：`manual_compaction_commit_is_atomic_and_idempotent`、`manual_compaction_commit_rechecks_all_pause_inputs`、`manual_compaction_restart_preserves_refs_and_admission`、`manual_compaction_has_no_schema_change`。prepare 后逐项改变 head/science/profile/指导/答案/停止/审批/unknown；使用临时触发器在 archive/任一事件/receipt 写入时注入失败。
 
 ```rust
 assert_eq!(failed_commit_counts, before_counts); // receipt/archive/events 全部
@@ -105,10 +107,12 @@ assert_eq!(reopened_archive_hash, first_archive_hash);
 assert_eq!(schema_after, schema_before);
 ```
 
-- [ ] **RED 运行**：`cargo test -p omicsops-store manual_compaction`。预期 snapshot/commit/hydration 缺失或竞态/原子断言失败。
-- [ ] **实现接口**：snapshot 一致读取，不创建 STARTED；commit `BEGIN IMMEDIATE` 重验普通 pause、source/spec/science、绑定 profile hash/project compute、guidance/stop/审批/dispatch；验证 prepared transcript/checkpoint/事件序列及 scope。原样一次写 receipt/archive/planned events，失败全 rollback。Completed optional admission 已在 event JSON，hydrate 不新增列；新请求无对外 STARTED，保留旧 recovery。
-- [ ] **GREEN**：重复 RED，再 `cargo test -p omicsops-store context_compaction`；预期旧 completed no-op/STARTED reconciliation 不回归。证明 checkpoint 非 Null 科学状态、引用重开可解析。
-- [ ] **Commit**：仅暂存本任务文件，`git commit -m "feat(store): atomically commit admitted context checkpoints"`。
+- [x] **RED 运行**：`cargo test -p omicsops-store manual_compaction`。预期 snapshot/commit/hydration 缺失或竞态/原子断言失败。
+- [x] **实现接口**：snapshot 一致读取，不创建 STARTED；commit `BEGIN IMMEDIATE` 重验普通 pause、source/spec/science、绑定 profile hash/project compute、guidance/stop/审批/dispatch；验证 prepared transcript/checkpoint/事件序列及 scope。原样一次写 receipt/archive/planned events，失败全 rollback。Completed optional admission 已在 event JSON，hydrate 不新增列；新请求无对外 STARTED，保留旧 recovery。
+- [x] **GREEN**：重复 RED，再 `cargo test -p omicsops-store context_compaction`；预期旧 completed no-op/STARTED reconciliation 不回归。证明 checkpoint 非 Null 科学状态、引用重开可解析。
+- [x] **Commit**：仅暂存本任务文件，`git commit -m "feat(store): atomically commit admitted context checkpoints"`。
+
+**实施证据（2026-10-08）**：Task 3 提交 `786e2d9` 经独立完整任务审阅通过。最终源上 Store 306、core 223、protocol 44 与格式检查通过；临时 SQLite 的六个写入中断点、源状态和绑定 CAS、回执重开、旧 STARTED 恢复、无 schema 变化均有真实断言。宿主租约、活动 driver 排除和桌面组合仍属于 Task 4；完整 clean-HEAD 检查与真实模型/SSH 验收仍待交付前记录。Windows 路径规范化与增量缓存提示是通过日志中的环境警告，最终交付记录须保留。
 
 ### Task 4: 宿主租约、resume composition 和 manual 命令
 
