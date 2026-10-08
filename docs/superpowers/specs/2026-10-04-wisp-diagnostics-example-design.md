@@ -59,7 +59,7 @@ Rust 类型加入 `crates/omicsops-dto/src/run_diagnostics.rs` 并由 crate 导�
 
 ### 安全投影与文件格式
 
-只读源在宿主内验证后，逐字段构建输出。字符串复用 [composer_references::public_text](../../../src-tauri/src/composer_references.rs)，它在 core API key/Bearer 规则外还处理 token/password/Authorization 赋值和完整或不完整 PEM 私钥块。自定义关键词采用 literal 替换，与 host 的 `public_text` 组合；先脱敏后限长。此接缝也供 publication report 使用，双方不用各自实现更弱的规则。
+只读源在宿主内验证后，逐字段构建输出。字符串复用 [composer_references::public_text](../../../src-tauri/src/composer_references.rs)，它在 core API key/Bearer 规则外还处理 token/password/Authorization 赋值和完整或不完整 PEM 私钥块。诊断自定义关键词仅针对 `public_text` 的原文本做非递归 literal 匹配，相交命中合并遮盖；新增的 `[REDACTED]` 不再作为下一轮输入。完整命中判断先于 UTF-8 安全限长，tool_label 最多 256 字节，不能先截断原秘密再遮盖。`public_text` 接缝也供 publication report 使用，双方不用各自实现更弱的凭据规则；诊断自定义关键词规则仍仅属本次请求。
 
 任意自由文本不进入第一版投影：排除 `ModelText` 内容、`ModelReplayRecorded` 内容、continuation/thinking、工具 arguments、`model_content`、`data`、provenance 字符串、plan 代码、用户输入、公开进度正文以及原始异常。上述事件可以有仅含固定 kind 和定位引用的行。`call_ref` 为对 `(run UUID, 原 call_id)` 的定长 SHA-256 引用，原 call_id 不导出。tool_label 经 public_text 和自定义词处理且限长；hash 字段必须是经链验证的 64 位十六进制值，首事件的 previous_hash 可以为空。无任意原始 JSON 透传字段。
 

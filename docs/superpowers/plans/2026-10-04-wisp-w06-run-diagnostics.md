@@ -15,6 +15,7 @@
 - Windows-first；自动测试只用临时 Store/目录、有效事件 fixtures、fake chooser 和 mock Tauri，无真实模型/SSH/网络。
 - 整 conversation 最多 10,000 事件、16 MiB 原始序列化事件、8 MiB 公开投影；完整校验后过滤，不截断链。
 - tool_id 最多 256 UTF-8 字节；脱敏词最多 32 个、每个 1 KiB、共 16 KiB，空词拒绝；词列表不持久化或导出。
+- 自定义脱敏词只在 `public_text` 后的原文本上做非递归 literal 匹配；相交匹配合并遮盖，生成的 `[REDACTED]` 不再参与匹配；匹配先于 UTF-8 安全截断，显示标签最多 256 字节。
 - DTO 进入 omicsops-dto，snake_case/严格请求；无 SQLite 迁移、执行/审批状态变化、新计时/用量采集。
 - 不调用会 terminal reconciliation 的旧 agent_v4_events 命令；共享入口文件与其他功能按 master 顺序整合。
 - 默认完整检查为 `cargo test --workspace`、`npm test`、`npm run build`；宿主组合另跑 `npm run build:desktop`。实际 live acceptance 结果单独记录。
@@ -59,7 +60,7 @@
 **Files:** Create `src-tauri/src/run_diagnostics.rs`; Modify `src-tauri/src/lib.rs`（module/invoke 注册）; Test 新模块 `#[cfg(test)]`。
 
 **Interfaces:**
-- Consumes: Task 1 Store/DTO，`composer_references::public_text(&str) -> String`、core literal secret redaction、`UsageTotalsV4::from_observations`。
+- Consumes: Task 1 Store/DTO，`composer_references::public_text(&str) -> String`、宿主有界非递归 literal 词遮盖、`UsageTotalsV4::from_observations`。
 - Produces: `project_run_diagnostics(events: &[AgentEventV4], request: &RunDiagnosticsRequestV4) -> Result<RunDiagnosticsSnapshotV4, String>`；`load_run_diagnostics(repository: &Store, request: &RunDiagnosticsRequestV4) -> Result<RunDiagnosticsSnapshotV4, String>`；Tauri `get_run_diagnostics_v4(state: State<'_, AppState>, request: RunDiagnosticsRequestV4) -> Result<RunDiagnosticsSnapshotV4, String>`。错误为固定安全码。
 
 - [ ] **RED — 写 `run_diagnostics_projection_*` 测试。** 两 run 同 call_id，正常/failed/uncertain/cancelled/reused outcome，缺 start/歧义 dispatch/反向时间，缺 observation 与 incomplete subtotal；固定 UTC 首事件/run UUID/sequence 排序。tool filter 精确匹配，不将无法归属的 RunFailed 混入某工具。
@@ -76,6 +77,8 @@
 - [ ] **实现三签名并注册 get 命令。** 完整链读取后才过滤；usage 是选中整 run 的 qualified 小计，不随工具/失败筛选重算。filtered 取是否启用任何筛选，不以数量恰好相同冒称完整。输入限额和投影 8 MiB 统一检查；keyword/filter 仅内存。每个 kind 可有固定元数据行，私有 payload 不进入输出；uncertain 不标失败/取消。
 - [ ] **GREEN — 同命令 PASS。** 加空结果、tool_id UTF-8 边界、关键词空/超量/超字节与投影超限测试，确认错误无原始内容，读取仍零模型/工具/事件写入。
 - [ ] **Commit —** `git add -- src-tauri/src/run_diagnostics.rs src-tauri/src/lib.rs`；`git commit -m "feat: project safe run diagnostic metadata"`。
+
+**实施证据（2026-10-08）**：Task 2 功能提交 `f51d321`、独立格式提交 `399129a` 的完整独立审阅发现一个 P1：合法的重复自定义词会在旧共享替换函数中反复匹配新增的 `[REDACTED]`，在限长前指数膨胀。仅在本 Task 的诊断模块修复：`566c1b7`、独立格式提交 `240abd4`；保持 `public_text` 既有凭据规则，后续词匹配只读原文本、合并相交范围、输出最多 256 UTF-8 字节。实际有界 RED→GREEN、最终与复审的诊断 17、Store 3、格式和 diff 检查通过；独立局部复审关闭唯一 P1，未发现新问题。完整链/原始 JSON 哈希兼容、公开字段白名单、用量与筛选合同依完整审阅继续成立。词列表仅请求内存，不写入事件/导出。证据见 `.superpowers/sdd/2026-10-04-wisp-w06-run-diagnostics/task-2-review.md`、`task-2-fix1-report.md` 与 `task-2-fix1-rereview.md`。安全导出、UI、完整 W06 与真实环境验收仍属后续任务。
 
 ### Task 3: 宿主重新校验的 HTML/JSON 保存
 
