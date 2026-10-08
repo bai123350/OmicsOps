@@ -8,7 +8,7 @@ use omicsops_dto::{
     RunDiagnosticsFilterSummaryV4, RunDiagnosticsRequestV4, RunDiagnosticsSnapshotV4,
     RunDiagnosticsSourceHeadV4,
 };
-use omicsops_protocol::{validate_event_chain_v4, AgentEventKindV4, AgentEventV4, UsageTotalsV4};
+use omicsops_protocol::{AgentEventKindV4, AgentEventV4, UsageTotalsV4, validate_event_chain_v4};
 use omicsops_store::{Store, StoreError};
 use sha2::{Digest, Sha256};
 use tauri::State;
@@ -22,10 +22,22 @@ const MAX_PROJECTION_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LABEL_BYTES: usize = 256;
 
 fn validate_request(request: &RunDiagnosticsRequestV4) -> Result<(), String> {
-    if request.filter.tool_id.as_ref().is_some_and(|id| id.len() > 256)
+    if request
+        .filter
+        .tool_id
+        .as_ref()
+        .is_some_and(|id| id.len() > 256)
         || request.redaction_keywords.len() > 32
-        || request.redaction_keywords.iter().any(|word| word.is_empty() || word.len() > 1024)
-        || request.redaction_keywords.iter().map(String::len).sum::<usize>() > 16 * 1024
+        || request
+            .redaction_keywords
+            .iter()
+            .any(|word| word.is_empty() || word.len() > 1024)
+        || request
+            .redaction_keywords
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+            > 16 * 1024
     {
         return Err("diagnostics_invalid_request".into());
     }
@@ -55,29 +67,37 @@ fn direct_tool(event: &AgentEventKindV4) -> Option<(&str, &str)> {
     match event {
         ToolRequested { call } => Some((&call.call_id, &call.tool_id)),
         ToolApprovalRequested { request } => Some((&request.call.call_id, &request.call.tool_id)),
-        ToolDispatchStarted { call_id, tool_id, .. }
+        ToolDispatchStarted {
+            call_id, tool_id, ..
+        }
         | ToolDispatchUncertain { call_id, tool_id } => Some((call_id, tool_id)),
-        ToolFinished { outcome } | ToolOutcomeReused { outcome, .. } => Some((&outcome.call_id, &outcome.tool_id)),
+        ToolFinished { outcome } | ToolOutcomeReused { outcome, .. } => {
+            Some((&outcome.call_id, &outcome.tool_id))
+        }
         _ => None,
     }
 }
 
 fn associated_call(event: &AgentEventKindV4) -> Option<&str> {
     use AgentEventKindV4::*;
-    direct_tool(event).map(|(call, _)| call).or_else(|| match event {
-        ToolDispatchResolved { call_id, .. }
-        | DelegationGraphStarted { call_id, .. }
-        | DelegationNodeFinished { call_id, .. }
-        | DelegationGraphFinished { call_id, .. } => Some(call_id),
-        _ => None,
-    })
+    direct_tool(event)
+        .map(|(call, _)| call)
+        .or_else(|| match event {
+            ToolDispatchResolved { call_id, .. }
+            | DelegationGraphStarted { call_id, .. }
+            | DelegationNodeFinished { call_id, .. }
+            | DelegationGraphFinished { call_id, .. } => Some(call_id),
+            _ => None,
+        })
 }
 
 fn status(event: &AgentEventKindV4) -> Option<RunDiagnosticStatusV4> {
     use AgentEventKindV4::*;
     use RunDiagnosticStatusV4::*;
     match event {
-        ToolFinished { outcome } | ToolOutcomeReused { outcome, .. } => Some(if outcome.succeeded { Succeeded } else { Failed }),
+        ToolFinished { outcome } | ToolOutcomeReused { outcome, .. } => {
+            Some(if outcome.succeeded { Succeeded } else { Failed })
+        }
         RunCompleted => Some(Succeeded),
         RunFailed { .. } | ModelRetrying { .. } => Some(Failed),
         ToolDispatchUncertain { .. } => Some(Uncertain),
@@ -160,10 +180,15 @@ pub(crate) fn project_run_diagnostics(
     let mut source_bytes = 0usize;
     let mut runs: BTreeMap<Uuid, Vec<AgentEventV4>> = BTreeMap::new();
     for event in events {
-        if event.project_id != request.project_id || event.conversation_id != request.conversation_id || event.schema_version != 4 {
+        if event.project_id != request.project_id
+            || event.conversation_id != request.conversation_id
+            || event.schema_version != 4
+        {
             return Err("diagnostics_source_invalid".into());
         }
-        source_bytes += serde_json::to_vec(event).map_err(|_| "diagnostics_source_invalid")?.len();
+        source_bytes += serde_json::to_vec(event)
+            .map_err(|_| "diagnostics_source_invalid")?
+            .len();
         if source_bytes > MAX_SOURCE_BYTES {
             return Err("diagnostics_source_limit".into());
         }
@@ -188,7 +213,11 @@ fn project_validated_run_diagnostics(
     if events.len() > MAX_EVENTS {
         return Err("diagnostics_source_limit".into());
     }
-    if events.iter().any(|event| event.project_id != request.project_id || event.conversation_id != request.conversation_id || event.schema_version != 4) {
+    if events.iter().any(|event| {
+        event.project_id != request.project_id
+            || event.conversation_id != request.conversation_id
+            || event.schema_version != 4
+    }) {
         return Err("diagnostics_source_invalid".into());
     }
     let mut runs: BTreeMap<Uuid, Vec<&AgentEventV4>> = BTreeMap::new();
@@ -199,7 +228,12 @@ fn project_validated_run_diagnostics(
     for (run_id, chain) in &mut runs {
         chain.sort_by_key(|event| event.sequence);
         let head = chain.last().ok_or("diagnostics_source_invalid")?;
-        heads.push(RunDiagnosticsSourceHeadV4 { run_id: *run_id, event_count: chain.len() as u64, last_sequence: head.sequence, event_hash: head.event_hash.clone() });
+        heads.push(RunDiagnosticsSourceHeadV4 {
+            run_id: *run_id,
+            event_count: chain.len() as u64,
+            last_sequence: head.sequence,
+            event_hash: head.event_hash.clone(),
+        });
     }
     let mut ordered = runs.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|(run_id, chain)| (chain[0].occurred_at, **run_id));
@@ -207,7 +241,11 @@ fn project_validated_run_diagnostics(
     let mut usage = Vec::new();
     let mut labels = BTreeMap::new();
     for (run_id, chain) in ordered {
-        if request.filter.run_id.is_some_and(|selected| selected != *run_id) {
+        if request
+            .filter
+            .run_id
+            .is_some_and(|selected| selected != *run_id)
+        {
             continue;
         }
         let mut tools: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
@@ -221,9 +259,15 @@ fn project_validated_run_diagnostics(
                 tools.entry(call).or_default().insert(tool);
             }
             match &event.event {
-                AgentEventKindV4::ToolDispatchStarted { call_id, .. } => { starts.entry(call_id).or_default().push(event); }
-                AgentEventKindV4::ToolFinished { outcome } => { *finishes.entry(&outcome.call_id).or_default() += 1; }
-                AgentEventKindV4::ModelRequestStarted { request } => { attempts.insert((request.logical_request_id, request.attempt_id)); }
+                AgentEventKindV4::ToolDispatchStarted { call_id, .. } => {
+                    starts.entry(call_id).or_default().push(event);
+                }
+                AgentEventKindV4::ToolFinished { outcome } => {
+                    *finishes.entry(&outcome.call_id).or_default() += 1;
+                }
+                AgentEventKindV4::ModelRequestStarted { request } => {
+                    attempts.insert((request.logical_request_id, request.attempt_id));
+                }
                 AgentEventKindV4::ModelUsageObserved { observation } => {
                     observed.insert((observation.logical_request_id, observation.attempt_id));
                     observations.push(observation.clone());
@@ -231,7 +275,11 @@ fn project_validated_run_diagnostics(
                 _ => {}
             }
         }
-        usage.push(RunDiagnosticUsageV4 { run_id: *run_id, totals: UsageTotalsV4::from_observations(observations), missing_observation_attempts: attempts.difference(&observed).count() as u32 });
+        usage.push(RunDiagnosticUsageV4 {
+            run_id: *run_id,
+            totals: UsageTotalsV4::from_observations(observations),
+            missing_observation_attempts: attempts.difference(&observed).count() as u32,
+        });
         for event in chain {
             let call = associated_call(&event.event);
             let tool = direct_tool(&event.event).map(|(_, tool)| tool).or_else(|| {
@@ -239,14 +287,27 @@ fn project_validated_run_diagnostics(
                 (candidates.len() == 1).then(|| *candidates.first().expect("one tool"))
             });
             let status = status(&event.event);
-            if request.filter.tool_id.as_deref().is_some_and(|selected| Some(selected) != tool)
-                || (request.filter.failures_only && !matches!(status, Some(RunDiagnosticStatusV4::Failed | RunDiagnosticStatusV4::Uncertain)))
+            if request
+                .filter
+                .tool_id
+                .as_deref()
+                .is_some_and(|selected| Some(selected) != tool)
+                || (request.filter.failures_only
+                    && !matches!(
+                        status,
+                        Some(RunDiagnosticStatusV4::Failed | RunDiagnosticStatusV4::Uncertain)
+                    ))
             {
                 continue;
             }
             let duration_ms = if let AgentEventKindV4::ToolFinished { outcome } = &event.event {
                 starts.get(outcome.call_id.as_str()).and_then(|starts| {
-                    if starts.len() != 1 || finishes.get(outcome.call_id.as_str()) != Some(&1) || tools.get(outcome.call_id.as_str()).is_none_or(|tools| tools.len() != 1) {
+                    if starts.len() != 1
+                        || finishes.get(outcome.call_id.as_str()) != Some(&1)
+                        || tools
+                            .get(outcome.call_id.as_str())
+                            .is_none_or(|tools| tools.len() != 1)
+                    {
                         return None;
                     }
                     let start = starts[0];
@@ -255,38 +316,92 @@ fn project_validated_run_diagnostics(
                     }
                     u64::try_from((event.occurred_at - start.occurred_at).num_milliseconds()).ok()
                 })
-            } else { None };
+            } else {
+                None
+            };
             rows.push(RunDiagnosticEventV4 {
-                run_id: *run_id, sequence: event.sequence, event_hash: event.event_hash.clone(), previous_hash: event.previous_hash.clone(), occurred_at: event.occurred_at,
-                event_kind: event_kind(&event.event).into(), status, tool_label: tool.map(|tool| labels.entry(tool).or_insert_with(|| tool_label(tool, request)).clone()), call_ref: call.map(|call| call_ref(*run_id, call)), duration_ms,
+                run_id: *run_id,
+                sequence: event.sequence,
+                event_hash: event.event_hash.clone(),
+                previous_hash: event.previous_hash.clone(),
+                occurred_at: event.occurred_at,
+                event_kind: event_kind(&event.event).into(),
+                status,
+                tool_label: tool.map(|tool| {
+                    labels
+                        .entry(tool)
+                        .or_insert_with(|| tool_label(tool, request))
+                        .clone()
+                }),
+                call_ref: call.map(|call| call_ref(*run_id, call)),
+                duration_ms,
             });
         }
     }
     let snapshot = RunDiagnosticsSnapshotV4 {
-        schema_version: 1, project_id: request.project_id, conversation_id: request.conversation_id,
-        filter_summary: RunDiagnosticsFilterSummaryV4 { run_id: request.filter.run_id, tool_label: request.filter.tool_id.as_deref().map(|tool| tool_label(tool, request)), failures_only: request.filter.failures_only },
-        source_heads: heads, source_chain_validated: true, total_event_count: events.len() as u64, selected_event_count: rows.len() as u64,
-        filtered: request.filter.run_id.is_some() || request.filter.tool_id.is_some() || request.filter.failures_only, events: rows, usage,
+        schema_version: 1,
+        project_id: request.project_id,
+        conversation_id: request.conversation_id,
+        filter_summary: RunDiagnosticsFilterSummaryV4 {
+            run_id: request.filter.run_id,
+            tool_label: request
+                .filter
+                .tool_id
+                .as_deref()
+                .map(|tool| tool_label(tool, request)),
+            failures_only: request.filter.failures_only,
+        },
+        source_heads: heads,
+        source_chain_validated: true,
+        total_event_count: events.len() as u64,
+        selected_event_count: rows.len() as u64,
+        filtered: request.filter.run_id.is_some()
+            || request.filter.tool_id.is_some()
+            || request.filter.failures_only,
+        events: rows,
+        usage,
     };
-    if serde_json::to_vec(&snapshot).map_err(|_| "diagnostics_projection_failed")?.len() > MAX_PROJECTION_BYTES {
+    if serde_json::to_vec(&snapshot)
+        .map_err(|_| "diagnostics_projection_failed")?
+        .len()
+        > MAX_PROJECTION_BYTES
+    {
         return Err("diagnostics_projection_limit".into());
     }
     Ok(snapshot)
 }
 
-pub(crate) async fn load_run_diagnostics(repository: &Store, request: &RunDiagnosticsRequestV4) -> Result<RunDiagnosticsSnapshotV4, String> {
+pub(crate) async fn load_run_diagnostics(
+    repository: &Store,
+    request: &RunDiagnosticsRequestV4,
+) -> Result<RunDiagnosticsSnapshotV4, String> {
     validate_request(request)?;
-    let events = repository.agent_events_for_context_v4_bounded(request.project_id, request.conversation_id, MAX_EVENTS, MAX_SOURCE_BYTES).await.map_err(|error| match error {
-        StoreError::InvalidInput(message) if message == "diagnostics source limit exceeded" => "diagnostics_source_limit",
-        StoreError::InvalidInput(message) if message == "diagnostics scope invalid" => "diagnostics_scope_invalid",
-        StoreError::InvalidInput(_) => "diagnostics_source_invalid",
-        _ => "diagnostics_read_failed",
-    })?;
+    let events = repository
+        .agent_events_for_context_v4_bounded(
+            request.project_id,
+            request.conversation_id,
+            MAX_EVENTS,
+            MAX_SOURCE_BYTES,
+        )
+        .await
+        .map_err(|error| match error {
+            StoreError::InvalidInput(message) if message == "diagnostics source limit exceeded" => {
+                "diagnostics_source_limit"
+            }
+            StoreError::InvalidInput(message) if message == "diagnostics scope invalid" => {
+                "diagnostics_scope_invalid"
+            }
+            StoreError::InvalidInput(_) => "diagnostics_source_invalid",
+            _ => "diagnostics_read_failed",
+        })?;
     project_validated_run_diagnostics(&events, request)
 }
 
 #[tauri::command]
-pub async fn get_run_diagnostics_v4(state: State<'_, AppState>, request: RunDiagnosticsRequestV4) -> Result<RunDiagnosticsSnapshotV4, String> {
+pub async fn get_run_diagnostics_v4(
+    state: State<'_, AppState>,
+    request: RunDiagnosticsRequestV4,
+) -> Result<RunDiagnosticsSnapshotV4, String> {
     load_run_diagnostics(&state.repository, &request).await
 }
 
@@ -294,8 +409,13 @@ pub async fn get_run_diagnostics_v4(state: State<'_, AppState>, request: RunDiag
 mod tests {
     use super::*;
     use chrono::{DateTime, Duration, Utc};
-    use omicsops_dto::{RunDiagnosticStatusV4 as Status, RunDiagnosticsFilterV4, RunDiagnosticsRequestV4};
-    use omicsops_protocol::{AgentEventKindV4 as Kind, AgentEventV4, ModelRequestStartedV4, ModelUsageObservationV4, RunModeV4, ToolEffectV4, ToolOutcomeV4};
+    use omicsops_dto::{
+        RunDiagnosticStatusV4 as Status, RunDiagnosticsFilterV4, RunDiagnosticsRequestV4,
+    };
+    use omicsops_protocol::{
+        AgentEventKindV4 as Kind, AgentEventV4, ModelRequestStartedV4, ModelUsageObservationV4,
+        RunModeV4, ToolEffectV4, ToolOutcomeV4,
+    };
     use serde_json::json;
     use uuid::Uuid;
 
@@ -303,7 +423,11 @@ mod tests {
         RunDiagnosticsRequestV4 {
             project_id: Uuid::from_u128(1),
             conversation_id: Uuid::from_u128(2),
-            filter: RunDiagnosticsFilterV4 { run_id: None, tool_id: None, failures_only: false },
+            filter: RunDiagnosticsFilterV4 {
+                run_id: None,
+                tool_id: None,
+                failures_only: false,
+            },
             redaction_keywords: vec![],
         }
     }
@@ -316,7 +440,13 @@ mod tests {
             let time = origin + Duration::milliseconds(millis);
             let event = match events.last() {
                 Some(previous) => AgentEventV4::next(previous, time, kind),
-                None => AgentEventV4::first(Uuid::from_u128(run), req.project_id, req.conversation_id, time, kind),
+                None => AgentEventV4::first(
+                    Uuid::from_u128(run),
+                    req.project_id,
+                    req.conversation_id,
+                    time,
+                    kind,
+                ),
             };
             events.push(event);
         }
@@ -324,47 +454,102 @@ mod tests {
     }
 
     fn start(call: &str, tool: &str) -> Kind {
-        Kind::ToolDispatchStarted { call_id: call.into(), tool_id: tool.into(), effect: ToolEffectV4::ReadOnly, idempotency_key: "PRIVATE_SENTINEL".into() }
+        Kind::ToolDispatchStarted {
+            call_id: call.into(),
+            tool_id: tool.into(),
+            effect: ToolEffectV4::ReadOnly,
+            idempotency_key: "PRIVATE_SENTINEL".into(),
+        }
     }
 
     fn outcome(call: &str, tool: &str, succeeded: bool) -> ToolOutcomeV4 {
-        ToolOutcomeV4 { call_id: call.into(), tool_id: tool.into(), succeeded, model_content: "PRIVATE_SENTINEL".into(), data: json!({"private": "PRIVATE_SENTINEL"}), provenance: vec!["PRIVATE_SENTINEL".into()] }
+        ToolOutcomeV4 {
+            call_id: call.into(),
+            tool_id: tool.into(),
+            succeeded,
+            model_content: "PRIVATE_SENTINEL".into(),
+            data: json!({"private": "PRIVATE_SENTINEL"}),
+            provenance: vec!["PRIVATE_SENTINEL".into()],
+        }
     }
 
     fn finish(call: &str, tool: &str, succeeded: bool) -> Kind {
-        Kind::ToolFinished { outcome: outcome(call, tool, succeeded) }
+        Kind::ToolFinished {
+            outcome: outcome(call, tool, succeeded),
+        }
     }
 
     fn attempt(id: u128) -> Kind {
-        Kind::ModelRequestStarted { request: serde_json::from_value::<ModelRequestStartedV4>(json!({
-            "logical_request_id": Uuid::from_u128(10), "attempt_id": Uuid::from_u128(id),
-            "model_profile_id": Uuid::from_u128(20), "context_limit_source": {"kind": "unknown"}
-        })).unwrap() }
+        Kind::ModelRequestStarted {
+            request: serde_json::from_value::<ModelRequestStartedV4>(json!({
+                "logical_request_id": Uuid::from_u128(10), "attempt_id": Uuid::from_u128(id),
+                "model_profile_id": Uuid::from_u128(20), "context_limit_source": {"kind": "unknown"}
+            }))
+            .unwrap(),
+        }
     }
 
     fn usage(id: u128, tokens: u64, aggregation: &str) -> Kind {
-        Kind::ModelUsageObserved { observation: serde_json::from_value::<ModelUsageObservationV4>(json!({
-            "logical_request_id": Uuid::from_u128(10), "attempt_id": Uuid::from_u128(id),
-            "model_profile_id": Uuid::from_u128(20), "sample_index": 0,
-            "state": "partial", "aggregation": aggregation,
-            "input_tokens": tokens, "context_limit_source": {"kind": "unknown"}
-        })).unwrap() }
+        Kind::ModelUsageObserved {
+            observation: serde_json::from_value::<ModelUsageObservationV4>(json!({
+                "logical_request_id": Uuid::from_u128(10), "attempt_id": Uuid::from_u128(id),
+                "model_profile_id": Uuid::from_u128(20), "sample_index": 0,
+                "state": "partial", "aggregation": aggregation,
+                "input_tokens": tokens, "context_limit_source": {"kind": "unknown"}
+            }))
+            .unwrap(),
+        }
     }
 
     #[test]
     fn run_diagnostics_projection_scopes_calls_durations_and_failure_filter() {
-        let mut events = chain(30, vec![
-            (0, start("same", "shell")), (100, finish("same", "shell", true)),
-            (101, Kind::ToolOutcomeReused { idempotency_key: "PRIVATE_SENTINEL".into(), outcome: outcome("same", "shell", false) }),
-            (102, Kind::ToolDispatchUncertain { call_id: "uncertain".into(), tool_id: "shell".into() }),
-            (103, Kind::RunFailed { message: "PRIVATE_SENTINEL".into() }),
-        ]);
-        events.extend(chain(31, vec![(0, start("same", "shell")), (400, finish("same", "shell", false)), (401, Kind::RunCancelled)]));
+        let mut events = chain(
+            30,
+            vec![
+                (0, start("same", "shell")),
+                (100, finish("same", "shell", true)),
+                (
+                    101,
+                    Kind::ToolOutcomeReused {
+                        idempotency_key: "PRIVATE_SENTINEL".into(),
+                        outcome: outcome("same", "shell", false),
+                    },
+                ),
+                (
+                    102,
+                    Kind::ToolDispatchUncertain {
+                        call_id: "uncertain".into(),
+                        tool_id: "shell".into(),
+                    },
+                ),
+                (
+                    103,
+                    Kind::RunFailed {
+                        message: "PRIVATE_SENTINEL".into(),
+                    },
+                ),
+            ],
+        );
+        events.extend(chain(
+            31,
+            vec![
+                (0, start("same", "shell")),
+                (400, finish("same", "shell", false)),
+                (401, Kind::RunCancelled),
+            ],
+        ));
         let snapshot = project_run_diagnostics(&events, &request()).unwrap();
         assert_eq!(snapshot.events[1].duration_ms, Some(100));
         assert_eq!(snapshot.events[6].duration_ms, Some(400));
         assert_ne!(snapshot.events[1].call_ref, snapshot.events[6].call_ref);
-        assert!(snapshot.events[1].call_ref.as_ref().unwrap().bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(
+            snapshot.events[1]
+                .call_ref
+                .as_ref()
+                .unwrap()
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit())
+        );
         assert_eq!(snapshot.events[1].call_ref.as_ref().unwrap().len(), 64);
         assert_eq!(snapshot.events[2].duration_ms, None);
         assert_eq!(snapshot.events[3].status, Some(Status::Uncertain));
@@ -372,7 +557,19 @@ mod tests {
         let mut req = request();
         req.filter.failures_only = true;
         let failed = project_run_diagnostics(&events, &req).unwrap();
-        assert_eq!(failed.events.iter().map(|e| e.event_kind.as_str()).collect::<Vec<_>>(), vec!["tool_outcome_reused", "tool_dispatch_uncertain", "run_failed", "tool_finished"]);
+        assert_eq!(
+            failed
+                .events
+                .iter()
+                .map(|e| e.event_kind.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "tool_outcome_reused",
+                "tool_dispatch_uncertain",
+                "run_failed",
+                "tool_finished"
+            ]
+        );
         req.filter.tool_id = Some("shell".into());
         let filtered = project_run_diagnostics(&events, &req).unwrap();
         assert_eq!(filtered.selected_event_count, 3);
@@ -380,19 +577,68 @@ mod tests {
         assert_eq!(filtered.source_heads.len(), 2);
         assert!(!filtered.events.iter().any(|e| e.event_kind == "run_failed"));
         req.filter.tool_id = Some("shel".into());
-        assert!(project_run_diagnostics(&events, &req).unwrap().events.is_empty());
+        assert!(
+            project_run_diagnostics(&events, &req)
+                .unwrap()
+                .events
+                .is_empty()
+        );
     }
 
     #[test]
     fn run_diagnostics_projection_unknown_duration_and_deterministic_order() {
-        let mut events = chain(33, vec![(0, start("ambiguous", "shell")), (1, start("ambiguous", "shell")), (10, finish("ambiguous", "shell", true))]);
-        events.extend(chain(32, vec![(0, start("reverse", "shell")), (-1, finish("reverse", "shell", true)), (20, finish("missing", "shell", true))]));
-        events.extend(chain(34, vec![(-10, Kind::RunCreated { mode: RunModeV4::Plan })]));
+        let mut events = chain(
+            33,
+            vec![
+                (0, start("ambiguous", "shell")),
+                (1, start("ambiguous", "shell")),
+                (10, finish("ambiguous", "shell", true)),
+            ],
+        );
+        events.extend(chain(
+            32,
+            vec![
+                (0, start("reverse", "shell")),
+                (-1, finish("reverse", "shell", true)),
+                (20, finish("missing", "shell", true)),
+            ],
+        ));
+        events.extend(chain(
+            34,
+            vec![(
+                -10,
+                Kind::RunCreated {
+                    mode: RunModeV4::Plan,
+                },
+            )],
+        ));
         events.reverse();
         let snapshot = project_run_diagnostics(&events, &request()).unwrap();
-        assert_eq!(snapshot.events.iter().map(|e| (e.run_id.as_u128(), e.sequence)).collect::<Vec<_>>(), vec![(34, 1), (32, 1), (32, 2), (32, 3), (33, 1), (33, 2), (33, 3)]);
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .map(|e| (e.run_id.as_u128(), e.sequence))
+                .collect::<Vec<_>>(),
+            vec![
+                (34, 1),
+                (32, 1),
+                (32, 2),
+                (32, 3),
+                (33, 1),
+                (33, 2),
+                (33, 3)
+            ]
+        );
         assert!(snapshot.events.iter().all(|e| e.duration_ms.is_none()));
-        assert_eq!(snapshot.source_heads.iter().map(|h| h.run_id.as_u128()).collect::<Vec<_>>(), vec![32, 33, 34]);
+        assert_eq!(
+            snapshot
+                .source_heads
+                .iter()
+                .map(|h| h.run_id.as_u128())
+                .collect::<Vec<_>>(),
+            vec![32, 33, 34]
+        );
         let mut req = request();
         req.filter.run_id = Some(Uuid::from_u128(34));
         let filtered = project_run_diagnostics(&events, &req).unwrap();
@@ -405,8 +651,25 @@ mod tests {
 
     #[test]
     fn run_diagnostics_projection_usage_is_per_run_qualified_and_filter_independent() {
-        let mut events = chain(30, vec![(0, attempt(100)), (1, usage(100, 9, "cumulative")), (2, usage(100, 9, "cumulative")), (3, attempt(101)), (4, attempt(101)), (5, finish("x", "shell", false))]);
-        events.extend(chain(31, vec![(0, attempt(100)), (1, usage(100, 77, "unknown")), (2, attempt(102))]));
+        let mut events = chain(
+            30,
+            vec![
+                (0, attempt(100)),
+                (1, usage(100, 9, "cumulative")),
+                (2, usage(100, 9, "cumulative")),
+                (3, attempt(101)),
+                (4, attempt(101)),
+                (5, finish("x", "shell", false)),
+            ],
+        );
+        events.extend(chain(
+            31,
+            vec![
+                (0, attempt(100)),
+                (1, usage(100, 77, "unknown")),
+                (2, attempt(102)),
+            ],
+        ));
         events.extend(chain(32, vec![(0, attempt(100))]));
         let snapshot = project_run_diagnostics(&events, &request()).unwrap();
         assert_eq!(snapshot.usage[0].totals.input_tokens.known, Some(9));
@@ -420,22 +683,65 @@ mod tests {
         let mut req = request();
         req.filter.tool_id = Some("shell".into());
         req.filter.failures_only = true;
-        assert_eq!(project_run_diagnostics(&events, &req).unwrap().usage, snapshot.usage);
+        assert_eq!(
+            project_run_diagnostics(&events, &req).unwrap().usage,
+            snapshot.usage
+        );
         req.filter.run_id = Some(Uuid::from_u128(31));
-        assert_eq!(project_run_diagnostics(&events, &req).unwrap().usage, vec![snapshot.usage[1].clone()]);
+        assert_eq!(
+            project_run_diagnostics(&events, &req).unwrap().usage,
+            vec![snapshot.usage[1].clone()]
+        );
     }
 
     #[test]
     fn run_diagnostics_projection_excludes_private_payloads_and_redacts_before_truncation() {
-        let label = format!("{} password=PRIVATE_SENTINEL token=PRIVATE_SENTINEL api_key=PRIVATE_SENTINEL Authorization: Bearer PRIVATE_SENTINEL\n-----BEGIN PRIVATE KEY-----\nPRIVATE_SENTINEL\n-----END PRIVATE KEY-----\nCUSTOM_LITERAL", "界".repeat(70));
-        let events = chain(30, vec![
-            (0, Kind::ModelText { text: "PRIVATE_SENTINEL".into() }),
-            (1, Kind::ToolRequested { call: omicsops_protocol::ToolCallV4 { call_id: "PRIVATE_SENTINEL".into(), tool_id: label.clone(), arguments: json!({"private": "PRIVATE_SENTINEL"}) } }),
-            (2, finish("PRIVATE_SENTINEL", &label, false)),
-            (3, Kind::UserInputAnswered { question_id: "PRIVATE_SENTINEL".into(), answer: "PRIVATE_SENTINEL".into() }),
-            (4, Kind::GuidanceConsumed { message_id: Uuid::from_u128(9), markdown: "PRIVATE_SENTINEL".into() }),
-            (5, Kind::RunFailed { message: "PRIVATE_SENTINEL provider/SSH error".into() }),
-        ]);
+        let label = format!(
+            "{} password=PRIVATE_SENTINEL token=PRIVATE_SENTINEL api_key=PRIVATE_SENTINEL Authorization: Bearer PRIVATE_SENTINEL\n-----BEGIN PRIVATE KEY-----\nPRIVATE_SENTINEL\n-----END PRIVATE KEY-----\nCUSTOM_LITERAL",
+            "界".repeat(70)
+        );
+        let events = chain(
+            30,
+            vec![
+                (
+                    0,
+                    Kind::ModelText {
+                        text: "PRIVATE_SENTINEL".into(),
+                    },
+                ),
+                (
+                    1,
+                    Kind::ToolRequested {
+                        call: omicsops_protocol::ToolCallV4 {
+                            call_id: "PRIVATE_SENTINEL".into(),
+                            tool_id: label.clone(),
+                            arguments: json!({"private": "PRIVATE_SENTINEL"}),
+                        },
+                    },
+                ),
+                (2, finish("PRIVATE_SENTINEL", &label, false)),
+                (
+                    3,
+                    Kind::UserInputAnswered {
+                        question_id: "PRIVATE_SENTINEL".into(),
+                        answer: "PRIVATE_SENTINEL".into(),
+                    },
+                ),
+                (
+                    4,
+                    Kind::GuidanceConsumed {
+                        message_id: Uuid::from_u128(9),
+                        markdown: "PRIVATE_SENTINEL".into(),
+                    },
+                ),
+                (
+                    5,
+                    Kind::RunFailed {
+                        message: "PRIVATE_SENTINEL provider/SSH error".into(),
+                    },
+                ),
+            ],
+        );
         let mut req = request();
         req.redaction_keywords = vec!["CUSTOM_LITERAL".into()];
         let snapshot = project_run_diagnostics(&events, &req).unwrap();
@@ -448,10 +754,21 @@ mod tests {
         assert!(snapshot.events[1].tool_label.as_ref().unwrap().len() <= 256);
         assert_eq!(snapshot.events[0].event_kind, "model_text");
         assert_eq!(snapshot.events[0].event_hash, events[0].event_hash);
-        for label in ["password=PRIVATE_SENTINEL", "token=PRIVATE_SENTINEL", "api_key=PRIVATE_SENTINEL", "Authorization: Bearer PRIVATE_SENTINEL", "-----BEGIN PRIVATE KEY-----\nPRIVATE_SENTINEL", "CUSTOM_LITERAL"] {
+        for label in [
+            "password=PRIVATE_SENTINEL",
+            "token=PRIVATE_SENTINEL",
+            "api_key=PRIVATE_SENTINEL",
+            "Authorization: Bearer PRIVATE_SENTINEL",
+            "-----BEGIN PRIVATE KEY-----\nPRIVATE_SENTINEL",
+            "CUSTOM_LITERAL",
+        ] {
             let mut query = req.clone();
             query.filter.tool_id = Some(label.into());
-            let safe = project_run_diagnostics(&chain(40, vec![(0, start("PRIVATE_SENTINEL", label))]), &query).unwrap();
+            let safe = project_run_diagnostics(
+                &chain(40, vec![(0, start("PRIVATE_SENTINEL", label))]),
+                &query,
+            )
+            .unwrap();
             let text = serde_json::to_string(&safe).unwrap();
             assert!(!text.contains("PRIVATE_SENTINEL"));
             assert!(!text.contains("CUSTOM_LITERAL"));
@@ -481,14 +798,41 @@ mod tests {
             json!({"kind": "model_retrying", "attempt": 1, "class": "transport", "message": private}),
             json!({"kind": "tool_dispatch_resolved", "call_id": private, "resolution": "side_effect_observed", "evidence": private}),
         ];
-        let events = chain(30, kinds.into_iter().enumerate().map(|(i, value)| (i as i64, serde_json::from_value(value).unwrap())).collect());
+        let events = chain(
+            30,
+            kinds
+                .into_iter()
+                .enumerate()
+                .map(|(i, value)| (i as i64, serde_json::from_value(value).unwrap()))
+                .collect(),
+        );
         let snapshot = project_run_diagnostics(&events, &request()).unwrap();
         assert_eq!(snapshot.events.len(), 8);
         let serialized = serde_json::to_value(&snapshot).unwrap();
         assert!(!serialized.to_string().contains(private));
-        let expected_keys = ["run_id", "sequence", "event_hash", "previous_hash", "occurred_at", "event_kind", "status", "tool_label", "call_ref", "duration_ms"].into_iter().collect::<BTreeSet<_>>();
+        let expected_keys = [
+            "run_id",
+            "sequence",
+            "event_hash",
+            "previous_hash",
+            "occurred_at",
+            "event_kind",
+            "status",
+            "tool_label",
+            "call_ref",
+            "duration_ms",
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
         for row in serialized["events"].as_array().unwrap() {
-            assert_eq!(row.as_object().unwrap().keys().map(String::as_str).collect::<BTreeSet<_>>(), expected_keys);
+            assert_eq!(
+                row.as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>(),
+                expected_keys
+            );
         }
         let mut req = request();
         req.filter.failures_only = true;
@@ -499,8 +843,24 @@ mod tests {
 
     #[test]
     fn run_diagnostics_projection_validates_hidden_chains_and_scope_before_filtering() {
-        let visible = chain(30, vec![(0, Kind::RunCreated { mode: RunModeV4::Plan })]);
-        let hidden = chain(31, vec![(0, Kind::ModelText { text: "PRIVATE_SENTINEL".into() })]);
+        let visible = chain(
+            30,
+            vec![(
+                0,
+                Kind::RunCreated {
+                    mode: RunModeV4::Plan,
+                },
+            )],
+        );
+        let hidden = chain(
+            31,
+            vec![(
+                0,
+                Kind::ModelText {
+                    text: "PRIVATE_SENTINEL".into(),
+                },
+            )],
+        );
         let mut req = request();
         req.filter.run_id = Some(Uuid::from_u128(30));
         for corruption in 0..4 {
@@ -513,7 +873,10 @@ mod tests {
                 _ => bad.sequence = 2,
             }
             events.push(bad);
-            assert_eq!(project_run_diagnostics(&events, &req).unwrap_err(), "diagnostics_source_invalid");
+            assert_eq!(
+                project_run_diagnostics(&events, &req).unwrap_err(),
+                "diagnostics_source_invalid"
+            );
         }
         let selected = project_run_diagnostics(&visible, &req).unwrap();
         assert!(selected.filtered);
@@ -530,13 +893,28 @@ mod tests {
         req.filter.tool_id = Some("界".repeat(85) + "a");
         assert!(project_run_diagnostics(&[], &req).is_ok());
         req.filter.tool_id.as_mut().unwrap().push('b');
-        assert_eq!(project_run_diagnostics(&[], &req).unwrap_err(), "diagnostics_invalid_request");
-        for keywords in [vec![String::new()], vec!["x".into(); 33], vec!["界".repeat(342)], vec!["x".repeat(1024); 17]] {
+        assert_eq!(
+            project_run_diagnostics(&[], &req).unwrap_err(),
+            "diagnostics_invalid_request"
+        );
+        for keywords in [
+            vec![String::new()],
+            vec!["x".into(); 33],
+            vec!["界".repeat(342)],
+            vec!["x".repeat(1024); 17],
+        ] {
             let mut req = request();
             req.redaction_keywords = keywords;
-            assert_eq!(project_run_diagnostics(&[], &req).unwrap_err(), "diagnostics_invalid_request");
+            assert_eq!(
+                project_run_diagnostics(&[], &req).unwrap_err(),
+                "diagnostics_invalid_request"
+            );
         }
-        for keywords in [vec!["x".into(); 32], vec!["x".repeat(1024); 16], vec!["界".repeat(341) + "a"]] {
+        for keywords in [
+            vec!["x".into(); 32],
+            vec!["x".repeat(1024); 16],
+            vec!["界".repeat(341) + "a"],
+        ] {
             let mut req = request();
             req.redaction_keywords = keywords;
             assert!(project_run_diagnostics(&[], &req).is_ok());
@@ -545,77 +923,246 @@ mod tests {
 
     #[test]
     fn run_diagnostics_projection_source_and_serialized_output_budgets_are_enforced() {
-        let mut events = chain(30, (0..10_000).map(|i| (i, Kind::ModelText { text: String::new() })).collect());
-        assert_eq!(project_run_diagnostics(&events, &request()).unwrap().selected_event_count, 10_000);
-        let next = AgentEventV4::next(events.last().unwrap(), events.last().unwrap().occurred_at, Kind::ModelText { text: String::new() });
+        let mut events = chain(
+            30,
+            (0..10_000)
+                .map(|i| {
+                    (
+                        i,
+                        Kind::ModelText {
+                            text: String::new(),
+                        },
+                    )
+                })
+                .collect(),
+        );
+        assert_eq!(
+            project_run_diagnostics(&events, &request())
+                .unwrap()
+                .selected_event_count,
+            10_000
+        );
+        let next = AgentEventV4::next(
+            events.last().unwrap(),
+            events.last().unwrap().occurred_at,
+            Kind::ModelText {
+                text: String::new(),
+            },
+        );
         events.push(next);
         let mut req = request();
         req.filter.run_id = Some(Uuid::from_u128(99));
-        assert_eq!(project_run_diagnostics(&events, &req).unwrap_err(), "diagnostics_source_limit");
-        let oversized = chain(30, vec![(0, Kind::ModelText { text: "x".repeat(16 * 1024 * 1024) })]);
-        assert_eq!(project_run_diagnostics(&oversized, &req).unwrap_err(), "diagnostics_source_limit");
+        assert_eq!(
+            project_run_diagnostics(&events, &req).unwrap_err(),
+            "diagnostics_source_limit"
+        );
+        let oversized = chain(
+            30,
+            vec![(
+                0,
+                Kind::ModelText {
+                    text: "x".repeat(16 * 1024 * 1024),
+                },
+            )],
+        );
+        assert_eq!(
+            project_run_diagnostics(&oversized, &req).unwrap_err(),
+            "diagnostics_source_limit"
+        );
         // JSON expands each control byte to six bytes. The raw chain fits 16 MiB,
         // but even a 256-byte label can exceed the 8 MiB public serialization cap.
-        let events = chain(30, (0..4_500).map(|i| (i, start("same", &"\u{1}".repeat(256)))).collect());
-        assert!(events.iter().map(|e| serde_json::to_vec(e).unwrap().len()).sum::<usize>() < 16 * 1024 * 1024);
-        assert_eq!(project_run_diagnostics(&events, &request()).unwrap_err(), "diagnostics_projection_limit");
+        let events = chain(
+            30,
+            (0..4_500)
+                .map(|i| (i, start("same", &"\u{1}".repeat(256))))
+                .collect(),
+        );
+        assert!(
+            events
+                .iter()
+                .map(|e| serde_json::to_vec(e).unwrap().len())
+                .sum::<usize>()
+                < 16 * 1024 * 1024
+        );
+        assert_eq!(
+            project_run_diagnostics(&events, &request()).unwrap_err(),
+            "diagnostics_projection_limit"
+        );
     }
 
     #[test]
     fn run_diagnostics_projection_ambiguous_call_identity_cannot_attribute_resolutions() {
-        let events = chain(30, vec![(0, start("same", "shell")), (1, finish("same", "read", false)), (2, Kind::ToolDispatchResolved { call_id: "same".into(), resolution: omicsops_protocol::UncertainResolutionV4::SideEffectObserved, evidence: "PRIVATE_SENTINEL".into() })]);
+        let events = chain(
+            30,
+            vec![
+                (0, start("same", "shell")),
+                (1, finish("same", "read", false)),
+                (
+                    2,
+                    Kind::ToolDispatchResolved {
+                        call_id: "same".into(),
+                        resolution: omicsops_protocol::UncertainResolutionV4::SideEffectObserved,
+                        evidence: "PRIVATE_SENTINEL".into(),
+                    },
+                ),
+            ],
+        );
         let snapshot = project_run_diagnostics(&events, &request()).unwrap();
         assert_eq!(snapshot.events[1].duration_ms, None);
         assert_eq!(snapshot.events[2].tool_label, None);
         let mut req = request();
         req.filter.tool_id = Some("shell".into());
-        assert_eq!(project_run_diagnostics(&events, &req).unwrap().selected_event_count, 1);
-        let duplicate = chain(30, vec![(0, start("same", "shell")), (1, finish("same", "shell", true)), (2, finish("same", "shell", true))]);
-        assert!(project_run_diagnostics(&duplicate, &request()).unwrap().events.iter().all(|row| row.duration_ms.is_none()));
-        let late_start = chain(30, vec![(1, finish("same", "shell", true)), (0, start("same", "shell"))]);
-        assert!(project_run_diagnostics(&late_start, &request()).unwrap().events.iter().all(|row| row.duration_ms.is_none()));
+        assert_eq!(
+            project_run_diagnostics(&events, &req)
+                .unwrap()
+                .selected_event_count,
+            1
+        );
+        let duplicate = chain(
+            30,
+            vec![
+                (0, start("same", "shell")),
+                (1, finish("same", "shell", true)),
+                (2, finish("same", "shell", true)),
+            ],
+        );
+        assert!(
+            project_run_diagnostics(&duplicate, &request())
+                .unwrap()
+                .events
+                .iter()
+                .all(|row| row.duration_ms.is_none())
+        );
+        let late_start = chain(
+            30,
+            vec![
+                (1, finish("same", "shell", true)),
+                (0, start("same", "shell")),
+            ],
+        );
+        assert!(
+            project_run_diagnostics(&late_start, &request())
+                .unwrap()
+                .events
+                .iter()
+                .all(|row| row.duration_ms.is_none())
+        );
     }
 
     async fn stored_fixture() -> (Store, RunDiagnosticsRequestV4) {
         use omicsops_core::workspace::{Conversation, Project, ProjectTemplate};
         let store = Store::open_in_memory().await.unwrap();
         let req = request();
-        store.save_project(&Project::new(req.project_id, "diagnostics", "C:\\diagnostics", ProjectTemplate::Blank, Utc::now())).await.unwrap();
-        store.save_conversation(&Conversation::new(req.conversation_id, req.project_id, "diagnostics", Utc::now())).await.unwrap();
+        store
+            .save_project(&Project::new(
+                req.project_id,
+                "diagnostics",
+                "C:\\diagnostics",
+                ProjectTemplate::Blank,
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
+        store
+            .save_conversation(&Conversation::new(
+                req.conversation_id,
+                req.project_id,
+                "diagnostics",
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
         (store, req)
     }
 
     #[tokio::test]
     async fn run_diagnostics_projection_loader_is_read_only_and_rejects_hidden_corruption() {
         let (store, mut req) = stored_fixture().await;
-        assert!(load_run_diagnostics(&store, &req).await.unwrap().events.is_empty());
-        let events = chain(30, vec![(0, start("same", "shell")), (1, finish("same", "shell", true))]);
-        for event in &events { store.append_agent_event_v4(event).await.unwrap(); }
-        let hidden = chain(31, vec![(0, Kind::ModelText { text: "PRIVATE_SENTINEL".into() })]);
+        assert!(
+            load_run_diagnostics(&store, &req)
+                .await
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        let events = chain(
+            30,
+            vec![
+                (0, start("same", "shell")),
+                (1, finish("same", "shell", true)),
+            ],
+        );
+        for event in &events {
+            store.append_agent_event_v4(event).await.unwrap();
+        }
+        let hidden = chain(
+            31,
+            vec![(
+                0,
+                Kind::ModelText {
+                    text: "PRIVATE_SENTINEL".into(),
+                },
+            )],
+        );
         store.append_agent_event_v4(&hidden[0]).await.unwrap();
-        let before: Vec<(String, String)> = sqlx::query_as("SELECT run_id,value_json FROM agent_runs_v4 ORDER BY run_id").fetch_all(store.pool()).await.unwrap();
+        let before: Vec<(String, String)> =
+            sqlx::query_as("SELECT run_id,value_json FROM agent_runs_v4 ORDER BY run_id")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
         req.filter.run_id = Some(Uuid::from_u128(30));
         let snapshot = load_run_diagnostics(&store, &req).await.unwrap();
         assert_eq!(snapshot.selected_event_count, 2);
         assert_eq!(snapshot.source_heads.len(), 2);
-        sqlx::query("UPDATE agent_events_v4 SET event_hash='invalid' WHERE run_id=?1").bind(hidden[0].run_id.to_string()).execute(store.pool()).await.unwrap();
-        assert_eq!(load_run_diagnostics(&store, &req).await.unwrap_err(), "diagnostics_source_invalid");
+        sqlx::query("UPDATE agent_events_v4 SET event_hash='invalid' WHERE run_id=?1")
+            .bind(hidden[0].run_id.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            load_run_diagnostics(&store, &req).await.unwrap_err(),
+            "diagnostics_source_invalid"
+        );
         req.project_id = Uuid::from_u128(99);
-        assert_eq!(load_run_diagnostics(&store, &req).await.unwrap_err(), "diagnostics_scope_invalid");
-        let after: Vec<(String, String)> = sqlx::query_as("SELECT run_id,value_json FROM agent_runs_v4 ORDER BY run_id").fetch_all(store.pool()).await.unwrap();
+        assert_eq!(
+            load_run_diagnostics(&store, &req).await.unwrap_err(),
+            "diagnostics_scope_invalid"
+        );
+        let after: Vec<(String, String)> =
+            sqlx::query_as("SELECT run_id,value_json FROM agent_runs_v4 ORDER BY run_id")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
         assert_eq!(before, after);
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events_v4").fetch_one(store.pool()).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events_v4")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
         assert_eq!(count, 3);
     }
 
     #[tokio::test]
     async fn run_diagnostics_projection_loader_checks_raw_utf8_budget_before_filtering() {
         let (store, mut req) = stored_fixture().await;
-        let events = chain(30, vec![(0, Kind::ModelText { text: "界".repeat(16 * 1024 * 1024 / 3) })]);
+        let events = chain(
+            30,
+            vec![(
+                0,
+                Kind::ModelText {
+                    text: "界".repeat(16 * 1024 * 1024 / 3),
+                },
+            )],
+        );
         store.append_agent_event_v4(&events[0]).await.unwrap();
         req.filter.run_id = Some(Uuid::from_u128(99));
-        assert_eq!(load_run_diagnostics(&store, &req).await.unwrap_err(), "diagnostics_source_limit");
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events_v4").fetch_one(store.pool()).await.unwrap();
+        assert_eq!(
+            load_run_diagnostics(&store, &req).await.unwrap_err(),
+            "diagnostics_source_limit"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events_v4")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -632,8 +1179,23 @@ mod tests {
         let original_hash = hex::encode(Sha256::digest(serde_json::to_vec(&value).unwrap()));
         value["event_hash"] = json!(original_hash);
         sqlx::query("UPDATE agent_events_v4 SET value_json=?1,event_hash=?2 WHERE run_id=?3")
-            .bind(value.to_string()).bind(&original_hash).bind(event.run_id.to_string()).execute(store.pool()).await.unwrap();
-        assert!(store.agent_events_for_context_v4_bounded(req.project_id, req.conversation_id, 10_000, 16 * 1024 * 1024).await.is_ok());
+            .bind(value.to_string())
+            .bind(&original_hash)
+            .bind(event.run_id.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .agent_events_for_context_v4_bounded(
+                    req.project_id,
+                    req.conversation_id,
+                    10_000,
+                    16 * 1024 * 1024
+                )
+                .await
+                .is_ok()
+        );
         let snapshot = load_run_diagnostics(&store, &req).await.unwrap();
         assert_eq!(snapshot.events[0].event_hash, original_hash);
         assert!(snapshot.source_chain_validated);
@@ -642,7 +1204,19 @@ mod tests {
     #[tokio::test]
     async fn run_diagnostics_projection_loader_enforces_entire_conversation_event_limit() {
         let (store, mut req) = stored_fixture().await;
-        let events = chain(30, (0..10_001).map(|i| (i, Kind::ModelText { text: String::new() })).collect());
+        let events = chain(
+            30,
+            (0..10_001)
+                .map(|i| {
+                    (
+                        i,
+                        Kind::ModelText {
+                            text: String::new(),
+                        },
+                    )
+                })
+                .collect(),
+        );
         store.append_agent_event_v4(&events[0]).await.unwrap();
         let mut tx = store.pool().begin().await.unwrap();
         for event in &events[1..10_000] {
@@ -656,6 +1230,9 @@ mod tests {
         assert_eq!(snapshot.total_event_count, 10_000);
         assert_eq!(snapshot.selected_event_count, 0);
         store.append_agent_event_v4(&events[10_000]).await.unwrap();
-        assert_eq!(load_run_diagnostics(&store, &req).await.unwrap_err(), "diagnostics_source_limit");
+        assert_eq!(
+            load_run_diagnostics(&store, &req).await.unwrap_err(),
+            "diagnostics_source_limit"
+        );
     }
 }
