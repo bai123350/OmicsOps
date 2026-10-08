@@ -7,6 +7,7 @@ import type { AgentRunEventV4, ContextCompactionReceiptV4, RunSummaryV4 } from "
 import * as projectTemplatesApi from "../../project-templates-api";
 import * as workflowApi from "../../composer-workflow-api";
 import * as guidanceApi from "../../tauri-api";
+import * as diagnosticsApi from "../../run-diagnostics-api";
 import * as remoteJobApi from "../../remote-job-api";
 import { WorkspaceShell } from "./WorkspaceShell";
 import { ComposerDraftStore } from "./composerDrafts";
@@ -1920,4 +1921,69 @@ it("blocks compaction for pending approval, unresolved dispatch, multiple questi
 beforeEach(() => {
   const runId = crypto.randomUUID();
   compactQuestion.run_id = runId; compactPlan.run_id = runId; compactProps.activeRunId = runId;
+});
+
+
+describe("run diagnostics entry", () => {
+  it("opens diagnostics above trajectory and immediately Escape closes only the top layer", () => {
+    render(<WorkspaceShell project={project} locale="en-US" activeConversationId="current" />);
+    fireEvent.change(screen.getByRole("textbox", { name: /Describe a research goal/ }), { target: { value: "/trajectory" } });
+    fireEvent.click(screen.getByRole("option", { name: /\/trajectory/ }));
+    const trajectory = screen.getByRole("dialog", { name: "Run trajectory" });
+    fireEvent.click(within(trajectory).getByRole("button", { name: "Run diagnostics" }));
+    expect(screen.getByRole("dialog", { name: "Run diagnostics" })).toBeVisible();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Run diagnostics" })).not.toBeInTheDocument();
+    expect(trajectory).toBeVisible();
+  });
+});
+
+
+describe("exact diagnostic source location", () => {
+  const source: AgentRunEventV4 = { schema_version: 4, project_id: project.id, conversation_id: "current", run_id: "run-a", sequence: 3, event_hash: "hash-a", previous_hash: "hash-before", occurred_at: "2026-10-08T00:00:00Z", event: { kind: "model_text", text: "PRIVATE_MODEL_TEXT" } };
+  const row = { run_id: source.run_id, sequence: source.sequence, event_hash: source.event_hash, previous_hash: source.previous_hash, occurred_at: source.occurred_at, event_kind: "model_text", status: null, tool_label: null, call_ref: null, duration_ms: null };
+  const snapshot: import("../../types").RunDiagnosticsSnapshotV4 = { schema_version: 1, project_id: project.id, conversation_id: "current", source_heads: [{ run_id: "run-a", event_count: 3, last_sequence: 3, event_hash: "hash-a" }], filter_summary: { run_id: null, tool_label: null, failures_only: false }, source_chain_validated: true, filtered: false, total_event_count: 3, selected_event_count: 1, events: [row], usage: [] };
+  async function openAndLocate() {
+    fireEvent.click(screen.getByRole("button", { name: "Run diagnostics" }));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh diagnostics" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Locate event 3" }));
+  }
+  beforeEach(() => { Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true }); });
+  afterEach(() => { Reflect.deleteProperty(window, "__TAURI_INTERNALS__"); });
+  it("focuses the exact cached ModelText metadata outside ActivityWindow and expands ancestors", async () => {
+    const get = vi.spyOn(diagnosticsApi, "getRunDiagnostics").mockResolvedValue(snapshot);
+    const onResume = vi.fn(); const onAnswer = vi.fn(); const onApproval = vi.fn();
+    render(<WorkspaceShell project={project} locale="en-US" activeConversationId="current" agentRunEventsV4={[source, ...Array.from({ length: 16 }, (_, index): AgentRunEventV4 => ({ ...source, sequence: 4 + index, event_hash: `later-${index}`, event: index % 2 ? { kind: "run_spec_frozen", approval_hash: "a", spec_hash: "b" } : { kind: "model_text", text: `Later progress ${index}` } })), { ...source, sequence: 20, event_hash: "last", event: { kind: "model_text", text: "Last progress" } }]} onResumeAgentRunV4={onResume} onAnswerAgentQuestionV4={onAnswer} onDecideToolApprovalV4={onApproval} />);
+    await openAndLocate();
+    const trajectory = screen.getByRole("dialog", { name: "Run trajectory" });
+    const target = trajectory.querySelector('[data-diagnostic-run-id="run-a"][data-diagnostic-sequence="3"][data-diagnostic-event-hash="hash-a"]');
+    expect(target).not.toBeNull(); expect(target).toHaveFocus(); expect(target).toHaveTextContent("model_text"); expect(target).not.toHaveTextContent("PRIVATE_MODEL_TEXT");
+    expect(trajectory.querySelector(".v4-earlier-activity")).not.toBeNull(); expect(target?.closest(".v4-process-timeline")).toBeNull(); let ancestor = target?.parentElement; while (ancestor) { if (ancestor instanceof HTMLDetailsElement) expect(ancestor.open).toBe(true); ancestor = ancestor.parentElement; }
+    expect(get).toHaveBeenCalledOnce(); expect(onResume).not.toHaveBeenCalled(); expect(onAnswer).not.toHaveBeenCalled(); expect(onApproval).not.toHaveBeenCalled();
+  });
+  it.each(["missing", "hash mismatch"])("refreshes only readonly metadata for %s cache without choosing adjacent sequence", async (mode) => {
+    const get = vi.spyOn(diagnosticsApi, "getRunDiagnostics").mockResolvedValue(snapshot);
+    const old = vi.spyOn(guidanceApi, "agentV4Events"); const oldContext = vi.spyOn(guidanceApi, "agentV4EventsForConversation");
+    render(<WorkspaceShell project={project} locale="en-US" activeConversationId="current" agentRunEventsV4={mode === "missing" ? [] : [{ ...source, event_hash: "wrong-hash" }, { ...source, sequence: 4 }]} />);
+    await openAndLocate(); const trajectory = screen.getByRole("dialog", { name: "Run trajectory" });
+    await waitFor(() => expect(trajectory.querySelector('[data-diagnostic-event-hash="hash-a"][data-diagnostic-sequence="3"]')).toHaveFocus());
+    expect(get).toHaveBeenCalledTimes(2); expect(get).toHaveBeenLastCalledWith({ project_id: project.id, conversation_id: "current", filter: { run_id: null, tool_id: null, failures_only: false }, redaction_keywords: [] });
+    expect(old).not.toHaveBeenCalled(); expect(oldContext).not.toHaveBeenCalled(); expect(within(trajectory).getByText(/metadata refreshed/i)).toBeVisible();
+  });
+  it("reports unavailable when readonly refresh cannot find the exact hash", async () => {
+    vi.spyOn(diagnosticsApi, "getRunDiagnostics").mockResolvedValueOnce(snapshot).mockResolvedValueOnce({ ...snapshot, events: [{ ...row, event_hash: "wrong-hash" }, { ...row, sequence: 4 }] });
+    render(<WorkspaceShell project={project} locale="en-US" activeConversationId="current" agentRunEventsV4={[]} />); await openAndLocate();
+    const trajectory = screen.getByRole("dialog", { name: "Run trajectory" }); await within(trajectory).findByText(/exact source event is unavailable/i);
+    expect(trajectory.querySelector('[data-diagnostic-event-hash="hash-a"]')).toBeNull();
+  });
+  it.each(["project", "conversation", "close", "reopen"])("discards late source refresh after %s", async (change) => {
+    let resolve!: (value: typeof snapshot) => void; const pending = new Promise<typeof snapshot>((r) => { resolve = r; });
+    vi.spyOn(diagnosticsApi, "getRunDiagnostics").mockResolvedValueOnce(snapshot).mockReturnValueOnce(pending);
+    const view = render(<WorkspaceShell project={project} locale="en-US" activeConversationId="current" />); await openAndLocate();
+    if (change === "close") fireEvent.keyDown(window, { key: "Escape" });
+    else if (change === "reopen") fireEvent.click(within(screen.getByRole("dialog", { name: "Run trajectory" })).getByRole("button", { name: "Run diagnostics" }));
+    else view.rerender(<WorkspaceShell project={change === "project" ? { ...project, id: "other" } : project} locale="en-US" activeConversationId={change === "conversation" ? "other" : "current"} />);
+    await act(async () => resolve(snapshot));
+    expect(document.querySelector('[data-diagnostic-event-hash="hash-a"]')).toBeNull(); expect(screen.queryByText(/metadata refreshed/i)).not.toBeInTheDocument();
+  });
 });

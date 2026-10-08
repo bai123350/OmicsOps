@@ -1,3 +1,6 @@
+import { RunDiagnosticsDialog } from "./RunDiagnosticsDialog";
+import { getRunDiagnostics } from "../../run-diagnostics-api";
+import type { RunDiagnosticLocator, RunDiagnosticEventV4 } from "../../types";
 import { useContextCompaction } from "./useContextCompaction";
 import { ContextUsagePanel, type ContextUsageView } from "./ContextUsagePanel";
 import { SideChatPanel } from "./SideChatPanel";
@@ -399,6 +402,54 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
   const [reviewDialogOpen, setReviewDialogOpen] = useState(false);
   const [reviewerSettingsOpen, setReviewerSettingsOpen] = useState(false);
   const [trajectoryOpen, setTrajectoryOpen] = useState(false);
+  const diagnosticScope = JSON.stringify([project.id, activeConversationId]);
+  const [diagnosticsScope, setDiagnosticsScope] = useState<string | null>(null);
+  const [diagnosticTarget, setDiagnosticTarget] = useState<RunDiagnosticLocator | null>(null);
+  const [diagnosticSource, setDiagnosticSource] = useState<RunDiagnosticEventV4 | null>(null);
+  const [diagnosticNotice, setDiagnosticNotice] = useState<"loading" | "unavailable" | null>(null);
+  const trajectoryRef = useRef<HTMLDivElement>(null);
+  const diagnosticGeneration = useRef(0);
+  useLayoutEffect(() => {
+    diagnosticGeneration.current++;
+    setDiagnosticsScope(null); setDiagnosticTarget(null); setDiagnosticSource(null); setDiagnosticNotice(null);
+    return () => { diagnosticGeneration.current++; };
+  }, [diagnosticScope]);
+  function openDiagnostics() {
+    diagnosticGeneration.current++; setDiagnosticTarget(null); setDiagnosticSource(null); setDiagnosticNotice(null);
+    setDiagnosticsScope(diagnosticScope);
+  }
+  function closeTrajectory() {
+    diagnosticGeneration.current++; setDiagnosticTarget(null); setDiagnosticSource(null); setDiagnosticNotice(null);
+    setTrajectoryOpen(false); draftRef.current?.focus();
+  }
+  async function locateDiagnostic(target: RunDiagnosticLocator) {
+    if (!activeConversationId) return;
+    const version = ++diagnosticGeneration.current;
+    setDiagnosticsScope(null); setDiagnosticTarget(null); setDiagnosticSource(null); setDiagnosticNotice(null); setTrajectoryOpen(true);
+    const matches = (event: RunDiagnosticLocator) => event.run_id === target.run_id && event.sequence === target.sequence && event.event_hash === target.event_hash;
+    if (agentRunEventsV4.some((event) => event.project_id === project.id && event.conversation_id === activeConversationId && matches(event))) {
+      setDiagnosticTarget(target); return;
+    }
+    setDiagnosticNotice("loading");
+    try {
+      // Buffer eviction is repaired only with the read-only public metadata query.
+      const snapshot = await getRunDiagnostics({ project_id: project.id, conversation_id: activeConversationId, filter: { run_id: null, tool_id: null, failures_only: false }, redaction_keywords: [] });
+      if (version !== diagnosticGeneration.current) return;
+      const source = snapshot.project_id === project.id && snapshot.conversation_id === activeConversationId && snapshot.source_chain_validated ? snapshot.events.find(matches) : undefined;
+      if (!source) { setDiagnosticNotice("unavailable"); return; }
+      setDiagnosticSource(source); setDiagnosticTarget(target); setDiagnosticNotice(null);
+    } catch { if (version === diagnosticGeneration.current) setDiagnosticNotice("unavailable"); }
+  }
+  useLayoutEffect(() => {
+    if (!trajectoryOpen || !diagnosticTarget) return;
+    const row = Array.from(trajectoryRef.current?.querySelectorAll<HTMLElement>("[data-diagnostic-run-id]") ?? []).find((element) =>
+      element.dataset.diagnosticRunId === diagnosticTarget.run_id && element.dataset.diagnosticSequence === String(diagnosticTarget.sequence) && element.dataset.diagnosticEventHash === diagnosticTarget.event_hash);
+    if (!row) { setDiagnosticNotice("unavailable"); return; }
+    let ancestor = row.parentElement;
+    while (ancestor && ancestor !== trajectoryRef.current) { if (ancestor instanceof HTMLDetailsElement) ancestor.open = true; ancestor = ancestor.parentElement; }
+    row.focus(); row.scrollIntoView?.({ block: "center" });
+  }, [trajectoryOpen, diagnosticTarget, diagnosticSource]);
+
   const [localWorkflowCatalogVersion, setLocalWorkflowCatalogVersion] = useState(0);
   const [catalog, setCatalog] = useState<ComposerCatalogItem[]>([]);
   const [catalogLoading, setCatalogLoading] = useState(false);
@@ -478,7 +529,7 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
   useWindowEscapeLayer(sendMenuOpen, () => setSendMenuOpen(false));
   useWindowEscapeLayer(modelMenuOpen, () => setModelMenuOpen(false));
   useWindowEscapeLayer(runtimeVisible, closeRuntime);
-  useWindowEscapeLayer(trajectoryOpen, () => { setTrajectoryOpen(false); draftRef.current?.focus(); });
+  useWindowEscapeLayer(trajectoryOpen, closeTrajectory);
   const [sentMessages, setSentMessages] = useState<string[]>([]);
   const [approved, setApproved] = useState(false);
   const [sendBusy, setSendBusy] = useState(false);
@@ -1119,7 +1170,7 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
     {workspacePage !== "conversation" && workspacePage !== "files" && <WorkspaceResearchPages key={`research:${project.id}`} page={workspacePage} projectId={project.id} locale={locale} registerBeforeLeave={registerBeforeLeave} onOpenConversation={(projectId, conversationId) => leaveGuard.current(() => { setWorkspacePage("conversation"); if (onOpenSourceConversation) void onOpenSourceConversation(projectId, conversationId); else if (projectId === project.id) void onSelectConversation?.(conversationId); })} onInsert={(text) => leaveGuard.current(() => { setDraft((current) => current ? `${current}\n\n${text}` : text); setWorkspacePage("conversation"); requestAnimationFrame(() => draftRef.current?.focus()); })} />}
 
     <main className={`conversation-pane ${workspacePage !== "conversation" ? "workspace-content-hidden" : ""}`} hidden={workspacePage !== "conversation"} aria-label={t.research}>
-      <header className="conversation-header"><div><small>{project.name}</small><h1>{conversationTitle}</h1></div><div className="workspace-header-actions">{showPlanPanel && <button className="sidebar-plan-link" onClick={() => openSidebarSection("plan")}>{zh ? "查看 Plan" : "Review Plan"}</button>}<span className="live-status"><i />{headerStatus}</span><button className="sidebar-toggle" aria-label={sidebarOpen ? (zh ? "收起侧栏" : "Collapse sidebar") : (zh ? "展开侧栏" : "Expand sidebar")} aria-expanded={sidebarOpen} aria-controls="workspace-sidebar" onClick={() => { if (sidebarOpen) closeSidebar(); else { if (!openTabs.length) { setOpenTabs(["artifacts"]); setTab("artifacts"); } setSidebarOpen(true); } }}><PanelRight size={19} /></button></div></header>
+      <header className="conversation-header"><div><small>{project.name}</small><h1>{conversationTitle}</h1></div><div className="workspace-header-actions">{activeConversationId && <button onClick={openDiagnostics}>{zh ? "运行诊断" : "Run diagnostics"}</button>}{showPlanPanel && <button className="sidebar-plan-link" onClick={() => openSidebarSection("plan")}>{zh ? "查看 Plan" : "Review Plan"}</button>}<span className="live-status"><i />{headerStatus}</span><button className="sidebar-toggle" aria-label={sidebarOpen ? (zh ? "收起侧栏" : "Collapse sidebar") : (zh ? "展开侧栏" : "Expand sidebar")} aria-expanded={sidebarOpen} aria-controls="workspace-sidebar" onClick={() => { if (sidebarOpen) closeSidebar(); else { if (!openTabs.length) { setOpenTabs(["artifacts"]); setTab("artifacts"); } setSidebarOpen(true); } }}><PanelRight size={19} /></button></div></header>
       <section className="message-stream" aria-live="polite" ref={messageStreamRef} onScroll={(event) => {
         const stream = event.currentTarget;
         const following = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 64;
@@ -1292,7 +1343,8 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
     }} />}
     {runtimeVisible && remoteJobsOpen && <RemoteJobsPanel projectId={project.id} conversationId={activeConversationId ?? null} bindingVersion={remoteJobBindingVersion} locale={locale} onClose={() => setRemoteJobsOpen(false)} />}
     {expanded && <div className="preview-overlay" role="dialog" aria-modal="true" aria-label={t.artifactPreview}><header><div><small>{project.name}</small><h2>{t.artifactPreview}</h2></div><button aria-label="Close" onClick={() => setExpanded(false)}><X /></button></header>{preview}</div>}
-    {trajectoryOpen && <div className="preview-overlay" role="dialog" aria-modal="true" aria-label={zh ? "运行轨迹" : "Run trajectory"}><header><div><small>{project.name}</small><h2>{zh ? "运行轨迹" : "Run trajectory"}</h2></div><button aria-label={zh ? "关闭运行轨迹" : "Close run trajectory"} onClick={() => { setTrajectoryOpen(false); draftRef.current?.focus(); }}><X /></button></header><div style={{ minHeight: 0, overflow: "auto", padding: "16px 20px" }}>{trajectoryRuns.length > 0 ? trajectoryRuns.map((run) => <V4RunTrace key={run.runId} locale={locale} events={run.events} onOpenRuntime={openRunRuntime} historical />) : <p role="status">{zh ? "当前会话暂无已记录的运行轨迹。" : "No recorded run trajectory is available for this conversation."}</p>}</div></div>}
+    {trajectoryOpen && <div ref={trajectoryRef} className="preview-overlay" role="dialog" aria-modal="true" aria-label={zh ? "运行轨迹" : "Run trajectory"}><header><div><small>{project.name}</small><h2>{zh ? "运行轨迹" : "Run trajectory"}</h2></div>{activeConversationId && <button onClick={openDiagnostics}>{zh ? "运行诊断" : "Run diagnostics"}</button>}<button aria-label={zh ? "关闭运行轨迹" : "Close run trajectory"} onClick={closeTrajectory}><X /></button></header><div style={{ minHeight: 0, overflow: "auto", padding: "16px 20px" }}>{diagnosticNotice && <p role="status">{diagnosticNotice === "loading" ? (zh ? "正在读取源事件元数据…" : "Reading source event metadata…") : (zh ? "精确源事件不可用。" : "The exact source event is unavailable.")}</p>}{diagnosticSource && <div><p>{zh ? "已只读刷新元数据；原始内容未载入当前缓存。" : "Source metadata refreshed read-only; original content is absent from the current buffer."}</p><ol className="v4-diagnostic-events"><li tabIndex={-1} data-diagnostic-run-id={diagnosticSource.run_id} data-diagnostic-sequence={diagnosticSource.sequence} data-diagnostic-event-hash={diagnosticSource.event_hash}><span>#{diagnosticSource.sequence}</span><code>{diagnosticSource.event_kind}</code><time>{diagnosticSource.occurred_at}</time></li></ol></div>}{trajectoryRuns.length > 0 ? trajectoryRuns.map((run) => <V4RunTrace key={run.runId} locale={locale} events={run.events} onOpenRuntime={openRunRuntime} historical />) : <p role="status">{zh ? "当前会话暂无已记录的运行轨迹。" : "No recorded run trajectory is available for this conversation."}</p>}</div></div>}
+    {diagnosticsScope === diagnosticScope && activeConversationId && <RunDiagnosticsDialog projectId={project.id} conversationId={activeConversationId} locale={locale} onLocate={(target) => void locateDiagnostic(target)} onClose={() => setDiagnosticsScope(null)} />}
   </div>;
 }
 
@@ -1411,7 +1463,7 @@ function V4RunTrace({ locale, events, previewText, reasoningPreview, modelActivi
       ].sort((a, b) => a.sequence - b.sequence).map(({ node }) => node)}</ActivityWindow>
 
       </section>
-        <details className="v4-process-context"><summary>{zh ? "诊断记录" : "Diagnostic records"}</summary><ol className="v4-diagnostic-events">{events.filter(({ event }) => event.kind !== "model_text").map((event) => <li key={event.sequence}><span>#{event.sequence}</span><code>{event.event.kind}</code><time dateTime={event.occurred_at}>{new Date(event.occurred_at).toLocaleTimeString()}</time></li>)}</ol></details>
+        <details className="v4-process-context"><summary>{zh ? "诊断记录" : "Diagnostic records"}</summary><ol className="v4-diagnostic-events">{events.map((event) => <li key={`${event.run_id}:${event.sequence}:${event.event_hash}`} tabIndex={-1} data-diagnostic-run-id={event.run_id} data-diagnostic-sequence={event.sequence} data-diagnostic-event-hash={event.event_hash}><span>#{event.sequence}</span><code>{event.event.kind}</code><time dateTime={event.occurred_at}>{new Date(event.occurred_at).toLocaleTimeString()}</time></li>)}</ol></details>
       </div>
     </details>
       {!terminal && previewText && <article aria-label={zh ? "模型实时输出" : "Live model output"} className="message assistant-message v4-live-response"><div><small className="response-eyebrow">{zh ? "正在回复" : "Responding"}</small><MarkdownContent markdown={previewText} /><span className="v4-streaming-cursor" aria-hidden="true">▍</span></div></article>}

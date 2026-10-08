@@ -908,6 +908,28 @@ export interface ModelUsageObservationV4 extends Omit<ModelRequestStartedV4, "im
   context_tokens?: number | null; serialized_request_bytes?: number | null; image_bound_tokens?: number | null;
 }
 export interface ObservedCounterV4 { known?: number | null; incomplete_attempts: number }
+export interface RunDiagnosticsFilterV4 { run_id: string | null; tool_id: string | null; failures_only: boolean }
+export interface RunDiagnosticsRequestV4 {
+  project_id: string; conversation_id: string; filter: RunDiagnosticsFilterV4; redaction_keywords: string[];
+}
+export interface RunDiagnosticsFilterSummaryV4 { run_id: string | null; tool_label: string | null; failures_only: boolean }
+export interface RunDiagnosticsSourceHeadV4 { run_id: string; event_count: number; last_sequence: number; event_hash: string }
+export type RunDiagnosticStatusV4 = "succeeded" | "failed" | "uncertain" | "cancelled";
+export interface RunDiagnosticEventV4 {
+  run_id: string; sequence: number; event_hash: string; previous_hash: string; occurred_at: string; event_kind: string;
+  status: RunDiagnosticStatusV4 | null; tool_label: string | null; call_ref: string | null; duration_ms: number | null;
+}
+export interface RunDiagnosticUsageV4 { run_id: string; totals: UsageTotalsV4; missing_observation_attempts: number }
+export interface RunDiagnosticsSnapshotV4 {
+  schema_version: number; project_id: string; conversation_id: string; filter_summary: RunDiagnosticsFilterSummaryV4;
+  source_heads: RunDiagnosticsSourceHeadV4[]; source_chain_validated: boolean; total_event_count: number;
+  selected_event_count: number; filtered: boolean; events: RunDiagnosticEventV4[]; usage: RunDiagnosticUsageV4[];
+}
+export type RunDiagnosticsExportFormatV4 = "html" | "json";
+export interface SaveRunDiagnosticsRequestV4 {
+  query: RunDiagnosticsRequestV4; expected_heads: RunDiagnosticsSourceHeadV4[]; format: RunDiagnosticsExportFormatV4;
+}
+export type RunDiagnosticLocator = Pick<RunDiagnosticEventV4, "run_id" | "sequence" | "event_hash">;
 export interface UsageTotalsV4 {
   input_tokens: ObservedCounterV4; output_tokens: ObservedCounterV4; reasoning_tokens: ObservedCounterV4;
   cache_read_input_tokens: ObservedCounterV4; cache_creation_input_tokens: ObservedCounterV4; reported_total_tokens: ObservedCounterV4;

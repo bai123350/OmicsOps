@@ -165,3 +165,17 @@ input:focus, select:focus { border-color: #249f7e; box-shadow: 0 0 0 3px rgba(36
   .progress-dialog-footer { align-items: flex-start; flex-direction: column; }
   .progress-dialog-footer .actions { width: 100%; justify-content: flex-end; }
 }
+/* Run diagnostics stays above its trajectory parent; metadata rows bypass timeline windowing. */
+.run-diagnostics-backdrop { position: fixed; inset: 0; z-index: 1800; background: #0008; display: grid; place-items: center; padding: 24px; }
+.run-diagnostics-dialog { width: min(960px, 100%); max-height: calc(100vh - 48px); overflow: auto; background: var(--panel, #fff); color: var(--text, #20232b); border-radius: 14px; padding: 24px; box-shadow: 0 20px 70px #0004; }
+.run-diagnostics-dialog header, .run-diagnostics-dialog nav { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.run-diagnostics-dialog nav { justify-content: flex-start; margin: 16px 0; flex-wrap: wrap; }
+.run-diagnostics-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 16px 0; }
+.run-diagnostics-filters label { display: flex; flex-direction: column; gap: 6px; }
+.run-diagnostics-filters input:not([type="checkbox"]), .run-diagnostics-filters textarea { width: 100%; box-sizing: border-box; }
+.run-diagnostics-filters input[type="checkbox"] { align-self: flex-start; }
+.run-diagnostics-events { padding-left: 24px; }
+.run-diagnostics-events li { display: grid; gap: 6px; padding: 12px; border-bottom: 1px solid #8884; }
+.run-diagnostics-dialog code { overflow-wrap: anywhere; }
+.run-diagnostics-events button { justify-self: start; }
+[data-diagnostic-run-id]:focus { outline: 2px solid #5079b8; outline-offset: 3px; }
