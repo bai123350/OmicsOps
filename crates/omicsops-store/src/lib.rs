@@ -4183,7 +4183,9 @@ impl Store {
             || u64::try_from(count).unwrap_or(u64::MAX) > max_events as u64
             || u64::try_from(bytes).unwrap_or(u64::MAX) > max_serialized_bytes as u64
         {
-            return Err(StoreError::InvalidInput("diagnostics source limit exceeded".into()));
+            return Err(StoreError::InvalidInput(
+                "diagnostics source limit exceeded".into(),
+            ));
         }
 
         let read_sql = format!(
@@ -4199,7 +4201,9 @@ impl Store {
             .fetch_all(&mut *tx)
             .await?;
         if rows.len() != usize::try_from(count).unwrap_or(usize::MAX) {
-            return Err(StoreError::InvalidInput("diagnostics source changed".into()));
+            return Err(StoreError::InvalidInput(
+                "diagnostics source changed".into(),
+            ));
         }
         let mut chains: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut indexes: BTreeMap<String, Vec<(String, String, i64, String, String)>> =
@@ -4221,7 +4225,9 @@ impl Store {
                 || row_project != project
                 || row_conversation != conversation
             {
-                return Err(StoreError::InvalidInput("diagnostics source invalid".into()));
+                return Err(StoreError::InvalidInput(
+                    "diagnostics source invalid".into(),
+                ));
             }
             indexes.entry(run.clone()).or_default().push((
                 row_project,
@@ -4249,7 +4255,9 @@ impl Store {
                     || previous_hash != &event.previous_hash
                     || event_hash != &event.event_hash
                 {
-                    return Err(StoreError::InvalidInput("diagnostics source invalid".into()));
+                    return Err(StoreError::InvalidInput(
+                        "diagnostics source invalid".into(),
+                    ));
                 }
             }
             events.extend(chain);
@@ -7590,7 +7598,13 @@ mod diagnostics_bounded_read_tests {
 
     async fn fixture() -> (Store, Uuid, Uuid) {
         let store = Store::open_in_memory().await.unwrap();
-        let project = Project::new(Uuid::new_v4(), "diagnostics", "C:\\diagnostics", ProjectTemplate::Blank, Utc::now());
+        let project = Project::new(
+            Uuid::new_v4(),
+            "diagnostics",
+            "C:\\diagnostics",
+            ProjectTemplate::Blank,
+            Utc::now(),
+        );
         let conversation = Conversation::new(Uuid::new_v4(), project.id, "diagnostics", Utc::now());
         store.save_project(&project).await.unwrap();
         store.save_conversation(&conversation).await.unwrap();
@@ -7598,7 +7612,15 @@ mod diagnostics_bounded_read_tests {
     }
 
     async fn add_event(store: &Store, project: Uuid, conversation: Uuid) -> AgentEventV4 {
-        let event = AgentEventV4::first(Uuid::new_v4(), project, conversation, Utc::now(), AgentEventKindV4::RunCreated { mode: RunModeV4::Plan });
+        let event = AgentEventV4::first(
+            Uuid::new_v4(),
+            project,
+            conversation,
+            Utc::now(),
+            AgentEventKindV4::RunCreated {
+                mode: RunModeV4::Plan,
+            },
+        );
         store.append_agent_event_v4(&event).await.unwrap();
         event
     }
@@ -7608,12 +7630,27 @@ mod diagnostics_bounded_read_tests {
         let (store, project, conversation) = fixture().await;
         let visible = add_event(&store, project, conversation).await;
         let hidden = add_event(&store, project, conversation).await;
-        assert_eq!(store.agent_events_for_context_v4_bounded(project, conversation, 2, 16 * 1024 * 1024).await.unwrap().len(), 2);
+        assert_eq!(
+            store
+                .agent_events_for_context_v4_bounded(project, conversation, 2, 16 * 1024 * 1024)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
         sqlx::query("UPDATE agent_events_v4 SET previous_hash='bad' WHERE run_id=?1")
-            .bind(hidden.run_id.to_string()).execute(store.pool()).await.unwrap();
+            .bind(hidden.run_id.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
         let before: (i64, String) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM agent_events_v4), value_json FROM agent_runs_v4 WHERE run_id=?1")
             .bind(hidden.run_id.to_string()).fetch_one(store.pool()).await.unwrap();
-        assert!(store.agent_events_for_context_v4_bounded(project, conversation, 2, 16 * 1024 * 1024).await.is_err());
+        assert!(
+            store
+                .agent_events_for_context_v4_bounded(project, conversation, 2, 16 * 1024 * 1024)
+                .await
+                .is_err()
+        );
         let after: (i64, String) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM agent_events_v4), value_json FROM agent_runs_v4 WHERE run_id=?1")
             .bind(hidden.run_id.to_string()).fetch_one(store.pool()).await.unwrap();
         assert_eq!(before, after);
@@ -7623,13 +7660,22 @@ mod diagnostics_bounded_read_tests {
             let (store, project, conversation) = fixture().await;
             let _visible = add_event(&store, project, conversation).await;
             let hidden = add_event(&store, project, conversation).await;
-            let other_project = Project::new(Uuid::new_v4(), "other", "C:\\other", ProjectTemplate::Blank, Utc::now());
-            let other_conversation = Conversation::new(Uuid::new_v4(), other_project.id, "other", Utc::now());
+            let other_project = Project::new(
+                Uuid::new_v4(),
+                "other",
+                "C:\\other",
+                ProjectTemplate::Blank,
+                Utc::now(),
+            );
+            let other_conversation =
+                Conversation::new(Uuid::new_v4(), other_project.id, "other", Utc::now());
             store.save_project(&other_project).await.unwrap();
             store.save_conversation(&other_conversation).await.unwrap();
             let sql = match column {
                 "project_id" => "UPDATE agent_events_v4 SET project_id=?1 WHERE run_id=?2",
-                "conversation_id" => "UPDATE agent_events_v4 SET conversation_id=?1 WHERE run_id=?2",
+                "conversation_id" => {
+                    "UPDATE agent_events_v4 SET conversation_id=?1 WHERE run_id=?2"
+                }
                 "sequence" => "UPDATE agent_events_v4 SET sequence=?1 WHERE run_id=?2",
                 _ => "UPDATE agent_events_v4 SET event_hash=?1 WHERE run_id=?2",
             };
@@ -7640,64 +7686,185 @@ mod diagnostics_bounded_read_tests {
                 _ => "f".repeat(64),
             };
             // This bypasses the writer, as a corrupted on-disk index would.
-            sqlx::query(sql).bind(replacement).bind(hidden.run_id.to_string())
-                .execute(store.pool()).await.unwrap();
-            assert!(store.agent_events_for_context_v4_bounded(project, conversation, 2, 16 * 1024 * 1024).await.is_err(), "{column}");
+            sqlx::query(sql)
+                .bind(replacement)
+                .bind(hidden.run_id.to_string())
+                .execute(store.pool())
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .agent_events_for_context_v4_bounded(project, conversation, 2, 16 * 1024 * 1024)
+                    .await
+                    .is_err(),
+                "{column}"
+            );
         }
 
         let (store, project, conversation) = fixture().await;
         let _visible = add_event(&store, project, conversation).await;
         let hidden = add_event(&store, project, conversation).await;
-        let other_project = Project::new(Uuid::new_v4(), "other", "C:\\other", ProjectTemplate::Blank, Utc::now());
-        let other_conversation = Conversation::new(Uuid::new_v4(), other_project.id, "other", Utc::now());
+        let other_project = Project::new(
+            Uuid::new_v4(),
+            "other",
+            "C:\\other",
+            ProjectTemplate::Blank,
+            Utc::now(),
+        );
+        let other_conversation =
+            Conversation::new(Uuid::new_v4(), other_project.id, "other", Utc::now());
         store.save_project(&other_project).await.unwrap();
         store.save_conversation(&other_conversation).await.unwrap();
         sqlx::query("UPDATE agent_runs_v4 SET project_id=?1,conversation_id=?2 WHERE run_id=?3")
-            .bind(other_project.id.to_string()).bind(other_conversation.id.to_string())
-            .bind(hidden.run_id.to_string()).execute(store.pool()).await.unwrap();
-        assert!(store.agent_events_for_context_v4_bounded(project, conversation, 2, 16 * 1024 * 1024).await.is_err());
+            .bind(other_project.id.to_string())
+            .bind(other_conversation.id.to_string())
+            .bind(hidden.run_id.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .agent_events_for_context_v4_bounded(project, conversation, 2, 16 * 1024 * 1024)
+                .await
+                .is_err()
+        );
 
         let (store, project, conversation) = fixture().await;
         let _visible = add_event(&store, project, conversation).await;
         let hidden = add_event(&store, project, conversation).await;
-        let foreign_envelope = AgentEventV4::first(Uuid::new_v4(), project, conversation, Utc::now(), AgentEventKindV4::RunCreated { mode: RunModeV4::Plan });
+        let foreign_envelope = AgentEventV4::first(
+            Uuid::new_v4(),
+            project,
+            conversation,
+            Utc::now(),
+            AgentEventKindV4::RunCreated {
+                mode: RunModeV4::Plan,
+            },
+        );
         sqlx::query("UPDATE agent_events_v4 SET event_hash=?1,value_json=?2 WHERE run_id=?3")
-            .bind(&foreign_envelope.event_hash).bind(serde_json::to_string(&foreign_envelope).unwrap())
-            .bind(hidden.run_id.to_string()).execute(store.pool()).await.unwrap();
-        assert!(store.agent_events_for_context_v4_bounded(project, conversation, 2, 16 * 1024 * 1024).await.is_err());
+            .bind(&foreign_envelope.event_hash)
+            .bind(serde_json::to_string(&foreign_envelope).unwrap())
+            .bind(hidden.run_id.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .agent_events_for_context_v4_bounded(project, conversation, 2, 16 * 1024 * 1024)
+                .await
+                .is_err()
+        );
 
         let (store, project, conversation) = fixture().await;
-        let terminal = AgentEventV4::first(Uuid::new_v4(), project, conversation, Utc::now(), AgentEventKindV4::RunCancelled);
+        let terminal = AgentEventV4::first(
+            Uuid::new_v4(),
+            project,
+            conversation,
+            Utc::now(),
+            AgentEventKindV4::RunCancelled,
+        );
         store.append_agent_event_v4(&terminal).await.unwrap();
-        let after_terminal = AgentEventV4::next(&terminal, Utc::now(), AgentEventKindV4::ModelText { text: "hidden".into() });
+        let after_terminal = AgentEventV4::next(
+            &terminal,
+            Utc::now(),
+            AgentEventKindV4::ModelText {
+                text: "hidden".into(),
+            },
+        );
         sqlx::query("INSERT INTO agent_events_v4(run_id,project_id,conversation_id,sequence,previous_hash,event_hash,value_json) VALUES (?1,?2,?3,?4,?5,?6,?7)")
             .bind(after_terminal.run_id.to_string()).bind(project.to_string()).bind(conversation.to_string())
             .bind(after_terminal.sequence as i64).bind(&after_terminal.previous_hash).bind(&after_terminal.event_hash)
             .bind(serde_json::to_string(&after_terminal).unwrap()).execute(store.pool()).await.unwrap();
-        assert!(store.agent_events_for_context_v4_bounded(project, conversation, 2, 16 * 1024 * 1024).await.is_err());
+        assert!(
+            store
+                .agent_events_for_context_v4_bounded(project, conversation, 2, 16 * 1024 * 1024)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn diagnostics_bounded_read_checks_scope_and_limits() {
         let (store, project, conversation) = fixture().await;
-        assert!(store.agent_events_for_context_v4_bounded(project, conversation, 0, 0).await.unwrap().is_empty());
+        assert!(
+            store
+                .agent_events_for_context_v4_bounded(project, conversation, 0, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let event = add_event(&store, project, conversation).await;
-        let bytes: i64 = sqlx::query_scalar("SELECT length(CAST(value_json AS BLOB)) FROM agent_events_v4 WHERE run_id=?1")
-            .bind(event.run_id.to_string()).fetch_one(store.pool()).await.unwrap();
-        assert_eq!(store.agent_events_for_context_v4_bounded(project, conversation, 1, bytes as usize).await.unwrap(), vec![event.clone()]);
-        assert!(store.agent_events_for_context_v4_bounded(project, conversation, 0, bytes as usize).await.is_err());
-        assert!(store.agent_events_for_context_v4_bounded(project, conversation, 1, bytes as usize - 1).await.is_err());
-        assert!(store.agent_events_for_context_v4_bounded(Uuid::new_v4(), conversation, 1, bytes as usize).await.is_err());
-        assert!(store.agent_events_for_context_v4_bounded(project, Uuid::new_v4(), 1, bytes as usize).await.is_err());
+        let bytes: i64 = sqlx::query_scalar(
+            "SELECT length(CAST(value_json AS BLOB)) FROM agent_events_v4 WHERE run_id=?1",
+        )
+        .bind(event.run_id.to_string())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            store
+                .agent_events_for_context_v4_bounded(project, conversation, 1, bytes as usize)
+                .await
+                .unwrap(),
+            vec![event.clone()]
+        );
+        assert!(
+            store
+                .agent_events_for_context_v4_bounded(project, conversation, 0, bytes as usize)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .agent_events_for_context_v4_bounded(project, conversation, 1, bytes as usize - 1)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .agent_events_for_context_v4_bounded(
+                    Uuid::new_v4(),
+                    conversation,
+                    1,
+                    bytes as usize
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .agent_events_for_context_v4_bounded(project, Uuid::new_v4(), 1, bytes as usize)
+                .await
+                .is_err()
+        );
 
         let (store, project, conversation) = fixture().await;
-        let utf8 = AgentEventV4::first(Uuid::new_v4(), project, conversation, Utc::now(), AgentEventKindV4::ModelText { text: "核验数据".into() });
+        let utf8 = AgentEventV4::first(
+            Uuid::new_v4(),
+            project,
+            conversation,
+            Utc::now(),
+            AgentEventKindV4::ModelText {
+                text: "核验数据".into(),
+            },
+        );
         store.append_agent_event_v4(&utf8).await.unwrap();
         let (characters, utf8_bytes): (i64, i64) = sqlx::query_as("SELECT length(value_json),length(CAST(value_json AS BLOB)) FROM agent_events_v4 WHERE run_id=?1")
             .bind(utf8.run_id.to_string()).fetch_one(store.pool()).await.unwrap();
         assert!(utf8_bytes > characters);
-        assert!(store.agent_events_for_context_v4_bounded(project, conversation, 1, characters as usize).await.is_err());
-        assert_eq!(store.agent_events_for_context_v4_bounded(project, conversation, 1, utf8_bytes as usize).await.unwrap(), vec![utf8]);
+        assert!(
+            store
+                .agent_events_for_context_v4_bounded(project, conversation, 1, characters as usize)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .agent_events_for_context_v4_bounded(project, conversation, 1, utf8_bytes as usize)
+                .await
+                .unwrap(),
+            vec![utf8]
+        );
     }
 
     #[tokio::test]
@@ -7706,7 +7873,10 @@ mod diagnostics_bounded_read_tests {
         let event = add_event(&store, project, conversation).await;
         let before: (i64, String) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM agent_events_v4), value_json FROM agent_runs_v4 WHERE run_id=?1")
             .bind(event.run_id.to_string()).fetch_one(store.pool()).await.unwrap();
-        store.agent_events_for_context_v4_bounded(project, conversation, 1, 16 * 1024 * 1024).await.unwrap();
+        store
+            .agent_events_for_context_v4_bounded(project, conversation, 1, 16 * 1024 * 1024)
+            .await
+            .unwrap();
         let after: (i64, String) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM agent_events_v4), value_json FROM agent_runs_v4 WHERE run_id=?1")
             .bind(event.run_id.to_string()).fetch_one(store.pool()).await.unwrap();
         assert_eq!(before, after);
