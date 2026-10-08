@@ -671,3 +671,11 @@ pub struct SessionReviewStartErrorV4 {
     pub kind: SessionReviewStartFailureKindV4,
     pub message: String,
 }
+
+mod offline_example_workspace;
+pub use offline_example_workspace::{
+    CreateOfflineExampleWorkspaceRequest, CreateOfflineExampleWorkspaceResult,
+    OfflineExampleAvailability, OfflineExampleEntry, OfflineExampleEntryKind,
+    OfflineExampleFileAvailability, OfflineExampleFileView, OfflineExampleSourceKind,
+    OfflineExampleText, OfflineExampleUnavailableReason, OfflineExampleWorkspaceView,
+};

@@ -38,6 +38,51 @@ use sqlx::{
 use thiserror::Error;
 use uuid::Uuid;
 
+const OFFLINE_EXAMPLE_MARKER_KIND: &str = "offline_example_workspace_v1";
+
+/// Safe identity only: no file contents, credentials, execution or scientific state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineExampleProjectMarkerV1 {
+    pub schema_version: u8,
+    pub project_id: Uuid,
+    pub request_id: Uuid,
+    pub example_id: String,
+    pub fixture_sha256: String,
+    pub root_binding_sha256: String,
+}
+
+/// Hash the UUID and the canonical final root supplied by the host as a JSON tuple.
+/// This is a pure identity binding, not filesystem validation or authorization.
+pub fn offline_example_root_binding(project: &Project) -> String {
+    let bytes = serde_json::to_vec(&(project.id, &project.local_root))
+        .expect("UUID and string serialization cannot fail");
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn invalid_offline_example_marker() -> StoreError {
+    StoreError::InvalidInput("offline_example_marker_invalid".into())
+}
+
+fn validate_offline_example_marker(
+    marker: &OfflineExampleProjectMarkerV1,
+    project_id: Uuid,
+) -> Result<(), StoreError> {
+    let valid_hash = |value: &str| {
+        value.len() == 64
+            && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    if marker.schema_version != 1
+        || marker.project_id != project_id
+        || marker.example_id != "synthetic-evidence-report-v1"
+        || !valid_hash(&marker.fixture_sha256)
+        || !valid_hash(&marker.root_binding_sha256)
+    {
+        return Err(invalid_offline_example_marker());
+    }
+    Ok(())
+}
+
 const SCHEMA_VERSION: u32 = 4;
 mod context_compaction;
 pub use context_compaction::CompactionSnapshotV4;
@@ -348,6 +393,108 @@ impl Store {
         Ok(())
     }
 
+    /// Register a new example atomically, or retain all metadata for the same identity.
+    /// Only the host creation/recovery path calls this; ordinary saves never alter markers.
+    pub async fn save_offline_example_project(
+        &self,
+        project: &Project,
+        marker: &OfflineExampleProjectMarkerV1,
+    ) -> Result<(), StoreError> {
+        use omicsops_core::workspace::{ProjectStatus, ProjectTemplate};
+        validate_project_input(project)?;
+        validate_offline_example_marker(marker, project.id)?;
+        if marker.root_binding_sha256 != offline_example_root_binding(project)
+            || project.template != ProjectTemplate::Blank
+            || project.status != ProjectStatus::Ready
+            || project.connection_id.is_some()
+            || project.remote_root.is_some()
+        {
+            return Err(invalid_offline_example_marker());
+        }
+        let conflict = || StoreError::InvalidInput("offline_example_identity_conflict".into());
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let root_conflict: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM projects p
+             LEFT JOIN project_omicsops e ON e.project_id=p.id
+             WHERE p.id<>?1 AND (p.workspace_dir=?2 OR e.local_root=?2))",
+        )
+        .bind(project.id.to_string())
+        .bind(&project.local_root)
+        .fetch_one(&mut *tx)
+        .await?;
+        if root_conflict != 0 {
+            return Err(conflict());
+        }
+        let existing = sqlx::query(
+            "SELECT p.id,p.name,p.description,p.workspace_dir,p.created_at,p.updated_at,
+                    e.local_root,e.remote_root,e.connection_id,e.template,e.status,e.ollama_only
+             FROM projects p LEFT JOIN project_omicsops e ON e.project_id=p.id WHERE p.id=?1",
+        )
+        .bind(project.id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let stored_marker: Option<String> = sqlx::query_scalar(
+            "SELECT value_json FROM app_objects WHERE kind=?1 AND id=?2",
+        )
+        .bind(OFFLINE_EXAMPLE_MARKER_KIND)
+        .bind(project.id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        match (existing, stored_marker) {
+            (None, None) => {
+                insert_project(&mut tx, project).await?;
+                sqlx::query("INSERT INTO app_objects (kind,id,value_json) VALUES (?1,?2,?3)")
+                    .bind(OFFLINE_EXAMPLE_MARKER_KIND)
+                    .bind(project.id.to_string())
+                    .bind(serde_json::to_string(marker)?)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            (Some(row), Some(raw)) => {
+                let workspace_dir: String = row.try_get(3)?;
+                let existing = project_from_row(row)?;
+                let stored: OfflineExampleProjectMarkerV1 =
+                    serde_json::from_str(&raw).map_err(|_| invalid_offline_example_marker())?;
+                validate_offline_example_marker(&stored, project.id)?;
+                if stored != *marker
+                    || workspace_dir != project.local_root
+                    || existing.local_root != project.local_root
+                    || existing.template != project.template
+                    || existing.connection_id != project.connection_id
+                    || existing.remote_root != project.remote_root
+                {
+                    return Err(conflict());
+                }
+                // The persisted name, description, status, timestamps and preferences win.
+            }
+            _ => return Err(conflict()),
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Preserve identity even when the project's root or receipt is later changed/missing.
+    /// The host compares the binding and emits an unavailable view; absence alone means None.
+    pub async fn get_offline_example_project_marker(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Option<OfflineExampleProjectMarkerV1>, StoreError> {
+        let raw = self
+            .get_json::<Value>(OFFLINE_EXAMPLE_MARKER_KIND, &project_id.to_string())
+            .await
+            .map_err(|error| match error {
+                StoreError::Json(_) => invalid_offline_example_marker(),
+                other => other,
+            })?;
+        raw.map(|value| {
+            let marker = serde_json::from_value(value)
+                .map_err(|_| invalid_offline_example_marker())?;
+            validate_offline_example_marker(&marker, project_id)?;
+            Ok(marker)
+        })
+        .transpose()
+    }
+
     pub async fn list_projects(&self) -> Result<Vec<Project>, StoreError> {
         let rows = sqlx::query(
             "SELECT p.id,p.name,p.description,p.workspace_dir,p.created_at,p.updated_at,
@@ -397,6 +544,11 @@ impl Store {
             tx.rollback().await?;
             return Ok(false);
         }
+        sqlx::query("DELETE FROM app_objects WHERE kind=?1 AND id=?2")
+            .bind(OFFLINE_EXAMPLE_MARKER_KIND)
+            .bind(&project_id)
+            .execute(&mut *tx)
+            .await?;
         delete_composer_quotes_in_scope(&mut *tx, &project_id, None).await?;
         sqlx::query(
             "DELETE FROM agent_context_archives_v4 WHERE run_id IN
@@ -7880,5 +8032,173 @@ mod diagnostics_bounded_read_tests {
         let after: (i64, String) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM agent_events_v4), value_json FROM agent_runs_v4 WHERE run_id=?1")
             .bind(event.run_id.to_string()).fetch_one(store.pool()).await.unwrap();
         assert_eq!(before, after);
+    }
+}
+#[cfg(test)]
+mod offline_example_marker_tests {
+    use super::*;
+    use omicsops_core::workspace::{ProjectStatus, ProjectTemplate};
+
+    fn fixture(root: &str) -> (Project, OfflineExampleProjectMarkerV1) {
+        let project = Project::new(Uuid::new_v4(), "example", root, ProjectTemplate::Blank, DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap());
+        let marker = OfflineExampleProjectMarkerV1 {
+            schema_version: 1,
+            project_id: project.id,
+            request_id: Uuid::new_v4(),
+            example_id: "synthetic-evidence-report-v1".into(),
+            fixture_sha256: "a".repeat(64),
+            root_binding_sha256: offline_example_root_binding(&project),
+        };
+        (project, marker)
+    }
+
+    #[tokio::test]
+    async fn offline_example_marker_atomic_failures_leave_no_half_records() {
+        for table in ["app_objects", "projects", "project_omicsops"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path().join("store.sqlite")).await.unwrap();
+            let (project, marker) = fixture("C:\\example");
+            sqlx::query(&format!("CREATE TRIGGER fail_example BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT, 'injected'); END"))
+                .execute(&store.pool).await.unwrap();
+            assert!(store.save_offline_example_project(&project, &marker).await.is_err());
+            assert!(store.get_project(project.id).await.unwrap().is_none());
+            assert!(store.get_offline_example_project_marker(project.id).await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_example_marker_reopen_noop_and_ordinary_save_preserve_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        let store = Store::open(&path).await.unwrap();
+        let (project, marker) = fixture(&dir.path().join("missing-example").to_string_lossy());
+        store.save_offline_example_project(&project, &marker).await.unwrap();
+        let mut edited = project.clone();
+        edited.name = "user title".into();
+        edited.description = "user notes".into();
+        edited.ollama_only = true;
+        edited.updated_at += chrono::Duration::seconds(5);
+        store.save_project(&edited).await.unwrap();
+        store.save_offline_example_project(&project, &marker).await.unwrap();
+        assert_eq!(store.get_project(project.id).await.unwrap(), Some(edited.clone()));
+        store.pool.close().await;
+        let store = Store::open(&path).await.unwrap();
+        assert_eq!(store.get_offline_example_project_marker(project.id).await.unwrap(), Some(marker.clone()));
+        edited.local_root.push_str("-moved");
+        store.save_project(&edited).await.unwrap();
+        assert_eq!(store.get_offline_example_project_marker(project.id).await.unwrap(), Some(marker.clone()));
+        assert!(store.save_offline_example_project(&project, &marker).await.is_err());
+        assert_eq!(store.get_project(project.id).await.unwrap(), Some(edited));
+        for table in ["conversation_records", "agent_runs_v4", "agent_events_v4", "scientific_evidence_v4"] {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&store.pool).await.unwrap();
+            assert_eq!(count, 0, "{table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_example_marker_rejects_ordinary_id_root_and_marker_conflicts() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (ordinary, ordinary_marker) = fixture("C:\\ordinary-missing");
+        store.save_project(&ordinary).await.unwrap();
+        assert!(store.get_offline_example_project_marker(ordinary.id).await.unwrap().is_none());
+        assert!(store.save_offline_example_project(&ordinary, &ordinary_marker).await.is_err());
+        let (collision, marker) = fixture(&ordinary.local_root);
+        assert!(store.save_offline_example_project(&collision, &marker).await.is_err());
+        assert!(store.get_project(collision.id).await.unwrap().is_none());
+        let (project, marker) = fixture("C:\\example");
+        store.save_offline_example_project(&project, &marker).await.unwrap();
+        for field in ["request_id", "fixture_sha256", "root_binding_sha256"] {
+            let mut changed = marker.clone();
+            match field {
+                "request_id" => changed.request_id = Uuid::new_v4(),
+                "fixture_sha256" => changed.fixture_sha256 = "b".repeat(64),
+                _ => changed.root_binding_sha256 = "b".repeat(64),
+            }
+            assert!(store.save_offline_example_project(&project, &changed).await.is_err());
+            assert_eq!(store.get_offline_example_project_marker(project.id).await.unwrap(), Some(marker.clone()));
+        }
+        let (other, other_marker) = fixture("C:\\orphan");
+        store.put_json("offline_example_workspace_v1", &other.id.to_string(), &other_marker).await.unwrap();
+        assert!(store.save_offline_example_project(&other, &other_marker).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn offline_example_marker_validates_fields_and_uses_safe_read_errors() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (project, marker) = fixture("C:\\example");
+        let value = serde_json::to_value(&marker).unwrap();
+        for (field, bad) in [
+            ("schema_version", serde_json::json!(2)),
+            ("project_id", serde_json::json!(Uuid::new_v4())),
+            ("example_id", serde_json::json!("private-unknown")),
+            ("fixture_sha256", serde_json::json!("secret-bad-hash")),
+            ("root_binding_sha256", serde_json::json!("z".repeat(64))),
+        ] {
+            let mut invalid = value.clone();
+            invalid[field] = bad;
+            let parsed = serde_json::from_value(invalid.clone()).unwrap();
+            assert!(store.save_offline_example_project(&project, &parsed).await.is_err());
+            store.put_json("offline_example_workspace_v1", &project.id.to_string(), &invalid).await.unwrap();
+            let error = store.get_offline_example_project_marker(project.id).await.unwrap_err();
+            assert_eq!(error.to_string(), "invalid input: offline_example_marker_invalid");
+        }
+        for invalid in [serde_json::json!(null), serde_json::json!({"private":"do-not-echo"})] {
+            store.put_json("offline_example_workspace_v1", &project.id.to_string(), &invalid).await.unwrap();
+            assert_eq!(store.get_offline_example_project_marker(project.id).await.unwrap_err().to_string(), "invalid input: offline_example_marker_invalid");
+        }
+        assert!(store.get_project(project.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn offline_example_marker_rejects_nonlocal_or_nonblank_initial_project() {
+        for case in 0..4 {
+            let store = Store::open_in_memory().await.unwrap();
+            let (mut project, marker) = fixture("C:\\example");
+            match case {
+                0 => project.connection_id = Some(Uuid::new_v4()),
+                1 => project.remote_root = Some("/remote".into()),
+                2 => project.template = ProjectTemplate::BulkRnaSeq,
+                _ => project.status = ProjectStatus::Running,
+            }
+            assert!(store.save_offline_example_project(&project, &marker).await.is_err());
+            assert!(store.get_project(project.id).await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_example_marker_delete_atomic_cleanup_keeps_user_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_file = dir.path().join("keep.txt");
+        fs::write(&user_file, "user bytes").unwrap();
+        let store = Store::open_in_memory().await.unwrap();
+        let (project, marker) = fixture(&dir.path().to_string_lossy());
+        store.save_offline_example_project(&project, &marker).await.unwrap();
+        store.put_json("unrelated", &project.id.to_string(), &true).await.unwrap();
+        sqlx::query("CREATE TRIGGER fail_delete BEFORE DELETE ON app_objects WHEN OLD.kind='offline_example_workspace_v1' BEGIN SELECT RAISE(ABORT, 'injected'); END")
+            .execute(&store.pool).await.unwrap();
+        assert!(store.delete_project(project.id).await.is_err());
+        assert!(store.get_project(project.id).await.unwrap().is_some());
+        assert_eq!(store.get_offline_example_project_marker(project.id).await.unwrap(), Some(marker));
+        sqlx::query("DROP TRIGGER fail_delete").execute(&store.pool).await.unwrap();
+        assert!(store.delete_project(project.id).await.unwrap());
+        assert!(store.get_offline_example_project_marker(project.id).await.unwrap().is_none());
+        assert_eq!(store.get_json::<bool>("unrelated", &project.id.to_string()).await.unwrap(), Some(true));
+        assert_eq!(fs::read_to_string(user_file).unwrap(), "user bytes");
+    }
+
+    #[test]
+    fn offline_example_marker_root_binding_is_deterministic_and_identity_bound() {
+        let (project, _) = fixture("C:\\not-required-to-exist\\科研");
+        let expected = hex::encode(Sha256::digest(serde_json::to_vec(&(project.id, &project.local_root)).unwrap()));
+        assert_eq!(offline_example_root_binding(&project), expected);
+        let mut changed = project.clone();
+        changed.name = "renamed".into();
+        assert_eq!(offline_example_root_binding(&changed), expected);
+        changed.id = Uuid::new_v4();
+        assert_ne!(offline_example_root_binding(&changed), expected);
+        changed = project.clone();
+        changed.local_root.push('x');
+        assert_ne!(offline_example_root_binding(&changed), expected);
     }
 }

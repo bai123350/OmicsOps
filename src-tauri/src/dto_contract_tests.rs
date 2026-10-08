@@ -1609,3 +1609,45 @@ fn manual_compaction_request_only_accepts_scope_and_request_identity() {
         assert!(serde_json::from_value::<CompactContextRequestV4>(injected).is_err());
     }
 }
+
+#[test]
+fn offline_example_dto_contract() {
+    use omicsops_dto::*;
+    let id = uuid::Uuid::from_u128(7);
+    let request = json!({"request_id":id,"example_id":"synthetic-evidence-report-v1","parent_directory":"C:\\Examples"});
+    let decoded: CreateOfflineExampleWorkspaceRequest = serde_json::from_value(request.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), request);
+    let mut extra = request;
+    extra["run_id"] = json!(id);
+    assert!(serde_json::from_value::<CreateOfflineExampleWorkspaceRequest>(extra).is_err());
+    let text = json!({"zh":"合成数据，预置结果，未在本机执行","en":"Synthetic data, preset results, not executed locally"});
+    let workspace = json!({
+        "schema_version":1,"project_id":id,"example_id":"synthetic-evidence-report-v1",
+        "source_kind":"synthetic","availability":"available","unavailable_reason":null,
+        "title":text,"disclaimer":text,"source_description":text,"license_spdx":"AGPL-3.0-only",
+        "fixture_sha256":"a".repeat(64),
+        "entries":[{"id":"goal","kind":"question","text":text},{"id":"source","kind":"narration","text":text},{"id":"result","kind":"result","text":text}],
+        "files":[{"relative_path":"README.md","media_type":"text/markdown","expected_sha256":"a".repeat(64),"current_sha256":null,"availability":"missing","preview_text":null}]
+    });
+    let result = json!({"project_id":id,"workspace":workspace});
+    let decoded: CreateOfflineExampleWorkspaceResult = serde_json::from_value(result.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), result);
+    for (value, wire) in [(OfflineExampleAvailability::Available,"available"),(OfflineExampleAvailability::Unavailable,"unavailable")] {
+        assert_eq!(serde_json::to_value(value).unwrap(), json!(wire));
+    }
+    for (value, wire) in [(OfflineExampleFileAvailability::Available,"available"),(OfflineExampleFileAvailability::Changed,"changed"),(OfflineExampleFileAvailability::Missing,"missing"),(OfflineExampleFileAvailability::Unavailable,"unavailable")] {
+        assert_eq!(serde_json::to_value(value).unwrap(), json!(wire));
+    }
+    for reason in ["receipt_missing","receipt_invalid","root_unavailable","identity_mismatch"] {
+        let mut unavailable = workspace.clone();
+        unavailable["availability"] = json!("unavailable");
+        unavailable["unavailable_reason"] = json!(reason);
+        unavailable["entries"] = json!([]);
+        unavailable["files"] = json!([]);
+        let decoded: OfflineExampleWorkspaceView = serde_json::from_value(unavailable.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), unavailable);
+    }
+    assert!(serde_json::from_value::<OfflineExampleAvailability>(json!("changed")).is_err());
+    assert!(serde_json::from_value::<OfflineExampleSourceKind>(json!("executed")).is_err());
+    assert!(serde_json::from_value::<OfflineExampleEntryKind>(json!("assistant")).is_err());
+}
