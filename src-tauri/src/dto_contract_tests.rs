@@ -6,6 +6,35 @@ use crate::dto::{
 use serde_json::json;
 
 #[test]
+fn run_diagnostics_dto_contract() {
+    use omicsops_dto::{RunDiagnosticStatusV4, RunDiagnosticsExportFormatV4, RunDiagnosticsRequestV4, SaveRunDiagnosticsRequestV4};
+    let request = json!({"project_id":uuid::Uuid::from_u128(1), "conversation_id":uuid::Uuid::from_u128(2),
+        "filter":{"run_id":null,"tool_id":null,"failures_only":false},"redaction_keywords":[]});
+    let parsed: RunDiagnosticsRequestV4 = serde_json::from_value(request.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+    let mut bad = request.clone();
+    bad["unexpected"] = json!(true);
+    assert!(serde_json::from_value::<RunDiagnosticsRequestV4>(bad).is_err());
+    let mut bad_filter = request.clone();
+    bad_filter["filter"]["payload"] = json!("private");
+    assert!(serde_json::from_value::<RunDiagnosticsRequestV4>(bad_filter).is_err());
+    assert_eq!(serde_json::to_value(RunDiagnosticStatusV4::Uncertain).unwrap(), json!("uncertain"));
+    assert_eq!(serde_json::to_value(RunDiagnosticsExportFormatV4::Json).unwrap(), json!("json"));
+    let save = json!({"query":request,"expected_heads":[],"format":"html"});
+    let parsed: SaveRunDiagnosticsRequestV4 = serde_json::from_value(save.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), save);
+    let mut bad = save;
+    bad["bytes"] = json!("private");
+    assert!(serde_json::from_value::<SaveRunDiagnosticsRequestV4>(bad).is_err());
+    let mut bad_head = json!({"query":json!({"project_id":uuid::Uuid::from_u128(1),"conversation_id":uuid::Uuid::from_u128(2),
+        "filter":{"run_id":null,"tool_id":null,"failures_only":false},"redaction_keywords":[]}),
+        "expected_heads":[{"run_id":uuid::Uuid::from_u128(3),"event_count":1,"last_sequence":1,"event_hash":"hash","payload":"private"}],"format":"json"});
+    assert!(serde_json::from_value::<SaveRunDiagnosticsRequestV4>(bad_head.clone()).is_err());
+    bad_head["expected_heads"][0].as_object_mut().unwrap().remove("payload");
+    assert!(serde_json::from_value::<SaveRunDiagnosticsRequestV4>(bad_head).is_ok());
+}
+
+#[test]
 fn context_compaction_receipt_exposes_optional_admission_without_private_preparation() {
     use omicsops_dto::ContextCompactionReceiptV4;
     let legacy = json!({

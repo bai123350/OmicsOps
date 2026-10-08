@@ -39,6 +39,9 @@ pub use runtime_boundary::*;
 mod project_table;
 pub use project_table::*;
 
+mod run_diagnostics;
+pub use run_diagnostics::*;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationExportFormat {
