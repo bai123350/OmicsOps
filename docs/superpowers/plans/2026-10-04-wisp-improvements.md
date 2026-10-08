@@ -43,7 +43,7 @@
 | W03 | [远端作业](2026-10-04-wisp-w03-remote-jobs.md) | 4 | metadata列表、手动status与明确启用的有限退避 | 已实现、4任务审阅通过 |
 | W04 | [内核观察](2026-10-04-wisp-w04-kernel-inspection.md) | 5 | 活着的Python/R metadata，不隐式启动或执行对象方法 | 已实现，5任务审阅通过；真实R/SSH/GUI未验收 |
 | W05 | [手动压缩](2026-10-04-wisp-w05-context-compaction.md) | 5 | 暂停ordinary run真正原子保存可恢复checkpoint | 已实现、5任务审阅通过；clean-HEAD与真实验收待执行 |
-| W06 | [运行诊断](2026-10-04-wisp-w06-run-diagnostics.md) | 4 | run/tool/失败筛选、精确来源定位、脱敏HTML/JSON | 进行中，2/4任务审阅通过；安全导出与UI待实施 |
+| W06 | [运行诊断](2026-10-04-wisp-w06-run-diagnostics.md) | 4 | run/tool/失败筛选、精确来源定位、脱敏HTML/JSON | 进行中，3/4任务审阅通过；诊断UI、完整检查与手工smoke待实施 |
 | W07 | [离线示例](2026-10-04-wisp-w07-offline-example.md) | 4 | 双语合成工作区，重启/坏receipt仍隔离于生产Agent | 待实施 |
 | W08a | [V4场景](2026-10-04-wisp-w08-scenarios.md) | 3 | 五场景manifest/hash/实际调用计数和安全报告 | 待实施 |
 | W08b | [Skill helpers](2026-10-04-wisp-w08-skill-helpers.md) | 3 | 固定本地helper离线行为回归与统一Python CI | 已实现、3任务审阅通过；CI未执行 |

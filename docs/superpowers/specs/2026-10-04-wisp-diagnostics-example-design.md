@@ -63,7 +63,7 @@ Rust 类型加入 `crates/omicsops-dto/src/run_diagnostics.rs` 并由 crate 导�
 
 任意自由文本不进入第一版投影：排除 `ModelText` 内容、`ModelReplayRecorded` 内容、continuation/thinking、工具 arguments、`model_content`、`data`、provenance 字符串、plan 代码、用户输入、公开进度正文以及原始异常。上述事件可以有仅含固定 kind 和定位引用的行。`call_ref` 为对 `(run UUID, 原 call_id)` 的定长 SHA-256 引用，原 call_id 不导出。tool_label 经 public_text 和自定义词处理且限长；hash 字段必须是经链验证的 64 位十六进制值，首事件的 previous_hash 可以为空。无任意原始 JSON 透传字段。
 
-JSON 是该 DTO 的版本化诊断投影；HTML 由宿主对所有字符串进行文本转义，使用静态 CSS 和当前会话导出的严格 CSP：`default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'`。不嵌入脚本、外部链接、图片、字体、工具文件或可执行 Markdown。两种格式均显示筛选条件、原/选中事件数、源 heads、用量 unknown/incomplete 和“公开诊断投影，非完整科研证据”。
+JSON 文件保留该 DTO 的全部版本化诊断投影字段与 `schema_version`，另有固定文件专用 `export_notes`，不改变查询/预览 DTO；HTML 由宿主对所有可变文本进行转义，使用静态 CSS 和当前会话导出的严格 CSP：`default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'`。不嵌入脚本、外部链接、图片、字体、工具文件或可执行 Markdown。两种格式均显示筛选条件、原/选中事件数、源 heads 截点、用量 unknown/incomplete 和“公开诊断投影，非完整科研证据”；文件专用说明也明确投影不能重算原事件哈希或作为可 replay 原始审计链。
 
 `event_hash` 是已验证原始事件的定位引用；删除敏感 payload 后的投影不能重算原事件哈希，文件不声称自身是可 replay 的原始审计链。自定义脱敏词列表不导出。生成 bytes 在 native Save dialog 前完成，限定 8 MiB；路径扩展名匹配格式，同目录临时文件写入并 sync 后原子替换，失败不返回成功。保存路径仅供本地确认，不作为诊断 manifest 内容。
 

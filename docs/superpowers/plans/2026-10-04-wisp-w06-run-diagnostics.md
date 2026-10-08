@@ -102,6 +102,8 @@
 - [ ] **GREEN — 同命令与 `cargo test -p omicsops-desktop --lib conversation_export` PASS。** 原 HTML/PNG 合同和 exact bytes 不回归；静态 snapshot 不因 native dialog 等待期间追加事件宣称“最新”。
 - [ ] **Commit —** `git add -- src-tauri/src/run_diagnostics.rs src-tauri/src/conversation_export.rs src-tauri/src/lib.rs`；`git commit -m "feat: export validated redacted run diagnostics"`。
 
+**实施证据（2026-10-08）**：Task 3 功能提交 `2a3b012` 与依 AGENTS.md 分离的纯格式提交 `d87f225` 经独立完整审阅通过，无待修复问题。保存命令仅接受严格请求，重新有界读取并核验完整事件链与全部 source heads，变化则在打开 native chooser 前拒绝；生成的 JSON/HTML 为固定快照，等待对话框期间追加事件不会把文件伪称为最新。JSON 保留查询 DTO 的版本化全部字段，另含固定文件专用 `export_notes` 说明截点、unknown/incomplete 用量与证据限制；HTML 把相同公开投影作为严格 CSP 下的转义文本。两种最终 bytes 含说明/转义均受 8 MiB 上限约束。复用的文件叶子保持旧 HTML/PNG 解码合同、同目录临时文件 sync/替换、取消为 `None`，诊断错误为固定安全码。定向诊断 22、旧会话导出 4、Store 3、格式/diff 检查通过；独立复审在正常文件权限下重跑诊断 22、会话导出 4、格式/diff 均通过，受限沙箱临时文件写入失败与相同源码重试另记。实际 RED 日志为 15 个预期 E0425 加 1 个环境 OUT_DIR 错误。证据见 `.superpowers/sdd/2026-10-04-wisp-w06-run-diagnostics/task-3-report.md` 与 `task-3-review.md`。诊断 UI、完整 W06 检查、Windows 原生保存手工 smoke 和真实模型/SSH 验收仍属后续任务。
+
 ### Task 4: 诊断 UI、精确定位与交付验证
 
 **Files:** Create `src/run-diagnostics-api.ts`、`src/features/workspace/RunDiagnosticsDialog.tsx`、`RunDiagnosticsDialog.test.tsx`; Modify `src/types.ts`、`WorkspaceShell.tsx`、`WorkspaceShell.test.tsx`、`src/styles.css`；完整路径的 WorkspaceShell/新增对话框均在 `src/features/workspace/`。
