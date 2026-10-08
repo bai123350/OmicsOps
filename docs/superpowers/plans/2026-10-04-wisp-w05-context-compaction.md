@@ -141,7 +141,7 @@ assert!(!public_error.contains(secret_sentinel));
 
 ### Task 5: 接通 UI、真实恢复回归与交付记录
 
-**Files:** Modify `src/context-usage-api.ts`、`src/features/workspace/ContextUsagePanel.tsx`、`src/features/workspace/ContextUsagePanel.test.tsx`、`src/features/workspace/WorkspaceShell.tsx`、`src/features/workspace/WorkspaceShell.test.tsx`、`src/features/workspace/useContextUsage.ts`、`README.md`、`acceptance/README.md`；Create `src/features/workspace/useContextCompaction.ts`、`src/features/workspace/useContextCompaction.test.tsx`。
+**Files:** Modify `src/context-usage-api.ts`、`src/features/workspace/ContextUsagePanel.tsx`、`src/features/workspace/ContextUsagePanel.test.tsx`、`src/features/workspace/WorkspaceShell.tsx`、`src/features/workspace/WorkspaceShell.test.tsx`、`src/features/workspace/useContextUsage.ts`、`README.md`、`acceptance/README.md`；Create `src/features/workspace/useContextCompaction.ts`、`src/features/workspace/useContextCompaction.test.tsx`。实施时经窄裁决补充 `src/DesktopApp.tsx` 的现有用量刷新回调单一传递、`src-tauri/src/agent_v4.rs` 的临时数据库恢复测试、`src/DesktopApp.test.tsx` 的实际返回项目再打开回归；没有新增 Rust 生产行为。
 
 **Interfaces:**
 - Consumes：原 CompactContextRequest/receipt 及 Task 4 命令；现有 Run summary/events、问题答案与 resume 入口。
@@ -164,8 +164,10 @@ expect(newConversationReceipt).toBeNull();
 
 ## Plan Self-Review
 
-契约/纯 full-request 准备/Store 原子性/宿主 gate/UI 分别绑定 Task 1–5；Review Focus 每项已有测试。无 migration、摘要模型、审批修改或 unknown 收口；签名不漂移，private composition 不暴露到 DTO。代码片段仅断言，步骤为 RED/实现/GREEN/commit；Task1已执行并审阅，Task2–5未执行。
+契约/纯 full-request 准备/Store 原子性/宿主 gate/UI 分别绑定 Task 1–5；Review Focus 每项已有测试。无 migration、摘要模型、审批修改或 unknown 收口；签名不漂移，private composition 不暴露到 DTO。代码片段仅断言，步骤为 RED/实现/GREEN/commit；实际执行与审阅证据见各任务段和下文。
 
 ## 当前实施证据
 
-2026-10-08：Task1提交c125a71及修复2a191c8，独立full/scoped审阅通过。旧Completed事件的固定JSON/hash保持可读，公开receipt新增可缺省admission字段，snapshot/prepared留在纯protocol内部；无migration或Store原子提交。实际初RED缺契约字段，desktop同次含OUT_DIR沙箱失败并分开记录；修复前补充bounded-admission RED。最终protocol33单元+10集成、DTO crate、Store压缩6、desktop DTO52、Web构建及fmt/diff通过，沙箱失败按原命令授权重试。审阅发现hash一致的非V4新计划事件/checkpoint可通过结构校验，修复用重算哈希的0/2 RED→2/2 GREEN证明V4拒绝，未改变旧事件verify或可选字段hash。全workspace、npm测试、native打包及真实模型/SSH尚未为此叶子重跑；Task2–5和最终分支检查仍待执行。
+2026-10-08：Task1提交c125a71及修复2a191c8，独立full/scoped审阅通过。旧Completed事件的固定JSON/hash保持可读，公开receipt新增可缺省admission字段，snapshot/prepared留在纯protocol内部；无migration或Store原子提交。实际初RED缺契约字段，desktop同次含OUT_DIR沙箱失败并分开记录；修复前补充bounded-admission RED。最终protocol33单元+10集成、DTO crate、Store压缩6、desktop DTO52、Web构建及fmt/diff通过，沙箱失败按原命令授权重试。审阅发现hash一致的非V4新计划事件/checkpoint可通过结构校验，修复用重算哈希的0/2 RED→2/2 GREEN证明V4拒绝，未改变旧事件verify或可选字段hash。此段仅为 Task1 当时证据；后续任务与分支验收另列。
+
+2026-10-08：Task5提交 `1809c75` 并经完整独立审阅发现一个 Important/P2：返回项目列表会卸载工作区并丢失进行中压缩的请求 ID。修复 `e64f394` 的独立定向复审确认已解决，无其他待修复发现；窗口生命周期内按 project/conversation/run 保存安全的请求身份、进行中状态与已核验回执，返回同一 Run 不重复派发，未知结果沿用原 ID，已确认成功后的新明确操作才换 ID。UI 不自动答题或恢复，刷新用量失败不抹去已确认回执。临时 SQLite 关闭重开测试覆盖显式答案、相同冻结组合、真实 core 恢复准入及旧证据分页；不使用真实模型或 SSH。初次最终源上 workspace 1715（18 ignored）、前端 1261 加扩展 22、Web/NSIS/fmt/diff 通过；修复后 UI 268、完整前端 1265 加扩展 22、Web/NSIS/fmt/diff 通过，Rust 未改故没有因该 UI 修复重复 workspace。NSIS 仅构建未安装；这些检查使用含既存外部未提交改动的共享工作区，最终 clean committed-HEAD 分支检查和真实模型/SSH/GUI 验收仍独立待做。证据见 `.superpowers/sdd/2026-10-04-wisp-w05-context-compaction/task-5-report.md`、`task-5-review.md`、`task-5-fix1-report.md` 和 `task-5-fix1-rereview.md`。

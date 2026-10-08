@@ -142,7 +142,7 @@ Store commit 在 `BEGIN IMMEDIATE` 内重新核验请求 ID 作用域、普通 R
 
 lease 忙返回可理解的“Run 正由其他操作持有”；预算/配置/原始数据校验失败返回固定原因，不保存原始 provider/SSH 错误。操作开始前已经落库的同请求结果仍可读取；新失败不会仅为记录失败而改变原始上下文。
 
-按钮只对符合条件的普通暂停 Run 启用。它调用现有请求 ID API，显示进行中、Completed/NotNeeded/受控错误，刷新 receipt 与上下文用量；重复点击复用本次 request ID。切换会话后的响应不写当前界面。成功不自动 resume，问题回答行为仍走既有宿主入口。
+按钮只对符合条件的普通暂停 Run 启用。它调用现有请求 ID API，显示进行中、Completed/NotNeeded/受控错误，刷新 receipt 与上下文用量；重复点击复用本次 request ID。窗口生命周期内以 project/conversation/run 保存安全的操作身份和进行中状态，返回项目列表再打开同一 Run 时不重复派发，未知结果沿用原 ID，已确认成功后的新明确操作才换 ID；不保存模型上下文或原始错误，也不跨应用重启承诺恢复 UI 状态。切换会话后的响应不写当前界面，用量刷新失败不改写已确认回执。成功不自动 resume，问题回答行为仍走既有宿主入口。
 
 应用重启后使用同一持久 checkpoint/archive 引用。准入证明只针对本次冻结配置和工作集；后续新答案、变化的项目规则或科学状态仍由正常 resume 的最终请求检查保护。SSH 后续加载远端 project rules 会触发正常的新 model turn/准入，不能把 manual 成功解释为未来所有 SSH 请求都必然可发送。
 
