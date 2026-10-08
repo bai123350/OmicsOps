@@ -1847,6 +1847,8 @@ mod tests {
             },
         );
         let prepared = PreparedContextCompactionV4 {
+            source_bindings_sha256: "d".repeat(64),
+            source_run_sha256: "e".repeat(64),
             request,
             source_through_sequence: source.sequence,
             source_head_hash: source.event_hash.clone(),
@@ -1961,6 +1963,8 @@ mod tests {
             },
         );
         let completed_prepared = PreparedContextCompactionV4 {
+            source_bindings_sha256: "d".repeat(64),
+            source_run_sha256: "e".repeat(64),
             request,
             source_through_sequence: source.sequence,
             source_head_hash: source.event_hash.clone(),
@@ -2084,6 +2088,8 @@ mod tests {
             },
         );
         PreparedContextCompactionV4 {
+            source_bindings_sha256: "d".repeat(64),
+            source_run_sha256: "e".repeat(64),
             request,
             source_through_sequence: source.sequence,
             source_head_hash: source.event_hash,

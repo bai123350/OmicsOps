@@ -40,6 +40,7 @@ use uuid::Uuid;
 
 const SCHEMA_VERSION: u32 = 4;
 mod context_compaction;
+pub use context_compaction::CompactionSnapshotV4;
 mod conversation_branches;
 mod guidance;
 mod model_profiles;

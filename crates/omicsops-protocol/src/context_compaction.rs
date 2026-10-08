@@ -25,6 +25,9 @@ pub struct ContextCompactionAdmissionV4 {
 #[serde(deny_unknown_fields)]
 pub struct ContextCompactionSnapshotV4 {
     pub request: CompactContextRequestV4,
+    pub source_bindings_sha256: String,
+    /// Digest of the exact durable run JSON captured by the host Store.
+    pub source_run_sha256: String,
     pub spec: RunSpecV4,
     pub events: Vec<AgentEventV4>,
     pub scientific_state: Value,
@@ -40,6 +43,8 @@ pub struct ContextCompactionSnapshotV4 {
 #[serde(deny_unknown_fields)]
 pub struct PreparedContextCompactionV4 {
     pub request: CompactContextRequestV4,
+    pub source_bindings_sha256: String,
+    pub source_run_sha256: String,
     pub source_through_sequence: u64,
     pub source_head_hash: String,
     pub frozen_spec_hash: String,
@@ -78,6 +83,8 @@ impl PreparedContextCompactionV4 {
             || self.request.run_id.is_nil()
             || self.request.project_id.is_nil()
             || self.request.conversation_id.is_nil()
+            || !is_sha256(&self.source_bindings_sha256)
+            || !is_sha256(&self.source_run_sha256)
             || self.frozen_spec_hash.is_empty()
             || self.scientific_sha256.is_empty()
             || !is_sha256(&self.admission.configuration_hash)
@@ -209,4 +216,68 @@ impl PreparedContextCompactionV4 {
 
 fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod binding_digest_tests {
+    use super::*;
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    #[test]
+    fn manual_compaction_rejects_unbounded_binding_digest() {
+        let request = CompactContextRequestV4 {
+            request_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            conversation_id: Uuid::new_v4(),
+            run_id: Uuid::new_v4(),
+        };
+        let event = AgentEventV4::first(
+            request.run_id,
+            request.project_id,
+            request.conversation_id,
+            Utc::now(),
+            AgentEventKindV4::ContextCompactionNotNeeded {
+                request_id: request.request_id,
+                before_bytes: 2,
+            },
+        );
+        let mut prepared = PreparedContextCompactionV4 {
+            request,
+            source_bindings_sha256: "d".repeat(64),
+            source_run_sha256: "e".repeat(64),
+            source_through_sequence: 0,
+            source_head_hash: String::new(),
+            frozen_spec_hash: "a".repeat(64),
+            scientific_revision: 0,
+            scientific_sha256: "b".repeat(64),
+            transcript: "[]".into(),
+            candidate_context: "{}".into(),
+            checkpoint: None,
+            archive: None,
+            planned_events: vec![event],
+            status: ContextCompactionStatusV4::NotNeeded,
+            before_bytes: 2,
+            after_bytes: 2,
+            admission: ContextCompactionAdmissionV4 {
+                configuration_hash: "c".repeat(64),
+                prompt_sha256: "d".repeat(64),
+                provider_request_bytes: None,
+            },
+        };
+        assert!(prepared.validate_structure().is_ok());
+        prepared.source_run_sha256 = "unbounded".into();
+        assert!(
+            prepared.validate_structure().is_err(),
+            "run digest must be bounded hex"
+        );
+        prepared.source_run_sha256 = "e".repeat(64);
+        for hash in [String::new(), "g".repeat(64), "a".repeat(65)] {
+            prepared.source_bindings_sha256 = hash;
+            assert!(
+                prepared.validate_structure().is_err(),
+                "binding digest must be bounded hex"
+            );
+        }
+    }
 }

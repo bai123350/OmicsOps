@@ -4821,6 +4821,16 @@ impl AgentCoreV4<'_> {
         let science: ScientificStateV4 =
             serde_json::from_value(snapshot.scientific_state.clone()).map_err(|_| invalid())?;
         if spec.execution_kind != RunExecutionKindV4::OrdinaryAgent
+            || snapshot.source_run_sha256.len() != 64
+            || !snapshot
+                .source_run_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || snapshot.source_bindings_sha256.len() != 64
+            || !snapshot
+                .source_bindings_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
             || snapshot.request.run_id != spec.run_id
             || snapshot.request.project_id != spec.project_id
             || snapshot.request.conversation_id != spec.conversation_id
@@ -5081,6 +5091,8 @@ impl AgentCoreV4<'_> {
             return Err(invalid());
         }
         let prepared = PreparedContextCompactionV4 {
+            source_bindings_sha256: snapshot.source_bindings_sha256.clone(),
+            source_run_sha256: snapshot.source_run_sha256.clone(),
             request: snapshot.request,
             source_through_sequence: source.sequence,
             source_head_hash: source.event_hash.clone(),
@@ -14629,6 +14641,8 @@ mod tests {
         let events = store.load_direct(spec.run_id).unwrap();
         let source = events.last().unwrap();
         omicsops_protocol::ContextCompactionSnapshotV4 {
+            source_bindings_sha256: "d".repeat(64),
+            source_run_sha256: "e".repeat(64),
             request: omicsops_protocol::CompactContextRequestV4 {
                 request_id: Uuid::new_v4(),
                 project_id: spec.project_id,
@@ -15724,6 +15738,44 @@ mod tests {
             assert_eq!(store.load_direct(spec.run_id).unwrap(), snapshot.events);
             assert!(store.archives.lock().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn manual_prepare_preserves_and_rejects_invalid_binding_digest() {
+        let (spec, store, model) = manual_fixture(false, 40_000);
+        let mut snapshot = manual_snapshot(&store, &spec, ScientificStateV4::new(spec.project_id));
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: None,
+        };
+        let prepared = core
+            .prepare_context_compaction(&snapshot, AgentLimitsV4::default())
+            .unwrap();
+        assert_eq!(
+            prepared.source_bindings_sha256,
+            snapshot.source_bindings_sha256
+        );
+        assert_eq!(prepared.source_run_sha256, snapshot.source_run_sha256);
+        model.inner.requests.lock().unwrap().clear();
+        snapshot.source_run_sha256 = "unbounded".into();
+        assert!(
+            core.prepare_context_compaction(&snapshot, AgentLimitsV4::default())
+                .is_err()
+        );
+        assert!(model.inner.requests.lock().unwrap().is_empty());
+        snapshot.source_run_sha256 = "e".repeat(64);
+        for hash in [String::new(), "g".repeat(64), "a".repeat(65)] {
+            snapshot.source_bindings_sha256 = hash;
+            assert!(
+                core.prepare_context_compaction(&snapshot, AgentLimitsV4::default())
+                    .is_err()
+            );
+            assert!(model.inner.requests.lock().unwrap().is_empty());
+        }
+        assert_eq!(store.load_direct(spec.run_id).unwrap(), snapshot.events);
+        assert!(store.archives.lock().unwrap().is_empty());
     }
 
     #[test]

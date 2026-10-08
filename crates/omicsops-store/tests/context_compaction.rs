@@ -198,6 +198,16 @@ async fn completed_compaction_is_atomic_idempotent_and_keeps_transcript() {
 
     let second = fixture.store.compact_context_v4(&request).await.unwrap();
     assert_eq!(second, first);
+    assert_eq!(
+        fixture
+            .store
+            .context_compaction_receipt_v4(&request)
+            .await
+            .unwrap(),
+        Some(first.clone())
+    );
+    assert_eq!(first.provider_request_bytes, None);
+    assert_eq!(first.admission_configuration_hash, None);
     let events = fixture.store.agent_events_v4(fixture.run_id).await.unwrap();
     assert!(events.iter().any(|event| matches!(
         event.event,
