@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "example_id": "synthetic-evidence-report-v1",
+  "source_kind": "synthetic",
+  "title": {
+    "zh": "来源、结果与报告：离线合成示例",
+    "en": "Sources, results and reports: offline synthetic example"
+  },
+  "disclaimer": {
+    "zh": "合成数据，预置结果，未在本机执行",
+    "en": "Synthetic data, preset results, not executed on this computer"
+  },
+  "source_description": {
+    "zh": "OmicsOps 仓库原创的预置算术示例。哈希只表示文件一致，不证明科研结论或复现成功。",
+    "en": "An original preset arithmetic example from the OmicsOps repository. Hashes indicate file equality, not scientific validity or successful reproduction."
+  },
+  "license_spdx": "AGPL-3.0-only",
+  "entries": [
+    {
+      "id": "goal",
+      "kind": "question",
+      "text": {
+        "zh": "如何从原始数据追溯到结果表与报告？",
+        "en": "How can a report be traced back to a result table and source data?"
+      }
+    },
+    {
+      "id": "observations",
+      "kind": "narration",
+      "text": {
+        "zh": "合成表：A 组为 2、4，B 组为 5、7。",
+        "en": "Synthetic observations: group A has 2 and 4; group B has 5 and 7."
+      }
+    },
+    {
+      "id": "summary",
+      "kind": "result",
+      "text": {
+        "zh": "预置结果：A 均值 3，B 均值 6，B−A 为 3。",
+        "en": "Preset results: A mean 3, B mean 6, B minus A equals 3."
+      }
+    },
+    {
+      "id": "reports",
+      "kind": "narration",
+      "text": {
+        "zh": "双语报告展示上述算术，不声称统计显著性、真实实验或本机执行。",
+        "en": "The bilingual reports illustrate this arithmetic; they claim no statistical significance, real experiment or local execution."
+      }
+    }
+  ],
+  "files": {
+    "data/observations.csv": "group,value\nA,2\nA,4\nB,5\nB,7\n",
+    "results/summary.csv": "measure,value\nA_mean,3\nB_mean,6\nB_minus_A,3\n",
+    "report.zh.md": "# 合成算术报告\n\n合成数据，预置结果，未在本机执行\n\nSynthetic data, preset results, not executed on this computer\n\nA 组：(2 + 4) / 2 = 3。B 组：(5 + 7) / 2 = 6。均值差 B − A = 3。\n\n来源：data/observations.csv。预置结果：results/summary.csv。\n\n仅演示算术；不代表真实实验或统计显著性。文件哈希不证明科研结论或复现成功。\n",
+    "report.en.md": "# Synthetic arithmetic report\n\nSynthetic data, preset results, not executed on this computer\n\n合成数据，预置结果，未在本机执行\n\nGroup A: (2 + 4) / 2 = 3. Group B: (5 + 7) / 2 = 6. Mean difference B minus A = 3.\n\nSource: data/observations.csv. Preset results: results/summary.csv.\n\nThis illustrates arithmetic only, with no real experiment or statistical significance. File hashes do not establish scientific validity or successful reproduction.\n",
+    "README.md": "# OmicsOps offline synthetic example / 离线合成示例\n\n合成数据，预置结果，未在本机执行\n\nSynthetic data, preset results, not executed on this computer\n\nFollow data/observations.csv → results/summary.csv → report.zh.md or report.en.md.\n\nA = 2, 4; B = 5, 7. Preset means: 3 and 6; difference: 3.\n\nOmicsOps original content, AGPL-3.0-only; see LICENSE.txt and SOURCE.json. No network, model, Python or R is needed. Hashes indicate file equality only.\n\n本示例为 OmicsOps 原创内容，许可 AGPL-3.0-only。无需网络、模型、Python 或 R。哈希仅证明文件一致，不证明结论或复现成功。\n"
+  }
+}

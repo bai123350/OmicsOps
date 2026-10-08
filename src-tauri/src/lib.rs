@@ -39,6 +39,7 @@ mod model_catalog_shared;
 pub mod model_commands;
 pub mod model_deletion;
 pub mod notification_settings;
+mod offline_example_workspace;
 pub mod p1_commands;
 #[cfg(test)]
 mod plan_revision_tests;
