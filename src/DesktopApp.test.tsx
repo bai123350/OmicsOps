@@ -1,3 +1,5 @@
+import * as contextApi from "./context-usage-api";
+import type { ContextCompactionReceiptV4 } from "./types";
 import * as queueApi from "./composer-queue-api";
 import * as preferencesApi from "./conversation-preferences-api";
 import { StrictMode, type ReactNode } from "react";
@@ -2209,4 +2211,40 @@ it("routes native idle sends through the durable queue and recovers the committe
     await waitFor(() => expect(input).toHaveValue(""));
     await waitFor(() => expect(screen.getAllByText("原子提交的研究任务")).toHaveLength(1));
   } finally { view.unmount(); Reflect.deleteProperty(window, "__TAURI_INTERNALS__"); }
+});
+
+it("retains pending compaction through Back to projects and reopening the same paused run", async () => {
+  const { stateSpy } = setupConversationStateHarness();
+  const runId = "compaction-library-remount";
+  const question = agentEvent(stateConversations[0].id, runId, 1, { kind: "input_requested", question_id: "sample", question: "Choose the sample before continuing" });
+  stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId, conversationId === stateConversations[0].id ? {
+    locked: true, latest_run: { ...stateRun(runId, "waiting_for_input", null, null, null), session_mode: "agent" },
+  } : {}));
+  vi.mocked(api.agentV4EventsForConversation).mockImplementation(async (_projectId, conversationId) => conversationId === stateConversations[0].id ? [question] : []);
+  vi.mocked(api.agentV4Events).mockResolvedValue([question]);
+  const pending = deferred<ContextCompactionReceiptV4>();
+  const compact = vi.spyOn(contextApi, "compactContextV4").mockReturnValue(pending.promise);
+  const answer = vi.spyOn(api, "agentV4Answer").mockResolvedValue();
+  const resume = vi.spyOn(api, "agentV4Resume").mockResolvedValue();
+  render(<DesktopApp />);
+  await screen.findByText("Choose the sample before continuing");
+  fireEvent.click(screen.getByRole("button", { name: "查看上下文用量" }));
+  const start = screen.getByRole("button", { name: "压缩上下文" });
+  await waitFor(() => expect(start).toBeEnabled()); fireEvent.click(start);
+  expect(compact).toHaveBeenCalledTimes(1);
+  const originalRequest = compact.mock.calls[0][0];
+  fireEvent.click(screen.getByRole("button", { name: "返回项目主页" }));
+  expect(screen.queryByRole("dialog", { name: "上下文用量" })).toBeNull();
+  fireEvent.click(await screen.findByRole("button", { name: `打开项目：${stateProject.name}` }));
+  await screen.findByRole("heading", { name: stateConversations[0].title });
+  fireEvent.click(screen.getByRole("button", { name: "查看上下文用量" }));
+  const returned = screen.getByRole("button", { name: "压缩中…" });
+  expect(returned).toBeDisabled(); fireEvent.click(returned); expect(compact).toHaveBeenCalledTimes(1);
+  await act(async () => pending.resolve({ ...originalRequest, status: "completed", source_through_sequence: 1, source_head_hash: "hash", before_bytes: 9000, after_bytes: 1000, created_at: "now", updated_at: "now" }));
+  expect(screen.queryByText(/上下文已压缩/)).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "压缩上下文" }));
+  expect(await screen.findByText(/上下文已压缩/)).toBeVisible();
+  expect(compact).toHaveBeenCalledTimes(1);
+  expect(screen.getByText("Choose the sample before continuing")).toBeVisible();
+  expect(answer).not.toHaveBeenCalled(); expect(resume).not.toHaveBeenCalled();
 });

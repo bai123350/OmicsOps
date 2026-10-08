@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as preferencesApi from "../../conversation-preferences-api";
 import * as contextApi from "../../context-usage-api";
@@ -1913,4 +1913,11 @@ it("blocks compaction for pending approval, unresolved dispatch, multiple questi
   }
   view.rerender(<WorkspaceShell {...compactProps} agentBusy />); expect(screen.getByRole("button", { name: "Compact context" })).toBeDisabled();
   view.rerender(<WorkspaceShell {...compactProps} conversationHydrating />); expect(screen.getByRole("button", { name: "Compact context" })).toBeDisabled();
+});
+
+// Each test represents a distinct durable run; the operation ledger now survives
+// component unmounts for the lifetime of this window, as real project navigation does.
+beforeEach(() => {
+  const runId = crypto.randomUUID();
+  compactQuestion.run_id = runId; compactPlan.run_id = runId; compactProps.activeRunId = runId;
 });
