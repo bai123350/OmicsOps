@@ -53,7 +53,11 @@ fn write_export(path: &Path, format: ConversationExportFormat, bytes: &[u8]) -> 
     write_export_bytes(path, extension(format), bytes)
 }
 
-pub(crate) fn write_export_bytes(path: &Path, expected_extension: &str, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_export_bytes(
+    path: &Path,
+    expected_extension: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
     if !path
         .extension()
         .and_then(|value| value.to_str())
@@ -154,10 +158,15 @@ mod tests {
         png[16..20].copy_from_slice(&480_u32.to_be_bytes());
         png[20..24].copy_from_slice(&1_u32.to_be_bytes());
         png[33..].copy_from_slice(b"\0\0\0\0IEND\xaeB`\x82");
-        for (format, original) in [(ConversationExportFormat::Html, html.as_slice()), (ConversationExportFormat::Png, png.as_slice())] {
+        for (format, original) in [
+            (ConversationExportFormat::Html, html.as_slice()),
+            (ConversationExportFormat::Png, png.as_slice()),
+        ] {
             let decoded = decode_export(&request(format, original)).unwrap();
             assert_eq!(decoded, original);
-            let path = directory.path().join(format!("existing.{}", extension(format)));
+            let path = directory
+                .path()
+                .join(format!("existing.{}", extension(format)));
             std::fs::write(&path, b"old").unwrap();
             write_export(&path, format, &decoded).unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), original);
@@ -174,6 +183,12 @@ mod tests {
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 4);
         png[16..20].copy_from_slice(&479_u32.to_be_bytes());
         assert!(decode_export(&request(ConversationExportFormat::Png, &png)).is_err());
-        assert!(decode_export(&request(ConversationExportFormat::Html, b"<!DOCTYPE html><html></html>")).is_err());
+        assert!(
+            decode_export(&request(
+                ConversationExportFormat::Html,
+                b"<!DOCTYPE html><html></html>"
+            ))
+            .is_err()
+        );
     }
 }
