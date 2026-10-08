@@ -2,7 +2,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use omicsops_core::redaction::redact_secrets;
 use omicsops_dto::{
     RunDiagnosticEventV4, RunDiagnosticStatusV4, RunDiagnosticUsageV4,
     RunDiagnosticsFilterSummaryV4, RunDiagnosticsRequestV4, RunDiagnosticsSnapshotV4,
@@ -45,12 +44,52 @@ fn validate_request(request: &RunDiagnosticsRequestV4) -> Result<(), String> {
 }
 
 fn tool_label(value: &str, request: &RunDiagnosticsRequestV4) -> String {
-    let mut label = redact_secrets(&public_text(value), &request.redaction_keywords);
-    let mut end = label.len().min(MAX_LABEL_BYTES);
-    while !label.is_char_boundary(end) {
-        end -= 1;
+    let original = public_text(value);
+    let keywords = request
+        .redaction_keywords
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let match_end = |offset: usize| {
+        keywords
+            .iter()
+            .filter(|keyword| original[offset..].starts_with(**keyword))
+            .map(|keyword| offset + keyword.len())
+            .max()
+            .unwrap_or(offset)
+    };
+    let mut label = String::with_capacity(MAX_LABEL_BYTES);
+    let mut cursor = 0;
+    while cursor < original.len() && label.len() < MAX_LABEL_BYTES {
+        let next = cursor + original[cursor..].chars().next().expect("remaining text").len_utf8();
+        let mut covered_end = match_end(cursor);
+        let piece = if covered_end > cursor {
+            // Longest match at the leftmost position; merge every intersecting
+            // original span so another keyword's suffix cannot become visible.
+            // Each original character start is scanned at most once, against
+            // the bounded keyword set. Emitted markers never enter this scan.
+            let mut scan = next;
+            while scan < covered_end {
+                covered_end = covered_end.max(match_end(scan));
+                scan += original[scan..].chars().next().expect("covered text").len_utf8();
+            }
+            "[REDACTED]"
+        } else {
+            covered_end = next;
+            &original[cursor..next]
+        };
+        // Match against the complete original text, then bound allocation while
+        // emitting. A keyword crossing the display cutoff is still fully masked.
+        let mut end = piece.len().min(MAX_LABEL_BYTES - label.len());
+        while !piece.is_char_boundary(end) {
+            end -= 1;
+        }
+        label.push_str(&piece[..end]);
+        if end < piece.len() {
+            break;
+        }
+        cursor = covered_end;
     }
-    label.truncate(end);
     label
 }
 
@@ -1073,6 +1112,72 @@ mod tests {
             .await
             .unwrap();
         (store, req)
+    }
+
+    #[tokio::test]
+    async fn run_diagnostics_projection_keywords_duplicate_markers_stay_bounded() {
+        let (store, mut req) = stored_fixture().await;
+        req.filter.tool_id = Some("E".into());
+        req.redaction_keywords = vec!["E".into(); 2];
+        // Keep this gate before the 32-keyword regression. The old recursive
+        // implementation fails safely here after only two tiny replacements.
+        let small = load_run_diagnostics(&store, &req).await.unwrap();
+        assert_eq!(small.filter_summary.tool_label.as_deref(), Some("[REDACTED]"));
+
+        req.redaction_keywords = vec!["E".into(); 32];
+        let empty = load_run_diagnostics(&store, &req).await.unwrap();
+        assert_eq!(empty.filter_summary.tool_label.as_deref(), Some("[REDACTED]"));
+        assert!(empty.events.is_empty());
+        assert!(!serde_json::to_string(&empty).unwrap().contains("redaction_keywords"));
+
+        let events = chain(30, vec![(0, start("call", "E"))]);
+        store.append_agent_event_v4(&events[0]).await.unwrap();
+        let snapshot = load_run_diagnostics(&store, &req).await.unwrap();
+        assert_eq!(snapshot.events[0].tool_label.as_deref(), Some("[REDACTED]"));
+        assert_eq!(snapshot.filter_summary.tool_label, snapshot.events[0].tool_label);
+    }
+
+    #[test]
+    fn run_diagnostics_projection_keywords_overlap_and_interact_only_with_original_text() {
+        let mut req = request();
+        req.filter.tool_id = Some("SECRET SECRETIVE E".into());
+        req.redaction_keywords = vec!["E".into(), "SECRET".into(), "SECRETIVE".into(), "[REDACTED]".into()];
+        let events = chain(30, vec![(0, start("call", "SECRET SECRETIVE E"))]);
+        let snapshot = project_run_diagnostics(&events, &req).unwrap();
+        let expected = Some("[REDACTED] [REDACTED] [REDACTED]");
+        assert_eq!(snapshot.events[0].tool_label.as_deref(), expected);
+        assert_eq!(snapshot.filter_summary.tool_label.as_deref(), expected);
+        assert!(!serde_json::to_string(&snapshot).unwrap().contains("SECRET"));
+        req.redaction_keywords.reverse();
+        assert_eq!(project_run_diagnostics(&events, &req).unwrap(), snapshot);
+
+        req.filter.tool_id = Some("abcde abcd".into());
+        req.redaction_keywords = vec!["abc".into(), "bcde".into(), "bcd".into()];
+        let events = chain(30, vec![(0, start("call", "abcde abcd"))]);
+        let snapshot = project_run_diagnostics(&events, &req).unwrap();
+        assert_eq!(snapshot.events[0].tool_label.as_deref(), Some("[REDACTED] [REDACTED]"));
+        assert_eq!(snapshot.filter_summary.tool_label, snapshot.events[0].tool_label);
+    }
+
+    #[test]
+    fn run_diagnostics_projection_keywords_match_full_secret_before_utf8_cutoff() {
+        let mut req = request();
+        req.redaction_keywords = vec!["PRIVATE_SENTINEL".into(), "界界".into(), "E".into()];
+        let crossing = format!("{}PRIVATE_SENTINEL", "x".repeat(250));
+        let labels = [crossing, format!("{}界", "x".repeat(255)), "界界".repeat(100_000), "E".repeat(100_000)];
+        for (index, label) in labels.iter().enumerate() {
+            let snapshot = project_run_diagnostics(&chain(30, vec![(0, start("call", label))]), &req).unwrap();
+            let actual = snapshot.events[0].tool_label.as_ref().unwrap();
+            assert!(actual.len() <= 256);
+            match index {
+                0 => assert_eq!(actual, &("x".repeat(250) + "[REDAC")),
+                1 => assert_eq!(actual, &"x".repeat(255)),
+                2 => assert_eq!(actual, "[REDACTED]"),
+                _ => assert_eq!(actual, &("[REDACTED]".repeat(25) + "[REDAC")),
+            }
+            assert!(!actual.contains("PRIVATE"));
+            assert!(!actual.contains('界'));
+        }
     }
 
     #[tokio::test]
