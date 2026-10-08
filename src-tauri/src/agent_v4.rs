@@ -14763,8 +14763,26 @@ pub(crate) mod manual_compaction_host_tests {
         CompactContextRequestV4,
         ModelProfile,
     ) {
+        fixture_with_storage(ssh, images, false).await
+    }
+    async fn fixture_with_storage(
+        ssh: bool,
+        images: bool,
+        durable: bool,
+    ) -> (
+        tempfile::TempDir,
+        AppState,
+        CompactContextRequestV4,
+        ModelProfile,
+    ) {
         let dir = tempfile::tempdir().unwrap();
-        let repository = Store::open_in_memory().await.unwrap();
+        let repository = if durable {
+            Store::open(dir.path().join("recovery.sqlite"))
+                .await
+                .unwrap()
+        } else {
+            Store::open_in_memory().await.unwrap()
+        };
         let mut project = Project::new(
             Uuid::new_v4(),
             "manual",
@@ -14847,7 +14865,11 @@ pub(crate) mod manual_compaction_host_tests {
             &request,
             run_id,
             "[]",
-            BTreeSet::from(["project.read".into()]),
+            if durable {
+                BTreeSet::from(["project.read".into(), "agent.read_tool_result".into()])
+            } else {
+                BTreeSet::from(["project.read".into()])
+            },
             DirectRunSnapshotV4 {
                 model_configuration_hash: profile.execution_configuration_hash(),
                 conversation_preferences: omicsops_protocol::ConversationAgentPreferencesV4 {
@@ -14900,6 +14922,23 @@ pub(crate) mod manual_compaction_host_tests {
                 reason: AgentInputReasonV4::Decision,
             },
         ] {
+            if durable && matches!(&kind, AgentEventKindV4::InputRequested { .. }) {
+                event = AgentEventV4::next(
+                    &event,
+                    Utc::now(),
+                    AgentEventKindV4::ToolFinished {
+                        outcome: ToolOutcomeV4 {
+                            call_id: "old-evidence".into(),
+                            tool_id: "project.read".into(),
+                            succeeded: true,
+                            model_content: "verified original evidence ".repeat(900),
+                            data: json!({"source":"original"}),
+                            provenance: vec![],
+                        },
+                    },
+                );
+                repository.append_agent_event_v4(&event).await.unwrap();
+            }
             event = AgentEventV4::next(&event, Utc::now(), kind);
             repository.append_agent_event_v4(&event).await.unwrap();
         }
@@ -14965,6 +15004,261 @@ pub(crate) mod manual_compaction_host_tests {
         .await
     }
 
+    struct RecoveryEvents(Store);
+    #[async_trait]
+    impl EventStoreV4 for RecoveryEvents {
+        async fn append(&self, event: &AgentEventV4) -> Result<(), String> {
+            self.0
+                .append_agent_event_v4(event)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        async fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String> {
+            self.0
+                .agent_events_v4(run_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        async fn archive_context(
+            &self,
+            _: Uuid,
+            _: &str,
+            _: &ContextCheckpointV4,
+        ) -> Result<ContextArchiveV4, String> {
+            panic!("explicit resume must reuse the durable manual checkpoint")
+        }
+    }
+    struct RecoveryModel {
+        desktop: Arc<DesktopModelPortV4>,
+        repository: Store,
+        source: AgentEventV4,
+        requests: std::sync::Mutex<Vec<ModelRequestV4>>,
+    }
+    #[async_trait]
+    impl ModelPortV4 for RecoveryModel {
+        fn prompt_layers(&self) -> PromptLayersV4 {
+            self.desktop.prompt_layers()
+        }
+        fn supports_native_replay(&self) -> bool {
+            self.desktop.supports_native_replay()
+        }
+        fn validate_request(&self, request: &ModelRequestV4) -> Result<(), ModelFailureV4> {
+            self.desktop.validate_request(request)
+        }
+        fn usage_metadata(&self) -> ModelUsageMetadataV4 {
+            self.desktop.usage_metadata()
+        }
+        fn usage_request_metadata(&self, request: &ModelRequestV4) -> ModelUsageRequestMetadataV4 {
+            self.desktop.usage_request_metadata(request)
+        }
+        async fn stream(
+            &self,
+            request: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            self.requests.lock().unwrap().push(request);
+            let events = self
+                .repository
+                .agent_events_v4(self.source.run_id)
+                .await
+                .unwrap();
+            let pages: Vec<_> = events
+                .iter()
+                .filter_map(|e| match &e.event {
+                    AgentEventKindV4::ToolFinished { outcome }
+                        if outcome.call_id.starts_with("recovery-page-") =>
+                    {
+                        Some(outcome)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let offset = pages
+                .last()
+                .map(|p| p.data["next_offset"].as_u64())
+                .unwrap_or(Some(0));
+            let call = if let Some(offset) = offset {
+                ToolCallV4 {
+                    call_id: format!("recovery-page-{}", pages.len()),
+                    tool_id: "agent.read_tool_result".into(),
+                    arguments: json!({"sequence":self.source.sequence,"event_hash":self.source.event_hash,"field":"model_content","offset":offset,"limit":8192}),
+                }
+            } else {
+                ToolCallV4 {
+                    call_id: "after-recovery".into(),
+                    tool_id: "agent.request_input".into(),
+                    arguments: json!({"question":"Evidence restored; continue?","reason":"decision"}),
+                }
+            };
+            Ok(ModelTurnV4 {
+                public_text: String::new(),
+                provider_continuation: Some(omicsops_protocol::ModelProviderContinuationV4 {
+                    items: vec![omicsops_protocol::ModelReplayItemV4::ToolCall {
+                        call: call.clone(),
+                    }],
+                }),
+                tool_calls: vec![call],
+            })
+        }
+    }
+    #[tokio::test]
+    async fn manual_compaction_reopen_answer_resume_uses_checkpoint_and_pages_original_evidence() {
+        let (dir, mut state, request, _) = fixture_with_storage(false, false, true).await;
+        let before = state
+            .repository
+            .agent_events_v4(request.run_id)
+            .await
+            .unwrap();
+        let source = before.iter().find(|e| matches!(&e.event, AgentEventKindV4::ToolFinished { outcome } if outcome.call_id == "old-evidence")).unwrap().clone();
+        let original = match &source.event {
+            AgentEventKindV4::ToolFinished { outcome } => outcome.model_content.clone(),
+            _ => unreachable!(),
+        };
+        let receipt = compact(dir.path(), &state, &request).await.unwrap();
+        assert_eq!(receipt.status, ContextCompactionStatusV4::Completed);
+        let archived = state
+            .repository
+            .agent_context_archive_v4(receipt.archive.as_ref().unwrap().archive_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let compacted_events = state
+            .repository
+            .agent_events_v4(request.run_id)
+            .await
+            .unwrap();
+        assert!(
+            !compacted_events
+                .iter()
+                .any(|e| matches!(e.event, AgentEventKindV4::UserInputAnswered { .. }))
+        );
+        state.repository.pool().close().await;
+        state.repository = Store::open(dir.path().join("recovery.sqlite"))
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .repository
+                .context_compaction_receipt_v4(&request)
+                .await
+                .unwrap()
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            state
+                .repository
+                .agent_context_archive_v4(receipt.archive.as_ref().unwrap().archive_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            archived
+        );
+        let answer = validate_answer_v4(&compacted_events, "pending-question", "sample-A").unwrap();
+        let answered = AgentEventV4::next(
+            compacted_events.last().unwrap(),
+            Utc::now(),
+            AgentEventKindV4::UserInputAnswered {
+                question_id: "pending-question".into(),
+                answer,
+            },
+        );
+        state
+            .repository
+            .append_agent_event_v4(&answered)
+            .await
+            .unwrap();
+        let record = load_record(&state.repository, request.run_id)
+            .await
+            .unwrap();
+        let spec = record.spec.as_ref().unwrap();
+        let composition = compose_frozen_ordinary_run_v4(&state, &record, spec)
+            .await
+            .unwrap();
+        let model = RecoveryModel {
+            desktop: composition.model,
+            repository: state.repository.clone(),
+            source,
+            requests: Default::default(),
+        };
+        let events = RecoveryEvents(state.repository.clone());
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: composition.tools.registry.as_ref(),
+            events: &events,
+            science: None,
+        };
+        let mut limits = composition.limits;
+        limits.auto_compact = false;
+        let result = core
+            .execute_with_limits(spec, limits, &AtomicBool::new(false))
+            .await;
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::WaitingForInput)),
+            "{result:?}"
+        );
+        let requests = model.requests.lock().unwrap();
+        let first: Value = serde_json::from_str(&requests[0].context).unwrap();
+        let checkpoint = compacted_events
+            .iter()
+            .find_map(|e| match &e.event {
+                AgentEventKindV4::ContextCheckpointed { checkpoint } => Some(checkpoint),
+                _ => None,
+            })
+            .unwrap();
+        // The model view replaces historical science with verified digest metadata.
+        assert_eq!(
+            first["checkpoint"]["scientific_state"]["snapshot_sha256"],
+            json!(hex::encode(sha2::Sha256::digest(
+                serde_json::to_vec(
+                    &serde_json::from_value::<ScientificStateV4>(
+                        checkpoint.scientific_state.clone()
+                    )
+                    .unwrap()
+                )
+                .unwrap()
+            )))
+        );
+        let mut projected = first["checkpoint"].clone();
+        projected["scientific_state"] = checkpoint.scientific_state.clone();
+        assert_eq!(projected, json!(checkpoint));
+        assert!(requests[0].context.contains("sample-A"));
+        drop(requests);
+        let after = state
+            .repository
+            .agent_events_v4(request.run_id)
+            .await
+            .unwrap();
+        assert_eq!(&after[..before.len()], before.as_slice());
+        assert_eq!(
+            after
+                .iter()
+                .filter(|e| matches!(e.event, AgentEventKindV4::ContextCheckpointed { .. }))
+                .count(),
+            1
+        );
+        let pages: Vec<_> = after
+            .iter()
+            .filter_map(|e| match &e.event {
+                AgentEventKindV4::ToolFinished { outcome }
+                    if outcome.call_id.starts_with("recovery-page-") =>
+                {
+                    Some(outcome)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(pages.len() > 1);
+        assert!(pages.iter().all(|p| p.succeeded));
+        assert_eq!(
+            pages
+                .iter()
+                .map(|p| p.data["content"].as_str().unwrap())
+                .collect::<String>(),
+            original
+        );
+        assert!(state.active_runs.lock().unwrap().is_empty());
+    }
     #[tokio::test]
     async fn manual_compaction_host_commits_paused_ordinary_run() {
         let (dir, state, request, _) = fixture().await;

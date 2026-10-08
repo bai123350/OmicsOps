@@ -1,3 +1,4 @@
+import { useContextCompaction } from "./useContextCompaction";
 import { ContextUsagePanel, type ContextUsageView } from "./ContextUsagePanel";
 import { SideChatPanel } from "./SideChatPanel";
 import type { SideChatController, SideChatInput } from "./useSideChat";
@@ -108,6 +109,7 @@ interface Props {
   onSearchRequestHandled?: (key: string) => void;
   contextUsage?: ContextUsageView | null;
   contextUsageError?: boolean;
+  onRefreshContextUsage?: () => Promise<void>;
   sideChat?: SideChatController;
   queueItems?: ComposerQueueItemV4[];
   queueError?: boolean;
@@ -222,7 +224,7 @@ function parseComposerCommand(text: string): ComposerCommandInvocation | null {
   return { id: match[1].toLowerCase(), args: match[2] ?? "", raw };
 }
 
-export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSettings, onBackToProjects, onOpenSourceConversation, onRegisterNavigationGuard, conversations = [], activeConversationId, capabilitySummary, capabilitiesLoading, capabilitiesError, onRefreshCapabilities, onSelectConversation, onNewConversation, onDeleteConversation, onOpenBranch, onBranchSend, branchSendOriginalMarkdown, branchSendBusy = false, branchSendPending = false, branchSendError = false, onRetryBranchSend, onSend, onQueue, replacement, sideChat, contextUsage = null, contextUsageError = false, queueItems = [], queueError = false, queueLoading = false, onQueueRefresh, referenceCatalog, workflowCatalogVersion = 0, onOpenSearch, searchRequest, onSearchRequestHandled, onSuggestFollowUps, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", conversationLoadError = "", onRetryConversationLoad, agentRetryNotice = "", modelLabel, activeModelProfile, modelProfiles = [], modelPicker, composerBusy = false, modelOptions = [], modelId, onModelChange, agentMode, onAgentModeChange, conversationLocked = false, conversationHydrating = false, planActionBusy = false, v4Plan, latestPlanRevision, computeBackends = [], runtimeDraftSelection = null, computeBackendId = "", containerImage = "", autonomyMode = "supervised", approvalPolicy = "auto_approve_except_local_deletion", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onApprovalPolicyChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onRequestPlanRevision, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, activeRunLastActivityAt, agentRunEventsV4 = [], agentTextPreview, agentReasoningPreview, agentModelActivity, guidanceAvailable = false, onAnswerAgentQuestionV4, onDecideToolApprovalV4, onResolveUncertainV4, onResumeAgentRunV4, onCancelRuntimeRecoveryV4, onCloseBrowserRunTabsV4, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
+export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSettings, onBackToProjects, onOpenSourceConversation, onRegisterNavigationGuard, conversations = [], activeConversationId, capabilitySummary, capabilitiesLoading, capabilitiesError, onRefreshCapabilities, onSelectConversation, onNewConversation, onDeleteConversation, onOpenBranch, onBranchSend, branchSendOriginalMarkdown, branchSendBusy = false, branchSendPending = false, branchSendError = false, onRetryBranchSend, onSend, onQueue, replacement, sideChat, contextUsage = null, contextUsageError = false, onRefreshContextUsage, queueItems = [], queueError = false, queueLoading = false, onQueueRefresh, referenceCatalog, workflowCatalogVersion = 0, onOpenSearch, searchRequest, onSearchRequestHandled, onSuggestFollowUps, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", conversationLoadError = "", onRetryConversationLoad, agentRetryNotice = "", modelLabel, activeModelProfile, modelProfiles = [], modelPicker, composerBusy = false, modelOptions = [], modelId, onModelChange, agentMode, onAgentModeChange, conversationLocked = false, conversationHydrating = false, planActionBusy = false, v4Plan, latestPlanRevision, computeBackends = [], runtimeDraftSelection = null, computeBackendId = "", containerImage = "", autonomyMode = "supervised", approvalPolicy = "auto_approve_except_local_deletion", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onApprovalPolicyChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onRequestPlanRevision, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, activeRunLastActivityAt, agentRunEventsV4 = [], agentTextPreview, agentReasoningPreview, agentModelActivity, guidanceAvailable = false, onAnswerAgentQuestionV4, onDecideToolApprovalV4, onResolveUncertainV4, onResumeAgentRunV4, onCancelRuntimeRecoveryV4, onCloseBrowserRunTabsV4, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
   const t = copy[locale];
   const zh = locale === "zh-CN";
   const { selectionActionsEnabled } = useGeneralPreferences();
@@ -718,6 +720,30 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
       && !hasApprovalPlan,
   );
   const guidanceEnabled = guidanceDialogAvailable && runStarted && !runFinished && !runPaused && !runStopping;
+  const compactionScopeKey = JSON.stringify([project.id, activeConversationId, effectiveActiveRunId]);
+  const compactionIds = useRef(new Map<string, string>());
+  if (!compactionIds.current.has(compactionScopeKey)) compactionIds.current.set(compactionScopeKey, crypto.randomUUID());
+  const compactEvents = currentScopeRunEventsV4.filter((item) => item.run_id === effectiveActiveRunId);
+  const unanswered = compactEvents.filter((item) => item.event.kind === "input_requested" && !compactEvents.some((answer) => answer.event.kind === "user_input_answered" && item.event.kind === "input_requested" && answer.event.question_id === item.event.question_id));
+  const pendingApproval = compactEvents.some((item) => item.event.kind === "tool_approval_requested" && !compactEvents.some((decision) => decision.event.kind === "tool_approval_decided" && item.event.kind === "tool_approval_requested" && decision.event.approval_id === item.event.request.approval_id));
+  const pendingDispatch = compactEvents.some((item) => (item.event.kind === "tool_dispatch_started" || item.event.kind === "tool_dispatch_uncertain") && !compactEvents.some((settled) => ((settled.event.kind === "tool_finished" && settled.event.outcome.call_id === (item.event as { call_id: string }).call_id) || (settled.event.kind === "tool_dispatch_resolved" && settled.event.call_id === (item.event as { call_id: string }).call_id)) && settled.sequence > item.sequence));
+  const compactEnabled = Boolean(activeConversationId && effectiveActiveRunId && v4Plan?.run_id === effectiveActiveRunId
+    && v4Plan.status === "waiting_for_input" && v4Plan.session_mode === "agent" && !v4Plan.approval_hash
+    && !hasApprovalPlan && !planModeEnabled && !planLoading && !planActionBusy && !conversationHydrating
+    && !agentBusy && !runStopping && !runFinished && unanswered.length === 1 && !pendingApproval && !pendingDispatch
+    && !guidanceDialogOpen && !guidancePendingRequestsRef.current.get(`${project.id}:${activeConversationId}:${effectiveActiveRunId}`)?.current);
+  const compaction = useContextCompaction(activeConversationId && effectiveActiveRunId ? {
+    project_id: project.id, conversation_id: activeConversationId, run_id: effectiveActiveRunId,
+    request_id: compactionIds.current.get(compactionScopeKey)!,
+  } : null, compactEnabled);
+  const refreshedCompaction = useRef<string | null>(null);
+  useEffect(() => {
+    if (!compaction.receipt || refreshedCompaction.current === compaction.receipt.request_id) return;
+    refreshedCompaction.current = compaction.receipt.request_id;
+    // Usage refresh has its own error state; a confirmed receipt stays successful.
+    void (async () => { try { await onRefreshContextUsage?.(); } catch { /* The usage hook owns refresh errors. */ } })();
+  }, [compaction.receipt, onRefreshContextUsage]);
+
 
   useEffect(() => { if (!controlledMode) setLocalMode("agent"); setPlanSessionActive(false); }, [activeConversationId, controlledMode]);
   useEffect(() => {
@@ -1244,7 +1270,7 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
     {workflowLibraryOpen && <WorkflowLibraryDialog key={project.id} projectId={project.id} zh={zh} onClose={() => { setWorkflowLibraryOpen(false); draftRef.current?.focus(); }} onChanged={() => setLocalWorkflowCatalogVersion((value) => value + 1)} />}
     {projectTemplatePickerOpen && <ProjectTemplatePicker key={project.id} selectedProject={project} locale={locale} onSelectWorkflow={insertQuickActionWorkflow} onSelectSpecialist={insertSpecialistDraft} onClose={() => { setProjectTemplatePickerOpen(false); draftRef.current?.focus(); }} />}
     {sharing && <ShareConversationDialog key={`${project.id}:${activeConversationId}`} messages={messages} locale={locale} onClose={() => { setSharing(false); draftRef.current?.focus(); }} />}
-    {contextUsageOpen && <ContextUsagePanel error={contextUsageError} value={contextUsage} locale={locale} onClose={() => setContextUsageOpen(false)} onNewConversation={!conversationHydrating && !agentBusy && !conversationLocked && onNewConversation ? () => { setContextUsageOpen(false); void onNewConversation(); } : undefined} />}
+    {contextUsageOpen && <ContextUsagePanel onCompact={() => void compaction.compact()} compactDisabled={!compactEnabled} compactBusy={compaction.busy} compactReceipt={compaction.receipt} compactError={compaction.error} error={contextUsageError} value={contextUsage} locale={locale} onClose={() => setContextUsageOpen(false)} onNewConversation={!conversationHydrating && !agentBusy && !conversationLocked && onNewConversation ? () => { setContextUsageOpen(false); void onNewConversation(); } : undefined} />}
     {sidebarOpen && <aside id="workspace-sidebar" className={`context-pane workspace-sidebar ${workspacePage !== "conversation" ? "workspace-content-hidden" : ""}`} hidden={workspacePage !== "conversation"} aria-label={t.context}>
       <div className="sidebar-heading">
         <div className="sidebar-tab-scroll" role="tablist" aria-label={zh ? "已打开的侧栏标签" : "Open sidebar tabs"}>

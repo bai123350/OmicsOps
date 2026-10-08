@@ -49,7 +49,7 @@ it("supports docking and immediate window Escape with focus restoration", () => 
   view.unmount(); expect(trigger).toHaveFocus(); trigger.remove();
 });
 
-it("closes only the top usage panel with one Escape", () => {
+it("context_panel_immediate_escape_keeps_parent", () => {
   const parentClose = vi.fn();
   function Parent() {
     const [open, setOpen] = useState(false);

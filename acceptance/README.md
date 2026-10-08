@@ -686,3 +686,55 @@ Remove-Item Env:OMICSOPS_LIVE_R_INSPECTION_DISPOSABLE
 ```
 
 必须记录实际命令和结果。默认测试中的 ignored 不代表通过；未显式执行时记录“未执行”。mock transport 和 Python AST helper 测试不证明真实 R 或 SSH 端到端验收。检查只返回基础元数据，不强制 promise 或调用用户方法；未求值表达式与 S3/S4 保守保持 opaque。SSH readiness 只检查当前 buffer/russh 可观测队列，不保证 clean 检查后任意网络帧不会到达。已派发检查/执行的等待被取消时会话不再复用，不表示远端计算已取消。
+
+## Paused ordinary Run manual context compaction (W05)
+
+Deterministic regression commands (no provider credentials or SSH):
+
+```powershell
+npx vitest run src/features/workspace/useContextCompaction.test.tsx src/features/workspace/ContextUsagePanel.test.tsx src/features/workspace/WorkspaceShell.test.tsx
+cargo test -p omicsops-desktop --lib manual_compaction_reopen_answer_resume
+```
+
+The Rust regression commits through the actual host flow into a disposable file
+SQLite database, closes and reopens it, validates and persists an explicit answer,
+and runs the ordinary core with the frozen desktop composition and a scripted
+provider transport. It checks the same durable checkpoint, unchanged source
+chain and paginated original evidence. This is deterministic recovery evidence,
+not a live model/SSH or native GUI acceptance result.
+
+Windows manual smoke (record separately as passed, failed or not executed):
+
+1. Use a disposable project and ordinary Agent run paused on exactly one question.
+   Type an answer draft, open `/context`, then compact. Double-click and close /
+   reopen the panel while pending: at most one operation should be in flight.
+   Confirm a success or no-change receipt, unchanged question, draft and visible
+   history. No answer, resume, compute initialization or SSH connection should
+   occur. Usage refresh failure must not turn a confirmed receipt into a failed
+   compaction. Bytes are admission/context sizes, not provider token usage.
+2. Retry an unconfirmed failure: keep the same request identity. After a known
+   success, another explicit click begins a new operation. Switch conversation,
+   project or run while pending: the late receipt/error must not appear in the
+   new scope; returning while the original request is pending must not duplicate
+   it. Closing the UI does not cancel the host transaction.
+3. Open the usage panel over an existing closeable layer and immediately press
+   Escape on the window: only the top panel closes. Press again to close its
+   parent. Test both docked and floating panel modes without moving focus inside.
+4. Confirm planning / approved-plan / running / stopping / multiple-question /
+   tool-approval states refuse compaction. The host also rejects an active driver,
+   pending guidance, unresolved side effects, changed frozen bindings and
+   insufficient full-request budget; retain the question and original evidence.
+   Do not interpret `unknown` dispatch as cancelled or solve it by compacting.
+5. After successful compaction restart the disposable app, reopen the same run,
+   explicitly answer and resume, and inspect original evidence through its
+   recorded references. New answers, rule files and scientific changes require
+   fresh resume admission; the compaction receipt certifies only its snapshot.
+   Compare the archive/checkpoint and frozen specification identity before and
+   after recovery. A deterministic checkpoint does not replace original evidence.
+
+Run `cargo test --workspace`, `npm test`, `npm run build`,
+`npm run build:desktop`, formatting and whitespace checks before delivery. A built
+installer is not an installation or GUI smoke pass. Real provider/SSH/R/Micromamba
+or PBMC workflows require the disposable-environment procedures above and an
+explicit recorded run; ignored tests, this scripted transport and successful
+builds must never be reported as that acceptance.

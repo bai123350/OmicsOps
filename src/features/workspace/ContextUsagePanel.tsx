@@ -1,5 +1,6 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import { useWindowEscapeLayer } from "../settings/BrowserSettings";
+import type { ContextCompactionReceiptV4 } from "../../types";
 import type { Locale } from "./copy";
 import "./context-usage.css";
 
@@ -21,7 +22,8 @@ export interface ContextUsageView {
   serializedRequestBytes?: number | null;
   imageBoundTokens?: number | null;
 }
-export function ContextUsagePanel({ value, locale, onClose, onNewConversation, onCompact, compactDisabled = true, error = false }: {
+export function ContextUsagePanel({ value, locale, onClose, onNewConversation, onCompact, compactDisabled = true, compactBusy = false, compactReceipt = null, compactError = false, error = false }: {
+  compactBusy?: boolean; compactReceipt?: ContextCompactionReceiptV4 | null; compactError?: boolean;
   error?: boolean; value: ContextUsageView | null; locale: Locale; onClose: () => void;
   onNewConversation?: () => void; onCompact?: () => void; compactDisabled?: boolean;
 }) {
@@ -89,7 +91,10 @@ export function ContextUsagePanel({ value, locale, onClose, onNewConversation, o
       {details && <dl><dt>{zh ? "推理 tokens" : "Reasoning tokens"}</dt><dd>{number(value?.reasoningTokens)}</dd><dt>{zh ? "缓存读取 tokens" : "Cache read tokens"}</dt><dd>{number(value?.cacheReadTokens)}</dd><dt>{zh ? "缓存写入 tokens" : "Cache creation tokens"}</dt><dd>{number(value?.cacheCreationTokens)}</dd><dt>{zh ? "序列化请求 bytes" : "Serialized request bytes"}</dt><dd>{number(value?.serializedRequestBytes)}</dd><dt>{zh ? "图像 tokens 保守上界" : "Conservative image token bound"}</dt><dd>{number(value?.imageBoundTokens)}</dd></dl>}
       {details && Boolean(value?.breakdown?.length) && <dl>{value!.breakdown!.map((row, index) => <div className="context-usage-breakdown" key={`${row.category}:${index}`}><dt>{row.category}</dt><dd>{row.estimated ? "≈ " : ""}{row.tokens != null ? `${number(row.tokens)} tokens` : row.bytes != null ? `${number(row.bytes)} bytes` : number(null)}</dd></div>)}</dl>}
       <p className="context-usage-note">{zh ? "请求字节数与图像预算用于容量检查，不是提供商实际用量。缓存分项不重复计入输入或输出。" : "Request bytes and image bounds are admission estimates, not provider usage. Cache facets are not added again to input or output."}</p>
-      <footer><button type="button" disabled={!onCompact || compactDisabled} onClick={onCompact}>{zh ? "压缩上下文" : "Compact context"}</button><button type="button" disabled={!onNewConversation} onClick={onNewConversation}>{zh ? "新建会话" : "New conversation"}</button></footer>
+      {compactError && <p role="alert">{zh ? "无法确认压缩结果，请重试查询同一次操作；原问题仍待回答。" : "Compaction could not be confirmed. Retry the same operation; the question still awaits your answer."}</p>}
+      {compactReceipt && <p role="status">{compactReceipt.status === "completed" ? (zh ? "上下文已压缩。" : "Context compacted.") : (zh ? "上下文无需再次压缩。" : "No further compaction needed.")} {zh ? "待回答问题和原始证据保留；请自行回答后继续。" : "The question and original evidence remain; answer explicitly to continue."} {compactReceipt.after_bytes != null && `${number(compactReceipt.before_bytes)} → ${number(compactReceipt.after_bytes)} bytes`} {compactReceipt.provider_request_bytes != null && (zh ? `本次请求预算 ${number(compactReceipt.provider_request_bytes)} bytes。` : `Admitted request: ${number(compactReceipt.provider_request_bytes)} bytes.`)}</p>}
+      <p>{zh ? "仅支持等待一个回答的普通运行。宿主会复查指导、审批和执行状态；本次准入不保证回答或规则变化后仍可恢复。" : "Available for ordinary runs awaiting one answer. The host rechecks guidance, approvals and execution state; admission applies only to this snapshot and is checked again after answers or rules change."}</p>
+      <footer><button type="button" disabled={!onCompact || compactDisabled || compactBusy} onClick={onCompact}>{compactBusy ? (zh ? "压缩中…" : "Compacting…") : (zh ? "压缩上下文" : "Compact context")}</button><button type="button" disabled={!onNewConversation} onClick={onNewConversation}>{zh ? "新建会话" : "New conversation"}</button></footer>
     </div>
   </section>;
 }

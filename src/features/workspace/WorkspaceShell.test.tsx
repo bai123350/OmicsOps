@@ -2,6 +2,8 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import * as preferencesApi from "../../conversation-preferences-api";
+import * as contextApi from "../../context-usage-api";
+import type { AgentRunEventV4, ContextCompactionReceiptV4, RunSummaryV4 } from "../../types";
 import * as projectTemplatesApi from "../../project-templates-api";
 import * as workflowApi from "../../composer-workflow-api";
 import * as guidanceApi from "../../tauri-api";
@@ -1839,4 +1841,76 @@ it("reports a clipboard failure without removing the answer", async () => {
     if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard);
     else Reflect.deleteProperty(navigator, "clipboard");
   }
+});
+const compactQuestion: AgentRunEventV4 = { schema_version: 4, project_id: project.id, conversation_id: "compact-c", run_id: "compact-r", sequence: 1, occurred_at: "now", previous_hash: "", event_hash: "h", event: { kind: "input_requested", question_id: "sample", question: "Which sample should continue?" } };
+const compactPlan: RunSummaryV4 = { run_id: "compact-r", status: "waiting_for_input", session_mode: "agent", plan: null, plan_hash: null, approval_hash: null, compute_selection: null };
+const compactProps = { project, locale: "en-US" as const, activeConversationId: "compact-c", activeRunId: "compact-r", v4Plan: compactPlan, agentRunEventsV4: [compactQuestion], runStarted: true };
+function openCompaction() { fireEvent.click(screen.getByRole("button", { name: "Inspect context usage" })); return screen.getByRole("button", { name: "Compact context" }); }
+it("manual_compact_button_requires_ordinary_pause", () => {
+  const view = render(<WorkspaceShell {...compactProps} />);
+  expect(openCompaction()).toBeEnabled();
+  for (const patch of [{ status: "running" }, { status: "completed" }, { session_mode: "plan" as const }, { approval_hash: "approved" }]) {
+    view.rerender(<WorkspaceShell {...compactProps} v4Plan={{ ...compactPlan, ...patch }} />);
+    expect(screen.getByRole("button", { name: "Compact context" })).toBeDisabled();
+  }
+  view.rerender(<WorkspaceShell {...compactProps} runStopping />); expect(screen.getByRole("button", { name: "Compact context" })).toBeDisabled();
+  view.rerender(<WorkspaceShell {...compactProps} agentRunEventsV4={[compactQuestion, { ...compactQuestion, sequence: 2, event: { kind: "user_input_answered", question_id: "sample", answer: "A" } }]} />); expect(screen.getByRole("button", { name: "Compact context" })).toBeDisabled();
+});
+it("manual_compact_discards_late_scope_and_retains_question", async () => {
+  const pending = deferred<ContextCompactionReceiptV4>(); const compact = vi.spyOn(contextApi, "compactContextV4").mockReturnValue(pending.promise);
+  const answer = vi.fn(); const resume = vi.fn(); const refresh = vi.fn().mockResolvedValue(undefined);
+  const props = { ...compactProps, onAnswerAgentQuestionV4: answer, onResumeAgentRunV4: resume, onRefreshContextUsage: refresh };
+  const view = render(<WorkspaceShell {...props} />);
+  fireEvent.change(screen.getByRole("textbox", { name: "Answer V4 question" }), { target: { value: "draft answer" } });
+  fireEvent.click(openCompaction()); fireEvent.click(screen.getByRole("button", { name: /Compacting/ }));
+  expect(compact).toHaveBeenCalledTimes(1); expect(screen.getByText("Which sample should continue?")).toBeVisible();
+  expect(screen.getByRole("textbox", { name: "Answer V4 question" })).toHaveValue("draft answer");
+  view.rerender(<WorkspaceShell {...props} activeConversationId="new-c" />);
+  await act(async () => pending.resolve({ ...compact.mock.calls[0][0], status: "completed", before_bytes: 9000, after_bytes: 1000, source_through_sequence: 1, source_head_hash: "h", created_at: "now", updated_at: "now" }));
+  openCompaction(); expect(screen.queryByText(/Context compacted/)).toBeNull();
+  expect(answer).not.toHaveBeenCalled(); expect(resume).not.toHaveBeenCalled(); expect(refresh).not.toHaveBeenCalled();
+});
+it("manual_compact_error_does_not_resume", async () => {
+  const compact = vi.spyOn(contextApi, "compactContextV4").mockRejectedValue(new Error("SECRET raw exception"));
+  const answer = vi.fn(); const resume = vi.fn();
+  render(<WorkspaceShell {...compactProps} onAnswerAgentQuestionV4={answer} onResumeAgentRunV4={resume} />);
+  fireEvent.click(openCompaction());
+  expect(await screen.findByText(/Compaction could not be confirmed/)).toBeVisible();
+  expect(screen.queryByText(/SECRET/)).toBeNull(); expect(screen.getByText("Which sample should continue?")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "Compact context" }));
+  await waitFor(() => expect(compact).toHaveBeenCalledTimes(2));
+  expect(compact.mock.calls[0][0].request_id).toBe(compact.mock.calls[1][0].request_id);
+  expect(answer).not.toHaveBeenCalled(); expect(resume).not.toHaveBeenCalled();
+});
+it("keeps a confirmed receipt when usage refresh fails and refreshes only once", async () => {
+  const compact = vi.spyOn(contextApi, "compactContextV4").mockImplementation(async (request) => ({ ...request, status: "completed", before_bytes: 9000, after_bytes: 1000, source_through_sequence: 1, source_head_hash: "h", created_at: "now", updated_at: "now" }));
+  const refresh = vi.fn().mockRejectedValue(new Error("usage unavailable"));
+  const answer = vi.fn(); const resume = vi.fn();
+  render(<WorkspaceShell {...compactProps} onRefreshContextUsage={refresh} onAnswerAgentQuestionV4={answer} onResumeAgentRunV4={resume} messages={[{ id: "old", role: "assistant", markdown: "Original evidence stays visible" }]} />);
+  fireEvent.change(screen.getByRole("textbox", { name: "Answer V4 question" }), { target: { value: "draft retained" } });
+  fireEvent.click(openCompaction());
+  expect(await screen.findByText(/Context compacted/)).toBeVisible();
+  expect(refresh).toHaveBeenCalledTimes(1); expect(compact).toHaveBeenCalledTimes(1);
+  expect(screen.queryByText(/Compaction could not be confirmed/)).toBeNull();
+  expect(screen.getByText("Original evidence stays visible")).toBeVisible();
+  expect(screen.getByRole("textbox", { name: "Answer V4 question" })).toHaveValue("draft retained");
+  expect(answer).not.toHaveBeenCalled(); expect(resume).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Compact context" }));
+  await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+  expect(compact.mock.calls[1][0].request_id).not.toBe(compact.mock.calls[0][0].request_id);
+});
+it("blocks compaction for pending approval, unresolved dispatch, multiple questions and driver activity", () => {
+  const view = render(<WorkspaceShell {...compactProps} />); openCompaction();
+  const blocked: AgentRunEventV4["event"][] = [
+    { kind: "tool_approval_requested", request: { approval_id: "approval", call: { call_id: "call", tool_id: "runtime.execute", arguments: {} }, effect: "mutating", reason: "approval", call_hash: "hash" } },
+    { kind: "input_requested", question_id: "second", question: "Another?" },
+    { kind: "tool_dispatch_started", call_id: "call", tool_id: "runtime.execute", effect: "side_effect", idempotency_key: "key" },
+    { kind: "tool_dispatch_uncertain", call_id: "call", tool_id: "runtime.execute" },
+  ];
+  for (const event of blocked) {
+    view.rerender(<WorkspaceShell {...compactProps} agentRunEventsV4={[compactQuestion, { ...compactQuestion, sequence: 2, event }]} />);
+    expect(screen.getByRole("button", { name: "Compact context" })).toBeDisabled();
+  }
+  view.rerender(<WorkspaceShell {...compactProps} agentBusy />); expect(screen.getByRole("button", { name: "Compact context" })).toBeDisabled();
+  view.rerender(<WorkspaceShell {...compactProps} conversationHydrating />); expect(screen.getByRole("button", { name: "Compact context" })).toBeDisabled();
 });

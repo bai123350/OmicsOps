@@ -150,3 +150,20 @@ npm run build:desktop
 - [Wisp Science 可借鉴改进清单与优先级](docs/superpowers/specs/2026-10-04-wisp-science-improvement-backlog.md)
 - [最初批准设计（历史背景）](docs/superpowers/specs/2026-07-29-omicsops-agent-design.md)
 - [真实环境验收流程](acceptance/README.md)
+
+## 手动压缩暂停的普通运行
+
+在上下文用量面板（输入 `/context` 或点击输入框旁用量按钮）选择“压缩上下文”。
+入口只对等待一个回答的普通 Agent 运行开放；计划执行、运行中、停止中和存在已知
+待审批或未决派发时不可用。宿主仍会核对实际 driver、待处理指导、冻结配置和全部
+暂停条件，并在完整请求预算准入后原子保存 archive、checkpoint 和回执。
+
+压缩使用确定性 checkpoint，不请求摘要模型、不启动计算或 SSH。可视历史、原始
+证据、待回答问题和答案草稿保留，用户须自行回答并恢复。请求失败或结果不确定时
+重试复用同一操作 ID；已确认成功后再次主动点击才开始新操作。关闭面板不取消宿主
+操作，切换项目、会话或运行后的迟到结果不会写入新作用域。用量刷新失败不撤销成功
+回执，bytes 是上下文/请求容量而非提供商 token 消耗。
+
+本次准入只覆盖捕获的快照；新答案、项目规则、科学状态或配置变化后，正常恢复仍需
+重新检查请求预算。摘要不替代原始证据，也不解决未决副作用。真实模型、SSH 与 GUI
+验收步骤见 [acceptance/README.md](acceptance/README.md)。

@@ -1617,7 +1617,7 @@ export default function DesktopApp() {
       if (!selected || !conversation || !activeModel || conversationHydratingRef.current) return false;
       return branchSend.submit({ sourceMessageId, message_markdown: markdown, mode: mode === "plan" ? "plan" : "agent", model_profile_id: activeModel.id, compute_selection: currentComputeSelection(), references, attachments });
     } : undefined}
-    contextUsage={contextUsage.value} contextUsageError={contextUsage.error}
+    contextUsage={contextUsage.value} contextUsageError={contextUsage.error} onRefreshContextUsage={contextUsage.refresh}
     sideChat={nativeQueueAvailable ? sideChat : undefined}
     queueItems={queue.items} queueError={queue.error} queueLoading={queue.loading} onQueueRefresh={queue.refresh} onQueueUpdate={queue.update} onQueueAction={queue.action}
     replacement={nativeQueueAvailable ? { busy: replacement.busy, pending: replacement.pending, error: replacement.error, originalMarkdown: replacement.originalTurn?.message_markdown, retry: replacement.retry, send: async (markdown, mode, target, references, attachments) => {
