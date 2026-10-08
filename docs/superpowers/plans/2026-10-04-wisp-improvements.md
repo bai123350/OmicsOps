@@ -43,7 +43,7 @@
 | W03 | [远端作业](2026-10-04-wisp-w03-remote-jobs.md) | 4 | metadata列表、手动status与明确启用的有限退避 | 已实现、4任务审阅通过 |
 | W04 | [内核观察](2026-10-04-wisp-w04-kernel-inspection.md) | 5 | 活着的Python/R metadata，不隐式启动或执行对象方法 | 已实现，5任务审阅通过；真实R/SSH/GUI未验收 |
 | W05 | [手动压缩](2026-10-04-wisp-w05-context-compaction.md) | 5 | 暂停ordinary run真正原子保存可恢复checkpoint | 已实现、5任务审阅通过；clean-HEAD与真实验收待执行 |
-| W06 | [运行诊断](2026-10-04-wisp-w06-run-diagnostics.md) | 4 | run/tool/失败筛选、精确来源定位、脱敏HTML/JSON | 进行中，3/4任务审阅通过；诊断UI、完整检查与手工smoke待实施 |
+| W06 | [运行诊断](2026-10-04-wisp-w06-run-diagnostics.md) | 4 | run/tool/失败筛选、精确来源定位、脱敏HTML/JSON | 已实现、4任务源码审阅通过；自动/桌面构建通过，原生手工smoke未执行 |
 | W07 | [离线示例](2026-10-04-wisp-w07-offline-example.md) | 4 | 双语合成工作区，重启/坏receipt仍隔离于生产Agent | 待实施 |
 | W08a | [V4场景](2026-10-04-wisp-w08-scenarios.md) | 3 | 五场景manifest/hash/实际调用计数和安全报告 | 待实施 |
 | W08b | [Skill helpers](2026-10-04-wisp-w08-skill-helpers.md) | 3 | 固定本地helper离线行为回归与统一Python CI | 已实现、3任务审阅通过；CI未执行 |
@@ -77,8 +77,8 @@ W07只需W02 Task1叶子，不需要table/SSH界面；W10/W11只需W09 Task1的�
 - [x] 3. W03 Task1–4：metadata、身份status、退避panel、Runtime入口/边界说明。
 - [x] 4. W08b Task1–3：helper正确行为基线、错误传播、统一Python CI。
 - [x] 5. W04 Task1–5：非启动contract、两套worker、weak registry、Runtime观察UI。
-- [ ] 6. W05 Task1–5：旧hash兼容、candidate/final准入、atomicStore、宿主租约、UI/恢复。
-- [ ] 7. W06 Task1–4：validated readonlychain、safeprojection、export、筛选/定位UI。
+- [x] 6. W05 Task1–5：旧hash兼容、candidate/final准入、atomicStore、宿主租约、UI/恢复。
+- [x] 7. W06 Task1–4：validated readonlychain、safeprojection、export、筛选/定位UI。
 - [ ] 8. W07 Task1–4：marker事务、合成fixture、safeview、所有项目选择入口。
 - [ ] 9. W08a Task1–3：五scenario manifest、控制行为、stable report/CI upload。
 - [ ] 10. W09 Task1–4：基础DTO/context、readiness、post-dialog包、保存revisionUI。
@@ -118,3 +118,5 @@ Windows合成数据smoke覆盖：导航/延迟发送、CSV/BOM/截断、jobs默�
 用户已选 **Subagent-driven**：12项跨文件读取、冻结运行、原子压缩和持久化，每任务由子Agent实施及独立审阅，最后全分支审阅。继续全部12项，不重复范围或执行方式确认。
 
 W01已实现：`afb1af3`/`ff8595b` 存储与Hook，`ae439c7`/`6312f60` 导航和删除清理，`9295ab2`/`bb3bbc7` 回执及真实调用方接受语义。3个任务均完成独立审阅及必要复审，无未解决发现。最终 `npm test` 为114文件/1,138前端与22扩展测试通过，`npm run build`通过（既有大chunk提示）；Rust/desktop及全分支最终审阅仍待后续整合。真实模型/SSH与Windows native smoke未执行。
+
+W06已实现：四任务源码独立审阅完成，最终UI提交 `d535b50`；定向163/Rust1741通过与18ignored/前端1290+扩展22/Web与native构建/fmt/diff通过。评审确认源码无待修复项；Windows GUI/native-save/static-HTML手工smoke明确延期且未执行（native computer API不可用），保留实际chooser/focus/browser残余风险，不能称该验收通过。既有warning债务留最终评审。累计28/50源码任务审阅；clean committed-HEAD、全分支和真实模型/SSH/R验收独立记录。

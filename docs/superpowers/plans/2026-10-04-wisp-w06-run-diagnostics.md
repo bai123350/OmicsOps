@@ -1,6 +1,6 @@
 # W06 Run Diagnostics Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** 在当前对话提供 run/tool/失败筛选、精确 sequence/hash 定位和宿主校验的脱敏 HTML/JSON 导出。
 
@@ -38,7 +38,7 @@
 - Consumes: `deserialize_event_chain_v4(&[String])`、protocol `AgentEventV4`/`UsageTotalsV4`、既有 project/conversation/run 索引；DTO 字段逐项采用 Spec 表。
 - Produces: `Store::agent_events_for_context_v4_bounded(&self, project_id: Uuid, conversation_id: Uuid, max_events: usize, max_serialized_bytes: usize) -> Result<Vec<AgentEventV4>, StoreError>`；Spec 中全部 `RunDiagnostics*V4`/`RunDiagnostic*V4` 和 `SaveRunDiagnosticsRequestV4` 的 serde 类型。
 
-- [ ] **RED — 写合同与 Store 失败测试。** 命名 `run_diagnostics_dto_contract`、`diagnostics_bounded_read_rejects_hidden_invalid_chain`、`diagnostics_bounded_read_checks_scope_and_limits`、`diagnostics_bounded_read_is_read_only`。fixture 用真实 AgentEventV4 构造有效 hash，再向数据库注入错绑 envelope/序列/终态；测试比较调用前后事件数和 run JSON，不经 reconcile。
+- [x] **RED — 写合同与 Store 失败测试。** 命名 `run_diagnostics_dto_contract`、`diagnostics_bounded_read_rejects_hidden_invalid_chain`、`diagnostics_bounded_read_checks_scope_and_limits`、`diagnostics_bounded_read_is_read_only`。fixture 用真实 AgentEventV4 构造有效 hash，再向数据库注入错绑 envelope/序列/终态；测试比较调用前后事件数和 run JSON，不经 reconcile。
 
   最小断言片段（fixture 使用本文件已有临时 Store 帮助函数）：
 
@@ -48,10 +48,10 @@
   assert!(serde_json::from_value::<RunDiagnosticsRequestV4>(unknown_field_request).is_err());
   ```
 
-- [ ] **RED — 运行并记录真实 FAIL。** `cargo test -p omicsops-store diagnostics_bounded_read -- --nocapture`、`cargo test -p omicsops-desktop --lib run_diagnostics_dto_contract`；预期缺少方法/类型而编译 FAIL，不以 ignored 计数代替失败。
-- [ ] **实现上述 Store 签名与 DTO。** 一次读事务先 COUNT/SUM(value_json UTF-8 bytes)，再读所有 run 链并核验索引/envelope/run 所有权及完整链；确认 conversation 属于 project，错误不返回其他 scope 内容。source heads 覆盖全部有事件 run，DTO 请求拒绝未知字段；保留原无限定 API。
-- [ ] **GREEN — 同两命令 PASS。** 补 0 事件、精确上限、超过字节预算、未选中 run 损坏与窗口 scope 归属测试；无新表/写事件。`cargo fmt --all -- --check` 格式偏差按 AGENTS.md 独立处理。
-- [ ] **Commit —** 仅 stage 本 task 四个文件：`git add -- crates/omicsops-dto/src/run_diagnostics.rs crates/omicsops-dto/src/lib.rs crates/omicsops-store/src/lib.rs src-tauri/src/dto_contract_tests.rs`；`git commit -m "feat: add validated bounded run diagnostic reads"`。
+- [x] **RED — 运行并记录真实 FAIL。** `cargo test -p omicsops-store diagnostics_bounded_read -- --nocapture`、`cargo test -p omicsops-desktop --lib run_diagnostics_dto_contract`；预期缺少方法/类型而编译 FAIL，不以 ignored 计数代替失败。
+- [x] **实现上述 Store 签名与 DTO。** 一次读事务先 COUNT/SUM(value_json UTF-8 bytes)，再读所有 run 链并核验索引/envelope/run 所有权及完整链；确认 conversation 属于 project，错误不返回其他 scope 内容。source heads 覆盖全部有事件 run，DTO 请求拒绝未知字段；保留原无限定 API。
+- [x] **GREEN — 同两命令 PASS。** 补 0 事件、精确上限、超过字节预算、未选中 run 损坏与窗口 scope 归属测试；无新表/写事件。`cargo fmt --all -- --check` 格式偏差按 AGENTS.md 独立处理。
+- [x] **Commit —** 仅 stage 本 task 四个文件：`git add -- crates/omicsops-dto/src/run_diagnostics.rs crates/omicsops-dto/src/lib.rs crates/omicsops-store/src/lib.rs src-tauri/src/dto_contract_tests.rs`；`git commit -m "feat: add validated bounded run diagnostic reads"`。
 
 **实施证据（2026-10-08）**：Task 1 功能提交 `8296078` 与依 AGENTS.md 分离的纯格式提交 `bb47a89` 经独立完整审阅通过，无待修复问题。Store 在同一只读事务中验证对话归属、整个作用域的事件数与 UTF-8 原始 JSON 字节预算，读取含错绑索引的 run 并核对原 JSON hash 链、SQL 索引、事件 envelope 与持久化 run 归属；旧无限定 API 不变，无迁移或 reconciliation。最终定向 Store 3、desktop DTO 1、格式和 diff 检查通过；初次 desktop 沙箱 OUT_DIR 失败另行记录并原命令重试。固定 10,000/16 MiB 宿主调用、公开投影、导出、UI 和完整 W06 检查仍属于后续任务；真实模型/SSH 未验收。证据见 `.superpowers/sdd/2026-10-04-wisp-w06-run-diagnostics/task-1-report.md` 与 `task-1-review.md`。
 
@@ -63,7 +63,7 @@
 - Consumes: Task 1 Store/DTO，`composer_references::public_text(&str) -> String`、宿主有界非递归 literal 词遮盖、`UsageTotalsV4::from_observations`。
 - Produces: `project_run_diagnostics(events: &[AgentEventV4], request: &RunDiagnosticsRequestV4) -> Result<RunDiagnosticsSnapshotV4, String>`；`load_run_diagnostics(repository: &Store, request: &RunDiagnosticsRequestV4) -> Result<RunDiagnosticsSnapshotV4, String>`；Tauri `get_run_diagnostics_v4(state: State<'_, AppState>, request: RunDiagnosticsRequestV4) -> Result<RunDiagnosticsSnapshotV4, String>`。错误为固定安全码。
 
-- [ ] **RED — 写 `run_diagnostics_projection_*` 测试。** 两 run 同 call_id，正常/failed/uncertain/cancelled/reused outcome，缺 start/歧义 dispatch/反向时间，缺 observation 与 incomplete subtotal；固定 UTC 首事件/run UUID/sequence 排序。tool filter 精确匹配，不将无法归属的 RunFailed 混入某工具。
+- [x] **RED — 写 `run_diagnostics_projection_*` 测试。** 两 run 同 call_id，正常/failed/uncertain/cancelled/reused outcome，缺 start/歧义 dispatch/反向时间，缺 observation 与 incomplete subtotal；固定 UTC 首事件/run UUID/sequence 排序。tool filter 精确匹配，不将无法归属的 RunFailed 混入某工具。
 
   ```rust
   assert_ne!(rows_for_two_runs[0].call_ref, rows_for_two_runs[1].call_ref);
@@ -73,10 +73,10 @@
   ```
 
   敏感 fixture 覆盖每个被排除 payload、tool label、自定义词、token/password/API/Bearer/私钥、原始 provider/SSH 错误；无任意 raw event/payload/model_content 字段。工具 label 先脱敏后限长；call_ref 用 `(run UUID, call_id)` SHA-256。
-- [ ] **RED — 运行 FAIL。** `cargo test -p omicsops-desktop --lib run_diagnostics_projection -- --nocapture`；预期新函数不存在。
-- [ ] **实现三签名并注册 get 命令。** 完整链读取后才过滤；usage 是选中整 run 的 qualified 小计，不随工具/失败筛选重算。filtered 取是否启用任何筛选，不以数量恰好相同冒称完整。输入限额和投影 8 MiB 统一检查；keyword/filter 仅内存。每个 kind 可有固定元数据行，私有 payload 不进入输出；uncertain 不标失败/取消。
-- [ ] **GREEN — 同命令 PASS。** 加空结果、tool_id UTF-8 边界、关键词空/超量/超字节与投影超限测试，确认错误无原始内容，读取仍零模型/工具/事件写入。
-- [ ] **Commit —** `git add -- src-tauri/src/run_diagnostics.rs src-tauri/src/lib.rs`；`git commit -m "feat: project safe run diagnostic metadata"`。
+- [x] **RED — 运行 FAIL。** `cargo test -p omicsops-desktop --lib run_diagnostics_projection -- --nocapture`；预期新函数不存在。
+- [x] **实现三签名并注册 get 命令。** 完整链读取后才过滤；usage 是选中整 run 的 qualified 小计，不随工具/失败筛选重算。filtered 取是否启用任何筛选，不以数量恰好相同冒称完整。输入限额和投影 8 MiB 统一检查；keyword/filter 仅内存。每个 kind 可有固定元数据行，私有 payload 不进入输出；uncertain 不标失败/取消。
+- [x] **GREEN — 同命令 PASS。** 加空结果、tool_id UTF-8 边界、关键词空/超量/超字节与投影超限测试，确认错误无原始内容，读取仍零模型/工具/事件写入。
+- [x] **Commit —** `git add -- src-tauri/src/run_diagnostics.rs src-tauri/src/lib.rs`；`git commit -m "feat: project safe run diagnostic metadata"`。
 
 **实施证据（2026-10-08）**：Task 2 功能提交 `f51d321`、独立格式提交 `399129a` 的完整独立审阅发现一个 P1：合法的重复自定义词会在旧共享替换函数中反复匹配新增的 `[REDACTED]`，在限长前指数膨胀。仅在本 Task 的诊断模块修复：`566c1b7`、独立格式提交 `240abd4`；保持 `public_text` 既有凭据规则，后续词匹配只读原文本、合并相交范围、输出最多 256 UTF-8 字节。实际有界 RED→GREEN、最终与复审的诊断 17、Store 3、格式和 diff 检查通过；独立局部复审关闭唯一 P1，未发现新问题。完整链/原始 JSON 哈希兼容、公开字段白名单、用量与筛选合同依完整审阅继续成立。词列表仅请求内存，不写入事件/导出。证据见 `.superpowers/sdd/2026-10-04-wisp-w06-run-diagnostics/task-2-review.md`、`task-2-fix1-report.md` 与 `task-2-fix1-rereview.md`。安全导出、UI、完整 W06 与真实环境验收仍属后续任务。
 
@@ -88,7 +88,7 @@
 - Consumes: Task 2 `load_run_diagnostics`、Task 1 `SaveRunDiagnosticsRequestV4`。
 - Produces: `render_run_diagnostics(snapshot: &RunDiagnosticsSnapshotV4, format: RunDiagnosticsExportFormatV4) -> Result<Vec<u8>, String>`；`prepare_run_diagnostics_export(repository: &Store, request: &SaveRunDiagnosticsRequestV4) -> Result<Vec<u8>, String>`（async，reread/head guard/renderer，供 command 与测试共用）；`conversation_export::write_export_bytes(path: &Path, expected_extension: &str, bytes: &[u8]) -> Result<(), String>`（pub(crate)，既有 write_export 委托，原解码契约不变）；Tauri `save_run_diagnostics_v4(app: AppHandle, state: State<'_, AppState>, request: SaveRunDiagnosticsRequestV4) -> Result<Option<String>, String>`。本模块窄保存 seam `save_diagnostic_bytes(bytes: &[u8], format: RunDiagnosticsExportFormatV4, choose_path: impl FnOnce(&str) -> Result<Option<PathBuf>, String>) -> Result<Option<String>, String>` 供 fake chooser。
 
-- [ ] **RED — 写 `run_diagnostics_export_*`。** 全 heads 与预览相等才能保存，追加事件返回 `diagnostics_snapshot_changed`；fake chooser None、不匹配扩展名、临时写失败均不成功。HTML 特殊字符/脚本只能是转义文本，严格 CSP、无脚本/远端资源；JSON/HTML 无敏感哨兵/关键词列表。
+- [x] **RED — 写 `run_diagnostics_export_*`。** 全 heads 与预览相等才能保存，追加事件返回 `diagnostics_snapshot_changed`；fake chooser None、不匹配扩展名、临时写失败均不成功。HTML 特殊字符/脚本只能是转义文本，严格 CSP、无脚本/远端资源；JSON/HTML 无敏感哨兵/关键词列表。
 
   ```rust
   assert_eq!(save_diagnostic_bytes(&bytes, Json, |_| Ok(None)).unwrap(), None);
@@ -97,10 +97,10 @@
   assert_eq!(stale_save_error, "diagnostics_snapshot_changed");
   ```
 
-- [ ] **RED — 运行 FAIL。** `cargo test -p omicsops-desktop --lib run_diagnostics_export -- --nocapture`；预期新 renderer/save seam 不存在。
-- [ ] **实现上述签名并注册 save 命令。** 客户端不传 bytes；host reread/验证/完整 head 比对后生成固定快照，8 MiB 内才打开 dialog。文件明确原/选中数、过滤与 head 截点、usage unknown/incomplete、“公开诊断投影，非完整科研证据”；原 event_hash 只作引用，不能声称投影可重算原 hash。临时文件 sync 后原子替换，固定安全错误码，不 raw OS to_string。
-- [ ] **GREEN — 同命令与 `cargo test -p omicsops-desktop --lib conversation_export` PASS。** 原 HTML/PNG 合同和 exact bytes 不回归；静态 snapshot 不因 native dialog 等待期间追加事件宣称“最新”。
-- [ ] **Commit —** `git add -- src-tauri/src/run_diagnostics.rs src-tauri/src/conversation_export.rs src-tauri/src/lib.rs`；`git commit -m "feat: export validated redacted run diagnostics"`。
+- [x] **RED — 运行 FAIL。** `cargo test -p omicsops-desktop --lib run_diagnostics_export -- --nocapture`；预期新 renderer/save seam 不存在。
+- [x] **实现上述签名并注册 save 命令。** 客户端不传 bytes；host reread/验证/完整 head 比对后生成固定快照，8 MiB 内才打开 dialog。文件明确原/选中数、过滤与 head 截点、usage unknown/incomplete、“公开诊断投影，非完整科研证据”；原 event_hash 只作引用，不能声称投影可重算原 hash。临时文件 sync 后原子替换，固定安全错误码，不 raw OS to_string。
+- [x] **GREEN — 同命令与 `cargo test -p omicsops-desktop --lib conversation_export` PASS。** 原 HTML/PNG 合同和 exact bytes 不回归；静态 snapshot 不因 native dialog 等待期间追加事件宣称“最新”。
+- [x] **Commit —** `git add -- src-tauri/src/run_diagnostics.rs src-tauri/src/conversation_export.rs src-tauri/src/lib.rs`；`git commit -m "feat: export validated redacted run diagnostics"`。
 
 **实施证据（2026-10-08）**：Task 3 功能提交 `2a3b012` 与依 AGENTS.md 分离的纯格式提交 `d87f225` 经独立完整审阅通过，无待修复问题。保存命令仅接受严格请求，重新有界读取并核验完整事件链与全部 source heads，变化则在打开 native chooser 前拒绝；生成的 JSON/HTML 为固定快照，等待对话框期间追加事件不会把文件伪称为最新。JSON 保留查询 DTO 的版本化全部字段，另含固定文件专用 `export_notes` 说明截点、unknown/incomplete 用量与证据限制；HTML 把相同公开投影作为严格 CSP 下的转义文本。两种最终 bytes 含说明/转义均受 8 MiB 上限约束。复用的文件叶子保持旧 HTML/PNG 解码合同、同目录临时文件 sync/替换、取消为 `None`，诊断错误为固定安全码。定向诊断 22、旧会话导出 4、Store 3、格式/diff 检查通过；独立复审在正常文件权限下重跑诊断 22、会话导出 4、格式/diff 均通过，受限沙箱临时文件写入失败与相同源码重试另记。实际 RED 日志为 15 个预期 E0425 加 1 个环境 OUT_DIR 错误。证据见 `.superpowers/sdd/2026-10-04-wisp-w06-run-diagnostics/task-3-report.md` 与 `task-3-review.md`。诊断 UI、完整 W06 检查、Windows 原生保存手工 smoke 和真实模型/SSH 验收仍属后续任务。
 
@@ -112,7 +112,7 @@
 - Consumes: host get/save commands，window `useWindowEscapeLayer`，现有 V4RunTrace 与作用域。
 - Produces: `getRunDiagnostics(request: RunDiagnosticsRequestV4): Promise<RunDiagnosticsSnapshotV4>`、`saveRunDiagnostics(request: SaveRunDiagnosticsRequestV4): Promise<string | null>`；`RunDiagnosticLocator = {run_id: string; sequence: number; event_hash: string}`；`RunDiagnosticsDialog({projectId, conversationId, locale, onLocate, onClose}: {projectId: string; conversationId: string; locale: Locale; onLocate: (target: RunDiagnosticLocator) => void; onClose: () => void})`。Locale 沿用 `src/features/workspace/copy.ts` 的定义。
 
-- [ ] **RED — 写 UI mock 行为测试。** 筛选变化清空旧预览；跨作用域晚响应被丢弃；save null/错误无成功 toast，pending 禁重复；点击 ModelText 元数据行按三元组展开/focus、hash mismatch 不定位相邻行。立即 Escape 仅关闭顶层。
+- [x] **RED — 写 UI mock 行为测试。** 筛选变化清空旧预览；跨作用域晚响应被丢弃；save null/错误无成功 toast，pending 禁重复；点击 ModelText 元数据行按三元组展开/focus、hash mismatch 不定位相邻行。立即 Escape 仅关闭顶层。
 
   ```tsx
   expect(onLocate).toHaveBeenCalledWith({run_id: "run-a", sequence: 3, event_hash: hashA});
@@ -122,9 +122,12 @@
   expect(screen.queryByText(/saved successfully/i)).not.toBeInTheDocument();
   ```
 
-- [ ] **RED — 运行 FAIL。** `npx vitest run src/features/workspace/RunDiagnosticsDialog.test.tsx src/features/workspace/WorkspaceShell.test.tsx`；预期新入口/组件/定位行为缺失。
-- [ ] **实现 API/组件及 WorkspaceShell 接入。** 以 project/conversation generation 丢晚响应；三字段 DOM 标记覆盖所有 kind，包括 ModelText，避免 ActivityWindow 裁剪；若源行未在缓存，通过新只读命令刷新再定位。不能用旧 reconcile 命令。browser 无宿主时给明确受限状态，不能伪称 host 校验下载。
-- [ ] **GREEN — 定向命令 PASS，执行默认完整与桌面检查。** `cargo test --workspace`、`npm test`、`npm run build`、`npm run build:desktop`、`git diff --check`；手工 Windows smoke 筛选/定位/取消保存/打开静态 HTML，无外部请求；记录 live acceptance 未执行。
-- [ ] **Commit —** `git add -- src/run-diagnostics-api.ts src/features/workspace/RunDiagnosticsDialog.tsx src/features/workspace/RunDiagnosticsDialog.test.tsx src/types.ts src/features/workspace/WorkspaceShell.tsx src/features/workspace/WorkspaceShell.test.tsx src/styles.css`（共享入口按 master 整合）；`git commit -m "feat: add scoped run diagnostics controls"`。
+- [x] **RED — 运行 FAIL。** `npx vitest run src/features/workspace/RunDiagnosticsDialog.test.tsx src/features/workspace/WorkspaceShell.test.tsx`；预期新入口/组件/定位行为缺失。
+- [x] **实现 API/组件及 WorkspaceShell 接入。** 以 project/conversation generation 丢晚响应；三字段 DOM 标记覆盖所有 kind，包括 ModelText，避免 ActivityWindow 裁剪；若源行未在缓存，通过新只读命令刷新再定位。不能用旧 reconcile 命令。browser 无宿主时给明确受限状态，不能伪称 host 校验下载。
+- [x] **GREEN — 定向命令 PASS，执行默认完整与桌面检查。** `cargo test --workspace`、`npm test`、`npm run build`、`npm run build:desktop`、`git diff --check`；手工 Windows smoke 筛选/定位/取消保存/打开静态 HTML，无外部请求；记录 live acceptance 未执行。
+- [x] **Commit —** `git add -- src/run-diagnostics-api.ts src/features/workspace/RunDiagnosticsDialog.tsx src/features/workspace/RunDiagnosticsDialog.test.tsx src/types.ts src/features/workspace/WorkspaceShell.tsx src/features/workspace/WorkspaceShell.test.tsx src/styles.css`（共享入口按 master 整合）；`git commit -m "feat: add scoped run diagnostics controls"`。
 
-本轮仅保存计划，尚未执行任何 checkbox。计划审阅与执行方式由下一阶段统一确认；不以文档或旧测试基线声称 W06 已交付。
+实施状态（2026-10-08）：四项源码任务已逐项独立审阅。复选标记表示实施和自动验证完成；计划所列 Windows 原生 GUI 手工 smoke 仍未执行，不能把 mock 或构建成功当作该验收通过。
+
+
+**Task 4 实施证据（2026-10-08）**：功能提交 `d535b50` 的七个 UI 路径经独立完整审阅，源码符合规格且无已发现缺陷。当前对话可筛选/脱敏查询、保存宿主重新验证的固定 HTML/JSON，并按 run/sequence/hash 精确定位全部事件 kind（含 ModelText）；缓存缺失仅刷新只读元数据，作用域变化、关闭/重开使晚结果失效。立即 Escape 仅关闭顶层。最终定向 163、Rust workspace 1,741 通过/18 ignored、前端 1,290 加扩展 22、Web/native 构建、fmt/diff 均通过。原生 Windows GUI/保存取消/静态 HTML 手工 smoke 因本会话缺少 native computer API 记录为未执行，独立审阅 I1 已由控制器明确延期，残余风险是实际 chooser/focus/browser 集成；不是通过。已有 hard-link/dead-code/linker/chunk 提示保留至最终评审。现有工作区包含受保护外部改动，最终干净 committed-HEAD archive 与全分支评审仍待总计划完成；真实模型/SSH/R 未验收。
