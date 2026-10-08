@@ -4070,6 +4070,124 @@ fn missing_terminal_event(
     }
 }
 
+/// The ordinary resume and manual paths must build exactly the same model,
+/// tools, images and limits. Construction leaves compute resources lazy.
+struct OrdinaryRunCompositionV4 {
+    model: Arc<DesktopModelPortV4>,
+    tools: ComposedToolsV4,
+    limits: AgentLimitsV4,
+}
+
+async fn compose_frozen_ordinary_run_v4(
+    state: &AppState,
+    record: &RunRecordV4,
+    spec: &RunSpecV4,
+) -> Result<OrdinaryRunCompositionV4, String> {
+    if spec.execution_kind != RunExecutionKindV4::OrdinaryAgent
+        || record.run_id != spec.run_id
+        || record.project_id != spec.project_id
+        || record.conversation_id != spec.conversation_id
+        || record.model_profile_id != spec.model_profile_id
+        || record.spec.as_ref() != Some(spec)
+    {
+        return Err("ordinary run frozen scope changed".into());
+    }
+    spec.validate_integrity()
+        .map_err(|error| error.to_string())?;
+    validate_frozen_spec(&state.repository, spec).await?;
+    let selection = spec
+        .compute_selection
+        .as_ref()
+        .ok_or("V4 execution spec is missing a compute selection")?;
+    let project = workspace_project(&state.repository, spec.project_id).await?;
+    validate_compute_binding(&state.repository, &project, selection).await?;
+    let settings = crate::agent_settings::load_iteration_settings(&state.repository).await?;
+    let limits = AgentLimitsV4 {
+        auto_continue: settings.auto_continue,
+        auto_continue_limit: settings.auto_continue_limit,
+        auto_compact: settings.auto_compact,
+        ..AgentLimitsV4::ordinary(settings.max_iterations)
+    };
+    let (model, tools) = compose(
+        state,
+        &project,
+        selection,
+        spec.model_profile_id,
+        spec.run_id,
+        spec.conversation_id,
+        Some(&spec.plan.requested_capabilities),
+        Some(classify_direct_request(&record.objective)),
+        spec.delegated_model.as_ref(),
+        spec.model_configuration_hash.as_deref(),
+        true,
+        &record.input_images,
+        spec.conversation_preferences.as_ref(),
+        spec.service_tier.as_ref(),
+        spec.reviewer_model.as_ref(),
+    )
+    .await?;
+    Ok(OrdinaryRunCompositionV4 {
+        model,
+        tools,
+        limits,
+    })
+}
+
+/// Pure core preparation has no live event/science adapter. If it ever starts
+/// requesting persistence, fail closed instead of exposing a write capability.
+struct ManualCompactionEventsV4;
+#[async_trait]
+impl EventStoreV4 for ManualCompactionEventsV4 {
+    async fn append(&self, _: &AgentEventV4) -> Result<(), String> {
+        Err("manual preparation cannot write events".into())
+    }
+    async fn load(&self, _: Uuid) -> Result<Vec<AgentEventV4>, String> {
+        Err("manual preparation uses only its captured snapshot".into())
+    }
+    async fn archive_context(
+        &self,
+        _: Uuid,
+        _: &str,
+        _: &ContextCheckpointV4,
+    ) -> Result<ContextArchiveV4, String> {
+        Err("manual preparation cannot write archives".into())
+    }
+}
+
+pub(crate) async fn prepare_manual_compaction_v4(
+    state: &AppState,
+    snapshot: &omicsops_store::CompactionSnapshotV4,
+) -> Result<omicsops_protocol::PreparedContextCompactionV4, String> {
+    let record: RunRecordV4 = serde_json::from_value(snapshot.run_value.clone())
+        .map_err(|_| "manual compaction run record is invalid")?;
+    let composition =
+        compose_frozen_ordinary_run_v4(state, &record, &snapshot.context.spec).await?;
+    let prepared = AgentCoreV4 {
+        model: composition.model.as_ref(),
+        tools: composition.tools.registry.as_ref(),
+        events: &ManualCompactionEventsV4,
+        science: None,
+    }
+    .prepare_context_compaction(&snapshot.context, composition.limits)
+    .map_err(|_| "manual compaction request could not be admitted")?;
+    // Store independently compares durable bindings and the full raw run row in
+    // its writer transaction. Recheck host filesystem/trust validity as well;
+    // this does not claim a filesystem/SQLite cross-domain transaction.
+    let project = workspace_project(&state.repository, record.project_id).await?;
+    validate_compute_binding(
+        &state.repository,
+        &project,
+        snapshot
+            .context
+            .spec
+            .compute_selection
+            .as_ref()
+            .ok_or("missing frozen compute selection")?,
+    )
+    .await?;
+    Ok(prepared)
+}
+
 async fn spawn_execution(
     app: AppHandle,
     state: &AppState,
@@ -4116,50 +4234,39 @@ async fn spawn_execution(
     }
     record = current;
     reject_cancelled_execution(&state.repository, spec.run_id).await?;
-    spec.validate_integrity()
-        .map_err(|error| error.to_string())?;
-    validate_frozen_spec(&state.repository, &spec).await?;
     let selection = spec
         .compute_selection
         .clone()
         .ok_or("V4 execution spec is missing a compute selection")?;
     let project = workspace_project(&state.repository, spec.project_id).await?;
-    if spec.execution_kind == RunExecutionKindV4::OrdinaryAgent {
-        validate_compute_binding(&state.repository, &project, &selection).await?;
+    let (model, mut tools, limits) = if spec.execution_kind == RunExecutionKindV4::OrdinaryAgent {
+        let composition = compose_frozen_ordinary_run_v4(state, &record, &spec).await?;
+        (composition.model, composition.tools, composition.limits)
     } else {
+        spec.validate_integrity()
+            .map_err(|error| error.to_string())?;
+        validate_frozen_spec(&state.repository, &spec).await?;
         validate_compute_selection(state, &project, &selection).await?;
-    }
-    let limits = if spec.execution_kind == RunExecutionKindV4::OrdinaryAgent {
-        let settings = crate::agent_settings::load_iteration_settings(&state.repository).await?;
-        AgentLimitsV4 {
-            auto_continue: settings.auto_continue,
-            auto_continue_limit: settings.auto_continue_limit,
-            auto_compact: settings.auto_compact,
-            ..AgentLimitsV4::ordinary(settings.max_iterations)
-        }
-    } else {
-        AgentLimitsV4::default()
+        let (model, tools) = compose(
+            state,
+            &project,
+            &selection,
+            spec.model_profile_id,
+            spec.run_id,
+            spec.conversation_id,
+            Some(&spec.plan.requested_capabilities),
+            None,
+            spec.delegated_model.as_ref(),
+            spec.model_configuration_hash.as_deref(),
+            false,
+            &record.input_images,
+            spec.conversation_preferences.as_ref(),
+            spec.service_tier.as_ref(),
+            spec.reviewer_model.as_ref(),
+        )
+        .await?;
+        (model, tools, AgentLimitsV4::default())
     };
-    let forced_route = (spec.execution_kind == RunExecutionKindV4::OrdinaryAgent)
-        .then(|| classify_direct_request(&record.objective));
-    let (model, mut tools) = compose(
-        state,
-        &project,
-        &selection,
-        spec.model_profile_id,
-        spec.run_id,
-        spec.conversation_id,
-        Some(&spec.plan.requested_capabilities),
-        forced_route,
-        spec.delegated_model.as_ref(),
-        spec.model_configuration_hash.as_deref(),
-        spec.execution_kind == RunExecutionKindV4::OrdinaryAgent,
-        &record.input_images,
-        spec.conversation_preferences.as_ref(),
-        spec.service_tier.as_ref(),
-        spec.reviewer_model.as_ref(),
-    )
-    .await?;
     let cancelled = Arc::new(AtomicBool::new(false));
     if !register_active_run(&state.active_runs, spec.run_id, cancelled.clone())? {
         // Resume/approval actions are idempotent. A duplicate UI submission
@@ -4928,6 +5035,8 @@ struct DesktopResourceFactoryV4 {
 #[async_trait]
 impl ExecutionResourceFactoryV4 for DesktopResourceFactoryV4 {
     async fn initialize(&self) -> Result<ExecutionResourcesV4, String> {
+        #[cfg(test)]
+        manual_compaction_host_tests::effect(self.project.id, 2);
         let project = &self.project;
         let selection = &self.selection;
         let current = workspace_project(&self.repository, project.id).await?;
@@ -4959,6 +5068,8 @@ impl ExecutionResourceFactoryV4 for DesktopResourceFactoryV4 {
                     .ok_or("SSH credential is missing")?;
                 let auth =
                     crate::commands::parse_authentication_secret(profile.authentication, &secret)?;
+                #[cfg(test)]
+                manual_compaction_host_tests::effect(self.project.id, 3);
                 let session = Arc::new(
                     SshSession::connect(&profile, auth)
                         .await
@@ -5595,7 +5706,18 @@ impl ModelPortV4 for DesktopModelPortV4 {
     }
 
     fn validate_request(&self, request: &ModelRequestV4) -> Result<(), ModelFailureV4> {
-        let provider_request = self.prepare_request(request.clone(), false)?;
+        // Reject unbounded image cost before reading files. Known-cost images
+        // must use verified bytes: empty base64 is not a valid provider image.
+        if self.supports_vision
+            && (!self.input_images.is_empty() || !request.image_refs.is_empty())
+            && !self.client.has_image_budget()
+        {
+            return Err(ModelFailureV4::permanent(
+                ModelErrorClassV4::InvalidRequest,
+                "model request has no verified image token budget",
+            ));
+        }
+        let provider_request = self.prepare_request(request.clone(), true)?;
         self.client
             .validate_request(&provider_request)
             .map_err(|error| {
@@ -5608,6 +5730,8 @@ impl ModelPortV4 for DesktopModelPortV4 {
         request: ModelRequestV4,
         on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
     ) -> Result<ModelTurnV4, ModelFailureV4> {
+        #[cfg(test)]
+        manual_compaction_host_tests::effect(self.usage_metadata.model_profile_id, 0);
         self.validate_request(&request)?;
         let observes_context = self
             .resources
@@ -7780,6 +7904,8 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
             .transpose()
     }
     async fn execute(&self, call: &ToolCallV4) -> Result<ToolOutcomeV4, String> {
+        #[cfg(test)]
+        manual_compaction_host_tests::effect(self.project_id, 1);
         self.execute_inner(call, false).await
     }
 
@@ -14577,5 +14703,681 @@ mod tests {
             }
             assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod manual_compaction_host_tests {
+    use super::*;
+    use omicsops_protocol::{
+        AgentInputReasonV4, CompactContextRequestV4, ContextCompactionStatusV4, RunModeV4,
+    };
+
+    type Effects = Arc<std::sync::Mutex<[usize; 4]>>;
+    static EFFECTS: OnceLock<std::sync::Mutex<HashMap<Uuid, Effects>>> = OnceLock::new();
+    pub(super) fn effect(key: Uuid, index: usize) {
+        let effects = EFFECTS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned();
+        if let Some(effects) = effects {
+            effects.lock().unwrap()[index] += 1;
+            panic!("manual compaction attempted a forbidden external effect");
+        }
+    }
+
+    pub(crate) struct CommitGate {
+        pub entered: tokio::sync::Notify,
+        pub release: tokio::sync::Notify,
+    }
+    static GATES: OnceLock<std::sync::Mutex<HashMap<Uuid, Arc<CommitGate>>>> = OnceLock::new();
+    pub(crate) async fn before_commit(run_id: Uuid) {
+        let gate = GATES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .get(&run_id)
+            .cloned();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    async fn fixture() -> (
+        tempfile::TempDir,
+        AppState,
+        CompactContextRequestV4,
+        ModelProfile,
+    ) {
+        fixture_with(false, false).await
+    }
+    async fn fixture_with(
+        ssh: bool,
+        images: bool,
+    ) -> (
+        tempfile::TempDir,
+        AppState,
+        CompactContextRequestV4,
+        ModelProfile,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let repository = Store::open_in_memory().await.unwrap();
+        let mut project = Project::new(
+            Uuid::new_v4(),
+            "manual",
+            dir.path().to_str().unwrap(),
+            omicsops_core::workspace::ProjectTemplate::Blank,
+            Utc::now(),
+        );
+        let connection_id = Uuid::new_v4();
+        if ssh {
+            project.connection_id = Some(connection_id);
+            project.remote_root = Some("/synthetic/project".into());
+            repository
+                .save_connection(&omicsops_core::domain::ConnectionProfile {
+                    id: connection_id,
+                    label: "manual".into(),
+                    host: "example.invalid".into(),
+                    port: 22,
+                    username: "fixture".into(),
+                    authentication: omicsops_core::domain::AuthenticationMethod::Password,
+                    authentication_reference: "no-real-secret".into(),
+                    host_key_fingerprint: Some("SHA256:fixture".into()),
+                })
+                .await
+                .unwrap();
+        }
+        repository.save_project(&project).await.unwrap();
+        let conversation = omicsops_core::workspace::Conversation::new(
+            Uuid::new_v4(),
+            project.id,
+            "manual",
+            Utc::now(),
+        );
+        repository.save_conversation(&conversation).await.unwrap();
+        let mut profile: ModelProfile = serde_json::from_value(json!({"id":Uuid::new_v4(),"label":"manual", "provider":"open_ai_codex", "base_url":"https://chatgpt.com/backend-api", "model":"gpt-5.4", "supports_tools":true, "supports_vision":true, "context_window_tokens":100000, "max_output_tokens":1024})).unwrap();
+        if images {
+            profile.provider = omicsops_core::workspace::ModelProviderKind::OpenAiCompatible;
+            profile.base_url = "https://api.openai.com/v1".into();
+            profile.credential_reference = Some("manual-fixture".into());
+        }
+        repository.save_model_profile(&profile).await.unwrap();
+        let mut child = profile.clone();
+        child.id = Uuid::new_v4();
+        repository.save_model_profile(&child).await.unwrap();
+        let mut reviewer = profile.clone();
+        reviewer.id = Uuid::new_v4();
+        repository.save_model_profile(&reviewer).await.unwrap();
+        let image_bytes=base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6AAAAAElFTkSuQmCC").unwrap();
+        let input_images = if images {
+            std::fs::write(dir.path().join("fixture.png"), &image_bytes).unwrap();
+            vec![ModelImageRefV4 {
+                relative_path: "fixture.png".into(),
+                media_type: "image/png".into(),
+                size_bytes: image_bytes.len() as u64,
+                sha256: hex::encode(sha2::Sha256::digest(&image_bytes)),
+            }]
+        } else {
+            vec![]
+        };
+        let effects = Arc::new(std::sync::Mutex::new([0; 4]));
+        EFFECTS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .extend([
+                (project.id, effects.clone()),
+                (profile.id, effects.clone()),
+                (child.id, effects.clone()),
+                (reviewer.id, effects),
+            ]);
+        let run_id = Uuid::new_v4();
+        let mut request = StartDirectV4Request {
+            project_id:project.id, conversation_id:conversation.id, model_profile_id:profile.id,
+            objective:"inspect evidence".into(), compute_selection: serde_json::from_value(json!({"schema_version":4,"backend_id":"local","backend_kind":"local","autonomy_mode":"supervised","environment":"system","network_policy":"host_inherited"})).unwrap(), references:vec![], attachments:vec![],
+        };
+        if ssh {
+            request.compute_selection.backend_id = format!("ssh:{connection_id}");
+            request.compute_selection.backend_kind = ComputeBackendKindV4::Ssh;
+        }
+        let (mut record, spec) = prepare_direct_run_v4(
+            &request,
+            run_id,
+            "[]",
+            BTreeSet::from(["project.read".into()]),
+            DirectRunSnapshotV4 {
+                model_configuration_hash: profile.execution_configuration_hash(),
+                conversation_preferences: omicsops_protocol::ConversationAgentPreferencesV4 {
+                    memory_enabled: false,
+                    ..Default::default()
+                },
+                service_tier: omicsops_protocol::RunServiceTierV4 {
+                    fast_mode: Some(false),
+                },
+                reviewer_model: Some(omicsops_protocol::ReviewerModelBindingV4 {
+                    profile_id: reviewer.id,
+                    configuration_hash: reviewer.execution_configuration_hash(),
+                    service_tier: omicsops_protocol::RunServiceTierV4 {
+                        fast_mode: Some(false),
+                    },
+                }),
+                delegated_model: Some(omicsops_protocol::DelegatedModelBindingV4 {
+                    profile_id: child.id,
+                    configuration_hash: child.execution_configuration_hash(),
+                }),
+                reference_context: String::new(),
+                input_images,
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        record.status = "waiting_for_input".into();
+        save_record(&repository, &record).await.unwrap();
+        let mut event = AgentEventV4::first(
+            run_id,
+            project.id,
+            conversation.id,
+            Utc::now(),
+            AgentEventKindV4::RunCreated {
+                mode: RunModeV4::Execute,
+            },
+        );
+        repository.append_agent_event_v4(&event).await.unwrap();
+        for kind in [
+            AgentEventKindV4::RunSpecFrozen {
+                approval_hash: spec.approval_hash.clone().unwrap(),
+                spec_hash: spec.spec_hash.clone().unwrap(),
+            },
+            AgentEventKindV4::ModelText {
+                text: "source evidence ".repeat(25000),
+            },
+            AgentEventKindV4::InputRequested {
+                question_id: "pending-question".into(),
+                question: "Which sample?".into(),
+                reason: AgentInputReasonV4::Decision,
+            },
+        ] {
+            event = AgentEventV4::next(&event, Utc::now(), kind);
+            repository.append_agent_event_v4(&event).await.unwrap();
+        }
+        if !images {
+            let logical = Uuid::new_v4();
+            let attempt = Uuid::new_v4();
+            for kind in [
+                AgentEventKindV4::ModelRequestStarted{request:serde_json::from_value(json!({"logical_request_id":logical,"attempt_id":attempt,"model_profile_id":profile.id,"model_configuration_hash":profile.execution_configuration_hash(),"context_limit_source":{"kind":"configured_bound"}})).unwrap()},
+                AgentEventKindV4::ModelReplayRecorded{replay:omicsops_protocol::ModelReplayRecordedV4{logical_request_id:logical,attempt_id:attempt,binding:omicsops_protocol::ModelReplayBindingV4{model_profile_id:profile.id,configuration_hash:profile.execution_configuration_hash()},continuation:omicsops_protocol::ModelProviderContinuationV4{items:vec![omicsops_protocol::ModelReplayItemV4::AssistantText{text:"native evidence ".repeat(700)}]}}},
+            ] {event=AgentEventV4::next(&event,Utc::now(),kind);repository.append_agent_event_v4(&event).await.unwrap();}
+        }
+        let vault = Arc::new(omicsops_adapters::credentials::MemoryCredentialVault::default());
+        vault.set("manual-fixture", "synthetic-test-value").unwrap();
+        let clock = Arc::new(omicsops_adapters::codex_auth::SystemCodexAuthClock);
+        let auth =
+            Arc::new(omicsops_adapters::codex_auth::CodexDeviceAuth::new(clock.clone()).unwrap());
+        let state = AppState {
+            repository,
+            credentials: SystemCredentialVault,
+            subscription_models: Arc::new(
+                crate::subscription_models::SubscriptionLoginManager::new(
+                    vault,
+                    auth,
+                    clock,
+                    Default::default(),
+                ),
+            ),
+            mcp_sessions: McpSessionManager::new(),
+            active_runs: Default::default(),
+            live_runtime_registry_v4: Default::default(),
+            skills_root: dir.path().join("skills"),
+            skills_gate: Default::default(),
+            research_last_request: Default::default(),
+            active_kernels: Default::default(),
+            project_kernel_queues: Default::default(),
+            sync_controls: Default::default(),
+            browser: omicsops_browser::BrowserRuntime::new(
+                dir.path().join("browser"),
+                dir.path().join("extension"),
+            ),
+        };
+        (
+            dir,
+            state,
+            CompactContextRequestV4 {
+                request_id: Uuid::new_v4(),
+                project_id: project.id,
+                conversation_id: conversation.id,
+                run_id,
+            },
+            profile,
+        )
+    }
+
+    async fn compact(
+        dir: &Path,
+        state: &AppState,
+        request: &CompactContextRequestV4,
+    ) -> Result<omicsops_protocol::ContextCompactionReceiptV4, String> {
+        crate::context_compaction::compact_context_with_lease_v4(state, request.clone(), || {
+            crate::run_ownership::try_lease_in(dir, request.run_id)
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_host_commits_paused_ordinary_run() {
+        let (dir, state, request, _) = fixture().await;
+        let captured = state
+            .repository
+            .context_compaction_snapshot_v4(&request)
+            .await
+            .expect("host fixture snapshot");
+        let record = load_record(&state.repository, request.run_id)
+            .await
+            .unwrap();
+        let composition = compose_frozen_ordinary_run_v4(&state, &record, &captured.context.spec)
+            .await
+            .expect("frozen ordinary composition");
+        let pure = AgentCoreV4 {
+            model: composition.model.as_ref(),
+            tools: composition.tools.registry.as_ref(),
+            events: &ManualCompactionEventsV4,
+            science: None,
+        }
+        .prepare_context_compaction(&captured.context, composition.limits)
+        .expect("complete desktop request admission");
+        assert_eq!(pure.status, ContextCompactionStatusV4::Completed);
+        let before = state
+            .repository
+            .agent_events_v4(request.run_id)
+            .await
+            .unwrap();
+        let receipt = compact(dir.path(), &state, &request)
+            .await
+            .expect("paused ordinary host must commit");
+        assert_eq!(receipt.status, ContextCompactionStatusV4::Completed);
+        assert!(receipt.archive.is_some());
+        assert!(
+            receipt
+                .provider_request_bytes
+                .is_some_and(|bytes| bytes > 0)
+        );
+        let after = state
+            .repository
+            .agent_events_v4(request.run_id)
+            .await
+            .unwrap();
+        assert_eq!(&after[..before.len()], before.as_slice());
+        assert_eq!(after.len(), before.len() + 4);
+        assert_eq!(
+            load_record(&state.repository, request.run_id)
+                .await
+                .unwrap()
+                .status,
+            "waiting_for_input"
+        );
+        assert!(state.active_runs.lock().unwrap().is_empty());
+        assert!(
+            crate::run_ownership::try_lease_in(dir.path(), request.run_id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_host_rejects_lease_and_frozen_profile_change() {
+        let (dir, state, request, mut profile) = fixture().await;
+        let held = crate::run_ownership::try_lease_in(dir.path(), request.run_id)
+            .unwrap()
+            .unwrap();
+        assert!(compact(dir.path(), &state, &request).await.is_err());
+        drop(held);
+        state
+            .active_runs
+            .lock()
+            .unwrap()
+            .insert(request.run_id, Arc::new(AtomicBool::new(false)));
+        assert!(compact(dir.path(), &state, &request).await.is_err());
+        state.active_runs.lock().unwrap().clear();
+        let old = profile.clone();
+        profile.model = "changed".into();
+        state.repository.save_model_profile(&profile).await.unwrap();
+        assert!(compact(dir.path(), &state, &request).await.is_err());
+        state.repository.save_model_profile(&old).await.unwrap();
+        assert_eq!(
+            compact(dir.path(), &state, &request).await.unwrap().status,
+            ContextCompactionStatusV4::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_host_never_initializes_or_streams() {
+        let (dir, state, request, _) = fixture().await;
+        let receipt = compact(dir.path(), &state, &request).await.unwrap();
+        assert_eq!(
+            *EFFECTS
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get(&request.project_id)
+                .unwrap()
+                .lock()
+                .unwrap(),
+            [0, 0, 0, 0]
+        );
+        assert_eq!(receipt.status, ContextCompactionStatusV4::Completed);
+        assert!(state.active_runs.lock().unwrap().is_empty());
+        assert!(state.active_kernels.lock().await.is_empty());
+        let events = state
+            .repository
+            .agent_events_v4(request.run_id)
+            .await
+            .unwrap();
+        assert!(!events.iter().any(|e| matches!(
+            e.event,
+            AgentEventKindV4::ToolRequested { .. } | AgentEventKindV4::UserInputAnswered { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_host_error_is_safe_and_receipt_retry_is_idempotent() {
+        let (dir, state, request, mut profile) = fixture().await;
+        let receipt = compact(dir.path(), &state, &request).await.unwrap();
+        let after = state
+            .repository
+            .agent_events_v4(request.run_id)
+            .await
+            .unwrap();
+        let _held = crate::run_ownership::try_lease_in(dir.path(), request.run_id)
+            .unwrap()
+            .unwrap();
+        profile.model = "requires SECRET_SENTINEL".into();
+        state.repository.save_model_profile(&profile).await.unwrap();
+        assert_eq!(
+            compact(dir.path(), &state, &request).await.unwrap(),
+            receipt
+        );
+        assert_eq!(
+            state
+                .repository
+                .agent_events_v4(request.run_id)
+                .await
+                .unwrap(),
+            after
+        );
+        let mut wrong = request.clone();
+        wrong.conversation_id = Uuid::new_v4();
+        assert!(compact(dir.path(), &state, &wrong).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_host_holds_lease_through_commit_and_rechecks_bindings() {
+        for change in ["none", "main", "child", "reviewer", "compute", "driver"] {
+            let (dir, state, request, profile) = fixture_with(true, false).await;
+            let before = state
+                .repository
+                .agent_events_v4(request.run_id)
+                .await
+                .unwrap();
+            let gate = Arc::new(CommitGate {
+                entered: Default::default(),
+                release: Default::default(),
+            });
+            GATES
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .insert(request.run_id, gate.clone());
+            let (result, ()) = tokio::join!(compact(dir.path(), &state, &request), async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), gate.entered.notified())
+                    .await
+                    .unwrap();
+                assert!(
+                    crate::run_ownership::try_lease_in(dir.path(), request.run_id)
+                        .unwrap()
+                        .is_none(),
+                    "lease released before commit"
+                );
+                let record = load_record(&state.repository, request.run_id)
+                    .await
+                    .unwrap();
+                if matches!(change, "main" | "child" | "reviewer") {
+                    let id = match change {
+                        "child" => {
+                            record
+                                .spec
+                                .as_ref()
+                                .unwrap()
+                                .delegated_model
+                                .as_ref()
+                                .unwrap()
+                                .profile_id
+                        }
+                        "reviewer" => {
+                            record
+                                .spec
+                                .as_ref()
+                                .unwrap()
+                                .reviewer_model
+                                .as_ref()
+                                .unwrap()
+                                .profile_id
+                        }
+                        _ => profile.id,
+                    };
+                    let mut changed = state
+                        .repository
+                        .get_model_profile(id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    changed.model = "changed".into();
+                    state.repository.save_model_profile(&changed).await.unwrap();
+                } else if change == "compute" {
+                    let mut project = state
+                        .repository
+                        .get_project(request.project_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    project.remote_root = Some("/different".into());
+                    state.repository.save_project(&project).await.unwrap();
+                } else if change == "driver" {
+                    state
+                        .active_runs
+                        .lock()
+                        .unwrap()
+                        .insert(request.run_id, Arc::new(AtomicBool::new(false)));
+                }
+                gate.release.notify_one();
+            });
+            GATES.get().unwrap().lock().unwrap().remove(&request.run_id);
+            if change == "none" {
+                assert_eq!(result.unwrap().status, ContextCompactionStatusV4::Completed);
+            } else {
+                assert!(result.is_err(), "accepted changed {change}");
+                assert_eq!(
+                    state
+                        .repository
+                        .agent_events_v4(request.run_id)
+                        .await
+                        .unwrap(),
+                    before
+                );
+                assert!(
+                    state
+                        .repository
+                        .context_compaction_receipt_v4(&request)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            assert!(
+                crate::run_ownership::try_lease_in(dir.path(), request.run_id)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                *EFFECTS
+                    .get()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .get(&request.project_id)
+                    .unwrap()
+                    .lock()
+                    .unwrap(),
+                [0, 0, 0, 0]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_host_images_schema_and_frozen_composition_are_measured() {
+        let (dir, state, request, _) = fixture_with(false, true).await;
+        let captured = state
+            .repository
+            .context_compaction_snapshot_v4(&request)
+            .await
+            .unwrap();
+        let record = load_record(&state.repository, request.run_id)
+            .await
+            .unwrap();
+        let composition = compose_frozen_ordinary_run_v4(&state, &record, &captured.context.spec)
+            .await
+            .unwrap();
+        assert_eq!(composition.model.input_images, record.input_images);
+        assert!(composition.model.delegated.is_some());
+        assert!(composition.model.reviewer.is_some());
+        assert!(
+            composition
+                .model
+                .resources
+                .as_ref()
+                .unwrap()
+                .ready
+                .get()
+                .is_none()
+        );
+        let full = ModelRequestV4 {
+            system: composition.model.prompt_layers().render(RunModeV4::Execute),
+            context: "evidence".into(),
+            tools: composition.tools.registry.descriptors(RunModeV4::Execute),
+            image_refs: vec![],
+            replay: vec![],
+        };
+        let mut oversized = full.clone();
+        oversized.tools[0].input_schema =
+            json!({"type":"object","description":"schema ".repeat(70000)});
+        assert!(composition.model.validate_request(&oversized).is_err());
+        let metrics = composition.model.usage_request_metadata(&full);
+        assert_eq!(metrics.image_count, Some(1));
+        assert!(metrics.image_bound_tokens.is_some_and(|v| v > 0));
+        assert!(
+            metrics
+                .serialized_request_bytes
+                .is_some_and(|v| v > record.input_images[0].size_bytes)
+        );
+        AgentCoreV4 {
+            model: composition.model.as_ref(),
+            tools: composition.tools.registry.as_ref(),
+            events: &ManualCompactionEventsV4,
+            science: None,
+        }
+        .prepare_context_compaction(&captured.context, composition.limits)
+        .expect("image full request admission");
+        let receipt = compact(dir.path(), &state, &request).await.unwrap();
+        assert_eq!(receipt.status, ContextCompactionStatusV4::Completed);
+        assert!(receipt.provider_request_bytes.is_some());
+        std::fs::write(
+            dir.path().join("fixture.png"),
+            b"changed image SECRET_SENTINEL",
+        )
+        .unwrap();
+        let mut next = request.clone();
+        next.request_id = Uuid::new_v4();
+        let error = compact(dir.path(), &state, &next).await.unwrap_err();
+        assert!(!error.contains("SECRET_SENTINEL"));
+        assert_eq!(
+            compact(dir.path(), &state, &request).await.unwrap(),
+            receipt
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_host_completed_noop_and_other_states_fail_closed() {
+        let (dir, state, request, _) = fixture().await;
+        let mut record = load_record(&state.repository, request.run_id)
+            .await
+            .unwrap();
+        let before = state
+            .repository
+            .agent_events_v4(request.run_id)
+            .await
+            .unwrap();
+        for status in [
+            "running",
+            "failed",
+            "cancelled",
+            "needs_attention",
+            "planning",
+        ] {
+            record.status = status.into();
+            save_record(&state.repository, &record).await.unwrap();
+            assert!(compact(dir.path(), &state, &request).await.is_err());
+            assert_eq!(
+                state
+                    .repository
+                    .agent_events_v4(request.run_id)
+                    .await
+                    .unwrap(),
+                before
+            );
+        }
+        let mut last = before.last().unwrap().clone();
+        for kind in [
+            AgentEventKindV4::CompletionProposalSubmitted {
+                proposal: omicsops_protocol::CompletionProposalV4 {
+                    schema_version: 4,
+                    summary: "fixture".into(),
+                    answer_markdown: "fixture".into(),
+                    criteria: vec![],
+                },
+            },
+            AgentEventKindV4::RunCompleted,
+        ] {
+            last = AgentEventV4::next(&last, Utc::now(), kind);
+            state.repository.append_agent_event_v4(&last).await.unwrap();
+        }
+        let before = state
+            .repository
+            .agent_events_v4(request.run_id)
+            .await
+            .unwrap();
+        record.status = "completed".into();
+        save_record(&state.repository, &record).await.unwrap();
+        let receipt = compact(dir.path(), &state, &request).await.unwrap();
+        assert_eq!(receipt.status, ContextCompactionStatusV4::NotNeeded);
+        assert!(receipt.archive.is_none());
+        assert!(receipt.admission_configuration_hash.is_none());
+        assert!(receipt.provider_request_bytes.is_none());
+        assert_eq!(
+            state
+                .repository
+                .agent_events_v4(request.run_id)
+                .await
+                .unwrap(),
+            before
+        );
+        let _lease = crate::run_ownership::try_lease_in(dir.path(), request.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            compact(dir.path(), &state, &request).await.unwrap(),
+            receipt
+        );
     }
 }

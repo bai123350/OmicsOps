@@ -1548,3 +1548,23 @@ fn subscription_resource_dto_accepts_only_symbolic_official_pages() {
         .is_err()
     );
 }
+
+#[test]
+fn manual_compaction_request_only_accepts_scope_and_request_identity() {
+    use omicsops_dto::CompactContextRequestV4;
+    let scope = json!({"request_id":uuid::Uuid::new_v4(),"project_id":uuid::Uuid::new_v4(),"conversation_id":uuid::Uuid::new_v4(),"run_id":uuid::Uuid::new_v4()});
+    let request: CompactContextRequestV4 = serde_json::from_value(scope.clone()).unwrap();
+    assert_eq!(serde_json::to_value(request).unwrap(), scope);
+    for field in [
+        "model_profile_id",
+        "compute_selection",
+        "candidate_context",
+        "approval_hash",
+        "resume",
+        "answer",
+    ] {
+        let mut injected = scope.clone();
+        injected[field] = json!("not-host-authority");
+        assert!(serde_json::from_value::<CompactContextRequestV4>(injected).is_err());
+    }
+}
