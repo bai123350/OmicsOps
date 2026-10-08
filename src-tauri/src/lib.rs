@@ -256,6 +256,7 @@ pub fn run() {
             agent_v4::agent_v4_context_usage,
             context_compaction::agent_v4_compact_context,
             run_diagnostics::get_run_diagnostics_v4,
+            run_diagnostics::save_run_diagnostics_v4,
             kernel_inspection_v4::agent_v4_inspect_kernel,
             browser_commands::browser_get_settings,
             follow_up_questions::agent_v4_suggest_follow_up_questions,

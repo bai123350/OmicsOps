@@ -1,16 +1,18 @@
 //! Read-only, metadata-only diagnostics for persisted V4 event chains.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use omicsops_dto::{
     RunDiagnosticEventV4, RunDiagnosticStatusV4, RunDiagnosticUsageV4,
     RunDiagnosticsFilterSummaryV4, RunDiagnosticsRequestV4, RunDiagnosticsSnapshotV4,
-    RunDiagnosticsSourceHeadV4,
+    RunDiagnosticsSourceHeadV4, RunDiagnosticsExportFormatV4, SaveRunDiagnosticsRequestV4,
 };
 use omicsops_protocol::{AgentEventKindV4, AgentEventV4, UsageTotalsV4, validate_event_chain_v4};
 use omicsops_store::{Store, StoreError};
 use sha2::{Digest, Sha256};
 use tauri::State;
+use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
 use crate::{commands::AppState, composer_references::public_text};
@@ -453,9 +455,111 @@ pub async fn get_run_diagnostics_v4(
     load_run_diagnostics(&state.repository, &request).await
 }
 
+// File-only explanatory metadata; the query/preview DTO and its version stay unchanged.
+const EXPORT_NOTES: &str = "公开诊断投影，非完整科研证据。 Public diagnostic projection, not complete scientific evidence. This fixed snapshot ends at source_heads (run_id, event_count, last_sequence, event_hash); it does not claim to be current after the save dialog. total_event_count counts the complete source; selected_event_count and filter_summary describe the selected rows. event_hash and previous_hash are references to validated original events: this redacted projection cannot recompute their original hashes and is not a replayable audit chain. Usage is the whole-run subtotal for selected runs, not recalculated by tool/failure filters. Missing observations or null values mean unknown, never zero; incomplete subtotals remain incomplete. No observations means unknown usage. A null duration_ms means unknown duration.";
+
+pub(crate) fn render_run_diagnostics(
+    snapshot: &RunDiagnosticsSnapshotV4,
+    format: RunDiagnosticsExportFormatV4,
+) -> Result<Vec<u8>, String> {
+    #[derive(serde::Serialize)]
+    struct Export<'a> {
+        #[serde(flatten)]
+        snapshot: &'a RunDiagnosticsSnapshotV4,
+        export_notes: &'static str,
+    }
+    let json = serde_json::to_vec_pretty(&Export { snapshot, export_notes: EXPORT_NOTES })
+        .map_err(|_| "diagnostics_render_failed")?;
+    if json.len() > MAX_PROJECTION_BYTES {
+        return Err("diagnostics_export_limit".into());
+    }
+    if format == RunDiagnosticsExportFormatV4::Json {
+        return Ok(json);
+    }
+    let text = std::str::from_utf8(&json).map_err(|_| "diagnostics_render_failed")?;
+    let mut html = String::from("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\"><title>OmicsOps run diagnostics</title><style>body{font-family:system-ui,sans-serif;margin:2rem;line-height:1.5}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style></head><body><h1>OmicsOps run diagnostics</h1><p>公开诊断投影，非完整科研证据</p><pre>");
+    // Every variable byte is text, including quotes and apostrophes. No resource URLs,
+    // Markdown, scripts or dynamic attributes are generated from the snapshot.
+    for character in text.chars() {
+        match character {
+            '&' => html.push_str("&amp;"),
+            '<' => html.push_str("&lt;"),
+            '>' => html.push_str("&gt;"),
+            '"' => html.push_str("&quot;"),
+            '\'' => html.push_str("&#39;"),
+            _ => html.push(character),
+        }
+        if html.len() > MAX_PROJECTION_BYTES {
+            return Err("diagnostics_export_limit".into());
+        }
+    }
+    html.push_str("</pre></body></html>");
+    if html.len() > MAX_PROJECTION_BYTES {
+        return Err("diagnostics_export_limit".into());
+    }
+    Ok(html.into_bytes())
+}
+
+pub(crate) async fn prepare_run_diagnostics_export(
+    repository: &Store,
+    request: &SaveRunDiagnosticsRequestV4,
+) -> Result<Vec<u8>, String> {
+    let snapshot = load_run_diagnostics(repository, &request.query).await?;
+    // Compare the complete, sorted vector, including runs hidden by filters.
+    if snapshot.source_heads != request.expected_heads {
+        return Err("diagnostics_snapshot_changed".into());
+    }
+    render_run_diagnostics(&snapshot, request.format)
+}
+
+fn save_diagnostic_bytes(
+    bytes: &[u8],
+    format: RunDiagnosticsExportFormatV4,
+    choose_path: impl FnOnce(&str) -> Result<Option<PathBuf>, String>,
+) -> Result<Option<String>, String> {
+    if bytes.len() > MAX_PROJECTION_BYTES {
+        return Err("diagnostics_export_limit".into());
+    }
+    let extension = match format {
+        RunDiagnosticsExportFormatV4::Html => "html",
+        RunDiagnosticsExportFormatV4::Json => "json",
+    };
+    let Some(mut path) = choose_path(extension).map_err(|_| "diagnostics_save_failed")? else {
+        return Ok(None);
+    };
+    if path.extension().is_none() {
+        path.set_extension(extension);
+    }
+    crate::conversation_export::write_export_bytes(&path, extension, bytes)
+        .map_err(|_| "diagnostics_save_failed")?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+pub async fn save_run_diagnostics_v4(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    request: SaveRunDiagnosticsRequestV4,
+) -> Result<Option<String>, String> {
+    // Reread, validate, compare every head and bound the final bytes before dialog.
+    // The bytes are immutable thereafter; a concurrent append cannot relabel them.
+    let bytes = prepare_run_diagnostics_export(&state.repository, &request).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        save_diagnostic_bytes(&bytes, request.format, |extension| {
+            app.dialog().file()
+                .add_filter("Run diagnostics", &[extension])
+                .set_file_name(format!("omicsops-run-diagnostics.{extension}"))
+                .blocking_save_file()
+                .map(|selected| selected.into_path().map_err(|_| "diagnostics_save_failed".into()))
+                .transpose()
+        })
+    }).await.map_err(|_| "diagnostics_save_failed")?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omicsops_dto::{RunDiagnosticsExportFormatV4::{Html, Json}, SaveRunDiagnosticsRequestV4};
     use chrono::{DateTime, Duration, Utc};
     use omicsops_dto::{
         RunDiagnosticStatusV4 as Status, RunDiagnosticsFilterV4, RunDiagnosticsRequestV4,
@@ -728,6 +832,11 @@ mod tests {
         assert_eq!(snapshot.usage[1].missing_observation_attempts, 1);
         assert_eq!(snapshot.usage[2].totals.input_tokens.known, None);
         assert_eq!(snapshot.usage[2].missing_observation_attempts, 1);
+        let exported: serde_json::Value = serde_json::from_slice(&render_run_diagnostics(&snapshot, Json).unwrap()).unwrap();
+        assert_eq!(exported["usage"][0]["totals"]["input_tokens"]["known"], 9);
+        assert_eq!(exported["usage"][0]["totals"]["input_tokens"]["incomplete_attempts"], 1);
+        assert_eq!(exported["usage"][0]["missing_observation_attempts"], 1);
+        assert!(exported["usage"][2]["totals"]["input_tokens"]["known"].is_null());
         let mut req = request();
         req.filter.tool_id = Some("shell".into());
         req.filter.failures_only = true;
@@ -799,6 +908,12 @@ mod tests {
         assert!(!serialized.contains("model_content"));
         assert!(!serialized.contains("arguments"));
         assert!(!serialized.contains("redaction_keywords"));
+        for format in [Html, Json] {
+            let exported = String::from_utf8(render_run_diagnostics(&snapshot, format).unwrap()).unwrap();
+            for forbidden in ["PRIVATE_SENTINEL", "CUSTOM_LITERAL", "model_content", "arguments", "redaction_keywords"] {
+                assert!(!exported.contains(forbidden), "{forbidden}");
+            }
+        }
         assert!(snapshot.events[1].tool_label.as_ref().unwrap().len() <= 256);
         assert_eq!(snapshot.events[0].event_kind, "model_text");
         assert_eq!(snapshot.events[0].event_hash, events[0].event_hash);
@@ -819,6 +934,11 @@ mod tests {
             .unwrap();
             let text = serde_json::to_string(&safe).unwrap();
             assert!(!text.contains("PRIVATE_SENTINEL"));
+            for format in [Html, Json] {
+                let exported = String::from_utf8(render_run_diagnostics(&safe, format).unwrap()).unwrap();
+                assert!(!exported.contains("PRIVATE_SENTINEL"));
+                assert!(!exported.contains("CUSTOM_LITERAL"));
+            }
             assert!(!text.contains("CUSTOM_LITERAL"));
         }
     }
@@ -858,6 +978,9 @@ mod tests {
         assert_eq!(snapshot.events.len(), 8);
         let serialized = serde_json::to_value(&snapshot).unwrap();
         assert!(!serialized.to_string().contains(private));
+        for format in [Html, Json] {
+            assert!(!String::from_utf8(render_run_diagnostics(&snapshot, format).unwrap()).unwrap().contains(private));
+        }
         let expected_keys = [
             "run_id",
             "sequence",
@@ -1121,6 +1244,139 @@ mod tests {
             .await
             .unwrap();
         (store, req)
+    }
+
+    #[tokio::test]
+    async fn run_diagnostics_export_requires_exact_complete_heads_and_rereads_source() {
+        let (store, mut query) = stored_fixture().await;
+        let visible = chain(30, vec![(0, start("call", "shell"))]);
+        let hidden = chain(31, vec![(0, start("call", "read")), (1, finish("call", "read", true))]);
+        store.append_agent_event_v4(&visible[0]).await.unwrap();
+        store.append_agent_event_v4(&hidden[0]).await.unwrap();
+        query.filter.run_id = Some(Uuid::from_u128(30));
+        let preview = load_run_diagnostics(&store, &query).await.unwrap();
+        let request = SaveRunDiagnosticsRequestV4 { query, expected_heads: preview.source_heads.clone(), format: Json };
+        let bytes = prepare_run_diagnostics_export(&store, &request).await.unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(document["selected_event_count"], 1);
+        assert_eq!(document["total_event_count"], 2);
+        assert_eq!(document["source_heads"].as_array().unwrap().len(), 2);
+        for mutation in 0..7 {
+            let mut bad = request.clone();
+            match mutation {
+                0 => { bad.expected_heads.pop(); }
+                1 => bad.expected_heads.reverse(),
+                2 => bad.expected_heads.push(bad.expected_heads[0].clone()),
+                3 => bad.expected_heads[1].event_count += 1,
+                4 => bad.expected_heads[1].last_sequence += 1,
+                5 => bad.expected_heads[1].event_hash = "PRIVATE_SENTINEL".into(),
+                _ => bad.expected_heads[1].run_id = Uuid::from_u128(99),
+            }
+            assert_eq!(prepare_run_diagnostics_export(&store, &bad).await.unwrap_err(), "diagnostics_snapshot_changed");
+        }
+        store.append_agent_event_v4(&hidden[1]).await.unwrap();
+        assert_eq!(prepare_run_diagnostics_export(&store, &request).await.unwrap_err(), "diagnostics_snapshot_changed");
+        // An already prepared file remains the explicit earlier cutoff while a chooser waits.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("snapshot.json");
+        save_diagnostic_bytes(&bytes, Json, |_| Ok(Some(path.clone()))).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_eq!(document["source_heads"][1]["last_sequence"], 1);
+        sqlx::query("UPDATE agent_events_v4 SET event_hash='invalid' WHERE run_id=?1 AND sequence=1")
+            .bind(hidden[0].run_id.to_string()).execute(store.pool()).await.unwrap();
+        assert_eq!(prepare_run_diagnostics_export(&store, &request).await.unwrap_err(), "diagnostics_source_invalid");
+    }
+
+    #[test]
+    fn run_diagnostics_export_escapes_html_preserves_schema_and_excludes_private_payloads() {
+        let mut req = request();
+        req.redaction_keywords = vec!["SECRET_WORD".into()];
+        let label = "<script>alert('x')</script><img src=\"https://invalid/x\" onerror='x'>& SECRET_WORD";
+        let events = chain(30, vec![(0, start("PRIVATE_CALL", label)), (1, Kind::ModelText { text: "PRIVATE_SENTINEL".into() }), (2, finish("PRIVATE_CALL", label, false))]);
+        let snapshot = project_run_diagnostics(&events, &req).unwrap();
+        let json_bytes = render_run_diagnostics(&snapshot, Json).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(serde_json::from_value::<RunDiagnosticsSnapshotV4>(value.clone()).unwrap(), snapshot);
+        let mut snapshot_only = value.clone();
+        assert!(snapshot_only.as_object_mut().unwrap().remove("export_notes").unwrap().is_string());
+        assert_eq!(snapshot_only, serde_json::to_value(&snapshot).unwrap());
+        assert!(value["events"][0].get("payload").is_none());
+        assert!(value["events"][0]["duration_ms"].is_null());
+        let html = String::from_utf8(render_run_diagnostics(&snapshot, Html).unwrap()).unwrap();
+        assert!(html.contains("default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"));
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(html.contains("&#39;x&#39;"));
+        assert!(html.contains("&quot;"));
+        assert!(html.contains("&amp;"));
+        for forbidden in ["<script", "<img", "<iframe", "<link", "<a ", "<form", "url(", "@import"] {
+            assert!(!html.contains(forbidden), "{forbidden}");
+        }
+        for output in [String::from_utf8(json_bytes).unwrap(), html] {
+            for secret in ["PRIVATE_SENTINEL", "PRIVATE_CALL", "SECRET_WORD", "redaction_keywords", "model_content", "idempotency_key"] {
+                assert!(!output.contains(secret), "{secret}");
+            }
+            assert!(output.contains("公开诊断投影，非完整科研证据"));
+            assert!(output.contains("unknown"));
+            assert!(output.contains("incomplete"));
+            assert!(output.contains("fixed snapshot"));
+            assert!(output.contains("cannot recompute"));
+        }
+    }
+
+    #[test]
+    fn run_diagnostics_export_save_cancel_errors_extensions_and_exact_bytes() {
+        let bytes = b"{\"exact\":\"\r\n\"}";
+        assert_eq!(save_diagnostic_bytes(bytes, Json, |_| Ok(None)).unwrap(), None);
+        assert_eq!(save_diagnostic_bytes(bytes, Json, |_| Err("PRIVATE_PATH".into())).unwrap_err(), "diagnostics_save_failed");
+        let directory = tempfile::tempdir().unwrap();
+        let wrong = directory.path().join("wrong.exe");
+        assert_eq!(save_diagnostic_bytes(bytes, Json, |_| Ok(Some(wrong.clone()))).unwrap_err(), "diagnostics_save_failed");
+        assert!(!wrong.exists());
+        for bad in [directory.path().join("missing/file.json"), directory.path().join("directory.json")] {
+            if bad.file_name().unwrap() == "directory.json" { std::fs::create_dir(&bad).unwrap(); }
+            assert_eq!(save_diagnostic_bytes(bytes, Json, |_| Ok(Some(bad))).unwrap_err(), "diagnostics_save_failed");
+        }
+        for (format, name, expected) in [(Json, "exact.JSON", "json"), (Html, "exact", "html")] {
+            let path = directory.path().join(name);
+            let saved = save_diagnostic_bytes(bytes, format, |ext| { assert_eq!(ext, expected); Ok(Some(path)) }).unwrap().unwrap();
+            assert_eq!(std::fs::read(saved).unwrap(), bytes);
+        }
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn run_diagnostics_export_enforces_generated_byte_budget_before_chooser() {
+        assert_eq!(save_diagnostic_bytes(&vec![b'x'; 8 * 1024 * 1024], Json, |_| Ok(None)).unwrap(), None);
+        let bytes = vec![b'x'; 8 * 1024 * 1024 + 1];
+        assert_eq!(save_diagnostic_bytes(&bytes, Json, |_| panic!("oversized export opened chooser")).unwrap_err(), "diagnostics_export_limit");
+        let req = request();
+        let events = chain(30, (0..6_000).map(|i| (i, start("same", &"&".repeat(256)))).collect());
+        let snapshot = project_run_diagnostics(&events, &req).unwrap();
+        assert!(serde_json::to_vec(&snapshot).unwrap().len() < 8 * 1024 * 1024);
+        assert_eq!(render_run_diagnostics(&snapshot, Html).unwrap_err(), "diagnostics_export_limit");
+        let mut oversized = snapshot;
+        oversized.events[0].tool_label = Some("x".repeat(8 * 1024 * 1024));
+        assert_eq!(render_run_diagnostics(&oversized, Json).unwrap_err(), "diagnostics_export_limit");
+    }
+
+    #[tokio::test]
+    async fn run_diagnostics_export_empty_snapshot_and_new_run_head_are_explicit() {
+        let (store, query) = stored_fixture().await;
+        let request = SaveRunDiagnosticsRequestV4 { query, expected_heads: vec![], format: Json };
+        let bytes = prepare_run_diagnostics_export(&store, &request).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["events"], json!([]));
+        assert_eq!(value["source_heads"], json!([]));
+        assert_eq!(value["usage"], json!([]));
+        assert_eq!(value["selected_event_count"], 0);
+        assert_eq!(value["total_event_count"], 0);
+        assert_eq!(value["filtered"], false);
+        let event = chain(30, vec![(0, start("call", "shell"))]).remove(0);
+        store.append_agent_event_v4(&event).await.unwrap();
+        assert_eq!(prepare_run_diagnostics_export(&store, &request).await.unwrap_err(), "diagnostics_snapshot_changed");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events_v4").fetch_one(store.pool()).await.unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]
