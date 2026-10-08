@@ -15,6 +15,7 @@ pub mod composer_reference_validation;
 pub mod composer_references;
 pub mod composer_workflows;
 pub mod context_compaction;
+pub mod run_diagnostics;
 mod conversation_branch_material;
 pub mod conversation_branches;
 pub mod conversation_export;
@@ -254,6 +255,7 @@ pub fn run() {
             agent_v4::agent_v4_events_for_conversation,
             agent_v4::agent_v4_context_usage,
             context_compaction::agent_v4_compact_context,
+            run_diagnostics::get_run_diagnostics_v4,
             kernel_inspection_v4::agent_v4_inspect_kernel,
             browser_commands::browser_get_settings,
             follow_up_questions::agent_v4_suggest_follow_up_questions,
