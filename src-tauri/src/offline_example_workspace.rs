@@ -450,18 +450,111 @@ fn verify_materialized(
     Ok(())
 }
 
-fn publish_directory(staging: &Path, child: &Path) -> Result<(), String> {
+// This read-attributes handle survives guard transitions and keeps the original
+// file ID alive. It permits rename, but every mutation must bind its own handle
+// to this retained identity before touching the filesystem.
+fn retain_staging_identity(path: &Path) -> Result<File, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::*;
+        let file = OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|_| "example_path_unavailable")?;
+        if !file.metadata().is_ok_and(|metadata| metadata.is_dir())
+            || internal_snapshot(&file)?.0
+                != fs::canonicalize(path).map_err(|_| "example_path_unavailable")?
+        {
+            return Err("example_path_unsafe".into());
+        }
+        Ok(file)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err("example_platform_unavailable".into())
+    }
+}
+
+fn retained_identity(file: &File) -> Result<(u32, u64), String> {
+    #[cfg(windows)]
+    {
+        let snapshot = internal_snapshot(file)?;
+        Ok((snapshot.1, snapshot.2))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        Err("example_platform_unavailable".into())
+    }
+}
+
+// No delete sharing: the actual handle being renamed/deleted pins its name until
+// that operation completes. Ancestor handles must already protect containment.
+fn open_mutation_handle(path: &Path) -> Result<File, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::*;
+        let file = OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES | DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|_| "example_path_unavailable")?;
+        if internal_snapshot(&file)?.0
+            != fs::canonicalize(path).map_err(|_| "example_path_unavailable")?
+        {
+            return Err("example_path_unsafe".into());
+        }
+        Ok(file)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err("example_platform_unavailable".into())
+    }
+}
+
+fn publish_directory(staging: &Path, child: &Path, trusted: &File) -> Result<(), String> {
+    let parent = child.parent().ok_or("example_path_unsafe")?;
+    let _parent_guards = lock_directory_chain(parent)?;
+    if staging.parent() != Some(parent) {
+        return Err("example_path_unsafe".into());
+    }
+    let source = open_mutation_handle(staging)?;
+    if retained_identity(&source)? != retained_identity(trusted)? {
+        return Err("example_path_unsafe".into());
+    }
     if fs::symlink_metadata(child).is_ok() {
         return Err("example_target_conflict".into());
     }
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-        let from: Vec<u16> = staging.as_os_str().encode_wide().chain(Some(0)).collect();
+        use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::*;
         let to: Vec<u16> = child.as_os_str().encode_wide().chain(Some(0)).collect();
-        // Flags=0 deliberately excludes MOVEFILE_REPLACE_EXISTING and cross-volume copy.
+        let size = std::mem::size_of::<FILE_RENAME_INFO>() + to.len() * 2;
+        // usize backing preserves FILE_RENAME_INFO alignment and includes the
+        // variable-length UTF-16 tail. Zero initialization means no replacement.
+        let mut buffer = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
+        let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        unsafe {
+            (*info).FileNameLength = ((to.len() - 1) * 2) as u32;
+            std::ptr::copy_nonoverlapping(to.as_ptr(), (*info).FileName.as_mut_ptr(), to.len());
+        }
+        #[cfg(test)]
+        tests::mutation_boundary("rename", child);
         if unsafe {
-            windows_sys::Win32::Storage::FileSystem::MoveFileExW(from.as_ptr(), to.as_ptr(), 0)
+            SetFileInformationByHandle(
+                source.as_raw_handle(),
+                FileRenameInfo,
+                info.cast(),
+                size as u32,
+            )
         } == 0
         {
             return Err("example_publish_failed".into());
@@ -470,7 +563,7 @@ fn publish_directory(staging: &Path, child: &Path) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        let _ = staging;
+        let _ = source;
         Err("example_platform_unavailable".into())
     }
 }
@@ -540,10 +633,12 @@ pub(crate) fn materialize_offline_example(
         Uuid::new_v4()
     ));
     fs::create_dir(&staging).map_err(|_| "example_write_failed")?;
-    let staging_identity = directory_identity(&staging)?;
+    let staging_identity = retain_staging_identity(&staging)?;
     let operation: Result<(), String> = (|| {
         let staging_guards = lock_directory_chain(&staging)?;
-        if canonical_local(&staging)? != staging {
+        if canonical_local(&staging)? != staging
+            || directory_identity(&staging)? != retained_identity(&staging_identity)?
+        {
             return Err("example_path_unsafe".into());
         }
         for directory in ["data", "results", ".omicsops"] {
@@ -570,43 +665,53 @@ pub(crate) fn materialize_offline_example(
         }
         verify_materialized(&staging, &prepared.project, fixture, &receipt)?;
         if canonical_local(&requested_parent)? != parent
-            || directory_identity(&staging)? != staging_identity
+            || directory_identity(&staging)? != retained_identity(&staging_identity)?
         {
             return Err("example_path_unsafe".into());
         }
         let _guards = lock_directory_chain(&parent)?;
         drop(staging_guards);
-        publish_directory(&staging, &child)?;
+        #[cfg(test)]
+        tests::mutation_boundary("publish", &staging);
+        publish_directory(&staging, &child, &staging_identity)?;
         // From publication onward never delete the final directory, even if verification
         // or the later atomic Store registration fails. Exact request retry can recover.
         verify_materialized(&child, &prepared.project, fixture, &receipt)?;
         Ok(())
     })();
     if operation.is_err() {
-        cleanup_staging(&parent, &staging, staging_identity);
+        cleanup_staging(&parent, &staging, &staging_identity);
     }
     operation?;
     Ok(prepared)
 }
 
-fn cleanup_staging(parent: &Path, staging: &Path, identity: (u32, u64)) {
+fn cleanup_staging(parent: &Path, staging: &Path, trusted: &File) {
     // Only a staging we created may reach this function. Never follow a replaced
     // directory or recursively delete unknown entries. A suspicious tree is retained.
-    if staging.parent() != Some(parent)
-        || canonical_local(staging).ok().as_deref() != Some(staging)
-        || directory_identity(staging).ok() != Some(identity)
+    let Ok(_parent_guards) = lock_directory_chain(parent) else {
+        return;
+    };
+    let Ok(identity) = retained_identity(trusted) else {
+        return;
+    };
+    if staging.parent() != Some(parent) || canonical_local(staging).ok().as_deref() != Some(staging)
     {
         return;
     }
-    let Ok(guards) = lock_directory_chain(staging) else {
+    #[cfg(test)]
+    tests::mutation_boundary("cleanup", staging);
+    let Ok(root_guard) = open_mutation_handle(staging) else {
         return;
     };
+    if retained_identity(&root_guard).ok() != Some(identity) {
+        return;
+    }
     let allowed: BTreeSet<_> = FIXED_FILES
         .into_iter()
         .chain([RECEIPT, PROJECT_MANIFEST])
         .collect();
     let mut files = Vec::new();
-    let mut dirs = vec![staging.to_owned()];
     let mut nested_guards = Vec::new();
     for directory in [
         staging.to_owned(),
@@ -620,10 +725,15 @@ fn cleanup_staging(parent: &Path, staging: &Path, identity: (u32, u64)) {
         if !reject_reparse(&directory).is_ok_and(|metadata| metadata.is_dir()) {
             return;
         }
-        let Ok(directory_guards) = lock_directory_chain(&directory) else {
-            return;
-        };
-        nested_guards.extend(directory_guards);
+        if directory != staging {
+            let Ok(guard) = open_mutation_handle(&directory) else {
+                return;
+            };
+            if !guard.metadata().is_ok_and(|metadata| metadata.is_dir()) {
+                return;
+            }
+            nested_guards.push(guard);
+        }
         let Ok(entries) = fs::read_dir(&directory) else {
             return;
         };
@@ -641,7 +751,7 @@ fn cleanup_staging(parent: &Path, staging: &Path, identity: (u32, u64)) {
                     .iter()
                     .any(|name| path == staging.join(name))
             {
-                dirs.push(path);
+                // Its handle is acquired before enumerating that directory.
             } else if metadata.is_file()
                 && path
                     .strip_prefix(staging)
@@ -649,26 +759,54 @@ fn cleanup_staging(parent: &Path, staging: &Path, identity: (u32, u64)) {
                     .and_then(Path::to_str)
                     .is_some_and(|relative| allowed.contains(relative.replace('\\', "/").as_str()))
             {
-                files.push(path);
+                let Ok(file) = open_mutation_handle(&path) else {
+                    return;
+                };
+                if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+                    return;
+                }
+                files.push(file);
             } else {
                 return;
             }
         }
     }
-    for path in files {
-        if reject_reparse(&path).is_ok_and(|metadata| metadata.is_file()) {
-            let _ = fs::remove_file(path);
+    for file in files {
+        if delete_by_handle(&file).is_err() {
+            return;
         }
     }
-    drop(nested_guards);
-    for path in dirs.into_iter().rev().filter(|path| path != staging) {
-        if reject_reparse(&path).is_ok_and(|metadata| metadata.is_dir()) {
-            let _ = fs::remove_dir(path);
+    for directory in nested_guards {
+        if delete_by_handle(&directory).is_err() {
+            return;
         }
     }
-    drop(guards);
-    if directory_identity(staging).ok() == Some(identity) {
-        let _ = fs::remove_dir(staging);
+    let _ = delete_by_handle(&root_guard);
+}
+
+fn delete_by_handle(file: &File) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::*;
+        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+        if unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfo,
+                (&info as *const FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err("example_cleanup_failed".into());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        Err("example_platform_unavailable".into())
     }
 }
 
@@ -678,6 +816,114 @@ mod tests {
     use omicsops_dto::CreateOfflineExampleWorkspaceRequest;
     use std::{fs, path::Path};
     use uuid::Uuid;
+
+    type BoundaryHook = (&'static str, Box<dyn FnOnce(&Path)>);
+    thread_local! {
+        static BOUNDARY_HOOK: std::cell::RefCell<Option<BoundaryHook>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    pub(super) fn mutation_boundary(name: &str, path: &Path) {
+        let hook = BOUNDARY_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().is_some_and(|hook| hook.0 == name) {
+                slot.take()
+            } else {
+                None
+            }
+        });
+        if let Some((_, hook)) = hook {
+            hook(path);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn offline_example_create_publication_rejects_boundary_source_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = canonical_local(dir.path()).unwrap();
+        let original = parent.join("original.staging");
+        let replacement = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed = replacement.clone();
+        let saved = original.clone();
+        BOUNDARY_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some((
+                "publish",
+                Box::new(move |staging| {
+                    let identity = directory_identity(staging).unwrap();
+                    fs::rename(staging, &saved).unwrap();
+                    fs::create_dir(staging).unwrap();
+                    fs::write(staging.join("README.md"), b"user-owned replacement").unwrap();
+                    *observed.borrow_mut() = Some((
+                        staging.to_owned(),
+                        identity,
+                        directory_identity(staging).unwrap(),
+                    ));
+                }),
+            ));
+        });
+        let request = request(&parent);
+        let result = materialize_offline_example(
+            &request,
+            &load_bundled_example().unwrap(),
+            write_new_example_file,
+        );
+        assert!(result.is_err());
+        let (staging, identity, replacement_identity) = replacement.borrow_mut().take().unwrap();
+        assert_eq!(
+            fs::read(staging.join("README.md")).unwrap(),
+            b"user-owned replacement"
+        );
+        assert_eq!(directory_identity(&staging).unwrap(), replacement_identity);
+        assert_eq!(directory_identity(&original).unwrap(), identity);
+        assert!(
+            !parent
+                .join(format!("omicsops-example-{}", request.request_id))
+                .exists()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn offline_example_create_cleanup_rejects_boundary_guard_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = canonical_local(dir.path()).unwrap();
+        let staging = parent.join("owned.staging");
+        let original = parent.join("original.staging");
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("README.md"), b"original owned bytes").unwrap();
+        let identity = directory_identity(&staging).unwrap();
+        let trusted = retain_staging_identity(&staging).unwrap();
+        let replacement = std::rc::Rc::new(std::cell::Cell::new(None));
+        let observed = replacement.clone();
+        let saved = original.clone();
+        BOUNDARY_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some((
+                "cleanup",
+                Box::new(move |staging| {
+                    fs::rename(staging, &saved).unwrap();
+                    fs::create_dir(staging).unwrap();
+                    fs::write(staging.join("README.md"), b"user-owned replacement").unwrap();
+                    observed.set(Some(directory_identity(staging).unwrap()));
+                }),
+            ));
+        });
+        cleanup_staging(&parent, &staging, &trusted);
+        assert_eq!(
+            fs::read(staging.join("README.md")).unwrap(),
+            b"user-owned replacement"
+        );
+        assert_eq!(
+            fs::read(original.join("README.md")).unwrap(),
+            b"original owned bytes"
+        );
+        assert_eq!(
+            directory_identity(&staging).unwrap(),
+            replacement.get().unwrap()
+        );
+        assert_eq!(directory_identity(&original).unwrap(), identity);
+    }
 
     fn request(parent: &Path) -> CreateOfflineExampleWorkspaceRequest {
         CreateOfflineExampleWorkspaceRequest {
@@ -945,13 +1191,58 @@ mod tests {
         let child = parent.path().join("child");
         fs::create_dir(&staging).unwrap();
         fs::write(staging.join("new.txt"), b"new").unwrap();
+        let trusted = retain_staging_identity(&staging).unwrap();
         fs::create_dir(&child).unwrap();
-        assert!(publish_directory(&staging, &child).is_err());
+        assert!(publish_directory(&staging, &child, &trusted).is_err());
         assert_eq!(fs::read_dir(&child).unwrap().count(), 0);
         fs::write(child.join("user.txt"), b"user").unwrap();
-        assert!(publish_directory(&staging, &child).is_err());
+        assert!(publish_directory(&staging, &child, &trusted).is_err());
         assert_eq!(fs::read(child.join("user.txt")).unwrap(), b"user");
         assert!(staging.join("new.txt").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn offline_example_create_publication_handles_late_target_without_replacement() {
+        for populated in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let parent = canonical_local(dir.path()).unwrap();
+            let staging = parent.join("owned.staging");
+            let child = parent.join("child");
+            fs::create_dir(&staging).unwrap();
+            fs::write(staging.join("README.md"), b"original owned bytes").unwrap();
+            let trusted = retain_staging_identity(&staging).unwrap();
+            let identity = retained_identity(&trusted).unwrap();
+            let captured = staging.clone();
+            BOUNDARY_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some((
+                    "rename",
+                    Box::new(move |child| {
+                        // At the actual Win32 operation boundary the source mutation
+                        // handle prevents replacement, while the target can appear.
+                        assert!(fs::rename(&captured, captured.with_extension("moved")).is_err());
+                        fs::create_dir(child).unwrap();
+                        if populated {
+                            fs::write(child.join("README.md"), b"user-owned target").unwrap();
+                        }
+                    }),
+                ));
+            });
+            assert!(publish_directory(&staging, &child, &trusted).is_err());
+            assert_eq!(directory_identity(&staging).unwrap(), identity);
+            assert_eq!(
+                fs::read(staging.join("README.md")).unwrap(),
+                b"original owned bytes"
+            );
+            if populated {
+                assert_eq!(
+                    fs::read(child.join("README.md")).unwrap(),
+                    b"user-owned target"
+                );
+            } else {
+                assert_eq!(fs::read_dir(&child).unwrap().count(), 0);
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -961,11 +1252,11 @@ mod tests {
         let parent = canonical_local(dir.path()).unwrap();
         let staging = parent.join("owned.staging");
         fs::create_dir(&staging).unwrap();
-        let identity = directory_identity(&staging).unwrap();
+        let trusted = retain_staging_identity(&staging).unwrap();
         fs::rename(&staging, parent.join("original.staging")).unwrap();
         fs::create_dir(&staging).unwrap();
         fs::write(staging.join("README.md"), b"user-owned replacement").unwrap();
-        cleanup_staging(&parent, &staging, identity);
+        cleanup_staging(&parent, &staging, &trusted);
         assert_eq!(
             fs::read(staging.join("README.md")).unwrap(),
             b"user-owned replacement"

@@ -21,7 +21,11 @@ may therefore place new examples among older projects. A retry checks the exact
 manifest, receipt and files and never repairs user edits. Published files survive
 a database registration failure. A fresh request creates a distinct directory.
 
-Directory publication currently supports Windows, using a no-replace Win32 move.
+Directory publication currently supports Windows. The host retains the staging
+directory's identity handle, verifies publication and cleanup root handles against
+that identity, and publishes with a Win32 handle rename that refuses an existing target.
+Cleanup retains directory guards and deletes through those same handles; unknown
+or replaced staging trees remain untouched for inspection.
 Other hosts return `example_platform_unavailable`; no macOS behavior or package is
 claimed as verified. Normal file preview is provided separately by the host's
 validated project-file reader. Hashes establish content equality only, not
