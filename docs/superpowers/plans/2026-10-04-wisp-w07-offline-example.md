@@ -61,7 +61,7 @@
 - Consumes: Task 1 DTO/marker/atomic Store，core Project，现有 project.json 格式及 LICENSE。
 - Produces: 模块内部 `OfflineExampleFixtureV1`（version、example ID、双语 entries、固定文件内容）、`OfflineExampleReceiptV1`（Spec 收据字段）、`PreparedOfflineExampleProject {project: Project, marker: OfflineExampleProjectMarkerV1}`；`load_bundled_example() -> Result<OfflineExampleFixtureV1, String>`；`materialize_offline_example(request: &CreateOfflineExampleWorkspaceRequest, fixture: &OfflineExampleFixtureV1, write_file: fn(&Path, &[u8]) -> Result<(), String>) -> Result<PreparedOfflineExampleProject, String>`；`write_new_example_file(path: &Path, bytes: &[u8]) -> Result<(), String>` 为 create_new 生产 writer，fn 参数仅窄失败注入，不提供通用 FS 框架。Task 3 接上 view 后产生完整 create 命令。
 
-- [ ] **RED — 写 `offline_example_create_*`。** fixture 数字为 A=2/4、B=5/7，means=3/6、difference=3；固定七文件及双语“合成数据，预置结果，未在本机执行”。测规范路径/UTF-8/预算、UNC/设备/遍历/reparse、已存目标/额外文件冲突、重复 request/new request、writer 失败与 marker 登记失败恢复。
+- [x] **RED — 写 `offline_example_create_*`。** fixture 数字为 A=2/4、B=5/7，means=3/6、difference=3；固定七文件及双语“合成数据，预置结果，未在本机执行”。测规范路径/UTF-8/预算、UNC/设备/遍历/reparse、已存目标/额外文件冲突、重复 request/new request、writer 失败与 marker 登记失败恢复。
 
   ```rust
   assert_eq!(child.file_name().unwrap(), format!("omicsops-example-{}", request.request_id).as_str());
@@ -70,10 +70,10 @@
   assert_ne!(first.project.id, other_request.project.id);
   ```
 
-- [ ] **RED — 运行 FAIL。** `cargo test -p omicsops-desktop --lib offline_example_create -- --nocapture`；预期 fixture loader/materialize 不存在。
-- [ ] **实现上述签名与 fixture。** include_str! 编译单例 fixture/现有 LICENSE。SOURCE hashes 不含 SOURCE 自身，receipt hashes 含全部七文件。只在验证 parent 下新 staging create_new，发布唯一 child 不覆盖，再调用原子 Store；相同 request 必须 receipt/manifest/全部 hashes/Store identity 相同才恢复。失败仅清理本请求拥有且路径已核验的 staging；final 已发布/登记失败保留目录并返回 `example_registration_failed`。
-- [ ] **GREEN — 同命令 PASS。** 失败 trigger 证明 final 留存且 DB 零半登记，相同 request 可恢复；用户改动后重试冲突，绝不删除/覆盖。Windows 路径检查包含 reparse/junction，不将 Unix symlink 测试当完整证明。
-- [ ] **Commit —** `git add -- examples/offline/synthetic-evidence-report-v1.json examples/offline/README.md src-tauri/src/offline_example_workspace.rs src-tauri/src/lib.rs`；`git commit -m "feat: materialize a bounded bilingual synthetic example"`。
+- [x] **RED — 运行 FAIL。** `cargo test -p omicsops-desktop --lib offline_example_create -- --nocapture`；预期 fixture loader/materialize 不存在。
+- [x] **实现上述签名与 fixture。** include_str! 编译单例 fixture/现有 LICENSE。SOURCE hashes 不含 SOURCE 自身，receipt hashes 含全部七文件。只在验证 parent 下新 staging create_new，发布唯一 child 不覆盖，再调用原子 Store；相同 request 必须 receipt/manifest/全部 hashes/Store identity 相同才恢复。失败仅清理本请求拥有且路径已核验的 staging；final 已发布/登记失败保留目录并返回 `example_registration_failed`。
+- [x] **GREEN — 同命令 PASS。** 失败 trigger 证明 final 留存且 DB 零半登记，相同 request 可恢复；用户改动后重试冲突，绝不删除/覆盖。Windows 路径检查包含 reparse/junction，不将 Unix symlink 测试当完整证明。
+- [x] **Commit —** `git add -- examples/offline/synthetic-evidence-report-v1.json examples/offline/README.md src-tauri/src/offline_example_workspace.rs src-tauri/src/lib.rs`；`git commit -m "feat: materialize a bounded bilingual synthetic example"`。
 
 ### Task 3: marker 优先的只读 view 与安全文件预览
 
@@ -83,7 +83,7 @@
 - Consumes: Tasks 1–2，W02 `ValidatedProjectFile::open(&Project, &str)` / `read_complete(64 * 1024)`，`composer_references::public_text`。
 - Produces: `load_offline_example_workspace(repository: &Store, project_id: Uuid) -> Result<Option<OfflineExampleWorkspaceView>, String>`；固定路径专用 `read_example_receipt(project: &Project) -> Result<OfflineExampleReceiptV1, String>`（64 KiB、同等 handle final-path/identity 检查，不放宽 W02 的内部目录拒绝）；Tauri `get_offline_example_workspace(state: State<'_, AppState>, project_id: Uuid) -> Result<Option<OfflineExampleWorkspaceView>, String>`、`create_offline_example_workspace(state: State<'_, AppState>, request: CreateOfflineExampleWorkspaceRequest) -> Result<CreateOfflineExampleWorkspaceResult, String>`。
 
-- [ ] **RED — 写 `offline_example_view_*`。** 无 marker 返回 None；有 marker 丢/坏 receipt、root 丢失/错绑返回 Some(unavailable)，未知/坏 marker 为安全错误，不 fallback。changed/missing/over-limit/reparse 文件标状态、无写回；受控私钥/token/HTML 哨兵不能进入 preview 原文。
+- [ ] **RED — 写 `offline_example_view_*`。** 无 marker 返回 None；有 marker 丢/坏 receipt、root 丢失/错绑返回 Some(unavailable)，未知/坏 marker 为安全错误，不 fallback。changed/missing/over-limit/reparse 文件标状态、无写回；受控私钥/token 值须经 public_text 脱敏；HTML/Markdown 保持当前文本字面量，Task 4 验证不解析元素或请求外部资源。
 
   ```rust
   assert!(without_marker.is_none());
@@ -123,3 +123,5 @@
 - [ ] **Commit —** `git add -- src/offline-example-api.ts src/features/projects/OfflineExampleWorkspace.tsx src/features/projects/OfflineExampleWorkspace.test.tsx src/types.ts src/DesktopApp.tsx src/DesktopApp.test.tsx src/features/projects/ProjectLibrary.tsx src/features/projects/ProjectLibrary.test.tsx src/styles.css docs/bundled-science.md acceptance/README.md`；`git commit -m "feat: route bilingual offline examples outside agent initialization"`。
 
 本轮仅保存计划，尚未执行 checkbox。W02 读取叶子和 DesktopApp 共享文件整合顺序服从 master；计划审阅与执行方式留待下一阶段，未声称 W07 功能已实现。
+
+2026-10-11：Task 2 初始提交 `228d129`，独立评审发现两个 staging identity 操作边界竞态；修复 `b77c393` 用保留身份 handle 与同一 mutation handle 完成 no-replace 发布/清理。确定性 RED 为原16通过、新2失败；最终19通过、0失败、0ignored，fmt/diff通过；独立 scoped 复审关闭 I1/I2。当前2/4任务源码审阅完成；Task3/4、完整交付检查和离线示例原生smoke待执行。Task3 的 HTML 哨兵断言按绑定设计澄清为 literal text/no network，凭据仍必须脱敏。
