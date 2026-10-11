@@ -8,7 +8,9 @@ use omicsops_dto::{
     OfflineExampleFileView, OfflineExampleSourceKind, OfflineExampleText,
     OfflineExampleUnavailableReason, OfflineExampleWorkspaceView,
 };
-use omicsops_store::{OfflineExampleProjectMarkerV1, Store, StoreError, offline_example_root_binding};
+use omicsops_store::{
+    OfflineExampleProjectMarkerV1, Store, StoreError, offline_example_root_binding,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -126,10 +128,9 @@ pub(crate) async fn load_offline_example_workspace(
 }
 
 /// Fixed internal exception only; ordinary W02 reads still reject .omicsops.
-pub(crate) fn read_example_receipt(
-    project: &Project,
-) -> Result<OfflineExampleReceiptV1, String> {
-    let root = validate_parent_spelling(&project.local_root).map_err(|_| "example_receipt_invalid")?;
+pub(crate) fn read_example_receipt(project: &Project) -> Result<OfflineExampleReceiptV1, String> {
+    let root =
+        validate_parent_spelling(&project.local_root).map_err(|_| "example_receipt_invalid")?;
     let _guards = lock_directory_chain(&root).map_err(|_| "example_receipt_invalid")?;
     // Only a safely checked normal internal directory can identify a missing
     // receipt. A replaced/junction directory remains an invalid receipt.
@@ -143,10 +144,12 @@ pub(crate) fn read_example_receipt(
                 "example_receipt_missing"
             } else {
                 "example_receipt_invalid"
-            }.into());
+            }
+            .into());
         }
     }
-    let _internal_guards = lock_directory_chain(&internal).map_err(|_| "example_receipt_invalid")?;
+    let _internal_guards =
+        lock_directory_chain(&internal).map_err(|_| "example_receipt_invalid")?;
     if fs::symlink_metadata(root.join(RECEIPT))
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
     {
@@ -156,8 +159,15 @@ pub(crate) fn read_example_receipt(
     serde_json::from_slice(&bytes).map_err(|_| "example_receipt_invalid".into())
 }
 
-fn read_example_file(project: &Project, path: &str, expected_sha256: &str) -> OfflineExampleFileView {
-    let media_type = match Path::new(path).extension().and_then(|extension| extension.to_str()) {
+fn read_example_file(
+    project: &Project,
+    path: &str,
+    expected_sha256: &str,
+) -> OfflineExampleFileView {
+    let media_type = match Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
         Some("csv") => "text/csv",
         Some("md") => "text/markdown",
         Some("json") => "application/json",
@@ -195,9 +205,10 @@ fn read_example_file(project: &Project, path: &str, expected_sha256: &str) -> Of
             // not classify an inaccessible/reparse-backed target as missing.
             let candidate = Path::new(&project.local_root).join(path);
             let mut parent = candidate.parent();
-            while parent.is_some_and(|parent| fs::symlink_metadata(parent)
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound))
-            {
+            while parent.is_some_and(|parent| {
+                fs::symlink_metadata(parent)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            }) {
                 parent = parent.and_then(Path::parent);
             }
             if parent.is_some_and(|parent| lock_directory_chain(parent).is_ok()) {
@@ -1025,21 +1036,44 @@ fn delete_by_handle(file: &File) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omicsops_dto::{OfflineExampleAvailability, OfflineExampleFileAvailability, OfflineExampleUnavailableReason};
+    use omicsops_dto::{
+        OfflineExampleAvailability, OfflineExampleFileAvailability, OfflineExampleUnavailableReason,
+    };
 
     #[cfg(windows)]
-    async fn view_setup(parent: &Path, db: &Path) -> (omicsops_store::Store, PreparedOfflineExampleProject) {
+    async fn view_setup(
+        parent: &Path,
+        db: &Path,
+    ) -> (omicsops_store::Store, PreparedOfflineExampleProject) {
         let store = omicsops_store::Store::open(db).await.unwrap();
-        let prepared = materialize_offline_example(&request(parent), &load_bundled_example().unwrap(), write_new_example_file).unwrap();
-        store.save_offline_example_project(&prepared.project, &prepared.marker).await.unwrap();
+        let prepared = materialize_offline_example(
+            &request(parent),
+            &load_bundled_example().unwrap(),
+            write_new_example_file,
+        )
+        .unwrap();
+        store
+            .save_offline_example_project(&prepared.project, &prepared.marker)
+            .await
+            .unwrap();
         (store, prepared)
     }
 
     async fn table_counts(store: &omicsops_store::Store) -> BTreeMap<String, i64> {
-        let tables: Vec<String> = sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").fetch_all(store.pool()).await.unwrap();
+        let tables: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
         let mut counts = BTreeMap::new();
         for table in tables {
-            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"{}\"", table.replace('"', "\"\""))).fetch_one(store.pool()).await.unwrap();
+            let count: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM \"{}\"",
+                table.replace('"', "\"\"")
+            ))
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
             counts.insert(table, count);
         }
         counts
@@ -1051,11 +1085,24 @@ mod tests {
         fs::create_dir(dir.path().join(".omicsops")).unwrap();
         fs::write(dir.path().join(RECEIPT), b"not a receipt").unwrap();
         let store = omicsops_store::Store::open_in_memory().await.unwrap();
-        let project = Project::new(Uuid::new_v4(), "ordinary", dir.path().to_str().unwrap(), ProjectTemplate::Blank, chrono::Utc::now());
+        let project = Project::new(
+            Uuid::new_v4(),
+            "ordinary",
+            dir.path().to_str().unwrap(),
+            ProjectTemplate::Blank,
+            chrono::Utc::now(),
+        );
         store.save_project(&project).await.unwrap();
-        let without_marker = load_offline_example_workspace(&store, project.id).await.unwrap();
+        let without_marker = load_offline_example_workspace(&store, project.id)
+            .await
+            .unwrap();
         assert!(without_marker.is_none());
-        assert!(load_offline_example_workspace(&store, Uuid::new_v4()).await.unwrap().is_none());
+        assert!(
+            load_offline_example_workspace(&store, Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg(windows)]
@@ -1066,31 +1113,65 @@ mod tests {
         let (store, prepared) = view_setup(dir.path(), &db).await;
         let before_counts = table_counts(&store).await;
         let root = Path::new(&prepared.project.local_root);
-        let before: Vec<_> = FIXED_FILES.into_iter().chain([RECEIPT, PROJECT_MANIFEST]).map(|p| (p, fs::read(root.join(p)).unwrap(), fs::metadata(root.join(p)).unwrap().modified().unwrap())).collect();
-        for table in before_counts.keys().filter(|table| !table.starts_with("sqlite_")) {
+        let before: Vec<_> = FIXED_FILES
+            .into_iter()
+            .chain([RECEIPT, PROJECT_MANIFEST])
+            .map(|p| {
+                (
+                    p,
+                    fs::read(root.join(p)).unwrap(),
+                    fs::metadata(root.join(p)).unwrap().modified().unwrap(),
+                )
+            })
+            .collect();
+        for table in before_counts
+            .keys()
+            .filter(|table| !table.starts_with("sqlite_"))
+        {
             for operation in ["INSERT", "UPDATE", "DELETE"] {
                 sqlx::query(&format!("CREATE TRIGGER \"no_view_{table}_{operation}\" BEFORE {operation} ON \"{table}\" BEGIN SELECT RAISE(ABORT, 'view must not write'); END")).execute(store.pool()).await.unwrap();
             }
         }
-        sqlx::query("PRAGMA query_only = ON").execute(store.pool()).await.unwrap();
+        sqlx::query("PRAGMA query_only = ON")
+            .execute(store.pool())
+            .await
+            .unwrap();
         for _ in 0..2 {
-            let view = load_offline_example_workspace(&store, prepared.project.id).await.unwrap().unwrap();
+            let view = load_offline_example_workspace(&store, prepared.project.id)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(view.availability, OfflineExampleAvailability::Available);
             assert_eq!(view.entries.len(), 4);
             assert_eq!(view.files.len(), 7);
-            assert!(view.files.iter().all(|file| file.availability == OfflineExampleFileAvailability::Available));
+            assert!(
+                view.files
+                    .iter()
+                    .all(|file| file.availability == OfflineExampleFileAvailability::Available)
+            );
         }
         assert_eq!(before_counts, table_counts(&store).await);
         store.pool().close().await;
         let reopened = omicsops_store::Store::open(&db).await.unwrap();
         let reopened_counts = table_counts(&reopened).await;
-        sqlx::query("PRAGMA query_only = ON").execute(reopened.pool()).await.unwrap();
-        assert!(load_offline_example_workspace(&reopened, prepared.project.id).await.unwrap().is_some());
+        sqlx::query("PRAGMA query_only = ON")
+            .execute(reopened.pool())
+            .await
+            .unwrap();
+        assert!(
+            load_offline_example_workspace(&reopened, prepared.project.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(before_counts, reopened_counts);
         assert_eq!(reopened_counts, table_counts(&reopened).await);
         for (path, bytes, modified) in before {
             assert_eq!(fs::read(root.join(path)).unwrap(), bytes);
-            assert_eq!(fs::metadata(root.join(path)).unwrap().modified().unwrap(), modified);
+            assert_eq!(
+                fs::metadata(root.join(path)).unwrap().modified().unwrap(),
+                modified
+            );
         }
         check_tree(root).unwrap();
     }
@@ -1098,17 +1179,36 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn offline_example_view_marker_survives_missing_invalid_and_mismatched_receipt() {
-        for mutation in ["missing", "json", "project", "request", "hash", "files", "large", "utf8"] {
+        for mutation in [
+            "missing", "json", "project", "request", "hash", "files", "large", "utf8",
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let (store, prepared) = view_setup(dir.path(), &dir.path().join("test.sqlite")).await;
             let path = Path::new(&prepared.project.local_root).join(RECEIPT);
             let reason = match mutation {
-                "missing" => { fs::remove_file(&path).unwrap(); OfflineExampleUnavailableReason::ReceiptMissing }
-                "json" => { fs::write(&path, b"not json").unwrap(); OfflineExampleUnavailableReason::ReceiptInvalid }
-                "large" => { fs::write(&path, vec![b'x'; MAX_FILE_BYTES + 1]).unwrap(); OfflineExampleUnavailableReason::ReceiptInvalid }
-                "utf8" => { fs::write(&path, [0xff]).unwrap(); OfflineExampleUnavailableReason::ReceiptInvalid }
+                "missing" => {
+                    fs::remove_file(&path).unwrap();
+                    OfflineExampleUnavailableReason::ReceiptMissing
+                }
+                "json" => {
+                    fs::write(&path, b"not json").unwrap();
+                    OfflineExampleUnavailableReason::ReceiptInvalid
+                }
+                "large" => {
+                    fs::write(&path, vec![b'x'; MAX_FILE_BYTES + 1]).unwrap();
+                    OfflineExampleUnavailableReason::ReceiptInvalid
+                }
+                "utf8" => {
+                    fs::write(&path, [0xff]).unwrap();
+                    OfflineExampleUnavailableReason::ReceiptInvalid
+                }
                 _ => {
-                    let mut receipt = expected_receipt(prepared.marker.request_id, prepared.project.id, &load_bundled_example().unwrap()).unwrap();
+                    let mut receipt = expected_receipt(
+                        prepared.marker.request_id,
+                        prepared.project.id,
+                        &load_bundled_example().unwrap(),
+                    )
+                    .unwrap();
                     match mutation {
                         "project" => receipt.project_id = Uuid::new_v4(),
                         "request" => receipt.request_id = Uuid::new_v4(),
@@ -1125,7 +1225,9 @@ mod tests {
                 }
             };
             let bytes = fs::read(&path).ok();
-            let after_receipt_removed = load_offline_example_workspace(&store, prepared.project.id).await.unwrap();
+            let after_receipt_removed = load_offline_example_workspace(&store, prepared.project.id)
+                .await
+                .unwrap();
             let view = after_receipt_removed.unwrap();
             assert_eq!(view.availability, OfflineExampleAvailability::Unavailable);
             assert_eq!(view.unavailable_reason, Some(reason));
@@ -1149,9 +1251,19 @@ mod tests {
                 project.local_root = dir.path().to_str().unwrap().into();
                 store.save_project(&project).await.unwrap();
             }
-            let view = load_offline_example_workspace(&store, prepared.project.id).await.unwrap().unwrap();
+            let view = load_offline_example_workspace(&store, prepared.project.id)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(view.availability, OfflineExampleAvailability::Unavailable);
-            assert_eq!(view.unavailable_reason, Some(if missing { OfflineExampleUnavailableReason::RootUnavailable } else { OfflineExampleUnavailableReason::IdentityMismatch }));
+            assert_eq!(
+                view.unavailable_reason,
+                Some(if missing {
+                    OfflineExampleUnavailableReason::RootUnavailable
+                } else {
+                    OfflineExampleUnavailableReason::IdentityMismatch
+                })
+            );
             assert!(view.entries.is_empty() && view.files.is_empty());
         }
     }
@@ -1170,20 +1282,41 @@ mod tests {
         fs::write(root.join("report.zh.md"), [0xff]).unwrap();
         let before = table_counts(&store).await;
         for _ in 0..2 {
-            let view = load_offline_example_workspace(&store, prepared.project.id).await.unwrap().unwrap();
+            let view = load_offline_example_workspace(&store, prepared.project.id)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(view.availability, OfflineExampleAvailability::Available);
-            let file = |path: &str| view.files.iter().find(|file| file.relative_path == path).unwrap();
+            let file = |path: &str| {
+                view.files
+                    .iter()
+                    .find(|file| file.relative_path == path)
+                    .unwrap()
+            };
             let edited_file = file("report.en.md");
-            assert_eq!(edited_file.availability, OfflineExampleFileAvailability::Changed);
+            assert_eq!(
+                edited_file.availability,
+                OfflineExampleFileAvailability::Changed
+            );
             assert_eq!(edited_file.current_sha256, Some(sha256(edited_bytes)));
             let preview = edited_file.preview_text.as_ref().unwrap();
-            assert!(preview.contains("<img src=\"https://invalid.test/x\"><script>literal()</script>"));
+            assert!(
+                preview.contains("<img src=\"https://invalid.test/x\"><script>literal()</script>")
+            );
             assert!(preview.contains("![image](https://invalid.test/y)"));
-            assert!(!preview.contains("controlled-secret") && !preview.contains("controlled-key-value"));
+            assert!(
+                !preview.contains("controlled-secret") && !preview.contains("controlled-key-value")
+            );
             assert!(preview.contains("[REDACTED]"));
-            assert_eq!(file("results/summary.csv").availability, OfflineExampleFileAvailability::Missing);
+            assert_eq!(
+                file("results/summary.csv").availability,
+                OfflineExampleFileAvailability::Missing
+            );
             for path in ["README.md", "report.zh.md"] {
-                assert_eq!(file(path).availability, OfflineExampleFileAvailability::Unavailable);
+                assert_eq!(
+                    file(path).availability,
+                    OfflineExampleFileAvailability::Unavailable
+                );
                 assert!(file(path).preview_text.is_none());
                 assert!(file(path).current_sha256.is_none());
             }
@@ -1191,13 +1324,35 @@ mod tests {
         assert_eq!(table_counts(&store).await, before);
         assert_eq!(std::fs::read(&edited_path).unwrap(), edited_bytes);
         assert!(!root.join("results/summary.csv").exists());
-        assert_eq!(fs::metadata(root.join("README.md")).unwrap().len(), (MAX_FILE_BYTES + 1) as u64);
+        assert_eq!(
+            fs::metadata(root.join("README.md")).unwrap().len(),
+            (MAX_FILE_BYTES + 1) as u64
+        );
         assert_eq!(fs::read(root.join("report.zh.md")).unwrap(), [0xff]);
         store.pool().close().await;
-        let reopened = omicsops_store::Store::open(dir.path().join("test.sqlite")).await.unwrap();
-        let view = load_offline_example_workspace(&reopened, prepared.project.id).await.unwrap().unwrap();
-        assert_eq!(view.files.iter().find(|file| file.relative_path == "report.en.md").unwrap().availability, OfflineExampleFileAvailability::Changed);
-        assert_eq!(view.files.iter().find(|file| file.relative_path == "results/summary.csv").unwrap().availability, OfflineExampleFileAvailability::Missing);
+        let reopened = omicsops_store::Store::open(dir.path().join("test.sqlite"))
+            .await
+            .unwrap();
+        let view = load_offline_example_workspace(&reopened, prepared.project.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            view.files
+                .iter()
+                .find(|file| file.relative_path == "report.en.md")
+                .unwrap()
+                .availability,
+            OfflineExampleFileAvailability::Changed
+        );
+        assert_eq!(
+            view.files
+                .iter()
+                .find(|file| file.relative_path == "results/summary.csv")
+                .unwrap()
+                .availability,
+            OfflineExampleFileAvailability::Missing
+        );
         assert_eq!(table_counts(&reopened).await, before);
         assert_eq!(std::fs::read(&edited_path).unwrap(), edited_bytes);
         assert!(!root.join("results/summary.csv").exists());
@@ -1206,13 +1361,32 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn offline_example_view_unknown_and_corrupt_markers_are_fixed_errors() {
-        for value in [serde_json::json!({}), serde_json::json!({"example_id":"unknown"})] {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"example_id":"unknown"}),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let (store, prepared) = view_setup(dir.path(), &dir.path().join("test.sqlite")).await;
             let mut marker = serde_json::to_value(&prepared.marker).unwrap();
-            if value.as_object().unwrap().is_empty() { marker = value; } else { marker["example_id"] = value["example_id"].clone(); }
-            store.put_json("offline_example_workspace_v1", &prepared.project.id.to_string(), &marker).await.unwrap();
-            assert_eq!(load_offline_example_workspace(&store, prepared.project.id).await.unwrap_err(), "offline_example_marker_invalid");
+            if value.as_object().unwrap().is_empty() {
+                marker = value;
+            } else {
+                marker["example_id"] = value["example_id"].clone();
+            }
+            store
+                .put_json(
+                    "offline_example_workspace_v1",
+                    &prepared.project.id.to_string(),
+                    &marker,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                load_offline_example_workspace(&store, prepared.project.id)
+                    .await
+                    .unwrap_err(),
+                "offline_example_marker_invalid"
+            );
         }
     }
 
@@ -1225,17 +1399,37 @@ mod tests {
             let (store, prepared) = view_setup(dir.path(), &dir.path().join("test.sqlite")).await;
             let path = Path::new(&prepared.project.local_root).join(relative);
             fs::rename(&path, outside.path().join("original")).unwrap();
-            if outside_file { fs::write(outside.path().join("observations.csv"), b"outside bytes").unwrap(); }
-            let status = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(&path).arg(outside.path()).output().unwrap();
+            if outside_file {
+                fs::write(outside.path().join("observations.csv"), b"outside bytes").unwrap();
+            }
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&path)
+                .arg(outside.path())
+                .output()
+                .unwrap();
             assert!(status.status.success());
-            let view = load_offline_example_workspace(&store, prepared.project.id).await.unwrap().unwrap();
+            let view = load_offline_example_workspace(&store, prepared.project.id)
+                .await
+                .unwrap()
+                .unwrap();
             if relative == "data" {
-                let file = view.files.iter().find(|file| file.relative_path == "data/observations.csv").unwrap();
-                assert_eq!(file.availability, OfflineExampleFileAvailability::Unavailable);
+                let file = view
+                    .files
+                    .iter()
+                    .find(|file| file.relative_path == "data/observations.csv")
+                    .unwrap();
+                assert_eq!(
+                    file.availability,
+                    OfflineExampleFileAvailability::Unavailable
+                );
                 assert!(file.preview_text.is_none());
             } else {
                 assert_eq!(view.availability, OfflineExampleAvailability::Unavailable);
-                assert_eq!(view.unavailable_reason, Some(OfflineExampleUnavailableReason::ReceiptInvalid));
+                assert_eq!(
+                    view.unavailable_reason,
+                    Some(OfflineExampleUnavailableReason::ReceiptInvalid)
+                );
                 assert!(view.entries.is_empty() && view.files.is_empty());
             }
             fs::remove_dir(&path).unwrap();
@@ -1250,19 +1444,55 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let (store, prepared) = view_setup(dir.path(), &dir.path().join("test.sqlite")).await;
         let root = Path::new(&prepared.project.local_root);
-        let locked = OpenOptions::new().read(true).share_mode(0).open(root.join("README.md")).unwrap();
-        let view = load_offline_example_workspace(&store, prepared.project.id).await.unwrap().unwrap();
-        let file = view.files.iter().find(|file| file.relative_path == "README.md").unwrap();
-        assert_eq!(file.availability, OfflineExampleFileAvailability::Unavailable);
+        let locked = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(root.join("README.md"))
+            .unwrap();
+        let view = load_offline_example_workspace(&store, prepared.project.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let file = view
+            .files
+            .iter()
+            .find(|file| file.relative_path == "README.md")
+            .unwrap();
+        assert_eq!(
+            file.availability,
+            OfflineExampleFileAvailability::Unavailable
+        );
         assert!(file.preview_text.is_none());
         drop(locked);
-        assert_eq!(load_offline_example_workspace(&store, prepared.project.id).await.unwrap().unwrap().files.iter().find(|file| file.relative_path == "README.md").unwrap().availability, OfflineExampleFileAvailability::Available);
+        assert_eq!(
+            load_offline_example_workspace(&store, prepared.project.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .files
+                .iter()
+                .find(|file| file.relative_path == "README.md")
+                .unwrap()
+                .availability,
+            OfflineExampleFileAvailability::Available
+        );
         fs::rename(root, outside.path().join("original")).unwrap();
-        let status = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(root).arg(outside.path().join("original")).output().unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(root)
+            .arg(outside.path().join("original"))
+            .output()
+            .unwrap();
         assert!(status.status.success());
-        let view = load_offline_example_workspace(&store, prepared.project.id).await.unwrap().unwrap();
+        let view = load_offline_example_workspace(&store, prepared.project.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(view.availability, OfflineExampleAvailability::Unavailable);
-        assert_eq!(view.unavailable_reason, Some(OfflineExampleUnavailableReason::RootUnavailable));
+        assert_eq!(
+            view.unavailable_reason,
+            Some(OfflineExampleUnavailableReason::RootUnavailable)
+        );
         assert!(view.entries.is_empty() && view.files.is_empty());
         fs::remove_dir(root).unwrap();
     }
@@ -1274,24 +1504,70 @@ mod tests {
         let store = omicsops_store::Store::open_in_memory().await.unwrap();
         let request = request(dir.path());
         sqlx::query("CREATE TRIGGER fail_example BEFORE INSERT ON app_objects BEGIN SELECT RAISE(ABORT, 'injected'); END").execute(store.pool()).await.unwrap();
-        assert_eq!(create_offline_example_for_repository(&store, &request).await.unwrap_err(), "example_registration_failed");
+        assert_eq!(
+            create_offline_example_for_repository(&store, &request)
+                .await
+                .unwrap_err(),
+            "example_registration_failed"
+        );
         assert!(store.list_projects().await.unwrap().is_empty());
-        assert!(store.get_offline_example_project_marker(request.request_id).await.unwrap().is_none());
-        let root = dir.path().join(format!("omicsops-example-{}", request.request_id));
+        assert!(
+            store
+                .get_offline_example_project_marker(request.request_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let root = dir
+            .path()
+            .join(format!("omicsops-example-{}", request.request_id));
         assert!(root.join(RECEIPT).exists());
         let before = fs::read(root.join(RECEIPT)).unwrap();
-        sqlx::query("DROP TRIGGER fail_example").execute(store.pool()).await.unwrap();
-        let created = create_offline_example_for_repository(&store, &request).await.unwrap();
+        sqlx::query("DROP TRIGGER fail_example")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let created = create_offline_example_for_repository(&store, &request)
+            .await
+            .unwrap();
         assert_eq!(created.project_id, request.request_id);
-        assert_eq!(created.workspace.availability, OfflineExampleAvailability::Available);
-        let mut project = store.get_project(created.project_id).await.unwrap().unwrap();
+        assert_eq!(
+            created.workspace.availability,
+            OfflineExampleAvailability::Available
+        );
+        let mut project = store
+            .get_project(created.project_id)
+            .await
+            .unwrap()
+            .unwrap();
         project.name = "User metadata".into();
         store.save_project(&project).await.unwrap();
-        assert_eq!(create_offline_example_for_repository(&store, &request).await.unwrap(), created);
-        assert_eq!(store.get_project(created.project_id).await.unwrap().unwrap().name, "User metadata");
+        assert_eq!(
+            create_offline_example_for_repository(&store, &request)
+                .await
+                .unwrap(),
+            created
+        );
+        assert_eq!(
+            store
+                .get_project(created.project_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .name,
+            "User metadata"
+        );
         assert_eq!(fs::read(root.join(RECEIPT)).unwrap(), before);
         let counts = table_counts(&store).await;
-        for table in ["conversation_records", "runs", "agent_events_v4", "approvals_v3", "scientific_evidence_v4"] { assert_eq!(counts[table], 0); }
+        for table in [
+            "conversation_records",
+            "runs",
+            "agent_events_v4",
+            "approvals_v3",
+            "scientific_evidence_v4",
+        ] {
+            assert_eq!(counts[table], 0);
+        }
     }
     use omicsops_dto::CreateOfflineExampleWorkspaceRequest;
     use std::{fs, path::Path};
