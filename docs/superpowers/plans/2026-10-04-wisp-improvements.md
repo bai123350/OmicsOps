@@ -43,8 +43,8 @@
 | W03 | [远端作业](2026-10-04-wisp-w03-remote-jobs.md) | 4 | metadata列表、手动status与明确启用的有限退避 | 已实现、4任务审阅通过 |
 | W04 | [内核观察](2026-10-04-wisp-w04-kernel-inspection.md) | 5 | 活着的Python/R metadata，不隐式启动或执行对象方法 | 已实现，5任务审阅通过；真实R/SSH/GUI未验收 |
 | W05 | [手动压缩](2026-10-04-wisp-w05-context-compaction.md) | 5 | 暂停ordinary run真正原子保存可恢复checkpoint | 已实现、5任务审阅通过；clean-HEAD与真实验收待执行 |
-| W06 | [运行诊断](2026-10-04-wisp-w06-run-diagnostics.md) | 4 | run/tool/失败筛选、精确来源定位、脱敏HTML/JSON | 已实现、4任务源码审阅通过；自动/桌面构建通过，原生手工smoke未执行 |
-| W07 | [离线示例](2026-10-04-wisp-w07-offline-example.md) | 4 | 双语合成工作区，重启/坏receipt仍隔离于生产Agent | 进行中，3/4任务源码审阅通过；统一入口与UI待实施 |
+| W06 | [运行诊断](2026-10-04-wisp-w06-run-diagnostics.md) | 4 | run/tool/失败筛选、精确来源定位、脱敏HTML/JSON | 已实现、4任务源码审阅通过；隔离旧HEAD原生smoke部分通过，静态HTML浏览仍未执行 |
+| W07 | [离线示例](2026-10-04-wisp-w07-offline-example.md) | 4 | 双语合成工作区，重启/坏receipt仍隔离于生产Agent | 已实现、4任务源码审阅通过；确定性/构建通过，原生手工smoke未执行 |
 | W08a | [V4场景](2026-10-04-wisp-w08-scenarios.md) | 3 | 五场景manifest/hash/实际调用计数和安全报告 | 待实施 |
 | W08b | [Skill helpers](2026-10-04-wisp-w08-skill-helpers.md) | 3 | 固定本地helper离线行为回归与统一Python CI | 已实现、3任务审阅通过；CI未执行 |
 | W09 | [稿件证据](2026-10-04-wisp-w09-publication-evidence.md) | 4 | 保存revision准备度与reference-only四entry证据ZIP | 待实施 |
@@ -79,7 +79,7 @@ W07只需W02 Task1叶子，不需要table/SSH界面；W10/W11只需W09 Task1的�
 - [x] 5. W04 Task1–5：非启动contract、两套worker、weak registry、Runtime观察UI。
 - [x] 6. W05 Task1–5：旧hash兼容、candidate/final准入、atomicStore、宿主租约、UI/恢复。
 - [x] 7. W06 Task1–4：validated readonlychain、safeprojection、export、筛选/定位UI。
-- [ ] 8. W07 Task1–4：marker事务、合成fixture、safeview、所有项目选择入口。
+- [x] 8. W07 Task1–4：marker事务、合成fixture、safeview、所有项目选择入口。
 - [ ] 9. W08a Task1–3：五scenario manifest、控制行为、stable report/CI upload。
 - [ ] 10. W09 Task1–4：基础DTO/context、readiness、post-dialog包、保存revisionUI。
 - [ ] 11. W10 Task1–4：immutableStore、safecontent/blob、diff、explicit选择UI。
@@ -124,3 +124,5 @@ W06已实现：四任务源码独立审阅完成，最终UI提交 `d535b50`；�
 2026-10-11：W07 Task2 材料化/重试及两项所有权竞态修复已独立审阅通过（`228d129`、`b77c393`）；最终定向19/19，累计30/50源码任务完成。当前 Windows native 工具已可用，W06 原生过滤/定位/保存取消/静态HTML验收仍未通过；正在仅以隔离测试副本准备验证，不把构建或测试替身当作该验收。
 
 2026-10-11：W07 Task3 marker-first只读视图与create/get命令独立审阅通过（`a32fe6a`、纯格式`7818c02`），view9/create19、fmt/diff通过，累计31/50源码任务完成。缓存warning与已纠正RED证据计数留最终审阅；UI/全量/原生验收仍分别待执行。
+
+2026-10-11：W07全部四任务SOURCE审阅完成（最终UI `a7e05c9`），近端157、Rust1777通过/18ignored、前端1316+扩展22、Web/native/fmt/diff通过，累计32/50。W07原生创建/重启/changed/missing/丢收据仍未执行，按用户GUI停止指令保留；W06隔离旧HEAD副本仅过滤、原生保存/取消、定位、Escape部分实际通过，静态HTML浏览未完成，均不是finalHEAD/生产端到端。之后继续W08场景，不将源码完成勾选解释为人工验收通过。

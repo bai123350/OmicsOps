@@ -1,6 +1,6 @@
 # Wisp Science 可借鉴改进清单
 
-日期：2026-10-04。状态：用户已选择全部12项首次范围、确认具体设计及[实施总计划](../plans/2026-10-04-wisp-improvements.md)，并选择子Agent逐项实施与审阅。W01–W04及W08 helper已实现并审阅通过，其余项继续实施；状态及实际检查见总计划。全部12项首次范围尚未交付。本文件保留源码对照，具体边界见[总设计](2026-10-04-wisp-improvements-design.md)。
+日期：2026-10-04。状态：用户已选择全部12项首次范围、确认具体设计及[实施总计划](../plans/2026-10-04-wisp-improvements.md)，并选择子Agent逐项实施与审阅。W01–W07及W08 helper源码已实现并审阅通过（32/50任务），其余项继续实施；W07原生手工验收未执行，W06隔离旧HEAD原生验收仅部分通过；状态及实际检查见总计划。全部12项首次范围尚未交付。本文件保留源码对照，具体边界见[总设计](2026-10-04-wisp-improvements-design.md)。
 
 本轮建议先补会话草稿隔离，再分别交付科学产物预览和 SSH 后台作业面板。这三项直接改善日常研究操作，并能复用现有组件与运行身份。其余候选按依赖分批推进，优先保留 OmicsOps 已有的科研证据、审批与恢复契约。
 
@@ -92,6 +92,8 @@ P0 表示优先解决可能影响操作正确性的问题；P1 表示直接改�
 
 ## W05 手动上下文压缩
 
+**实施状态：**五任务源码已独立审阅，暂停 ordinary run 的完整请求准入、原子Store提交、宿主租约和恢复UI已接入；旧hash/来源兼容，binding/raw-run CAS与自动压缩非原子残余边界已记录。功能验证与真实模型/SSH未验收区别见[W05计划](../plans/2026-10-04-wisp-w05-context-compaction.md)；最终clean-HEAD和全分支检查仍待执行。
+
 **参考事实：**上游[压缩实现][w-compact]先归档、失败回滚，并将模型工作集与可视历史分离。OmicsOps 已有 archive/checkpoint/receipt 基础，但[宿主入口](../../../src-tauri/src/context_compaction.rs)仅对 completed 返回 NotNeeded；WorkspaceShell 未传 onCompact，按钮仍禁用。
 
 **建议切片：**只针对无活动 driver、无待消费 guidance 的暂停 ordinary run，复用现有身份、请求 ID 和冻结配置，构建压缩候选并证明完整 provider 请求可准入，成功后才原子提交与接通按钮。摘要不足或预算失败保留原上下文。
@@ -102,6 +104,8 @@ P0 表示优先解决可能影响操作正确性的问题；P1 表示直接改�
 
 ## W06 轨迹诊断与安全导出
 
+**实施状态：**四任务源码独立审阅通过，validated只读链、脱敏投影、安全HTML/JSON保存及筛选定位UI已实现，确定性/桌面构建通过。2026-10-11隔离旧HEAD测试副本中真实过滤、原生保存/取消、来源定位和Escape部分通过；静态HTML浏览未完成，用户随后停止GUI。此受限副本证据不是最终HEAD或生产端到端，详见[W06计划](../plans/2026-10-04-wisp-w06-run-diagnostics.md)与最终交付记录。
+
 **参考事实：**上游[轨迹重建][w-trace]与[宿主导出][w-trace-export]将工具、turn 和用量重建为可定位视图。OmicsOps 的 WorkspaceShell 第 1232 行起已有 V4RunTrace、模型/工具计时与折叠展示；Usage 已读取持久化观察。
 
 **建议切片：**新增 run/tool/失败筛选、跳到精确 event sequence/hash，以及脱敏 HTML/JSON 诊断导出。导出由宿主重新读取、核验作用域和事件链；复用现有存储，先不增加新的 timing 或 usage 系统。
@@ -111,6 +115,8 @@ P0 表示优先解决可能影响操作正确性的问题；P1 表示直接改�
 此项便于继续验证既有[性能优化](2026-10-04-agent-performance-followup.md)，实际耗时结论仍需同任务、同模型配置的受控测量。
 
 ## W07 离线示例工作区
+
+**实施状态：**四任务源码独立审阅通过；marker事务、固定双语合成fixture、保留handle身份的no-replace发布/清理、只读view及所有项目选择入口已接入。最终`a7e05c9`；近端157、Rust1777通过/18ignored、前端1316+扩展22、Web/native/fmt/diff通过。原生创建/重启/改删文件/丢收据smoke未执行（用户停止GUI），真实科学工作流未执行；不能把预置算术与hash当执行证据。详见[W07计划](../plans/2026-10-04-wisp-w07-offline-example.md)。
 
 **参考事实：**上游[seed 实现及测试][w-seed]导入预录转录与配套文件，不需要模型密钥。OmicsOps 当前项目模板和工作流文本配方没有配套录制示例，捆绑文档明确 ESR1 种子未导入。
 
