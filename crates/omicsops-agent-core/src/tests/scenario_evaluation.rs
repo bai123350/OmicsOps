@@ -307,7 +307,7 @@ fn validate_suite(manifest: &SuiteManifestV4) -> Result<(), ManifestErrorCodeV4>
     let mut conversations = BTreeSet::new();
     let mut runs = BTreeSet::new();
     for scenario in &manifest.scenarios {
-        if !ids.insert(&scenario.id) {
+        if !ids.insert(normalize_lf(&scenario.id)) {
             return Err(ManifestErrorCodeV4::DuplicateId);
         }
         let seed = &scenario.seed;
@@ -408,9 +408,13 @@ fn validate_suite(manifest: &SuiteManifestV4) -> Result<(), ManifestErrorCodeV4>
     Ok(())
 }
 
+fn normalize_lf(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 fn canonical_value(value: Value) -> Result<Value, ManifestErrorCodeV4> {
     Ok(match value {
-        Value::String(text) => Value::String(text.replace("\r\n", "\n").replace('\r', "\n")),
+        Value::String(text) => Value::String(normalize_lf(&text)),
         Value::Array(values) => Value::Array(
             values
                 .into_iter()
@@ -420,7 +424,7 @@ fn canonical_value(value: Value) -> Result<Value, ManifestErrorCodeV4> {
         Value::Object(values) => {
             let mut sorted = BTreeMap::new();
             for (key, value) in values {
-                let key = key.replace("\r\n", "\n").replace('\r', "\n");
+                let key = normalize_lf(&key);
                 if sorted.insert(key, canonical_value(value)?).is_some() {
                     return Err(ManifestErrorCodeV4::InvalidScript);
                 }
@@ -446,7 +450,9 @@ fn suite_hash(
         return Err(ManifestErrorCodeV4::InvalidScript);
     }
     let mut sorted = manifest.clone();
-    sorted.scenarios.sort_by(|a, b| a.id.cmp(&b.id));
+    sorted
+        .scenarios
+        .sort_by_cached_key(|scenario| normalize_lf(&scenario.id));
     let canonical = canonical_value(json!({"manifest": sorted, "fixtures": fixtures}))?;
     let bytes = serde_json::to_vec(&canonical).map_err(|_| ManifestErrorCodeV4::InvalidScript)?;
     Ok(hex::encode(Sha256::digest(bytes)))
@@ -621,6 +627,13 @@ fn manifest_rejects_invalid_version_fields_ids_seeds_and_actions() {
         parse_suite(&duplicate_assertion.to_string()).unwrap_err(),
         ManifestErrorCodeV4::InvalidAssertion
     );
+    let mut canonical_duplicate = source;
+    canonical_duplicate["scenarios"][0]["id"] = json!("duplicate\r\nid");
+    canonical_duplicate["scenarios"][1]["id"] = json!("duplicate\nid");
+    assert_eq!(
+        parse_suite(&canonical_duplicate.to_string()).unwrap_err(),
+        ManifestErrorCodeV4::DuplicateId
+    );
 }
 
 #[test]
@@ -670,6 +683,15 @@ fn manifest_hash_is_canonical_across_crlf_and_order() {
     }
     let reversed = parse_suite(&reverse_keys(&reordered)).unwrap();
     assert_eq!(hash, suite_hash(&reversed, &fixtures).unwrap());
+    let mut mixed_ids = suite.clone();
+    mixed_ids.scenarios[0].id = "a\r\nb".into();
+    mixed_ids.scenarios[1].id = "a\nz".into();
+    let mut normalized_ids = mixed_ids.clone();
+    normalized_ids.scenarios[0].id = "a\nb".into();
+    assert_eq!(
+        suite_hash(&mixed_ids, &fixtures).unwrap(),
+        suite_hash(&normalized_ids, &fixtures).unwrap()
+    );
 }
 
 #[test]
