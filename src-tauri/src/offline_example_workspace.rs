@@ -3,10 +3,12 @@
 use crate::project_file_read::ValidatedProjectFile;
 use omicsops_core::workspace::{Project, ProjectTemplate};
 use omicsops_dto::{
-    CreateOfflineExampleWorkspaceRequest, OfflineExampleEntry, OfflineExampleSourceKind,
-    OfflineExampleText,
+    CreateOfflineExampleWorkspaceRequest, CreateOfflineExampleWorkspaceResult,
+    OfflineExampleAvailability, OfflineExampleEntry, OfflineExampleFileAvailability,
+    OfflineExampleFileView, OfflineExampleSourceKind, OfflineExampleText,
+    OfflineExampleUnavailableReason, OfflineExampleWorkspaceView,
 };
-use omicsops_store::{OfflineExampleProjectMarkerV1, offline_example_root_binding};
+use omicsops_store::{OfflineExampleProjectMarkerV1, Store, StoreError, offline_example_root_binding};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -32,6 +34,216 @@ const FIXED_FILES: [&str; 7] = [
 ];
 const RECEIPT: &str = ".omicsops/offline-example.json";
 const PROJECT_MANIFEST: &str = ".omicsops/project.json";
+
+/// Identity always comes from Store; a disk receipt cannot turn an ordinary
+/// project into an example. Sequential file reads are not an atomic snapshot.
+pub(crate) async fn load_offline_example_workspace(
+    repository: &Store,
+    project_id: Uuid,
+) -> Result<Option<OfflineExampleWorkspaceView>, String> {
+    let Some(marker) = repository
+        .get_offline_example_project_marker(project_id)
+        .await
+        .map_err(|error| match error {
+            StoreError::InvalidInput(_) | StoreError::Json(_) => "offline_example_marker_invalid",
+            _ => "example_read_failed",
+        })?
+    else {
+        return Ok(None);
+    };
+    let fixture = load_bundled_example()?;
+    if marker.fixture_sha256 != fixture_sha256(&fixture)? {
+        return Err("offline_example_marker_invalid".into());
+    }
+    let mut view = OfflineExampleWorkspaceView {
+        schema_version: 1,
+        project_id,
+        example_id: EXAMPLE_ID.into(),
+        source_kind: OfflineExampleSourceKind::Synthetic,
+        availability: OfflineExampleAvailability::Unavailable,
+        unavailable_reason: Some(OfflineExampleUnavailableReason::IdentityMismatch),
+        title: fixture.title.clone(),
+        disclaimer: fixture.disclaimer.clone(),
+        source_description: fixture.source_description.clone(),
+        license_spdx: fixture.license_spdx.clone(),
+        fixture_sha256: marker.fixture_sha256.clone(),
+        entries: Vec::new(),
+        files: Vec::new(),
+    };
+    let Some(project) = repository
+        .get_project(project_id)
+        .await
+        .map_err(|_| "example_read_failed")?
+    else {
+        return Ok(Some(view));
+    };
+    if offline_example_root_binding(&project) != marker.root_binding_sha256 {
+        return Ok(Some(view));
+    }
+    // Keep the root chain pinned on Windows while consuming the fixed receipt
+    // and file list. Every ordinary file still passes the W02 handle checks.
+    let root = match validate_parent_spelling(&project.local_root) {
+        Ok(root) => root,
+        Err(_) => {
+            view.unavailable_reason = Some(OfflineExampleUnavailableReason::RootUnavailable);
+            return Ok(Some(view));
+        }
+    };
+    let _root_guards = match lock_directory_chain(&root) {
+        Ok(guards) => guards,
+        Err(_) => {
+            view.unavailable_reason = Some(OfflineExampleUnavailableReason::RootUnavailable);
+            return Ok(Some(view));
+        }
+    };
+    let receipt = match read_example_receipt(&project) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            view.unavailable_reason = Some(if error == "example_receipt_missing" {
+                OfflineExampleUnavailableReason::ReceiptMissing
+            } else {
+                OfflineExampleUnavailableReason::ReceiptInvalid
+            });
+            return Ok(Some(view));
+        }
+    };
+    if receipt.project_id != project_id || receipt.request_id != marker.request_id {
+        view.unavailable_reason = Some(OfflineExampleUnavailableReason::IdentityMismatch);
+        return Ok(Some(view));
+    }
+    if receipt != expected_receipt(marker.request_id, project_id, &fixture)? {
+        view.unavailable_reason = Some(OfflineExampleUnavailableReason::ReceiptInvalid);
+        return Ok(Some(view));
+    }
+    view.availability = OfflineExampleAvailability::Available;
+    view.unavailable_reason = None;
+    view.entries = fixture.entries;
+    view.files = FIXED_FILES
+        .iter()
+        .map(|path| read_example_file(&project, path, &sha256(fixture.files[*path].as_bytes())))
+        .collect();
+    Ok(Some(view))
+}
+
+/// Fixed internal exception only; ordinary W02 reads still reject .omicsops.
+pub(crate) fn read_example_receipt(
+    project: &Project,
+) -> Result<OfflineExampleReceiptV1, String> {
+    let root = validate_parent_spelling(&project.local_root).map_err(|_| "example_receipt_invalid")?;
+    let _guards = lock_directory_chain(&root).map_err(|_| "example_receipt_invalid")?;
+    // Only a safely checked normal internal directory can identify a missing
+    // receipt. A replaced/junction directory remains an invalid receipt.
+    let internal = root.join(".omicsops");
+    match reject_reparse(&internal) {
+        Ok(metadata) if metadata.is_dir() => (),
+        _ => {
+            return Err(if fs::symlink_metadata(&internal)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                "example_receipt_missing"
+            } else {
+                "example_receipt_invalid"
+            }.into());
+        }
+    }
+    let _internal_guards = lock_directory_chain(&internal).map_err(|_| "example_receipt_invalid")?;
+    if fs::symlink_metadata(root.join(RECEIPT))
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Err("example_receipt_missing".into());
+    }
+    let bytes = read_internal_file(&root, RECEIPT).map_err(|_| "example_receipt_invalid")?;
+    serde_json::from_slice(&bytes).map_err(|_| "example_receipt_invalid".into())
+}
+
+fn read_example_file(project: &Project, path: &str, expected_sha256: &str) -> OfflineExampleFileView {
+    let media_type = match Path::new(path).extension().and_then(|extension| extension.to_str()) {
+        Some("csv") => "text/csv",
+        Some("md") => "text/markdown",
+        Some("json") => "application/json",
+        _ => "text/plain",
+    };
+    let mut view = OfflineExampleFileView {
+        relative_path: path.into(),
+        media_type: media_type.into(),
+        expected_sha256: expected_sha256.into(),
+        current_sha256: None,
+        availability: OfflineExampleFileAvailability::Unavailable,
+        preview_text: None,
+    };
+    // A NotFound probe is only used for status. Content always comes from W02.
+    let read = ValidatedProjectFile::open(project, path)
+        .and_then(|mut file| file.read_complete(MAX_FILE_BYTES));
+    match read {
+        Ok(read) => {
+            if let Ok(text) = std::str::from_utf8(&read.bytes) {
+                view.availability = if read.sha256 == expected_sha256 {
+                    OfflineExampleFileAvailability::Available
+                } else {
+                    OfflineExampleFileAvailability::Changed
+                };
+                view.current_sha256 = Some(read.sha256);
+                view.preview_text = Some(crate::composer_references::public_text(text));
+            }
+        }
+        Err(crate::project_file_read::FileReadError::Unavailable)
+            if fs::symlink_metadata(Path::new(&project.local_root).join(path))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            // W02 can encounter NotFound before reaching a junction ancestor.
+            // Check the nearest existing directory chain for status only; do
+            // not classify an inaccessible/reparse-backed target as missing.
+            let candidate = Path::new(&project.local_root).join(path);
+            let mut parent = candidate.parent();
+            while parent.is_some_and(|parent| fs::symlink_metadata(parent)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound))
+            {
+                parent = parent.and_then(Path::parent);
+            }
+            if parent.is_some_and(|parent| lock_directory_chain(parent).is_ok()) {
+                view.availability = OfflineExampleFileAvailability::Missing;
+            }
+        }
+        Err(_) => (),
+    }
+    view
+}
+
+async fn create_offline_example_for_repository(
+    repository: &Store,
+    request: &CreateOfflineExampleWorkspaceRequest,
+) -> Result<CreateOfflineExampleWorkspaceResult, String> {
+    let fixture = load_bundled_example()?;
+    let prepared = materialize_offline_example(request, &fixture, write_new_example_file)?;
+    repository
+        .save_offline_example_project(&prepared.project, &prepared.marker)
+        .await
+        .map_err(|_| "example_registration_failed")?;
+    // Reload Store's project so an identical retry retains user metadata.
+    let workspace = load_offline_example_workspace(repository, prepared.project.id)
+        .await?
+        .ok_or("example_read_failed")?;
+    Ok(CreateOfflineExampleWorkspaceResult {
+        project_id: prepared.project.id,
+        workspace,
+    })
+}
+
+#[tauri::command]
+pub async fn get_offline_example_workspace(
+    state: tauri::State<'_, crate::commands::AppState>,
+    project_id: Uuid,
+) -> Result<Option<OfflineExampleWorkspaceView>, String> {
+    load_offline_example_workspace(&state.repository, project_id).await
+}
+
+#[tauri::command]
+pub async fn create_offline_example_workspace(
+    state: tauri::State<'_, crate::commands::AppState>,
+    request: CreateOfflineExampleWorkspaceRequest,
+) -> Result<CreateOfflineExampleWorkspaceResult, String> {
+    create_offline_example_for_repository(&state.repository, &request).await
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -813,6 +1025,274 @@ fn delete_by_handle(file: &File) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omicsops_dto::{OfflineExampleAvailability, OfflineExampleFileAvailability, OfflineExampleUnavailableReason};
+
+    #[cfg(windows)]
+    async fn view_setup(parent: &Path, db: &Path) -> (omicsops_store::Store, PreparedOfflineExampleProject) {
+        let store = omicsops_store::Store::open(db).await.unwrap();
+        let prepared = materialize_offline_example(&request(parent), &load_bundled_example().unwrap(), write_new_example_file).unwrap();
+        store.save_offline_example_project(&prepared.project, &prepared.marker).await.unwrap();
+        (store, prepared)
+    }
+
+    async fn table_counts(store: &omicsops_store::Store) -> BTreeMap<String, i64> {
+        let tables: Vec<String> = sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").fetch_all(store.pool()).await.unwrap();
+        let mut counts = BTreeMap::new();
+        for table in tables {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"{}\"", table.replace('"', "\"\""))).fetch_one(store.pool()).await.unwrap();
+            counts.insert(table, count);
+        }
+        counts
+    }
+
+    #[tokio::test]
+    async fn offline_example_view_without_marker_never_consumes_disk_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".omicsops")).unwrap();
+        fs::write(dir.path().join(RECEIPT), b"not a receipt").unwrap();
+        let store = omicsops_store::Store::open_in_memory().await.unwrap();
+        let project = Project::new(Uuid::new_v4(), "ordinary", dir.path().to_str().unwrap(), ProjectTemplate::Blank, chrono::Utc::now());
+        store.save_project(&project).await.unwrap();
+        let without_marker = load_offline_example_workspace(&store, project.id).await.unwrap();
+        assert!(without_marker.is_none());
+        assert!(load_offline_example_workspace(&store, Uuid::new_v4()).await.unwrap().is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn offline_example_view_repeated_and_reopened_reads_write_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("test.sqlite");
+        let (store, prepared) = view_setup(dir.path(), &db).await;
+        let before_counts = table_counts(&store).await;
+        let root = Path::new(&prepared.project.local_root);
+        let before: Vec<_> = FIXED_FILES.into_iter().chain([RECEIPT, PROJECT_MANIFEST]).map(|p| (p, fs::read(root.join(p)).unwrap(), fs::metadata(root.join(p)).unwrap().modified().unwrap())).collect();
+        for table in before_counts.keys().filter(|table| !table.starts_with("sqlite_")) {
+            for operation in ["INSERT", "UPDATE", "DELETE"] {
+                sqlx::query(&format!("CREATE TRIGGER \"no_view_{table}_{operation}\" BEFORE {operation} ON \"{table}\" BEGIN SELECT RAISE(ABORT, 'view must not write'); END")).execute(store.pool()).await.unwrap();
+            }
+        }
+        sqlx::query("PRAGMA query_only = ON").execute(store.pool()).await.unwrap();
+        for _ in 0..2 {
+            let view = load_offline_example_workspace(&store, prepared.project.id).await.unwrap().unwrap();
+            assert_eq!(view.availability, OfflineExampleAvailability::Available);
+            assert_eq!(view.entries.len(), 4);
+            assert_eq!(view.files.len(), 7);
+            assert!(view.files.iter().all(|file| file.availability == OfflineExampleFileAvailability::Available));
+        }
+        assert_eq!(before_counts, table_counts(&store).await);
+        store.pool().close().await;
+        let reopened = omicsops_store::Store::open(&db).await.unwrap();
+        let reopened_counts = table_counts(&reopened).await;
+        sqlx::query("PRAGMA query_only = ON").execute(reopened.pool()).await.unwrap();
+        assert!(load_offline_example_workspace(&reopened, prepared.project.id).await.unwrap().is_some());
+        assert_eq!(before_counts, reopened_counts);
+        assert_eq!(reopened_counts, table_counts(&reopened).await);
+        for (path, bytes, modified) in before {
+            assert_eq!(fs::read(root.join(path)).unwrap(), bytes);
+            assert_eq!(fs::metadata(root.join(path)).unwrap().modified().unwrap(), modified);
+        }
+        check_tree(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn offline_example_view_marker_survives_missing_invalid_and_mismatched_receipt() {
+        for mutation in ["missing", "json", "project", "request", "hash", "files", "large", "utf8"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, prepared) = view_setup(dir.path(), &dir.path().join("test.sqlite")).await;
+            let path = Path::new(&prepared.project.local_root).join(RECEIPT);
+            let reason = match mutation {
+                "missing" => { fs::remove_file(&path).unwrap(); OfflineExampleUnavailableReason::ReceiptMissing }
+                "json" => { fs::write(&path, b"not json").unwrap(); OfflineExampleUnavailableReason::ReceiptInvalid }
+                "large" => { fs::write(&path, vec![b'x'; MAX_FILE_BYTES + 1]).unwrap(); OfflineExampleUnavailableReason::ReceiptInvalid }
+                "utf8" => { fs::write(&path, [0xff]).unwrap(); OfflineExampleUnavailableReason::ReceiptInvalid }
+                _ => {
+                    let mut receipt = expected_receipt(prepared.marker.request_id, prepared.project.id, &load_bundled_example().unwrap()).unwrap();
+                    match mutation {
+                        "project" => receipt.project_id = Uuid::new_v4(),
+                        "request" => receipt.request_id = Uuid::new_v4(),
+                        "hash" => receipt.fixture_sha256 = "0".repeat(64),
+                        "files" => receipt.files[0].relative_path = "outside.txt".into(),
+                        _ => unreachable!(),
+                    }
+                    fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+                    if matches!(mutation, "project" | "request") {
+                        OfflineExampleUnavailableReason::IdentityMismatch
+                    } else {
+                        OfflineExampleUnavailableReason::ReceiptInvalid
+                    }
+                }
+            };
+            let bytes = fs::read(&path).ok();
+            let after_receipt_removed = load_offline_example_workspace(&store, prepared.project.id).await.unwrap();
+            let view = after_receipt_removed.unwrap();
+            assert_eq!(view.availability, OfflineExampleAvailability::Unavailable);
+            assert_eq!(view.unavailable_reason, Some(reason));
+            assert_eq!(view.source_kind, OfflineExampleSourceKind::Synthetic);
+            assert!(!view.disclaimer.zh.is_empty() && !view.disclaimer.en.is_empty());
+            assert!(view.entries.is_empty() && view.files.is_empty());
+            assert_eq!(fs::read(&path).ok(), bytes);
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn offline_example_view_missing_and_rebound_root_keep_identity() {
+        for missing in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, prepared) = view_setup(dir.path(), &dir.path().join("test.sqlite")).await;
+            if missing {
+                fs::rename(&prepared.project.local_root, dir.path().join("moved")).unwrap();
+            } else {
+                let mut project = prepared.project.clone();
+                project.local_root = dir.path().to_str().unwrap().into();
+                store.save_project(&project).await.unwrap();
+            }
+            let view = load_offline_example_workspace(&store, prepared.project.id).await.unwrap().unwrap();
+            assert_eq!(view.availability, OfflineExampleAvailability::Unavailable);
+            assert_eq!(view.unavailable_reason, Some(if missing { OfflineExampleUnavailableReason::RootUnavailable } else { OfflineExampleUnavailableReason::IdentityMismatch }));
+            assert!(view.entries.is_empty() && view.files.is_empty());
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn offline_example_view_changed_missing_large_and_invalid_utf8_are_not_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, prepared) = view_setup(dir.path(), &dir.path().join("test.sqlite")).await;
+        let root = Path::new(&prepared.project.local_root);
+        let edited_path = root.join("report.en.md");
+        let edited_bytes = b"# Changed\n<img src=\"https://invalid.test/x\"><script>literal()</script>\n![image](https://invalid.test/y)\ntoken=controlled-secret\n-----BEGIN PRIVATE KEY-----\ncontrolled-key-value\n-----END PRIVATE KEY-----\n";
+        fs::write(&edited_path, edited_bytes).unwrap();
+        fs::remove_file(root.join("results/summary.csv")).unwrap();
+        fs::write(root.join("README.md"), vec![b'x'; MAX_FILE_BYTES + 1]).unwrap();
+        fs::write(root.join("report.zh.md"), [0xff]).unwrap();
+        let before = table_counts(&store).await;
+        for _ in 0..2 {
+            let view = load_offline_example_workspace(&store, prepared.project.id).await.unwrap().unwrap();
+            assert_eq!(view.availability, OfflineExampleAvailability::Available);
+            let file = |path: &str| view.files.iter().find(|file| file.relative_path == path).unwrap();
+            let edited_file = file("report.en.md");
+            assert_eq!(edited_file.availability, OfflineExampleFileAvailability::Changed);
+            assert_eq!(edited_file.current_sha256, Some(sha256(edited_bytes)));
+            let preview = edited_file.preview_text.as_ref().unwrap();
+            assert!(preview.contains("<img src=\"https://invalid.test/x\"><script>literal()</script>"));
+            assert!(preview.contains("![image](https://invalid.test/y)"));
+            assert!(!preview.contains("controlled-secret") && !preview.contains("controlled-key-value"));
+            assert!(preview.contains("[REDACTED]"));
+            assert_eq!(file("results/summary.csv").availability, OfflineExampleFileAvailability::Missing);
+            for path in ["README.md", "report.zh.md"] {
+                assert_eq!(file(path).availability, OfflineExampleFileAvailability::Unavailable);
+                assert!(file(path).preview_text.is_none());
+                assert!(file(path).current_sha256.is_none());
+            }
+        }
+        assert_eq!(table_counts(&store).await, before);
+        assert_eq!(std::fs::read(&edited_path).unwrap(), edited_bytes);
+        assert!(!root.join("results/summary.csv").exists());
+        assert_eq!(fs::metadata(root.join("README.md")).unwrap().len(), (MAX_FILE_BYTES + 1) as u64);
+        assert_eq!(fs::read(root.join("report.zh.md")).unwrap(), [0xff]);
+        store.pool().close().await;
+        let reopened = omicsops_store::Store::open(dir.path().join("test.sqlite")).await.unwrap();
+        let view = load_offline_example_workspace(&reopened, prepared.project.id).await.unwrap().unwrap();
+        assert_eq!(view.files.iter().find(|file| file.relative_path == "report.en.md").unwrap().availability, OfflineExampleFileAvailability::Changed);
+        assert_eq!(view.files.iter().find(|file| file.relative_path == "results/summary.csv").unwrap().availability, OfflineExampleFileAvailability::Missing);
+        assert_eq!(table_counts(&reopened).await, before);
+        assert_eq!(std::fs::read(&edited_path).unwrap(), edited_bytes);
+        assert!(!root.join("results/summary.csv").exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn offline_example_view_unknown_and_corrupt_markers_are_fixed_errors() {
+        for value in [serde_json::json!({}), serde_json::json!({"example_id":"unknown"})] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, prepared) = view_setup(dir.path(), &dir.path().join("test.sqlite")).await;
+            let mut marker = serde_json::to_value(&prepared.marker).unwrap();
+            if value.as_object().unwrap().is_empty() { marker = value; } else { marker["example_id"] = value["example_id"].clone(); }
+            store.put_json("offline_example_workspace_v1", &prepared.project.id.to_string(), &marker).await.unwrap();
+            assert_eq!(load_offline_example_workspace(&store, prepared.project.id).await.unwrap_err(), "offline_example_marker_invalid");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn offline_example_view_junction_files_and_receipt_fail_closed() {
+        for (relative, outside_file) in [("data", true), ("data", false), (".omicsops", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let (store, prepared) = view_setup(dir.path(), &dir.path().join("test.sqlite")).await;
+            let path = Path::new(&prepared.project.local_root).join(relative);
+            fs::rename(&path, outside.path().join("original")).unwrap();
+            if outside_file { fs::write(outside.path().join("observations.csv"), b"outside bytes").unwrap(); }
+            let status = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(&path).arg(outside.path()).output().unwrap();
+            assert!(status.status.success());
+            let view = load_offline_example_workspace(&store, prepared.project.id).await.unwrap().unwrap();
+            if relative == "data" {
+                let file = view.files.iter().find(|file| file.relative_path == "data/observations.csv").unwrap();
+                assert_eq!(file.availability, OfflineExampleFileAvailability::Unavailable);
+                assert!(file.preview_text.is_none());
+            } else {
+                assert_eq!(view.availability, OfflineExampleAvailability::Unavailable);
+                assert_eq!(view.unavailable_reason, Some(OfflineExampleUnavailableReason::ReceiptInvalid));
+                assert!(view.entries.is_empty() && view.files.is_empty());
+            }
+            fs::remove_dir(&path).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn offline_example_view_locked_file_and_replaced_root_are_unavailable() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let (store, prepared) = view_setup(dir.path(), &dir.path().join("test.sqlite")).await;
+        let root = Path::new(&prepared.project.local_root);
+        let locked = OpenOptions::new().read(true).share_mode(0).open(root.join("README.md")).unwrap();
+        let view = load_offline_example_workspace(&store, prepared.project.id).await.unwrap().unwrap();
+        let file = view.files.iter().find(|file| file.relative_path == "README.md").unwrap();
+        assert_eq!(file.availability, OfflineExampleFileAvailability::Unavailable);
+        assert!(file.preview_text.is_none());
+        drop(locked);
+        assert_eq!(load_offline_example_workspace(&store, prepared.project.id).await.unwrap().unwrap().files.iter().find(|file| file.relative_path == "README.md").unwrap().availability, OfflineExampleFileAvailability::Available);
+        fs::rename(root, outside.path().join("original")).unwrap();
+        let status = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(root).arg(outside.path().join("original")).output().unwrap();
+        assert!(status.status.success());
+        let view = load_offline_example_workspace(&store, prepared.project.id).await.unwrap().unwrap();
+        assert_eq!(view.availability, OfflineExampleAvailability::Unavailable);
+        assert_eq!(view.unavailable_reason, Some(OfflineExampleUnavailableReason::RootUnavailable));
+        assert!(view.entries.is_empty() && view.files.is_empty());
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn offline_example_view_create_registration_error_retains_recoverable_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = omicsops_store::Store::open_in_memory().await.unwrap();
+        let request = request(dir.path());
+        sqlx::query("CREATE TRIGGER fail_example BEFORE INSERT ON app_objects BEGIN SELECT RAISE(ABORT, 'injected'); END").execute(store.pool()).await.unwrap();
+        assert_eq!(create_offline_example_for_repository(&store, &request).await.unwrap_err(), "example_registration_failed");
+        assert!(store.list_projects().await.unwrap().is_empty());
+        assert!(store.get_offline_example_project_marker(request.request_id).await.unwrap().is_none());
+        let root = dir.path().join(format!("omicsops-example-{}", request.request_id));
+        assert!(root.join(RECEIPT).exists());
+        let before = fs::read(root.join(RECEIPT)).unwrap();
+        sqlx::query("DROP TRIGGER fail_example").execute(store.pool()).await.unwrap();
+        let created = create_offline_example_for_repository(&store, &request).await.unwrap();
+        assert_eq!(created.project_id, request.request_id);
+        assert_eq!(created.workspace.availability, OfflineExampleAvailability::Available);
+        let mut project = store.get_project(created.project_id).await.unwrap().unwrap();
+        project.name = "User metadata".into();
+        store.save_project(&project).await.unwrap();
+        assert_eq!(create_offline_example_for_repository(&store, &request).await.unwrap(), created);
+        assert_eq!(store.get_project(created.project_id).await.unwrap().unwrap().name, "User metadata");
+        assert_eq!(fs::read(root.join(RECEIPT)).unwrap(), before);
+        let counts = table_counts(&store).await;
+        for table in ["conversation_records", "runs", "agent_events_v4", "approvals_v3", "scientific_evidence_v4"] { assert_eq!(counts[table], 0); }
+    }
     use omicsops_dto::CreateOfflineExampleWorkspaceRequest;
     use std::{fs, path::Path};
     use uuid::Uuid;

@@ -204,6 +204,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            offline_example_workspace::create_offline_example_workspace,
+            offline_example_workspace::get_offline_example_workspace,
             conversation_export::save_conversation_export,
             composer_references::composer_reference_catalog,
             composer_files::list_local_composer_files,
