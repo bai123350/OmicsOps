@@ -45,7 +45,7 @@
 | W05 | [手动压缩](2026-10-04-wisp-w05-context-compaction.md) | 5 | 暂停ordinary run真正原子保存可恢复checkpoint | 已实现、5任务审阅通过；clean-HEAD与真实验收待执行 |
 | W06 | [运行诊断](2026-10-04-wisp-w06-run-diagnostics.md) | 4 | run/tool/失败筛选、精确来源定位、脱敏HTML/JSON | 已实现、4任务源码审阅通过；隔离旧HEAD原生smoke部分通过，静态HTML浏览仍未执行 |
 | W07 | [离线示例](2026-10-04-wisp-w07-offline-example.md) | 4 | 双语合成工作区，重启/坏receipt仍隔离于生产Agent | 已实现、4任务源码审阅通过；确定性/构建通过，原生手工smoke未执行 |
-| W08a | [V4场景](2026-10-04-wisp-w08-scenarios.md) | 3 | 五场景manifest/hash/实际调用计数和安全报告 | 待实施 |
+| W08a | [V4场景](2026-10-04-wisp-w08-scenarios.md) | 3 | 五场景manifest/hash/实际调用计数和安全报告 | 进行中，manifest/hash Task1独立审阅通过，runner/report待实施 |
 | W08b | [Skill helpers](2026-10-04-wisp-w08-skill-helpers.md) | 3 | 固定本地helper离线行为回归与统一Python CI | 已实现、3任务审阅通过；CI未执行 |
 | W09 | [稿件证据](2026-10-04-wisp-w09-publication-evidence.md) | 4 | 保存revision准备度与reference-only四entry证据ZIP | 待实施 |
 | W10 | [文件基线](2026-10-04-wisp-w10-file-baselines.md) | 4 | 显式安全小本地文本immutable snapshot/有界diff | 待实施 |
@@ -126,3 +126,5 @@ W06已实现：四任务源码独立审阅完成，最终UI提交 `d535b50`；�
 2026-10-11：W07 Task3 marker-first只读视图与create/get命令独立审阅通过（`a32fe6a`、纯格式`7818c02`），view9/create19、fmt/diff通过，累计31/50源码任务完成。缓存warning与已纠正RED证据计数留最终审阅；UI/全量/原生验收仍分别待执行。
 
 2026-10-11：W07全部四任务SOURCE审阅完成（最终UI `a7e05c9`），近端157、Rust1777通过/18ignored、前端1316+扩展22、Web/native/fmt/diff通过，累计32/50。W07原生创建/重启/changed/missing/丢收据仍未执行，按用户GUI停止指令保留；W06隔离旧HEAD副本仅过滤、原生保存/取消、定位、Escape部分实际通过，静态HTML浏览未完成，均不是finalHEAD/生产端到端。之后继续W08场景，不将源码完成勾选解释为人工验收通过。
+
+2026-10-11：W08a Task1 `c1f348e..a500df7` manifest/parser/hash独立审阅通过，近端3/core226/fmt/diff通过，累计33/50 SOURCE完成。Windows路径/cache warnings保留；共享工作树检查不是最终clean-HEAD证明，Task2/3继续。

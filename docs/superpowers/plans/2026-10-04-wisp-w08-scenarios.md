@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust cargo unit tests、serde/serde_json、Tokio test-util、dev SHA-256/hex、Windows CI。Python Skill helper 有独立计划，此 runner 不调用 Python。
 
-**Spec:** [W08 Runtime 设计](../specs/2026-10-04-wisp-runtime-design.md#w08manifest-驱动的离线-v4-场景与稳定报告)，已审阅设计提交 `161199f`。当前只准备实施计划，产品/测试实现待计划审阅。
+**Spec:** [W08 Runtime 设计](../specs/2026-10-04-wisp-runtime-design.md#w08manifest-驱动的离线-v4-场景与稳定报告)，已审阅设计提交 `161199f`。Task1 manifest/parser/hash 已实现并独立审阅；Task2 runner 和 Task3 报告/CI 待实施。
 
 ## Global Constraints
 
@@ -42,7 +42,7 @@
 - Produces：`ScriptedToolStepV4 { stage: ToolScriptStageV4, call_id: String, tool_id: String, outcome: Option<ToolOutcomeV4>, failure: Option<ScriptFailureV4> }`；stage 为 Prepare/Execute/Recover，failure 为 ArgumentPreflight/BusinessFailure/UncertainDispatch，outcome/failure 恰一项。`ScenarioSeedEventV4` 为 SuccessfulTool/McpDirectory（typed outcome）、UncertainDispatch（typed call）、UserGuidance（message_id/markdown）封闭 variants，不接受原始任意 event/shell/文件 action。`AssertionSpecV4 { name: ScenarioAssertionV4, expected: Value }` 的白名单为 ValidEvidenceRef/RejectedForeignRef/DeniedNoDispatch/UncertainNoReplay/RecoveredOnce/PreflightPreservesServer/CorrectedMcpSuccess/DiscoveredOnce/FullBudgetAdmitted/SourceRetrievable/FrozenAuthorityRetained/ModelAttempts/ToolProposals/ToolDispatches/RecoveredOutcomes；parser 按 name 检查 expected 为 bool 或 u64，Task 1 即定义该 enum。
 - Produces：`parse_suite(source: &str) -> Result<SuiteManifestV4, ManifestErrorCodeV4>`；`suite_hash(manifest: &SuiteManifestV4, fixtures: &BTreeMap<String, String>) -> Result<String, ManifestErrorCodeV4>`；错误仅固定 InvalidVersion/UnknownField/DuplicateId/InvalidSeed/InvalidScript/InvalidAssertion。
 
-- [ ] **RED 写测试**：`manifest_rejects_invalid_version_fields_ids_seeds_and_actions`、`manifest_hash_is_canonical_across_crlf_and_order`、`manifest_hash_changes_with_fixture_content`。定义标准五场景 manifest，未搭 runner 之前仅测解析/身份/哈希。
+- [x] **RED 写测试**：`manifest_rejects_invalid_version_fields_ids_seeds_and_actions`、`manifest_hash_is_canonical_across_crlf_and_order`、`manifest_hash_changes_with_fixture_content`。定义标准五场景 manifest，未搭 runner 之前仅测解析/身份/哈希。
 
 ```rust
 assert_eq!(suite.scenarios.len(), 5);
@@ -51,10 +51,10 @@ assert_ne!(hash_before_fixture_change, hash_after_fixture_change);
 assert_eq!(parse_suite(&duplicate_id).unwrap_err(), ManifestErrorCodeV4::DuplicateId);
 ```
 
-- [ ] **RED 运行**：`cargo test -p omicsops-agent-core scenario_evaluation::manifest`。预期 parser/hash/模块缺失或断言失败。
-- [ ] **实现接口**：嵌套模块 `super::*`，不移动整个既有测试模块；serde unknown fields 拒绝，逐项核验唯一 id/UUID/script/assertion 类型，canonical BTree key 排序与 LF 字符内容。只增加 workspace `sha2/hex` dev-dependencies。manifest 不自带信任或能力授权。
-- [ ] **GREEN**：重复 RED；现有 `cargo test -p omicsops-agent-core`。预期 hash 固定、旧 fixtures 不回归。
-- [ ] **Commit**：仅暂存本任务文件，`git commit -m "test(agent): define offline V4 scenario manifest"`。
+- [x] **RED 运行**：`cargo test -p omicsops-agent-core scenario_evaluation::manifest`。预期 parser/hash/模块缺失或断言失败。
+- [x] **实现接口**：嵌套模块 `super::*`，不移动整个既有测试模块；serde unknown fields 拒绝，逐项核验唯一 id/UUID/script/assertion 类型，canonical BTree key 排序与 LF 字符内容。只增加 workspace `sha2/hex` dev-dependencies。manifest 不自带信任或能力授权。
+- [x] **GREEN**：重复 RED；现有 `cargo test -p omicsops-agent-core`。预期 hash 固定、旧 fixtures 不回归。
+- [x] **Commit**：仅暂存本任务文件，`git commit -m "test(agent): define offline V4 scenario manifest"`。
 
 ### Task 2: 五场景 runner 和故障注入断言
 
@@ -116,3 +116,5 @@ assert!(!failed_report_json.contains(raw_provider_error));
 ## Plan Self-Review
 
 五场景、manifest/hash、脚本严格消费、故障注入、计数和安全报告/CI 分别绑定 Task 1–3；Review Focus 全有具名测试。无新增 CLI/product API/DTO/DB，report/upload 与 helper plan 的文件责任已协调。没有完整框架/实现 body，所有片段是最小断言；RED/GREEN/commit 仍未执行。
+
+2026-10-11：Task1 `c1f348e..a500df7` 独立完整审阅 Spec compliant / Approved；manifest 3、core 226 通过，fmt/diff通过。canonical LF/key/ID、完整payload和fixture hash、固定错误码均已覆盖；既有sha2复用，仅增加现有hex dev锁边。shared working source测试不替代最终clean-HEAD；Windows路径/cache警告留最终验证。累计33/50 SOURCE任务审阅完成，runner/report与真实模型/SSH/GUI仍未由此证明。
