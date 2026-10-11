@@ -1,0 +1,350 @@
+{
+  "schema_version": 1,
+  "suite_id": "offline-v4-controls",
+  "runner_contract_version": 1,
+  "scenarios": [
+    {
+      "id": "read_evidence",
+      "label": "Read Evidence",
+      "scenario_kind": "read_evidence",
+      "objective": "Verify read evidence with fixed offline fixtures.",
+      "seed": {
+        "project_id": "10000000-0000-4000-8000-000000000001",
+        "conversation_id": "20000000-0000-4000-8000-000000000001",
+        "run_id": "30000000-0000-4000-8000-000000000001"
+      },
+      "model_script": [
+        {
+          "public_text": "Inspect offline control evidence.",
+          "tool_calls": []
+        }
+      ],
+      "tool_script": [],
+      "seed_events": [
+        {
+          "kind": "successful_tool",
+          "outcome": {
+            "call_id": "call-1",
+            "tool_id": "read_file",
+            "succeeded": true,
+            "model_content": "Offline evidence\nsource line",
+            "data": {
+              "source": "fixture"
+            },
+            "provenance": [
+              "fixture:evidence.txt"
+            ]
+          }
+        }
+      ],
+      "limits": {
+        "context_max_bytes": null,
+        "max_turns": 8,
+        "max_tool_calls": 8,
+        "checkpoint_recent_events": null
+      },
+      "assertions": [
+        {
+          "name": "valid_evidence_ref",
+          "expected": true
+        },
+        {
+          "name": "rejected_foreign_ref",
+          "expected": true
+        }
+      ]
+    },
+    {
+      "id": "deny_approval",
+      "label": "Deny Approval",
+      "scenario_kind": "deny_approval",
+      "objective": "Verify deny approval with fixed offline fixtures.",
+      "seed": {
+        "project_id": "10000000-0000-4000-8000-000000000002",
+        "conversation_id": "20000000-0000-4000-8000-000000000002",
+        "run_id": "30000000-0000-4000-8000-000000000002"
+      },
+      "model_script": [
+        {
+          "public_text": "Inspect offline control evidence.",
+          "tool_calls": [
+            {
+              "call_id": "call-2",
+              "tool_id": "read_file",
+              "arguments": {
+                "path": "evidence.txt"
+              }
+            }
+          ]
+        }
+      ],
+      "tool_script": [
+        {
+          "stage": "prepare",
+          "call_id": "call-2",
+          "tool_id": "read_file",
+          "outcome": {
+            "call_id": "call-2",
+            "tool_id": "read_file",
+            "succeeded": true,
+            "model_content": "Offline evidence\nsource line",
+            "data": {
+              "source": "fixture"
+            },
+            "provenance": [
+              "fixture:evidence.txt"
+            ]
+          },
+          "failure": null
+        }
+      ],
+      "seed_events": [],
+      "limits": {
+        "context_max_bytes": null,
+        "max_turns": 8,
+        "max_tool_calls": 8,
+        "checkpoint_recent_events": null
+      },
+      "assertions": [
+        {
+          "name": "denied_no_dispatch",
+          "expected": true
+        },
+        {
+          "name": "tool_dispatches",
+          "expected": 0
+        }
+      ]
+    },
+    {
+      "id": "recover_uncertain",
+      "label": "Recover Uncertain",
+      "scenario_kind": "recover_uncertain",
+      "objective": "Verify recover uncertain with fixed offline fixtures.",
+      "seed": {
+        "project_id": "10000000-0000-4000-8000-000000000003",
+        "conversation_id": "20000000-0000-4000-8000-000000000003",
+        "run_id": "30000000-0000-4000-8000-000000000003"
+      },
+      "model_script": [
+        {
+          "public_text": "Inspect offline control evidence.",
+          "tool_calls": []
+        }
+      ],
+      "tool_script": [
+        {
+          "stage": "recover",
+          "call_id": "call-3",
+          "tool_id": "read_file",
+          "outcome": {
+            "call_id": "call-3",
+            "tool_id": "read_file",
+            "succeeded": true,
+            "model_content": "Offline evidence\nsource line",
+            "data": {
+              "source": "fixture"
+            },
+            "provenance": [
+              "fixture:evidence.txt"
+            ]
+          },
+          "failure": null
+        }
+      ],
+      "seed_events": [
+        {
+          "kind": "uncertain_dispatch",
+          "call": {
+            "call_id": "call-3",
+            "tool_id": "read_file",
+            "arguments": {
+              "path": "evidence.txt"
+            }
+          }
+        }
+      ],
+      "limits": {
+        "context_max_bytes": null,
+        "max_turns": 8,
+        "max_tool_calls": 8,
+        "checkpoint_recent_events": null
+      },
+      "assertions": [
+        {
+          "name": "uncertain_no_replay",
+          "expected": true
+        },
+        {
+          "name": "recovered_once",
+          "expected": true
+        },
+        {
+          "name": "tool_dispatches",
+          "expected": 0
+        }
+      ]
+    },
+    {
+      "id": "correct_mcp_arguments",
+      "label": "Correct Mcp Arguments",
+      "scenario_kind": "correct_mcp_arguments",
+      "objective": "Verify correct mcp arguments with fixed offline fixtures.",
+      "seed": {
+        "project_id": "10000000-0000-4000-8000-000000000004",
+        "conversation_id": "20000000-0000-4000-8000-000000000004",
+        "run_id": "30000000-0000-4000-8000-000000000004"
+      },
+      "model_script": [
+        {
+          "public_text": "Inspect offline control evidence.",
+          "tool_calls": [
+            {
+              "call_id": "call-4",
+              "tool_id": "mcp.call",
+              "arguments": {
+                "query": "fixture"
+              }
+            }
+          ]
+        },
+        {
+          "public_text": "Corrected arguments.",
+          "tool_calls": [
+            {
+              "call_id": "corrected-4",
+              "tool_id": "mcp.call",
+              "arguments": {
+                "query": "corrected fixture"
+              }
+            }
+          ]
+        }
+      ],
+      "tool_script": [
+        {
+          "stage": "prepare",
+          "call_id": "call-4",
+          "tool_id": "mcp.call",
+          "outcome": null,
+          "failure": "argument_preflight"
+        },
+        {
+          "stage": "execute",
+          "call_id": "corrected-4",
+          "tool_id": "mcp.call",
+          "outcome": {
+            "call_id": "corrected-4",
+            "tool_id": "mcp.call",
+            "succeeded": true,
+            "model_content": "Offline evidence\nsource line",
+            "data": {
+              "source": "fixture"
+            },
+            "provenance": [
+              "fixture:evidence.txt"
+            ]
+          },
+          "failure": null
+        }
+      ],
+      "seed_events": [
+        {
+          "kind": "mcp_directory",
+          "outcome": {
+            "call_id": "directory-4",
+            "tool_id": "mcp.discover",
+            "succeeded": true,
+            "model_content": "Offline evidence\nsource line",
+            "data": {
+              "source": "fixture"
+            },
+            "provenance": [
+              "fixture:evidence.txt"
+            ]
+          }
+        }
+      ],
+      "limits": {
+        "context_max_bytes": null,
+        "max_turns": 8,
+        "max_tool_calls": 8,
+        "checkpoint_recent_events": null
+      },
+      "assertions": [
+        {
+          "name": "preflight_preserves_server",
+          "expected": true
+        },
+        {
+          "name": "corrected_mcp_success",
+          "expected": true
+        },
+        {
+          "name": "discovered_once",
+          "expected": true
+        }
+      ]
+    },
+    {
+      "id": "compact_preserve_sources",
+      "label": "Compact Preserve Sources",
+      "scenario_kind": "compact_preserve_sources",
+      "objective": "Verify compact preserve sources with fixed offline fixtures.",
+      "seed": {
+        "project_id": "10000000-0000-4000-8000-000000000005",
+        "conversation_id": "20000000-0000-4000-8000-000000000005",
+        "run_id": "30000000-0000-4000-8000-000000000005"
+      },
+      "model_script": [
+        {
+          "public_text": "Inspect offline control evidence.",
+          "tool_calls": []
+        }
+      ],
+      "tool_script": [],
+      "seed_events": [
+        {
+          "kind": "successful_tool",
+          "outcome": {
+            "call_id": "call-5",
+            "tool_id": "read_file",
+            "succeeded": true,
+            "model_content": "Offline evidence\nsource line",
+            "data": {
+              "source": "fixture"
+            },
+            "provenance": [
+              "fixture:evidence.txt"
+            ]
+          }
+        },
+        {
+          "kind": "user_guidance",
+          "message_id": "50000000-0000-4000-8000-000000000005",
+          "markdown": "Preserve original source references."
+        }
+      ],
+      "limits": {
+        "context_max_bytes": 2048,
+        "max_turns": 8,
+        "max_tool_calls": 8,
+        "checkpoint_recent_events": 1
+      },
+      "assertions": [
+        {
+          "name": "full_budget_admitted",
+          "expected": true
+        },
+        {
+          "name": "source_retrievable",
+          "expected": true
+        },
+        {
+          "name": "frozen_authority_retained",
+          "expected": true
+        }
+      ]
+    }
+  ]
+}

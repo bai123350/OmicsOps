@@ -18,4 +18,5 @@ tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+hex.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

@@ -3611,6 +3611,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures-util",
+ "hex",
  "omicsops-protocol",
  "omicsops-science",
  "serde",

@@ -6941,6 +6941,8 @@ fn checkpoint_unresolved_errors(events: &[AgentEventV4], use_views: bool) -> Vec
 
 #[cfg(test)]
 mod tests {
+    mod scenario_evaluation;
+
     use super::*;
     use async_trait::async_trait;
     use omicsops_protocol::{
