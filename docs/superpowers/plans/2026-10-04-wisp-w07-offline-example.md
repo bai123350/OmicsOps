@@ -83,7 +83,7 @@
 - Consumes: Tasks 1–2，W02 `ValidatedProjectFile::open(&Project, &str)` / `read_complete(64 * 1024)`，`composer_references::public_text`。
 - Produces: `load_offline_example_workspace(repository: &Store, project_id: Uuid) -> Result<Option<OfflineExampleWorkspaceView>, String>`；固定路径专用 `read_example_receipt(project: &Project) -> Result<OfflineExampleReceiptV1, String>`（64 KiB、同等 handle final-path/identity 检查，不放宽 W02 的内部目录拒绝）；Tauri `get_offline_example_workspace(state: State<'_, AppState>, project_id: Uuid) -> Result<Option<OfflineExampleWorkspaceView>, String>`、`create_offline_example_workspace(state: State<'_, AppState>, request: CreateOfflineExampleWorkspaceRequest) -> Result<CreateOfflineExampleWorkspaceResult, String>`。
 
-- [ ] **RED — 写 `offline_example_view_*`。** 无 marker 返回 None；有 marker 丢/坏 receipt、root 丢失/错绑返回 Some(unavailable)，未知/坏 marker 为安全错误，不 fallback。changed/missing/over-limit/reparse 文件标状态、无写回；受控私钥/token 值须经 public_text 脱敏；HTML/Markdown 保持当前文本字面量，Task 4 验证不解析元素或请求外部资源。
+- [x] **RED — 写 `offline_example_view_*`。** 无 marker 返回 None；有 marker 丢/坏 receipt、root 丢失/错绑返回 Some(unavailable)，未知/坏 marker 为安全错误，不 fallback。changed/missing/over-limit/reparse 文件标状态、无写回；受控私钥/token 值须经 public_text 脱敏；HTML/Markdown 保持当前文本字面量，Task 4 验证不解析元素或请求外部资源。
 
   ```rust
   assert!(without_marker.is_none());
@@ -92,10 +92,10 @@
   assert_eq!(std::fs::read(&edited_path).unwrap(), edited_bytes);
   ```
 
-- [ ] **RED — 运行 FAIL。** `cargo test -p omicsops-desktop --lib offline_example_view -- --nocapture`；预期 view/命令不存在。
-- [ ] **实现签名并注册两个命令。** marker 永远优先，unavailable view 保留固定合成来源/banner、清空 entries/files；普通文件清单固定，完整有界 UTF-8读取，先脱敏再返回 preview。任一文件内容 changed 不改变来源身份，不把多文件读取宣称原子快照；请求不允许任意客户端路径。create 只在 materialize 与原子登记后加载 view，返回 ID 不复制 Project DTO。
-- [ ] **GREEN — 同命令 PASS。** 重开 DB 与反复打开均零文件/生产表写入，changed/missing 不自动修复，只有完全可读未修改文件为 available。W02叶子未就绪时等待 master 接入，不另造安全框架。
-- [ ] **Commit —** `git add -- src-tauri/src/offline_example_workspace.rs src-tauri/src/lib.rs`；`git commit -m "feat: read offline examples without production run state"`。
+- [x] **RED — 运行 FAIL。** `cargo test -p omicsops-desktop --lib offline_example_view -- --nocapture`；预期 view/命令不存在。
+- [x] **实现签名并注册两个命令。** marker 永远优先，unavailable view 保留固定合成来源/banner、清空 entries/files；普通文件清单固定，完整有界 UTF-8读取，先脱敏再返回 preview。任一文件内容 changed 不改变来源身份，不把多文件读取宣称原子快照；请求不允许任意客户端路径。create 只在 materialize 与原子登记后加载 view，返回 ID 不复制 Project DTO。
+- [x] **GREEN — 同命令 PASS。** 重开 DB 与反复打开均零文件/生产表写入，changed/missing 不自动修复，只有完全可读未修改文件为 available。W02叶子未就绪时等待 master 接入，不另造安全框架。
+- [x] **Commit —** `git add -- src-tauri/src/offline_example_workspace.rs src-tauri/src/lib.rs`；`git commit -m "feat: read offline examples without production run state"`。
 
 ### Task 4: 全项目选择入口与双语独立 UI
 
@@ -125,3 +125,5 @@
 本轮仅保存计划，尚未执行 checkbox。W02 读取叶子和 DesktopApp 共享文件整合顺序服从 master；计划审阅与执行方式留待下一阶段，未声称 W07 功能已实现。
 
 2026-10-11：Task 2 初始提交 `228d129`，独立评审发现两个 staging identity 操作边界竞态；修复 `b77c393` 用保留身份 handle 与同一 mutation handle 完成 no-replace 发布/清理。确定性 RED 为原16通过、新2失败；最终19通过、0失败、0ignored，fmt/diff通过；独立 scoped 复审关闭 I1/I2。当前2/4任务源码审阅完成；Task3/4、完整交付检查和离线示例原生smoke待执行。Task3 的 HTML 哨兵断言按绑定设计澄清为 literal text/no network，凭据仍必须脱敏。
+
+2026-10-11：Task3 源码 `a32fe6a` 与纯格式 `7818c02` 完成独立 spec/quality 审阅，无 Critical/Important。marker 优先、只读 view、固定收据和当前文件预览、原子登记后 reload/保留失败目录均已接入；view9/create19通过，fmt/diff通过，纯格式与已测源码等价已核验。正式RED是12 E0425缺API加1 OUT_DIR环境错误，另有空目录junction状态回归RED→GREEN。已解析收据的 project/request 归属不符用 IdentityMismatch，其余结构/版本/fixture/files损坏用 ReceiptInvalid。当前3/4任务源码完成；UI及完整/原生验证仍待Task4。

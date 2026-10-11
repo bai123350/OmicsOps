@@ -44,7 +44,7 @@
 | W04 | [内核观察](2026-10-04-wisp-w04-kernel-inspection.md) | 5 | 活着的Python/R metadata，不隐式启动或执行对象方法 | 已实现，5任务审阅通过；真实R/SSH/GUI未验收 |
 | W05 | [手动压缩](2026-10-04-wisp-w05-context-compaction.md) | 5 | 暂停ordinary run真正原子保存可恢复checkpoint | 已实现、5任务审阅通过；clean-HEAD与真实验收待执行 |
 | W06 | [运行诊断](2026-10-04-wisp-w06-run-diagnostics.md) | 4 | run/tool/失败筛选、精确来源定位、脱敏HTML/JSON | 已实现、4任务源码审阅通过；自动/桌面构建通过，原生手工smoke未执行 |
-| W07 | [离线示例](2026-10-04-wisp-w07-offline-example.md) | 4 | 双语合成工作区，重启/坏receipt仍隔离于生产Agent | 进行中，2/4任务源码审阅通过；只读视图/UI待实施 |
+| W07 | [离线示例](2026-10-04-wisp-w07-offline-example.md) | 4 | 双语合成工作区，重启/坏receipt仍隔离于生产Agent | 进行中，3/4任务源码审阅通过；统一入口与UI待实施 |
 | W08a | [V4场景](2026-10-04-wisp-w08-scenarios.md) | 3 | 五场景manifest/hash/实际调用计数和安全报告 | 待实施 |
 | W08b | [Skill helpers](2026-10-04-wisp-w08-skill-helpers.md) | 3 | 固定本地helper离线行为回归与统一Python CI | 已实现、3任务审阅通过；CI未执行 |
 | W09 | [稿件证据](2026-10-04-wisp-w09-publication-evidence.md) | 4 | 保存revision准备度与reference-only四entry证据ZIP | 待实施 |
@@ -122,3 +122,5 @@ W01已实现：`afb1af3`/`ff8595b` 存储与Hook，`ae439c7`/`6312f60` 导航和
 W06已实现：四任务源码独立审阅完成，最终UI提交 `d535b50`；定向163/Rust1741通过与18ignored/前端1290+扩展22/Web与native构建/fmt/diff通过。评审确认源码无待修复项；Windows GUI/native-save/static-HTML手工smoke明确延期且未执行（当时 native computer API 不可用；2026-10-11 已确认新 API 可用，隔离原生验证仍待完成），保留实际chooser/focus/browser残余风险，不能称该验收通过。既有warning债务留最终评审。累计28/50源码任务审阅；clean committed-HEAD、全分支和真实模型/SSH/R验收独立记录。
 
 2026-10-11：W07 Task2 材料化/重试及两项所有权竞态修复已独立审阅通过（`228d129`、`b77c393`）；最终定向19/19，累计30/50源码任务完成。当前 Windows native 工具已可用，W06 原生过滤/定位/保存取消/静态HTML验收仍未通过；正在仅以隔离测试副本准备验证，不把构建或测试替身当作该验收。
+
+2026-10-11：W07 Task3 marker-first只读视图与create/get命令独立审阅通过（`a32fe6a`、纯格式`7818c02`），view9/create19、fmt/diff通过，累计31/50源码任务完成。缓存warning与已纠正RED证据计数留最终审阅；UI/全量/原生验收仍分别待执行。
