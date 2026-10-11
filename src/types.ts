@@ -1183,3 +1183,43 @@ export interface RemoteJobObservationV4 {
   captures: RemoteJobCaptureReferenceV4[];
   resubmitted: boolean;
 }
+export interface CreateOfflineExampleWorkspaceRequest {
+  request_id: string;
+  example_id: string;
+  parent_directory: string;
+}
+
+export interface OfflineExampleText { zh: string; en: string }
+export interface OfflineExampleEntry {
+  id: string;
+  kind: "question" | "narration" | "result";
+  text: OfflineExampleText;
+}
+export interface OfflineExampleFileView {
+  relative_path: string;
+  media_type: "text/plain" | "text/csv" | "text/markdown" | "application/json";
+  expected_sha256: string;
+  current_sha256: string | null;
+  availability: "available" | "changed" | "missing" | "unavailable";
+  preview_text: string | null;
+}
+export type OfflineExampleUnavailableReason = "receipt_missing" | "receipt_invalid" | "root_unavailable" | "identity_mismatch";
+export interface OfflineExampleWorkspaceView {
+  schema_version: 1;
+  project_id: string;
+  example_id: string;
+  source_kind: "synthetic";
+  availability: "available" | "unavailable";
+  unavailable_reason: OfflineExampleUnavailableReason | null;
+  title: OfflineExampleText;
+  disclaimer: OfflineExampleText;
+  source_description: OfflineExampleText;
+  license_spdx: string;
+  fixture_sha256: string;
+  entries: OfflineExampleEntry[];
+  files: OfflineExampleFileView[];
+}
+export interface CreateOfflineExampleWorkspaceResult {
+  project_id: string;
+  workspace: OfflineExampleWorkspaceView;
+}

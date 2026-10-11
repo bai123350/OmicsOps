@@ -738,3 +738,69 @@ installer is not an installation or GUI smoke pass. Real provider/SSH/R/Micromam
 or PBMC workflows require the disposable-environment procedures above and an
 explicit recorded run; ignored tests, this scripted transport and successful
 builds must never be reported as that acceptance.
+
+
+## W07 offline synthetic example / 离线合成示例
+
+Deterministic UI/host tests and build results are recorded separately from native
+smoke and real scientific acceptance. The fixture is original OmicsOps content,
+`synthetic-evidence-report-v1`, `source_kind=synthetic`, AGPL-3.0-only. It creates
+only a local Blank/Ready Project, fixed files and a source marker. Viewing does not
+execute Python/R, contact a model/MCP/SSH service, or create production conversations,
+Runs, approvals, Evidence or Agent events. Global settings can still read local
+model/Skills/MCP/connection metadata. A previously identified ordinary workspace
+may remain visible during a cancellable source/usage lookup; its earlier authorized
+work may continue. Only the candidate is guaranteed to have zero initialization.
+
+Windows native manual smoke (use an isolated disposable app-data directory and
+local parent folder, no live credentials; record actual passed/failed/not executed):
+
+1. With credentials absent and networking unavailable, open Project Library's
+   **Offline example / 离线示例**. Immediately press window Escape: only this top
+   creation layer closes. Reopen, cancel the parent-folder picker: zero creation.
+   Choose an existing local parent and create; no ordinary remote-default flow.
+2. Confirm bilingual synthetic/preset/not-executed labels, four sections and seven
+   files. Open observations, summary and both reports. Check A = 2, 4; B = 5, 7;
+   preset means 3 and 6, difference 3. No conversation, model/compute/SSH startup or
+   Agent dispatch is permitted for the example. Hashes only compare file equality.
+3. Restart that isolated app and open the example via startup, Project Library,
+   exact search/source and usage navigation where available. Inapplicable production
+   targets must show the synthetic view with a target-unavailable notice. During a
+   deferred lookup, cancel navigation: keep the identified old workspace/draft and
+   discard late responses. No candidate initialization before marker None.
+4. Edit a fixed text file to include literal HTML/Markdown remote image/link/script/
+   iframe strings. Reopen and see **Changed / 已更改**, current user text and a changed
+   hash, with zero remote resource requests. Delete another fixed file and reopen:
+   **Missing / 缺失**, no preview or automatic repair. Over-limit/unreadable files show
+   **Unavailable / 不可用** rather than a truncated complete-file claim.
+5. Delete `.omicsops/offline-example.json`, restart/reopen: retain the synthetic
+   identity, display receipt-missing unavailable, no file reads/previews and zero
+   production initialization. Corrupt/rebind root identity similarly fails closed.
+6. Inject a registration failure in a disposable host: saved directory remains;
+   retry within the same open creation panel uses the same UUID. Close/reopen starts
+   a new explicit request. A conflicting or user-edited target must not be overwritten.
+
+中文：示例/捆绑哈希/三个 helper/脚本 V4 的成功各自只证明覆盖的契约，不代表真实
+科学结果或全部依赖可用。changed 文件是当前用户文本，不能继续称作原始预置结果。
+普通模型、MCP 或外部服务仍可能接收提示词、结果或元数据；此示例的离线能力不是
+全产品的数据不出本机保证。
+
+2026-10-11 status: W07 native GUI creation/restart/changed/missing/receipt smoke
+**not executed** in this task. Computer-use was stopped by the user; no application,
+installer or real database was launched through a substitute route. The separate
+older-HEAD W06 harness is not W07 evidence. Real provider, SSH, R, Micromamba, GPU,
+SLURM and PBMC scientific workflows **not executed**. Default ignored tests, mocks,
+web/native builds and installer generation are not a native or live acceptance pass.
+
+
+2026-10-11 deterministic gate results: `cargo test --locked --workspace` passed
+(1777 passed, 0 failed, 18 ignored); `npm test` passed (1316 Vitest + 22 extension
+Node tests); `npm run build` and normal `npm run build:desktop` passed. Final
+Task4 closest three-file suite passed 157/157; `npx tsc -b --force`,
+`cargo fmt --all -- --check` and `git diff --check` passed. Rust cache/dead-code/
+linker and Vite chunk-size warnings are retained in the task report. No locks
+changed, so `npm ci` was not required. Only the later fail-fast test helper was
+retested; product code matches full gates, with a separately byte-proven removal
+of one extra EOF newline from the type-only DTO file. Native app/bundle generation
+is recorded as build evidence; no W07 GUI smoke or live scientific workflow pass
+is claimed.

@@ -147,6 +147,56 @@ Python 3.12 与 Node 22，修改配置本身不是 CI 运行证据。helper 输�
 也不修改 Skills 源码、SOURCE pin、哈希或冻结规则。真实验收另见
 [acceptance/README.md](../acceptance/README.md)。
 
+## 离线合成示例 / Offline synthetic example
+
+项目库的“离线示例 / Offline example”是独立的本地创建入口。选择已有本地父目录后，
+应用创建唯一子目录，保存普通 Blank/Ready 项目和来源 marker；无需凭据、网络、
+SSH、Python 或 R。唯一例子为 `synthetic-evidence-report-v1`，由本仓库原创，
+采用 `AGPL-3.0-only`，附带原许可正文。它与上游 Skills、helper 和真实科学工作流
+是独立的证据范围，不导入上游 transcript、thinking 或真实样本。
+
+The Project Library's **Offline example** action creates a separate local child
+folder under an existing parent. The original `synthetic-evidence-report-v1`
+fixture uses `AGPL-3.0-only` and requires no credentials, network, model, SSH,
+Python or R. Creation records source identity; viewing does not execute a workflow.
+
+专用双语视图展示目标、合成表、预置结果与报告四段，以及七个文本文件：
+`data/observations.csv`、`results/summary.csv`、`report.zh.md`、`report.en.md`、
+`README.md`、`SOURCE.json`、`LICENSE.txt`。A 为 2、4，B 为 5、7；预置均值为
+3 和 6、差为 3，未在本机执行，不能作为统计显著性或复现成功的证据。
+SHA-256 只用于比较文件与预置内容的一致性，不证明科研结论。
+
+The four sections and seven text files show synthetic observations A = 2, 4 and
+B = 5, 7, preset means 3 and 6, and difference 3. These are already-written
+arithmetic examples, not locally executed results or evidence of significance.
+Hashes indicate file equality only.
+
+启动、创建后、项目库和精确来源/用量跳转先查询 Store marker。已有 marker 时，即使
+收据删除、损坏或目录不可用，也保留示例身份并显示不可用，不创建生产会话或派发
+Agent/compute/SSH。身份查询失败阻断候选打开。普通当前项目可在可取消的来源
+查询中继续显示，候选不会提前初始化；其先前授权工作可能继续。
+全局设置只读取本地目录元数据。模型、MCP 和实际工作流仍可能传输信息，不能把
+这一离线例子的无网络要求推广成产品的全部数据驻留保证。
+
+Marker identification precedes candidate workspace initialization. Missing or
+invalid receipts retain the synthetic identity with an unavailable view. Identity
+errors never fall back to production initialization. A previously identified
+ordinary workspace may remain visible during cancellable navigation; its earlier
+authorized work may continue.
+
+文件预览显示有界、脱敏的当前文本，不解析 HTML/Markdown，不加载远端图片、
+链接、脚本、iframe 或字体。changed 明示为当前用户文本；missing/unavailable
+禁用预览，不补写或覆盖。创建登记失败可在同面板重试，保持同一 request UUID；
+关闭后重开是新尝试。创建与重启/文件状态的 Windows 原生 smoke 和真实科学验收
+分别记录于 [acceptance/README.md](../acceptance/README.md)，模拟 UI 与构建不算通过。
+
+Previews render bounded, redacted current text literally, including HTML and
+Markdown syntax, without loading remote resources. Changed files are labelled as
+current user text; missing/unavailable files cannot be previewed and are never
+repaired automatically. A retry within one creation attempt retains its request
+UUID; reopening the creation panel starts a new attempt. Mock tests and builds do
+not establish native smoke or real scientific acceptance.
+
 ## 项目文件记忆
 
 保存、检索、计数统一使用 `<项目目录>/.omicsops/memory/` 第一层 UTF-8 Markdown

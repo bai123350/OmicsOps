@@ -11,6 +11,7 @@ const baseProps = {
   onOpen: () => undefined,
   onDelete: vi.fn().mockResolvedValue(undefined),
   onSettings: () => undefined,
+  onCreateOfflineExample: vi.fn().mockResolvedValue(undefined),
 };
 
 const recentProject = {
@@ -37,6 +38,31 @@ const templateCases = [
 ] as const;
 
 describe("ProjectLibrary homepage actions", () => {
+  it("creates a local-only example with a selected parent and no ordinary create call", async () => {
+    const onCreate = vi.fn(); const onCreateOfflineExample = vi.fn().mockResolvedValue(undefined);
+    render(<ProjectLibrary {...baseProps} connections={[{ id: "ssh", label: "Trusted", host: "host", port: 22, username: "user", authentication: "password", authentication_reference: "ref", host_key_fingerprint: "trusted" }]} onCreate={onCreate} onCreateOfflineExample={onCreateOfflineExample} onChooseLocalRoot={vi.fn().mockResolvedValue({ path: "E:/Examples", usedFallback: false })} />);
+    fireEvent.click(screen.getByRole("button", { name: "离线示例" }));
+    const dialog = screen.getByRole("dialog", { name: "创建离线示例" });
+    expect(within(dialog).queryByRole("radio")).toBeNull();
+    fireEvent.click(within(dialog).getByRole("button", { name: "选择父目录" }));
+    await screen.findByText("E:/Examples");
+    fireEvent.click(within(dialog).getByRole("button", { name: "创建示例" }));
+    await waitFor(() => expect(onCreateOfflineExample).toHaveBeenCalledWith("E:/Examples"));
+    expect(onCreate).not.toHaveBeenCalled();
+  });
+
+  it("does not create on parent-picker cancellation and immediately closes only the top example layer", async () => {
+    const parentClose = vi.fn(); const onCreateOfflineExample = vi.fn();
+    function Parent() { useWindowEscapeLayer(true, parentClose); return <ProjectLibrary {...baseProps} onCreate={vi.fn()} onCreateOfflineExample={onCreateOfflineExample} onChooseLocalRoot={vi.fn().mockResolvedValue({ path: null, usedFallback: false })} />; }
+    render(<Parent />);
+    fireEvent.click(screen.getByRole("button", { name: "离线示例" }));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull(); expect(parentClose).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "离线示例" }));
+    fireEvent.click(screen.getByRole("button", { name: "选择父目录" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "创建示例" })).toBeDisabled());
+    expect(onCreateOfflineExample).not.toHaveBeenCalled();
+  });
   it("opens and consumes a menu request without reopening after Escape", () => {
     const onCreateRequestHandled = vi.fn();
     const props = { ...baseProps, onChooseLocalRoot: vi.fn(), onCreate: vi.fn(), onCreateRequestHandled };

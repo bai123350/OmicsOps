@@ -150,6 +150,10 @@ ProjectLibrary 新增 `onCreateOfflineExample` 与独立“离线示例 / Offlin
 
 请求 token/generation 用于抑制晚响应和启动默认选择与显式导航竞态，只有最后有效的打开请求提交状态。loading 状态在身份识别完成后结束；等待期间 selected 为空，不能先选择项目后补查来源。创建成功同样走统一入口或使用其同一已核验身份分支。示例状态不得触发原 selected-project effect 创建 conversation、选择 model/compute、连接 SSH 或发送 Agent 请求；后续当前项目元数据刷新也不能绕过标记检查切换到生产视图。
 
+2026-10-11 实施边界澄清：上述等待期间 selected 为空适用于启动、项目库及没有已识别当前项目的入口。可取消的来源/用量导航可以在候选 marker 查询期间保留先前已由 None 确认的普通当前项目，显示“正在识别项目来源”，不能提前选择或初始化候选。None 才提交普通目标；Some 清除旧 selected 并打开独立示例；错误不回退到候选。取消、后续导航及 generation 失效保留原视图、草稿和已有记录，晚响应无效；尚未识别的项目不能作为保留当前项目。代价是原工作区仍可见，其先前授权工作可继续，因此只保证候选零初始化，不声明全应用零网络。全局设置目录的本地 model/Skills/MCP/连接元数据读取可保留，不启动 provider、MCP、SSH 或 compute。
+
+ProjectLibrary 可提供窄生命周期回调 `onBeginOfflineExample(): void`，每次显式打开示例创建面板重置 DesktopApp 的创建尝试。必须保持 `onCreateOfflineExample(parentDirectory)` 签名；同一次打开内失败/重试保持 request UUID，关闭后重开获得新的 UUID，选择器取消不创建。此回调仅区分 UI 创建尝试，不改变宿主 DTO、授权或恢复登记规则。
+
 `OfflineExampleWorkspace` 只提供本地预览与返回项目库。源/结果/报告都有明显 synthetic banner，changed/missing/unavailable 与 available 分别显示；changed 文件预览的是用户当前文本，不能继续将其称为随包原始结果。整个 view 为 unavailable 时保留合成身份/banner 和固定原因，禁止文件预览与生产会话初始化。Markdown 预览不加载图片、远程链接、脚本、iframe 或外部字体，文本经过 host public_text；无需 Markdown 打开网络才能看完示例。
 
 | 失败条件 | 用户可观察行为与留存 |

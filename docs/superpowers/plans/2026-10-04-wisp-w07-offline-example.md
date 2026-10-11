@@ -99,13 +99,17 @@
 
 ### Task 4: 全项目选择入口与双语独立 UI
 
+2026-10-11 经控制器与根任务确认的实施澄清（见绑定 W07 设计）：启动/项目库的候选识别期间 selected 为空；来源/用量导航可以保留已经由 marker None 确认的旧普通项目。候选直到 None 前不得进入 selected 或读生产会话，Some 转独立示例，错误禁止候选回退。generation/取消使晚响应无效，保留旧稿/记录。显示准确的识别等待状态；原授权工作可继续，不声明全应用零网络。当前项目 metadata 更新也先识别 marker，旧更新不能覆盖显式导航。新增/更新 deferred marker、取消/后续来源导航、目标零初始化及 metadata 回归。
+
+创建面板增加可选 `onBeginOfflineExample(): void` 回调以重置每次显式打开的尝试。既定 `onCreateOfflineExample(parentDirectory)` 不变；同面板失败→重试保持 UUID，关闭/重开→新 UUID，选择器取消零创建。此次窄生命周期耦合不修改宿主 API。Task4 额外拥有本计划与绑定设计两份文档，以记录此明确边界。
+
 **Files:** Create `src/offline-example-api.ts`、`src/features/projects/OfflineExampleWorkspace.tsx`、`src/features/projects/OfflineExampleWorkspace.test.tsx`; Modify `src/types.ts`、`src/DesktopApp.tsx`、`src/DesktopApp.test.tsx`、`src/features/projects/ProjectLibrary.tsx`、`ProjectLibrary.test.tsx`、`src/styles.css`、`docs/bundled-science.md`、`acceptance/README.md`。
 
 **Interfaces:**
 - Consumes: Task 3 host commands、listProjects、existing chooseProjectDirectory、Locale（`src/features/workspace/copy.ts`）、Escape stack；共享 DesktopApp 改动由 master 串行整合。
 - Produces: `createOfflineExampleWorkspace(request: CreateOfflineExampleWorkspaceRequest): Promise<CreateOfflineExampleWorkspaceResult>`、`getOfflineExampleWorkspace(projectId: string): Promise<OfflineExampleWorkspaceView | null>`；DesktopApp 内 `openProjectWorkspace(project: WorkspaceProject, navigation?: {conversationId?: string; runId?: string; sourceId?: string}): Promise<boolean>`；ProjectLibrary callback `onCreateOfflineExample(parentDirectory: string): Promise<void>`；`OfflineExampleWorkspace({workspace, locale, onBack}: {workspace: OfflineExampleWorkspaceView; locale: Locale; onBack: () => void})`。
 
-- [ ] **RED — 写 UI mocks。** 启动 items[0] 为示例、创建后、search 精确来源、usage conversation、workspace source、恢复导航都不得先 setSelected；删除 receipt 后重启仍 unavailable。晚默认启动响应不能覆盖显式导航，身份查询拒绝不能 fallback；原普通项目路线不回归。视图双语、四段/七文件、changed/missing/unavailable、外链/图片无请求，示例创建关闭立即 Escape 只关顶层。
+- [x] **RED — 写 UI mocks。** 启动 items[0] 为示例、创建后、search 精确来源、usage conversation、workspace source、恢复导航都不得先 setSelected；删除 receipt 后重启仍 unavailable。晚默认启动响应不能覆盖显式导航，身份查询拒绝不能 fallback；原普通项目路线不回归。视图双语、四段/七文件、changed/missing/unavailable、外链/图片无请求，示例创建关闭立即 Escape 只关顶层。
 
   ```tsx
   expect(api.createConversation).not.toHaveBeenCalled();
@@ -117,8 +121,8 @@
   expect(parentClose).not.toHaveBeenCalled();
   ```
 
-- [ ] **RED — 运行 FAIL。** `npx vitest run src/DesktopApp.test.tsx src/features/projects/ProjectLibrary.test.tsx src/features/projects/OfflineExampleWorkspace.test.tsx`；预期新组件/统一识别路径缺失，首项目示例当前仍会创建 conversation。
-- [ ] **实现签名、入口与视图。** 全部新项目 selection 通过 openProjectWorkspace，只有 marker query None 才设普通 selected/application requestedConversation；Some 转专用 view，等待/错误不临时进入普通项目。project generation 丢晚响应、识别完成才结束 loading。独立 local-only action 不调用默认远端 beginCreate，request ID 在同次提交/重试稳定；取消 parent picker 不创建。HTML/Markdown 只显示安全文本，不载外部资源。
+- [x] **RED — 运行 FAIL。** `npx vitest run src/DesktopApp.test.tsx src/features/projects/ProjectLibrary.test.tsx src/features/projects/OfflineExampleWorkspace.test.tsx`；预期新组件/统一识别路径缺失，首项目示例当前仍会创建 conversation。
+- [x] **实现签名、入口与视图。** 全部新项目 selection 通过 openProjectWorkspace，只有 marker query None 才设普通 selected/application requestedConversation；Some 转专用 view，等待/错误不临时进入普通项目。project generation 丢晚响应、识别完成才结束 loading。独立 local-only action 不调用默认远端 beginCreate，request ID 在同次提交/重试稳定；取消 parent picker 不创建。HTML/Markdown 只显示安全文本，不载外部资源。
 - [ ] **GREEN — 定向命令 PASS，默认/桌面检查 PASS。** `cargo test --workspace`、`npm test`、`npm run build`、`npm run build:desktop`、`git diff --check`。Windows smoke：无 credentials 创建、重启、预览、改/删文件、删 receipt，确认合成标记和零派发；记录真实科学工作流未执行。docs 分开 bundle/helper/example 与实际工作流证据。
 - [ ] **Commit —** `git add -- src/offline-example-api.ts src/features/projects/OfflineExampleWorkspace.tsx src/features/projects/OfflineExampleWorkspace.test.tsx src/types.ts src/DesktopApp.tsx src/DesktopApp.test.tsx src/features/projects/ProjectLibrary.tsx src/features/projects/ProjectLibrary.test.tsx src/styles.css docs/bundled-science.md acceptance/README.md`；`git commit -m "feat: route bilingual offline examples outside agent initialization"`。
 
@@ -127,3 +131,5 @@
 2026-10-11：Task 2 初始提交 `228d129`，独立评审发现两个 staging identity 操作边界竞态；修复 `b77c393` 用保留身份 handle 与同一 mutation handle 完成 no-replace 发布/清理。确定性 RED 为原16通过、新2失败；最终19通过、0失败、0ignored，fmt/diff通过；独立 scoped 复审关闭 I1/I2。当前2/4任务源码审阅完成；Task3/4、完整交付检查和离线示例原生smoke待执行。Task3 的 HTML 哨兵断言按绑定设计澄清为 literal text/no network，凭据仍必须脱敏。
 
 2026-10-11：Task3 源码 `a32fe6a` 与纯格式 `7818c02` 完成独立 spec/quality 审阅，无 Critical/Important。marker 优先、只读 view、固定收据和当前文件预览、原子登记后 reload/保留失败目录均已接入；view9/create19通过，fmt/diff通过，纯格式与已测源码等价已核验。正式RED是12 E0425缺API加1 OUT_DIR环境错误，另有空目录junction状态回归RED→GREEN。已解析收据的 project/request 归属不符用 IdentityMismatch，其余结构/版本/fixture/files损坏用 ReceiptInvalid。当前3/4任务源码完成；UI及完整/原生验证仍待Task4。
+
+2026-10-11：Task4 实现 marker-first 的启动/项目库/普通与示例创建/精确搜索/usage/来源/metadata 入口、稳定创建请求和双语独立预览。正式 UI RED 为 131 旧测试通过、新3失败及缺新组件的 collection 错误；EPERM 基础设施失败单独记录。来源请求残留另有1失败→覆盖9通过。最终近端157通过；`cargo test --locked --workspace` 1777通过、18 ignored、0失败，`npm test` 1316 Vitest与22扩展测试通过，Web与正常桌面构建通过，fmt/diff通过。完整检查后仅加强 fail-fast 测试替身并补跑近端157及强制 TypeScript；另删除 types 的单个多余 EOF 换行，有精确字节等价证明。Rust未改，无格式提交或锁文件变化。细节日志/源码/共享文件 staging 证据位于 ignored Task4 报告。W07 Windows 原生创建/重启/changed/missing/收据 smoke 未执行（用户停止 GUI）；真实模型、SSH、R/Micromamba/GPU/PBMC均未执行。因原生 smoke 未执行，整体验收 GREEN checkbox 保持未勾；实现和确定性 gate 已完成，独立源码审阅仍待控制器安排。正常构建不替代原生/科学验收。

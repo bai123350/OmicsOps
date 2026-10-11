@@ -21,6 +21,8 @@ interface Props {
   locale: Locale;
   onChooseLocalRoot: () => Promise<ProjectDirectoryChoice>;
   onCreate: (options: CreateProjectOptions) => Promise<void>;
+  onCreateOfflineExample: (parentDirectory: string) => Promise<void>;
+  onBeginOfflineExample?: () => void;
   onOpen: (project: WorkspaceProject) => void;
   onDelete: (projectId: string) => Promise<void>;
   onSettings: () => void;
@@ -36,7 +38,7 @@ const templates = [
   { id: "blank", zh: "空白研究项目", en: "Blank research project", zhDescription: "从自由对话、文件和远端环境开始", enDescription: "Start from conversation, files, and remote compute", icon: FilePlus2 },
 ] satisfies Array<{ id: WorkspaceTemplate; zh: string; en: string; zhDescription: string; enDescription: string; icon: typeof Dna }>;
 
-export function ProjectLibrary({ projects, connections = [], locale, onChooseLocalRoot, onCreate, onOpen, onDelete, onSettings, onOpenSearch, createRequestKey, onCreateRequestHandled }: Props) {
+export function ProjectLibrary({ projects, connections = [], locale, onChooseLocalRoot, onCreate, onCreateOfflineExample, onBeginOfflineExample, onOpen, onDelete, onSettings, onOpenSearch, createRequestKey, onCreateRequestHandled }: Props) {
   const zh = locale === "zh-CN";
   const projectDescriptionPrefix = useId();
   const trustedConnections = useMemo(() => connections.filter((connection) => connection.host_key_fingerprint), [connections]);
@@ -51,8 +53,46 @@ export function ProjectLibrary({ projects, connections = [], locale, onChooseLoc
   const [directoryNotice, setDirectoryNotice] = useState("");
   const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState("");
+  const [exampleOpen, setExampleOpen] = useState(false);
+  const [exampleParent, setExampleParent] = useState("");
+  const [exampleBusy, setExampleBusy] = useState(false);
+  const [exampleError, setExampleError] = useState("");
+  const exampleGeneration = useRef(0);
   useWindowEscapeLayer(template !== null, () => { if (!submitting) setTemplate(null); });
+  useWindowEscapeLayer(exampleOpen, closeExample);
   const selectedConnection = connections.find((connection) => connection.id === connectionId);
+
+  function closeExample() {
+    if (exampleBusy) return;
+    exampleGeneration.current += 1;
+    setExampleOpen(false);
+  }
+
+  async function chooseExampleParent() {
+    const generation = exampleGeneration.current;
+    try {
+      const choice = await onChooseLocalRoot();
+      if (generation !== exampleGeneration.current) return;
+      if (choice.path) { setExampleParent(choice.path); setExampleError(""); }
+    } catch { if (generation === exampleGeneration.current) setExampleError(zh ? "无法选择本地父目录。请重试。" : "Could not choose a local parent folder. Please retry."); }
+  }
+
+  async function createExample() {
+    if (!exampleParent || exampleBusy) return;
+    setExampleBusy(true); setExampleError("");
+    try { await onCreateOfflineExample(exampleParent); setExampleOpen(false); }
+    catch (reason) {
+      const code = reason instanceof Error ? reason.message : String(reason);
+      const message = code === "example_registration_failed"
+        ? (zh ? "文件已保存，但项目登记失败。重试将沿用同一请求。" : "Files were saved, but registration failed. Retry uses the same request.")
+        : code === "example_target_conflict"
+          ? (zh ? "目标与示例不一致，未覆盖现有文件。请选择其他父目录或开始新的示例。" : "The target conflicts with the example. Existing files were preserved. Choose another parent or start a new example.")
+          : code === "example_platform_unavailable"
+            ? (zh ? "请在 Windows 桌面应用中创建离线示例。" : "Create the offline example in the Windows desktop app.")
+            : (zh ? "无法创建离线示例。请检查本地父目录后重试。" : "Could not create the offline example. Check the local parent folder and retry.");
+      setExampleError(message);
+    } finally { setExampleBusy(false); }
+  }
 
   function beginCreate(id: WorkspaceTemplate, initialName: string) {
     setTemplate(id); setName(initialName); setLocalRoot(""); setRemoteRoot(""); setError(""); setDirectoryNotice("");
@@ -134,9 +174,15 @@ export function ProjectLibrary({ projects, connections = [], locale, onChooseLoc
         <section className="library-column library-create" aria-labelledby="create-project-heading">
           <div className="section-title"><div><span className="section-kicker">{zh ? "开始研究" : "Start research"}</span><h2 id="create-project-heading">{zh ? "创建新项目" : "Create a project"}</h2><p>{zh ? "选择模板后确认本地存储位置和计算位置" : "Choose a template, then confirm storage and compute locations"}</p></div></div>
           <div className="template-grid">{templates.map(({ id, zh: nameZh, en, zhDescription, enDescription, icon: Icon }) => <button type="button" key={id} className="template-card" onClick={() => beginCreate(id, zh ? nameZh : en)}><span className="template-icon" aria-hidden="true"><Icon size={19} /></span><span className="template-copy"><b>{zh ? nameZh : en}</b><small>{zh ? zhDescription : enDescription}</small></span><span className="template-arrow" aria-hidden="true"><Plus size={16} /></span></button>)}</div>
+          <button type="button" className="library-primary-action offline-example-action" onClick={() => { exampleGeneration.current += 1; onBeginOfflineExample?.(); setExampleParent(""); setExampleError(""); setExampleOpen(true); }}>{zh ? "离线示例" : "Offline example"}</button>
         </section>
       </div>
     </main>
+    {exampleOpen && <div className="create-project-backdrop"><section className="create-project-dialog" role="dialog" aria-modal="true" aria-label={zh ? "创建离线示例" : "Create offline example"}>
+      <header><h2>{zh ? "创建离线示例" : "Create offline example"}</h2><button type="button" aria-label={zh ? "关闭离线示例" : "Close offline example"} disabled={exampleBusy} onClick={closeExample}><X size={18} /></button></header>
+      <div className="create-project-body"><p>{zh ? "合成数据，预置结果，未在本机执行。无需网络、模型、SSH、Python 或 R。" : "Synthetic data, preset results, not executed on this computer. No network, model, SSH, Python or R is needed."}</p><p>{zh ? "选择已有本地父目录；将在其中创建独立的示例子目录。" : "Choose an existing local parent folder; a separate example child folder will be created inside it."}</p><code>{exampleParent || (zh ? "尚未选择父目录" : "No parent folder selected")}</code><button type="button" disabled={exampleBusy} onClick={() => void chooseExampleParent()}>{zh ? "选择父目录" : "Choose parent folder"}</button>{exampleError && <p role="alert">{exampleError}</p>}</div>
+      <footer><button type="button" disabled={exampleBusy} onClick={closeExample}>{zh ? "取消" : "Cancel"}</button><button type="button" className="primary" disabled={exampleBusy || !exampleParent} onClick={() => void createExample()}>{exampleBusy ? "…" : (zh ? "创建示例" : "Create example")}</button></footer>
+    </section></div>}
     {template && <div className="create-project-backdrop"><section className="create-project-dialog" role="dialog" aria-modal="true" aria-label={zh ? "创建新项目" : "Create project"}><header><div><small>{zh ? "本地工作区与计算位置" : "Workspace and compute location"}</small><h2>{zh ? "创建新项目" : "Create project"}</h2></div><button aria-label="Close" onClick={() => setTemplate(null)}><X size={18} /></button></header><div className="create-project-body">
       <label>{zh ? "项目名称" : "Project name"}<input aria-label={zh ? "项目名称" : "Project name"} value={name} onChange={(event) => setName(event.target.value)} /></label>
       <div className="location-card"><HardDrive size={20} /><div><b>{zh ? "本地工作区（必选）" : "Local workspace (required)"}</b><small>{zh ? "文献、笔记、脚本及选定产物保存在这里，不会自动全量上传。" : "Literature, notes, scripts, and selected artifacts live here and are never fully uploaded implicitly."}</small><code>{localRoot || (zh ? "尚未选择本地目录" : "No local folder selected")}</code>{directoryNotice && <small className="directory-fallback-notice" role="status">{directoryNotice}</small>}</div><button onClick={async () => { const choice = await onChooseLocalRoot(); if (choice.usedFallback) setDirectoryNotice(zh ? "保存的起始目录已不可用，文件夹选择器已使用系统默认位置。" : "The saved start folder is unavailable. The folder picker used the system default location."); if (choice.path) setLocalRoot(choice.path); }}><FolderOpen size={14} />{zh ? "选择目录" : "Choose"}</button></div>

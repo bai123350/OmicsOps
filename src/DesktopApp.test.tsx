@@ -10,11 +10,16 @@ import DesktopApp, { samePendingSubmission } from "./DesktopApp";
 import { ComposerDraftStore } from "./features/workspace/composerDrafts";
 import { AppearanceProvider } from "./use-appearance";
 import * as api from "./tauri-api";
+import * as offlineExampleApi from "./offline-example-api";
+import fixture from "../examples/offline/synthetic-evidence-report-v1.json";
+import type { OfflineExampleWorkspaceView } from "./types";
 import * as referenceApi from "./composer-reference-api";
 import * as attachmentApi from "./composer-attachment-api";
 import * as usageApi from "./usage-settings-api";
 import * as navigationApi from "./workspace-navigation-api";
 import * as remoteJobsPanel from "./features/workspace/RemoteJobsPanel";
+import * as workspaceShell from "./features/workspace/WorkspaceShell";
+import * as settingsPanel from "./features/settings/SettingsPanel";
 import type { AgentRunEventV4, ComposerReference, ConversationAgentStateV4, ExecutionPlanV4, KernelEvent, ProposedPlanRevisionV4, RunSummaryV4, StopRunReceiptV4, SyncEntry, WorkspaceMessage } from "./types";
 
 const render = (ui: ReactNode) => testingRender(ui, { wrapper: AppearanceProvider });
@@ -23,6 +28,7 @@ beforeEach(() => {
   vi.restoreAllMocks();
   window.localStorage.clear();
   vi.spyOn(api, "latestUsedConversation").mockResolvedValue(null);
+  vi.spyOn(offlineExampleApi, "getOfflineExampleWorkspace").mockResolvedValue(null);
 });
 
 const stateProject = { id: "project-state", name: "状态测试项目", description: "", local_root: "E:/Science/state", remote_root: null, connection_id: null, template: "single_cell_rna_seq" as const, status: "running" as const, ollama_only: false, created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" };
@@ -65,6 +71,21 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+const offlineProject = { ...stateProject, id: "example-project", name: "离线合成示例", template: "blank" as const, status: "ready" as const };
+function offlineView(projectId = offlineProject.id): OfflineExampleWorkspaceView {
+  return { schema_version: 1, project_id: projectId, example_id: fixture.example_id, source_kind: "synthetic", availability: "available", unavailable_reason: null, title: fixture.title, disclaimer: fixture.disclaimer, source_description: fixture.source_description, license_spdx: fixture.license_spdx, fixture_sha256: "fixture", entries: fixture.entries as OfflineExampleWorkspaceView["entries"], files: [] };
+}
+
+function forbidOfflineDispatch() {
+  const spies = [
+    vi.spyOn(api, "createConversation"), vi.spyOn(api, "agentV4StartDirect"), vi.spyOn(api, "agentV4StartPlanning"),
+    vi.spyOn(api, "agentV4ComputeBackends"), vi.spyOn(api, "testConnection"), vi.spyOn(api, "listRemoteFiles"),
+    vi.spyOn(api, "startKernel"), vi.spyOn(api, "probeModelProfile"), vi.spyOn(window, "fetch"),
+  ];
+  for (const spy of spies) spy.mockImplementation(() => { throw new Error("offline candidate initialization forbidden"); });
+  return () => { for (const spy of spies) expect(spy).not.toHaveBeenCalled(); };
+}
+
 function agentEvent(conversationId: string, runId: string, sequence: number, event: AgentRunEventV4["event"]): AgentRunEventV4 {
   return {
     schema_version: 4,
@@ -92,6 +113,187 @@ function setupConversationStateHarness() {
 }
 
 describe("DesktopApp", () => {
+  it("does not carry an example source request into the next ordinary workspace", async () => {
+    const { stateSpy } = setupConversationStateHarness(); stateSpy.mockImplementation(async (_id, conversationId) => stateSnapshot(conversationId));
+    vi.mocked(api.listProjects).mockResolvedValue([offlineProject, stateProject]);
+    vi.mocked(offlineExampleApi.getOfflineExampleWorkspace).mockImplementation(async (id) => id === offlineProject.id ? offlineView() : null);
+    vi.spyOn(referenceApi, "composerReferenceCatalog").mockResolvedValue([{ reference: { kind: "artifact", project_id: offlineProject.id, id: "example-source" }, label: "Example source", description: "Preset" }]);
+    const shell = vi.spyOn(workspaceShell, "WorkspaceShell");
+    render(<DesktopApp />); await screen.findByText(fixture.disclaimer.zh);
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true }); fireEvent.click(await screen.findByRole("button", { name: "打开 Example source" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "搜索工作区" })).toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "返回项目库" }));
+    fireEvent.click(screen.getByRole("button", { name: `打开项目：${stateProject.name}` }));
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    expect(shell.mock.calls.at(-1)?.[0].searchRequest).toBeNull();
+  });
+  it("identifies a normally created project before production initialization", async () => {
+    vi.spyOn(api, "listProjects").mockResolvedValue([]);
+    vi.spyOn(api, "chooseProjectDirectory").mockResolvedValue({ path: "E:/Created", usedFallback: false });
+    vi.spyOn(api, "createProject").mockResolvedValue(offlineProject);
+    const pending = deferred<OfflineExampleWorkspaceView | null>();
+    vi.mocked(offlineExampleApi.getOfflineExampleWorkspace).mockReturnValue(pending.promise);
+    const noDispatch = forbidOfflineDispatch(); const sessions = vi.spyOn(api, "listConversations");
+    render(<DesktopApp />);
+    fireEvent.click(await screen.findByRole("button", { name: "创建空白项目" }));
+    fireEvent.click(screen.getByRole("button", { name: "选择目录" }));
+    await screen.findAllByText("E:/Created");
+    fireEvent.click(screen.getByRole("button", { name: "创建项目" }));
+    await waitFor(() => expect(offlineExampleApi.getOfflineExampleWorkspace).toHaveBeenCalledWith(offlineProject.id));
+    noDispatch(); expect(sessions).not.toHaveBeenCalled();
+    await act(async () => pending.resolve(offlineView()));
+    expect(screen.getByText(fixture.disclaimer.zh)).toBeInTheDocument(); noDispatch(); expect(sessions).not.toHaveBeenCalled();
+  });
+
+  it.each(["usage", "source"] as const)("preserves the identified current draft and receipt when deferred %s identity is cancelled", async (route) => {
+    const { stateSpy } = setupConversationStateHarness(); stateSpy.mockImplementation(async (_id, conversationId) => stateSnapshot(conversationId));
+    vi.mocked(api.listProjects).mockResolvedValue([stateProject, offlineProject]);
+    vi.mocked(api.listMessages).mockResolvedValue([{ id: "receipt", project_id: stateProject.id, conversation_id: stateConversations[0].id, sequence: 1, role: "assistant", markdown: "Retained receipt fixture", created_at: "now" }]);
+    const pending = deferred<OfflineExampleWorkspaceView | null>();
+    vi.mocked(offlineExampleApi.getOfflineExampleWorkspace).mockImplementation((id) => id === offlineProject.id ? pending.promise : Promise.resolve(null));
+    if (route === "usage") vi.spyOn(settingsPanel, "SettingsPanel").mockImplementation(({ onOpenUsageConversation, onClose }) => <div><button onClick={() => void onOpenUsageConversation?.(offlineProject.id, "example-session")}>Open deferred usage</button><button onClick={onClose}>Close deferred usage</button></div>);
+    else {
+      const OriginalShell = workspaceShell.WorkspaceShell;
+      vi.spyOn(workspaceShell, "WorkspaceShell").mockImplementation((props) => <><button onClick={() => void props.onOpenSourceConversation?.(offlineProject.id, "example-session")}>Open deferred source</button><button onClick={() => void props.onOpenSourceConversation?.(stateProject.id, stateConversations[0].id)}>Keep current source</button><OriginalShell {...props} /></>);
+    }
+    render(<DesktopApp />);
+    const input = await screen.findByRole("textbox", { name: /描述研究目标/ }); await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "Keep identified project draft" } });
+    if (route === "usage") fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(await screen.findByRole("button", { name: `Open deferred ${route}` }));
+    await screen.findByText("正在识别项目来源…");
+    expect(input).toHaveValue("Keep identified project draft"); expect(screen.getByText("Retained receipt fixture")).toBeInTheDocument();
+    if (route === "usage") fireEvent.click(screen.getByRole("button", { name: "Close deferred usage" }));
+    else fireEvent.click(screen.getByRole("button", { name: "Keep current source" }));
+    await act(async () => pending.resolve(offlineView()));
+    expect(screen.getByRole("heading", { name: stateConversations[0].title })).toBeInTheDocument();
+    expect(input).toHaveValue("Keep identified project draft"); expect(screen.getByText("Retained receipt fixture")).toBeInTheDocument();
+    expect(screen.queryByText(fixture.disclaimer.zh)).toBeNull();
+    expect(api.listConversations).not.toHaveBeenCalledWith(offlineProject.id);
+    expect(api.agentV4ComputeBackends).not.toHaveBeenCalledWith(offlineProject.id, expect.anything());
+  });
+
+  it("rechecks a current project's marker before committing refreshed metadata", async () => {
+    const { stateSpy } = setupConversationStateHarness(); stateSpy.mockImplementation(async (_id, conversationId) => stateSnapshot(conversationId));
+    let refresh!: (connectionId: string, remoteRoot: string) => Promise<void>;
+    vi.spyOn(settingsPanel, "SettingsPanel").mockImplementation(({ onBindProjectRemote }) => { refresh = onBindProjectRemote!; return <span>Metadata settings</span>; });
+    vi.spyOn(api, "updateProjectRemote").mockResolvedValue({ ...stateProject, connection_id: null, remote_root: null });
+    render(<DesktopApp />); await screen.findByRole("heading", { name: stateConversations[0].title });
+    fireEvent.click(screen.getByRole("button", { name: "设置" })); await screen.findByText("Metadata settings");
+    vi.mocked(offlineExampleApi.getOfflineExampleWorkspace).mockResolvedValue(offlineView(stateProject.id));
+    await act(async () => { await refresh("", ""); });
+    expect(screen.getByText(fixture.disclaimer.zh)).toBeInTheDocument();
+    expect(offlineExampleApi.getOfflineExampleWorkspace).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("textbox", { name: /描述研究目标/ })).toBeNull();
+  });
+  it("waits for marker identity without mounting Agent and fails closed on rejection", async () => {
+    vi.spyOn(api, "listProjects").mockResolvedValue([offlineProject]);
+    const pending = deferred<OfflineExampleWorkspaceView | null>();
+    vi.mocked(offlineExampleApi.getOfflineExampleWorkspace).mockReturnValue(pending.promise);
+    const noDispatch = forbidOfflineDispatch(); const sessions = vi.spyOn(api, "listConversations");
+    render(<DesktopApp />);
+    await waitFor(() => expect(offlineExampleApi.getOfflineExampleWorkspace).toHaveBeenCalledWith(offlineProject.id));
+    expect(screen.queryByRole("textbox", { name: /描述研究目标/ })).toBeNull(); noDispatch(); expect(sessions).not.toHaveBeenCalled();
+    await act(async () => pending.reject(new Error("unsafe raw path/API-key must not be shown")));
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法识别项目来源");
+    expect(screen.queryByText(/unsafe raw path/)).toBeNull(); noDispatch(); expect(sessions).not.toHaveBeenCalled();
+  });
+
+  it("reopens a missing-receipt marker as unavailable and never restores production sessions", async () => {
+    vi.spyOn(api, "listProjects").mockResolvedValue([offlineProject]);
+    vi.mocked(offlineExampleApi.getOfflineExampleWorkspace).mockResolvedValue({ ...offlineView(), availability: "unavailable", unavailable_reason: "receipt_missing", entries: [], files: [] });
+    const noDispatch = forbidOfflineDispatch(); const sessions = vi.spyOn(api, "listConversations");
+    const view = render(<DesktopApp />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("收据缺失");
+    view.unmount(); render(<DesktopApp />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("收据缺失");
+    expect(screen.getByText(fixture.disclaimer.zh)).toBeInTheDocument();
+    noDispatch(); expect(sessions).not.toHaveBeenCalled(); expect(api.latestUsedConversation).not.toHaveBeenCalled();
+  });
+
+  it("ignores a late startup identity after an explicit project-list navigation", async () => {
+    vi.spyOn(api, "listProjects").mockResolvedValue([offlineProject]);
+    const startup = deferred<OfflineExampleWorkspaceView | null>();
+    vi.mocked(offlineExampleApi.getOfflineExampleWorkspace).mockReturnValueOnce(startup.promise).mockResolvedValue(offlineView());
+    const noDispatch = forbidOfflineDispatch();
+    render(<DesktopApp />);
+    await waitFor(() => expect(offlineExampleApi.getOfflineExampleWorkspace).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("menuitem", { name: "File" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "项目列表" }));
+    fireEvent.click(await screen.findByRole("button", { name: `打开项目：${offlineProject.name}` }));
+    await screen.findByText(fixture.disclaimer.zh);
+    await act(async () => startup.resolve(null));
+    expect(screen.getByText(fixture.disclaimer.zh)).toBeInTheDocument(); noDispatch();
+  });
+
+  it("keeps one creation request through failure/retry and starts a new request after close/reopen", async () => {
+    vi.spyOn(api, "listProjects").mockResolvedValue([]);
+    vi.spyOn(api, "chooseProjectDirectory").mockResolvedValue({ path: "E:/Examples", usedFallback: false });
+    const create = vi.spyOn(offlineExampleApi, "createOfflineExampleWorkspace").mockRejectedValue(new Error("example_registration_failed"));
+    const ordinaryCreate = vi.spyOn(api, "createProject"); const noDispatch = forbidOfflineDispatch();
+    render(<DesktopApp />);
+    fireEvent.click(await screen.findByRole("button", { name: "离线示例" }));
+    fireEvent.click(screen.getByRole("button", { name: "选择父目录" }));
+    await screen.findByText("E:/Examples");
+    fireEvent.click(screen.getByRole("button", { name: "创建示例" })); await screen.findByRole("alert");
+    fireEvent.click(screen.getByRole("button", { name: "创建示例" })); await waitFor(() => expect(create).toHaveBeenCalledTimes(2));
+    expect(create.mock.calls[1][0]).toEqual(create.mock.calls[0][0]);
+    fireEvent.keyDown(window, { key: "Escape" }); fireEvent.click(screen.getByRole("button", { name: "离线示例" }));
+    fireEvent.click(screen.getByRole("button", { name: "选择父目录" })); await screen.findByText("E:/Examples");
+    vi.mocked(api.listProjects).mockResolvedValue([offlineProject]);
+    create.mockResolvedValue({ project_id: offlineProject.id, workspace: offlineView() });
+    vi.mocked(offlineExampleApi.getOfflineExampleWorkspace).mockResolvedValue(offlineView());
+    fireEvent.click(screen.getByRole("button", { name: "创建示例" }));
+    await screen.findByText(fixture.disclaimer.zh);
+    expect(create.mock.calls[2][0].request_id).not.toBe(create.mock.calls[0][0].request_id);
+    expect(create.mock.calls[2][0]).toMatchObject({ example_id: "synthetic-evidence-report-v1", parent_directory: "E:/Examples" });
+    expect(offlineExampleApi.getOfflineExampleWorkspace).toHaveBeenCalledWith(offlineProject.id);
+    expect(ordinaryCreate).not.toHaveBeenCalled(); noDispatch();
+  });
+
+  it.each(["session", "artifact", "project"] as const)("identifies an offline %s search target before any target conversation initialization", async (kind) => {
+    vi.spyOn(api, "listProjects").mockResolvedValue([offlineProject]);
+    vi.mocked(offlineExampleApi.getOfflineExampleWorkspace).mockResolvedValue(offlineView());
+    vi.spyOn(referenceApi, "composerReferenceCatalog").mockResolvedValue(kind === "project" ? [] : [{ reference: { kind, project_id: offlineProject.id, id: "exact-source" }, label: "Exact offline source", description: "Preset source" }]);
+    const sessions = vi.spyOn(api, "listConversations"); const noDispatch = forbidOfflineDispatch();
+    render(<DesktopApp />); await screen.findByText(fixture.disclaimer.zh);
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    fireEvent.click(await screen.findByRole("button", { name: `打开 ${kind === "project" ? offlineProject.name : "Exact offline source"}` }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "搜索工作区" })).toBeNull());
+    expect(screen.getByText(fixture.disclaimer.zh)).toBeInTheDocument();
+    if (kind !== "project") expect(screen.getByRole("status")).toHaveTextContent("示例没有生产会话或运行来源");
+    expect(sessions).not.toHaveBeenCalled(); noDispatch();
+  });
+
+  it.each(["usage", "source"] as const)("routes cross-project %s callbacks through the marker without reading example conversations", async (route) => {
+    const { stateSpy } = setupConversationStateHarness(); stateSpy.mockImplementation(async (_id, conversationId) => stateSnapshot(conversationId));
+    vi.mocked(api.listProjects).mockResolvedValue([stateProject, offlineProject]);
+    vi.mocked(offlineExampleApi.getOfflineExampleWorkspace).mockImplementation(async (id) => id === offlineProject.id ? offlineView() : null);
+    if (route === "usage") vi.spyOn(settingsPanel, "SettingsPanel").mockImplementation(({ onOpenUsageConversation }) => <button onClick={() => void onOpenUsageConversation?.(offlineProject.id, "example-session")}>Open example usage</button>);
+    else vi.spyOn(workspaceShell, "WorkspaceShell").mockImplementation(({ onOpenSourceConversation }) => <button onClick={() => void onOpenSourceConversation?.(offlineProject.id, "example-session")}>Open example source</button>);
+    render(<DesktopApp />);
+    if (route === "usage") { await screen.findByRole("heading", { name: stateConversations[0].title }); fireEvent.click(screen.getByRole("button", { name: "设置" })); }
+    fireEvent.click(await screen.findByRole("button", { name: `Open example ${route}` }));
+    await screen.findByText(fixture.disclaimer.zh);
+    expect(screen.getByRole("status")).toHaveTextContent("示例没有生产会话或运行来源");
+    expect(api.listConversations).not.toHaveBeenCalledWith(offlineProject.id);
+    expect(api.latestUsedConversation).not.toHaveBeenCalledWith(offlineProject.id);
+    expect(api.agentV4ComputeBackends).not.toHaveBeenCalledWith(offlineProject.id, expect.anything());
+  });
+  it("does not initialize a production conversation when the first project is an offline example", async () => {
+    const example = { ...stateProject, id: "example-project", name: "离线合成示例", template: "blank" as const, status: "ready" as const };
+    vi.mocked(offlineExampleApi.getOfflineExampleWorkspace).mockResolvedValue(offlineView(example.id));
+    vi.spyOn(api, "listProjects").mockResolvedValue([example]);
+    const create = vi.spyOn(api, "createConversation").mockResolvedValue({ ...stateConversations[0], project_id: example.id });
+    vi.spyOn(api, "listConversations").mockResolvedValue([]);
+    const compute = vi.spyOn(api, "agentV4ComputeBackends").mockResolvedValue([]);
+    const direct = vi.spyOn(api, "agentV4StartDirect"); const planning = vi.spyOn(api, "agentV4StartPlanning");
+    render(<DesktopApp />);
+    await waitFor(() => expect(screen.queryByText("OmicsOps", { selector: ".desktop-loading" })).not.toBeInTheDocument());
+    expect(create).not.toHaveBeenCalled(); expect(compute).not.toHaveBeenCalled();
+    expect(direct).not.toHaveBeenCalled(); expect(planning).not.toHaveBeenCalled();
+    expect(screen.getByText(/合成数据，预置结果/)).toBeInTheDocument();
+  });
   it("passes the current project binding to remote job observation on load and settings update", async () => {
     const { stateSpy } = setupConversationStateHarness();
     stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));

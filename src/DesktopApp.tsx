@@ -11,6 +11,9 @@ import { referenceKey } from "./features/workspace/ComposerReferences";
 import type { ComposerReference } from "./types";
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "./tauri-api";
+import * as offlineExampleApi from "./offline-example-api";
+import type { CreateOfflineExampleWorkspaceRequest, OfflineExampleWorkspaceView } from "./types";
+import { OfflineExampleWorkspace } from "./features/projects/OfflineExampleWorkspace";
 import type { AgentModelActivityReceiptV4, AgentReasoningPreviewV4, AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendAvailabilityV4, ComputeSelectionV4, ConnectionProfile, ConversationAgentStateV4, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, ProjectArtifact, ProposedPlanRevisionV4, RemoteFileEntry, RunSummaryV4, SessionAgentModeV4, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
 import { WorkspaceShell } from "./features/workspace/WorkspaceShell";
@@ -67,6 +70,13 @@ export default function DesktopApp() {
   const registerWorkspaceNavigationGuard = useCallback((guard: (next: () => void, onCancel?: () => void) => void) => { workspaceNavigationGuard.current = guard; }, []);
   const [projects, setProjects] = useState<WorkspaceProject[]>([]);
   const [selected, setSelected] = useState<WorkspaceProject | null>(null);
+  const [offlineExampleView, setOfflineExampleView] = useState<OfflineExampleWorkspaceView | null>(null);
+  const offlineExampleProjectId = useRef<string | null>(null);
+  const [projectOpening, setProjectOpening] = useState(false);
+  const [projectOpenError, setProjectOpenError] = useState(false);
+  const [offlineNavigationUnavailable, setOfflineNavigationUnavailable] = useState(false);
+  const projectOpenGeneration = useRef(0);
+  const offlineCreateAttempt = useRef<CreateOfflineExampleWorkspaceRequest | null>(null);
   const [createProjectRequest, setCreateProjectRequest] = useState<string | null>(null);
   const startupNavigationRequested = useRef(false);
   const [chromeDismissRequest, setChromeDismissRequest] = useState(0);
@@ -107,6 +117,86 @@ export default function DesktopApp() {
   function closeSettings() {
     usageOpenGeneration.current += 1;
     setSettingsOpen(false);
+  }
+
+  function backToProjectLibrary() {
+    startupNavigationRequested.current = true;
+    projectOpenGeneration.current += 1;
+    setProjectOpening(false); setProjectOpenError(false); setOfflineNavigationUnavailable(false);
+    setOfflineExampleView(null); setSelected(null); setLoading(false);
+    offlineExampleProjectId.current = null;
+    requestedConversation.current = null;
+    setSearchRequest(null);
+  }
+
+  async function openProjectWorkspace(project: WorkspaceProject, navigation?: { conversationId?: string; runId?: string; sourceId?: string }): Promise<boolean> {
+    const generation = ++projectOpenGeneration.current;
+    const searchGeneration = searchOpenRef.current ? searchActionGeneration.current : null;
+    const settingsGeneration = settingsOpenRef.current ? usageOpenGeneration.current : null;
+    const sourceConversationId = currentConversationIdentity.current.conversationId;
+    const current = () => generation === projectOpenGeneration.current
+      && (searchGeneration === null || searchGeneration === searchActionGeneration.current)
+      && (settingsGeneration === null || settingsGeneration === usageOpenGeneration.current)
+      && (!selected || (currentConversationIdentity.current.projectId === selected.id
+        && (sourceConversationId === null || currentConversationIdentity.current.conversationId === sourceConversationId)));
+    startupNavigationRequested.current = true;
+    setProjectOpening(true); setProjectOpenError(false);
+    try {
+      let workspace: OfflineExampleWorkspaceView | null;
+      try { workspace = await offlineExampleApi.getOfflineExampleWorkspace(project.id); }
+      catch {
+        if (current()) setProjectOpenError(true);
+        return false;
+      }
+      if (!current()) return false;
+      if (workspace !== null) {
+        offlineExampleProjectId.current = project.id;
+        requestedConversation.current = null;
+        setSearchRequest(null); setSelected(null);
+        setOfflineExampleView(workspace);
+        setOfflineNavigationUnavailable(Boolean(navigation?.conversationId || navigation?.runId || navigation?.sourceId));
+        return true;
+      }
+      // Only a confirmed absent marker permits production conversation reads.
+      let available: WorkspaceConversation[] | null = null;
+      let target: WorkspaceConversation | undefined;
+      if (navigation?.conversationId) {
+        available = await api.listConversations(project.id);
+        if (!current()) return false;
+        target = available.find((item) => item.id === navigation.conversationId && item.project_id === project.id);
+        if (!target) throw new Error(locale === "zh-CN" ? "来源会话已不存在。" : "The saved conversation is no longer available.");
+      }
+      setOfflineExampleView(null); setOfflineNavigationUnavailable(false);
+      offlineExampleProjectId.current = null;
+      if (selected?.id === project.id) {
+        setSelected(project);
+        if (target && available) { setConversations(available); activateConversation(target); }
+      } else {
+        requestedConversation.current = target ? { projectId: project.id, conversationId: target.id } : null;
+        setSelected(project);
+      }
+      return true;
+    } finally {
+      if (generation === projectOpenGeneration.current) { setProjectOpening(false); setLoading(false); }
+    }
+  }
+
+  async function createOfflineExample(parentDirectory: string) {
+    let request = offlineCreateAttempt.current;
+    if (!request || request.parent_directory !== parentDirectory) {
+      request = { request_id: crypto.randomUUID(), example_id: "synthetic-evidence-report-v1", parent_directory: parentDirectory };
+      offlineCreateAttempt.current = request;
+    }
+    const generation = projectOpenGeneration.current;
+    const created = await offlineExampleApi.createOfflineExampleWorkspace(request);
+    const items = await api.listProjects();
+    setProjects(items);
+    if (generation !== projectOpenGeneration.current || offlineCreateAttempt.current !== request) return;
+    const project = items.find((item) => item.id === created.project_id);
+    if (!project) throw new Error("example_registration_failed");
+    const opened = await openProjectWorkspace(project);
+    if (!opened) throw new Error("offline_example_marker_invalid");
+    if (offlineCreateAttempt.current === request) offlineCreateAttempt.current = null;
   }
   const [conversations, setConversations] = useState<WorkspaceConversation[]>([]);
   const [conversation, setConversation] = useState<WorkspaceConversation | null>(null);
@@ -359,14 +449,18 @@ export default function DesktopApp() {
   }
 
   useEffect(() => {
-    Promise.all([api.listProjects(), api.listModelProfiles(), api.listSkillPackages(), api.listMcpServers(), api.listConnections()]).then(([items, profiles, skills, servers, savedConnections]) => {
+    let disposed = false;
+    Promise.all([api.listProjects(), api.listModelProfiles(), api.listSkillPackages(), api.listMcpServers(), api.listConnections()]).then(async ([items, profiles, skills, servers, savedConnections]) => {
+      if (disposed) return;
       setProjects(items);
-      if (!startupNavigationRequested.current) setSelected(items[0] ?? null);
       setModelProfiles(profiles); setActiveModelProfileId(profiles[0]?.id ?? null);
       setSkillPackages(skills);
       setMcpServers(servers);
       setConnections(savedConnections);
-    }).finally(() => setLoading(false));
+      if (!startupNavigationRequested.current && items[0]) await openProjectWorkspace(items[0]);
+      else if (!items[0] || projectOpenGeneration.current === 0) setLoading(false);
+    }).catch(() => { if (!disposed) { setProjectOpenError(true); setLoading(false); } });
+    return () => { disposed = true; projectOpenGeneration.current += 1; };
   }, []);
   useEffect(() => {
     const token = ++projectRequestToken.current;
@@ -968,25 +1062,17 @@ export default function DesktopApp() {
     if (entry.kind === "session") {
       const reference = entry.item?.reference;
       if (reference?.kind !== "session") return false;
-      const generation = searchActionGeneration.current;
-      const available = await api.listConversations(sourceProject.id);
-      if (generation !== searchActionGeneration.current) return false;
-      const target = available.find((item) => item.id === reference.id && item.project_id === sourceProject.id);
-      if (!target) throw new Error("The saved conversation is no longer available.");
+      if (!await openProjectWorkspace(sourceProject, { conversationId: reference.id })) return false;
       closeSettings();
-      setSearchRequest({ key: crypto.randomUUID(), kind: "reveal", projectId: sourceProject.id });
-      if (selected?.id === sourceProject.id) { setConversations(available); activateConversation(target); }
-      else {
-        requestedConversation.current = { projectId: sourceProject.id, conversationId: target.id };
-        setSelected(sourceProject);
-      }
+      if (offlineExampleProjectId.current !== sourceProject.id) setSearchRequest({ key: crypto.randomUUID(), kind: "reveal", projectId: sourceProject.id });
       return true;
     }
-    requestedConversation.current = null;
+    if (!await openProjectWorkspace(sourceProject, entry.kind === "artifact" && entry.item ? { sourceId: entry.item.reference.kind === "artifact" ? entry.item.reference.id : entry.key } : undefined)) return false;
     closeSettings();
-    if (entry.kind === "artifact" && entry.item) setSearchRequest({ key: crypto.randomUUID(), kind: "artifact", projectId: sourceProject.id, item: entry.item });
-    else setSearchRequest({ key: crypto.randomUUID(), kind: "reveal", projectId: sourceProject.id });
-    setSelected(sourceProject);
+    if (offlineExampleProjectId.current !== sourceProject.id) {
+      if (entry.kind === "artifact" && entry.item) setSearchRequest({ key: crypto.randomUUID(), kind: "artifact", projectId: sourceProject.id, item: entry.item });
+      else setSearchRequest({ key: crypto.randomUUID(), kind: "reveal", projectId: sourceProject.id });
+    }
     return true;
   }
 
@@ -1001,22 +1087,12 @@ export default function DesktopApp() {
   }
 
   async function openUsageConversation(projectId: string, conversationId: string) {
-    const operation = ++usageOpenGeneration.current;
+    usageOpenGeneration.current += 1;
     const sourceProject = projects.find((project) => project.id === projectId);
     if (!sourceProject) throw new Error("usage project unavailable");
-    const available = selected?.id === projectId ? conversations : await api.listConversations(projectId);
-    if (operation !== usageOpenGeneration.current || !settingsOpenRef.current) return;
-    const target = available.find((item) => item.id === conversationId && item.project_id === projectId);
-    if (!target) throw new Error("saved conversation unavailable");
+    if (!await openProjectWorkspace(sourceProject, { conversationId })) return;
     closeSettings();
-    setSearchRequest({ key: crypto.randomUUID(), kind: "reveal", projectId });
-    if (selected?.id === projectId) {
-      setConversations(available);
-      activateConversation(target);
-    } else {
-      requestedConversation.current = { projectId, conversationId };
-      setSelected(sourceProject);
-    }
+    if (offlineExampleProjectId.current !== projectId) setSearchRequest({ key: crypto.randomUUID(), kind: "reveal", projectId });
   }
 
   async function refreshQueuedConversation() {
@@ -1167,12 +1243,8 @@ export default function DesktopApp() {
     try {
       const sourceProject = projects.find((item) => item.id === projectId);
       if (!sourceProject) throw new Error(locale === "zh-CN" ? "来源项目已不存在。" : "The source project is no longer available.");
-      const available = selected?.id === projectId ? conversations : await api.listConversations(projectId);
       if (!isCurrentConversationGeneration(generation)) return;
-      const target = available.find((item) => item.id === conversationId && item.project_id === projectId);
-      if (!target) throw new Error(locale === "zh-CN" ? "来源会话已不存在。" : "The source conversation is no longer available.");
-      if (selected?.id === projectId) { setConversations(available); activateConversation(target); }
-      else { requestedConversation.current = { projectId, conversationId }; setSelected(sourceProject); }
+      await openProjectWorkspace(sourceProject, { conversationId });
     } catch (error) { if (isCurrentConversationGeneration(generation)) setAgentNotice(error instanceof Error ? error.message : String(error)); }
   }
 
@@ -1182,14 +1254,13 @@ export default function DesktopApp() {
     hasProject={Boolean(selected)}
     newConversationDisabled={loading || agentBusy || conversationHydrating || conversationLocked}
     onNewProject={() => workspaceNavigationGuard.current(() => {
-      startupNavigationRequested.current = true;
       closeSettings();
       closeWorkspaceSearch();
-      setSelected(null);
+      backToProjectLibrary();
       setCreateProjectRequest(crypto.randomUUID());
     })}
     onNewConversation={() => workspaceNavigationGuard.current(() => { void newConversation(); })}
-    onProjects={() => workspaceNavigationGuard.current(() => { startupNavigationRequested.current = true; closeSettings(); closeWorkspaceSearch(); setSelected(null); })}
+    onProjects={() => workspaceNavigationGuard.current(() => { closeSettings(); closeWorkspaceSearch(); backToProjectLibrary(); })}
     onSearch={openWorkspaceSearch}
     onSettings={openApplicationSettings}
     onFiles={() => workspaceNavigationGuard.current(() => {
@@ -1201,6 +1272,12 @@ export default function DesktopApp() {
   ><NativeWindowControls locale={locale} /></ApplicationMenuBar>;
 
   if (loading) return <div className="desktop-frame">{applicationMenu}<div className="desktop-frame-content"><div className="desktop-loading">OmicsOps</div></div></div>;
+
+  const projectRoutingNotice = <>
+    {projectOpening && <p className="project-routing-notice" role="status">{locale === "zh-CN" ? "正在识别项目来源…" : "Checking project source…"}</p>}
+    {projectOpenError && <p className="project-routing-notice" role="alert">{locale === "zh-CN" ? "无法识别项目来源。请重试打开项目。" : "Could not identify the project source. Please retry opening the project."}</p>}
+    {offlineNavigationUnavailable && <p className="project-routing-notice" role="status">{locale === "zh-CN" ? "示例没有生产会话或运行来源，已打开合成来源视图。" : "This example has no production conversation or run source. The synthetic source view is open."}</p>}
+  </>;
   const searchEntries: WorkspaceSearchEntry[] = [
     ...workspaceSearch.entries,
     { key: "action:models", kind: "action", label: locale === "zh-CN" ? "管理模型" : "Manage models", description: locale === "zh-CN" ? "打开模型设置" : "Open model settings" },
@@ -1245,7 +1322,7 @@ export default function DesktopApp() {
     setSearchRequest({ key: crypto.randomUUID(), kind: "attach", projectId: selected.id, conversationId: conversation.id, item: entry.item });
     return true;
   }} /> : null;
-  const settings = settingsOpen ? <SettingsPanel key={settingsNavigationKey} initialSection={settingsSection} locale={locale} onLocaleChange={setLocale} onClose={closeSettings} modelProfiles={modelProfiles} skillPackages={skillPackages} mcpServers={mcpServers} connections={connections} projects={projects} selectedProject={selected} onOpenUsageConversation={openGuardedUsageConversation} onWorkflowsChanged={() => setWorkflowCatalogVersion((value) => value + 1)} onMemoryChanged={capabilities.refresh} onSaveConnection={async (profile, secret) => { await api.saveConnection(profile, secret); setConnections(await api.listConnections()); }} onTestConnection={api.testConnection} onConfirmHostKey={async (profileId, fingerprint) => { await api.confirmHostKey(profileId, fingerprint); setConnections(await api.listConnections()); }} onBindProjectRemote={async (connectionId, remoteRoot) => { if (!selected) return; const updated = await api.updateProjectRemote(selected.id, connectionId, remoteRoot); setSelected((current) => current?.id === updated.id ? updated : current); setProjects((current) => current.map((project) => project.id === updated.id ? updated : project)); }} onSaveModel={async (request) => {
+  const settings = settingsOpen ? <SettingsPanel key={settingsNavigationKey} initialSection={settingsSection} locale={locale} onLocaleChange={setLocale} onClose={closeSettings} modelProfiles={modelProfiles} skillPackages={skillPackages} mcpServers={mcpServers} connections={connections} projects={projects} selectedProject={selected} onOpenUsageConversation={openGuardedUsageConversation} onWorkflowsChanged={() => setWorkflowCatalogVersion((value) => value + 1)} onMemoryChanged={capabilities.refresh} onSaveConnection={async (profile, secret) => { await api.saveConnection(profile, secret); setConnections(await api.listConnections()); }} onTestConnection={api.testConnection} onConfirmHostKey={async (profileId, fingerprint) => { await api.confirmHostKey(profileId, fingerprint); setConnections(await api.listConnections()); }} onBindProjectRemote={async (connectionId, remoteRoot) => { if (!selected) return; const generation = projectOpenGeneration.current; const updated = await api.updateProjectRemote(selected.id, connectionId, remoteRoot); setProjects((current) => current.map((project) => project.id === updated.id ? updated : project)); if (generation === projectOpenGeneration.current && currentConversationIdentity.current.projectId === updated.id) await openProjectWorkspace(updated); }} onSaveModel={async (request) => {
     if (modelSelectionInFlight.current) throw new Error("Model selection is currently locked");
     modelSelectionInFlight.current = true;
     setModelSelectionBusy(true);
@@ -1258,7 +1335,8 @@ export default function DesktopApp() {
       setModelSelectionBusy(false);
     }
   }} onDeleteModel={removeModelProfile} onProbeModel={api.probeModelProfile} onListModels={api.listModelProfileModels} onModelDiscovery={api.listModelProfileModelDiscovery} onSubscriptionSaved={profile => { setModelProfiles(current => [profile, ...current.filter(item => item.id !== profile.id)]); setActiveModelProfileId(profile.id); }} onImportSkill={async () => { const sourcePath = await api.chooseSkillDirectory(); if (!sourcePath) return; const skill = await api.importSkillDirectory(sourcePath); setSkillPackages((current) => [skill, ...current.filter((item) => item.id !== skill.id)]); }} onSetSkillEnabled={async (skillId, enabled) => { const updated = await api.setSkillEnabled(skillId, enabled); setSkillPackages(await api.listSkillPackages()); return updated; }} onSkillsChanged={async () => setSkillPackages(await api.listSkillPackages())} onPluginsChanged={async () => setSkillPackages(await api.listSkillPackages())} onSaveMcpServer={async (request) => { const updated = await api.saveMcpServer(request); setMcpServers(await api.listMcpServers()); return updated; }} onConfigurePubMedMcp={async (request) => { const updated = await api.configurePubMedMcpCredentials(request); setMcpServers(await api.listMcpServers()); return updated; }} onListBundledMcpPresets={api.listBundledMcpPresets} onAddBundledMcp={async (request) => { const updated = await api.addBundledMcpServer(request); setMcpServers(await api.listMcpServers()); return updated; }} onInspectMcpServer={async (serverId) => { if (!selected) throw new Error(locale === "zh-CN" ? "请先打开一个项目，再检查 MCP server。" : "Open a project before inspecting an MCP server."); await api.inspectConfiguredMcpServer(selected.id, serverId); setMcpServers(await api.listMcpServers()); }} onSetMcpServerEnabled={async (serverId, enabled) => { const updated = await api.setMcpServerEnabled(serverId, enabled); setMcpServers(await api.listMcpServers()); return updated; }} onSetMcpLaunchApproval={async (serverId, approved) => { const updated = await api.setMcpLaunchApproval(serverId, approved); setMcpServers(await api.listMcpServers()); return updated; }} onSetMcpToolApproval={async (serverId, tool, approved) => { const updated = await api.setMcpToolApproval(serverId, tool, approved); setMcpServers(await api.listMcpServers()); return updated; }} /> : null;
-  if (!selected) return <div className="desktop-frame">{applicationMenu}<div className="desktop-frame-content"><ProjectLibrary createRequestKey={createProjectRequest} onCreateRequestHandled={(key) => setCreateProjectRequest((current) => current === key ? null : current)} onOpenSearch={openWorkspaceSearch} projects={projects} connections={connections} locale={locale} onSettings={() => openApplicationSettings("general")} onOpen={setSelected} onDelete={async (projectId) => { await api.deleteProject(projectId); composerDraftStore.removeProject(projectId); setProjects((current) => current.filter((project) => project.id !== projectId)); }} onChooseLocalRoot={api.chooseProjectDirectory} onCreate={async ({ template, name, localRoot, connectionId, remoteRoot }) => { const project = await api.createProject({ name, description: "", local_root: localRoot, template, connection_id: connectionId, remote_root: remoteRoot }); setProjects((current) => [project, ...current]); setSelected(project); }} /></div>{settings}{searchDialog}</div>;
+  if (offlineExampleView) return <div className="desktop-frame">{applicationMenu}<div className="desktop-frame-content">{projectRoutingNotice}<OfflineExampleWorkspace key={offlineExampleView.project_id} workspace={offlineExampleView} locale={locale} onBack={backToProjectLibrary} /></div>{settings}{searchDialog}</div>;
+  if (!selected) return <div className="desktop-frame">{applicationMenu}<div className="desktop-frame-content">{projectRoutingNotice}<ProjectLibrary createRequestKey={createProjectRequest} onCreateRequestHandled={(key) => setCreateProjectRequest((current) => current === key ? null : current)} onOpenSearch={openWorkspaceSearch} projects={projects} connections={connections} locale={locale} onSettings={() => openApplicationSettings("general")} onOpen={(project) => { void openProjectWorkspace(project); }} onDelete={async (projectId) => { await api.deleteProject(projectId); composerDraftStore.removeProject(projectId); setProjects((current) => current.filter((project) => project.id !== projectId)); }} onChooseLocalRoot={api.chooseProjectDirectory} onBeginOfflineExample={() => { offlineCreateAttempt.current = null; }} onCreateOfflineExample={createOfflineExample} onCreate={async ({ template, name, localRoot, connectionId, remoteRoot }) => { const generation = projectOpenGeneration.current; const project = await api.createProject({ name, description: "", local_root: localRoot, template, connection_id: connectionId, remote_root: remoteRoot }); setProjects((current) => [project, ...current.filter((item) => item.id !== project.id)]); if (generation === projectOpenGeneration.current) await openProjectWorkspace(project); }} /></div>{settings}{searchDialog}</div>;
   async function changeConversationMode(nextMode: SessionAgentModeV4) {
     if (!selected || !conversation || nextMode === conversationMode) return;
     const projectId = selected.id;
@@ -1441,7 +1519,7 @@ export default function DesktopApp() {
     }
   }
   const currentConversationAction = captureConversationAction();
-  return <div className="desktop-frame">{applicationMenu}<div className="desktop-frame-content"><WorkspaceShell
+  return <div className="desktop-frame">{applicationMenu}<div className="desktop-frame-content">{projectRoutingNotice}<WorkspaceShell
     composerDraftStore={composerDraftStore}
     onOpenSearch={openWorkspaceSearch} searchRequest={searchRequest}
     onRegisterNavigationGuard={registerWorkspaceNavigationGuard} onOpenSourceConversation={openWorkspaceSourceConversation}
@@ -1451,7 +1529,7 @@ export default function DesktopApp() {
     capabilitiesError={capabilities.error} onRefreshCapabilities={capabilities.refresh}
     project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template, connection_id: selected.connection_id, remote_root: selected.remote_root }}
     workflowCatalogVersion={workflowCatalogVersion}
-    locale={locale} onOpenSettings={(section = "models") => { setSettingsSection(section); setSettingsOpen(true); }} onBackToProjects={() => setSelected(null)}
+    locale={locale} onOpenSettings={(section = "models") => { setSettingsSection(section); setSettingsOpen(true); }} onBackToProjects={backToProjectLibrary}
     conversations={conversations} activeConversationId={conversation?.id} onSelectConversation={selectConversation} onNewConversation={newConversation} onOpenBranch={openCreatedBranch} onDeleteConversation={deleteConversation}
     messages={messages} agentBusy={agentBusy} agentNotice={agentNotice} conversationLoadError={conversationLoadError} onRetryConversationLoad={() => setConversationLoadRetry((value) => value + 1)} modelLabel={activeModel?.model} activeModelProfile={activeModel} modelProfiles={modelProfiles}
     composerBusy={modelSelectionBusy || !conversation}
