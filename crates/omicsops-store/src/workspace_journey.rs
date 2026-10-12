@@ -132,40 +132,9 @@ pub(crate) async fn publication_source_value(
             "saved source scope is invalid".into(),
         ));
     }
-    if let Some(conversation) = source.conversation_id {
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM conversation_records WHERE project_id=? AND frame_id=?)",
-        )
-        .bind(project.to_string())
-        .bind(conversation.to_string())
-        .fetch_one(&mut **tx)
-        .await?;
-        if !exists {
-            return Ok(None);
-        }
-    }
-    if let Some(run) = source
-        .run_id
-        .filter(|_| source.kind != SourceKind::LegacyArtifact)
-    {
-        let conversation: Option<String> = sqlx::query_scalar(
-            "SELECT conversation_id FROM agent_runs_v4 WHERE project_id=? AND run_id=?",
-        )
-        .bind(project.to_string())
-        .bind(run.to_string())
-        .fetch_optional(&mut **tx)
-        .await?;
-        let Some(conversation) = conversation else {
-            return Ok(None);
-        };
-        if source
-            .conversation_id
-            .is_some_and(|id| id.to_string() != conversation)
-        {
-            *resolution = Some(SourceAvailability::Unavailable);
-            return Ok(None);
-        }
-    }
+    // Resolve the project-owned source row before classifying association
+    // mismatches. A missing selector alone cannot prove that the cited row was
+    // deleted; each branch validates its own run/conversation identity.
     match source.kind {
         SourceKind::Message => {
             if source.run_id.is_some() || source.sequence.is_some() || source.event_hash.is_some() {
@@ -242,6 +211,10 @@ pub(crate) async fn publication_source_value(
             ))
         }
         SourceKind::LegacyArtifact => {
+            if source.run_id.is_some() || source.conversation_id.is_some() {
+                *resolution = Some(SourceAvailability::Unavailable);
+                return Ok(None);
+            }
             let row = sqlx::query("SELECT id,project_id,source_run_id,filename,remote_path,content_type,size_bytes,sha256,verified,created_at FROM artifacts WHERE project_id=? AND id=?")
                 .bind(project.to_string()).bind(&source.id).fetch_optional(&mut **tx).await?;
             row.map(|row| Ok(serde_json::to_value(crate::artifact_from_row(row)?)?))
@@ -284,6 +257,19 @@ pub(crate) async fn publication_source_value(
             {
                 *resolution = Some(SourceAvailability::Unavailable);
                 return Ok(None);
+            }
+            if let Some(run) = source.run_id {
+                let owned: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM agent_runs_v4 WHERE project_id=? AND run_id=?)",
+                )
+                .bind(project.to_string())
+                .bind(run.to_string())
+                .fetch_one(&mut **tx)
+                .await?;
+                if !owned {
+                    *resolution = Some(SourceAvailability::Unavailable);
+                    return Ok(None);
+                }
             }
             if let Some(conversation) = source.conversation_id {
                 let Some(run) = derived_run else {

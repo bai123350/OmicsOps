@@ -540,3 +540,83 @@ async fn context_shared_artifact_producer_counts_scientific_bytes_once() {
             .all(|item| item.availability.is_none() && item.value.is_some())
     );
 }
+
+#[tokio::test]
+async fn context_distinguishes_existing_run_bad_association_from_missing_source() {
+    let store = Store::open_in_memory().await.unwrap();
+    let p = project(&store).await;
+    let c = conversation(&store, p).await;
+    let foreign_project = project(&store).await;
+    let foreign_conversation = conversation(&store, foreign_project).await;
+    let run = Uuid::new_v4();
+    store
+        .save_agent_run_v4(run, p, c, "running", &json!({}))
+        .await
+        .unwrap();
+    let publication = store
+        .workspace_save_publication(&SavePublicationRecord {
+            request: SavePublicationRequest {
+                request_id: Uuid::new_v4(),
+                project_id: p,
+                publication_id: None,
+                expected_revision: 0,
+                title: "Association".into(),
+                markdown: "Body".into(),
+                sources: vec![],
+            },
+            references: vec![],
+        })
+        .await
+        .unwrap()
+        .publication
+        .id;
+    let mut wrong_run = snapshot(p, SourceKind::Run, run.to_string());
+    wrong_run.source.run_id = Some(Uuid::new_v4());
+    wrong_run.source.conversation_id = Some(c);
+    let mut foreign_conversation_ref = snapshot(p, SourceKind::Run, run.to_string());
+    foreign_conversation_ref.source.run_id = Some(run);
+    foreign_conversation_ref.source.conversation_id = Some(foreign_conversation);
+    let mut nonexistent_conversation_ref = snapshot(p, SourceKind::Run, run.to_string());
+    nonexistent_conversation_ref.source.run_id = Some(run);
+    nonexistent_conversation_ref.source.conversation_id = Some(Uuid::new_v4());
+    let missing = snapshot(p, SourceKind::Run, Uuid::new_v4().to_string());
+    let references = vec![
+        wrong_run,
+        foreign_conversation_ref,
+        nonexistent_conversation_ref,
+        missing,
+    ];
+    let content =
+        json!({"schema_version":1,"title":"Association","markdown":"Body","references":references})
+            .to_string();
+    sqlx::query(
+        "INSERT INTO publication_revisions(id,publication_id,revision,content) VALUES(?,?,2,?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(publication.to_string())
+    .bind(content)
+    .execute(store.pool())
+    .await
+    .unwrap();
+    let context = store
+        .workspace_publication_read_context(p, publication, 2)
+        .await
+        .unwrap();
+    assert_eq!(context.revision.references.len(), 4);
+    assert_eq!(
+        context.current_sources[0].availability,
+        Some(SourceAvailability::Unavailable)
+    );
+    assert_eq!(
+        context.current_sources[1].availability,
+        Some(SourceAvailability::Unavailable)
+    );
+    assert_eq!(
+        context.current_sources[2].availability,
+        Some(SourceAvailability::Unavailable)
+    );
+    assert_eq!(
+        context.current_sources[3].availability,
+        Some(SourceAvailability::Missing)
+    );
+}
