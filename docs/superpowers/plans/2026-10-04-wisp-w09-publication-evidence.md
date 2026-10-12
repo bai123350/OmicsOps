@@ -76,29 +76,30 @@ git commit -m "feat: add bounded publication evidence read contract"
 
 - Create: `src-tauri/src/workspace_publication_evidence.rs`（含 `#[cfg(test)] mod tests`）。
 - Modify: `src-tauri/src/workspace_navigation.rs:225`, `:273`, `:506`, `src-tauri/src/lib.rs:62`, `:198`.
-- Test: `src-tauri/src/workspace_publication_evidence.rs`.
+- Modify: `crates/omicsops-store/src/workspace_navigation.rs`（同事务有界 typed `run_conversations`，仅已到达的明示V4 run）。
+- Test: `src-tauri/src/workspace_publication_evidence.rs`, `crates/omicsops-store/tests/publication_readiness_context.rs`.
 
 **Interfaces:**
 
 - Consumes: Task 1 `Store::workspace_publication_read_context(&self, project_id: Uuid, publication_id: Uuid, revision: u64) -> Result<PublicationReadContext, StoreError>`与 `PublicationSelectionV1`/报告DTO；既有host公开投影/来源availability。
 - Produces: `workspace_check_publication_readiness(state: State<'_, AppState>, request: PublicationSelectionV1) -> Result<PublicationReadinessReportV1, PublicationEvidenceErrorV1>`；测试用聚焦repository接缝 `check_publication_readiness(repository: &Store, request: &PublicationSelectionV1, observed_at: &str) -> Result<PublicationReadinessReportV1, PublicationEvidenceErrorV1>`，不另建来源解析框架。
 
-- [ ] **Step 1: Write failing tests.** 测试名统一 `readiness_`：invalid evidence/artifact、stale analysis、缺seed/software/database/sample、missing lineage、record budget、历史backend、legacy hash及cross-project。为mock运行/SSH/keyring接口加调用计数，结果必须为零。
+- [x] **Step 1: Write failing tests.** 测试名统一 `readiness_`：invalid evidence/artifact、stale analysis、缺seed/software/database/sample、missing lineage、record budget、历史backend、legacy hash及cross-project。用真实Store调用前后状态/SQLite写入计数不变与实际repository-only命令委派证明只读；核对源码无运行/SSH/keyring/model能力端口。现有AppState为具体实现，未提供可注入外部计数接口，故不声称instrumented numeric zero，不增加无连接mock计数器。
 
 ```rust
 assert_eq!(report.reproduction_status, ReproductionStatusV1::NotExecuted);
 assert!(report.findings.iter().any(|f| f.code == ReadinessFindingCodeV1::InvalidEvidence));
 assert_eq!(legacy_report.revision_hash_scope, PublicationRevisionHashScopeV1::PublicLegacyMarkdown);
-assert_eq!(external_call_count, 0);
+assert_eq!(store_changes_after, store_changes_before); // actual SQLite connection
 ```
 
-- [ ] **Step 2: Run RED.** `cargo test -p omicsops-desktop --lib workspace_publication_evidence::tests::readiness_`。Expected: FAIL，缺命令/repository接缝或finding/hash/scope断言失败。
-- [ ] **Step 3: Implement both signatures and register command.** 从Task 1 context分类，不改证据或revision；对齐现有公开legacy hash，source call ID不建立lineage；超限返回InspectionLimit，原文件始终NotChecked，unsafe公开内容给typed安全错误。公开投影只提取必要共用函数，不重写既有resolver。
-- [ ] **Step 4: Run GREEN.** 重跑RED命令，运行 `cargo test -p omicsops-desktop --lib workspace_navigation::tests`。Expected: PASS，已删会话引用和legacy restore回归仍通过；报告测试前后Store可观察状态相同。
-- [ ] **Step 5: Commit.**
+- [x] **Step 2: Run RED.** `cargo test -p omicsops-desktop --lib workspace_publication_evidence::tests::readiness_`。Expected: FAIL，缺命令/repository接缝或finding/hash/scope断言失败。
+- [x] **Step 3: Implement both signatures and register command.** 从Task 1 context分类，不改证据或revision；对齐现有公开legacy hash，source call ID不建立lineage；超限返回InspectionLimit，原文件始终NotChecked，unsafe公开内容给typed安全错误。公开投影只提取必要共用函数，不重写既有resolver。
+- [x] **Step 4: Run GREEN.** 重跑RED命令，运行 `cargo test -p omicsops-desktop --lib workspace_navigation::tests`。Expected: PASS，已删会话引用和legacy restore回归仍通过；报告测试前后Store可观察状态相同。
+- [x] **Step 5: Commit.**
 
 ```powershell
-git add src-tauri/src/workspace_publication_evidence.rs src-tauri/src/workspace_navigation.rs src-tauri/src/lib.rs
+git add src-tauri/src/workspace_publication_evidence.rs src-tauri/src/workspace_navigation.rs src-tauri/src/lib.rs crates/omicsops-store/src/workspace_navigation.rs crates/omicsops-store/tests/publication_readiness_context.rs
 git commit -m "feat: report saved publication evidence readiness"
 ```
 
@@ -171,3 +172,5 @@ git commit -m "feat: show publication readiness and reference package actions"
 spec覆盖：共同DTO/ownership由Task 1、有效性/预算由Task 2、hash/导出失败由Task 3、保存选择/Escape由Task 4承接；无首范围遗漏。五项Review Focus各有具体测试。接口名称与spec一致，内部接缝不新增UI授权。只有断言片段和签名，没有产品body；计划不重复全部DTO。执行记录、真实检查结果及实施方式待计划评审后填写，当前没有实现或测试结果。
 
 2026-10-12：Task1 `1b19093..15d727a` 经一次完整及三轮定向独立审阅完成，36/50 SOURCE。四共享DTO、W09合同、精确保存revision的单事务有界context已实现。修复Tool/Run关联分类、Run时间投影、重复producer预算及LegacyArtifact既有合法选择兼容；最终context13/navigation18/fmt/diff通过，未变DTO最近1/1通过。current_sources的None表示内部raw待Task2公开投影比较，Changed/Unavailable/Missing分别保留；不直出raw、不额外读库。7外部RAW未改，cache警告保留；Tasks2–4报告/包/UI、完整功能与clean-HEAD/native/live检查仍独立待执行。
+
+2026-10-13：W09 Task2 `b00993f..24073b4` 完整及一轮定向独立审阅完成，累计37/50 SOURCE。只读准备度/同context公开投影与有界run-conversation内部映射已实现；修复JSON转义前原始source字符串安全扫描，实际RED3/GREEN3、最终readiness13/fmt/diff通过，未变host navigation11/Store context14/navigation18先前通过。外部能力缺席为结构证明而非插桩零调用计数，真实Store不变有测试；包/UI与完整及clean-HEAD/native/live检查仍待后续。7外部RAW保留，cache警告不隐去。

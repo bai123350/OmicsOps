@@ -182,7 +182,7 @@ UI 报告绑定 `(project,publication,revision,expected_sha256)`，切换或离�
 
 ### 验收、文件地图与依赖
 
-自动化覆盖：保存历史版本与 head 分离；源 changed/deleted 时保存快照仍可导出；跨项目 source/run/record 被拒；失效 evidence/产物、stale analysis、缺种子/软件/数据库/样本均产生对应 finding；缺失关联和预算截断不能显示检查通过；legacy hash scope 与 structured 区分；再次脱敏后的包 hash 正确；私钥/认证/token/密码样例不出包、不进错误；固定 zip 名拒绝路径注入；每项 checksum 校验正确；取消及写入失败无 Store 写入；mock kernel/SSH/凭据接口调用数为零。UI 覆盖未保存稿件、切版本旧回包、立即 Escape 且一次只关最顶层。
+自动化覆盖：保存历史版本与 head 分离；源 changed/deleted 时保存快照仍可导出；跨项目 source/run/record 被拒；失效 evidence/产物、stale analysis、缺种子/软件/数据库/样本均产生对应 finding；缺失关联和预算截断不能显示检查通过；legacy hash scope 与 structured 区分；再次脱敏后的包 hash 正确；私钥/认证/token/密码样例不出包、不进错误；固定 zip 名拒绝路径注入；每项 checksum 校验正确；取消及写入失败无 Store 写入；真实 Store 前后状态/SQLite写入计数不变，并核对实际 repository-only 委派无 kernel/SSH/凭据/模型能力端口；当前具体 AppState 没有可注入计数接口，故该证据是结构性无调用边界，而不是插桩零调用计数，也不使用与产品路径无连接的 mock 计数。UI 覆盖未保存稿件、切版本旧回包、立即 Escape 且一次只关最顶层。
 
 手工 smoke 使用合成项目和已保存小型引用：检查一个旧 revision，修改/删除其来源，再导包核对保留快照、当前 availability 和遗漏；Windows 路径含空格、保存取消、磁盘写入失败。无需真实模型/SSH。测试通过仍不表示独立科研复现已执行。
 
