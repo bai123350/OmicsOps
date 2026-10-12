@@ -211,14 +211,41 @@ pub(crate) async fn publication_source_value(
             ))
         }
         SourceKind::LegacyArtifact => {
-            if source.run_id.is_some() || source.conversation_id.is_some() {
-                *resolution = Some(SourceAvailability::Unavailable);
-                return Ok(None);
-            }
             let row = sqlx::query("SELECT id,project_id,source_run_id,filename,remote_path,content_type,size_bytes,sha256,verified,created_at FROM artifacts WHERE project_id=? AND id=?")
                 .bind(project.to_string()).bind(&source.id).fetch_optional(&mut **tx).await?;
-            row.map(|row| Ok(serde_json::to_value(crate::artifact_from_row(row)?)?))
-                .transpose()
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            if let Some(run) = source.run_id {
+                let conversation: Option<String> = sqlx::query_scalar(
+                    "SELECT conversation_id FROM agent_runs_v4 WHERE project_id=? AND run_id=?",
+                )
+                .bind(project.to_string())
+                .bind(run.to_string())
+                .fetch_optional(&mut **tx)
+                .await?;
+                if conversation.as_deref().is_none_or(|actual| {
+                    source
+                        .conversation_id
+                        .is_some_and(|id| actual != id.to_string())
+                }) {
+                    *resolution = Some(SourceAvailability::Unavailable);
+                    return Ok(None);
+                }
+            } else if let Some(conversation) = source.conversation_id {
+                let owned: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM conversation_records WHERE project_id=? AND frame_id=?)",
+                )
+                .bind(project.to_string())
+                .bind(conversation.to_string())
+                .fetch_one(&mut **tx)
+                .await?;
+                if !owned {
+                    *resolution = Some(SourceAvailability::Unavailable);
+                    return Ok(None);
+                }
+            }
+            Ok(Some(serde_json::to_value(crate::artifact_from_row(row)?)?))
         }
         kind if scientific_table(kind).is_some() => {
             if source.sequence.is_some()

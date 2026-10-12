@@ -1,5 +1,5 @@
 use chrono::Utc;
-use omicsops_core::workspace::{Conversation, Project, ProjectTemplate};
+use omicsops_core::workspace::{Artifact, Conversation, Project, ProjectTemplate};
 use omicsops_dto::{
     SavePublicationRequest, SourceAvailability, SourceKind, WorkspaceSourceRef,
     WorkspaceSourceSnapshot,
@@ -617,6 +617,136 @@ async fn context_distinguishes_existing_run_bad_association_from_missing_source(
     );
     assert_eq!(
         context.current_sources[3].availability,
+        Some(SourceAvailability::Missing)
+    );
+}
+
+#[tokio::test]
+async fn context_preserves_accepted_legacy_artifact_associations() {
+    let store = Store::open_in_memory().await.unwrap();
+    let p = project(&store).await;
+    let c = conversation(&store, p).await;
+    let run = Uuid::new_v4();
+    store
+        .save_agent_run_v4(run, p, c, "running", &json!({}))
+        .await
+        .unwrap();
+
+    let mut references = Vec::new();
+    for (saved_run, saved_conversation) in
+        [(Some(run), None), (None, Some(c)), (Some(run), Some(c))]
+    {
+        let artifact = Artifact {
+            id: Uuid::new_v4(),
+            project_id: p,
+            run_id: None,
+            relative_path: "synthetic.txt".into(),
+            remote_path: None,
+            media_type: "text/plain".into(),
+            size_bytes: 12,
+            sha256: "a".repeat(64),
+            verified: true,
+            created_at: Utc::now(),
+        };
+        store.save_artifact_v3(&artifact).await.unwrap();
+        let mut reference = snapshot(p, SourceKind::LegacyArtifact, artifact.id.to_string());
+        reference.source.run_id = saved_run;
+        reference.source.conversation_id = saved_conversation;
+        references.push(reference);
+    }
+    let mut absent = snapshot(p, SourceKind::LegacyArtifact, Uuid::new_v4().to_string());
+    absent.source.run_id = Some(run);
+    absent.source.conversation_id = Some(c);
+    references.push(absent);
+
+    // Exercise the existing save contract, including its run/conversation checks.
+    let publication = store
+        .workspace_save_publication(&SavePublicationRecord {
+            request: SavePublicationRequest {
+                request_id: Uuid::new_v4(),
+                project_id: p,
+                publication_id: None,
+                expected_revision: 0,
+                title: "Legacy artifact associations".into(),
+                markdown: "Body".into(),
+                sources: references.iter().map(|item| item.source.clone()).collect(),
+            },
+            references,
+        })
+        .await
+        .unwrap()
+        .publication
+        .id;
+    let context = store
+        .workspace_publication_read_context(p, publication, 1)
+        .await
+        .unwrap();
+    for item in &context.current_sources[..3] {
+        assert_eq!(item.availability, None);
+        assert_eq!(
+            item.value,
+            store
+                .workspace_source_record(p, SourceKind::LegacyArtifact, &item.source.id)
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        context.current_sources[3].availability,
+        Some(SourceAvailability::Missing)
+    );
+
+    let foreign_project = project(&store).await;
+    let foreign_conversation = conversation(&store, foreign_project).await;
+    let foreign_run = Uuid::new_v4();
+    store
+        .save_agent_run_v4(
+            foreign_run,
+            foreign_project,
+            foreign_conversation,
+            "running",
+            &json!({}),
+        )
+        .await
+        .unwrap();
+    let existing_id = context.current_sources[0].source.id.clone();
+    let mut wrong_run = snapshot(p, SourceKind::LegacyArtifact, existing_id.clone());
+    wrong_run.source.run_id = Some(foreign_run);
+    let mut wrong_conversation = snapshot(p, SourceKind::LegacyArtifact, existing_id);
+    wrong_conversation.source.conversation_id = Some(foreign_conversation);
+    let mut missing_with_wrong_selector =
+        snapshot(p, SourceKind::LegacyArtifact, Uuid::new_v4().to_string());
+    missing_with_wrong_selector.source.run_id = Some(foreign_run);
+    let content = json!({
+        "schema_version": 1,
+        "title": "Historical associations",
+        "markdown": "Body",
+        "references": [wrong_run, wrong_conversation, missing_with_wrong_selector]
+    })
+    .to_string();
+    sqlx::query(
+        "INSERT INTO publication_revisions(id,publication_id,revision,content) VALUES(?,?,2,?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(publication.to_string())
+    .bind(content)
+    .execute(store.pool())
+    .await
+    .unwrap();
+    let historical = store
+        .workspace_publication_read_context(p, publication, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        historical.current_sources[0].availability,
+        Some(SourceAvailability::Unavailable)
+    );
+    assert_eq!(
+        historical.current_sources[1].availability,
+        Some(SourceAvailability::Unavailable)
+    );
+    assert_eq!(
+        historical.current_sources[2].availability,
         Some(SourceAvailability::Missing)
     );
 }
