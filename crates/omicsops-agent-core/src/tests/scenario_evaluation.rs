@@ -1,8 +1,411 @@
 use super::*;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
 
 const MANIFEST: &str = include_str!("data/v4-scenarios.json");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportWriteErrorCodeV4 {
+    InvalidPath,
+    WriteFailed,
+}
+
+fn evaluation_target() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("fixed workspace layout")
+        .join("target")
+}
+
+fn report_bytes(report: &SuiteReportV4) -> Result<Vec<u8>, ReportWriteErrorCodeV4> {
+    // The curated suite has closed, public identities. Reject arbitrary string
+    // fields instead of allowing malformed fixtures to leak into a CI artifact.
+    let allowed_ids = [
+        "compact_preserve_sources",
+        "correct_mcp_arguments",
+        "deny_approval",
+        "read_evidence",
+        "recover_uncertain",
+    ];
+    let mut scenarios: Vec<_> = report.scenarios.iter().collect();
+    scenarios.sort_by(|a, b| a.id.cmp(&b.id));
+    if report.schema_version != 1
+        || report.runner_contract_version != 1
+        || report.suite_id != "offline-v4-controls"
+        || report.suite_hash.len() != 64
+        || !report
+            .suite_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || scenarios
+            .iter()
+            .map(|scenario| scenario.id.as_str())
+            .collect::<Vec<_>>()
+            != allowed_ids
+    {
+        return Err(ReportWriteErrorCodeV4::WriteFailed);
+    }
+    let mut value =
+        serde_json::to_value(report).map_err(|_| ReportWriteErrorCodeV4::WriteFailed)?;
+    value["scenarios"] =
+        serde_json::to_value(scenarios).map_err(|_| ReportWriteErrorCodeV4::WriteFailed)?;
+    serde_json::to_vec(&value).map_err(|_| ReportWriteErrorCodeV4::WriteFailed)
+}
+
+fn report_path_alias(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+fn report_destination_in(workspace: &Path, path: &Path) -> Result<PathBuf, ReportWriteErrorCodeV4> {
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        || path.file_name().is_none()
+    {
+        return Err(ReportWriteErrorCodeV4::InvalidPath);
+    }
+    if !path.is_absolute() && !path.starts_with("target") {
+        return Err(ReportWriteErrorCodeV4::InvalidPath);
+    }
+    let destination = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        workspace.join(path)
+    };
+    let canonical_workspace = workspace
+        .canonicalize()
+        .map_err(|_| ReportWriteErrorCodeV4::InvalidPath)?;
+    let canonical_target = canonical_workspace.join("target");
+    let parent = destination
+        .parent()
+        .ok_or(ReportWriteErrorCodeV4::InvalidPath)?;
+    let ancestor = parent
+        .ancestors()
+        .find(|ancestor| ancestor.exists())
+        .ok_or(ReportWriteErrorCodeV4::InvalidPath)?;
+    if !ancestor.is_dir()
+        || parent.ancestors().any(|ancestor| {
+            std::fs::symlink_metadata(ancestor).is_ok_and(|metadata| report_path_alias(&metadata))
+        })
+        || std::fs::symlink_metadata(&destination)
+            .is_ok_and(|metadata| report_path_alias(&metadata))
+    {
+        return Err(ReportWriteErrorCodeV4::InvalidPath);
+    }
+    // Reconstruct the missing suffix from a validated existing ancestor before
+    // creating anything. This also works with a custom Cargo build directory.
+    let future_parent = ancestor
+        .canonicalize()
+        .map_err(|_| ReportWriteErrorCodeV4::InvalidPath)?
+        .join(
+            parent
+                .strip_prefix(ancestor)
+                .map_err(|_| ReportWriteErrorCodeV4::InvalidPath)?,
+        );
+    if !future_parent.starts_with(&canonical_target) {
+        return Err(ReportWriteErrorCodeV4::InvalidPath);
+    }
+    std::fs::create_dir_all(&future_parent).map_err(|_| ReportWriteErrorCodeV4::WriteFailed)?;
+    let canonical_parent = future_parent
+        .canonicalize()
+        .map_err(|_| ReportWriteErrorCodeV4::InvalidPath)?;
+    if !canonical_parent.starts_with(canonical_target) {
+        return Err(ReportWriteErrorCodeV4::InvalidPath);
+    }
+    // Also reject a destination symlink rather than replacing a path alias.
+    if std::fs::symlink_metadata(&destination).is_ok_and(|metadata| report_path_alias(&metadata)) {
+        return Err(ReportWriteErrorCodeV4::InvalidPath);
+    }
+    Ok(canonical_parent.join(
+        destination
+            .file_name()
+            .ok_or(ReportWriteErrorCodeV4::InvalidPath)?,
+    ))
+}
+
+fn write_report_atomically(
+    bytes: &[u8],
+    path: &Path,
+    persist: impl FnOnce(tempfile::NamedTempFile, &Path) -> Result<(), ReportWriteErrorCodeV4>,
+) -> Result<(), ReportWriteErrorCodeV4> {
+    let target = evaluation_target();
+    let workspace = target.parent().ok_or(ReportWriteErrorCodeV4::InvalidPath)?;
+    write_report_atomically_in(bytes, path, workspace, persist)
+}
+
+fn write_report_atomically_in(
+    bytes: &[u8],
+    path: &Path,
+    workspace: &Path,
+    persist: impl FnOnce(tempfile::NamedTempFile, &Path) -> Result<(), ReportWriteErrorCodeV4>,
+) -> Result<(), ReportWriteErrorCodeV4> {
+    let destination = report_destination_in(workspace, path)?;
+    let parent = destination
+        .parent()
+        .ok_or(ReportWriteErrorCodeV4::InvalidPath)?;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).map_err(|_| ReportWriteErrorCodeV4::WriteFailed)?;
+    temporary
+        .write_all(bytes)
+        .map_err(|_| ReportWriteErrorCodeV4::WriteFailed)?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|_| ReportWriteErrorCodeV4::WriteFailed)?;
+    persist(temporary, &destination)
+}
+
+fn emit_report_using(
+    report: &SuiteReportV4,
+    path: Option<&Path>,
+    write: impl FnOnce(&[u8], &Path) -> Result<(), ReportWriteErrorCodeV4>,
+) -> Result<(), ReportWriteErrorCodeV4> {
+    let bytes = report_bytes(report)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| ReportWriteErrorCodeV4::WriteFailed)?;
+    println!("OMICSOPS_V4_SCENARIOS={text}");
+    if let Some(path) = path {
+        write(&bytes, path)?;
+    }
+    Ok(())
+}
+
+fn emit_report(report: &SuiteReportV4, path: Option<&Path>) -> Result<(), ReportWriteErrorCodeV4> {
+    emit_report_using(report, path, |bytes, path| {
+        write_report_atomically(bytes, path, |temporary, destination| {
+            temporary
+                .persist(destination)
+                .map(|_| ())
+                .map_err(|_| ReportWriteErrorCodeV4::WriteFailed)
+        })
+    })
+}
+
+fn assert_suite_passed(report: &SuiteReportV4) {
+    assert_eq!(report.failed, 0, "V4 scenario suite failed");
+}
+
+#[tokio::test(start_paused = true)]
+async fn scenario_evaluation_suite() {
+    let manifest = parse_suite(MANIFEST).expect("invalid V4 scenario manifest");
+    // All five fixtures are inline in this manifest; there are no external paths.
+    let hash = suite_hash(&manifest, &BTreeMap::new()).expect("invalid V4 suite hash input");
+    let report = run_suite(&manifest, &hash).await;
+    let path = std::env::var_os("OMICSOPS_EVAL_REPORT_PATH").map(PathBuf::from);
+    if let Err(code) = emit_report(&report, path.as_deref()) {
+        panic!("V4 report emission failed: {code:?}");
+    }
+    assert_suite_passed(&report);
+}
+
+// These exercise the real file writer: a missing opt-in, destructive replacement,
+// early failure, or serialization of raw fixture text must break the contract.
+fn report_test_directory() -> tempfile::TempDir {
+    let target = evaluation_target();
+    std::fs::create_dir_all(&target).unwrap();
+    tempfile::tempdir_in(target).unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn report_explicit_creates_absent_target_without_default_write() {
+    let workspace = report_test_directory();
+    let manifest = parse_suite(MANIFEST).unwrap();
+    let hash = suite_hash(&manifest, &BTreeMap::new()).unwrap();
+    let report = run_suite(&manifest, &hash).await;
+    let path = Path::new("target/evaluation/report.json");
+    let emit = |requested_path| {
+        emit_report_using(&report, requested_path, |bytes, path| {
+            write_report_atomically_in(bytes, path, workspace.path(), |temporary, destination| {
+                temporary
+                    .persist(destination)
+                    .map(|_| ())
+                    .map_err(|_| ReportWriteErrorCodeV4::WriteFailed)
+            })
+        })
+    };
+    emit(None).unwrap();
+    assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
+    assert_eq!(
+        emit(Some(Path::new("docs/report.json"))),
+        Err(ReportWriteErrorCodeV4::InvalidPath)
+    );
+    assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
+    emit(Some(path)).unwrap();
+    assert_eq!(
+        std::fs::read(workspace.path().join(path)).unwrap(),
+        report_bytes(&report).unwrap()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn report_default_writes_no_file() {
+    let directory = report_test_directory();
+    let before_files = std::fs::read_dir(directory.path()).unwrap().count();
+    let manifest = parse_suite(MANIFEST).unwrap();
+    let hash = suite_hash(&manifest, &BTreeMap::new()).unwrap();
+    let report = run_suite(&manifest, &hash).await;
+    emit_report(&report, None).unwrap();
+    emit_report_using(&report, None, |_, _| {
+        panic!("default must never dispatch a file write")
+    })
+    .unwrap();
+    let files_without_explicit_path = std::fs::read_dir(directory.path()).unwrap().count();
+    assert_eq!(files_without_explicit_path, before_files);
+}
+
+#[tokio::test(start_paused = true)]
+async fn report_atomic_replace_retains_previous_on_failure() {
+    let directory = report_test_directory();
+    let path = directory.path().join("report.json");
+    let manifest = parse_suite(MANIFEST).unwrap();
+    let hash = suite_hash(&manifest, &BTreeMap::new()).unwrap();
+    let report = run_suite(&manifest, &hash).await;
+    let old_bytes = b"previous complete report";
+    std::fs::write(&path, old_bytes).unwrap();
+    let bytes = report_bytes(&report).unwrap();
+    // Fail exactly at the persistence boundary, after the temporary file was written.
+    assert_eq!(
+        write_report_atomically(&bytes, &path, |_, _| Err(
+            ReportWriteErrorCodeV4::WriteFailed
+        )),
+        Err(ReportWriteErrorCodeV4::WriteFailed)
+    );
+    let old_bytes_after_failed_replace = std::fs::read(&path).unwrap();
+    assert_eq!(old_bytes_after_failed_replace, old_bytes);
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    emit_report(&report, Some(&path)).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    emit_report(&report, Some(&path)).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+
+    let existing_directory = directory.path().join("directory");
+    std::fs::create_dir(&existing_directory).unwrap();
+    let sentinel = existing_directory.join("retain.json");
+    std::fs::write(&sentinel, old_bytes).unwrap();
+    assert_eq!(
+        emit_report(&report, Some(&existing_directory)),
+        Err(ReportWriteErrorCodeV4::WriteFailed)
+    );
+    assert_eq!(std::fs::read(sentinel).unwrap(), old_bytes);
+    assert_eq!(
+        emit_report(&report, Some(&path.join("child.json"))),
+        Err(ReportWriteErrorCodeV4::InvalidPath)
+    );
+    assert_eq!(
+        emit_report(&report, Some(std::path::Path::new("docs/report.json"))),
+        Err(ReportWriteErrorCodeV4::InvalidPath)
+    );
+    assert_eq!(
+        emit_report(&report, Some(std::path::Path::new("target/../report.json"))),
+        Err(ReportWriteErrorCodeV4::InvalidPath)
+    );
+    assert_eq!(
+        emit_report(&report, Some(std::path::Path::new(""))),
+        Err(ReportWriteErrorCodeV4::InvalidPath)
+    );
+    let nested = directory.path().join("new-parent").join("report.json");
+    emit_report(&report, Some(&nested)).unwrap();
+    assert_eq!(std::fs::read(nested).unwrap(), bytes);
+}
+
+#[tokio::test(start_paused = true)]
+async fn report_failure_still_emits_all_scenarios() {
+    let directory = report_test_directory();
+    let path = directory.path().join("failed.json");
+    let mut manifest = parse_suite(MANIFEST).unwrap();
+    let hash = suite_hash(&manifest, &BTreeMap::new()).unwrap();
+    manifest.scenarios[0].model_script.clear();
+    let failed_report = run_suite(&manifest, &hash).await;
+    assert_eq!(failed_report.scenarios.len(), 5);
+    emit_report(&failed_report, Some(&path)).unwrap();
+    let saved: SuiteReportV4 = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(saved.scenarios.len(), 5);
+    assert_eq!((saved.passed, saved.failed), (4, 1));
+    assert!(std::panic::catch_unwind(|| assert_suite_passed(&failed_report)).is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn report_stability_and_redaction() {
+    let directory = report_test_directory();
+    let path = directory.path().join("stable.json");
+    let mut manifest = parse_suite(MANIFEST).unwrap();
+    let hash = suite_hash(&manifest, &BTreeMap::new()).unwrap();
+    let raw_provider_error = "raw-provider-error-sk-secret-C:\\private\\host";
+    manifest.scenarios[0].objective = raw_provider_error.into();
+    manifest.scenarios[3].tool_script[0].call_id = raw_provider_error.into();
+    manifest.scenarios[3].model_script[0].public_text = raw_provider_error.into();
+    let mut first = run_suite(&manifest, &hash).await;
+    first.scenarios.reverse();
+    emit_report(&first, Some(&path)).unwrap();
+    let report_bytes_run1 = std::fs::read(&path).unwrap();
+    emit_report(&run_suite(&manifest, &hash).await, Some(&path)).unwrap();
+    let report_bytes_run2 = std::fs::read(&path).unwrap();
+    assert_eq!(report_bytes_run1, report_bytes_run2);
+    let failed_report_json = String::from_utf8(report_bytes_run1).unwrap();
+    assert!(!failed_report_json.contains(raw_provider_error));
+    let value: Value = serde_json::from_str(&failed_report_json).unwrap();
+    let ids: Vec<_> = value["scenarios"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "compact_preserve_sources",
+            "correct_mcp_arguments",
+            "deny_approval",
+            "read_evidence",
+            "recover_uncertain"
+        ]
+    );
+    for forbidden in [
+        "arguments",
+        "outcome",
+        "reasoning",
+        "transcript",
+        "objective",
+        "public_text",
+        "timestamp",
+        "duration",
+        "attempt_id",
+    ] {
+        assert!(!failed_report_json.contains(&format!("\"{forbidden}\":")));
+    }
+    first.scenarios[0].id = raw_provider_error.into();
+    assert_eq!(
+        emit_report(&first, Some(&path)),
+        Err(ReportWriteErrorCodeV4::WriteFailed)
+    );
+    first.scenarios[0].id = "compact_preserve_sources".into();
+    first.suite_id = raw_provider_error.into();
+    assert_eq!(
+        emit_report(&first, Some(&path)),
+        Err(ReportWriteErrorCodeV4::WriteFailed)
+    );
+    first.suite_id = "offline-v4-controls".into();
+    first.suite_hash = raw_provider_error.into();
+    assert_eq!(
+        emit_report(&first, Some(&path)),
+        Err(ReportWriteErrorCodeV4::WriteFailed)
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), report_bytes_run2);
+}
 
 #[tokio::test(start_paused = true)]
 async fn scenarios_run_all_five_and_measure_actual_dispatch() {

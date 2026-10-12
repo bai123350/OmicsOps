@@ -21,6 +21,15 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -B -m unittest discover -s scripts -p "test_*.py"
+      - name: V4 scenario evaluation
+        run: cargo test -p omicsops-agent-core scenario_evaluation_suite -- --nocapture
+        env:
+          OMICSOPS_EVAL_REPORT_PATH: target/evaluation/v4-scenarios.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v4-scenarios
+          path: target/evaluation/v4-scenarios.json
       - run: cargo test --workspace
       - run: npm test
       - run: npm run build
