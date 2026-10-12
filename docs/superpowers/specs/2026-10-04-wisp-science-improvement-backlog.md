@@ -1,6 +1,6 @@
 # Wisp Science 可借鉴改进清单
 
-日期：2026-10-04。状态：用户已选择全部12项首次范围、确认具体设计及[实施总计划](../plans/2026-10-04-wisp-improvements.md)，并选择子Agent逐项实施与审阅。W01–W08源码已实现并审阅通过（35/50任务），其余项继续实施；W07原生手工验收未执行，W06隔离旧HEAD原生验收仅部分通过；状态及实际检查见总计划。全部12项首次范围尚未交付。本文件保留源码对照，具体边界见[总设计](2026-10-04-wisp-improvements-design.md)。
+日期：2026-10-04。状态：用户已选择全部12项首次范围、确认具体设计及[实施总计划](../plans/2026-10-04-wisp-improvements.md)，并选择子Agent逐项实施与审阅。W01–W08及W09共享DTO/只读context源码已实现并审阅通过（36/50任务），其余项继续实施；W07原生手工验收未执行，W06隔离旧HEAD原生验收仅部分通过；状态及实际检查见总计划。全部12项首次范围尚未交付。本文件保留源码对照，具体边界见[总设计](2026-10-04-wisp-improvements-design.md)。
 
 本轮建议先补会话草稿隔离，再分别交付科学产物预览和 SSH 后台作业面板。这三项直接改善日常研究操作，并能复用现有组件与运行身份。其余候选按依赖分批推进，优先保留 OmicsOps 已有的科研证据、审批与恢复契约。
 
@@ -139,6 +139,8 @@ P0 表示优先解决可能影响操作正确性的问题；P1 表示直接改�
 不新增旧布局中的 cli crate，不搬上游 debug 凭据文件，不用容易抖动的机器耗时阈值代替行为断言。
 
 ## W09 稿件准备度和证据包
+
+**实施进度（2026-10-12）：**Task1共享DTO与单事务有界精确revision context已完成独立审阅（9cfa558、537ab71、ef6fb9c、15d727a）；最终context13/navigation18/fmt/diff通过，DTO合同1/1先前通过。报告分类、reference-only包及UI仍待Tasks2–4，不能称W09已交付；源码替身不证明真实复现或native验收。
 
 **参考事实：**上游[准备度检查][w-readiness]不冻结草稿，freeze 前重新检查证据；[证据包导出][w-capsule]使用已冻结 revision 和 canonical manifest 校验。OmicsOps 已有[科学状态](../../../crates/omicsops-science/src/lib.rs)与[稿件 revision/来源快照](../../../src-tauri/src/workspace_navigation.rs)，现有用户导出仍是 Markdown。
 

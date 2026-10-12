@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- 本计划当前只供审阅；执行方式在后续阶段确认，不能由此文档开始产品实现。
+- 用户已通过实施总计划确认全部首次范围及子Agent逐项实施/独立审阅；按既定任务边界继续，不重复询问授权。
 - DTO 不依赖 Tauri、Store、异步运行时或 Win32；请求使用 `#[serde(deny_unknown_fields)]`，枚举使用 `snake_case`；UUID 使用 `Uuid`，字节数和 revision 使用 `u64`，时间使用 RFC 3339 UTC 字符串。
 - 最多 32 个保存引用；关联闭包上限 64 个科学记录、深度 4；每个科学 JSON 最多 256 KiB、合计 4 MiB；报告最多 512 KiB、128 条 finding，每条消息最多 512 字节；包总未压缩字节最多 16 MiB。
 - 不提供 `ready: bool`；`reproduction_status` 只有 `NotExecuted`；原始文件状态只有 `NotChecked`。不读取 live 科学文件、整个 scientific state JSON、凭据、SSH、kernel、MCP 或模型。
@@ -50,7 +50,7 @@ Task 1 唯一创建 `crates/omicsops-dto/src/workspace_files.rs` 的四个基础
 - Consumes: `Store::workspace_get_publication(&self, project_id: Uuid, publication_id: Uuid) -> Result<PublicationDetail, StoreError>`；现有 `WorkspaceSourceRef`/`WorkspaceSourceSnapshot`、科学记录分表及 project/run/sequence 所有权查询。
 - Produces: spec全部W09 DTO与共享四基础DTO；`Store::workspace_publication_read_context(&self, project_id: Uuid, publication_id: Uuid, revision: u64) -> Result<PublicationReadContext, StoreError>`。内部context字段使用 `revision`（所选PublicationRevision）、`current_sources`（当前来源投影）、`related_records`（关联科学记录）、`scientific_revision`/`scientific_state_sha256`（可空header）和 `truncated`；不能成为UI请求或读取任意表。
 
-- [ ] **Step 1: Write failing tests.** 在新Store测试构造两个保存revision、已删来源、跨项目重复ID、合成分表记录及较大的state JSON；新增 `context_keeps_missing_snapshot`、`context_selects_exact_revision`、`context_rejects_foreign_owner`、`context_bounds_related_records`、`context_does_not_read_whole_state`。DTO合同覆盖unknown字段拒绝、nullable字段、snake_case及u64。最小断言片段放入对应测试：
+- [x] **Step 1: Write failing tests.** 在新Store测试构造两个保存revision、已删来源、跨项目重复ID、合成分表记录及较大的state JSON；新增 `context_keeps_missing_snapshot`、`context_selects_exact_revision`、`context_rejects_foreign_owner`、`context_bounds_related_records`、`context_does_not_read_whole_state`。DTO合同覆盖unknown字段拒绝、nullable字段、snake_case及u64。最小断言片段放入对应测试：
 
 ```rust
 assert_eq!(context.revision.revision, 1);
@@ -60,10 +60,10 @@ assert!(context.related_records.len() <= 64);
 assert!(serde_json::from_value::<PublicationSelectionV1>(with_extra).is_err());
 ```
 
-- [ ] **Step 2: Run RED.** `cargo test -p omicsops-store --test publication_readiness_context`；`cargo test -p omicsops-desktop --lib dto_contract_tests::publication_evidence`。Expected: FAIL，缺新method/type或身份/预算断言失败；不能以测试target不存在作为预期失败。
-- [ ] **Step 3: Implement the signatures above.** 按spec加入DTO/reexport与只读context；单事务精确取一个revision，长度检查在JSON解析前完成；从科学分表沿明确lineage读取，stable key去重和预算截断，只读science header，不调用标题修复路径。保持已保存snapshot正文，当前source missing只装饰availability。
-- [ ] **Step 4: Run GREEN.** 重跑RED命令，再运行 `cargo test -p omicsops-store --test workspace_navigation`，Expected: PASS，既有append-only/legacy/ownership行为保持。
-- [ ] **Step 5: Commit.** 仅提交本任务文件：
+- [x] **Step 2: Run RED.** `cargo test -p omicsops-store --test publication_readiness_context`；`cargo test -p omicsops-desktop --lib dto_contract_tests::publication_evidence`。Expected: FAIL，缺新method/type或身份/预算断言失败；不能以测试target不存在作为预期失败。
+- [x] **Step 3: Implement the signatures above.** 按spec加入DTO/reexport与只读context；单事务精确取一个revision，长度检查在JSON解析前完成；从科学分表沿明确lineage读取，stable key去重和预算截断，只读science header，不调用标题修复路径。保持已保存snapshot正文，当前source missing只装饰availability。
+- [x] **Step 4: Run GREEN.** 重跑RED命令，再运行 `cargo test -p omicsops-store --test workspace_navigation`，Expected: PASS，既有append-only/legacy/ownership行为保持。
+- [x] **Step 5: Commit.** 仅提交本任务文件：
 
 ```powershell
 git add crates/omicsops-dto/src/workspace_files.rs crates/omicsops-dto/src/publication_evidence.rs crates/omicsops-dto/src/lib.rs crates/omicsops-store/src/workspace_navigation.rs crates/omicsops-store/src/workspace_journey.rs crates/omicsops-store/tests/publication_readiness_context.rs src-tauri/src/dto_contract_tests.rs
@@ -169,3 +169,5 @@ git commit -m "feat: show publication readiness and reference package actions"
 ## Plan Self-Review
 
 spec覆盖：共同DTO/ownership由Task 1、有效性/预算由Task 2、hash/导出失败由Task 3、保存选择/Escape由Task 4承接；无首范围遗漏。五项Review Focus各有具体测试。接口名称与spec一致，内部接缝不新增UI授权。只有断言片段和签名，没有产品body；计划不重复全部DTO。执行记录、真实检查结果及实施方式待计划评审后填写，当前没有实现或测试结果。
+
+2026-10-12：Task1 `1b19093..15d727a` 经一次完整及三轮定向独立审阅完成，36/50 SOURCE。四共享DTO、W09合同、精确保存revision的单事务有界context已实现。修复Tool/Run关联分类、Run时间投影、重复producer预算及LegacyArtifact既有合法选择兼容；最终context13/navigation18/fmt/diff通过，未变DTO最近1/1通过。current_sources的None表示内部raw待Task2公开投影比较，Changed/Unavailable/Missing分别保留；不直出raw、不额外读库。7外部RAW未改，cache警告保留；Tasks2–4报告/包/UI、完整功能与clean-HEAD/native/live检查仍独立待执行。
