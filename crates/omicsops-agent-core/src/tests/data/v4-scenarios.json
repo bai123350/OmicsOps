@@ -15,8 +15,45 @@
       },
       "model_script": [
         {
-          "public_text": "Inspect offline control evidence.",
-          "tool_calls": []
+          "public_text": "Offline control fixture.",
+          "tool_calls": [
+            {
+              "call_id": "read-1",
+              "tool_id": "agent.read_tool_result",
+              "arguments": {
+                "sequence": 3,
+                "event_hash": "seed_source",
+                "field": "model_content",
+                "offset": 0,
+                "limit": 8192
+              }
+            }
+          ]
+        },
+        {
+          "public_text": "Offline control fixture.",
+          "tool_calls": [
+            {
+              "call_id": "complete-1",
+              "tool_id": "agent.complete",
+              "arguments": {
+                "schema_version": 4,
+                "summary": "Fixture evidence verified",
+                "answer_markdown": "Verified offline evidence.",
+                "criteria": [
+                  {
+                    "criterion": "verified output",
+                    "evidence": [
+                      {
+                        "kind": "event",
+                        "sequence": 3
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
         }
       ],
       "tool_script": [],
@@ -51,6 +88,22 @@
         {
           "name": "rejected_foreign_ref",
           "expected": true
+        },
+        {
+          "name": "model_attempts",
+          "expected": 2
+        },
+        {
+          "name": "tool_proposals",
+          "expected": 2
+        },
+        {
+          "name": "tool_dispatches",
+          "expected": 0
+        },
+        {
+          "name": "recovered_outcomes",
+          "expected": 0
         }
       ]
     },
@@ -66,13 +119,95 @@
       },
       "model_script": [
         {
-          "public_text": "Inspect offline control evidence.",
+          "public_text": "Offline control fixture.",
           "tool_calls": [
             {
               "call_id": "call-2",
-              "tool_id": "read_file",
+              "tool_id": "runtime.execute",
               "arguments": {
-                "path": "evidence.txt"
+                "language": "python",
+                "code": "print(42)"
+              }
+            }
+          ]
+        },
+        {
+          "public_text": "Offline control fixture.",
+          "tool_calls": [
+            {
+              "call_id": "input-2",
+              "tool_id": "agent.request_input",
+              "arguments": {
+                "question": "How should the denied operation proceed?",
+                "reason": "decision"
+              }
+            }
+          ]
+        }
+      ],
+      "tool_script": [],
+      "seed_events": [],
+      "limits": {
+        "context_max_bytes": null,
+        "max_turns": 8,
+        "max_tool_calls": 8,
+        "checkpoint_recent_events": null
+      },
+      "assertions": [
+        {
+          "name": "denied_no_dispatch",
+          "expected": true
+        },
+        {
+          "name": "model_attempts",
+          "expected": 2
+        },
+        {
+          "name": "tool_proposals",
+          "expected": 2
+        },
+        {
+          "name": "tool_dispatches",
+          "expected": 0
+        },
+        {
+          "name": "recovered_outcomes",
+          "expected": 0
+        }
+      ]
+    },
+    {
+      "id": "recover_uncertain",
+      "label": "Recover Uncertain",
+      "scenario_kind": "recover_uncertain",
+      "objective": "Verify recover uncertain with fixed offline fixtures.",
+      "seed": {
+        "project_id": "10000000-0000-4000-8000-000000000003",
+        "conversation_id": "20000000-0000-4000-8000-000000000003",
+        "run_id": "30000000-0000-4000-8000-000000000003"
+      },
+      "model_script": [
+        {
+          "public_text": "Offline control fixture.",
+          "tool_calls": [
+            {
+              "call_id": "complete-3",
+              "tool_id": "agent.complete",
+              "arguments": {
+                "schema_version": 4,
+                "summary": "Fixture evidence verified",
+                "answer_markdown": "Verified offline evidence.",
+                "criteria": [
+                  {
+                    "criterion": "verified output",
+                    "evidence": [
+                      {
+                        "kind": "event",
+                        "sequence": 5
+                      }
+                    ]
+                  }
+                ]
               }
             }
           ]
@@ -80,12 +215,216 @@
       ],
       "tool_script": [
         {
-          "stage": "prepare",
-          "call_id": "call-2",
-          "tool_id": "read_file",
+          "stage": "recover",
+          "call_id": "unknown-3",
+          "tool_id": "runtime.execute",
+          "outcome": null,
+          "failure": "missing_receipt"
+        },
+        {
+          "stage": "recover",
+          "call_id": "receipt-3",
+          "tool_id": "runtime.execute",
           "outcome": {
-            "call_id": "call-2",
-            "tool_id": "read_file",
+            "call_id": "receipt-3",
+            "tool_id": "runtime.execute",
+            "succeeded": true,
+            "model_content": "Offline evidence\nsource line",
+            "data": {
+              "source": "fixture"
+            },
+            "provenance": [
+              "fixture:evidence.txt"
+            ]
+          },
+          "failure": null
+        }
+      ],
+      "seed_events": [
+        {
+          "kind": "uncertain_dispatch",
+          "call": {
+            "call_id": "unknown-3",
+            "tool_id": "runtime.execute",
+            "arguments": {
+              "language": "python",
+              "code": "write()"
+            }
+          }
+        },
+        {
+          "kind": "uncertain_dispatch",
+          "call": {
+            "call_id": "receipt-3",
+            "tool_id": "runtime.execute",
+            "arguments": {
+              "language": "python",
+              "code": "write()"
+            }
+          }
+        }
+      ],
+      "limits": {
+        "context_max_bytes": null,
+        "max_turns": 8,
+        "max_tool_calls": 8,
+        "checkpoint_recent_events": null
+      },
+      "assertions": [
+        {
+          "name": "uncertain_no_replay",
+          "expected": true
+        },
+        {
+          "name": "recovered_once",
+          "expected": true
+        },
+        {
+          "name": "model_attempts",
+          "expected": 1
+        },
+        {
+          "name": "tool_proposals",
+          "expected": 1
+        },
+        {
+          "name": "tool_dispatches",
+          "expected": 0
+        },
+        {
+          "name": "recovered_outcomes",
+          "expected": 1
+        }
+      ]
+    },
+    {
+      "id": "correct_mcp_arguments",
+      "label": "Correct Mcp Arguments",
+      "scenario_kind": "correct_mcp_arguments",
+      "objective": "Verify correct mcp arguments with fixed offline fixtures.",
+      "seed": {
+        "project_id": "10000000-0000-4000-8000-000000000004",
+        "conversation_id": "20000000-0000-4000-8000-000000000004",
+        "run_id": "30000000-0000-4000-8000-000000000004"
+      },
+      "model_script": [
+        {
+          "public_text": "Offline control fixture.",
+          "tool_calls": [
+            {
+              "call_id": "directory-4",
+              "tool_id": "search_mcp_tools",
+              "arguments": {}
+            }
+          ]
+        },
+        {
+          "public_text": "Offline control fixture.",
+          "tool_calls": [
+            {
+              "call_id": "call-4",
+              "tool_id": "use_mcp_tool",
+              "arguments": {
+                "server_id": "fixture-server",
+                "tool": "lookup",
+                "arguments": {
+                  "wrong": 1
+                }
+              }
+            }
+          ]
+        },
+        {
+          "public_text": "Offline control fixture.",
+          "tool_calls": [
+            {
+              "call_id": "corrected-4",
+              "tool_id": "use_mcp_tool",
+              "arguments": {
+                "server_id": "fixture-server",
+                "tool": "lookup",
+                "arguments": {
+                  "query": "fixture"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "public_text": "Offline control fixture.",
+          "tool_calls": [
+            {
+              "call_id": "complete-4",
+              "tool_id": "agent.complete",
+              "arguments": {
+                "schema_version": 4,
+                "summary": "Fixture evidence verified",
+                "answer_markdown": "Verified offline evidence.",
+                "criteria": [
+                  {
+                    "criterion": "verified output",
+                    "evidence": [
+                      {
+                        "kind": "event",
+                        "sequence": 0
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "tool_script": [
+        {
+          "stage": "execute",
+          "call_id": "directory-4",
+          "tool_id": "search_mcp_tools",
+          "outcome": {
+            "call_id": "directory-4",
+            "tool_id": "search_mcp_tools",
+            "succeeded": true,
+            "model_content": "Offline directory",
+            "data": {
+              "tools": [
+                {
+                  "server_id": "fixture-server",
+                  "tool_name": "lookup",
+                  "input_schema": {
+                    "type": "object",
+                    "required": [
+                      "query"
+                    ],
+                    "properties": {
+                      "query": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            "provenance": [
+              "fixture:evidence.txt"
+            ]
+          },
+          "failure": null
+        },
+        {
+          "stage": "prepare",
+          "call_id": "call-4",
+          "tool_id": "use_mcp_tool",
+          "outcome": null,
+          "failure": "argument_preflight"
+        },
+        {
+          "stage": "execute",
+          "call_id": "corrected-4",
+          "tool_id": "use_mcp_tool",
+          "outcome": {
+            "call_id": "corrected-4",
+            "tool_id": "use_mcp_tool",
             "succeeded": true,
             "model_content": "Offline evidence\nsource line",
             "data": {
@@ -107,172 +446,6 @@
       },
       "assertions": [
         {
-          "name": "denied_no_dispatch",
-          "expected": true
-        },
-        {
-          "name": "tool_dispatches",
-          "expected": 0
-        }
-      ]
-    },
-    {
-      "id": "recover_uncertain",
-      "label": "Recover Uncertain",
-      "scenario_kind": "recover_uncertain",
-      "objective": "Verify recover uncertain with fixed offline fixtures.",
-      "seed": {
-        "project_id": "10000000-0000-4000-8000-000000000003",
-        "conversation_id": "20000000-0000-4000-8000-000000000003",
-        "run_id": "30000000-0000-4000-8000-000000000003"
-      },
-      "model_script": [
-        {
-          "public_text": "Inspect offline control evidence.",
-          "tool_calls": []
-        }
-      ],
-      "tool_script": [
-        {
-          "stage": "recover",
-          "call_id": "call-3",
-          "tool_id": "read_file",
-          "outcome": {
-            "call_id": "call-3",
-            "tool_id": "read_file",
-            "succeeded": true,
-            "model_content": "Offline evidence\nsource line",
-            "data": {
-              "source": "fixture"
-            },
-            "provenance": [
-              "fixture:evidence.txt"
-            ]
-          },
-          "failure": null
-        }
-      ],
-      "seed_events": [
-        {
-          "kind": "uncertain_dispatch",
-          "call": {
-            "call_id": "call-3",
-            "tool_id": "read_file",
-            "arguments": {
-              "path": "evidence.txt"
-            }
-          }
-        }
-      ],
-      "limits": {
-        "context_max_bytes": null,
-        "max_turns": 8,
-        "max_tool_calls": 8,
-        "checkpoint_recent_events": null
-      },
-      "assertions": [
-        {
-          "name": "uncertain_no_replay",
-          "expected": true
-        },
-        {
-          "name": "recovered_once",
-          "expected": true
-        },
-        {
-          "name": "tool_dispatches",
-          "expected": 0
-        }
-      ]
-    },
-    {
-      "id": "correct_mcp_arguments",
-      "label": "Correct Mcp Arguments",
-      "scenario_kind": "correct_mcp_arguments",
-      "objective": "Verify correct mcp arguments with fixed offline fixtures.",
-      "seed": {
-        "project_id": "10000000-0000-4000-8000-000000000004",
-        "conversation_id": "20000000-0000-4000-8000-000000000004",
-        "run_id": "30000000-0000-4000-8000-000000000004"
-      },
-      "model_script": [
-        {
-          "public_text": "Inspect offline control evidence.",
-          "tool_calls": [
-            {
-              "call_id": "call-4",
-              "tool_id": "mcp.call",
-              "arguments": {
-                "query": "fixture"
-              }
-            }
-          ]
-        },
-        {
-          "public_text": "Corrected arguments.",
-          "tool_calls": [
-            {
-              "call_id": "corrected-4",
-              "tool_id": "mcp.call",
-              "arguments": {
-                "query": "corrected fixture"
-              }
-            }
-          ]
-        }
-      ],
-      "tool_script": [
-        {
-          "stage": "prepare",
-          "call_id": "call-4",
-          "tool_id": "mcp.call",
-          "outcome": null,
-          "failure": "argument_preflight"
-        },
-        {
-          "stage": "execute",
-          "call_id": "corrected-4",
-          "tool_id": "mcp.call",
-          "outcome": {
-            "call_id": "corrected-4",
-            "tool_id": "mcp.call",
-            "succeeded": true,
-            "model_content": "Offline evidence\nsource line",
-            "data": {
-              "source": "fixture"
-            },
-            "provenance": [
-              "fixture:evidence.txt"
-            ]
-          },
-          "failure": null
-        }
-      ],
-      "seed_events": [
-        {
-          "kind": "mcp_directory",
-          "outcome": {
-            "call_id": "directory-4",
-            "tool_id": "mcp.discover",
-            "succeeded": true,
-            "model_content": "Offline evidence\nsource line",
-            "data": {
-              "source": "fixture"
-            },
-            "provenance": [
-              "fixture:evidence.txt"
-            ]
-          }
-        }
-      ],
-      "limits": {
-        "context_max_bytes": null,
-        "max_turns": 8,
-        "max_tool_calls": 8,
-        "checkpoint_recent_events": null
-      },
-      "assertions": [
-        {
           "name": "preflight_preserves_server",
           "expected": true
         },
@@ -283,6 +456,22 @@
         {
           "name": "discovered_once",
           "expected": true
+        },
+        {
+          "name": "model_attempts",
+          "expected": 4
+        },
+        {
+          "name": "tool_proposals",
+          "expected": 4
+        },
+        {
+          "name": "tool_dispatches",
+          "expected": 2
+        },
+        {
+          "name": "recovered_outcomes",
+          "expected": 0
         }
       ]
     },
@@ -298,8 +487,45 @@
       },
       "model_script": [
         {
-          "public_text": "Inspect offline control evidence.",
-          "tool_calls": []
+          "public_text": "Offline control fixture.",
+          "tool_calls": [
+            {
+              "call_id": "read-5",
+              "tool_id": "agent.read_tool_result",
+              "arguments": {
+                "sequence": 3,
+                "event_hash": "seed_source",
+                "field": "model_content",
+                "offset": 0,
+                "limit": 8192
+              }
+            }
+          ]
+        },
+        {
+          "public_text": "Offline control fixture.",
+          "tool_calls": [
+            {
+              "call_id": "complete-5",
+              "tool_id": "agent.complete",
+              "arguments": {
+                "schema_version": 4,
+                "summary": "Fixture evidence verified",
+                "answer_markdown": "Verified offline evidence.",
+                "criteria": [
+                  {
+                    "criterion": "verified output",
+                    "evidence": [
+                      {
+                        "kind": "event",
+                        "sequence": 3
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
         }
       ],
       "tool_script": [],
@@ -310,7 +536,7 @@
             "call_id": "call-5",
             "tool_id": "read_file",
             "succeeded": true,
-            "model_content": "Offline evidence\nsource line",
+            "model_content": "source line\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
             "data": {
               "source": "fixture"
             },
@@ -326,10 +552,12 @@
         }
       ],
       "limits": {
-        "context_max_bytes": 2048,
+        "context_max_bytes": 24000,
         "max_turns": 8,
         "max_tool_calls": 8,
-        "checkpoint_recent_events": 1
+        "checkpoint_recent_events": 1,
+        "request_max_bytes": 45000,
+        "tool_schema_padding_bytes": 24000
       },
       "assertions": [
         {
@@ -343,6 +571,22 @@
         {
           "name": "frozen_authority_retained",
           "expected": true
+        },
+        {
+          "name": "model_attempts",
+          "expected": 2
+        },
+        {
+          "name": "tool_proposals",
+          "expected": 2
+        },
+        {
+          "name": "tool_dispatches",
+          "expected": 0
+        },
+        {
+          "name": "recovered_outcomes",
+          "expected": 0
         }
       ]
     }
