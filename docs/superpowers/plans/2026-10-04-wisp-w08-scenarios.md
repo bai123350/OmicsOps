@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust cargo unit tests、serde/serde_json、Tokio test-util、dev SHA-256/hex、Windows CI。Python Skill helper 有独立计划，此 runner 不调用 Python。
 
-**Spec:** [W08 Runtime 设计](../specs/2026-10-04-wisp-runtime-design.md#w08manifest-驱动的离线-v4-场景与稳定报告)，已审阅设计提交 `161199f`。Task1 manifest/parser/hash 与 Task2 五场景 runner 已实现并独立审阅；Task3 报告/CI 待实施。
+**Spec:** [W08 Runtime 设计](../specs/2026-10-04-wisp-runtime-design.md#w08manifest-驱动的离线-v4-场景与稳定报告)，已审阅设计提交 `161199f`。三个任务源码均已实现并独立审阅；CI已配置，最终clean-HEAD及真实验收另记。
 
 ## Global Constraints
 
@@ -98,7 +98,7 @@ assert!(!serialized_report.contains(secret_sentinel));
 - Produces：`emit_report(report: &SuiteReportV4, path: Option<&Path>) -> Result<(), ReportWriteErrorCodeV4>`；test-only `scenario_evaluation_suite`，先 emit 完整报告，再断言 failed==0。stdout 固定前缀 `OMICSOPS_V4_SCENARIOS=`，JSON stable id 排序、无时间/耗时/随机 UUID。
 - Produces：ReportWriteErrorCodeV4 为 InvalidPath/WriteFailed；使用 `tempfile` dev dependency 的同目录 NamedTempFile/persist 进行 Windows 原子替换，拒绝未授权默认写入和失败前删除原报告。只使用 Rust 文件 API，不拼 shell，不删除目录。
 
-- [ ] **RED 写测试**：`report_default_writes_no_file`、`report_atomic_replace_retains_previous_on_failure`、`report_failure_still_emits_all_scenarios`、`report_stability_and_redaction`。给显式临时路径，测试重复写、现有目录/无效父路径等确定性故障，不依赖 Windows ACL 或机器权限。
+- [x] **RED 写测试**：`report_default_writes_no_file`、`report_atomic_replace_retains_previous_on_failure`、`report_failure_still_emits_all_scenarios`、`report_stability_and_redaction`。给显式临时路径，测试重复写、现有目录/无效父路径等确定性故障，不依赖 Windows ACL 或机器权限。
 
 ```rust
 assert_eq!(report_bytes_run1, report_bytes_run2);
@@ -108,15 +108,17 @@ assert_eq!(failed_report.scenarios.len(), 5);
 assert!(!failed_report_json.contains(raw_provider_error));
 ```
 
-- [ ] **RED 运行**：`cargo test -p omicsops-agent-core scenario_evaluation::report`；预期报告接口/默认零写入/安全投影失败。
-- [ ] **实现接口**：写报告失败返回固定错误，外层测试 fail 而不打印 raw异常；suite 失败先保存全部安全结果再非零。CI 增定向 cargo command，step env 仅 `OMICSOPS_EVAL_REPORT_PATH: target/evaluation/v4-scenarios.json`；随后 `actions/upload-artifact@v4`，`if: always()`，固定 name `v4-scenarios` 与上述 path。不改 Python setup/discovery，不替换 npm ci/workspace/npm/build。
-- [ ] **GREEN**：重复 RED；正常定向 suite 通过。使用已有 test seam 的失败 SuiteReport 和 emission 测试断言 fail condition；额外一次性复制测试 manifest 的明确故障验证定向 cargo 非零且完整报告存在，恢复夹具后确认通过，禁止提交故障输入。默认 `cargo test --workspace`、`npm test`、`npm run build`、fmt/diff check；记录真实验收未执行。报告路径仅 target，不进 Git。
-- [ ] **Commit**：仅暂存本任务源码/CI/文档，`git commit -m "test(ci): publish safe V4 scenario reports"`。Cargo.lock 若发生 Rust dev 依赖变化说明原因；npm lock 若变化必须 npm ci，正常本任务不需改变 npm 依赖。
+- [x] **RED 运行**：`cargo test -p omicsops-agent-core scenario_evaluation::report`；预期报告接口/默认零写入/安全投影失败。
+- [x] **实现接口**：写报告失败返回固定错误，外层测试 fail 而不打印 raw异常；suite 失败先保存全部安全结果再非零。CI 增定向 cargo command，step env 仅 `OMICSOPS_EVAL_REPORT_PATH: target/evaluation/v4-scenarios.json`；随后 `actions/upload-artifact@v4`，`if: always()`，固定 name `v4-scenarios` 与上述 path。不改 Python setup/discovery，不替换 npm ci/workspace/npm/build。
+- [x] **GREEN**：重复 RED；正常定向 suite 通过。使用已有 test seam 的失败 SuiteReport 和 emission 测试断言 fail condition；额外一次性复制测试 manifest 的明确故障验证定向 cargo 非零且完整报告存在，恢复夹具后确认通过，禁止提交故障输入。默认 `cargo test --workspace`、`npm test`、`npm run build`、fmt/diff check；记录真实验收未执行。报告路径仅 target，不进 Git。
+- [x] **Commit**：仅暂存本任务源码/CI/文档，`git commit -m "test(ci): publish safe V4 scenario reports"`。Cargo.lock 若发生 Rust dev 依赖变化说明原因；npm lock 若变化必须 npm ci，正常本任务不需改变 npm 依赖。
 
 ## Plan Self-Review
 
-五场景、manifest/hash、脚本严格消费、故障注入、计数和安全报告/CI 分别绑定 Task 1–3；Review Focus 全有具名测试。无新增 CLI/product API/DTO/DB，report/upload 与 helper plan 的文件责任已协调。没有完整框架/实现 body，所有片段是最小断言；RED/GREEN/commit 仍未执行。
+五场景、manifest/hash、脚本严格消费、故障注入、计数和安全报告/CI 分别绑定 Task 1–3；Review Focus 全有具名测试。无新增 CLI/product API/DTO/DB，report/upload 与 helper plan 的文件责任已协调。没有完整框架/实现 body，所有片段是最小断言；三个任务RED/GREEN/commit与独立审阅均已执行；逐项证据见下方记录。
 
 2026-10-11：Task1 `c1f348e..a500df7` 独立完整审阅 Spec compliant / Approved；manifest 3、core 226 通过，fmt/diff通过。canonical LF/key/ID、完整payload和fixture hash、固定错误码均已覆盖；既有sha2复用，仅增加现有hex dev锁边。shared working source测试不替代最终clean-HEAD；Windows路径/cache警告留最终验证。累计33/50 SOURCE任务审阅完成，runner/report与真实模型/SSH/GUI仍未由此证明。
 
 2026-10-12：Task2 `6f05b71..9711ef6` 独立完整审阅 Spec compliant / Approved；五场景真实 core 控制行为、直接调用计数、严格脚本消费、安全稳定报告类型和故障断言已实现。scenario 9/core 232通过，0 ignored，fmt/diff通过；初始 fmt 权限失败及通过的审批重试原始记录保留。固定 fixture 身份耦合和 Cargo/cache warnings 作为 Minor 留最终审阅；7个外部文件原始字节不变。累计34/50 SOURCE，报告写入/非零/CI仍待Task3，clean-HEAD与真实模型/SSH/GUI不由此证明。
+
+2026-10-12：Task3 `97265dc..1081b28` 独立完整审阅 Spec compliant / Approved。评审最终消息发生capacity错误，但完整双verdict及检查证据已先保存，读取后恢复交付，未重复派发审阅。默认零写入、target限定原子报告、完整结果先emit后失败与Windows CI完成；真实注入故障cargo101/五项JSON(4通过1失败)、夹具RAW恢复后五项通过，写入失败cargo101保留完整安全stdout。缺target根修订前workspace1791通过/18ignored；修订后core238/scenario15/Python48/frontend1316+bridge22/Web/fmt/diff通过，最后仅测试断言追加单独1/1。首次受限权限失败与通过重跑、Cargo/cache/dead-code/Vite warnings保留。W08两部分共6任务源码完成，累计35/50；最终fresh workspace/clean-HEAD/native、CI与真实模型/SSH/R验收未由这些结果替代。
