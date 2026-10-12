@@ -2,7 +2,9 @@
 //! These methods never open a path or infer a source from a bare tool call ID.
 use crate::{Store, StoreError};
 use omicsops_core::workspace::{Conversation, Message};
-use omicsops_dto::{JourneyEntry, JourneyPage, JourneyRequest, SourceKind, WorkspaceSourceRef};
+use omicsops_dto::{
+    JourneyEntry, JourneyPage, JourneyRequest, SourceAvailability, SourceKind, WorkspaceSourceRef,
+};
 use omicsops_protocol::AgentEventV4;
 use serde_json::{Value, json};
 use sqlx::{Row, Sqlite, Transaction};
@@ -94,6 +96,27 @@ pub(crate) async fn provenance_ids_for_analysis(
         .collect()
 }
 
+/// Check only the producer's bounded run identity. Its JSON is charged once
+/// if the explicit lineage closure later reads the distinct analysis record.
+async fn bounded_producer_run(
+    tx: &mut Transaction<'_, Sqlite>,
+    project: Uuid,
+    producer: &str,
+    truncated: &mut bool,
+) -> Result<Option<String>, StoreError> {
+    let length: Option<i64> = sqlx::query_scalar("SELECT length(CAST(value_json AS BLOB)) FROM scientific_analyses_v4 WHERE project_id=? AND id=?")
+        .bind(project.to_string()).bind(producer).fetch_optional(&mut **tx).await?;
+    let Some(length) = length else {
+        return Ok(None);
+    };
+    if length > 262_144 {
+        *truncated = true;
+        return Ok(None);
+    }
+    sqlx::query_scalar("SELECT json_extract(value_json,'$.run_id') FROM scientific_analyses_v4 WHERE project_id=? AND id=?")
+        .bind(project.to_string()).bind(producer).fetch_one(&mut **tx).await.map_err(Into::into)
+}
+
 /// Raw current source projection for a saved reference. This validates project,
 /// conversation, run and event sequence in the same transaction as its caller.
 pub(crate) async fn publication_source_value(
@@ -102,6 +125,7 @@ pub(crate) async fn publication_source_value(
     source: &WorkspaceSourceRef,
     bytes: &mut i64,
     truncated: &mut bool,
+    resolution: &mut Option<SourceAvailability>,
 ) -> Result<Option<Value>, StoreError> {
     if source.project_id != project || source.id.is_empty() || source.id.len() > 512 {
         return Err(StoreError::InvalidInput(
@@ -138,12 +162,14 @@ pub(crate) async fn publication_source_value(
             .conversation_id
             .is_some_and(|id| id.to_string() != conversation)
         {
+            *resolution = Some(SourceAvailability::Unavailable);
             return Ok(None);
         }
     }
     match source.kind {
         SourceKind::Message => {
             if source.run_id.is_some() || source.sequence.is_some() || source.event_hash.is_some() {
+                *resolution = Some(SourceAvailability::Unavailable);
                 return Ok(None);
             }
             let row = sqlx::query("SELECT id,project_id,conversation_id,seq,role,content,ts,project_id FROM messages WHERE project_id=? AND id=?")
@@ -155,12 +181,14 @@ pub(crate) async fn publication_source_value(
                 row.try_get::<String, _>("conversation_id").ok().as_deref()
                     != Some(id.to_string().as_str())
             }) {
+                *resolution = Some(SourceAvailability::Unavailable);
                 return Ok(None);
             }
             Ok(Some(serde_json::to_value(crate::message_from_row(row)?)?))
         }
         SourceKind::Tool => {
             let (Some(run), Some(sequence)) = (source.run_id, source.sequence) else {
+                *resolution = Some(SourceAvailability::Unavailable);
                 return Ok(None);
             };
             let sequence = i64::try_from(sequence)
@@ -170,15 +198,16 @@ pub(crate) async fn publication_source_value(
             let Some(row) = row else {
                 return Ok(None);
             };
-            if source.event_hash.as_deref().is_some_and(|hash| {
-                row.try_get::<String, _>("event_hash").ok().as_deref() != Some(hash)
-            }) {
-                return Ok(None);
-            }
             if source.conversation_id.is_some_and(|id| {
                 row.try_get::<String, _>("conversation_id").ok().as_deref()
                     != Some(id.to_string().as_str())
             }) {
+                *resolution = Some(SourceAvailability::Unavailable);
+                return Ok(None);
+            }
+            let current_hash: String = row.try_get("event_hash")?;
+            if source.event_hash.as_deref() != Some(current_hash.as_str()) {
+                *resolution = Some(SourceAvailability::Changed);
                 return Ok(None);
             }
             let json: String = row.try_get("value_json")?;
@@ -190,9 +219,13 @@ pub(crate) async fn publication_source_value(
         }
         SourceKind::Run => {
             if source.run_id.is_some_and(|id| id.to_string() != source.id) {
+                *resolution = Some(SourceAvailability::Unavailable);
                 return Ok(None);
             }
-            let row = sqlx::query("SELECT run_id,project_id,conversation_id,status FROM agent_runs_v4 WHERE project_id=? AND run_id=?")
+            let row = sqlx::query("SELECT r.run_id,r.project_id,r.conversation_id,r.status,
+                (SELECT json_extract(e.value_json,'$.occurred_at') FROM agent_events_v4 e WHERE e.run_id=r.run_id ORDER BY e.sequence LIMIT 1) AS started_at,
+                (SELECT json_extract(e.value_json,'$.occurred_at') FROM agent_events_v4 e WHERE e.run_id=r.run_id ORDER BY e.sequence DESC LIMIT 1) AS last_event_at
+                FROM agent_runs_v4 r WHERE r.project_id=? AND r.run_id=?")
                 .bind(project.to_string()).bind(&source.id).fetch_optional(&mut **tx).await?;
             let Some(row) = row else {
                 return Ok(None);
@@ -201,10 +234,11 @@ pub(crate) async fn publication_source_value(
                 row.try_get::<String, _>("conversation_id").ok().as_deref()
                     != Some(id.to_string().as_str())
             }) {
+                *resolution = Some(SourceAvailability::Unavailable);
                 return Ok(None);
             }
             Ok(Some(
-                json!({"id":row.try_get::<String,_>("run_id")?,"project_id":project,"conversation_id":row.try_get::<String,_>("conversation_id")?,"status":row.try_get::<String,_>("status")?}),
+                json!({"id":row.try_get::<String,_>("run_id")?,"project_id":project,"conversation_id":row.try_get::<String,_>("conversation_id")?,"status":row.try_get::<String,_>("status")?,"started_at":row.try_get::<Option<String>,_>("started_at")?,"last_event_at":row.try_get::<Option<String>,_>("last_event_at")?}),
             ))
         }
         SourceKind::LegacyArtifact => {
@@ -220,6 +254,7 @@ pub(crate) async fn publication_source_value(
                 || source.end.is_some()
                 || source.content_sha256.is_some()
             {
+                *resolution = Some(SourceAvailability::Unavailable);
                 return Ok(None);
             }
             let value =
@@ -239,17 +274,7 @@ pub(crate) async fn publication_source_value(
                         .get("producer_analysis_id")
                         .and_then(Value::as_str)
                         .unwrap_or("");
-                    let producer_value = bounded_scientific_value(
-                        tx,
-                        project,
-                        SourceKind::Analysis,
-                        producer,
-                        bytes,
-                        truncated,
-                    )
-                    .await?;
-                    producer_value
-                        .and_then(|v| v.get("run_id").and_then(Value::as_str).map(str::to_owned))
+                    bounded_producer_run(tx, project, producer, truncated).await?
                 }
                 _ => None,
             };
@@ -257,10 +282,12 @@ pub(crate) async fn publication_source_value(
                 .run_id
                 .is_some_and(|id| derived_run.as_deref() != Some(id.to_string().as_str()))
             {
+                *resolution = Some(SourceAvailability::Unavailable);
                 return Ok(None);
             }
             if let Some(conversation) = source.conversation_id {
                 let Some(run) = derived_run else {
+                    *resolution = Some(SourceAvailability::Unavailable);
                     return Ok(None);
                 };
                 let owner: Option<String> = sqlx::query_scalar(
@@ -271,6 +298,7 @@ pub(crate) async fn publication_source_value(
                 .fetch_optional(&mut **tx)
                 .await?;
                 if owner.as_deref() != Some(conversation.to_string().as_str()) {
+                    *resolution = Some(SourceAvailability::Unavailable);
                     return Ok(None);
                 }
             }

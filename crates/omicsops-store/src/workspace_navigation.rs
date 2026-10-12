@@ -20,6 +20,8 @@ const MAX_SCIENTIFIC_DEPTH: u8 = 4;
 
 /// A Store-owned raw projection. `None` availability means the row was found;
 /// the host must derive public text and compare it with the saved snapshot.
+/// A known identity/hash mismatch is returned as `Changed` or `Unavailable`,
+/// never as a deleted row.
 #[derive(Debug, Clone)]
 pub struct PublicationCurrentSource {
     pub source: WorkspaceSourceRef,
@@ -296,16 +298,20 @@ impl Store {
                 return Err(invalid("saved source owner mismatch"));
             }
             let mut source_truncated = false;
+            let mut resolution = None;
             let value = crate::workspace_journey::publication_source_value(
                 &mut tx,
                 project_id,
                 source,
                 &mut science_bytes,
                 &mut source_truncated,
+                &mut resolution,
             )
             .await?;
             truncated |= source_truncated;
-            let availability = if value.is_some() {
+            let availability = if let Some(resolution) = resolution {
+                Some(resolution)
+            } else if value.is_some() {
                 None
             } else if source_truncated {
                 Some(SourceAvailability::Unavailable)

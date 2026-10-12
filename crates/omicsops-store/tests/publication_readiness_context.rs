@@ -1,9 +1,10 @@
 use chrono::Utc;
-use omicsops_core::workspace::{Project, ProjectTemplate};
+use omicsops_core::workspace::{Conversation, Project, ProjectTemplate};
 use omicsops_dto::{
     SavePublicationRequest, SourceAvailability, SourceKind, WorkspaceSourceRef,
     WorkspaceSourceSnapshot,
 };
+use omicsops_protocol::{AgentEventKindV4, AgentEventV4, RunModeV4, ToolCallV4};
 use omicsops_store::{SavePublicationRecord, Store};
 use serde_json::json;
 use uuid::Uuid;
@@ -18,6 +19,15 @@ async fn project(store: &Store) -> Uuid {
             ProjectTemplate::Blank,
             Utc::now(),
         ))
+        .await
+        .unwrap();
+    id
+}
+
+async fn conversation(store: &Store, project_id: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    store
+        .save_conversation(&Conversation::new(id, project_id, "Synthetic", Utc::now()))
         .await
         .unwrap();
     id
@@ -372,5 +382,161 @@ async fn context_traverses_only_explicit_scientific_lineage() {
             .unwrap()
             .run_owner_verified,
         Some(false)
+    );
+}
+
+#[tokio::test]
+async fn context_classifies_saved_tool_hash_change() {
+    let store = Store::open_in_memory().await.unwrap();
+    let p = project(&store).await;
+    let c = conversation(&store, p).await;
+    let run = Uuid::new_v4();
+    store
+        .save_agent_run_v4(run, p, c, "running", &json!({}))
+        .await
+        .unwrap();
+    let call_id = "source-call".to_string();
+    let event = AgentEventV4::first(
+        run,
+        p,
+        c,
+        Utc::now(),
+        AgentEventKindV4::ToolRequested {
+            call: ToolCallV4 {
+                call_id: call_id.clone(),
+                tool_id: "synthetic_tool".into(),
+                arguments: json!({}),
+            },
+        },
+    );
+    store.append_agent_event_v4(&event).await.unwrap();
+    let mut saved = snapshot(p, SourceKind::Tool, call_id);
+    saved.source.run_id = Some(run);
+    saved.source.conversation_id = Some(c);
+    saved.source.sequence = Some(event.sequence);
+    saved.source.event_hash = Some("a".repeat(64));
+    assert_ne!(
+        saved.source.event_hash.as_deref(),
+        Some(event.event_hash.as_str())
+    );
+    let publication = save(&store, p, None, 0, saved).await;
+    let context = store
+        .workspace_publication_read_context(p, publication, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        context.current_sources[0].availability,
+        Some(SourceAvailability::Changed)
+    );
+}
+
+#[tokio::test]
+async fn context_run_projection_matches_existing_source_reader() {
+    let store = Store::open_in_memory().await.unwrap();
+    let p = project(&store).await;
+    let c = conversation(&store, p).await;
+    let run = Uuid::new_v4();
+    store
+        .save_agent_run_v4(run, p, c, "completed", &json!({}))
+        .await
+        .unwrap();
+    let first = AgentEventV4::first(
+        run,
+        p,
+        c,
+        Utc::now(),
+        AgentEventKindV4::RunCreated {
+            mode: RunModeV4::Execute,
+        },
+    );
+    let last = AgentEventV4::next(
+        &first,
+        first.occurred_at + chrono::Duration::minutes(2),
+        AgentEventKindV4::RunNeedsAttention {
+            message: "Synthetic stop".into(),
+        },
+    );
+    store.append_agent_event_v4(&first).await.unwrap();
+    store.append_agent_event_v4(&last).await.unwrap();
+    let mut saved = snapshot(p, SourceKind::Run, run.to_string());
+    saved.source.run_id = Some(run);
+    saved.source.conversation_id = Some(c);
+    let publication = save(&store, p, None, 0, saved).await;
+    let context = store
+        .workspace_publication_read_context(p, publication, 1)
+        .await
+        .unwrap();
+    let existing = store
+        .workspace_source_record(p, SourceKind::Run, &run.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(context.current_sources[0].availability, None);
+    assert_eq!(context.current_sources[0].value.as_ref(), Some(&existing));
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(existing["started_at"].as_str().unwrap()).unwrap(),
+        first.occurred_at
+    );
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(existing["last_event_at"].as_str().unwrap()).unwrap(),
+        last.occurred_at
+    );
+}
+
+#[tokio::test]
+async fn context_shared_artifact_producer_counts_scientific_bytes_once() {
+    let store = Store::open_in_memory().await.unwrap();
+    let p = project(&store).await;
+    let c = conversation(&store, p).await;
+    let run = Uuid::new_v4();
+    store
+        .save_agent_run_v4(run, p, c, "completed", &json!({}))
+        .await
+        .unwrap();
+    let analysis = Uuid::new_v4();
+    sqlx::query("INSERT INTO scientific_analyses_v4(id,project_id,status,value_json) VALUES(?,?,'completed',?)")
+        .bind(analysis.to_string()).bind(p.to_string())
+        .bind(json!({"id":analysis,"project_id":p,"run_id":run,"input_dataset_ids":[],"padding":"x".repeat(200_000)}).to_string())
+        .execute(store.pool()).await.unwrap();
+    let mut references = Vec::new();
+    for _ in 0..16 {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO scientific_artifacts_v4(id,project_id,producer_analysis_id,valid,value_json) VALUES(?,?,?,1,?)")
+            .bind(id.to_string()).bind(p.to_string()).bind(analysis.to_string())
+            .bind(json!({"id":id,"project_id":p,"producer_analysis_id":analysis,"padding":"x".repeat(200_000)}).to_string())
+            .execute(store.pool()).await.unwrap();
+        let mut reference = snapshot(p, SourceKind::Artifact, id.to_string());
+        reference.source.run_id = Some(run);
+        reference.source.conversation_id = Some(c);
+        references.push(reference);
+    }
+    let publication = store
+        .workspace_save_publication(&SavePublicationRecord {
+            request: SavePublicationRequest {
+                request_id: Uuid::new_v4(),
+                project_id: p,
+                publication_id: None,
+                expected_revision: 0,
+                title: "Shared producer".into(),
+                markdown: "Body".into(),
+                sources: references.iter().map(|item| item.source.clone()).collect(),
+            },
+            references,
+        })
+        .await
+        .unwrap()
+        .publication
+        .id;
+    let context = store
+        .workspace_publication_read_context(p, publication, 1)
+        .await
+        .unwrap();
+    assert!(!context.truncated);
+    assert_eq!(context.related_records.len(), 17);
+    assert!(
+        context
+            .current_sources
+            .iter()
+            .all(|item| item.availability.is_none() && item.value.is_some())
     );
 }
