@@ -189,14 +189,22 @@ pub(crate) fn publication_report_from_context(
         return Err(error(PublicationEvidenceErrorCodeV1::StorageReadFailed));
     }
     for saved in &revision.references {
-        let encoded = serde_json::to_string(&saved.source)
-            .map_err(|_| error(PublicationEvidenceErrorCodeV1::UnsafePublicContent))?;
         if saved.source.project_id != request.project_id
             || saved.source.id.is_empty()
             || saved.source.id.len() > 512
         {
             return Err(error(PublicationEvidenceErrorCodeV1::UnsafePublicContent));
         }
+        // Check original strings before JSON escaping can hide assignment
+        // delimiters. Findings retain these source fields verbatim.
+        for value in std::iter::once(saved.source.id.as_str())
+            .chain(saved.source.event_hash.as_deref())
+            .chain(saved.source.content_sha256.as_deref())
+        {
+            ensure_safe_public_text(value)?;
+        }
+        let encoded = serde_json::to_string(&saved.source)
+            .map_err(|_| error(PublicationEvidenceErrorCodeV1::UnsafePublicContent))?;
         ensure_safe_public_text(&encoded)?;
         ensure_safe_public_text(&saved.text)?;
         ensure_safe_public_text(&saved.title)?;
@@ -1069,6 +1077,84 @@ mod tests {
                 .unwrap()
                 .contains("do-not-echo")
         );
+    }
+
+    #[tokio::test]
+    async fn readiness_rejects_quoted_password_in_source_id_without_echo() {
+        let (store, p, _, _) = fixture().await;
+        let mut reference = source(p, SourceKind::Evidence, Uuid::new_v4());
+        reference.id = r#""password": "synthetic-password-secret""#.into();
+        let selection = save(&store, p, vec![saved(reference)]).await;
+        let result = check_publication_readiness(&store, &selection, OBSERVED).await;
+        assert!(
+            result.is_err(),
+            "quoted password source ID must be rejected"
+        );
+        let failure = result.unwrap_err();
+        assert_eq!(
+            failure.code,
+            PublicationEvidenceErrorCodeV1::UnsafePublicContent
+        );
+        assert!(
+            !serde_json::to_string(&failure)
+                .unwrap()
+                .contains("synthetic-password-secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_rejects_quoted_token_in_source_id_without_echo() {
+        let (store, p, _, _) = fixture().await;
+        let mut reference = source(p, SourceKind::Tool, Uuid::new_v4());
+        reference.id = r#""token": "synthetic-token-secret""#.into();
+        let selection = save(&store, p, vec![saved(reference)]).await;
+        let result = check_publication_readiness(&store, &selection, OBSERVED).await;
+        assert!(result.is_err(), "quoted token source ID must be rejected");
+        let failure = result.unwrap_err();
+        assert_eq!(
+            failure.code,
+            PublicationEvidenceErrorCodeV1::UnsafePublicContent
+        );
+        assert!(
+            !serde_json::to_string(&failure)
+                .unwrap()
+                .contains("synthetic-token-secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_rejects_quoted_secret_in_historical_string_selectors() {
+        let (store, p, _, _) = fixture().await;
+        let mut selection = save(&store, p, vec![]).await;
+        for (revision, field) in [(2, "event_hash"), (3, "content_sha256")] {
+            let mut reference = saved(source(p, SourceKind::Tool, Uuid::new_v4()));
+            let secret = Some(r#""password": "synthetic-selector-secret""#.to_owned());
+            if field == "event_hash" {
+                reference.source.event_hash = secret;
+            } else {
+                reference.source.content_sha256 = secret;
+            }
+            // Defensive read of a historical row that save-time hash validation
+            // would reject. Keep the exact stored revision hash for selection.
+            let content = json!({"schema_version":1,"title":"Historical","markdown":"Saved","references":[reference]}).to_string();
+            sqlx::query("INSERT INTO publication_revisions(id,publication_id,revision,content) VALUES(?,?,?,?)")
+                .bind(Uuid::new_v4().to_string()).bind(selection.publication_id.to_string()).bind(revision).bind(&content).execute(store.pool()).await.unwrap();
+            selection.revision = revision as u64;
+            selection.expected_revision_sha256 =
+                hex::encode(sha2::Sha256::digest(content.as_bytes()));
+            let result = check_publication_readiness(&store, &selection, OBSERVED).await;
+            assert!(result.is_err(), "raw {field} secret must be rejected");
+            let failure = result.unwrap_err();
+            assert_eq!(
+                failure.code,
+                PublicationEvidenceErrorCodeV1::UnsafePublicContent
+            );
+            assert!(
+                !serde_json::to_string(&failure)
+                    .unwrap()
+                    .contains("synthetic-selector-secret")
+            );
+        }
     }
 
     #[tokio::test]
