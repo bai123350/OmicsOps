@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqliteConnection, sqlite::SqliteRow};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use uuid::Uuid;
 
 const MAX_TEXT_BYTES: usize = 1_048_576;
@@ -43,6 +43,9 @@ pub struct PublicationReadContext {
     pub revision: PublicationRevision,
     pub current_sources: Vec<PublicationCurrentSource>,
     pub related_records: Vec<PublicationRelatedRecord>,
+    /// Only explicitly reached V4 runs, observed in this same transaction.
+    /// `None` means no project-owned run; legacy artifact runs are excluded.
+    pub run_conversations: BTreeMap<Uuid, Option<Uuid>>,
     pub scientific_revision: Option<u64>,
     pub scientific_state_sha256: Option<String>,
     pub truncated: bool,
@@ -408,11 +411,57 @@ impl Store {
             remaining.sort();
             queue.extend(remaining);
         }
+        let mut runs = BTreeSet::new();
+        for current in &current_sources {
+            if let Some(value) = &current.value {
+                let key = match current.source.kind {
+                    SourceKind::Run => Some("id"),
+                    SourceKind::Analysis | SourceKind::Provenance => Some("run_id"),
+                    _ => None,
+                };
+                if let Some(run) = key
+                    .and_then(|key| value.get(key))
+                    .and_then(Value::as_str)
+                    .and_then(|run| Uuid::parse_str(run).ok())
+                {
+                    runs.insert(run);
+                }
+            }
+        }
+        for record in &related_records {
+            if matches!(record.kind, SourceKind::Analysis | SourceKind::Provenance) {
+                if let Some(run) = record
+                    .value
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .and_then(|run| Uuid::parse_str(run).ok())
+                {
+                    runs.insert(run);
+                }
+            }
+        }
+        let mut run_conversations = BTreeMap::new();
+        for run in runs {
+            let conversation: Option<String> = sqlx::query_scalar(
+                "SELECT conversation_id FROM agent_runs_v4 WHERE project_id=? AND run_id=?",
+            )
+            .bind(project_id.to_string())
+            .bind(run.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+            run_conversations.insert(
+                run,
+                conversation
+                    .map(|id| Uuid::parse_str(&id).map_err(|_| invalid("invalid run conversation")))
+                    .transpose()?,
+            );
+        }
         tx.commit().await?;
         Ok(PublicationReadContext {
             revision: selected,
             current_sources,
             related_records,
+            run_conversations,
             scientific_revision,
             scientific_state_sha256,
             truncated,

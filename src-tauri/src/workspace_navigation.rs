@@ -20,7 +20,7 @@ use crate::{commands::AppState, composer_references::public_text};
 const MAX_SNAPSHOT_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
-enum SourceError {
+pub(crate) enum SourceError {
     Missing,
     Changed,
     Invalid(&'static str),
@@ -122,7 +122,7 @@ fn snapshot(
     })
 }
 
-fn message_snapshot(
+pub(crate) fn message_snapshot(
     source: &WorkspaceSourceRef,
     message: &Message,
 ) -> Result<WorkspaceSourceSnapshot, SourceError> {
@@ -171,7 +171,7 @@ fn message_snapshot(
     )
 }
 
-fn tool_snapshot(
+pub(crate) fn tool_snapshot(
     source: &WorkspaceSourceRef,
     event: &AgentEventV4,
 ) -> Result<WorkspaceSourceSnapshot, SourceError> {
@@ -270,7 +270,7 @@ fn uuid_field(record: &Value, key: &str) -> Option<Uuid> {
     Uuid::parse_str(text_field(record, key)).ok()
 }
 
-async fn resolve_source(
+pub(crate) async fn resolve_source(
     repository: &Store,
     source: &WorkspaceSourceRef,
 ) -> Result<WorkspaceSourceSnapshot, SourceError> {
@@ -326,7 +326,7 @@ async fn resolve_source(
             "record source cannot include message or event selectors",
         ));
     }
-    let mut record = repository
+    let record = repository
         .workspace_source_record(source.project_id, source.kind, &source.id)
         .await
         .map_err(|_| SourceError::Unavailable)?
@@ -336,6 +336,50 @@ async fn resolve_source(
     {
         return Err(SourceError::Invalid("record owner mismatch"));
     }
+    let producer = if source.kind == SourceKind::Artifact {
+        repository
+            .workspace_source_record(
+                source.project_id,
+                SourceKind::Analysis,
+                text_field(&record, "producer_analysis_id"),
+            )
+            .await
+            .map_err(|_| SourceError::Unavailable)?
+    } else {
+        None
+    };
+    let run = record_run_id(source.kind, &record, producer.as_ref());
+    let conversation = if let Some(run) = run {
+        repository
+            .workspace_run_conversation(source.project_id, run)
+            .await
+            .map_err(|_| SourceError::Unavailable)?
+    } else {
+        None
+    };
+    record_snapshot(source, record, producer.as_ref(), conversation, true)
+}
+
+pub(crate) fn record_run_id(
+    kind: SourceKind,
+    record: &Value,
+    producer: Option<&Value>,
+) -> Option<Uuid> {
+    match kind {
+        SourceKind::Run => uuid_field(record, "id"),
+        SourceKind::Artifact => producer.and_then(|value| uuid_field(value, "run_id")),
+        SourceKind::Analysis | SourceKind::Provenance => uuid_field(record, "run_id"),
+        _ => None,
+    }
+}
+
+pub(crate) fn record_snapshot(
+    source: &WorkspaceSourceRef,
+    mut record: Value,
+    producer: Option<&Value>,
+    conversation: Option<Uuid>,
+    validate_associations: bool,
+) -> Result<WorkspaceSourceSnapshot, SourceError> {
     let mut run_id = if source.kind == SourceKind::Run {
         Uuid::parse_str(&source.id).ok()
     } else {
@@ -357,12 +401,7 @@ async fn resolve_source(
             text_field(&record, "status").to_owned(),
         ),
         SourceKind::Artifact => {
-            let producer = text_field(&record, "producer_analysis_id");
-            if let Some(analysis) = repository
-                .workspace_source_record(source.project_id, SourceKind::Analysis, producer)
-                .await
-                .map_err(|_| SourceError::Unavailable)?
-            {
+            if let Some(analysis) = producer {
                 run_id = uuid_field(&analysis, "run_id");
                 // Historical producer identity; deliberately never consult current SSH/project binding.
                 metadata.insert(
@@ -453,16 +492,9 @@ async fn resolve_source(
         SourceKind::Run => ("Agent run".into(), text_field(&record, "status").to_owned()),
         _ => return Err(SourceError::Invalid("unsupported source")),
     };
-    let conversation = if let Some(run) = run_id {
-        repository
-            .workspace_run_conversation(source.project_id, run)
-            .await
-            .map_err(|_| SourceError::Unavailable)?
-    } else {
-        None
-    };
-    if source.run_id.is_some() && source.run_id != run_id
-        || source.conversation_id.is_some() && source.conversation_id != conversation
+    if validate_associations
+        && (source.run_id.is_some() && source.run_id != run_id
+            || source.conversation_id.is_some() && source.conversation_id != conversation)
     {
         return Err(SourceError::Invalid(
             "record run or conversation association mismatch",
@@ -485,7 +517,7 @@ async fn refresh_snapshot(repository: &Store, saved: &mut WorkspaceSourceSnapsho
     saved.availability = source_availability(saved, &current);
 }
 
-fn source_availability(
+pub(crate) fn source_availability(
     saved: &WorkspaceSourceSnapshot,
     current: &Result<WorkspaceSourceSnapshot, SourceError>,
 ) -> SourceAvailability {

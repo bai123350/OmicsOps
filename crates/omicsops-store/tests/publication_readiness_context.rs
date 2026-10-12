@@ -83,6 +83,58 @@ async fn save(
 }
 
 #[tokio::test]
+async fn context_records_project_owned_run_conversations_without_selectors() {
+    let store = Store::open_in_memory().await.unwrap();
+    let p = project(&store).await;
+    let c = conversation(&store, p).await;
+    let run = Uuid::new_v4();
+    store
+        .save_agent_run_v4(run, p, c, "needs_attention", &json!({}))
+        .await
+        .unwrap();
+    let analysis = Uuid::new_v4();
+    sqlx::query("INSERT INTO scientific_analyses_v4(id,project_id,status,value_json) VALUES(?,?,'succeeded',?)")
+        .bind(analysis.to_string()).bind(p.to_string())
+        .bind(json!({"id":analysis,"project_id":p,"run_id":run}).to_string()).execute(store.pool()).await.unwrap();
+    let publication = save(
+        &store,
+        p,
+        None,
+        0,
+        snapshot(p, SourceKind::Analysis, analysis.to_string()),
+    )
+    .await;
+    let context = store
+        .workspace_publication_read_context(p, publication, 1)
+        .await
+        .unwrap();
+    assert_eq!(context.run_conversations.get(&run), Some(&Some(c)));
+    let foreign = project(&store).await;
+    sqlx::query("UPDATE agent_runs_v4 SET project_id=? WHERE run_id=?")
+        .bind(foreign.to_string())
+        .bind(run.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let context = store
+        .workspace_publication_read_context(p, publication, 1)
+        .await
+        .unwrap();
+    assert_eq!(context.run_conversations.get(&run), Some(&None));
+    assert_eq!(context.related_records[0].run_owner_verified, Some(false));
+    sqlx::query("DELETE FROM agent_runs_v4 WHERE run_id=?")
+        .bind(run.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let context = store
+        .workspace_publication_read_context(p, publication, 1)
+        .await
+        .unwrap();
+    assert_eq!(context.run_conversations.get(&run), Some(&None));
+}
+
+#[tokio::test]
 async fn context_keeps_missing_snapshot() {
     let store = Store::open_in_memory().await.unwrap();
     let p = project(&store).await;

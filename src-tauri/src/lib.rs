@@ -68,6 +68,7 @@ pub mod sync_commands;
 pub mod usage_settings;
 pub mod workspace_commands;
 pub mod workspace_navigation;
+pub mod workspace_publication_evidence;
 
 use commands::AppState;
 use omicsops_adapters::credentials::SystemCredentialVault;
@@ -342,6 +343,7 @@ pub fn run() {
             workspace_navigation::workspace_source_detail,
             workspace_navigation::workspace_list_publications,
             workspace_navigation::workspace_get_publication,
+            workspace_publication_evidence::workspace_check_publication_readiness,
             workspace_navigation::workspace_save_publication,
             workspace_navigation::workspace_restore_publication,
             workspace_navigation::workspace_export_publication,
