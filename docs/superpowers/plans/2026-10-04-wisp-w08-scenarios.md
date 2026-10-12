@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust cargo unit tests、serde/serde_json、Tokio test-util、dev SHA-256/hex、Windows CI。Python Skill helper 有独立计划，此 runner 不调用 Python。
 
-**Spec:** [W08 Runtime 设计](../specs/2026-10-04-wisp-runtime-design.md#w08manifest-驱动的离线-v4-场景与稳定报告)，已审阅设计提交 `161199f`。Task1 manifest/parser/hash 已实现并独立审阅；Task2 runner 和 Task3 报告/CI 待实施。
+**Spec:** [W08 Runtime 设计](../specs/2026-10-04-wisp-runtime-design.md#w08manifest-驱动的离线-v4-场景与稳定报告)，已审阅设计提交 `161199f`。Task1 manifest/parser/hash 与 Task2 五场景 runner 已实现并独立审阅；Task3 报告/CI 待实施。
 
 ## Global Constraints
 
@@ -66,7 +66,7 @@ assert_eq!(parse_suite(&duplicate_id).unwrap_err(), ManifestErrorCodeV4::Duplica
 - Produces：`ScenarioOutcomeV4 { id: String, status: ScenarioStatusV4, model_attempts: u64, tool_proposals: u64, tool_dispatches: u64, recovered_outcomes: u64, assertions_passed: u64, assertions_failed: u64, failure_reason_code: Option<ScenarioFailureCodeV4> }`。SuiteReport 为 schema_version/suite_id/suite_hash/runner_contract_version/passed/failed/scenarios。
 - Consumes：Task 1 `ScenarioAssertionV4` 全部白名单；Produces assertion evaluator 和失败码 AssertionFailed/ScriptExhausted/UnusedScript/InvalidFixture/CoreRejected。报告不接收 raw error 字符串。
 
-- [ ] **RED 写测试**：`scenarios_run_all_five_and_measure_actual_dispatch`、`scenarios_continue_after_failure_and_require_exact_script_consumption`、`scenario_fault_injections_break_expected_assertions`、`scenario_report_omits_sensitive_payloads`。
+- [x] **RED 写测试**：`scenarios_run_all_five_and_measure_actual_dispatch`、`scenarios_continue_after_failure_and_require_exact_script_consumption`、`scenario_fault_injections_break_expected_assertions`、`scenario_report_omits_sensitive_payloads`。
 
 ```rust
 assert_eq!(report.scenarios.len(), 5);
@@ -78,16 +78,16 @@ assert!(source_read_back_verified);
 assert!(!serialized_report.contains(secret_sentinel));
 ```
 
-- [ ] **RED 运行**：`cargo test -p omicsops-agent-core scenario_evaluation::scenarios`；`cargo test -p omicsops-agent-core scenario_evaluation::scenario_fault`。预期 runner/计数/行为失败。
-- [ ] **实现接口**：
+- [x] **RED 运行**：`cargo test -p omicsops-agent-core scenario_evaluation::scenarios`；`cargo test -p omicsops-agent-core scenario_evaluation::scenario_fault`。预期 runner/计数/行为失败。
+- [x] **实现接口**：
   - ReadEvidence：seed 真正已签名证据，从 sequence/hash 取回并验证，损坏/跨 scope 拒绝；无数据的计划不能作为完成证据。
   - DenyApproval：先 core 等待审批，再以正确 scope 写 Denied 并 resume；实际 execute 为 0，capability 不扩大。
   - RecoverUncertain：载入无确认的副作用 dispatch，零重派；独立已完成 receipt fixture recover/reuse 恰一次，未知仍 Attention。
   - CorrectMcpArguments：typed fake preflight 首次返回参数错误且零 dispatch；更正调用成功，core 对 preflight/business 分类与发现目录去重按现有行为断言。此项证明 core 对宿主结果的响应，真实 MCP 参数校验仍由 host tests 负责。
   - CompactPreserveSources：schema 大/context 小触发完整预算，checkpoint/source引用和 guidance/frozen boundary 可取回；不依赖 W05 未实现接口，也不宣称 MemoryStore 证明事务原子性。
   使用 Tokio 虚拟时间，无耗时阈值；场景返回 typed failure 而非提前 panic。错误注入仅在 test seam 修改观测/fixture，不改 production 代码。
-- [ ] **GREEN**：重复 RED；`cargo test -p omicsops-agent-core scenario_evaluation -- --nocapture`。预期五场景通过，故障注入测试确认对应断言失败后自身通过，剩余脚本必失败。
-- [ ] **Commit**：仅暂存本任务文件，`git commit -m "test(agent): run deterministic V4 behavior scenarios"`。
+- [x] **GREEN**：重复 RED；`cargo test -p omicsops-agent-core scenario_evaluation -- --nocapture`。预期五场景通过，故障注入测试确认对应断言失败后自身通过，剩余脚本必失败。
+- [x] **Commit**：仅暂存本任务文件，`git commit -m "test(agent): run deterministic V4 behavior scenarios"`。
 
 ### Task 3: 安全报告、非零失败与 Windows CI
 
@@ -118,3 +118,5 @@ assert!(!failed_report_json.contains(raw_provider_error));
 五场景、manifest/hash、脚本严格消费、故障注入、计数和安全报告/CI 分别绑定 Task 1–3；Review Focus 全有具名测试。无新增 CLI/product API/DTO/DB，report/upload 与 helper plan 的文件责任已协调。没有完整框架/实现 body，所有片段是最小断言；RED/GREEN/commit 仍未执行。
 
 2026-10-11：Task1 `c1f348e..a500df7` 独立完整审阅 Spec compliant / Approved；manifest 3、core 226 通过，fmt/diff通过。canonical LF/key/ID、完整payload和fixture hash、固定错误码均已覆盖；既有sha2复用，仅增加现有hex dev锁边。shared working source测试不替代最终clean-HEAD；Windows路径/cache警告留最终验证。累计33/50 SOURCE任务审阅完成，runner/report与真实模型/SSH/GUI仍未由此证明。
+
+2026-10-12：Task2 `6f05b71..9711ef6` 独立完整审阅 Spec compliant / Approved；五场景真实 core 控制行为、直接调用计数、严格脚本消费、安全稳定报告类型和故障断言已实现。scenario 9/core 232通过，0 ignored，fmt/diff通过；初始 fmt 权限失败及通过的审批重试原始记录保留。固定 fixture 身份耦合和 Cargo/cache warnings 作为 Minor 留最终审阅；7个外部文件原始字节不变。累计34/50 SOURCE，报告写入/非零/CI仍待Task3，clean-HEAD与真实模型/SSH/GUI不由此证明。
