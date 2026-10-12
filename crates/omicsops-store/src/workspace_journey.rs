@@ -5,8 +5,280 @@ use omicsops_core::workspace::{Conversation, Message};
 use omicsops_dto::{JourneyEntry, JourneyPage, JourneyRequest, SourceKind, WorkspaceSourceRef};
 use omicsops_protocol::AgentEventV4;
 use serde_json::{Value, json};
-use sqlx::Row;
+use sqlx::{Row, Sqlite, Transaction};
 use uuid::Uuid;
+
+fn scientific_table(kind: SourceKind) -> Option<&'static str> {
+    match kind {
+        SourceKind::Dataset => Some("scientific_datasets_v4"),
+        SourceKind::Analysis => Some("scientific_analyses_v4"),
+        SourceKind::Artifact => Some("scientific_artifacts_v4"),
+        SourceKind::Evidence => Some("scientific_evidence_v4"),
+        SourceKind::Provenance => Some("scientific_provenance_v4"),
+        _ => None,
+    }
+}
+
+/// Transaction-aware scientific row reader: length is checked before fetching
+/// or deserializing payload. The table is selected exclusively from this module's allowlist.
+pub(crate) async fn bounded_scientific_value(
+    tx: &mut Transaction<'_, Sqlite>,
+    project: Uuid,
+    kind: SourceKind,
+    id: &str,
+    bytes: &mut i64,
+    truncated: &mut bool,
+) -> Result<Option<Value>, StoreError> {
+    let table = scientific_table(kind)
+        .ok_or_else(|| StoreError::InvalidInput("not a scientific source kind".into()))?;
+    let length_sql =
+        format!("SELECT length(CAST(value_json AS BLOB)) FROM {table} WHERE project_id=? AND id=?");
+    let length: Option<i64> = sqlx::query_scalar(&length_sql)
+        .bind(project.to_string())
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let Some(length) = length else {
+        return Ok(None);
+    };
+    if length > 262_144 || *bytes + length > 4_194_304 {
+        *truncated = true;
+        return Ok(None);
+    }
+    let sql = format!("SELECT value_json FROM {table} WHERE project_id=? AND id=?");
+    let json: String = sqlx::query_scalar(&sql)
+        .bind(project.to_string())
+        .bind(id)
+        .fetch_one(&mut **tx)
+        .await?;
+    // Rows cannot change within this SQLite read transaction; retain a defense
+    // against malformed lengths or a future query rewrite.
+    if json.len() as i64 > 262_144 || *bytes + json.len() as i64 > 4_194_304 {
+        *truncated = true;
+        return Ok(None);
+    }
+    let value: Value = serde_json::from_str(&json)?;
+    if value.get("project_id").and_then(Value::as_str) != Some(project.to_string().as_str())
+        || value.get("id").and_then(Value::as_str) != Some(id)
+    {
+        return Err(StoreError::InvalidInput(
+            "scientific record owner mismatch".into(),
+        ));
+    }
+    *bytes += json.len() as i64;
+    Ok(Some(value))
+}
+
+/// Discover manifests only through a known analysis and its recorded run.
+/// The bounded ID query never deserializes arbitrary project records.
+pub(crate) async fn provenance_ids_for_analysis(
+    tx: &mut Transaction<'_, Sqlite>,
+    project: Uuid,
+    analysis: Uuid,
+    run: Option<&str>,
+    truncated: &mut bool,
+) -> Result<Vec<Uuid>, StoreError> {
+    let rows = sqlx::query("SELECT id FROM scientific_provenance_v4 WHERE project_id=? AND (analysis_id=? OR run_id=?) ORDER BY id LIMIT 65")
+        .bind(project.to_string()).bind(analysis.to_string()).bind(run.unwrap_or(""))
+        .fetch_all(&mut **tx).await?;
+    if rows.len() > 64 {
+        *truncated = true;
+    }
+    rows.into_iter()
+        .take(64)
+        .map(|row| {
+            let id: String = row.try_get("id")?;
+            Uuid::parse_str(&id)
+                .map_err(|_| StoreError::InvalidInput("invalid provenance identifier".into()))
+        })
+        .collect()
+}
+
+/// Raw current source projection for a saved reference. This validates project,
+/// conversation, run and event sequence in the same transaction as its caller.
+pub(crate) async fn publication_source_value(
+    tx: &mut Transaction<'_, Sqlite>,
+    project: Uuid,
+    source: &WorkspaceSourceRef,
+    bytes: &mut i64,
+    truncated: &mut bool,
+) -> Result<Option<Value>, StoreError> {
+    if source.project_id != project || source.id.is_empty() || source.id.len() > 512 {
+        return Err(StoreError::InvalidInput(
+            "saved source scope is invalid".into(),
+        ));
+    }
+    if let Some(conversation) = source.conversation_id {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conversation_records WHERE project_id=? AND frame_id=?)",
+        )
+        .bind(project.to_string())
+        .bind(conversation.to_string())
+        .fetch_one(&mut **tx)
+        .await?;
+        if !exists {
+            return Ok(None);
+        }
+    }
+    if let Some(run) = source
+        .run_id
+        .filter(|_| source.kind != SourceKind::LegacyArtifact)
+    {
+        let conversation: Option<String> = sqlx::query_scalar(
+            "SELECT conversation_id FROM agent_runs_v4 WHERE project_id=? AND run_id=?",
+        )
+        .bind(project.to_string())
+        .bind(run.to_string())
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(conversation) = conversation else {
+            return Ok(None);
+        };
+        if source
+            .conversation_id
+            .is_some_and(|id| id.to_string() != conversation)
+        {
+            return Ok(None);
+        }
+    }
+    match source.kind {
+        SourceKind::Message => {
+            if source.run_id.is_some() || source.sequence.is_some() || source.event_hash.is_some() {
+                return Ok(None);
+            }
+            let row = sqlx::query("SELECT id,project_id,conversation_id,seq,role,content,ts,project_id FROM messages WHERE project_id=? AND id=?")
+                .bind(project.to_string()).bind(&source.id).fetch_optional(&mut **tx).await?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            if source.conversation_id.is_some_and(|id| {
+                row.try_get::<String, _>("conversation_id").ok().as_deref()
+                    != Some(id.to_string().as_str())
+            }) {
+                return Ok(None);
+            }
+            Ok(Some(serde_json::to_value(crate::message_from_row(row)?)?))
+        }
+        SourceKind::Tool => {
+            let (Some(run), Some(sequence)) = (source.run_id, source.sequence) else {
+                return Ok(None);
+            };
+            let sequence = i64::try_from(sequence)
+                .map_err(|_| StoreError::InvalidInput("event sequence is too large".into()))?;
+            let row = sqlx::query("SELECT e.value_json,e.event_hash,e.conversation_id FROM agent_events_v4 e JOIN agent_runs_v4 r ON r.run_id=e.run_id AND r.project_id=e.project_id AND r.conversation_id=e.conversation_id WHERE e.project_id=? AND e.run_id=? AND e.sequence=?")
+                .bind(project.to_string()).bind(run.to_string()).bind(sequence).fetch_optional(&mut **tx).await?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            if source.event_hash.as_deref().is_some_and(|hash| {
+                row.try_get::<String, _>("event_hash").ok().as_deref() != Some(hash)
+            }) {
+                return Ok(None);
+            }
+            if source.conversation_id.is_some_and(|id| {
+                row.try_get::<String, _>("conversation_id").ok().as_deref()
+                    != Some(id.to_string().as_str())
+            }) {
+                return Ok(None);
+            }
+            let json: String = row.try_get("value_json")?;
+            if json.len() > 262_144 {
+                *truncated = true;
+                return Ok(None);
+            }
+            Ok(Some(serde_json::from_str(&json)?))
+        }
+        SourceKind::Run => {
+            if source.run_id.is_some_and(|id| id.to_string() != source.id) {
+                return Ok(None);
+            }
+            let row = sqlx::query("SELECT run_id,project_id,conversation_id,status FROM agent_runs_v4 WHERE project_id=? AND run_id=?")
+                .bind(project.to_string()).bind(&source.id).fetch_optional(&mut **tx).await?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            if source.conversation_id.is_some_and(|id| {
+                row.try_get::<String, _>("conversation_id").ok().as_deref()
+                    != Some(id.to_string().as_str())
+            }) {
+                return Ok(None);
+            }
+            Ok(Some(
+                json!({"id":row.try_get::<String,_>("run_id")?,"project_id":project,"conversation_id":row.try_get::<String,_>("conversation_id")?,"status":row.try_get::<String,_>("status")?}),
+            ))
+        }
+        SourceKind::LegacyArtifact => {
+            let row = sqlx::query("SELECT id,project_id,source_run_id,filename,remote_path,content_type,size_bytes,sha256,verified,created_at FROM artifacts WHERE project_id=? AND id=?")
+                .bind(project.to_string()).bind(&source.id).fetch_optional(&mut **tx).await?;
+            row.map(|row| Ok(serde_json::to_value(crate::artifact_from_row(row)?)?))
+                .transpose()
+        }
+        kind if scientific_table(kind).is_some() => {
+            if source.sequence.is_some()
+                || source.event_hash.is_some()
+                || source.start.is_some()
+                || source.end.is_some()
+                || source.content_sha256.is_some()
+            {
+                return Ok(None);
+            }
+            let value =
+                bounded_scientific_value(tx, project, kind, &source.id, bytes, truncated).await?;
+            let Some(value) = value else {
+                return Ok(None);
+            };
+            let derived_run = match kind {
+                SourceKind::Analysis | SourceKind::Provenance => value
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                SourceKind::Artifact
+                    if source.run_id.is_some() || source.conversation_id.is_some() =>
+                {
+                    let producer = value
+                        .get("producer_analysis_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let producer_value = bounded_scientific_value(
+                        tx,
+                        project,
+                        SourceKind::Analysis,
+                        producer,
+                        bytes,
+                        truncated,
+                    )
+                    .await?;
+                    producer_value
+                        .and_then(|v| v.get("run_id").and_then(Value::as_str).map(str::to_owned))
+                }
+                _ => None,
+            };
+            if source
+                .run_id
+                .is_some_and(|id| derived_run.as_deref() != Some(id.to_string().as_str()))
+            {
+                return Ok(None);
+            }
+            if let Some(conversation) = source.conversation_id {
+                let Some(run) = derived_run else {
+                    return Ok(None);
+                };
+                let owner: Option<String> = sqlx::query_scalar(
+                    "SELECT conversation_id FROM agent_runs_v4 WHERE project_id=? AND run_id=?",
+                )
+                .bind(project.to_string())
+                .bind(run)
+                .fetch_optional(&mut **tx)
+                .await?;
+                if owner.as_deref() != Some(conversation.to_string().as_str()) {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(value))
+        }
+        _ => Ok(None),
+    }
+}
 
 impl Store {
     pub async fn workspace_source_conversation(

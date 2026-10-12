@@ -33,6 +33,12 @@ pub use subscription_models::*;
 mod workspace_navigation;
 pub use workspace_navigation::*;
 
+mod workspace_files;
+pub use workspace_files::*;
+
+mod publication_evidence;
+pub use publication_evidence::*;
+
 mod runtime_boundary;
 pub use runtime_boundary::*;
 

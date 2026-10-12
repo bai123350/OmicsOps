@@ -4,8 +4,10 @@ use chrono::{DateTime, Utc};
 use omicsops_core::redaction::redact_secrets;
 use omicsops_dto::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqliteConnection, sqlite::SqliteRow};
+use std::collections::{BTreeSet, VecDeque};
 use uuid::Uuid;
 
 const MAX_TEXT_BYTES: usize = 1_048_576;
@@ -13,6 +15,36 @@ const MAX_SNAPSHOT_BYTES: usize = 262_144;
 const MAX_REFERENCES: usize = 32;
 const MAX_HISTORY_REVISIONS: i64 = 1_000;
 const MAX_HISTORY_BYTES: i64 = 16_777_216;
+const MAX_SCIENTIFIC_RECORDS: usize = 64;
+const MAX_SCIENTIFIC_DEPTH: u8 = 4;
+
+/// A Store-owned raw projection. `None` availability means the row was found;
+/// the host must derive public text and compare it with the saved snapshot.
+#[derive(Debug, Clone)]
+pub struct PublicationCurrentSource {
+    pub source: WorkspaceSourceRef,
+    pub value: Option<Value>,
+    pub availability: Option<SourceAvailability>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublicationRelatedRecord {
+    pub kind: SourceKind,
+    pub id: Uuid,
+    pub value: Value,
+    /// Analysis/provenance run association, verified against a project-owned run.
+    pub run_owner_verified: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublicationReadContext {
+    pub revision: PublicationRevision,
+    pub current_sources: Vec<PublicationCurrentSource>,
+    pub related_records: Vec<PublicationRelatedRecord>,
+    pub scientific_revision: Option<u64>,
+    pub scientific_state_sha256: Option<String>,
+    pub truncated: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct SavePublicationRecord {
@@ -182,6 +214,203 @@ impl Store {
         let detail = publication_detail(&mut tx, project_id, publication_id, None).await?;
         tx.commit().await?;
         Ok(detail)
+    }
+
+    /// Observe exactly one saved revision and its bounded, project-owned sources.
+    /// All database reads share the same deferred read transaction.
+    pub async fn workspace_publication_read_context(
+        &self,
+        project_id: Uuid,
+        publication_id: Uuid,
+        revision: u64,
+    ) -> Result<PublicationReadContext, StoreError> {
+        let revision_number =
+            i64::try_from(revision).map_err(|_| invalid("invalid publication revision"))?;
+        let mut tx = self.pool.begin().await?;
+        let publication_row = sqlx::query("SELECT p.*,COALESCE((SELECT MAX(revision) FROM publication_revisions WHERE publication_id=p.id),0) AS revision FROM publications p WHERE p.id=? AND p.project_id=?")
+            .bind(publication_id.to_string()).bind(project_id.to_string())
+            .fetch_optional(&mut *tx).await?.ok_or_else(|| invalid("publication not found in project"))?;
+        let publication = publication_summary_from_row(&publication_row)?;
+        let content_bytes: Option<i64> = sqlx::query_scalar("SELECT length(CAST(content AS BLOB)) FROM publication_revisions WHERE publication_id=? AND revision=?")
+            .bind(publication_id.to_string()).bind(revision_number)
+            .fetch_optional(&mut *tx).await?;
+        let content_bytes =
+            content_bytes.ok_or_else(|| invalid("publication revision not found"))?;
+        if content_bytes > (MAX_TEXT_BYTES * 2) as i64 {
+            return Err(invalid("publication revision exceeds safe size"));
+        }
+        let row = sqlx::query("SELECT r.id,r.revision,r.content,r.created_at,l.title AS legacy_title FROM publication_revisions r LEFT JOIN publication_legacy_titles l ON l.revision_id=r.id WHERE r.publication_id=? AND r.revision=?")
+            .bind(publication_id.to_string()).bind(revision_number)
+            .fetch_one(&mut *tx).await?;
+        let content: String = row.try_get("content")?;
+        let structured = serde_json::from_str::<PublicationContent>(&content)
+            .ok()
+            .filter(|body| body.schema_version == 1);
+        let (title, markdown, references, legacy) = match structured {
+            Some(body) => (body.title, body.markdown, body.references, false),
+            None => (
+                row.try_get::<Option<String>, _>("legacy_title")?
+                    .unwrap_or(publication.title),
+                public_text(&content),
+                vec![],
+                true,
+            ),
+        };
+        if references.len() > MAX_REFERENCES {
+            return Err(invalid("publication references exceed safe limit"));
+        }
+        let selected = PublicationRevision {
+            id: row_uuid(&row, "id")?,
+            publication_id,
+            revision,
+            title: public_text(&title),
+            markdown,
+            references,
+            sha256: hash(&content),
+            created_at: timestamp(row.try_get("created_at")?)?,
+            legacy,
+        };
+        let header = sqlx::query(
+            "SELECT revision,state_sha256 FROM scientific_states_v4 WHERE project_id=?",
+        )
+        .bind(project_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (scientific_revision, scientific_state_sha256) = match header {
+            Some(row) => (
+                Some(
+                    u64::try_from(row.try_get::<i64, _>("revision")?)
+                        .map_err(|_| invalid("invalid scientific revision"))?,
+                ),
+                Some(row.try_get("state_sha256")?),
+            ),
+            None => (None, None),
+        };
+        let mut current_sources = Vec::with_capacity(selected.references.len());
+        let mut pending = BTreeSet::new();
+        let mut truncated = false;
+        let mut science_bytes = 0_i64;
+        for saved in &selected.references {
+            let source = &saved.source;
+            if source.project_id != project_id {
+                return Err(invalid("saved source owner mismatch"));
+            }
+            let mut source_truncated = false;
+            let value = crate::workspace_journey::publication_source_value(
+                &mut tx,
+                project_id,
+                source,
+                &mut science_bytes,
+                &mut source_truncated,
+            )
+            .await?;
+            truncated |= source_truncated;
+            let availability = if value.is_some() {
+                None
+            } else if source_truncated {
+                Some(SourceAvailability::Unavailable)
+            } else {
+                Some(SourceAvailability::Missing)
+            };
+            if value.is_some() && scientific_table(source.kind).is_some() {
+                if let Ok(id) = Uuid::parse_str(&source.id) {
+                    pending.insert((science_key(source.kind), id, 0_u8));
+                }
+            }
+            current_sources.push(PublicationCurrentSource {
+                source: source.clone(),
+                value,
+                availability,
+            });
+        }
+        let mut seen = BTreeSet::new();
+        let mut related_records = Vec::new();
+        let mut queue: VecDeque<_> = pending.into_iter().collect();
+        while let Some((kind_key, id, depth)) = queue.pop_front() {
+            if !seen.insert((kind_key, id)) {
+                continue;
+            }
+            if related_records.len() >= MAX_SCIENTIFIC_RECORDS {
+                truncated = true;
+                break;
+            }
+            let kind = scientific_kind(kind_key);
+            let value = if let Some(current) = current_sources
+                .iter()
+                .find(|item| item.source.kind == kind && item.source.id == id.to_string())
+            {
+                current.value.clone()
+            } else {
+                crate::workspace_journey::bounded_scientific_value(
+                    &mut tx,
+                    project_id,
+                    kind,
+                    &id.to_string(),
+                    &mut science_bytes,
+                    &mut truncated,
+                )
+                .await?
+            };
+            let Some(value) = value else {
+                continue;
+            };
+            for next in science_lineage(kind, &value) {
+                if depth < MAX_SCIENTIFIC_DEPTH {
+                    queue.push_back((science_key(next.0), next.1, depth + 1));
+                } else {
+                    truncated = true;
+                }
+            }
+            if kind == SourceKind::Analysis {
+                let linked = crate::workspace_journey::provenance_ids_for_analysis(
+                    &mut tx,
+                    project_id,
+                    id,
+                    value.get("run_id").and_then(Value::as_str),
+                    &mut truncated,
+                )
+                .await?;
+                for manifest in linked {
+                    if depth < MAX_SCIENTIFIC_DEPTH {
+                        queue.push_back((science_key(SourceKind::Provenance), manifest, depth + 1));
+                    } else {
+                        truncated = true;
+                    }
+                }
+            }
+            let run_owner_verified =
+                if matches!(kind, SourceKind::Analysis | SourceKind::Provenance) {
+                    let run = value.get("run_id").and_then(Value::as_str).unwrap_or("");
+                    let exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM agent_runs_v4 WHERE project_id=? AND run_id=?)",
+                )
+                .bind(project_id.to_string())
+                .bind(run)
+                .fetch_one(&mut *tx)
+                .await?;
+                    Some(exists)
+                } else {
+                    None
+                };
+            related_records.push(PublicationRelatedRecord {
+                kind,
+                id,
+                value,
+                run_owner_verified,
+            });
+            let mut remaining: Vec<_> = queue.drain(..).collect();
+            remaining.sort();
+            queue.extend(remaining);
+        }
+        tx.commit().await?;
+        Ok(PublicationReadContext {
+            revision: selected,
+            current_sources,
+            related_records,
+            scientific_revision,
+            scientific_state_sha256,
+            truncated,
+        })
     }
 
     /// Replay before source resolution: a source may disappear after commit.
@@ -716,6 +945,78 @@ fn publication_summary_from_row(row: &SqliteRow) -> Result<PublicationSummary, S
             .map_err(|_| invalid("invalid publication revision"))?,
         updated_at: timestamp(row.try_get("updated_at")?)?,
     })
+}
+
+fn scientific_table(kind: SourceKind) -> Option<&'static str> {
+    match kind {
+        SourceKind::Dataset => Some("scientific_datasets_v4"),
+        SourceKind::Analysis => Some("scientific_analyses_v4"),
+        SourceKind::Artifact => Some("scientific_artifacts_v4"),
+        SourceKind::Evidence => Some("scientific_evidence_v4"),
+        SourceKind::Provenance => Some("scientific_provenance_v4"),
+        _ => None,
+    }
+}
+fn science_key(kind: SourceKind) -> u8 {
+    match kind {
+        SourceKind::Dataset => 0,
+        SourceKind::Analysis => 1,
+        SourceKind::Artifact => 2,
+        SourceKind::Evidence => 3,
+        SourceKind::Provenance => 4,
+        _ => 255,
+    }
+}
+fn scientific_kind(key: u8) -> SourceKind {
+    match key {
+        0 => SourceKind::Dataset,
+        1 => SourceKind::Analysis,
+        2 => SourceKind::Artifact,
+        3 => SourceKind::Evidence,
+        4 => SourceKind::Provenance,
+        _ => unreachable!("science queue contains allowlisted kinds"),
+    }
+}
+fn science_lineage(kind: SourceKind, value: &Value) -> Vec<(SourceKind, Uuid)> {
+    let mut links = Vec::new();
+    let mut push = |kind, id: Option<&str>| {
+        if let Some(id) = id.and_then(|text| Uuid::parse_str(text).ok()) {
+            links.push((kind, id));
+        }
+    };
+    match kind {
+        SourceKind::Evidence => {
+            if let Some(sources) = value.get("sources").and_then(Value::as_array) {
+                for source in sources {
+                    if source.get("kind").and_then(Value::as_str) == Some("artifact") {
+                        push(
+                            SourceKind::Artifact,
+                            source.get("artifact_id").and_then(Value::as_str),
+                        );
+                    }
+                }
+            }
+        }
+        SourceKind::Artifact => push(
+            SourceKind::Analysis,
+            value.get("producer_analysis_id").and_then(Value::as_str),
+        ),
+        SourceKind::Analysis => {
+            if let Some(inputs) = value.get("input_dataset_ids").and_then(Value::as_array) {
+                for id in inputs {
+                    push(SourceKind::Dataset, id.as_str());
+                }
+            }
+        }
+        SourceKind::Provenance => push(
+            SourceKind::Analysis,
+            value.get("analysis_id").and_then(Value::as_str),
+        ),
+        _ => {}
+    }
+    links.sort_by_key(|(kind, id)| (science_key(*kind), *id));
+    links.dedup();
+    links
 }
 async fn publication_detail(
     connection: &mut SqliteConnection,

@@ -1667,3 +1667,34 @@ fn offline_example_dto_contract() {
     assert!(serde_json::from_value::<OfflineExampleSourceKind>(json!("executed")).is_err());
     assert!(serde_json::from_value::<OfflineExampleEntryKind>(json!("assistant")).is_err());
 }
+
+#[test]
+fn publication_evidence_contract_rejects_unknown_fields_and_preserves_nullable_u64() {
+    use omicsops_dto::*;
+    let id = Uuid::new_v4();
+    let selection = json!({"project_id":id,"publication_id":Uuid::new_v4(),"revision":4_294_967_297_u64,"expected_revision_sha256":"a".repeat(64)});
+    let parsed: PublicationSelectionV1 = serde_json::from_value(selection.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), selection);
+    let mut with_extra = selection.clone();
+    with_extra["markdown"] = json!("unsaved text");
+    assert!(serde_json::from_value::<PublicationSelectionV1>(with_extra).is_err());
+    assert_eq!(
+        serde_json::to_value(PublicationRevisionHashScopeV1::StoredRevisionContent).unwrap(),
+        json!("stored_revision_content")
+    );
+    assert_eq!(
+        serde_json::to_value(ReproductionStatusV1::NotExecuted).unwrap(),
+        json!("not_executed")
+    );
+    assert_eq!(
+        serde_json::to_value(WorkspaceContentModeV1::ReferenceOnly).unwrap(),
+        json!("reference_only")
+    );
+    assert_eq!(
+        serde_json::to_value(FileReferenceHashScopeV1::RecordedFile).unwrap(),
+        json!("recorded_file")
+    );
+    let report = json!({"schema_version":1,"selection":selection,"revision_hash_scope":"stored_revision_content","observed_at":"2026-10-12T00:00:00Z","scientific_revision":null,"scientific_state_sha256":null,"references_checked":0,"related_records_checked":0,"attention_count":0,"unverified_count":0,"findings":[],"truncated":false,"reproduction_status":"not_executed"});
+    let decoded: PublicationReadinessReportV1 = serde_json::from_value(report.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), report);
+}
