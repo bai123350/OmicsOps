@@ -344,6 +344,7 @@ pub fn run() {
             workspace_navigation::workspace_list_publications,
             workspace_navigation::workspace_get_publication,
             workspace_publication_evidence::workspace_check_publication_readiness,
+            workspace_publication_evidence::workspace_export_publication_reference_package,
             workspace_navigation::workspace_save_publication,
             workspace_navigation::workspace_restore_publication,
             workspace_navigation::workspace_export_publication,

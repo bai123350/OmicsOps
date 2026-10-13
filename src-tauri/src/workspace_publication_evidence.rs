@@ -5,7 +5,13 @@ use omicsops_store::Store;
 use omicsops_store::{StoreError, workspace_navigation::PublicationReadContext};
 use serde_json::Value;
 use sha2::Digest;
+use std::{
+    future::Future,
+    io::Write,
+    path::{Path, PathBuf},
+};
 use tauri::State;
+use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
 use crate::{
@@ -19,6 +25,7 @@ use crate::{
 
 const MAX_FINDINGS: usize = 128;
 const MAX_REPORT_BYTES: usize = 512 * 1024;
+const MAX_PACKAGE_BYTES: usize = 16 * 1024 * 1024;
 
 fn error(code: PublicationEvidenceErrorCodeV1) -> PublicationEvidenceErrorV1 {
     let message = match code {
@@ -35,12 +42,452 @@ fn error(code: PublicationEvidenceErrorCodeV1) -> PublicationEvidenceErrorV1 {
         PublicationEvidenceErrorCodeV1::UnsafePublicContent => {
             "Publication contains unsafe public content"
         }
+        PublicationEvidenceErrorCodeV1::ExportWriteFailed => {
+            "Publication package could not be saved"
+        }
         _ => "Publication evidence could not be read",
     };
     PublicationEvidenceErrorV1 {
         code,
         message: message.into(),
     }
+}
+
+#[tauri::command]
+pub async fn workspace_export_publication_reference_package(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    request: PublicationSelectionV1,
+) -> Result<Option<PublicationPackageExportResultV1>, PublicationEvidenceErrorV1> {
+    let revision = request.revision;
+    export_reference_package(
+        &state.repository,
+        &request,
+        || async move {
+            tauri::async_runtime::spawn_blocking(move || {
+                app.dialog()
+                    .file()
+                    .add_filter("Reference package", &["zip"])
+                    .set_file_name(format!("omicsops-publication-v{revision}.zip"))
+                    .blocking_save_file()
+                    .map(|path| {
+                        path.into_path()
+                            .map_err(|_| error(PublicationEvidenceErrorCodeV1::ExportWriteFailed))
+                    })
+                    .transpose()
+            })
+            .await
+            .map_err(|_| error(PublicationEvidenceErrorCodeV1::ExportWriteFailed))?
+        },
+        || chrono::Utc::now().to_rfc3339(),
+        |path, bytes| async move {
+            tauri::async_runtime::spawn_blocking(move || write_package_atomic(&path, &bytes))
+                .await
+                .map_err(|_| error(PublicationEvidenceErrorCodeV1::ExportWriteFailed))?
+        },
+    )
+    .await
+}
+
+/// Only Store observation, explicit host chooser and local package writer are capabilities.
+async fn export_reference_package<C, CF, W, WF>(
+    repository: &Store,
+    selection: &PublicationSelectionV1,
+    choose: C,
+    observed_at: impl FnOnce() -> String,
+    write: W,
+) -> Result<Option<PublicationPackageExportResultV1>, PublicationEvidenceErrorV1>
+where
+    C: FnOnce() -> CF,
+    CF: Future<Output = Result<Option<PathBuf>, PublicationEvidenceErrorV1>>,
+    W: FnOnce(PathBuf, Vec<u8>) -> WF,
+    WF: Future<Output = Result<(), PublicationEvidenceErrorV1>>,
+{
+    // Drop the precheck observation; no package or reusable report crosses the dialog.
+    check_publication_readiness(repository, selection, &chrono::Utc::now().to_rfc3339()).await?;
+    let Some(mut path) = choose().await? else {
+        return Ok(None);
+    };
+    if path.extension().is_none() {
+        path.set_extension("zip");
+    }
+    if !path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+    {
+        return Err(error(PublicationEvidenceErrorCodeV1::ExportWriteFailed));
+    }
+    let context = repository
+        .workspace_publication_read_context(
+            selection.project_id,
+            selection.publication_id,
+            selection.revision,
+        )
+        .await
+        .map_err(storage_error)?;
+    let (bytes, manifest_sha256) = build_reference_package(&context, selection, &observed_at())?;
+    let receipt = PublicationPackageExportResultV1 {
+        path: path.to_string_lossy().into_owned(),
+        package_sha256: hex::encode(sha2::Sha256::digest(&bytes)),
+        size_bytes: bytes.len() as u64,
+        manifest_sha256,
+        selection: selection.clone(),
+    };
+    write(path, bytes).await?;
+    Ok(Some(receipt))
+}
+
+fn write_package_atomic(path: &Path, bytes: &[u8]) -> Result<(), PublicationEvidenceErrorV1> {
+    write_package_atomic_with(path, bytes, |file, bytes| file.write_all(bytes))
+}
+
+fn write_package_atomic_with(
+    path: &Path,
+    bytes: &[u8],
+    fill: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> Result<(), PublicationEvidenceErrorV1> {
+    let failed = || error(PublicationEvidenceErrorCodeV1::ExportWriteFailed);
+    let parent = path.parent().ok_or_else(failed)?;
+    let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|_| failed())?;
+    fill(file.as_file_mut(), bytes).map_err(|_| failed())?;
+    file.as_file_mut().flush().map_err(|_| failed())?;
+    file.as_file().sync_all().map_err(|_| failed())?;
+    file.persist(path).map_err(|_| failed())?;
+    Ok(())
+}
+
+fn omission(source: Option<&WorkspaceSourceRef>, code: &str) -> PublicationPackageOmissionV1 {
+    let message = match code {
+        "public_projection" => {
+            "Saved content was projected to public package fields; exported text is not the complete original snapshot"
+        }
+        "historical_location_omitted" => {
+            "Historical location could not be represented safely; original location remains unverified"
+        }
+        "recorded_hash_omitted" => {
+            "Recorded file hash was absent or invalid; original file was not hashed"
+        }
+        "original_files_excluded" => {
+            "Original files and samples are excluded; original files were not opened or hashed"
+        }
+        _ => {
+            "Credentials, authorizations, environment configuration and runtime recovery identities are excluded"
+        }
+    };
+    PublicationPackageOmissionV1 {
+        source: source.cloned(),
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
+fn safe_package_relative_path(value: &str) -> Option<String> {
+    ensure_safe_public_text(value).ok()?;
+    let path = crate::composer_files::normalize_workspace_relative_path(value).ok()?;
+    // Reject Windows device aliases and forbidden punctuation without touching the filesystem.
+    if path.split('/').any(|part| {
+        let stem = part.split('.').next().unwrap_or("").to_ascii_uppercase();
+        part.contains(['<', '>', '"', '|', '?', '*'])
+            || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || (stem.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+    }) {
+        return None;
+    }
+    Some(path)
+}
+
+/// The immutable saved JSON, never the current raw record, is the projection source.
+fn package_snapshot_text(
+    saved: &WorkspaceSourceSnapshot,
+) -> Result<String, PublicationEvidenceErrorV1> {
+    let Ok(value) = serde_json::from_str::<Value>(&saved.text) else {
+        return Ok(public_text(&saved.text)
+            .replace("\r\n", "\n")
+            .replace('\r', "\n"));
+    };
+    let fields: &[&str] = match saved.source.kind {
+        SourceKind::Dataset => &[
+            "id",
+            "project_id",
+            "name",
+            "active",
+            "sample_ids",
+            "format",
+            "size_bytes",
+        ],
+        SourceKind::Artifact | SourceKind::LegacyArtifact => &[
+            "id",
+            "project_id",
+            "artifact_type",
+            "valid",
+            "verified",
+            "producer_analysis_id",
+            "size_bytes",
+        ],
+        SourceKind::Analysis => &[
+            "id",
+            "project_id",
+            "analysis_type",
+            "status",
+            "input_dataset_ids",
+            "sample_ids",
+            "random_seed",
+            "software_requirements",
+        ],
+        SourceKind::Evidence => &["id", "project_id", "claim", "valid"],
+        SourceKind::Provenance => &["id", "project_id", "analysis_id", "complete"],
+        SourceKind::Run => &["id", "project_id", "status", "started_at", "finished_at"],
+        // Tool payloads are arbitrary execution metadata; retain only descriptive fields.
+        SourceKind::Tool => &["tool", "name", "status", "summary"],
+        SourceKind::Message => {
+            return Ok(public_text(&saved.text)
+                .replace("\r\n", "\n")
+                .replace('\r', "\n"));
+        }
+    };
+    let mut projected = serde_json::Map::new();
+    for key in fields {
+        if let Some(v) = value.get(*key) {
+            // No nested maps can smuggle arbitrary execution metadata through allowed fields.
+            if v.is_null()
+                || v.is_boolean()
+                || v.is_number()
+                || v.is_string()
+                || v.as_array()
+                    .is_some_and(|a| a.iter().all(|v| v.is_string()))
+            {
+                for raw in v
+                    .as_str()
+                    .into_iter()
+                    .chain(v.as_array().into_iter().flatten().filter_map(Value::as_str))
+                {
+                    ensure_safe_public_text(raw)?;
+                }
+                projected.insert((*key).into(), v.clone());
+            }
+        }
+    }
+    if let Some(path) = value
+        .get("relative_path")
+        .and_then(Value::as_str)
+        .and_then(safe_package_relative_path)
+    {
+        projected.insert("relative_path".into(), Value::String(path));
+    }
+    if saved.source.kind == SourceKind::Evidence {
+        if let Some(sources) = value.get("sources").and_then(Value::as_array) {
+            let sources: Vec<_> = sources
+                .iter()
+                .filter_map(|s| {
+                    (s["kind"] == "artifact")
+                        .then(|| {
+                            s["artifact_id"]
+                                .as_str()
+                                .and_then(|id| Uuid::parse_str(id).ok())
+                        })
+                        .flatten()
+                        .map(|id| serde_json::json!({"kind":"artifact","artifact_id":id}))
+                })
+                .collect();
+            projected.insert("sources".into(), Value::Array(sources));
+        }
+    }
+    let text = serde_json::to_string_pretty(&projected)
+        .map_err(|_| error(PublicationEvidenceErrorCodeV1::UnsafePublicContent))?;
+    ensure_safe_public_text(&text)?;
+    Ok(public_text(&text))
+}
+
+fn build_reference_package(
+    context: &PublicationReadContext,
+    selection: &PublicationSelectionV1,
+    observed_at: &str,
+) -> Result<(Vec<u8>, String), PublicationEvidenceErrorV1> {
+    // Check before large copies/serialization, including the saved snapshots.
+    let input_bytes = context
+        .revision
+        .references
+        .iter()
+        .try_fold(context.revision.markdown.len(), |sum, s| {
+            sum.checked_add(s.text.len())
+        });
+    if input_bytes.is_none_or(|size| size > MAX_PACKAGE_BYTES) {
+        return Err(error(PublicationEvidenceErrorCodeV1::LimitExceeded));
+    }
+    let report = publication_report_from_context(context, selection, observed_at)?;
+    let mut manifest = PublicationReferencePackageManifestV1 {
+        schema_version: 1,
+        mode: WorkspaceContentModeV1::ReferenceOnly,
+        selection: selection.clone(),
+        revision_hash_scope: report.revision_hash_scope,
+        exported_at: observed_at.into(),
+        reproduction_status: ReproductionStatusV1::NotExecuted,
+        references: vec![],
+        omissions: vec![
+            omission(None, "original_files_excluded"),
+            omission(None, "execution_configuration_excluded"),
+        ],
+    };
+    let mut pairs: Vec<_> = context
+        .revision
+        .references
+        .iter()
+        .zip(&context.current_sources)
+        .collect();
+    pairs.sort_by_cached_key(|(saved, _)| serde_json::to_string(&saved.source).unwrap_or_default());
+    for (saved, current) in pairs {
+        let text = package_snapshot_text(saved)?;
+        ensure_safe_public_text(&text)?;
+        let saved_hash = if valid_hash(&saved.sha256) {
+            saved.sha256.clone()
+        } else {
+            hex::encode(sha2::Sha256::digest(saved.text.as_bytes()))
+        };
+        let exported_hash = hex::encode(sha2::Sha256::digest(text.as_bytes()));
+        if saved_hash != exported_hash {
+            manifest
+                .omissions
+                .push(omission(Some(&saved.source), "public_projection"));
+        }
+        let is_file = matches!(
+            saved.source.kind,
+            SourceKind::Artifact | SourceKind::LegacyArtifact | SourceKind::Dataset
+        );
+        let relative_path = is_file
+            .then(|| {
+                saved
+                    .metadata
+                    .get("relative_path")
+                    .and_then(|p| safe_package_relative_path(p))
+            })
+            .flatten();
+        let location_root = relative_path.as_ref().map(|_| {
+            match saved.metadata.get("backend_id").map(String::as_str) {
+                Some("local") | Some("system") => PackageLocationRootV1::LocalProjectRoot,
+                Some(backend) if backend.starts_with("ssh:") => {
+                    PackageLocationRootV1::HistoricalSshRoot
+                }
+                _ => PackageLocationRootV1::Unknown,
+            }
+        });
+        if is_file
+            && (relative_path.is_none() || location_root == Some(PackageLocationRootV1::Unknown))
+        {
+            manifest
+                .omissions
+                .push(omission(Some(&saved.source), "historical_location_omitted"));
+        }
+        let recorded_file_sha256 = is_file
+            .then(|| {
+                saved
+                    .metadata
+                    .get("file_sha256")
+                    .filter(|h| valid_hash(h))
+                    .cloned()
+            })
+            .flatten();
+        if is_file && recorded_file_sha256.is_none() {
+            manifest
+                .omissions
+                .push(omission(Some(&saved.source), "recorded_hash_omitted"));
+        }
+        let title = if is_file && safe_package_relative_path(&saved.title).is_none() {
+            "Recorded file reference".into()
+        } else {
+            public_text(&saved.title)
+        };
+        manifest.references.push(PublicationPackageReferenceV1 {
+            source: saved.source.clone(),
+            title,
+            text,
+            saved_snapshot_sha256: saved_hash,
+            exported_text_sha256: exported_hash,
+            current_availability: current.availability.unwrap_or_else(|| {
+                source_availability(
+                    saved,
+                    &current_projection(context, &saved.source, current.value.as_ref()),
+                )
+            }),
+            recorded_file_sha256,
+            relative_path,
+            location_root,
+            original_file_status: OriginalFileStatusV1::NotChecked,
+        });
+    }
+    let mut publication = format!(
+        "# {}\n\n{}\n",
+        public_text(&context.revision.title),
+        public_text(&context.revision.markdown)
+    );
+    if !manifest.references.is_empty() {
+        publication.push_str("\n## Source references\n\nSaved summaries are references; original files were not checked and independent reproduction was not executed.\n");
+        for r in &manifest.references {
+            publication.push_str(&format!(
+                "\n- {} ({:?}:{}) — saved snapshot SHA-256: {}; current availability: {:?}\n",
+                r.title,
+                r.source.kind,
+                r.source.id,
+                r.saved_snapshot_sha256,
+                r.current_availability
+            ));
+        }
+    }
+    publication = publication.replace("\r\n", "\n").replace('\r', "\n");
+    ensure_safe_public_text(&publication)?;
+    let mut entries = vec![
+        ("publication.md", publication.into_bytes()),
+        (
+            "manifest.json",
+            serde_json::to_vec_pretty(&manifest)
+                .map_err(|_| error(PublicationEvidenceErrorCodeV1::UnsafePublicContent))?,
+        ),
+        (
+            "readiness.json",
+            serde_json::to_vec_pretty(&report)
+                .map_err(|_| error(PublicationEvidenceErrorCodeV1::StorageReadFailed))?,
+        ),
+    ];
+    if entries[2].1.len() > MAX_REPORT_BYTES {
+        return Err(error(PublicationEvidenceErrorCodeV1::LimitExceeded));
+    }
+    let manifest_sha256 = hex::encode(sha2::Sha256::digest(&entries[1].1));
+    let checksums = [1, 0, 2]
+        .iter()
+        .map(|i| {
+            format!(
+                "{}  {}\n",
+                hex::encode(sha2::Sha256::digest(&entries[*i].1)),
+                entries[*i].0
+            )
+        })
+        .collect::<String>();
+    entries.push(("checksums.sha256", checksums.into_bytes()));
+    let total = entries
+        .iter()
+        .try_fold(0usize, |sum, (_, bytes)| sum.checked_add(bytes.len()));
+    if total.is_none_or(|size| size > MAX_PACKAGE_BYTES) {
+        return Err(error(PublicationEvidenceErrorCodeV1::LimitExceeded));
+    }
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .last_modified_time(zip::DateTime::default())
+        .unix_permissions(0o644);
+    for (name, bytes) in entries {
+        zip.start_file(name, options)
+            .map_err(|_| error(PublicationEvidenceErrorCodeV1::ExportWriteFailed))?;
+        zip.write_all(&bytes)
+            .map_err(|_| error(PublicationEvidenceErrorCodeV1::ExportWriteFailed))?;
+    }
+    Ok((
+        zip.finish()
+            .map_err(|_| error(PublicationEvidenceErrorCodeV1::ExportWriteFailed))?
+            .into_inner(),
+        manifest_sha256,
+    ))
 }
 
 fn valid_hash(value: &str) -> bool {
@@ -602,6 +1049,470 @@ mod tests {
     use serde_json::{Value, json};
 
     const OBSERVED: &str = "2026-10-12T00:00:00Z";
+
+    fn unpack(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+        use std::io::Read;
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        (0..archive.len())
+            .map(|index| {
+                let mut entry = archive.by_index(index).unwrap();
+                let mut bytes = vec![];
+                entry.read_to_end(&mut bytes).unwrap();
+                (entry.name().to_owned(), bytes)
+            })
+            .collect()
+    }
+
+    async fn export_to(
+        store: &Store,
+        selection: &PublicationSelectionV1,
+        path: std::path::PathBuf,
+    ) -> PublicationPackageExportResultV1 {
+        export_reference_package(
+            store,
+            selection,
+            || async { Ok(Some(path)) },
+            || OBSERVED.into(),
+            |path, bytes| async move { write_package_atomic(&path, &bytes) },
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    async fn replace_historical_content(
+        store: &Store,
+        selection: &PublicationSelectionV1,
+        content: &str,
+    ) {
+        // An imported/corrupt historical replacement, not an allowed UI mutation.
+        // The production immutable UPDATE trigger stays installed and intact.
+        sqlx::query("DELETE FROM publication_revisions WHERE publication_id=? AND revision=?")
+            .bind(selection.publication_id.to_string())
+            .bind(selection.revision as i64)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO publication_revisions(id,publication_id,revision,content) VALUES(?,?,?,?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(selection.publication_id.to_string())
+        .bind(selection.revision as i64)
+        .bind(content)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn package_reloads_after_dialog() {
+        let (store, p, _, _) = fixture().await;
+        let selection = save(&store, p, vec![]).await;
+        let dir = tempfile::tempdir().unwrap();
+        for delete in [false, true] {
+            let selected = save(&store, p, vec![]).await;
+            let path = dir.path().join("reload.zip");
+            let result = export_reference_package(
+                &store,
+                &selected,
+                || async {
+                    if delete {
+                        sqlx::query("DELETE FROM publication_revisions WHERE publication_id=?")
+                            .bind(selected.publication_id.to_string())
+                            .execute(store.pool())
+                            .await
+                            .unwrap();
+                    } else {
+                        replace_historical_content(&store, &selected, "Changed while dialog open")
+                            .await;
+                    }
+                    Ok(Some(path.clone()))
+                },
+                || OBSERVED.into(),
+                |path, bytes| async move { write_package_atomic(&path, &bytes) },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                result.code,
+                if delete {
+                    PublicationEvidenceErrorCodeV1::NotFound
+                } else {
+                    PublicationEvidenceErrorCodeV1::RevisionChanged
+                }
+            );
+            assert!(!path.exists());
+        }
+        assert!(
+            check_publication_readiness(&store, &selection, OBSERVED)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn package_keeps_saved_missing_snapshot() {
+        let (store, p, _, _) = fixture().await;
+        let e = Uuid::new_v4();
+        insert(
+            &store,
+            SourceKind::Evidence,
+            &json!({"id":e,"project_id":p,"valid":true,"sources":[],"claim":"Saved claim"}),
+        )
+        .await;
+        let snapshot = crate::workspace_navigation::resolve_source(
+            &store,
+            &source(p, SourceKind::Evidence, e),
+        )
+        .await
+        .unwrap();
+        let selection = save(&store, p, vec![snapshot.clone()]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.zip");
+        let result = export_reference_package(
+            &store,
+            &selection,
+            || async {
+                sqlx::query("DELETE FROM scientific_evidence_v4 WHERE id=?")
+                    .bind(e.to_string())
+                    .execute(store.pool())
+                    .await
+                    .unwrap();
+                store
+                    .workspace_save_publication(&SavePublicationRecord {
+                        request: SavePublicationRequest {
+                            request_id: Uuid::new_v4(),
+                            project_id: p,
+                            publication_id: Some(selection.publication_id),
+                            expected_revision: 1,
+                            title: "New head".into(),
+                            markdown: "UNSELECTED HEAD".into(),
+                            sources: vec![],
+                        },
+                        references: vec![],
+                    })
+                    .await
+                    .unwrap();
+                Ok(Some(path.clone()))
+            },
+            || OBSERVED.into(),
+            |path, bytes| async move { write_package_atomic(&path, &bytes) },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let entries = unpack(&std::fs::read(&path).unwrap());
+        let manifest: PublicationReferencePackageManifestV1 =
+            serde_json::from_slice(&entries[1].1).unwrap();
+        let report: PublicationReadinessReportV1 = serde_json::from_slice(&entries[2].1).unwrap();
+        assert_eq!(result.selection, selection);
+        assert_eq!(
+            manifest.references[0].current_availability,
+            SourceAvailability::Missing
+        );
+        assert!(manifest.references[0].text.contains("Saved claim"));
+        assert_eq!(
+            manifest.references[0].saved_snapshot_sha256,
+            snapshot.sha256
+        );
+        assert!(has(&report, ReadinessFindingCodeV1::SourceMissing));
+        assert!(!String::from_utf8_lossy(&entries[0].1).contains("UNSELECTED HEAD"));
+    }
+
+    #[tokio::test]
+    async fn package_public_projection_hashes() {
+        let (store, p, _, _) = fixture().await;
+        let mut snapshot = saved(source(p, SourceKind::Artifact, Uuid::new_v4()));
+        snapshot.text = json!({"id":snapshot.source.id,"valid":false,"relative_path":"results/qc.tsv","producer_runtime":{"backend_id":"ssh:PRIVATE-HOST","process_identity":"PRIVATE-PROCESS"},"metadata":{"secret_unknown":"PRIVATE-METADATA"}}).to_string();
+        snapshot.sha256 = hex::encode(sha2::Sha256::digest(snapshot.text.as_bytes()));
+        snapshot
+            .metadata
+            .insert("relative_path".into(), "results/qc.tsv".into());
+        snapshot
+            .metadata
+            .insert("backend_id".into(), "ssh:PRIVATE-HOST".into());
+        snapshot
+            .metadata
+            .insert("file_sha256".into(), "a".repeat(64));
+        let selection = save(&store, p, vec![snapshot.clone()]).await;
+        let before = store
+            .workspace_get_publication(p, selection.publication_id)
+            .await
+            .unwrap();
+        let changes: i64 = sqlx::query_scalar("SELECT total_changes()")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let result = export_to(&store, &selection, dir.path().join("projection.zip")).await;
+        let bytes = std::fs::read(&result.path).unwrap();
+        let entries = unpack(&bytes);
+        for (_, bytes) in &entries {
+            let text = String::from_utf8_lossy(bytes);
+            for sentinel in ["PRIVATE-HOST", "PRIVATE-PROCESS", "PRIVATE-METADATA"] {
+                assert!(!text.contains(sentinel));
+            }
+        }
+        let manifest: PublicationReferencePackageManifestV1 =
+            serde_json::from_slice(&entries[1].1).unwrap();
+        let reference = &manifest.references[0];
+        assert_eq!(reference.saved_snapshot_sha256, snapshot.sha256);
+        assert_eq!(
+            reference.exported_text_sha256,
+            hex::encode(sha2::Sha256::digest(reference.text.as_bytes()))
+        );
+        assert_ne!(
+            reference.saved_snapshot_sha256,
+            reference.exported_text_sha256
+        );
+        assert_eq!(reference.relative_path.as_deref(), Some("results/qc.tsv"));
+        assert_eq!(
+            reference.location_root,
+            Some(PackageLocationRootV1::HistoricalSshRoot)
+        );
+        assert_eq!(reference.recorded_file_sha256, Some("a".repeat(64)));
+        assert_eq!(
+            reference.original_file_status,
+            OriginalFileStatusV1::NotChecked
+        );
+        assert!(
+            manifest
+                .omissions
+                .iter()
+                .any(|o| o.code == "public_projection")
+        );
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(&entries[1].1)),
+            result.manifest_sha256
+        );
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(&bytes)),
+            result.package_sha256
+        );
+        assert_eq!(bytes.len() as u64, result.size_bytes);
+        assert_eq!(
+            before,
+            store
+                .workspace_get_publication(p, selection.publication_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            changes,
+            sqlx::query_scalar::<_, i64>("SELECT total_changes()")
+                .fetch_one(store.pool())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn package_fixed_entries_and_checksums() {
+        let (store, p, _, _) = fixture().await;
+        let mut reference = saved(source(p, SourceKind::Evidence, Uuid::new_v4()));
+        reference.source.id = "../../arbitrary-entry".into();
+        let selection = save(&store, p, vec![reference]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let result = export_to(&store, &selection, dir.path().join("entry.zip")).await;
+        let entries = unpack(&std::fs::read(result.path).unwrap());
+        assert_eq!(
+            entries.iter().map(|e| e.0.as_str()).collect::<Vec<_>>(),
+            [
+                "publication.md",
+                "manifest.json",
+                "readiness.json",
+                "checksums.sha256"
+            ]
+        );
+        let lines = String::from_utf8(entries[3].1.clone()).unwrap();
+        assert_eq!(lines.lines().count(), 3);
+        assert_eq!(
+            lines
+                .lines()
+                .map(|line| line.split_once("  ").unwrap().1)
+                .collect::<Vec<_>>(),
+            ["manifest.json", "publication.md", "readiness.json"]
+        );
+        for line in lines.lines() {
+            let (hash, name) = line.split_once("  ").unwrap();
+            let (_, bytes) = entries.iter().find(|e| e.0 == name).unwrap();
+            assert_eq!(hash, hex::encode(sha2::Sha256::digest(bytes)));
+        }
+    }
+
+    #[tokio::test]
+    async fn package_cancel_and_write_failure() {
+        use std::io::Write;
+        let (store, p, _, _) = fixture().await;
+        let selection = save(&store, p, vec![]).await;
+        let before = store
+            .workspace_get_publication(p, selection.publication_id)
+            .await
+            .unwrap();
+        let changes: i64 = sqlx::query_scalar("SELECT total_changes()")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        let cancelled = export_reference_package(
+            &store,
+            &selection,
+            || async { Ok(None) },
+            || panic!("cancel must not observe"),
+            |_, _| async { panic!("cancel must not write") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(cancelled, None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.zip");
+        std::fs::write(&path, b"preserved destination").unwrap();
+        let failure = export_reference_package(
+            &store,
+            &selection,
+            || async { Ok(Some(path.clone())) },
+            || OBSERVED.into(),
+            |path, bytes| async move {
+                write_package_atomic_with(&path, &bytes, |file, bytes| {
+                    file.write_all(&bytes[..10])?;
+                    Err(std::io::Error::other("PRIVATE-WRITER-ERROR"))
+                })
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            failure.code,
+            PublicationEvidenceErrorCodeV1::ExportWriteFailed
+        );
+        assert!(!failure.message.contains("PRIVATE-WRITER-ERROR"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"preserved destination");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(
+            before,
+            store
+                .workspace_get_publication(p, selection.publication_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            changes,
+            sqlx::query_scalar::<_, i64>("SELECT total_changes()")
+                .fetch_one(store.pool())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn package_bound_and_deterministic_bytes() {
+        let (store, p, _, _) = fixture().await;
+        let selection = save(&store, p, vec![]).await;
+        let mut context = store
+            .workspace_publication_read_context(p, selection.publication_id, 1)
+            .await
+            .unwrap();
+        let first = build_reference_package(&context, &selection, OBSERVED).unwrap();
+        assert_eq!(
+            first,
+            build_reference_package(&context, &selection, OBSERVED).unwrap()
+        );
+        assert_ne!(
+            first.0,
+            build_reference_package(&context, &selection, "2026-10-13T00:00:00Z")
+                .unwrap()
+                .0
+        );
+        // Direct bounded assembler test, beyond Store's stricter revision input limit.
+        context.revision.markdown = "x".repeat(16 * 1024 * 1024);
+        assert_eq!(
+            build_reference_package(&context, &selection, OBSERVED)
+                .unwrap_err()
+                .code,
+            PublicationEvidenceErrorCodeV1::LimitExceeded
+        );
+    }
+
+    #[tokio::test]
+    async fn package_secrets_never_reach_entries_or_errors() {
+        let (store, p, _, _) = fixture().await;
+        let mut selection = save(&store, p, vec![]).await;
+        let dir = tempfile::tempdir().unwrap();
+        for secret in [
+            "-----BEGIN PRIVATE KEY-----\nSYNTHETIC-SECRET\n-----END PRIVATE KEY-----",
+            "password=SYNTHETIC-SECRET",
+            "api_key=SYNTHETIC-SECRET",
+            "token=SYNTHETIC-SECRET",
+            "https://user:SYNTHETIC-SECRET@example.invalid",
+        ] {
+            for legacy in [false, true] {
+                let content = if legacy {
+                    secret.to_owned()
+                } else {
+                    json!({"schema_version":1,"title":"Synthetic","markdown":secret,"references":[]}).to_string()
+                };
+                replace_historical_content(&store, &selection, &content).await;
+                selection.expected_revision_sha256 = hex::encode(sha2::Sha256::digest(
+                    if legacy { public_text(secret) } else { content }.as_bytes(),
+                ));
+                let path = dir.path().join("safe.zip");
+                let result = export_reference_package(
+                    &store,
+                    &selection,
+                    || async { Ok(Some(path.clone())) },
+                    || OBSERVED.into(),
+                    |path, bytes| async move { write_package_atomic(&path, &bytes) },
+                )
+                .await;
+                match result {
+                    Ok(Some(_)) => {
+                        for (_, bytes) in unpack(&std::fs::read(&path).unwrap()) {
+                            assert!(!String::from_utf8_lossy(&bytes).contains("SYNTHETIC-SECRET"));
+                            assert!(!String::from_utf8_lossy(&bytes).contains("PRIVATE KEY"));
+                        }
+                    }
+                    Err(error) => {
+                        assert_eq!(
+                            error.code,
+                            PublicationEvidenceErrorCodeV1::UnsafePublicContent
+                        );
+                        assert!(!error.message.contains("SYNTHETIC-SECRET"));
+                    }
+                    _ => panic!("export did not select"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn package_checks_free_text_before_json_escaping() {
+        let (store, p, _, _) = fixture().await;
+        let mut snapshot = saved(source(p, SourceKind::Evidence, Uuid::new_v4()));
+        snapshot.text =
+            json!({"claim":r#""password": "SYNTHETIC-NESTED-SECRET""#,"valid":true}).to_string();
+        let selection = save(&store, p, vec![snapshot]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unsafe.zip");
+        let result = export_reference_package(
+            &store,
+            &selection,
+            || async { Ok(Some(path.clone())) },
+            || OBSERVED.into(),
+            |path, bytes| async move { write_package_atomic(&path, &bytes) },
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "original claim must be checked before JSON escaping"
+        );
+        let failure = result.unwrap_err();
+        assert_eq!(
+            failure.code,
+            PublicationEvidenceErrorCodeV1::UnsafePublicContent
+        );
+        assert!(!failure.message.contains("SYNTHETIC-NESTED-SECRET"));
+        assert!(!path.exists());
+    }
 
     async fn fixture() -> (Store, Uuid, Uuid, Uuid) {
         let store = Store::open_in_memory().await.unwrap();

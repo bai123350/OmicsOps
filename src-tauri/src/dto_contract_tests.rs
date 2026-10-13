@@ -1698,3 +1698,38 @@ fn publication_evidence_contract_rejects_unknown_fields_and_preserves_nullable_u
     let decoded: PublicationReadinessReportV1 = serde_json::from_value(report.clone()).unwrap();
     assert_eq!(serde_json::to_value(decoded).unwrap(), report);
 }
+
+#[test]
+fn publication_reference_package_contract_has_explicit_hash_and_file_scopes() {
+    use omicsops_dto::*;
+    let selection = json!({"project_id":Uuid::new_v4(),"publication_id":Uuid::new_v4(),"revision":4_294_967_297_u64,"expected_revision_sha256":"a".repeat(64)});
+    let manifest = json!({
+        "schema_version":1,"mode":"reference_only","selection":selection,
+        "revision_hash_scope":"public_legacy_markdown","exported_at":"2026-10-13T00:00:00Z",
+        "reproduction_status":"not_executed","references":[{
+            "source":{"project_id":selection["project_id"],"kind":"artifact","id":Uuid::new_v4().to_string(),"conversation_id":null,"run_id":null,"sequence":null,"event_hash":null,"content_sha256":null,"start":null,"end":null},
+            "title":"Recorded artifact","text":"Saved summary","saved_snapshot_sha256":"b".repeat(64),
+            "exported_text_sha256":"c".repeat(64),"current_availability":"missing",
+            "recorded_file_sha256":null,"relative_path":"results/qc.tsv","location_root":"historical_ssh_root",
+            "original_file_status":"not_checked"
+        }],"omissions":[{"source":null,"code":"original_files_excluded","message":"Original files are excluded"}]
+    });
+    let decoded: PublicationReferencePackageManifestV1 =
+        serde_json::from_value(manifest.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), manifest);
+    let mut unsafe_contract = manifest.clone();
+    unsafe_contract["references"][0]["metadata"] = json!({"runtime":"forbidden"});
+    assert!(
+        serde_json::from_value::<PublicationReferencePackageManifestV1>(unsafe_contract).is_err()
+    );
+    let mut executed = manifest;
+    executed["reproduction_status"] = json!("executed");
+    assert!(serde_json::from_value::<PublicationReferencePackageManifestV1>(executed).is_err());
+    let receipt = json!({"path":"C:\\Synthetic Folder\\reference.zip","package_sha256":"d".repeat(64),"size_bytes":4_294_967_297_u64,"manifest_sha256":"e".repeat(64),"selection":selection});
+    let decoded: PublicationPackageExportResultV1 =
+        serde_json::from_value(receipt.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), receipt);
+    let mut destination = selection;
+    destination["path"] = json!("C:\\client-selected.zip");
+    assert!(serde_json::from_value::<PublicationSelectionV1>(destination).is_err());
+}
