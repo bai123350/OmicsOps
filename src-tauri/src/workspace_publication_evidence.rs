@@ -105,12 +105,10 @@ where
 {
     // Drop the precheck observation; no package or reusable report crosses the dialog.
     check_publication_readiness(repository, selection, &chrono::Utc::now().to_rfc3339()).await?;
-    let Some(mut path) = choose().await? else {
+    let Some(path) = choose().await? else {
         return Ok(None);
     };
-    if path.extension().is_none() {
-        path.set_extension("zip");
-    }
+    // Persist only the exact dialog-selected path, never an unconfirmed sibling.
     if !path
         .extension()
         .and_then(|e| e.to_str())
@@ -168,6 +166,9 @@ fn omission(source: Option<&WorkspaceSourceRef>, code: &str) -> PublicationPacka
         "recorded_hash_omitted" => {
             "Recorded file hash was absent or invalid; original file was not hashed"
         }
+        "saved_snapshot_text_omitted" => {
+            "Saved record text could not be projected safely and was omitted; the original saved snapshot hash is retained"
+        }
         "original_files_excluded" => {
             "Original files and samples are excluded; original files were not opened or hashed"
         }
@@ -202,12 +203,9 @@ fn safe_package_relative_path(value: &str) -> Option<String> {
 /// The immutable saved JSON, never the current raw record, is the projection source.
 fn package_snapshot_text(
     saved: &WorkspaceSourceSnapshot,
-) -> Result<String, PublicationEvidenceErrorV1> {
-    let Ok(value) = serde_json::from_str::<Value>(&saved.text) else {
-        return Ok(public_text(&saved.text)
-            .replace("\r\n", "\n")
-            .replace('\r', "\n"));
-    };
+) -> Result<(String, Option<&'static str>), PublicationEvidenceErrorV1> {
+    // Record-like sources require the whitelist even when their saved text is
+    // malformed. Only conversational/descriptive kinds permit plain summaries.
     let fields: &[&str] = match saved.source.kind {
         SourceKind::Dataset => &[
             "id",
@@ -243,9 +241,31 @@ fn package_snapshot_text(
         // Tool payloads are arbitrary execution metadata; retain only descriptive fields.
         SourceKind::Tool => &["tool", "name", "status", "summary"],
         SourceKind::Message => {
-            return Ok(public_text(&saved.text)
-                .replace("\r\n", "\n")
-                .replace('\r', "\n"));
+            ensure_safe_public_text(&saved.text)?;
+            return Ok((
+                public_text(&saved.text)
+                    .replace("\r\n", "\n")
+                    .replace('\r', "\n"),
+                None,
+            ));
+        }
+    };
+    let value = match serde_json::from_str::<Value>(&saved.text) {
+        Ok(value) => value,
+        Err(_) if saved.source.kind == SourceKind::Tool => {
+            ensure_safe_public_text(&saved.text)?;
+            return Ok((
+                public_text(&saved.text)
+                    .replace("\r\n", "\n")
+                    .replace('\r', "\n"),
+                None,
+            ));
+        }
+        Err(_) => {
+            return Ok((
+                "Saved record text omitted: safe structured projection unavailable.".into(),
+                Some("saved_snapshot_text_omitted"),
+            ));
         }
     };
     let mut projected = serde_json::Map::new();
@@ -298,7 +318,7 @@ fn package_snapshot_text(
     let text = serde_json::to_string_pretty(&projected)
         .map_err(|_| error(PublicationEvidenceErrorCodeV1::UnsafePublicContent))?;
     ensure_safe_public_text(&text)?;
-    Ok(public_text(&text))
+    Ok((public_text(&text), None))
 }
 
 fn build_reference_package(
@@ -339,7 +359,10 @@ fn build_reference_package(
         .collect();
     pairs.sort_by_cached_key(|(saved, _)| serde_json::to_string(&saved.source).unwrap_or_default());
     for (saved, current) in pairs {
-        let text = package_snapshot_text(saved)?;
+        let (text, omission_code) = package_snapshot_text(saved)?;
+        if let Some(code) = omission_code {
+            manifest.omissions.push(omission(Some(&saved.source), code));
+        }
         ensure_safe_public_text(&text)?;
         let saved_hash = if valid_hash(&saved.sha256) {
             saved.sha256.clone()
@@ -1482,6 +1505,171 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn package_malformed_scientific_snapshots_omit_identity_text() {
+        let (store, p, _, _) = fixture().await;
+        let malformed = r#"{"producer_runtime":{"backend_id":"ssh:SYNTHETIC-HOST","process_identity":"SYNTHETIC-PROCESS"}"#;
+        let plain_science = "Saved scientific summary with no structured fields";
+        let plain_description = "Recorded descriptive summary";
+        let mut snapshots = vec![];
+        for kind in [
+            SourceKind::Artifact,
+            SourceKind::Dataset,
+            SourceKind::Analysis,
+            SourceKind::Evidence,
+            SourceKind::Provenance,
+            SourceKind::Run,
+            SourceKind::LegacyArtifact,
+        ] {
+            for text in [malformed, plain_science] {
+                let mut snapshot = saved(source(p, kind, Uuid::new_v4()));
+                snapshot.text = text.into();
+                snapshots.push(snapshot);
+            }
+        }
+        for kind in [SourceKind::Message, SourceKind::Tool] {
+            let mut snapshot = saved(source(p, kind, Uuid::new_v4()));
+            snapshot.text = plain_description.into();
+            snapshots.push(snapshot);
+        }
+        let selection = save(&store, p, snapshots).await;
+        let before = store
+            .workspace_get_publication(p, selection.publication_id)
+            .await
+            .unwrap();
+        let changes: i64 = sqlx::query_scalar("SELECT total_changes()")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let result = export_to(&store, &selection, dir.path().join("malformed.zip")).await;
+        let entries = unpack(&std::fs::read(&result.path).unwrap());
+        assert_eq!(entries.len(), 4);
+        for (_, bytes) in &entries {
+            let text = String::from_utf8_lossy(bytes);
+            for sentinel in ["SYNTHETIC-HOST", "SYNTHETIC-PROCESS", plain_science] {
+                assert!(
+                    !text.contains(sentinel),
+                    "unprojectable scientific text must not enter any entry"
+                );
+            }
+        }
+        let manifest: PublicationReferencePackageManifestV1 =
+            serde_json::from_slice(&entries[1].1).unwrap();
+        for reference in &manifest.references {
+            let original = before.revisions[0]
+                .references
+                .iter()
+                .find(|s| s.source == reference.source)
+                .unwrap();
+            assert_eq!(reference.saved_snapshot_sha256, original.sha256);
+            assert_eq!(
+                reference.exported_text_sha256,
+                hex::encode(sha2::Sha256::digest(reference.text.as_bytes()))
+            );
+            if matches!(
+                reference.source.kind,
+                SourceKind::Message | SourceKind::Tool
+            ) {
+                assert_eq!(reference.text, plain_description);
+            } else {
+                assert_eq!(
+                    reference.text,
+                    "Saved record text omitted: safe structured projection unavailable."
+                );
+                assert_ne!(
+                    reference.saved_snapshot_sha256,
+                    reference.exported_text_sha256
+                );
+                assert!(
+                    manifest
+                        .omissions
+                        .iter()
+                        .any(|o| o.source.as_ref() == Some(&reference.source)
+                            && o.code == "saved_snapshot_text_omitted")
+                );
+            }
+        }
+        assert_eq!(
+            before,
+            store
+                .workspace_get_publication(p, selection.publication_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            changes,
+            sqlx::query_scalar::<_, i64>("SELECT total_changes()")
+                .fetch_one(store.pool())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn package_chooser_path_requires_explicit_zip_extension() {
+        let (store, p, _, _) = fixture().await;
+        let selection = save(&store, p, vec![]).await;
+        let before = store
+            .workspace_get_publication(p, selection.publication_id)
+            .await
+            .unwrap();
+        let changes: i64 = sqlx::query_scalar("SELECT total_changes()")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let sibling = dir.path().join("chosen.zip");
+        std::fs::write(&sibling, b"unconfirmed sibling destination").unwrap();
+        for name in ["chosen", "chosen.txt"] {
+            let path = dir.path().join(name);
+            let result = export_reference_package(
+                &store,
+                &selection,
+                || async { Ok(Some(path.clone())) },
+                || OBSERVED.into(),
+                |path, bytes| async move { write_package_atomic(&path, &bytes) },
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "host chooser destination must not be rewritten to a sibling .zip"
+            );
+            assert_eq!(
+                result.unwrap_err().code,
+                PublicationEvidenceErrorCodeV1::ExportWriteFailed
+            );
+            assert!(!path.exists());
+            assert_eq!(
+                std::fs::read(&sibling).unwrap(),
+                b"unconfirmed sibling destination"
+            );
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+        let chosen = dir.path().join("valid.ZIP");
+        let receipt = export_to(&store, &selection, chosen.clone()).await;
+        assert_eq!(receipt.path, chosen.to_string_lossy());
+        assert!(chosen.exists());
+        assert_eq!(
+            std::fs::read(&sibling).unwrap(),
+            b"unconfirmed sibling destination"
+        );
+        assert_eq!(
+            before,
+            store
+                .workspace_get_publication(p, selection.publication_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            changes,
+            sqlx::query_scalar::<_, i64>("SELECT total_changes()")
+                .fetch_one(store.pool())
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
