@@ -47,7 +47,7 @@
 | W07 | [离线示例](2026-10-04-wisp-w07-offline-example.md) | 4 | 双语合成工作区，重启/坏receipt仍隔离于生产Agent | 已实现、4任务源码审阅通过；确定性/构建通过，原生手工smoke未执行 |
 | W08a | [V4场景](2026-10-04-wisp-w08-scenarios.md) | 3 | 五场景manifest/hash/实际调用计数和安全报告 | 已实现、3任务源码审阅通过；安全报告/故障非零验证通过，CI未执行 |
 | W08b | [Skill helpers](2026-10-04-wisp-w08-skill-helpers.md) | 3 | 固定本地helper离线行为回归与统一Python CI | 已实现、3任务审阅通过；CI未执行 |
-| W09 | [稿件证据](2026-10-04-wisp-w09-publication-evidence.md) | 4 | 保存revision准备度与reference-only四entry证据ZIP | 进行中，Task1–3共享DTO/context/报告/引用包已审阅，保存版本UI待实施 |
+| W09 | [稿件证据](2026-10-04-wisp-w09-publication-evidence.md) | 4 | 保存revision准备度与reference-only四entry证据ZIP | SOURCE完成并独立审阅；确定性全量/Web/native构建通过，native手工未执行 |
 | W10 | [文件基线](2026-10-04-wisp-w10-file-baselines.md) | 4 | 显式安全小本地文本immutable snapshot/有界diff | 待实施 |
 | W11 | [迁移预览](2026-10-04-wisp-w11-migration-preview.md) | 3 | 空默认选择、类别COUNT、文件状态/hash与rebind/omissions | 待实施 |
 | W12 | [会话可见性](2026-10-04-wisp-w12-conversation-visibility.md) | 4 | 持久可逆收起/恢复，分页前过滤，精确引用保持 | 待实施 |
@@ -81,7 +81,7 @@ W07只需W02 Task1叶子，不需要table/SSH界面；W10/W11只需W09 Task1的�
 - [x] 7. W06 Task1–4：validated readonlychain、safeprojection、export、筛选/定位UI。
 - [x] 8. W07 Task1–4：marker事务、合成fixture、safeview、所有项目选择入口。
 - [x] 9. W08a Task1–3：五scenario manifest、控制行为、stable report/CI upload。
-- [ ] 10. W09 Task1–4：基础DTO/context、readiness、post-dialog包、保存revisionUI。
+- [x] 10. W09 Task1–4：基础DTO/context、readiness、post-dialog包、保存revisionUI。
 - [ ] 11. W10 Task1–4：immutableStore、safecontent/blob、diff、explicit选择UI。
 - [ ] 12. W12 Task1–4：visibility/schema/CAS、discovery/directget、collection、banner/cache。
 - [ ] 13. W11 Task1–3：只读metadata、boundedfiles/digest、project-card预览。
@@ -138,3 +138,5 @@ W06已实现：四任务源码独立审阅完成，最终UI提交 `d535b50`；�
 2026-10-13：W09 Task2 `b00993f..24073b4` 完整及一轮定向独立审阅完成，累计37/50 SOURCE。只读准备度/同context公开投影与有界run-conversation内部映射已实现；修复JSON转义前原始source字符串安全扫描，实际RED3/GREEN3、最终readiness13/fmt/diff通过，未变host navigation11/Store context14/navigation18先前通过。外部能力缺席为结构证明而非插桩零调用计数，真实Store不变有测试；包/UI与完整及clean-HEAD/native/live检查仍待后续。7外部RAW保留，cache警告不隐去。
 
 2026-10-13：W09 Task3 `e0c9223..dcdd8c6` 完整及一轮定向独立审阅完成，累计38/50 SOURCE。宿主保存对话框后的单次只读context生成固定四entry引用包、各范围hash和原子写入；修复畸形科学快照绕过白名单及无扩展名目的地被改写的问题。实际修复RED2、最终package10/evidence23/fmt/diff通过；DTO2为未变合同的先前通过。7外部RAW及candidate/inverse/replay/postcommit证明保留；UI、全量/clean-HEAD、native手工与真实复现仍待各自后续验证。
+
+2026-10-13：W09 Task4 `38bfd11..2649097` 保存版本UI/API完成独立完整审阅，累计39/50 SOURCE。dirty正文不进入请求、不隐式保存；选择/generation隔离、类型化安全错误、中性取消及立即Escape保护已覆盖。最终focused32和既有regression32、全量Vitest1345+Node22、Web/native构建通过；Rust1831通过/18ignored及Python48为未变源码的实际通过。最初native106错误、限定DTO/Store release缓存恢复及最终UI字节4m34s构建分别记录，缓存陈旧根因未确定。源码与确定性检查完成，native手工在用户STOP下未执行，真实模型/SSH/复现与最终clean-HEAD/全分支交付检查未完成。

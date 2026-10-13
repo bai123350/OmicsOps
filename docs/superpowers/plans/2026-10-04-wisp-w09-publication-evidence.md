@@ -151,7 +151,7 @@ git commit -m "feat: export reference-only publication evidence package"
 - Consumes: two native commands above；现有 `PublicationRevision`、ResearchDialog/window Escape层与dirty leave guard。
 - Produces: `checkWorkspacePublicationReadiness(request: PublicationSelectionV1): Promise<PublicationReadinessReportV1>`、`exportWorkspacePublicationReferencePackage(request: PublicationSelectionV1): Promise<PublicationPackageExportResultV1 | null>`；保存revision报告/包按钮与只读结果，保留现有Markdown导出。
 
-- [ ] **Step 1: Write failing API/component tests.** `saved_revision_and_generation` 检查dirty正文不进invoke、revision变更后旧report丢弃；`cancel_and_safe_error`；`escape_top_layer`；展示attention/unverified/truncated/NotExecuted和recorded hash标签。API测试精确command/request，无frontend目的地字段。
+- [x] **Step 1: Write failing API/component tests.** `saved_revision_and_generation` 检查dirty正文不进invoke、revision变更后旧report丢弃；`cancel_and_safe_error`；`escape_top_layer`；展示attention/unverified/truncated/NotExecuted和recorded hash标签。API测试精确command/request，无frontend目的地字段。
 
 ```ts
 expect(invoke).toHaveBeenCalledWith("workspace_check_publication_readiness", { request: savedSelection });
@@ -160,22 +160,27 @@ expect(screen.queryByText("old report")).not.toBeInTheDocument();
 expect(parentDialog).toBeVisible(); // one immediate Escape closed only the report
 ```
 
-- [ ] **Step 2: Run RED.** `npx vitest run src/workspace-navigation-api.test.ts src/features/workspace/WorkspacePublicationEvidence.test.tsx`。Expected: FAIL，缺wrapper/按钮或saved identity/generation/Escape断言失败。
-- [ ] **Step 3: Implement the TS signatures and UI.** exact DTO映射不手工复制native类型；按钮明确“保存版本N”，未保存编辑不隐式保存；选择tuple/generation绑定、typed错误、安全取消说明、原文件未检查/未执行复现始终可见；沿用window Escape和dirty guard。
+- [x] **Step 2: Run RED.** `npx vitest run src/workspace-navigation-api.test.ts src/features/workspace/WorkspacePublicationEvidence.test.tsx`。Expected: FAIL，缺wrapper/按钮或saved identity/generation/Escape断言失败。
+- [x] **Step 3: Implement the TS signatures and UI.** exact DTO映射不手工复制native类型；按钮明确“保存版本N”，未保存编辑不隐式保存；选择tuple/generation绑定、typed错误、安全取消说明、原文件未检查/未执行复现始终可见；沿用window Escape和dirty guard。
 - [ ] **Step 4: Run GREEN and delivery checks.** 重跑RED命令与两份Regression测试；运行 `cargo fmt --all -- --check`、`cargo test --workspace`、`npm test`、`npm run build`、`npm run build:desktop`、`git diff --check`。Expected: 全部PASS；记录actual/ignored，依赖锁变化先 `npm ci`。用合成Windows项目手工检查保存取消、空格路径、写失败、旧revision来源变化和zip校验；没有真实复现/SSH验收则明确未执行。
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```powershell
 git add src/workspace-navigation-types.ts src/workspace-navigation-api.ts src/workspace-navigation-api.test.ts src/features/workspace/WorkspacePublicationPage.tsx src/features/workspace/workspace-research-pages.css src/features/workspace/WorkspacePublicationEvidence.test.tsx
 git commit -m "feat: show publication readiness and reference package actions"
 ```
 
+
+源码及自动化交付检查完成；Step4保留未勾选，因为其中Windows native手工smoke受用户物理STOP而未执行。构建成功不替代真实窗口/保存对话框验收。
+
 ## Plan Self-Review
 
-spec覆盖：共同DTO/ownership由Task 1、有效性/预算由Task 2、hash/导出失败由Task 3、保存选择/Escape由Task 4承接；无首范围遗漏。五项Review Focus各有具体测试。接口名称与spec一致，内部接缝不新增UI授权。只有断言片段和签名，没有产品body；计划不重复全部DTO。执行记录、真实检查结果及实施方式待计划评审后填写，当前没有实现或测试结果。
+spec覆盖：共同DTO/ownership由Task 1、有效性/预算由Task 2、hash/导出失败由Task 3、保存选择/Escape由Task 4承接；无首范围遗漏。五项Review Focus各有具体测试。接口名称与spec一致，内部接缝不新增UI授权。只有断言片段和签名，没有产品body；计划不重复全部DTO。上述为2026-10-04初始计划自审记录；后续实际实现、独立审阅和检查结果见下方按日期记录。
 
 2026-10-12：Task1 `1b19093..15d727a` 经一次完整及三轮定向独立审阅完成，36/50 SOURCE。四共享DTO、W09合同、精确保存revision的单事务有界context已实现。修复Tool/Run关联分类、Run时间投影、重复producer预算及LegacyArtifact既有合法选择兼容；最终context13/navigation18/fmt/diff通过，未变DTO最近1/1通过。current_sources的None表示内部raw待Task2公开投影比较，Changed/Unavailable/Missing分别保留；不直出raw、不额外读库。7外部RAW未改，cache警告保留；Tasks2–4报告/包/UI、完整功能与clean-HEAD/native/live检查仍独立待执行。
 
 2026-10-13：W09 Task2 `b00993f..24073b4` 完整及一轮定向独立审阅完成，累计37/50 SOURCE。只读准备度/同context公开投影与有界run-conversation内部映射已实现；修复JSON转义前原始source字符串安全扫描，实际RED3/GREEN3、最终readiness13/fmt/diff通过，未变host navigation11/Store context14/navigation18先前通过。外部能力缺席为结构证明而非插桩零调用计数，真实Store不变有测试；包/UI与完整及clean-HEAD/native/live检查仍待后续。7外部RAW保留，cache警告不隐去。
 
 2026-10-13：W09 Task3 `e0c9223..dcdd8c6` 完整及一轮定向独立审阅完成，累计38/50 SOURCE。宿主保存对话框后的单次只读context生成固定四entry引用包、各范围hash和原子写入；修复畸形科学快照绕过白名单及无扩展名目的地被改写的问题。实际修复RED2、最终package10/evidence23/fmt/diff通过；DTO2为未变合同的先前通过。7外部RAW及candidate/inverse/replay/postcommit证明保留；UI、全量/clean-HEAD、native手工与真实复现仍待各自后续验证。
+
+2026-10-13：W09 Task4 `38bfd11..2649097` 保存版本UI/API完成独立完整审阅，累计39/50 SOURCE。dirty正文不进入请求、不隐式保存；选择/generation隔离、类型化安全错误、中性取消及立即Escape保护已覆盖。最终focused32和既有regression32、全量Vitest1345+Node22、Web/native构建通过；Rust1831通过/18ignored及Python48为未变源码的实际通过。最初native106错误、限定DTO/Store release缓存恢复及最终UI字节4m34s构建分别记录，缓存陈旧根因未确定。源码与确定性检查完成，native手工在用户STOP下未执行，真实模型/SSH/复现与最终clean-HEAD/全分支交付检查未完成。
