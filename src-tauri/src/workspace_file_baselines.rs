@@ -67,6 +67,25 @@ async fn diff_with_source_open(
     request: DiffFileBaselineRequestV1,
     open_source: impl Fn(&Project, &str) -> Result<ValidatedProjectFile, FileReadError>,
 ) -> Result<FileBaselineDiffV1, FileBaselineErrorV1> {
+    diff_with_source_io(
+        store,
+        storage,
+        request,
+        open_source,
+        ValidatedProjectFile::read_complete,
+    )
+    .await
+}
+async fn diff_with_source_io(
+    store: &Store,
+    storage: &FileBaselineStorage,
+    request: DiffFileBaselineRequestV1,
+    open_source: impl Fn(&Project, &str) -> Result<ValidatedProjectFile, FileReadError>,
+    mut read_source: impl FnMut(
+        &mut ValidatedProjectFile,
+        usize,
+    ) -> Result<crate::project_file_read::BoundedFileRead, FileReadError>,
+) -> Result<FileBaselineDiffV1, FileBaselineErrorV1> {
     let lock = storage.project_lock(request.project_id)?;
     let _lock = lock.lock().await;
     let saved = selected_baseline(
@@ -89,7 +108,7 @@ async fn diff_with_source_open(
         work: 200_000,
     };
     let mut entries = Vec::new();
-    let mut read_bytes = 0;
+    let mut attempted_read_bytes = 0;
     for (index, baseline) in saved.baseline.entries.iter().enumerate() {
         let mut entry = FileBaselineDiffEntryV1 {
             baseline: baseline.clone(),
@@ -131,15 +150,18 @@ async fn diff_with_source_open(
                     entry.current_size_bytes = Some(size);
                     if size > MAX_ITEM as u64 {
                         entry.state = BaselineDiffStateV1::CurrentTooLarge;
-                    } else if size > MAX_CAPTURE - read_bytes {
+                    } else if size > MAX_CAPTURE - attempted_read_bytes {
                         // No aggregate-budget state exists in V1; conservative
                         // Unreadable makes no claim about unobserved content.
                         entry.state = BaselineDiffStateV1::Unreadable;
                     } else {
-                        match file.read_complete(MAX_ITEM) {
+                        // Errors do not expose consumed bytes. Reserve the
+                        // entire payload allowance before attempting the read,
+                        // and pass that exact bound to W02 even if it grows.
+                        attempted_read_bytes += size;
+                        match read_source(&mut file, size as usize) {
                             Err(issue) => entry.state = diff_file_issue(issue)?,
                             Ok(read) => {
-                                read_bytes += read.read_bytes;
                                 if !read.eof
                                     || read.hash_scope
                                         != crate::project_file_read::FileHashScope::Full
@@ -597,6 +619,27 @@ async fn capture_with_source_open(
     checkpoint: impl Fn(CaptureStage) -> Result<(), FileBaselineErrorV1>,
     open_source: impl Fn(&Project, &str) -> Result<ValidatedProjectFile, FileReadError>,
 ) -> Result<FileBaselineV1, FileBaselineErrorV1> {
+    capture_with_source_io(
+        store,
+        storage,
+        request,
+        checkpoint,
+        open_source,
+        ValidatedProjectFile::read_complete,
+    )
+    .await
+}
+async fn capture_with_source_io(
+    store: &Store,
+    storage: &FileBaselineStorage,
+    request: CreateFileBaselineRequestV1,
+    checkpoint: impl Fn(CaptureStage) -> Result<(), FileBaselineErrorV1>,
+    open_source: impl Fn(&Project, &str) -> Result<ValidatedProjectFile, FileReadError>,
+    mut read_source: impl FnMut(
+        &mut ValidatedProjectFile,
+        usize,
+    ) -> Result<crate::project_file_read::BoundedFileRead, FileReadError>,
+) -> Result<FileBaselineV1, FileBaselineErrorV1> {
     let (request, digest) = canonical_request(request)?;
     let lock = storage.project_lock(request.project_id)?;
     let _lock = lock.lock().await;
@@ -642,7 +685,7 @@ async fn capture_with_source_open(
     let mut entries = Vec::new();
     let mut bodies = BTreeMap::new();
     let mut captured = 0;
-    let mut read_bytes = 0;
+    let mut attempted_read_bytes = 0;
     for f in &request.files {
         let path = &f.relative_path;
         let mut entry = FileBaselineEntryV1 {
@@ -686,16 +729,18 @@ async fn capture_with_source_open(
                         == Err(SmallWorkspaceTextIssue::UnsupportedContent)
                     {
                         entry.omission = Some(BaselineOmissionCodeV1::UnsupportedContent);
-                    } else if size > MAX_CAPTURE - read_bytes {
+                    } else if size > MAX_CAPTURE - attempted_read_bytes {
                         entry.omission = Some(BaselineOmissionCodeV1::AggregateBudget);
                     } else {
-                        match file.read_complete(MAX_ITEM) {
+                        // Keep the same conservative attempt accounting as
+                        // diff: a recoverable failure cannot refund capacity.
+                        attempted_read_bytes += size;
+                        match read_source(&mut file, size as usize) {
                             Err(FileReadError::SourceChanged) => {
                                 return Err(error(FileBaselineErrorCodeV1::SourceChanged));
                             }
                             Err(issue) => entry.omission = Some(file_omission(issue)),
                             Ok(read) => {
-                                read_bytes += read.read_bytes;
                                 if !read.eof
                                     || read.hash_scope
                                         != crate::project_file_read::FileHashScope::Full
@@ -1217,6 +1262,209 @@ mod tests {
     use super::*;
     use omicsops_core::workspace::{Project, ProjectTemplate};
     use uuid::Uuid;
+    fn budget_files(project: &Project, request: &mut CreateFileBaselineRequestV1, sizes: &[usize]) {
+        request.files.clear();
+        for (i, &size) in sizes.iter().enumerate() {
+            let path = format!("{i:02}.txt");
+            fs::write(Path::new(&project.local_root).join(&path), vec![b'x'; size]).unwrap();
+            request.files.push(ProjectFileSelectionV1 {
+                backend_id: "local".into(),
+                relative_path: path,
+                expected_full_sha256: None,
+            });
+        }
+    }
+    #[tokio::test]
+    async fn read_budget_diff_failed_attempts_consume_aggregate_budget() {
+        let (_d, s, p, b, mut r) = fixture().await;
+        budget_files(&p, &mut r, &[1; 9]);
+        let saved = capture_file_baseline(&s, &b, r.clone()).await.unwrap();
+        budget_files(&p, &mut r, &[MAX_ITEM; 9]);
+        let mut allowances = Vec::new();
+        let mut consumed = 0;
+        let result = diff_with_source_io(
+            &s,
+            &b,
+            diff_request(&saved),
+            ValidatedProjectFile::open,
+            |file, limit| {
+                allowances.push(limit);
+                consumed += file.read_complete(limit)?.read_bytes;
+                // Model a recoverable EOF-probe/post-observation failure after
+                // consuming actual W02 payload, without returning its byte count.
+                Err(FileReadError::Unavailable)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(consumed <= MAX_CAPTURE, "actual W02 payload {consumed}");
+        assert!(allowances.iter().sum::<usize>() <= MAX_CAPTURE as usize);
+        assert_eq!(allowances.len(), 8);
+        for entry in &result.entries {
+            assert_uncompared(entry, BaselineDiffStateV1::Unreadable);
+        }
+    }
+    #[tokio::test]
+    async fn read_budget_capture_failed_attempts_consume_aggregate_budget() {
+        let (_d, s, p, b, mut r) = fixture().await;
+        budget_files(&p, &mut r, &[MAX_ITEM; 9]);
+        let mut allowances = Vec::new();
+        let mut consumed = 0;
+        let saved = capture_with_source_io(
+            &s,
+            &b,
+            r,
+            |_| Ok(()),
+            ValidatedProjectFile::open,
+            |file, limit| {
+                allowances.push(limit);
+                consumed += file.read_complete(limit)?.read_bytes;
+                Err(FileReadError::Unavailable)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(consumed <= MAX_CAPTURE, "actual W02 payload {consumed}");
+        assert!(allowances.iter().sum::<usize>() <= MAX_CAPTURE as usize);
+        assert_eq!(allowances.len(), 8);
+        assert!(
+            saved.entries[..8]
+                .iter()
+                .all(|entry| entry.omission == Some(BaselineOmissionCodeV1::Unreadable))
+        );
+        assert_eq!(
+            saved.entries[8].omission,
+            Some(BaselineOmissionCodeV1::AggregateBudget)
+        );
+        assert_eq!(saved.captured_text_bytes, 0);
+        assert!(saved.entries.iter().all(|entry| entry.content_mode
+            == WorkspaceContentModeV1::ReferenceOnly
+            && entry.hash.is_none()));
+    }
+    #[tokio::test]
+    async fn read_budget_diff_normal_remaining_bounds_each_allowance() {
+        let (_d, s, p, b, mut r) = fixture().await;
+        budget_files(&p, &mut r, &[1; 9]);
+        let saved = capture_file_baseline(&s, &b, r.clone()).await.unwrap();
+        let mut sizes = vec![MAX_ITEM; 9];
+        sizes[7] = MAX_ITEM / 2;
+        budget_files(&p, &mut r, &sizes);
+        let mut allowances = Vec::new();
+        let result = diff_with_source_io(
+            &s,
+            &b,
+            diff_request(&saved),
+            ValidatedProjectFile::open,
+            |file, limit| {
+                allowances.push(limit);
+                file.read_complete(limit)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(allowances, sizes[..8]);
+        assert!(allowances.iter().sum::<usize>() <= MAX_CAPTURE as usize);
+        assert!(result.entries[..8].iter().all(|entry| entry.state
+            == BaselineDiffStateV1::Changed
+            && entry.current_hash.is_some()));
+        assert_uncompared(&result.entries[8], BaselineDiffStateV1::Unreadable);
+        assert_eq!(result.entries[8].current_size_bytes, Some(MAX_ITEM as u64));
+    }
+    #[tokio::test]
+    async fn read_budget_capture_normal_remaining_bounds_each_allowance() {
+        let (_d, s, p, b, mut r) = fixture().await;
+        let mut sizes = vec![MAX_ITEM; 9];
+        sizes[7] = MAX_ITEM / 2;
+        budget_files(&p, &mut r, &sizes);
+        let mut allowances = Vec::new();
+        let saved = capture_with_source_io(
+            &s,
+            &b,
+            r,
+            |_| Ok(()),
+            ValidatedProjectFile::open,
+            |file, limit| {
+                allowances.push(limit);
+                file.read_complete(limit)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(allowances, sizes[..8]);
+        assert!(allowances.iter().sum::<usize>() <= MAX_CAPTURE as usize);
+        assert_eq!(
+            saved.captured_text_bytes,
+            (7 * MAX_ITEM + MAX_ITEM / 2) as u64
+        );
+        assert!(
+            saved.entries[..8]
+                .iter()
+                .all(|entry| entry.content_mode == WorkspaceContentModeV1::TextSnapshot)
+        );
+        assert_eq!(
+            saved.entries[8].omission,
+            Some(BaselineOmissionCodeV1::AggregateBudget)
+        );
+        assert_eq!(saved.entries[8].hash, None);
+    }
+    #[tokio::test]
+    async fn read_budget_diff_growth_allowance_preserves_source_changed() {
+        let (_d, s, p, b, r) = fixture().await;
+        let saved = capture_file_baseline(&s, &b, r).await.unwrap();
+        let mut observed = None;
+        let result = diff_with_source_io(
+            &s,
+            &b,
+            diff_request(&saved),
+            ValidatedProjectFile::open,
+            |file, limit| {
+                let size = file.metadata().size_bytes;
+                fs::write(Path::new(&p.local_root).join("a.txt"), vec![b'x'; MAX_ITEM]).unwrap();
+                let issue = file.read_complete(limit).unwrap_err();
+                observed = Some((size, limit, issue));
+                Err(issue)
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(result.code, FileBaselineErrorCodeV1::SourceChanged);
+        assert_eq!(observed, Some((6, 6, FileReadError::SourceChanged)));
+    }
+    #[tokio::test]
+    async fn read_budget_capture_growth_allowance_preserves_source_changed() {
+        let (_d, s, p, b, r) = fixture().await;
+        let mut observed = None;
+        let result = capture_with_source_io(
+            &s,
+            &b,
+            r,
+            |_| Ok(()),
+            ValidatedProjectFile::open,
+            |file, limit| {
+                let size = file.metadata().size_bytes;
+                fs::write(Path::new(&p.local_root).join("a.txt"), vec![b'x'; MAX_ITEM]).unwrap();
+                let issue = file.read_complete(limit).unwrap_err();
+                observed = Some((size, limit, issue));
+                Err(issue)
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(result.code, FileBaselineErrorCodeV1::SourceChanged);
+        assert_eq!(observed, Some((6, 6, FileReadError::SourceChanged)));
+        assert!(
+            s.workspace_list_file_baselines(&ListFileBaselinesRequestV1 {
+                project_id: p.id,
+                branch_conversation_id: None,
+                offset: 0,
+                limit: 64
+            })
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+        );
+    }
     fn diff_request(b: &FileBaselineV1) -> DiffFileBaselineRequestV1 {
         DiffFileBaselineRequestV1 {
             project_id: b.project_id,
@@ -1572,17 +1820,17 @@ mod tests {
         let first = capture_file_baseline(&s, &b, r.clone()).await.unwrap();
         r.request_id = Uuid::new_v4();
         let second = capture_file_baseline(&s, &b, r).await.unwrap();
-        // Store orders second-resolution capture time, then UUID, not capture
-        // call order when the two records share a timestamp.
+        // Store orders millisecond-resolution capture time, then UUID, not
+        // capture call order when the two records share a timestamp.
         let mut expected = vec![first.clone(), second];
         expected.sort_by(|a, b| {
             chrono::DateTime::parse_from_rfc3339(&b.created_at)
                 .unwrap()
-                .timestamp()
+                .timestamp_millis()
                 .cmp(
                     &chrono::DateTime::parse_from_rfc3339(&a.created_at)
                         .unwrap()
-                        .timestamp(),
+                        .timestamp_millis(),
                 )
                 .then_with(|| a.id.cmp(&b.id))
         });
