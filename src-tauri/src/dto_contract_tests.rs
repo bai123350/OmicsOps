@@ -6,6 +6,32 @@ use crate::dto::{
 use serde_json::json;
 
 #[test]
+fn file_baseline_metadata_and_diff_command_contracts() {
+    use omicsops_dto::{
+        DiffFileBaselineRequestV1, FileBaselineDiffV1, FileBaselinePageV1,
+        ListFileBaselinesRequestV1,
+    };
+    let project = uuid::Uuid::from_u128(2);
+    let baseline = uuid::Uuid::from_u128(3);
+    let list =
+        json!({"project_id": project, "branch_conversation_id": null, "offset": 4, "limit": 8});
+    let parsed: ListFileBaselinesRequestV1 = serde_json::from_value(list.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), list);
+    let diff = json!({"project_id": project, "baseline_id": baseline, "expected_manifest_sha256": "a".repeat(64)});
+    let parsed: DiffFileBaselineRequestV1 = serde_json::from_value(diff.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), diff);
+    let mut forbidden = diff;
+    forbidden["blob_path"] = json!("arbitrary");
+    assert!(serde_json::from_value::<DiffFileBaselineRequestV1>(forbidden).is_err());
+    let page = json!({"items": [], "next_offset": null});
+    let parsed: FileBaselinePageV1 = serde_json::from_value(page.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), page);
+    let response = json!({"project_id": project, "baseline_id": baseline, "manifest_sha256": "a".repeat(64), "observed_at": "2026-10-13T00:00:00Z", "entries": []});
+    let parsed: FileBaselineDiffV1 = serde_json::from_value(response.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), response);
+}
+
+#[test]
 fn file_baseline_nullable_hash_path_and_line_endings_contract() {
     use omicsops_dto::{CreateFileBaselineRequestV1, FileBaselineDiffEntryV1};
     let value = json!({"baseline":{"backend_id":"local","relative_path":null,"content_mode":"reference_only","size_bytes":null,"hash":null,"omission":"sensitive_content","captured_at":"2026-10-13T00:00:00Z"},"state":"reference_only","current_size_bytes":null,"current_hash":null,"line_endings_changed":null,"final_newline_changed":null,"hunks":[],"hunks_truncated":false});
@@ -16,6 +42,7 @@ fn file_baseline_nullable_hash_path_and_line_endings_contract() {
     changed["line_endings_changed"] = json!(true);
     changed["final_newline_changed"] = json!(false);
     changed["current_hash"] = json!({"sha256":"a".repeat(64),"scope":"full_file"});
+    changed["hunks"] = json!([{"old_start":1,"old_lines":2,"new_start":1,"new_lines":2,"lines":[{"kind":"context","text":"same"},{"kind":"removed","text":"old"},{"kind":"added","text":"new\t\"value\""}]}]);
     let parsed: FileBaselineDiffEntryV1 = serde_json::from_value(changed.clone()).unwrap();
     assert_eq!(serde_json::to_value(parsed).unwrap(), changed);
     let request = json!({"request_id":uuid::Uuid::from_u128(1),"project_id":uuid::Uuid::from_u128(2),"branch_conversation_id":null,"title":"Baseline","files":[{"backend_id":"local","relative_path":"script.py","expected_full_sha256":null}]});

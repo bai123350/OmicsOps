@@ -1,4 +1,4 @@
-//! Host-only bounded capture. W02 owns all source file opens and reads.
+//! Host-only bounded capture and comparison. W02 owns source opens and reads.
 use crate::{
     commands::AppState,
     project_file_read::{FileReadError, ValidatedProjectFile},
@@ -27,6 +27,328 @@ const MAX_ITEM: usize = 512 * 1024;
 const MAX_CAPTURE: u64 = 4 * 1024 * 1024;
 const MAX_PHYSICAL: u64 = 256 * 1024 * 1024;
 const NAMESPACE: &str = "workspace-file-baselines";
+async fn list_file_baselines(
+    store: &Store,
+    request: ListFileBaselinesRequestV1,
+) -> Result<FileBaselinePageV1, FileBaselineErrorV1> {
+    if request.project_id.is_nil() || request.branch_conversation_id.is_some_and(|id| id.is_nil()) {
+        return Err(error(FileBaselineErrorCodeV1::InvalidSelection));
+    }
+    store
+        .workspace_list_file_baselines(&request)
+        .await
+        .map_err(storage_error)
+}
+async fn get_file_baseline(
+    store: &Store,
+    project_id: Uuid,
+    baseline_id: Uuid,
+) -> Result<FileBaselineV1, FileBaselineErrorV1> {
+    if project_id.is_nil() || baseline_id.is_nil() {
+        return Err(error(FileBaselineErrorCodeV1::InvalidSelection));
+    }
+    store
+        .workspace_get_file_baseline(project_id, baseline_id)
+        .await
+        .map_err(storage_error)?
+        .map(|s| s.baseline)
+        .ok_or_else(|| error(FileBaselineErrorCodeV1::NotFound))
+}
+async fn diff_file_baseline(
+    store: &Store,
+    storage: &FileBaselineStorage,
+    request: DiffFileBaselineRequestV1,
+) -> Result<FileBaselineDiffV1, FileBaselineErrorV1> {
+    diff_with_source_open(store, storage, request, ValidatedProjectFile::open).await
+}
+async fn diff_with_source_open(
+    store: &Store,
+    storage: &FileBaselineStorage,
+    request: DiffFileBaselineRequestV1,
+    open_source: impl Fn(&Project, &str) -> Result<ValidatedProjectFile, FileReadError>,
+) -> Result<FileBaselineDiffV1, FileBaselineErrorV1> {
+    let lock = storage.project_lock(request.project_id)?;
+    let _lock = lock.lock().await;
+    let saved = selected_baseline(
+        store,
+        request.project_id,
+        request.baseline_id,
+        &request.expected_manifest_sha256,
+    )
+    .await?;
+    let project = store
+        .get_project(request.project_id)
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(|| error(FileBaselineErrorCodeV1::NotFound))?;
+    let binding_changed = saved.local_root_binding_sha256 != local_root_binding_sha256(&project);
+    // Reserve the JSON [] of every entry, including those that emit no hunks.
+    let mut budget = DiffBudget {
+        bytes: 256 * 1024 - 2 * saved.baseline.entries.len(),
+        lines: 2000,
+        work: 200_000,
+    };
+    let mut entries = Vec::new();
+    let mut read_bytes = 0;
+    for (index, baseline) in saved.baseline.entries.iter().enumerate() {
+        let mut entry = FileBaselineDiffEntryV1 {
+            baseline: baseline.clone(),
+            state: BaselineDiffStateV1::ReferenceOnly,
+            current_size_bytes: None,
+            current_hash: None,
+            line_endings_changed: None,
+            final_newline_changed: None,
+            hunks: Vec::new(),
+            hunks_truncated: false,
+        };
+        if binding_changed {
+            entry.state = BaselineDiffStateV1::BindingChanged;
+        } else if baseline.content_mode == WorkspaceContentModeV1::TextSnapshot {
+            let path = baseline
+                .relative_path
+                .as_deref()
+                .ok_or_else(|| error(FileBaselineErrorCodeV1::StorageFailed))?;
+            let hash = saved
+                .blob_sha256_by_entry
+                .get(index)
+                .and_then(Option::as_deref)
+                .ok_or_else(|| error(FileBaselineErrorCodeV1::StorageFailed))?;
+            // History has an independent lifetime; its corruption must not be
+            // disguised as a missing/unavailable current source.
+            let old = read_blob(
+                storage,
+                project.id,
+                hash,
+                baseline
+                    .size_bytes
+                    .ok_or_else(|| error(FileBaselineErrorCodeV1::StorageFailed))?,
+                path,
+            )?;
+            match open_source(&project, path) {
+                Err(issue) => entry.state = diff_file_issue(issue)?,
+                Ok(mut file) => {
+                    let size = file.metadata().size_bytes;
+                    entry.current_size_bytes = Some(size);
+                    if size > MAX_ITEM as u64 {
+                        entry.state = BaselineDiffStateV1::CurrentTooLarge;
+                    } else if size > MAX_CAPTURE - read_bytes {
+                        // No aggregate-budget state exists in V1; conservative
+                        // Unreadable makes no claim about unobserved content.
+                        entry.state = BaselineDiffStateV1::Unreadable;
+                    } else {
+                        match file.read_complete(MAX_ITEM) {
+                            Err(issue) => entry.state = diff_file_issue(issue)?,
+                            Ok(read) => {
+                                read_bytes += read.read_bytes;
+                                if !read.eof
+                                    || read.hash_scope
+                                        != crate::project_file_read::FileHashScope::Full
+                                {
+                                    return Err(error(FileBaselineErrorCodeV1::SourceChanged));
+                                }
+                                match inspect_small_workspace_text(path, &read.bytes) {
+                                    Err(SmallWorkspaceTextIssue::SensitiveContent) => {
+                                        entry.state = BaselineDiffStateV1::SensitiveCurrentContent
+                                    }
+                                    Err(SmallWorkspaceTextIssue::TooLarge) => {
+                                        entry.state = BaselineDiffStateV1::CurrentTooLarge
+                                    }
+                                    Err(SmallWorkspaceTextIssue::UnsupportedContent) => {
+                                        entry.state = BaselineDiffStateV1::Unreadable
+                                    }
+                                    Ok(current) => {
+                                        let old = std::str::from_utf8(&old).map_err(|_| {
+                                            error(FileBaselineErrorCodeV1::StorageFailed)
+                                        })?;
+                                        entry.current_hash = Some(FileReferenceHashV1 {
+                                            sha256: read.sha256.clone(),
+                                            scope: FileReferenceHashScopeV1::FullFile,
+                                        });
+                                        entry.state = if hash == read.sha256 {
+                                            BaselineDiffStateV1::Unchanged
+                                        } else {
+                                            BaselineDiffStateV1::Changed
+                                        };
+                                        entry.line_endings_changed =
+                                            Some(line_endings_changed(old, current));
+                                        entry.final_newline_changed =
+                                            Some(old.ends_with('\n') != current.ends_with('\n'));
+                                        if entry.state == BaselineDiffStateV1::Changed {
+                                            let (hunks, truncated) =
+                                                bounded_hunks(old, current, &mut budget)?;
+                                            entry.hunks = hunks;
+                                            entry.hunks_truncated = truncated;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        entries.push(entry);
+    }
+    // Sequential observations are not an atomic snapshot. Do not attach them
+    // to a root that was rebound while files were being read.
+    let current = store
+        .get_project(project.id)
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(|| error(FileBaselineErrorCodeV1::NotFound))?;
+    if current.local_root != project.local_root {
+        for entry in &mut entries {
+            entry.state = BaselineDiffStateV1::BindingChanged;
+            entry.current_size_bytes = None;
+            entry.current_hash = None;
+            entry.line_endings_changed = None;
+            entry.final_newline_changed = None;
+            entry.hunks.clear();
+            entry.hunks_truncated = false;
+        }
+    }
+    Ok(FileBaselineDiffV1 {
+        project_id: project.id,
+        baseline_id: saved.baseline.id,
+        manifest_sha256: saved.baseline.manifest_sha256,
+        observed_at: chrono::Utc::now().to_rfc3339(),
+        entries,
+    })
+}
+fn diff_file_issue(issue: FileReadError) -> Result<BaselineDiffStateV1, FileBaselineErrorV1> {
+    Ok(match issue {
+        FileReadError::SourceChanged => return Err(error(FileBaselineErrorCodeV1::SourceChanged)),
+        FileReadError::InvalidPath | FileReadError::UnsafeFile | FileReadError::NotRegular => {
+            BaselineDiffStateV1::UnsafeFile
+        }
+        FileReadError::TooLarge => BaselineDiffStateV1::CurrentTooLarge,
+        FileReadError::Unavailable => BaselineDiffStateV1::Unreadable,
+    })
+}
+// Compare observed terminator styles, including mixed-style order. A missing
+// final terminator is reported separately, not inferred to be another style.
+fn line_endings_changed(old: &str, new: &str) -> bool {
+    let old_styles = newline_styles(old);
+    let new_styles = newline_styles(new);
+    old_styles != (false, false)
+        && new_styles != (false, false)
+        && (old_styles != new_styles
+            || newline_kinds(old)
+                .zip(newline_kinds(new))
+                .any(|(a, b)| a != b))
+}
+fn newline_kinds(text: &str) -> impl Iterator<Item = bool> + '_ {
+    let bytes = text.as_bytes();
+    bytes
+        .iter()
+        .enumerate()
+        .filter_map(move |(i, b)| (*b == b'\n').then(|| i > 0 && bytes[i - 1] == b'\r'))
+}
+fn newline_styles(text: &str) -> (bool, bool) {
+    newline_kinds(text).fold((false, false), |(lf, crlf), kind| {
+        (lf || !kind, crlf || kind)
+    })
+}
+struct DiffBudget {
+    bytes: usize,
+    lines: usize,
+    work: usize,
+}
+fn bounded_hunks(
+    old: &str,
+    new: &str,
+    budget: &mut DiffBudget,
+) -> Result<(Vec<BaselineTextHunkV1>, bool), FileBaselineErrorV1> {
+    // Rust lines removes LF/CRLF terminators and the trailing empty line only.
+    let old: Vec<_> = old.lines().take(10_001).collect();
+    let new: Vec<_> = new.lines().take(10_001).collect();
+    if old.len() > 10_000 || new.len() > 10_000 {
+        return Ok((Vec::new(), true));
+    }
+    // Also reserve linear equality/traversal comparisons, rather than only
+    // the quadratic table cells. The budget is shared across all files.
+    let linear = 2 * (old.len() + new.len());
+    if linear > budget.work {
+        return Ok((Vec::new(), true));
+    }
+    budget.work -= linear;
+    if old == new {
+        return Ok((Vec::new(), false));
+    }
+    let cells = old.len().saturating_mul(new.len());
+    if cells > budget.work {
+        return Ok((Vec::new(), true));
+    }
+    budget.work -= cells;
+    // Allocation and quadratic work occur only after the cell budget check.
+    let width = new.len() + 1;
+    let mut lcs = vec![0u16; (old.len() + 1) * width];
+    for i in (0..old.len()).rev() {
+        for j in (0..new.len()).rev() {
+            lcs[i * width + j] = if old[i] == new[j] {
+                1 + lcs[(i + 1) * width + j + 1]
+            } else {
+                lcs[(i + 1) * width + j].max(lcs[i * width + j + 1])
+            };
+        }
+    }
+    let mut hunk = BaselineTextHunkV1 {
+        old_start: u32::from(!old.is_empty()),
+        old_lines: u32::MAX,
+        new_start: u32::from(!new.is_empty()),
+        new_lines: u32::MAX,
+        lines: Vec::new(),
+    };
+    // Reserve header with longest possible count encoding; each line is
+    // measured with serde_json, so quotes/backslashes/control escapes count.
+    let mut bytes = serde_json::to_vec(&hunk)
+        .map_err(|_| error(FileBaselineErrorCodeV1::StorageFailed))?
+        .len();
+    hunk.old_lines = 0;
+    hunk.new_lines = 0;
+    let (mut i, mut j) = (0, 0);
+    while i < old.len() || j < new.len() {
+        let (kind, text) = if i < old.len() && j < new.len() && old[i] == new[j] {
+            (BaselineDiffLineKindV1::Context, old[i])
+        } else if i < old.len()
+            && (j == new.len() || lcs[(i + 1) * width + j] >= lcs[i * width + j + 1])
+        {
+            (BaselineDiffLineKindV1::Removed, old[i])
+        } else {
+            (BaselineDiffLineKindV1::Added, new[j])
+        };
+        let line = BaselineDiffLineV1 {
+            kind,
+            text: text.into(),
+        };
+        let cost = serde_json::to_vec(&line)
+            .map_err(|_| error(FileBaselineErrorCodeV1::StorageFailed))?
+            .len()
+            + usize::from(!hunk.lines.is_empty());
+        if hunk.lines.len() == budget.lines || bytes.saturating_add(cost) > budget.bytes {
+            break;
+        }
+        bytes += cost;
+        if kind != BaselineDiffLineKindV1::Added {
+            i += 1;
+            hunk.old_lines += 1;
+        }
+        if kind != BaselineDiffLineKindV1::Removed {
+            j += 1;
+            hunk.new_lines += 1;
+        }
+        hunk.lines.push(line);
+    }
+    let truncated = i < old.len() || j < new.len();
+    if hunk.lines.is_empty() {
+        return Ok((Vec::new(), truncated));
+    }
+    budget.lines -= hunk.lines.len();
+    budget.bytes -= serde_json::to_vec(&hunk)
+        .map_err(|_| error(FileBaselineErrorCodeV1::StorageFailed))?
+        .len();
+    Ok((vec![hunk], truncated))
+}
 pub(crate) struct FileBaselineStorage {
     root: PathBuf,
     locks: Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
@@ -195,6 +517,30 @@ fn canonical_request(
     r.files = unique.into_values().collect();
     let digest = sha256(&serde_json::to_vec(&r).map_err(|_| invalid())?);
     Ok((r, digest))
+}
+#[tauri::command]
+pub async fn workspace_list_file_baselines(
+    state: State<'_, AppState>,
+    request: ListFileBaselinesRequestV1,
+) -> Result<FileBaselinePageV1, FileBaselineErrorV1> {
+    list_file_baselines(&state.repository, request).await
+}
+#[tauri::command]
+pub async fn workspace_get_file_baseline(
+    state: State<'_, AppState>,
+    project_id: Uuid,
+    baseline_id: Uuid,
+) -> Result<FileBaselineV1, FileBaselineErrorV1> {
+    get_file_baseline(&state.repository, project_id, baseline_id).await
+}
+#[tauri::command]
+pub async fn workspace_diff_file_baseline(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: DiffFileBaselineRequestV1,
+) -> Result<FileBaselineDiffV1, FileBaselineErrorV1> {
+    let _ = app;
+    diff_file_baseline(&state.repository, &state.file_baseline_storage, request).await
 }
 #[tauri::command]
 pub async fn workspace_create_file_baseline(
@@ -871,6 +1217,446 @@ mod tests {
     use super::*;
     use omicsops_core::workspace::{Project, ProjectTemplate};
     use uuid::Uuid;
+    fn diff_request(b: &FileBaselineV1) -> DiffFileBaselineRequestV1 {
+        DiffFileBaselineRequestV1 {
+            project_id: b.project_id,
+            baseline_id: b.id,
+            expected_manifest_sha256: b.manifest_sha256.clone(),
+        }
+    }
+    fn assert_uncompared(e: &FileBaselineDiffEntryV1, state: BaselineDiffStateV1) {
+        assert_eq!(e.state, state);
+        assert!(e.hunks.is_empty());
+        assert_eq!(e.line_endings_changed, None);
+        assert_eq!(e.final_newline_changed, None);
+        assert_eq!(e.current_hash, None);
+    }
+    #[tokio::test]
+    async fn diff_binding_changed() {
+        let (_d, s, mut p, b, r) = fixture().await;
+        let saved = capture_file_baseline(&s, &b, r).await.unwrap();
+        p.local_root.push_str("-changed");
+        s.save_project(&p).await.unwrap();
+        let result = diff_with_source_open(&s, &b, diff_request(&saved), |_, _| {
+            panic!("binding changed must not open source")
+        })
+        .await
+        .unwrap();
+        assert_uncompared(&result.entries[0], BaselineDiffStateV1::BindingChanged);
+    }
+    #[tokio::test]
+    async fn diff_reference_only_never_reads() {
+        let (_d, s, p, b, mut r) = fixture().await;
+        fs::write(
+            Path::new(&p.local_root).join("a.txt"),
+            b"password='SYNTHETIC_123456'",
+        )
+        .unwrap();
+        r.files.push(ProjectFileSelectionV1 {
+            backend_id: "local".into(),
+            relative_path: "absent.txt".into(),
+            expected_full_sha256: None,
+        });
+        let saved = capture_file_baseline(&s, &b, r).await.unwrap();
+        let result = diff_with_source_open(&s, &b, diff_request(&saved), |_, _| {
+            panic!("reference only must not open source")
+        })
+        .await
+        .unwrap();
+        for e in &result.entries {
+            assert_uncompared(e, BaselineDiffStateV1::ReferenceOnly);
+        }
+    }
+    #[tokio::test]
+    async fn diff_newlines_and_budget() {
+        let (_d, s, p, b, mut r) = fixture().await;
+        let path = Path::new(&p.local_root).join("a.txt");
+        fs::write(&path, b"hello\r\nworld\r\n").unwrap();
+        let saved = capture_file_baseline(&s, &b, r.clone()).await.unwrap();
+        fs::write(&path, b"hello\nworld").unwrap();
+        let result = diff_file_baseline(&s, &b, diff_request(&saved))
+            .await
+            .unwrap();
+        let e = &result.entries[0];
+        assert_eq!(e.state, BaselineDiffStateV1::Changed);
+        assert_eq!(e.line_endings_changed, Some(true));
+        assert_eq!(e.final_newline_changed, Some(true));
+        assert!(e.hunks.is_empty());
+        r.request_id = Uuid::new_v4();
+        fs::write(&path, "old\n".repeat(250)).unwrap();
+        r.files.push(ProjectFileSelectionV1 {
+            backend_id: "local".into(),
+            relative_path: "b.txt".into(),
+            expected_full_sha256: None,
+        });
+        fs::write(Path::new(&p.local_root).join("b.txt"), "old\n".repeat(250)).unwrap();
+        let saved = capture_file_baseline(&s, &b, r).await.unwrap();
+        // Tabs cost two JSON bytes each, not one UTF-8 byte.
+        let changed = format!("{}\n", "\t".repeat(600)).repeat(250);
+        fs::write(&path, &changed).unwrap();
+        fs::write(Path::new(&p.local_root).join("b.txt"), changed).unwrap();
+        let result = diff_file_baseline(&s, &b, diff_request(&saved))
+            .await
+            .unwrap();
+        assert!(result.entries.iter().any(|e| e.hunks_truncated));
+        let bytes: usize = result
+            .entries
+            .iter()
+            .map(|e| serde_json::to_vec(&e.hunks).unwrap().len())
+            .sum();
+        let lines: usize = result
+            .entries
+            .iter()
+            .flat_map(|e| &e.hunks)
+            .map(|h| h.lines.len())
+            .sum();
+        assert!(bytes <= 256 * 1024, "{bytes}");
+        assert!(lines <= 2000);
+    }
+    #[tokio::test]
+    async fn diff_current_sensitive_or_too_large() {
+        let (_d, s, p, b, r) = fixture().await;
+        let saved = capture_file_baseline(&s, &b, r).await.unwrap();
+        let path = Path::new(&p.local_root).join("a.txt");
+        for (bytes, state) in [
+            (
+                b"password='SYNTHETIC_123456'".to_vec(),
+                BaselineDiffStateV1::SensitiveCurrentContent,
+            ),
+            (
+                vec![b'x'; MAX_ITEM + 1],
+                BaselineDiffStateV1::CurrentTooLarge,
+            ),
+            (vec![0, 255], BaselineDiffStateV1::Unreadable),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            let result = diff_file_baseline(&s, &b, diff_request(&saved))
+                .await
+                .unwrap();
+            assert_uncompared(&result.entries[0], state);
+        }
+        let changed = diff_with_source_open(&s, &b, diff_request(&saved), |_, _| {
+            Err(FileReadError::SourceChanged)
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(changed.code, FileBaselineErrorCodeV1::SourceChanged);
+        let unsafe_result = diff_with_source_open(&s, &b, diff_request(&saved), |_, _| {
+            Err(FileReadError::UnsafeFile)
+        })
+        .await
+        .unwrap();
+        assert_uncompared(&unsafe_result.entries[0], BaselineDiffStateV1::UnsafeFile);
+    }
+    #[tokio::test]
+    async fn diff_missing_and_bad_manifest() {
+        let (_d, s, p, b, r) = fixture().await;
+        let saved = capture_file_baseline(&s, &b, r).await.unwrap();
+        fs::remove_file(Path::new(&p.local_root).join("a.txt")).unwrap();
+        let result = diff_file_baseline(&s, &b, diff_request(&saved))
+            .await
+            .unwrap();
+        assert_uncompared(&result.entries[0], BaselineDiffStateV1::Unreadable);
+        let mut q = diff_request(&saved);
+        q.expected_manifest_sha256 = "a".repeat(64);
+        assert_eq!(
+            diff_file_baseline(&s, &b, q).await.unwrap_err().code,
+            FileBaselineErrorCodeV1::ManifestChanged
+        );
+        let hash = &saved.entries[0].hash.as_ref().unwrap().sha256;
+        fs::write(b.blob_path(p.id, hash).unwrap(), b"other\n").unwrap();
+        assert_eq!(
+            diff_file_baseline(&s, &b, diff_request(&saved))
+                .await
+                .unwrap_err()
+                .code,
+            FileBaselineErrorCodeV1::StorageFailed
+        );
+        fs::remove_file(b.blob_path(p.id, hash).unwrap()).unwrap();
+        assert_eq!(
+            diff_file_baseline(&s, &b, diff_request(&saved))
+                .await
+                .unwrap_err()
+                .code,
+            FileBaselineErrorCodeV1::StorageFailed
+        );
+        sqlx::query("UPDATE exploration_baselines_v4 SET manifest_json='{}' WHERE id=?")
+            .bind(saved.id.to_string())
+            .execute(s.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            diff_file_baseline(&s, &b, diff_request(&saved))
+                .await
+                .unwrap_err()
+                .code,
+            FileBaselineErrorCodeV1::ManifestChanged
+        );
+    }
+    #[tokio::test]
+    async fn diff_foreign_owner() {
+        let (_d, s, mut p, b, r) = fixture().await;
+        let saved = capture_file_baseline(&s, &b, r).await.unwrap();
+        p.id = Uuid::new_v4();
+        s.save_project(&p).await.unwrap();
+        let mut q = diff_request(&saved);
+        q.project_id = p.id;
+        assert_eq!(
+            diff_with_source_open(&s, &b, q, |_, _| panic!(
+                "foreign baseline must not open source"
+            ))
+            .await
+            .unwrap_err()
+            .code,
+            FileBaselineErrorCodeV1::OwnershipMismatch
+        );
+    }
+    #[tokio::test]
+    async fn diff_final_newline_only_and_mixed_styles() {
+        let (_d, s, p, b, mut r) = fixture().await;
+        let path = Path::new(&p.local_root).join("a.txt");
+        let saved = capture_file_baseline(&s, &b, r.clone()).await.unwrap();
+        fs::write(&path, b"hello").unwrap();
+        let result = diff_file_baseline(&s, &b, diff_request(&saved))
+            .await
+            .unwrap();
+        assert_eq!(result.entries[0].line_endings_changed, Some(false));
+        assert_eq!(result.entries[0].final_newline_changed, Some(true));
+        assert!(result.entries[0].hunks.is_empty());
+        r.request_id = Uuid::new_v4();
+        fs::write(&path, b"first\r\nsecond\n").unwrap();
+        let saved = capture_file_baseline(&s, &b, r).await.unwrap();
+        fs::write(&path, b"first\nsecond\r\n").unwrap();
+        let result = diff_file_baseline(&s, &b, diff_request(&saved))
+            .await
+            .unwrap();
+        assert_eq!(result.entries[0].line_endings_changed, Some(true));
+        assert_eq!(result.entries[0].final_newline_changed, Some(false));
+        assert!(result.entries[0].hunks.is_empty());
+    }
+    #[tokio::test]
+    async fn diff_algorithm_inputs_work_and_global_line_budget() {
+        let (_d, s, p, b, mut r) = fixture().await;
+        let path = Path::new(&p.local_root).join("a.txt");
+        for count in [10_001, 450, 447] {
+            r.request_id = Uuid::new_v4();
+            fs::write(&path, "old\n".repeat(count)).unwrap();
+            let saved = capture_file_baseline(&s, &b, r.clone()).await.unwrap();
+            fs::write(&path, "new\n".repeat(count)).unwrap();
+            let result = diff_file_baseline(&s, &b, diff_request(&saved))
+                .await
+                .unwrap();
+            let e = &result.entries[0];
+            assert_eq!(e.state, BaselineDiffStateV1::Changed);
+            assert!(e.current_hash.is_some());
+            assert!(e.hunks.is_empty());
+            assert!(e.hunks_truncated);
+        }
+        r.request_id = Uuid::new_v4();
+        r.files.clear();
+        for i in 0..3 {
+            let path = format!("{i}.txt");
+            fs::write(Path::new(&p.local_root).join(&path), b"").unwrap();
+            r.files.push(ProjectFileSelectionV1 {
+                backend_id: "local".into(),
+                relative_path: path,
+                expected_full_sha256: None,
+            });
+        }
+        let saved = capture_file_baseline(&s, &b, r).await.unwrap();
+        for i in 0..3 {
+            fs::write(
+                Path::new(&p.local_root).join(format!("{i}.txt")),
+                "new\n".repeat(900),
+            )
+            .unwrap();
+        }
+        let result = diff_file_baseline(&s, &b, diff_request(&saved))
+            .await
+            .unwrap();
+        let lines: usize = result
+            .entries
+            .iter()
+            .flat_map(|e| &e.hunks)
+            .map(|h| h.lines.len())
+            .sum();
+        assert_eq!(lines, 2000);
+        assert!(result.entries[2].hunks_truncated);
+        assert_eq!(result.entries[0].hunks[0].old_lines, 0);
+        assert_eq!(result.entries[0].hunks[0].new_lines, 900);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn diff_changed_hunk_and_root_rebound_during_observation() {
+        let (_d, s, p, b, r) = fixture().await;
+        let saved = capture_file_baseline(&s, &b, r).await.unwrap();
+        fs::write(Path::new(&p.local_root).join("a.txt"), b"hi\n").unwrap();
+        let result = diff_file_baseline(&s, &b, diff_request(&saved))
+            .await
+            .unwrap();
+        let hunk = &result.entries[0].hunks[0];
+        assert_eq!(
+            (
+                hunk.old_start,
+                hunk.new_start,
+                hunk.old_lines,
+                hunk.new_lines
+            ),
+            (1, 1, 1, 1)
+        );
+        assert_eq!(
+            hunk.lines[0],
+            BaselineDiffLineV1 {
+                kind: BaselineDiffLineKindV1::Removed,
+                text: "hello".into()
+            }
+        );
+        assert_eq!(
+            hunk.lines[1],
+            BaselineDiffLineV1 {
+                kind: BaselineDiffLineKindV1::Added,
+                text: "hi".into()
+            }
+        );
+        assert!(!result.entries[0].hunks_truncated);
+        let result = diff_with_source_open(&s, &b, diff_request(&saved), |project, path| {
+            let file = ValidatedProjectFile::open(project, path)?;
+            let mut rebound = project.clone();
+            rebound.local_root.push_str("-rebound");
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(s.save_project(&rebound))
+            })
+            .unwrap();
+            Ok(file)
+        })
+        .await
+        .unwrap();
+        assert_uncompared(&result.entries[0], BaselineDiffStateV1::BindingChanged);
+        assert_eq!(result.entries[0].current_size_bytes, None);
+    }
+    #[tokio::test]
+    async fn diff_normalized_equal_lines_still_bound_comparisons() {
+        let (_d, s, p, b, mut r) = fixture().await;
+        r.files.clear();
+        for i in 0..6 {
+            let path = format!("{i}.txt");
+            fs::write(
+                Path::new(&p.local_root).join(&path),
+                "same\r\n".repeat(10_000),
+            )
+            .unwrap();
+            r.files.push(ProjectFileSelectionV1 {
+                backend_id: "local".into(),
+                relative_path: path,
+                expected_full_sha256: None,
+            });
+        }
+        let saved = capture_file_baseline(&s, &b, r).await.unwrap();
+        for i in 0..6 {
+            fs::write(
+                Path::new(&p.local_root).join(format!("{i}.txt")),
+                "same\n".repeat(10_000),
+            )
+            .unwrap();
+        }
+        let result = diff_file_baseline(&s, &b, diff_request(&saved))
+            .await
+            .unwrap();
+        assert_eq!(result.entries[5].state, BaselineDiffStateV1::Changed);
+        assert_eq!(result.entries[5].line_endings_changed, Some(true));
+        assert!(result.entries[5].hunks.is_empty());
+        assert!(result.entries[5].hunks_truncated);
+    }
+    #[tokio::test]
+    async fn metadata_pagination_get_and_diff_are_read_only() {
+        let (d, s, p, b, mut r) = fixture().await;
+        let first = capture_file_baseline(&s, &b, r.clone()).await.unwrap();
+        r.request_id = Uuid::new_v4();
+        let second = capture_file_baseline(&s, &b, r).await.unwrap();
+        // Store orders second-resolution capture time, then UUID, not capture
+        // call order when the two records share a timestamp.
+        let mut expected = vec![first.clone(), second];
+        expected.sort_by(|a, b| {
+            chrono::DateTime::parse_from_rfc3339(&b.created_at)
+                .unwrap()
+                .timestamp()
+                .cmp(
+                    &chrono::DateTime::parse_from_rfc3339(&a.created_at)
+                        .unwrap()
+                        .timestamp(),
+                )
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(s.pool())
+            .await
+            .unwrap();
+        let db = fs::read(d.path().join("test.db")).unwrap();
+        let source = fs::read(Path::new(&p.local_root).join("a.txt")).unwrap();
+        let q = ListFileBaselinesRequestV1 {
+            project_id: p.id,
+            branch_conversation_id: None,
+            offset: 0,
+            limit: 1,
+        };
+        let page = list_file_baselines(&s, q.clone()).await.unwrap();
+        assert_eq!(page.items, vec![expected[0].clone()]);
+        assert_eq!(page.next_offset, Some(1));
+        let mut next = q.clone();
+        next.offset = 1;
+        let page = list_file_baselines(&s, next).await.unwrap();
+        assert_eq!(page.items, vec![expected[1].clone()]);
+        assert_eq!(page.next_offset, None);
+        assert_eq!(get_file_baseline(&s, p.id, first.id).await.unwrap(), first);
+        let result = diff_file_baseline(&s, &b, diff_request(&first))
+            .await
+            .unwrap();
+        assert_eq!(result.entries[0].state, BaselineDiffStateV1::Unchanged);
+        assert_eq!(result.entries[0].line_endings_changed, Some(false));
+        assert_eq!(result.entries[0].final_newline_changed, Some(false));
+        assert_eq!(fs::read(d.path().join("test.db")).unwrap(), db);
+        assert_eq!(
+            fs::read(Path::new(&p.local_root).join("a.txt")).unwrap(),
+            source
+        );
+        let mut bad = q.clone();
+        bad.limit = 0;
+        assert_eq!(
+            list_file_baselines(&s, bad).await.unwrap_err().code,
+            FileBaselineErrorCodeV1::InvalidSelection
+        );
+        let mut bad = q.clone();
+        bad.limit = 65;
+        assert_eq!(
+            list_file_baselines(&s, bad).await.unwrap_err().code,
+            FileBaselineErrorCodeV1::InvalidSelection
+        );
+        let mut bad = q.clone();
+        bad.project_id = Uuid::nil();
+        assert_eq!(
+            list_file_baselines(&s, bad).await.unwrap_err().code,
+            FileBaselineErrorCodeV1::InvalidSelection
+        );
+        let mut bad = q;
+        bad.branch_conversation_id = Some(Uuid::new_v4());
+        assert_eq!(
+            list_file_baselines(&s, bad).await.unwrap_err().code,
+            FileBaselineErrorCodeV1::OwnershipMismatch
+        );
+        assert_eq!(
+            get_file_baseline(&s, p.id, Uuid::new_v4())
+                .await
+                .unwrap_err()
+                .code,
+            FileBaselineErrorCodeV1::NotFound
+        );
+        assert_eq!(
+            get_file_baseline(&s, p.id, Uuid::nil())
+                .await
+                .unwrap_err()
+                .code,
+            FileBaselineErrorCodeV1::InvalidSelection
+        );
+    }
     async fn fixture() -> (
         tempfile::TempDir,
         Store,
