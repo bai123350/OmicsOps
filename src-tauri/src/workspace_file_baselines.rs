@@ -4,6 +4,7 @@ use crate::{
     project_file_read::{FileReadError, ValidatedProjectFile},
     workspace_file_content::{
         SmallWorkspaceTextIssue, inspect_small_workspace_text, safe_workspace_public_text,
+        sensitive_workspace_filename,
     },
 };
 use omicsops_core::workspace::Project;
@@ -234,6 +235,22 @@ async fn capture_with_checkpoint(
     request: CreateFileBaselineRequestV1,
     checkpoint: impl Fn(CaptureStage) -> Result<(), FileBaselineErrorV1>,
 ) -> Result<FileBaselineV1, FileBaselineErrorV1> {
+    capture_with_source_open(
+        store,
+        storage,
+        request,
+        checkpoint,
+        ValidatedProjectFile::open,
+    )
+    .await
+}
+async fn capture_with_source_open(
+    store: &Store,
+    storage: &FileBaselineStorage,
+    request: CreateFileBaselineRequestV1,
+    checkpoint: impl Fn(CaptureStage) -> Result<(), FileBaselineErrorV1>,
+    open_source: impl Fn(&Project, &str) -> Result<ValidatedProjectFile, FileReadError>,
+) -> Result<FileBaselineV1, FileBaselineErrorV1> {
     let (request, digest) = canonical_request(request)?;
     let lock = storage.project_lock(request.project_id)?;
     let _lock = lock.lock().await;
@@ -294,6 +311,8 @@ async fn capture_with_checkpoint(
         if !safe_workspace_public_text(path) {
             entry.relative_path = None;
             entry.omission = Some(BaselineOmissionCodeV1::SensitiveContent);
+        } else if sensitive_workspace_filename(path) {
+            entry.omission = Some(BaselineOmissionCodeV1::SensitiveContent);
         } else if f.backend_id != "local" {
             let (size, hash) = store
                 .workspace_file_recorded_reference(project.id, &f.backend_id, path)
@@ -306,7 +325,10 @@ async fn capture_with_checkpoint(
             });
             entry.omission = Some(BaselineOmissionCodeV1::RemoteReference);
         } else {
-            match ValidatedProjectFile::open(&project, path) {
+            match open_source(&project, path) {
+                Err(FileReadError::SourceChanged) => {
+                    return Err(error(FileBaselineErrorCodeV1::SourceChanged));
+                }
                 Err(issue) => entry.omission = Some(file_omission(issue)),
                 Ok(mut file) => {
                     checkpoint(CaptureStage::AfterSourceOpen)?;
@@ -1289,8 +1311,48 @@ mod tests {
         );
         let analysis = Uuid::new_v4();
         let artifact = Uuid::new_v4();
-        let a = serde_json::json!({"id":artifact,"project_id":p.id,"relative_path":"a.txt","producer_analysis_id":analysis,"size_bytes":9,"sha256":"a".repeat(64)});
-        let n = serde_json::json!({"id":analysis,"project_id":p.id,"runtime":{"backend_id":format!("ssh:{id}")}});
+        let producer = omicsops_science::AnalysisRecordV4 {
+            schema_version: 4,
+            id: analysis,
+            project_id: p.id,
+            run_id: Uuid::new_v4(),
+            source_call_id: "fixture".into(),
+            analysis_type: "file".into(),
+            input_dataset_ids: Default::default(),
+            sample_ids: Default::default(),
+            method: "fixture".into(),
+            parameters: serde_json::json!({}),
+            software_requirements: Default::default(),
+            database_versions: Default::default(),
+            random_seed: Some(1),
+            status: omicsops_science::AnalysisStatusV4::Succeeded,
+            runtime: omicsops_science::RuntimeIdentityV4 {
+                backend_id: format!("ssh:{id}"),
+                language: "python".into(),
+                environment: "system".into(),
+                session_id: None,
+                process_identity: None,
+            },
+            started_at: chrono::Utc::now(),
+            ended_at: Some(chrono::Utc::now()),
+            validation_issues: vec![],
+        };
+        let record = omicsops_science::ArtifactRecordV4 {
+            schema_version: 4,
+            id: artifact,
+            project_id: p.id,
+            artifact_type: "file".into(),
+            relative_path: "a.txt".into(),
+            producer_analysis_id: analysis,
+            size_bytes: 9,
+            sha256: "a".repeat(64),
+            preview: None,
+            metadata: serde_json::json!({}),
+            valid: true,
+            created_at: chrono::Utc::now(),
+        };
+        let a = serde_json::to_value(record).unwrap();
+        let n = serde_json::to_value(producer).unwrap();
         sqlx::query("INSERT INTO scientific_analyses_v4(id,project_id,status,value_json) VALUES(?,?,'succeeded',?)").bind(analysis.to_string()).bind(p.id.to_string()).bind(n.to_string()).execute(s.pool()).await.unwrap();
         sqlx::query("INSERT INTO scientific_artifacts_v4(id,project_id,producer_analysis_id,valid,value_json) VALUES(?,?,?,1,?)").bind(artifact.to_string()).bind(p.id.to_string()).bind(analysis.to_string()).bind(a.to_string()).execute(s.pool()).await.unwrap();
         r.request_id = Uuid::new_v4();
@@ -1480,5 +1542,109 @@ mod tests {
         );
         assert_eq!(baseline.entries[0].size_bytes, None);
         assert_eq!(baseline.entries[0].hash, None);
+    }
+    #[tokio::test]
+    async fn capture_sensitive_filename_downgrades_before_source_open_and_never_persists_body() {
+        for path in [
+            "credentials.json",
+            "CrEdEnTiAlS.JsOn",
+            "AUTH/data.txt",
+            "private_key.txt",
+            "PRIVATE-KEY/value.R",
+            "id_ed25519.txt",
+            "config/.ENV/values.json",
+        ] {
+            let (_d, s, p, b, mut r) = fixture().await;
+            let source = Path::new(&p.local_root).join(path);
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(source, b"harmless UTF8").unwrap();
+            r.files[0].relative_path = path.into();
+            let opens = std::cell::Cell::new(0);
+            let baseline = capture_with_source_open(
+                &s,
+                &b,
+                r,
+                |_| Ok(()),
+                |project, path| {
+                    opens.set(opens.get() + 1);
+                    ValidatedProjectFile::open(project, path)
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                opens.get(),
+                0,
+                "credential filenames must be rejected before opening sources"
+            );
+            assert_eq!(
+                baseline.entries[0].content_mode,
+                WorkspaceContentModeV1::ReferenceOnly
+            );
+            assert_eq!(
+                baseline.entries[0].omission,
+                Some(BaselineOmissionCodeV1::SensitiveContent)
+            );
+            assert_eq!(baseline.entries[0].relative_path.as_deref(), Some(path));
+            assert!(
+                scan_blobs(&b.project_dir(p.id).join("sha256"))
+                    .unwrap()
+                    .0
+                    .is_empty()
+            );
+            assert_eq!(baseline.captured_text_bytes, 0);
+        }
+    }
+    #[tokio::test]
+    async fn capture_open_time_source_change_aborts_entire_request_but_unavailable_is_unreadable() {
+        let (_d, s, p, b, mut r) = fixture().await;
+        std::fs::write(Path::new(&p.local_root).join("z.txt"), b"later source").unwrap();
+        r.files.push(ProjectFileSelectionV1 {
+            backend_id: "local".into(),
+            relative_path: "z.txt".into(),
+            expected_full_sha256: None,
+        });
+        let result = capture_with_source_open(
+            &s,
+            &b,
+            r.clone(),
+            |_| Ok(()),
+            |project, path| {
+                if path == "z.txt" {
+                    Err(FileReadError::SourceChanged)
+                } else {
+                    ValidatedProjectFile::open(project, path)
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().code,
+            FileBaselineErrorCodeV1::SourceChanged
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM exploration_baselines_v4")
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(
+            scan_blobs(&b.project_dir(p.id).join("sha256"))
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        let baseline = capture_with_source_open(
+            &s,
+            &b,
+            r,
+            |_| Ok(()),
+            |_, _| Err(FileReadError::Unavailable),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            baseline.entries[0].omission,
+            Some(BaselineOmissionCodeV1::Unreadable)
+        );
     }
 }

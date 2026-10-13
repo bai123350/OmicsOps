@@ -9,6 +9,9 @@ pub(crate) fn inspect_small_workspace_text<'a>(
     relative_path: &str,
     bytes: &'a [u8],
 ) -> Result<&'a str, SmallWorkspaceTextIssue> {
+    if sensitive_workspace_filename(relative_path) {
+        return Err(SmallWorkspaceTextIssue::SensitiveContent);
+    }
     if bytes.len() > 512 * 1024 {
         return Err(SmallWorkspaceTextIssue::TooLarge);
     }
@@ -31,6 +34,51 @@ pub(crate) fn inspect_small_workspace_text<'a>(
         return Err(SmallWorkspaceTextIssue::SensitiveContent);
     }
     Ok(text)
+}
+/// Filename policy only; W02 remains the sole filesystem/path validator.
+/// Credential-shaped components are excluded even when their bytes look harmless.
+pub(crate) fn sensitive_workspace_filename(relative_path: &str) -> bool {
+    relative_path.split(['/', '\\']).any(|component| {
+        let lower = component.to_ascii_lowercase();
+        if lower == ".env"
+            || lower.starts_with(".env.")
+            || matches!(lower.as_str(), ".ssh" | ".aws")
+            || [".pem", ".key", ".p12", ".pfx"]
+                .iter()
+                .any(|suffix| lower.ends_with(suffix))
+        {
+            return true;
+        }
+        lower
+            .trim_start_matches('.')
+            .split(['.', '-', '_'])
+            .any(|token| {
+                matches!(
+                    token,
+                    "credential"
+                        | "credentials"
+                        | "auth"
+                        | "authentication"
+                        | "authorization"
+                        | "password"
+                        | "passwords"
+                        | "passphrase"
+                        | "secret"
+                        | "secrets"
+                        | "token"
+                        | "tokens"
+                        | "key"
+                        | "keys"
+                        | "privatekey"
+                        | "apikey"
+                        | "keystore"
+                        | "rsa"
+                        | "dsa"
+                        | "ecdsa"
+                        | "ed25519"
+                )
+            })
+    })
 }
 /// Equality is intentional: even a harmless-looking public projection change
 /// disqualifies original text. Authentication URIs never enter saved bodies.
@@ -108,5 +156,42 @@ mod tests {
                 Err(SmallWorkspaceTextIssue::SensitiveContent)
             );
         }
+    }
+    #[test]
+    fn small_text_sensitive_filenames_and_components_precede_body_policy() {
+        for path in [
+            "credentials.json",
+            "CREDENTIALS.JSON",
+            "PrivateKey.JSON",
+            "APIKEY.txt",
+            ".env",
+            "private.pem",
+            "config/CrEdEnTiAlS/data.txt",
+            "auth.json",
+            "AUTH/settings.py",
+            "authentication.txt",
+            "private_key.txt",
+            "PRIVATE-KEY/key.R",
+            "id_rsa.txt",
+            "SSH/id_ED25519.json",
+            "api_key.json",
+            "secrets/value.txt",
+            ".env.txt",
+            "config/.ENV/local.json",
+        ] {
+            assert_eq!(
+                inspect_small_workspace_text(path, b"harmless UTF8"),
+                Err(SmallWorkspaceTextIssue::SensitiveContent),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            inspect_small_workspace_text("research/authorship.md", b"safe"),
+            Ok("safe")
+        );
+        assert_eq!(
+            inspect_small_workspace_text("data/keyboard.txt", b"safe"),
+            Ok("safe")
+        );
     }
 }

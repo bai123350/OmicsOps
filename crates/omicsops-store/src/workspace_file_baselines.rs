@@ -3,6 +3,7 @@ use crate::{Store, StoreError};
 use chrono::{DateTime, Utc};
 use omicsops_core::redaction::redact_secrets;
 use omicsops_dto::*;
+use omicsops_science::{AnalysisRecordV4, AnalysisStatusV4, ArtifactRecordV4};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, SqliteConnection, Transaction, sqlite::SqliteRow};
@@ -429,7 +430,7 @@ impl Store {
         if bound == 0 {
             return Ok((None, None));
         }
-        let rows=sqlx::query("SELECT CASE WHEN length(a.id)=36 THEN a.id ELSE NULL END AS id,a.project_id,CASE WHEN length(a.producer_analysis_id)=36 THEN a.producer_analysis_id ELSE NULL END AS producer_analysis_id,CASE WHEN length(n.id)=36 THEN n.id ELSE NULL END AS analysis_id,n.project_id AS analysis_project, CASE WHEN length(CAST(a.value_json AS BLOB))<=65536 THEN CASE WHEN json_valid(a.value_json) THEN a.value_json ELSE NULL END ELSE NULL END AS artifact_json, CASE WHEN length(CAST(n.value_json AS BLOB))<=65536 THEN CASE WHEN json_valid(n.value_json) THEN n.value_json ELSE NULL END ELSE NULL END AS analysis_json FROM scientific_artifacts_v4 a LEFT JOIN scientific_analyses_v4 n ON n.id=a.producer_analysis_id AND n.project_id=a.project_id WHERE a.project_id=? AND (CASE WHEN length(CAST(a.value_json AS BLOB))<=65536 THEN CASE WHEN json_valid(a.value_json) THEN json_extract(a.value_json,'$.relative_path') ELSE NULL END ELSE NULL END=? OR CASE WHEN length(CAST(a.value_json AS BLOB))<=65536 THEN json_valid(a.value_json) ELSE 0 END=0) ORDER BY a.id LIMIT 3")
+        let rows=sqlx::query("SELECT CASE WHEN length(a.id)=36 THEN a.id ELSE NULL END AS id,a.project_id,a.valid AS artifact_valid,CASE WHEN n.status='succeeded' THEN 'succeeded' ELSE NULL END AS analysis_status,CASE WHEN length(a.producer_analysis_id)=36 THEN a.producer_analysis_id ELSE NULL END AS producer_analysis_id,CASE WHEN length(n.id)=36 THEN n.id ELSE NULL END AS analysis_id,n.project_id AS analysis_project, CASE WHEN length(CAST(a.value_json AS BLOB))<=65536 THEN CASE WHEN json_valid(a.value_json) THEN a.value_json ELSE NULL END ELSE NULL END AS artifact_json, CASE WHEN length(CAST(n.value_json AS BLOB))<=65536 THEN CASE WHEN json_valid(n.value_json) THEN n.value_json ELSE NULL END ELSE NULL END AS analysis_json FROM scientific_artifacts_v4 a LEFT JOIN scientific_analyses_v4 n ON n.id=a.producer_analysis_id AND n.project_id=a.project_id WHERE a.project_id=? AND (CASE WHEN length(CAST(a.value_json AS BLOB))<=65536 THEN CASE WHEN json_valid(a.value_json) THEN json_extract(a.value_json,'$.relative_path') ELSE NULL END ELSE NULL END=? OR CASE WHEN length(CAST(a.value_json AS BLOB))<=65536 THEN json_valid(a.value_json) ELSE 0 END=0) ORDER BY a.id LIMIT 3")
             .bind(project_id.to_string()).bind(relative_path).fetch_all(&mut *tx).await?;
         if rows.len() >= 3 {
             return Ok((None, None));
@@ -453,36 +454,46 @@ impl Store {
             let Some(analysis): Option<&str> = row.try_get("analysis_json")? else {
                 return Ok((None, None));
             };
-            let artifact: serde_json::Value = match serde_json::from_str(artifact) {
-                Ok(v) => v,
+            let artifact: ArtifactRecordV4 = match serde_json::from_str(artifact) {
+                Ok(value) => value,
                 Err(_) => return Ok((None, None)),
             };
-            let analysis: serde_json::Value = match serde_json::from_str(analysis) {
-                Ok(v) => v,
+            let analysis: AnalysisRecordV4 = match serde_json::from_str(analysis) {
+                Ok(value) => value,
                 Err(_) => return Ok((None, None)),
             };
-            if artifact["id"].as_str() != Some(row.try_get("id")?)
-                || artifact["project_id"].as_str() != Some(project_id.to_string().as_str())
-                || artifact["producer_analysis_id"].as_str()
-                    != Some(row.try_get("producer_analysis_id")?)
-                || analysis["id"].as_str() != row.try_get::<Option<&str>, _>("analysis_id")?
-                || analysis["project_id"].as_str() != Some(project_id.to_string().as_str())
+            if artifact.schema_version != 4
+                || analysis.schema_version != 4
+                || !artifact.valid
+                || analysis.status != AnalysisStatusV4::Succeeded
+                || row.try_get::<i64, _>("artifact_valid")? != 1
+                || row.try_get::<Option<&str>, _>("analysis_status")? != Some("succeeded")
+            {
+                return Ok((None, None));
+            }
+            if artifact.id.to_string() != row.try_get::<&str, _>("id")?
+                || artifact.project_id != project_id
+                || artifact.producer_analysis_id.to_string()
+                    != row.try_get::<&str, _>("producer_analysis_id")?
+                || analysis.id.to_string() != row.try_get::<&str, _>("analysis_id")?
+                || artifact.producer_analysis_id != analysis.id
+                || analysis.project_id != project_id
                 || row.try_get::<Option<&str>, _>("analysis_project")?
                     != Some(project_id.to_string().as_str())
             {
                 return Ok((None, None));
             }
-            if artifact["relative_path"].as_str() != Some(relative_path)
-                || analysis["runtime"]["backend_id"].as_str() != Some(backend_id)
+            if artifact.relative_path != relative_path || analysis.runtime.backend_id != backend_id
             {
                 continue;
             }
             let value = (
-                artifact["size_bytes"].as_u64(),
-                artifact["sha256"]
-                    .as_str()
-                    .filter(|h| valid_hash(h))
-                    .map(str::to_owned),
+                Some(artifact.size_bytes),
+                if valid_hash(&artifact.sha256) {
+                    Some(artifact.sha256)
+                } else {
+                    None
+                },
             );
             if result.as_ref().is_some_and(|old| old != &value) {
                 return Ok((None, None));

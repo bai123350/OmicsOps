@@ -389,42 +389,10 @@ async fn baseline_migration_rejects_malformed_request_identity() {
 
 #[tokio::test]
 async fn baseline_recorded_reference_is_bounded_and_checks_exact_provenance() {
-    let store = Store::open_in_memory().await.unwrap();
-    let mut p = project(&store).await;
-    let connection = Uuid::from_u128(9);
-    store
-        .save_connection(&omicsops_core::domain::ConnectionProfile {
-            id: connection,
-            label: "fixture".into(),
-            host: "example.invalid".into(),
-            port: 22,
-            username: "fixture".into(),
-            authentication: omicsops_core::domain::AuthenticationMethod::Password,
-            authentication_reference: "fixture-ref".into(),
-            host_key_fingerprint: None,
-        })
-        .await
-        .unwrap();
-    p.connection_id = Some(connection);
-    p.remote_root = Some("/project".into());
-    store.save_project(&p).await.unwrap();
-    let backend = format!("ssh:{connection}");
-    let analysis = Uuid::new_v4();
-    let artifact = Uuid::new_v4();
-    let a=serde_json::json!({"id":artifact,"project_id":p.id,"relative_path":"a.txt","producer_analysis_id":analysis,"size_bytes":7,"sha256":"a".repeat(64)}).to_string();
-    let n = serde_json::json!({"id":analysis,"project_id":p.id,"runtime":{"backend_id":backend}})
-        .to_string();
-    sqlx::query(
-        "INSERT INTO scientific_analyses_v4(id,project_id,status,value_json) VALUES(?,?,?,?)",
-    )
-    .bind(analysis.to_string())
-    .bind(p.id.to_string())
-    .bind("succeeded")
-    .bind(&n)
-    .execute(store.pool())
-    .await
-    .unwrap();
-    sqlx::query("INSERT INTO scientific_artifacts_v4(id,project_id,producer_analysis_id,valid,value_json) VALUES(?,?,?,1,?)").bind(artifact.to_string()).bind(p.id.to_string()).bind(analysis.to_string()).bind(&a).execute(store.pool()).await.unwrap();
+    let (store, mut p, backend, record, producer) = valid_recorded_fixture().await;
+    let analysis = producer.id;
+    let artifact = record.id;
+    let a = serde_json::to_string(&record).unwrap();
     assert_eq!(
         store
             .workspace_file_recorded_reference(p.id, &backend, "a.txt")
@@ -509,7 +477,7 @@ async fn baseline_recorded_reference_is_bounded_and_checks_exact_provenance() {
             .workspace_file_recorded_reference(p.id, &backend, "a.txt")
             .await
             .unwrap(),
-        (None, Some("a".repeat(64)))
+        (None, None)
     );
     sqlx::query("UPDATE scientific_artifacts_v4 SET value_json=? WHERE id=?")
         .bind(format!("{}{}", a, " ".repeat(65536)))
@@ -578,4 +546,181 @@ async fn baseline_recorded_reference_is_bounded_and_checks_exact_provenance() {
             .unwrap(),
         (None, None)
     );
+}
+
+async fn valid_recorded_fixture() -> (
+    Store,
+    Project,
+    String,
+    omicsops_science::ArtifactRecordV4,
+    omicsops_science::AnalysisRecordV4,
+) {
+    use omicsops_science::{
+        AnalysisRecordV4, AnalysisStatusV4, ArtifactRecordV4, RuntimeIdentityV4,
+    };
+    let store = Store::open_in_memory().await.unwrap();
+    let mut p = project(&store).await;
+    let connection = Uuid::new_v4();
+    store
+        .save_connection(&omicsops_core::domain::ConnectionProfile {
+            id: connection,
+            label: "fixture".into(),
+            host: "example.invalid".into(),
+            port: 22,
+            username: "fixture".into(),
+            authentication: omicsops_core::domain::AuthenticationMethod::Password,
+            authentication_reference: "fixture-ref".into(),
+            host_key_fingerprint: None,
+        })
+        .await
+        .unwrap();
+    p.connection_id = Some(connection);
+    p.remote_root = Some("/project".into());
+    store.save_project(&p).await.unwrap();
+    let backend = format!("ssh:{connection}");
+    let producer = AnalysisRecordV4 {
+        schema_version: 4,
+        id: Uuid::new_v4(),
+        project_id: p.id,
+        run_id: Uuid::new_v4(),
+        source_call_id: "fixture".into(),
+        analysis_type: "file".into(),
+        input_dataset_ids: Default::default(),
+        sample_ids: Default::default(),
+        method: "fixture".into(),
+        parameters: serde_json::json!({}),
+        software_requirements: Default::default(),
+        database_versions: Default::default(),
+        random_seed: Some(1),
+        status: AnalysisStatusV4::Succeeded,
+        runtime: RuntimeIdentityV4 {
+            backend_id: backend.clone(),
+            language: "python".into(),
+            environment: "system".into(),
+            session_id: None,
+            process_identity: None,
+        },
+        started_at: Utc::now(),
+        ended_at: Some(Utc::now()),
+        validation_issues: vec![],
+    };
+    let record = ArtifactRecordV4 {
+        schema_version: 4,
+        id: Uuid::new_v4(),
+        project_id: p.id,
+        artifact_type: "file".into(),
+        relative_path: "a.txt".into(),
+        producer_analysis_id: producer.id,
+        size_bytes: 7,
+        sha256: "a".repeat(64),
+        preview: None,
+        metadata: serde_json::json!({}),
+        valid: true,
+        created_at: Utc::now(),
+    };
+    sqlx::query("INSERT INTO scientific_analyses_v4(id,project_id,status,value_json) VALUES(?,?,'succeeded',?)").bind(producer.id.to_string()).bind(p.id.to_string()).bind(serde_json::to_string(&producer).unwrap()).execute(store.pool()).await.unwrap();
+    sqlx::query("INSERT INTO scientific_artifacts_v4(id,project_id,producer_analysis_id,valid,value_json) VALUES(?,?,?,1,?)").bind(record.id.to_string()).bind(p.id.to_string()).bind(producer.id.to_string()).bind(serde_json::to_string(&record).unwrap()).execute(store.pool()).await.unwrap();
+    (store, p, backend, record, producer)
+}
+#[tokio::test]
+async fn baseline_recorded_reference_rejects_invalid_v4_and_row_body_disagreement() {
+    let (store, p, backend, record, producer) = valid_recorded_fixture().await;
+    assert_eq!(
+        store
+            .workspace_file_recorded_reference(p.id, &backend, "a.txt")
+            .await
+            .unwrap(),
+        (Some(7), Some("a".repeat(64)))
+    );
+    for case in [
+        "artifact_invalid",
+        "body_artifact_invalid",
+        "row_artifact_invalid",
+        "producer_failed",
+        "producer_stale",
+        "producer_running",
+        "producer_cancelled",
+        "body_producer_failed",
+        "body_producer_stale",
+        "row_producer_failed",
+        "row_producer_stale",
+        "artifact_schema3",
+        "producer_schema3",
+        "missing_artifact_valid",
+        "missing_producer_status",
+        "missing_size",
+        "malformed_size",
+        "partial_record",
+    ] {
+        let mut artifact = serde_json::to_value(&record).unwrap();
+        let mut analysis = serde_json::to_value(&producer).unwrap();
+        let mut row_valid = 1;
+        let mut row_status = "succeeded";
+        match case {
+            "artifact_invalid" => {
+                artifact["valid"] = serde_json::json!(false);
+                row_valid = 0;
+            }
+            "body_artifact_invalid" => artifact["valid"] = serde_json::json!(false),
+            "row_artifact_invalid" => row_valid = 0,
+            "producer_failed" => {
+                analysis["status"] = serde_json::json!("failed");
+                row_status = "failed";
+            }
+            "producer_stale" => {
+                analysis["status"] = serde_json::json!("stale");
+                row_status = "stale";
+            }
+            "producer_running" => {
+                analysis["status"] = serde_json::json!("running");
+                row_status = "running";
+            }
+            "producer_cancelled" => {
+                analysis["status"] = serde_json::json!("cancelled");
+                row_status = "cancelled";
+            }
+            "body_producer_failed" => analysis["status"] = serde_json::json!("failed"),
+            "body_producer_stale" => analysis["status"] = serde_json::json!("stale"),
+            "row_producer_failed" => row_status = "failed",
+            "row_producer_stale" => row_status = "stale",
+            "artifact_schema3" => artifact["schema_version"] = serde_json::json!(3),
+            "producer_schema3" => analysis["schema_version"] = serde_json::json!(3),
+            "missing_artifact_valid" => {
+                artifact.as_object_mut().unwrap().remove("valid");
+            }
+            "missing_producer_status" => {
+                analysis.as_object_mut().unwrap().remove("status");
+            }
+            "missing_size" => {
+                artifact.as_object_mut().unwrap().remove("size_bytes");
+            }
+            "malformed_size" => artifact["size_bytes"] = serde_json::json!("unknown"),
+            "partial_record" => {
+                artifact.as_object_mut().unwrap().remove("artifact_type");
+            }
+            _ => unreachable!(),
+        }
+        sqlx::query("UPDATE scientific_artifacts_v4 SET valid=?,value_json=? WHERE id=?")
+            .bind(row_valid)
+            .bind(artifact.to_string())
+            .bind(record.id.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE scientific_analyses_v4 SET status=?,value_json=? WHERE id=?")
+            .bind(row_status)
+            .bind(analysis.to_string())
+            .bind(producer.id.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .workspace_file_recorded_reference(p.id, &backend, "a.txt")
+                .await
+                .unwrap(),
+            (None, None),
+            "{case}"
+        );
+    }
 }
