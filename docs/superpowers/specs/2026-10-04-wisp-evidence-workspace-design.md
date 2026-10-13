@@ -365,9 +365,9 @@ pub async fn workspace_get_file_baseline(
 
 标题 1–80 字符、最多 320 字节。每次 1–32 个明确选择；仅 `.py`、`.r`、`.rmd`、`.md`、`.txt`、`.json`、`.csv`、`.tsv` 的 UTF-8 文本允许正文捕获，扩展名大小写不敏感。扩展名不是内容可信证明；仍需无 NUL、敏感内容检查和公开投影一致。`.env`、认证/私钥/凭据文件名、`.omicsops` 内部目录及其等价 Windows 名称禁止正文捕获。安全相对路径也必须脱敏不改变；路径含秘密时省略公开路径，给出 `SensitiveContent`，内部 manifest 不保存该原文。Notebook/HTML/Office 的解析和渲染不进入此首范围。
 
-单文件完整读取上限 512 KiB，捕获正文合计 4 MiB；排序后的下一项若使总额超标，记录 `AggregateBudget` reference-only。捕获前即过大的文件只读取 metadata，不计算新的完整 hash。SSH 文件仅使用项目绑定引用和已有可信记录的 size/hash，未知为 `None`，标注 `RecordedFile`；不调用 SSH/MCP。敏感文本即使已经暂时读取，也不写入 blob、SQLite、日志或模型上下文；若安全完整读取后可以保留 hash，它仍只标示已读字节，不表示内容被保存。
+单文件完整读取上限 512 KiB，捕获正文合计 4 MiB；排序后的下一项若使总额超标，记录 `AggregateBudget` reference-only。捕获前即过大的文件只读取 metadata，不计算新的完整 hash。SSH 文件仅使用项目绑定引用和已有可信记录的 size/hash，未知为 `None`，标注 `RecordedFile`；不调用 SSH/MCP。实际只读Store helper在同一事务核验当前绑定，以V4 artifact/producer analysis的项目、路径、backend与row/body canonical UUID相符为依据。每份JSON最多64 KiB，JSON函数由有界有效CASE保护，最多取3对（384 KiB），仅至多2份无歧义候选可提供已知size/hash。先按实际ArtifactRecordV4/AnalysisRecordV4解码并核验schema4、artifact valid、producer succeeded及row/body一致；必填size非u64或缺失使整条未知，合法size与无效hash则保留size、仅将hash设为None。过多、畸形、冲突或无legacy provenance时保守未知，代价是不能局部挽救schema不完整的历史记录。代价是省略部分历史metadata，查询仍可能筛选项目既有rows，不进行远端核验。敏感文本即使已经暂时读取，也不写入 blob、SQLite、日志或模型上下文；若安全完整读取后可以保留 hash，它仍只标示已读字节，不表示内容被保存。
 
-局部文件打不开、missing、unsafe、unsupported 等可预期文件级结果保留为 reference-only entry；错误消息不回显未验证路径。格式非法、backend/分支归属错误、请求 ID 冲突或本次实际完整 hash 不等于 `expected_full_sha256` 则整次失败，不提交基线。expected hash 无法在预算内核验也拒绝整个请求，提示重新选择或取消此断言，不以 recorded hash 匹配。创建前先查相同请求的 committed receipt，重试不会重新捕获已变化的文件；并发提交在事务中再次判 replay。未知回执错误重试原请求，不生成新 ID。
+局部文件打不开、missing、unsafe、unsupported 等可预期文件级结果保留为 reference-only entry；错误消息不回显未验证路径。既有W02的`FileReadError::Unavailable`不能区分不存在、权限不足和其他不可用，捕获映射为`Unreadable`，diff及W11消费者也保留该不确定性；不新增探测或改写W02框架。`Missing`保留给未来能明确证明不存在的生产者，代价是缺失文件提示较不具体。格式非法、backend/分支归属错误、请求 ID 冲突或本次实际完整 hash 不等于 `expected_full_sha256` 则整次失败，不提交基线。expected hash 无法在预算内核验也拒绝整个请求，提示重新选择或取消此断言，不以 recorded hash 匹配。创建前先查相同请求的 committed receipt，重试不会重新捕获已变化的文件；并发提交在事务中再次判 replay。未知回执错误重试原请求，不生成新 ID。
 
 读取保存正文仅接受所选baseline的entry index和manifest hash，不接受blob path；校验同项目、TextSnapshot、宿主固定存储路径、完整blob长度/hash和UTF-8，最多512 KiB，再次执行公开/敏感检查。reference-only项返回InvalidSelection；坏blob或公开检查不一致返回StorageFailed，不显示未经校验正文。正文查看不依赖当前项目根或当前源文件还存在。
 
@@ -379,7 +379,7 @@ diff校验project/baseline/manifest hash和当前local root binding。根变更�
 
 blob 位于 `app_data_dir/workspace-file-baselines/<project_id>/sha256/<前两位>/<sha256>`，名字仅由宿主 hash 构造，每项正文 UTF-8 原字节不做换行转换。SQLite 只保存 manifest/身份/hash，不保存文件正文。每项目最多 64 个基线、正文计费总额 256 MiB（按每个基线逻辑内容计费，不能利用去重绕过），达到上限返回 `LimitExceeded`，不自动删除旧基线。持久blob的实际磁盘硬上限也为256 MiB，每次创建最多额外4 MiB staging；先清理确认未引用的旧blob，再在persist前核验物理预算，不允许失败重试累积突破上限。
 
-先写同目录临时 blob、sync、校验 hash 并 persist，再提交引用它们的 DB 事务。已存在 hash blob 必须校验长度/hash；损坏时停止。事务失败不能产生引用缺失 blob 的已提交基线；未提交 staging 可删除，persist 后的无引用 blob只由宿主扫描 ledger/manifest 确认未引用后清理。每项目创建使用宿主 project-scoped mutex，清理与创建互斥；清理只覆盖此固定宿主目录且同样拒绝 reparse，绝不遍历/删除项目根。项目删除的 DB cascade 后由专用宿主清理移除其 blob，不把路径从数据库拼接到 shell。无基线删除或正文恢复命令进入首范围。
+先写同目录临时 blob、sync、校验 hash 并 persist，再提交引用它们的 DB 事务。同目录指最终hash前缀目录；固定`baseline-<16 ASCII alphanumeric>.tmp`计入独立4 MiB staging，最终hash文件计入256 MiB持久预算。扫描最多256前缀、4096文件、32临时文件；未知名字/不安全祖先拒绝处理，Windows保留目录句柄，清理不递归删除。其代价是额外分类/上限及保守拒绝，可能读取校验最多项目物理预算内的既有blob。已存在 hash blob 必须校验长度/hash；损坏时停止。事务失败不能产生引用缺失 blob 的已提交基线；未提交 staging 可删除，persist 后的无引用 blob只由宿主扫描 ledger/manifest 确认未引用后清理。每项目创建使用宿主 project-scoped mutex，清理与创建互斥；清理只覆盖此固定宿主目录且同样拒绝 reparse，绝不遍历/删除项目根。项目删除的 DB cascade 后由专用宿主清理移除其 blob，不把路径从数据库拼接到 shell。实际`delete_project`保留原活动运行/内核检查，同一project mutex覆盖DB删除与清理；DB已提交后清理失败必须明确报告项目已删除、基线存储清理失败，不能称回滚或暗中重试。代价是可能保留私有孤儿blob/空目录；不扩展为删除项目源文件。无基线删除或正文恢复命令进入首范围。
 
 初始化只增加 `CREATE TABLE/INDEX IF NOT EXISTS` 和验证，不重写 legacy `workspace_snapshots`、不更改 schema version 解释、不挪动已有项目根。重复打开/迁移无重复 rows；旧库没有新表时列表为空。
 

@@ -83,7 +83,7 @@ git commit -m "feat: persist typed exploration file baselines"
 - Produces: `workspace_create_file_baseline(app: AppHandle, state: State<'_, AppState>, request: CreateFileBaselineRequestV1) -> Result<FileBaselineV1, FileBaselineErrorV1>`；`workspace_read_baseline_text(app: AppHandle, state: State<'_, AppState>, request: ReadBaselineTextRequestV1) -> Result<BaselineTextSnapshotV1, FileBaselineErrorV1>`。
 - Produces shared pure function: `inspect_small_workspace_text<'a>(relative_path: &str, bytes: &'a [u8]) -> Result<&'a str, SmallWorkspaceTextIssue>` in `workspace_file_content.rs`；内部enum只有 `TooLarge`、`UnsupportedContent`、`SensitiveContent`，W10映射到BaselineOmissionCodeV1、W11映射到MigrationFileStateV1，不依赖基线DTO/Store。只做UTF-8/extension/公开一致/敏感判断，不验证目录、开文件或读keyring。宿主 `FileBaselineStorage` app-scoped持有固定app-data根与project mutex，`FileBaselineStorage::new(app_data_root: PathBuf) -> Self`，初始化一次。
 
-- [ ] **Step 1: Write failing tests.** 前缀 `capture_`：安全小文本、32/512 KiB/4 MiB预算、unknown/recorded SSH引用、expected hash无法核验/冲突、invalid selection、sensitive/path null、retry不重读、file identity变化、坏/缺blob、temp/persist/DB故障、orphan物理预算、reparse app-data cleanup不触项目根，以及实际 delete_project 成功后的专用清理 hook；DB 已提交删除与后续清理失败须如实区分，不假称回滚。`saved_text_`：entry越界/reference-only拒绝、坏blob/UTF-8/再检查拒绝及root改变仍能查看历史正文。纯函数测试前缀 `small_text_`，使用假凭据sentinel。
+- [x] **Step 1: Write failing tests.** 前缀 `capture_`：安全小文本、32/512 KiB/4 MiB预算、unknown/recorded SSH引用、expected hash无法核验/冲突、invalid selection、sensitive/path null、retry不重读、file identity变化、坏/缺blob、temp/persist/DB故障、orphan物理预算、reparse app-data cleanup不触项目根，以及实际 delete_project 成功后的专用清理 hook；DB 已提交删除与后续清理失败须如实区分，不假称回滚。`saved_text_`：entry越界/reference-only拒绝、坏blob/UTF-8/再检查拒绝及root改变仍能查看历史正文。纯函数测试前缀 `small_text_`，使用假凭据sentinel。
 
 ```rust
 assert_eq!(sensitive.entries[0].content_mode, WorkspaceContentModeV1::ReferenceOnly);
@@ -94,10 +94,10 @@ assert_eq!(saved_text.full_sha256, full_hash);
 assert_eq!(ssh_call_count, 0);
 ```
 
-- [ ] **Step 2: Run RED.** `cargo test -p omicsops-desktop --lib workspace_file_content::tests`；`cargo test -p omicsops-desktop --lib workspace_file_baselines::tests::capture_`；`cargo test -p omicsops-desktop --lib workspace_file_baselines::tests::saved_text_`。Expected: FAIL，缺capture/read接缝或安全/atomic断言失败。
-- [ ] **Step 3: Implement the listed signatures.** 固定app-data content-addressed路径；project mutex覆盖创建/清理；查replay在读取源文件之前，事务再判replay。所有source读取经W02同一handle完整读；大/SSH仅metadata/reference，正文降引用不持久化。temp/sync/persist blob后才DB提交，计逻辑与物理预算，清理仅确认未引用blob；saved read验证length/hash/UTF-8与公开一致。不调用shell/runtime/SSH，也不删除源文件。
-- [ ] **Step 4: Run GREEN.** 重跑RED三命令；检查临时app-data与SQLite无sentinel、fault后无已提交坏基线、persisted blob<=256 MiB/staging<=4 MiB。Expected: PASS；W02 handle/reparse测试继续通过，不复制其框架。
-- [ ] **Step 5: Commit.**
+- [x] **Step 2: Run RED.** `cargo test -p omicsops-desktop --lib workspace_file_content::tests`；`cargo test -p omicsops-desktop --lib workspace_file_baselines::tests::capture_`；`cargo test -p omicsops-desktop --lib workspace_file_baselines::tests::saved_text_`。Expected: FAIL，缺capture/read接缝或安全/atomic断言失败。
+- [x] **Step 3: Implement the listed signatures.** 固定app-data content-addressed路径；project mutex覆盖创建/清理；查replay在读取源文件之前，事务再判replay。所有source读取经W02同一handle完整读；大/SSH仅metadata/reference，正文降引用不持久化。temp/sync/persist blob后才DB提交，计逻辑与物理预算，清理仅确认未引用blob；saved read验证length/hash/UTF-8与公开一致。不调用shell/runtime/SSH，也不删除源文件。
+- [x] **Step 4: Run GREEN.** 重跑RED三命令；检查临时app-data与SQLite无sentinel、fault后无已提交坏基线、persisted blob<=256 MiB/staging<=4 MiB。Expected: PASS；W02 handle/reparse测试继续通过，不复制其框架。
+- [x] **Step 5: Commit.**
 
 ```powershell
 git add src-tauri/src/workspace_file_baselines.rs src-tauri/src/workspace_file_content.rs src-tauri/src/commands.rs src-tauri/src/lib.rs src-tauri/src/workspace_commands.rs
@@ -176,3 +176,5 @@ git commit -m "feat: expose explicit exploration baseline and diff UI"
 spec覆盖：Task 1typed migration/ownership/replay；Task 2安全捕获、物理预算与正文查看；Task 3根身份/完整hash/有界diff；Task 4显式file/branch UI与最终验证。Review Focus五项均映射具体测试。命令/DTO与spec一致，nullable路径和未比较换行字段未被TS改成必填；共享读取接缝不复制。计划只列签名和断言，不含实现body/真实样本；未运行列出的检查，没有首范围外的恢复/执行工作。
 
 2026-10-13：W10 Task1 `f93878c..5085908` 类型化基线DTO、immutable manifest与Store迁移/replay/逻辑quota完成独立完整审阅，累计40/50 SOURCE。实际缺接口编译RED与sandbox OUT_DIR分开记录；随后畸形持久请求UUID行为RED为8通过/1失败，修复后最终Store9、branch9、native DTO1、fmt/diff通过。7外部RAW及candidate/inverse/replay/postcommit证明保留；宿主正文/blob物理预算/cleanup、diff/UI及全量/clean-HEAD/真实验收仍由后续任务承接。
+
+2026-10-13：W10 Task2 `f07d9a3` 安全捕获/blob/保存正文/删除清理及 `4a6eb14` 三项修复完成完整与定向独立审阅，累计41/50 SOURCE。敏感文件名在读取前降引用，V4历史引用严格校验类型/schema/有效性/producer状态，open-time SourceChanged整次拒绝；既有Unavailable仍为Unreadable。修复因果RED为纯策略0/1、capture15/2、Store0/2；最新capture17/pure5/saved4/Store11共37通过，fmt/diff及精确候选/逆向/replay/提交审计通过。原62是修复前历史检查，未变W02 handle16/table11/delete2沿用此前结果；完整/clean-HEAD/真实验收未完成。7外部RAW保留；六处working initializer中五处提交，一处外部测试内W10兼容initializer明确未暂存，与既有W04残留分开。diff/UI仍待Tasks3–4，不能称全部文件基线功能已交付。

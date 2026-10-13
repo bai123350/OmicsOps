@@ -48,7 +48,7 @@
 | W08a | [V4场景](2026-10-04-wisp-w08-scenarios.md) | 3 | 五场景manifest/hash/实际调用计数和安全报告 | 已实现、3任务源码审阅通过；安全报告/故障非零验证通过，CI未执行 |
 | W08b | [Skill helpers](2026-10-04-wisp-w08-skill-helpers.md) | 3 | 固定本地helper离线行为回归与统一Python CI | 已实现、3任务审阅通过；CI未执行 |
 | W09 | [稿件证据](2026-10-04-wisp-w09-publication-evidence.md) | 4 | 保存revision准备度与reference-only四entry证据ZIP | SOURCE完成并独立审阅；确定性全量/Web/native构建通过，native手工未执行 |
-| W10 | [文件基线](2026-10-04-wisp-w10-file-baselines.md) | 4 | 显式安全小本地文本immutable snapshot/有界diff | 进行中，Task1 DTO/Store已审阅，宿主捕获/diff/UI待实施 |
+| W10 | [文件基线](2026-10-04-wisp-w10-file-baselines.md) | 4 | 显式安全小本地文本immutable snapshot/有界diff | 进行中，Task1–2 DTO/Store及安全捕获已审阅，diff/UI待实施 |
 | W11 | [迁移预览](2026-10-04-wisp-w11-migration-preview.md) | 3 | 空默认选择、类别COUNT、文件状态/hash与rebind/omissions | 待实施 |
 | W12 | [会话可见性](2026-10-04-wisp-w12-conversation-visibility.md) | 4 | 持久可逆收起/恢复，分页前过滤，精确引用保持 | 待实施 |
 
@@ -142,3 +142,5 @@ W06已实现：四任务源码独立审阅完成，最终UI提交 `d535b50`；�
 2026-10-13：W09 Task4 `38bfd11..2649097` 保存版本UI/API完成独立完整审阅，累计39/50 SOURCE。dirty正文不进入请求、不隐式保存；选择/generation隔离、类型化安全错误、中性取消及立即Escape保护已覆盖。最终focused32和既有regression32、全量Vitest1345+Node22、Web/native构建通过；Rust1831通过/18ignored及Python48为未变源码的实际通过。最初native106错误、限定DTO/Store release缓存恢复及最终UI字节4m34s构建分别记录，缓存陈旧根因未确定。源码与确定性检查完成，native手工在用户STOP下未执行，真实模型/SSH/复现与最终clean-HEAD/全分支交付检查未完成。
 
 2026-10-13：W10 Task1 `f93878c..5085908` 类型化基线DTO、immutable manifest与Store迁移/replay/逻辑quota完成独立完整审阅，累计40/50 SOURCE。实际缺接口编译RED与sandbox OUT_DIR分开记录；随后畸形持久请求UUID行为RED为8通过/1失败，修复后最终Store9、branch9、native DTO1、fmt/diff通过。7外部RAW及candidate/inverse/replay/postcommit证明保留；宿主正文/blob物理预算/cleanup、diff/UI及全量/clean-HEAD/真实验收仍由后续任务承接。
+
+2026-10-13：W10 Task2 `f07d9a3` 安全捕获/blob/保存正文/删除清理及 `4a6eb14` 三项修复完成完整与定向独立审阅，累计41/50 SOURCE。敏感文件名在读取前降引用，V4历史引用严格校验类型/schema/有效性/producer状态，open-time SourceChanged整次拒绝；既有Unavailable仍为Unreadable。修复因果RED为纯策略0/1、capture15/2、Store0/2；最新capture17/pure5/saved4/Store11共37通过，fmt/diff及精确候选/逆向/replay/提交审计通过。原62是修复前历史检查，未变W02 handle16/table11/delete2沿用此前结果；完整/clean-HEAD/真实验收未完成。7外部RAW保留；六处working initializer中五处提交，一处外部测试内W10兼容initializer明确未暂存，与既有W04残留分开。diff/UI仍待Tasks3–4，不能称全部文件基线功能已交付。
