@@ -30,3 +30,9 @@
 html[data-omicsops-theme="dark"] .workspace-research-page,html[data-omicsops-theme="dark"] .research-dialog-backdrop{--research-bg:#16231f;--research-panel:#1c2c26;--research-ink:#e1eae5;--research-muted:#9cada3;--research-border:#354b40;--research-soft:#263b30;--research-accent:#3c916e}html[data-omicsops-theme="dark"] .research-error{background:#3c2721;border-color:#734638;color:#f0baa6}
 @media(max-width:900px){.research-page-header{padding:20px}.research-page-body{padding:18px 20px}.research-publication-layout{grid-template-columns:160px minmax(0,1fr);gap:14px}.research-manuscript-editor{padding:14px}}
 @media(max-width:650px){.research-publication-layout{grid-template-columns:minmax(0,1fr)}.research-manuscript-list{max-height:200px;overflow:auto}.research-filters{flex-direction:column}.research-filters select{max-width:none}.research-dialog-backdrop{padding:12px}.research-dialog{width:calc(100vw - 24px);max-height:calc(100vh - 24px)}.research-dialog-content{padding:15px}.research-metadata{grid-template-columns:100px minmax(0,1fr)}.research-entry{align-items:flex-start;flex-direction:column}.research-editor-toolbar{align-items:flex-start;flex-direction:column}}
+.research-publication-evidence { display: grid; gap: 12px; }
+.research-publication-evidence p { margin: 0; }
+.research-publication-evidence dd { overflow-wrap: anywhere; }
+.research-evidence-findings { margin: 0; padding-left: 20px; display: grid; gap: 12px; }
+.research-evidence-findings li p { margin-top: 4px; }
+.research-evidence-severity { font-weight: 600; }

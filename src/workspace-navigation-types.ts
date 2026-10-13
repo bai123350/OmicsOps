@@ -17,6 +17,22 @@ export interface JourneyPage { entries: JourneyEntry[]; next_offset: number | nu
 export interface PublicationSummary { id: string; project_id: string; title: string; revision: number; updated_at: string }
 export interface PublicationRevision { id: string; publication_id: string; revision: number; title: string; markdown: string; references: WorkspaceSourceSnapshot[]; sha256: string; created_at: string; legacy: boolean }
 export interface PublicationDetail { publication: PublicationSummary; revisions: PublicationRevision[] }
+// Serde wire shapes from omicsops-dto/src/publication_evidence.rs.
+export interface PublicationSelectionV1 { project_id: string; publication_id: string; revision: number; expected_revision_sha256: string }
+export type PublicationRevisionHashScopeV1 = "stored_revision_content" | "public_legacy_markdown";
+export type ReadinessFindingSeverityV1 = "attention" | "unverified" | "info";
+export type ReadinessFindingCodeV1 = "source_changed" | "source_missing" | "source_unavailable" | "invalid_evidence" | "invalid_artifact" | "stale_analysis" | "incomplete_provenance" | "missing_random_seed" | "missing_software_version" | "missing_database_version" | "missing_sample" | "invalid_input" | "provenance_not_recorded" | "lineage_not_recorded" | "original_file_not_checked" | "historical_location_unverified" | "legacy_revision" | "inspection_limit";
+export interface ReadinessFindingV1 { code: ReadinessFindingCodeV1; severity: ReadinessFindingSeverityV1; source: WorkspaceSourceRef | null; related_record_id: string | null; message: string }
+export type ReproductionStatusV1 = "not_executed";
+export interface PublicationReadinessReportV1 {
+  schema_version: number; selection: PublicationSelectionV1; revision_hash_scope: PublicationRevisionHashScopeV1;
+  observed_at: string; scientific_revision: number | null; scientific_state_sha256: string | null;
+  references_checked: number; related_records_checked: number; attention_count: number; unverified_count: number;
+  findings: ReadinessFindingV1[]; truncated: boolean; reproduction_status: ReproductionStatusV1;
+}
+export interface PublicationPackageExportResultV1 { path: string; package_sha256: string; size_bytes: number; manifest_sha256: string; selection: PublicationSelectionV1 }
+export type PublicationEvidenceErrorCodeV1 = "invalid_selection" | "not_found" | "revision_changed" | "limit_exceeded" | "unsafe_public_content" | "storage_read_failed" | "export_write_failed";
+export interface PublicationEvidenceErrorV1 { code: PublicationEvidenceErrorCodeV1; message: string }
 export type LibraryKind = "code" | "excerpt" | "artifact";
 export interface LibrarySummary { id: string; kind: LibraryKind; title: string; source_project_id: string; source_project_name: string; source_conversation_id: string | null; source_conversation_title: string | null; text_preview: string; created_at: string }
 export interface LibraryDetail { item: LibrarySummary; snapshot: WorkspaceSourceSnapshot }

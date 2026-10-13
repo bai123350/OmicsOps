@@ -3,10 +3,29 @@ import { exportWorkspacePublication, getWorkspacePublication, listWorkspacePubli
 import type { PublicationDetail, PublicationSummary, RestoreWorkspacePublicationRequest, SaveWorkspacePublicationRequest, WorkspaceSourceRef, WorkspaceSourceSnapshot } from "../../workspace-navigation-types";
 import { JourneyBrowser, formatResearchDate, type WorkspaceResearchPagesProps } from "./WorkspaceResearchPages";
 import { ResearchDialog, ResearchError, SnapshotView, SourceDialog, errorText, sourceKey, useAlive, useResearchList } from "./ResearchPagePrimitives";
+import { checkWorkspacePublicationReadiness, exportWorkspacePublicationReferencePackage } from "../../workspace-navigation-api";
+import type { PublicationEvidenceErrorCodeV1, PublicationPackageExportResultV1, PublicationReadinessReportV1, PublicationSelectionV1 } from "../../workspace-navigation-types";
 
 type Draft = { title: string; markdown: string; sources: WorkspaceSourceRef[] };
 type PendingWrite = { kind: "save"; request: SaveWorkspacePublicationRequest } | { kind: "restore"; request: RestoreWorkspacePublicationRequest };
 const EMPTY_DRAFT: Draft = { title: "", markdown: "", sources: [] };
+function evidenceSelectionKey(value: PublicationSelectionV1 | null): string {
+  return JSON.stringify(value ? [value.project_id, value.publication_id, value.revision, value.expected_revision_sha256] : null);
+}
+
+function evidenceError(cause: unknown, zh: boolean): string {
+  const code = cause && typeof cause === "object" && "code" in cause ? cause.code : null;
+  const messages: Record<PublicationEvidenceErrorCodeV1, [string, string]> = {
+    invalid_selection: ["Invalid saved revision selection. Reload and try again.", "保存版本选择无效，请重新加载。"],
+    not_found: ["The saved revision is no longer available. Reload and try again.", "保存版本已不可用，请重新加载。"],
+    revision_changed: ["The saved revision hash changed. Reload before trying again.", "保存版本哈希已变化，请重新加载后重试。"],
+    limit_exceeded: ["The saved revision exceeds the inspection or package limit.", "保存版本超出检查或包大小限制。"],
+    unsafe_public_content: ["Public content could not be safely inspected or exported.", "公开内容无法安全检查或导出。"],
+    storage_read_failed: ["The saved revision could not be read. Try again.", "无法读取保存版本，请重试。"],
+    export_write_failed: ["The reference package could not be saved. Choose a writable .zip destination and try again.", "引用证据包未能保存，请选择可写的 .zip 目的地后重试。"],
+  };
+  return typeof code === "string" && Object.hasOwn(messages, code) ? messages[code as PublicationEvidenceErrorCodeV1][zh ? 1 : 0] : zh ? "保存版本检查或包导出未完成，请重试。" : "Saved revision inspection or package export could not be completed. Try again.";
+}
 
 export function WorkspacePublicationPage({ projectId, zh, onOpenConversation, registerBeforeLeave }: WorkspaceResearchPagesProps & { zh: boolean }) {
   const publications = useResearchList<PublicationSummary>(projectId, async () => ({ items: await listWorkspacePublications(projectId), next: null }));
@@ -31,6 +50,13 @@ export function WorkspacePublicationPage({ projectId, zh, onOpenConversation, re
   const pendingRef = useRef<PendingWrite | null>(null);
   const busyRef = useRef(false);
   const loadGeneration = useRef(0);
+  const evidenceGeneration = useRef(0);
+  const [evidenceOpen, setEvidenceOpen] = useState(false);
+  const [evidencePending, setEvidencePending] = useState(false);
+  const [evidenceReport, setEvidenceReport] = useState<PublicationReadinessReportV1 | null>(null);
+  const [packageReceipt, setPackageReceipt] = useState<PublicationPackageExportResultV1 | null>(null);
+  const [evidenceFailure, setEvidenceFailure] = useState("");
+  const [evidenceNotice, setEvidenceNotice] = useState("");
   const alive = useAlive();
   const dirty = editing && (JSON.stringify(draft) !== JSON.stringify(baseline) || pending !== null);
   const dirtyRef = useRef(dirty);
@@ -60,10 +86,24 @@ export function WorkspacePublicationPage({ projectId, zh, onOpenConversation, re
 
   const head = detail?.revisions.find((value) => value.revision === detail.publication.revision);
   const selected = detail?.revisions.find((value) => value.revision === revision);
+  const savedSelection: PublicationSelectionV1 | null = selected && detail?.publication.project_id === projectId ? { project_id: projectId, publication_id: detail.publication.id, revision: selected.revision, expected_revision_sha256: selected.sha256 } : null;
+  const selectionKey = evidenceSelectionKey(savedSelection);
+  const selectionKeyRef = useRef(selectionKey);
+  selectionKeyRef.current = selectionKey;
+  const invalidateEvidence = useCallback(() => {
+    evidenceGeneration.current += 1;
+    setEvidenceOpen(false); setEvidencePending(false); setEvidenceReport(null); setPackageReceipt(null); setEvidenceFailure(""); setEvidenceNotice("");
+  }, []);
+  useEffect(() => {
+    invalidateEvidence();
+    return () => { evidenceGeneration.current += 1; };
+  }, [projectId, selectionKey, invalidateEvidence]);
   const readOnly = Boolean(selected && (selected.revision !== detail?.publication.revision || selected.legacy));
   const locked = busy || pending !== null;
+  const evidenceBlocked = busy || evidencePending || loading || Boolean(picker || snapshot || source || leave);
 
   function accept(value: PublicationDetail, saved = false) {
+    invalidateEvidence();
     const current = value.revisions.find((item) => item.revision === value.publication.revision);
     const nextDraft = { title: current?.title ?? value.publication.title, markdown: current?.markdown ?? "", sources: current?.references.map((item) => item.source) ?? [] };
     setDetail(value); setEditing(true); setDraft(nextDraft); setBaseline(nextDraft); setRevision(value.publication.revision);
@@ -72,6 +112,7 @@ export function WorkspacePublicationPage({ projectId, zh, onOpenConversation, re
     setNotice(saved ? (zh ? `版本 ${value.publication.revision} 已保存。` : `Revision ${value.publication.revision} saved.`) : "");
   }
   async function open(publicationId: string) {
+    invalidateEvidence();
     const ticket = ++loadGeneration.current;
     setLoading(true); setError(""); setLoadError(""); setNotice("");
     failedPublication.current = publicationId;
@@ -80,6 +121,7 @@ export function WorkspacePublicationPage({ projectId, zh, onOpenConversation, re
     finally { if (alive.current && ticket === loadGeneration.current) setLoading(false); }
   }
   function create() {
+    invalidateEvidence();
     loadGeneration.current += 1;
     setDetail(null); setEditing(true); setDraft(EMPTY_DRAFT); setBaseline(EMPTY_DRAFT); setRevision(null); setError(""); setNotice(""); setLoading(false); pendingRef.current = null; setPending(null);
     setLoadError("");
@@ -87,6 +129,7 @@ export function WorkspacePublicationPage({ projectId, zh, onOpenConversation, re
   function chooseRevision(value: number) {
     const version = detail?.revisions.find((item) => item.revision === value);
     if (!version) return;
+    invalidateEvidence();
     const next = { title: version.title, markdown: version.markdown, sources: version.references.map((item) => item.source) };
     setRevision(value); setDraft(next); setBaseline(next); setError(""); setNotice(""); pendingRef.current = null; setPending(null);
   }
@@ -136,6 +179,26 @@ export function WorkspacePublicationPage({ projectId, zh, onOpenConversation, re
       if (alive.current) setNotice(path === null ? (zh ? "已取消导出。" : "Export cancelled.") : (zh ? `已导出至 ${path}` : `Exported to ${path}`));
     } catch (cause) { if (alive.current) setError(errorText(cause)); }
     finally { busyRef.current = false; if (alive.current) setBusy(false); }
+  }
+  async function inspectSavedRevision(operation: "check" | "export") {
+    if (!savedSelection || evidenceBlocked || busyRef.current) return;
+    const ticket = ++evidenceGeneration.current;
+    const key = selectionKey;
+    const current = () => alive.current && ticket === evidenceGeneration.current && key === selectionKeyRef.current;
+    setEvidenceOpen(true); setEvidencePending(true); setEvidenceReport(null); setPackageReceipt(null); setEvidenceFailure(""); setEvidenceNotice("");
+    try {
+      if (operation === "check") {
+        const value = await checkWorkspacePublicationReadiness(savedSelection);
+        if (current() && evidenceSelectionKey(value.selection) === key) setEvidenceReport(value);
+      } else {
+        const value = await exportWorkspacePublicationReferencePackage(savedSelection);
+        if (current()) {
+          if (value === null) setEvidenceNotice(zh ? "已取消引用证据包导出，未保存任何内容。" : "Reference package export cancelled. Nothing was saved.");
+          else if (evidenceSelectionKey(value.selection) === key) setPackageReceipt(value);
+        }
+      }
+    } catch (cause) { if (current()) setEvidenceFailure(evidenceError(cause, zh)); }
+    finally { if (current()) setEvidencePending(false); }
   }
   function updateDraft(value: Partial<Draft>) { if (!locked && !readOnly) { setDraft((previous) => ({ ...previous, ...value })); setNotice(""); } }
   function discardAndLeave() {
@@ -187,11 +250,41 @@ export function WorkspacePublicationPage({ projectId, zh, onOpenConversation, re
             {!readOnly && <button type="button" className="research-primary" disabled={busy} onClick={() => void write()}>{pending ? (zh ? "重试保存" : "Retry save") : (zh ? "保存版本" : "Save revision")}</button>}
             {readOnly && <button type="button" className="research-primary" disabled={busy} onClick={() => void write("restore")}>{pending ? (zh ? "重试恢复" : "Retry restore") : (zh ? "恢复此版本" : "Restore this revision")}</button>}
             {detail && <button type="button" disabled={busy} onClick={() => void exportRevision()}>{zh ? "导出 Markdown" : "Export Markdown"}</button>}
+            {savedSelection && <button type="button" disabled={evidenceBlocked} onClick={() => void inspectSavedRevision("check")}>{zh ? `检查保存版本 ${savedSelection.revision}` : `Check saved revision ${savedSelection.revision}`}</button>}
+            {savedSelection && <button type="button" disabled={evidenceBlocked} onClick={() => void inspectSavedRevision("export")}>{zh ? `导出保存版本 ${savedSelection.revision} 引用证据包` : `Export saved revision ${savedSelection.revision} reference package`}</button>}
             {detail && <button type="button" disabled={busy} onClick={() => guard(() => void open(detail.publication.id))}>{zh ? "重新加载最新版本" : "Reload latest revision"}</button>}
           </div>
         </>}
       </div>
     </div>
+    {evidenceOpen && savedSelection && <ResearchDialog title={zh ? "保存版本证据" : "Saved revision evidence"} zh={zh} onClose={invalidateEvidence}>
+      <div className="research-publication-evidence">
+        <p>{zh ? `保存版本 ${savedSelection.revision}；未保存编辑不会被检查、导出或自动保存。` : `Saved revision ${savedSelection.revision}; unsaved edits are not inspected, exported or automatically saved.`}</p>
+        <p className="research-note">{zh ? "原始文件未检查（NotChecked）；未执行独立复现（NotExecuted）。来源可用仅表示 Store 记录可解析。" : "Original files: NotChecked. Independent reproduction: NotExecuted. Source availability only describes Store records."}</p>
+        <p className="research-note">{zh ? "导出会在保存对话框后重新检查；此报告不是导出包快照。包仅保存到本机，不代表投稿、发布或复现。" : "Export rechecks after the save dialog; this report is not a package snapshot. A package is saved locally and does not establish submission, publication or reproduction."}</p>
+        <dl className="research-metadata">
+          <dt>{zh ? "保存版本 SHA-256 范围" : "Saved revision SHA-256 scope"}</dt><dd>{selected?.legacy ? "PublicLegacyMarkdown" : "StoredRevisionContent"}: {savedSelection.expected_revision_sha256}</dd>
+          <dt>{zh ? "保存快照文本 SHA-256" : "Saved snapshot text SHA-256"}</dt><dd>{zh ? "保存时的引用文本。" : "Reference text at save time."}</dd>
+          <dt>{zh ? "导出引用文本 SHA-256" : "Exported reference text SHA-256"}</dt><dd>{zh ? "包内公开投影的文本，可能与保存快照不同。" : "Public reference text in the package; it may differ from the saved snapshot."}</dd>
+          <dt>{zh ? "记录的文件 SHA-256" : "Recorded file SHA-256"}</dt><dd>{zh ? "历史元数据，不是当前文件的校验结果。" : "Historical metadata; it does not verify the current file."}</dd>
+        </dl>
+        {evidencePending && <p role="status">{zh ? "正在处理保存版本…" : "Processing saved revision…"}</p>}
+        <ResearchError error={evidenceFailure} zh={zh} />
+        {evidenceNotice && <p role="status">{evidenceNotice}</p>}
+        {evidenceReport && <>
+          <p>{zh ? "观察时间" : "Observed at"}: {evidenceReport.observed_at}</p>
+          <div className="research-badges"><span>{zh ? "需关注" : "Attention"}: {evidenceReport.attention_count}</span><span>{zh ? "未核验" : "Unverified"}: {evidenceReport.unverified_count}</span></div>
+          <p>{zh ? "已检查引用 / 关联记录" : "References / related records inspected"}: {evidenceReport.references_checked} / {evidenceReport.related_records_checked}</p>
+          <p className="research-note">{evidenceReport.revision_hash_scope === "public_legacy_markdown" ? "PublicLegacyMarkdown" : "StoredRevisionContent"}</p>
+          {evidenceReport.truncated && <p className="research-note">{zh ? "检查已截断：部分记录未检查，不能视为检查通过。" : "Inspection truncated: some records were not checked; this is not a passing result."}</p>}
+          <ul className="research-evidence-findings">{evidenceReport.findings.map((finding, index) => <li key={`${finding.code}:${index}`}><span className="research-evidence-severity">{finding.severity}</span> <code>{finding.code}</code><p>{finding.message}</p></li>)}</ul>
+        </>}
+        {packageReceipt && <>
+          <p role="status">{zh ? `包已保存至 ${packageReceipt.path}` : `Package saved to ${packageReceipt.path}`}</p>
+          <dl className="research-metadata"><dt>{zh ? "ZIP 字节 SHA-256" : "ZIP bytes SHA-256"}</dt><dd>{packageReceipt.package_sha256}</dd><dt>{zh ? "Manifest 字节 SHA-256" : "Manifest bytes SHA-256"}</dt><dd>{packageReceipt.manifest_sha256}</dd><dt>{zh ? "ZIP 字节数" : "ZIP size in bytes"}</dt><dd>{packageReceipt.size_bytes}</dd></dl>
+        </>}
+      </div>
+    </ResearchDialog>}
     {picker && <ResearchDialog title={zh ? "选择证据" : "Choose evidence"} zh={zh} onClose={() => setPicker(false)}><JourneyBrowser projectId={projectId} zh={zh} onOpenConversation={(p, c) => guard(() => onOpenConversation(p, c))} selected={draft.sources} onSelect={(ref) => updateDraft({ sources: [...draft.sources, ref] })} /><div className="research-actions"><button type="button" onClick={() => setPicker(false)}>{zh ? "完成" : "Done"}</button></div></ResearchDialog>}
     {snapshot && <ResearchDialog title={zh ? "保存的引用" : "Saved reference"} zh={zh} onClose={() => setSnapshot(null)}><SnapshotView snapshot={snapshot} zh={zh} /></ResearchDialog>}
     {source && <SourceDialog key={sourceKey(source)} source={source} zh={zh} onClose={() => setSource(null)} onOpenConversation={(p, c) => guard(() => onOpenConversation(p, c))} />}

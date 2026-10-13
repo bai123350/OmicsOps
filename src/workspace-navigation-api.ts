@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { PublicationSelectionV1, PublicationReadinessReportV1, PublicationPackageExportResultV1 } from "./workspace-navigation-types";
 import type { ConversationGroup, ConversationGroupState, JourneyPage, LibraryDetail, LibraryPage, MoveConversationsRequest, PublicationDetail, PublicationSummary, RestoreWorkspacePublicationRequest, SaveConversationGroupRequest, SaveWorkspaceLibraryItemRequest, SaveWorkspacePublicationRequest, WorkspaceJourneyRequest, WorkspaceLibraryRequest, WorkspaceSourceRef, WorkspaceSourceSnapshot } from "./workspace-navigation-types";
 
 export function isWorkspaceDesktopHost() { return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window; }
@@ -22,6 +23,8 @@ export const getWorkspacePublication = (projectId: string, publicationId: string
 export const saveWorkspacePublication = (request: SaveWorkspacePublicationRequest) => host<PublicationDetail>("workspace_save_publication", { request });
 export const restoreWorkspacePublication = (request: RestoreWorkspacePublicationRequest) => host<PublicationDetail>("workspace_restore_publication", { request });
 export const exportWorkspacePublication = (projectId: string, publicationId: string, revision: number) => host<string | null>("workspace_export_publication", { projectId, publicationId, revision });
+export const checkWorkspacePublicationReadiness = (request: PublicationSelectionV1): Promise<PublicationReadinessReportV1> => host<PublicationReadinessReportV1>("workspace_check_publication_readiness", { request });
+export const exportWorkspacePublicationReferencePackage = (request: PublicationSelectionV1): Promise<PublicationPackageExportResultV1 | null> => host<PublicationPackageExportResultV1 | null>("workspace_export_publication_reference_package", { request });
 export const listWorkspaceLibrary = (request: WorkspaceLibraryRequest) => host<LibraryPage>("workspace_list_library", { request });
 export const getWorkspaceLibraryItem = (itemId: string) => host<LibraryDetail>("workspace_get_library_item", { itemId });
 export const saveWorkspaceLibraryItem = (request: SaveWorkspaceLibraryItemRequest) => host<LibraryDetail>("workspace_save_library_item", { request });

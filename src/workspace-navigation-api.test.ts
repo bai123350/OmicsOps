@@ -26,3 +26,20 @@ it("rejects an incompatible host response without replacing the session list", a
   vi.mocked(invoke).mockResolvedValueOnce([]);
   await expect(api.listConversationGroups("p")).rejects.toThrow("Invalid session groups");
 });
+
+it("sends only the saved selection to exact evidence commands and preserves cancellation", async () => {
+  const savedSelection = { project_id: "p", publication_id: "paper", revision: 2, expected_revision_sha256: "a".repeat(64) };
+  const report = { selection: savedSelection };
+  vi.mocked(invoke).mockResolvedValueOnce(report);
+  await expect(api.checkWorkspacePublicationReadiness(savedSelection)).resolves.toBe(report);
+  expect(invoke).toHaveBeenLastCalledWith("workspace_check_publication_readiness", { request: savedSelection });
+  vi.mocked(invoke).mockResolvedValueOnce(null);
+  await expect(api.exportWorkspacePublicationReferencePackage(savedSelection)).resolves.toBeNull();
+  expect(invoke).toHaveBeenLastCalledWith("workspace_export_publication_reference_package", { request: savedSelection });
+  const receipt = { selection: savedSelection, path: "C:/synthetic study/package.zip", package_sha256: "b".repeat(64), manifest_sha256: "c".repeat(64), size_bytes: 1024 };
+  vi.mocked(invoke).mockResolvedValueOnce(receipt);
+  await expect(api.exportWorkspacePublicationReferencePackage(savedSelection)).resolves.toBe(receipt);
+  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  await expect(api.checkWorkspacePublicationReadiness(savedSelection)).rejects.toThrow(/desktop/i);
+  await expect(api.exportWorkspacePublicationReferencePackage(savedSelection)).rejects.toThrow(/desktop/i);
+});
