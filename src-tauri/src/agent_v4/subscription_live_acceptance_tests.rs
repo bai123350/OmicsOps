@@ -401,6 +401,9 @@ async fn run_live_subscription_acceptance(expected: ModelProviderKind) -> Result
         active_runs: Default::default(),
         live_runtime_registry_v4: Default::default(),
         skills_root: directory.path().join("skills"),
+        file_baseline_storage: crate::workspace_file_baselines::FileBaselineStorage::new(
+            directory.path().join("baseline-app"),
+        ),
         skills_gate: Default::default(),
         research_last_request: Default::default(),
         active_kernels: Default::default(),

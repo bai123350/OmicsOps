@@ -386,3 +386,196 @@ async fn baseline_migration_rejects_malformed_request_identity() {
     store.pool().close().await;
     assert!(Store::open(&path).await.is_err());
 }
+
+#[tokio::test]
+async fn baseline_recorded_reference_is_bounded_and_checks_exact_provenance() {
+    let store = Store::open_in_memory().await.unwrap();
+    let mut p = project(&store).await;
+    let connection = Uuid::from_u128(9);
+    store
+        .save_connection(&omicsops_core::domain::ConnectionProfile {
+            id: connection,
+            label: "fixture".into(),
+            host: "example.invalid".into(),
+            port: 22,
+            username: "fixture".into(),
+            authentication: omicsops_core::domain::AuthenticationMethod::Password,
+            authentication_reference: "fixture-ref".into(),
+            host_key_fingerprint: None,
+        })
+        .await
+        .unwrap();
+    p.connection_id = Some(connection);
+    p.remote_root = Some("/project".into());
+    store.save_project(&p).await.unwrap();
+    let backend = format!("ssh:{connection}");
+    let analysis = Uuid::new_v4();
+    let artifact = Uuid::new_v4();
+    let a=serde_json::json!({"id":artifact,"project_id":p.id,"relative_path":"a.txt","producer_analysis_id":analysis,"size_bytes":7,"sha256":"a".repeat(64)}).to_string();
+    let n = serde_json::json!({"id":analysis,"project_id":p.id,"runtime":{"backend_id":backend}})
+        .to_string();
+    sqlx::query(
+        "INSERT INTO scientific_analyses_v4(id,project_id,status,value_json) VALUES(?,?,?,?)",
+    )
+    .bind(analysis.to_string())
+    .bind(p.id.to_string())
+    .bind("succeeded")
+    .bind(&n)
+    .execute(store.pool())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO scientific_artifacts_v4(id,project_id,producer_analysis_id,valid,value_json) VALUES(?,?,?,1,?)").bind(artifact.to_string()).bind(p.id.to_string()).bind(analysis.to_string()).bind(&a).execute(store.pool()).await.unwrap();
+    assert_eq!(
+        store
+            .workspace_file_recorded_reference(p.id, &backend, "a.txt")
+            .await
+            .unwrap(),
+        (Some(7), Some("a".repeat(64)))
+    );
+    assert_eq!(
+        store
+            .workspace_file_recorded_reference(p.id, "ssh:other", "a.txt")
+            .await
+            .unwrap(),
+        (None, None)
+    );
+    assert_eq!(
+        store
+            .workspace_file_recorded_reference(p.id, &backend, "other.txt")
+            .await
+            .unwrap(),
+        (None, None)
+    );
+    let mut value: serde_json::Value = serde_json::from_str(&a).unwrap();
+    value["project_id"] = serde_json::json!(Uuid::new_v4());
+    sqlx::query("UPDATE scientific_artifacts_v4 SET value_json=? WHERE id=?")
+        .bind(value.to_string())
+        .bind(artifact.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .workspace_file_recorded_reference(p.id, &backend, "a.txt")
+            .await
+            .unwrap(),
+        (None, None)
+    );
+    sqlx::query("UPDATE scientific_artifacts_v4 SET value_json=? WHERE id=?")
+        .bind("{malformed")
+        .bind(artifact.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .workspace_file_recorded_reference(p.id, &backend, "a.txt")
+            .await
+            .unwrap(),
+        (None, None)
+    );
+    sqlx::query("UPDATE scientific_artifacts_v4 SET value_json=? WHERE id=?")
+        .bind(&a)
+        .bind(artifact.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let mut unknown_hash: serde_json::Value = serde_json::from_str(&a).unwrap();
+    unknown_hash["sha256"] = serde_json::json!("not-a-hash");
+    sqlx::query("UPDATE scientific_artifacts_v4 SET value_json=? WHERE id=?")
+        .bind(unknown_hash.to_string())
+        .bind(artifact.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .workspace_file_recorded_reference(p.id, &backend, "a.txt")
+            .await
+            .unwrap(),
+        (Some(7), None)
+    );
+    let mut unknown_size: serde_json::Value = serde_json::from_str(&a).unwrap();
+    unknown_size["size_bytes"] = serde_json::json!("unknown");
+    sqlx::query("UPDATE scientific_artifacts_v4 SET value_json=? WHERE id=?")
+        .bind(unknown_size.to_string())
+        .bind(artifact.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .workspace_file_recorded_reference(p.id, &backend, "a.txt")
+            .await
+            .unwrap(),
+        (None, Some("a".repeat(64)))
+    );
+    sqlx::query("UPDATE scientific_artifacts_v4 SET value_json=? WHERE id=?")
+        .bind(format!("{}{}", a, " ".repeat(65536)))
+        .bind(artifact.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .workspace_file_recorded_reference(p.id, &backend, "a.txt")
+            .await
+            .unwrap(),
+        (None, None)
+    );
+    sqlx::query("UPDATE scientific_artifacts_v4 SET value_json=? WHERE id=?")
+        .bind(&a)
+        .bind(artifact.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let second = Uuid::new_v4();
+    let mut conflicting: serde_json::Value = serde_json::from_str(&a).unwrap();
+    conflicting["id"] = serde_json::json!(second);
+    conflicting["size_bytes"] = serde_json::json!(8);
+    sqlx::query("INSERT INTO scientific_artifacts_v4(id,project_id,producer_analysis_id,valid,value_json) VALUES(?,?,?,1,?)").bind(second.to_string()).bind(p.id.to_string()).bind(analysis.to_string()).bind(conflicting.to_string()).execute(store.pool()).await.unwrap();
+    assert_eq!(
+        store
+            .workspace_file_recorded_reference(p.id, &backend, "a.txt")
+            .await
+            .unwrap(),
+        (None, None)
+    );
+    sqlx::query("DELETE FROM scientific_artifacts_v4 WHERE id=?")
+        .bind(second.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let mut bad_identity: serde_json::Value = serde_json::from_str(&a).unwrap();
+    bad_identity["id"] = serde_json::json!("malformed-row-id");
+    sqlx::query("UPDATE scientific_artifacts_v4 SET id='malformed-row-id',value_json=? WHERE id=?")
+        .bind(bad_identity.to_string())
+        .bind(artifact.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .workspace_file_recorded_reference(p.id, &backend, "a.txt")
+            .await
+            .unwrap(),
+        (None, None)
+    );
+    sqlx::query("UPDATE scientific_artifacts_v4 SET id=?,value_json=? WHERE id='malformed-row-id'")
+        .bind(artifact.to_string())
+        .bind(&a)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    p.connection_id = None;
+    p.remote_root = None;
+    store.save_project(&p).await.unwrap();
+    assert_eq!(
+        store
+            .workspace_file_recorded_reference(p.id, &backend, "a.txt")
+            .await
+            .unwrap(),
+        (None, None)
+    );
+}

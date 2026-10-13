@@ -413,3 +413,82 @@ pub(crate) async fn validate_file_baselines(
     }
     Ok(())
 }
+
+impl Store {
+    /// Read only recorded metadata with explicit V4 producer-backend provenance.
+    /// At most three bounded candidates; malformed/oversized or ambiguous matches
+    /// are unknown. No runtime identity is returned, and this never stats SSH.
+    pub async fn workspace_file_recorded_reference(
+        &self,
+        project_id: Uuid,
+        backend_id: &str,
+        relative_path: &str,
+    ) -> Result<(Option<u64>, Option<String>), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let bound:i64=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project_omicsops p JOIN connections c ON c.id=p.connection_id WHERE p.project_id=? AND 'ssh:'||c.id=? AND p.remote_root IS NOT NULL AND length(trim(p.remote_root))>0)").bind(project_id.to_string()).bind(backend_id).fetch_one(&mut *tx).await?;
+        if bound == 0 {
+            return Ok((None, None));
+        }
+        let rows=sqlx::query("SELECT CASE WHEN length(a.id)=36 THEN a.id ELSE NULL END AS id,a.project_id,CASE WHEN length(a.producer_analysis_id)=36 THEN a.producer_analysis_id ELSE NULL END AS producer_analysis_id,CASE WHEN length(n.id)=36 THEN n.id ELSE NULL END AS analysis_id,n.project_id AS analysis_project, CASE WHEN length(CAST(a.value_json AS BLOB))<=65536 THEN CASE WHEN json_valid(a.value_json) THEN a.value_json ELSE NULL END ELSE NULL END AS artifact_json, CASE WHEN length(CAST(n.value_json AS BLOB))<=65536 THEN CASE WHEN json_valid(n.value_json) THEN n.value_json ELSE NULL END ELSE NULL END AS analysis_json FROM scientific_artifacts_v4 a LEFT JOIN scientific_analyses_v4 n ON n.id=a.producer_analysis_id AND n.project_id=a.project_id WHERE a.project_id=? AND (CASE WHEN length(CAST(a.value_json AS BLOB))<=65536 THEN CASE WHEN json_valid(a.value_json) THEN json_extract(a.value_json,'$.relative_path') ELSE NULL END ELSE NULL END=? OR CASE WHEN length(CAST(a.value_json AS BLOB))<=65536 THEN json_valid(a.value_json) ELSE 0 END=0) ORDER BY a.id LIMIT 3")
+            .bind(project_id.to_string()).bind(relative_path).fetch_all(&mut *tx).await?;
+        if rows.len() >= 3 {
+            return Ok((None, None));
+        }
+        let mut result = None;
+        for row in rows {
+            for column in ["id", "producer_analysis_id", "analysis_id"] {
+                let Some(id): Option<&str> = row.try_get(column)? else {
+                    return Ok((None, None));
+                };
+                if !Uuid::parse_str(id)
+                    .ok()
+                    .is_some_and(|uuid| uuid.to_string() == id)
+                {
+                    return Ok((None, None));
+                }
+            }
+            let Some(artifact): Option<&str> = row.try_get("artifact_json")? else {
+                return Ok((None, None));
+            };
+            let Some(analysis): Option<&str> = row.try_get("analysis_json")? else {
+                return Ok((None, None));
+            };
+            let artifact: serde_json::Value = match serde_json::from_str(artifact) {
+                Ok(v) => v,
+                Err(_) => return Ok((None, None)),
+            };
+            let analysis: serde_json::Value = match serde_json::from_str(analysis) {
+                Ok(v) => v,
+                Err(_) => return Ok((None, None)),
+            };
+            if artifact["id"].as_str() != Some(row.try_get("id")?)
+                || artifact["project_id"].as_str() != Some(project_id.to_string().as_str())
+                || artifact["producer_analysis_id"].as_str()
+                    != Some(row.try_get("producer_analysis_id")?)
+                || analysis["id"].as_str() != row.try_get::<Option<&str>, _>("analysis_id")?
+                || analysis["project_id"].as_str() != Some(project_id.to_string().as_str())
+                || row.try_get::<Option<&str>, _>("analysis_project")?
+                    != Some(project_id.to_string().as_str())
+            {
+                return Ok((None, None));
+            }
+            if artifact["relative_path"].as_str() != Some(relative_path)
+                || analysis["runtime"]["backend_id"].as_str() != Some(backend_id)
+            {
+                continue;
+            }
+            let value = (
+                artifact["size_bytes"].as_u64(),
+                artifact["sha256"]
+                    .as_str()
+                    .filter(|h| valid_hash(h))
+                    .map(str::to_owned),
+            );
+            if result.as_ref().is_some_and(|old| old != &value) {
+                return Ok((None, None));
+            }
+            result = Some(value);
+        }
+        Ok(result.unwrap_or((None, None)))
+    }
+}

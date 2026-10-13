@@ -26,6 +26,7 @@ use crate::inspection::{ServerInspection, inspection_command, parse_server_inspe
 
 pub struct AppState {
     pub repository: Store,
+    pub(crate) file_baseline_storage: crate::workspace_file_baselines::FileBaselineStorage,
     pub credentials: SystemCredentialVault,
     pub subscription_models: Arc<crate::subscription_models::SubscriptionLoginManager>,
     pub mcp_sessions: McpSessionManager,

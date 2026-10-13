@@ -86,26 +86,7 @@ pub async fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>, S
 
 #[tauri::command]
 pub async fn delete_project(state: State<'_, AppState>, project_id: Uuid) -> Result<(), String> {
-    if state
-        .repository
-        .get_project(project_id)
-        .await
-        .map_err(|error| error.to_string())?
-        .is_none()
-    {
-        return Err("project was not found".into());
-    }
-    ensure_project_deletable(&state, project_id).await?;
-
-    let deleted = state
-        .repository
-        .delete_project(project_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    if !deleted {
-        return Err("project was not found".into());
-    }
-    Ok(())
+    delete_project_with_baseline_cleanup(&state, project_id).await
 }
 
 pub async fn ensure_project_deletable(state: &AppState, project_id: Uuid) -> Result<(), String> {
@@ -386,5 +367,152 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error, "project was not found");
+    }
+}
+
+async fn delete_project_with_baseline_cleanup(
+    state: &AppState,
+    project_id: Uuid,
+) -> Result<(), String> {
+    let lock = state
+        .file_baseline_storage
+        .project_lock(project_id)
+        .map_err(|_| "file baseline storage lock failed".to_owned())?;
+    let _lock = lock.lock().await;
+
+    if state
+        .repository
+        .get_project(project_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return Err("project was not found".into());
+    }
+    ensure_project_deletable(state, project_id).await?;
+
+    let deleted = state
+        .repository
+        .delete_project(project_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !deleted {
+        return Err("project was not found".into());
+    }
+    state
+        .file_baseline_storage
+        .cleanup_deleted_project(project_id)
+        .map_err(|_| "project was deleted, but baseline storage cleanup failed".to_owned())?;
+    Ok(())
+}
+#[cfg(test)]
+mod baseline_cleanup_tests {
+    use super::*;
+    async fn fixture() -> (tempfile::TempDir, AppState, Project) {
+        let d = tempfile::tempdir().unwrap();
+        let store = omicsops_store::Store::open(d.path().join("test.db"))
+            .await
+            .unwrap();
+        let p = Project::new(
+            Uuid::new_v4(),
+            "fixture",
+            d.path().join("project").to_str().unwrap(),
+            ProjectTemplate::Blank,
+            Utc::now(),
+        );
+        std::fs::create_dir_all(&p.local_root).unwrap();
+        std::fs::write(Path::new(&p.local_root).join("a.txt"), b"safe").unwrap();
+        store.save_project(&p).await.unwrap();
+        let state = AppState {
+            repository: store,
+            credentials: omicsops_adapters::credentials::SystemCredentialVault,
+            subscription_models: std::sync::Arc::new(
+                crate::subscription_models::SubscriptionLoginManager::system(Default::default())
+                    .unwrap(),
+            ),
+            mcp_sessions: omicsops_mcp::McpSessionManager::new(),
+            file_baseline_storage: crate::workspace_file_baselines::FileBaselineStorage::new(
+                d.path().join("app"),
+            ),
+            live_runtime_registry_v4: Default::default(),
+            active_runs: Default::default(),
+            skills_root: d.path().join("skills"),
+            skills_gate: Default::default(),
+            research_last_request: Default::default(),
+            active_kernels: Default::default(),
+            project_kernel_queues: Default::default(),
+            sync_controls: Default::default(),
+            browser: omicsops_browser::BrowserRuntime::new(
+                d.path().join("browser"),
+                d.path().join("extension"),
+            ),
+        };
+        let r = omicsops_dto::CreateFileBaselineRequestV1 {
+            request_id: Uuid::new_v4(),
+            project_id: p.id,
+            branch_conversation_id: None,
+            title: "fixture".into(),
+            files: vec![omicsops_dto::ProjectFileSelectionV1 {
+                backend_id: "local".into(),
+                relative_path: "a.txt".into(),
+                expected_full_sha256: None,
+            }],
+        };
+        crate::workspace_file_baselines::capture_file_baseline(
+            &state.repository,
+            &state.file_baseline_storage,
+            r,
+        )
+        .await
+        .unwrap();
+        (d, state, p)
+    }
+    #[tokio::test]
+    async fn capture_actual_delete_hook_cleans_only_host_blobs() {
+        let (d, state, p) = fixture().await;
+        let blob = d
+            .path()
+            .join("app/workspace-file-baselines")
+            .join(p.id.to_string())
+            .join("sha256/8b/8b3369944dd2a3fab39e32d1aeb1f763946a458ae3e6368a46432adc8f3a0860");
+        assert!(blob.exists());
+        delete_project_with_baseline_cleanup(&state, p.id)
+            .await
+            .unwrap();
+        assert!(state.repository.get_project(p.id).await.unwrap().is_none());
+        assert_eq!(
+            std::fs::read(Path::new(&p.local_root).join("a.txt")).unwrap(),
+            b"safe"
+        );
+        let hash = "8b3369944dd2a3fab39e32d1aeb1f763946a458ae3e6368a46432adc8f3a0860";
+        assert!(
+            !d.path()
+                .join("app/workspace-file-baselines")
+                .join(p.id.to_string())
+                .join("sha256/8b")
+                .join(hash)
+                .exists()
+        );
+    }
+    #[tokio::test]
+    async fn capture_actual_delete_cleanup_failure_truthfully_keeps_db_deleted() {
+        let (d, state, p) = fixture().await;
+        std::fs::write(
+            d.path()
+                .join("app/workspace-file-baselines")
+                .join(p.id.to_string())
+                .join("sha256/unrecognized"),
+            b"do not delete",
+        )
+        .unwrap();
+        let error = delete_project_with_baseline_cleanup(&state, p.id)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "project was deleted, but baseline storage cleanup failed"
+        );
+        assert!(state.repository.get_project(p.id).await.unwrap().is_none());
+        assert!(Path::new(&p.local_root).join("a.txt").exists());
     }
 }

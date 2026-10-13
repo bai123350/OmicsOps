@@ -67,6 +67,8 @@ pub mod subscription_models;
 pub mod sync_commands;
 pub mod usage_settings;
 pub mod workspace_commands;
+mod workspace_file_baselines;
+mod workspace_file_content;
 pub mod workspace_navigation;
 pub mod workspace_publication_evidence;
 
@@ -188,6 +190,9 @@ pub fn run() {
             );
             app.manage(AppState {
                 repository,
+                file_baseline_storage: workspace_file_baselines::FileBaselineStorage::new(
+                    data_dir.clone(),
+                ),
                 credentials: SystemCredentialVault,
                 subscription_models,
                 mcp_sessions: omicsops_mcp::McpSessionManager::new(),
@@ -322,6 +327,8 @@ pub fn run() {
             workspace_commands::list_projects,
             workspace_commands::create_project,
             workspace_commands::delete_project,
+            workspace_file_baselines::workspace_create_file_baseline,
+            workspace_file_baselines::workspace_read_baseline_text,
             workspace_commands::update_project_remote,
             remote_job_commands::list_remote_jobs_v4,
             remote_job_commands::refresh_remote_job_v4,

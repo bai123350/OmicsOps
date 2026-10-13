@@ -10402,6 +10402,9 @@ mod tests {
             active_runs: Default::default(),
             live_runtime_registry_v4: Default::default(),
             skills_root: dir.path().join("skills"),
+            file_baseline_storage: crate::workspace_file_baselines::FileBaselineStorage::new(
+                dir.path().join("baseline-app"),
+            ),
             skills_gate: Default::default(),
             research_last_request: Default::default(),
             active_kernels: Default::default(),
@@ -14278,6 +14281,9 @@ mod tests {
             active_runs: Default::default(),
             live_runtime_registry_v4: Default::default(),
             skills_root: dir.path().join("skills"),
+            file_baseline_storage: crate::workspace_file_baselines::FileBaselineStorage::new(
+                dir.path().join("baseline-app"),
+            ),
             skills_gate: Default::default(),
             research_last_request: Default::default(),
             active_kernels: Default::default(),
@@ -14970,6 +14976,9 @@ pub(crate) mod manual_compaction_host_tests {
             active_runs: Default::default(),
             live_runtime_registry_v4: Default::default(),
             skills_root: dir.path().join("skills"),
+            file_baseline_storage: crate::workspace_file_baselines::FileBaselineStorage::new(
+                dir.path().join("baseline-app"),
+            ),
             skills_gate: Default::default(),
             research_last_request: Default::default(),
             active_kernels: Default::default(),
