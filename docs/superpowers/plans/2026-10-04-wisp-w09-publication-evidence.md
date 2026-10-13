@@ -115,7 +115,7 @@ git commit -m "feat: report saved publication evidence readiness"
 - Consumes: Tasks 1/2的context、报告与公开投影；现有zip/sha2/tempfile和可模拟宿主save dialog/文件写入。
 - Produces: `workspace_export_publication_reference_package(app: AppHandle, state: State<'_, AppState>, request: PublicationSelectionV1) -> Result<Option<PublicationPackageExportResultV1>, PublicationEvidenceErrorV1>`。固定四entry manifest字段直接采用spec，不从客户端接正文或目的地。
 
-- [ ] **Step 1: Write failing tests.** `package_reloads_after_dialog` 用mock chooser回调改变/delete所选revision；`package_keeps_saved_missing_snapshot`、`package_public_projection_hashes`、`package_fixed_entries_and_checksums`、`package_cancel_and_write_failure`、`package_bound_and_deterministic_bytes`。假私钥/password/API token/认证URI sentinel不出任何包entry或错误；同时覆盖结构化与legacy。
+- [x] **Step 1: Write failing tests.** `package_reloads_after_dialog` 用mock chooser回调改变/delete所选revision；`package_keeps_saved_missing_snapshot`、`package_public_projection_hashes`、`package_fixed_entries_and_checksums`、`package_cancel_and_write_failure`、`package_bound_and_deterministic_bytes`。假私钥/password/API token/认证URI sentinel不出任何包entry或错误；同时覆盖结构化与legacy。
 
 ```rust
 assert_eq!(entry_names, ["publication.md", "manifest.json", "readiness.json", "checksums.sha256"]);
@@ -125,15 +125,18 @@ assert!(!String::from_utf8_lossy(&manifest_bytes).contains("PRIVATE KEY"));
 assert_eq!(checksum_publication, sha256(&publication_bytes));
 ```
 
-- [ ] **Step 2: Run RED.** `cargo test -p omicsops-desktop --lib workspace_publication_evidence::tests::package_`。Expected: FAIL，命令缺失或重读/entry/hash/atomic失败语义不符合断言。
-- [ ] **Step 3: Implement the export signature.** 固定执行顺序：预检→chooser→重读revision/context→一次生成四entry与全部hash→同目录temp/sync/persist。稳定序列化、zip顺序/时间戳与压缩方式；超过16 MiB拒绝；cancel返回None、写失败无DB状态；省略原路径/恢复身份和raw metadata。不可保留旧包搭配新报告。
-- [ ] **Step 4: Run GREEN.** 重跑RED命令与 `cargo test -p omicsops-desktop --lib workspace_publication_evidence::tests`；Expected: PASS。解zip逐文件校验，并证明Store/外部接口无写入/调用。
-- [ ] **Step 5: Commit.**
+- [x] **Step 2: Run RED.** `cargo test -p omicsops-desktop --lib workspace_publication_evidence::tests::package_`。Expected: FAIL，命令缺失或重读/entry/hash/atomic失败语义不符合断言。
+- [x] **Step 3: Implement the export signature.** 固定执行顺序：预检→chooser→重读revision/context→一次生成四entry与全部hash→同目录temp/sync/persist。稳定序列化、zip顺序/时间戳与压缩方式；超过16 MiB拒绝；cancel返回None、写失败无DB状态；省略原路径/恢复身份和raw metadata。不可保留旧包搭配新报告。
+- [x] **Step 4: Run GREEN.** 重跑RED命令与 `cargo test -p omicsops-desktop --lib workspace_publication_evidence::tests`；Expected: PASS。解zip逐文件校验，并证明Store/外部接口无写入/调用。
+- [x] **Step 5: Commit.**
 
 ```powershell
 git add src-tauri/src/workspace_publication_evidence.rs src-tauri/src/lib.rs src-tauri/src/dto_contract_tests.rs
 git commit -m "feat: export reference-only publication evidence package"
 ```
+
+
+实现边界补充：科学/Run保存快照无法解析时使用固定安全省略正文及原因，保留原saved hash并计算实际exported hash；Message/Tool普通说明沿用安全检查。宿主返回目的地必须已有大小写不敏感的`.zip`扩展名，无扩展名或其他扩展名安全拒绝，不改写为未确认的同名路径。
 
 ### Task 4: Saved-revision UI, API and delivery verification
 
@@ -174,3 +177,5 @@ spec覆盖：共同DTO/ownership由Task 1、有效性/预算由Task 2、hash/导
 2026-10-12：Task1 `1b19093..15d727a` 经一次完整及三轮定向独立审阅完成，36/50 SOURCE。四共享DTO、W09合同、精确保存revision的单事务有界context已实现。修复Tool/Run关联分类、Run时间投影、重复producer预算及LegacyArtifact既有合法选择兼容；最终context13/navigation18/fmt/diff通过，未变DTO最近1/1通过。current_sources的None表示内部raw待Task2公开投影比较，Changed/Unavailable/Missing分别保留；不直出raw、不额外读库。7外部RAW未改，cache警告保留；Tasks2–4报告/包/UI、完整功能与clean-HEAD/native/live检查仍独立待执行。
 
 2026-10-13：W09 Task2 `b00993f..24073b4` 完整及一轮定向独立审阅完成，累计37/50 SOURCE。只读准备度/同context公开投影与有界run-conversation内部映射已实现；修复JSON转义前原始source字符串安全扫描，实际RED3/GREEN3、最终readiness13/fmt/diff通过，未变host navigation11/Store context14/navigation18先前通过。外部能力缺席为结构证明而非插桩零调用计数，真实Store不变有测试；包/UI与完整及clean-HEAD/native/live检查仍待后续。7外部RAW保留，cache警告不隐去。
+
+2026-10-13：W09 Task3 `e0c9223..dcdd8c6` 完整及一轮定向独立审阅完成，累计38/50 SOURCE。宿主保存对话框后的单次只读context生成固定四entry引用包、各范围hash和原子写入；修复畸形科学快照绕过白名单及无扩展名目的地被改写的问题。实际修复RED2、最终package10/evidence23/fmt/diff通过；DTO2为未变合同的先前通过。7外部RAW及candidate/inverse/replay/postcommit证明保留；UI、全量/clean-HEAD、native手工与真实复现仍待各自后续验证。

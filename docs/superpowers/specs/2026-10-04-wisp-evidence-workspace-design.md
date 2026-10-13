@@ -176,7 +176,9 @@ pub async fn workspace_publication_read_context(
 
 manifest 不包含任意原始 metadata map、完整 runtime/process identity、SSH 地址/用户/指纹/私钥引用、模型 endpoint、环境变量、请求批准对象、外部工具授权或恢复句柄。`saved_snapshot_sha256` 表示保存快照文本，`exported_text_sha256` 表示再次公开投影后的 UTF-8 text；若二者不同，添加公开脱敏遗漏说明，不宣称原文完整。JSON 对象使用稳定字段顺序，数组按稳定 source key 排序。zip entry 顺序和时间戳固定，压缩方式固定；内容相同的包字节稳定，但重新观察产生的时间/状态可以改变包 hash。manifest hash 是最终 manifest 文件字节 hash；整个 zip hash 单独由回执返回。
 
-总生成未压缩字节最多16 MiB。严格顺序为：预检选定revision存在/所属项目/公开hash及输入预算；打开宿主保存对话框；确认目的地后重新读取所选revision及完整只读context；以这次context一次生成report、manifest、publication、checksums和zip，并计算所有最终字节hash；最后atomic persist。预检不保留可复用的旧package或旧report，不能混用对话框前的正文与之后的准备度。对话框取消返回 `Ok(None)`，不写Store。目的地不是请求字段。重新读取时revision被删除或hash不符即停止，不能导出head替代所选历史版本。写入目的地同目录临时文件、flush/sync后原子persist；既有目的地的覆盖由宿主保存对话框确认，不在后台覆盖。写失败返回 `ExportWriteFailed`，不创建“已导出”状态或更改稿件。无DB migration。
+科学记录和Run的保存快照正文按种类做包专用字段白名单投影；无法解析的历史正文使用固定安全省略文本与`saved_snapshot_text_omitted`原因，保留原saved snapshot hash并按实际导出文本重算hash。这个保守边界可能省略旧的纯文本科学摘要，但不会修改保存版本或用当前记录替换。Message/Tool普通文字说明仍沿用公开和敏感内容检查。
+
+总生成未压缩字节最多16 MiB。严格顺序为：预检选定revision存在/所属项目/公开hash及输入预算；打开宿主保存对话框；确认目的地后重新读取所选revision及完整只读context；以这次context一次生成report、manifest、publication、checksums和zip，并计算所有最终字节hash；最后atomic persist。预检不保留可复用的旧package或旧report，不能混用对话框前的正文与之后的准备度。对话框取消返回 `Ok(None)`，不写Store。目的地不是请求字段。宿主对话框返回的路径必须已经具有大小写不敏感的`.zip`扩展名；无扩展名或其他扩展名返回安全的ExportWriteFailed，不改写对话框所选路径，避免覆盖未经该次选择确认的同名`.zip`文件。如果系统选择器返回无扩展名路径，用户须显式输入`.zip`文件名。重新读取时revision被删除或hash不符即停止，不能导出head替代所选历史版本。写入目的地同目录临时文件、flush/sync后原子persist；既有目的地的覆盖由宿主保存对话框确认，不在后台覆盖。写失败返回 `ExportWriteFailed`，不创建“已导出”状态或更改稿件。无DB migration。
 
 UI 报告绑定 `(project,publication,revision,expected_sha256)`，切换或离开时用 generation 丢弃旧响应。未保存稿件编辑存在时两个入口明确显示“检查/导出保存版本 N”，不会隐式保存，沿用现有离开 guard。报告里的“来源可用”只指 Store 记录当前可解析；“原始文件未检查”和“未执行独立复现”始终可见。包只是本机保存，没有投稿、云发布或远程传输。
 
