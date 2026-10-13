@@ -6,6 +6,27 @@ use crate::dto::{
 use serde_json::json;
 
 #[test]
+fn file_baseline_nullable_hash_path_and_line_endings_contract() {
+    use omicsops_dto::{CreateFileBaselineRequestV1, FileBaselineDiffEntryV1};
+    let value = json!({"baseline":{"backend_id":"local","relative_path":null,"content_mode":"reference_only","size_bytes":null,"hash":null,"omission":"sensitive_content","captured_at":"2026-10-13T00:00:00Z"},"state":"reference_only","current_size_bytes":null,"current_hash":null,"line_endings_changed":null,"final_newline_changed":null,"hunks":[],"hunks_truncated":false});
+    let parsed: FileBaselineDiffEntryV1 = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+    let mut changed = value.clone();
+    changed["state"] = json!("changed");
+    changed["line_endings_changed"] = json!(true);
+    changed["final_newline_changed"] = json!(false);
+    changed["current_hash"] = json!({"sha256":"a".repeat(64),"scope":"full_file"});
+    let parsed: FileBaselineDiffEntryV1 = serde_json::from_value(changed.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), changed);
+    let request = json!({"request_id":uuid::Uuid::from_u128(1),"project_id":uuid::Uuid::from_u128(2),"branch_conversation_id":null,"title":"Baseline","files":[{"backend_id":"local","relative_path":"script.py","expected_full_sha256":null}]});
+    let parsed: CreateFileBaselineRequestV1 = serde_json::from_value(request.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+    let mut bad = request;
+    bad["internal_manifest_json"] = json!("forbidden");
+    assert!(serde_json::from_value::<CreateFileBaselineRequestV1>(bad).is_err());
+}
+
+#[test]
 fn run_diagnostics_dto_contract() {
     use omicsops_dto::{
         RunDiagnosticStatusV4, RunDiagnosticsExportFormatV4, RunDiagnosticsRequestV4,

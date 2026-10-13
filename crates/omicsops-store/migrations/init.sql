@@ -685,6 +685,23 @@ CREATE TABLE IF NOT EXISTS workspace_snapshots (
     created_at INTEGER NOT NULL DEFAULT 0
 );
 
+-- Typed immutable file manifests are separate from legacy workspace_snapshots.
+CREATE TABLE IF NOT EXISTS exploration_baselines_v4 (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    branch_conversation_id TEXT REFERENCES conversation_records(frame_id) ON DELETE SET NULL,
+    request_id TEXT NOT NULL UNIQUE,
+    request_sha256 TEXT NOT NULL,
+    manifest_sha256 TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    captured_text_bytes INTEGER NOT NULL CHECK (captured_text_bytes >= 0),
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_exploration_baselines_project
+    ON exploration_baselines_v4(project_id, created_at DESC, id);
+CREATE INDEX IF NOT EXISTS idx_exploration_baselines_branch
+    ON exploration_baselines_v4(project_id, branch_conversation_id, created_at DESC, id);
+
 CREATE TABLE IF NOT EXISTS context_archives (
     id TEXT PRIMARY KEY CHECK (length(trim(id)) > 0),
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,

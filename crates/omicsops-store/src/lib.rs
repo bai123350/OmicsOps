@@ -99,6 +99,10 @@ mod session_reviews;
 mod side_chat;
 mod skill_removals;
 mod usage;
+pub mod workspace_file_baselines;
+pub use workspace_file_baselines::{
+    FileBaselineManifestEntryV1, FileBaselineManifestV1, SaveFileBaselineRecord, StoredFileBaseline,
+};
 pub mod workspace_journey;
 pub mod workspace_navigation;
 pub use usage::{
@@ -5553,6 +5557,7 @@ async fn validate_before_commit(tx: &mut Transaction<'_, Sqlite>) -> Result<(), 
     validate_projects(tx).await?;
     validate_project_extensions(tx).await?;
     validate_conversation_ownership(tx).await?;
+    workspace_file_baselines::validate_file_baselines(tx).await?;
     validate_message_ownership(tx).await?;
     validate_agent_runs(tx).await?;
     run_stops::validate_persisted_stop_requests(tx).await?;
