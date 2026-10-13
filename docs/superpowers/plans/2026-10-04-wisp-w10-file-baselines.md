@@ -49,7 +49,7 @@
 - Consumes: W09 Task 1四基础DTO；现有workspace request ledger；同项目branch/conversation查询。
 - Produces: spec全部baseline/diff DTO与Store内部 `SaveFileBaselineRecord`/`StoredFileBaseline`；`workspace_find_file_baseline_request(&self, request_id: Uuid, request_sha256: &str) -> Result<Option<FileBaselineV1>, StoreError>`；`workspace_save_file_baseline(&self, record: SaveFileBaselineRecord) -> Result<FileBaselineV1, StoreError>`；`workspace_list_file_baselines(&self, request: &ListFileBaselinesRequestV1) -> Result<FileBaselinePageV1, StoreError>`；`workspace_get_file_baseline(&self, project_id: Uuid, baseline_id: Uuid) -> Result<Option<StoredFileBaseline>, StoreError>`。
 
-- [ ] **Step 1: Write failing tests.** `baseline_request_replay`、`baseline_request_conflict`、`baseline_foreign_branch_rejected`、`baseline_branch_unlink`、`baseline_quotas`、`baseline_migration_twice_keeps_legacy`；用synthetic host-validated metadata，不保存真实样本。合同测试覆盖relative_path null、nullable hashes和line-ending字段。删除branch后当前association为None但原manifest/hash不变。
+- [x] **Step 1: Write failing tests.** `baseline_request_replay`、`baseline_request_conflict`、`baseline_foreign_branch_rejected`、`baseline_branch_unlink`、`baseline_quotas`、`baseline_migration_twice_keeps_legacy`；用synthetic host-validated metadata，不保存真实样本。合同测试覆盖relative_path null、nullable hashes和line-ending字段。删除branch后当前association为None但原manifest/hash不变。
 
 ```rust
 assert_eq!(replay.id, original.id);
@@ -59,10 +59,10 @@ assert_eq!(legacy_row_count_after, legacy_row_count_before);
 assert!(save_sixty_fifth.is_err());
 ```
 
-- [ ] **Step 2: Run RED.** `cargo test -p omicsops-store --test workspace_file_baselines`；`cargo test -p omicsops-desktop --lib dto_contract_tests::file_baseline`。Expected: FAIL，缺DTO/Store方法或replay/迁移/ownership断言失败；新测试target先创建，不能只因target不存在失败。
-- [ ] **Step 3: Implement the Store signatures and spec schema.** 新表CREATE/INDEX IF NOT EXISTS、同项目branch/manifest invariants、64/256 MiB逻辑quota、immutable metadata及同事务ledger；现有branch relation单独移除路径同事务unlink，conversation FK SET NULL，archive/merge不清理；不要重解释legacy rows，不保存文件正文/请求原文。
-- [ ] **Step 4: Run GREEN.** 重跑RED命令及 `cargo test -p omicsops-store --test conversation_branches`。Expected: PASS；打开旧库两次、重开Store后读取基线一致。
-- [ ] **Step 5: Commit.**
+- [x] **Step 2: Run RED.** `cargo test -p omicsops-store --test workspace_file_baselines`；`cargo test -p omicsops-desktop --lib dto_contract_tests::file_baseline`。Expected: FAIL，缺DTO/Store方法或replay/迁移/ownership断言失败；新测试target先创建，不能只因target不存在失败。
+- [x] **Step 3: Implement the Store signatures and spec schema.** 新表CREATE/INDEX IF NOT EXISTS、同项目branch/manifest invariants、64/256 MiB逻辑quota、immutable metadata及同事务ledger；现有branch relation单独移除路径同事务unlink，conversation FK SET NULL，archive/merge不清理；不要重解释legacy rows，不保存文件正文/请求原文。
+- [x] **Step 4: Run GREEN.** 重跑RED命令及 `cargo test -p omicsops-store --test conversation_branches`。Expected: PASS；打开旧库两次、重开Store后读取基线一致。
+- [x] **Step 5: Commit.**
 
 ```powershell
 git add crates/omicsops-dto/src/workspace_files.rs crates/omicsops-dto/src/lib.rs crates/omicsops-store/migrations/init.sql crates/omicsops-store/src/lib.rs crates/omicsops-store/src/workspace_file_baselines.rs crates/omicsops-store/tests/workspace_file_baselines.rs src-tauri/src/dto_contract_tests.rs
@@ -174,3 +174,5 @@ git commit -m "feat: expose explicit exploration baseline and diff UI"
 ## Plan Self-Review
 
 spec覆盖：Task 1typed migration/ownership/replay；Task 2安全捕获、物理预算与正文查看；Task 3根身份/完整hash/有界diff；Task 4显式file/branch UI与最终验证。Review Focus五项均映射具体测试。命令/DTO与spec一致，nullable路径和未比较换行字段未被TS改成必填；共享读取接缝不复制。计划只列签名和断言，不含实现body/真实样本；未运行列出的检查，没有首范围外的恢复/执行工作。
+
+2026-10-13：W10 Task1 `f93878c..5085908` 类型化基线DTO、immutable manifest与Store迁移/replay/逻辑quota完成独立完整审阅，累计40/50 SOURCE。实际缺接口编译RED与sandbox OUT_DIR分开记录；随后畸形持久请求UUID行为RED为8通过/1失败，修复后最终Store9、branch9、native DTO1、fmt/diff通过。7外部RAW及candidate/inverse/replay/postcommit证明保留；宿主正文/blob物理预算/cleanup、diff/UI及全量/clean-HEAD/真实验收仍由后续任务承接。

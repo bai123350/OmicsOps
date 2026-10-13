@@ -359,6 +359,8 @@ pub async fn workspace_get_file_baseline(
 
 `SaveFileBaselineRecord` 的字段为 `request_id:Uuid`、`request_sha256:String`、`baseline:FileBaselineV1`、`internal_manifest_json:String`；`StoredFileBaseline` 的字段为 `baseline:FileBaselineV1`、`local_root_binding_sha256:String`、`blob_sha256_by_entry:Vec<Option<String>>`，向量与entries一一对应。这些类型仅在Store/宿主边界使用，不能反序列化前端请求为它们。宿主核验 immutable manifest 与blob hash，不接受前端提供的正文或blob路径。查找请求、写入和quota判定复用workspace request ledger的operation/digest/result语义；`workspace_save_file_baseline`事务内再检查replay和project/branch所有权。
 
+实施后的Store内部固定schema为`FileBaselineManifestV1`（`schema_version=1`），字段是id、project_id、原始branch_conversation_id、title、entries、captured_text_bytes、created_at与local_root_binding_sha256。每个`FileBaselineManifestEntryV1`显式嵌套`entry: FileBaselineEntryV1`和`blob_sha256`，拒绝未知字段，不使用flatten或复制另一套entry DTO。manifest不包含自身hash，按所存UTF-8原始字节计算；当前nullable分支关联由row投影，unlink不改写原manifest。这个新增内部schema成为后续宿主生产者契约，未来演进需要兼容处理。请求ledger保存project/baseline identity并按当前row返回回执，保留原manifest/hash；host给出的规范request digest原样保存。
+
 ### 捕获与 diff 的预算及失败语义
 
 标题 1–80 字符、最多 320 字节。每次 1–32 个明确选择；仅 `.py`、`.r`、`.rmd`、`.md`、`.txt`、`.json`、`.csv`、`.tsv` 的 UTF-8 文本允许正文捕获，扩展名大小写不敏感。扩展名不是内容可信证明；仍需无 NUL、敏感内容检查和公开投影一致。`.env`、认证/私钥/凭据文件名、`.omicsops` 内部目录及其等价 Windows 名称禁止正文捕获。安全相对路径也必须脱敏不改变；路径含秘密时省略公开路径，给出 `SensitiveContent`，内部 manifest 不保存该原文。Notebook/HTML/Office 的解析和渲染不进入此首范围。
@@ -373,7 +375,7 @@ diff校验project/baseline/manifest hash和当前local root binding。根变更�
 
 ### 存储、迁移、UI 与恢复边界
 
-新增 `exploration_baselines_v4`，字段为 `id TEXT PRIMARY KEY`、`project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE`、`branch_conversation_id TEXT NULL REFERENCES conversation_records(frame_id) ON DELETE SET NULL`、`request_id TEXT NOT NULL UNIQUE`、`request_sha256 TEXT NOT NULL`、`manifest_sha256 TEXT NOT NULL`、`manifest_json TEXT NOT NULL`、`captured_text_bytes INTEGER NOT NULL CHECK >=0`、`created_at INTEGER NOT NULL`。索引 `(project_id,created_at DESC,id)` 与 `(project_id,branch_conversation_id,created_at DESC,id)`。Store提交时校验branch是同项目现有分支，并在 `validate_before_commit` 加所有权验证。删除branch conversation时FK只清空关联，基线仍在；archive/merge只改变已有分支状态，不删除基线或源文件。若单独移除branch relation而保留conversation，移除该relation的Store事务须同时unlink基线关联。
+新增 `exploration_baselines_v4`，字段为 `id TEXT PRIMARY KEY`、`project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE`、`branch_conversation_id TEXT NULL REFERENCES conversation_records(frame_id) ON DELETE SET NULL`、`request_id TEXT NOT NULL UNIQUE`、`request_sha256 TEXT NOT NULL`、`manifest_sha256 TEXT NOT NULL`、`manifest_json TEXT NOT NULL`、`captured_text_bytes INTEGER NOT NULL CHECK >=0`、`created_at INTEGER NOT NULL`。索引 `(project_id,created_at DESC,id)` 与 `(project_id,branch_conversation_id,created_at DESC,id)`。Store提交时校验branch是同项目现有分支，并在 `validate_before_commit` 加所有权验证。删除branch conversation时FK只清空关联，基线仍在；archive/merge只改变已有分支状态，不删除基线或源文件。若单独移除branch relation而保留conversation，移除该relation的Store事务须同时unlink基线关联。当前实际生产删除入口为`Store::delete_conversation`，无单独relation删除API；本次不为该条件新增操作，未来增加此类入口时必须落实同事务unlink。
 
 blob 位于 `app_data_dir/workspace-file-baselines/<project_id>/sha256/<前两位>/<sha256>`，名字仅由宿主 hash 构造，每项正文 UTF-8 原字节不做换行转换。SQLite 只保存 manifest/身份/hash，不保存文件正文。每项目最多 64 个基线、正文计费总额 256 MiB（按每个基线逻辑内容计费，不能利用去重绕过），达到上限返回 `LimitExceeded`，不自动删除旧基线。持久blob的实际磁盘硬上限也为256 MiB，每次创建最多额外4 MiB staging；先清理确认未引用的旧blob，再在persist前核验物理预算，不允许失败重试累积突破上限。
 
