@@ -1,6 +1,6 @@
 # Wisp Science 可借鉴改进清单
 
-日期：2026-10-04。状态：用户已选择全部12项首次范围、确认具体设计及[实施总计划](../plans/2026-10-04-wisp-improvements.md)，并选择子Agent逐项实施与审阅。W01–W09及W10基线DTO/Store和安全捕获源码已实现并审阅通过（41/50任务），其余项继续实施；W07原生手工验收未执行，W06隔离旧HEAD原生验收仅部分通过；状态及实际检查见总计划。全部12项首次范围尚未交付。本文件保留源码对照，具体边界见[总设计](2026-10-04-wisp-improvements-design.md)。
+日期：2026-10-04。状态：用户已选择全部12项首次范围、确认具体设计及[实施总计划](../plans/2026-10-04-wisp-improvements.md)，并选择子Agent逐项实施与审阅。W01–W09及W10基线DTO/Store、安全捕获和有界diff源码已实现并审阅通过（42/50任务），其余项继续实施；W07原生手工验收未执行，W06隔离旧HEAD原生验收仅部分通过；状态及实际检查见总计划。全部12项首次范围尚未交付。本文件保留源码对照，具体边界见[总设计](2026-10-04-wisp-improvements-design.md)。
 
 本轮建议先补会话草稿隔离，再分别交付科学产物预览和 SSH 后台作业面板。这三项直接改善日常研究操作，并能复用现有组件与运行身份。其余候选按依赖分批推进，优先保留 OmicsOps 已有的科研证据、审批与恢复契约。
 
@@ -157,6 +157,8 @@ P0 表示优先解决可能影响操作正确性的问题；P1 表示直接改�
 后续若包含原始字节，先建立已校验内容快照，禁止 live-file fallback。上游[干净复现仅支持 local Runs][w-reproduction]，其文本网络/路径规则不能作为 OS 隔离保证；OmicsOps 的真正复现执行仍须经过本地/SSH 审批和 Run 生命周期。
 
 ## W10 探索文件基线和差异
+
+**实施进度（2026-10-13）：**W10 Task3 已完成独立审阅：source 783ee03、fix1 e82aed0；FULL审阅指出失败读取未计预算，fresh scoped复核确认diff I1及同类capture C1均已解决且无新增阻断。两个消费者按opened size在读取前预留并传递精确payload额度，失败不返还，W02 EOF probe单独保留；额外保守省略/回归成本已记录。最新6项预算测试包含于baseline38项通过，fmt/diff通过；初始baseline32与DTO59为此前字节证据，DTO未在本轮重跑。实际RED宽filter为14通过/7失败，其中6预算因果失败、1既有毫秒排序fixture精度错误（仅修测试）。全请求work/序列化hunk预算、Unreadable余量不足与顺序非原子限制已同步；Task4 UI/完整交付检查尚待完成，GUI smoke仍未执行。累计42/50源码任务已独立审阅，不等于完整产品/真实环境验收。
 
 **实施进度（2026-10-13）：**2026-10-13：W10 Task2 `f07d9a3` 安全捕获/blob/保存正文/删除清理及 `4a6eb14` 三项修复完成完整与定向独立审阅，累计41/50 SOURCE。敏感文件名在读取前降引用，V4历史引用严格校验类型/schema/有效性/producer状态，open-time SourceChanged整次拒绝；既有Unavailable仍为Unreadable。修复因果RED为纯策略0/1、capture15/2、Store0/2；最新capture17/pure5/saved4/Store11共37通过，fmt/diff及精确候选/逆向/replay/提交审计通过。原62是修复前历史检查，未变W02 handle16/table11/delete2沿用此前结果；完整/clean-HEAD/真实验收未完成。7外部RAW保留；六处working initializer中五处提交，一处外部测试内W10兼容initializer明确未暂存，与既有W04残留分开。diff/UI仍待Tasks3–4，不能称全部文件基线功能已交付。
 

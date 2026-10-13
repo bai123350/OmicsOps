@@ -116,7 +116,7 @@ git commit -m "feat: capture safe bounded file baseline blobs"
 - Consumes: Task 1 StoredFileBaseline/get/list、Task 2saved blob reader/纯判定与storage、W02read_complete。
 - Produces: `workspace_list_file_baselines(state: State<'_, AppState>, request: ListFileBaselinesRequestV1) -> Result<FileBaselinePageV1, FileBaselineErrorV1>`；`workspace_get_file_baseline(state: State<'_, AppState>, project_id: Uuid, baseline_id: Uuid) -> Result<FileBaselineV1, FileBaselineErrorV1>`；`workspace_diff_file_baseline(app: AppHandle, state: State<'_, AppState>, request: DiffFileBaselineRequestV1) -> Result<FileBaselineDiffV1, FileBaselineErrorV1>`。
 
-- [ ] **Step 1: Write failing tests.** `diff_binding_changed`、`diff_reference_only_never_reads`、`diff_newlines_and_budget`、`diff_current_sensitive_or_too_large`、`diff_missing_and_bad_manifest`、`diff_foreign_owner`；列表pagination/get与每项状态匹配spec。当前变更敏感时无hunks；未比较项换行字段均None。
+- [x] **Step 1: Write failing tests.** `diff_binding_changed`、`diff_reference_only_never_reads`、`diff_newlines_and_budget`、`diff_current_sensitive_or_too_large`、`diff_missing_and_bad_manifest`、`diff_foreign_owner`；列表pagination/get与每项状态匹配spec。当前变更敏感时无hunks；未比较项换行字段均None。
 
 ```rust
 assert_eq!(entry.state, BaselineDiffStateV1::BindingChanged);
@@ -127,10 +127,10 @@ assert!(large_diff.hunks_truncated);
 assert!(serialized_hunks.len() <= 256 * 1024);
 ```
 
-- [ ] **Step 2: Run RED.** `cargo test -p omicsops-desktop --lib workspace_file_baselines::tests::diff_`。Expected: FAIL，缺diff或hash/binding/output上限断言失败。
-- [ ] **Step 3: Implement the three signatures.** 先验证owner/manifest/root binding，只重读TextSnapshot安全Some路径；reference-only不升级读取。完整hash相等Unchanged，差异Changed，按spec限算法输入/工作量/输出；换行差异由DTO明确表示；已捕获blob验证失败给StorageFailed，不当成源Missing。此任务不写Store/源文件。
-- [ ] **Step 4: Run GREEN.** 重跑RED与 `cargo test -p omicsops-desktop --lib workspace_file_baselines::tests`。Expected: PASS；验证Store/源字节前后相同、runtime/SSH调用数0。
-- [ ] **Step 5: Commit.**
+- [x] **Step 2: Run RED.** `cargo test -p omicsops-desktop --lib workspace_file_baselines::tests::diff_`。Expected: FAIL，缺diff或hash/binding/output上限断言失败。
+- [x] **Step 3: Implement the three signatures.** 先验证owner/manifest/root binding，只重读TextSnapshot安全Some路径；reference-only不升级读取。完整hash相等Unchanged，差异Changed，按spec限算法输入/工作量/输出；换行差异由DTO明确表示；已捕获blob验证失败给StorageFailed，不当成源Missing。此任务不写Store/源文件。
+- [x] **Step 4: Run GREEN.** 重跑RED与 `cargo test -p omicsops-desktop --lib workspace_file_baselines::tests`。Expected: PASS；验证Store/源字节前后相同、runtime/SSH调用数0。
+- [x] **Step 5: Commit.**
 
 ```powershell
 git add src-tauri/src/workspace_file_baselines.rs src-tauri/src/lib.rs src-tauri/src/dto_contract_tests.rs
@@ -178,3 +178,5 @@ spec覆盖：Task 1typed migration/ownership/replay；Task 2安全捕获、物�
 2026-10-13：W10 Task1 `f93878c..5085908` 类型化基线DTO、immutable manifest与Store迁移/replay/逻辑quota完成独立完整审阅，累计40/50 SOURCE。实际缺接口编译RED与sandbox OUT_DIR分开记录；随后畸形持久请求UUID行为RED为8通过/1失败，修复后最终Store9、branch9、native DTO1、fmt/diff通过。7外部RAW及candidate/inverse/replay/postcommit证明保留；宿主正文/blob物理预算/cleanup、diff/UI及全量/clean-HEAD/真实验收仍由后续任务承接。
 
 2026-10-13：W10 Task2 `f07d9a3` 安全捕获/blob/保存正文/删除清理及 `4a6eb14` 三项修复完成完整与定向独立审阅，累计41/50 SOURCE。敏感文件名在读取前降引用，V4历史引用严格校验类型/schema/有效性/producer状态，open-time SourceChanged整次拒绝；既有Unavailable仍为Unreadable。修复因果RED为纯策略0/1、capture15/2、Store0/2；最新capture17/pure5/saved4/Store11共37通过，fmt/diff及精确候选/逆向/replay/提交审计通过。原62是修复前历史检查，未变W02 handle16/table11/delete2沿用此前结果；完整/clean-HEAD/真实验收未完成。7外部RAW保留；六处working initializer中五处提交，一处外部测试内W10兼容initializer明确未暂存，与既有W04残留分开。diff/UI仍待Tasks3–4，不能称全部文件基线功能已交付。
+
+W10 Task3 已完成独立审阅：source 783ee03、fix1 e82aed0；FULL审阅指出失败读取未计预算，fresh scoped复核确认diff I1及同类capture C1均已解决且无新增阻断。两个消费者按opened size在读取前预留并传递精确payload额度，失败不返还，W02 EOF probe单独保留；额外保守省略/回归成本已记录。最新6项预算测试包含于baseline38项通过，fmt/diff通过；初始baseline32与DTO59为此前字节证据，DTO未在本轮重跑。实际RED宽filter为14通过/7失败，其中6预算因果失败、1既有毫秒排序fixture精度错误（仅修测试）。全请求work/序列化hunk预算、Unreadable余量不足与顺序非原子限制已同步；Task4 UI/完整交付检查尚待完成，GUI smoke仍未执行。累计42/50源码任务已独立审阅，不等于完整产品/真实环境验收。
