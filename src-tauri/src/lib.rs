@@ -23,9 +23,9 @@ pub mod conversation_mode;
 mod conversation_mode_tests;
 pub mod conversation_preferences;
 #[cfg(test)]
-mod conversation_visibility_tests;
-#[cfg(test)]
 mod conversation_state_tests;
+#[cfg(test)]
+mod conversation_visibility_tests;
 pub mod credential_settings;
 pub mod dto;
 #[cfg(test)]

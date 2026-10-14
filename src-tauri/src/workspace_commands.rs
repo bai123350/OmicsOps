@@ -342,7 +342,10 @@ pub(crate) fn conversation_visibility_error(error: StoreError) -> ConversationVi
         RequestConflict => "Request identifier was already used for a different operation",
         StorageFailed => "Conversation visibility storage failed",
     };
-    ConversationVisibilityErrorV1 { code, message: message.into() }
+    ConversationVisibilityErrorV1 {
+        code,
+        message: message.into(),
+    }
 }
 
 // Store-only response seams keep these presentation preferences independent of
@@ -351,7 +354,10 @@ pub(crate) async fn workspace_list_conversation_visibility_response(
     repository: &Store,
     request: ConversationVisibilityListRequestV1,
 ) -> Result<ConversationVisibilityPageV1, ConversationVisibilityErrorV1> {
-    repository.workspace_list_conversation_visibility(&request).await.map_err(conversation_visibility_error)
+    repository
+        .workspace_list_conversation_visibility(&request)
+        .await
+        .map_err(conversation_visibility_error)
 }
 
 #[tauri::command]
@@ -366,7 +372,10 @@ pub(crate) async fn workspace_set_conversation_visibility_response(
     repository: &Store,
     request: SetConversationVisibilityRequestV1,
 ) -> Result<ConversationVisibilityReceiptV1, ConversationVisibilityErrorV1> {
-    repository.workspace_set_conversation_visibility(&request).await.map_err(conversation_visibility_error)
+    repository
+        .workspace_set_conversation_visibility(&request)
+        .await
+        .map_err(conversation_visibility_error)
 }
 
 #[tauri::command]
@@ -382,10 +391,17 @@ pub(crate) async fn workspace_get_conversation_response(
     project_id: Uuid,
     conversation_id: Uuid,
 ) -> Result<Conversation, String> {
-    if repository.get_project(project_id).await.map_err(|_| "Conversation storage failed".to_owned())?.is_none() {
+    if repository
+        .get_project(project_id)
+        .await
+        .map_err(|_| "Conversation storage failed".to_owned())?
+        .is_none()
+    {
         return Err("project was not found".into());
     }
-    let mut conversation = repository.workspace_source_conversation(project_id, conversation_id).await
+    let mut conversation = repository
+        .workspace_source_conversation(project_id, conversation_id)
+        .await
         .map_err(|_| "Conversation storage failed".to_owned())?
         .ok_or_else(|| "conversation was not found in this project".to_owned())?;
     conversation.title = omicsops_core::redaction::public_text(&conversation.title);
@@ -406,7 +422,10 @@ pub(crate) async fn workspace_get_conversation_visibility_response(
     project_id: Uuid,
     conversation_id: Uuid,
 ) -> Result<ConversationVisibilityRecordV1, ConversationVisibilityErrorV1> {
-    repository.workspace_get_conversation_visibility(project_id, conversation_id).await.map_err(conversation_visibility_error)
+    repository
+        .workspace_get_conversation_visibility(project_id, conversation_id)
+        .await
+        .map_err(conversation_visibility_error)
 }
 
 #[tauri::command]
@@ -415,7 +434,8 @@ pub async fn workspace_get_conversation_visibility(
     project_id: Uuid,
     conversation_id: Uuid,
 ) -> Result<ConversationVisibilityRecordV1, ConversationVisibilityErrorV1> {
-    workspace_get_conversation_visibility_response(&state.repository, project_id, conversation_id).await
+    workspace_get_conversation_visibility_response(&state.repository, project_id, conversation_id)
+        .await
 }
 
 pub fn conversation_title_needs_first_message(title: &str) -> bool {
