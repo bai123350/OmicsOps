@@ -52,6 +52,7 @@ import type {
 } from "./types";
 
 export { agentV4GetStop, agentV4RequestStop } from "./agent-stop-api";
+export { listConversationVisibility, setConversationVisibility, getConversationVisibility, getWorkspaceConversation } from "./workspace-navigation-api";
 export { listRemoteJobsV4, refreshRemoteJobV4 } from "./remote-job-api";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;

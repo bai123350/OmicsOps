@@ -62,3 +62,32 @@ it("sends only the saved selection to exact evidence commands and preserves canc
   await expect(api.checkWorkspacePublicationReadiness(savedSelection)).rejects.toThrow(/desktop/i);
   await expect(api.exportWorkspacePublicationReferencePackage(savedSelection)).rejects.toThrow(/desktop/i);
 });
+
+it("visibility_api_exact_payloads", async () => {
+  const list = { project_id: "p", visibility: "shelved" as const, query: "RNA", offset: 50, limit: 50 };
+  const page = { items: [], next_offset: null };
+  vi.mocked(invoke).mockResolvedValueOnce(page);
+  await expect(api.listConversationVisibility(list)).resolves.toBe(page);
+  expect(invoke).toHaveBeenLastCalledWith("workspace_list_conversation_visibility", { request: list });
+  const set = { request_id: "r", project_id: "p", conversation_id: "hidden", expected_revision: 7, visibility: "visible" as const };
+  const receipt = { request_id: "r", state: { project_id: "p", conversation_id: "hidden", visibility: "visible", revision: 8, changed_at: null }, changed: true };
+  vi.mocked(invoke).mockResolvedValueOnce(receipt);
+  await expect(api.setConversationVisibility(set)).resolves.toBe(receipt);
+  expect(invoke).toHaveBeenLastCalledWith("workspace_set_conversation_visibility", { request: set });
+  const current = { ...receipt.state, revision: 10 };
+  vi.mocked(invoke).mockResolvedValueOnce(current);
+  await expect(api.getConversationVisibility("p", "hidden")).resolves.toBe(current);
+  expect(invoke).toHaveBeenLastCalledWith("workspace_get_conversation_visibility", { projectId: "p", conversationId: "hidden" });
+  const conversation = { id: "hidden", project_id: "p", title: "RNA", status: "running", model_profile_id: null, created_at: "2026-10-04T00:00:00Z", updated_at: "2026-10-04T00:00:00Z" };
+  vi.mocked(invoke).mockResolvedValueOnce(conversation);
+  await expect(api.getWorkspaceConversation("p", "hidden")).resolves.toBe(conversation);
+  expect(invoke).toHaveBeenLastCalledWith("workspace_get_conversation", { projectId: "p", conversationId: "hidden" });
+  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  for (const call of [() => api.listConversationVisibility(list), () => api.setConversationVisibility(set), () => api.getConversationVisibility("p", "hidden"), () => api.getWorkspaceConversation("p", "hidden")]) await expect(call()).rejects.toThrow(/desktop/i);
+});
+
+it("visibility_safe_error preserves the typed native error for safe consumer rendering", async () => {
+  const error = { code: "not_found", message: "Conversation unavailable." };
+  vi.mocked(invoke).mockRejectedValueOnce(error);
+  await expect(api.getConversationVisibility("p", "missing")).rejects.toBe(error);
+});

@@ -1,9 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { WorkspaceConversation } from "./types";
+import type { ConversationVisibilityListRequestV1, ConversationVisibilityPageV1, SetConversationVisibilityRequestV1, ConversationVisibilityReceiptV1, ConversationVisibilityRecordV1 } from "./workspace-navigation-types";
 import type { CreateFileBaselineRequestV1, ListFileBaselinesRequestV1, DiffFileBaselineRequestV1, ReadBaselineTextRequestV1, BaselineTextSnapshotV1, FileBaselineV1, FileBaselinePageV1, FileBaselineDiffV1 } from "./workspace-navigation-types";
 import type { PublicationSelectionV1, PublicationReadinessReportV1, PublicationPackageExportResultV1 } from "./workspace-navigation-types";
 import type { ConversationGroup, ConversationGroupState, JourneyPage, LibraryDetail, LibraryPage, MoveConversationsRequest, PublicationDetail, PublicationSummary, RestoreWorkspacePublicationRequest, SaveConversationGroupRequest, SaveWorkspaceLibraryItemRequest, SaveWorkspacePublicationRequest, WorkspaceJourneyRequest, WorkspaceLibraryRequest, WorkspaceSourceRef, WorkspaceSourceSnapshot } from "./workspace-navigation-types";
 
 export function isWorkspaceDesktopHost() { return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window; }
+export const listConversationVisibility = (request: ConversationVisibilityListRequestV1): Promise<ConversationVisibilityPageV1> => host<ConversationVisibilityPageV1>("workspace_list_conversation_visibility", { request });
+export const setConversationVisibility = (request: SetConversationVisibilityRequestV1): Promise<ConversationVisibilityReceiptV1> => host<ConversationVisibilityReceiptV1>("workspace_set_conversation_visibility", { request });
+export const getConversationVisibility = (projectId: string, conversationId: string): Promise<ConversationVisibilityRecordV1> => host<ConversationVisibilityRecordV1>("workspace_get_conversation_visibility", { projectId, conversationId });
+export const getWorkspaceConversation = (projectId: string, conversationId: string): Promise<WorkspaceConversation> => host<WorkspaceConversation>("workspace_get_conversation", { projectId, conversationId });
 export const createWorkspaceFileBaseline = (request: CreateFileBaselineRequestV1): Promise<FileBaselineV1> => host<FileBaselineV1>("workspace_create_file_baseline", { request });
 export const listWorkspaceFileBaselines = (request: ListFileBaselinesRequestV1): Promise<FileBaselinePageV1> => host<FileBaselinePageV1>("workspace_list_file_baselines", { request });
 export const getWorkspaceFileBaseline = (projectId: string, baselineId: string): Promise<FileBaselineV1> => host<FileBaselineV1>("workspace_get_file_baseline", { projectId, baselineId });

@@ -1,0 +1,10 @@
+.shelved-conversations { display: grid; gap: 14px; }
+.shelved-conversations > p { margin: 0; color: var(--research-muted); line-height: 1.6; }
+.shelved-conversations > label { display: grid; gap: 6px; }
+.shelved-conversations > button { justify-self: start; }
+.shelved-conversations > ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.shelved-conversations li { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 14px; border: 1px solid var(--research-border); border-radius: 8px; }
+.shelved-conversations li > div:first-child { display: grid; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+.shelved-conversations small, .shelved-conversations code { color: var(--research-muted); font-size: 11px; }
+.shelved-conversation-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+@media (max-width: 650px) { .shelved-conversations li { align-items: flex-start; flex-direction: column; } }

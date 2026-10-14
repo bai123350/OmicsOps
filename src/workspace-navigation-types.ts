@@ -1,3 +1,5 @@
+import type { WorkspaceConversation } from "./types";
+
 export type SourceKind = "message" | "tool" | "dataset" | "analysis" | "artifact" | "evidence" | "provenance" | "legacy_artifact" | "run";
 export interface WorkspaceSourceRef {
   project_id: string; kind: SourceKind; id: string;
@@ -71,3 +73,15 @@ export interface SaveWorkspaceLibraryItemRequest { request_id: string; title: st
 export function workspaceSource(projectId: string, kind: SourceKind, id: string, fields: Partial<WorkspaceSourceRef> = {}): WorkspaceSourceRef {
   return { project_id: projectId, kind, id, conversation_id: null, run_id: null, sequence: null, event_hash: null, content_sha256: null, start: null, end: null, ...fields };
 }
+// Serde wire shapes from omicsops-dto/src/conversation_visibility.rs.
+export type ConversationVisibilityV1 = "visible" | "shelved";
+export type ConversationVisibilityFilterV1 = ConversationVisibilityV1 | "all";
+export interface ConversationVisibilityListRequestV1 { project_id: string; visibility: ConversationVisibilityFilterV1; query: string; offset: number; limit: number }
+export interface ConversationVisibilityRecordV1 { project_id: string; conversation_id: string; visibility: ConversationVisibilityV1; revision: number; changed_at: string | null }
+export interface ConversationVisibilityListItemV1 { state: ConversationVisibilityRecordV1; title: string; conversation_status: WorkspaceConversation["status"]; conversation_created_at: string; conversation_updated_at: string }
+export interface ConversationVisibilityPageV1 { items: ConversationVisibilityListItemV1[]; next_offset: number | null }
+export interface SetConversationVisibilityRequestV1 { request_id: string; project_id: string; conversation_id: string; expected_revision: number; visibility: ConversationVisibilityV1 }
+/** Historical receipt; read getConversationVisibility again for current state. */
+export interface ConversationVisibilityReceiptV1 { request_id: string; state: ConversationVisibilityRecordV1; changed: boolean }
+export type ConversationVisibilityErrorCodeV1 = "invalid_input" | "not_found" | "ownership_mismatch" | "revision_conflict" | "request_conflict" | "storage_failed";
+export interface ConversationVisibilityErrorV1 { code: ConversationVisibilityErrorCodeV1; message: string }
