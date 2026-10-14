@@ -85,7 +85,7 @@ git commit -m "feat: persist reversible conversation visibility"
 - Produces: `workspace_list_conversation_visibility(state: State<'_, AppState>, request: ConversationVisibilityListRequestV1) -> Result<ConversationVisibilityPageV1, ConversationVisibilityErrorV1>`；`workspace_set_conversation_visibility(state: State<'_, AppState>, request: SetConversationVisibilityRequestV1) -> Result<ConversationVisibilityReceiptV1, ConversationVisibilityErrorV1>`；`workspace_get_conversation(state: State<'_, AppState>, project_id: Uuid, conversation_id: Uuid) -> Result<Conversation, String>`；`workspace_get_conversation_visibility(state: State<'_, AppState>, project_id: Uuid, conversation_id: Uuid) -> Result<ConversationVisibilityRecordV1, ConversationVisibilityErrorV1>`。
 - Produces compatibility behavior：既有list_conversations/latest_used命令保留响应形状，改用Visible presentation；catalog只过滤Session discovery，exact ensure/resolve仍ALL/direct owner。
 
-- [ ] **Step 1: Write failing tests.** `visibility_catalog_vs_resolve`（含消息的Shelved缺Session候选，但直接Session与保存稿件来源仍解析）、`visibility_direct_getter_default_and_foreign_owner`、`visibility_command_shape_and_errors`、`visibility_no_runtime_effect`、`visibility_latest_default`。Artifact/Skill/compute候选不因Session收起消失。命令replay不返回raw SQL/秘密。
+- [x] **Step 1: Write failing tests.** `visibility_catalog_vs_resolve`（含消息的Shelved缺Session候选，但直接Session与保存稿件来源仍解析）、`visibility_direct_getter_default_and_foreign_owner`、`visibility_command_shape_and_errors`、`visibility_no_runtime_effect`、`visibility_latest_default`。Artifact/Skill/compute候选不因Session收起消失。命令replay不返回raw SQL/秘密。
 
 ```rust
 assert!(!catalog.iter().any(|item| item.reference == shelved_session));
@@ -95,10 +95,10 @@ assert_eq!(direct_visibility.revision, 0);
 assert_eq!(runtime_call_count, 0);
 ```
 
-- [ ] **Step 2: Run RED.** `cargo test -p omicsops-desktop --lib conversation_visibility_tests`。Expected: FAIL，缺commands或discovery/direct/compatibility断言失败。
-- [ ] **Step 3: Implement the four signatures and register.** 仅展示commands改Visible；catalog在加载message/限制候选前用Visible查询，exact resolve不使用它；typed安全errors及direct owner验证。保留旧title修复行为的展示命令，但readonly visibility/direct/source路径不调用title修复或runtime恢复。
-- [ ] **Step 4: Run GREEN.** 重跑RED；运行 `cargo test -p omicsops-desktop --lib composer_references::tests`、`cargo test -p omicsops-desktop --lib workspace_navigation::tests`。Expected: PASS，跨项目来源拒绝与missing source历史行为仍成立。
-- [ ] **Step 5: Commit.**
+- [x] **Step 2: Run RED.** `cargo test -p omicsops-desktop --lib conversation_visibility_tests`。Expected: FAIL，缺commands或discovery/direct/compatibility断言失败。
+- [x] **Step 3: Implement the four signatures and register.** 仅展示commands改Visible；catalog在加载message/限制候选前用Visible查询，exact resolve不使用它；typed安全errors及direct owner验证。保留旧title修复行为的展示命令，但readonly visibility/direct/source路径不调用title修复或runtime恢复。
+- [x] **Step 4: Run GREEN.** 重跑RED；运行 `cargo test -p omicsops-desktop --lib composer_references::tests`、`cargo test -p omicsops-desktop --lib workspace_navigation::tests`。Expected: PASS，跨项目来源拒绝与missing source历史行为仍成立。
+- [x] **Step 5: Commit.**
 
 ```powershell
 git add src-tauri/src/workspace_commands.rs src-tauri/src/composer_references.rs src-tauri/src/conversation_visibility_tests.rs src-tauri/src/lib.rs
@@ -178,3 +178,5 @@ git commit -m "feat: integrate reversible session shelving with search and navig
 spec覆盖：Task 1migration/default/ownership/CAS/replay/pagination；Task 2presentation/direct/candidate-vs-reference；Task 3paged集合/typed边界/Escape；Task 4active banner/stable请求/精确跳转/cache与最终验证。Review Focus五项都有测试，精确state getter保证任意同名/旧ID可取revision而不靠分页。方法/DTO签名一致、不改core或run语义；没有产品实现body/真实外部前提，当前计划命令均未执行。
 
 2026-10-15：W12 Task1 feature3809c25、独立格式提交8a47454及I1修复e4faae6完成完整与定向独立审阅，累计44/50 SOURCE。独立visibility表/DTO、exact owner getter、CAS和历史回执重放、分页前public-title查询及Visible latest已实现；旧ALL/内部latest不变，新默认latest按user时间的差异与O(全部合格标题字节)每页投影成本明确记录。I1发现core窄脱敏不等于native完整public_text，修复将原赋值/PEM纯算法共享到core并保留native原路径；实际修复RED2，最终Store14/core4/native19共37通过，fmt/diff通过。最初Store12/DTO2/latest6/branches9为此前阶段；compile RED67/8错误零执行、后置mutation1失败与真实修复RED分别保留，不混称。预格式候选仅按留存diff重建、不冒充曾捕获RAW；source7/fmt1/fix4及protected7/两个兼容残留审计通过。next_offset越界与缓存警告Minor交最终审阅；宿主/UI、全量/clean-HEAD/native手工及真实验收仍待后续。
+
+2026-10-15：W12 Task2 展示过滤/精确来源命令源码已独立审阅通过（source 8f20cc5 + separate fmt bd6a4ec；FULL spec compliant / quality Approved），累计45/50。四个宿主命令保持 Store-only，Visible 展示/用户消息时间排序与 ALL 精确引用分离，直接读取只投影安全标题而不写回；历史 receipt 与当前 getter 分离。最终新测试5、composer19、navigation11（35项独立覆盖），fmt/diff 通过。导航临时文件 persist 在 sandbox 内 OS5 失败，经同操作诊断与相同测试正常提权1/1、完整最近导航11/11通过；原失败保留，无导航代码修改。立即格式化前 RAW4 已捕获，feature4/format3 分别提交，protected7/外部差异/空 index 与 candidate/inverse/replay/postproof 通过。继承 SQL/DTO/CAS/脱敏约束由 Task1 FULL+scoped 闭合；M1缓存 hard-link 警告保留最终审阅，UI Tasks3–4、最终全量/clean HEAD及人工/真实验收尚未执行。
