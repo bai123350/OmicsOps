@@ -103,9 +103,9 @@ pub mod workspace_file_baselines;
 pub use workspace_file_baselines::{
     FileBaselineManifestEntryV1, FileBaselineManifestV1, SaveFileBaselineRecord, StoredFileBaseline,
 };
+mod workspace_conversation_visibility;
 pub mod workspace_journey;
 pub mod workspace_navigation;
-mod workspace_conversation_visibility;
 pub use usage::{
     UsageConversationEventPage, UsageConversationEventSet, UsageEventPage, UsageEventRow,
     UsageEventRun, UsageSnapshotBoundary,
