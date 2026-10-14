@@ -50,7 +50,7 @@
 | W09 | [稿件证据](2026-10-04-wisp-w09-publication-evidence.md) | 4 | 保存revision准备度与reference-only四entry证据ZIP | SOURCE完成并独立审阅；确定性全量/Web/native构建通过，native手工未执行 |
 | W10 | [文件基线](2026-10-04-wisp-w10-file-baselines.md) | 4 | 显式安全小本地文本immutable snapshot/有界diff | 源码已完成并审阅，完整确定性检查已记录；原生手工验收未执行 |
 | W11 | [迁移预览](2026-10-04-wisp-w11-migration-preview.md) | 3 | 空默认选择、类别COUNT、文件状态/hash与rebind/omissions | 待实施 |
-| W12 | [会话可见性](2026-10-04-wisp-w12-conversation-visibility.md) | 4 | 持久可逆收起/恢复，分页前过滤，精确引用保持 | 待实施 |
+| W12 | [会话可见性](2026-10-04-wisp-w12-conversation-visibility.md) | 4 | 持久可逆收起/恢复，分页前过滤，精确引用保持 | 进行中，Task1独立visibility DTO/Store/CAS已审阅，宿主/UI待实施 |
 
 W08只有两部分都通过才算完成。W02/W04两种worker/source的deterministic协议回归均必需，单独本地入口不满足范围；真实远端/模型验收独立记“未执行”时不冒充端到端通过。
 
@@ -148,3 +148,5 @@ W06已实现：四任务源码独立审阅完成，最终UI提交 `d535b50`；�
 W10 Task3 已完成独立审阅：source 783ee03、fix1 e82aed0；FULL审阅指出失败读取未计预算，fresh scoped复核确认diff I1及同类capture C1均已解决且无新增阻断。两个消费者按opened size在读取前预留并传递精确payload额度，失败不返还，W02 EOF probe单独保留；额外保守省略/回归成本已记录。最新6项预算测试包含于baseline38项通过，fmt/diff通过；初始baseline32与DTO59为此前字节证据，DTO未在本轮重跑。实际RED宽filter为14通过/7失败，其中6预算因果失败、1既有毫秒排序fixture精度错误（仅修测试）。全请求work/序列化hunk预算、Unreadable余量不足与顺序非原子限制已同步；Task4 UI/完整交付检查尚待完成，GUI smoke仍未执行。累计42/50源码任务已独立审阅，不等于完整产品/真实环境验收。
 
 2026-10-14：W10 Task4 `5b4cc5a..19ac40d` 文件显式选择、可选已验证branch关联、窗口内稳定请求、保存正文和有界diff界面完成独立完整审阅，累计43/50 SOURCE。最终focused175、全量Vitest1363+Node22、Web通过；新原生恢复构建显式exit0/release5m27/NSIS1，前次相同最终源码构建成功输出但终态exit遗失，未冒充exit0。Rust1889通过/18ignored、Python48、fmt为相关未变字节的先前实际通过；候选/逆向/重放/提交后RAW11、外部7文件与两个兼容残留保留证明通过。三项非阻断Minor（JSX可读性、延迟diff/分页覆盖、构建警告）交最终全分支审阅。Windows手工smoke受用户STOP未执行，CI/真实SSH/模型/R/Micromamba/PBMC及最终clean-HEAD/整分支交付检查仍非本任务通过项。
+
+2026-10-15：W12 Task1 feature3809c25、独立格式提交8a47454及I1修复e4faae6完成完整与定向独立审阅，累计44/50 SOURCE。独立visibility表/DTO、exact owner getter、CAS和历史回执重放、分页前public-title查询及Visible latest已实现；旧ALL/内部latest不变，新默认latest按user时间的差异与O(全部合格标题字节)每页投影成本明确记录。I1发现core窄脱敏不等于native完整public_text，修复将原赋值/PEM纯算法共享到core并保留native原路径；实际修复RED2，最终Store14/core4/native19共37通过，fmt/diff通过。最初Store12/DTO2/latest6/branches9为此前阶段；compile RED67/8错误零执行、后置mutation1失败与真实修复RED分别保留，不混称。预格式候选仅按留存diff重建、不冒充曾捕获RAW；source7/fmt1/fix4及protected7/两个兼容残留审计通过。next_offset越界与缓存警告Minor交最终审阅；宿主/UI、全量/clean-HEAD/native手工及真实验收仍待后续。

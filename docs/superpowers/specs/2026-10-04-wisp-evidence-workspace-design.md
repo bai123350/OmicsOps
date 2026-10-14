@@ -613,7 +613,7 @@ pub struct ConversationVisibilityErrorV1 {
 }
 ```
 
-list item 是特定用途投影，不复制model_profile_id或core对象；`conversation_status` 由 core enum序列化的现有值产生，TypeScript使用现有 `WorkspaceConversation["status"]` 校验，不另起状态枚举。直接打开返回现有 `Conversation`；它不进行模型/运行恢复，也不改变visibility。page `query` 最多200字符/1KiB，只搜公开标题；limit=1..100、offset<=10,000，默认UI50条。按 conversation updated_at DESC、id稳定排序，SQL先project/visibility/query过滤再分页；不拉一页后在React剔除。offset分页不承诺并发收起下的稳定快照；操作后重置到第一页并刷新。
+list item 是特定用途投影，不复制model_profile_id或core对象；`conversation_status` 由 core enum序列化的现有值产生，TypeScript使用现有 `WorkspaceConversation["status"]` 校验，不另起状态枚举。直接打开返回现有 `Conversation`；它不进行模型/运行恢复，也不改变visibility。page `query` 最多200字符/1KiB，只搜公开标题；limit=1..100、offset<=10,000，默认UI50条。按 conversation updated_at DESC、id稳定排序，SQL先project/visibility/query过滤再分页；不拉一页后在React剔除。公开标题搜索在同一只读事务内先取project/visibility过滤的ID/title并应用共享core public_text完整脱敏（既有native public_text的赋值/PEM逻辑抽取，native仍委托同一实现），再将安全标题投影绑定到json_each CTE，由SQL按公开标题过滤、稳定排序后分页；被既有投影去除的秘密子串不能通过匹配成员关系被发现；不保证任意秘密文本均被识别。不读取transcript/body或写搜索索引。代价是每页需要O(全部合格标题字节)的投影/绑定及相应内存，而非仅page大小；不截断候选以冒充完整结果，不承诺大项目OOM恢复。offset分页不承诺并发收起下的稳定快照；操作后重置到第一页并刷新。
 
 Store 新增 `workspace_conversations_for_presentation(&self,project_id:Uuid)->Result<Vec<Conversation>,StoreError>`（Visible，与旧展示形状一致）、`workspace_latest_visible_conversation(&self,project_id:Uuid)->Result<Option<Conversation>,StoreError>`、`workspace_list_conversation_visibility(&self,request:&ConversationVisibilityListRequestV1)->Result<ConversationVisibilityPageV1,StoreError>`、`workspace_set_conversation_visibility(&self,request:&SetConversationVisibilityRequestV1)->Result<ConversationVisibilityReceiptV1,StoreError>`，以及 `workspace_get_conversation_visibility(&self,project_id:Uuid,conversation_id:Uuid)->Result<ConversationVisibilityRecordV1,StoreError>`。后者先验证同项目会话存在，再读取可见性；缺行返回 Visible/revision0，异项目或已删除会话拒绝，不能把查不到行都视为默认可见。它供精确来源打开后的横幅和恢复操作读取当前 revision，不能靠标题或分页集合猜测状态。精确打开复用现有 `workspace_source_conversation(project,id)`，不通过Visible列表判断对象是否存在。
 
@@ -645,7 +645,7 @@ CREATE INDEX IF NOT EXISTS idx_conversation_visibility_project
 
 `composer_references.rs` 只把catalog中的Session发现查询换成Visible，并在候选上限/分页前过滤；Artifact/Skill的独立可发现性保持原有规则。全局搜索通过该catalog构建Session候选，因此默认同样Visible；visibility mutation提交后使项目catalog/search缓存generation失效并刷新。仅在客户端当前页过滤不满足此边界。
 
-`ensure_conversation` 和精确 `resolve_composer_references` 保留ALL或改为同项目direct getter；不能把其查询替换为Visible。已有Session chip、保存稿件来源和旧消息引用可解析Shelved。精确解析不是发现入口，不因运行/状态变化自动恢复。默认 `latest_used_conversation` 的展示命令用新的Visible查询，仍按真实user message时间判最近，收起不伪造message时间。
+`ensure_conversation` 和精确 `resolve_composer_references` 保留ALL或改为同项目direct getter；不能把其查询替换为Visible。已有Session chip、保存稿件来源和旧消息引用可解析Shelved。精确解析不是发现入口，不因运行/状态变化自动恢复。默认 `latest_used_conversation` 的展示命令用新的Visible查询，仍按真实user message时间判最近，收起不伪造message时间。新Visible查询只按主transcript的user消息时间排序；旧Store latest_used_conversation仍保留已有user后按任意主消息活动排序的内部兼容语义。展示默认入口切到新查询后，较晚assistant/system/tool消息不再让较旧用户提问的会话超过较新用户提问；这是明确的默认排序差异，收起/恢复本身不改消息时间。
 
 `DesktopApp.tsx` 所有通过 `listConversations(...).find(...)` 打开已知ID的路径改用 `workspace_get_conversation`：项目初始指定source、global search打开、usage/run来源、branch/merge/share等精确来源跳转。只改列表而漏掉这些入口会导致已有隐式引用“找不到”，因此属于同一首交付的必要范围。source resolver的所有权仍由Store确认，不能因为已知ID跳过project检查。
 

@@ -1,6 +1,6 @@
 # Wisp Science 可借鉴改进清单
 
-日期：2026-10-04。状态：用户已选择全部12项首次范围、确认具体设计及[实施总计划](../plans/2026-10-04-wisp-improvements.md)，并选择子Agent逐项实施与审阅。W01–W10源码已实现并审阅通过（43/50任务），其余项继续实施；W07原生手工验收未执行，W06隔离旧HEAD原生验收仅部分通过；状态及实际检查见总计划。全部12项首次范围尚未交付。本文件保留源码对照，具体边界见[总设计](2026-10-04-wisp-improvements-design.md)。
+日期：2026-10-04。状态：用户已选择全部12项首次范围、确认具体设计及[实施总计划](../plans/2026-10-04-wisp-improvements.md)，并选择子Agent逐项实施与审阅。W01–W10及W12独立visibility DTO/Store/CAS源码已实现并审阅通过（44/50任务），其余项继续实施；W07原生手工验收未执行，W06隔离旧HEAD原生验收仅部分通过；状态及实际检查见总计划。全部12项首次范围尚未交付。本文件保留源码对照，具体边界见[总设计](2026-10-04-wisp-improvements-design.md)。
 
 本轮建议先补会话草稿隔离，再分别交付科学产物预览和 SSH 后台作业面板。这三项直接改善日常研究操作，并能复用现有组件与运行身份。其余候选按依赖分批推进，优先保留 OmicsOps 已有的科研证据、审批与恢复契约。
 
@@ -185,6 +185,8 @@ P0 表示优先解决可能影响操作正确性的问题；P1 表示直接改�
 keyring 引用不等于可移植授权；资料中的提示词与路径也须按现有脱敏边界处理。云中继、常驻同步和跨设备活跃运行恢复另行评估。
 
 ## W12 收起和恢复会话
+
+**实施进度：**2026-10-15：W12 Task1 feature3809c25、独立格式提交8a47454及I1修复e4faae6完成完整与定向独立审阅，累计44/50 SOURCE。独立visibility表/DTO、exact owner getter、CAS和历史回执重放、分页前public-title查询及Visible latest已实现；旧ALL/内部latest不变，新默认latest按user时间的差异与O(全部合格标题字节)每页投影成本明确记录。I1发现core窄脱敏不等于native完整public_text，修复将原赋值/PEM纯算法共享到core并保留native原路径；实际修复RED2，最终Store14/core4/native19共37通过，fmt/diff通过。最初Store12/DTO2/latest6/branches9为此前阶段；compile RED67/8错误零执行、后置mutation1失败与真实修复RED分别保留，不混称。预格式候选仅按留存diff重建、不冒充曾捕获RAW；source7/fmt1/fix4及protected7/两个兼容残留审计通过。next_offset越界与缓存警告Minor交最终审阅；宿主/UI、全量/clean-HEAD/native手工及真实验收仍待后续。
 
 **参考事实：**上游[会话可见性实现][w-shelve]和[持久化测试][w-shelve-tests]支持可逆收起，默认列表、搜索与 # 候选过滤；历史、已有引用与导出仍保留。本地当前分支 archived 状态是分支关系语义，没有相同的普通会话可见性入口。
 

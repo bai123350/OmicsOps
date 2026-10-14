@@ -50,7 +50,7 @@ W12独立于W09/W10/W11/W02；W09历史source与W11ALL计数必须继续可用�
 - Produces spec DTO与Store methods：`workspace_conversations_for_presentation(&self, project_id: Uuid) -> Result<Vec<Conversation>, StoreError>`；`workspace_latest_visible_conversation(&self, project_id: Uuid) -> Result<Option<Conversation>, StoreError>`；`workspace_list_conversation_visibility(&self, request: &ConversationVisibilityListRequestV1) -> Result<ConversationVisibilityPageV1, StoreError>`；`workspace_set_conversation_visibility(&self, request: &SetConversationVisibilityRequestV1) -> Result<ConversationVisibilityReceiptV1, StoreError>`。
 - Produces direct state getter：`workspace_get_conversation_visibility(&self, project_id: Uuid, conversation_id: Uuid) -> Result<ConversationVisibilityRecordV1, StoreError>`；先验证同项目conversation存在，缺visibility row返回Visible/rev0；不存在/异project拒绝，不通过title或分页查找。
 
-- [ ] **Step 1: Write failing tests.** `visibility_migration_preserves_legacy`（fresh/legacy/reopen/twice、Archived/merged保留）、`visibility_filter_before_pagination`（>100隐藏项与50可见项）、`visibility_getter_by_owner_and_id`（同名/超page/缺row）、`visibility_replay_after_restore`、`visibility_noop_and_revision_conflict`、`visibility_composite_owner_fk`、`visibility_latest_and_delete_cascade`；检查message/group/run与Conversation时间不变。DTO合同unknown/nullable/enum/默认revision。
+- [x] **Step 1: Write failing tests.** `visibility_migration_preserves_legacy`（fresh/legacy/reopen/twice、Archived/merged保留）、`visibility_filter_before_pagination`（>100隐藏项与50可见项）、`visibility_getter_by_owner_and_id`（同名/超page/缺row）、`visibility_replay_after_restore`、`visibility_noop_and_revision_conflict`、`visibility_composite_owner_fk`、`visibility_latest_and_delete_cascade`；检查message/group/run与Conversation时间不变。DTO合同unknown/nullable/enum/默认revision。
 
 ```rust
 assert_eq!(default_state.visibility, ConversationVisibilityV1::Visible);
@@ -61,10 +61,10 @@ assert_eq!(current.visibility, ConversationVisibilityV1::Visible);
 assert_eq!(conversation_after.updated_at, conversation_before.updated_at);
 ```
 
-- [ ] **Step 2: Run RED.** `cargo test -p omicsops-store --test conversation_visibility`；`cargo test -p omicsops-desktop --lib dto_contract_tests::conversation_visibility`。Expected: FAIL，缺DTO/method或FK/CAS/filter断言失败；测试target必须先创建。
-- [ ] **Step 3: Implement the methods and exact spec schema.** 父unique `(frame_id,project_id)` index先于新表；CREATE IF NOT EXISTS、compositeFK/检查、缺row默认、不回填旧表；CAS+ledger同BEGIN IMMEDIATE，no-op只记receipt。Visible latest按真实user message时间。direct state getter验证owner后left join，不误把异project缺row当默认Visible。
-- [ ] **Step 4: Run GREEN.** 重跑RED与 `cargo test -p omicsops-store --test latest_used_conversation`、`cargo test -p omicsops-store --test conversation_branches`。Expected: PASS；原内部ALL/latest方法语义不变，新的presentation方法按visibility过滤。
-- [ ] **Step 5: Commit.**
+- [x] **Step 2: Run RED.** `cargo test -p omicsops-store --test conversation_visibility`；`cargo test -p omicsops-desktop --lib dto_contract_tests::conversation_visibility`。Expected: FAIL，缺DTO/method或FK/CAS/filter断言失败；测试target必须先创建。
+- [x] **Step 3: Implement the methods and exact spec schema.** 父unique `(frame_id,project_id)` index先于新表；CREATE IF NOT EXISTS、compositeFK/检查、缺row默认、不回填旧表；CAS+ledger同BEGIN IMMEDIATE，no-op只记receipt。Visible latest按真实user message时间。direct state getter验证owner后left join，不误把异project缺row当默认Visible。
+- [x] **Step 4: Run GREEN.** 重跑RED与 `cargo test -p omicsops-store --test latest_used_conversation`、`cargo test -p omicsops-store --test conversation_branches`。Expected: PASS；原内部ALL/latest方法语义不变，新的presentation方法按visibility过滤。
+- [x] **Step 5: Commit.**
 
 ```powershell
 git add crates/omicsops-dto/src/conversation_visibility.rs crates/omicsops-dto/src/lib.rs crates/omicsops-store/migrations/init.sql crates/omicsops-store/src/lib.rs crates/omicsops-store/src/workspace_conversation_visibility.rs crates/omicsops-store/tests/conversation_visibility.rs src-tauri/src/dto_contract_tests.rs
@@ -176,3 +176,5 @@ git commit -m "feat: integrate reversible session shelving with search and navig
 ## Plan Self-Review
 
 spec覆盖：Task 1migration/default/ownership/CAS/replay/pagination；Task 2presentation/direct/candidate-vs-reference；Task 3paged集合/typed边界/Escape；Task 4active banner/stable请求/精确跳转/cache与最终验证。Review Focus五项都有测试，精确state getter保证任意同名/旧ID可取revision而不靠分页。方法/DTO签名一致、不改core或run语义；没有产品实现body/真实外部前提，当前计划命令均未执行。
+
+2026-10-15：W12 Task1 feature3809c25、独立格式提交8a47454及I1修复e4faae6完成完整与定向独立审阅，累计44/50 SOURCE。独立visibility表/DTO、exact owner getter、CAS和历史回执重放、分页前public-title查询及Visible latest已实现；旧ALL/内部latest不变，新默认latest按user时间的差异与O(全部合格标题字节)每页投影成本明确记录。I1发现core窄脱敏不等于native完整public_text，修复将原赋值/PEM纯算法共享到core并保留native原路径；实际修复RED2，最终Store14/core4/native19共37通过，fmt/diff通过。最初Store12/DTO2/latest6/branches9为此前阶段；compile RED67/8错误零执行、后置mutation1失败与真实修复RED分别保留，不混称。预格式候选仅按留存diff重建、不冒充曾捕获RAW；source7/fmt1/fix4及protected7/两个兼容残留审计通过。next_offset越界与缓存警告Minor交最终审阅；宿主/UI、全量/clean-HEAD/native手工及真实验收仍待后续。
