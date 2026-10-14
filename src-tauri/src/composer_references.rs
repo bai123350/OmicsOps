@@ -83,7 +83,7 @@ pub async fn composer_reference_catalog_for_repository(
     items.extend(catalog_compute_items(project_id, &backends));
 
     for conversation in repository
-        .conversations_for_project(project_id)
+        .workspace_conversations_for_presentation(project_id)
         .await
         .map_err(|error| error.to_string())?
     {

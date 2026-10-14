@@ -3,6 +3,13 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use omicsops_core::workspace::{Conversation, MessageRole, Project, ProjectTemplate};
+use omicsops_dto::{
+    ConversationVisibilityErrorCodeV1, ConversationVisibilityErrorV1,
+    ConversationVisibilityListRequestV1, ConversationVisibilityPageV1,
+    ConversationVisibilityReceiptV1, ConversationVisibilityRecordV1,
+    SetConversationVisibilityRequestV1,
+};
+use omicsops_store::{Store, StoreError};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
@@ -248,17 +255,22 @@ pub async fn list_conversations(
     state: State<'_, AppState>,
     project_id: Uuid,
 ) -> Result<Vec<Conversation>, String> {
-    let mut conversations = state
-        .repository
-        .conversations_for_project(project_id)
+    list_conversations_response(&state.repository, project_id).await
+}
+
+pub(crate) async fn list_conversations_response(
+    repository: &Store,
+    project_id: Uuid,
+) -> Result<Vec<Conversation>, String> {
+    let mut conversations = repository
+        .workspace_conversations_for_presentation(project_id)
         .await
         .map_err(|error| error.to_string())?;
     for conversation in &mut conversations {
         if !conversation_title_needs_first_message(&conversation.title) {
             continue;
         }
-        let first_question = state
-            .repository
+        let first_question = repository
             .messages_for_conversation(conversation.id)
             .await
             .map_err(|error| error.to_string())?
@@ -273,8 +285,7 @@ pub async fn list_conversations(
             });
         if let Some(title) = first_question.filter(|title| !title.is_empty()) {
             conversation.title = title;
-            state
-                .repository
+            repository
                 .save_conversation(conversation)
                 .await
                 .map_err(|error| error.to_string())?;
@@ -296,7 +307,7 @@ pub(crate) async fn latest_used_conversation_response(
         return Err("project was not found".into());
     }
     repository
-        .latest_used_conversation(project_id)
+        .workspace_latest_visible_conversation(project_id)
         .await
         .map_err(|error| error.to_string())
 }
@@ -307,6 +318,104 @@ pub async fn latest_used_conversation(
     project_id: Uuid,
 ) -> Result<Option<Conversation>, String> {
     latest_used_conversation_response(&state.repository, project_id).await
+}
+
+/// This boundary never echoes database details or invalid stored text.
+pub(crate) fn conversation_visibility_error(error: StoreError) -> ConversationVisibilityErrorV1 {
+    use ConversationVisibilityErrorCodeV1::*;
+    let code = match &error {
+        StoreError::InvalidInput(tag) => match tag.as_str() {
+            "conversation_visibility_invalid_input" => InvalidInput,
+            "conversation_visibility_not_found" => NotFound,
+            "conversation_visibility_ownership_mismatch" => OwnershipMismatch,
+            "conversation_visibility_revision_conflict" => RevisionConflict,
+            "conversation_visibility_request_conflict" => RequestConflict,
+            _ => StorageFailed,
+        },
+        _ => StorageFailed,
+    };
+    let message = match code {
+        InvalidInput => "Conversation visibility request is invalid",
+        NotFound => "Project or conversation was not found",
+        OwnershipMismatch => "Conversation does not belong to the requested project",
+        RevisionConflict => "Conversation visibility has changed; refresh before retrying",
+        RequestConflict => "Request identifier was already used for a different operation",
+        StorageFailed => "Conversation visibility storage failed",
+    };
+    ConversationVisibilityErrorV1 { code, message: message.into() }
+}
+
+// Store-only response seams keep these presentation preferences independent of
+// runtime execution, credentials, recovery and persisted title repair.
+pub(crate) async fn workspace_list_conversation_visibility_response(
+    repository: &Store,
+    request: ConversationVisibilityListRequestV1,
+) -> Result<ConversationVisibilityPageV1, ConversationVisibilityErrorV1> {
+    repository.workspace_list_conversation_visibility(&request).await.map_err(conversation_visibility_error)
+}
+
+#[tauri::command]
+pub async fn workspace_list_conversation_visibility(
+    state: State<'_, AppState>,
+    request: ConversationVisibilityListRequestV1,
+) -> Result<ConversationVisibilityPageV1, ConversationVisibilityErrorV1> {
+    workspace_list_conversation_visibility_response(&state.repository, request).await
+}
+
+pub(crate) async fn workspace_set_conversation_visibility_response(
+    repository: &Store,
+    request: SetConversationVisibilityRequestV1,
+) -> Result<ConversationVisibilityReceiptV1, ConversationVisibilityErrorV1> {
+    repository.workspace_set_conversation_visibility(&request).await.map_err(conversation_visibility_error)
+}
+
+#[tauri::command]
+pub async fn workspace_set_conversation_visibility(
+    state: State<'_, AppState>,
+    request: SetConversationVisibilityRequestV1,
+) -> Result<ConversationVisibilityReceiptV1, ConversationVisibilityErrorV1> {
+    workspace_set_conversation_visibility_response(&state.repository, request).await
+}
+
+pub(crate) async fn workspace_get_conversation_response(
+    repository: &Store,
+    project_id: Uuid,
+    conversation_id: Uuid,
+) -> Result<Conversation, String> {
+    if repository.get_project(project_id).await.map_err(|_| "Conversation storage failed".to_owned())?.is_none() {
+        return Err("project was not found".into());
+    }
+    let mut conversation = repository.workspace_source_conversation(project_id, conversation_id).await
+        .map_err(|_| "Conversation storage failed".to_owned())?
+        .ok_or_else(|| "conversation was not found in this project".to_owned())?;
+    conversation.title = omicsops_core::redaction::public_text(&conversation.title);
+    Ok(conversation)
+}
+
+#[tauri::command]
+pub async fn workspace_get_conversation(
+    state: State<'_, AppState>,
+    project_id: Uuid,
+    conversation_id: Uuid,
+) -> Result<Conversation, String> {
+    workspace_get_conversation_response(&state.repository, project_id, conversation_id).await
+}
+
+pub(crate) async fn workspace_get_conversation_visibility_response(
+    repository: &Store,
+    project_id: Uuid,
+    conversation_id: Uuid,
+) -> Result<ConversationVisibilityRecordV1, ConversationVisibilityErrorV1> {
+    repository.workspace_get_conversation_visibility(project_id, conversation_id).await.map_err(conversation_visibility_error)
+}
+
+#[tauri::command]
+pub async fn workspace_get_conversation_visibility(
+    state: State<'_, AppState>,
+    project_id: Uuid,
+    conversation_id: Uuid,
+) -> Result<ConversationVisibilityRecordV1, ConversationVisibilityErrorV1> {
+    workspace_get_conversation_visibility_response(&state.repository, project_id, conversation_id).await
 }
 
 pub fn conversation_title_needs_first_message(title: &str) -> bool {

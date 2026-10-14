@@ -23,6 +23,8 @@ pub mod conversation_mode;
 mod conversation_mode_tests;
 pub mod conversation_preferences;
 #[cfg(test)]
+mod conversation_visibility_tests;
+#[cfg(test)]
 mod conversation_state_tests;
 pub mod credential_settings;
 pub mod dto;
@@ -342,6 +344,10 @@ pub fn run() {
             composer_queue::composer_queue_action,
             composer_queue::composer_queue_reconcile,
             workspace_commands::list_conversations,
+            workspace_commands::workspace_list_conversation_visibility,
+            workspace_commands::workspace_set_conversation_visibility,
+            workspace_commands::workspace_get_conversation,
+            workspace_commands::workspace_get_conversation_visibility,
             workspace_commands::latest_used_conversation,
             workspace_commands::create_conversation,
             workspace_commands::delete_conversation,
