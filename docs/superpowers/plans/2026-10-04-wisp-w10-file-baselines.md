@@ -151,7 +151,7 @@ git commit -m "feat: compare file baselines with bounded local diffs"
 - Produces TS wrappers: `createWorkspaceFileBaseline(request: CreateFileBaselineRequestV1): Promise<FileBaselineV1>`；`listWorkspaceFileBaselines(request: ListFileBaselinesRequestV1): Promise<FileBaselinePageV1>`；`getWorkspaceFileBaseline(projectId: string, baselineId: string): Promise<FileBaselineV1>`；`readWorkspaceBaselineText(request: ReadBaselineTextRequestV1): Promise<BaselineTextSnapshotV1>`；`diffWorkspaceFileBaseline(request: DiffFileBaselineRequestV1): Promise<FileBaselineDiffV1>`。
 - Produces component: `WorkspaceFileBaselinesPanel(props: { projectId: string; branchConversationId: string | null; locale: Locale; selectedFiles: ProjectFileSelectionV1[]; onClose: () => void }): ReactNode`；显式选择、列表、保存正文与diff视图，不加恢复/执行按钮。
 
-- [ ] **Step 1: Write failing tests.** API exactinvoke；明确选file而不展开目录、TextSnapshot/reference-only/unknown显示、retry原request、branch可选association、源丢失仍看snapshot、根变更说明、budget truncation、project/generation旧回包、立即Escape只关正文/diff顶层。panel保存回执不清空另一项目选择。
+- [x] **Step 1: Write failing tests.** API exactinvoke；明确选file而不展开目录、TextSnapshot/reference-only/unknown显示、retry原request、branch可选association、源丢失仍看snapshot、根变更说明、budget truncation、project/generation旧回包、立即Escape只关正文/diff顶层。panel保存回执不清空另一项目选择。
 
 ```ts
 expect(invoke).toHaveBeenCalledWith("workspace_create_file_baseline", { request: selectedRequest });
@@ -161,10 +161,10 @@ expect(screen.queryByRole("button", { name: /Restore files/ })).not.toBeInTheDoc
 expect(parentPanel).toBeVisible();
 ```
 
-- [ ] **Step 2: Run RED.** `npx vitest run src/workspace-navigation-api.test.ts src/features/workspace/WorkspaceFileBaselinesPanel.test.tsx src/features/workspace/RemoteFileTree.test.tsx src/features/workspace/WorkspaceShell.test.tsx`。Expected: FAIL，缺panel/wrapper/选择动作或scope/Escape断言失败。
-- [ ] **Step 3: Implement the TS interfaces and wire actual file sidebar.** RemoteFileTree只提供显式file选择，WorkspaceShell绑定project/backend；branch banner只能传已验证分支ID；保留原sync/attachment能力而不调用它们捕获。pending请求稳定ID、typed错误、metadata/reference标签、逐项顺序捕获提示和generation/Escape；不渲染HTML或执行脚本。
+- [x] **Step 2: Run RED.** `npx vitest run src/workspace-navigation-api.test.ts src/features/workspace/WorkspaceFileBaselinesPanel.test.tsx src/features/workspace/RemoteFileTree.test.tsx src/features/workspace/WorkspaceShell.test.tsx`。Expected: FAIL，缺panel/wrapper/选择动作或scope/Escape断言失败。
+- [x] **Step 3: Implement the TS interfaces and wire actual file sidebar.** RemoteFileTree只提供显式file选择，WorkspaceShell绑定project/backend；branch banner只能传已验证分支ID；保留原sync/attachment能力而不调用它们捕获。pending请求稳定ID、typed错误、metadata/reference标签、逐项顺序捕获提示和generation/Escape；不渲染HTML或执行脚本。
 - [ ] **Step 4: Run GREEN and delivery checks.** 重跑RED；运行 `cargo fmt --all -- --check`、`cargo test --workspace`、`npm test`、`npm run build`、`npm run build:desktop`、`git diff --check`；锁变化 `npm ci`。Expected: PASS并记录非零测试数/ignored。Windows合成小脚本smoke覆盖空格路径、保存后改动、缺源/根变更、branch删除只unlink、重启后查看与diff；真实SSH/样本未执行须写明。
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```powershell
 git add src/workspace-navigation-types.ts src/workspace-navigation-api.ts src/workspace-navigation-api.test.ts src/features/workspace/WorkspaceShell.tsx src/features/workspace/RemoteFileTree.tsx src/features/workspace/ConversationBranchBanner.tsx src/features/workspace/WorkspaceFileBaselinesPanel.tsx src/features/workspace/workspace-file-baselines.css src/features/workspace/WorkspaceFileBaselinesPanel.test.tsx src/features/workspace/RemoteFileTree.test.tsx src/features/workspace/WorkspaceShell.test.tsx
@@ -180,3 +180,6 @@ spec覆盖：Task 1typed migration/ownership/replay；Task 2安全捕获、物�
 2026-10-13：W10 Task2 `f07d9a3` 安全捕获/blob/保存正文/删除清理及 `4a6eb14` 三项修复完成完整与定向独立审阅，累计41/50 SOURCE。敏感文件名在读取前降引用，V4历史引用严格校验类型/schema/有效性/producer状态，open-time SourceChanged整次拒绝；既有Unavailable仍为Unreadable。修复因果RED为纯策略0/1、capture15/2、Store0/2；最新capture17/pure5/saved4/Store11共37通过，fmt/diff及精确候选/逆向/replay/提交审计通过。原62是修复前历史检查，未变W02 handle16/table11/delete2沿用此前结果；完整/clean-HEAD/真实验收未完成。7外部RAW保留；六处working initializer中五处提交，一处外部测试内W10兼容initializer明确未暂存，与既有W04残留分开。diff/UI仍待Tasks3–4，不能称全部文件基线功能已交付。
 
 W10 Task3 已完成独立审阅：source 783ee03、fix1 e82aed0；FULL审阅指出失败读取未计预算，fresh scoped复核确认diff I1及同类capture C1均已解决且无新增阻断。两个消费者按opened size在读取前预留并传递精确payload额度，失败不返还，W02 EOF probe单独保留；额外保守省略/回归成本已记录。最新6项预算测试包含于baseline38项通过，fmt/diff通过；初始baseline32与DTO59为此前字节证据，DTO未在本轮重跑。实际RED宽filter为14通过/7失败，其中6预算因果失败、1既有毫秒排序fixture精度错误（仅修测试）。全请求work/序列化hunk预算、Unreadable余量不足与顺序非原子限制已同步；Task4 UI/完整交付检查尚待完成，GUI smoke仍未执行。累计42/50源码任务已独立审阅，不等于完整产品/真实环境验收。
+
+源码及自动化交付检查完成；Step4保留未勾选，因为Windows native手工smoke受用户物理STOP而未执行。构建成功不替代真实窗口验收。
+2026-10-14：W10 Task4 `5b4cc5a..19ac40d` 文件显式选择、可选已验证branch关联、窗口内稳定请求、保存正文和有界diff界面完成独立完整审阅，累计43/50 SOURCE。最终focused175、全量Vitest1363+Node22、Web通过；新原生恢复构建显式exit0/release5m27/NSIS1，前次相同最终源码构建成功输出但终态exit遗失，未冒充exit0。Rust1889通过/18ignored、Python48、fmt为相关未变字节的先前实际通过；候选/逆向/重放/提交后RAW11、外部7文件与两个兼容残留保留证明通过。三项非阻断Minor（JSX可读性、延迟diff/分页覆盖、构建警告）交最终全分支审阅。Windows手工smoke受用户STOP未执行，CI/真实SSH/模型/R/Micromamba/PBMC及最终clean-HEAD/整分支交付检查仍非本任务通过项。

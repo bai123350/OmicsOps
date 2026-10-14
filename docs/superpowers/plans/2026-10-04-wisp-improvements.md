@@ -48,7 +48,7 @@
 | W08a | [V4场景](2026-10-04-wisp-w08-scenarios.md) | 3 | 五场景manifest/hash/实际调用计数和安全报告 | 已实现、3任务源码审阅通过；安全报告/故障非零验证通过，CI未执行 |
 | W08b | [Skill helpers](2026-10-04-wisp-w08-skill-helpers.md) | 3 | 固定本地helper离线行为回归与统一Python CI | 已实现、3任务审阅通过；CI未执行 |
 | W09 | [稿件证据](2026-10-04-wisp-w09-publication-evidence.md) | 4 | 保存revision准备度与reference-only四entry证据ZIP | SOURCE完成并独立审阅；确定性全量/Web/native构建通过，native手工未执行 |
-| W10 | [文件基线](2026-10-04-wisp-w10-file-baselines.md) | 4 | 显式安全小本地文本immutable snapshot/有界diff | 进行中，Task1–3 DTO/Store/安全捕获/有界diff已审阅，UI待实施 |
+| W10 | [文件基线](2026-10-04-wisp-w10-file-baselines.md) | 4 | 显式安全小本地文本immutable snapshot/有界diff | 源码已完成并审阅，完整确定性检查已记录；原生手工验收未执行 |
 | W11 | [迁移预览](2026-10-04-wisp-w11-migration-preview.md) | 3 | 空默认选择、类别COUNT、文件状态/hash与rebind/omissions | 待实施 |
 | W12 | [会话可见性](2026-10-04-wisp-w12-conversation-visibility.md) | 4 | 持久可逆收起/恢复，分页前过滤，精确引用保持 | 待实施 |
 
@@ -82,7 +82,7 @@ W07只需W02 Task1叶子，不需要table/SSH界面；W10/W11只需W09 Task1的�
 - [x] 8. W07 Task1–4：marker事务、合成fixture、safeview、所有项目选择入口。
 - [x] 9. W08a Task1–3：五scenario manifest、控制行为、stable report/CI upload。
 - [x] 10. W09 Task1–4：基础DTO/context、readiness、post-dialog包、保存revisionUI。
-- [ ] 11. W10 Task1–4：immutableStore、safecontent/blob、diff、explicit选择UI。
+- [x] 11. W10 Task1–4：immutableStore、safecontent/blob、diff、explicit选择UI。
 - [ ] 12. W12 Task1–4：visibility/schema/CAS、discovery/directget、collection、banner/cache。
 - [ ] 13. W11 Task1–3：只读metadata、boundedfiles/digest、project-card预览。
 - [ ] 14. 全分支独立审阅和最终交付验证，修复任何未解决的范围/行为问题。
@@ -146,3 +146,5 @@ W06已实现：四任务源码独立审阅完成，最终UI提交 `d535b50`；�
 2026-10-13：W10 Task2 `f07d9a3` 安全捕获/blob/保存正文/删除清理及 `4a6eb14` 三项修复完成完整与定向独立审阅，累计41/50 SOURCE。敏感文件名在读取前降引用，V4历史引用严格校验类型/schema/有效性/producer状态，open-time SourceChanged整次拒绝；既有Unavailable仍为Unreadable。修复因果RED为纯策略0/1、capture15/2、Store0/2；最新capture17/pure5/saved4/Store11共37通过，fmt/diff及精确候选/逆向/replay/提交审计通过。原62是修复前历史检查，未变W02 handle16/table11/delete2沿用此前结果；完整/clean-HEAD/真实验收未完成。7外部RAW保留；六处working initializer中五处提交，一处外部测试内W10兼容initializer明确未暂存，与既有W04残留分开。diff/UI仍待Tasks3–4，不能称全部文件基线功能已交付。
 
 W10 Task3 已完成独立审阅：source 783ee03、fix1 e82aed0；FULL审阅指出失败读取未计预算，fresh scoped复核确认diff I1及同类capture C1均已解决且无新增阻断。两个消费者按opened size在读取前预留并传递精确payload额度，失败不返还，W02 EOF probe单独保留；额外保守省略/回归成本已记录。最新6项预算测试包含于baseline38项通过，fmt/diff通过；初始baseline32与DTO59为此前字节证据，DTO未在本轮重跑。实际RED宽filter为14通过/7失败，其中6预算因果失败、1既有毫秒排序fixture精度错误（仅修测试）。全请求work/序列化hunk预算、Unreadable余量不足与顺序非原子限制已同步；Task4 UI/完整交付检查尚待完成，GUI smoke仍未执行。累计42/50源码任务已独立审阅，不等于完整产品/真实环境验收。
+
+2026-10-14：W10 Task4 `5b4cc5a..19ac40d` 文件显式选择、可选已验证branch关联、窗口内稳定请求、保存正文和有界diff界面完成独立完整审阅，累计43/50 SOURCE。最终focused175、全量Vitest1363+Node22、Web通过；新原生恢复构建显式exit0/release5m27/NSIS1，前次相同最终源码构建成功输出但终态exit遗失，未冒充exit0。Rust1889通过/18ignored、Python48、fmt为相关未变字节的先前实际通过；候选/逆向/重放/提交后RAW11、外部7文件与两个兼容残留保留证明通过。三项非阻断Minor（JSX可读性、延迟diff/分页覆盖、构建警告）交最终全分支审阅。Windows手工smoke受用户STOP未执行，CI/真实SSH/模型/R/Micromamba/PBMC及最终clean-HEAD/整分支交付检查仍非本任务通过项。

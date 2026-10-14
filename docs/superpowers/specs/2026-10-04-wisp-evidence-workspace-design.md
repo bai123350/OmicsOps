@@ -383,7 +383,7 @@ blob 位于 `app_data_dir/workspace-file-baselines/<project_id>/sha256/<前两�
 
 初始化只增加 `CREATE TABLE/INDEX IF NOT EXISTS` 和验证，不重写 legacy `workspace_snapshots`、不更改 schema version 解释、不挪动已有项目根。重复打开/迁移无重复 rows；旧库没有新表时列表为空。
 
-UI 在现有文件侧栏提供多选后的“保存探索基线”；选择器从 `WorkspaceShell` 已绑定的backend与 `RemoteFileTree` 显式文件选择构造请求。当前会话属于现有分支时可由 `ConversationBranchBanner` 带明确branch ID打开同一选择器，不假设存在独立分支页。展示逐项TextSnapshot/reference-only和遗漏原因。保存成功显示捕获时间与“多文件依次读取”。基线列表、选择与diff为独立只读面板；没有执行、同步、恢复到原路径按钮。异步结果绑定project/baseline/generation；对话框进入窗口Escape栈，关闭不撤销已提交基线。
+UI 在现有文件侧栏提供多选后的“保存探索基线”；选择器从 `WorkspaceShell` 已绑定的backend与 `RemoteFileTree` 显式文件选择构造请求。当前会话属于现有分支时可由 `ConversationBranchBanner` 带明确branch ID打开同一选择器，不假设存在独立分支页。展示逐项TextSnapshot/reference-only和遗漏原因。保存成功显示捕获时间与“多文件依次读取”。基线列表、选择与diff为独立只读面板；没有执行、同步、恢复到原路径按钮。异步结果绑定project/baseline/generation；对话框进入窗口Escape栈，关闭不撤销已提交基线。WorkspaceShell按project/backend在窗口寿命内保留pending原请求与已知回执，通过可选prop交给面板；关闭不销毁未知request identity，不保留隐藏dialog/Escape层。代价是暂存原选择/请求metadata，不承诺跨重启持久化或跨窗口lease。返回原scope可显式重试同ID同正文，旧scope结果只能结清原record，不能覆盖新项目选择或后来打开的正文/diff。仅native创建返回SourceChanged或LimitExceeded时提供显式编辑/新请求入口且不自动派发，因为这两码发生在新基线提交前；其余码与本地错误响应仍保留原ID。InvalidSelection也可能来自已有receipt的manifest解析，不能把所有typed error视为未提交；代价是歧义错误下恢复保守。允许新请求不声称没有私有orphan blob。
 
 ### 验收、文件地图与依赖
 
