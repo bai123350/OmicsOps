@@ -39,7 +39,8 @@ function ShelvedCollection({ projectId, locale, onClose, onOpenConversation, onS
   const currentScope = useRef(scope); currentScope.current = scope;
   const generation = useRef(0);
   const closed = useRef(false);
-  const pending = useRef<string | null>(null);
+  const operationSequence = useRef(0);
+  const pending = useRef<{ scopeGeneration: number; operationId: number } | null>(null);
   const [page, setPage] = useState<ConversationVisibilityPageV1 | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -47,6 +48,7 @@ function ShelvedCollection({ projectId, locale, onClose, onOpenConversation, onS
   const validQuery = [...selection.query].length <= 200 && new TextEncoder().encode(selection.query).length <= 1024;
   useEffect(() => {
     const ticket = ++generation.current;
+    pending.current = null;
     setPage(null); setError(""); setBusy(null); setLoading(validQuery);
     if (!validQuery) return;
     void listConversationVisibility({ project_id: projectId, visibility: "shelved", query: selection.query, offset: selection.offset, limit: 50 }).then((value) => {
@@ -65,18 +67,21 @@ function ShelvedCollection({ projectId, locale, onClose, onOpenConversation, onS
   function refresh() { setSelection((value) => ({ ...value, offset: 0, refresh: value.refresh + 1 })); }
   function close() { closed.current = true; generation.current++; onClose(); }
   async function action(item: ConversationVisibilityListItemV1, restore: boolean) {
-    if (closed.current || pending.current === scope) return;
-    const actionScope = scope; pending.current = actionScope; setBusy(item.state.conversation_id); setError("");
+    if (closed.current || pending.current?.scopeGeneration === generation.current) return;
+    const operation = { scopeGeneration: generation.current, operationId: ++operationSequence.current };
+    pending.current = operation; setBusy(item.state.conversation_id); setError("");
+    // Query/page values can recur. Both the monotonic generation and this
+    // unique operation must still own the UI before any completion applies.
+    const isCurrentOperation = () => !closed.current && operation.scopeGeneration === generation.current && pending.current?.operationId === operation.operationId && scope === currentScope.current;
     try {
       if (restore) await onSetVisibility(item.state.conversation_id, "visible", item.state.revision);
       else await onOpenConversation(item.state.conversation_id);
       // Do not apply historical receipts to rows; requery the first current page.
-      if (restore && !closed.current && actionScope === currentScope.current) refresh();
+      if (restore && isCurrentOperation()) refresh();
     } catch (cause) {
-      if (!closed.current && actionScope === currentScope.current) setError(safeError(cause, zh));
+      if (isCurrentOperation()) setError(safeError(cause, zh));
     } finally {
-      if (pending.current === actionScope) pending.current = null;
-      if (!closed.current && actionScope === currentScope.current) setBusy(null);
+      if (isCurrentOperation()) { pending.current = null; setBusy(null); }
     }
   }
   const queryError = validQuery ? "" : zh ? "搜索最多 200 个字符 / 1 KiB。" : "Search is limited to 200 characters / 1 KiB.";

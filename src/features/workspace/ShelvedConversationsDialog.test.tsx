@@ -9,7 +9,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const row = (id: string, revision = 1, projectId = "p") => ({ state: { project_id: projectId, conversation_id: id, visibility: "shelved", revision, changed_at: null }, title: "Same title", conversation_status: "running", conversation_created_at: "2026-10-04T00:00:00Z", conversation_updated_at: "2026-10-04T00:00:00Z" });
 const page = (id: string, next: number | null = null, projectId = "p") => ({ items: [row(id, 1, projectId)], next_offset: next });
 const props = () => ({ projectId: "p", locale: "en-US" as const, onClose: vi.fn(), onOpenConversation: vi.fn(), onSetVisibility: vi.fn().mockResolvedValue(undefined) });
-function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>((done) => { resolve = done; }); return { promise, resolve }; }
+function deferred<T>() { let resolve!: (value: T) => void; let reject!: (cause: unknown) => void; const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; }); return { promise, resolve, reject }; }
 beforeEach(() => { vi.mocked(invoke).mockReset(); Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} }); });
 
 it("visibility_dialog_query_and_page resets refresh and restore to page zero using row ID/revision", async () => {
@@ -100,4 +100,51 @@ it("does not refresh a new query when an old restore finishes", async () => {
   await screen.findByText("restore-old"); fireEvent.click(screen.getByRole("button", { name: "Restore" }));
   fireEvent.change(screen.getByRole("textbox", { name: "Search shelved conversations" }), { target: { value: "new" } }); await screen.findByText("new-query");
   await act(async () => pending.resolve()); expect(invoke).toHaveBeenCalledTimes(2); expect(screen.getByText("new-query")).toBeVisible();
+});
+
+async function changeRecurrenceScope(mode: "query" | "page", away: boolean, expectedId: string) {
+  if (mode === "query") fireEvent.change(screen.getByRole("textbox", { name: "Search shelved conversations" }), { target: { value: away ? "B" : "" } });
+  else fireEvent.click(screen.getByRole("button", { name: away ? "Next page" : "Previous page" }));
+  await screen.findByText(expectedId);
+}
+
+it.each([
+  ["query", "success"], ["query", "error"], ["page", "success"], ["page", "error"],
+] as const)("discards stale %s recurrence restore %s", async (mode, outcome) => {
+  vi.mocked(invoke).mockResolvedValueOnce(page("first-A", 50)).mockResolvedValueOnce(page("B", 100)).mockResolvedValueOnce(page("returned-A", 50)).mockResolvedValue(page("unexpected-refresh"));
+  const old = deferred<void>(); const callbacks = { ...props(), onSetVisibility: vi.fn(() => old.promise) };
+  render(<ShelvedConversationsDialog {...callbacks} />); await screen.findByText("first-A");
+  fireEvent.click(screen.getByRole("button", { name: "Restore" })); expect(callbacks.onSetVisibility).toHaveBeenCalledWith("first-A", "visible", 1);
+  await changeRecurrenceScope(mode, true, "B"); await changeRecurrenceScope(mode, false, "returned-A");
+  expect(invoke).toHaveBeenCalledTimes(3);
+  await act(async () => { if (outcome === "success") old.resolve(); else old.reject({ code: "revision_conflict" }); });
+  expect(invoke).toHaveBeenCalledTimes(3); expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(screen.getByText("returned-A")).toBeVisible(); expect(screen.getByRole("button", { name: "Restore" })).toBeEnabled();
+});
+
+it.each(["query", "page"] as const)("allows a new restore after %s recurrence while the old restore is pending", async (mode) => {
+  vi.mocked(invoke).mockResolvedValueOnce(page("first-A", 50)).mockResolvedValueOnce(page("B", 100)).mockResolvedValueOnce(page("returned-A", 50));
+  const old = deferred<void>(); const newer = deferred<void>(); const callbacks = { ...props(), onSetVisibility: vi.fn().mockReturnValueOnce(old.promise).mockReturnValueOnce(newer.promise) };
+  render(<ShelvedConversationsDialog {...callbacks} />); await screen.findByText("first-A"); fireEvent.click(screen.getByRole("button", { name: "Restore" }));
+  await changeRecurrenceScope(mode, true, "B"); await changeRecurrenceScope(mode, false, "returned-A");
+  fireEvent.click(screen.getByRole("button", { name: "Restore" }));
+  expect(callbacks.onSetVisibility).toHaveBeenCalledTimes(2); expect(callbacks.onSetVisibility).toHaveBeenLastCalledWith("returned-A", "visible", 1);
+  expect(screen.getByRole("button", { name: "Open" })).toBeDisabled();
+});
+
+it.each(["query", "page"] as const)("old %s recurrence completion cannot clear a newer pending restore", async (mode) => {
+  vi.mocked(invoke).mockResolvedValueOnce(page("first-A", 50)).mockResolvedValueOnce(page("B", 100)).mockResolvedValueOnce(page("returned-A", 50)).mockResolvedValueOnce(page("confirmed-current"));
+  const old = deferred<void>(); const middle = deferred<void>(); const newer = deferred<void>();
+  const callbacks = { ...props(), onSetVisibility: vi.fn().mockReturnValueOnce(old.promise).mockReturnValueOnce(middle.promise).mockReturnValueOnce(newer.promise) };
+  render(<ShelvedConversationsDialog {...callbacks} />); await screen.findByText("first-A"); fireEvent.click(screen.getByRole("button", { name: "Restore" }));
+  await changeRecurrenceScope(mode, true, "B"); fireEvent.click(screen.getByRole("button", { name: "Restore" }));
+  await changeRecurrenceScope(mode, false, "returned-A"); fireEvent.click(screen.getByRole("button", { name: "Restore" }));
+  expect(callbacks.onSetVisibility).toHaveBeenCalledTimes(3); expect(screen.getByRole("button", { name: "Open" })).toBeDisabled();
+  await act(async () => old.resolve());
+  expect(invoke).toHaveBeenCalledTimes(3); expect(screen.getByRole("button", { name: "Open" })).toBeDisabled(); expect(screen.getByRole("button", { name: "Working…" })).toBeDisabled();
+  await act(async () => middle.reject({ code: "not_found" }));
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument(); expect(screen.getByRole("button", { name: "Open" })).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "Working…" })); expect(callbacks.onSetVisibility).toHaveBeenCalledTimes(3);
+  await act(async () => newer.resolve()); await screen.findByText("confirmed-current");
+  expect(invoke).toHaveBeenCalledTimes(4); expect(screen.getByRole("button", { name: "Restore" })).toBeEnabled();
 });
