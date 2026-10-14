@@ -105,6 +105,7 @@ pub use workspace_file_baselines::{
 };
 pub mod workspace_journey;
 pub mod workspace_navigation;
+mod workspace_conversation_visibility;
 pub use usage::{
     UsageConversationEventPage, UsageConversationEventSet, UsageEventPage, UsageEventRow,
     UsageEventRun, UsageSnapshotBoundary,

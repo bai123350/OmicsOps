@@ -78,6 +78,21 @@ CREATE TABLE IF NOT EXISTS conversation_records (
     updated_at INTEGER NOT NULL
 );
 
+-- The composite owner key must exist before the visibility child table.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_records_frame_project
+    ON conversation_records(frame_id, project_id);
+CREATE TABLE IF NOT EXISTS conversation_visibility_v4 (
+    conversation_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    visibility TEXT NOT NULL CHECK (visibility IN ('visible','shelved')),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    changed_at INTEGER NOT NULL,
+    FOREIGN KEY (conversation_id,project_id)
+        REFERENCES conversation_records(frame_id,project_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_conversation_visibility_project
+    ON conversation_visibility_v4(project_id,visibility,conversation_id);
+
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY CHECK (length(trim(id)) > 0),
     frame_id TEXT NOT NULL REFERENCES frames(id) ON DELETE CASCADE,

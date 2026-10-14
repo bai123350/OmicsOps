@@ -1781,3 +1781,65 @@ fn publication_reference_package_contract_has_explicit_hash_and_file_scopes() {
     destination["path"] = json!("C:\\client-selected.zip");
     assert!(serde_json::from_value::<PublicationSelectionV1>(destination).is_err());
 }
+
+#[test]
+fn conversation_visibility_contracts() {
+    use omicsops_dto::*;
+    let state = json!({"project_id":uuid::Uuid::from_u128(1),"conversation_id":uuid::Uuid::from_u128(2),"visibility":"visible","revision":0,"changed_at":null});
+    let parsed: ConversationVisibilityRecordV1 = serde_json::from_value(state.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), state);
+    let request = json!({"request_id":uuid::Uuid::from_u128(3),"project_id":uuid::Uuid::from_u128(1),"conversation_id":uuid::Uuid::from_u128(2),"expected_revision":0,"visibility":"shelved"});
+    let parsed: SetConversationVisibilityRequestV1 =
+        serde_json::from_value(request.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+    let mut unknown = request.clone();
+    unknown["cancel_run"] = json!(true);
+    assert!(serde_json::from_value::<SetConversationVisibilityRequestV1>(unknown).is_err());
+    let mut invalid = request;
+    invalid["visibility"] = json!("archived");
+    assert!(serde_json::from_value::<SetConversationVisibilityRequestV1>(invalid).is_err());
+    let list = json!({"project_id":uuid::Uuid::from_u128(1),"visibility":"all","query":"","offset":0,"limit":50});
+    let parsed: ConversationVisibilityListRequestV1 = serde_json::from_value(list.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), list);
+    let receipt = json!({"request_id":uuid::Uuid::from_u128(3),"state":state,"changed":false});
+    let parsed: ConversationVisibilityReceiptV1 = serde_json::from_value(receipt.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), receipt);
+    let page = json!({"items":[],"next_offset":null});
+    let parsed: ConversationVisibilityPageV1 = serde_json::from_value(page.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), page);
+    for code in [
+        "invalid_input",
+        "not_found",
+        "ownership_mismatch",
+        "revision_conflict",
+        "request_conflict",
+        "storage_failed",
+    ] {
+        let value = json!({"code":code,"message":"safe reason"});
+        let parsed: ConversationVisibilityErrorV1 = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+    }
+}
+
+#[test]
+fn conversation_visibility_nullable_fields_unknown_fields_and_unsigned_revisions() {
+    use omicsops_dto::*;
+    let state = json!({"project_id":uuid::Uuid::from_u128(1),"conversation_id":uuid::Uuid::from_u128(2),"visibility":"shelved","revision":4_294_967_297_u64,"changed_at":"2026-10-14T00:00:00Z"});
+    let parsed: ConversationVisibilityRecordV1 = serde_json::from_value(state.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), state);
+    let mut negative = state.clone();
+    negative["revision"] = json!(-1);
+    assert!(serde_json::from_value::<ConversationVisibilityRecordV1>(negative).is_err());
+    let mut missing = state.clone();
+    missing.as_object_mut().unwrap().remove("revision");
+    assert!(serde_json::from_value::<ConversationVisibilityRecordV1>(missing).is_err());
+    let item = json!({"state":state,"title":"public title","conversation_status":"archived","conversation_created_at":"2026-10-14T00:00:00Z","conversation_updated_at":"2026-10-14T00:00:00Z"});
+    let parsed: ConversationVisibilityListItemV1 = serde_json::from_value(item.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), item);
+    let mut forged = item;
+    forged["model_profile_id"] = json!(uuid::Uuid::nil());
+    assert!(serde_json::from_value::<ConversationVisibilityListItemV1>(forged).is_err());
+    let mut list = json!({"project_id":uuid::Uuid::nil(),"visibility":"visible","query":"","offset":0,"limit":50});
+    list["run_id"] = json!(uuid::Uuid::nil());
+    assert!(serde_json::from_value::<ConversationVisibilityListRequestV1>(list).is_err());
+}

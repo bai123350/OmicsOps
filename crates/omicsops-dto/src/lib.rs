@@ -685,3 +685,6 @@ pub use offline_example_workspace::{
     OfflineExampleFileAvailability, OfflineExampleFileView, OfflineExampleSourceKind,
     OfflineExampleText, OfflineExampleUnavailableReason, OfflineExampleWorkspaceView,
 };
+
+mod conversation_visibility;
+pub use conversation_visibility::*;
