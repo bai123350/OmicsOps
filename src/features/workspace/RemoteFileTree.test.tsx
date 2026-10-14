@@ -10,6 +10,18 @@ const files = [
   { relative_path: "README.md", directory: false, size_bytes: 512, modified_unix_seconds: 0 },
 ];
 
+it("selects only explicit baseline file leaves without attachment, transfer or directory selection", () => {
+  const select = vi.fn(); const attach = vi.fn(); const download = vi.fn();
+  render(<RemoteFileTree locale="en-US" remoteFiles={files} busy={false} onToggleBaselineFile={select} baselineSelectedPaths={["README.md"]} onAttach={attach} onDownload={download} />);
+  expect(screen.getByRole("checkbox", { name: "Select for baseline README.md" })).toBeChecked();
+  expect(screen.queryByRole("checkbox", { name: "Select for baseline src" })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("treeitem", { name: "Expand folder：src" }));
+  expect(select).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("checkbox", { name: "Select for baseline src/scanpy_workflow_v3.py" }));
+  expect(select).toHaveBeenCalledWith("src/scanpy_workflow_v3.py");
+  expect(attach).not.toHaveBeenCalled(); expect(download).not.toHaveBeenCalled();
+});
+
 it("routes only CSV and TSV preview actions to the table while keeping text, attachment and drag separate", () => {
   const onPreviewTable = vi.fn(); const onPreviewText = vi.fn(); const onAttach = vi.fn();
   const reference = { kind: "workspace_file" as const, project_id: "p", backend_id: "ssh:c", relative_path: "data/A.CSV" };

@@ -1,0 +1,8 @@
+.file-baselines-backdrop,.file-baselines-child{position:fixed;inset:0;z-index:1080;display:grid;place-items:center;padding:24px;background:#10182866}
+.file-baselines-panel{background:var(--omicsops-surface,#fff);color:var(--omicsops-text,#172033);border:1px solid var(--omicsops-border,#d6d3cd);border-radius:16px;box-shadow:0 20px 80px #10182833;width:min(900px,100%);max-height:90vh;overflow:auto;padding:22px;overflow-wrap:anywhere}
+.file-baselines-panel header,.file-baselines-actions{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.file-baselines-panel h2{margin:0;font-size:20px}.file-baselines-panel p,.file-baselines-panel small{font-size:13px;line-height:1.5}
+.file-baselines-panel button,.file-baselines-panel input:not([type=checkbox]){padding:8px 12px;border:1px solid var(--omicsops-border,#d6d3cd);border-radius:8px;background:var(--omicsops-surface,#fff);color:inherit;font:inherit}
+.file-baselines-panel label{display:block;margin:12px 0}.file-baselines-panel label input:not([type=checkbox]){display:block;width:100%;box-sizing:border-box;margin-top:6px}.file-baselines-panel [role=alert]{color:#a32626}
+.file-baselines-panel article{border-top:1px solid var(--omicsops-border,#d6d3cd);padding:14px 0}.file-baselines-list{padding:0;list-style:none}.file-baselines-list li{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:8px 0}
+.file-baselines-panel pre{white-space:pre-wrap;overflow:auto;border:1px solid var(--omicsops-border,#d6d3cd);border-radius:8px;padding:12px;font-size:13px}.baseline-line-added{background:#e7f4e8;color:#175b27}.baseline-line-removed{background:#fdecec;color:#8a2424}

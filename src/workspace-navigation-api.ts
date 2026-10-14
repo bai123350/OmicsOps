@@ -1,8 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { CreateFileBaselineRequestV1, ListFileBaselinesRequestV1, DiffFileBaselineRequestV1, ReadBaselineTextRequestV1, BaselineTextSnapshotV1, FileBaselineV1, FileBaselinePageV1, FileBaselineDiffV1 } from "./workspace-navigation-types";
 import type { PublicationSelectionV1, PublicationReadinessReportV1, PublicationPackageExportResultV1 } from "./workspace-navigation-types";
 import type { ConversationGroup, ConversationGroupState, JourneyPage, LibraryDetail, LibraryPage, MoveConversationsRequest, PublicationDetail, PublicationSummary, RestoreWorkspacePublicationRequest, SaveConversationGroupRequest, SaveWorkspaceLibraryItemRequest, SaveWorkspacePublicationRequest, WorkspaceJourneyRequest, WorkspaceLibraryRequest, WorkspaceSourceRef, WorkspaceSourceSnapshot } from "./workspace-navigation-types";
 
 export function isWorkspaceDesktopHost() { return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window; }
+export const createWorkspaceFileBaseline = (request: CreateFileBaselineRequestV1): Promise<FileBaselineV1> => host<FileBaselineV1>("workspace_create_file_baseline", { request });
+export const listWorkspaceFileBaselines = (request: ListFileBaselinesRequestV1): Promise<FileBaselinePageV1> => host<FileBaselinePageV1>("workspace_list_file_baselines", { request });
+export const getWorkspaceFileBaseline = (projectId: string, baselineId: string): Promise<FileBaselineV1> => host<FileBaselineV1>("workspace_get_file_baseline", { projectId, baselineId });
+export const readWorkspaceBaselineText = (request: ReadBaselineTextRequestV1): Promise<BaselineTextSnapshotV1> => host<BaselineTextSnapshotV1>("workspace_read_baseline_text", { request });
+export const diffWorkspaceFileBaseline = (request: DiffFileBaselineRequestV1): Promise<FileBaselineDiffV1> => host<FileBaselineDiffV1>("workspace_diff_file_baseline", { request });
 async function host<T>(command: string, args: Record<string, unknown>): Promise<T> {
   if (!isWorkspaceDesktopHost()) throw new Error("This action requires the desktop app.");
   return invoke<T>(command, args);

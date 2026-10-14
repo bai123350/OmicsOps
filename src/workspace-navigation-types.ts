@@ -33,6 +33,28 @@ export interface PublicationReadinessReportV1 {
 export interface PublicationPackageExportResultV1 { path: string; package_sha256: string; size_bytes: number; manifest_sha256: string; selection: PublicationSelectionV1 }
 export type PublicationEvidenceErrorCodeV1 = "invalid_selection" | "not_found" | "revision_changed" | "limit_exceeded" | "unsafe_public_content" | "storage_read_failed" | "export_write_failed";
 export interface PublicationEvidenceErrorV1 { code: PublicationEvidenceErrorCodeV1; message: string }
+// Serde wire shapes from omicsops-dto/src/workspace_files.rs. Unknowns stay null.
+export interface ProjectFileSelectionV1 { backend_id: string; relative_path: string; expected_full_sha256: string | null }
+export type WorkspaceContentModeV1 = "text_snapshot" | "reference_only";
+export type FileReferenceHashScopeV1 = "full_file" | "recorded_file";
+export interface FileReferenceHashV1 { sha256: string; scope: FileReferenceHashScopeV1 }
+export interface CreateFileBaselineRequestV1 { request_id: string; project_id: string; branch_conversation_id: string | null; title: string; files: ProjectFileSelectionV1[] }
+export interface ListFileBaselinesRequestV1 { project_id: string; branch_conversation_id: string | null; offset: number; limit: number }
+export interface DiffFileBaselineRequestV1 { project_id: string; baseline_id: string; expected_manifest_sha256: string }
+export interface ReadBaselineTextRequestV1 extends DiffFileBaselineRequestV1 { entry_index: number }
+export interface BaselineTextSnapshotV1 { project_id: string; baseline_id: string; entry_index: number; relative_path: string; full_sha256: string; text: string }
+export type BaselineOmissionCodeV1 = "remote_reference" | "too_large" | "unsupported_content" | "sensitive_content" | "missing" | "unreadable" | "unsafe_file" | "aggregate_budget";
+export interface FileBaselineEntryV1 { backend_id: string; relative_path: string | null; content_mode: WorkspaceContentModeV1; size_bytes: number | null; hash: FileReferenceHashV1 | null; omission: BaselineOmissionCodeV1 | null; captured_at: string }
+export interface FileBaselineV1 { schema_version: number; id: string; project_id: string; branch_conversation_id: string | null; title: string; entries: FileBaselineEntryV1[]; manifest_sha256: string; captured_text_bytes: number; created_at: string }
+export interface FileBaselinePageV1 { items: FileBaselineV1[]; next_offset: number | null }
+export type BaselineDiffStateV1 = "unchanged" | "changed" | "missing" | "unreadable" | "unsafe_file" | "reference_only" | "binding_changed" | "current_too_large" | "sensitive_current_content";
+export type BaselineDiffLineKindV1 = "context" | "added" | "removed";
+export interface BaselineDiffLineV1 { kind: BaselineDiffLineKindV1; text: string }
+export interface BaselineTextHunkV1 { old_start: number; old_lines: number; new_start: number; new_lines: number; lines: BaselineDiffLineV1[] }
+export interface FileBaselineDiffEntryV1 { baseline: FileBaselineEntryV1; state: BaselineDiffStateV1; current_size_bytes: number | null; current_hash: FileReferenceHashV1 | null; line_endings_changed: boolean | null; final_newline_changed: boolean | null; hunks: BaselineTextHunkV1[]; hunks_truncated: boolean }
+export interface FileBaselineDiffV1 { project_id: string; baseline_id: string; manifest_sha256: string; observed_at: string; entries: FileBaselineDiffEntryV1[] }
+export type FileBaselineErrorCodeV1 = "invalid_selection" | "not_found" | "ownership_mismatch" | "request_conflict" | "source_changed" | "manifest_changed" | "limit_exceeded" | "storage_failed";
+export interface FileBaselineErrorV1 { code: FileBaselineErrorCodeV1; message: string }
 export type LibraryKind = "code" | "excerpt" | "artifact";
 export interface LibrarySummary { id: string; kind: LibraryKind; title: string; source_project_id: string; source_project_name: string; source_conversation_id: string | null; source_conversation_title: string | null; text_preview: string; created_at: string }
 export interface LibraryDetail { item: LibrarySummary; snapshot: WorkspaceSourceSnapshot }

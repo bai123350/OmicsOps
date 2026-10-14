@@ -12,6 +12,8 @@ import * as remoteJobApi from "../../remote-job-api";
 import { WorkspaceShell } from "./WorkspaceShell";
 import { ComposerDraftStore } from "./composerDrafts";
 import * as branchApi from "../../conversation-branch-api";
+import * as baselineApi from "../../workspace-navigation-api";
+import * as composerFilesApi from "../../composer-file-api";
 import { SettingsPanel } from "../settings/SettingsPanel";
 import { setComposerSendPreference } from "../settings/useComposerSendPreference";
 import { setSelectionActionsEnabled } from "../../use-general-preferences";
@@ -71,6 +73,69 @@ function deferred<T>() {
   });
   return { promise, resolve, reject };
 }
+
+async function openBaselineFiles() {
+  fireEvent.click(screen.getByRole("button", { name: "Add context or choose mode" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: /Browse project files/ }));
+  await screen.findByRole("tree", { name: "Remote project files" });
+}
+it("integrates explicit tree selection and same-request baseline retry across close and backend change", async () => {
+  const create = vi.spyOn(baselineApi, "createWorkspaceFileBaseline").mockRejectedValueOnce({ code: "storage_failed", message: "unknown receipt" });
+  vi.spyOn(baselineApi, "listWorkspaceFileBaselines").mockResolvedValue({ items: [], next_offset: null });
+  const download = vi.fn();
+  render(<WorkspaceShell project={{ ...project, connection_id: "c" }} locale="en-US" remoteFiles={[{ relative_path: "my script.py", directory: false, size_bytes: 12, modified_unix_seconds: 0 }]} onDownloadFile={download} />);
+  await openBaselineFiles(); fireEvent.click(screen.getByRole("checkbox", { name: "Select for baseline my script.py" }));
+  fireEvent.click(screen.getByRole("button", { name: "File baselines (1)" })); fireEvent.click(screen.getByRole("button", { name: "Save baseline" }));
+  await screen.findByRole("button", { name: "Retry same request" }); const original = create.mock.calls[0][0];
+  expect(original.files).toEqual([{ backend_id: "ssh:c", relative_path: "my script.py", expected_full_sha256: null }]); expect(original.branch_conversation_id).toBeNull(); expect(download).not.toHaveBeenCalled();
+  fireEvent.keyDown(window, { key: "Escape" }); expect(screen.queryByRole("dialog", { name: "File baselines" })).not.toBeInTheDocument(); expect(screen.getByRole("complementary")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Local" })); fireEvent.click(screen.getByRole("button", { name: "File baselines (0)" })); expect(screen.queryByRole("button", { name: "Retry same request" })).not.toBeInTheDocument();
+  fireEvent.keyDown(window, { key: "Escape" }); fireEvent.click(screen.getByRole("button", { name: "SSH" })); fireEvent.click(screen.getByRole("button", { name: "File baselines (1)" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Retry same request" })); await waitFor(() => expect(create).toHaveBeenCalledTimes(2)); expect(create.mock.calls[1][0]).toEqual(original);
+});
+
+it("settles a closed baseline request in its original project without clearing another project's files", async () => {
+  const pending = deferred<import("../../workspace-navigation-types").FileBaselineV1>(); const create = vi.spyOn(baselineApi, "createWorkspaceFileBaseline").mockReturnValue(pending.promise);
+  vi.spyOn(baselineApi, "listWorkspaceFileBaselines").mockResolvedValue({ items: [], next_offset: null });
+  const file = { relative_path: "x.txt", directory: false, size_bytes: 1, modified_unix_seconds: 0 };
+  const view = render(<WorkspaceShell project={{ ...project, connection_id: "c" }} locale="en-US" remoteFiles={[file]} />);
+  await openBaselineFiles(); fireEvent.click(screen.getByRole("checkbox", { name: "Select for baseline x.txt" })); fireEvent.click(screen.getByRole("button", { name: "File baselines (1)" })); fireEvent.click(screen.getByRole("button", { name: "Save baseline" }));
+  const request = create.mock.calls[0][0]; fireEvent.keyDown(window, { key: "Escape" });
+  view.rerender(<WorkspaceShell project={{ ...project, id: "other", connection_id: "c" }} locale="en-US" remoteFiles={[file]} />);
+  fireEvent.click(screen.getByRole("checkbox", { name: "Select for baseline x.txt" }));
+  await act(async () => pending.resolve({ schema_version: 1, id: "b", project_id: project.id, branch_conversation_id: null, title: request.title, entries: [], manifest_sha256: "a".repeat(64), captured_text_bytes: 0, created_at: "now" }));
+  expect(screen.getByRole("checkbox", { name: "Select for baseline x.txt" })).toBeChecked();
+  view.rerender(<WorkspaceShell project={{ ...project, connection_id: "c" }} locale="en-US" remoteFiles={[file]} />); fireEvent.click(screen.getByRole("button", { name: "File baselines (1)" })); await screen.findByText(/Saved baseline: /); expect(create).toHaveBeenCalledTimes(1);
+});
+
+it("keeps baseline text under a later real table dialog and closes only the visible top layer immediately", async () => {
+  const hash = "a".repeat(64);
+  const saved: import("../../workspace-navigation-types").FileBaselineV1 = { schema_version: 1, id: "b", project_id: project.id, branch_conversation_id: null, title: "Before", entries: [{ backend_id: "ssh:c", relative_path: "x.txt", content_mode: "text_snapshot", size_bytes: 1, hash: { scope: "full_file", sha256: hash }, omission: null, captured_at: "now" }], manifest_sha256: hash, captured_text_bytes: 1, created_at: "now" };
+  vi.spyOn(baselineApi, "listWorkspaceFileBaselines").mockResolvedValue({ items: [saved], next_offset: null }); vi.spyOn(baselineApi, "getWorkspaceFileBaseline").mockResolvedValue(saved);
+  const pending = deferred<import("../../workspace-navigation-types").BaselineTextSnapshotV1>(); vi.spyOn(baselineApi, "readWorkspaceBaselineText").mockReturnValue(pending.promise);
+  vi.spyOn(composerFilesApi, "previewProjectTable").mockRejectedValue("unavailable_backend");
+  render(<WorkspaceShell project={{ ...project, connection_id: "c" }} locale="en-US" remoteFiles={[{ relative_path: "x.txt", directory: false, size_bytes: 1, modified_unix_seconds: 0 }, { relative_path: "x.csv", directory: false, size_bytes: 1, modified_unix_seconds: 0 }]} />);
+  await openBaselineFiles(); fireEvent.click(screen.getByRole("button", { name: "File baselines (0)" })); fireEvent.click(await screen.findByRole("button", { name: "Open baseline Before" })); fireEvent.click(await screen.findByRole("button", { name: "View saved text x.txt" }));
+  fireEvent.click(screen.getByRole("button", { name: "Preview table x.csv" }));
+  expect(screen.getByRole("dialog", { name: "Preview table" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "File baselines (0)" })).toBeDisabled();
+  await act(async () => pending.resolve({ project_id: project.id, baseline_id: "b", entry_index: 0, relative_path: "x.txt", full_sha256: hash, text: "saved" }));
+  expect(screen.getByRole("dialog", { name: "Saved baseline text" })).toHaveTextContent("saved");
+  fireEvent.keyDown(window, { key: "Escape" }); expect(screen.queryByRole("dialog", { name: "Preview table" })).not.toBeInTheDocument(); expect(screen.getByRole("dialog", { name: "Saved baseline text" })).toBeInTheDocument();
+  fireEvent.keyDown(window, { key: "Escape" }); expect(screen.queryByRole("dialog", { name: "Saved baseline text" })).not.toBeInTheDocument(); expect(screen.getByRole("dialog", { name: "File baselines" })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Compare current files" })); expect(screen.getByRole("dialog", { name: "Baseline diff" })).toBeInTheDocument(); fireEvent.keyDown(window, { key: "Escape" }); expect(screen.queryByRole("dialog", { name: "Baseline diff" })).not.toBeInTheDocument(); expect(screen.getByRole("dialog", { name: "File baselines" })).toBeInTheDocument();
+});
+
+it("offers branch association only from the verified branch identity and preserves source navigation", async () => {
+  const verified: import("../../types").ConversationBranchV4 = { request_id: "r", branch_conversation_id: "branch", project_id: project.id, source_conversation_id: "source", source_message_id: "m", source_sequence: 1, source_head_sequence: 2, checkpoint_kind: "after_response", boundary_hash: "hash", request_hash: "hash", state: "active", created_at: "now", updated_at: "now" };
+  vi.spyOn(branchApi, "getConversationBranch").mockResolvedValueOnce({ ...verified, project_id: "wrong" }).mockResolvedValueOnce(verified);
+  vi.spyOn(baselineApi, "listWorkspaceFileBaselines").mockResolvedValue({ items: [], next_offset: null });
+  const onSelect = vi.fn(); const props = { project: { ...project, connection_id: "c" }, locale: "en-US" as const, onOpenBranch: vi.fn(), onSelectConversation: onSelect };
+  const view = render(<WorkspaceShell {...props} activeConversationId="wrong" />); await act(async () => {}); expect(screen.queryByRole("button", { name: "Branch file baselines" })).not.toBeInTheDocument();
+  view.rerender(<WorkspaceShell {...props} activeConversationId="branch" />); fireEvent.click(await screen.findByRole("button", { name: "Open source conversation" })); expect(onSelect).toHaveBeenCalledWith("source");
+  fireEvent.click(screen.getByRole("button", { name: "Branch file baselines" })); expect(screen.getByRole("checkbox", { name: "Associate verified branch" })).not.toBeChecked();
+  fireEvent.click(screen.getByRole("checkbox", { name: "Only verified branch baselines" })); await waitFor(() => expect(baselineApi.listWorkspaceFileBaselines).toHaveBeenLastCalledWith({ project_id: project.id, branch_conversation_id: "branch", offset: 0, limit: 20 }));
+});
 
 describe("WorkspaceShell", () => {
   it("keeps an uncancelled inspection visibly pending after reopening, then requires an explicit fresh query", async () => {

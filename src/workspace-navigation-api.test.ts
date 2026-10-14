@@ -5,6 +5,25 @@ import * as api from "./workspace-navigation-api";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 beforeEach(() => { vi.clearAllMocks(); (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {}; });
 
+it("uses the five exact baseline commands with native nullable request fields", async () => {
+  const create = { request_id: "r", project_id: "p", branch_conversation_id: null, title: "Before analysis", files: [{ backend_id: "local", relative_path: "my script.py", expected_full_sha256: null }] };
+  await api.createWorkspaceFileBaseline(create);
+  expect(invoke).toHaveBeenLastCalledWith("workspace_create_file_baseline", { request: create });
+  const list = { project_id: "p", branch_conversation_id: null, offset: 0, limit: 20 };
+  await api.listWorkspaceFileBaselines(list);
+  expect(invoke).toHaveBeenLastCalledWith("workspace_list_file_baselines", { request: list });
+  await api.getWorkspaceFileBaseline("p", "b");
+  expect(invoke).toHaveBeenLastCalledWith("workspace_get_file_baseline", { projectId: "p", baselineId: "b" });
+  const diff = { project_id: "p", baseline_id: "b", expected_manifest_sha256: "a".repeat(64) };
+  await api.diffWorkspaceFileBaseline(diff);
+  expect(invoke).toHaveBeenLastCalledWith("workspace_diff_file_baseline", { request: diff });
+  const read = { ...diff, entry_index: 0 };
+  await api.readWorkspaceBaselineText(read);
+  expect(invoke).toHaveBeenLastCalledWith("workspace_read_baseline_text", { request: read });
+  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  for (const call of [() => api.createWorkspaceFileBaseline(create), () => api.listWorkspaceFileBaselines(list), () => api.getWorkspaceFileBaseline("p", "b"), () => api.diffWorkspaceFileBaseline(diff), () => api.readWorkspaceBaselineText(read)]) await expect(call()).rejects.toThrow(/desktop/i);
+});
+
 it("keeps project ownership and stable write IDs in native requests", async () => {
   const request = { request_id: "r", project_id: "p", group_id: null, name: "RNA" };
   await api.saveConversationGroup(request);
