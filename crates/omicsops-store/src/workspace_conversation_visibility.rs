@@ -1,7 +1,7 @@
 //! Reversible project-owned presentation preferences and immutable request receipts.
 use crate::{Store, StoreError, conversation_from_row, from_timestamp, parse_uuid};
 use chrono::Utc;
-use omicsops_core::{redaction::redact_secrets, workspace::Conversation};
+use omicsops_core::{redaction::public_text, workspace::Conversation};
 use omicsops_dto::*;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqliteConnection, sqlite::SqliteRow};
@@ -74,12 +74,12 @@ impl Store {
             .map(|row| {
                 Ok((
                     row.try_get("frame_id")?,
-                    redact_secrets(row.try_get::<&str, _>("title")?, &[] as &[&str]),
+                    public_text(row.try_get::<&str, _>("title")?),
                 ))
             })
             .collect::<Result<_, StoreError>>()?;
-        // SQL uses only redacted titles. Searching a secret cannot disclose which
-        // conversation stored it, even indirectly through pagination/counts.
+        // SQL uses only the common public projection. Text removed by that
+        // projection cannot match a query or affect pagination/counts.
         let titles_json = serde_json::to_string(&public_titles)?;
         let rows=sqlx::query(&format!("WITH public_titles AS (SELECT json_extract(value,'$[0]') AS id,json_extract(value,'$[1]') AS title FROM json_each(?1))
             SELECT c.frame_id,c.project_id,v.visibility,v.revision,v.changed_at,p.title AS public_title,c.status,c.created_at,c.updated_at

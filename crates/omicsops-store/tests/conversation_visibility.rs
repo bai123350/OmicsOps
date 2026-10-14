@@ -713,3 +713,84 @@ async fn visibility_receipts_and_restored_row_survive_reopen() {
         s.pool().close().await;
     }
 }
+
+fn sensitive_public_title_fixtures() -> [(&'static str, &'static str); 8] {
+    [
+        (
+            "Public research password=fixture-password followup",
+            "fixture-password",
+        ),
+        (
+            "Public research access_token=fixture-access followup",
+            "fixture-access",
+        ),
+        (
+            "Public research token=fixture-token followup",
+            "fixture-token",
+        ),
+        (
+            "Public research passphrase=fixture-passphrase followup",
+            "fixture-passphrase",
+        ),
+        (
+            "Public research refresh_token=fixture-refresh followup",
+            "fixture-refresh",
+        ),
+        (
+            r#"Public research "password": "fixture-quoted with spaces" followup"#,
+            "fixture-quoted",
+        ),
+        (
+            r#"Public research authorization="fixture-auth with spaces" followup"#,
+            "fixture-auth",
+        ),
+        (
+            "Public research\n-----BEGIN RSA PRIVATE KEY-----\nfixture-pem-material\n-----END RSA PRIVATE KEY-----\nfollowup",
+            "fixture-pem-material",
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn visibility_public_title_removes_sensitive_assignments_quoted_values_and_pem() {
+    let (s, p, mut c) = fixture().await;
+    for (title, secret) in sensitive_public_title_fixtures() {
+        c.title = title.into();
+        s.save_conversation(&c).await.unwrap();
+        let mut request = list(p.id, ConversationVisibilityFilterV1::All);
+        request.query = "Public research".into();
+        let page = s
+            .workspace_list_conversation_visibility(&request)
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(page.items[0].title.contains("Public research"));
+        assert!(page.items[0].title.contains("followup"));
+        assert!(
+            !page.items[0].title.contains(secret),
+            "sensitive title value survived public projection"
+        );
+        assert!(page.items[0].title.contains("[REDACTED]"));
+        assert!(!page.items[0].title.contains("PRIVATE KEY"));
+    }
+}
+
+#[tokio::test]
+async fn visibility_public_title_query_cannot_discover_sensitive_assignments_or_pem_body() {
+    let (s, p, mut c) = fixture().await;
+    for (title, secret) in sensitive_public_title_fixtures() {
+        c.title = title.into();
+        s.save_conversation(&c).await.unwrap();
+        let mut request = list(p.id, ConversationVisibilityFilterV1::All);
+        request.query = secret.into();
+        let page = s
+            .workspace_list_conversation_visibility(&request)
+            .await
+            .unwrap();
+        assert!(
+            page.items.is_empty(),
+            "query matched a sensitive title value"
+        );
+        assert_eq!(page.next_offset, None);
+    }
+}
