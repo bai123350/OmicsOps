@@ -1,6 +1,6 @@
 # Wisp Science 可借鉴改进清单
 
-日期：2026-10-04。状态：用户已选择全部12项首次范围、确认具体设计及[实施总计划](../plans/2026-10-04-wisp-improvements.md)，并选择子Agent逐项实施与审阅。W01–W10及W12持久化/展示过滤/精确来源命令源码已实现并审阅通过（45/50任务），其余项继续实施；W07原生手工验收未执行，W06隔离旧HEAD原生验收仅部分通过；状态及实际检查见总计划。全部12项首次范围尚未交付。本文件保留源码对照，具体边界见[总设计](2026-10-04-wisp-improvements-design.md)。
+日期：2026-10-04。状态：用户已选择全部12项首次范围、确认具体设计及[实施总计划](../plans/2026-10-04-wisp-improvements.md)，并选择子Agent逐项实施与审阅。W01–W10及W12持久化/宿主命令/类型API与收起集合源码已实现并审阅通过（46/50任务），其余项继续实施；W07原生手工验收未执行，W06隔离旧HEAD原生验收仅部分通过；状态及实际检查见总计划。全部12项首次范围尚未交付。本文件保留源码对照，具体边界见[总设计](2026-10-04-wisp-improvements-design.md)。
 
 本轮建议先补会话草稿隔离，再分别交付科学产物预览和 SSH 后台作业面板。这三项直接改善日常研究操作，并能复用现有组件与运行身份。其余候选按依赖分批推进，优先保留 OmicsOps 已有的科研证据、审批与恢复契约。
 
@@ -185,6 +185,8 @@ P0 表示优先解决可能影响操作正确性的问题；P1 表示直接改�
 keyring 引用不等于可移植授权；资料中的提示词与路径也须按现有脱敏边界处理。云中继、常驻同步和跨设备活跃运行恢复另行评估。
 
 ## W12 收起和恢复会话
+
+**实施进度：**2026-10-15：W12 Task3 类型API/收起集合 source54a3318、fix4f788b1 已完成FULL及定向I1独立审阅，累计46/50。四个API保持精确载荷和历史receipt语义；集合按Shelved/default50分页，打开与恢复分离，使用行ID/revision，查询/刷新/恢复回首页与立即window Escape。FULL发现重复query/page A→B→A可复活旧action，八个真实递延回归先失败后修复，现以单调generation+唯一operation ID保护success/error/finally及新pending。最终API7+dialog17+overlays3共27项通过，noEmit/fmt/diff通过；先前19项是较早阶段，重复运行不累加。初始缺API/组件RED、Escape静态fixture13/14后改真实父层先开子层、locale TS2322九项修正均分别记录。source7/fix2候选/逆向/重放/提交后及protected7/两个兼容残留/外部差异/空index证明通过。UI拒绝超界next_offset并提示缩小搜索不等于修复native cursor Minor；应用整合、全量/clean HEAD与人工真实验收仍待Task4/最终阶段。
 
 **实施进度：**2026-10-15：W12 Task2 展示过滤/精确来源命令源码已独立审阅通过（source 8f20cc5 + separate fmt bd6a4ec；FULL spec compliant / quality Approved），累计45/50。四个宿主命令保持 Store-only，Visible 展示/用户消息时间排序与 ALL 精确引用分离，直接读取只投影安全标题而不写回；历史 receipt 与当前 getter 分离。最终新测试5、composer19、navigation11（35项独立覆盖），fmt/diff 通过。导航临时文件 persist 在 sandbox 内 OS5 失败，经同操作诊断与相同测试正常提权1/1、完整最近导航11/11通过；原失败保留，无导航代码修改。立即格式化前 RAW4 已捕获，feature4/format3 分别提交，protected7/外部差异/空 index 与 candidate/inverse/replay/postproof 通过。继承 SQL/DTO/CAS/脱敏约束由 Task1 FULL+scoped 闭合；M1缓存 hard-link 警告保留最终审阅，UI Tasks3–4、最终全量/clean HEAD及人工/真实验收尚未执行。
 

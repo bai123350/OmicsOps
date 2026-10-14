@@ -50,7 +50,7 @@
 | W09 | [稿件证据](2026-10-04-wisp-w09-publication-evidence.md) | 4 | 保存revision准备度与reference-only四entry证据ZIP | SOURCE完成并独立审阅；确定性全量/Web/native构建通过，native手工未执行 |
 | W10 | [文件基线](2026-10-04-wisp-w10-file-baselines.md) | 4 | 显式安全小本地文本immutable snapshot/有界diff | 源码已完成并审阅，完整确定性检查已记录；原生手工验收未执行 |
 | W11 | [迁移预览](2026-10-04-wisp-w11-migration-preview.md) | 3 | 空默认选择、类别COUNT、文件状态/hash与rebind/omissions | 待实施 |
-| W12 | [会话可见性](2026-10-04-wisp-w12-conversation-visibility.md) | 4 | 持久可逆收起/恢复，分页前过滤，精确引用保持 | 进行中，Task1–2 visibility持久化/展示过滤/精确来源命令已审阅，UI待实施 |
+| W12 | [会话可见性](2026-10-04-wisp-w12-conversation-visibility.md) | 4 | 持久可逆收起/恢复，分页前过滤，精确引用保持 | 进行中，Task1–3 持久化/宿主命令/类型API与收起集合已审阅，应用整合待实施 |
 
 W08只有两部分都通过才算完成。W02/W04两种worker/source的deterministic协议回归均必需，单独本地入口不满足范围；真实远端/模型验收独立记“未执行”时不冒充端到端通过。
 
@@ -152,3 +152,5 @@ W10 Task3 已完成独立审阅：source 783ee03、fix1 e82aed0；FULL审阅指�
 2026-10-15：W12 Task1 feature3809c25、独立格式提交8a47454及I1修复e4faae6完成完整与定向独立审阅，累计44/50 SOURCE。独立visibility表/DTO、exact owner getter、CAS和历史回执重放、分页前public-title查询及Visible latest已实现；旧ALL/内部latest不变，新默认latest按user时间的差异与O(全部合格标题字节)每页投影成本明确记录。I1发现core窄脱敏不等于native完整public_text，修复将原赋值/PEM纯算法共享到core并保留native原路径；实际修复RED2，最终Store14/core4/native19共37通过，fmt/diff通过。最初Store12/DTO2/latest6/branches9为此前阶段；compile RED67/8错误零执行、后置mutation1失败与真实修复RED分别保留，不混称。预格式候选仅按留存diff重建、不冒充曾捕获RAW；source7/fmt1/fix4及protected7/两个兼容残留审计通过。next_offset越界与缓存警告Minor交最终审阅；宿主/UI、全量/clean-HEAD/native手工及真实验收仍待后续。
 
 2026-10-15：W12 Task2 展示过滤/精确来源命令源码已独立审阅通过（source 8f20cc5 + separate fmt bd6a4ec；FULL spec compliant / quality Approved），累计45/50。四个宿主命令保持 Store-only，Visible 展示/用户消息时间排序与 ALL 精确引用分离，直接读取只投影安全标题而不写回；历史 receipt 与当前 getter 分离。最终新测试5、composer19、navigation11（35项独立覆盖），fmt/diff 通过。导航临时文件 persist 在 sandbox 内 OS5 失败，经同操作诊断与相同测试正常提权1/1、完整最近导航11/11通过；原失败保留，无导航代码修改。立即格式化前 RAW4 已捕获，feature4/format3 分别提交，protected7/外部差异/空 index 与 candidate/inverse/replay/postproof 通过。继承 SQL/DTO/CAS/脱敏约束由 Task1 FULL+scoped 闭合；M1缓存 hard-link 警告保留最终审阅，UI Tasks3–4、最终全量/clean HEAD及人工/真实验收尚未执行。
+
+2026-10-15：W12 Task3 类型API/收起集合 source54a3318、fix4f788b1 已完成FULL及定向I1独立审阅，累计46/50。四个API保持精确载荷和历史receipt语义；集合按Shelved/default50分页，打开与恢复分离，使用行ID/revision，查询/刷新/恢复回首页与立即window Escape。FULL发现重复query/page A→B→A可复活旧action，八个真实递延回归先失败后修复，现以单调generation+唯一operation ID保护success/error/finally及新pending。最终API7+dialog17+overlays3共27项通过，noEmit/fmt/diff通过；先前19项是较早阶段，重复运行不累加。初始缺API/组件RED、Escape静态fixture13/14后改真实父层先开子层、locale TS2322九项修正均分别记录。source7/fix2候选/逆向/重放/提交后及protected7/两个兼容残留/外部差异/空index证明通过。UI拒绝超界next_offset并提示缩小搜索不等于修复native cursor Minor；应用整合、全量/clean HEAD与人工真实验收仍待Task4/最终阶段。
