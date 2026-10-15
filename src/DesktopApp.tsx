@@ -135,6 +135,9 @@ export default function DesktopApp() {
     const generation = ++projectOpenGeneration.current;
     const searchGeneration = searchOpenRef.current ? searchActionGeneration.current : null;
     const settingsGeneration = settingsOpenRef.current ? usageOpenGeneration.current : null;
+    const listGeneration = visibleListGeneration.current;
+    const visibilityGeneration = visibilityReadGeneration.current;
+    const activeVisibilityGeneration = activeVisibilityReadGeneration.current;
     const sourceConversationId = currentConversationIdentity.current.conversationId;
     const current = () => generation === projectOpenGeneration.current
       && (searchGeneration === null || searchGeneration === searchActionGeneration.current)
@@ -175,7 +178,13 @@ export default function DesktopApp() {
       offlineExampleProjectId.current = null;
       if (selected?.id === project.id) {
         setSelected(project);
-        if (target) { publishVisibleConversations(available!); setActiveConversationVisibility(targetVisibility!); activateConversation(target); }
+        if (target) {
+          if (listGeneration === visibleListGeneration.current && visibilityGeneration === visibilityReadGeneration.current
+            && activeVisibilityGeneration === activeVisibilityReadGeneration.current) {
+            publishVisibleConversations(available!); publishActiveVisibility(targetVisibility!);
+          }
+          activateConversation(target);
+        }
       } else {
         requestedConversation.current = target ? { projectId: project.id, conversationId: target.id } : null;
         setSelected(project);
@@ -219,6 +228,11 @@ export default function DesktopApp() {
   const [, refreshPendingVisibility] = useState(0);
   const visibilityOperations = useRef(new Map<string, object>());
   const visibilityReadGeneration = useRef(0);
+  const activeVisibilityReadGeneration = useRef(0);
+  function publishActiveVisibility(state: ConversationVisibilityRecordV1) {
+    activeVisibilityReadGeneration.current += 1;
+    setActiveConversationVisibility(state);
+  }
   const [conversationMode, setConversationMode] = useState<SessionAgentModeV4>("agent");
   const [conversationState, setConversationState] = useState<ConversationAgentStateV4 | null>(null);
   const [messageSequence, setMessageSequence] = useState(1);
@@ -310,12 +324,13 @@ export default function DesktopApp() {
   useEffect(() => { setShelvedOpen(false); }, [selected?.id]);
   useEffect(() => {
     let disposed = false;
-    const generation = ++visibilityReadGeneration.current;
+    visibilityReadGeneration.current += 1;
+    const generation = ++activeVisibilityReadGeneration.current;
     const projectId = selected?.id;
     const conversationId = conversation?.id;
     setActiveConversationVisibility(null);
     if (projectId && conversationId) void api.getConversationVisibility(projectId, conversationId).then((state) => {
-      if (!disposed && generation === visibilityReadGeneration.current && state.project_id === projectId && state.conversation_id === conversationId) setActiveConversationVisibility(state);
+      if (!disposed && generation === activeVisibilityReadGeneration.current && state.project_id === projectId && state.conversation_id === conversationId) publishActiveVisibility(state);
     }).catch(() => { /* Exact read failure cannot imply Visible or mutate the session. */ });
     return () => { disposed = true; };
   }, [selected?.id, conversation?.id]);
@@ -352,7 +367,7 @@ export default function DesktopApp() {
             const [state, items] = await Promise.all([api.getConversationVisibility(projectId, id), api.listConversations(projectId)]);
             if (current() && readGeneration === visibilityReadGeneration.current && state.project_id === projectId && state.conversation_id === id) {
               publishVisibleConversations(items);
-              if (currentConversationIdentity.current.conversationId === id) setActiveConversationVisibility(state);
+              if (currentConversationIdentity.current.conversationId === id) publishActiveVisibility(state);
               workspaceSearch.retry(); setReferenceCatalogVersion((version) => version + 1);
             }
           } catch { /* Preserve the explicit rejection if reconciliation is unavailable. */ }
@@ -369,7 +384,7 @@ export default function DesktopApp() {
     refreshPendingVisibility((version) => version + 1);
     visibilityOperations.current.delete(key);
     publishVisibleConversations(items);
-    if (currentConversationIdentity.current.conversationId === id) setActiveConversationVisibility(state);
+    if (currentConversationIdentity.current.conversationId === id) publishActiveVisibility(state);
     workspaceSearch.retry();
     setReferenceCatalogVersion((version) => version + 1);
   }
@@ -1143,10 +1158,15 @@ export default function DesktopApp() {
     if (!selected) return;
     const generation = captureConversationGeneration();
     const requestGeneration = ++projectOpenGeneration.current;
-    const next = await api.getWorkspaceConversation(selected.id, conversationId);
-    if (requestGeneration !== projectOpenGeneration.current || !isCurrentConversationGeneration(generation)) return;
-    if (next.id !== conversationId || next.project_id !== selected.id) throw { code: "ownership_mismatch" };
-    activateConversation(next);
+    const current = () => requestGeneration === projectOpenGeneration.current && isCurrentConversationGeneration(generation);
+    try {
+      const next = await api.getWorkspaceConversation(selected.id, conversationId);
+      if (!current()) return;
+      if (!next || next.id !== conversationId || next.project_id !== selected.id) throw { code: "ownership_mismatch" };
+      activateConversation(next);
+    } catch {
+      if (current()) setAgentNotice(locale === "zh-CN" ? "无法打开会话，请重试。" : "Could not open the conversation. Try again.");
+    }
   }
 
   function openGuardedSearchEntry(entry: WorkspaceSearchEntry): Promise<boolean> {
@@ -1232,12 +1252,14 @@ export default function DesktopApp() {
     const generation = captureConversationGeneration();
     if (generation.projectId !== branch.project_id || generation.conversationId !== branch.source_conversation_id) return false;
     const requestGeneration = ++projectOpenGeneration.current;
+    const listGeneration = visibleListGeneration.current;
+    const visibilityGeneration = visibilityReadGeneration.current;
     const target = await api.getWorkspaceConversation(branch.project_id, branch.branch_conversation_id);
     if (requestGeneration !== projectOpenGeneration.current || !isCurrentConversationGeneration(generation)) return false;
     if (!target || target.id !== branch.branch_conversation_id || target.project_id !== branch.project_id) throw new Error("The saved branch could not be loaded.");
     const available = await api.listConversations(branch.project_id);
     if (requestGeneration !== projectOpenGeneration.current || !isCurrentConversationGeneration(generation)) return false;
-    publishVisibleConversations(available);
+    if (listGeneration === visibleListGeneration.current && visibilityGeneration === visibilityReadGeneration.current) publishVisibleConversations(available);
     activateConversation(target);
     return true;
   }
