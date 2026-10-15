@@ -6,6 +6,43 @@ use crate::dto::{
 use serde_json::json;
 
 #[test]
+fn migration_preview_contracts() {
+    use omicsops_dto::*;
+    let request=json!({"project_id":uuid::Uuid::nil(),"categories":[],"files":[]});
+    let parsed:ProjectMigrationPreviewRequestV1=serde_json::from_value(request.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(),request);
+    let mut forbidden=request; forbidden["destination"]=json!("C:/forbidden");
+    assert!(serde_json::from_value::<ProjectMigrationPreviewRequestV1>(forbidden).is_err());
+    let file=json!({"backend_id":"local","relative_path":null,"size_bytes":null,"hash":null,"state":"unreadable","reason":"Source unavailable"});
+    let parsed:MigrationFilePreviewV1=serde_json::from_value(file.clone()).unwrap();
+    assert_eq!(parsed.size_bytes,None); assert_eq!(parsed.hash,None);
+    assert_eq!(serde_json::to_value(parsed).unwrap(),file);
+    for scope in ["full_file","recorded_file"] {
+        let mut value=file.clone(); value["hash"]=json!({"sha256":"a".repeat(64),"scope":scope});
+        let parsed:MigrationFilePreviewV1=serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(),value);
+    }
+    let report=json!({"schema_version":1,"project":{"source_project_id":uuid::Uuid::nil(),"name":"Synthetic","description":"","template":"blank","created_at":"2026-10-15T00:00:00Z"},"observed_at":"2026-10-15T00:00:00Z","scientific_revision":null,"categories":[],"files":[file],"selected_known_file_bytes":0,"unknown_size_file_count":1,"rebind":[],"exclusions":[],"preview_sha256":"b".repeat(64)});
+    let parsed:ProjectMigrationPreviewV1=serde_json::from_value(report.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(),report);
+    for key in ["credential_reference","local_root","destination"] {
+        let mut bad=report.clone(); bad["project"][key]=json!("forbidden");
+        assert!(serde_json::from_value::<ProjectMigrationPreviewV1>(bad).is_err());
+    }
+    let error=json!({"code":"storage_read_failed","message":"Metadata unavailable"});
+    let parsed:MigrationPreviewErrorV1=serde_json::from_value(error.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(),error);
+    assert_eq!(serde_json::to_value(MigrationMetadataCategoryV1::ScientificMetadata).unwrap(),"scientific_metadata");
+    assert_eq!(serde_json::to_value(MigrationRebindKindV1::SkillGrant).unwrap(),"skill_grant");
+    let counts=json!({"category":"scientific_metadata","selected":false,"record_count":0,"kind_counts":[{"kind":"dataset","record_count":0},{"kind":"analysis","record_count":0},{"kind":"artifact","record_count":0},{"kind":"evidence","record_count":0},{"kind":"provenance","record_count":0}],"examples":[],"examples_truncated":false});
+    let parsed:MigrationCategorySummaryV1=serde_json::from_value(counts.clone()).unwrap();
+    assert_eq!(parsed.kind_counts.len(),5);
+    assert_eq!(serde_json::to_value(parsed).unwrap(),counts);
+    let mut bad=counts; bad["kind_counts"][0]["private_metadata"]=json!("forbidden");
+    assert!(serde_json::from_value::<MigrationCategorySummaryV1>(bad).is_err());
+}
+
+#[test]
 fn file_baseline_metadata_and_diff_command_contracts() {
     use omicsops_dto::{
         DiffFileBaselineRequestV1, FileBaselineDiffV1, FileBaselinePageV1,

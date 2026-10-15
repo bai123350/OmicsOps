@@ -36,6 +36,9 @@ pub use workspace_navigation::*;
 mod workspace_files;
 pub use workspace_files::*;
 
+mod project_migration;
+pub use project_migration::*;
+
 mod publication_evidence;
 pub use publication_evidence::*;
 
