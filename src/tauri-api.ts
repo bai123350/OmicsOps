@@ -65,6 +65,11 @@ export async function getConversationCapabilitiesV4(projectId: string, conversat
 export async function listProjects(): Promise<WorkspaceProject[]> {
   return isTauri() ? invoke("list_projects") : [];
 }
+export function previewProjectMigration(request: import("./types").ProjectMigrationPreviewRequestV1): Promise<import("./types").ProjectMigrationPreviewV1> {
+  if (!isTauri()) return Promise.reject(new Error("Migration preview requires the desktop app."));
+  return invoke("workspace_preview_project_migration", { request });
+}
+
 export async function chooseProjectDirectory(): Promise<ProjectDirectoryChoice> {
   if (!isTauri()) return { path: "E:/Science/omicsops-demo", usedFallback: false };
   const preferences = await settingsGeneralPreferences().catch(

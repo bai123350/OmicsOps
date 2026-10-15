@@ -24,6 +24,7 @@ interface Props {
   onCreateOfflineExample: (parentDirectory: string) => Promise<void>;
   onBeginOfflineExample?: () => void;
   onOpen: (project: WorkspaceProject) => void;
+  onPreviewMigration?: (project: WorkspaceProject) => void;
   onDelete: (projectId: string) => Promise<void>;
   onSettings: () => void;
   onOpenSearch?: () => void;
@@ -38,7 +39,7 @@ const templates = [
   { id: "blank", zh: "空白研究项目", en: "Blank research project", zhDescription: "从自由对话、文件和远端环境开始", enDescription: "Start from conversation, files, and remote compute", icon: FilePlus2 },
 ] satisfies Array<{ id: WorkspaceTemplate; zh: string; en: string; zhDescription: string; enDescription: string; icon: typeof Dna }>;
 
-export function ProjectLibrary({ projects, connections = [], locale, onChooseLocalRoot, onCreate, onCreateOfflineExample, onBeginOfflineExample, onOpen, onDelete, onSettings, onOpenSearch, createRequestKey, onCreateRequestHandled }: Props) {
+export function ProjectLibrary({ projects, connections = [], locale, onChooseLocalRoot, onCreate, onCreateOfflineExample, onBeginOfflineExample, onOpen, onPreviewMigration, onDelete, onSettings, onOpenSearch, createRequestKey, onCreateRequestHandled }: Props) {
   const zh = locale === "zh-CN";
   const projectDescriptionPrefix = useId();
   const trustedConnections = useMemo(() => connections.filter((connection) => connection.host_key_fingerprint), [connections]);
@@ -168,6 +169,7 @@ export function ProjectLibrary({ projects, connections = [], locale, onChooseLoc
                 <ChevronRight className="recent-project-chevron" size={17} aria-hidden="true" />
               </button>
               <button type="button" className="recent-project-delete" aria-label={zh ? `删除项目：${project.name}` : `Delete project: ${project.name}`} aria-describedby={projectDescriptionIds} title={zh ? "删除项目" : "Delete project"} disabled={deletingProjectId !== null} onClick={() => void deleteProject(project)}>{deleting ? <span className="delete-spinner" aria-hidden="true">…</span> : <Trash2 size={16} aria-hidden="true" />}</button>
+              {onPreviewMigration && <button type="button" className="recent-project-migration" aria-label={zh ? `迁移清单预览：${project.name}` : `Migration preview: ${project.name}`} disabled={deletingProjectId !== null} onClick={() => onPreviewMigration(project)}>{zh ? "迁移清单预览" : "Migration preview"}</button>}
             </article>;
           })}</div> : <div className="library-empty-state"><span className="library-empty-icon" aria-hidden="true"><Library size={21} /></span><div><h2>{zh ? "还没有项目" : "No projects yet"}</h2><p>{zh ? "从空白项目开始，或选择一个研究模板。" : "Start from a blank project or choose a research template."}</p></div><button type="button" className="library-primary-action" onClick={() => beginCreate("blank", zh ? "空白研究项目" : "Blank research project")}><Plus size={15} aria-hidden="true" />{zh ? "创建空白项目" : "Create a blank project"}</button></div>}
         </section>

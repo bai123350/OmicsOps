@@ -38,6 +38,13 @@ const templateCases = [
 ] as const;
 
 describe("ProjectLibrary homepage actions", () => {
+  it("opens migration preview from the card through a separate callback", () => {
+    const onPreviewMigration = vi.fn(); const onOpen = vi.fn(); const onCreate = vi.fn();
+    render(<ProjectLibrary {...baseProps} projects={[recentProject]} onOpen={onOpen} onPreviewMigration={onPreviewMigration} onCreate={onCreate} onChooseLocalRoot={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "迁移清单预览：PBMC 图谱" }));
+    expect(onPreviewMigration).toHaveBeenCalledTimes(1); expect(onPreviewMigration).toHaveBeenCalledWith(recentProject);
+    expect(onOpen).not.toHaveBeenCalled(); expect(onCreate).not.toHaveBeenCalled();
+  });
   it("creates a local-only example with a selected parent and no ordinary create call", async () => {
     const onCreate = vi.fn(); const onCreateOfflineExample = vi.fn().mockResolvedValue(undefined);
     render(<ProjectLibrary {...baseProps} connections={[{ id: "ssh", label: "Trusted", host: "host", port: 22, username: "user", authentication: "password", authentication_reference: "ref", host_key_fingerprint: "trusted" }]} onCreate={onCreate} onCreateOfflineExample={onCreateOfflineExample} onChooseLocalRoot={vi.fn().mockResolvedValue({ path: "E:/Examples", usedFallback: false })} />);

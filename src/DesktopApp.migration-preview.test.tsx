@@ -1,0 +1,41 @@
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { beforeEach, expect, it, vi } from "vitest";
+import DesktopApp from "./DesktopApp";
+import { AppearanceProvider } from "./use-appearance";
+import * as api from "./tauri-api";
+import * as files from "./composer-file-api";
+import * as navigation from "./workspace-navigation-api";
+import type { ProjectMigrationPreviewV1, WorkspaceProject } from "./types";
+const project: WorkspaceProject = { id: "preview-project", name: "Preview target", description: "", local_root: "C:/data", connection_id: null, remote_root: null, template: "blank", status: "ready", ollama_only: false, created_at: "now", updated_at: "now" };
+beforeEach(() => {
+  vi.restoreAllMocks(); window.localStorage.clear(); window.localStorage.setItem("omicsops.sessions.resumeLast", "false");
+  vi.spyOn(api, "listProjects").mockResolvedValue([project]);
+  vi.spyOn(api, "listModelProfiles").mockResolvedValue([]); vi.spyOn(api, "listSkillPackages").mockResolvedValue([]); vi.spyOn(api, "listMcpServers").mockResolvedValue([]); vi.spyOn(api, "listConnections").mockResolvedValue([]);
+});
+it("the actual project card opens a preview before any project conversation or model action", async () => {
+  const noOpen = [vi.spyOn(api, "latestUsedConversation"), vi.spyOn(api, "listConversations"), vi.spyOn(api, "createConversation"), vi.spyOn(api, "listMessages"), vi.spyOn(api, "agentV4ComputeBackends"), vi.spyOn(api, "listRemoteFiles"), vi.spyOn(api, "probeModelProfile")];
+  const preview = vi.spyOn(api, "previewProjectMigration").mockRejectedValue({ code: "storage_read_failed", message: "SECRET" });
+  const local = vi.spyOn(files, "listLocalComposerFiles"); const journey = vi.spyOn(navigation, "getWorkspaceJourney");
+  render(<AppearanceProvider><DesktopApp /></AppearanceProvider>);
+  fireEvent.click(await screen.findByRole("button", { name: "迁移清单预览：Preview target" }));
+  const dialog = screen.getByRole("dialog", { name: "迁移清单预览" });
+  expect(screen.getByRole("button", { name: "打开项目：Preview target" })).toBeVisible(); expect(preview).not.toHaveBeenCalled();
+  fireEvent.click(within(dialog).getByRole("button", { name: "生成预览" }));
+  await screen.findByRole("alert"); expect(preview).toHaveBeenCalledTimes(1); expect(preview).toHaveBeenCalledWith({ project_id: project.id, categories: [], files: [] });
+  expect(screen.queryByText("SECRET")).toBeNull(); expect(local).not.toHaveBeenCalled(); expect(journey).not.toHaveBeenCalled();
+  for (const spy of noOpen) expect(spy).not.toHaveBeenCalled();
+});
+it("actual parent overlay remains after immediate topmost Escape and close/reopen rejects the old preview", async () => {
+  let resolve!: (value: ProjectMigrationPreviewV1) => void;
+  vi.spyOn(api, "previewProjectMigration").mockReturnValueOnce(new Promise((yes) => { resolve = yes; }));
+  render(<AppearanceProvider><DesktopApp /></AppearanceProvider>);
+  const card = await screen.findByRole("button", { name: "迁移清单预览：Preview target" });
+  fireEvent.click(screen.getByRole("button", { name: /空白研究项目/ }));
+  expect(screen.getByRole("dialog", { name: "创建新项目" })).toBeVisible();
+  fireEvent.click(card); fireEvent.keyDown(window, { key: "Escape" });
+  expect(screen.queryByRole("dialog", { name: "迁移清单预览" })).toBeNull(); expect(screen.getByRole("dialog", { name: "创建新项目" })).toBeVisible();
+  fireEvent.click(card); fireEvent.click(screen.getByRole("button", { name: "生成预览" })); fireEvent.keyDown(window, { key: "Escape" }); fireEvent.click(card);
+  await act(async () => resolve({ project: { source_project_id: project.id, name: "OLD" } } as ProjectMigrationPreviewV1));
+  expect(screen.queryByText("OLD")).toBeNull(); expect(screen.getByRole("button", { name: "生成预览" })).toBeEnabled();
+  fireEvent.keyDown(window, { key: "Escape" }); expect(screen.getByRole("dialog", { name: "创建新项目" })).toBeVisible();
+});

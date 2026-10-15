@@ -1,0 +1,12 @@
+.migration-preview-backdrop { position: fixed; inset: 0; z-index: 360; display: grid; place-items: center; padding: 24px; background: #0008; }
+.migration-preview-dialog { width: min(820px, 100%); max-height: 90vh; display: flex; flex-direction: column; background: var(--omicsops-surface, #fff); color: var(--omicsops-text, #20252b); border: 1px solid var(--omicsops-border, #d9dfe5); border-radius: 14px; box-shadow: 0 20px 70px #0004; }
+.migration-preview-dialog header { display: flex; align-items: center; justify-content: space-between; padding: 16px 22px; border-bottom: 1px solid var(--omicsops-border, #d9dfe5); }
+.migration-preview-dialog h2 { margin: 0; font-size: 18px; }
+.migration-preview-body { padding: 20px; overflow: auto; overflow-wrap: anywhere; }
+.migration-preview-body fieldset { margin-bottom: 16px; border: 1px solid var(--omicsops-border, #d9dfe5); border-radius: 8px; }
+.migration-preview-body label { display: flex; gap: 8px; align-items: center; margin: 9px 0; }
+.migration-preview-body button { margin: 5px; padding: 7px 10px; border-radius: 6px; }
+.migration-preview-result { margin-top: 18px; border-top: 1px solid var(--omicsops-border, #d9dfe5); }
+.migration-preview-result.stale { opacity: .65; }
+.recent-project-card { flex-wrap: wrap; }
+.recent-project-migration { margin: 0 12px 10px 58px; flex-basis: calc(100% - 70px); text-align: left; font-size: 12px; padding: 5px 8px; color: var(--omicsops-text-muted, #526174); border: 1px solid var(--omicsops-border, #d9dfe5); border-radius: 6px; background: transparent; }

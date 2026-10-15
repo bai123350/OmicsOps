@@ -99,6 +99,25 @@ export interface WorkspaceProject {
   updated_at: string;
 }
 
+// Pure serde wire shapes from omicsops-dto/src/project_migration.rs.
+export type MigrationMetadataCategoryV1 = "conversations" | "publications" | "scientific_metadata";
+export interface ProjectMigrationPreviewRequestV1 { project_id: string; categories: MigrationMetadataCategoryV1[]; files: import("./workspace-navigation-types").ProjectFileSelectionV1[] }
+export interface MigrationProjectMetadataV1 { source_project_id: string; name: string; description: string; template: string; created_at: string }
+export interface MigrationKindCountV1 { kind: string; record_count: number }
+export interface MigrationRecordSummaryV1 { source_id: string; kind: string; label: string; status: string; revision: number | null }
+export interface MigrationCategorySummaryV1 { category: MigrationMetadataCategoryV1; selected: boolean; record_count: number; kind_counts: MigrationKindCountV1[]; examples: MigrationRecordSummaryV1[]; examples_truncated: boolean }
+export type MigrationFileStateV1 = "small_text_candidate" | "reference_only" | "missing" | "unsafe_file" | "sensitive_content" | "unsupported_content" | "unreadable";
+export interface MigrationFilePreviewV1 { backend_id: string; relative_path: string | null; size_bytes: number | null; hash: import("./workspace-navigation-types").FileReferenceHashV1 | null; state: MigrationFileStateV1; reason: string }
+export type MigrationRebindKindV1 = "project_paths" | "ssh_connection" | "model_profile" | "kernel_environment" | "mcp_server" | "skill_grant" | "runtime_jobs";
+export interface MigrationRebindRequirementV1 { kind: MigrationRebindKindV1; count: number; message: string }
+export interface ProjectMigrationPreviewV1 {
+  schema_version: number; project: MigrationProjectMetadataV1; observed_at: string; scientific_revision: number | null;
+  categories: MigrationCategorySummaryV1[]; files: MigrationFilePreviewV1[]; selected_known_file_bytes: number; unknown_size_file_count: number;
+  rebind: MigrationRebindRequirementV1[]; exclusions: string[]; preview_sha256: string;
+}
+export type MigrationPreviewErrorCodeV1 = "invalid_selection" | "not_found" | "ownership_mismatch" | "source_changed" | "limit_exceeded" | "storage_read_failed";
+export interface MigrationPreviewErrorV1 { code: MigrationPreviewErrorCodeV1; message: string }
+
 export interface WorkspaceConversation {
   id: string;
   project_id: string;
