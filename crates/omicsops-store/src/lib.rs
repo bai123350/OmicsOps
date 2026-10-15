@@ -103,8 +103,8 @@ pub mod workspace_file_baselines;
 pub use workspace_file_baselines::{
     FileBaselineManifestEntryV1, FileBaselineManifestV1, SaveFileBaselineRecord, StoredFileBaseline,
 };
-mod workspace_conversation_visibility;
 mod project_migration;
+mod workspace_conversation_visibility;
 pub use project_migration::MigrationMetadataReadContext;
 pub mod workspace_journey;
 pub mod workspace_navigation;

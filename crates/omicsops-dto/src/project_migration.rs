@@ -5,7 +5,11 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MigrationMetadataCategoryV1 { Conversations, Publications, ScientificMetadata }
+pub enum MigrationMetadataCategoryV1 {
+    Conversations,
+    Publications,
+    ScientificMetadata,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,7 +59,15 @@ pub struct MigrationRecordSummaryV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MigrationFileStateV1 { SmallTextCandidate, ReferenceOnly, Missing, UnsafeFile, SensitiveContent, UnsupportedContent, Unreadable }
+pub enum MigrationFileStateV1 {
+    SmallTextCandidate,
+    ReferenceOnly,
+    Missing,
+    UnsafeFile,
+    SensitiveContent,
+    UnsupportedContent,
+    Unreadable,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,7 +82,15 @@ pub struct MigrationFilePreviewV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MigrationRebindKindV1 { ProjectPaths, SshConnection, ModelProfile, KernelEnvironment, McpServer, SkillGrant, RuntimeJobs }
+pub enum MigrationRebindKindV1 {
+    ProjectPaths,
+    SshConnection,
+    ModelProfile,
+    KernelEnvironment,
+    McpServer,
+    SkillGrant,
+    RuntimeJobs,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,7 +118,14 @@ pub struct ProjectMigrationPreviewV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MigrationPreviewErrorCodeV1 { InvalidSelection, NotFound, OwnershipMismatch, SourceChanged, LimitExceeded, StorageReadFailed }
+pub enum MigrationPreviewErrorCodeV1 {
+    InvalidSelection,
+    NotFound,
+    OwnershipMismatch,
+    SourceChanged,
+    LimitExceeded,
+    StorageReadFailed,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
