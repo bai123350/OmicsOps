@@ -46,8 +46,8 @@ pub mod p1_commands;
 #[cfg(test)]
 mod plan_revision_tests;
 mod project_file_read;
-mod project_migration_preview;
 pub mod project_memory;
+mod project_migration_preview;
 mod project_table;
 mod project_table_commands;
 pub mod project_templates;

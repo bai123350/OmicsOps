@@ -12,7 +12,8 @@ fn migration_preview_contracts() {
     let parsed: ProjectMigrationPreviewRequestV1 = serde_json::from_value(request.clone()).unwrap();
     assert_eq!(serde_json::to_value(parsed).unwrap(), request);
     let explicit = json!({"project_id":uuid::Uuid::nil(),"categories":["conversations"],"files":[{"backend_id":"local","relative_path":"a.txt","expected_full_sha256":"a".repeat(64)}]});
-    let parsed: ProjectMigrationPreviewRequestV1 = serde_json::from_value(explicit.clone()).unwrap();
+    let parsed: ProjectMigrationPreviewRequestV1 =
+        serde_json::from_value(explicit.clone()).unwrap();
     assert_eq!(serde_json::to_value(parsed).unwrap(), explicit);
     let mut bad_file = explicit;
     bad_file["files"][0]["credential_reference"] = json!("forbidden");
