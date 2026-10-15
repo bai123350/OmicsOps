@@ -1,6 +1,6 @@
 # Wisp Science 可借鉴改进清单
 
-日期：2026-10-04。状态：用户已选择全部12项首次范围、确认具体设计及[实施总计划](../plans/2026-10-04-wisp-improvements.md)，并选择子Agent逐项实施与审阅。W01–W10及W12持久化/宿主命令/类型API与收起集合源码已实现并审阅通过（46/50任务），其余项继续实施；W07原生手工验收未执行，W06隔离旧HEAD原生验收仅部分通过；状态及实际检查见总计划。全部12项首次范围尚未交付。本文件保留源码对照，具体边界见[总设计](2026-10-04-wisp-improvements-design.md)。
+日期：2026-10-04。状态：用户已选择全部12项首次范围、确认具体设计及[实施总计划](../plans/2026-10-04-wisp-improvements.md)，并选择子Agent逐项实施与审阅。W01–W10及W12全部源码已实现并审阅通过（47/50任务），其余项继续实施；W07原生手工验收未执行，W06隔离旧HEAD原生验收仅部分通过；状态及实际检查见总计划。全部12项首次范围尚未交付。本文件保留源码对照，具体边界见[总设计](2026-10-04-wisp-improvements-design.md)。
 
 本轮建议先补会话草稿隔离，再分别交付科学产物预览和 SSH 后台作业面板。这三项直接改善日常研究操作，并能复用现有组件与运行身份。其余候选按依赖分批推进，优先保留 OmicsOps 已有的科研证据、审批与恢复契约。
 
@@ -185,6 +185,8 @@ P0 表示优先解决可能影响操作正确性的问题；P1 表示直接改�
 keyring 引用不等于可移植授权；资料中的提示词与路径也须按现有脱敏边界处理。云中继、常驻同步和跨设备活跃运行恢复另行评估。
 
 ## W12 收起和恢复会话
+
+**实施进度：**2026-10-15：W12 Task4 source67257de、fix4e5db85已完成独立FULL及R1定向复审，I1–I3全部关闭，无新增问题，累计47/50 SOURCE。精确打开Shelved会话、原request窗口内重试、receipt后当前状态重读、默认Visible导航和搜索/#刷新、运行中保留transcript/draft与实际窗口Escape集成完成。FULL发现旧exact-open覆盖Restore、非active操作压掉active getter、async选择异常未处理；真实递延/拒绝RED后，修复将列表与active读所有权分离，保持branch精确打开并安全处理当前scope错误。最终closest374/Web(typecheck+Vite)/diff通过；修复前完整Vitest1409项+Node桥接22项（本地Node24.16）/native release+NSIS1构建通过，Rust1914通过/18ignored、Python48、fmt为相关未变后端阶段，不冒充最终fix字节全量验收。最初Cargo终态遗失UNKNOWN、后续阻塞mock的已确认进程Ctrl-C中断与正常访问重跑、Python WinError5恢复、两个设置Escape失败后独立/全量恢复但根因UNKNOWN、测试fixture修正均保留。原生E0432后仅备份并清理验证过的target/release core包21文件/13,703,382字节后普通构建通过；旧smoke路径dep-info支持缓存问题但未证明原rustc extern/根因，没有源码/mtime或应用控制绕过。五项正式裁决保留原理由和成本：默认resume空态区别于禁用恢复的新建偏好；独立不可变重试和额外显式操作；仅中断已确认阻塞验证的重跑成本；更新事件完整Visible列表查询及旧标题修复开销；仅core编译缓存重建成本。source11/fix2候选、逆向、重放、提交后RAW/protected7/两个工作区兼容残留/外部差异/空index证明通过。M1 native cursor、M2构建警告、M3设置Escape UNKNOWN留待最终整分支审阅。用户物理Escape STOP下Windows手工及真实SSH/模型/R/Micromamba/PBMC未执行，组合Step4保持未勾选；后续all50工作树与干净归档全量、CI和最终整分支验收不属于本任务通过项。
 
 **实施进度：**2026-10-15：W12 Task3 类型API/收起集合 source54a3318、fix4f788b1 已完成FULL及定向I1独立审阅，累计46/50。四个API保持精确载荷和历史receipt语义；集合按Shelved/default50分页，打开与恢复分离，使用行ID/revision，查询/刷新/恢复回首页与立即window Escape。FULL发现重复query/page A→B→A可复活旧action，八个真实递延回归先失败后修复，现以单调generation+唯一operation ID保护success/error/finally及新pending。最终API7+dialog17+overlays3共27项通过，noEmit/fmt/diff通过；先前19项是较早阶段，重复运行不累加。初始缺API/组件RED、Escape静态fixture13/14后改真实父层先开子层、locale TS2322九项修正均分别记录。source7/fix2候选/逆向/重放/提交后及protected7/两个兼容残留/外部差异/空index证明通过。UI拒绝超界next_offset并提示缩小搜索不等于修复native cursor Minor；应用整合、全量/clean HEAD与人工真实验收仍待Task4/最终阶段。
 

@@ -50,7 +50,7 @@
 | W09 | [稿件证据](2026-10-04-wisp-w09-publication-evidence.md) | 4 | 保存revision准备度与reference-only四entry证据ZIP | SOURCE完成并独立审阅；确定性全量/Web/native构建通过，native手工未执行 |
 | W10 | [文件基线](2026-10-04-wisp-w10-file-baselines.md) | 4 | 显式安全小本地文本immutable snapshot/有界diff | 源码已完成并审阅，完整确定性检查已记录；原生手工验收未执行 |
 | W11 | [迁移预览](2026-10-04-wisp-w11-migration-preview.md) | 3 | 空默认选择、类别COUNT、文件状态/hash与rebind/omissions | 待实施 |
-| W12 | [会话可见性](2026-10-04-wisp-w12-conversation-visibility.md) | 4 | 持久可逆收起/恢复，分页前过滤，精确引用保持 | 进行中，Task1–3 持久化/宿主命令/类型API与收起集合已审阅，应用整合待实施 |
+| W12 | [会话可见性](2026-10-04-wisp-w12-conversation-visibility.md) | 4 | 持久可逆收起/恢复，分页前过滤，精确引用保持 | 源码全部完成并审阅；修复后focused/Web、修复前全量/native已记录，原生手工未执行 |
 
 W08只有两部分都通过才算完成。W02/W04两种worker/source的deterministic协议回归均必需，单独本地入口不满足范围；真实远端/模型验收独立记“未执行”时不冒充端到端通过。
 
@@ -83,7 +83,7 @@ W07只需W02 Task1叶子，不需要table/SSH界面；W10/W11只需W09 Task1的�
 - [x] 9. W08a Task1–3：五scenario manifest、控制行为、stable report/CI upload。
 - [x] 10. W09 Task1–4：基础DTO/context、readiness、post-dialog包、保存revisionUI。
 - [x] 11. W10 Task1–4：immutableStore、safecontent/blob、diff、explicit选择UI。
-- [ ] 12. W12 Task1–4：visibility/schema/CAS、discovery/directget、collection、banner/cache。
+- [x] 12. W12 Task1–4：visibility/schema/CAS、discovery/directget、collection、banner/cache。
 - [ ] 13. W11 Task1–3：只读metadata、boundedfiles/digest、project-card预览。
 - [ ] 14. 全分支独立审阅和最终交付验证，修复任何未解决的范围/行为问题。
 
@@ -154,3 +154,5 @@ W10 Task3 已完成独立审阅：source 783ee03、fix1 e82aed0；FULL审阅指�
 2026-10-15：W12 Task2 展示过滤/精确来源命令源码已独立审阅通过（source 8f20cc5 + separate fmt bd6a4ec；FULL spec compliant / quality Approved），累计45/50。四个宿主命令保持 Store-only，Visible 展示/用户消息时间排序与 ALL 精确引用分离，直接读取只投影安全标题而不写回；历史 receipt 与当前 getter 分离。最终新测试5、composer19、navigation11（35项独立覆盖），fmt/diff 通过。导航临时文件 persist 在 sandbox 内 OS5 失败，经同操作诊断与相同测试正常提权1/1、完整最近导航11/11通过；原失败保留，无导航代码修改。立即格式化前 RAW4 已捕获，feature4/format3 分别提交，protected7/外部差异/空 index 与 candidate/inverse/replay/postproof 通过。继承 SQL/DTO/CAS/脱敏约束由 Task1 FULL+scoped 闭合；M1缓存 hard-link 警告保留最终审阅，UI Tasks3–4、最终全量/clean HEAD及人工/真实验收尚未执行。
 
 2026-10-15：W12 Task3 类型API/收起集合 source54a3318、fix4f788b1 已完成FULL及定向I1独立审阅，累计46/50。四个API保持精确载荷和历史receipt语义；集合按Shelved/default50分页，打开与恢复分离，使用行ID/revision，查询/刷新/恢复回首页与立即window Escape。FULL发现重复query/page A→B→A可复活旧action，八个真实递延回归先失败后修复，现以单调generation+唯一operation ID保护success/error/finally及新pending。最终API7+dialog17+overlays3共27项通过，noEmit/fmt/diff通过；先前19项是较早阶段，重复运行不累加。初始缺API/组件RED、Escape静态fixture13/14后改真实父层先开子层、locale TS2322九项修正均分别记录。source7/fix2候选/逆向/重放/提交后及protected7/两个兼容残留/外部差异/空index证明通过。UI拒绝超界next_offset并提示缩小搜索不等于修复native cursor Minor；应用整合、全量/clean HEAD与人工真实验收仍待Task4/最终阶段。
+
+2026-10-15：W12 Task4 source67257de、fix4e5db85已完成独立FULL及R1定向复审，I1–I3全部关闭，无新增问题，累计47/50 SOURCE。精确打开Shelved会话、原request窗口内重试、receipt后当前状态重读、默认Visible导航和搜索/#刷新、运行中保留transcript/draft与实际窗口Escape集成完成。FULL发现旧exact-open覆盖Restore、非active操作压掉active getter、async选择异常未处理；真实递延/拒绝RED后，修复将列表与active读所有权分离，保持branch精确打开并安全处理当前scope错误。最终closest374/Web(typecheck+Vite)/diff通过；修复前完整Vitest1409项+Node桥接22项（本地Node24.16）/native release+NSIS1构建通过，Rust1914通过/18ignored、Python48、fmt为相关未变后端阶段，不冒充最终fix字节全量验收。最初Cargo终态遗失UNKNOWN、后续阻塞mock的已确认进程Ctrl-C中断与正常访问重跑、Python WinError5恢复、两个设置Escape失败后独立/全量恢复但根因UNKNOWN、测试fixture修正均保留。原生E0432后仅备份并清理验证过的target/release core包21文件/13,703,382字节后普通构建通过；旧smoke路径dep-info支持缓存问题但未证明原rustc extern/根因，没有源码/mtime或应用控制绕过。五项正式裁决保留原理由和成本：默认resume空态区别于禁用恢复的新建偏好；独立不可变重试和额外显式操作；仅中断已确认阻塞验证的重跑成本；更新事件完整Visible列表查询及旧标题修复开销；仅core编译缓存重建成本。source11/fix2候选、逆向、重放、提交后RAW/protected7/两个工作区兼容残留/外部差异/空index证明通过。M1 native cursor、M2构建警告、M3设置Escape UNKNOWN留待最终整分支审阅。用户物理Escape STOP下Windows手工及真实SSH/模型/R/Micromamba/PBMC未执行，组合Step4保持未勾选；后续all50工作树与干净归档全量、CI和最终整分支验收不属于本任务通过项。

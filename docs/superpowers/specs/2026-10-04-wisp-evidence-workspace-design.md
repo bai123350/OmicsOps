@@ -538,9 +538,9 @@ UI 从现有 `ProjectLibrary` 项目卡片的独立“迁移清单预览”按�
 
 研究者可以把暂不需要的会话从默认导航、全局搜索会话候选与 `#` Session 候选中收起，并在独立“已收起会话”入口查询、打开和恢复。历史消息、run、分组、分支、稿件引用和精确Session引用保留原身份。
 
-推荐用独立 visibility table，缺省 Visible，不改变 core `Conversation` 的 status/model字段，也不以 Archived 状态实现收起。运行中的会话也可收起，因为这是本机可见性偏好；其原 run继续，job不会取消，active对话仍可查看/发送并显示“已收起”横幅。新消息不会自动恢复可见性，恢复是显式操作。
+推荐用独立 visibility table，缺省 Visible，不改变 core `Conversation` 的 status/model字段，也不以 Archived 状态实现收起。运行中的会话也可收起，因为这是本机可见性偏好；其原 run继续，job不会取消，active对话仍可查看/发送并显示“已收起”横幅。新消息不会自动恢复可见性，恢复是显式操作。会话更新事件独立更新当前精确打开的会话对象，并重新查询权威Visible导航列表，不能直接把事件对象插回导航；旧事件查询受项目/视图及请求代次约束，不能覆盖更新的显式可见性结果。成本是每次此类事件读取完整Visible列表及窗口内代次协调，现有列表命令还可能读取消息并修复旧占位标题；不是分页有界查询。当前事件来自首次标题提交和已提交队列启动，不是每个流式token。
 
-默认导航只显示 Visible；收起当前打开会话后保持当前 transcript，不把它重新插入默认列表。切项目/下次默认进入项目时，latest-used只在Visible中选；没有可见候选则显示项目空状态，保留“已收起会话”入口。通过保存来源、搜索独立收起集合或精确导航打开Shelved不会自动恢复。
+默认导航只显示 Visible；收起当前打开会话后保持当前 transcript，不把它重新插入默认列表。切项目/下次默认进入项目时，latest-used只在Visible中选；没有可见候选则显示项目空状态，保留“已收起会话”入口。此默认恢复路径仅指启用恢复上次会话且未指定精确会话ID；关闭恢复的既有偏好仍表示显式新建空白会话且不查询latest-used恢复候选（导航Visible列表仍可读取），手动“新会话”仍创建，指定ID则优先精确打开。成本：默认恢复无合格用户会话时需显式新建；关闭恢复时即使旧会话全已收起仍可创建新的Visible会话。通过保存来源、搜索独立收起集合或精确导航打开Shelved不会自动恢复。
 
 ### 精确命令与 DTO
 
@@ -639,7 +639,7 @@ CREATE INDEX IF NOT EXISTS idx_conversation_visibility_project
 
 设置在 `BEGIN IMMEDIATE` 事务中：先验证同一 request ID的operation与request digest；相同请求返回原receipt，不重复应用；同ID不同正文为RequestConflict。随后验证project/conversation归属与expected revision。陈旧expected值为RevisionConflict；当前值已等于目标时changed=false，不更改visibility revision/changed_at/conversation updated_at，但仍记录request receipt。实际变化只改visibility表，并在同事务写现有 `workspace_request_ledger` 的hash与result identifiers，不写raw请求或对话正文。
 
-不同请求并发靠expected_revision决定先后；未知提交/丢失回执只能重试原request，不发新的相反操作。receipt是该次提交的历史结果；前端拿到replay receipt后再读取当前state/list，防止旧“收起成功”回包覆盖随后已经完成的恢复。project或conversation已删除时精确打开NotFound；删除仍沿现有独立流程，visibility FK cascade只清掉偏好。收起失败不从UI提前永久移除，会话状态/运行不变；UI显示可重试原请求或刷新冲突。
+不同请求并发靠expected_revision决定先后；未知提交/丢失回执只能重试原request，不发新的相反操作。若原操作的入口因当前状态变化而消失，精确打开会话后提供独立的待确认操作重试入口，原request ID/body不变；重放并重新读取当前state/list完成后，才允许用户另一次显式相反操作使用展示的准确revision。不会在同一次相反意图点击内自动重放再替换revision连续写入。成本是少量Shell pending/retry props、窗口内安全请求元数据及一次额外显式重试步骤；不跨重启持久化，也不锁整应用。receipt是该次提交的历史结果；前端拿到replay receipt后再读取当前state/list，防止旧“收起成功”回包覆盖随后已经完成的恢复。project或conversation已删除时精确打开NotFound；删除仍沿现有独立流程，visibility FK cascade只清掉偏好。收起失败不从UI提前永久移除，会话状态/运行不变；UI显示可重试原请求或刷新冲突。
 
 ### 导航、搜索、`#` 与UI联动
 
