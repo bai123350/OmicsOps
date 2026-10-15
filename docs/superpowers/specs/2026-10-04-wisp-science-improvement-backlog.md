@@ -1,6 +1,6 @@
 # Wisp Science 可借鉴改进清单
 
-日期：2026-10-04。状态：用户已选择全部12项首次范围、确认具体设计及[实施总计划](../plans/2026-10-04-wisp-improvements.md)，并选择子Agent逐项实施与审阅。W01–W10、W12全部及W11只读metadata/DTO源码已实现并审阅通过（48/50任务），其余项继续实施；W07原生手工验收未执行，W06隔离旧HEAD原生验收仅部分通过；状态及实际检查见总计划。全部12项首次范围尚未交付。本文件保留源码对照，具体边界见[总设计](2026-10-04-wisp-improvements-design.md)。
+日期：2026-10-04。状态：用户已选择全部12项首次范围、确认具体设计及[实施总计划](../plans/2026-10-04-wisp-improvements.md)，并选择子Agent逐项实施与审阅。W01–W10、W12全部及W11 metadata/DTO与有界文件原生预览源码已实现并审阅通过（49/50任务），其余项继续实施；W07原生手工验收未执行，W06隔离旧HEAD原生验收仅部分通过；状态及实际检查见总计划。全部12项首次范围尚未交付。本文件保留源码对照，具体边界见[总设计](2026-10-04-wisp-improvements-design.md)。
 
 本轮建议先补会话草稿隔离，再分别交付科学产物预览和 SSH 后台作业面板。这三项直接改善日常研究操作，并能复用现有组件与运行身份。其余候选按依赖分批推进，优先保留 OmicsOps 已有的科研证据、审批与恢复契约。
 
@@ -175,6 +175,8 @@ P0 表示优先解决可能影响操作正确性的问题；P1 表示直接改�
 未来独立执行另建 ExecutionContext 与授权，不从会话分支继承副作用权限。文件复制和路径范围检查不等于 OS 沙盒。
 
 ## W11 可选择的项目迁移
+
+**实施进度：**2026-10-15：W11 Task2 semanticcbc0dd6及独立纯格式e56fc12完成独立FULL，Spec compliant/Approved，无Critical/Important，累计49/50 SOURCE。原生只读preview命令/注册、公开metadata与kind_counts/Shelved注记、稳定digest、显式文件身份/预算/完整hash与保存SSH引用已实现。actual W02保留handle、每项512KiB/请求4MiB在尝试前预留并传同一allowance、失败不退款、EOF探针单列；expected_full必须实际完整核验，否则整次拒绝。shared纯文本策略在敏感文件名前置，unsupported可报告metadata但不读payload；未知size/hash保持None，Unavailable记Unreadable不猜Missing。避免会读取profile_json的既有backend helper，直接校验内部project的精确canonical绑定，再使用已审阅Store typed V4 recorded-reference；仅public_project进入响应，底层SQL/路径异常固定安全映射。此为既定白名单约束内实现选择，无新增正式Ruling。最终semantic native15（725 filtered）、Store5、DTO1（739 filtered）通过，fmt/diff0；初始编译RED0 executed、FK fixture在preview前12pass/1fail及临时legacy构造/恢复、unsupported binary sizeNone对Some7行为RED1均保留。前后15项属不同断言阶段不累加；后续断言并非各有独立RED。三路径候选/逆向/重放、preformat等于semanticHEAD、纯rustfmt精确输出、RAW/canonical/protected7/外部差异/两个工作区兼容残留/空index证明通过。Minor环境hardlink警告留最终审阅。Task1 native消费CV已关闭；Task3 TS/UI、空默认显式生成、catalog无SSH刷新、scope/selection/generation失效和立即Escape及完整交付检查仍待实施。DB与逐文件观察非原子快照，digest不是批准token；GUI STOP下手工及真实SSH/模型/R/Micromamba/PBMC未执行，全量工作树/干净归档/CI/最终整分支不属于本任务通过项。
 
 **实施进度：**2026-10-15：W11 Task1 source72a3c1c及独立纯格式f55860a完成独立FULL审阅，Spec compliant/Approved，无Critical/Important，累计48/50 SOURCE。只读单事务白名单metadata、独立COUNT/最多20摘要、所有会话含Shelved与legacy Archived、science header/分kind计数、当前publication revision/hash摘要、固定安全project/rebind/exclusions及纯DTO完成。新增正式裁决：原精确DTO只有aggregate/examples不能表达设计要求的五种科学计数，故增加kind_counts与MigrationKindCountV1，固定dataset/analysis/artifact/evidence/provenance含零、其他类别为空；成本是纯DTO字段/类型与serde契约，以及后续digest/TS/UI同步，不新增持久化或重载label/重复category。最终semantic Store5/nativeDTO1（724 filtered）通过，纯fmt前RAW与实际rustfmt输出证明连接最终字节，fmt/diff显式exit0；初始及kind_counts编译RED为0 executed，publication hash行为RED1失败、两次fixture失败均保留。一次DTO/Store启动重叠仅观察到build-directory lock等待，两个终态保留，不冒充严格串行；后续检查串行。六路径候选/逆向/重放/RAW/canonicalHEAD/protected7/外部差异/两个工作区兼容残留/空index证明通过。Minor为hardlink cache警告，留待最终整分支审阅。Task2仍需文件identity/预算/expected hash/稳定digest（含kind_counts）/固定安全错误与仅public_project序列化；Task3仍需TS/UI、显式生成/范围失效/Escape及完整交付检查。全量工作树与干净归档、CI、Windows手工/真实SSH/模型/R/Micromamba/PBMC均非本Task1通过项；物理Escape STOP保持。
 

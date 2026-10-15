@@ -83,7 +83,7 @@ git commit -m "feat: project safe migration metadata preview"
 - Consumes: Task 1metadata context/DTO、W02唯一handle接缝和W10共享纯文本判定；现有saved science artifact/source投影只取可信记录，不推断legacy backend。
 - Produces: `workspace_preview_project_migration(state: State<'_, AppState>, request: ProjectMigrationPreviewRequestV1) -> Result<ProjectMigrationPreviewV1, MigrationPreviewErrorV1>`；测试用 `preview_project_migration(repository: &Store, request: &ProjectMigrationPreviewRequestV1, observed_at: &str) -> Result<ProjectMigrationPreviewV1, MigrationPreviewErrorV1>`，只依赖本地/保存metadata，不接受destination。
 
-- [ ] **Step 1: Write failing tests.** 前缀 `migration_preview_`：remote_unknown、hash_budget、source_changed、unsafe_windows_file、sensitive_content、stable_digest、no_effects。构造>512 KiB文件和合计>4 MiB，assert没有全读/hash；expected必须完整核验；metadata/文件读取各自范围清楚，preview前后源字节/Store不变。mock运行/SSH/keyring/MCP计数全0。
+- [x] **Step 1: Write failing tests.** 前缀 `migration_preview_`：remote_unknown、hash_budget、source_changed、unsafe_windows_file、sensitive_content、stable_digest、no_effects。构造>512 KiB文件和合计>4 MiB，assert没有全读/hash；expected必须完整核验；metadata/文件读取各自范围清楚，preview前后源字节/Store不变。mock运行/SSH/keyring/MCP计数全0。
 
 ```rust
 assert_eq!(remote.hash, None);
@@ -94,10 +94,10 @@ assert_eq!(external_call_count, 0);
 assert_eq!(store_write_count, 0);
 ```
 
-- [ ] **Step 2: Run RED.** `cargo test -p omicsops-desktop --lib project_migration_preview::tests::migration_preview_`。Expected: FAIL，缺接缝/command或budget/digest/zero-effect断言失败。
-- [ ] **Step 3: Implement both signatures and register.** 校验project/backend/selection长度、排序去重；W02metadata先判预算，只安全小文本完整读后立即丢弃正文。recorded/current/unknown hash区分；invalid identity/无法验证expected整次拒绝，单项missing/unsafe保留状态。稳定公开内容digest排除观察时间/自身；固定rebind/exclusions、不输出任意metadata，绝不使用sync/export/import或runtime恢复API。
-- [ ] **Step 4: Run GREEN.** 重跑RED与Task 1Store测试；Expected: PASS；验证未读取oversized正文、无temp/blob/DB新增文件，能力身份不出preview/errors。
-- [ ] **Step 5: Commit.**
+- [x] **Step 2: Run RED.** `cargo test -p omicsops-desktop --lib project_migration_preview::tests::migration_preview_`。Expected: FAIL，缺接缝/command或budget/digest/zero-effect断言失败。
+- [x] **Step 3: Implement both signatures and register.** 校验project/backend/selection长度、排序去重；W02metadata先判预算，只安全小文本完整读后立即丢弃正文。recorded/current/unknown hash区分；invalid identity/无法验证expected整次拒绝，单项missing/unsafe保留状态。稳定公开内容digest排除观察时间/自身；固定rebind/exclusions、不输出任意metadata，绝不使用sync/export/import或runtime恢复API。
+- [x] **Step 4: Run GREEN.** 重跑RED与Task 1Store测试；Expected: PASS；验证未读取oversized正文、无temp/blob/DB新增文件，能力身份不出preview/errors。
+- [x] **Step 5: Commit.**
 
 ```powershell
 git add src-tauri/src/project_migration_preview.rs src-tauri/src/lib.rs src-tauri/src/dto_contract_tests.rs
@@ -143,3 +143,5 @@ git commit -m "feat: add explicit project migration preview dialog"
 spec覆盖：Task 1metadata COUNT/白名单/只读与DTO；Task 2有界文件/hash/digest/重绑定/无副作用；Task 3项目卡片、空默认选择、scope/Escape与完整验证。五项Review Focus各有测试。shared四DTO与handle契约不重复，pure text issue不依赖baseline存储；没有destination/export/import接口。只列最小断言和实现签名，比例小于spec的数倍；计划阶段未执行任何列出的命令。
 
 2026-10-15：W11 Task1 source72a3c1c及独立纯格式f55860a完成独立FULL审阅，Spec compliant/Approved，无Critical/Important，累计48/50 SOURCE。只读单事务白名单metadata、独立COUNT/最多20摘要、所有会话含Shelved与legacy Archived、science header/分kind计数、当前publication revision/hash摘要、固定安全project/rebind/exclusions及纯DTO完成。新增正式裁决：原精确DTO只有aggregate/examples不能表达设计要求的五种科学计数，故增加kind_counts与MigrationKindCountV1，固定dataset/analysis/artifact/evidence/provenance含零、其他类别为空；成本是纯DTO字段/类型与serde契约，以及后续digest/TS/UI同步，不新增持久化或重载label/重复category。最终semantic Store5/nativeDTO1（724 filtered）通过，纯fmt前RAW与实际rustfmt输出证明连接最终字节，fmt/diff显式exit0；初始及kind_counts编译RED为0 executed，publication hash行为RED1失败、两次fixture失败均保留。一次DTO/Store启动重叠仅观察到build-directory lock等待，两个终态保留，不冒充严格串行；后续检查串行。六路径候选/逆向/重放/RAW/canonicalHEAD/protected7/外部差异/两个工作区兼容残留/空index证明通过。Minor为hardlink cache警告，留待最终整分支审阅。Task2仍需文件identity/预算/expected hash/稳定digest（含kind_counts）/固定安全错误与仅public_project序列化；Task3仍需TS/UI、显式生成/范围失效/Escape及完整交付检查。全量工作树与干净归档、CI、Windows手工/真实SSH/模型/R/Micromamba/PBMC均非本Task1通过项；物理Escape STOP保持。
+
+2026-10-15：W11 Task2 semanticcbc0dd6及独立纯格式e56fc12完成独立FULL，Spec compliant/Approved，无Critical/Important，累计49/50 SOURCE。原生只读preview命令/注册、公开metadata与kind_counts/Shelved注记、稳定digest、显式文件身份/预算/完整hash与保存SSH引用已实现。actual W02保留handle、每项512KiB/请求4MiB在尝试前预留并传同一allowance、失败不退款、EOF探针单列；expected_full必须实际完整核验，否则整次拒绝。shared纯文本策略在敏感文件名前置，unsupported可报告metadata但不读payload；未知size/hash保持None，Unavailable记Unreadable不猜Missing。避免会读取profile_json的既有backend helper，直接校验内部project的精确canonical绑定，再使用已审阅Store typed V4 recorded-reference；仅public_project进入响应，底层SQL/路径异常固定安全映射。此为既定白名单约束内实现选择，无新增正式Ruling。最终semantic native15（725 filtered）、Store5、DTO1（739 filtered）通过，fmt/diff0；初始编译RED0 executed、FK fixture在preview前12pass/1fail及临时legacy构造/恢复、unsupported binary sizeNone对Some7行为RED1均保留。前后15项属不同断言阶段不累加；后续断言并非各有独立RED。三路径候选/逆向/重放、preformat等于semanticHEAD、纯rustfmt精确输出、RAW/canonical/protected7/外部差异/两个工作区兼容残留/空index证明通过。Minor环境hardlink警告留最终审阅。Task1 native消费CV已关闭；Task3 TS/UI、空默认显式生成、catalog无SSH刷新、scope/selection/generation失效和立即Escape及完整交付检查仍待实施。DB与逐文件观察非原子快照，digest不是批准token；GUI STOP下手工及真实SSH/模型/R/Micromamba/PBMC未执行，全量工作树/干净归档/CI/最终整分支不属于本任务通过项。
