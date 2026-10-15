@@ -14,6 +14,7 @@ import { ComposerDraftStore } from "./composerDrafts";
 import * as branchApi from "../../conversation-branch-api";
 import * as baselineApi from "../../workspace-navigation-api";
 import * as composerFilesApi from "../../composer-file-api";
+import * as referenceApi from "../../composer-reference-api";
 import { SettingsPanel } from "../settings/SettingsPanel";
 import { setComposerSendPreference } from "../settings/useComposerSendPreference";
 import { setSelectionActionsEnabled } from "../../use-general-preferences";
@@ -24,6 +25,66 @@ const project = {
   status: "running" as const,
   template: "single_cell_rna_seq" as const,
 };
+
+it("visibility_catalog_refresh invalidates an open # request without clearing a selected historical chip", async () => {
+  const item = { reference: { kind: "session" as const, project_id: project.id, id: "old-session" }, label: "Historical session", description: "Saved source" };
+  let finishOld!: (items: typeof item[]) => void;
+  const catalog = vi.spyOn(referenceApi, "composerReferenceCatalog").mockResolvedValue([item]);
+  const send = vi.fn().mockResolvedValue(true);
+  const view = render(<WorkspaceShell project={project} locale="en-US" activeConversationId="active" onSend={send} referenceCatalogVersion={0} />);
+  const input = screen.getByRole("textbox", { name: /Describe/ });
+  fireEvent.change(input, { target: { value: "#", selectionStart: 1 } });
+  fireEvent.click(await screen.findByRole("option", { name: /Historical session/ }));
+  await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)); });
+  expect(screen.getByRole("button", { name: "Remove reference: Historical session" })).toBeEnabled();
+  catalog.mockReturnValueOnce(new Promise((resolve) => { finishOld = resolve; })).mockResolvedValue([]);
+  fireEvent.change(input, { target: { value: "#", selectionStart: 1 } });
+  await waitFor(() => expect(catalog).toHaveBeenCalledTimes(2));
+  view.rerender(<WorkspaceShell project={project} locale="en-US" activeConversationId="active" onSend={send} referenceCatalogVersion={1} />);
+  await screen.findByText("No matching references");
+  await act(async () => finishOld([item]));
+  expect(screen.queryByRole("option", { name: /Historical session/ })).toBeNull();
+  expect(screen.getByRole("button", { name: "Remove reference: Historical session" })).toBeEnabled();
+  catalog.mockResolvedValue([item]);
+  view.rerender(<WorkspaceShell project={project} locale="en-US" activeConversationId="active" onSend={send} referenceCatalogVersion={2} />);
+  await screen.findByRole("option", { name: /Historical session/ });
+  vi.restoreAllMocks();
+});
+
+it("visibility_scope_and_escape drops a restore completion after A to B to A and keeps newer restore busy", async () => {
+  let finishOld!: () => void; let finishNew!: () => void;
+  const restore = vi.fn().mockImplementationOnce(() => new Promise<void>((resolve) => { finishOld = resolve; })).mockImplementationOnce(() => new Promise<void>((resolve) => { finishNew = resolve; }));
+  const state = { project_id: project.id, conversation_id: "a", visibility: "shelved" as const, revision: 3, changed_at: null };
+  const props = { project, locale: "en-US" as const, onSetVisibility: restore, activeConversationVisibility: state };
+  const view = render(<WorkspaceShell {...props} activeConversationId="a" />);
+  fireEvent.click(screen.getByRole("button", { name: "Restore conversation" }));
+  view.rerender(<WorkspaceShell {...props} activeConversationId="b" />);
+  view.rerender(<WorkspaceShell {...props} activeConversationId="a" />);
+  fireEvent.click(screen.getByRole("button", { name: "Restore conversation" }));
+  await act(async () => finishOld());
+  expect(screen.getByRole("button", { name: "Restore conversation" })).toBeDisabled();
+  await act(async () => finishNew());
+  expect(screen.getByRole("button", { name: "Restore conversation" })).toBeEnabled();
+  expect(restore).toHaveBeenNthCalledWith(2, "a", "visible", 3);
+});
+
+it("keeps a newer explicit retry busy after an old A to B to A retry fails", async () => {
+  const old = deferred<void>(); const newer = deferred<void>();
+  const retry = vi.fn().mockReturnValueOnce(old.promise).mockReturnValueOnce(newer.promise);
+  const props = { project, locale: "en-US" as const, pendingVisibilityTarget: "shelved" as const, onRetryConversationVisibility: retry };
+  const view = render(<WorkspaceShell {...props} activeConversationId="a" />);
+  fireEvent.click(screen.getByRole("button", { name: "Retry original visibility action" }));
+  view.rerender(<WorkspaceShell {...props} activeConversationId="b" pendingVisibilityTarget={undefined} />);
+  expect(screen.queryByRole("button", { name: "Retry original visibility action" })).toBeNull();
+  view.rerender(<WorkspaceShell {...props} activeConversationId="a" />);
+  fireEvent.click(screen.getByRole("button", { name: "Retry original visibility action" }));
+  await act(async () => old.reject(new Error("late old retry failure")));
+  expect(screen.getByRole("button", { name: "Retry original visibility action" })).toBeDisabled();
+  expect(screen.queryByText("Visibility action failed. Retry the same operation.")).toBeNull();
+  await act(async () => newer.reject(new Error("current retry failure")));
+  expect(screen.getByRole("button", { name: "Retry original visibility action" })).toBeEnabled();
+  expect(screen.getByText("Visibility action failed. Retry the same operation.")).toBeVisible();
+});
 
 const fastProfile = {
   id: "fast-model",

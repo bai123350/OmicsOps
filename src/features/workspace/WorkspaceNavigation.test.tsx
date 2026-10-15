@@ -1,14 +1,41 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vitest";
 import { WorkspaceNavigation, conversationDateBucket } from "./WorkspaceNavigation";
 import * as api from "../../workspace-navigation-api";
 import type { WorkspaceConversation } from "../../types";
 import { useWindowEscapeLayer } from "../settings/BrowserSettings";
 
-vi.mock("../../workspace-navigation-api", () => ({ listConversationGroups: vi.fn(), saveConversationGroup: vi.fn(), deleteConversationGroup: vi.fn(), moveConversations: vi.fn() }));
+vi.mock("../../workspace-navigation-api", () => ({ getConversationVisibility: vi.fn(), listConversationGroups: vi.fn(), saveConversationGroup: vi.fn(), deleteConversationGroup: vi.fn(), moveConversations: vi.fn() }));
 const conversation = (id: string, title: string, status: WorkspaceConversation["status"] = "idle"): WorkspaceConversation => ({ id, title, status, project_id: "p", model_profile_id: null, created_at: "2026-09-20T02:00:00Z", updated_at: "2026-09-22T02:00:00Z" });
 const props = { projectId: "p", projectName: "RNA", locale: "en-US" as const, conversations: [conversation("a", "Alpha"), conversation("b", "Beta", "completed")], activeConversationId: "a", collapsed: false, onToggleCollapsed: vi.fn(), onNavigate: vi.fn(), onNewConversation: vi.fn(), onSelectConversation: vi.fn(), onOpenSearch: vi.fn(), onBack: vi.fn() };
 beforeEach(() => { vi.resetAllMocks(); vi.mocked(api.listConversationGroups).mockResolvedValue({ groups: [], memberships: [] }); });
+
+it("shelves a running visible member with its exact revision and preserves group membership", async () => {
+  vi.mocked(api.getConversationVisibility).mockResolvedValue({ project_id: "p", conversation_id: "a", visibility: "visible", revision: 7, changed_at: null });
+  vi.mocked(api.listConversationGroups).mockResolvedValue({ groups: [{ id: "g", project_id: "p", name: "Group", created_at: "", updated_at: "" }], memberships: [{ conversation_id: "a", group_id: "g" }] });
+  const set = vi.fn().mockResolvedValue(undefined); const open = vi.fn();
+  const view = render(<WorkspaceNavigation {...props} conversations={[conversation("a", "Alpha", "running")]} onSetVisibility={set} onOpenShelvedConversations={open} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Expand group: Group" }));
+  fireEvent.click(screen.getByRole("button", { name: "Shelve conversation: Alpha" }));
+  await waitFor(() => expect(set).toHaveBeenCalledWith("a", "shelved", 7));
+  view.rerender(<WorkspaceNavigation {...props} conversations={[]} onSetVisibility={set} onOpenShelvedConversations={open} />);
+  expect(screen.queryByRole("button", { name: "Alpha" })).toBeNull();
+  expect(api.moveConversations).not.toHaveBeenCalled(); expect(api.deleteConversationGroup).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Shelved conversations" })); expect(open).toHaveBeenCalledOnce();
+});
+
+it("drops a shelve revision read after active scope A to B to A", async () => {
+  let resolve!: (state: Awaited<ReturnType<typeof api.getConversationVisibility>>) => void;
+  vi.mocked(api.getConversationVisibility).mockReturnValue(new Promise((done) => { resolve = done; }));
+  const set = vi.fn();
+  const view = render(<WorkspaceNavigation {...props} onSetVisibility={set} />);
+  fireEvent.click(screen.getByRole("button", { name: "Shelve conversation: Alpha" }));
+  view.rerender(<WorkspaceNavigation {...props} activeConversationId="b" onSetVisibility={set} />);
+  view.rerender(<WorkspaceNavigation {...props} onSetVisibility={set} />);
+  await act(async () => resolve({ project_id: "p", conversation_id: "a", visibility: "visible", revision: 0, changed_at: null }));
+  expect(set).not.toHaveBeenCalled();
+  expect(screen.getByRole("button", { name: "Shelve conversation: Alpha" })).toBeEnabled();
+});
 
 it("provides all requested sidebar destinations and keeps new session/search shortcuts visible", async () => {
   render(<WorkspaceNavigation {...props} />);

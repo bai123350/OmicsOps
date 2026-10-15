@@ -34,6 +34,7 @@ import { CollectSourceButton } from "./CollectSourceButton";
 import { messageLibrarySource } from "./librarySources";
 import { saveWorkspaceLibraryItem } from "../../workspace-navigation-api";
 import type { SaveWorkspaceLibraryItemRequest } from "../../workspace-navigation-types";
+import type { ConversationVisibilityRecordV1, ConversationVisibilityV1 } from "../../workspace-navigation-types";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -92,6 +93,12 @@ interface Props {
   onRegisterNavigationGuard?: (guard: (next: () => void, onCancel?: () => void) => void) => void;
   conversations?: WorkspaceConversation[];
   activeConversationId?: string | null;
+  activeConversationTitle?: string;
+  activeConversationVisibility?: ConversationVisibilityRecordV1 | null;
+  pendingVisibilityTarget?: ConversationVisibilityV1;
+  onRetryConversationVisibility?: () => Promise<void>;
+  onSetVisibility?: (id: string, visibility: ConversationVisibilityV1, expectedRevision: number) => Promise<void>;
+  onOpenShelvedConversations?: () => void;
   capabilitySummary?: ConversationCapabilitiesV4 | null;
   capabilitiesLoading?: boolean;
   capabilitiesError?: string;
@@ -109,6 +116,7 @@ interface Props {
   onSuggestFollowUps?: (runId: string) => Promise<string[]>;
   referenceCatalog?: ComposerCatalogItem[];
   workflowCatalogVersion?: number;
+  referenceCatalogVersion?: number;
   onOpenSearch?: () => void;
   searchRequest?: WorkspaceSearchRequest | null;
   onSearchRequestHandled?: (key: string) => void;
@@ -229,7 +237,26 @@ function parseComposerCommand(text: string): ComposerCommandInvocation | null {
   return { id: match[1].toLowerCase(), args: match[2] ?? "", raw };
 }
 
-export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSettings, onBackToProjects, onOpenSourceConversation, onRegisterNavigationGuard, conversations = [], activeConversationId, capabilitySummary, capabilitiesLoading, capabilitiesError, onRefreshCapabilities, onSelectConversation, onNewConversation, onDeleteConversation, onOpenBranch, onBranchSend, branchSendOriginalMarkdown, branchSendBusy = false, branchSendPending = false, branchSendError = false, onRetryBranchSend, onSend, onQueue, replacement, sideChat, contextUsage = null, contextUsageError = false, onRefreshContextUsage, queueItems = [], queueError = false, queueLoading = false, onQueueRefresh, referenceCatalog, workflowCatalogVersion = 0, onOpenSearch, searchRequest, onSearchRequestHandled, onSuggestFollowUps, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", conversationLoadError = "", onRetryConversationLoad, agentRetryNotice = "", modelLabel, activeModelProfile, modelProfiles = [], modelPicker, composerBusy = false, modelOptions = [], modelId, onModelChange, agentMode, onAgentModeChange, conversationLocked = false, conversationHydrating = false, planActionBusy = false, v4Plan, latestPlanRevision, computeBackends = [], runtimeDraftSelection = null, computeBackendId = "", containerImage = "", autonomyMode = "supervised", approvalPolicy = "auto_approve_except_local_deletion", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onApprovalPolicyChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onRequestPlanRevision, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, activeRunLastActivityAt, agentRunEventsV4 = [], agentTextPreview, agentReasoningPreview, agentModelActivity, guidanceAvailable = false, onAnswerAgentQuestionV4, onDecideToolApprovalV4, onResolveUncertainV4, onResumeAgentRunV4, onCancelRuntimeRecoveryV4, onCloseBrowserRunTabsV4, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
+export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSettings, onBackToProjects, onOpenSourceConversation, onRegisterNavigationGuard, conversations = [], activeConversationId, activeConversationTitle, activeConversationVisibility, pendingVisibilityTarget, onRetryConversationVisibility, onSetVisibility, onOpenShelvedConversations, capabilitySummary, capabilitiesLoading, capabilitiesError, onRefreshCapabilities, onSelectConversation, onNewConversation, onDeleteConversation, onOpenBranch, onBranchSend, branchSendOriginalMarkdown, branchSendBusy = false, branchSendPending = false, branchSendError = false, onRetryBranchSend, onSend, onQueue, replacement, sideChat, contextUsage = null, contextUsageError = false, onRefreshContextUsage, queueItems = [], queueError = false, queueLoading = false, onQueueRefresh, referenceCatalog, workflowCatalogVersion = 0, referenceCatalogVersion = 0, onOpenSearch, searchRequest, onSearchRequestHandled, onSuggestFollowUps, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", conversationLoadError = "", onRetryConversationLoad, agentRetryNotice = "", modelLabel, activeModelProfile, modelProfiles = [], modelPicker, composerBusy = false, modelOptions = [], modelId, onModelChange, agentMode, onAgentModeChange, conversationLocked = false, conversationHydrating = false, planActionBusy = false, v4Plan, latestPlanRevision, computeBackends = [], runtimeDraftSelection = null, computeBackendId = "", containerImage = "", autonomyMode = "supervised", approvalPolicy = "auto_approve_except_local_deletion", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onApprovalPolicyChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onRequestPlanRevision, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, activeRunLastActivityAt, agentRunEventsV4 = [], agentTextPreview, agentReasoningPreview, agentModelActivity, guidanceAvailable = false, onAnswerAgentQuestionV4, onDecideToolApprovalV4, onResolveUncertainV4, onResumeAgentRunV4, onCancelRuntimeRecoveryV4, onCloseBrowserRunTabsV4, remoteFiles, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
+  const visibilityScope = useRef(0);
+  const visibilityOperation = useRef<object | null>(null);
+  const [visibilityBusy, setVisibilityBusy] = useState(false);
+  const [visibilityError, setVisibilityError] = useState("");
+  useEffect(() => {
+    visibilityScope.current += 1; visibilityOperation.current = null;
+    setVisibilityBusy(false); setVisibilityError("");
+    return () => { visibilityScope.current += 1; visibilityOperation.current = null; };
+  }, [project.id, activeConversationId]);
+  async function runVisibilityAction(action: () => Promise<void>) {
+    if (visibilityOperation.current) return;
+    const generation = visibilityScope.current;
+    const token = {}; visibilityOperation.current = token;
+    const current = () => generation === visibilityScope.current && visibilityOperation.current === token;
+    setVisibilityBusy(true); setVisibilityError("");
+    try { await action(); }
+    catch { if (current()) setVisibilityError(locale === "zh-CN" ? "可见性操作失败。请重试同一次操作。" : "Visibility action failed. Retry the same operation."); }
+    finally { if (current()) { visibilityOperation.current = null; setVisibilityBusy(false); } }
+  }
   const t = copy[locale];
   const zh = locale === "zh-CN";
   const { selectionActionsEnabled } = useGeneralPreferences();
@@ -470,7 +497,7 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
       if (current) setCatalogError(locale === "zh-CN" ? "引用加载失败，请重新打开重试。" : "Could not load references. Reopen to retry.");
     }).finally(() => { if (current) setCatalogLoading(false); });
     return () => { current = false; };
-  }, [referencesOpen, project.id, referenceCatalog, locale, workflowCatalogVersion, localWorkflowCatalogVersion]);
+  }, [referencesOpen, project.id, referenceCatalog, locale, workflowCatalogVersion, localWorkflowCatalogVersion, referenceCatalogVersion, activeConversationId]);
   function selectReference(item: ComposerCatalogItem) {
     if (!referenceTrigger) return false;
     if (selectedReferences.length >= 12 && !selectedReferences.some((entry) => referenceKey(entry.reference) === referenceKey(item.reference))) {
@@ -626,7 +653,7 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
       : "";
   const sendLabel = fileReferenceBusy ? (zh ? "校验路径中…" : "Checking paths…") : queuedSend ? (zh ? "加入队列" : "Add to queue") : reviewBusy ? (zh ? "审核中…" : "Reviewing…") : composerDisabled || planLoading ? (planModeEnabled ? (zh ? "规划中…" : "Planning…") : (zh ? "执行中…" : "Running…")) : queuedSend ? (zh ? "加入队列" : "Add to queue") : t.send;
   const activeConversation = conversations.find((item) => item.id === activeConversationId);
-  const conversationTitle = activeConversation?.title || (zh ? "新会话" : "New conversation");
+  const conversationTitle = (activeConversationTitle ?? activeConversation?.title) || (zh ? "新会话" : "New conversation");
   const historicalAgentRunEventsV4 = effectiveActiveRunId
     ? agentRunEventsV4.filter((event) => event.run_id !== effectiveActiveRunId)
     : agentRunEventsV4;
@@ -1189,13 +1216,17 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
   }
 
   return <div className={`science-shell ${sidebarOpen ? "sidebar-open" : "sidebar-collapsed"} ${navigationCollapsed ? "navigation-collapsed" : ""} ${workspacePage !== "conversation" ? "research-page-open" : ""}`}>
-    <WorkspaceNavigation key={`navigation:${project.id}`} projectId={project.id} projectName={project.name} locale={locale} conversations={conversations} activeConversationId={activeConversationId} collapsed={navigationCollapsed} onToggleCollapsed={() => setNavigationCollapsed((value) => { try { localStorage.setItem("omicsops.workspaceNavigationCollapsed", String(!value)); } catch { /* Keep usable in restricted storage. */ } return !value; })} page={workspacePage === "conversation" && sidebarOpen && tab === "files" ? "files" : workspacePage} onNavigate={navigateWorkspace} onNewConversation={onNewConversation ? () => leaveGuard.current(() => { setWorkspacePage("conversation"); void onNewConversation(); }) : undefined} newConversationDisabled={conversationHydrating || agentBusy || conversationLocked} onSelectConversation={(id) => leaveGuard.current(() => { setWorkspacePage("conversation"); void onSelectConversation?.(id); })} onDeleteConversation={onDeleteConversation ? (item) => leaveGuard.current(() => { void deleteConversation(item); }) : undefined} deleteDisabled={(item) => deletingConversationId !== null || conversationHydrating || conversationLocked || (item.id === activeConversationId && (agentBusy || runActive))} onOpenSearch={onOpenSearch} onBack={() => leaveGuard.current(() => onBackToProjects?.())}>
+    <WorkspaceNavigation key={`navigation:${project.id}`} projectId={project.id} projectName={project.name} locale={locale} conversations={conversations} activeConversationId={activeConversationId} onSetVisibility={onSetVisibility} onOpenShelvedConversations={onOpenShelvedConversations} collapsed={navigationCollapsed} onToggleCollapsed={() => setNavigationCollapsed((value) => { try { localStorage.setItem("omicsops.workspaceNavigationCollapsed", String(!value)); } catch { /* Keep usable in restricted storage. */ } return !value; })} page={workspacePage === "conversation" && sidebarOpen && tab === "files" ? "files" : workspacePage} onNavigate={navigateWorkspace} onNewConversation={onNewConversation ? () => leaveGuard.current(() => { setWorkspacePage("conversation"); void onNewConversation(); }) : undefined} newConversationDisabled={conversationHydrating || agentBusy || conversationLocked} onSelectConversation={(id) => leaveGuard.current(() => { setWorkspacePage("conversation"); void onSelectConversation?.(id); })} onDeleteConversation={onDeleteConversation ? (item) => leaveGuard.current(() => { void deleteConversation(item); }) : undefined} deleteDisabled={(item) => deletingConversationId !== null || conversationHydrating || conversationLocked || (item.id === activeConversationId && (agentBusy || runActive))} onOpenSearch={onOpenSearch} onBack={() => leaveGuard.current(() => onBackToProjects?.())}>
       <ConversationCapabilities projectId={project.id} conversationId={activeConversationId} summary={capabilitySummary} loading={capabilitiesLoading} error={capabilitiesError} onRefresh={onRefreshCapabilities} locale={locale} onOpenSettings={onOpenSettings} />
     </WorkspaceNavigation>
     {workspacePage !== "conversation" && workspacePage !== "files" && <WorkspaceResearchPages key={`research:${project.id}`} page={workspacePage} projectId={project.id} locale={locale} registerBeforeLeave={registerBeforeLeave} onOpenConversation={(projectId, conversationId) => leaveGuard.current(() => { setWorkspacePage("conversation"); if (onOpenSourceConversation) void onOpenSourceConversation(projectId, conversationId); else if (projectId === project.id) void onSelectConversation?.(conversationId); })} onInsert={(text) => leaveGuard.current(() => { setDraft((current) => current ? `${current}\n\n${text}` : text); setWorkspacePage("conversation"); requestAnimationFrame(() => draftRef.current?.focus()); })} />}
 
     <main className={`conversation-pane ${workspacePage !== "conversation" ? "workspace-content-hidden" : ""}`} hidden={workspacePage !== "conversation"} aria-label={t.research}>
       <header className="conversation-header"><div><small>{project.name}</small><h1>{conversationTitle}</h1></div><div className="workspace-header-actions">{activeConversationId && <button onClick={openDiagnostics}>{zh ? "运行诊断" : "Run diagnostics"}</button>}{showPlanPanel && <button className="sidebar-plan-link" onClick={() => openSidebarSection("plan")}>{zh ? "查看 Plan" : "Review Plan"}</button>}<span className="live-status"><i />{headerStatus}</span><button className="sidebar-toggle" aria-label={sidebarOpen ? (zh ? "收起侧栏" : "Collapse sidebar") : (zh ? "展开侧栏" : "Expand sidebar")} aria-expanded={sidebarOpen} aria-controls="workspace-sidebar" onClick={() => { if (sidebarOpen) closeSidebar(); else { if (!openTabs.length) { setOpenTabs(["artifacts"]); setTab("artifacts"); } setSidebarOpen(true); } }}><PanelRight size={19} /></button></div></header>
+      {activeConversationVisibility?.project_id === project.id && activeConversationVisibility.conversation_id === activeConversationId && activeConversationVisibility.visibility === "shelved" && <div className="conversation-visibility-banner" role="status"><p>{zh ? "此会话已收起。消息和正在运行的计算会继续保留。" : "This conversation is shelved. Messages and running computation remain available."}</p><button disabled={visibilityBusy || !onSetVisibility || !!pendingVisibilityTarget} onClick={() => { const state = activeConversationVisibility; if (onSetVisibility && !pendingVisibilityTarget) void runVisibilityAction(() => onSetVisibility(state.conversation_id, "visible", state.revision)); }}>{zh ? "恢复会话" : "Restore conversation"}</button></div>}
+      {pendingVisibilityTarget && activeConversationId && <div className="conversation-visibility-banner" role="status"><p>{zh ? `上次${pendingVisibilityTarget === "shelved" ? "收起" : "恢复"}操作尚未确认。请重试原操作，再选择后续操作。` : `The previous ${pendingVisibilityTarget === "shelved" ? "shelve" : "restore"} action is unconfirmed. Retry it before choosing another action.`}</p><button disabled={visibilityBusy || !onRetryConversationVisibility} onClick={() => { if (onRetryConversationVisibility) void runVisibilityAction(onRetryConversationVisibility); }}>{zh ? "重试原可见性操作" : "Retry original visibility action"}</button></div>}
+      {visibilityError && <p role="alert">{visibilityError}</p>}
+      {!activeConversationId && !conversationHydrating && !conversationLoadError && onOpenShelvedConversations && <div className="conversation-visibility-banner"><p>{zh ? "暂无可恢复的可见会话。可新建会话或打开收起的会话。" : "No visible session to resume. Create a conversation or open shelved conversations."}</p></div>}
       <section className="message-stream" aria-live="polite" ref={messageStreamRef} onScroll={(event) => {
         const stream = event.currentTarget;
         const following = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 64;

@@ -40,6 +40,14 @@ it("restores persisted source navigation when opening a branch", async () => {
   expect(select).toHaveBeenCalledWith("c1");
 });
 
+it("opens a shelved branch source even when the source is absent from navigation", async () => {
+  vi.mocked(api.getConversationBranch).mockResolvedValue(branch);
+  const select = vi.fn(); const restore = vi.fn();
+  render(<WorkspaceShell {...base} activeConversationId="b1" conversations={[]} activeConversationVisibility={{ project_id: "p1", conversation_id: "b1", visibility: "shelved", revision: 4, changed_at: null }} onSetVisibility={restore} onOpenBranch={vi.fn()} onSelectConversation={select} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Open source conversation" }));
+  expect(select).toHaveBeenCalledWith("c1"); expect(restore).not.toHaveBeenCalled();
+});
+
 it("sends the composer draft through branch-and-send when the native flow is available", async () => {
   const branchSend = vi.fn().mockResolvedValue(true); const normalSend = vi.fn();
   const computeBackends = [{ descriptor: { schema_version: 4 as const, backend_id: "local", kind: "local" as const, isolation: "process" as const, available: true, supports_python: true, supports_r: true, supports_network_policy: false }, selectable: true, reason: null, python_status: "available" as const, r_status: "available" as const, resolved_image_id: null }];

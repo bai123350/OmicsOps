@@ -11,6 +11,8 @@ import { referenceKey } from "./features/workspace/ComposerReferences";
 import type { ComposerReference } from "./types";
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "./tauri-api";
+import type { ConversationVisibilityRecordV1, ConversationVisibilityV1, SetConversationVisibilityRequestV1 } from "./workspace-navigation-types";
+import { ShelvedConversationsDialog } from "./features/workspace/ShelvedConversationsDialog";
 import * as offlineExampleApi from "./offline-example-api";
 import type { CreateOfflineExampleWorkspaceRequest, OfflineExampleWorkspaceView } from "./types";
 import { OfflineExampleWorkspace } from "./features/projects/OfflineExampleWorkspace";
@@ -158,19 +160,22 @@ export default function DesktopApp() {
         return true;
       }
       // Only a confirmed absent marker permits production conversation reads.
-      let available: WorkspaceConversation[] | null = null;
       let target: WorkspaceConversation | undefined;
+      let targetVisibility: ConversationVisibilityRecordV1 | undefined;
+      let available: WorkspaceConversation[] | undefined;
       if (navigation?.conversationId) {
-        available = await api.listConversations(project.id);
+        target = await api.getWorkspaceConversation(project.id, navigation.conversationId);
         if (!current()) return false;
-        target = available.find((item) => item.id === navigation.conversationId && item.project_id === project.id);
-        if (!target) throw new Error(locale === "zh-CN" ? "来源会话已不存在。" : "The saved conversation is no longer available.");
+        if (!target || target.id !== navigation.conversationId || target.project_id !== project.id) throw new Error(locale === "zh-CN" ? "来源会话已不存在。" : "The saved conversation is no longer available.");
+        [targetVisibility, available] = await Promise.all([api.getConversationVisibility(project.id, target.id), api.listConversations(project.id)]);
+        if (!current()) return false;
+        if (targetVisibility.project_id !== project.id || targetVisibility.conversation_id !== target.id) throw { code: "ownership_mismatch" };
       }
       setOfflineExampleView(null); setOfflineNavigationUnavailable(false);
       offlineExampleProjectId.current = null;
       if (selected?.id === project.id) {
         setSelected(project);
-        if (target && available) { setConversations(available); activateConversation(target); }
+        if (target) { publishVisibleConversations(available!); setActiveConversationVisibility(targetVisibility!); activateConversation(target); }
       } else {
         requestedConversation.current = target ? { projectId: project.id, conversationId: target.id } : null;
         setSelected(project);
@@ -199,7 +204,21 @@ export default function DesktopApp() {
     if (offlineCreateAttempt.current === request) offlineCreateAttempt.current = null;
   }
   const [conversations, setConversations] = useState<WorkspaceConversation[]>([]);
+  const visibleListGeneration = useRef(0);
+  const conversationUpdateRequest = useRef(0);
+  function publishVisibleConversations(next: Parameters<typeof setConversations>[0]) {
+    // An explicit list commit supersedes background event snapshots.
+    visibleListGeneration.current += 1;
+    setConversations(next);
+  }
   const [conversation, setConversation] = useState<WorkspaceConversation | null>(null);
+  const [activeConversationVisibility, setActiveConversationVisibility] = useState<ConversationVisibilityRecordV1 | null>(null);
+  const [shelvedOpen, setShelvedOpen] = useState(false);
+  const [referenceCatalogVersion, setReferenceCatalogVersion] = useState(0);
+  const pendingVisibility = useRef(new Map<string, SetConversationVisibilityRequestV1>());
+  const [, refreshPendingVisibility] = useState(0);
+  const visibilityOperations = useRef(new Map<string, object>());
+  const visibilityReadGeneration = useRef(0);
   const [conversationMode, setConversationMode] = useState<SessionAgentModeV4>("agent");
   const [conversationState, setConversationState] = useState<ConversationAgentStateV4 | null>(null);
   const [messageSequence, setMessageSequence] = useState(1);
@@ -287,6 +306,79 @@ export default function DesktopApp() {
   const conversationHydratingRef = useRef(false);
   currentConversationIdentity.current = { projectId: selected?.id ?? null, conversationId: conversation?.id ?? null };
   activeRunIdRef.current = runId;
+
+  useEffect(() => { setShelvedOpen(false); }, [selected?.id]);
+  useEffect(() => {
+    let disposed = false;
+    const generation = ++visibilityReadGeneration.current;
+    const projectId = selected?.id;
+    const conversationId = conversation?.id;
+    setActiveConversationVisibility(null);
+    if (projectId && conversationId) void api.getConversationVisibility(projectId, conversationId).then((state) => {
+      if (!disposed && generation === visibilityReadGeneration.current && state.project_id === projectId && state.conversation_id === conversationId) setActiveConversationVisibility(state);
+    }).catch(() => { /* Exact read failure cannot imply Visible or mutate the session. */ });
+    return () => { disposed = true; };
+  }, [selected?.id, conversation?.id]);
+
+  async function setConversationVisibility(id: string, visibility: ConversationVisibilityV1, expectedRevision: number) {
+    const projectId = selected?.id;
+    if (!projectId) throw { code: "ownership_mismatch" };
+    const projectToken = projectRequestToken.current;
+    const openGeneration = projectOpenGeneration.current;
+    const action = captureConversationGeneration();
+    const key = JSON.stringify([projectId, id]);
+    const pending = pendingVisibility.current.get(key);
+    // An uncertain write must be replayed before an opposite operation is allowed.
+    if (pending && pending.visibility !== visibility) throw { code: "request_conflict" };
+    visibleListGeneration.current += 1;
+    const request = pending ?? { request_id: crypto.randomUUID(), project_id: projectId, conversation_id: id, expected_revision: expectedRevision, visibility };
+    const operation = {};
+    visibilityOperations.current.set(key, operation);
+    const current = () => visibilityOperations.current.get(key) === operation && projectToken === projectRequestToken.current && openGeneration === projectOpenGeneration.current && isCurrentConversationGeneration(action);
+    pendingVisibility.current.set(key, request);
+    refreshPendingVisibility((version) => version + 1);
+    try {
+      await api.setConversationVisibility(request);
+    } catch (cause) {
+      const code = cause && typeof cause === "object" && "code" in cause ? cause.code : null;
+      // These Store rejections precede the transaction write. Storage/transport
+      // failures and request conflicts do not prove that the request is settled.
+      if (current() && ["invalid_input", "not_found", "ownership_mismatch", "revision_conflict"].includes(String(code)) && pendingVisibility.current.get(key) === request) {
+        pendingVisibility.current.delete(key);
+        refreshPendingVisibility((version) => version + 1);
+        if (code === "revision_conflict") {
+          const readGeneration = ++visibilityReadGeneration.current;
+          try {
+            const [state, items] = await Promise.all([api.getConversationVisibility(projectId, id), api.listConversations(projectId)]);
+            if (current() && readGeneration === visibilityReadGeneration.current && state.project_id === projectId && state.conversation_id === id) {
+              publishVisibleConversations(items);
+              if (currentConversationIdentity.current.conversationId === id) setActiveConversationVisibility(state);
+              workspaceSearch.retry(); setReferenceCatalogVersion((version) => version + 1);
+            }
+          } catch { /* Preserve the explicit rejection if reconciliation is unavailable. */ }
+        }
+      }
+      throw cause;
+    }
+    if (!current()) return;
+    const readGeneration = ++visibilityReadGeneration.current;
+    const [state, items] = await Promise.all([api.getConversationVisibility(projectId, id), api.listConversations(projectId)]);
+    if (!current() || readGeneration !== visibilityReadGeneration.current) return;
+    if (state.project_id !== projectId || state.conversation_id !== id || items.some((item) => item.project_id !== projectId)) throw { code: "ownership_mismatch" };
+    if (pendingVisibility.current.get(key) === request) pendingVisibility.current.delete(key);
+    refreshPendingVisibility((version) => version + 1);
+    visibilityOperations.current.delete(key);
+    publishVisibleConversations(items);
+    if (currentConversationIdentity.current.conversationId === id) setActiveConversationVisibility(state);
+    workspaceSearch.retry();
+    setReferenceCatalogVersion((version) => version + 1);
+  }
+
+  async function retryConversationVisibility() {
+    if (!selected?.id || !conversation?.id) return;
+    const request = pendingVisibility.current.get(JSON.stringify([selected.id, conversation.id]));
+    if (request) await setConversationVisibility(request.conversation_id, request.visibility, request.expected_revision);
+  }
 
   useEffect(() => {
     const pending = pendingSubmissionRef.current;
@@ -474,7 +566,7 @@ export default function DesktopApp() {
     requestedConversation.current = null;
     const shouldResume = resumeLastSession;
     if (!selected) {
-      setConversations([]);
+      publishVisibleConversations([]);
       setConversation(null);
       setConversationLoadError("");
       setHydrationState(false);
@@ -482,23 +574,24 @@ export default function DesktopApp() {
     }
     setConversationLoadError("");
     setHydrationState(true);
-    setConversations([]);
+    publishVisibleConversations([]);
     setConversation(null);
     const requestedForProject = requested?.projectId === selected.id ? requested : null;
     const loadConversation = async () => {
       const [items, latest] = await Promise.all([
         api.listConversations(selected.id),
-        requestedForProject || !shouldResume ? Promise.resolve(null) : api.latestUsedConversation(selected.id),
+        requestedForProject ? api.getWorkspaceConversation(selected.id, requestedForProject.conversationId) : !shouldResume ? Promise.resolve(null) : api.latestUsedConversation(selected.id),
       ]);
       if (disposed || !isCurrentConversationProject(selected.id, token)) return;
-      let active = requestedForProject ? items.find((item) => item.id === requestedForProject.conversationId) : latest;
+      let active = latest;
       if (requestedForProject && !active) throw new Error("The requested saved conversation is no longer available.");
       if (active && active.project_id !== selected.id) throw new Error("The restored conversation belongs to another project.");
       if (!active) {
+        if (shouldResume) { publishVisibleConversations(items); setHydrationState(false); return; }
         active = await createBlankConversation(selected.id);
         if (disposed || !isCurrentConversationProject(selected.id, token)) return;
       }
-      setConversations(items.some((item) => item.id === active.id) ? items : [active, ...items]);
+      publishVisibleConversations(!shouldResume && !requestedForProject && !items.some((item) => item.id === active.id) ? [active, ...items] : items);
       setConversation(active);
     };
     void loadConversation().catch(() => {
@@ -735,8 +828,26 @@ export default function DesktopApp() {
     });
     api.onConversationUpdated((event) => {
       if (!isCurrentSubscriptionProject() || event.project_id !== subscriptionProjectId) return;
-      setConversations((current) => [event.conversation, ...current.filter((item) => item.id !== event.conversation.id)]);
+      // The event updates the exact open object, but carries no visibility state.
       setConversation((current) => current?.id === event.conversation.id ? event.conversation : current);
+      const action = captureConversationGeneration();
+      const openGeneration = projectOpenGeneration.current;
+      const listGeneration = visibleListGeneration.current;
+      const visibilityGeneration = visibilityReadGeneration.current;
+      const request = ++conversationUpdateRequest.current;
+      const current = () => isCurrentSubscriptionProject()
+        && isCurrentConversationGeneration(action)
+        && openGeneration === projectOpenGeneration.current
+        && listGeneration === visibleListGeneration.current
+        && visibilityGeneration === visibilityReadGeneration.current
+        && request === conversationUpdateRequest.current;
+      void api.listConversations(event.project_id).then((items) => {
+        if (!current() || items.some((item) => item.project_id !== event.project_id)) return;
+        // Event reads do not invalidate a user-initiated exact navigation.
+        setConversations(items);
+      }).catch((error) => {
+        if (current()) setAgentNotice(subscriptionError("conversation updates", error));
+      });
     }).then((fn) => disposed ? fn() : unlisten.push(fn)).catch((error) => {
       if (!disposed && isCurrentSubscriptionProject()) setAgentNotice(subscriptionError("conversation updates", error));
     });
@@ -1029,8 +1140,13 @@ export default function DesktopApp() {
   }
 
   async function selectConversation(conversationId: string) {
-    const next = conversations.find((item) => item.id === conversationId);
-    if (next) activateConversation(next);
+    if (!selected) return;
+    const generation = captureConversationGeneration();
+    const requestGeneration = ++projectOpenGeneration.current;
+    const next = await api.getWorkspaceConversation(selected.id, conversationId);
+    if (requestGeneration !== projectOpenGeneration.current || !isCurrentConversationGeneration(generation)) return;
+    if (next.id !== conversationId || next.project_id !== selected.id) throw { code: "ownership_mismatch" };
+    activateConversation(next);
   }
 
   function openGuardedSearchEntry(entry: WorkspaceSearchEntry): Promise<boolean> {
@@ -1115,11 +1231,13 @@ export default function DesktopApp() {
   async function openCreatedBranch(branch: import("./types").ConversationBranchV4): Promise<boolean> {
     const generation = captureConversationGeneration();
     if (generation.projectId !== branch.project_id || generation.conversationId !== branch.source_conversation_id) return false;
+    const requestGeneration = ++projectOpenGeneration.current;
+    const target = await api.getWorkspaceConversation(branch.project_id, branch.branch_conversation_id);
+    if (requestGeneration !== projectOpenGeneration.current || !isCurrentConversationGeneration(generation)) return false;
+    if (!target || target.id !== branch.branch_conversation_id || target.project_id !== branch.project_id) throw new Error("The saved branch could not be loaded.");
     const available = await api.listConversations(branch.project_id);
-    if (!isCurrentConversationGeneration(generation)) return false;
-    const target = available.find((item) => item.id === branch.branch_conversation_id && item.project_id === branch.project_id);
-    if (!target) throw new Error("The saved branch could not be loaded.");
-    setConversations(available);
+    if (requestGeneration !== projectOpenGeneration.current || !isCurrentConversationGeneration(generation)) return false;
+    publishVisibleConversations(available);
     activateConversation(target);
     return true;
   }
@@ -1132,7 +1250,7 @@ export default function DesktopApp() {
       const created = await api.createConversation(generation.projectId!);
       if (generation.conversationId === null) composerDraftStore.adoptUnassigned(generation.projectId!, created.id);
       if (!isCurrentConversationGeneration(generation)) return;
-      setConversations((current) => [created, ...current]);
+      publishVisibleConversations((current) => [created, ...current]);
       ++conversationRequestToken.current;
       resetConversationWork(true);
       setConversation(created);
@@ -1154,7 +1272,7 @@ export default function DesktopApp() {
       if (!isCurrentConversationGeneration(generation)) return;
       const remaining = conversations.filter((item) => item.id !== conversationId);
       if (conversation?.id !== conversationId) {
-        setConversations(remaining);
+        publishVisibleConversations(remaining);
         return;
       }
       let next = remaining[0];
@@ -1162,7 +1280,7 @@ export default function DesktopApp() {
         next = await api.createConversation(generation.projectId!);
         if (!isCurrentConversationGeneration(generation)) return;
       }
-      setConversations(remaining.length > 0 ? remaining : [next]);
+      publishVisibleConversations(remaining.length > 0 ? remaining : [next]);
       ++conversationRequestToken.current;
       resetConversationWork(true);
       setConversation(next);
@@ -1305,7 +1423,7 @@ export default function DesktopApp() {
       && projectId === currentConversationIdentity.current.projectId
       && projectToken === projectRequestToken.current) {
       const refreshedConversations = conversationsResult.value;
-      setConversations(refreshedConversations);
+      publishVisibleConversations(refreshedConversations);
       setConversation((current) => current
         ? refreshedConversations.find((item) => item.id === current.id) ?? current
         : current);
@@ -1529,6 +1647,11 @@ export default function DesktopApp() {
     capabilitiesError={capabilities.error} onRefreshCapabilities={capabilities.refresh}
     project={{ id: selected.id, name: selected.name, status: selected.status, template: selected.template, connection_id: selected.connection_id, remote_root: selected.remote_root }}
     workflowCatalogVersion={workflowCatalogVersion}
+    referenceCatalogVersion={referenceCatalogVersion} activeConversationVisibility={activeConversationVisibility}
+    pendingVisibilityTarget={selected && conversation ? pendingVisibility.current.get(JSON.stringify([selected.id, conversation.id]))?.visibility : undefined}
+    onRetryConversationVisibility={retryConversationVisibility}
+    activeConversationTitle={conversation?.title}
+    onSetVisibility={setConversationVisibility} onOpenShelvedConversations={() => setShelvedOpen(true)}
     locale={locale} onOpenSettings={(section = "models") => { setSettingsSection(section); setSettingsOpen(true); }} onBackToProjects={backToProjectLibrary}
     conversations={conversations} activeConversationId={conversation?.id} onSelectConversation={selectConversation} onNewConversation={newConversation} onOpenBranch={openCreatedBranch} onDeleteConversation={deleteConversation}
     messages={messages} agentBusy={agentBusy} agentNotice={agentNotice} conversationLoadError={conversationLoadError} onRetryConversationLoad={() => setConversationLoadRetry((value) => value + 1)} modelLabel={activeModel?.model} activeModelProfile={activeModel} modelProfiles={modelProfiles}
@@ -1799,7 +1922,7 @@ export default function DesktopApp() {
     onApprovePlan={approvePlan}
     onRequestPlanRevision={requestPlanRevision}
     onCancelRun={activePlanRunId ? cancelRun : undefined}
-  /></div>{settings}{searchDialog}</div>;
+  /></div>{shelvedOpen && <ShelvedConversationsDialog key={selected.id} projectId={selected.id} locale={locale} onClose={() => setShelvedOpen(false)} onSetVisibility={setConversationVisibility} onOpenConversation={(id) => new Promise<void>((resolve, reject) => { workspaceNavigationGuard.current(() => { void openWorkspaceSourceConversation(selected.id, id).then(resolve, reject); }, resolve); })} />}{settings}{searchDialog}</div>;
 }
 function mergeAgentRunEventsV4(current: AgentRunEventV4[], incoming: AgentRunEventV4[]) {
   return [...current, ...incoming]

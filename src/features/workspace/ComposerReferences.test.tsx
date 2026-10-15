@@ -52,6 +52,15 @@ const trigger = (kind: ComposerReferenceTrigger["kind"], query = ""): ComposerRe
   query,
 });
 
+it("keeps a selected Session reference usable when discovery removes the shelved session", () => {
+  const item = session("shelved", "Historical session", "Saved transcript");
+  const remove = vi.fn();
+  render(<><ComposerReferenceChips references={[item.reference]} items={[item]} onRemove={remove} /><ComposerReferencePicker zh={false} items={[]} trigger={trigger("session")} onSelect={vi.fn()} onClose={vi.fn()} /></>);
+  expect(screen.queryByRole("option", { name: /Historical session/ })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Remove reference: Historical session" }));
+  expect(remove).toHaveBeenCalledWith(item.reference, 0);
+});
+
 describe("parseComposerTrigger", () => {
   it("finds an @, #, or / token immediately before the caret", () => {
     expect(parseComposerTrigger("Compare @batch", "Compare @batch".length)).toEqual({

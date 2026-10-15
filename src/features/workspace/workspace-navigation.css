@@ -20,3 +20,6 @@
 .collect-source-action{display:inline-flex;align-items:center;gap:8px;font-size:11px;color:var(--omicsops-text-muted);align-self:flex-start}.collect-source-action button{display:inline-flex;align-items:center;gap:5px;border:0;background:transparent;color:inherit;border-radius:6px;padding:4px 6px}.collect-source-action button:hover{color:var(--omicsops-accent);background:var(--omicsops-surface-muted)}.collect-source-action small[role=alert]{color:#b42318}
 @media(max-height:760px){.wn-actions>button{min-height:32px;padding-top:6px;padding-bottom:6px}.wn-header{min-height:42px}.wn-sessions{margin-top:7px}.workspace-navigation .capability-footer button{padding-top:6px;padding-bottom:6px}}
 @media(max-width:1050px){.science-shell.navigation-collapsed.sidebar-open{grid-template-columns:64px minmax(0,1fr)}}
+.conversation-visibility-banner { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 20px; border-bottom: 1px solid var(--omicsops-border); background: var(--omicsops-surface-muted); }
+.conversation-visibility-banner p { margin: 0; }
+.conversation-visibility-banner button { flex-shrink: 0; }

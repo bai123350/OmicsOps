@@ -17,6 +17,7 @@ import * as referenceApi from "./composer-reference-api";
 import * as attachmentApi from "./composer-attachment-api";
 import * as usageApi from "./usage-settings-api";
 import * as navigationApi from "./workspace-navigation-api";
+import type { ConversationVisibilityRecordV1, SetConversationVisibilityRequestV1 } from "./workspace-navigation-types";
 import * as remoteJobsPanel from "./features/workspace/RemoteJobsPanel";
 import * as workspaceShell from "./features/workspace/WorkspaceShell";
 import * as settingsPanel from "./features/settings/SettingsPanel";
@@ -29,6 +30,13 @@ beforeEach(() => {
   window.localStorage.clear();
   vi.spyOn(api, "latestUsedConversation").mockResolvedValue(null);
   vi.spyOn(offlineExampleApi, "getOfflineExampleWorkspace").mockResolvedValue(null);
+  vi.spyOn(api, "getConversationVisibility").mockImplementation(async (projectId, conversationId) => ({ project_id: projectId, conversation_id: conversationId, visibility: "visible", revision: 0, changed_at: null }));
+  vi.spyOn(api, "getWorkspaceConversation").mockImplementation(async (projectId, conversationId) => {
+    const item = (await api.listConversations(projectId)).find((value) => value.id === conversationId);
+    if (!item) throw { code: "not_found" };
+    return item;
+  });
+  vi.spyOn(navigationApi, "getConversationVisibility").mockImplementation((projectId, conversationId) => api.getConversationVisibility(projectId, conversationId));
 });
 
 const stateProject = { id: "project-state", name: "状态测试项目", description: "", local_root: "E:/Science/state", remote_root: null, connection_id: null, template: "single_cell_rna_seq" as const, status: "running" as const, ollama_only: false, created_at: "2026-08-11T00:00:00Z", updated_at: "2026-08-11T00:00:00Z" };
@@ -113,6 +121,387 @@ function setupConversationStateHarness() {
 }
 
 describe("DesktopApp", () => {
+  function visibilityHarness() {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_id, id) => stateSnapshot(id));
+    let current: ConversationVisibilityRecordV1 = { project_id: stateProject.id, conversation_id: stateConversations[0].id, visibility: "visible", revision: 0, changed_at: null };
+    vi.mocked(api.getConversationVisibility).mockImplementation(async (projectId, id) => id === current.conversation_id ? { ...current } : { project_id: projectId, conversation_id: id, visibility: "visible", revision: 0, changed_at: null });
+    vi.mocked(api.listConversations).mockImplementation(async () => stateConversations.filter((item) => item.id !== current.conversation_id || current.visibility === "visible"));
+    vi.mocked(api.getWorkspaceConversation).mockImplementation(async (_projectId, id) => stateConversations.find((item) => item.id === id)!);
+    vi.spyOn(navigationApi, "listConversationVisibility").mockImplementation(async () => ({ items: current.visibility === "shelved" ? [{ state: { ...current }, title: stateConversations[0].title, conversation_status: "running", conversation_created_at: stateConversations[0].created_at, conversation_updated_at: stateConversations[0].updated_at }] : [], next_offset: null }));
+    const set = vi.spyOn(api, "setConversationVisibility").mockImplementation(async (request) => {
+      current = { ...current, visibility: request.visibility, revision: current.revision + 1 };
+      return { request_id: request.request_id, state: { ...current }, changed: true };
+    });
+    return { set, change: (value: ConversationVisibilityRecordV1) => { current = value; }, get: () => current };
+  }
+
+  it("visibility_running_stays_open and collection uses immediate window Escape", async () => {
+    const { set } = visibilityHarness();
+    const cancel = vi.spyOn(api, "agentV4Cancel");
+    const kernel = vi.spyOn(api, "startKernel");
+    vi.mocked(api.agentV4ConversationState).mockImplementation(async (_id, id) => stateSnapshot(id, { latest_run: stateRun("running", "running", null, null, null), locked: true }));
+    vi.mocked(api.listMessages).mockResolvedValue([{ id: "running-message", project_id: stateProject.id, conversation_id: stateConversations[0].id, sequence: 1, role: "assistant", markdown: "running transcript", created_at: "now" }]);
+    render(<DesktopApp />);
+    await screen.findByText("running transcript");
+    const draft = screen.getByRole("textbox", { name: /描述研究目标/ });
+    fireEvent.change(draft, { target: { value: "retained draft" } });
+    fireEvent.click(screen.getByRole("button", { name: `收起会话：${stateConversations[0].title}` }));
+    await screen.findByText("此会话已收起。消息和正在运行的计算会继续保留。");
+    expect(screen.getByText("running transcript")).toBeVisible();
+    expect(draft).toHaveValue("retained draft");
+    expect(within(screen.getByRole("navigation", { name: "项目与会话" })).queryByRole("button", { name: stateConversations[0].title })).toBeNull();
+    expect(cancel).not.toHaveBeenCalled(); expect(kernel).not.toHaveBeenCalled(); expect(set).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "收起的会话" }));
+    await screen.findByRole("dialog", { name: "收起的会话" });
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "收起的会话" })).toBeNull();
+  });
+
+  it("visibility_lost_reply_requery keeps the immutable request and historical receipts cannot override current restore", async () => {
+    const { set, change, get } = visibilityHarness();
+    let first!: SetConversationVisibilityRequestV1;
+    set.mockImplementationOnce(async (request) => { first = request; change({ ...get(), visibility: "shelved", revision: 1 }); throw new Error("reply lost"); });
+    render(<DesktopApp />); await screen.findByRole("heading", { name: stateConversations[0].title });
+    fireEvent.click(screen.getByRole("button", { name: `收起会话：${stateConversations[0].title}` }));
+    await screen.findByText("可见性操作失败。请重试同一次操作。");
+    change({ ...get(), visibility: "visible", revision: 2 });
+    set.mockImplementationOnce(async (request) => ({ request_id: request.request_id, changed: true, state: { ...get(), visibility: "shelved", revision: 1 } }));
+    fireEvent.click(screen.getByRole("button", { name: `收起会话：${stateConversations[0].title}` }));
+    await waitFor(() => expect(set).toHaveBeenCalledTimes(2));
+    expect(set.mock.calls[1][0]).toEqual(first);
+    await waitFor(() => expect(screen.queryByText("此会话已收起。消息和正在运行的计算会继续保留。")).toBeNull());
+    expect(api.getConversationVisibility).toHaveBeenCalledWith(stateProject.id, stateConversations[0].id);
+  });
+
+  it("visibility_direct_source_open loads a shelved exact ID outside the Visible list", async () => {
+    const { change, get } = visibilityHarness();
+    vi.spyOn(referenceApi, "composerReferenceCatalog").mockResolvedValue([{ reference: { kind: "session", project_id: stateProject.id, id: stateConversations[0].id }, label: "Saved hidden source", description: "historical source" }]);
+    render(<DesktopApp />); await screen.findByRole("heading", { name: stateConversations[0].title });
+    fireEvent.click(screen.getByRole("button", { name: stateConversations[1].title }));
+    await screen.findByRole("heading", { name: stateConversations[1].title });
+    change({ ...get(), visibility: "shelved", revision: 1 });
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    fireEvent.click(await screen.findByRole("button", { name: "打开 Saved hidden source" }));
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    await screen.findByText("此会话已收起。消息和正在运行的计算会继续保留。");
+    expect(api.getWorkspaceConversation).toHaveBeenCalledWith(stateProject.id, stateConversations[0].id);
+  });
+
+  it("keeps an explicit retry reachable after a lost shelf reply and exact reopening, without chaining restore", async () => {
+    const { set, change, get } = visibilityHarness();
+    let first!: SetConversationVisibilityRequestV1;
+    set.mockImplementationOnce(async (request) => { first = request; change({ ...get(), visibility: "shelved", revision: 1 }); throw new Error("reply lost"); });
+    render(<DesktopApp />); await screen.findByRole("heading", { name: stateConversations[0].title });
+    fireEvent.click(screen.getByRole("button", { name: `收起会话：${stateConversations[0].title}` }));
+    await screen.findByText("可见性操作失败。请重试同一次操作。");
+    expect(screen.getByRole("button", { name: "重试原可见性操作" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: stateConversations[1].title }));
+    await screen.findByRole("heading", { name: stateConversations[1].title });
+    expect(screen.queryByRole("button", { name: "重试原可见性操作" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "收起的会话" }));
+    const dialog = await screen.findByRole("dialog", { name: "收起的会话" });
+    fireEvent.click(await within(dialog).findByRole("button", { name: "打开" }));
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    fireEvent.keyDown(window, { key: "Escape" });
+    await screen.findByText("此会话已收起。消息和正在运行的计算会继续保留。");
+    expect(screen.getByRole("button", { name: "恢复会话" })).toBeDisabled();
+    set.mockRejectedValueOnce(new Error("retry reply lost"));
+    fireEvent.click(screen.getByRole("button", { name: "重试原可见性操作" }));
+    await screen.findByText("可见性操作失败。请重试同一次操作。");
+    expect(set.mock.calls[1][0]).toEqual(first);
+    // A receipt without a current read still leaves the original operation pending.
+    const read = vi.mocked(api.getConversationVisibility).getMockImplementation()!;
+    vi.mocked(api.getConversationVisibility).mockRejectedValueOnce(new Error("requery unavailable"));
+    set.mockImplementationOnce(async (request) => ({ request_id: request.request_id, changed: true, state: { ...get() } }));
+    fireEvent.click(screen.getByRole("button", { name: "重试原可见性操作" }));
+    await waitFor(() => expect(set).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(screen.getByRole("button", { name: "重试原可见性操作" })).toBeEnabled());
+    expect(screen.getByRole("button", { name: "恢复会话" })).toBeDisabled();
+    change({ ...get(), visibility: "visible", revision: 2 });
+    vi.mocked(api.getConversationVisibility).mockImplementation(read);
+    set.mockImplementationOnce(async (request) => ({ request_id: request.request_id, changed: true, state: { ...get(), visibility: "shelved", revision: 1 } }));
+    fireEvent.click(screen.getByRole("button", { name: "重试原可见性操作" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "重试原可见性操作" })).toBeNull());
+    expect(set).toHaveBeenCalledTimes(4);
+    for (const [request] of set.mock.calls) expect(request).toEqual(first);
+    expect(screen.queryByRole("button", { name: "恢复会话" })).toBeNull();
+    expect(screen.getByRole("button", { name: stateConversations[0].title })).toBeVisible();
+    // Only a later explicit action creates a new mutation at the displayed revision.
+    fireEvent.click(screen.getByRole("button", { name: `收起会话：${stateConversations[0].title}` }));
+    await waitFor(() => expect(set).toHaveBeenCalledTimes(5));
+    expect(set.mock.calls[4][0]).toMatchObject({ visibility: "shelved", expected_revision: 2 });
+    expect(set.mock.calls[4][0].request_id).not.toBe(first.request_id);
+  });
+
+  it("visibility_scope_and_escape closes a later search first and collection before the underlying sidebar", async () => {
+    visibilityHarness();
+    render(<DesktopApp />); await screen.findByRole("heading", { name: stateConversations[0].title });
+    fireEvent.click(screen.getByRole("button", { name: "展开侧栏" }));
+    fireEvent.click(screen.getByRole("button", { name: "收起的会话" }));
+    await screen.findByRole("dialog", { name: "收起的会话" });
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    await screen.findByRole("dialog", { name: "搜索工作区" });
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "搜索工作区" })).toBeNull();
+    expect(screen.getByRole("dialog", { name: "收起的会话" })).toBeVisible();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "收起的会话" })).toBeNull();
+    expect(screen.getByRole("button", { name: "收起侧栏" })).toHaveAttribute("aria-expanded", "true");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByRole("button", { name: "展开侧栏" })).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("retains the active retry through project reentry and allows restore only after shelf reconciliation", async () => {
+    const { set, change, get } = visibilityHarness();
+    set.mockImplementationOnce(async () => { change({ ...get(), visibility: "shelved", revision: 1 }); throw new Error("lost shelf reply"); });
+    render(<DesktopApp />); await screen.findByRole("heading", { name: stateConversations[0].title });
+    fireEvent.click(screen.getByRole("button", { name: `收起会话：${stateConversations[0].title}` }));
+    await screen.findByText("可见性操作失败。请重试同一次操作。");
+    fireEvent.click(screen.getByRole("button", { name: "返回项目主页" }));
+    expect(screen.queryByRole("button", { name: "重试原可见性操作" })).toBeNull();
+    fireEvent.click(await screen.findByRole("button", { name: `打开项目：${stateProject.name}` }));
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    await screen.findByText("此会话已收起。消息和正在运行的计算会继续保留。");
+    expect(screen.getByRole("button", { name: "恢复会话" })).toBeDisabled();
+    set.mockImplementationOnce(async (request) => ({ request_id: request.request_id, changed: true, state: { ...get() } }));
+    fireEvent.click(screen.getByRole("button", { name: "重试原可见性操作" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "重试原可见性操作" })).toBeNull());
+    expect(set).toHaveBeenCalledTimes(2);
+    expect(set.mock.calls[1][0]).toEqual(set.mock.calls[0][0]);
+    expect(screen.getByRole("button", { name: "恢复会话" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "恢复会话" }));
+    await waitFor(() => expect(set).toHaveBeenCalledTimes(3));
+    expect(set.mock.calls[2][0]).toMatchObject({ visibility: "visible", expected_revision: 1 });
+    expect(set.mock.calls[2][0].request_id).not.toBe(set.mock.calls[0][0].request_id);
+    await waitFor(() => expect(screen.queryByRole("button", { name: "恢复会话" })).toBeNull());
+  });
+
+  it("keeps host unknown request through A to B to A and ignores old settlement while a newer retry is pending", async () => {
+    const { set } = visibilityHarness();
+    const old = deferred<Awaited<ReturnType<typeof api.setConversationVisibility>>>();
+    const newer = deferred<Awaited<ReturnType<typeof api.setConversationVisibility>>>();
+    set.mockReturnValueOnce(old.promise).mockReturnValueOnce(newer.promise);
+    const shell = vi.spyOn(workspaceShell, "WorkspaceShell");
+    render(<DesktopApp />); await screen.findByRole("heading", { name: stateConversations[0].title });
+    let first!: Promise<void>;
+    await act(async () => { first = shell.mock.calls.at(-1)![0].onSetVisibility!(stateConversations[0].id, "shelved", 0); });
+    fireEvent.click(screen.getByRole("button", { name: stateConversations[1].title }));
+    await screen.findByRole("heading", { name: stateConversations[1].title });
+    fireEvent.click(screen.getByRole("button", { name: stateConversations[0].title }));
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    let retry!: Promise<void>;
+    await act(async () => { retry = shell.mock.calls.at(-1)![0].onSetVisibility!(stateConversations[0].id, "shelved", 99); });
+    expect(set.mock.calls[1][0]).toEqual(set.mock.calls[0][0]);
+    const read = vi.mocked(api.getConversationVisibility).mock.calls.length;
+    await act(async () => { old.resolve({ request_id: set.mock.calls[0][0].request_id, changed: true, state: { project_id: stateProject.id, conversation_id: stateConversations[0].id, visibility: "shelved", revision: 1, changed_at: null } }); await first; });
+    expect(api.getConversationVisibility).toHaveBeenCalledTimes(read);
+    await act(async () => { newer.reject({ code: "storage_failed" }); await retry.catch(() => undefined); });
+    await act(async () => { await shell.mock.calls.at(-1)![0].onSetVisibility!(stateConversations[0].id, "shelved", 42); });
+    expect(set.mock.calls[2][0]).toEqual(set.mock.calls[0][0]);
+  });
+
+  it("ignores a superseded same-view visibility retry completion and blocks the opposite operation while unknown", async () => {
+    const { set } = visibilityHarness();
+    const old = deferred<Awaited<ReturnType<typeof api.setConversationVisibility>>>();
+    const newer = deferred<Awaited<ReturnType<typeof api.setConversationVisibility>>>();
+    set.mockReturnValueOnce(old.promise).mockReturnValueOnce(newer.promise);
+    const shell = vi.spyOn(workspaceShell, "WorkspaceShell");
+    render(<DesktopApp />); await screen.findByRole("heading", { name: stateConversations[0].title });
+    const callback = shell.mock.calls.at(-1)![0].onSetVisibility!;
+    let first!: Promise<void>; let retry!: Promise<void>;
+    await act(async () => { first = callback(stateConversations[0].id, "shelved", 0); retry = callback(stateConversations[0].id, "shelved", 8); });
+    const reads = vi.mocked(api.getConversationVisibility).mock.calls.length;
+    await act(async () => { old.resolve({ request_id: set.mock.calls[0][0].request_id, changed: true, state: { project_id: stateProject.id, conversation_id: stateConversations[0].id, visibility: "shelved", revision: 1, changed_at: null } }); await first; });
+    expect(api.getConversationVisibility).toHaveBeenCalledTimes(reads);
+    await expect(callback(stateConversations[0].id, "visible", 1)).rejects.toEqual({ code: "request_conflict" });
+    expect(set).toHaveBeenCalledTimes(2);
+    await act(async () => { newer.reject(new Error("lost reply")); await retry.catch(() => undefined); });
+  });
+
+  it("visibility_catalog_refresh retries global discovery independently from workflow catalogs", async () => {
+    const { get } = visibilityHarness();
+    const item = { reference: { kind: "session" as const, project_id: stateProject.id, id: stateConversations[0].id }, label: "Discoverable session", description: "Saved transcript" };
+    const catalog = vi.spyOn(referenceApi, "composerReferenceCatalog").mockImplementation(async () => get().visibility === "visible" ? [item] : []);
+    const shell = vi.spyOn(workspaceShell, "WorkspaceShell");
+    render(<DesktopApp />); await screen.findByRole("heading", { name: stateConversations[0].title });
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    await screen.findByRole("button", { name: "打开 Discoverable session" });
+    await act(async () => { await shell.mock.calls.at(-1)![0].onSetVisibility!(stateConversations[0].id, "shelved", 0); });
+    await waitFor(() => expect(screen.queryByRole("button", { name: "打开 Discoverable session" })).toBeNull());
+    expect(catalog).toHaveBeenCalledTimes(2);
+    expect(shell.mock.calls.at(-1)![0].referenceCatalogVersion).toBe(1);
+    expect(shell.mock.calls.at(-1)![0].workflowCatalogVersion).toBe(0);
+    await act(async () => { await shell.mock.calls.at(-1)![0].onSetVisibility!(stateConversations[0].id, "visible", 1); });
+    await screen.findByRole("button", { name: "打开 Discoverable session" });
+    expect(shell.mock.calls.at(-1)![0].referenceCatalogVersion).toBe(2);
+  });
+
+  it("opens a collection exact ID and restores using its current banner revision", async () => {
+    const { change, get, set } = visibilityHarness();
+    change({ ...get(), visibility: "shelved", revision: 5 });
+    vi.mocked(api.latestUsedConversation).mockResolvedValue(stateConversations[1]);
+    render(<DesktopApp />); await screen.findByRole("heading", { name: stateConversations[1].title });
+    fireEvent.click(screen.getByRole("button", { name: "收起的会话" }));
+    const dialog = await screen.findByRole("dialog", { name: "收起的会话" });
+    fireEvent.click(await within(dialog).findByRole("button", { name: "打开" }));
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    expect(set).not.toHaveBeenCalled();
+    fireEvent.keyDown(window, { key: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: "恢复会话" }));
+    await waitFor(() => expect(set).toHaveBeenCalledWith(expect.objectContaining({ visibility: "visible", expected_revision: 5 })));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "恢复会话" })).toBeNull());
+    expect(screen.getByRole("button", { name: stateConversations[0].title })).toBeVisible();
+  });
+
+  it("opens a shelved exact branch result without relying on Visible membership", async () => {
+    const { change, get, set } = visibilityHarness();
+    change({ ...get(), visibility: "shelved", revision: 1 });
+    vi.mocked(api.latestUsedConversation).mockResolvedValue(stateConversations[1]);
+    const shell = vi.spyOn(workspaceShell, "WorkspaceShell");
+    render(<DesktopApp />); await screen.findByRole("heading", { name: stateConversations[1].title });
+    const branch = { project_id: stateProject.id, source_conversation_id: stateConversations[1].id, branch_conversation_id: stateConversations[0].id } as Parameters<NonNullable<Parameters<typeof workspaceShell.WorkspaceShell>[0]["onOpenBranch"]>>[0];
+    await act(async () => { expect(await shell.mock.calls.at(-1)![0].onOpenBranch!(branch)).toBe(true); });
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    await screen.findByRole("button", { name: "恢复会话" });
+    expect(screen.queryByRole("button", { name: stateConversations[0].title })).toBeNull();
+    expect(set).not.toHaveBeenCalled();
+  });
+
+  it("new messages in a shelved session do not restore visibility or reinsert navigation", async () => {
+    const { set } = visibilityHarness();
+    const submit = vi.spyOn(api, "submitMessage").mockImplementation(async (request) => ({ id: "new-shelved-message", project_id: request.project_id, conversation_id: request.conversation_id, sequence: 1, role: "user", markdown: request.markdown, created_at: "" }));
+    vi.spyOn(api, "agentV4StartDirect").mockResolvedValue({ ...stateRun("shelved-run", "running", null, null, null), session_mode: "agent" });
+    render(<DesktopApp />); await screen.findByRole("heading", { name: stateConversations[0].title });
+    fireEvent.click(screen.getByRole("button", { name: `收起会话：${stateConversations[0].title}` }));
+    await screen.findByRole("button", { name: "恢复会话" });
+    const input = screen.getByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "Continue shelved research" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(submit).toHaveBeenCalledWith(expect.objectContaining({ conversation_id: stateConversations[0].id, markdown: "Continue shelved research" })));
+    await screen.findByText("Continue shelved research");
+    expect(screen.getByRole("button", { name: "恢复会话" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: stateConversations[0].title })).toBeNull();
+    expect(set).toHaveBeenCalledTimes(1);
+  });
+
+  it("delivered conversation updates retain the exact Shelved transcript without reinserting navigation", async () => {
+    const { set, get } = visibilityHarness();
+    const updated = vi.spyOn(api, "onConversationUpdated").mockResolvedValue(() => {});
+    const messages = vi.spyOn(api, "onConversationEvent").mockResolvedValue(() => {});
+    render(<DesktopApp />); await screen.findByRole("heading", { name: stateConversations[0].title });
+    fireEvent.click(screen.getByRole("button", { name: `收起会话：${stateConversations[0].title}` }));
+    await screen.findByRole("button", { name: "恢复会话" });
+    await act(async () => {
+      messages.mock.calls.at(-1)![0]({ project_id: stateProject.id, conversation_id: stateConversations[0].id, message: { id: "live-shelved", project_id: stateProject.id, conversation_id: stateConversations[0].id, sequence: 1, role: "user", markdown: "delivered shelved message", created_at: "now" } });
+      updated.mock.calls.at(-1)![0]({ project_id: stateProject.id, conversation: { ...stateConversations[0], title: "Updated exact shelved title", status: "running" } });
+    });
+    expect(screen.getByText("delivered shelved message")).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Updated exact shelved title" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Updated exact shelved title" })).toBeNull();
+    expect(get().visibility).toBe("shelved"); expect(set).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops a late event list after a newer Shelf reconciliation", async () => {
+    visibilityHarness();
+    const updated = vi.spyOn(api, "onConversationUpdated").mockResolvedValue(() => {});
+    render(<DesktopApp />); await screen.findByRole("heading", { name: stateConversations[0].title });
+    const oldList = deferred<typeof stateConversations>();
+    vi.mocked(api.listConversations).mockReturnValueOnce(oldList.promise);
+    await act(async () => updated.mock.calls.at(-1)![0]({ project_id: stateProject.id, conversation: stateConversations[0] }));
+    fireEvent.click(screen.getByRole("button", { name: `收起会话：${stateConversations[0].title}` }));
+    await screen.findByRole("button", { name: "恢复会话" });
+    await act(async () => oldList.resolve(stateConversations));
+    expect(screen.queryByRole("button", { name: stateConversations[0].title })).toBeNull();
+    expect(screen.getByRole("button", { name: "恢复会话" })).toBeEnabled();
+  });
+
+  it("drops a late event list through project A to B to A and preserves a newer event refresh", async () => {
+    visibilityHarness();
+    const otherProject = { ...stateProject, id: "event-project-b", name: "Event project B" };
+    const otherConversation = { ...stateConversations[0], id: "event-conversation-b", project_id: otherProject.id, title: "Event conversation B" };
+    vi.mocked(api.listProjects).mockResolvedValue([stateProject, otherProject]);
+    const list = vi.mocked(api.listConversations).getMockImplementation()!;
+    vi.mocked(api.listConversations).mockImplementation(async (id) => id === otherProject.id ? [otherConversation] : list(id));
+    vi.mocked(api.latestUsedConversation).mockImplementation(async (id) => id === otherProject.id ? otherConversation : stateConversations[0]);
+    vi.mocked(api.agentV4ConversationState).mockImplementation(async (id, conversationId) => ({ ...stateSnapshot(conversationId), project_id: id }));
+    const updated = vi.spyOn(api, "onConversationUpdated").mockResolvedValue(() => {});
+    render(<DesktopApp />); await screen.findByRole("heading", { name: stateConversations[0].title });
+    const oldList = deferred<typeof stateConversations>(); const newList = deferred<typeof stateConversations>();
+    const staleItem = { ...stateConversations[0], id: "stale-event", title: "Stale event discovery" };
+    const newItem = { ...stateConversations[0], id: "new-event", title: "New visible discovery" };
+    vi.mocked(api.listConversations).mockReturnValueOnce(oldList.promise);
+    await act(async () => updated.mock.calls.at(-1)![0]({ project_id: stateProject.id, conversation: stateConversations[0] }));
+    fireEvent.click(screen.getByRole("button", { name: "返回项目主页" }));
+    fireEvent.click(await screen.findByRole("button", { name: `打开项目：${otherProject.name}` }));
+    await screen.findByRole("heading", { name: otherConversation.title });
+    fireEvent.click(screen.getByRole("button", { name: "返回项目主页" }));
+    fireEvent.click(await screen.findByRole("button", { name: `打开项目：${stateProject.name}` }));
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    vi.mocked(api.listConversations).mockReturnValueOnce(newList.promise);
+    await act(async () => updated.mock.calls.at(-1)![0]({ project_id: stateProject.id, conversation: stateConversations[0] }));
+    await act(async () => oldList.resolve([staleItem]));
+    expect(screen.queryByRole("button", { name: staleItem.title })).toBeNull();
+    await act(async () => newList.resolve([...stateConversations, newItem]));
+    expect(screen.getByRole("button", { name: newItem.title })).toBeVisible();
+    expect(screen.getByRole("heading", { name: stateConversations[0].title })).toBeVisible();
+  });
+
+  it("discovers a newly Visible conversation from the authoritative event refresh", async () => {
+    visibilityHarness();
+    const updated = vi.spyOn(api, "onConversationUpdated").mockResolvedValue(() => {});
+    render(<DesktopApp />); await screen.findByRole("heading", { name: stateConversations[0].title });
+    const item = { ...stateConversations[0], id: "new-visible", title: "Created visible conversation" };
+    vi.mocked(api.listConversations).mockResolvedValue([...stateConversations, item]);
+    await act(async () => updated.mock.calls.at(-1)![0]({ project_id: stateProject.id, conversation: item }));
+    expect(screen.getByRole("button", { name: item.title })).toBeVisible();
+    expect(screen.getByRole("heading", { name: stateConversations[0].title })).toBeVisible();
+  });
+
+  it("keeps the newest same-view event list when an older refresh completes last", async () => {
+    visibilityHarness();
+    const updated = vi.spyOn(api, "onConversationUpdated").mockResolvedValue(() => {});
+    render(<DesktopApp />); await screen.findByRole("heading", { name: stateConversations[0].title });
+    const oldList = deferred<typeof stateConversations>(); const newList = deferred<typeof stateConversations>();
+    const staleItem = { ...stateConversations[0], id: "stale-event", title: "Stale event discovery" };
+    const newItem = { ...stateConversations[0], id: "new-event", title: "New visible discovery" };
+    vi.mocked(api.listConversations).mockReturnValueOnce(oldList.promise).mockReturnValueOnce(newList.promise);
+    await act(async () => {
+      updated.mock.calls.at(-1)![0]({ project_id: stateProject.id, conversation: stateConversations[0] });
+      updated.mock.calls.at(-1)![0]({ project_id: stateProject.id, conversation: stateConversations[0] });
+    });
+    await act(async () => newList.resolve([...stateConversations, newItem]));
+    expect(screen.getByRole("button", { name: newItem.title })).toBeVisible();
+    await act(async () => oldList.resolve([staleItem]));
+    expect(screen.queryByRole("button", { name: staleItem.title })).toBeNull();
+    expect(screen.getByRole("button", { name: newItem.title })).toBeVisible();
+  });
+
+  it("reaches the original unknown Shelf retry after exact reopening and only permits a later explicit Restore", async () => {
+    const { set, change, get } = visibilityHarness();
+    set.mockImplementationOnce(async () => { change({ ...get(), visibility: "shelved", revision: 1 }); throw new Error("lost committed reply"); });
+    render(<DesktopApp />); await screen.findByRole("heading", { name: stateConversations[0].title });
+    fireEvent.click(screen.getByRole("button", { name: `收起会话：${stateConversations[0].title}` }));
+    await screen.findByText("可见性操作失败。请重试同一次操作。");
+    fireEvent.click(screen.getByRole("button", { name: stateConversations[1].title }));
+    await screen.findByRole("heading", { name: stateConversations[1].title });
+    fireEvent.click(screen.getByRole("button", { name: "收起的会话" }));
+    fireEvent.click(await within(await screen.findByRole("dialog", { name: "收起的会话" })).findByRole("button", { name: "打开" }));
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByRole("button", { name: "恢复会话" })).toBeDisabled();
+    set.mockImplementationOnce(async (request) => ({ request_id: request.request_id, changed: true, state: { ...get(), visibility: "shelved", revision: 1 } }));
+    fireEvent.click(screen.getByRole("button", { name: "重试原可见性操作" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "恢复会话" })).toBeEnabled());
+    expect(set.mock.calls[1][0]).toEqual(set.mock.calls[0][0]);
+    expect(set).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole("button", { name: "恢复会话" }));
+    await waitFor(() => expect(set).toHaveBeenCalledTimes(3));
+    expect(set.mock.calls[2][0]).toMatchObject({ visibility: "visible", expected_revision: 1 });
+    expect(set.mock.calls[2][0].request_id).not.toBe(set.mock.calls[0][0].request_id);
+  });
   it("does not carry an example source request into the next ordinary workspace", async () => {
     const { stateSpy } = setupConversationStateHarness(); stateSpy.mockImplementation(async (_id, conversationId) => stateSnapshot(conversationId));
     vi.mocked(api.listProjects).mockResolvedValue([offlineProject, stateProject]);
@@ -331,6 +720,7 @@ describe("DesktopApp", () => {
   });
 
   it.each(["create", "restore"] as const)("adopts unassigned notes only after confirmed creation, not %s navigation", async (path) => {
+    if (path === "create") window.localStorage.setItem("omicsops.sessions.resumeLast", "false");
     const { stateSpy } = setupConversationStateHarness();
     stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
     vi.mocked(api.listConversations).mockRejectedValueOnce(new Error("Load failed"));
@@ -430,7 +820,7 @@ describe("DesktopApp", () => {
     await waitFor(() => expect(query).toHaveBeenCalledWith(expect.objectContaining({ source: "draft_selection", project_id: stateProject.id })));
     expect(screen.getByRole("dialog", { name: "运行时" })).toHaveTextContent("正在加载运行边界");
     fireEvent.click(screen.getByRole("button", { name: stateConversations[1].title }));
-    expect(screen.queryByRole("dialog", { name: "运行时" })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "运行时" })).not.toBeInTheDocument());
     await act(async () => pending.resolve({ project_id: stateProject.id, source: { kind: "draft_selection" }, compute_selection: { schema_version: 4, backend_id: "local", backend_kind: "local", autonomy_mode: "supervised", environment: "system", network_policy: "host_inherited" }, execution_location: "local_host", isolation: "process", limits: ["same_user_permissions"], interactive_lifecycle: "run_scoped_no_restart_reconnect", detached_job_lifecycle: "unsupported", verification: "not_checked_by_this_view" }));
     expect(screen.queryByRole("dialog", { name: "运行时" })).not.toBeInTheDocument();
   });
@@ -658,6 +1048,7 @@ describe("DesktopApp", () => {
     const other = { ...stateProject, id: "project-other", name: "Other project" };
     const first = { ...stateConversations[0], project_id: other.id, id: "other-first", title: "Other first" };
     const requested = { ...first, id: "other-requested", title: "Requested saved session" };
+    vi.mocked(api.getWorkspaceConversation).mockImplementation(async (projectId, id) => projectId === other.id ? [first, requested].find((item) => item.id === id)! : stateConversations.find((item) => item.id === id)!);
     vi.mocked(api.listProjects).mockResolvedValue([stateProject, other]);
     let otherReads = 0;
     vi.mocked(api.listConversations).mockImplementation(async (projectId) => {
@@ -2066,7 +2457,7 @@ describe("DesktopApp", () => {
     expect(api.listMessages).toHaveBeenCalledWith(stateConversations[1].id);
   });
 
-  it("creates a blank conversation when resume is enabled but the backend has no candidate", async () => {
+  it("visibility_no_visible_latest shows an empty state when resume is enabled and no candidate exists", async () => {
     const { stateSpy } = setupConversationStateHarness();
     const blank = { ...stateConversations[0], id: "blank-no-candidate", title: "" };
     vi.mocked(api.latestUsedConversation).mockResolvedValue(null);
@@ -2075,10 +2466,10 @@ describe("DesktopApp", () => {
 
     render(<DesktopApp />);
 
-    await waitFor(() => expect(create).toHaveBeenCalledOnce());
-    await waitFor(() => expect(api.listMessages).toHaveBeenCalledWith(blank.id));
-    expect(screen.getByRole("heading", { name: "新会话" })).toBeInTheDocument();
-    expect(create).toHaveBeenCalledWith(stateProject.id);
+    await screen.findByText("暂无可恢复的可见会话。可新建会话或打开收起的会话。");
+    expect(create).not.toHaveBeenCalled();
+    expect(api.listMessages).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "收起的会话" })).toBeEnabled();
   });
 
   it("starts a blank conversation without querying history when resume is disabled", async () => {
@@ -2175,6 +2566,7 @@ describe("DesktopApp", () => {
   });
 
   it("deduplicates blank conversation creation during StrictMode effect replay", async () => {
+    window.localStorage.setItem("omicsops.sessions.resumeLast", "false");
     const { stateSpy } = setupConversationStateHarness();
     const pending = deferred<Awaited<ReturnType<typeof api.createConversation>>>();
     vi.mocked(api.listConversations).mockResolvedValue([]);

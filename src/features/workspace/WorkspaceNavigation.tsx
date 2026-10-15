@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ArrowLeft, BookOpen, ChevronDown, ChevronLeft, ChevronRight, File, FolderPlus, History, Pencil, Plus, Search, SlidersHorizontal, Star, Trash2, X } from "lucide-react";
 import type { WorkspaceConversation } from "../../types";
-import type { ConversationGroup, ConversationGroupState, SaveConversationGroupRequest } from "../../workspace-navigation-types";
-import { deleteConversationGroup, listConversationGroups, moveConversations, saveConversationGroup } from "../../workspace-navigation-api";
+import type { ConversationGroup, ConversationGroupState, SaveConversationGroupRequest, ConversationVisibilityV1 } from "../../workspace-navigation-types";
+import { deleteConversationGroup, listConversationGroups, moveConversations, saveConversationGroup, getConversationVisibility } from "../../workspace-navigation-api";
 import { useWindowEscapeLayer } from "../settings/BrowserSettings";
 import type { Locale } from "./copy";
 import "./workspace-navigation.css";
@@ -27,6 +27,8 @@ interface Props {
   onDeleteConversation?: (conversation: WorkspaceConversation) => void | Promise<void>;
   deleteDisabled?: (conversation: WorkspaceConversation) => boolean;
   onOpenSearch?: () => void; onBack?: () => void; children?: ReactNode;
+  onSetVisibility?: (id: string, visibility: ConversationVisibilityV1, expectedRevision: number) => Promise<void>;
+  onOpenShelvedConversations?: () => void;
 }
 
 export function WorkspaceNavigation(props: Props) {
@@ -51,6 +53,29 @@ export function WorkspaceNavigation(props: Props) {
   const pendingSave = useRef<SaveConversationGroupRequest | null>(null);
   const mounted = useRef(true);
   const operation = useRef(false);
+  const visibilityGeneration = useRef(0);
+  const visibilityOperation = useRef<object | null>(null);
+  const [visibilityBusy, setVisibilityBusy] = useState<string | null>(null);
+  const [visibilityError, setVisibilityError] = useState("");
+  useEffect(() => {
+    visibilityGeneration.current += 1;
+    visibilityOperation.current = null; setVisibilityBusy(null); setVisibilityError("");
+    return () => { visibilityGeneration.current += 1; visibilityOperation.current = null; };
+  }, [projectId, props.activeConversationId]);
+  async function shelve(id: string) {
+    if (!props.onSetVisibility || visibilityOperation.current) return;
+    const generation = visibilityGeneration.current;
+    const token = {}; visibilityOperation.current = token;
+    const current = () => mounted.current && generation === visibilityGeneration.current && visibilityOperation.current === token;
+    setVisibilityBusy(id); setVisibilityError("");
+    try {
+      const state = await getConversationVisibility(projectId, id);
+      if (!current()) return;
+      if (state.project_id !== projectId || state.conversation_id !== id) throw { code: "ownership_mismatch" };
+      await props.onSetVisibility(id, "shelved", state.revision);
+    } catch { if (current()) setVisibilityError(zh ? "可见性操作失败。请重试同一次操作。" : "Visibility action failed. Retry the same operation."); }
+    finally { if (current()) { visibilityOperation.current = null; setVisibilityBusy(null); } }
+  }
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   const conversationIds = conversations.map((item) => item.id).sort().join(",");
   useEffect(() => {
@@ -112,6 +137,7 @@ export function WorkspaceNavigation(props: Props) {
       return <div className={`wn-session ${item.id === props.activeConversationId ? "active" : ""}`} key={item.id}>
         {selecting && <input type="checkbox" aria-label={`${zh ? "选择" : "Select"}: ${title}`} checked={selected.includes(item.id)} onChange={(event) => setSelected((ids) => event.target.checked ? [...ids, item.id] : ids.filter((id) => id !== item.id))} />}
         <button className="wn-session-link" aria-current={item.id === props.activeConversationId ? "page" : undefined} title={title} onClick={() => void props.onSelectConversation?.(item.id)}>{title}</button>
+        {!selecting && props.onSetVisibility && <button className="wn-icon" aria-label={zh ? `收起会话：${title}` : `Shelve conversation: ${title}`} disabled={visibilityBusy !== null} onClick={() => void shelve(item.id)}><History size={14} /></button>}
         {!selecting && props.onDeleteConversation && <button className="wn-icon wn-delete" aria-label={zh ? `删除会话：${title}` : `Delete conversation: ${title}`} disabled={props.deleteDisabled?.(item)} onClick={() => void props.onDeleteConversation?.(item)}><Trash2 size={14} /></button>}
       </div>;
     });
@@ -131,6 +157,7 @@ export function WorkspaceNavigation(props: Props) {
       <button aria-label={zh ? "新建会话" : "New conversation"} title={zh ? "新建会话 · Ctrl+N" : "New conversation · Ctrl+N"} disabled={props.newConversationDisabled || !props.onNewConversation} onClick={() => void props.onNewConversation?.()}><Plus size={19} /><span>{zh ? "新建会话" : "New session"}</span><kbd>Ctrl+N</kbd></button>
       <button aria-label={zh ? "搜索项目" : "Search projects"} title={zh ? "搜索 · Ctrl+K" : "Search · Ctrl+K"} onClick={props.onOpenSearch} disabled={!props.onOpenSearch}><Search size={19} /><span>{zh ? "搜索" : "Search"}</span><kbd>Ctrl+K</kbd></button>
       <button aria-label={zh ? "新建分组" : "New group"} title={zh ? "新建分组" : "New group"} onClick={() => editGroup()} disabled={busy}><FolderPlus size={19} /><span>{zh ? "新建分组" : "New group"}</span></button>
+      {props.onOpenShelvedConversations && <button aria-label={zh ? "收起的会话" : "Shelved conversations"} title={zh ? "收起的会话" : "Shelved conversations"} onClick={props.onOpenShelvedConversations}><History size={19} /><span>{zh ? "收起的会话" : "Shelved conversations"}</span></button>}
       {destinations.map(({ id, label, icon: Icon }) => <button key={id} aria-label={label} title={label} aria-current={props.page === id ? "page" : undefined} onClick={() => props.onNavigate(id)}><Icon size={19} /><span>{label}</span></button>)}
     </div>
     {!collapsed && <section className="wn-sessions" aria-label={zh ? "会话列表" : "Sessions"}>
@@ -143,6 +170,7 @@ export function WorkspaceNavigation(props: Props) {
       </div>}
       {selecting && <div className="wn-selection"><small>{selected.length} {zh ? "已选" : "selected"}</small><select aria-label={zh ? "移动所选会话到分组" : "Move selected to group"} value={targetGroup} onChange={(event) => setTargetGroup(event.target.value)}><option value="">{zh ? "移出分组" : "Ungrouped"}</option>{groups.groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select><button disabled={!selected.length || busy} onClick={() => void mutate(() => moveConversations({ project_id: projectId, group_id: targetGroup || null, conversation_ids: selected }))}>{zh ? "移动" : "Move"}</button></div>}
       {error && <p role="alert">{error}<button onClick={() => setRefresh((n) => n + 1)}>{zh ? "重试" : "Retry"}</button></p>}
+      {visibilityError && <p role="alert">{visibilityError}</p>}
       <div className="wn-session-scroll" aria-busy={loading}>
         {sort !== "created" && groups.groups.filter((group) => !groupFilter || groupFilter === group.id).map((group) => {
           const items = filtered.filter((item) => groupByConversation.get(item.id) === group.id);

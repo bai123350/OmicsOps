@@ -36,3 +36,12 @@ it("keeps the research editor mounted when a background plan becomes available",
   expect(screen.getByRole("region", { name: "Research page" })).toBe(editor);
   expect(screen.queryByRole("textbox", { name: "Describe a research goal or @ mention a project file…" })).not.toBeInTheDocument();
 });
+
+it("passes collection entry through real navigation while retaining a shelved transcript and draft", () => {
+  const open = vi.fn(); const restore = vi.fn(); const cancel = vi.fn();
+  render(<WorkspaceShell {...props} activeConversationId="hidden" activeConversationVisibility={{ project_id: "p", conversation_id: "hidden", visibility: "shelved", revision: 2, changed_at: null }} onOpenShelvedConversations={open} onSetVisibility={restore} messages={[{ id: "m", role: "assistant", markdown: "running transcript" }]} onCancelRun={cancel} runStarted agentBusy />);
+  const input = screen.getByRole("textbox", { name: /Describe/ }); fireEvent.change(input, { target: { value: "retained notes" } });
+  fireEvent.click(screen.getByRole("button", { name: "Shelved conversations" }));
+  expect(open).toHaveBeenCalledOnce(); expect(screen.getByText("running transcript")).toBeVisible();
+  expect(input).toHaveValue("retained notes"); expect(cancel).not.toHaveBeenCalled(); expect(restore).not.toHaveBeenCalled();
+});

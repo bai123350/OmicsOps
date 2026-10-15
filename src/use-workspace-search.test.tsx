@@ -25,6 +25,18 @@ const session = (projectId: string, id: string): ComposerCatalogItem => ({
 afterEach(() => vi.restoreAllMocks());
 
 describe("useWorkspaceSearch", () => {
+  it("visibility_catalog_refresh removes and restores Session discovery on retry", async () => {
+    const catalog = vi.spyOn(referenceApi, "composerReferenceCatalog").mockResolvedValue([session("p1", "historical")]);
+    const { result } = renderHook(() => useWorkspaceSearch(true, [projects[0]]));
+    await waitFor(() => expect(result.current.entries.some((entry) => entry.kind === "session")).toBe(true));
+    catalog.mockResolvedValue([]);
+    act(() => result.current.retry());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.entries.some((entry) => entry.kind === "session")).toBe(false);
+    catalog.mockResolvedValue([session("p1", "historical")]);
+    act(() => result.current.retry());
+    await waitFor(() => expect(result.current.entries.some((entry) => entry.kind === "session")).toBe(true));
+  });
   it("indexes projects immediately and lazily loads catalogs only when open", async () => {
     let resolveP1!: (items: ComposerCatalogItem[]) => void;
     let resolveP2!: (items: ComposerCatalogItem[]) => void;
