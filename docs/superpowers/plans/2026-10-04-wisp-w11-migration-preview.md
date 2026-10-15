@@ -50,7 +50,7 @@
 - Consumes: `Store::get_project(&self, id: Uuid) -> Result<Option<Project>, StoreError>`、project-owned conversation/publication/science分表和安全绑定列；W09 Task 1 `ProjectFileSelectionV1`/hash类型。
 - Produces: spec全部 `ProjectMigrationPreviewRequestV1`/report/error DTO；`Store::workspace_project_migration_metadata(&self, project_id: Uuid, categories: &[MigrationMetadataCategoryV1]) -> Result<MigrationMetadataReadContext, StoreError>`。内部context含project、类别COUNT/选中类别examples、science header与能力计数，不成为前端请求；不用Sqlite schema枚举或整state JSON。
 
-- [ ] **Step 1: Write failing tests.** `migration_metadata_empty_selection`、`migration_metadata_selected_categories_bounded`、`migration_metadata_all_sessions_and_safe_bindings`、`migration_metadata_owner_and_readonly`。构造>20条/类别、legacy与shelved会话、active mock run、绑定但无秘密的配置；读取前后DB状态一致。DTO测试unknown字段/nullable hash与unknown size。
+- [x] **Step 1: Write failing tests.** `migration_metadata_empty_selection`、`migration_metadata_selected_categories_bounded`、`migration_metadata_all_sessions_and_safe_bindings`、`migration_metadata_owner_and_readonly`。构造>20条/类别、legacy与shelved会话、active mock run、绑定但无秘密的配置；读取前后DB状态一致。DTO测试unknown字段/nullable hash与unknown size。
 
 ```rust
 assert!(empty.categories.iter().all(|c| !c.selected && c.examples.is_empty()));
@@ -60,10 +60,10 @@ assert_eq!(db_state_after, db_state_before);
 assert!(!public_json.contains("credential_reference"));
 ```
 
-- [ ] **Step 2: Run RED.** `cargo test -p omicsops-store --test project_migration_preview`；`cargo test -p omicsops-desktop --lib dto_contract_tests::migration_preview`。Expected: FAIL，缺DTO/method或COUNT/selection/safety断言失败；新测试target先创建。
-- [ ] **Step 3: Implement the DTO and Store signature.** 单只读事务、明确列与表白名单、COUNT独立于examples限制；只读选中类别安全摘要及science header，不查transcript/事件正文/credentials，不调用会写旧title的list_conversations。Conversations计数包括shelved；name/description公开截断说明进入exclusions。
-- [ ] **Step 4: Run GREEN.** 重跑RED命令；Expected: PASS，DB/active run状态不变，unknown/hash/null契约与spec一致。
-- [ ] **Step 5: Commit.**
+- [x] **Step 2: Run RED.** `cargo test -p omicsops-store --test project_migration_preview`；`cargo test -p omicsops-desktop --lib dto_contract_tests::migration_preview`。Expected: FAIL，缺DTO/method或COUNT/selection/safety断言失败；新测试target先创建。
+- [x] **Step 3: Implement the DTO and Store signature.** 单只读事务、明确列与表白名单、COUNT独立于examples限制；只读选中类别安全摘要及science header，不查transcript/事件正文/credentials，不调用会写旧title的list_conversations。Conversations计数包括shelved；name/description公开截断说明进入exclusions。
+- [x] **Step 4: Run GREEN.** 重跑RED命令；Expected: PASS，DB/active run状态不变，unknown/hash/null契约与spec一致。
+- [x] **Step 5: Commit.**
 
 ```powershell
 git add crates/omicsops-dto/src/project_migration.rs crates/omicsops-dto/src/lib.rs crates/omicsops-store/src/project_migration.rs crates/omicsops-store/src/lib.rs crates/omicsops-store/tests/project_migration_preview.rs src-tauri/src/dto_contract_tests.rs
@@ -141,3 +141,5 @@ git commit -m "feat: add explicit project migration preview dialog"
 ## Plan Self-Review
 
 spec覆盖：Task 1metadata COUNT/白名单/只读与DTO；Task 2有界文件/hash/digest/重绑定/无副作用；Task 3项目卡片、空默认选择、scope/Escape与完整验证。五项Review Focus各有测试。shared四DTO与handle契约不重复，pure text issue不依赖baseline存储；没有destination/export/import接口。只列最小断言和实现签名，比例小于spec的数倍；计划阶段未执行任何列出的命令。
+
+2026-10-15：W11 Task1 source72a3c1c及独立纯格式f55860a完成独立FULL审阅，Spec compliant/Approved，无Critical/Important，累计48/50 SOURCE。只读单事务白名单metadata、独立COUNT/最多20摘要、所有会话含Shelved与legacy Archived、science header/分kind计数、当前publication revision/hash摘要、固定安全project/rebind/exclusions及纯DTO完成。新增正式裁决：原精确DTO只有aggregate/examples不能表达设计要求的五种科学计数，故增加kind_counts与MigrationKindCountV1，固定dataset/analysis/artifact/evidence/provenance含零、其他类别为空；成本是纯DTO字段/类型与serde契约，以及后续digest/TS/UI同步，不新增持久化或重载label/重复category。最终semantic Store5/nativeDTO1（724 filtered）通过，纯fmt前RAW与实际rustfmt输出证明连接最终字节，fmt/diff显式exit0；初始及kind_counts编译RED为0 executed，publication hash行为RED1失败、两次fixture失败均保留。一次DTO/Store启动重叠仅观察到build-directory lock等待，两个终态保留，不冒充严格串行；后续检查串行。六路径候选/逆向/重放/RAW/canonicalHEAD/protected7/外部差异/两个工作区兼容残留/空index证明通过。Minor为hardlink cache警告，留待最终整分支审阅。Task2仍需文件identity/预算/expected hash/稳定digest（含kind_counts）/固定安全错误与仅public_project序列化；Task3仍需TS/UI、显式生成/范围失效/Escape及完整交付检查。全量工作树与干净归档、CI、Windows手工/真实SSH/模型/R/Micromamba/PBMC均非本Task1通过项；物理Escape STOP保持。

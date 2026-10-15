@@ -442,8 +442,13 @@ pub struct MigrationCategorySummaryV1 {
     pub category: MigrationMetadataCategoryV1,
     pub selected: bool,
     pub record_count: u64,
+    pub kind_counts: Vec<MigrationKindCountV1>,
     pub examples: Vec<MigrationRecordSummaryV1>,
     pub examples_truncated: bool,
+}
+pub struct MigrationKindCountV1 {
+    pub kind: String, // fixed dataset/analysis/artifact/evidence/provenance
+    pub record_count: u64,
 }
 pub struct MigrationRecordSummaryV1 {
     pub source_id: String,
@@ -496,7 +501,7 @@ pub struct MigrationPreviewErrorV1 {
 }
 ```
 
-类别数组去重，空数组合法，只预览项目基本 metadata 与显式文件。Project 基本 metadata 始终包含；description 最多 4 KiB，name 最多 800 字节；公开投影改变或过长时使用安全截断并在 exclusions 说明。template/status/kind 用宿主固定值，不返回任意 metadata map。每类别 examples 最多 20 条；只在选中类别取摘要，不取正文。ScientificMetadata 的计数和例子按 dataset/analysis/artifact/evidence/provenance 分 kind 表达；publication 例子只给当前 revision 的标题/状态/hash摘要，conversation 例子只给标题/状态，不含消息或模型配置。
+类别数组去重，空数组合法，只预览项目基本 metadata 与显式文件。Project 基本 metadata 始终包含；description 最多 4 KiB，name 最多 800 字节；公开投影改变或过长时使用安全截断并在 exclusions 说明。template/status/kind 用宿主固定值，不返回任意 metadata map。每类别 examples 最多 20 条；只在选中类别取摘要，不取正文。ScientificMetadata 的计数和例子按 dataset/analysis/artifact/evidence/provenance 分 kind 表达；`kind_counts`按上述固定顺序提供全部五种计数（含零），Conversations/Publications该数组为空；ScientificMetadata的aggregate `record_count`仍为五种计数之和，examples每类别合计最多20条。新增纯DTO字段/类型使规定的分kind计数可表达，不重载label或重复category；代价是serde契约、稳定digest和TS/UI消费端同步更新，无持久化变更。publication 例子只给当前 revision 的标题/状态/hash摘要，conversation 例子只给标题/状态，不含消息或模型配置。
 
 Store 新增 `workspace_project_migration_metadata(&self,project_id:Uuid,categories:&[MigrationMetadataCategoryV1])->Result<MigrationMetadataReadContext,StoreError>`，在一个只读事务内取项目、类别 COUNT/有界摘要、science header 与能力绑定计数。只访问显式列和批准的表，不枚举 SQLite schema，不调用 `list_conversations` 的标题修复路径，不读取 credentials/profile密文。是否包含已收起会话由 Conversations 类别统一包括并给出 `shelved` 计数注记；收起不是删除或秘密标记，选择 Conversations 时不能静默漏掉历史。
 
