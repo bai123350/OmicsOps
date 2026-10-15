@@ -46,6 +46,7 @@ pub mod p1_commands;
 #[cfg(test)]
 mod plan_revision_tests;
 mod project_file_read;
+mod project_migration_preview;
 pub mod project_memory;
 mod project_table;
 mod project_table_commands;
@@ -330,6 +331,7 @@ pub fn run() {
             workspace_commands::create_project,
             workspace_commands::delete_project,
             workspace_file_baselines::workspace_create_file_baseline,
+            project_migration_preview::workspace_preview_project_migration,
             workspace_file_baselines::workspace_list_file_baselines,
             workspace_file_baselines::workspace_get_file_baseline,
             workspace_file_baselines::workspace_diff_file_baseline,
