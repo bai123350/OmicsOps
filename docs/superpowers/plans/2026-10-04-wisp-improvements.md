@@ -49,7 +49,7 @@
 | W08b | [Skill helpers](2026-10-04-wisp-w08-skill-helpers.md) | 3 | 固定本地helper离线行为回归与统一Python CI | 已实现、3任务审阅通过；CI未执行 |
 | W09 | [稿件证据](2026-10-04-wisp-w09-publication-evidence.md) | 4 | 保存revision准备度与reference-only四entry证据ZIP | SOURCE完成并独立审阅；确定性全量/Web/native构建通过，native手工未执行 |
 | W10 | [文件基线](2026-10-04-wisp-w10-file-baselines.md) | 4 | 显式安全小本地文本immutable snapshot/有界diff | 源码已完成并审阅，完整确定性检查已记录；原生手工验收未执行 |
-| W11 | [迁移预览](2026-10-04-wisp-w11-migration-preview.md) | 3 | 空默认选择、类别COUNT、文件状态/hash与rebind/omissions | 进行中，Task1–2 metadata/DTO与有界文件原生预览已实现并审阅，UI待实施 |
+| W11 | [迁移预览](2026-10-04-wisp-w11-migration-preview.md) | 3 | 空默认选择、类别COUNT、文件状态/hash与rebind/omissions | 源码全部完成并审阅；阶段检查已记录，最终整分支检查及原生手工待完成 |
 | W12 | [会话可见性](2026-10-04-wisp-w12-conversation-visibility.md) | 4 | 持久可逆收起/恢复，分页前过滤，精确引用保持 | 源码全部完成并审阅；修复后focused/Web、修复前全量/native已记录，原生手工未执行 |
 
 W08只有两部分都通过才算完成。W02/W04两种worker/source的deterministic协议回归均必需，单独本地入口不满足范围；真实远端/模型验收独立记“未执行”时不冒充端到端通过。
@@ -84,7 +84,7 @@ W07只需W02 Task1叶子，不需要table/SSH界面；W10/W11只需W09 Task1的�
 - [x] 10. W09 Task1–4：基础DTO/context、readiness、post-dialog包、保存revisionUI。
 - [x] 11. W10 Task1–4：immutableStore、safecontent/blob、diff、explicit选择UI。
 - [x] 12. W12 Task1–4：visibility/schema/CAS、discovery/directget、collection、banner/cache。
-- [ ] 13. W11 Task1–3：只读metadata、boundedfiles/digest、project-card预览。
+- [x] 13. W11 Task1–3：只读metadata、boundedfiles/digest、project-card预览。
 - [ ] 14. 全分支独立审阅和最终交付验证，修复任何未解决的范围/行为问题。
 
 完成任务后才勾选对应子计划checkbox；记录提交、RED实际失败原因、GREEN实际数量、完整检查与手工/真实验收状态。更新此表及原清单的实现状态，不把计划存在或旧基线PASS记为功能完成。失败先查根因和对应spec，修复当前功能所需最小边界；范围外云服务/授权/真实主机信息不足不阻止确定性实现。
@@ -160,3 +160,5 @@ W10 Task3 已完成独立审阅：source 783ee03、fix1 e82aed0；FULL审阅指�
 2026-10-15：W11 Task1 source72a3c1c及独立纯格式f55860a完成独立FULL审阅，Spec compliant/Approved，无Critical/Important，累计48/50 SOURCE。只读单事务白名单metadata、独立COUNT/最多20摘要、所有会话含Shelved与legacy Archived、science header/分kind计数、当前publication revision/hash摘要、固定安全project/rebind/exclusions及纯DTO完成。新增正式裁决：原精确DTO只有aggregate/examples不能表达设计要求的五种科学计数，故增加kind_counts与MigrationKindCountV1，固定dataset/analysis/artifact/evidence/provenance含零、其他类别为空；成本是纯DTO字段/类型与serde契约，以及后续digest/TS/UI同步，不新增持久化或重载label/重复category。最终semantic Store5/nativeDTO1（724 filtered）通过，纯fmt前RAW与实际rustfmt输出证明连接最终字节，fmt/diff显式exit0；初始及kind_counts编译RED为0 executed，publication hash行为RED1失败、两次fixture失败均保留。一次DTO/Store启动重叠仅观察到build-directory lock等待，两个终态保留，不冒充严格串行；后续检查串行。六路径候选/逆向/重放/RAW/canonicalHEAD/protected7/外部差异/两个工作区兼容残留/空index证明通过。Minor为hardlink cache警告，留待最终整分支审阅。Task2仍需文件identity/预算/expected hash/稳定digest（含kind_counts）/固定安全错误与仅public_project序列化；Task3仍需TS/UI、显式生成/范围失效/Escape及完整交付检查。全量工作树与干净归档、CI、Windows手工/真实SSH/模型/R/Micromamba/PBMC均非本Task1通过项；物理Escape STOP保持。
 
 2026-10-15：W11 Task2 semanticcbc0dd6及独立纯格式e56fc12完成独立FULL，Spec compliant/Approved，无Critical/Important，累计49/50 SOURCE。原生只读preview命令/注册、公开metadata与kind_counts/Shelved注记、稳定digest、显式文件身份/预算/完整hash与保存SSH引用已实现。actual W02保留handle、每项512KiB/请求4MiB在尝试前预留并传同一allowance、失败不退款、EOF探针单列；expected_full必须实际完整核验，否则整次拒绝。shared纯文本策略在敏感文件名前置，unsupported可报告metadata但不读payload；未知size/hash保持None，Unavailable记Unreadable不猜Missing。避免会读取profile_json的既有backend helper，直接校验内部project的精确canonical绑定，再使用已审阅Store typed V4 recorded-reference；仅public_project进入响应，底层SQL/路径异常固定安全映射。此为既定白名单约束内实现选择，无新增正式Ruling。最终semantic native15（725 filtered）、Store5、DTO1（739 filtered）通过，fmt/diff0；初始编译RED0 executed、FK fixture在preview前12pass/1fail及临时legacy构造/恢复、unsupported binary sizeNone对Some7行为RED1均保留。前后15项属不同断言阶段不累加；后续断言并非各有独立RED。三路径候选/逆向/重放、preformat等于semanticHEAD、纯rustfmt精确输出、RAW/canonical/protected7/外部差异/两个工作区兼容残留/空index证明通过。Minor环境hardlink警告留最终审阅。Task1 native消费CV已关闭；Task3 TS/UI、空默认显式生成、catalog无SSH刷新、scope/selection/generation失效和立即Escape及完整交付检查仍待实施。DB与逐文件观察非原子快照，digest不是批准token；GUI STOP下手工及真实SSH/模型/R/Micromamba/PBMC未执行，全量工作树/干净归档/CI/最终整分支不属于本任务通过项。
+
+2026-10-15 W11 Task3 源码19e2e32018778fb6636b7b65bd6ec7aba99474ea（BASE b90f99365527ee130c8a01306ca6e00673cd9a6a，精确10个前端文件）经独立 FULL task-3-review.md 审阅：Spec compliant / Approved，无 Critical/Important；Task1/2 原生投影、文件边界与摘要契约沿用已审阅生产者，本任务关闭其 TS/UI 下游义务。closest最终41通过；PRE-REVIEW阶段串行 fmt、Rust1935通过/18ignored、Python48、npm1438+Node22、Web、native BUILD ONLY及diff均terminal0。最终工作树覆盖是否采用仍待完整字节溯源裁决；candidate10于Rust运行期间捕获，完整1121文件manifest在Rust/Python后、前端检查前，不能称为pre-Rust快照。保留cache/chunk/linker警告Minor与历史settings Escape原因UNKNOWN。原生手工/真实SSH、模型、R、Micromamba、PBMC未执行，组合Step4保持unchecked；50任务源码审阅完成，干净提交归档npm ci/全套检查、W08真实故障恢复、最强整分支审阅与永久交付记录仍待完成。
