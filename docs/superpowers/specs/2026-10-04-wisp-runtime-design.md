@@ -82,6 +82,15 @@ Local/容器的终端验证后及下次写入前，检查buffer与当前descript
 
 ### 自动验收与文件地图
 
+窗口焦点所有权按可见层级确定：全局 Search 打开时，Desktop 显式将其状态传给
+WorkspaceShell，暂停 Runtime 及其内核元数据子面板的 Tab/Shift+Tab 捕获。
+Search 在自身控件范围内循环 Tab，关闭后恢复原来的 Runtime/子面板控件。
+更高层的导航决定对话框使用自己的键盘事件，不被 Search 的局部处理抢焦点。
+Runtime 始终高于较低的运行轨迹；Runtime 可见时轨迹暂停 Escape 注册。
+远端作业仍独立暂停 Runtime 焦点。一次立即 Escape 仅关闭最高层并保留父层；
+不从 DOM 顺序或 Escape 注册先后推断视觉层级。此组合由 Desktop/Shell 确定性
+测试覆盖，不等于 Windows 原生 GUI 验收（2026-10-19 最终审阅修正）。
+
 确定性测试证明零 launch/零 SSH connect/零 execute；mock Local/SSH 请求错序或错 ID 均拒绝；执行占锁时立即 Busy；检查期间 rebuild/interrupt 导致旧 session 结果拒绝；弱注册表不会延长内核寿命或跨 scope 泄漏。超量对象、超长名称、敏感哨兵及非法 dimensions 有界处理。Python 元数据 helper 可用系统测试 Python 验证恶意 repr/len/property 不触发，无科研库依赖；未知类型不伪造 shape。R 协议用 mock 验证，不把 mock 当作真实 R 无副作用证明；R active binding/promise 行为作为显式 ignored worker 验收，在一次性、有 R 的环境验证，默认 CI 不要求 R。未完成真实 R 验收时记录未执行，不声称完整 worker 端到端通过。DTO 旧 execute/shutdown 契约不变。UI 空态、Busy 手动刷新、异步切换和打开后立即 Escape 均测试。
 
 文件地图：protocol 类型；`omicsops-dto/src/lib.rs` 导出；`omicsops-runtime/src/lib.rs` trait/非启动 lookup；`process_backend.rs` 两种嵌入 worker 与解码；`omicsops-agent/src/lib.rs` SSH 请求/事件；`omicsops-adapters/src/kernel.rs` SSH Python/R worker；`src-tauri/src/commands.rs` 注册表；`agent_v4.rs` slot 注册与 SSH inspect；新增桌面 `kernel_inspection_v4.rs` 命令；`src-tauri/src/lib.rs` 命令注册；DTO 契约测试；前端 types/API/RuntimeDialog/WorkspaceShell 与近邻测试。不新增数据库表。

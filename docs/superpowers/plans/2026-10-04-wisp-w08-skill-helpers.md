@@ -96,8 +96,8 @@
   ```
 
 - [x] **RED/基线 — 运行并记录实际结果。** `python -B -m unittest discover -s scripts -p "test_*.py" -v`；新 smoke 未实现时记录 FAIL，已存在 unittest 正确行为首跑即 PASS 时记录事实；当前 CI 尚无 Python step 是待实现配置，不伪造运行失败。
-- [x] **实现 CI 两个新增步骤和 smoke/docs。** 保留 npm ci→workspace→npm test→build 的顺序；Python discovery 置 npm ci 后、workspace 前，setup-python 在其前。step不加 continue-on-error 或 always-success；仅 runtime owner 管理 OMICSOPS_EVAL_REPORT_PATH 和 upload-artifact。docs 明确 bundle/hash、helper PASS、scripted V4 PASS 与 live acceptance 未执行各自证明什么。
-- [x] **GREEN — discovery PASS，默认完整检查 PASS。** `cargo test --workspace`、`npm test`、`npm run build`、`git diff --check`；纯测试/CI变化无桌面打包必要，若整合时改宿主资源则按 master 跑桌面检查。用 stdlib环境运行，记录 case数量/零skip；确认三个 runtime.py/SOURCE hash未变。CI实际执行状态未发生时注明“本地通过，CI未执行”，不把修改YAML当已通过CI。
+- [x] **实现 CI 两个新增步骤和 smoke/docs。** 当前顺序为 npm ci→Python discovery→V4 scenario/report→Web build→workspace→npm test；setup-python 在 discovery 前。Web 先生成桌面 Rust 编译所需 dist（2026-10-19 最终审阅修正；下方 dated 记录保留原执行顺序）。step不加 continue-on-error 或 always-success；仅 runtime owner 管理 OMICSOPS_EVAL_REPORT_PATH 和 upload-artifact。docs 明确 bundle/hash、helper PASS、scripted V4 PASS 与 live acceptance 未执行各自证明什么。
+- [x] **GREEN — discovery PASS，默认完整检查 PASS。** 当前默认顺序 `npm run build`、`cargo test --workspace`、`npm test`、`git diff --check`；纯测试/CI变化无桌面打包必要，若整合时改宿主资源则按 master 跑桌面检查。用 stdlib环境运行，记录 case数量/零skip；确认三个 runtime.py/SOURCE hash未变。CI实际执行状态未发生时注明“本地通过，CI未执行”，不把修改YAML当已通过CI。
 - [x] **Commit —** `git add -- scripts/test_bundled_skill_helpers.py .github/workflows/ci.yml scripts/README.md docs/bundled-science.md acceptance/README.md`；`git commit -m "ci: run deterministic bundled skill helper regressions"`。
 
 ## 当前实施证据

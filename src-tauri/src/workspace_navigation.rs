@@ -878,12 +878,9 @@ fn write_publication_export(
     selected: Option<std::path::PathBuf>,
     text: &str,
 ) -> Result<Option<String>, String> {
-    let Some(mut path) = selected else {
+    let Some(path) = selected else {
         return Ok(None);
     };
-    if path.extension().is_none() {
-        path.set_extension("md");
-    }
     if !path
         .extension()
         .and_then(|e| e.to_str())
@@ -1449,6 +1446,26 @@ mod tests {
             save_publication(&store, request).await.is_err(),
             "deleted-source fallback must never accept a new unverified reference"
         );
+    }
+
+    #[test]
+    fn chooser_keeps_exact_publication_target_and_rejects_unconfirmed_siblings() {
+        let directory = tempfile::tempdir().unwrap();
+        let chosen = directory.path().join("chosen");
+        let sibling = directory.path().join("chosen.md");
+        std::fs::write(&chosen, b"chosen old").unwrap();
+        std::fs::write(&sibling, b"sibling old").unwrap();
+        assert_eq!(write_publication_export(Some(chosen.clone()), "new").unwrap_err(), "Choose a Markdown (.md) save path");
+        assert_eq!(std::fs::read(&chosen).unwrap(), b"chosen old");
+        assert_eq!(std::fs::read(&sibling).unwrap(), b"sibling old");
+        let wrong = directory.path().join("wrong.exe");
+        assert_eq!(write_publication_export(Some(wrong.clone()), "new").unwrap_err(), "Choose a Markdown (.md) save path");
+        assert!(!wrong.exists());
+        assert_eq!(write_publication_export(None, "new").unwrap(), None);
+        let exact = directory.path().join("exact.MD");
+        assert_eq!(write_publication_export(Some(exact.clone()), "new").unwrap(), Some(exact.to_string_lossy().into_owned()));
+        assert_eq!(std::fs::read(exact).unwrap(), b"new");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 3);
     }
 
     #[test]

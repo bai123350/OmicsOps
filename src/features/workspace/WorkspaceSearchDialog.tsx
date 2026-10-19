@@ -193,9 +193,21 @@ export function WorkspaceSearchDialog({
     }
   }
 
+  function handleDialogTab(event: ReactKeyboardEvent<HTMLElement>) {
+    if (event.key !== "Tab" || event.defaultPrevented) return;
+    // Scoped to Search: a higher navigation decision owns its own keyboard events.
+    const controls = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex="0"]',
+    ) ?? []).filter((item) => !item.hidden && window.getComputedStyle(item).display !== "none" && window.getComputedStyle(item).visibility !== "hidden");
+    if (!controls.length) return;
+    event.preventDefault();
+    const index = controls.indexOf(document.activeElement as HTMLElement);
+    controls[index < 0 ? (event.shiftKey ? controls.length - 1 : 0) : (index + (event.shiftKey ? -1 : 1) + controls.length) % controls.length].focus();
+  }
+
   return (
     <div className="workspace-search-backdrop">
-      <section ref={dialogRef} className="workspace-search-dialog" role="dialog" aria-modal="true" aria-label={dialogLabel} aria-busy={busy || undefined}>
+      <section ref={dialogRef} className="workspace-search-dialog" role="dialog" aria-modal="true" aria-label={dialogLabel} aria-busy={busy || undefined} onKeyDown={handleDialogTab}>
         <header className="workspace-search-header">
           <div>
             <span className="workspace-search-kicker">OmicsOps</span>

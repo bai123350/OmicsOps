@@ -142,8 +142,8 @@ python -B -m unittest discover -s scripts -p "test_*.py" -v
 
 本 helper 增量的本地测试通过与 GitHub CI 实际通过分别记录；CI 配置为 Windows、
 Python 3.12 与 Node 22，修改配置本身不是 CI 运行证据。helper 输出不汇入 V4
-模型调用计数或 suite hash。W08 的 V4 场景 manifest、runner 和报告仍待独立交付，
-整个 W08 尚未完成。本增量未执行真实模型、SSH、R、GPU、PBMC 或原生 UI 验收，
+模型调用计数或 suite hash。W08 的确定性 V4 场景 manifest、runner 和报告已交付，
+使用与证据边界见[场景说明](testing/v4-scenarios.md)。本增量未执行真实模型、SSH、R、GPU、PBMC 或原生 UI 验收，
 也不修改 Skills 源码、SOURCE pin、哈希或冻结规则。真实验收另见
 [acceptance/README.md](../acceptance/README.md)。
 

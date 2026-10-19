@@ -85,7 +85,7 @@ it("drops superseded list generations and rejects wrong-owner get receipts", asy
   vi.mocked(api.getWorkspaceFileBaseline).mockResolvedValueOnce({ ...saved, project_id: "wrong" }); fireEvent.click(screen.getByRole("button", { name: "Open baseline Before" })); await screen.findByRole("alert"); expect(screen.queryByRole("button", { name: "View saved text my script.py" })).not.toBeInTheDocument();
 });
 
-it("closes pending text immediately and discards late text/diff and wrong manifest responses", async () => {
+it("closes pending text immediately and discards deferred text and mismatched diff responses", async () => {
   const pending = deferred<BaselineTextSnapshotV1>(); vi.mocked(api.readWorkspaceBaselineText).mockReturnValueOnce(pending.promise);
   render(<WorkspaceFileBaselinesPanel {...props} />); await openSaved(); fireEvent.click(screen.getByRole("button", { name: "View saved text my script.py" }));
   expect(screen.getByRole("dialog", { name: "Saved baseline text" })).toBeInTheDocument(); fireEvent.keyDown(window, { key: "Escape" }); await act(async () => pending.resolve(text)); expect(screen.queryByText(/window.BAD/)).not.toBeInTheDocument();

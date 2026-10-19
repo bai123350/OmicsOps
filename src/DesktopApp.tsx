@@ -1664,7 +1664,7 @@ export default function DesktopApp() {
   const currentConversationAction = captureConversationAction();
   return <div className="desktop-frame">{applicationMenu}<div className="desktop-frame-content">{projectRoutingNotice}<WorkspaceShell
     composerDraftStore={composerDraftStore}
-    onOpenSearch={openWorkspaceSearch} searchRequest={searchRequest}
+    onOpenSearch={openWorkspaceSearch} globalSearchOpen={searchOpen} searchRequest={searchRequest}
     onRegisterNavigationGuard={registerWorkspaceNavigationGuard} onOpenSourceConversation={openWorkspaceSourceConversation}
     onSearchRequestHandled={(key) => setSearchRequest((current) => current?.key === key ? null : current)}
     onSuggestFollowUps={api.agentV4SuggestFollowUps}

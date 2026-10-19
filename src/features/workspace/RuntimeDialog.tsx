@@ -80,8 +80,8 @@ function useDialogFocus(active: boolean) {
 const inspectionLabels: Record<KernelInspectionStatusV4, [string, string]> = {
   ready: ["可观察 · 内存快照", "Ready · memory snapshot"], not_started: ["未启动 / 当前不可观察", "Not started / currently unobservable"], busy: ["忙碌，请稍后手动刷新", "Busy; refresh manually later"], stale_session: ["会话已改变，请手动刷新", "Stale session; refresh manually"], unavailable: ["当前不可观察", "Unavailable"],
 };
-function KernelInspectionDialog({ zh, language, value, loading, error, refresh, close }: { zh: boolean; language: KernelLanguage; value: KernelInspectionV4 | null; loading: boolean; error: boolean; refresh?: () => void; close: () => void }) {
-  const { dialogRef, closeRef } = useDialogFocus(true); useWindowEscapeLayer(true, close);
+function KernelInspectionDialog({ zh, language, value, loading, error, refresh, close, focusActive }: { focusActive: boolean; zh: boolean; language: KernelLanguage; value: KernelInspectionV4 | null; loading: boolean; error: boolean; refresh?: () => void; close: () => void }) {
+  const { dialogRef, closeRef } = useDialogFocus(focusActive); useWindowEscapeLayer(true, close);
   const unknown = zh ? "未知" : "Unknown";
   return <div className="runtime-dialog-backdrop" style={{ zIndex: 130 }}>
     <section ref={dialogRef} className="runtime-dialog" style={{ height: "auto", maxHeight: "85vh", overflow: "auto" }} role="dialog" aria-modal="true" aria-labelledby="kernel-inspection-title">
@@ -103,7 +103,7 @@ function KernelInspectionDialog({ zh, language, value, loading, error, refresh, 
 
 export function RuntimeDialog({ zh, language, onLanguageChange, backend, boundary, boundaryLoading, boundaryError, onRetryBoundary, onClose, onSettings, onPrepare, onOpenRemoteJobs, kernelInspection = null, kernelInspectionLoading = false, kernelInspectionError = false, onRefreshKernelInspection, kernelInspectionOpen = false, onOpenKernelInspection, onCloseKernelInspection, focusActive = true, frozen = false }: RuntimeDialogProps) {
   // Runtime covers the lower trajectory regardless of sibling DOM order;
-  // only its own child or the independent remote-jobs panel owns focus above it.
+  // its child, remote jobs and global Search can suspend its focus ownership.
   const { dialogRef, closeRef } = useDialogFocus(focusActive && !kernelInspectionOpen);
   const isFrozen = frozen || boundary?.source.kind === "frozen_run";
   const selection = boundary?.compute_selection;
@@ -141,6 +141,6 @@ export function RuntimeDialog({ zh, language, onLanguageChange, backend, boundar
         </main>
       </div>
     </section>
-    {kernelInspectionOpen && onCloseKernelInspection && <KernelInspectionDialog zh={zh} language={language} value={kernelInspection} loading={kernelInspectionLoading} error={kernelInspectionError} refresh={onRefreshKernelInspection} close={onCloseKernelInspection} />}
+    {kernelInspectionOpen && onCloseKernelInspection && <KernelInspectionDialog focusActive={focusActive} zh={zh} language={language} value={kernelInspection} loading={kernelInspectionLoading} error={kernelInspectionError} refresh={onRefreshKernelInspection} close={onCloseKernelInspection} />}
   </div>;
 }

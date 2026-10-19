@@ -45,7 +45,9 @@ python -B -m unittest discover -s scripts -p "test_*.py" -v
 
 The unified command includes model catalog, remote job bridge, kernel inspection
 and bundled helper tests. Windows CI uses Python 3.12 after `npm ci` and before
-`cargo test --workspace`, followed by `npm test` and `npm run build` on Node 22.
+`npm run build`, then `cargo test --workspace` and `npm test` on Node 22.
+The Web build generates `dist`, required when compiling the desktop crate; CI
+also retains the V4 scenario gate and always-upload report before these gates.
 The Python tests use the standard library; no pip install, real credentials,
 network, SSH, GPU or R is required. `-B` avoids generating `.pyc` files.
 
@@ -61,8 +63,8 @@ unsuccessful `TestResult`; it is excluded from normal discovery.
 Bundle/hash checks establish packaged source identity. Helper PASS establishes
 behavior under controlled inputs. Scripted V4 PASS establishes only the runtime
 contracts exercised by its own fixtures; helper output is not part of V4 model
-call counts or suite hashes. The W08 V4 scenario manifest/runner/report work is
-still pending independently of this helper CI increment. Local PASS does not
+call counts or suite hashes. The W08 V4 scenario manifest, runner and report are delivered; see
+[deterministic scenario guidance](../docs/testing/v4-scenarios.md). Local PASS does not
 mean the updated GitHub CI has run or that all 26 Skills, scientific dependencies
 or scientific conclusions have been validated. Real model/SSH/R/PBMC acceptance
 remains opt-in and unexecuted for this increment; follow

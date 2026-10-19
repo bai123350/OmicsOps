@@ -21,9 +21,10 @@ Bundle/hash PASS proves packaged source identity and integrity. Helper PASS
 proves behavior under controlled inputs. Scripted V4 PASS proves only the runtime
 contracts covered by the executed model/tool fixtures. None establishes live
 provider access, all 26 Skills' dependencies or scientific validity. Helper
-results do not enter V4 model call counts or suite hashes. The W08 V4 scenario
-manifest/runner/report work remains pending; this helper increment does not
-complete W08.
+results do not enter V4 model call counts or suite hashes. The W08 deterministic V4 scenario
+manifest, runner and report are delivered; see the
+[scenario commands and evidence boundaries](../docs/testing/v4-scenarios.md).
+Deterministic delivery does not establish real-service or native acceptance.
 
 Local checks and the updated GitHub CI must be reported separately. CI targets
 Windows, Python 3.12 and Node 22; editing the workflow is not a CI pass. For this
@@ -346,9 +347,9 @@ created only by the explicitly approved `runtime.environment.ensure` tool.
 Run the deterministic suite first:
 
 ```text
+npm run build
 cargo test --workspace
 npm test -- --run
-npm run build
 ```
 
 Then run the real low-privilege SSH test using the same pinned-host variables
@@ -644,9 +645,9 @@ The read-only historical diagnosis and the remaining manual smoke steps are in
 ```powershell
 npx vitest run src/features/workspace/RuntimeDialog.test.tsx src/features/workspace/useKernelInspection.test.tsx src/features/workspace/WorkspaceShell.test.tsx
 python -B -m unittest discover -s scripts -p "test_*.py"
+npm run build
 cargo test --workspace
 npm test
-npm run build
 npm run build:desktop
 cargo fmt --all -- --check
 git diff --check
@@ -673,7 +674,8 @@ Ready 是临时内存元数据快照，不是科研证据；结果不写事件�
 端到端验收；本轮不运行或分发安装包。Linux/macOS native readiness 分支未编译、
 未执行，不作平台保证。readiness 只检查当下可观察 queued 数据，不能保证拦截
 检查后任意新帧。真实 R fixture（以下命令）、SSH、模型、容器和科学数据验收
-均未执行，默认 ignored 不算通过。此项完成仍需独立审阅；W08 后续场景尚待完成。
+均未执行，默认 ignored 不算通过。W04 确定性实现与独立审阅已完成；W08 确定性场景也已交付，
+见[场景说明](../docs/testing/v4-scenarios.md)。这些结果不替代上述真实验收。
 
 ### 一次性 R worker
 
@@ -732,7 +734,7 @@ Windows manual smoke (record separately as passed, failed or not executed):
    Compare the archive/checkpoint and frozen specification identity before and
    after recovery. A deterministic checkpoint does not replace original evidence.
 
-Run `cargo test --workspace`, `npm test`, `npm run build`,
+Run `npm run build` first to generate `dist`, then `cargo test --workspace`, `npm test`,
 `npm run build:desktop`, formatting and whitespace checks before delivery. A built
 installer is not an installation or GUI smoke pass. Real provider/SSH/R/Micromamba
 or PBMC workflows require the disposable-environment procedures above and an

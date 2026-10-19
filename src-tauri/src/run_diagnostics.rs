@@ -529,12 +529,9 @@ fn save_diagnostic_bytes(
         RunDiagnosticsExportFormatV4::Html => "html",
         RunDiagnosticsExportFormatV4::Json => "json",
     };
-    let Some(mut path) = choose_path(extension).map_err(|_| "diagnostics_save_failed")? else {
+    let Some(path) = choose_path(extension).map_err(|_| "diagnostics_save_failed")? else {
         return Ok(None);
     };
-    if path.extension().is_none() {
-        path.set_extension(extension);
-    }
     crate::conversation_export::write_export_bytes(&path, extension, bytes)
         .map_err(|_| "diagnostics_save_failed")?;
     Ok(Some(path.to_string_lossy().into_owned()))
@@ -1424,6 +1421,28 @@ mod tests {
     }
 
     #[test]
+    fn chooser_keeps_exact_diagnostic_target_and_rejects_unconfirmed_siblings() {
+        for (format, suffix) in [(Json, "JSON"), (Html, "HTML")] {
+            let directory = tempfile::tempdir().unwrap();
+            let chosen = directory.path().join("chosen");
+            let sibling = directory.path().join(format!("chosen.{}", suffix.to_lowercase()));
+            std::fs::write(&chosen, b"chosen old").unwrap();
+            std::fs::write(&sibling, b"sibling old").unwrap();
+            assert_eq!(save_diagnostic_bytes(b"new", format, |_| Ok(Some(chosen.clone()))).unwrap_err(), "diagnostics_save_failed");
+            assert_eq!(std::fs::read(&chosen).unwrap(), b"chosen old");
+            assert_eq!(std::fs::read(&sibling).unwrap(), b"sibling old");
+            let wrong = directory.path().join("wrong.exe");
+            assert_eq!(save_diagnostic_bytes(b"new", format, |_| Ok(Some(wrong.clone()))).unwrap_err(), "diagnostics_save_failed");
+            assert!(!wrong.exists());
+            assert_eq!(save_diagnostic_bytes(b"new", format, |_| Ok(None)).unwrap(), None);
+            let exact = directory.path().join(format!("exact.{suffix}"));
+            assert_eq!(save_diagnostic_bytes(b"new", format, |_| Ok(Some(exact.clone()))).unwrap(), Some(exact.to_string_lossy().into_owned()));
+            assert_eq!(std::fs::read(exact).unwrap(), b"new");
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 3);
+        }
+    }
+
+    #[test]
     fn run_diagnostics_export_save_cancel_errors_extensions_and_exact_bytes() {
         let bytes = b"{\"exact\":\"\r\n\"}";
         assert_eq!(
@@ -1453,7 +1472,7 @@ mod tests {
                 "diagnostics_save_failed"
             );
         }
-        for (format, name, expected) in [(Json, "exact.JSON", "json"), (Html, "exact", "html")] {
+        for (format, name, expected) in [(Json, "exact.JSON", "json"), (Html, "exact.HTML", "html")] {
             let path = directory.path().join(name);
             let saved = save_diagnostic_bytes(bytes, format, |ext| {
                 assert_eq!(ext, expected);

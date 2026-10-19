@@ -30,7 +30,7 @@ jobs:
         with:
           name: v4-scenarios
           path: target/evaluation/v4-scenarios.json
+      - run: npm run build
       - run: cargo test --workspace
       - run: npm test
-      - run: npm run build
 

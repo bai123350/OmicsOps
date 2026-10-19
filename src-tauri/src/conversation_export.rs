@@ -1,6 +1,6 @@
 use base64::Engine;
 use omicsops_dto::{ConversationExportFormat, ConversationExportRequest};
-use std::{io::Write, path::Path};
+use std::{io::Write, path::{Path, PathBuf}};
 use tauri_plugin_dialog::DialogExt;
 
 const MAX_BYTES: usize = 24 * 1024 * 1024;
@@ -76,6 +76,17 @@ pub(crate) fn write_export_bytes(
     Ok(())
 }
 
+fn save_conversation_bytes(
+    bytes: &[u8],
+    format: ConversationExportFormat,
+    choose_path: impl FnOnce(&str) -> Result<Option<PathBuf>, String>,
+) -> Result<Option<String>, String> {
+    let ext = extension(format);
+    let Some(path) = choose_path(ext)? else { return Ok(None); };
+    write_export(&path, format, bytes)?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
 #[tauri::command]
 pub async fn save_conversation_export(
     app: tauri::AppHandle,
@@ -83,22 +94,13 @@ pub async fn save_conversation_export(
 ) -> Result<Option<String>, String> {
     let bytes = decode_export(&request)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let ext = extension(request.format);
-        let Some(selected) = app
-            .dialog()
-            .file()
-            .add_filter("Conversation", &[ext])
-            .set_file_name(format!("omicsops-conversation.{ext}"))
-            .blocking_save_file()
-        else {
-            return Ok(None);
-        };
-        let mut path = selected.into_path().map_err(|error| error.to_string())?;
-        if path.extension().is_none() {
-            path.set_extension(ext);
-        }
-        write_export(&path, request.format, &bytes)?;
-        Ok(Some(path.to_string_lossy().into_owned()))
+        save_conversation_bytes(&bytes, request.format, |ext| {
+            app.dialog().file().add_filter("Conversation", &[ext])
+                .set_file_name(format!("omicsops-conversation.{ext}"))
+                .blocking_save_file()
+                .map(|selected| selected.into_path().map_err(|error| error.to_string()))
+                .transpose()
+        })
     })
     .await
     .map_err(|error| error.to_string())?
@@ -114,6 +116,28 @@ mod tests {
             content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
         }
     }
+    #[test]
+    fn chooser_keeps_exact_conversation_target_and_rejects_unconfirmed_siblings() {
+        for (format, suffix) in [(ConversationExportFormat::Html, "HTML"), (ConversationExportFormat::Png, "PNG")] {
+            let directory = tempfile::tempdir().unwrap();
+            let chosen = directory.path().join("chosen");
+            let sibling = directory.path().join(format!("chosen.{}", suffix.to_lowercase()));
+            std::fs::write(&chosen, b"chosen old").unwrap();
+            std::fs::write(&sibling, b"sibling old").unwrap();
+            assert_eq!(save_conversation_bytes(b"new", format, |_| Ok(Some(chosen.clone()))).unwrap_err(), "Save path extension does not match export format");
+            assert_eq!(std::fs::read(&chosen).unwrap(), b"chosen old");
+            assert_eq!(std::fs::read(&sibling).unwrap(), b"sibling old");
+            let wrong = directory.path().join("wrong.exe");
+            assert_eq!(save_conversation_bytes(b"new", format, |_| Ok(Some(wrong.clone()))).unwrap_err(), "Save path extension does not match export format");
+            assert!(!wrong.exists());
+            assert_eq!(save_conversation_bytes(b"new", format, |_| Ok(None)).unwrap(), None);
+            let exact = directory.path().join(format!("exact.{suffix}"));
+            assert_eq!(save_conversation_bytes(b"new", format, |_| Ok(Some(exact.clone()))).unwrap(), Some(exact.to_string_lossy().into_owned()));
+            assert_eq!(std::fs::read(exact).unwrap(), b"new");
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 3);
+        }
+    }
+
     #[test]
     fn rejects_mismatched_signatures_and_oversized_payloads() {
         assert!(decode_export(&request(ConversationExportFormat::Png, b"html")).is_err());

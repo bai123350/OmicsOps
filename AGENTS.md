@@ -110,13 +110,14 @@ crate。捆绑的 Skills 位于根目录 `skills/`，同步逻辑在
 先运行与改动最接近的检查，交付前运行默认完整检查：
 
 ```powershell
+npm run build
 cargo test --workspace
 npm test
-npm run build
 ```
 
-CI 在 Windows、Node.js 22 上依次运行 `npm ci`、Rust workspace 测试、前端测试
-和生产 Web 构建。依赖锁文件发生变化时，必须用 `npm ci` 验证干净安装，而不
+干净检出必须先生成 `dist`，桌面 crate 的 Rust 编译会嵌入 Web 产物。CI 在
+Windows、Node.js 22 上运行 `npm ci`、Python 检查、V4 场景与报告上传、生产
+Web 构建、Rust workspace 测试和前端测试。依赖锁文件发生变化时，必须用 `npm ci` 验证干净安装，而不
 能只依赖现有 `node_modules`。
 
 涉及 Tauri 配置、桌面组合、打包资源或安装行为时，再运行：

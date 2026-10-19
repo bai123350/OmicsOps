@@ -911,6 +911,60 @@ describe("DesktopApp", () => {
     expect(input).toHaveValue(result === "success" ? "" : "Delete source notes");
   });
 
+  it.each([false, true])("global Search owns focus above real Runtime and kernel=%s", async (kernel) => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    const event = agentEvent(stateConversations[0].id, "run-search", 1, { kind: "run_spec_frozen", approval_hash: "approval", spec_hash: "spec" });
+    vi.mocked(api.agentV4EventsForConversation).mockResolvedValue([event, agentEvent(stateConversations[0].id, "run-search", 2, { kind: "run_completed" })]);
+    vi.spyOn(api, "agentV4RuntimeBoundary").mockResolvedValue({ project_id: stateProject.id, source: { kind: "frozen_run", run_id: "run-search" }, compute_selection: { schema_version: 4, backend_id: "local", backend_kind: "local", autonomy_mode: "supervised", environment: "system", network_policy: "host_inherited" }, execution_location: "local_host", isolation: "process", limits: ["same_user_permissions"], interactive_lifecycle: "run_scoped_no_restart_reconnect", detached_job_lifecycle: "unsupported", verification: "not_checked_by_this_view" });
+    vi.spyOn(referenceApi, "composerReferenceCatalog").mockResolvedValue([]);
+    render(<DesktopApp />);
+    const composer = await screen.findByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(composer).toBeEnabled());
+    fireEvent.change(composer, { target: { value: "/trajectory" } });
+    fireEvent.click(screen.getByRole("option", { name: /\/trajectory/ }));
+    const trajectory = screen.getByRole("dialog", { name: "运行轨迹" });
+    fireEvent.click(await within(trajectory).findByRole("button", { name: "运行环境" }));
+    const runtime = screen.getByRole("dialog", { name: "运行时" });
+    if (kernel) fireEvent.click(within(runtime).getByRole("button", { name: "查看内核元数据" }));
+    const owner = kernel ? screen.getByRole("dialog", { name: "内核元数据" }) : runtime;
+    const previous = within(owner).getByRole("button", { name: kernel ? "关闭内核元数据" : "关闭运行时" });
+    previous.focus();
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    const search = screen.getByRole("dialog", { name: "搜索工作区" });
+    const input = within(search).getByRole("searchbox", { name: "搜索工作区内容" });
+    expect(input).toHaveFocus();
+    // A lower window trap must remain suspended even outside DOM bubbling.
+    for (const shiftKey of [false, true]) {
+      const tab = new KeyboardEvent("keydown", { key: "Tab", shiftKey, bubbles: true, cancelable: true });
+      window.dispatchEvent(tab);
+      expect(tab.defaultPrevented).toBe(false);
+      expect(input).toHaveFocus();
+    }
+    const searchClose = within(search).getByRole("button", { name: "关闭搜索" });
+    fireEvent.keyDown(input, { key: "Tab", shiftKey: true });
+    expect(searchClose).toHaveFocus();
+    fireEvent.keyDown(searchClose, { key: "Tab", shiftKey: true });
+    expect(searchClose).not.toHaveFocus();
+    expect(search.contains(document.activeElement)).toBe(true);
+    fireEvent.keyDown(document.activeElement!, { key: "Tab" });
+    expect(searchClose).toHaveFocus();
+    // Cycle past both ends: actual Search controls retain keyboard ownership.
+    for (const shiftKey of [false, true]) for (let index = 0; index < within(search).getAllByRole("button").length + 2; index++) {
+      fireEvent.keyDown(document.activeElement!, { key: "Tab", shiftKey });
+      expect(search.contains(document.activeElement)).toBe(true);
+    }
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "搜索工作区" })).not.toBeInTheDocument();
+    expect(runtime).toBeVisible(); expect(trajectory).toBeVisible(); expect(previous).toHaveFocus();
+    fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
+    expect(owner.contains(document.activeElement)).toBe(true);
+    fireEvent.keyDown(window, { key: "Escape" });
+    if (kernel) { expect(screen.queryByRole("dialog", { name: "内核元数据" })).not.toBeInTheDocument(); expect(runtime).toBeVisible(); }
+    else expect(screen.queryByRole("dialog", { name: "运行时" })).not.toBeInTheDocument();
+    expect(trajectory).toBeVisible();
+  });
+
   it("does not describe a container until its current project and image response resolves", async () => {
     const { stateSpy } = setupConversationStateHarness();
     stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
