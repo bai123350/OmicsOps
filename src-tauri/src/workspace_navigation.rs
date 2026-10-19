@@ -1455,15 +1455,24 @@ mod tests {
         let sibling = directory.path().join("chosen.md");
         std::fs::write(&chosen, b"chosen old").unwrap();
         std::fs::write(&sibling, b"sibling old").unwrap();
-        assert_eq!(write_publication_export(Some(chosen.clone()), "new").unwrap_err(), "Choose a Markdown (.md) save path");
+        assert_eq!(
+            write_publication_export(Some(chosen.clone()), "new").unwrap_err(),
+            "Choose a Markdown (.md) save path"
+        );
         assert_eq!(std::fs::read(&chosen).unwrap(), b"chosen old");
         assert_eq!(std::fs::read(&sibling).unwrap(), b"sibling old");
         let wrong = directory.path().join("wrong.exe");
-        assert_eq!(write_publication_export(Some(wrong.clone()), "new").unwrap_err(), "Choose a Markdown (.md) save path");
+        assert_eq!(
+            write_publication_export(Some(wrong.clone()), "new").unwrap_err(),
+            "Choose a Markdown (.md) save path"
+        );
         assert!(!wrong.exists());
         assert_eq!(write_publication_export(None, "new").unwrap(), None);
         let exact = directory.path().join("exact.MD");
-        assert_eq!(write_publication_export(Some(exact.clone()), "new").unwrap(), Some(exact.to_string_lossy().into_owned()));
+        assert_eq!(
+            write_publication_export(Some(exact.clone()), "new").unwrap(),
+            Some(exact.to_string_lossy().into_owned())
+        );
         assert_eq!(std::fs::read(exact).unwrap(), b"new");
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 3);
     }

@@ -1425,18 +1425,32 @@ mod tests {
         for (format, suffix) in [(Json, "JSON"), (Html, "HTML")] {
             let directory = tempfile::tempdir().unwrap();
             let chosen = directory.path().join("chosen");
-            let sibling = directory.path().join(format!("chosen.{}", suffix.to_lowercase()));
+            let sibling = directory
+                .path()
+                .join(format!("chosen.{}", suffix.to_lowercase()));
             std::fs::write(&chosen, b"chosen old").unwrap();
             std::fs::write(&sibling, b"sibling old").unwrap();
-            assert_eq!(save_diagnostic_bytes(b"new", format, |_| Ok(Some(chosen.clone()))).unwrap_err(), "diagnostics_save_failed");
+            assert_eq!(
+                save_diagnostic_bytes(b"new", format, |_| Ok(Some(chosen.clone()))).unwrap_err(),
+                "diagnostics_save_failed"
+            );
             assert_eq!(std::fs::read(&chosen).unwrap(), b"chosen old");
             assert_eq!(std::fs::read(&sibling).unwrap(), b"sibling old");
             let wrong = directory.path().join("wrong.exe");
-            assert_eq!(save_diagnostic_bytes(b"new", format, |_| Ok(Some(wrong.clone()))).unwrap_err(), "diagnostics_save_failed");
+            assert_eq!(
+                save_diagnostic_bytes(b"new", format, |_| Ok(Some(wrong.clone()))).unwrap_err(),
+                "diagnostics_save_failed"
+            );
             assert!(!wrong.exists());
-            assert_eq!(save_diagnostic_bytes(b"new", format, |_| Ok(None)).unwrap(), None);
+            assert_eq!(
+                save_diagnostic_bytes(b"new", format, |_| Ok(None)).unwrap(),
+                None
+            );
             let exact = directory.path().join(format!("exact.{suffix}"));
-            assert_eq!(save_diagnostic_bytes(b"new", format, |_| Ok(Some(exact.clone()))).unwrap(), Some(exact.to_string_lossy().into_owned()));
+            assert_eq!(
+                save_diagnostic_bytes(b"new", format, |_| Ok(Some(exact.clone()))).unwrap(),
+                Some(exact.to_string_lossy().into_owned())
+            );
             assert_eq!(std::fs::read(exact).unwrap(), b"new");
             assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 3);
         }
@@ -1472,7 +1486,8 @@ mod tests {
                 "diagnostics_save_failed"
             );
         }
-        for (format, name, expected) in [(Json, "exact.JSON", "json"), (Html, "exact.HTML", "html")] {
+        for (format, name, expected) in [(Json, "exact.JSON", "json"), (Html, "exact.HTML", "html")]
+        {
             let path = directory.path().join(name);
             let saved = save_diagnostic_bytes(bytes, format, |ext| {
                 assert_eq!(ext, expected);
