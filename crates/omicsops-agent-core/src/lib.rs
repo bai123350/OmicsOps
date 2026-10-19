@@ -1011,6 +1011,7 @@ impl AgentCoreV4<'_> {
                 .await?;
                 let outcome = match self.tools.execute(RunModeV4::Plan, call.clone()).await {
                     Ok(outcome) => outcome,
+                    Err(_) if static_effect == ToolEffectV4::ReadOnly => failed_read_outcome(&call),
                     Err(error) => {
                         self.push(
                             run_id,
@@ -1378,7 +1379,7 @@ impl AgentCoreV4<'_> {
                                     model_content: format!(
                                         "host rejected tool request before dispatch; correct the arguments and try again: {message}"
                                     ),
-                                    data: json!({"error_kind":"validation","recoverable":true}),
+                                    data: json!({"error_kind":"validation","recoverable":true,"operation_dispatched":false}),
                                     provenance: vec![],
                                 },
                             },
@@ -1692,7 +1693,7 @@ impl AgentCoreV4<'_> {
                                 tool_id: call.tool_id,
                                 succeeded: false,
                                 model_content: format!("host rejected tool request: {message}"),
-                                data: json!({"error_kind":"validation"}),
+                                data: json!({"error_kind":"validation","operation_dispatched":false}),
                                 provenance: vec![],
                             },
                         },
@@ -1869,6 +1870,13 @@ impl AgentCoreV4<'_> {
                 for (call, result) in outcomes {
                     let mut outcome = match result {
                         Ok(outcome) => outcome,
+                        Err(_)
+                            if !cancellation_requested
+                                && self.tools.effect(&call.tool_id)
+                                    == Some(ToolEffectV4::ReadOnly) =>
+                        {
+                            failed_read_outcome(&call)
+                        }
                         Err(error) => {
                             if cancellation_requested
                                 && self.tools.effect(&call.tool_id) == Some(ToolEffectV4::ReadOnly)
@@ -1900,7 +1908,7 @@ impl AgentCoreV4<'_> {
                             )));
                         }
                     };
-                    let scientific_update = if outcome.succeeded {
+                    let scientific_update = if scientific_outcome_requires_update(&call, &outcome) {
                         Some(self.science_after_tool(spec, &call, &outcome).await)
                     } else {
                         None
@@ -3399,6 +3407,7 @@ impl AgentCoreV4<'_> {
         cancelled: Option<&AtomicBool>,
     ) -> Result<ReviewerReportV4, AgentCoreErrorV4> {
         let mut attempt = 0_u8;
+        let mut malformed_arguments_regenerated = false;
         loop {
             if cancelled.is_some_and(|token| token.load(Ordering::SeqCst)) {
                 if let Some(token) = cancelled {
@@ -3419,6 +3428,26 @@ impl AgentCoreV4<'_> {
                 });
             match review {
                 Ok(report) => return Ok(report),
+                Err(error)
+                    if !error.retryable
+                        && error.class == omicsops_protocol::ModelErrorClassV4::InvalidResponse
+                        && error.message.contains("returned malformed JSON arguments:")
+                        && !malformed_arguments_regenerated =>
+                {
+                    // Regenerate only the read-only report from the same frozen
+                    // evidence. This does not consume a transport retry or replay
+                    // any executor call, and a second malformed report still fails.
+                    malformed_arguments_regenerated = true;
+                    self.push(
+                        run_id,
+                        AgentEventKindV4::ModelRetrying {
+                            attempt: 1,
+                            class: error.class,
+                            message: "reviewer: malformed JSON arguments; regenerating the read-only review once from unchanged frozen evidence. No executor tool was dispatched.".into(),
+                        },
+                    )
+                    .await?;
+                }
                 Err(error) if error.retryable && attempt < max_retries => {
                     attempt += 1;
                     self.push(
@@ -3731,7 +3760,7 @@ impl AgentCoreV4<'_> {
                             "recovered result belongs to another dispatch".into(),
                         ));
                     }
-                    let update = if outcome.succeeded {
+                    let update = if scientific_outcome_requires_update(&call, &outcome) {
                         Some(self.science_after_tool(spec, &call, &outcome).await)
                     } else {
                         None
@@ -3928,6 +3957,7 @@ impl AgentCoreV4<'_> {
             .await?;
             let mut outcome = match self.tools.execute(RunModeV4::Execute, call.clone()).await {
                 Ok(outcome) => outcome,
+                Err(_) if effect == ToolEffectV4::ReadOnly => failed_read_outcome(&call),
                 Err(error) => {
                     self.push(
                         run_id,
@@ -3943,7 +3973,7 @@ impl AgentCoreV4<'_> {
                     )));
                 }
             };
-            let scientific_update = if outcome.succeeded {
+            let scientific_update = if scientific_outcome_requires_update(&call, &outcome) {
                 Some(self.science_after_tool(spec, &call, &outcome).await)
             } else {
                 None
@@ -4124,6 +4154,7 @@ impl AgentCoreV4<'_> {
         .await?;
         let outcome = match self.tools.execute(RunModeV4::Plan, call.clone()).await {
             Ok(outcome) => outcome,
+            Err(_) if static_effect == ToolEffectV4::ReadOnly => failed_read_outcome(&call),
             Err(error) => {
                 self.push(
                     scope.run_id,
@@ -6307,6 +6338,35 @@ fn disabled_capability_outcome(
         }),
         provenance: vec!["conversation-preferences-v4".into()],
     }
+}
+
+fn failed_read_outcome(call: &ToolCallV4) -> ToolOutcomeV4 {
+    // Host-owned static ReadOnly declarations guarantee this error cannot leave
+    // an uncertain requested side effect. Do not copy raw OS/SSH errors into
+    // the event chain or model context; they may contain secrets or host paths.
+    // A dynamically authorized MCP read retains its static Network boundary.
+    ToolOutcomeV4 {
+        call_id: call.call_id.clone(),
+        tool_id: call.tool_id.clone(),
+        succeeded: false,
+        model_content: "The Host could not complete this read-only tool call. No result was obtained; reconsider the selected execution context or use another available source.".into(),
+        data: json!({
+            "error_kind": "read_only_tool",
+            "recoverable": true,
+            "operation_dispatched": true,
+        }),
+        provenance: vec![],
+    }
+}
+
+fn scientific_outcome_requires_update(call: &ToolCallV4, outcome: &ToolOutcomeV4) -> bool {
+    outcome.succeeded
+        || (call.tool_id == "runtime.execute"
+            && outcome.call_id == call.call_id
+            && outcome.tool_id == call.tool_id
+            && outcome.data.get("operation_dispatched") != Some(&Value::Bool(false))
+            && serde_json::from_value::<omicsops_protocol::RuntimeResultV4>(outcome.data.clone())
+                .is_ok_and(|result| !result.succeeded))
 }
 
 fn cancelled_read_outcome(call: &ToolCallV4) -> ToolOutcomeV4 {
@@ -11170,10 +11230,18 @@ mod tests {
             (tool_id == "project.read").then_some(ToolEffectV4::ReadOnly)
         }
 
+        fn validate(&self, _: RunModeV4, call: &ToolCallV4) -> Result<(), String> {
+            if call.arguments.get("fixture_disabled") == Some(&json!(true)) {
+                Err("tool is disabled in the selected execution context".into())
+            } else {
+                Ok(())
+            }
+        }
+
         async fn execute(&self, _: RunModeV4, call: ToolCallV4) -> Result<ToolOutcomeV4, String> {
             self.calls.fetch_add(1, AtomicOrdering::SeqCst);
             if call.call_id == "missing-artifact" {
-                return Err("realpath: expected report.md: No such file or directory".into());
+                return Err("READ_ERROR_SECRET: private host path and server output".into());
             }
             Ok(ToolOutcomeV4 {
                 call_id: call.call_id,
@@ -11187,63 +11255,331 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executor_error_after_dispatch_is_uncertain_and_not_finished() {
-        let run_id = Uuid::new_v4();
-        let spec = execution_spec(run_id);
-        let store = MemoryStore::default();
-        seed_execution(&store, &spec);
-        let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
-            public_text: "creating report".into(),
+    async fn read_only_executor_failure_keeps_batch_results_and_reaches_next_turn() {
+        for ordinary in [false, true] {
+            let run_id = Uuid::new_v4();
+            let spec = if ordinary {
+                ordinary_execution_spec(run_id)
+            } else {
+                execution_spec(run_id)
+            };
+            let store = MemoryStore::default();
+            seed_execution(&store, &spec);
+            let model = ScriptedModel(Mutex::new(vec![
+                ModelTurnV4 {
+                    public_text: String::new(),
+                    tool_calls: vec![
+                        failed_read_fixture_call(),
+                        ToolCallV4 {
+                            call_id: "sibling-read".into(),
+                            tool_id: "project.read".into(),
+                            arguments: json!({"path":"results/existing-report.md"}),
+                        },
+                    ],
+                    provider_continuation: None,
+                },
+                read_failure_input_turn(),
+            ]));
+            let tools = RecoverableExecutorErrorTools {
+                calls: AtomicUsize::new(0),
+            };
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &tools,
+                events: &store,
+                science: None,
+            };
+            let result = core.execute(&spec, 4).await;
+            assert!(
+                matches!(result, Err(AgentCoreErrorV4::WaitingForInput)),
+                "{result:?}"
+            );
+            let events = store.load_direct(run_id).unwrap();
+            assert_sanitized_read_failure(&events);
+            assert!(events.iter().any(|event| matches!(&event.event,
+                AgentEventKindV4::ToolFinished { outcome } if outcome.call_id == "sibling-read" && outcome.succeeded)));
+            assert!(events.iter().any(|event| matches!(&event.event,
+                AgentEventKindV4::InputRequested { question_id, .. } if question_id == "after-read-failure")));
+            assert_eq!(tools.calls.load(AtomicOrdering::SeqCst), 2);
+            core.recover_interrupted_dispatches(
+                &spec,
+                AgentLimitsV4::default(),
+                &AtomicBool::new(false),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                tools.calls.load(AtomicOrdering::SeqCst),
+                2,
+                "closed calls must not be replayed"
+            );
+        }
+    }
+
+    fn failed_read_fixture_call() -> ToolCallV4 {
+        ToolCallV4 {
+            call_id: "missing-artifact".into(),
+            tool_id: "project.read".into(),
+            arguments: json!({"path":"results/missing-report.md"}),
+        }
+    }
+
+    fn read_failure_input_turn() -> ModelTurnV4 {
+        ModelTurnV4 {
+            public_text: String::new(),
             tool_calls: vec![ToolCallV4 {
-                call_id: "missing-artifact".into(),
-                tool_id: "project.read".into(),
-                arguments: json!({"path":"results/missing-report.md"}),
+                call_id: "after-read-failure".into(),
+                tool_id: "agent.request_input".into(),
+                arguments: json!({"question":"Which available source should be inspected?","reason":"blocker"}),
             }],
             provider_continuation: None,
-        }]));
+        }
+    }
+
+    fn assert_sanitized_read_failure(events: &[AgentEventV4]) {
+        let outcomes = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEventKindV4::ToolFinished { outcome }
+                    if outcome.call_id == "missing-artifact" =>
+                {
+                    Some(outcome)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes.len(), 1);
+        assert!(!outcomes[0].succeeded);
+        assert_eq!(
+            outcomes[0].data.get("error_kind"),
+            Some(&json!("read_only_tool"))
+        );
+        assert_eq!(outcomes[0].data.get("recoverable"), Some(&json!(true)));
+        assert_eq!(
+            outcomes[0].data.get("operation_dispatched"),
+            Some(&json!(true))
+        );
+        assert!(outcomes[0].provenance.is_empty());
+        assert!(
+            !serde_json::to_string(events)
+                .unwrap()
+                .contains("READ_ERROR_SECRET")
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::ToolDispatchUncertain { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_executor_failure_closes_recovered_execute_dispatch() {
+        for dispatched in [false, true] {
+            let run_id = Uuid::new_v4();
+            let spec = execution_spec(run_id);
+            let store = MemoryStore::default();
+            seed_execution(&store, &spec);
+            let call = failed_read_fixture_call();
+            append_test_event(
+                &store,
+                run_id,
+                AgentEventKindV4::ToolRequested { call: call.clone() },
+            );
+            if dispatched {
+                append_test_event(
+                    &store,
+                    run_id,
+                    AgentEventKindV4::ToolDispatchStarted {
+                        call_id: call.call_id.clone(),
+                        tool_id: call.tool_id.clone(),
+                        effect: ToolEffectV4::ReadOnly,
+                        idempotency_key: call.call_id.clone(),
+                    },
+                );
+            }
+            let model = ScriptedModel(Mutex::new(vec![]));
+            let tools = RecoverableExecutorErrorTools {
+                calls: AtomicUsize::new(0),
+            };
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &tools,
+                events: &store,
+                science: None,
+            };
+            core.recover_interrupted_dispatches(
+                &spec,
+                AgentLimitsV4::default(),
+                &AtomicBool::new(false),
+            )
+            .await
+            .unwrap();
+            assert_sanitized_read_failure(&store.load_direct(run_id).unwrap());
+            core.recover_interrupted_dispatches(
+                &spec,
+                AgentLimitsV4::default(),
+                &AtomicBool::new(false),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                tools.calls.load(AtomicOrdering::SeqCst),
+                1,
+                "failed recovered read must be closed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_executor_failure_closes_fresh_plan_dispatch() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let scope = plan_approval_scope(run_id, project_id, conversation_id);
+        let store = MemoryStore::default();
+        let model = ScriptedModel(Mutex::new(vec![
+            ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![failed_read_fixture_call()],
+                provider_continuation: None,
+            },
+            read_failure_input_turn(),
+        ]));
         let tools = RecoverableExecutorErrorTools {
             calls: AtomicUsize::new(0),
         };
-        let error = AgentCoreV4 {
+        let core = AgentCoreV4 {
             model: &model,
             tools: &tools,
             events: &store,
             science: None,
-        }
-        .execute(&spec, 4)
-        .await
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            AgentCoreErrorV4::UncertainSideEffect(message)
-                if message.contains("missing-artifact")
-        ));
+        };
+        let result = core
+            .plan_with_scope(
+                run_id,
+                project_id,
+                conversation_id,
+                "inspect files",
+                scope,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::WaitingForInput)),
+            "{result:?}"
+        );
+        assert_sanitized_read_failure(&store.load_direct(run_id).unwrap());
+        core.recover_pending_plan_tool_call(scope, &AtomicBool::new(false))
+            .await
+            .unwrap();
         assert_eq!(tools.calls.load(AtomicOrdering::SeqCst), 1);
-        let events = store.load_direct(run_id).unwrap();
-        assert!(events.iter().any(|event| {
-            matches!(
-                &event.event,
-                AgentEventKindV4::ToolDispatchStarted { call_id, .. }
-                    if call_id == "missing-artifact"
-            )
-        }));
-        assert!(events.iter().any(|event| {
-            matches!(
-                &event.event,
-                AgentEventKindV4::ToolDispatchUncertain { call_id, .. }
-                    if call_id == "missing-artifact"
-            )
-        }));
-        assert!(!events.iter().any(|event| {
-            matches!(
-                &event.event,
-                AgentEventKindV4::ToolFinished { outcome }
-                    if outcome.call_id == "missing-artifact"
-            )
-        }));
     }
 
-    struct UncertainRuntimeErrorTools;
+    #[tokio::test]
+    async fn read_only_executor_failure_closes_recovered_plan_dispatch() {
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let scope = plan_approval_scope(run_id, project_id, conversation_id);
+        let store = MemoryStore::default();
+        store
+            .append_direct(&AgentEventV4::first(
+                run_id,
+                project_id,
+                conversation_id,
+                Utc::now(),
+                AgentEventKindV4::RunCreated {
+                    mode: RunModeV4::Plan,
+                },
+            ))
+            .unwrap();
+        append_test_event(
+            &store,
+            run_id,
+            AgentEventKindV4::ToolRequested {
+                call: failed_read_fixture_call(),
+            },
+        );
+        let model = ScriptedModel(Mutex::new(vec![]));
+        let tools = RecoverableExecutorErrorTools {
+            calls: AtomicUsize::new(0),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        core.recover_pending_plan_tool_call(scope, &AtomicBool::new(false))
+            .await
+            .unwrap();
+        assert_sanitized_read_failure(&store.load_direct(run_id).unwrap());
+        core.recover_pending_plan_tool_call(scope, &AtomicBool::new(false))
+            .await
+            .unwrap();
+        assert_eq!(tools.calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn read_only_validation_failure_is_not_dispatched() {
+        let run_id = Uuid::new_v4();
+        let spec = ordinary_execution_spec(run_id);
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = ScriptedModel(Mutex::new(vec![
+            ModelTurnV4 {
+                public_text: String::new(),
+                tool_calls: vec![ToolCallV4 {
+                    call_id: "disabled-read".into(),
+                    tool_id: "project.read".into(),
+                    arguments: json!({"fixture_disabled":true}),
+                }],
+                provider_continuation: None,
+            },
+            read_failure_input_turn(),
+        ]));
+        let tools = RecoverableExecutorErrorTools {
+            calls: AtomicUsize::new(0),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        };
+        assert!(matches!(
+            core.execute(&spec, 4).await,
+            Err(AgentCoreErrorV4::WaitingForInput)
+        ));
+        let events = store.load_direct(run_id).unwrap();
+        let outcome = events
+            .iter()
+            .find_map(|event| match &event.event {
+                AgentEventKindV4::ToolFinished { outcome }
+                    if outcome.call_id == "disabled-read" =>
+                {
+                    Some(outcome)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(!outcome.succeeded);
+        assert_eq!(
+            outcome.data.get("operation_dispatched"),
+            Some(&json!(false))
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event.event,
+            AgentEventKindV4::ToolDispatchStarted { .. }
+                | AgentEventKindV4::ToolDispatchUncertain { .. }
+        )));
+        assert_eq!(tools.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    struct UncertainRuntimeErrorTools {
+        effect: ToolEffectV4,
+        calls: AtomicUsize,
+    }
 
     #[async_trait]
     impl ToolPortV4 for UncertainRuntimeErrorTools {
@@ -11252,50 +11588,65 @@ mod tests {
                 id: "runtime.execute".into(),
                 description: "execute code".into(),
                 input_schema: json!({}),
-                effect: ToolEffectV4::Runtime,
+                effect: self.effect,
             }]
         }
 
         fn effect(&self, tool_id: &str) -> Option<ToolEffectV4> {
-            (tool_id == "runtime.execute").then_some(ToolEffectV4::Runtime)
+            (tool_id == "runtime.execute").then_some(self.effect)
         }
 
         async fn execute(&self, _: RunModeV4, _: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
             Err("worker disconnected after dispatch".into())
         }
     }
 
     #[tokio::test]
     async fn runtime_executor_errors_are_not_blindly_retried() {
-        let run_id = Uuid::new_v4();
-        let spec = execution_spec(run_id);
-        let store = MemoryStore::default();
-        seed_execution(&store, &spec);
-        let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
-            public_text: "running analysis".into(),
-            tool_calls: vec![ToolCallV4 {
-                call_id: "runtime-call".into(),
-                tool_id: "runtime.execute".into(),
-                arguments: json!({"code":"write_output()"}),
-            }],
-            provider_continuation: None,
-        }]));
+        for effect in [ToolEffectV4::Runtime, ToolEffectV4::Mutating] {
+            let run_id = Uuid::new_v4();
+            let spec = execution_spec(run_id);
+            let store = MemoryStore::default();
+            seed_execution(&store, &spec);
+            let model = ScriptedModel(Mutex::new(vec![ModelTurnV4 {
+                public_text: "running analysis".into(),
+                tool_calls: vec![ToolCallV4 {
+                    call_id: "runtime-call".into(),
+                    tool_id: "runtime.execute".into(),
+                    arguments: json!({"code":"write_output()"}),
+                }],
+                provider_continuation: None,
+            }]));
 
-        let error = AgentCoreV4 {
-            model: &model,
-            tools: &UncertainRuntimeErrorTools,
-            events: &store,
-            science: None,
-        }
-        .execute(&spec, 4)
-        .await
-        .unwrap_err();
+            let tools = UncertainRuntimeErrorTools {
+                effect,
+                calls: AtomicUsize::new(0),
+            };
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &tools,
+                events: &store,
+                science: None,
+            };
+            let error = core.execute(&spec, 4).await.unwrap_err();
 
-        assert!(matches!(error, AgentCoreErrorV4::UncertainSideEffect(_)));
-        assert!(store.events.lock().unwrap().iter().any(|event| {
-            matches!(&event.event, AgentEventKindV4::ToolDispatchUncertain { call_id, .. }
+            assert!(matches!(error, AgentCoreErrorV4::UncertainSideEffect(_)));
+            assert!(store.events.lock().unwrap().iter().any(|event| {
+                matches!(&event.event, AgentEventKindV4::ToolDispatchUncertain { call_id, .. }
                 if call_id == "runtime-call")
-        }));
+            }));
+            assert!(matches!(
+                core.recover_interrupted_dispatches(
+                    &spec,
+                    AgentLimitsV4::default(),
+                    &AtomicBool::new(false)
+                )
+                .await,
+                Err(AgentCoreErrorV4::UncertainSideEffect(_))
+            ));
+            assert_eq!(tools.calls.load(AtomicOrdering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]
@@ -16842,6 +17193,354 @@ mod tests {
 
     struct RetryingReviewer {
         attempts: AtomicUsize,
+    }
+
+    struct ScriptedReviewer {
+        outcomes: Mutex<Vec<Result<ReviewerReportV4, ModelFailureV4>>>,
+        requests: Mutex<Vec<ReviewerRequestV4>>,
+        cancel_after_review: Option<Arc<AtomicBool>>,
+    }
+
+    #[async_trait]
+    impl ModelPortV4 for ScriptedReviewer {
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            unreachable!("review regeneration must not redispatch the executor")
+        }
+
+        async fn review(
+            &self,
+            request: ReviewerRequestV4,
+        ) -> Result<ReviewerReportV4, ModelFailureV4> {
+            self.requests.lock().unwrap().push(request);
+            let result = self.outcomes.lock().unwrap().remove(0);
+            if let Some(cancelled) = &self.cancel_after_review {
+                cancelled.store(true, AtomicOrdering::SeqCst);
+            }
+            result
+        }
+    }
+
+    fn malformed_reviewer_arguments() -> ModelFailureV4 {
+        ModelFailureV4::permanent(
+            omicsops_protocol::ModelErrorClassV4::InvalidResponse,
+            "tool call review-call returned malformed JSON arguments: expected comma at line 1 column 3134",
+        )
+    }
+
+    fn frozen_reviewer_request(spec: &RunSpecV4) -> ReviewerRequestV4 {
+        ReviewerRequestV4 {
+            frozen_objective: spec.plan.objective.clone(),
+            completion_criteria: spec.plan.completion_criteria.clone(),
+            proposal: CompletionProposalV4 {
+                schema_version: 4,
+                summary: "done".into(),
+                answer_markdown: "done".into(),
+                criteria: vec![],
+            },
+            deterministic_report: DeterministicVerificationV4 {
+                schema_version: 4,
+                passed: true,
+                findings: vec![],
+            },
+            scientific_state: ScientificStateV4::new(spec.project_id),
+            verified_evidence: vec![ReviewerEvidenceV4 {
+                reference: CompletionEvidenceRefV4::Event { sequence: 7 },
+                payload: json!({"verified":"unchanged source evidence"}),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn reviewer_malformed_arguments_regenerate_from_identical_frozen_evidence() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let expected = review(VerificationSeverityV4::Error);
+        let model = ScriptedReviewer {
+            outcomes: Mutex::new(vec![
+                Err(malformed_reviewer_arguments()),
+                Ok(expected.clone()),
+            ]),
+            requests: Mutex::new(vec![]),
+            cancel_after_review: None,
+        };
+        let request = frozen_reviewer_request(&spec);
+        let report = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        }
+        .review_with_retry(
+            spec.run_id,
+            request.clone(),
+            0,
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report, expected);
+        assert!(
+            report.has_errors(),
+            "format recovery must preserve scientific errors"
+        );
+        assert_eq!(
+            *model.requests.lock().unwrap(),
+            vec![request.clone(), request]
+        );
+        let events = store.load_direct(spec.run_id).unwrap();
+        let retries: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEventKindV4::ModelRetrying {
+                    attempt,
+                    class,
+                    message,
+                } => Some((attempt, class, message)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(retries.len(), 1);
+        assert_eq!(*retries[0].0, 1);
+        assert_eq!(
+            *retries[0].1,
+            omicsops_protocol::ModelErrorClassV4::InvalidResponse
+        );
+        assert!(!retries[0].2.contains("review-call"));
+        assert!(!retries[0].2.contains("3134"));
+    }
+
+    #[tokio::test]
+    async fn reviewer_malformed_arguments_retry_once_without_expanding_other_failures() {
+        for (failure, expected_requests) in [
+            (malformed_reviewer_arguments(), 2),
+            (
+                ModelFailureV4::permanent(
+                    omicsops_protocol::ModelErrorClassV4::Authentication,
+                    "credential missing",
+                ),
+                1,
+            ),
+            (
+                ModelFailureV4::permanent(
+                    omicsops_protocol::ModelErrorClassV4::InvalidResponse,
+                    "reviewer did not call agent.submit_review",
+                ),
+                1,
+            ),
+            (
+                ModelFailureV4::permanent(
+                    omicsops_protocol::ModelErrorClassV4::InvalidResponse,
+                    "unknown_provider_tool: response used an unavailable tool",
+                ),
+                1,
+            ),
+        ] {
+            let spec = execution_spec(Uuid::new_v4());
+            let store = MemoryStore::default();
+            seed_execution(&store, &spec);
+            let message = failure.message.clone();
+            let model = ScriptedReviewer {
+                outcomes: Mutex::new(vec![Err(failure.clone()), Err(failure)]),
+                requests: Mutex::new(vec![]),
+                cancel_after_review: None,
+            };
+            let result = AgentCoreV4 {
+                model: &model,
+                tools: &FakeTools,
+                events: &store,
+                science: None,
+            }
+            .review_with_retry(
+                spec.run_id,
+                frozen_reviewer_request(&spec),
+                3,
+                Duration::from_secs(1),
+                None,
+            )
+            .await;
+            assert!(matches!(result, Err(AgentCoreErrorV4::Model(actual)) if actual == message));
+            assert_eq!(model.requests.lock().unwrap().len(), expected_requests);
+            assert_eq!(
+                store
+                    .load_direct(spec.run_id)
+                    .unwrap()
+                    .iter()
+                    .filter(|event| matches!(event.event, AgentEventKindV4::ModelRetrying { .. }))
+                    .count(),
+                expected_requests - 1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reviewer_malformed_arguments_regeneration_preserves_transport_retry_allowance() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let model = ScriptedReviewer {
+            outcomes: Mutex::new(vec![
+                Err(malformed_reviewer_arguments()),
+                Err(ModelFailureV4::transient(
+                    omicsops_protocol::ModelErrorClassV4::Transport,
+                    "transport interrupted",
+                )),
+                Ok(review(VerificationSeverityV4::Ok)),
+            ]),
+            requests: Mutex::new(vec![]),
+            cancel_after_review: None,
+        };
+        let report = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        }
+        .review_with_retry(
+            spec.run_id,
+            frozen_reviewer_request(&spec),
+            1,
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!report.has_errors());
+        assert_eq!(model.requests.lock().unwrap().len(), 3);
+        assert_eq!(
+            store
+                .load_direct(spec.run_id)
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event.event, AgentEventKindV4::ModelRetrying { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewer_malformed_arguments_cancellation_prevents_regeneration_request() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let model = ScriptedReviewer {
+            outcomes: Mutex::new(vec![Err(malformed_reviewer_arguments())]),
+            requests: Mutex::new(vec![]),
+            cancel_after_review: Some(cancelled.clone()),
+        };
+        let result = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        }
+        .review_with_retry(
+            spec.run_id,
+            frozen_reviewer_request(&spec),
+            3,
+            Duration::from_secs(1),
+            Some(&cancelled),
+        )
+        .await;
+        assert!(matches!(result, Err(AgentCoreErrorV4::Cancelled)));
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+        assert!(matches!(
+            store
+                .load_direct(spec.run_id)
+                .unwrap()
+                .last()
+                .unwrap()
+                .event,
+            AgentEventKindV4::RunCancelled
+        ));
+    }
+
+    #[tokio::test]
+    async fn reviewer_malformed_arguments_resume_checkpoint_without_executor_dispatch() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        let evidence_sequence = seed_success_evidence(&store, &spec);
+        let proposal = CompletionProposalV4 {
+            schema_version: 4,
+            summary: "persisted completion".into(),
+            answer_markdown: "## Result\n\nPersisted completion.".into(),
+            criteria: vec![CompletionCriterionEvidenceV4 {
+                criterion: "verified output".into(),
+                evidence: vec![CompletionEvidenceRefV4::Event {
+                    sequence: evidence_sequence,
+                }],
+            }],
+        };
+        for kind in [
+            AgentEventKindV4::CompletionProposed,
+            AgentEventKindV4::CompletionProposalSubmitted {
+                proposal: proposal.clone(),
+            },
+            AgentEventKindV4::DeterministicVerificationFinished {
+                report: DeterministicVerificationV4 {
+                    schema_version: 4,
+                    passed: true,
+                    findings: vec![],
+                },
+            },
+        ] {
+            let previous = store.events.lock().unwrap().last().unwrap().clone();
+            store
+                .append_direct(&AgentEventV4::next(&previous, Utc::now(), kind))
+                .unwrap();
+        }
+        let expected_review = review(VerificationSeverityV4::Warn);
+        let model = ScriptedReviewer {
+            outcomes: Mutex::new(vec![
+                Err(malformed_reviewer_arguments()),
+                Ok(expected_review.clone()),
+            ]),
+            requests: Mutex::new(vec![]),
+            cancel_after_review: None,
+        };
+        let tools = OptionalCapabilityTools {
+            execute_calls: AtomicUsize::new(0),
+        };
+        AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        }
+        .execute_with_limits(&spec, AgentLimitsV4::default(), &AtomicBool::new(false))
+        .await
+        .unwrap();
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        assert_eq!(requests[1].proposal, proposal);
+        assert_eq!(tools.execute_calls.load(AtomicOrdering::SeqCst), 0);
+        let events = store.load_direct(spec.run_id).unwrap();
+        assert!(matches!(
+            events.last().unwrap().event,
+            AgentEventKindV4::RunCompleted
+        ));
+        assert!(!events.iter().any(|event| matches!(
+            event.event,
+            AgentEventKindV4::ToolRequested { .. } | AgentEventKindV4::ToolDispatchStarted { .. }
+        )));
+        assert!(events.iter().any(|event| matches!(&event.event, AgentEventKindV4::ReviewerFinished { report } if report == &expected_review)));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.event,
+                    AgentEventKindV4::CompletionProposalSubmitted { .. }
+                ))
+                .count(),
+            1
+        );
     }
 
     #[async_trait]

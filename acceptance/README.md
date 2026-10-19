@@ -180,6 +180,24 @@ the original conversation and its historical runs are not resumed or modified.
 cargo test -p omicsops-desktop agent_v4::go_live_acceptance_tests::live_opencode_go_agent_reads_file_and_returns_nonce -- --ignored --exact --nocapture
 ```
 
+The reviewer-enabled variant uses the same explicitly selected profile,
+read-only source database, keyring credential, temporary Store and nonce file:
+
+```text
+cargo test -p omicsops-desktop agent_v4::go_live_acceptance_tests::live_opencode_go_agent_reviews_file_and_returns_nonce -- --ignored --exact --nocapture
+```
+
+It freezes the reviewer model through the production composition, enables
+`auto_review`, and requires `ReviewerFinished` before `RunCompleted`. The old
+read-only nonce variant still disables automatic review. Neither variant
+requires the live provider to produce malformed JSON; deterministic tests cover
+the single reviewer regeneration after malformed arguments, including failure
+limits and preservation of the frozen evidence. A live pass validates the
+selected model's read-tool-to-review-to-completion path only, not the original
+literature task, SSH, or scientific provenance end to end. Actual results for the
+2026-10-06 fix are recorded in
+`docs/superpowers/specs/2026-10-06-reviewer-json-regeneration.md`.
+
 On 2026-09-21, after aligning the production model timeout, the exact command
 above also passed 1/1 in 31.57 seconds using a saved `glm-5.3-flash` profile and
 the production default timeout. This isolated nonce/read-tool acceptance does

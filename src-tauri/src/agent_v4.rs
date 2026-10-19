@@ -5325,6 +5325,20 @@ fn disabled_tools_for_preferences(
     disabled
 }
 
+fn builtin_tool_definitions_for_selection(selection: &ComputeSelectionV4) -> Vec<ToolDescriptorV4> {
+    let mut definitions = builtin_tool_definitions_v4();
+    if selection.backend_kind != ComputeBackendKindV4::Ssh {
+        if let Some(execute) = definitions
+            .iter_mut()
+            .find(|tool| tool.id == "runtime.execute")
+        {
+            execute.description = "Execute code in a persistent kernel on the frozen selected backend. This backend supports foreground execution only; background must be false. Successful captured files are re-read by the Host and returned in artifacts with relative_path, size_bytes and sha256. Reuse those facts for the captured content; re-verify after content changes or when required facts are missing.".into();
+            execute.input_schema["properties"]["background"]["const"] = json!(false);
+        }
+    }
+    definitions
+}
+
 async fn compose(
     state: &AppState,
     project: &Project,
@@ -5403,8 +5417,11 @@ async fn compose(
         )),
         forced_route,
     });
-    let disabled_tools = disabled_tools_for_preferences(preferences);
-    let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), executor)
+    let mut disabled_tools = disabled_tools_for_preferences(preferences);
+    if selection.backend_kind != ComputeBackendKindV4::Ssh {
+        disabled_tools.insert("runtime.remote_job_status".into());
+    }
+    let registry = ToolRegistryV4::new(builtin_tool_definitions_for_selection(selection), executor)
         .map_err(|error| error.to_string())?
         .with_disabled_tools(disabled_tools)
         .with_side_effect_lock(project_side_effect_lock_v4(project.id));
@@ -6567,6 +6584,23 @@ fn auto_policy_mcp_grant(
 }
 
 impl DesktopToolExecutorV4 {
+    fn remote_job_preflight(&self, call: &ToolCallV4) -> Option<ToolOutcomeV4> {
+        let detached = call.tool_id == "runtime.remote_job_status"
+            || (call.tool_id == "runtime.execute"
+                && call.arguments.get("background").and_then(Value::as_bool) == Some(true));
+        if !detached || self.selection.backend_kind == ComputeBackendKindV4::Ssh {
+            return None;
+        }
+        Some(ToolOutcomeV4 {
+            call_id: call.call_id.clone(),
+            tool_id: call.tool_id.clone(),
+            succeeded: false,
+            model_content: "Detached job submission and status queries require an SSH Linux backend and are unavailable on the frozen selected backend. No operation was dispatched. Continue with foreground runtime.execute (background=false) on this backend; do not switch the frozen backend or resubmit a remote job to reconnect.".into(),
+            data: json!({"error_kind":"remote_jobs_unsupported_backend","recoverable":true,"operation_dispatched":false}),
+            provenance: vec![],
+        })
+    }
+
     fn key(
         &self,
         language: KernelLanguageV4,
@@ -7198,6 +7232,9 @@ impl DesktopToolExecutorV4 {
         call: &ToolCallV4,
         require_read_only_hint: bool,
     ) -> Result<ToolOutcomeV4, String> {
+        if let Some(outcome) = self.remote_job_preflight(call) {
+            return Ok(outcome);
+        }
         if call.tool_id == "browser_setup" || call.tool_id.starts_with("web_") {
             // Temporarily disabled; retain the bridge implementation for later.
             const AGENT_BROWSER_ENABLED: bool = false;
@@ -7779,6 +7816,9 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
         })
     }
     async fn prepare_call(&self, call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
+        if let Some(outcome) = self.remote_job_preflight(call) {
+            return Ok(Some(outcome));
+        }
         if call.tool_id == "use_mcp_tool" {
             let events = self
                 .repository
@@ -8924,7 +8964,128 @@ impl RepositoryScientificStateStoreV4 {
 #[async_trait]
 impl ScientificStateStoreV4 for RepositoryScientificStateStoreV4 {
     async fn snapshot(&self, project_id: Uuid) -> Result<ScientificStateV4, String> {
-        self.load(project_id).await
+        // Older builds skipped the scientific hook for completed failures.
+        // Reconcile only an exact, persisted terminal receipt. A failed run or
+        // an interrupted wait is not proof that a computation has finished.
+        let state = self.load(project_id).await?;
+        let mut reconciled = false;
+        for analysis in state.analyses.values().filter(|analysis| {
+            analysis.project_id == project_id && analysis.status == AnalysisStatusV4::Running
+        }) {
+            let Some(record) = self
+                .repository
+                .agent_run_v4(analysis.run_id)
+                .await
+                .map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            let Some(spec) = record
+                .get("spec")
+                .and_then(|value| serde_json::from_value::<RunSpecV4>(value.clone()).ok())
+            else {
+                continue;
+            };
+            let Some(selection) = &spec.compute_selection else {
+                continue;
+            };
+            if spec.project_id != project_id
+                || spec.run_id != analysis.run_id
+                || spec.validate_integrity().is_err()
+                || selection.backend_id != analysis.runtime.backend_id
+                || selection.environment != analysis.runtime.environment
+            {
+                continue;
+            }
+            let events = self
+                .repository
+                .agent_events_v4(analysis.run_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            if events.iter().any(|event| event.project_id != project_id
+                || event.run_id != analysis.run_id
+                || matches!(&event.event, AgentEventKindV4::ToolDispatchUncertain { call_id, .. }
+                    if call_id == &analysis.source_call_id))
+            {
+                continue;
+            }
+            let Some((request_sequence, call)) =
+                events.iter().find_map(|event| match &event.event {
+                    AgentEventKindV4::ToolRequested { call }
+                        if call.call_id == analysis.source_call_id
+                            && call.tool_id == "runtime.execute" =>
+                    {
+                        Some((event.sequence, call))
+                    }
+                    _ => None,
+                })
+            else {
+                continue;
+            };
+            if call.arguments.get("background").and_then(Value::as_bool) == Some(true)
+                || call.arguments.get("analysis").is_none()
+                || call
+                    .arguments
+                    .get("language")
+                    .and_then(Value::as_str)
+                    .map(str::to_ascii_lowercase)
+                    .as_deref()
+                    != Some(analysis.runtime.language.as_str())
+                || call
+                    .arguments
+                    .get("environment")
+                    .and_then(Value::as_str)
+                    .unwrap_or("system")
+                    != analysis.runtime.environment
+            {
+                continue;
+            }
+            let Some(dispatch_sequence) = events.iter().find_map(|event| match &event.event {
+                AgentEventKindV4::ToolDispatchStarted {
+                    call_id,
+                    tool_id,
+                    effect,
+                    ..
+                } if event.sequence > request_sequence
+                    && call_id == &call.call_id
+                    && tool_id == &call.tool_id
+                    && *effect == ToolEffectV4::Runtime =>
+                {
+                    Some(event.sequence)
+                }
+                _ => None,
+            }) else {
+                continue;
+            };
+            let Some(outcome) = events.iter().find_map(|event| match &event.event {
+                AgentEventKindV4::ToolFinished { outcome }
+                    if event.sequence > dispatch_sequence
+                        && outcome.call_id == call.call_id
+                        && outcome.tool_id == call.tool_id
+                        && !outcome.succeeded
+                        && outcome.data.get("operation_dispatched")
+                            != Some(&Value::Bool(false)) =>
+                {
+                    Some(outcome)
+                }
+                _ => None,
+            }) else {
+                continue;
+            };
+            if !serde_json::from_value::<RuntimeResultV4>(outcome.data.clone())
+                .is_ok_and(|result| !result.succeeded)
+            {
+                continue;
+            }
+            self.after_tool(project_id, analysis.run_id, call, outcome)
+                .await?;
+            reconciled = true;
+        }
+        if reconciled {
+            self.load(project_id).await
+        } else {
+            Ok(state)
+        }
     }
 
     async fn before_tool(
@@ -9635,6 +9796,8 @@ fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
 #[cfg(test)]
 mod go_live_acceptance_tests;
 #[cfg(test)]
+mod scientific_failure_contract_tests;
+#[cfg(test)]
 mod subscription_contract_tests;
 #[cfg(test)]
 mod subscription_live_acceptance_tests;
@@ -9900,6 +10063,231 @@ mod tests {
             call_id: "resource-test".into(),
             tool_id: tool.into(),
             arguments: json!({"path":"."}),
+        }
+    }
+
+    fn detached_jobs_selection(kind: ComputeBackendKindV4) -> ComputeSelectionV4 {
+        let container = matches!(
+            kind,
+            ComputeBackendKindV4::Docker | ComputeBackendKindV4::Podman
+        );
+        ComputeSelectionV4 {
+            schema_version: 4,
+            backend_id: match kind {
+                ComputeBackendKindV4::Local => "local",
+                ComputeBackendKindV4::Ssh => "ssh:fixture",
+                ComputeBackendKindV4::Docker => "docker",
+                ComputeBackendKindV4::Podman => "podman",
+            }
+            .into(),
+            backend_kind: kind,
+            autonomy_mode: AutonomyModeV4::Supervised,
+            approval_policy: ApprovalPolicyV4::RiskBased,
+            environment: "system".into(),
+            network_policy: if container {
+                NetworkPolicyV4::None
+            } else {
+                NetworkPolicyV4::HostInherited
+            },
+            container_image: container.then(|| omicsops_protocol::ContainerImageSelectionV4 {
+                reference: "synthetic:latest".into(),
+                image_id: "sha256:synthetic".into(),
+            }),
+        }
+    }
+
+    fn detached_job_calls() -> [ToolCallV4; 2] {
+        [
+            ToolCallV4 {
+                call_id: "stale-remote-status".into(),
+                tool_id: "runtime.remote_job_status".into(),
+                arguments: json!({}),
+            },
+            ToolCallV4 {
+                call_id: "forced-background".into(),
+                tool_id: "runtime.execute".into(),
+                arguments: json!({"language":"python","code":"print(42)","background":true}),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn detached_remote_jobs_catalog_matches_the_frozen_backend_without_initialization() {
+        let repository = Store::open_in_memory().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = Project::new(
+            Uuid::new_v4(),
+            "catalog",
+            dir.path().to_str().unwrap(),
+            omicsops_core::workspace::ProjectTemplate::Blank,
+            Utc::now(),
+        );
+        repository.save_project(&project).await.unwrap();
+        let profile: omicsops_core::workspace::ModelProfile = serde_json::from_value(json!({
+            "id":Uuid::new_v4(),"label":"test","provider":"ollama","base_url":"http://127.0.0.1:1",
+            "model":"not-contacted","supports_tools":true,"supports_vision":false
+        }))
+        .unwrap();
+        repository.save_model_profile(&profile).await.unwrap();
+        let state = AppState {
+            repository,
+            credentials: SystemCredentialVault,
+            subscription_models: Arc::new(
+                crate::subscription_models::SubscriptionLoginManager::system(Default::default())
+                    .unwrap(),
+            ),
+            mcp_sessions: McpSessionManager::new(),
+            active_runs: Default::default(),
+            live_runtime_registry_v4: Default::default(),
+            skills_root: dir.path().join("skills"),
+            file_baseline_storage: crate::workspace_file_baselines::FileBaselineStorage::new(
+                dir.path().join("baseline-app"),
+            ),
+            skills_gate: Default::default(),
+            research_last_request: Default::default(),
+            active_kernels: Default::default(),
+            project_kernel_queues: Default::default(),
+            sync_controls: Default::default(),
+            browser: omicsops_browser::BrowserRuntime::new(
+                dir.path().join("browser"),
+                dir.path().join("extension"),
+            ),
+        };
+        for kind in [
+            ComputeBackendKindV4::Local,
+            ComputeBackendKindV4::Docker,
+            ComputeBackendKindV4::Podman,
+            ComputeBackendKindV4::Ssh,
+        ] {
+            let selection = detached_jobs_selection(kind);
+            let (model, tools) = compose(
+                &state,
+                &project,
+                &selection,
+                profile.id,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                None,
+                None,
+                None,
+                None,
+                true,
+                &[],
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(model.resources.as_ref().unwrap().ready.get().is_none());
+            let ssh = kind == ComputeBackendKindV4::Ssh;
+            for mode in [RunModeV4::Plan, RunModeV4::Execute] {
+                let descriptors = tools.registry.descriptors(mode);
+                assert_eq!(
+                    descriptors
+                        .iter()
+                        .any(|tool| tool.id == "runtime.remote_job_status"),
+                    ssh,
+                    "{kind:?}/{mode:?}"
+                );
+            }
+            let descriptors = tools.registry.descriptors(RunModeV4::Execute);
+            let execute = descriptors
+                .iter()
+                .find(|tool| tool.id == "runtime.execute")
+                .unwrap();
+            assert_eq!(
+                tools.registry.effect("runtime.remote_job_status"),
+                Some(ToolEffectV4::ReadOnly)
+            );
+            if ssh {
+                assert!(
+                    execute.input_schema["properties"]["background"]
+                        .get("const")
+                        .is_none()
+                );
+                assert!(execute.description.contains("runtime.remote_job_status"));
+                assert!(
+                    model
+                        .prompt_layers()
+                        .environment
+                        .contains("Linux only; not checked")
+                );
+            } else {
+                assert_eq!(
+                    execute.input_schema["properties"]["background"]["const"],
+                    false
+                );
+                assert!(!execute.description.contains("runtime.remote_job_status"));
+                assert!(
+                    tools
+                        .registry
+                        .validate(RunModeV4::Execute, &detached_job_calls()[0])
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_remote_jobs_preparation_rejects_non_ssh_before_resources_or_interpreter_checks()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        for kind in [
+            ComputeBackendKindV4::Local,
+            ComputeBackendKindV4::Docker,
+            ComputeBackendKindV4::Podman,
+        ] {
+            let mut executor = project_filesystem_executor(dir.path()).await;
+            let (resources, factory) = mock_resource_slot(dir.path(), false, true);
+            executor.resources = resources;
+            executor.selection = detached_jobs_selection(kind);
+            for call in detached_job_calls() {
+                let outcome = executor.prepare_call(&call).await.unwrap().unwrap();
+                assert!(!outcome.succeeded);
+                assert_eq!(outcome.call_id, call.call_id);
+                assert_eq!(outcome.tool_id, call.tool_id);
+                assert_eq!(
+                    outcome.data["error_kind"],
+                    "remote_jobs_unsupported_backend"
+                );
+                assert_eq!(outcome.data["recoverable"], true);
+                assert_eq!(outcome.data["operation_dispatched"], false);
+                assert!(outcome.provenance.is_empty());
+                assert_eq!(factory.attempts.load(Ordering::SeqCst), 0);
+                assert!(executor.resources.ready.get().is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_remote_jobs_direct_execution_rejects_non_ssh_before_resources_or_kernel_dispatch()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        for kind in [
+            ComputeBackendKindV4::Local,
+            ComputeBackendKindV4::Docker,
+            ComputeBackendKindV4::Podman,
+        ] {
+            let mut executor = project_filesystem_executor(dir.path()).await;
+            let (resources, factory) = mock_resource_slot(dir.path(), false, true);
+            executor.resources = resources;
+            executor.selection = detached_jobs_selection(kind);
+            for call in detached_job_calls() {
+                let outcome = executor.execute(&call).await.unwrap();
+                assert!(!outcome.succeeded);
+                assert_eq!(outcome.call_id, call.call_id);
+                assert_eq!(outcome.tool_id, call.tool_id);
+                assert_eq!(
+                    outcome.data["error_kind"],
+                    "remote_jobs_unsupported_backend"
+                );
+                assert_eq!(outcome.data["recoverable"], true);
+                assert_eq!(outcome.data["operation_dispatched"], false);
+                assert!(outcome.provenance.is_empty());
+                assert_eq!(factory.attempts.load(Ordering::SeqCst), 0);
+                assert!(executor.resources.ready.get().is_none());
+            }
         }
     }
 

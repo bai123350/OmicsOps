@@ -284,7 +284,7 @@ fn refreshed_go_profile(source: &ModelProfile) -> Result<ModelProfile, String> {
     Ok(refreshed)
 }
 
-async fn run_live_go_agent_acceptance() -> Result<(), String> {
+async fn run_live_go_agent_acceptance(auto_review: bool) -> Result<(), String> {
     let source = selected_saved_profile().await?;
     let profile = refreshed_go_profile(&source)?;
     let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
@@ -361,11 +361,13 @@ async fn run_live_go_agent_acceptance() -> Result<(), String> {
     };
     let preferences = ConversationAgentPreferencesV4 {
         delegation_enabled: false,
-        auto_review: false,
+        auto_review,
         memory_enabled: false,
         fast_mode: None,
     };
     let service_tier = RunServiceTierV4 { fast_mode: None };
+    let reviewer_model =
+        super::freeze_reviewer_model(&repository, &profile, &preferences, service_tier).await?;
     let run_id = Uuid::new_v4();
     let objective = format!(
         "This is a bounded live acceptance task. Use project.read exactly once to read `{filename}`. The file contains a random validation nonce that is not present in this request. Do not guess it and do not call any other task tool. After reading the file, call agent.complete with the exact nonce in answer_markdown and cite the successful project.read event as evidence for the frozen completion criterion."
@@ -388,7 +390,7 @@ async fn run_live_go_agent_acceptance() -> Result<(), String> {
             model_configuration_hash: profile.execution_configuration_hash(),
             conversation_preferences: preferences,
             service_tier,
-            reviewer_model: None,
+            reviewer_model,
             delegated_model: None,
             reference_context: String::new(),
             input_images: vec![],
@@ -452,7 +454,7 @@ async fn run_live_go_agent_acceptance() -> Result<(), String> {
         &[],
         spec.conversation_preferences.as_ref(),
         spec.service_tier.as_ref(),
-        None,
+        spec.reviewer_model.as_ref(),
     )
     .await?;
     let core = AgentCoreV4 {
@@ -524,11 +526,18 @@ async fn run_live_go_agent_acceptance() -> Result<(), String> {
             "the final Agent answer did not contain the nonce returned by project.read".into(),
         );
     }
-    if !recorded
+    let completed_index = recorded
         .iter()
-        .any(|event| matches!(event.event, AgentEventKindV4::RunCompleted))
-    {
-        return Err("the production Agent loop did not record RunCompleted".into());
+        .position(|event| matches!(event.event, AgentEventKindV4::RunCompleted))
+        .ok_or("the production Agent loop did not record RunCompleted")?;
+    let reviewer_index = recorded
+        .iter()
+        .position(|event| matches!(event.event, AgentEventKindV4::ReviewerFinished { .. }));
+    if auto_review && !reviewer_index.is_some_and(|index| index < completed_index) {
+        return Err("automatic review did not record ReviewerFinished before RunCompleted".into());
+    }
+    if !auto_review && reviewer_index.is_some() {
+        return Err("the review-disabled acceptance unexpectedly recorded ReviewerFinished".into());
     }
     if recorded.iter().any(|event| {
         matches!(
@@ -545,7 +554,15 @@ async fn run_live_go_agent_acceptance() -> Result<(), String> {
 #[tokio::test]
 #[ignore = "requires an existing saved OpenCode Go profile and its Windows keyring credential"]
 async fn live_opencode_go_agent_reads_file_and_returns_nonce() {
-    if let Err(error) = run_live_go_agent_acceptance().await {
+    if let Err(error) = run_live_go_agent_acceptance(false).await {
         panic!("OpenCode Go Agent live acceptance failed: {error}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires an existing saved OpenCode Go profile and its Windows keyring credential"]
+async fn live_opencode_go_agent_reviews_file_and_returns_nonce() {
+    if let Err(error) = run_live_go_agent_acceptance(true).await {
+        panic!("OpenCode Go Agent reviewer live acceptance failed: {error}");
     }
 }
