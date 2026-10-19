@@ -42,15 +42,15 @@
 | W02 | [表格预览](2026-10-04-wisp-w02-table-preview.md) | 4 | 本地/SSH CSV/TSV有界逻辑记录、来源/hash/truncation | 已实现、4任务审阅通过 |
 | W03 | [远端作业](2026-10-04-wisp-w03-remote-jobs.md) | 4 | metadata列表、手动status与明确启用的有限退避 | 已实现、4任务审阅通过 |
 | W04 | [内核观察](2026-10-04-wisp-w04-kernel-inspection.md) | 5 | 活着的Python/R metadata，不隐式启动或执行对象方法 | 已实现，5任务审阅通过；真实R/SSH/GUI未验收 |
-| W05 | [手动压缩](2026-10-04-wisp-w05-context-compaction.md) | 5 | 暂停ordinary run真正原子保存可恢复checkpoint | 已实现、5任务审阅通过；clean-HEAD与真实验收待执行 |
+| W05 | [手动压缩](2026-10-04-wisp-w05-context-compaction.md) | 5 | 暂停ordinary run真正原子保存可恢复checkpoint | 已实现、5任务及最终整合审阅通过；bcec075干净归档已验证，N01残余保留，真实验收未执行 |
 | W06 | [运行诊断](2026-10-04-wisp-w06-run-diagnostics.md) | 4 | run/tool/失败筛选、精确来源定位、脱敏HTML/JSON | 已实现、4任务源码审阅通过；隔离旧HEAD原生smoke部分通过，静态HTML浏览仍未执行 |
 | W07 | [离线示例](2026-10-04-wisp-w07-offline-example.md) | 4 | 双语合成工作区，重启/坏receipt仍隔离于生产Agent | 已实现、4任务源码审阅通过；确定性/构建通过，原生手工smoke未执行 |
 | W08a | [V4场景](2026-10-04-wisp-w08-scenarios.md) | 3 | 五场景manifest/hash/实际调用计数和安全报告 | 已实现、3任务源码审阅通过；安全报告/故障非零验证通过，CI未执行 |
 | W08b | [Skill helpers](2026-10-04-wisp-w08-skill-helpers.md) | 3 | 固定本地helper离线行为回归与统一Python CI | 已实现、3任务审阅通过；CI未执行 |
 | W09 | [稿件证据](2026-10-04-wisp-w09-publication-evidence.md) | 4 | 保存revision准备度与reference-only四entry证据ZIP | SOURCE完成并独立审阅；确定性全量/Web/native构建通过，native手工未执行 |
 | W10 | [文件基线](2026-10-04-wisp-w10-file-baselines.md) | 4 | 显式安全小本地文本immutable snapshot/有界diff | 源码已完成并审阅，完整确定性检查已记录；原生手工验收未执行 |
-| W11 | [迁移预览](2026-10-04-wisp-w11-migration-preview.md) | 3 | 空默认选择、类别COUNT、文件状态/hash与rebind/omissions | 源码全部完成并审阅；阶段检查已记录，最终整分支检查及原生手工待完成 |
-| W12 | [会话可见性](2026-10-04-wisp-w12-conversation-visibility.md) | 4 | 持久可逆收起/恢复，分页前过滤，精确引用保持 | 源码全部完成并审阅；修复后focused/Web、修复前全量/native已记录，原生手工未执行 |
+| W11 | [迁移预览](2026-10-04-wisp-w11-migration-preview.md) | 3 | 空默认选择、类别COUNT、文件状态/hash与rebind/omissions | 源码与最终整合审阅通过；c9a5338确定性检查及保留输入证据已裁决，原生手工/真实验收未执行 |
+| W12 | [会话可见性](2026-10-04-wisp-w12-conversation-visibility.md) | 4 | 持久可逆收起/恢复，分页前过滤，精确引用保持 | 源码及最终修复审阅通过；SOURCE50及后续全量字节覆盖已记录，cursor/SettingsUNKNOWN残余保留，原生手工未执行 |
 
 W08只有两部分都通过才算完成。W02/W04两种worker/source的deterministic协议回归均必需，单独本地入口不满足范围；真实远端/模型验收独立记“未执行”时不冒充端到端通过。
 
@@ -95,10 +95,10 @@ W07只需W02 Task1叶子，不需要table/SSH界面；W10/W11只需W09 Task1的�
 
 ```powershell
 cargo fmt --all -- --check
+npm run build
 cargo test --workspace
 python -B -m unittest discover -s scripts -p "test_*.py"
 npm test
-npm run build
 npm run build:desktop
 git diff --check
 ```
@@ -162,3 +162,10 @@ W10 Task3 已完成独立审阅：source 783ee03、fix1 e82aed0；FULL审阅指�
 2026-10-15：W11 Task2 semanticcbc0dd6及独立纯格式e56fc12完成独立FULL，Spec compliant/Approved，无Critical/Important，累计49/50 SOURCE。原生只读preview命令/注册、公开metadata与kind_counts/Shelved注记、稳定digest、显式文件身份/预算/完整hash与保存SSH引用已实现。actual W02保留handle、每项512KiB/请求4MiB在尝试前预留并传同一allowance、失败不退款、EOF探针单列；expected_full必须实际完整核验，否则整次拒绝。shared纯文本策略在敏感文件名前置，unsupported可报告metadata但不读payload；未知size/hash保持None，Unavailable记Unreadable不猜Missing。避免会读取profile_json的既有backend helper，直接校验内部project的精确canonical绑定，再使用已审阅Store typed V4 recorded-reference；仅public_project进入响应，底层SQL/路径异常固定安全映射。此为既定白名单约束内实现选择，无新增正式Ruling。最终semantic native15（725 filtered）、Store5、DTO1（739 filtered）通过，fmt/diff0；初始编译RED0 executed、FK fixture在preview前12pass/1fail及临时legacy构造/恢复、unsupported binary sizeNone对Some7行为RED1均保留。前后15项属不同断言阶段不累加；后续断言并非各有独立RED。三路径候选/逆向/重放、preformat等于semanticHEAD、纯rustfmt精确输出、RAW/canonical/protected7/外部差异/两个工作区兼容残留/空index证明通过。Minor环境hardlink警告留最终审阅。Task1 native消费CV已关闭；Task3 TS/UI、空默认显式生成、catalog无SSH刷新、scope/selection/generation失效和立即Escape及完整交付检查仍待实施。DB与逐文件观察非原子快照，digest不是批准token；GUI STOP下手工及真实SSH/模型/R/Micromamba/PBMC未执行，全量工作树/干净归档/CI/最终整分支不属于本任务通过项。
 
 2026-10-15 W11 Task3 源码19e2e32018778fb6636b7b65bd6ec7aba99474ea（BASE b90f99365527ee130c8a01306ca6e00673cd9a6a，精确10个前端文件）经独立 FULL task-3-review.md 审阅：Spec compliant / Approved，无 Critical/Important；Task1/2 原生投影、文件边界与摘要契约沿用已审阅生产者，本任务关闭其 TS/UI 下游义务。closest最终41通过；PRE-REVIEW阶段串行 fmt、Rust1935通过/18ignored、Python48、npm1438+Node22、Web、native BUILD ONLY及diff均terminal0。最终工作树覆盖是否采用仍待完整字节溯源裁决；candidate10于Rust运行期间捕获，完整1121文件manifest在Rust/Python后、前端检查前，不能称为pre-Rust快照。保留cache/chunk/linker警告Minor与历史settings Escape原因UNKNOWN。原生手工/真实SSH、模型、R、Micromamba、PBMC未执行，组合Step4保持unchecked；50任务源码审阅完成，干净提交归档npm ci/全套检查、W08真实故障恢复、最强整分支审阅与永久交付记录仍待完成。
+
+
+2026-10-19 最终源码整合：首次12项/50任务独立FULL/必要SCOPED链关闭；原最强整分支审阅及completion、54196dce/a993efa修复审阅、实际c9a5338d70ad14207a7a58eb7d37793498e9b840的NB-I1 targeted closure及3653/0有界provenance经根接受。最终正常npm1441+22/native0；Rust1938/18为第五fixture前实际执行，经1120其他RAW与3dist内容桥保留，native beforeBuild验证final5。Python48/npmci/W08为未变输入的带日期证据；bcec075干净归档1916/17不是fresh最新HEAD/CI验收。
+
+当前W05/W11/W12状态和命令顺序按实际裁决同步；上面的带日期任务历史保持原文。剩余M2/M3/M4/M6/M7/M8、M5真实diff/分页测试债务、N01、12包依赖审计及各UNKNOWN失败仍明确保留；GUI STOP、原生/真实服务/CI未执行边界不变。本段仅记录progress378已接受的源码结论，不预先宣告后续文档审计/提交或授权清理/发布。
+
+永久工程记录：[交付与验证](../reports/2026-10-19-wisp-delivery.md)、[全部原始裁决/理由/成本](../reports/2026-10-19-wisp-rulings.md)、[证据指纹与实际位置](../reports/2026-10-19-wisp-evidence-index.md)。协调主记录截止progress378；后续纯文档审计/提交观察不改变本次源码结论。
