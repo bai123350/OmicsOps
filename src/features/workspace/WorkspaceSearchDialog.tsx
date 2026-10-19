@@ -194,8 +194,8 @@ export function WorkspaceSearchDialog({
   }
 
   function handleDialogTab(event: ReactKeyboardEvent<HTMLElement>) {
-    if (event.key !== "Tab" || event.defaultPrevented) return;
-    // Scoped to Search: a higher navigation decision owns its own keyboard events.
+    if (event.key !== "Tab" || event.defaultPrevented || document.querySelector('[data-navigation-decision="true"]')) return;
+    // The actual higher navigation decision owns focus and Tab until it closes.
     const controls = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>(
       'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex="0"]',
     ) ?? []).filter((item) => !item.hidden && window.getComputedStyle(item).display !== "none" && window.getComputedStyle(item).visibility !== "hidden");

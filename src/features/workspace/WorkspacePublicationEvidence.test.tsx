@@ -29,7 +29,12 @@ function deferred<T>() {
 }
 const props = { page: "publication" as const, projectId: "p1", locale: "en-US" as const, zh: false, onOpenConversation: vi.fn(), onInsert: vi.fn() };
 function page(projectId = "p1") { return <WorkspacePublicationPage {...props} projectId={projectId} />; }
-async function open() { fireEvent.click(await screen.findByRole("button", { name: "Study" })); await screen.findByRole("button", { name: "Check saved revision 2" }); }
+async function open() {
+  const study = await screen.findByRole("button", { name: "Study" });
+  await act(async () => { fireEvent.click(study); });
+  expect(await screen.findByRole("button", { name: "Check saved revision 2" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Export saved revision 2 reference package" })).toBeEnabled();
+}
 beforeEach(() => {
   Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
   host.mockReset();

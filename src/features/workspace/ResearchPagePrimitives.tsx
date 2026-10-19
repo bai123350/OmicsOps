@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { X } from "lucide-react";
 import { getWorkspaceSourceDetail, saveWorkspaceLibraryItem } from "../../workspace-navigation-api";
 import type { WorkspaceSourceRef, WorkspaceSourceSnapshot } from "../../workspace-navigation-types";
@@ -52,9 +52,30 @@ export function useResearchList<T, M = undefined>(key: string, fetchPage: (offse
 }
 
 export function ResearchDialog({ title, onClose, children, zh, navigationDecision = false }: { title: string; onClose: () => void; children: ReactNode; zh: boolean; navigationDecision?: boolean }) {
+  const dialogRef = useRef<HTMLElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
+  useLayoutEffect(() => {
+    if (!navigationDecision) return;
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const dialog = dialogRef.current;
+    closeRef.current?.focus();
+    return () => {
+      if (previous?.isConnected && (dialog?.contains(document.activeElement) || document.activeElement === document.body)) previous.focus();
+    };
+  }, [navigationDecision]);
+  function handleNavigationTab(event: ReactKeyboardEvent<HTMLElement>) {
+    if (event.key !== "Tab" || event.defaultPrevented) return;
+    const controls = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex="0"]',
+    ) ?? []).filter((item) => !item.hidden && window.getComputedStyle(item).display !== "none" && window.getComputedStyle(item).visibility !== "hidden");
+    if (!controls.length) return;
+    event.preventDefault();
+    const index = controls.indexOf(document.activeElement as HTMLElement);
+    controls[index < 0 ? (event.shiftKey ? controls.length - 1 : 0) : (index + (event.shiftKey ? -1 : 1) + controls.length) % controls.length].focus();
+  }
   useWindowEscapeLayer(true, onClose);
-  return <div className="research-dialog-backdrop" data-navigation-decision={navigationDecision || undefined}><section className="research-dialog" role="dialog" aria-modal="true" aria-label={title}>
-    <header><h2>{title}</h2><button type="button" aria-label={zh ? "关闭" : "Close"} onClick={onClose}><X size={18} /></button></header>
+  return <div className="research-dialog-backdrop" data-navigation-decision={navigationDecision || undefined}><section ref={dialogRef} className="research-dialog" role="dialog" aria-modal="true" aria-label={title} onKeyDown={navigationDecision ? handleNavigationTab : undefined}>
+    <header><h2>{title}</h2><button ref={closeRef} type="button" aria-label={zh ? "关闭" : "Close"} onClick={onClose}><X size={18} /></button></header>
     <div className="research-dialog-content">{children}</div>
   </section></div>;
 }

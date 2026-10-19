@@ -85,7 +85,13 @@ Local/容器的终端验证后及下次写入前，检查buffer与当前descript
 窗口焦点所有权按可见层级确定：全局 Search 打开时，Desktop 显式将其状态传给
 WorkspaceShell，暂停 Runtime 及其内核元数据子面板的 Tab/Shift+Tab 捕获。
 Search 在自身控件范围内循环 Tab，关闭后恢复原来的 Runtime/子面板控件。
-更高层的导航决定对话框使用自己的键盘事件，不被 Search 的局部处理抢焦点。
+更高层的 `navigationDecision` 对话框打开时记录原焦点并自动聚焦关闭按钮，
+只在该决定内部循环 Tab/Shift+Tab，每次按键重新选择当前可用且可见的控件，
+跳过保存期间禁用的操作。实际 `[data-navigation-decision="true"]` 边界存在时，
+Search 明确暂停低层 Tab 处理；窗口 Escape 仍只关闭顶层决定并保留 Search。
+取消/卸载决定时，仅当焦点仍在决定内或 body 且原控件仍连接时恢复原焦点；
+不抢回已移到其他位置的焦点，不聚焦已卸载控件。普通 ResearchDialog 不启用
+这组焦点行为。此更高层转移由加载结果后键盘 Enter 的真实组合回归覆盖。
 Runtime 始终高于较低的运行轨迹；Runtime 可见时轨迹暂停 Escape 注册。
 远端作业仍独立暂停 Runtime 焦点。一次立即 Escape 仅关闭最高层并保留父层；
 不从 DOM 顺序或 Escape 注册先后推断视觉层级。此组合由 Desktop/Shell 确定性

@@ -1024,6 +1024,62 @@ describe("DesktopApp", () => {
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "搜索工作区" })).not.toBeInTheDocument());
   });
 
+  it("keyboard navigation decision owns focus above Search and restores it on cancellation", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    vi.spyOn(navigationApi, "isWorkspaceDesktopHost").mockReturnValue(true);
+    vi.spyOn(navigationApi, "listWorkspacePublications").mockResolvedValue([]);
+    const save = deferred<Awaited<ReturnType<typeof navigationApi.saveWorkspacePublication>>>();
+    const saveRequest = vi.spyOn(navigationApi, "saveWorkspacePublication").mockReturnValue(save.promise);
+    vi.spyOn(referenceApi, "composerReferenceCatalog").mockResolvedValue([{ reference: { kind: "session", project_id: stateProject.id, id: stateConversations[1].id }, label: "Guarded keyboard session", description: "Saved transcript" }]);
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: stateConversations[0].title });
+    fireEvent.click(screen.getByRole("button", { name: "发表工作区" }));
+    fireEvent.click(await screen.findByRole("button", { name: "新建稿件" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "标题" }), { target: { value: "Keyboard draft" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Markdown" }), { target: { value: "Keep keyboard draft" } });
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    const search = screen.getByRole("dialog", { name: "搜索工作区" });
+    const input = within(search).getByRole("searchbox", { name: "搜索工作区内容" });
+    fireEvent.change(input, { target: { value: "Guarded keyboard session" } });
+    const result = await within(search).findByRole("button", { name: "打开 Guarded keyboard session" });
+    await waitFor(() => expect(result).toBeEnabled());
+    expect(input).toHaveFocus();
+    fireEvent.keyDown(input, { key: "Enter" });
+    const decision = await screen.findByRole("dialog", { name: "未保存的稿件" });
+    const close = within(decision).getByRole("button", { name: "关闭" });
+    const initialTopFocus = document.activeElement === close;
+    // Even a stray event from the covered input cannot reclaim the top decision's focus.
+    close.focus();
+    const lowerTab = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+    fireEvent(input, lowerTab);
+    expect({ initialTopFocus, lowerSearchConsumedTab: lowerTab.defaultPrevented, topFocusAfterLowerTab: document.activeElement === close }).toEqual({ initialTopFocus: true, lowerSearchConsumedTab: false, topFocusAfterLowerTab: true });
+    const keepEditing = within(decision).getByRole("button", { name: "继续编辑" });
+    fireEvent.keyDown(close, { key: "Tab", shiftKey: true }); expect(keepEditing).toHaveFocus();
+    fireEvent.keyDown(keepEditing, { key: "Tab" }); expect(close).toHaveFocus();
+    const saveAndLeave = within(decision).getByRole("button", { name: "保存并离开" });
+    fireEvent.keyDown(close, { key: "Tab" }); expect(saveAndLeave).toHaveFocus();
+    fireEvent.click(saveAndLeave);
+    await waitFor(() => expect(saveRequest).toHaveBeenCalledTimes(1));
+    expect(saveAndLeave).toBeDisabled();
+    expect(within(decision).getByRole("button", { name: "放弃并离开" })).toBeDisabled();
+    // Controls are recomputed after busy state changes, so disabled actions are skipped.
+    close.focus(); fireEvent.keyDown(close, { key: "Tab" }); expect(keepEditing).toHaveFocus();
+    fireEvent.keyDown(keepEditing, { key: "Tab", shiftKey: true }); expect(close).toHaveFocus();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "未保存的稿件" })).not.toBeInTheDocument();
+    expect(search).toBeVisible(); expect(input).toHaveFocus();
+    expect(screen.getByRole("textbox", { name: "Markdown" })).toHaveValue("Keep keyboard draft");
+    await act(async () => save.reject(new Error("save unavailable")));
+    expect(input).toHaveFocus();
+    await waitFor(() => expect(result).toBeEnabled());
+    fireEvent.keyDown(input, { key: "Tab", shiftKey: true });
+    expect(within(search).getByRole("button", { name: "关闭搜索" })).toHaveFocus();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "搜索工作区" })).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Markdown" })).toHaveValue("Keep keyboard draft");
+  });
+
   it("keeps a dirty manuscript when cancelling search navigation and permits retry", async () => {
     const { stateSpy } = setupConversationStateHarness();
     stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
