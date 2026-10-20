@@ -22,7 +22,7 @@ const MODEL_MAX_RETRIES: u8 = 3;
 pub const MODEL_PROBE_OUTPUT_TOKENS: u32 = 4096;
 const OPENCODE_GO_USER_AGENT: &str = concat!("OmicsOps/", env!("CARGO_PKG_VERSION"));
 
-fn is_opencode_go_base_url(url: &Url) -> bool {
+pub(crate) fn is_opencode_go_base_url(url: &Url) -> bool {
     url.scheme() == "https"
         && url.host_str() == Some("opencode.ai")
         && url.port_or_known_default() == Some(443)
@@ -77,6 +77,42 @@ mod opencode_go_tests {
             .headers()
             .get(name)
             .and_then(|value| value.to_str().ok())
+    }
+
+    #[test]
+    fn go_model_discovery_omits_credentials_but_inference_keeps_them() {
+        for protocol in [
+            ProviderProtocol::OpenAiCompatible,
+            ProviderProtocol::Anthropic,
+        ] {
+            let mut client = client("https://opencode.ai/zen/go/v1", Uuid::new_v4());
+            client.protocol = protocol;
+            let discovery = client
+                .get_request(provider_models_endpoint(protocol, client.base_url.clone()).unwrap())
+                .build()
+                .unwrap();
+            assert_eq!(header(&discovery, "authorization"), None);
+            assert_eq!(header(&discovery, "x-api-key"), None);
+            let inference = client
+                .post_json_request(
+                    provider_endpoint(protocol, client.base_url.clone()).unwrap(),
+                    &json!({"model":"fixture"}),
+                )
+                .build()
+                .unwrap();
+            match protocol {
+                ProviderProtocol::OpenAiCompatible => {
+                    assert_eq!(
+                        header(&inference, "authorization"),
+                        Some("Bearer test-only")
+                    );
+                }
+                ProviderProtocol::Anthropic => {
+                    assert_eq!(header(&inference, "x-api-key"), Some("test-only"));
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]
@@ -2257,13 +2293,18 @@ pub struct UnifiedModelClient {
 }
 
 impl UnifiedModelClient {
-    fn authenticate(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn identify(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         builder = builder.header(reqwest::header::ACCEPT_ENCODING, "identity");
         if is_opencode_go_base_url(&self.base_url) {
             builder = builder
                 .header(reqwest::header::USER_AGENT, OPENCODE_GO_USER_AGENT)
                 .header("x-opencode-session", self.session_id.to_string());
         }
+        builder
+    }
+
+    fn authenticate(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let builder = self.identify(builder);
         match self.protocol {
             ProviderProtocol::Anthropic => builder
                 .header("x-api-key", self.credential.as_deref().unwrap_or_default())
@@ -2345,7 +2386,14 @@ impl UnifiedModelClient {
     }
 
     fn get_request(&self, endpoint: Url) -> reqwest::RequestBuilder {
-        self.authenticate(self.http.get(endpoint))
+        let builder = self.http.get(endpoint);
+        if self.protocol != ProviderProtocol::Ollama && is_opencode_go_base_url(&self.base_url) {
+            // Go publishes its model list without authentication. Sending an
+            // expired key turns a public catalog request into a failing 401.
+            self.identify(builder)
+        } else {
+            self.authenticate(builder)
+        }
     }
 
     /// Attach a preflight budget to subsequent model generation requests.

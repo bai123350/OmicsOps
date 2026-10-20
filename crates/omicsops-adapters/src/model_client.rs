@@ -5,7 +5,8 @@ use crate::{
     codex_auth::CodexCredentialCoordinator,
     credentials::CredentialVault,
     llm::{
-        ModelProbeResult, ProviderProtocol, RequestBudget, RequestBudgetMetrics, UnifiedModelClient,
+        ModelProbeResult, ProviderProtocol, RequestBudget, RequestBudgetMetrics,
+        UnifiedModelClient, is_opencode_go_base_url,
     },
     responses::{
         ResponsesAuthorization, ResponsesEndpointKind, ResponsesHttpClient, ResponsesTransport,
@@ -55,6 +56,62 @@ pub enum ModelClient {
     Responses(OpenCodeGoModelClient),
     Claude(ClaudeCodeClient),
 }
+
+/// Model enumeration has a separate lifecycle from authenticated inference.
+pub enum ModelDiscoveryClient {
+    OpenCodeGo(ResponsesHttpClient),
+    Authenticated(ModelClient),
+}
+
+impl ModelDiscoveryClient {
+    pub fn from_profile(
+        profile: &ModelProfile,
+        services: Arc<ModelClientServices>,
+    ) -> AdapterResult<Self> {
+        let base = Url::parse(&profile.base_url).map_err(|_| error("model_endpoint_invalid"))?;
+        if matches!(
+            profile.provider,
+            ModelProviderKind::OpenAiCompatible
+                | ModelProviderKind::Anthropic
+                | ModelProviderKind::OpenAiResponses
+        ) && is_opencode_go_base_url(&base)
+        {
+            // Public discovery neither validates inference options nor reads
+            // keyring. Keep saved profiles and inference authorization intact.
+            return Ok(Self::OpenCodeGo(ResponsesHttpClient::new(
+                ResponsesEndpointKind::OpenCodeGo,
+                base,
+                profile.model.clone(),
+                None,
+                Uuid::new_v4(),
+            )?));
+        }
+        Ok(Self::Authenticated(ModelClient::from_profile(
+            profile, services,
+        )?))
+    }
+
+    pub fn with_responses_transport(self, transport: Arc<dyn ResponsesTransport>) -> Self {
+        match self {
+            Self::OpenCodeGo(client) => Self::OpenCodeGo(client.with_transport(transport)),
+            Self::Authenticated(client) => {
+                Self::Authenticated(client.with_responses_transport(transport))
+            }
+        }
+    }
+
+    pub async fn discover_models(&self) -> AdapterResult<ModelDiscoveryResult> {
+        match self {
+            Self::OpenCodeGo(client) => Ok(ModelDiscoveryResult {
+                models: client.list_go_models().await?,
+                source: ModelDiscoverySource::Provider,
+                can_refresh: true,
+            }),
+            Self::Authenticated(client) => client.discover_models().await,
+        }
+    }
+}
+
 impl From<UnifiedModelClient> for ModelClient {
     fn from(client: UnifiedModelClient) -> Self {
         Self::Http(client)
@@ -389,7 +446,7 @@ impl ModelClient {
         let (models, source, can_refresh) = match self {
             Self::Http(c) => (c.list_models().await?, ModelDiscoverySource::Provider, true),
             Self::Responses(c) => (
-                c.transport.list_go_models(go_authorization(c)?).await?,
+                c.transport.list_go_models().await?,
                 ModelDiscoverySource::Provider,
                 true,
             ),

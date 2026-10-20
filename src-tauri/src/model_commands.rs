@@ -1,7 +1,7 @@
 use omicsops_adapters::{
     credentials::{CredentialVault, credential_account},
     llm::{MODEL_PROBE_OUTPUT_TOKENS, ModelProbeResult, RequestBudget},
-    model_client::ModelClient,
+    model_client::{ModelClient, ModelDiscoveryClient},
 };
 use omicsops_core::workspace::{ModelProfile, ModelProviderKind, OPENCODE_GO_RESPONSES_MODELS};
 use tauri::State;
@@ -348,19 +348,30 @@ pub async fn list_model_profile_models(
     state: State<'_, AppState>,
     profile_id: Uuid,
 ) -> Result<Vec<String>, String> {
-    client_for_profile(&state, profile_id)
-        .await?
-        .list_models()
+    discover_models_for_profile(&state, profile_id)
         .await
-        .map_err(|error| error.to_string())
+        .map(|discovery| discovery.models)
 }
 #[tauri::command]
 pub async fn list_model_profile_model_discovery(
     state: State<'_, AppState>,
     profile_id: Uuid,
 ) -> Result<omicsops_dto::ModelDiscoveryResult, String> {
-    client_for_profile(&state, profile_id)
-        .await?
+    discover_models_for_profile(&state, profile_id).await
+}
+
+async fn discover_models_for_profile(
+    state: &AppState,
+    profile_id: Uuid,
+) -> Result<omicsops_dto::ModelDiscoveryResult, String> {
+    let profile = state
+        .repository
+        .get_model_profile(profile_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "model profile not found".to_string())?;
+    ModelDiscoveryClient::from_profile(&profile, state.subscription_models.model_services())
+        .map_err(|error| error.to_string())?
         .discover_models()
         .await
         .map_err(|error| error.to_string())

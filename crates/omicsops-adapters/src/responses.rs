@@ -702,21 +702,15 @@ impl ResponsesHttpClient {
     pub fn request_budget(&self) -> Option<RequestBudget> {
         self.budget
     }
-    pub async fn list_go_models(
-        &self,
-        authorization: ResponsesAuthorization,
-    ) -> AdapterResult<Vec<String>> {
-        if self.kind != ResponsesEndpointKind::OpenCodeGo || authorization.account_id.is_some() {
+    pub async fn list_go_models(&self) -> AdapterResult<Vec<String>> {
+        if self.kind != ResponsesEndpointKind::OpenCodeGo {
             return Err(invalid("responses_discovery_not_allowed"));
         }
         responses_endpoint(self.kind, &self.base)?;
         let endpoint = Url::parse("https://opencode.ai/zen/go/v1/models")
             .map_err(|_| invalid("responses_endpoint_invalid"))?;
         let mut headers = HeaderMap::new();
-        let mut bearer = HeaderValue::from_str(&format!("Bearer {}", authorization.token))
-            .map_err(|_| invalid("responses_authorization_invalid"))?;
-        bearer.set_sensitive(true);
-        headers.insert("authorization", bearer);
+        headers.insert("accept-encoding", HeaderValue::from_static("identity"));
         headers.insert(
             "user-agent",
             HeaderValue::from_static(concat!("OmicsOps/", env!("CARGO_PKG_VERSION"))),

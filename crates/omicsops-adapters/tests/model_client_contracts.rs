@@ -5,7 +5,7 @@ use omicsops_adapters::{
     claude_code::SystemClaudeProcessRunner,
     codex_auth::*,
     credentials::{CredentialVault, MemoryCredentialVault},
-    model_client::{ModelClient, ModelClientServices},
+    model_client::{ModelClient, ModelClientServices, ModelDiscoveryClient},
     responses::{ResponsesHttpStream, ResponsesTransport},
 };
 use omicsops_agent::{
@@ -349,7 +349,11 @@ impl ResponsesTransport for DiscoveryTransport {
         _: Duration,
     ) -> AdapterResult<ResponsesHttpStream> {
         assert_eq!(endpoint.as_str(), "https://opencode.ai/zen/go/v1/models");
-        assert!(headers["authorization"].is_sensitive());
+        assert!(
+            !headers.contains_key("authorization"),
+            "the public Go model list must not depend on a valid API key"
+        );
+        assert!(!headers.contains_key("x-api-key"));
         assert_eq!(
             headers["user-agent"],
             concat!("OmicsOps/", env!("CARGO_PKG_VERSION"))
@@ -392,5 +396,172 @@ async fn model_client_discovery_reports_only_valid_provider_data() {
             assert!(result.can_refresh);
         }
         assert_eq!(transport.gets.load(Ordering::SeqCst), 1);
+    }
+}
+
+struct UnavailableVault;
+impl CredentialVault for UnavailableVault {
+    fn get(&self, _: &str) -> AdapterResult<Option<String>> {
+        panic!("public Go discovery must not read credentials")
+    }
+    fn set(&self, _: &str, _: &str) -> AdapterResult<()> {
+        panic!("discovery must not write credentials")
+    }
+    fn delete(&self, _: &str) -> AdapterResult<()> {
+        panic!("discovery must not delete credentials")
+    }
+}
+
+#[tokio::test]
+async fn public_go_discovery_is_independent_of_credentials_and_inference_options() {
+    for kind in [
+        ModelProviderKind::OpenAiCompatible,
+        ModelProviderKind::Anthropic,
+        ModelProviderKind::OpenAiResponses,
+    ] {
+        for invalid_options in [false, true] {
+            let (services, _, _) = services();
+            let services = Arc::new(ModelClientServices {
+                vault: Arc::new(UnavailableVault),
+                codex: services.codex.clone(),
+                claude: services.claude.clone(),
+            });
+            let mut profile = profile(kind);
+            profile.base_url = "https://opencode.ai:443/zen/go/v1/".into();
+            if invalid_options {
+                profile.fast_mode = Some(true);
+                profile.reasoning_effort = Some("not-a-supported-effort".into());
+            } else {
+                profile.credential_reference = None;
+            }
+            let transport = Arc::new(DiscoveryTransport {
+                status: 200,
+                value: json!({"object":"list","data":[
+                    {"id":"minimax-m3","object":"model","created":0,"owned_by":"opencode"},
+                    {"id":"glm-5.3-flash","object":"model","created":0,"owned_by":"opencode"},
+                    {"id":"glm-5.3-flash","object":"model","created":0,"owned_by":"opencode"}
+                ]}),
+                gets: AtomicUsize::new(0),
+            });
+            let result = ModelDiscoveryClient::from_profile(&profile, services.clone())
+                .unwrap()
+                .with_responses_transport(transport.clone())
+                .discover_models()
+                .await
+                .unwrap();
+            assert_eq!(result.models, ["glm-5.3-flash", "minimax-m3"]);
+            assert_eq!(result.source, ModelDiscoverySource::Provider);
+            assert!(result.can_refresh);
+            assert_eq!(transport.gets.load(Ordering::SeqCst), 1);
+            if invalid_options || kind != ModelProviderKind::OpenAiResponses {
+                assert!(ModelClient::from_profile(&profile, services).is_err());
+            } else {
+                let error = ModelClient::from_profile(&profile, services)
+                    .unwrap()
+                    .with_responses_transport(transport)
+                    .probe()
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("go_credential_missing"));
+            }
+        }
+    }
+}
+
+#[test]
+fn public_go_discovery_does_not_bypass_other_endpoints_or_providers() {
+    for base in [
+        "http://opencode.ai/zen/go/v1",
+        "https://opencode.ai:8443/zen/go/v1",
+        "https://opencode.ai.example/zen/go/v1",
+        "https://opencode.ai/zen/go/v10",
+        "https://opencode.ai/zen/v1",
+        "https://opencode.ai/zen/go/v1?forward=1",
+        "https://opencode.ai/zen/go/v1#fragment",
+        "https://user@opencode.ai/zen/go/v1",
+    ] {
+        let (services, _, _) = services();
+        let mut profile = profile(ModelProviderKind::OpenAiCompatible);
+        profile.base_url = base.into();
+        profile.credential_reference = None;
+        assert!(
+            ModelDiscoveryClient::from_profile(&profile, services).is_err(),
+            "{base}"
+        );
+    }
+    for kind in [
+        ModelProviderKind::OpenAiCodex,
+        ModelProviderKind::ClaudeCode,
+        ModelProviderKind::Ollama,
+    ] {
+        let (services, _, _) = services();
+        let mut profile = profile(kind);
+        profile.base_url = "https://opencode.ai/zen/go/v1".into();
+        profile.fast_mode = Some(true);
+        assert!(ModelDiscoveryClient::from_profile(&profile, services).is_err());
+    }
+}
+
+#[tokio::test]
+async fn public_go_discovery_preserves_empty_lists_and_rejects_failed_or_malformed_responses() {
+    for (status, value, expected) in [
+        (200, json!({"data":[]}), Some(Vec::<String>::new())),
+        (401, json!({"error":"fixture"}), None),
+        (500, json!({"data":[]}), None),
+        (307, json!({"data":[]}), None),
+        (200, json!({"models":[]}), None),
+        (200, json!({"data":[{"id":""}]}), None),
+        (200, json!({"data":[{"id":"x".repeat(257)}]}), None),
+        (200, json!({"data":[{"id":"x".repeat(1024 * 1024)}]}), None),
+    ] {
+        let (services, _, _) = services();
+        let mut profile = profile(ModelProviderKind::OpenAiCompatible);
+        profile.base_url = "https://opencode.ai/zen/go/v1".into();
+        let result = ModelDiscoveryClient::from_profile(&profile, services)
+            .unwrap()
+            .with_responses_transport(Arc::new(DiscoveryTransport {
+                status,
+                value,
+                gets: AtomicUsize::new(0),
+            }))
+            .discover_models()
+            .await;
+        match expected {
+            Some(models) => assert_eq!(result.unwrap().models, models),
+            None => assert!(result.is_err()),
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires OMICSOPS_LIVE_GO_DISCOVERY=1 and public OpenCode network access; no credentials or inference"]
+async fn live_public_go_discovery_without_credentials() {
+    assert_eq!(
+        std::env::var("OMICSOPS_LIVE_GO_DISCOVERY").as_deref(),
+        Ok("1")
+    );
+    for kind in [
+        ModelProviderKind::OpenAiCompatible,
+        ModelProviderKind::Anthropic,
+        ModelProviderKind::OpenAiResponses,
+    ] {
+        let (services, _, _) = services();
+        let services = Arc::new(ModelClientServices {
+            vault: Arc::new(UnavailableVault),
+            codex: services.codex.clone(),
+            claude: services.claude.clone(),
+        });
+        let mut profile = profile(kind);
+        profile.base_url = "https://opencode.ai/zen/go/v1".into();
+        profile.credential_reference = None;
+        let result = ModelDiscoveryClient::from_profile(&profile, services)
+            .unwrap()
+            .discover_models()
+            .await
+            .unwrap();
+        assert_eq!(result.source, ModelDiscoverySource::Provider);
+        assert!(result.can_refresh);
+        assert!(!result.models.is_empty());
+        println!("{kind:?}: {} public models", result.models.len());
     }
 }

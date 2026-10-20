@@ -137,6 +137,25 @@ OMICSOPS_LIVE_MODEL_NAME
 OMICSOPS_LIVE_MODEL_CREDENTIAL         # omitted only for Ollama
 ```
 
+## OpenCode Go public model discovery (opt-in, no API key)
+
+After the deterministic checks, this exact ignored test exercises production
+public discovery for Chat Completions, Messages, and Responses profiles:
+
+```powershell
+$env:OMICSOPS_LIVE_GO_DISCOVERY = "1"
+cargo test -p omicsops-adapters --test model_client_contracts live_public_go_discovery_without_credentials -- --ignored --exact --nocapture
+Remove-Item Env:OMICSOPS_LIVE_GO_DISCOVERY
+```
+
+The profiles and services exist only in memory. Credential access fails the test;
+it never opens the desktop database, reads keyring, sends an API key, or requests
+inference. Only protocol names and model counts are printed. The official legacy
+`https://opencode.ai/zen/go/v1/models` endpoint remains supported and public.
+Each request retains the production 15-second deadline and bounded response.
+A passing result proves public model enumeration, not authentication, account
+entitlements, model inference, or Agent V4 acceptance. Normal CI ignores it.
+
 ## OpenCode Go ordinary Agent acceptance (Windows, opt-in)
 
 The separate subscription checks below cover Codex and Go Responses. The older
