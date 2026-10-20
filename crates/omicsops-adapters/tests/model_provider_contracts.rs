@@ -659,15 +659,24 @@ fn truncated_responses_never_turn_into_completed_tool_calls() {
     for (protocol, value) in [
         (
             ProviderProtocol::OpenAiCompatible,
-            json!({"choices":[{"finish_reason":"length","message":{"content":"partial"}}]}),
+            json!({"choices":[{"finish_reason":"length","message":{
+                "content":"partial",
+                "tool_calls":[{"id":"c1","function":{"name":"remote.read","arguments":"{\"path\":\"result.tsv\"}"}}]
+            }}]}),
         ),
         (
             ProviderProtocol::Anthropic,
-            json!({"stop_reason":"max_tokens","content":[{"type":"text","text":"partial"}]}),
+            json!({"stop_reason":"max_tokens","content":[
+                {"type":"text","text":"partial"},
+                {"type":"tool_use","id":"c1","name":"remote.read","input":{"path":"result.tsv"}}
+            ]}),
         ),
         (
             ProviderProtocol::Ollama,
-            json!({"done":true,"done_reason":"length","message":{"content":"partial"}}),
+            json!({"done":true,"done_reason":"length","message":{
+                "content":"partial",
+                "tool_calls":[{"id":"c1","function":{"name":"remote.read","arguments":{"path":"result.tsv"}}}]
+            }}),
         ),
     ] {
         assert!(
@@ -687,6 +696,75 @@ fn truncated_responses_never_turn_into_completed_tool_calls() {
     );
     let mut anthropic = ProviderToolStreamDecoder::new(ProviderProtocol::Anthropic);
     assert!(anthropic.push(b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n").is_err());
+}
+
+#[test]
+fn truncated_streams_reject_buffered_complete_and_partial_tool_arguments() {
+    let request = request();
+    for protocol in [
+        ProviderProtocol::OpenAiCompatible,
+        ProviderProtocol::Anthropic,
+        ProviderProtocol::Ollama,
+    ] {
+        for arguments in [r#"{"path":"result.tsv"}"#, r#"{"path":"result"#] {
+            let (prefix, terminal) = match protocol {
+                ProviderProtocol::OpenAiCompatible => (
+                    format!(
+                        "data: {}\n\n",
+                        json!({"choices":[{"delta":{"tool_calls":[{
+                            "index":0,"id":"c1","function":{"name":"remote.read","arguments":arguments}
+                        }]}}]})
+                    ),
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+                ),
+                ProviderProtocol::Anthropic => (
+                    format!(
+                        "data: {}\n\ndata: {}\n\n",
+                        json!({"type":"content_block_start","index":0,"content_block":{
+                            "type":"tool_use","id":"c1","name":"remote.read","input":{}
+                        }}),
+                        json!({"type":"content_block_delta","index":0,"delta":{
+                            "type":"input_json_delta","partial_json":arguments
+                        }})
+                    ),
+                    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n",
+                ),
+                ProviderProtocol::Ollama => (
+                    format!(
+                        "{}\n",
+                        json!({"message":{"tool_calls":[{
+                            "id":"c1","function":{"name":"remote.read","arguments":arguments}
+                        }]},"done":false})
+                    ),
+                    "{\"message\":{},\"done\":true,\"done_reason\":\"length\"}\n",
+                ),
+            };
+            let mut decoder = ProviderToolStreamDecoder::for_request(protocol, &request);
+            let mut pending_events = Vec::new();
+            for chunk in prefix.as_bytes().chunks(7) {
+                pending_events.extend(decoder.push(chunk).unwrap());
+            }
+            assert!(pending_events.iter().any(|event| matches!(
+                event,
+                ProviderStreamEvent::ToolCallStarted { tool_id, .. } if tool_id == "remote.read"
+            )));
+            assert!(pending_events.iter().any(|event| matches!(
+                event,
+                ProviderStreamEvent::ToolArgumentsDelta { arguments: actual, .. } if actual == arguments
+            )));
+            assert!(!pending_events.iter().any(|event| matches!(
+                event,
+                ProviderStreamEvent::ToolCallCompleted { .. } | ProviderStreamEvent::Completed
+            )));
+
+            let error = decoder.push(terminal.as_bytes()).unwrap_err().to_string();
+            assert!(error.contains("truncated_output:"), "{protocol:?}: {error}");
+            assert!(
+                decoder.finish().is_err(),
+                "{protocol:?} must not accept buffered arguments after truncation"
+            );
+        }
+    }
 }
 
 #[test]

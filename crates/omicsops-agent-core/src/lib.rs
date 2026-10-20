@@ -3407,7 +3407,7 @@ impl AgentCoreV4<'_> {
         cancelled: Option<&AtomicBool>,
     ) -> Result<ReviewerReportV4, AgentCoreErrorV4> {
         let mut attempt = 0_u8;
-        let mut malformed_arguments_regenerated = false;
+        let mut output_regenerated = false;
         loop {
             if cancelled.is_some_and(|token| token.load(Ordering::SeqCst)) {
                 if let Some(token) = cancelled {
@@ -3431,19 +3431,26 @@ impl AgentCoreV4<'_> {
                 Err(error)
                     if !error.retryable
                         && error.class == omicsops_protocol::ModelErrorClassV4::InvalidResponse
-                        && error.message.contains("returned malformed JSON arguments:")
-                        && !malformed_arguments_regenerated =>
+                        && (error.message.contains("returned malformed JSON arguments:")
+                            || error.message.contains("truncated_output:"))
+                        && !output_regenerated =>
                 {
                     // Regenerate only the read-only report from the same frozen
                     // evidence. This does not consume a transport retry or replay
-                    // any executor call, and a second malformed report still fails.
-                    malformed_arguments_regenerated = true;
+                    // any executor call. Malformed and truncated reports share
+                    // one regeneration; a second invalid report still fails.
+                    output_regenerated = true;
+                    let reason = if error.message.contains("truncated_output:") {
+                        "output limit reached"
+                    } else {
+                        "malformed JSON arguments"
+                    };
                     self.push(
                         run_id,
                         AgentEventKindV4::ModelRetrying {
                             attempt: 1,
                             class: error.class,
-                            message: "reviewer: malformed JSON arguments; regenerating the read-only review once from unchanged frozen evidence. No executor tool was dispatched.".into(),
+                            message: format!("reviewer: {reason}; regenerating the read-only review once from unchanged frozen evidence. No executor tool was dispatched."),
                         },
                     )
                     .await?;
@@ -17231,6 +17238,13 @@ mod tests {
         )
     }
 
+    fn truncated_reviewer_output() -> ModelFailureV4 {
+        ModelFailureV4::permanent(
+            omicsops_protocol::ModelErrorClassV4::InvalidResponse,
+            "model endpoint failed: truncated_output: provider exhausted its output allowance; partial tool calls cannot execute",
+        )
+    }
+
     fn frozen_reviewer_request(spec: &RunSpecV4) -> ReviewerRequestV4 {
         ReviewerRequestV4 {
             frozen_objective: spec.plan.objective.clone(),
@@ -17256,15 +17270,23 @@ mod tests {
 
     #[tokio::test]
     async fn reviewer_malformed_arguments_regenerate_from_identical_frozen_evidence() {
+        assert_reviewer_regenerates_from_identical_frozen_evidence(malformed_reviewer_arguments())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn reviewer_truncated_output_regenerates_from_identical_frozen_evidence() {
+        assert_reviewer_regenerates_from_identical_frozen_evidence(truncated_reviewer_output())
+            .await;
+    }
+
+    async fn assert_reviewer_regenerates_from_identical_frozen_evidence(failure: ModelFailureV4) {
         let spec = execution_spec(Uuid::new_v4());
         let store = MemoryStore::default();
         seed_execution(&store, &spec);
         let expected = review(VerificationSeverityV4::Error);
         let model = ScriptedReviewer {
-            outcomes: Mutex::new(vec![
-                Err(malformed_reviewer_arguments()),
-                Ok(expected.clone()),
-            ]),
+            outcomes: Mutex::new(vec![Err(failure), Ok(expected.clone())]),
             requests: Mutex::new(vec![]),
             cancel_after_review: None,
         };
@@ -17313,6 +17335,63 @@ mod tests {
         );
         assert!(!retries[0].2.contains("review-call"));
         assert!(!retries[0].2.contains("3134"));
+    }
+
+    #[tokio::test]
+    async fn reviewer_truncated_output_shares_one_regeneration_with_malformed_arguments() {
+        for (first, second) in [
+            (truncated_reviewer_output(), truncated_reviewer_output()),
+            (truncated_reviewer_output(), malformed_reviewer_arguments()),
+            (malformed_reviewer_arguments(), truncated_reviewer_output()),
+        ] {
+            let spec = execution_spec(Uuid::new_v4());
+            let store = MemoryStore::default();
+            seed_execution(&store, &spec);
+            let expected_error = second.message.clone();
+            let request = frozen_reviewer_request(&spec);
+            let model = ScriptedReviewer {
+                outcomes: Mutex::new(vec![
+                    Err(first),
+                    Err(second),
+                    Ok(review(VerificationSeverityV4::Ok)),
+                ]),
+                requests: Mutex::new(vec![]),
+                cancel_after_review: None,
+            };
+            let result = AgentCoreV4 {
+                model: &model,
+                tools: &FakeTools,
+                events: &store,
+                science: None,
+            }
+            .review_with_retry(
+                spec.run_id,
+                request.clone(),
+                3,
+                Duration::from_secs(1),
+                None,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(AgentCoreErrorV4::Model(actual)) if actual == expected_error)
+            );
+            assert_eq!(
+                *model.requests.lock().unwrap(),
+                vec![request.clone(), request]
+            );
+            let events = store.load_direct(spec.run_id).unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event.event, AgentEventKindV4::ModelRetrying { .. }))
+                    .count(),
+                1
+            );
+            assert!(!events.iter().any(|event| matches!(
+                event.event,
+                AgentEventKindV4::ReviewerFinished { .. } | AgentEventKindV4::RunCompleted
+            )));
+        }
     }
 
     #[tokio::test]
@@ -17380,12 +17459,29 @@ mod tests {
 
     #[tokio::test]
     async fn reviewer_malformed_arguments_regeneration_preserves_transport_retry_allowance() {
+        assert_reviewer_regeneration_preserves_transport_retry_allowance(
+            malformed_reviewer_arguments(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reviewer_truncated_output_regeneration_preserves_transport_retry_allowance() {
+        assert_reviewer_regeneration_preserves_transport_retry_allowance(
+            truncated_reviewer_output(),
+        )
+        .await;
+    }
+
+    async fn assert_reviewer_regeneration_preserves_transport_retry_allowance(
+        failure: ModelFailureV4,
+    ) {
         let spec = execution_spec(Uuid::new_v4());
         let store = MemoryStore::default();
         seed_execution(&store, &spec);
         let model = ScriptedReviewer {
             outcomes: Mutex::new(vec![
-                Err(malformed_reviewer_arguments()),
+                Err(failure),
                 Err(ModelFailureV4::transient(
                     omicsops_protocol::ModelErrorClassV4::Transport,
                     "transport interrupted",
@@ -17425,12 +17521,23 @@ mod tests {
 
     #[tokio::test]
     async fn reviewer_malformed_arguments_cancellation_prevents_regeneration_request() {
+        assert_reviewer_cancellation_prevents_regeneration_request(malformed_reviewer_arguments())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn reviewer_truncated_output_cancellation_prevents_regeneration_request() {
+        assert_reviewer_cancellation_prevents_regeneration_request(truncated_reviewer_output())
+            .await;
+    }
+
+    async fn assert_reviewer_cancellation_prevents_regeneration_request(failure: ModelFailureV4) {
         let spec = execution_spec(Uuid::new_v4());
         let store = MemoryStore::default();
         seed_execution(&store, &spec);
         let cancelled = Arc::new(AtomicBool::new(false));
         let model = ScriptedReviewer {
-            outcomes: Mutex::new(vec![Err(malformed_reviewer_arguments())]),
+            outcomes: Mutex::new(vec![Err(failure)]),
             requests: Mutex::new(vec![]),
             cancel_after_review: Some(cancelled.clone()),
         };
@@ -17463,6 +17570,17 @@ mod tests {
 
     #[tokio::test]
     async fn reviewer_malformed_arguments_resume_checkpoint_without_executor_dispatch() {
+        assert_reviewer_resumes_checkpoint_without_executor_dispatch(malformed_reviewer_arguments())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn reviewer_truncated_output_resumes_checkpoint_without_executor_dispatch() {
+        assert_reviewer_resumes_checkpoint_without_executor_dispatch(truncated_reviewer_output())
+            .await;
+    }
+
+    async fn assert_reviewer_resumes_checkpoint_without_executor_dispatch(failure: ModelFailureV4) {
         let spec = execution_spec(Uuid::new_v4());
         let store = MemoryStore::default();
         let evidence_sequence = seed_success_evidence(&store, &spec);
@@ -17489,6 +17607,9 @@ mod tests {
                     findings: vec![],
                 },
             },
+            AgentEventKindV4::RunFailed {
+                message: failure.message.clone(),
+            },
         ] {
             let previous = store.events.lock().unwrap().last().unwrap().clone();
             store
@@ -17497,10 +17618,7 @@ mod tests {
         }
         let expected_review = review(VerificationSeverityV4::Warn);
         let model = ScriptedReviewer {
-            outcomes: Mutex::new(vec![
-                Err(malformed_reviewer_arguments()),
-                Ok(expected_review.clone()),
-            ]),
+            outcomes: Mutex::new(vec![Err(failure), Ok(expected_review.clone())]),
             requests: Mutex::new(vec![]),
             cancel_after_review: None,
         };

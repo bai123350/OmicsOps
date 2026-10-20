@@ -1,5 +1,8 @@
 # Reviewer 工具参数 JSON 失败后的完整重生成
 
+2026-10-20 补充：明确的输出截断现与畸形 JSON 共享一次完整重生成额度，
+详见 `2026-10-20-reviewer-truncated-output-recovery.md`。以下保留当时的故障与验证记录。
+
 ## 故障证据
 
 用户的 OpenCode Go `deepseek-v4.1-flash` 截图报告工具参数 JSON 在第 1 行、
