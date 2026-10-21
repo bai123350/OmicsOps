@@ -2,6 +2,7 @@ import { modelSelectionRequest } from "./subscription-models";
 import { useConversationBranchSend } from "./features/workspace/useConversationBranchSend";
 import { useContextUsage } from "./features/workspace/useContextUsage";
 import { useSideChat } from "./features/workspace/useSideChat";
+import { useRemoteFiles } from "./features/workspace/useRemoteFiles";
 import { useWorkspaceSearch } from "./use-workspace-search";
 import { validateComposerReferences } from "./composer-reference-api";
 import { validateComposerAttachments } from "./composer-attachment-api";
@@ -16,7 +17,7 @@ import { ShelvedConversationsDialog } from "./features/workspace/ShelvedConversa
 import * as offlineExampleApi from "./offline-example-api";
 import type { CreateOfflineExampleWorkspaceRequest, OfflineExampleWorkspaceView } from "./types";
 import { OfflineExampleWorkspace } from "./features/projects/OfflineExampleWorkspace";
-import type { AgentModelActivityReceiptV4, AgentReasoningPreviewV4, AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendAvailabilityV4, ComputeSelectionV4, ConnectionProfile, ConversationAgentStateV4, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, ProjectArtifact, ProposedPlanRevisionV4, RemoteFileEntry, RunSummaryV4, SessionAgentModeV4, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
+import type { AgentModelActivityReceiptV4, AgentReasoningPreviewV4, AgentRunEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendAvailabilityV4, ComputeSelectionV4, ConnectionProfile, ConversationAgentStateV4, KernelEvent, KernelLanguage, KernelSession, McpServerProfile, MemoryFact, ModelProfile, NotebookEntry, ProjectArtifact, ProposedPlanRevisionV4, RunSummaryV4, SessionAgentModeV4, SkillPackage, SyncEntry, WorkspaceConversation, WorkspaceMessage, WorkspaceProject } from "./types";
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
 import { ProjectMigrationPreviewDialog } from "./features/projects/ProjectMigrationPreviewDialog";
 import { WorkspaceShell } from "./features/workspace/WorkspaceShell";
@@ -276,7 +277,7 @@ export default function DesktopApp() {
   const contextUsage = useContextUsage(selected?.id, conversation?.id, nativeQueueAvailable && !conversationHydrating);
   const sideChat = useSideChat(selected?.id, conversation?.id, nativeQueueAvailable && !conversationHydrating, activeModelProfileId);
   const branchSend = useConversationBranchSend(selected?.id, conversation?.id, openCreatedBranch);
-  const [remoteFiles, setRemoteFiles] = useState<RemoteFileEntry[]>([]);
+  const { files: remoteFiles, status: remoteFilesStatus, error: remoteFilesError, refresh: refreshRemoteFiles } = useRemoteFiles(selected);
   const [filesBusy, setFilesBusy] = useState(false);
   const [fileNotice, setFileNotice] = useState("");
   const [skillPackages, setSkillPackages] = useState<SkillPackage[]>([]);
@@ -661,11 +662,6 @@ export default function DesktopApp() {
   }, [selected?.id, agentRunEventsV4.at(-1)?.sequence]);
   useEffect(() => {
     setFileNotice("");
-    if (!selected?.connection_id || !selected.remote_root) {
-      setRemoteFiles([]);
-      return;
-    }
-    void refreshRemoteFiles(selected.id);
   }, [selected?.id, selected?.connection_id, selected?.remote_root]);
   useEffect(() => {
     setKernelEvents([]);
@@ -946,7 +942,7 @@ export default function DesktopApp() {
       if (!disposed) setAgentNotice(subscriptionError("Agent V4", error));
     });
     return () => { disposed = true; unlisten.forEach((fn) => fn()); };
-  }, [conversation?.id, selected?.id]);
+  }, [conversation?.id, selected?.id, refreshRemoteFiles]);
 
   useEffect(() => {
     const activeRunId = runId;
@@ -994,18 +990,6 @@ export default function DesktopApp() {
     await withKernelBusy(async () => replaceKernelSession(await api.startKernel(selected.id, language, rebuildSessionId)));
   }
 
-  async function refreshRemoteFiles(projectId = selected?.id) {
-    if (!projectId) return;
-    setFilesBusy(true);
-    try {
-      setRemoteFiles(await api.listRemoteFiles(projectId));
-    } catch (error) {
-      setFileNotice(error instanceof Error ? error.message : String(error));
-    } finally {
-      setFilesBusy(false);
-    }
-  }
-
   async function uploadFiles() {
     if (!selected) return;
     try {
@@ -1015,7 +999,7 @@ export default function DesktopApp() {
       const entries = await api.uploadSelectedFiles(selected.id, relativePaths);
       setSyncEntries(await api.listSyncEntries(selected.id));
       setFileNotice(locale === "zh-CN" ? `已校验上传 ${entries.length} 个文件` : `${entries.length} uploaded files verified`);
-      setRemoteFiles(await api.listRemoteFiles(selected.id));
+      await refreshRemoteFiles(selected.id);
     } catch (error) {
       setFileNotice(error instanceof Error ? error.message : String(error));
     } finally {
@@ -1823,7 +1807,7 @@ export default function DesktopApp() {
       }
     }}
     runStopping={runStopping}
-    remoteFiles={remoteFiles} filesBusy={filesBusy} fileNotice={fileNotice}
+    remoteFiles={remoteFiles} remoteFilesStatus={remoteFilesStatus} remoteFilesError={remoteFilesError} filesBusy={filesBusy} fileNotice={fileNotice}
     syncEntries={syncEntries}
     onPauseSync={async (id) => { await api.pauseSyncTransfer(id); setSyncEntries(await api.listSyncEntries(selected.id)); }}
     onCancelSync={async (id) => { await api.cancelSyncTransfer(id); setSyncEntries(await api.listSyncEntries(selected.id)); }}

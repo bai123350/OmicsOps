@@ -120,6 +120,52 @@ function setupConversationStateHarness() {
   return { stateSpy: vi.spyOn(api, "agentV4ConversationState") };
 }
 
+describe("remote file listing state", () => {
+  it("keeps listing failures out of transfer notices and clears the error after a successful retry", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, id) => stateSnapshot(id));
+    vi.mocked(api.listProjects).mockResolvedValue([{ ...stateProject, connection_id: "ssh-a", remote_root: "/project" }]);
+    const retry = deferred<import("./types").RemoteFileEntry[]>();
+    vi.spyOn(api, "listRemoteFiles").mockRejectedValueOnce(new Error("remote_root_unavailable: PRIVATE_DETAILS")).mockReturnValueOnce(retry.promise);
+    const shell = vi.spyOn(workspaceShell, "WorkspaceShell");
+    render(<DesktopApp />);
+    await waitFor(() => expect(shell.mock.calls.at(-1)?.[0].remoteFilesStatus).toBe("error"));
+    expect(shell.mock.calls.at(-1)![0].remoteFilesError).toBe("remote_root_unavailable");
+    expect(shell.mock.calls.at(-1)![0].remoteFiles).toEqual([]);
+    expect(shell.mock.calls.at(-1)![0].fileNotice).toBe("");
+    expect(screen.queryByText(/PRIVATE_DETAILS/)).not.toBeInTheDocument();
+
+    act(() => { void shell.mock.calls.at(-1)![0].onRefreshFiles?.(); });
+    await waitFor(() => expect(shell.mock.calls.at(-1)?.[0].remoteFilesStatus).toBe("loading"));
+    expect(shell.mock.calls.at(-1)![0].remoteFilesError).toBeUndefined();
+    const entry = { relative_path: "result.tsv", directory: false, size_bytes: 9, modified_unix_seconds: 0 };
+    await act(async () => retry.resolve([entry]));
+    await waitFor(() => expect(shell.mock.calls.at(-1)?.[0].remoteFilesStatus).toBe("ready"));
+    expect(shell.mock.calls.at(-1)![0].remoteFiles).toEqual([entry]);
+    expect(shell.mock.calls.at(-1)![0].remoteFilesError).toBeUndefined();
+    expect(shell.mock.calls.at(-1)![0].fileNotice).toBe("");
+  });
+
+  it("preserves the upload success notice when its subsequent listing fails", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, id) => stateSnapshot(id));
+    vi.mocked(api.listProjects).mockResolvedValue([{ ...stateProject, connection_id: "ssh-a", remote_root: "/project" }]);
+    const uploaded: SyncEntry = { id: "uploaded", project_id: stateProject.id, relative_path: "result.tsv", local_relative_path: "result.tsv", remote_path: "/project/result.tsv", direction: "local_to_remote", size_bytes: 9, sha256: "verified", state: "synced", transferred_bytes: 9, retry_count: 0, error: null, updated_at: "2026-10-21T00:00:00Z" };
+    vi.spyOn(api, "chooseProjectFiles").mockResolvedValue(["result.tsv"]);
+    vi.spyOn(api, "uploadSelectedFiles").mockResolvedValue([uploaded]);
+    vi.spyOn(api, "listSyncEntries").mockResolvedValue([uploaded]);
+    vi.spyOn(api, "listRemoteFiles").mockResolvedValueOnce([]).mockRejectedValueOnce(new Error("PRIVATE_LISTING_ERROR"));
+    const shell = vi.spyOn(workspaceShell, "WorkspaceShell");
+    render(<DesktopApp />);
+    await waitFor(() => expect(shell.mock.calls.at(-1)?.[0].remoteFilesStatus).toBe("ready"));
+    await act(async () => shell.mock.calls.at(-1)![0].onUploadFiles?.());
+    expect(shell.mock.calls.at(-1)![0].remoteFilesStatus).toBe("error");
+    expect(shell.mock.calls.at(-1)![0].fileNotice).toMatch(/已校验上传 1 个文件|1 uploaded files verified/);
+    expect(shell.mock.calls.at(-1)![0].filesBusy).toBe(false);
+    expect(screen.queryByText(/PRIVATE_LISTING_ERROR/)).not.toBeInTheDocument();
+  });
+});
+
 describe("DesktopApp", () => {
   function visibilityHarness() {
     const { stateSpy } = setupConversationStateHarness();

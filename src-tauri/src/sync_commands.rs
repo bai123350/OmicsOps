@@ -487,7 +487,7 @@ pub fn parse_remote_index(raw: &str) -> Result<Vec<RemoteFileEntry>, String> {
         .map(|record| {
             let path = record[0].replace('\\', "/");
             if path.starts_with('/') || path.contains("/../") || path.starts_with("../") {
-                return Err(format!("unsafe remote index path: {path}"));
+                return Err("unsafe remote index path".into());
             }
             Ok(RemoteFileEntry {
                 relative_path: path,
@@ -711,16 +711,80 @@ pub async fn list_remote_files(
     let profile = find_profile(&state.repository, profile_id).await?;
     require_trusted_host(&profile)?;
     let session = connect_profile(&state, &profile).await?;
-    let root = canonical_remote_root(&session, &remote_root).await?;
-    let output = session.execute_checked(&format!(
-        "find {} -mindepth 1 -maxdepth 8 -not -path '*/.omicsops/*' -not -path '*/.omicsops' -printf '%P\\0%y\\0%s\\0%T@\\0'",
-        shell_quote(&root)
-    )).await.map_err(|error| error.to_string())?;
-    session
-        .disconnect()
+    list_remote_files_in_session(session, &remote_root).await
+}
+
+#[async_trait::async_trait]
+trait RemoteFileCommandSession: Send + Sync {
+    async fn execute(&self, command: &str)
+    -> Result<omicsops_adapters::ssh::CommandOutput, String>;
+    async fn disconnect(self) -> Result<(), String>;
+}
+
+#[async_trait::async_trait]
+impl RemoteFileCommandSession for omicsops_adapters::ssh::SshSession {
+    async fn execute(
+        &self,
+        command: &str,
+    ) -> Result<omicsops_adapters::ssh::CommandOutput, String> {
+        Self::execute(self, command)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn disconnect(self) -> Result<(), String> {
+        Self::disconnect(self)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+async fn checked_remote_file_command(
+    session: &impl RemoteFileCommandSession,
+    command: &str,
+) -> Result<omicsops_adapters::ssh::CommandOutput, String> {
+    let output = session
+        .execute(command)
         .await
-        .map_err(|error| error.to_string())?;
-    parse_remote_index(&output.stdout)
+        .map_err(|_| "remote command transport failed".to_string())?;
+    if output.status != 0 {
+        let diagnostic = if output.stderr.trim().is_empty() {
+            "no diagnostic output"
+        } else {
+            "diagnostic withheld"
+        };
+        return Err(format!(
+            "remote command failed with status {}: {}",
+            output.status, diagnostic
+        ));
+    }
+    Ok(output)
+}
+
+async fn list_remote_files_in_session(
+    session: impl RemoteFileCommandSession,
+    remote_root: &str,
+) -> Result<Vec<RemoteFileEntry>, String> {
+    let result = async {
+        let root = canonical_remote_root(&session, remote_root).await?;
+        let output = checked_remote_file_command(&session, &format!(
+            "find {} -mindepth 1 -maxdepth 8 -name '.omicsops' -prune -o -printf '%P\\0%y\\0%s\\0%T@\\0'",
+            shell_quote(&root)
+        )).await.map_err(|error| format!("remote_listing_failed: {error}"))?;
+        parse_remote_index(&output.stdout)
+            .map_err(|error| format!("remote_listing_failed: {error}"))
+    }
+    .await;
+    // A resolution, directory, or listing failure remains the primary error.
+    // Cleanup is attempted even when no usable index was produced.
+    let disconnected = session.disconnect().await;
+    match result {
+        Err(error) => Err(error),
+        Ok(entries) => {
+            disconnected.map_err(|_| "remote_listing_failed: disconnect failed".to_string())?;
+            Ok(entries)
+        }
+    }
 }
 
 #[tauri::command]
@@ -1072,21 +1136,35 @@ fn ensure_safe_download_parent(root: &Path, target: &Path) -> Result<(), String>
 }
 
 async fn canonical_remote_root(
-    session: &omicsops_adapters::ssh::SshSession,
+    session: &impl RemoteFileCommandSession,
     remote_root: &str,
 ) -> Result<String, String> {
-    let output = session
-        .execute_checked(&format!(
-            "root=$(realpath -- {}) && test -d \"$root\" && printf '%s' \"$root\"",
-            shell_quote(remote_root)
-        ))
+    let output = checked_remote_file_command(
+        session,
+        &format!("realpath -- {}", shell_quote(remote_root)),
+    )
+    .await
+    .map_err(|error| format!("remote_root_resolution_failed: {error}"))?;
+    let root = parse_canonical_remote_root(&output.stdout)
+        .map_err(|error| format!("remote_root_resolution_failed: {error}"))?;
+    checked_remote_file_command(session, &format!("test -d {}", shell_quote(&root)))
         .await
-        .map_err(|error| error.to_string())?;
-    let root = output.stdout.trim().to_owned();
-    if root.is_empty() {
-        Err("remote project root did not resolve".into())
+        .map_err(|error| format!("remote_root_unavailable: {error}"))?;
+    Ok(root)
+}
+
+fn parse_canonical_remote_root(stdout: &str) -> Result<String, String> {
+    // realpath adds one line terminator. Spaces are part of the resolved path;
+    // startup chatter and paths containing control characters are not trusted.
+    let root = stdout.strip_suffix('\n').unwrap_or(stdout);
+    if !root.starts_with('/')
+        || root.starts_with("//")
+        || root.chars().any(char::is_control)
+        || root.split('/').any(|part| matches!(part, "." | ".."))
+    {
+        Err("remote canonical root was not a single absolute normalized path".into())
     } else {
-        Ok(root)
+        Ok(root.to_owned())
     }
 }
 
@@ -1160,6 +1238,256 @@ async fn remote_sha256(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct MockRemoteFileSession {
+        outputs: std::sync::Mutex<
+            std::collections::VecDeque<Result<omicsops_adapters::ssh::CommandOutput, String>>,
+        >,
+        commands: Arc<std::sync::Mutex<Vec<String>>>,
+        disconnects: Arc<AtomicU64>,
+        disconnect_error: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteFileCommandSession for MockRemoteFileSession {
+        async fn execute(
+            &self,
+            command: &str,
+        ) -> Result<omicsops_adapters::ssh::CommandOutput, String> {
+            self.commands.lock().unwrap().push(command.into());
+            self.outputs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err("unexpected command after fixture exhausted".into()))
+        }
+
+        async fn disconnect(self) -> Result<(), String> {
+            self.disconnects.fetch_add(1, Ordering::SeqCst);
+            self.disconnect_error.map_or(Ok(()), Err)
+        }
+    }
+
+    fn remote_command_output(
+        status: u32,
+        stdout: &str,
+        stderr: &str,
+    ) -> Result<omicsops_adapters::ssh::CommandOutput, String> {
+        Ok(omicsops_adapters::ssh::CommandOutput {
+            status,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        })
+    }
+
+    fn remote_file_session(
+        outputs: Vec<Result<omicsops_adapters::ssh::CommandOutput, String>>,
+    ) -> MockRemoteFileSession {
+        MockRemoteFileSession {
+            outputs: std::sync::Mutex::new(outputs.into()),
+            commands: Arc::new(std::sync::Mutex::new(vec![])),
+            disconnects: Arc::new(AtomicU64::new(0)),
+            disconnect_error: None,
+        }
+    }
+
+    #[test]
+    fn remote_listing_canonical_root_preserves_path_spaces() {
+        for (output, expected) in [
+            ("/", "/"),
+            ("/project\n", "/project"),
+            ("/project with spaces \n", "/project with spaces "),
+            ("/project with spaces ", "/project with spaces "),
+        ] {
+            assert_eq!(parse_canonical_remote_root(output).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn remote_listing_canonical_root_rejects_ambiguous_or_noncanonical_output() {
+        for output in [
+            "",
+            "\n",
+            "relative/path\n",
+            " /project\n",
+            "/project\nunexpected output\n",
+            "\n/project\n",
+            "/project\n\n",
+            "/project\r\n",
+            "/project\0suffix\n",
+            "/project\tname\n",
+            "/project/../outside\n",
+            "/project/./child\n",
+            "//project\n",
+        ] {
+            assert!(parse_canonical_remote_root(output).is_err(), "{output:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_listing_root_commands_are_independent_and_preserve_quoted_paths() {
+        let session = remote_file_session(vec![
+            remote_command_output(0, "/data/study 'one' $value \n", ""),
+            remote_command_output(0, "", ""),
+        ]);
+        let root = canonical_remote_root(&session, "/configured project")
+            .await
+            .unwrap();
+        assert_eq!(root, "/data/study 'one' $value ");
+        assert_eq!(
+            *session.commands.lock().unwrap(),
+            vec![
+                "realpath -- '/configured project'",
+                "test -d '/data/study '\"'\"'one'\"'\"' $value '",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_listing_resolution_failure_stops_before_directory_check_and_disconnects() {
+        for output in [
+            remote_command_output(1, "/ignored partial root\n", ""),
+            remote_command_output(1, "", "PRIVATE_HOST_DETAILS"),
+            Err("transport unavailable: PRIVATE_HOST_DETAILS".into()),
+            remote_command_output(0, "PRIVATE_HOST_DETAILS\n/project\n", ""),
+        ] {
+            let mut session = remote_file_session(vec![output]);
+            session.disconnect_error = Some("cleanup failure".into());
+            let commands = session.commands.clone();
+            let disconnects = session.disconnects.clone();
+            let error = list_remote_files_in_session(session, "/configured")
+                .await
+                .unwrap_err();
+            assert!(
+                error.starts_with("remote_root_resolution_failed:"),
+                "{error}"
+            );
+            assert!(!error.contains("cleanup failure"), "{error}");
+            assert!(!error.contains("PRIVATE_HOST_DETAILS"), "{error}");
+            assert!(!error.contains("disconnect"), "{error}");
+            assert_eq!(*commands.lock().unwrap(), vec!["realpath -- '/configured'"]);
+            assert_eq!(disconnects.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_listing_unavailable_directory_has_a_stage_even_without_stderr() {
+        for (stderr, diagnostic) in [
+            ("", "no diagnostic output"),
+            ("PRIVATE_HOST_DETAILS", "diagnostic withheld"),
+        ] {
+            let mut session = remote_file_session(vec![
+                remote_command_output(0, "/resolved\n", ""),
+                remote_command_output(1, "", stderr),
+            ]);
+            session.disconnect_error = Some("cleanup failure".into());
+            let commands = session.commands.clone();
+            let disconnects = session.disconnects.clone();
+            let error = list_remote_files_in_session(session, "/configured")
+                .await
+                .unwrap_err();
+            assert!(error.starts_with("remote_root_unavailable:"), "{error}");
+            assert!(error.contains("status 1"), "{error}");
+            assert!(error.contains(diagnostic), "{error}");
+            assert!(!error.contains("cleanup failure"), "{error}");
+            assert!(!error.contains("PRIVATE_HOST_DETAILS"), "{error}");
+            assert!(!error.contains("disconnect"), "{error}");
+            assert_eq!(
+                *commands.lock().unwrap(),
+                vec!["realpath -- '/configured'", "test -d '/resolved'"]
+            );
+            assert_eq!(disconnects.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_listing_prunes_internal_directories_and_accepts_only_complete_results() {
+        for index in ["", "result.tsv\0f\012\01700000000.5\0"] {
+            let session = remote_file_session(vec![
+                remote_command_output(0, "/resolved project\n", ""),
+                remote_command_output(0, "", ""),
+                remote_command_output(0, index, ""),
+            ]);
+            let commands = session.commands.clone();
+            let disconnects = session.disconnects.clone();
+            let entries = list_remote_files_in_session(session, "/configured")
+                .await
+                .unwrap();
+            if index.is_empty() {
+                assert!(entries.is_empty());
+            } else {
+                assert_eq!(
+                    entries,
+                    vec![RemoteFileEntry {
+                        relative_path: "result.tsv".into(),
+                        directory: false,
+                        size_bytes: 12,
+                        modified_unix_seconds: 1_700_000_000.5,
+                    }]
+                );
+            }
+            assert_eq!(
+                *commands.lock().unwrap(),
+                vec![
+                    "realpath -- '/configured'",
+                    "test -d '/resolved project'",
+                    "find '/resolved project' -mindepth 1 -maxdepth 8 -name '.omicsops' -prune -o -printf '%P\\0%y\\0%s\\0%T@\\0'",
+                ]
+            );
+            assert_eq!(disconnects.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_listing_failure_discards_partial_results_and_preserves_primary_error() {
+        for output in [
+            remote_command_output(1, "result.tsv\0f\012\01700000000.5\0", ""),
+            remote_command_output(
+                1,
+                "result.tsv\0f\012\01700000000.5\0",
+                "PRIVATE_HOST_DETAILS",
+            ),
+            Err("listing transport failure: PRIVATE_HOST_DETAILS".into()),
+            remote_command_output(0, "incomplete record\0f\0", ""),
+            remote_command_output(0, "../PRIVATE_HOST_DETAILS\0f\012\01700000000.5\0", ""),
+        ] {
+            let mut session = remote_file_session(vec![
+                remote_command_output(0, "/resolved\n", ""),
+                remote_command_output(0, "", ""),
+                output,
+            ]);
+            session.disconnect_error = Some("cleanup failure".into());
+            let disconnects = session.disconnects.clone();
+            let error = list_remote_files_in_session(session, "/configured")
+                .await
+                .unwrap_err();
+            assert!(error.starts_with("remote_listing_failed:"), "{error}");
+            assert!(!error.contains("cleanup failure"), "{error}");
+            assert!(!error.contains("result.tsv"), "{error}");
+            assert!(!error.contains("PRIVATE_HOST_DETAILS"), "{error}");
+            assert!(!error.contains("disconnect"), "{error}");
+            assert_eq!(disconnects.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_listing_disconnect_failure_is_reported_after_successful_enumeration() {
+        let mut session = remote_file_session(vec![
+            remote_command_output(0, "/resolved\n", ""),
+            remote_command_output(0, "", ""),
+            remote_command_output(0, "", ""),
+        ]);
+        session.disconnect_error = Some("cleanup failure: PRIVATE_HOST_DETAILS".into());
+        let commands = session.commands.clone();
+        let disconnects = session.disconnects.clone();
+        let error = list_remote_files_in_session(session, "/configured")
+            .await
+            .unwrap_err();
+        assert_eq!(error, "remote_listing_failed: disconnect failed");
+        assert!(!error.contains("PRIVATE_HOST_DETAILS"), "{error}");
+        assert_eq!(commands.lock().unwrap().len(), 3);
+        assert_eq!(disconnects.load(Ordering::SeqCst), 1);
+    }
 
     fn test_sync_entry(project_id: Uuid) -> SyncEntry {
         SyncEntry {

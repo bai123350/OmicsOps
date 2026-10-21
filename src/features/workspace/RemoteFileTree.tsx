@@ -5,6 +5,9 @@ import { WORKSPACE_FILE_DRAG_TYPE, type WorkspaceFileReference } from "../../com
 import type { RemoteFileEntry, SyncEntry } from "../../types";
 import type { Locale } from "./copy";
 
+export type FileListingStatus = "idle" | "loading" | "ready" | "error";
+export type FileListingError = "remote_root_resolution_failed" | "remote_root_unavailable" | "remote_listing_failed";
+
 interface Props {
   locale: Locale;
   baselineSelectedPaths?: string[];
@@ -15,6 +18,8 @@ interface Props {
   onAttach?: (relativePath: string) => void;
   dragReference?: (relativePath: string) => WorkspaceFileReference;
   remoteFiles?: RemoteFileEntry[];
+  listingStatus?: FileListingStatus;
+  listingError?: FileListingError;
   busy: boolean;
   notice?: string;
   onUpload?: () => Promise<void> | void;
@@ -34,9 +39,10 @@ interface RemoteTreeNode {
   children: RemoteTreeNode[];
 }
 
-export function RemoteFileTree({ baselineSelectedPaths = [], onToggleBaselineFile, locale, source = "remote", onPreviewText, onPreviewTable, onAttach, dragReference, remoteFiles, busy, notice, onUpload, onRefresh, onDownload, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
+export function RemoteFileTree({ baselineSelectedPaths = [], onToggleBaselineFile, locale, source = "remote", onPreviewText, onPreviewTable, onAttach, dragReference, remoteFiles, listingStatus = remoteFiles ? "ready" : "idle", listingError, busy, notice, onUpload, onRefresh, onDownload, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
   const zh = locale === "zh-CN";
   const files = remoteFiles ?? [];
+  const actionsDisabled = busy || listingStatus === "loading";
   const tree = useMemo(() => buildRemoteTree(files), [files]);
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set());
 
@@ -53,16 +59,31 @@ export function RemoteFileTree({ baselineSelectedPaths = [], onToggleBaselineFil
     <div className="context-heading file-heading">
       <div><b>{zh ? "项目文件" : "Project files"}</b><small>{source === "local" ? (zh ? "本地文件；附加引用不会上传" : "Local files; references do not upload") : (zh ? "远端文件；附加引用不会下载" : "Remote files; references do not download")}</small></div>
       <div className="file-heading-actions">
-        <button aria-label={source === "local" ? (zh ? "刷新本地目录" : "Refresh local directory") : (zh ? "刷新远端目录" : "Refresh remote directory")} disabled={busy || !onRefresh} onClick={() => void onRefresh?.()}><RefreshCw size={14} /></button>
-        {source === "remote" && <button className="upload-action" aria-label={zh ? "选择上传文件" : "Choose files to upload"} disabled={busy || !onUpload} onClick={() => void onUpload?.()}><Upload size={14} /><span>{zh ? "上传" : "Upload"}</span></button>}
+        <button aria-label={source === "local" ? (zh ? "刷新本地目录" : "Refresh local directory") : (zh ? "刷新远端目录" : "Refresh remote directory")} disabled={actionsDisabled || !onRefresh} onClick={() => void onRefresh?.()}><RefreshCw size={14} /></button>
+        {source === "remote" && <button className="upload-action" aria-label={zh ? "选择上传文件" : "Choose files to upload"} disabled={actionsDisabled || !onUpload} onClick={() => void onUpload?.()}><Upload size={14} /><span>{zh ? "上传" : "Upload"}</span></button>}
       </div>
     </div>
     {source === "local" && <small className="file-list-limit">{zh ? "最多扫描 2,000 项、8 层目录；隐藏内部目录与符号链接。" : "Scans up to 2,000 entries and 8 directory levels; internal folders and symlinks are omitted."}</small>}
     {notice && <div className="file-notice" role="status">{notice}</div>}
+    {listingStatus === "idle" && <div className="file-notice" role="status">{zh ? "目录尚未加载" : "Directory not loaded"}</div>}
+    {listingStatus === "loading" && <div className="file-notice" role="status">{source === "local" ? (zh ? "正在加载本地目录" : "Loading local directory") : (zh ? "正在加载远端目录" : "Loading remote directory")}</div>}
+    {listingStatus === "error" && <div className="file-notice" role="alert">{fileListingErrorMessage(source, locale, listingError)}</div>}
     {syncEntries.length > 0 && <div className="sync-queue"><b>{zh ? "传输任务" : "Transfers"}</b>{syncEntries.slice(-5).reverse().map((entry) => <article key={entry.id}><span>{entry.relative_path}</span><small>{entry.state} · {formatBytes(entry.transferred_bytes)} / {formatBytes(entry.size_bytes)} · {entry.retry_count} retries</small><progress max={Math.max(1, entry.size_bytes)} value={entry.transferred_bytes} />{entry.error && <em>{entry.error}</em>}<div>{entry.state === "transferring" && <><button onClick={() => void onPauseSync?.(entry.id)}>{zh ? "暂停" : "Pause"}</button><button onClick={() => void onCancelSync?.(entry.id)}>{zh ? "取消" : "Cancel"}</button></>}{(["paused", "failed", "canceled"] as string[]).includes(entry.state) && <button onClick={() => void onRetrySync?.(entry.id)}>{zh ? "续传/重试" : "Resume/retry"}</button>}</div></article>)}</div>}
-    {files.length === 0 && <div className="empty-file-tree">{source === "local" ? (zh ? "本地目录为空" : "The local directory is empty") : (zh ? "远端目录为空" : "The remote directory is empty")}</div>}
-    {tree.length > 0 && <div className="remote-file-tree" role="tree" aria-label={source === "local" ? (zh ? "本地项目文件" : "Local project files") : (zh ? "远端项目文件" : "Remote project files")}>{tree.map((node) => <RemoteTreeItem key={node.relativePath} node={node} depth={0} locale={locale} expandedPaths={expandedPaths} busy={busy} onToggle={toggleDirectory} onDownload={onDownload} onPreviewText={onPreviewText} onPreviewTable={onPreviewTable} onAttach={onAttach} dragReference={dragReference} baselineSelectedPaths={baselineSelectedPaths} onToggleBaselineFile={onToggleBaselineFile} />)}</div>}
+    {listingStatus === "ready" && files.length === 0 && <div className="empty-file-tree">{source === "local" ? (zh ? "本地目录为空" : "The local directory is empty") : (zh ? "远端目录为空" : "The remote directory is empty")}</div>}
+    {tree.length > 0 && <div className="remote-file-tree" role="tree" aria-label={source === "local" ? (zh ? "本地项目文件" : "Local project files") : (zh ? "远端项目文件" : "Remote project files")}>{tree.map((node) => <RemoteTreeItem key={node.relativePath} node={node} depth={0} locale={locale} expandedPaths={expandedPaths} busy={actionsDisabled} onToggle={toggleDirectory} onDownload={onDownload} onPreviewText={onPreviewText} onPreviewTable={onPreviewTable} onAttach={onAttach} dragReference={dragReference} baselineSelectedPaths={baselineSelectedPaths} onToggleBaselineFile={onToggleBaselineFile} />)}</div>}
   </div>;
+}
+
+function fileListingErrorMessage(source: "local" | "remote", locale: Locale, error?: FileListingError): string {
+  const zh = locale === "zh-CN";
+  if (source === "local") return zh ? "本地目录加载失败，请刷新重试。" : "Could not load the local directory. Refresh to retry.";
+  if (error === "remote_root_unavailable") {
+    return zh ? "绑定的远端项目目录不可访问，请检查项目的 SSH 目录和权限。" : "The bound remote project directory is inaccessible. Check the project's SSH directory and permissions.";
+  }
+  if (error === "remote_root_resolution_failed") {
+    return zh ? "无法解析远端项目目录，请检查目录配置和服务器工具。" : "Could not resolve the remote project directory. Check the directory configuration and server tools.";
+  }
+  return zh ? "远端目录加载失败，请刷新重试。" : "Could not load the remote directory. Refresh to retry.";
 }
 
 function RemoteTreeItem({ baselineSelectedPaths, onToggleBaselineFile, node, depth, locale, expandedPaths, busy, onToggle, onDownload, onPreviewText, onPreviewTable, onAttach, dragReference }: { baselineSelectedPaths: string[]; onToggleBaselineFile?: (relativePath: string) => void; onPreviewTable?: (relativePath: string) => void; onPreviewText?: (relativePath: string) => void; onAttach?: (relativePath: string) => void; dragReference?: (relativePath: string) => WorkspaceFileReference; node: RemoteTreeNode; depth: number; locale: Locale; expandedPaths: Set<string>; busy: boolean; onToggle: (relativePath: string) => void; onDownload?: (relativePath: string) => Promise<void> | void }) {

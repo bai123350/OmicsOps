@@ -47,6 +47,49 @@ it("attaches local and remote file leaves without downloading and refreshes on Y
   await waitFor(() => expect(list.mock.calls.length).toBe(calls + 1));
 });
 
+it("shows local listing loading and failure without claiming the directory is empty, then retries", async () => {
+  let fail!: (reason: unknown) => void;
+  let finish!: (files: typeof entry[]) => void;
+  vi.spyOn(fileApi, "listLocalComposerFiles")
+    .mockReturnValueOnce(new Promise((_resolve, reject) => { fail = reject; }))
+    .mockReturnValueOnce(new Promise((resolve) => { finish = resolve; }));
+  render(<WorkspaceShell {...props} project={{ ...project, connection_id: null }} />);
+  openFiles();
+  expect(screen.getByText("Loading local directory")).toBeInTheDocument();
+  expect(screen.queryByText("The local directory is empty")).not.toBeInTheDocument();
+  await act(async () => fail(new Error("PRIVATE_LOCAL_PATH")));
+  expect(screen.getByRole("alert")).toHaveTextContent("Could not load the local directory. Refresh to retry.");
+  expect(screen.queryByText(/PRIVATE_LOCAL_PATH|The local directory is empty/)).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Refresh local directory" }));
+  expect(screen.getByText("Loading local directory")).toBeInTheDocument();
+  expect(screen.queryByText("Could not load the local directory. Refresh to retry.")).not.toBeInTheDocument();
+  await act(async () => finish([]));
+  expect(screen.getByText("The local directory is empty")).toBeInTheDocument();
+});
+
+it("passes a safe remote listing error to the file tree separately from a transfer notice", () => {
+  render(<WorkspaceShell {...props} locale="zh-CN" remoteFiles={[]} remoteFilesStatus="error" remoteFilesError="remote_root_unavailable" fileNotice="已校验上传 1 个文件" />);
+  fireEvent.click(screen.getByRole("button", { name: "添加上下文或选择模式" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: /你的文件/ }));
+  expect(screen.getByRole("alert")).toHaveTextContent("绑定的远端项目目录不可访问，请检查项目的 SSH 目录和权限。");
+  expect(screen.getByText("已校验上传 1 个文件")).toBeInTheDocument();
+  expect(screen.queryByText("远端目录为空")).not.toBeInTheDocument();
+});
+
+it("ignores a local listing that finishes after changing projects", async () => {
+  let finishOld!: (files: typeof entry[]) => void;
+  vi.spyOn(fileApi, "listLocalComposerFiles")
+    .mockReturnValueOnce(new Promise((resolve) => { finishOld = resolve; }))
+    .mockResolvedValueOnce([]);
+  const view = render(<WorkspaceShell {...props} project={{ ...project, connection_id: null }} />);
+  openFiles();
+  view.rerender(<WorkspaceShell {...props} project={{ ...project, id: "other-project", connection_id: null }} />);
+  await screen.findByText("The local directory is empty");
+  await act(async () => finishOld([entry]));
+  expect(screen.queryByText("counts.csv")).not.toBeInTheDocument();
+  expect(screen.getByText("The local directory is empty")).toBeInTheDocument();
+});
+
 it("blocks send during clipboard path validation and ignores a result from the previous conversation", async () => {
   let finish!: (items: ComposerCatalogItem[]) => void;
   vi.spyOn(fileApi, "resolveComposerClipboardPaths").mockReturnValue(new Promise((resolve) => { finish = resolve; }));
