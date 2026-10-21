@@ -310,6 +310,54 @@ reported access denied while two running OmicsOps instances held that file.
 The existing executable therefore remains the old build until those instances
 exit and the build is rerun. No application was forcibly terminated.
 
+### OpenCode Go selected-environment inspection (Windows, opt-in)
+
+After the deterministic checks, use the same single
+`OMICSOPS_LIVE_MODEL_PROFILE_ID` and keyring credential to explicitly run:
+
+```powershell
+cargo test -p omicsops-desktop agent_v4::go_live_acceptance_tests::live_opencode_go_agent_inspects_selected_environment -- --ignored --exact --nocapture
+```
+
+This case starts an empty temporary project with an in-memory Store, fixes the
+selection to Local/system, and uses the production Agent composition. Its natural
+Chinese request asks whether Python and R are prepared in the current environment
+and folder without naming a tool. The model sees the normal built-in tool
+directory; delegation, memory, and automatic review are disabled. The fixture
+retains RiskBased approval. Because some low-risk runtime code can be
+auto-approved, an additional fixture-only event-store guard rejects any
+non-read-only dispatch before its executor is invoked. An attempted side effect
+therefore fails this routing acceptance instead of running arbitrary model code.
+
+The case requires exactly one successful `runtime.environment.inspect`, no
+`runtime.execute` or `runtime.environment.ensure` dispatch, and `RunCompleted`.
+It allows at most four model requests and four tool calls, with no model retries
+and a 180-second total fixture deadline. The saved model timeout and reasoning
+effort remain unchanged. Only status, elapsed time, and counts are printed; raw
+errors, interpreter paths, code, reasoning, and credentials are not printed.
+The deadline marks the fixture failed; it does not claim cancellation of any
+remote computation. Existing nonce cases keep their original limits and behavior.
+
+This is real-model routing acceptance against a disposable **local** project,
+not SSH acceptance or proof of installed scientific dependencies. It never
+accesses an existing project or an SSH host. Normal CI leaves it ignored; record
+the explicit command and actual outcome separately before calling it passed.
+
+On 2026-10-21, after the full deterministic checks (1,991 Rust tests, 1,494
+frontend tests, 22 browser bridge tests, and production web build), this exact
+case passed with one selected saved `deepseek-v4.1-flash` profile. The command
+reused the workspace build:
+
+```powershell
+cargo test --workspace agent_v4::go_live_acceptance_tests::live_opencode_go_agent_inspects_selected_environment -- --ignored --exact --nocapture
+```
+
+Exit status was 0. The temporary fixture completed in 10,323 ms (Agent execution
+10,283 ms), with two model requests, three tool requests, exactly one successful
+inspection, zero execute/ensure dispatches, zero guard rejections, and
+RunCompleted. This is a real Go model result for the disposable Local/system
+case; SSH and native UI acceptance remain unexecuted.
+
 ## Agent Runtime V4 stage-1 acceptance
 
 `agent_v4::tests::live_v4_model_plan_and_persistent_ssh_python_kernel` uses the

@@ -120,6 +120,104 @@ function setupConversationStateHarness() {
   return { stateSpy: vi.spyOn(api, "agentV4ConversationState") };
 }
 
+describe("project compute selection", () => {
+  const remoteProject = { ...stateProject, connection_id: "remote-a", remote_root: "/work/project" };
+  const remoteBackend = { ...stateBackend, descriptor: { ...stateBackend.descriptor, backend_id: "ssh:remote-a", kind: "ssh" as const }, python_status: "unverified" as const, r_status: "unverified" as const };
+
+  function harness() {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (projectId, id) => ({ ...stateSnapshot(id), project_id: projectId }));
+    vi.mocked(api.listProjects).mockResolvedValue([remoteProject]);
+    vi.mocked(api.agentV4ComputeBackends).mockResolvedValue([stateBackend, remoteBackend]);
+    return vi.spyOn(workspaceShell, "WorkspaceShell");
+  }
+
+  it("defaults a newly opened SSH-bound project to SSH instead of the initial local backend", async () => {
+    const shell = harness();
+    render(<DesktopApp />);
+    await screen.findByText(/Agent 模式：SSH/);
+    expect(shell.mock.calls.at(-1)?.[0].runtimeDraftSelection).toMatchObject({ backend_id: "ssh:remote-a", backend_kind: "ssh" });
+  });
+
+  it("keeps an explicit Local choice when changing conversations and refreshing the same project's catalog", async () => {
+    const shell = harness();
+    render(<DesktopApp />);
+    await screen.findByText(/Agent 模式：SSH/);
+    fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
+    fireEvent.click(screen.getByRole("radio", { name: /LOCAL/ }));
+    fireEvent.keyDown(window, { key: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: stateConversations[1].title }));
+    await screen.findByRole("heading", { name: stateConversations[1].title });
+    const pending = deferred<Awaited<ReturnType<typeof api.agentV4ComputeBackends>>>();
+    vi.mocked(api.agentV4ComputeBackends).mockReturnValueOnce(pending.promise);
+    act(() => shell.mock.calls.at(-1)![0].onContainerImageChange?.("catalog-refresh"));
+    const composer = screen.getByRole("textbox", { name: /描述研究目标/ });
+    expect(composer).toBeEnabled();
+    fireEvent.change(composer, { target: { value: "检查环境" } });
+    expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+    expect(shell.mock.calls.at(-1)?.[0].runtimeDraftSelection).toBeNull();
+    await waitFor(() => expect(api.agentV4ComputeBackends).toHaveBeenCalledWith(stateProject.id, "catalog-refresh"));
+    await act(async () => pending.resolve([stateBackend, remoteBackend]));
+    await waitFor(() => expect(shell.mock.calls.at(-1)?.[0].runtimeDraftSelection).toMatchObject({ backend_id: "local", backend_kind: "local" }));
+  });
+
+  it.each(["chat", "plan"] as const)("blocks %s submission until a switched project's compute catalog resolves", async (mode) => {
+    const shell = harness();
+    const otherProject = { ...remoteProject, id: "remote-project-b", name: "远端项目 B", connection_id: "remote-b" };
+    const otherConversation = { ...stateConversations[0], id: "remote-conversation-b", project_id: otherProject.id, title: "远端会话 B" };
+    const otherBackend = { ...remoteBackend, descriptor: { ...remoteBackend.descriptor, backend_id: "ssh:remote-b" } };
+    const pending = deferred<Awaited<ReturnType<typeof api.agentV4ComputeBackends>>>();
+    vi.mocked(api.listProjects).mockResolvedValue([stateProject, otherProject]);
+    vi.mocked(api.listConversations).mockImplementation(async (id) => id === stateProject.id ? stateConversations : [otherConversation]);
+    vi.mocked(api.latestUsedConversation).mockImplementation(async (id) => id === stateProject.id ? stateConversations[0] : otherConversation);
+    vi.mocked(api.agentV4ComputeBackends).mockImplementation((id) => id === stateProject.id ? Promise.resolve([stateBackend]) : pending.promise);
+    const submit = vi.spyOn(api, "submitMessage");
+    const direct = vi.spyOn(api, "agentV4StartDirect");
+    const plan = vi.spyOn(api, "agentV4StartPlanning");
+    render(<DesktopApp />);
+    await screen.findByText(/Agent 模式：LOCAL/);
+    fireEvent.click(screen.getByRole("button", { name: "返回项目主页" }));
+    fireEvent.click(await screen.findByRole("button", { name: "打开项目：远端项目 B" }));
+    await screen.findByRole("heading", { name: "远端会话 B" });
+    await waitFor(() => expect(shell.mock.calls.at(-1)?.[0].conversationHydrating).toBe(false));
+    fireEvent.change(screen.getByRole("textbox", { name: /描述研究目标/ }), { target: { value: "检查远端环境" } });
+    expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+    await act(async () => { expect(await shell.mock.calls.at(-1)![0].onSend?.("检查远端环境", mode)).toBe(false); });
+    expect(submit).not.toHaveBeenCalled();
+    expect(direct).not.toHaveBeenCalled();
+    expect(plan).not.toHaveBeenCalled();
+    await act(async () => pending.resolve([stateBackend, otherBackend]));
+    await screen.findByText(/Agent 模式：SSH/);
+    expect(shell.mock.calls.at(-1)?.[0].runtimeDraftSelection).toMatchObject({ backend_id: "ssh:remote-b" });
+    expect(screen.getByRole("button", { name: "发送" })).toBeEnabled();
+  });
+
+  it("keeps the container image editable during debounce and freezes only the final verified image", async () => {
+    const shell = harness();
+    const docker = { ...stateBackend, descriptor: { ...stateBackend.descriptor, backend_id: "docker", kind: "docker" as const, isolation: "container" as const, supports_network_policy: true }, resolved_image_id: "sha256:previous" };
+    const pending = deferred<Awaited<ReturnType<typeof api.agentV4ComputeBackends>>>();
+    vi.mocked(api.agentV4ComputeBackends).mockImplementation((_id, image) => image ? pending.promise : Promise.resolve([stateBackend, docker]));
+    render(<DesktopApp />);
+    await screen.findByText(/Agent 模式：LOCAL/);
+    fireEvent.change(screen.getByRole("textbox", { name: /描述研究目标/ }), { target: { value: "检查容器环境" } });
+    fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
+    fireEvent.click(screen.getByRole("radio", { name: /DOCKER/ }));
+    const image = screen.getByRole("textbox", { name: "容器镜像" });
+    for (const value of ["p", "py", "python:verified"]) {
+      fireEvent.change(image, { target: { value } });
+      expect(image).toBeEnabled();
+      expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+      expect(shell.mock.calls.at(-1)?.[0].runtimeDraftSelection).toBeNull();
+    }
+    await waitFor(() => expect(api.agentV4ComputeBackends).toHaveBeenCalledWith(stateProject.id, "python:verified"));
+    expect(vi.mocked(api.agentV4ComputeBackends).mock.calls.map((call) => call[1])).toEqual(["", "python:verified"]);
+    expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+    await act(async () => pending.resolve([{ ...docker, resolved_image_id: "sha256:verified" }]));
+    await waitFor(() => expect(shell.mock.calls.at(-1)?.[0].runtimeDraftSelection).toMatchObject({ backend_id: "docker", container_image: { reference: "python:verified", image_id: "sha256:verified" } }));
+    expect(screen.getByRole("button", { name: "发送" })).toBeEnabled();
+  });
+});
+
 describe("project data refresh", () => {
   function harness() {
     const { stateSpy } = setupConversationStateHarness();
@@ -2824,6 +2922,8 @@ describe("DesktopApp", () => {
     await screen.findByText(/Agent 模式：LOCAL/);
     fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
     fireEvent.click(screen.getByRole("radio", { name: /DOCKER/ }));
+    fireEvent.change(screen.getByRole("textbox", { name: "容器镜像" }), { target: { value: "omicsops:test" } });
+    await screen.findByText(/Agent 模式：DOCKER/);
     fireEvent.click(screen.getByRole("button", { name: "Agent 权限" }));
     fireEvent.click(screen.getByRole("menuitemradio", { name: /^完全访问权限/ }));
     expect(screen.getByText(/Agent 模式：DOCKER · 完全访问/)).toBeInTheDocument();

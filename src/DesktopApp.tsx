@@ -257,6 +257,7 @@ export default function DesktopApp() {
   const [computeBackends, setComputeBackends] = useState<ComputeBackendAvailabilityV4[]>([]);
   const [computeBackendsResponseKey, setComputeBackendsResponseKey] = useState<string | null>(null);
   const [computeBackendId, setComputeBackendId] = useState("local");
+  const computeSelectionScope = useRef<string | null>(null);
   const [containerImage, setContainerImage] = useState("");
   const [autonomyMode, setAutonomyMode] = useState<AutonomyModeV4>("supervised");
   const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicyV4>("auto_approve_except_local_deletion");
@@ -621,8 +622,15 @@ export default function DesktopApp() {
   }, [selected?.id, conversationLoadRetry]);
   useEffect(() => {
     let disposed = false;
-    if (!selected) { setComputeBackends([]); setComputeBackendsResponseKey(null); return () => { disposed = true; }; }
-    const responseKey = JSON.stringify([selected.id, containerImage]);
+    if (!selected) { setComputeBackends([]); setComputeBackendsResponseKey(null); setComputeBusy(false); return () => { disposed = true; }; }
+    const scopeKey = JSON.stringify([selected.id, selected.connection_id, selected.remote_root]);
+    if (computeSelectionScope.current !== scopeKey) {
+      computeSelectionScope.current = scopeKey;
+      setComputeBackendId("");
+      setComputeEnvironment("system");
+    }
+    const responseKey = JSON.stringify([selected.id, selected.connection_id, selected.remote_root, containerImage]);
+    setComputeBackendsResponseKey(null);
     const timer = window.setTimeout(() => {
       setComputeBusy(true);
       api.agentV4ComputeBackends(selected.id, containerImage)
@@ -642,7 +650,7 @@ export default function DesktopApp() {
         .finally(() => { if (!disposed) setComputeBusy(false); });
     }, 250);
     return () => { disposed = true; window.clearTimeout(timer); };
-  }, [selected?.id, selected?.connection_id, containerImage]);
+  }, [selected?.id, selected?.connection_id, selected?.remote_root, containerImage]);
   useEffect(() => {
     const backend = computeBackends.find((item) => item.descriptor.backend_id === computeBackendId);
     if (!backend) return;
@@ -1077,6 +1085,9 @@ export default function DesktopApp() {
   }
 
   function currentComputeSelection(): ComputeSelectionV4 {
+    if (!selected || computeBusy || computeBackendsResponseKey !== JSON.stringify([selected.id, selected.connection_id, selected.remote_root, containerImage])) {
+      throw new Error(locale === "zh-CN" ? "当前项目的计算配置尚未加载，请稍后重试。" : "The current project's compute configuration has not loaded. Please retry shortly.");
+    }
     const backend = computeBackends.find((item) => item.descriptor.backend_id === computeBackendId);
     if (!backend?.selectable) throw new Error(locale === "zh-CN" ? "请选择一个有效的 V4 计算配置。" : "Select a valid V4 compute configuration.");
     const container = backend.descriptor.kind === "docker" || backend.descriptor.kind === "podman";
@@ -1094,7 +1105,7 @@ export default function DesktopApp() {
   }
 
   let runtimeDraftSelection: ComputeSelectionV4 | null = null;
-  if (selected && !computeBusy && computeBackendsResponseKey === JSON.stringify([selected.id, containerImage])) {
+  if (selected) {
     try { runtimeDraftSelection = currentComputeSelection(); }
     catch { /* Incomplete configuration is shown as such in the runtime dialog. */ }
   }
@@ -1732,7 +1743,7 @@ export default function DesktopApp() {
     agentMode={conversationMode} conversationLocked={conversationLocked} conversationHydrating={conversationHydrating} onAgentModeChange={changeConversationMode}
     latestPlanRevision={latestPlanRevision} v4Plan={v4Plan} planLoading={planLoading} planApproved={planApproved} canStartRun={false} runStarted={Boolean(runId && !currentRunAwaitsPlanApproval)} activeRunId={runId} activeRunLastActivityAt={activeRunLastActivityAt} agentRunEventsV4={agentRunEventsV4} agentTextPreview={agentTextPreview} agentReasoningPreview={agentReasoningPreview} agentModelActivity={agentModelActivity}
     guidanceAvailable={v4Plan?.session_mode === "agent" && !planApproved && latestPlanRevision?.run_id !== v4Plan?.run_id}
-    computeBackends={computeBackends} runtimeDraftSelection={runtimeDraftSelection} computeBackendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} approvalPolicy={approvalPolicy} computeEnvironment={computeEnvironment} computeBusy={computeBusy}
+    computeBackends={computeBackends} runtimeDraftSelection={runtimeDraftSelection} computeSelectionReady={Boolean(runtimeDraftSelection)} computeBackendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} approvalPolicy={approvalPolicy} computeEnvironment={computeEnvironment} computeBusy={computeBusy}
     onComputeBackendChange={setComputeBackendId} onContainerImageChange={setContainerImage} onAutonomyModeChange={setAutonomyMode} onApprovalPolicyChange={setApprovalPolicy} onComputeEnvironmentChange={setComputeEnvironment}
     onAnswerAgentQuestionV4={async (answerRunId, questionId, answer) => {
       const action = currentConversationAction;
@@ -1882,6 +1893,7 @@ export default function DesktopApp() {
     onSend={async (markdown, mode, references = [], attachments = []) => {
       if (!conversation || !activeModel) { setSettingsOpen(true); return false; }
       if (conversationHydratingRef.current || conversationLocked || modelSelectionInFlight.current) return false;
+      if (!runtimeDraftSelection) return false;
       const projectId = selected.id;
       const conversationId = conversation.id;
       // The send is a newer conversation transition than any reconnect read

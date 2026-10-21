@@ -164,6 +164,18 @@ impl ToolRegistryV4 {
         {
             return Err(ToolRegistryErrorV4::CapabilityDenied(call.tool_id.clone()));
         }
+        if call.tool_id == "runtime.environment.inspect"
+            && !call
+                .arguments
+                .as_object()
+                .is_some_and(|arguments| arguments.is_empty())
+        {
+            return Err(ToolRegistryErrorV4::InvalidArguments(
+                call.tool_id.clone(),
+                "expected an empty object {}; inspection uses only the frozen selected context"
+                    .into(),
+            ));
+        }
         const ANALYSIS_SEED_ERROR: &str = "analysis.random_seed must be an unsigned integer actually used by the analysis; for environment inspection, omit analysis and cite the tool result directly";
         let schema = if recovering_dispatched && call.tool_id == "runtime.execute" {
             // Old dispatched calls may lack a seed. Reading their exact durable
@@ -678,7 +690,7 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "runtime.execute",
-            "Execute code in a persistent kernel, or background=true for a detached one-shot SSH job. Successful captured files are re-read by the Host and returned in artifacts with relative_path, size_bytes and sha256. Reuse those facts for the captured content; re-verify after content changes or when required facts are missing. Background jobs survive disconnects and Agent Stop; they do not share kernel variables. Query runtime.remote_job_status after restart. Never resubmit to reconnect.",
+            "Execute code in a persistent kernel, or background=true for a detached one-shot SSH job. For ordinary Python/R availability checks, prefer runtime.environment.inspect and cite its observations directly. Use bounded code probes only for explicitly requested package compatibility or other environment details beyond that tool, within the frozen execution scope; omit analysis for inspection, and do not load large package inventories or create repeated audit reports. Finding an interpreter does not prove dependencies are installed. Include analysis only for scientific computation with its actual random seed; never invent a seed for an inspection. Successful captured files are re-read by the Host and returned in artifacts with relative_path, size_bytes and sha256. Reuse those facts for the captured content; re-verify after content changes or when required facts are missing. Background jobs survive disconnects and Agent Stop; they do not share kernel variables. Query runtime.remote_job_status after restart. Never resubmit to reconnect.",
             ToolEffectV4::Runtime,
             json!({"type":"object","required":["language","code"],"properties":{"language":{"type":"string"},"environment":{"type":"string","default":"system"},"code":{"type":"string"},"background":{"type":"boolean","default":false},"capture_paths":{"type":"array","description":"Project-relative files to capture. Returned artifact facts include Host-verified size_bytes and sha256 for this captured content; capture does not guarantee the file stays unchanged."},"analysis":{"type":"object","description":"Optional scientific analysis declaration, omitted for environment inspection. All declared analyses must satisfy provenance requirements.","required":["analysis_type","input_dataset_ids","sample_ids","method","parameters","random_seed"],"properties":{"analysis_type":{"type":"string"},"input_dataset_ids":{"type":"array"},"sample_ids":{"type":"array"},"method":{"type":"string"},"parameters":{"type":"object"},"software_requirements":{"type":"array","items":{"type":"string"},"description":"Provide bare installed Python distribution or R package names, one per item (for example numpy, pandas, or Seurat). Omit version constraints, combined strings, standard-library modules, and the Python/R interpreter; the Host records the interpreter automatically. Use [] for standard-library-only code."},"database_versions":{"type":"object"},"random_seed":{"type":"integer","minimum":0,"description":"Actual random seed used by the scientific computation. Required for analysis provenance; do not invent one for environment inspection, which should omit analysis."}}}}}),
         ),
@@ -707,6 +719,12 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
                 "strength":{"type":"string","enum":["exploratory","supporting","strong"]},
                 "conflicts_with":{"type":"array","items":{"type":"string","format":"uuid"}}
             }}),
+        ),
+        descriptor(
+            "runtime.environment.inspect",
+            "Inspect only Python and R interpreter paths/versions in the frozen selected execution context. Takes only {}. The Host probe budget is at most 20 seconds after execution resource initialization. It does not inspect project environment markers, import packages, traverse all Conda environments, start a persistent kernel, install software, or change the selected backend/environment. Cite the returned observations directly and finish an ordinary availability check; interpreter discovery does not verify dependencies or package compatibility. Unknown, error, or timeout states do not prove absence. Reuse existing reports for the facts they establish and inspect only when required facts are missing or outdated.",
+            ToolEffectV4::ReadOnly,
+            json!({"type":"object","properties":{},"additionalProperties":false}),
         ),
         descriptor(
             "runtime.environment.ensure",
@@ -980,6 +998,120 @@ mod tests {
     }
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct Noop;
+
+    #[tokio::test]
+    async fn environment_inspect_is_a_zero_argument_read_in_plan_and_execute() {
+        let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap();
+        let call = ToolCallV4 {
+            call_id: "inspect-environment".into(),
+            tool_id: "runtime.environment.inspect".into(),
+            arguments: json!({}),
+        };
+        for mode in [RunModeV4::Plan, RunModeV4::Execute] {
+            let descriptor = registry
+                .descriptors(mode)
+                .into_iter()
+                .find(|tool| tool.id == call.tool_id)
+                .expect("inspection tool must be available");
+            assert_eq!(descriptor.effect, ToolEffectV4::ReadOnly);
+            assert_eq!(
+                descriptor.input_schema,
+                json!({"type":"object","properties":{},"additionalProperties":false})
+            );
+            assert!(
+                registry
+                    .execute(mode, call.clone())
+                    .await
+                    .unwrap()
+                    .succeeded
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn environment_inspect_rejects_all_arguments_before_dispatch() {
+        struct NoInspectionDispatch;
+        #[async_trait]
+        impl ToolExecutorV4 for NoInspectionDispatch {
+            async fn execute(&self, _: &ToolCallV4) -> Result<ToolOutcomeV4, String> {
+                panic!("parameterized inspection must not dispatch");
+            }
+        }
+        let registry = ToolRegistryV4::new(
+            builtin_tool_definitions_v4(),
+            Arc::new(NoInspectionDispatch),
+        )
+        .unwrap();
+        let mut arguments = vec![json!(null), json!([]), json!(""), json!(1)];
+        for key in [
+            "code",
+            "backend",
+            "backend_id",
+            "environment",
+            "path",
+            "language",
+            "timeout",
+            "unknown",
+        ] {
+            arguments.push(json!({key:"unapproved"}));
+        }
+        for arguments in arguments {
+            let call = ToolCallV4 {
+                call_id: "invalid-inspection".into(),
+                tool_id: "runtime.environment.inspect".into(),
+                arguments,
+            };
+            for mode in [RunModeV4::Plan, RunModeV4::Execute] {
+                let error = registry.execute(mode, call.clone()).await.unwrap_err();
+                assert!(error.contains("empty object"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn environment_inspect_obeys_frozen_capabilities_and_disabled_tools() {
+        let call = ToolCallV4 {
+            call_id: "inspect-environment".into(),
+            tool_id: "runtime.environment.inspect".into(),
+            arguments: json!({}),
+        };
+        let denied = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop))
+            .unwrap()
+            .with_execute_capabilities(BTreeSet::from(["runtime.execute".into()]));
+        assert!(
+            denied
+                .validate(RunModeV4::Execute, &call)
+                .unwrap_err()
+                .contains("not approved")
+        );
+        assert!(
+            !denied
+                .descriptors(RunModeV4::Execute)
+                .iter()
+                .any(|tool| tool.id == call.tool_id)
+        );
+        assert!(denied.validate(RunModeV4::Plan, &call).is_ok());
+        let allowed = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop))
+            .unwrap()
+            .with_execute_capabilities(BTreeSet::from([call.tool_id.clone()]));
+        assert!(allowed.validate(RunModeV4::Execute, &call).is_ok());
+        let disabled = allowed.with_disabled_tools(BTreeSet::from([call.tool_id.clone()]));
+        for mode in [RunModeV4::Plan, RunModeV4::Execute] {
+            assert!(
+                disabled
+                    .validate(mode, &call)
+                    .unwrap_err()
+                    .contains("not approved")
+            );
+            assert!(
+                !disabled
+                    .descriptors(mode)
+                    .iter()
+                    .any(|tool| tool.id == call.tool_id)
+            );
+        }
+    }
+
     #[test]
     fn scientific_snapshot_reader_is_authorized_only_for_execute_with_bounded_pages() {
         let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap();

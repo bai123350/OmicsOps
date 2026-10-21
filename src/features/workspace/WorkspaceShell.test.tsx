@@ -1352,6 +1352,20 @@ describe("WorkspaceShell", () => {
     await waitFor(() => expect(onSend).toHaveBeenCalledWith("寻找肝癌单细胞文献", "chat"));
   });
 
+  it("does not send using a selectable backend while its catalog is refreshing", async () => {
+    const onSend = vi.fn(() => true);
+    const backend = { descriptor: { schema_version: 4 as const, backend_id: "local", kind: "local" as const, isolation: "process" as const, available: true, supports_python: true, supports_r: false, supports_network_policy: false }, selectable: true, reason: null, python_status: "available" as const, r_status: "unavailable" as const, resolved_image_id: null };
+    const { rerender } = render(<WorkspaceShell project={project} locale="zh-CN" onSend={onSend} computeBackendId="local" computeBackends={[backend]} computeBusy />);
+    const input = screen.getByRole("textbox", { name: /描述研究目标/ });
+    fireEvent.change(input, { target: { value: "检查环境" } });
+    expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+    rerender(<WorkspaceShell project={project} locale="zh-CN" onSend={onSend} computeBackendId="local" computeBackends={[backend]} />);
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("检查环境", "chat"));
+  });
+
   it("shows the real agent state instead of a fixed remote progress value", async () => {
     let finish!: (value: boolean) => void;
     const onSend = vi.fn(() => new Promise<boolean>((resolve) => { finish = resolve; }));

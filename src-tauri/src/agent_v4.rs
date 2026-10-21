@@ -88,6 +88,9 @@ use crate::p1_commands::{
     McpServerProfile, MemorySearchRequest, invoke_configured_mcp_tool_v4, memory_facts,
 };
 
+#[path = "environment_probe_v4.rs"]
+mod environment_probe_v4;
+
 static PROJECT_SIDE_EFFECT_LOCKS_V4: OnceLock<std::sync::Mutex<HashMap<Uuid, Weak<Mutex<()>>>>> =
     OnceLock::new();
 static SCIENTIFIC_STATE_LOCKS_V4: OnceLock<std::sync::Mutex<HashMap<Uuid, Weak<Mutex<()>>>>> =
@@ -5224,6 +5227,7 @@ fn requires_execution_resources(tool: &str) -> bool {
             | "runtime.execute"
             | "runtime.remote_job_status"
             | "runtime.environment.ensure"
+            | "runtime.environment.inspect"
             | "runtime.rebuild"
             | "runtime.interrupt"
             | "science.register_dataset"
@@ -5332,7 +5336,7 @@ fn builtin_tool_definitions_for_selection(selection: &ComputeSelectionV4) -> Vec
             .iter_mut()
             .find(|tool| tool.id == "runtime.execute")
         {
-            execute.description = "Execute code in a persistent kernel on the frozen selected backend. This backend supports foreground execution only; background must be false. Successful captured files are re-read by the Host and returned in artifacts with relative_path, size_bytes and sha256. Reuse those facts for the captured content; re-verify after content changes or when required facts are missing.".into();
+            execute.description = "Execute code in a persistent kernel on the frozen selected backend. This backend supports foreground execution only; background must be false. For Python/R availability questions, call runtime.environment.inspect first; report its observations and limitations without scanning every environment, loading scientific packages, writing audit reports, or repeating checks. Interpreter availability does not prove dependencies are installed. Omit analysis for inspection. Successful captured files are re-read by the Host and returned in artifacts with relative_path, size_bytes and sha256. Reuse those facts for the captured content; re-verify after content changes or when required facts are missing.".into();
             execute.input_schema["properties"]["background"]["const"] = json!(false);
         }
     }
@@ -6041,6 +6045,16 @@ trait ProjectFilesystemPortV4: Send + Sync {
 
 #[async_trait]
 trait RuntimeEnvironmentPortV4: Send + Sync {
+    async fn inspect(
+        &self,
+        _environment: &str,
+    ) -> Result<
+        environment_probe_v4::EnvironmentInspectionV4,
+        environment_probe_v4::InspectionErrorV4,
+    > {
+        Err(environment_probe_v4::InspectionErrorV4::Unsupported)
+    }
+
     /// Read-only availability probe. Containers retain their frozen image
     /// validation; this hook must not launch containers or create environments.
     async fn check_interpreter(
@@ -6272,6 +6286,19 @@ struct LocalEnvironmentPortV4;
 
 #[async_trait]
 impl RuntimeEnvironmentPortV4 for LocalEnvironmentPortV4 {
+    async fn inspect(
+        &self,
+        environment: &str,
+    ) -> Result<
+        environment_probe_v4::EnvironmentInspectionV4,
+        environment_probe_v4::InspectionErrorV4,
+    > {
+        if environment != "system" {
+            return Err(environment_probe_v4::InspectionErrorV4::Unsupported);
+        }
+        Ok(environment_probe_v4::inspect_local().await)
+    }
+
     async fn check_interpreter(
         &self,
         language: KernelLanguageV4,
@@ -6383,6 +6410,16 @@ struct SshEnvironmentPortV4 {
 
 #[async_trait]
 impl RuntimeEnvironmentPortV4 for SshEnvironmentPortV4 {
+    async fn inspect(
+        &self,
+        environment: &str,
+    ) -> Result<
+        environment_probe_v4::EnvironmentInspectionV4,
+        environment_probe_v4::InspectionErrorV4,
+    > {
+        environment_probe_v4::inspect_remote(&self.session, &self.root, environment).await
+    }
+
     async fn check_interpreter(
         &self,
         language: KernelLanguageV4,
@@ -6457,6 +6494,18 @@ fn system_environment_ready(
     language: KernelLanguageV4,
     versions: BTreeMap<String, String>,
 ) -> Result<String, String> {
+    let interpreter = match language {
+        KernelLanguageV4::Python => "python",
+        KernelLanguageV4::R => "R",
+    };
+    if versions
+        .get(interpreter)
+        .is_none_or(|version| version.trim().is_empty())
+    {
+        return Err(
+            "system environment probe did not return the requested interpreter version".into(),
+        );
+    }
     serde_json::to_string(&json!({
         "environment": "system",
         "language": language,
@@ -7232,6 +7281,21 @@ impl DesktopToolExecutorV4 {
         call: &ToolCallV4,
         require_read_only_hint: bool,
     ) -> Result<ToolOutcomeV4, String> {
+        if call.tool_id == "runtime.environment.inspect"
+            && !call
+                .arguments
+                .as_object()
+                .is_some_and(|arguments| arguments.is_empty())
+        {
+            return Ok(ToolOutcomeV4 {
+                call_id: call.call_id.clone(),
+                tool_id: call.tool_id.clone(),
+                succeeded: false,
+                model_content: "Environment inspection accepts no arguments and uses only the frozen selected backend and environment.".into(),
+                data: json!({"error_kind":"validation","operation_dispatched":false}),
+                provenance: vec![],
+            });
+        }
         if let Some(outcome) = self.remote_job_preflight(call) {
             return Ok(outcome);
         }
@@ -7666,6 +7730,61 @@ impl DesktopToolExecutorV4 {
                     vec![],
                 )
             }
+            "runtime.environment.inspect" => {
+                validate_environment_name(&self.selection.environment)?;
+                let result = tokio::time::timeout(
+                    environment_probe_v4::INSPECTION_TIMEOUT,
+                    self.resources
+                        .get()?
+                        .environment_port
+                        .inspect(&self.selection.environment),
+                )
+                .await
+                .unwrap_or(Err(environment_probe_v4::InspectionErrorV4::Timeout));
+                let mut data = json!({
+                    "backend_id":self.backend_id,
+                    "backend_kind":self.selection.backend_kind,
+                    "environment":self.selection.environment,
+                    "scope":"selected_environment",
+                    "packages_checked":false,
+                    "limitations":[
+                        "Only the frozen selected environment was inspected; project and unselected environment discovery was not performed.",
+                        "Interpreter availability does not verify scientific dependencies.",
+                    ],
+                });
+                let succeeded = match result {
+                    Ok(report) => {
+                        data["interpreters"] = serde_json::to_value(report)
+                            .map_err(|error| error.to_string())?["interpreters"]
+                            .clone();
+                        data["status"] = json!("observed");
+                        true
+                    }
+                    Err(error) => {
+                        use environment_probe_v4::InspectionErrorV4 as E;
+                        data["error_kind"] = json!(match error {
+                            E::Unsupported => "environment_inspection_unsupported",
+                            E::Transport => "environment_inspection_transport",
+                            E::Timeout => "environment_inspection_timeout",
+                            E::Protocol => "environment_inspection_protocol",
+                        });
+                        data["status"] = json!("unverified");
+                        data["message"] = json!(
+                            "The bounded check could not produce verified observations. This does not prove an interpreter is missing. Report the limitation; do not expand to an exhaustive scan or retry the same check. A local wait ending does not confirm remote process termination."
+                        );
+                        false
+                    }
+                };
+                return Ok(ToolOutcomeV4 {
+                    call_id: call.call_id.clone(),
+                    tool_id: call.tool_id.clone(),
+                    succeeded,
+                    model_content: serde_json::to_string(&data)
+                        .map_err(|error| error.to_string())?,
+                    data,
+                    provenance: vec![],
+                });
+            }
             "runtime.environment.ensure" => {
                 let language = parse_language(required(&call.arguments, "language")?)?;
                 let environment = required(&call.arguments, "environment")?;
@@ -7673,12 +7792,29 @@ impl DesktopToolExecutorV4 {
                 if environment != self.selection.environment {
                     return Err("environment ensure does not match the frozen selection".into());
                 }
-                let excerpt = self
+                let excerpt = match self
                     .resources
                     .get()?
                     .environment_port
                     .ensure(language, environment)
-                    .await?;
+                    .await
+                {
+                    Ok(excerpt) => excerpt,
+                    // System readiness only probes versions; it never installs or
+                    // changes the selected environment. A failed probe must not
+                    // inherit the uncertainty of managed environment creation.
+                    Err(_) if environment == "system" => {
+                        return Ok(ToolOutcomeV4 {
+                            call_id: call.call_id.clone(),
+                            tool_id: call.tool_id.clone(),
+                            succeeded: false,
+                            model_content: "The selected system environment readiness check was attempted but could not verify the interpreter. No environment was created or changed. This failure does not prove the interpreter or its dependencies are absent. Do not install software, switch the frozen backend, or repeat this failed check. Use runtime.environment.inspect once to obtain bounded read-only observations if it has not already been checked; otherwise report the existing observations and limitations without additional scans.".into(),
+                            data: json!({"error_kind":"environment_check_failed","recoverable":true,"check_attempted":true,"mutated":false,"backend_id":self.backend_id,"environment":environment,"language":language}),
+                            provenance: vec![],
+                        });
+                    }
+                    Err(error) => return Err(error),
+                };
                 (
                     excerpt,
                     json!({"environment":environment,"language":language}),
@@ -7899,7 +8035,10 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
         if let Some(outcome) = self.resources.before_call(call).await {
             return Ok(Some(outcome));
         }
-        if matches!(call.tool_id.as_str(), "runtime.execute" | "runtime.rebuild") {
+        if matches!(
+            call.tool_id.as_str(),
+            "runtime.execute" | "runtime.rebuild" | "runtime.environment.ensure"
+        ) {
             let language = parse_language(required(&call.arguments, "language")?)?;
             let environment = call
                 .arguments
@@ -7907,18 +8046,26 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                 .and_then(Value::as_str)
                 .unwrap_or("system");
             self.key(language, environment)?;
-            if self
-                .resources
-                .get()?
-                .environment_port
-                .check_interpreter(language, environment)
-                .await
-                .is_err()
+            if (call.tool_id != "runtime.environment.ensure" || environment == "system")
+                && self
+                    .resources
+                    .get()?
+                    .environment_port
+                    .check_interpreter(language, environment)
+                    .await
+                    .is_err()
             {
                 return Ok(Some(ToolOutcomeV4 {
-                    call_id: call.call_id.clone(), tool_id: call.tool_id.clone(), succeeded: false,
-                    model_content: "The selected interpreter or its execution connection is unavailable. No computation was dispatched. Inspect or prepare the selected environment before retrying; do not switch the frozen backend or environment.".into(),
-                    data: json!({"error_kind":"interpreter_unavailable","recoverable":true,"operation_dispatched":false}), provenance: vec![],
+                    call_id: call.call_id.clone(),
+                    tool_id: call.tool_id.clone(),
+                    succeeded: false,
+                    model_content: if call.tool_id == "runtime.environment.ensure" {
+                        "The selected interpreter availability check failed before environment readiness verification. No environment operation was dispatched. This failure does not prove the interpreter or its dependencies are absent. Do not install software, switch the frozen backend, or repeat this failed check. Use runtime.environment.inspect once to obtain bounded read-only observations if it has not already been checked; otherwise report the existing observations and limitations without additional scans.".into()
+                    } else {
+                        "The selected interpreter or its execution connection is unavailable. No computation was dispatched. Inspect or prepare the selected environment before retrying; do not switch the frozen backend or environment.".into()
+                    },
+                    data: json!({"error_kind":"interpreter_unavailable","recoverable":true,"operation_dispatched":false,"backend_id":self.backend_id,"environment":environment,"language":language}),
+                    provenance: vec![],
                 }));
             }
         }
@@ -12925,6 +13072,349 @@ mod tests {
         assert_eq!(value["status"], "ready");
         assert_eq!(value["mutated"], false);
         assert_eq!(value["software_versions"]["python"], "3.12.0");
+    }
+
+    #[test]
+    fn system_environment_ensure_requires_the_requested_interpreter_version() {
+        for (language, versions) in [
+            (KernelLanguageV4::Python, BTreeMap::new()),
+            (
+                KernelLanguageV4::R,
+                BTreeMap::from([("python".into(), "3.12.0".into())]),
+            ),
+            (
+                KernelLanguageV4::R,
+                BTreeMap::from([("R".into(), "  ".into())]),
+            ),
+        ] {
+            assert!(system_environment_ready(language, versions).is_err());
+        }
+        assert!(
+            system_environment_ready(
+                KernelLanguageV4::R,
+                BTreeMap::from([("R".into(), "R version 4.4.0".into())]),
+            )
+            .is_ok()
+        );
+    }
+
+    struct InspectionOnlyPort {
+        delay: std::time::Duration,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RuntimeEnvironmentPortV4 for InspectionOnlyPort {
+        async fn inspect(
+            &self,
+            environment: &str,
+        ) -> Result<
+            environment_probe_v4::EnvironmentInspectionV4,
+            environment_probe_v4::InspectionErrorV4,
+        > {
+            assert_eq!(environment, "system");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            Ok(environment_probe_v4::EnvironmentInspectionV4 {
+                interpreters: [KernelLanguageV4::Python, KernelLanguageV4::R]
+                    .into_iter()
+                    .map(|language| {
+                        environment_probe_v4::InterpreterObservationV4::new(
+                            language,
+                            environment_probe_v4::ProbeStatusV4::NotFound,
+                        )
+                    })
+                    .collect(),
+            })
+        }
+
+        async fn software_versions(
+            &self,
+            _: KernelLanguageV4,
+            _: &str,
+            _: Vec<String>,
+        ) -> Result<BTreeMap<String, String>, String> {
+            panic!("inspection must not use the unrestricted package version query")
+        }
+
+        async fn ensure(&self, _: KernelLanguageV4, _: &str) -> Result<String, String> {
+            panic!("inspection must not create or prepare an environment")
+        }
+    }
+
+    struct InspectionMustNotLaunchKernel;
+
+    #[async_trait]
+    impl KernelBackendV4 for InspectionMustNotLaunchKernel {
+        fn descriptor(&self) -> ComputeBackendDescriptorV4 {
+            panic!("inspection must not discover runtime backends")
+        }
+        async fn launch(
+            &self,
+            _: &ExecutionContextKeyV4,
+        ) -> Result<Arc<dyn KernelProcessV4>, String> {
+            panic!("inspection must not launch a kernel")
+        }
+    }
+
+    async fn environment_inspection_executor(
+        root: &Path,
+        port: Arc<dyn RuntimeEnvironmentPortV4>,
+    ) -> DesktopToolExecutorV4 {
+        let mut executor = project_filesystem_executor(root).await;
+        let (_, factory) = mock_resource_slot(root, false, false);
+        let mut resources = factory.initialize().await.unwrap();
+        resources.environment_port = port;
+        resources.runtime = Arc::new(RuntimeManagerV4::new(Arc::new(
+            InspectionMustNotLaunchKernel,
+        )));
+        executor.resources = test_ready_resources(resources);
+        executor
+    }
+
+    fn environment_inspection_call() -> ToolCallV4 {
+        ToolCallV4 {
+            call_id: "bounded-environment-inspection".into(),
+            tool_id: "runtime.environment.inspect".into(),
+            arguments: json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn environment_inspection_negative_observations_complete_in_execute_and_plan_without_files()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let port = Arc::new(InspectionOnlyPort {
+            delay: std::time::Duration::ZERO,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let executor = environment_inspection_executor(directory.path(), port.clone()).await;
+        let before = std::fs::read_dir(directory.path()).unwrap().count();
+        let call = environment_inspection_call();
+        assert!(executor.prepare_call(&call).await.unwrap().is_none());
+        for outcome in [
+            executor.execute(&call).await.unwrap(),
+            executor.execute_plan(&call).await.unwrap(),
+        ] {
+            assert!(outcome.succeeded);
+            assert_eq!(outcome.data["backend_id"], "local");
+            assert_eq!(outcome.data["scope"], "selected_environment");
+            assert_eq!(outcome.data["environment"], "system");
+            assert_eq!(outcome.data["packages_checked"], false);
+            assert_eq!(outcome.data["interpreters"][0]["status"], "not_found");
+            assert_eq!(outcome.data["interpreters"][1]["status"], "not_found");
+            assert_eq!(outcome.data["limitations"].as_array().unwrap().len(), 2);
+        }
+        assert_eq!(port.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), before);
+    }
+
+    #[tokio::test]
+    async fn environment_inspection_host_total_deadline_is_twenty_seconds() {
+        let directory = tempfile::tempdir().unwrap();
+        let port = Arc::new(InspectionOnlyPort {
+            delay: std::time::Duration::from_secs(300),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let executor = environment_inspection_executor(directory.path(), port.clone()).await;
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let outcome = executor
+            .execute(&environment_inspection_call())
+            .await
+            .unwrap();
+        assert!(!outcome.succeeded);
+        assert_eq!(outcome.data["error_kind"], "environment_inspection_timeout");
+        assert_eq!(outcome.data["status"], "unverified");
+        assert!(outcome.data.get("interpreters").is_none());
+        // Tokio's timer wheel rounds a deadline to the next millisecond.
+        assert!(started.elapsed() >= std::time::Duration::from_secs(20));
+        assert!(started.elapsed() <= std::time::Duration::from_millis(20_001));
+        assert_eq!(port.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn environment_inspection_containers_are_explicitly_unsupported_without_starting_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut executor = environment_inspection_executor(
+            directory.path(),
+            Arc::new(ContainerEnvironmentPortV4 {
+                program: "must-not-execute".into(),
+                image_id: "must-not-start".into(),
+            }),
+        )
+        .await;
+        executor.selection = detached_jobs_selection(ComputeBackendKindV4::Docker);
+        executor.backend_id = executor.selection.backend_id.clone();
+        let outcome = executor
+            .execute_plan(&environment_inspection_call())
+            .await
+            .unwrap();
+        assert!(!outcome.succeeded);
+        assert_eq!(
+            outcome.data["error_kind"],
+            "environment_inspection_unsupported"
+        );
+        assert_eq!(outcome.data["backend_kind"], "docker");
+    }
+
+    #[tokio::test]
+    async fn environment_inspection_override_is_rejected_before_resource_initialization() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut executor = project_filesystem_executor(directory.path()).await;
+        let (resources, factory) = mock_resource_slot(directory.path(), true, false);
+        executor.resources = resources;
+        let mut call = environment_inspection_call();
+        for arguments in [
+            json!({"code":"must-not-execute"}),
+            json!({"environment":"other"}),
+            json!({"path":"/other"}),
+            Value::Null,
+        ] {
+            call.arguments = arguments;
+            let outcome = executor.execute_plan(&call).await.unwrap();
+            assert!(!outcome.succeeded);
+            assert_eq!(outcome.data["operation_dispatched"], false);
+        }
+        assert_eq!(factory.attempts.load(Ordering::SeqCst), 0);
+        call.arguments = json!({});
+        let outcome = executor.execute_plan(&call).await.unwrap();
+        assert_eq!(outcome.data["error_kind"], "project_context_loaded");
+        assert_eq!(factory.attempts.load(Ordering::SeqCst), 1);
+    }
+
+    struct EnvironmentEnsureProbe {
+        interpreter_available: bool,
+        checks: std::sync::atomic::AtomicUsize,
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RuntimeEnvironmentPortV4 for EnvironmentEnsureProbe {
+        async fn check_interpreter(
+            &self,
+            language: KernelLanguageV4,
+            environment: &str,
+        ) -> Result<(), String> {
+            assert_eq!(language, KernelLanguageV4::R);
+            assert_eq!(environment, "system");
+            self.checks.fetch_add(1, Ordering::SeqCst);
+            if self.interpreter_available {
+                Ok(())
+            } else {
+                Err("program not found: PRIVATE_SENTINEL".into())
+            }
+        }
+
+        async fn software_versions(
+            &self,
+            _: KernelLanguageV4,
+            _: &str,
+            _: Vec<String>,
+        ) -> Result<BTreeMap<String, String>, String> {
+            panic!("ensure fixture owns the simulated version probe")
+        }
+
+        async fn ensure(&self, language: KernelLanguageV4, _: &str) -> Result<String, String> {
+            assert_eq!(language, KernelLanguageV4::R);
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err("program not found: PRIVATE_SENTINEL".into())
+        }
+    }
+
+    async fn environment_ensure_executor(
+        root: &Path,
+        kind: ComputeBackendKindV4,
+        environment: &str,
+        interpreter_available: bool,
+    ) -> (DesktopToolExecutorV4, Arc<EnvironmentEnsureProbe>) {
+        let mut executor = project_filesystem_executor(root).await;
+        let (_, factory) = mock_resource_slot(root, false, false);
+        let mut resources = factory.initialize().await.unwrap();
+        let probe = Arc::new(EnvironmentEnsureProbe {
+            interpreter_available,
+            checks: std::sync::atomic::AtomicUsize::new(0),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        resources.environment_port = probe.clone();
+        executor.resources = test_ready_resources(resources);
+        executor.selection = detached_jobs_selection(kind);
+        executor.selection.environment = environment.into();
+        executor.backend_id = executor.selection.backend_id.clone();
+        (executor, probe)
+    }
+
+    fn environment_ensure_call(environment: &str) -> ToolCallV4 {
+        ToolCallV4 {
+            call_id: "ensure-r".into(),
+            tool_id: "runtime.environment.ensure".into(),
+            arguments: json!({"language":"R","environment":environment}),
+        }
+    }
+
+    #[tokio::test]
+    async fn system_environment_ensure_missing_interpreter_is_recoverable_before_dispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        for kind in [ComputeBackendKindV4::Local, ComputeBackendKindV4::Ssh] {
+            let (executor, probe) =
+                environment_ensure_executor(directory.path(), kind, "system", false).await;
+            let call = environment_ensure_call("system");
+            let outcome = executor.prepare_call(&call).await.unwrap().unwrap();
+            assert!(!outcome.succeeded);
+            assert_eq!(outcome.data["error_kind"], "interpreter_unavailable");
+            assert_eq!(outcome.data["recoverable"], true);
+            assert_eq!(outcome.data["operation_dispatched"], false);
+            assert!(!outcome.model_content.contains("PRIVATE_SENTINEL"));
+            assert!(outcome.provenance.is_empty());
+            assert_eq!(probe.checks.load(Ordering::SeqCst), 1);
+            assert_eq!(probe.attempts.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn system_environment_ensure_read_only_failure_is_a_completed_failed_outcome() {
+        let directory = tempfile::tempdir().unwrap();
+        for kind in [
+            ComputeBackendKindV4::Local,
+            ComputeBackendKindV4::Ssh,
+            ComputeBackendKindV4::Docker,
+        ] {
+            let (executor, probe) =
+                environment_ensure_executor(directory.path(), kind, "system", true).await;
+            let call = environment_ensure_call("system");
+            assert!(executor.prepare_call(&call).await.unwrap().is_none());
+            let outcome = executor.execute(&call).await.unwrap();
+            assert!(!outcome.succeeded);
+            assert_eq!(outcome.data["error_kind"], "environment_check_failed");
+            assert_eq!(outcome.data["recoverable"], true);
+            assert_eq!(outcome.data["check_attempted"], true);
+            assert!(outcome.data.get("operation_dispatched").is_none());
+            assert_eq!(outcome.data["mutated"], false);
+            assert!(!outcome.model_content.contains("PRIVATE_SENTINEL"));
+            assert!(outcome.provenance.is_empty());
+            assert_eq!(probe.checks.load(Ordering::SeqCst), 1);
+            assert_eq!(probe.attempts.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_environment_ensure_preserves_dispatch_uncertainty() {
+        let directory = tempfile::tempdir().unwrap();
+        let (executor, probe) = environment_ensure_executor(
+            directory.path(),
+            ComputeBackendKindV4::Ssh,
+            "project-r",
+            false,
+        )
+        .await;
+        let call = environment_ensure_call("project-r");
+        assert!(executor.prepare_call(&call).await.unwrap().is_none());
+        assert_eq!(
+            executor.execute(&call).await.unwrap_err(),
+            "program not found: PRIVATE_SENTINEL"
+        );
+        assert_eq!(probe.checks.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.attempts.load(Ordering::SeqCst), 1);
     }
 
     #[test]

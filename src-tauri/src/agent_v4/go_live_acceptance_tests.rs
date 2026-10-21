@@ -1,8 +1,11 @@
 use std::{
     collections::BTreeSet,
     path::PathBuf,
-    sync::{Mutex, atomic::AtomicBool},
-    time::Instant,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -14,7 +17,7 @@ use omicsops_core::workspace::{
 use omicsops_protocol::{
     AgentEventKindV4, AgentEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendKindV4,
     ComputeSelectionV4, ContextArchiveV4, ContextCheckpointV4, ConversationAgentPreferencesV4,
-    NetworkPolicyV4, RunModeV4, RunServiceTierV4,
+    NetworkPolicyV4, RunModeV4, RunServiceTierV4, ToolEffectV4,
 };
 use omicsops_store::Store;
 use sqlx::{Connection, sqlite::SqliteConnectOptions};
@@ -47,6 +50,9 @@ struct TemporaryEventStore {
     repository: Store,
     run_id: Uuid,
     reasoning_observation: Mutex<ReasoningObservation>,
+    inspection_guard: bool,
+    rejected_dispatches: AtomicUsize,
+    model_request_count: AtomicUsize,
 }
 
 #[derive(Debug, Default)]
@@ -144,6 +150,22 @@ impl EventStoreV4 for TemporaryEventStore {
     }
 
     async fn append(&self, event: &AgentEventV4) -> Result<(), String> {
+        // This fixture keeps the full production tool directory and RiskBased
+        // routing. Low-risk runtime code can otherwise be auto-approved, so the
+        // inspection case must stop before any side-effect executor is called.
+        if self.inspection_guard {
+            if matches!(&event.event, AgentEventKindV4::ToolDispatchStarted { effect, .. }
+                if *effect != ToolEffectV4::ReadOnly)
+            {
+                self.rejected_dispatches.fetch_add(1, Ordering::SeqCst);
+                return Err("live inspection rejected side-effect dispatch".into());
+            }
+            if matches!(event.event, AgentEventKindV4::ModelRequestStarted { .. })
+                && self.model_request_count.fetch_add(1, Ordering::SeqCst) >= 4
+            {
+                return Err("live inspection reached its four-request limit".into());
+            }
+        }
         self.repository
             .append_agent_event_v4_with_conversation(event)
             .await
@@ -172,6 +194,109 @@ impl EventStoreV4 for TemporaryEventStore {
             .archive_agent_context_v4(run_id, transcript, checkpoint)
             .await
             .map_err(|error| error.to_string())
+    }
+}
+
+#[tokio::test]
+async fn inspection_guard_blocks_side_effects_and_fifth_model_request_before_persistence() {
+    let repository = Store::open_in_memory().await.unwrap();
+    let now = chrono::Utc::now();
+    let project = Project::new(
+        Uuid::new_v4(),
+        "synthetic guard fixture",
+        "synthetic-workspace",
+        ProjectTemplate::Blank,
+        now,
+    );
+    let conversation = Conversation::new(Uuid::new_v4(), project.id, "guard fixture", now);
+    repository.save_project(&project).await.unwrap();
+    repository.save_conversation(&conversation).await.unwrap();
+
+    for inspection_guard in [true, false] {
+        let run_id = Uuid::new_v4();
+        let events = TemporaryEventStore {
+            repository: repository.clone(),
+            run_id,
+            reasoning_observation: Mutex::new(ReasoningObservation::default()),
+            inspection_guard,
+            rejected_dispatches: AtomicUsize::new(0),
+            model_request_count: AtomicUsize::new(0),
+        };
+        let mut previous = AgentEventV4::first(
+            run_id,
+            project.id,
+            conversation.id,
+            now,
+            AgentEventKindV4::RunCreated {
+                mode: RunModeV4::Execute,
+            },
+        );
+        events.append(&previous).await.unwrap();
+        for effect in [
+            ToolEffectV4::ReadOnly,
+            ToolEffectV4::Mutating,
+            ToolEffectV4::Runtime,
+            ToolEffectV4::Network,
+            ToolEffectV4::Delegation,
+        ] {
+            let next = AgentEventV4::next(
+                &previous,
+                now,
+                AgentEventKindV4::ToolDispatchStarted {
+                    call_id: "synthetic-call".into(),
+                    tool_id: "synthetic-tool".into(),
+                    effect,
+                    idempotency_key: "synthetic-key".into(),
+                },
+            );
+            let result = events.append(&next).await;
+            if inspection_guard && effect != ToolEffectV4::ReadOnly {
+                assert_eq!(
+                    result.unwrap_err(),
+                    "live inspection rejected side-effect dispatch"
+                );
+            } else {
+                result.unwrap();
+                previous = next;
+            }
+        }
+        for attempt in 1..=5 {
+            let next = AgentEventV4::next(
+                &previous,
+                now,
+                AgentEventKindV4::ModelRequestStarted {
+                    request: omicsops_protocol::ModelRequestStartedV4 {
+                        logical_request_id: Uuid::new_v4(),
+                        attempt_id: Uuid::new_v4(),
+                        model_profile_id: Uuid::new_v4(),
+                        model_configuration_hash: None,
+                        context_limit_tokens: None,
+                        context_limit_source: Default::default(),
+                        serialized_request_bytes: None,
+                        image_count: None,
+                        image_bound_tokens: None,
+                        breakdown: None,
+                    },
+                },
+            );
+            let result = events.append(&next).await;
+            if inspection_guard && attempt == 5 {
+                assert_eq!(
+                    result.unwrap_err(),
+                    "live inspection reached its four-request limit"
+                );
+            } else {
+                result.unwrap();
+                previous = next;
+            }
+        }
+        let recorded = events.load(run_id).await.unwrap();
+        assert_eq!(recorded.last(), Some(&previous));
+        assert_eq!(recorded.len(), if inspection_guard { 6 } else { 11 });
+        assert_eq!(
+            events.rejected_dispatches.load(Ordering::SeqCst),
+            if inspection_guard { 4 } else { 0 }
+        );
     }
 }
 
@@ -284,17 +409,27 @@ fn refreshed_go_profile(source: &ModelProfile) -> Result<ModelProfile, String> {
     Ok(refreshed)
 }
 
-async fn run_live_go_agent_acceptance(auto_review: bool) -> Result<(), String> {
+#[derive(Clone, Copy)]
+enum LiveGoCase {
+    Nonce { auto_review: bool },
+    EnvironmentInspection,
+}
+
+async fn run_live_go_agent_acceptance(case: LiveGoCase) -> Result<(), String> {
+    let inspection = matches!(case, LiveGoCase::EnvironmentInspection);
+    let auto_review = matches!(case, LiveGoCase::Nonce { auto_review: true });
     let source = selected_saved_profile().await?;
     let profile = refreshed_go_profile(&source)?;
     let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
     let nonce = Uuid::new_v4().simple().to_string();
     let filename = format!("opencode-go-live-{}.txt", Uuid::new_v4().simple());
-    std::fs::write(
-        directory.path().join(&filename),
-        format!("OpenCode Go Agent acceptance nonce: {nonce}\n"),
-    )
-    .map_err(|error| error.to_string())?;
+    if !inspection {
+        std::fs::write(
+            directory.path().join(&filename),
+            format!("OpenCode Go Agent acceptance nonce: {nonce}\n"),
+        )
+        .map_err(|error| error.to_string())?;
+    }
 
     let repository = Store::open_in_memory()
         .await
@@ -369,9 +504,19 @@ async fn run_live_go_agent_acceptance(auto_review: bool) -> Result<(), String> {
     let reviewer_model =
         super::freeze_reviewer_model(&repository, &profile, &preferences, service_tier).await?;
     let run_id = Uuid::new_v4();
-    let objective = format!(
-        "This is a bounded live acceptance task. Use project.read exactly once to read `{filename}`. The file contains a random validation nonce that is not present in this request. Do not guess it and do not call any other task tool. After reading the file, call agent.complete with the exact nonce in answer_markdown and cite the successful project.read event as evidence for the frozen completion criterion."
-    );
+    let objective = if inspection {
+        "帮我在当前执行环境下，检查有没有在此文件夹下准备好 Python 和 R 环境。只需检查并给出结果。"
+            .into()
+    } else {
+        format!(
+            "This is a bounded live acceptance task. Use project.read exactly once to read `{filename}`. The file contains a random validation nonce that is not present in this request. Do not guess it and do not call any other task tool. After reading the file, call agent.complete with the exact nonce in answer_markdown and cite the successful project.read event as evidence for the frozen completion criterion."
+        )
+    };
+    let capabilities = if inspection {
+        super::queue_execute_capabilities(&preferences)
+    } else {
+        BTreeSet::from(["project.read".into()])
+    };
     let request = StartDirectV4Request {
         project_id: project.id,
         conversation_id: conversation.id,
@@ -385,7 +530,7 @@ async fn run_live_go_agent_acceptance(auto_review: bool) -> Result<(), String> {
         &request,
         run_id,
         "[]",
-        BTreeSet::from(["project.read".into()]),
+        capabilities,
         DirectRunSnapshotV4 {
             model_configuration_hash: profile.execution_configuration_hash(),
             conversation_preferences: preferences,
@@ -411,6 +556,9 @@ async fn run_live_go_agent_acceptance(auto_review: bool) -> Result<(), String> {
         repository: repository.clone(),
         run_id,
         reasoning_observation: Mutex::new(ReasoningObservation::default()),
+        inspection_guard: inspection,
+        rejected_dispatches: AtomicUsize::new(0),
+        model_request_count: AtomicUsize::new(0),
     };
     events
         .append(&AgentEventV4::first(
@@ -464,11 +612,64 @@ async fn run_live_go_agent_acceptance(auto_review: bool) -> Result<(), String> {
         science: None,
     };
     let mut limits = AgentLimitsV4::ordinary(4);
-    limits.max_tool_calls = 3;
+    limits.max_tool_calls = if inspection { 4 } else { 3 };
     limits.max_model_retries = 0;
+    let started_at = Instant::now();
     let execution = core
         .execute_with_limits(&spec, limits, &AtomicBool::new(false))
         .await;
+
+    if inspection {
+        let recorded = events.load(run_id).await?;
+        let model_requests = recorded
+            .iter()
+            .filter(|event| matches!(event.event, AgentEventKindV4::ModelRequestStarted { .. }))
+            .count();
+        let tool_requests = recorded
+            .iter()
+            .filter(|event| matches!(event.event, AgentEventKindV4::ToolRequested { .. }))
+            .count();
+        let inspection_requests = recorded.iter().filter(|event| matches!(&event.event, AgentEventKindV4::ToolRequested { call } if call.tool_id == "runtime.environment.inspect")).count();
+        let successful_inspections = recorded.iter().filter(|event| matches!(&event.event, AgentEventKindV4::ToolFinished { outcome } if outcome.tool_id == "runtime.environment.inspect" && outcome.succeeded)).count();
+        let runtime_dispatches = recorded.iter().filter(|event| matches!(&event.event, AgentEventKindV4::ToolDispatchStarted { tool_id, .. } if matches!(tool_id.as_str(), "runtime.execute" | "runtime.environment.ensure"))).count();
+        let completed = recorded
+            .iter()
+            .any(|event| matches!(event.event, AgentEventKindV4::RunCompleted));
+        let rejected_dispatches = events.rejected_dispatches.load(Ordering::SeqCst);
+        println!(
+            "OpenCode Go environment inspection: status={}, elapsed_ms={}, model_requests={}, tool_requests={}, inspection_requests={}, successful_inspections={}, runtime_dispatches={}, rejected_dispatches={}, completed={}",
+            if execution.is_ok() {
+                "finished"
+            } else {
+                "failed"
+            },
+            started_at.elapsed().as_millis(),
+            model_requests,
+            tool_requests,
+            inspection_requests,
+            successful_inspections,
+            runtime_dispatches,
+            rejected_dispatches,
+            completed,
+        );
+        if execution.is_err()
+            || !completed
+            || !(2..=4).contains(&model_requests)
+            || tool_requests > 4
+            || inspection_requests != 1
+            || successful_inspections != 1
+            || runtime_dispatches != 0
+            || rejected_dispatches != 0
+            || recorded
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::ReviewerFinished { .. }))
+        {
+            return Err(
+                "live environment inspection did not satisfy the bounded routing contract".into(),
+            );
+        }
+        return Ok(());
+    }
 
     let reasoning = events.reasoning_observation.lock().unwrap();
     println!(
@@ -554,7 +755,8 @@ async fn run_live_go_agent_acceptance(auto_review: bool) -> Result<(), String> {
 #[tokio::test]
 #[ignore = "requires an existing saved OpenCode Go profile and its Windows keyring credential"]
 async fn live_opencode_go_agent_reads_file_and_returns_nonce() {
-    if let Err(error) = run_live_go_agent_acceptance(false).await {
+    if let Err(error) = run_live_go_agent_acceptance(LiveGoCase::Nonce { auto_review: false }).await
+    {
         panic!("OpenCode Go Agent live acceptance failed: {error}");
     }
 }
@@ -562,7 +764,32 @@ async fn live_opencode_go_agent_reads_file_and_returns_nonce() {
 #[tokio::test]
 #[ignore = "requires an existing saved OpenCode Go profile and its Windows keyring credential"]
 async fn live_opencode_go_agent_reviews_file_and_returns_nonce() {
-    if let Err(error) = run_live_go_agent_acceptance(true).await {
+    if let Err(error) = run_live_go_agent_acceptance(LiveGoCase::Nonce { auto_review: true }).await
+    {
         panic!("OpenCode Go Agent reviewer live acceptance failed: {error}");
     }
+}
+
+#[tokio::test]
+#[ignore = "requires one explicitly selected saved OpenCode Go profile; temporary local environment routing only, no SSH"]
+async fn live_opencode_go_agent_inspects_selected_environment() {
+    let started_at = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(180),
+        run_live_go_agent_acceptance(LiveGoCase::EnvironmentInspection),
+    )
+    .await;
+    let status = match result {
+        Ok(Ok(())) => "passed",
+        Ok(Err(_)) => "failed",
+        Err(_) => "timed_out",
+    };
+    println!(
+        "OpenCode Go environment acceptance: status={status}, elapsed_ms={}",
+        started_at.elapsed().as_millis()
+    );
+    assert_eq!(
+        status, "passed",
+        "live environment routing acceptance failed; raw errors are intentionally not printed"
+    );
 }
