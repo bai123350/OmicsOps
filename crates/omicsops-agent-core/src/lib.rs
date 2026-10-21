@@ -469,6 +469,12 @@ pub trait ToolPortV4: Send + Sync {
     fn validate(&self, _mode: RunModeV4, _call: &ToolCallV4) -> Result<(), String> {
         Ok(())
     }
+    /// Validate read-only recovery of a call already recorded as dispatched.
+    /// Hosts may retain the historical argument contract while preserving all
+    /// capability and target checks. This never authorizes a new dispatch.
+    fn validate_recovery(&self, call: &ToolCallV4) -> Result<(), String> {
+        self.validate(RunModeV4::Execute, call)
+    }
     /// Host-only, read-only preparation after authorization, before scientific
     /// state or dispatch is recorded. Returning an outcome defers the call;
     /// implementations must never execute the requested operation here.
@@ -625,6 +631,7 @@ pub struct AgentLimitsV4 {
     pub model_attempt_timeout: Duration,
     pub context_max_bytes: usize,
     pub checkpoint_recent_events: usize,
+    pub max_deterministic_corrections: u8,
     pub max_reviewer_corrections: u8,
     pub max_delegation_nodes: usize,
     pub max_delegation_concurrency: usize,
@@ -655,6 +662,7 @@ impl Default for AgentLimitsV4 {
             model_attempt_timeout: Duration::from_secs(180),
             context_max_bytes: 256 * 1024,
             checkpoint_recent_events: 24,
+            max_deterministic_corrections: 2,
             max_reviewer_corrections: 2,
             max_delegation_nodes: 8,
             max_delegation_concurrency: 3,
@@ -1133,6 +1141,16 @@ impl AgentCoreV4<'_> {
                 )
             })
             .count() as u8;
+        // Count durable failures, not tool activity or scientific-state revisions:
+        // producing another report cannot repair a rejected completion by itself.
+        let mut deterministic_failures = Self::deterministic_failure_count(&existing);
+        self.check_deterministic_correction_budget(
+            spec.run_id,
+            deterministic_failures,
+            limits,
+            cancelled,
+        )
+        .await?;
         if self
             .resume_pending_review(
                 spec,
@@ -2237,6 +2255,14 @@ impl AgentCoreV4<'_> {
                 )
                 .await?;
                 if !deterministic.passed {
+                    deterministic_failures += 1;
+                    self.check_deterministic_correction_budget(
+                        spec.run_id,
+                        deterministic_failures,
+                        limits,
+                        cancelled,
+                    )
+                    .await?;
                     continue;
                 }
                 if cancelled.load(Ordering::SeqCst) {
@@ -2316,6 +2342,43 @@ impl AgentCoreV4<'_> {
                 continue;
             }
         }
+    }
+
+    fn deterministic_failure_count(events: &[AgentEventV4]) -> usize {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(&event.event,
+            AgentEventKindV4::DeterministicVerificationFinished { report } if !report.passed)
+            })
+            .count()
+    }
+
+    async fn check_deterministic_correction_budget(
+        &self,
+        run_id: Uuid,
+        failures: usize,
+        limits: AgentLimitsV4,
+        cancelled: &AtomicBool,
+    ) -> Result<(), AgentCoreErrorV4> {
+        if failures <= usize::from(limits.max_deterministic_corrections) {
+            return Ok(());
+        }
+        if self.stop_if_cancelled(run_id, cancelled).await? {
+            return Err(AgentCoreErrorV4::Cancelled);
+        }
+        let message = format!(
+            "deterministic verification errors remain after {} correction rounds; automatic retries stopped. Review the recorded verification findings; prior tool results are preserved",
+            limits.max_deterministic_corrections,
+        );
+        self.push(
+            run_id,
+            AgentEventKindV4::RunNeedsAttention {
+                message: message.clone(),
+            },
+        )
+        .await?;
+        Err(AgentCoreErrorV4::NeedsAttention(message))
     }
 
     async fn summarize_iteration_limit(
@@ -3661,6 +3724,8 @@ impl AgentCoreV4<'_> {
             .map_err(AgentCoreErrorV4::Store)?;
         let mut pending = BTreeMap::<String, (ToolCallV4, bool)>::new();
         let mut pending_task_updates = BTreeMap::<String, ToolCallV4>::new();
+        let correction_budget_exhausted = Self::deterministic_failure_count(&events)
+            > usize::from(limits.max_deterministic_corrections);
         for event in &events {
             match &event.event {
                 AgentEventKindV4::ToolRequested { call }
@@ -3728,6 +3793,28 @@ impl AgentCoreV4<'_> {
                 .tools
                 .effect(&call.tool_id)
                 .ok_or_else(|| AgentCoreErrorV4::Tool(format!("unknown tool {}", call.tool_id)))?;
+            if correction_budget_exhausted && (!dispatched || effect == ToolEffectV4::ReadOnly) {
+                // Recovery may still contain an unresolved side effect. Leave
+                // its cancellation fence to the caller before writing a terminal.
+                if cancelled.load(Ordering::SeqCst) {
+                    return Err(AgentCoreErrorV4::Cancelled);
+                }
+                self.push(run_id, AgentEventKindV4::ToolFinished {
+                    outcome: ToolOutcomeV4 {
+                        call_id: call.call_id,
+                        tool_id: call.tool_id,
+                        succeeded: false,
+                        model_content: "Host did not replay this pending call because the deterministic verification correction budget is exhausted. No new operation was dispatched.".into(),
+                        data: json!({
+                            "error_kind":"deterministic_correction_limit",
+                            "recoverable":false,
+                            "operation_dispatched":dispatched,
+                        }),
+                        provenance: vec![],
+                    },
+                }).await?;
+                continue;
+            }
             if let Some(capability) = optional_capability_disabled(spec, &call.tool_id) {
                 // A read-only call that was already marked dispatched must
                 // not be replayed after a restart. Side-effecting calls still
@@ -3748,7 +3835,7 @@ impl AgentCoreV4<'_> {
                     return Err(AgentCoreErrorV4::Cancelled);
                 }
                 self.tools
-                    .validate(RunModeV4::Execute, &call)
+                    .validate_recovery(&call)
                     .map_err(AgentCoreErrorV4::Tool)?;
                 // Once explicitly classified uncertain, retain the existing
                 // human reconciliation path rather than resolve it implicitly.
@@ -13643,17 +13730,156 @@ mod tests {
         }
     }
 
+    struct RecoveryValidationTools {
+        strict_checks: AtomicUsize,
+        recovery_checks: AtomicUsize,
+        recoveries: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ToolPortV4 for RecoveryValidationTools {
+        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
+            vec![]
+        }
+        fn effect(&self, _: &str) -> Option<ToolEffectV4> {
+            Some(ToolEffectV4::Runtime)
+        }
+        fn validate(&self, _: RunModeV4, _: &ToolCallV4) -> Result<(), String> {
+            self.strict_checks.fetch_add(1, Ordering::SeqCst);
+            Err("new analysis declaration requires a seed".into())
+        }
+        fn validate_recovery(&self, _: &ToolCallV4) -> Result<(), String> {
+            self.recovery_checks.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn execute(&self, _: RunModeV4, _: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            panic!("validation or receipt recovery must never dispatch code")
+        }
+        async fn recover_result(&self, call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
+            self.recoveries.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(ToolOutcomeV4 {
+                call_id: call.call_id.clone(),
+                tool_id: call.tool_id.clone(),
+                succeeded: true,
+                model_content: "historical receipt".into(),
+                data: json!({}),
+                provenance: vec!["verified-receipt".into()],
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_validation_applies_only_to_already_dispatched_side_effects() {
+        for dispatched in [false, true] {
+            let spec = execution_spec(Uuid::new_v4());
+            let store = MemoryStore::default();
+            seed_execution(&store, &spec);
+            let call = native_call(
+                "legacy-inspection",
+                "runtime.execute",
+                json!({
+                    "language":"python", "code":"print('available')", "analysis":{"random_seed":null}
+                }),
+            );
+            append_test_event(
+                &store,
+                spec.run_id,
+                AgentEventKindV4::ToolRequested { call: call.clone() },
+            );
+            if dispatched {
+                append_test_event(
+                    &store,
+                    spec.run_id,
+                    AgentEventKindV4::ToolDispatchStarted {
+                        call_id: call.call_id.clone(),
+                        tool_id: call.tool_id.clone(),
+                        effect: ToolEffectV4::Runtime,
+                        idempotency_key: call.call_id.clone(),
+                    },
+                );
+            }
+            let tools = RecoveryValidationTools {
+                strict_checks: AtomicUsize::new(0),
+                recovery_checks: AtomicUsize::new(0),
+                recoveries: AtomicUsize::new(0),
+            };
+            let model = ScriptedModel(Mutex::new(vec![]));
+            AgentCoreV4 {
+                model: &model,
+                tools: &tools,
+                events: &store,
+                science: None,
+            }
+            .recover_interrupted_dispatches(
+                &spec,
+                AgentLimitsV4::default(),
+                &AtomicBool::new(false),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                tools.strict_checks.load(Ordering::SeqCst),
+                usize::from(!dispatched)
+            );
+            assert_eq!(
+                tools.recovery_checks.load(Ordering::SeqCst),
+                usize::from(dispatched)
+            );
+            assert_eq!(
+                tools.recoveries.load(Ordering::SeqCst),
+                usize::from(dispatched)
+            );
+            let events = store.load_direct(spec.run_id).unwrap();
+            let outcome = events
+                .iter()
+                .find_map(|event| match &event.event {
+                    AgentEventKindV4::ToolFinished { outcome } => Some(outcome),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(outcome.succeeded, dispatched);
+            if !dispatched {
+                assert_eq!(outcome.data["error_kind"], "validation");
+                assert_eq!(outcome.data["operation_dispatched"], false);
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event.event,
+                        AgentEventKindV4::ToolDispatchStarted { .. }
+                    ))
+                    .count(),
+                usize::from(dispatched)
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_validation_defaults_to_the_current_validation_contract() {
+        assert!(
+            SensitiveBrowserTools
+                .validate_recovery(&native_call("unsafe", "web_open_tab", json!({})))
+                .is_err()
+        );
+    }
+
     struct ReceiptTools {
         available: bool,
         recoveries: AtomicUsize,
+        effect: ToolEffectV4,
     }
     #[async_trait]
     impl ToolPortV4 for ReceiptTools {
         fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
             vec![]
         }
-        fn effect(&self, _: &str) -> Option<ToolEffectV4> {
-            Some(ToolEffectV4::Runtime)
+        fn effect(&self, tool_id: &str) -> Option<ToolEffectV4> {
+            Some(if tool_id == "project.list" {
+                ToolEffectV4::ReadOnly
+            } else {
+                self.effect
+            })
         }
         async fn execute(&self, _: RunModeV4, _: ToolCallV4) -> Result<ToolOutcomeV4, String> {
             panic!("recovery must not execute")
@@ -13710,6 +13936,7 @@ mod tests {
             let tools = ReceiptTools {
                 available,
                 recoveries: AtomicUsize::new(0),
+                effect: ToolEffectV4::Runtime,
             };
             let model = ScriptedModel(Mutex::new(vec![]));
             let core = AgentCoreV4 {
@@ -13747,6 +13974,189 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn deterministic_correction_budget_prevents_replay_but_keeps_dispatched_receipts() {
+        for (dispatched, effect) in [
+            (false, ToolEffectV4::Runtime),
+            (false, ToolEffectV4::ReadOnly),
+            (true, ToolEffectV4::ReadOnly),
+            (true, ToolEffectV4::Runtime),
+        ] {
+            let spec = execution_spec(Uuid::new_v4());
+            let store = MemoryStore::default();
+            let evidence = seed_success_evidence(&store, &spec);
+            let proposal = serde_json::from_value(completion_arguments(evidence)).unwrap();
+            let report = verify_completion_v4(
+                &spec,
+                &missing_seed_science(&spec),
+                &store.load_direct(spec.run_id).unwrap(),
+                &proposal,
+            );
+            assert!(!report.passed);
+            for _ in 0..3 {
+                append_test_event(
+                    &store,
+                    spec.run_id,
+                    AgentEventKindV4::DeterministicVerificationFinished {
+                        report: report.clone(),
+                    },
+                );
+            }
+            let call = native_call(
+                "pending-after-exhaustion",
+                "runtime.execute",
+                json!({
+                    "language":"python", "code":"print('do not replay')"
+                }),
+            );
+            append_test_event(
+                &store,
+                spec.run_id,
+                AgentEventKindV4::ToolRequested { call: call.clone() },
+            );
+            if dispatched {
+                append_test_event(
+                    &store,
+                    spec.run_id,
+                    AgentEventKindV4::ToolDispatchStarted {
+                        call_id: call.call_id.clone(),
+                        tool_id: call.tool_id.clone(),
+                        effect,
+                        idempotency_key: call.call_id.clone(),
+                    },
+                );
+            }
+            let tools = ReceiptTools {
+                available: true,
+                recoveries: AtomicUsize::new(0),
+                effect,
+            };
+            let model = native_decision_model(spec.model_profile_id, vec![]);
+            let result = AgentCoreV4 {
+                model: &model,
+                tools: &tools,
+                events: &store,
+                science: None,
+            }
+            .execute(&spec, 1)
+            .await;
+            assert!(
+                matches!(result, Err(AgentCoreErrorV4::NeedsAttention(_))),
+                "{result:?}"
+            );
+            assert!(model.requests.lock().unwrap().is_empty());
+            let recovered = dispatched && effect != ToolEffectV4::ReadOnly;
+            assert_eq!(
+                tools.recoveries.load(Ordering::SeqCst),
+                usize::from(recovered)
+            );
+            let events = store.load_direct(spec.run_id).unwrap();
+            let outcome = events
+                .iter()
+                .find_map(|event| match &event.event {
+                    AgentEventKindV4::ToolFinished { outcome }
+                        if outcome.call_id == call.call_id =>
+                    {
+                        Some(outcome)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(outcome.succeeded, recovered);
+            if !recovered {
+                assert_eq!(outcome.data["error_kind"], "deterministic_correction_limit");
+                assert_eq!(outcome.data["operation_dispatched"], dispatched);
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event.event,
+                        AgentEventKindV4::ToolDispatchStarted { .. }
+                    ))
+                    .count(),
+                usize::from(dispatched)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deterministic_correction_budget_stop_preserves_unresolved_mixed_dispatches() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        let evidence = seed_success_evidence(&store, &spec);
+        let proposal = serde_json::from_value(completion_arguments(evidence)).unwrap();
+        let report = verify_completion_v4(
+            &spec,
+            &missing_seed_science(&spec),
+            &store.load_direct(spec.run_id).unwrap(),
+            &proposal,
+        );
+        for _ in 0..3 {
+            append_test_event(
+                &store,
+                spec.run_id,
+                AgentEventKindV4::DeterministicVerificationFinished {
+                    report: report.clone(),
+                },
+            );
+        }
+        let read = native_call("a-pending-read", "project.list", json!({}));
+        let runtime = native_call(
+            "z-unresolved-runtime",
+            "runtime.execute",
+            json!({
+                "language":"python", "code":"print('already dispatched')"
+            }),
+        );
+        for call in [&read, &runtime] {
+            append_test_event(
+                &store,
+                spec.run_id,
+                AgentEventKindV4::ToolRequested { call: call.clone() },
+            );
+        }
+        append_test_event(
+            &store,
+            spec.run_id,
+            AgentEventKindV4::ToolDispatchStarted {
+                call_id: runtime.call_id.clone(),
+                tool_id: runtime.tool_id.clone(),
+                effect: ToolEffectV4::Runtime,
+                idempotency_key: runtime.call_id.clone(),
+            },
+        );
+        let before = store.load_direct(spec.run_id).unwrap();
+        let tools = ReceiptTools {
+            available: true,
+            recoveries: AtomicUsize::new(0),
+            effect: ToolEffectV4::Runtime,
+        };
+        let model = ScriptedModel(Mutex::new(vec![]));
+        let result = AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        }
+        .recover_interrupted_dispatches(&spec, AgentLimitsV4::default(), &AtomicBool::new(true))
+        .await;
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::Cancelled)),
+            "{result:?}"
+        );
+        assert_eq!(tools.recoveries.load(Ordering::SeqCst), 0);
+        let events = store.load_direct(spec.run_id).unwrap();
+        assert!(
+            events == before,
+            "Stop must leave unresolved side effects for the existing cancellation fence"
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event.event,
+            AgentEventKindV4::RunCancelled | AgentEventKindV4::RunNeedsAttention { .. }
+        )));
     }
 
     struct ResultReadTools;
@@ -18076,6 +18486,343 @@ mod tests {
         let sequence = event.sequence;
         store.append_direct(&event).unwrap();
         sequence
+    }
+
+    fn missing_seed_science(spec: &RunSpecV4) -> ScientificStateV4 {
+        let mut state = ScientificStateV4::new(spec.project_id);
+        state
+            .start_analysis(
+                spec.run_id,
+                "environment-check".into(),
+                AnalysisDeclarationV4 {
+                    analysis_type: "environment_check".into(),
+                    input_dataset_ids: BTreeSet::new(),
+                    sample_ids: BTreeSet::new(),
+                    method: "inspect interpreter".into(),
+                    parameters: json!({}),
+                    software_requirements: BTreeSet::new(),
+                    database_versions: BTreeMap::new(),
+                    random_seed: None,
+                },
+                RuntimeIdentityV4 {
+                    backend_id: "ssh:fixture".into(),
+                    language: "python".into(),
+                    environment: "system".into(),
+                    session_id: None,
+                    process_identity: None,
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        state
+            .finish_analysis(
+                "environment-check",
+                true,
+                None,
+                None,
+                vec![],
+                BTreeMap::new(),
+                "print('interpreter available')".into(),
+                Utc::now(),
+            )
+            .unwrap();
+        state
+    }
+
+    #[tokio::test]
+    async fn deterministic_correction_budget_stops_repeated_incomplete_provenance() {
+        for ordinary in [false, true] {
+            let mut spec = execution_spec(Uuid::new_v4());
+            if ordinary {
+                spec.execution_kind = RunExecutionKindV4::OrdinaryAgent;
+            }
+            let store = MemoryStore::default();
+            let evidence = seed_success_evidence(&store, &spec);
+            let science = SnapshotScience(Mutex::new(missing_seed_science(&spec)));
+            let model = native_decision_model(
+                spec.model_profile_id,
+                (0..3)
+                    .map(|index| {
+                        vec![native_call(
+                            &format!("complete-{index}"),
+                            "agent.complete",
+                            completion_arguments(evidence),
+                        )]
+                    })
+                    .collect(),
+            );
+            let result = AgentCoreV4 {
+                model: &model,
+                tools: &NativeDecisionTools,
+                events: &store,
+                science: Some(&science),
+            }
+            .execute(&spec, 3)
+            .await;
+            assert!(
+                matches!(result, Err(AgentCoreErrorV4::NeedsAttention(ref message))
+                if message.contains("deterministic verification")),
+                "{result:?}"
+            );
+            assert_eq!(model.requests.lock().unwrap().len(), 3);
+            let events = store.load_direct(spec.run_id).unwrap();
+            assert_eq!(events.iter().filter(|event| matches!(&event.event,
+                AgentEventKindV4::DeterministicVerificationFinished { report }
+                    if !report.passed && report.findings.iter().all(|finding| finding.code == "provenance_incomplete")
+            )).count(), 3);
+            assert!(!events.iter().any(|event| matches!(
+                event.event,
+                AgentEventKindV4::RunCompleted | AgentEventKindV4::ReviewerFinished { .. }
+            )));
+            assert!(matches!(
+                events.last().unwrap().event,
+                AgentEventKindV4::RunNeedsAttention { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn deterministic_correction_budget_survives_reload_and_new_scientific_state() {
+        for prior_failures in [2, 3] {
+            let spec = execution_spec(Uuid::new_v4());
+            let store = MemoryStore::default();
+            let evidence = seed_success_evidence(&store, &spec);
+            let state = missing_seed_science(&spec);
+            let proposal: CompletionProposalV4 =
+                serde_json::from_value(completion_arguments(evidence)).unwrap();
+            let report = verify_completion_v4(
+                &spec,
+                &state,
+                &store.load_direct(spec.run_id).unwrap(),
+                &proposal,
+            );
+            assert!(!report.passed);
+            for revision in 0..prior_failures {
+                append_test_event(
+                    &store,
+                    spec.run_id,
+                    AgentEventKindV4::CompletionProposalSubmitted {
+                        proposal: proposal.clone(),
+                    },
+                );
+                append_test_event(
+                    &store,
+                    spec.run_id,
+                    AgentEventKindV4::DeterministicVerificationFinished {
+                        report: report.clone(),
+                    },
+                );
+                append_test_event(
+                    &store,
+                    spec.run_id,
+                    AgentEventKindV4::ScientificStateChanged {
+                        revision,
+                        state_sha256: state.digest(),
+                        changes: vec!["unrelated evidence recorded".into()],
+                    },
+                );
+            }
+            let reloaded = MemoryStore::default();
+            *reloaded.events.lock().unwrap() = serde_json::from_str(
+                &serde_json::to_string(&store.load_direct(spec.run_id).unwrap()).unwrap(),
+            )
+            .unwrap();
+            let science = SnapshotScience(Mutex::new(state));
+            let model = native_decision_model(
+                spec.model_profile_id,
+                vec![vec![native_call(
+                    "complete-after-reload",
+                    "agent.complete",
+                    completion_arguments(evidence),
+                )]],
+            );
+            let result = AgentCoreV4 {
+                model: &model,
+                tools: &NativeDecisionTools,
+                events: &reloaded,
+                science: Some(&science),
+            }
+            .execute(&spec, 1)
+            .await;
+            assert!(
+                matches!(result, Err(AgentCoreErrorV4::NeedsAttention(ref message))
+                if message.contains("deterministic verification")),
+                "{result:?}"
+            );
+            assert_eq!(
+                model.requests.lock().unwrap().len(),
+                usize::from(prior_failures == 2)
+            );
+            let events = reloaded.load_direct(spec.run_id).unwrap();
+            assert_eq!(events.iter().filter(|event| matches!(&event.event,
+                AgentEventKindV4::DeterministicVerificationFinished { report } if !report.passed
+            )).count(), 3);
+            assert!(matches!(
+                events.last().unwrap().event,
+                AgentEventKindV4::RunNeedsAttention { .. }
+            ));
+        }
+    }
+
+    struct CancelAtVerificationStore {
+        inner: MemoryStore,
+        cancelled: AtomicBool,
+        failures: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl EventStoreV4 for CancelAtVerificationStore {
+        async fn append(&self, event: &AgentEventV4) -> Result<(), String> {
+            self.inner.append(event).await?;
+            if matches!(&event.event,
+                AgentEventKindV4::DeterministicVerificationFinished { report } if !report.passed)
+                && self.failures.fetch_add(1, Ordering::SeqCst) == 2
+            {
+                self.cancelled.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        async fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String> {
+            self.inner.load(run_id).await
+        }
+        async fn archive_context(
+            &self,
+            run_id: Uuid,
+            transcript: &str,
+            checkpoint: &ContextCheckpointV4,
+        ) -> Result<ContextArchiveV4, String> {
+            self.inner
+                .archive_context(run_id, transcript, checkpoint)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn deterministic_correction_budget_preserves_stop_before_resume_or_at_final_failure() {
+        for cancelled_before_resume in [false, true] {
+            let spec = execution_spec(Uuid::new_v4());
+            let store = CancelAtVerificationStore {
+                inner: MemoryStore::default(),
+                cancelled: AtomicBool::new(cancelled_before_resume),
+                failures: AtomicUsize::new(0),
+            };
+            let evidence = seed_success_evidence(&store.inner, &spec);
+            let state = missing_seed_science(&spec);
+            if cancelled_before_resume {
+                let proposal: CompletionProposalV4 =
+                    serde_json::from_value(completion_arguments(evidence)).unwrap();
+                let report = verify_completion_v4(
+                    &spec,
+                    &state,
+                    &store.inner.load_direct(spec.run_id).unwrap(),
+                    &proposal,
+                );
+                for _ in 0..3 {
+                    append_test_event(
+                        &store.inner,
+                        spec.run_id,
+                        AgentEventKindV4::DeterministicVerificationFinished {
+                            report: report.clone(),
+                        },
+                    );
+                }
+            }
+            let science = SnapshotScience(Mutex::new(state));
+            let model = native_decision_model(
+                spec.model_profile_id,
+                (0..3)
+                    .map(|index| {
+                        vec![native_call(
+                            &format!("complete-{index}"),
+                            "agent.complete",
+                            completion_arguments(evidence),
+                        )]
+                    })
+                    .collect(),
+            );
+            let result = AgentCoreV4 {
+                model: &model,
+                tools: &NativeDecisionTools,
+                events: &store,
+                science: Some(&science),
+            }
+            .execute_with_limits(
+                &spec,
+                AgentLimitsV4 {
+                    max_turns: 3,
+                    ..Default::default()
+                },
+                &store.cancelled,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(AgentCoreErrorV4::Cancelled)),
+                "{result:?}"
+            );
+            assert_eq!(
+                model.requests.lock().unwrap().len(),
+                if cancelled_before_resume { 0 } else { 3 }
+            );
+            let events = store.inner.load_direct(spec.run_id).unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event.event, AgentEventKindV4::RunCancelled))
+                    .count(),
+                1
+            );
+            assert!(!events.iter().any(|event| matches!(
+                event.event,
+                AgentEventKindV4::RunNeedsAttention { .. } | AgentEventKindV4::RunCompleted
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn deterministic_correction_budget_allows_corrected_evidence_to_complete() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        let evidence = seed_success_evidence(&store, &spec);
+        let model = native_decision_model(
+            spec.model_profile_id,
+            vec![
+                vec![native_call(
+                    "bad-completion",
+                    "agent.complete",
+                    completion_arguments(u64::MAX),
+                )],
+                vec![native_call(
+                    "fixed-completion",
+                    "agent.complete",
+                    completion_arguments(evidence),
+                )],
+            ],
+        );
+        *model.reviews.lock().unwrap() = vec![review(VerificationSeverityV4::Ok)];
+        AgentCoreV4 {
+            model: &model,
+            tools: &NativeDecisionTools,
+            events: &store,
+            science: None,
+        }
+        .execute(&spec, 2)
+        .await
+        .unwrap();
+        assert_eq!(model.requests.lock().unwrap().len(), 2);
+        let events = store.load_direct(spec.run_id).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(&event.event,
+                    AgentEventKindV4::DeterministicVerificationFinished { report } if !report.passed
+                ))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            events.last().unwrap().event,
+            AgentEventKindV4::RunCompleted
+        ));
     }
 
     #[tokio::test]

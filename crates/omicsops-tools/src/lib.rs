@@ -119,6 +119,15 @@ impl ToolRegistryV4 {
         mode: RunModeV4,
         call: &ToolCallV4,
     ) -> Result<&ToolDescriptorV4, ToolRegistryErrorV4> {
+        self.authorize_call(mode, call, false)
+    }
+
+    fn authorize_call(
+        &self,
+        mode: RunModeV4,
+        call: &ToolCallV4,
+        recovering_dispatched: bool,
+    ) -> Result<&ToolDescriptorV4, ToolRegistryErrorV4> {
         if self.disabled_tools.contains(&call.tool_id) {
             return Err(ToolRegistryErrorV4::CapabilityDenied(call.tool_id.clone()));
         }
@@ -155,8 +164,44 @@ impl ToolRegistryV4 {
         {
             return Err(ToolRegistryErrorV4::CapabilityDenied(call.tool_id.clone()));
         }
-        validate_required(&definition.input_schema, &call.arguments)
-            .map_err(|error| ToolRegistryErrorV4::InvalidArguments(call.tool_id.clone(), error))?;
+        const ANALYSIS_SEED_ERROR: &str = "analysis.random_seed must be an unsigned integer actually used by the analysis; for environment inspection, omit analysis and cite the tool result directly";
+        let schema = if recovering_dispatched && call.tool_id == "runtime.execute" {
+            // Old dispatched calls may lack a seed. Reading their exact durable
+            // result must remain possible without authorizing a new execution.
+            let mut schema = definition.input_schema.clone();
+            if let Some(required) = schema
+                .pointer_mut("/properties/analysis/required")
+                .and_then(Value::as_array_mut)
+            {
+                required.retain(|field| field.as_str() != Some("random_seed"));
+            }
+            std::borrow::Cow::Owned(schema)
+        } else {
+            std::borrow::Cow::Borrowed(&definition.input_schema)
+        };
+        validate_required(&schema, &call.arguments).map_err(|error| {
+            let message = if call.tool_id == "runtime.execute"
+                && error == "missing required field analysis.random_seed"
+            {
+                ANALYSIS_SEED_ERROR.into()
+            } else {
+                error
+            };
+            ToolRegistryErrorV4::InvalidArguments(call.tool_id.clone(), message)
+        })?;
+        if !recovering_dispatched
+            && call.tool_id == "runtime.execute"
+            && let Some(analysis) = call.arguments.get("analysis")
+            && analysis
+                .get("random_seed")
+                .and_then(Value::as_u64)
+                .is_none()
+        {
+            return Err(ToolRegistryErrorV4::InvalidArguments(
+                call.tool_id.clone(),
+                ANALYSIS_SEED_ERROR.into(),
+            ));
+        }
         validate_browser_call(call)
             .map_err(|error| ToolRegistryErrorV4::InvalidArguments(call.tool_id.clone(), error))?;
         Ok(definition)
@@ -201,9 +246,13 @@ impl ToolRegistryV4 {
 
 #[async_trait]
 impl ToolPortV4 for ToolRegistryV4 {
+    fn validate_recovery(&self, call: &ToolCallV4) -> Result<(), String> {
+        self.authorize_call(RunModeV4::Execute, call, true)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
     async fn recover_result(&self, call: &ToolCallV4) -> Result<Option<ToolOutcomeV4>, String> {
-        self.authorize(RunModeV4::Execute, call)
-            .map_err(|error| error.to_string())?;
+        self.validate_recovery(call)?;
         self.executor.recover_result(call).await
     }
     fn descriptors(&self, mode: RunModeV4) -> Vec<ToolDescriptorV4> {
@@ -631,7 +680,7 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
             "runtime.execute",
             "Execute code in a persistent kernel, or background=true for a detached one-shot SSH job. Successful captured files are re-read by the Host and returned in artifacts with relative_path, size_bytes and sha256. Reuse those facts for the captured content; re-verify after content changes or when required facts are missing. Background jobs survive disconnects and Agent Stop; they do not share kernel variables. Query runtime.remote_job_status after restart. Never resubmit to reconnect.",
             ToolEffectV4::Runtime,
-            json!({"type":"object","required":["language","code"],"properties":{"language":{"type":"string"},"environment":{"type":"string","default":"system"},"code":{"type":"string"},"background":{"type":"boolean","default":false},"capture_paths":{"type":"array","description":"Project-relative files to capture. Returned artifact facts include Host-verified size_bytes and sha256 for this captured content; capture does not guarantee the file stays unchanged."},"analysis":{"type":"object","required":["analysis_type","input_dataset_ids","sample_ids","method","parameters"],"properties":{"analysis_type":{"type":"string"},"input_dataset_ids":{"type":"array"},"sample_ids":{"type":"array"},"method":{"type":"string"},"parameters":{"type":"object"},"software_requirements":{"type":"array","items":{"type":"string"},"description":"Provide bare installed Python distribution or R package names, one per item (for example numpy, pandas, or Seurat). Omit version constraints, combined strings, standard-library modules, and the Python/R interpreter; the Host records the interpreter automatically. Use [] for standard-library-only code."},"database_versions":{"type":"object"},"random_seed":{"type":["integer","null"]}}}}}),
+            json!({"type":"object","required":["language","code"],"properties":{"language":{"type":"string"},"environment":{"type":"string","default":"system"},"code":{"type":"string"},"background":{"type":"boolean","default":false},"capture_paths":{"type":"array","description":"Project-relative files to capture. Returned artifact facts include Host-verified size_bytes and sha256 for this captured content; capture does not guarantee the file stays unchanged."},"analysis":{"type":"object","description":"Optional scientific analysis declaration, omitted for environment inspection. All declared analyses must satisfy provenance requirements.","required":["analysis_type","input_dataset_ids","sample_ids","method","parameters","random_seed"],"properties":{"analysis_type":{"type":"string"},"input_dataset_ids":{"type":"array"},"sample_ids":{"type":"array"},"method":{"type":"string"},"parameters":{"type":"object"},"software_requirements":{"type":"array","items":{"type":"string"},"description":"Provide bare installed Python distribution or R package names, one per item (for example numpy, pandas, or Seurat). Omit version constraints, combined strings, standard-library modules, and the Python/R interpreter; the Host records the interpreter automatically. Use [] for standard-library-only code."},"database_versions":{"type":"object"},"random_seed":{"type":"integer","minimum":0,"description":"Actual random seed used by the scientific computation. Required for analysis provenance; do not invent one for environment inspection, which should omit analysis."}}}}}),
         ),
         descriptor(
             "runtime.remote_job_status",
@@ -1425,6 +1474,124 @@ mod tests {
         ] {
             assert!(description.contains(phrase), "{phrase}");
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_analysis_rejects_missing_or_invalid_seed_before_dispatch() {
+        struct NoDispatch;
+        #[async_trait]
+        impl ToolExecutorV4 for NoDispatch {
+            async fn execute(&self, _call: &ToolCallV4) -> Result<ToolOutcomeV4, String> {
+                panic!("invalid analysis must not reach the runtime");
+            }
+        }
+        let registry =
+            ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(NoDispatch)).unwrap();
+        for seed in [
+            None,
+            Some(json!(null)),
+            Some(json!(-1)),
+            Some(json!(1.5)),
+            Some(json!("42")),
+        ] {
+            let mut analysis = json!({
+                "analysis_type":"environment_inventory",
+                "input_dataset_ids":[],"sample_ids":[],"method":"inspect","parameters":{}
+            });
+            if let Some(seed) = seed {
+                analysis["random_seed"] = seed;
+            }
+            let call = ToolCallV4 {
+                call_id: "invalid-analysis".into(),
+                tool_id: "runtime.execute".into(),
+                arguments: json!({"language":"python","code":"print('inspect')","analysis":analysis}),
+            };
+            let error = registry.validate(RunModeV4::Execute, &call).unwrap_err();
+            assert!(error.contains("analysis.random_seed"), "{error}");
+            assert!(error.contains("omit analysis"), "{error}");
+            assert!(registry.execute(RunModeV4::Execute, call).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_inspection_without_analysis_and_seeded_analysis_remain_executable() {
+        let registry = ToolRegistryV4::new(builtin_tool_definitions_v4(), Arc::new(Noop)).unwrap();
+        for analysis in [
+            None,
+            Some(json!({
+                "analysis_type":"simulation","input_dataset_ids":[],"sample_ids":[],
+                "method":"seeded","parameters":{},"random_seed":42
+            })),
+        ] {
+            let mut arguments = json!({"language":"python","code":"print('result')"});
+            if let Some(analysis) = analysis {
+                arguments["analysis"] = analysis;
+            }
+            let call = ToolCallV4 {
+                call_id: "valid-runtime".into(),
+                tool_id: "runtime.execute".into(),
+                arguments,
+            };
+            registry.validate(RunModeV4::Execute, &call).unwrap();
+            assert!(
+                registry
+                    .execute(RunModeV4::Execute, call)
+                    .await
+                    .unwrap()
+                    .succeeded
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn previously_dispatched_seedless_analysis_can_only_recover_its_result() {
+        struct RecoverOnly(AtomicUsize);
+        #[async_trait]
+        impl ToolExecutorV4 for RecoverOnly {
+            async fn execute(&self, _call: &ToolCallV4) -> Result<ToolOutcomeV4, String> {
+                panic!("legacy analysis must never be dispatched again");
+            }
+            async fn recover_result(
+                &self,
+                _call: &ToolCallV4,
+            ) -> Result<Option<ToolOutcomeV4>, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }
+        }
+        let executor = Arc::new(RecoverOnly(AtomicUsize::new(0)));
+        let registry =
+            ToolRegistryV4::new(builtin_tool_definitions_v4(), executor.clone()).unwrap();
+        let mut call = ToolCallV4 {
+            call_id: "legacy-dispatched".into(),
+            tool_id: "runtime.execute".into(),
+            arguments: json!({"language":"python","code":"print('old job')","analysis":{
+                "analysis_type":"inventory","input_dataset_ids":[],"sample_ids":[],"method":"inspect","parameters":{}
+            }}),
+        };
+        for seed in [None, Some(json!(null))] {
+            if let Some(seed) = seed {
+                call.arguments["analysis"]["random_seed"] = seed;
+            }
+            assert!(registry.validate(RunModeV4::Execute, &call).is_err());
+            assert!(
+                registry
+                    .execute(RunModeV4::Execute, call.clone())
+                    .await
+                    .is_err()
+            );
+            assert!(registry.recover_result(&call).await.unwrap().is_none());
+        }
+        assert_eq!(executor.0.load(Ordering::SeqCst), 2);
+        let denied = registry.with_execute_capabilities(BTreeSet::new());
+        assert!(
+            denied
+                .recover_result(&call)
+                .await
+                .unwrap_err()
+                .contains("not approved")
+        );
+        assert_eq!(executor.0.load(Ordering::SeqCst), 2);
     }
 
     #[test]
