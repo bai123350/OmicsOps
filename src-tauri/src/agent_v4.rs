@@ -5935,7 +5935,7 @@ impl ModelPortV4 for DesktopModelPortV4 {
         })?;
         let submit = ToolDescriptorV4 {
             id: "agent.submit_review".into(),
-            description: "Submit the independent read-only ReviewerReportV4. Every finding must cite evidence present in the frozen review context.".into(),
+            description: "Submit the independent read-only ReviewerReportV4 with all required fields: schema_version must be the integer 4, summary must be non-empty, and findings must be an array (empty when there are no findings). Every finding must cite evidence present in the frozen review context.".into(),
             input_schema: json!({
                 "type":"object",
                 "required":["schema_version","summary","findings"],
@@ -5959,7 +5959,7 @@ impl ModelPortV4 for DesktopModelPortV4 {
         let turn = self
             .stream(
                 ModelRequestV4 {
-                    system: "You are an independent read-only scientific Reviewer. You receive only the frozen objective, completion criteria, Host-verified Scientific State, completion proposal, and deterministic verification report. You cannot modify the run. Check sample completeness, numerical/report consistency, evidence support, provenance, seed, versions, and statistical fields. Call agent.submit_review exactly once; cite evidence for every finding.".into(),
+                    system: "You are an independent read-only scientific Reviewer. You receive only the frozen objective, completion criteria, Host-verified Scientific State, completion proposal, and deterministic verification report. You cannot modify the run. Check sample completeness, numerical/report consistency, evidence support, provenance, seed, versions, and statistical fields. Call agent.submit_review exactly once with a strict JSON object shaped as {\"schema_version\":4,\"summary\":\"Non-empty review summary\",\"findings\":[]}. Always include all three top-level fields; schema_version must be the integer 4. Use an empty findings array if no findings are warranted. Each finding must include severity (error, warn, or ok), non-empty code and message, and a non-empty evidence array citing only supplied evidence. Do not invent evidence or omit required fields.".into(),
                     context,
                     tools: vec![submit],
                     image_refs: vec![],
@@ -5979,11 +5979,19 @@ impl ModelPortV4 for DesktopModelPortV4 {
                     "reviewer did not call agent.submit_review",
                 )
             })?;
-        let report: ReviewerReportV4 = serde_json::from_value(arguments).map_err(|error| {
-            ModelFailureV4::permanent(ModelErrorClassV4::InvalidResponse, error.to_string())
+        let report: ReviewerReportV4 = serde_json::from_value(arguments).map_err(|_| {
+            // The core owns one shared report-regeneration allowance. Do not
+            // echo serde errors: invalid enum/type values may contain model text.
+            ModelFailureV4::permanent(
+                ModelErrorClassV4::InvalidResponse,
+                "reviewer_report_schema: report fields or types do not match ReviewerReportV4; include schema_version 4, summary, and findings",
+            )
         })?;
-        report.validate().map_err(|error| {
-            ModelFailureV4::permanent(ModelErrorClassV4::InvalidResponse, error.to_string())
+        report.validate().map_err(|_| {
+            ModelFailureV4::permanent(
+                ModelErrorClassV4::InvalidResponse,
+                "reviewer_report_schema: report requires schema_version 4, a non-empty summary, and valid findings with evidence",
+            )
         })?;
         Ok(report)
     }
@@ -9999,6 +10007,8 @@ fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
 
 #[cfg(test)]
 mod go_live_acceptance_tests;
+#[cfg(test)]
+mod reviewer_schema_tests;
 #[cfg(test)]
 mod scientific_failure_contract_tests;
 #[cfg(test)]

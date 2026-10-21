@@ -210,8 +210,9 @@ It freezes the reviewer model through the production composition, enables
 `auto_review`, and requires `ReviewerFinished` before `RunCompleted`. The old
 read-only nonce variant still disables automatic review. Neither variant
 requires the live provider to produce malformed JSON; deterministic tests cover
-the single reviewer regeneration after malformed arguments, including failure
-limits and preservation of the frozen evidence. A live pass validates the
+the single shared reviewer regeneration after malformed arguments, truncation,
+or missing/invalid report fields, including failure limits and preservation of
+the frozen evidence. A live pass validates the
 selected model's read-tool-to-review-to-completion path only, not the original
 literature task, SSH, or scientific provenance end to end. Actual results for the
 2026-10-06 fix are recorded in

@@ -3495,15 +3495,19 @@ impl AgentCoreV4<'_> {
                     if !error.retryable
                         && error.class == omicsops_protocol::ModelErrorClassV4::InvalidResponse
                         && (error.message.contains("returned malformed JSON arguments:")
-                            || error.message.contains("truncated_output:"))
+                            || error.message.contains("truncated_output:")
+                            || error.message.starts_with("reviewer_report_schema:"))
                         && !output_regenerated =>
                 {
                     // Regenerate only the read-only report from the same frozen
                     // evidence. This does not consume a transport retry or replay
-                    // any executor call. Malformed and truncated reports share
-                    // one regeneration; a second invalid report still fails.
+                    // any executor call. Malformed, truncated and schema-invalid
+                    // reports share one regeneration; a second invalid report
+                    // still fails without weakening review validation.
                     output_regenerated = true;
-                    let reason = if error.message.contains("truncated_output:") {
+                    let reason = if error.message.starts_with("reviewer_report_schema:") {
+                        "report did not match the required review schema"
+                    } else if error.message.contains("truncated_output:") {
                         "output limit reached"
                     } else {
                         "malformed JSON arguments"
@@ -17655,6 +17659,17 @@ mod tests {
         )
     }
 
+    fn invalid_reviewer_report_schema() -> ModelFailureV4 {
+        let error = serde_json::from_value::<ReviewerReportV4>(json!({
+            "summary":"review omitted its version", "findings":[]
+        }))
+        .unwrap_err();
+        ModelFailureV4::permanent(
+            omicsops_protocol::ModelErrorClassV4::InvalidResponse,
+            format!("reviewer_report_schema: {error}"),
+        )
+    }
+
     fn frozen_reviewer_request(spec: &RunSpecV4) -> ReviewerRequestV4 {
         ReviewerRequestV4 {
             frozen_objective: spec.plan.objective.clone(),
@@ -17687,6 +17702,12 @@ mod tests {
     #[tokio::test]
     async fn reviewer_truncated_output_regenerates_from_identical_frozen_evidence() {
         assert_reviewer_regenerates_from_identical_frozen_evidence(truncated_reviewer_output())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn reviewer_report_schema_regenerates_from_identical_frozen_evidence() {
+        assert_reviewer_regenerates_from_identical_frozen_evidence(invalid_reviewer_report_schema())
             .await;
     }
 
@@ -17748,11 +17769,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reviewer_truncated_output_shares_one_regeneration_with_malformed_arguments() {
+    async fn reviewer_format_failures_share_one_regeneration() {
         for (first, second) in [
             (truncated_reviewer_output(), truncated_reviewer_output()),
             (truncated_reviewer_output(), malformed_reviewer_arguments()),
             (malformed_reviewer_arguments(), truncated_reviewer_output()),
+            (
+                invalid_reviewer_report_schema(),
+                invalid_reviewer_report_schema(),
+            ),
+            (
+                invalid_reviewer_report_schema(),
+                malformed_reviewer_arguments(),
+            ),
+            (
+                malformed_reviewer_arguments(),
+                invalid_reviewer_report_schema(),
+            ),
+            (
+                invalid_reviewer_report_schema(),
+                truncated_reviewer_output(),
+            ),
+            (
+                truncated_reviewer_output(),
+                invalid_reviewer_report_schema(),
+            ),
         ] {
             let spec = execution_spec(Uuid::new_v4());
             let store = MemoryStore::default();
@@ -17808,6 +17849,7 @@ mod tests {
     async fn reviewer_malformed_arguments_retry_once_without_expanding_other_failures() {
         for (failure, expected_requests) in [
             (malformed_reviewer_arguments(), 2),
+            (invalid_reviewer_report_schema(), 2),
             (
                 ModelFailureV4::permanent(
                     omicsops_protocol::ModelErrorClassV4::Authentication,
@@ -17826,6 +17868,13 @@ mod tests {
                 ModelFailureV4::permanent(
                     omicsops_protocol::ModelErrorClassV4::InvalidResponse,
                     "unknown_provider_tool: response used an unavailable tool",
+                ),
+                1,
+            ),
+            (
+                ModelFailureV4::permanent(
+                    omicsops_protocol::ModelErrorClassV4::InvalidResponse,
+                    "provider failure mentioning reviewer_report_schema: is not a report failure",
                 ),
                 1,
             ),
@@ -17879,6 +17928,14 @@ mod tests {
     async fn reviewer_truncated_output_regeneration_preserves_transport_retry_allowance() {
         assert_reviewer_regeneration_preserves_transport_retry_allowance(
             truncated_reviewer_output(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reviewer_report_schema_regeneration_preserves_transport_retry_allowance() {
+        assert_reviewer_regeneration_preserves_transport_retry_allowance(
+            invalid_reviewer_report_schema(),
         )
         .await;
     }
@@ -17941,6 +17998,12 @@ mod tests {
             .await;
     }
 
+    #[tokio::test]
+    async fn reviewer_report_schema_cancellation_prevents_regeneration_request() {
+        assert_reviewer_cancellation_prevents_regeneration_request(invalid_reviewer_report_schema())
+            .await;
+    }
+
     async fn assert_reviewer_cancellation_prevents_regeneration_request(failure: ModelFailureV4) {
         let spec = execution_spec(Uuid::new_v4());
         let store = MemoryStore::default();
@@ -17988,6 +18051,126 @@ mod tests {
     async fn reviewer_truncated_output_resumes_checkpoint_without_executor_dispatch() {
         assert_reviewer_resumes_checkpoint_without_executor_dispatch(truncated_reviewer_output())
             .await;
+    }
+
+    #[tokio::test]
+    async fn reviewer_report_schema_resumes_checkpoint_without_executor_dispatch() {
+        assert_reviewer_resumes_checkpoint_without_executor_dispatch(
+            invalid_reviewer_report_schema(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reviewer_report_schema_after_fresh_execution_recovers_without_repeating_tools() {
+        struct CompletingModel<'a> {
+            store: &'a MemoryStore,
+            run_id: Uuid,
+            reviewer: ScriptedReviewer,
+        }
+        #[async_trait]
+        impl ModelPortV4 for CompletingModel<'_> {
+            async fn stream(
+                &self,
+                _: ModelRequestV4,
+                _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+            ) -> Result<ModelTurnV4, ModelFailureV4> {
+                let events = self.store.load_direct(self.run_id).unwrap();
+                let observed = events.iter().find_map(|event| match &event.event {
+                    AgentEventKindV4::ToolFinished { outcome }
+                        if outcome.call_id == "one-list" && outcome.succeeded =>
+                    {
+                        Some(event.sequence)
+                    }
+                    _ => None,
+                });
+                let call = match observed {
+                    None => ToolCallV4 {
+                        call_id: "one-list".into(),
+                        tool_id: "project.list".into(),
+                        arguments: json!({"path":"."}),
+                    },
+                    Some(sequence) => ToolCallV4 {
+                        call_id: "one-completion".into(),
+                        tool_id: "agent.complete".into(),
+                        arguments: completion_arguments(sequence),
+                    },
+                };
+                Ok(ModelTurnV4 {
+                    public_text: String::new(),
+                    tool_calls: vec![call],
+                    provider_continuation: None,
+                })
+            }
+
+            async fn review(
+                &self,
+                request: ReviewerRequestV4,
+            ) -> Result<ReviewerReportV4, ModelFailureV4> {
+                self.reviewer.review(request).await
+            }
+        }
+
+        let spec = ordinary_execution_spec(Uuid::new_v4());
+        assert!(auto_review_enabled(&spec));
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let expected_review = review(VerificationSeverityV4::Warn);
+        let model = CompletingModel {
+            store: &store,
+            run_id: spec.run_id,
+            reviewer: ScriptedReviewer {
+                outcomes: Mutex::new(vec![
+                    Err(invalid_reviewer_report_schema()),
+                    Ok(expected_review.clone()),
+                ]),
+                requests: Mutex::new(vec![]),
+                cancel_after_review: None,
+            },
+        };
+        let tools = OptionalCapabilityTools {
+            execute_calls: AtomicUsize::new(0),
+        };
+        let mut limits = AgentLimitsV4::ordinary(2);
+        limits.max_model_retries = 0;
+        AgentCoreV4 {
+            model: &model,
+            tools: &tools,
+            events: &store,
+            science: None,
+        }
+        .execute_with_limits(&spec, limits, &AtomicBool::new(false))
+        .await
+        .unwrap();
+        assert_eq!(tools.execute_calls.load(AtomicOrdering::SeqCst), 1);
+        let reviews = model.reviewer.requests.lock().unwrap();
+        assert_eq!(reviews.len(), 2);
+        assert_eq!(reviews[0], reviews[1]);
+        assert_eq!(reviews[0].verified_evidence.len(), 1);
+        let events = store.load_direct(spec.run_id).unwrap();
+        assert!(matches!(
+            events.last().unwrap().event,
+            AgentEventKindV4::RunCompleted
+        ));
+        assert_eq!(events.iter().filter(|event| matches!(&event.event, AgentEventKindV4::ToolDispatchStarted { call_id, .. } if call_id == "one-list")).count(), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.event,
+                    AgentEventKindV4::CompletionProposalSubmitted { .. }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, AgentEventKindV4::ModelRetrying { .. }))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(&event.event, AgentEventKindV4::ReviewerFinished { report } if report == &expected_review)));
     }
 
     async fn assert_reviewer_resumes_checkpoint_without_executor_dispatch(failure: ModelFailureV4) {
