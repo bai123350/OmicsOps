@@ -907,6 +907,12 @@ pub async fn agent_v4_start_direct(
         &conversation,
         capabilities,
         DirectRunSnapshotV4 {
+            stopped_run_ids: stopped_run_ids_for_new_request(
+                &state.repository,
+                request.project_id,
+                request.conversation_id,
+            )
+            .await?,
             model_configuration_hash: main_profile.execution_configuration_hash(),
             conversation_preferences,
             service_tier,
@@ -1203,9 +1209,44 @@ fn objective_with_references(objective: &str, references: &str) -> String {
     }
 }
 
+const STOPPED_RUN_CONTEXT_LIMIT: u32 = 8;
+
+async fn stopped_run_ids_for_new_request(
+    repository: &Store,
+    project_id: Uuid,
+    conversation_id: Uuid,
+) -> Result<Vec<Uuid>, String> {
+    repository
+        .stopped_unresolved_run_ids_for_context(
+            project_id,
+            conversation_id,
+            STOPPED_RUN_CONTEXT_LIMIT,
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Host facts only: never copy a prior tool's arguments, code or output into a
+/// new run, and never interpret a local Stop as cancellation of remote work.
+fn with_stopped_run_boundary(context: String, stopped_run_ids: &[Uuid]) -> String {
+    if stopped_run_ids.is_empty() {
+        return context;
+    }
+    let ids = stopped_run_ids
+        .iter()
+        .take(STOPPED_RUN_CONTEXT_LIMIT as usize)
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "HOST STOP BOUNDARY (trusted host facts)\nThe host observed a local Stop for earlier runs whose side-effect results remain unresolved. Up to {STOPPED_RUN_CONTEXT_LIMIT} recent run IDs are shown; this is not an exhaustive list: {ids}. A local Stop does not prove that remote computation was cancelled, completed, or rolled back. The current user request is a new, independent task under its own frozen execution context and approval policy. Do not automatically resume, replay, or retry earlier operations. If the new task depends on their effects, first use bounded read-only observations; report uncertainty if those observations cannot establish the state. Earlier generated code or claims are not evidence of execution.\n\n{context}"
+    )
+}
+
 /// Host-resolved values shared by immediate and durable queued starts. Preparing
 /// a run must not allocate IDs, reload settings, write messages or invoke a model.
 struct DirectRunSnapshotV4 {
+    stopped_run_ids: Vec<Uuid>,
     model_configuration_hash: String,
     conversation_preferences: omicsops_protocol::ConversationAgentPreferencesV4,
     service_tier: omicsops_protocol::RunServiceTierV4,
@@ -1224,6 +1265,7 @@ fn prepare_direct_run_v4(
     frozen_at: chrono::DateTime<Utc>,
 ) -> Result<(RunRecordV4, RunSpecV4), String> {
     let DirectRunSnapshotV4 {
+        stopped_run_ids,
         model_configuration_hash,
         conversation_preferences,
         service_tier,
@@ -1233,7 +1275,8 @@ fn prepare_direct_run_v4(
         input_images,
     } = snapshot;
     let objective = objective_with_references(request.objective.trim(), &reference_context);
-    let plan = direct_execution_plan(&objective, &conversation, capabilities);
+    let mut plan = direct_execution_plan(&objective, &conversation, capabilities);
+    plan.objective = with_stopped_run_boundary(plan.objective, &stopped_run_ids);
     let approval_hash = RunSpecV4::approval_hash_for(
         run_id,
         request.project_id,
@@ -1451,6 +1494,12 @@ async fn prepare_queued_agent(
         &conversation,
         queue_execute_capabilities(&item.frozen.conversation_preferences),
         DirectRunSnapshotV4 {
+            stopped_run_ids: stopped_run_ids_for_new_request(
+                &state.repository,
+                item.project_id,
+                item.conversation_id,
+            )
+            .await?,
             model_configuration_hash: item.frozen.model_configuration_hash.clone(),
             conversation_preferences: item.frozen.conversation_preferences,
             service_tier: item.frozen.service_tier,
@@ -3506,6 +3555,7 @@ pub async fn conversation_state_response(
         conversation_id: snapshot.conversation_id,
         mode: snapshot.mode,
         locked: snapshot.locked,
+        composer_blocking_run_ids: snapshot.composer_blocking_run_ids,
         latest_plan_revision: snapshot.latest_plan_revision,
         latest_run,
     })
@@ -5374,7 +5424,14 @@ async fn compose(
         RuntimeBoundarySourceV4::FrozenRun { run_id },
         selection,
     )?;
-    let boundary_summary = crate::runtime_boundary_v4::format_runtime_boundary(&boundary);
+    // Shared by Plan, ordinary Agent and approved execution, including lazy
+    // resource initialization. The generated plan need not repeat these facts.
+    let stopped_run_ids =
+        stopped_run_ids_for_new_request(&state.repository, project.id, conversation_id).await?;
+    let boundary_summary = with_stopped_run_boundary(
+        crate::runtime_boundary_v4::format_runtime_boundary(&boundary),
+        &stopped_run_ids,
+    );
     let resources = Arc::new(ExecutionResourcesSlotV4 {
         factory: Arc::new(DesktopResourceFactoryV4 {
             repository: state.repository.clone(),
@@ -9945,6 +10002,8 @@ mod go_live_acceptance_tests;
 #[cfg(test)]
 mod scientific_failure_contract_tests;
 #[cfg(test)]
+mod stopped_turn_tests;
+#[cfg(test)]
 mod subscription_contract_tests;
 #[cfg(test)]
 mod subscription_live_acceptance_tests;
@@ -10270,6 +10329,13 @@ mod tests {
             Utc::now(),
         );
         repository.save_project(&project).await.unwrap();
+        let conversation = omicsops_core::workspace::Conversation::new(
+            Uuid::new_v4(),
+            project.id,
+            "catalog",
+            Utc::now(),
+        );
+        repository.save_conversation(&conversation).await.unwrap();
         let profile: omicsops_core::workspace::ModelProfile = serde_json::from_value(json!({
             "id":Uuid::new_v4(),"label":"test","provider":"ollama","base_url":"http://127.0.0.1:1",
             "model":"not-contacted","supports_tools":true,"supports_vision":false
@@ -10313,7 +10379,7 @@ mod tests {
                 &selection,
                 profile.id,
                 Uuid::new_v4(),
-                Uuid::new_v4(),
+                conversation.id,
                 None,
                 None,
                 None,
@@ -10926,6 +10992,13 @@ mod tests {
             "model":"not-contacted","credential_reference":null,"supports_tools":true,"supports_vision":false
         })).unwrap();
         repository.save_model_profile(&model_profile).await.unwrap();
+        let conversation = omicsops_core::workspace::Conversation::new(
+            Uuid::new_v4(),
+            project.id,
+            "lazy",
+            Utc::now(),
+        );
+        repository.save_conversation(&conversation).await.unwrap();
         let state = AppState {
             repository: repository.clone(),
             credentials: SystemCredentialVault,
@@ -10957,7 +11030,7 @@ mod tests {
             &selection,
             model_profile.id,
             Uuid::new_v4(),
-            Uuid::new_v4(),
+            conversation.id,
             None,
             None,
             None,
@@ -12432,6 +12505,7 @@ mod tests {
                 "[]",
                 BTreeSet::from(["project.read".into()]),
                 DirectRunSnapshotV4 {
+                    stopped_run_ids: vec![],
                     model_configuration_hash: "a".repeat(64),
                     conversation_preferences:
                         omicsops_protocol::ConversationAgentPreferencesV4::default(),
@@ -12503,6 +12577,7 @@ mod tests {
             "[]",
             BTreeSet::from(["project.read".into()]),
             DirectRunSnapshotV4 {
+                stopped_run_ids: vec![],
                 model_configuration_hash: "a".repeat(64),
                 conversation_preferences:
                     omicsops_protocol::ConversationAgentPreferencesV4::default(),
@@ -15115,6 +15190,7 @@ mod tests {
             "[]",
             BTreeSet::from(["project.read".into()]),
             DirectRunSnapshotV4 {
+                stopped_run_ids: vec![],
                 model_configuration_hash: "a".repeat(64),
                 conversation_preferences: Default::default(),
                 service_tier: omicsops_protocol::RunServiceTierV4 { fast_mode: None },
@@ -15755,6 +15831,7 @@ pub(crate) mod manual_compaction_host_tests {
                 BTreeSet::from(["project.read".into()])
             },
             DirectRunSnapshotV4 {
+                stopped_run_ids: vec![],
                 model_configuration_hash: profile.execution_configuration_hash(),
                 conversation_preferences: omicsops_protocol::ConversationAgentPreferencesV4 {
                     memory_enabled: false,

@@ -26,6 +26,62 @@ fn invalid(message: &str) -> StoreError {
 }
 
 impl Store {
+    /// Permission to schedule a new run, not to resolve or resume the old run.
+    pub async fn can_advance_after_attention_run(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let status: Option<String> = sqlx::query_scalar("SELECT status FROM agent_runs_v4 WHERE run_id=?1 AND project_id=?2 AND conversation_id=?3")
+            .bind(run_id.to_string()).bind(project_id.to_string()).bind(conversation_id.to_string())
+            .fetch_optional(&mut *tx).await?;
+        if status.as_deref() != Some("needs_attention") {
+            return Ok(false);
+        }
+        let allowed =
+            can_advance_after_attention_in_tx(&mut tx, project_id, conversation_id, run_id).await?;
+        tx.commit().await?;
+        Ok(allowed)
+    }
+
+    /// Bounded host context only. No tool code, output or execution authority
+    /// is copied into a new run; the requested limit is capped at sixteen.
+    pub async fn stopped_unresolved_run_ids_for_context(
+        &self,
+        project_id: Uuid,
+        conversation_id: Uuid,
+        limit: u32,
+    ) -> Result<Vec<Uuid>, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        crate::ensure_conversation_owner_executor(&mut tx, project_id, conversation_id).await?;
+        let rows: Vec<String> = sqlx::query_scalar("SELECT r.run_id FROM agent_runs_v4 r JOIN agent_run_stop_requests_v4 s ON s.run_id=r.run_id AND s.project_id=r.project_id AND s.conversation_id=r.conversation_id WHERE r.project_id=?1 AND r.conversation_id=?2 AND r.status='needs_attention' AND s.status='observed' ORDER BY r.rowid DESC")
+            .bind(project_id.to_string()).bind(conversation_id.to_string())
+            .fetch_all(&mut *tx).await?;
+        let mut result = Vec::new();
+        for value in rows {
+            if result.len() >= limit.min(16) as usize {
+                break;
+            }
+            let run_id = crate::parse_uuid(value, "stopped run id")?;
+            let Some(events) =
+                validated_attention_events_in_tx(&mut tx, project_id, conversation_id, run_id)
+                    .await?
+            else {
+                continue;
+            };
+            if crate::has_unresolved_side_effect_dispatch(&events)
+                && has_observed_attention_stop_in_tx(&mut tx, project_id, conversation_id, run_id)
+                    .await?
+            {
+                result.push(run_id);
+            }
+        }
+        tx.commit().await?;
+        Ok(result)
+    }
+
     pub async fn safe_needs_attention_run(
         &self,
         project_id: Uuid,
@@ -345,8 +401,9 @@ impl Store {
                     && event.project_id == project_id
                     && event.conversation_id == conversation_id
             });
-            let safe_attention =
-                safe_needs_attention_in_tx(&mut tx, project_id, conversation_id, run_id).await?;
+            let can_advance_attention =
+                can_advance_after_attention_in_tx(&mut tx, project_id, conversation_id, run_id)
+                    .await?;
             let next = if let (Some(run), Some((message_project, message_conversation))) =
                 (&run, &message)
             {
@@ -361,7 +418,21 @@ impl Store {
                     "uncertain"
                 } else {
                     terminal_queue_status(&events)
-                        .or_else(|| safe_attention.then_some("failed"))
+                        .or_else(|| {
+                            events
+                                .iter()
+                                .any(|event| {
+                                    matches!(
+                                        event.event,
+                                        AgentEventKindV4::RunNeedsAttention { .. }
+                                    )
+                                })
+                                .then_some(if can_advance_attention {
+                                    "failed"
+                                } else {
+                                    "uncertain"
+                                })
+                        })
                         .unwrap_or("running")
                 }
             } else if run.is_none()
@@ -585,7 +656,7 @@ fn terminal_queue_status(events: &[AgentEventV4]) -> Option<&'static str> {
     })
 }
 
-fn safe_needs_attention_events(
+fn valid_needs_attention_events(
     events: &[AgentEventV4],
     project_id: Uuid,
     conversation_id: Uuid,
@@ -610,7 +681,6 @@ fn safe_needs_attention_events(
                     | AgentEventKindV4::RunCancelled
             )
         })
-        && !crate::has_unresolved_side_effect_dispatch(events)
 }
 
 /// Validate the persisted JSON chain and the indexed columns before allowing a
@@ -621,19 +691,32 @@ pub(super) async fn safe_needs_attention_in_tx(
     conversation_id: Uuid,
     run_id: Uuid,
 ) -> Result<bool, StoreError> {
+    Ok(
+        validated_attention_events_in_tx(tx, project_id, conversation_id, run_id)
+            .await?
+            .is_some_and(|events| !crate::has_unresolved_side_effect_dispatch(&events)),
+    )
+}
+
+async fn validated_attention_events_in_tx(
+    tx: &mut SqliteConnection,
+    project_id: Uuid,
+    conversation_id: Uuid,
+    run_id: Uuid,
+) -> Result<Option<Vec<AgentEventV4>>, StoreError> {
     let rows = sqlx::query("SELECT project_id,conversation_id,sequence,previous_hash,event_hash,value_json FROM agent_events_v4 WHERE run_id=?1 ORDER BY sequence")
         .bind(run_id.to_string()).fetch_all(&mut *tx).await?;
     if rows.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     let events = match crate::load_agent_events_in_tx(tx, run_id).await {
         Ok(events) => events,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(None),
     };
     if events.len() != rows.len()
-        || !safe_needs_attention_events(&events, project_id, conversation_id, run_id)
+        || !valid_needs_attention_events(&events, project_id, conversation_id, run_id)
     {
-        return Ok(false);
+        return Ok(None);
     }
     for (row, event) in rows.iter().zip(&events) {
         if row.try_get::<String, _>(0)? != project_id.to_string()
@@ -642,10 +725,60 @@ pub(super) async fn safe_needs_attention_in_tx(
             || row.try_get::<String, _>(3)? != event.previous_hash
             || row.try_get::<String, _>(4)? != event.event_hash
         {
-            return Ok(false);
+            return Ok(None);
         }
     }
-    Ok(true)
+    Ok(Some(events))
+}
+
+pub(super) async fn can_advance_after_attention_in_tx(
+    tx: &mut SqliteConnection,
+    project_id: Uuid,
+    conversation_id: Uuid,
+    run_id: Uuid,
+) -> Result<bool, StoreError> {
+    let Some(events) =
+        validated_attention_events_in_tx(tx, project_id, conversation_id, run_id).await?
+    else {
+        return Ok(false);
+    };
+    if !crate::has_unresolved_side_effect_dispatch(&events) {
+        return Ok(true);
+    }
+    has_observed_attention_stop_in_tx(tx, project_id, conversation_id, run_id).await
+}
+
+async fn has_observed_attention_stop_in_tx(
+    tx: &mut SqliteConnection,
+    project_id: Uuid,
+    conversation_id: Uuid,
+    run_id: Uuid,
+) -> Result<bool, StoreError> {
+    // An observed local Stop releases scheduling ownership, not external-effect
+    // uncertainty. Match all three scope fields, never just the receipt status.
+    let request_id: Option<String> = sqlx::query_scalar("SELECT s.request_id FROM agent_runs_v4 r JOIN agent_run_stop_requests_v4 s ON s.run_id=r.run_id AND s.project_id=r.project_id AND s.conversation_id=r.conversation_id WHERE r.run_id=?1 AND r.project_id=?2 AND r.conversation_id=?3 AND r.status='needs_attention' AND s.status='observed'")
+        .bind(run_id.to_string()).bind(project_id.to_string()).bind(conversation_id.to_string())
+        .fetch_optional(&mut *tx).await?;
+    Ok(request_id
+        .and_then(|id| Uuid::parse_str(&id).ok())
+        .is_some_and(|id| !id.is_nil()))
+}
+
+pub(super) async fn composer_blocking_attention_run_ids_in_tx(
+    tx: &mut SqliteConnection,
+    project_id: Uuid,
+    conversation_id: Uuid,
+) -> Result<Vec<Uuid>, StoreError> {
+    let rows: Vec<String> = sqlx::query_scalar("SELECT run_id FROM agent_runs_v4 WHERE project_id=?1 AND conversation_id=?2 AND status='needs_attention' ORDER BY rowid")
+        .bind(project_id.to_string()).bind(conversation_id.to_string()).fetch_all(&mut *tx).await?;
+    let mut blocked = Vec::new();
+    for value in rows {
+        let run_id = crate::parse_uuid(value, "attention run id")?;
+        if !can_advance_after_attention_in_tx(tx, project_id, conversation_id, run_id).await? {
+            blocked.push(run_id);
+        }
+    }
+    Ok(blocked)
 }
 
 pub(super) async fn has_blocking_run_in_tx(
@@ -670,7 +803,7 @@ pub(super) async fn has_blocking_run_except_in_tx(
             return Ok(true);
         }
         let run_id = crate::parse_uuid(row.try_get::<String, _>(0)?, "run id")?;
-        if !safe_needs_attention_in_tx(tx, project_id, conversation_id, run_id).await? {
+        if !can_advance_after_attention_in_tx(tx, project_id, conversation_id, run_id).await? {
             return Ok(true);
         }
     }
@@ -681,25 +814,30 @@ pub(super) async fn observe_terminal_event_in_tx(
     tx: &mut SqliteConnection,
     event: &AgentEventV4,
 ) -> Result<(), StoreError> {
-    let status = terminal_queue_status(std::slice::from_ref(event)).or_else(|| {
-        matches!(event.event, AgentEventKindV4::RunNeedsAttention { .. }).then_some("failed")
-    });
-    let Some(status) = status else {
-        return Ok(());
+    let status = if matches!(event.event, AgentEventKindV4::RunNeedsAttention { .. }) {
+        if can_advance_after_attention_in_tx(
+            tx,
+            event.project_id,
+            event.conversation_id,
+            event.run_id,
+        )
+        .await?
+        {
+            "failed"
+        } else {
+            // No verified effect result or observed Stop has released this
+            // scheduling barrier. The local run is no longer running.
+            "uncertain"
+        }
+    } else {
+        let Some(status) = terminal_queue_status(std::slice::from_ref(event)) else {
+            return Ok(());
+        };
+        status
     };
-    if matches!(event.event, AgentEventKindV4::RunNeedsAttention { .. })
-        && !safe_needs_attention_in_tx(tx, event.project_id, event.conversation_id, event.run_id)
-            .await?
-    {
-        return Ok(());
-    }
-    let failure_code = match status {
-        "failed" => Some(crate::enum_string(&ComposerQueueFailureCodeV4::RunFailed)?),
-        "cancelled" => Some(crate::enum_string(
-            &ComposerQueueFailureCodeV4::CancelledByUser,
-        )?),
-        _ => None,
-    };
+    let failure_code = queue_failure_code_for_status(status)
+        .map(|code| crate::enum_string(&code))
+        .transpose()?;
     sqlx::query(
         "UPDATE composer_queue_v4
          SET status=?1,

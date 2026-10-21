@@ -532,6 +532,7 @@ async fn run_live_go_agent_acceptance(case: LiveGoCase) -> Result<(), String> {
         "[]",
         capabilities,
         DirectRunSnapshotV4 {
+            stopped_run_ids: vec![],
             model_configuration_hash: profile.execution_configuration_hash(),
             conversation_preferences: preferences,
             service_tier,

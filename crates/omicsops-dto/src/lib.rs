@@ -433,6 +433,10 @@ pub struct ConversationAgentStateV4 {
     pub conversation_id: Uuid,
     pub mode: SessionAgentModeV4,
     pub locked: bool,
+    /// Historical attention runs that still block a new conversation turn.
+    /// This does not assert that remote side effects have been cancelled.
+    #[serde(default)]
+    pub composer_blocking_run_ids: Vec<Uuid>,
     #[serde(default)]
     pub latest_plan_revision: Option<ProposedPlanRevisionV4>,
     #[serde(default)]
@@ -499,6 +503,7 @@ mod tests {
             conversation_id,
             mode: SessionAgentModeV4::Plan,
             locked: true,
+            composer_blocking_run_ids: Vec::new(),
             latest_plan_revision: None,
             latest_run: None,
         };
@@ -509,6 +514,7 @@ mod tests {
                 "conversation_id": conversation_id,
                 "mode": "plan",
                 "locked": true,
+                "composer_blocking_run_ids": [],
                 "latest_plan_revision": null,
                 "latest_run": null
             })
@@ -523,6 +529,7 @@ mod tests {
         .unwrap();
         assert_eq!(legacy.latest_plan_revision, None);
         assert_eq!(legacy.latest_run, None);
+        assert!(legacy.composer_blocking_run_ids.is_empty());
     }
 
     #[test]

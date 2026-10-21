@@ -3,7 +3,7 @@ import * as api from "../../composer-queue-api";
 import type { ComposerQueueActionRequestV4, ComposerQueueItemV4, EnqueueComposerTurnRequestV4, UpdateComposerQueueRequestV4 } from "../../types";
 
 type QueueInput = Omit<EnqueueComposerTurnRequestV4, "request_id" | "message_id" | "run_id">;
-export function useComposerQueue(projectId: string | null | undefined, conversationId: string | null | undefined, enabled: boolean, onRunActivity?: () => Promise<void>) {
+export function useComposerQueue(projectId: string | null | undefined, conversationId: string | null | undefined, enabled: boolean, onRunActivity?: () => Promise<void | boolean>) {
   const [items, setItems] = useState<ComposerQueueItemV4[]>([]);
   const [error, setError] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -25,8 +25,10 @@ export function useComposerQueue(projectId: string | null | undefined, conversat
     const signature = scoped.filter((item) => item.status !== "pending" && item.status !== "dispatching").map((item) => `${item.request_id}:${item.status}:${item.revision}`).join("|");
     if (signature && signature !== activity.current && !activityInFlight.current && callback.current) {
       activityInFlight.current = true;
-      void callback.current().then(() => {
-        if (current.current === scope && captured === generation.current) activity.current = signature;
+      void callback.current().then((complete) => {
+        // A live event can supersede the conversation snapshot without a read
+        // failure. Keep this signature eligible for the next polling attempt.
+        if (complete !== false && current.current === scope && captured === generation.current) activity.current = signature;
       }).catch(() => {
         if (current.current === scope && captured === generation.current) setError(true);
       }).finally(() => {

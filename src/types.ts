@@ -374,6 +374,8 @@ export interface ConversationAgentStateV4 {
   conversation_id: string;
   mode: SessionAgentModeV4;
   locked: boolean;
+  /** Host queue barrier for historical runs; omitted by older hosts. */
+  composer_blocking_run_ids?: string[];
   latest_plan_revision: ProposedPlanRevisionV4 | null;
   latest_run: RunSummaryV4 | null;
 }

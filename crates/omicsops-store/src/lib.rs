@@ -252,6 +252,7 @@ pub struct ConversationAgentStateSnapshotV4 {
     pub locked: bool,
     pub latest_plan_revision: Option<ProposedPlanRevisionV4>,
     pub latest_run_json: Option<Value>,
+    pub composer_blocking_run_ids: Vec<Uuid>,
 }
 
 #[derive(Clone)]
@@ -716,6 +717,13 @@ impl Store {
             None
         };
 
+        let composer_blocking_run_ids =
+            composer_queue_dispatch::composer_blocking_attention_run_ids_in_tx(
+                &mut tx,
+                project_id,
+                conversation_id,
+            )
+            .await?;
         tx.commit().await?;
         Ok(ConversationAgentStateSnapshotV4 {
             project_id,
@@ -724,6 +732,7 @@ impl Store {
             locked: locked != 0,
             latest_plan_revision,
             latest_run_json,
+            composer_blocking_run_ids,
         })
     }
 

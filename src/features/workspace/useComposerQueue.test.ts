@@ -57,6 +57,21 @@ it("retries conversation recovery after a failed refresh even when queue status 
   expect(result.current.error).toBe(false);
 });
 
+it("retries an incomplete conversation snapshot without treating a superseded read as an error", async () => {
+  const failed = { ...receipt({ ...input, request_id: "q", message_id: "m", run_id: "r" }), status: "failed" as const };
+  vi.mocked(api.reconcileComposerQueue).mockResolvedValue([failed]);
+  const recover = vi.fn().mockResolvedValueOnce(false).mockResolvedValue(true);
+  const { result } = renderHook(() => useComposerQueue("p", "c", true, recover));
+  await waitFor(() => expect(result.current.loading).toBe(false));
+  expect(recover).toHaveBeenCalledTimes(1);
+  expect(result.current.error).toBe(false);
+  await act(async () => { await result.current.refresh(); });
+  expect(recover).toHaveBeenCalledTimes(2);
+  await act(async () => { await result.current.refresh(); });
+  expect(recover).toHaveBeenCalledTimes(2);
+  expect(result.current.error).toBe(false);
+});
+
 it("preserves the draft if an unconfirmed request was cancelled in another window", async () => {
   vi.mocked(api.enqueueComposerTurn).mockRejectedValueOnce(new Error("lost response"));
   const { result } = renderHook(() => useComposerQueue("p", "c", true));

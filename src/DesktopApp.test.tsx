@@ -3307,6 +3307,247 @@ it("routes native idle sends through the durable queue and recovers the committe
   } finally { view.unmount(); Reflect.deleteProperty(window, "__TAURI_INTERNALS__"); }
 });
 
+it("sends a new turn in the same conversation after the host settles an observed stop", async () => {
+  const { stateSpy } = setupConversationStateHarness();
+  const conversationId = stateConversations[0].id;
+  const runId = "stopped-remote-dispatch";
+  let stopped = false;
+  let reconciled = false;
+  const events: AgentRunEventV4[] = [
+    agentEvent(conversationId, runId, 1, { kind: "run_created", mode: "execute" }),
+    agentEvent(conversationId, runId, 2, { kind: "tool_requested", call: { call_id: "remote-cell", tool_id: "runtime.execute", arguments: { language: "python", code: "print('ready')" } } }),
+  ];
+  stateSpy.mockImplementation(async (_projectId, id) => stateSnapshot(id, {
+    latest_run: { ...stateRun(runId, stopped ? "needs_attention" : "running", null, null, null), session_mode: "agent" },
+    composer_blocking_run_ids: [],
+  }));
+  vi.mocked(api.agentV4EventsForConversation).mockImplementation(async () => [...events]);
+  vi.mocked(api.agentV4Events).mockImplementation(async () => [...events]);
+  for (const name of ["onConversationEvent", "onConversationUpdated", "onSyncEvent", "onKernelEvent", "onAgentV4Event", "onAgentV4TextPreview", "onAgentV4ReasoningPreview", "onAgentV4ModelActivity"] as const) vi.spyOn(api, name).mockResolvedValue(() => {});
+  vi.spyOn(api, "agentV4GetStop").mockResolvedValue(null);
+  vi.spyOn(api, "getConversationCapabilitiesV4").mockResolvedValue({ project_id: stateProject.id, conversation_id: conversationId, skills: [], mcp_servers: [], memory_count: 0 });
+  vi.spyOn(preferencesApi, "getConversationAgentPreferencesV4").mockResolvedValue({ delegation_enabled: true, auto_review: true, memory_enabled: true });
+  const computeSelection = { schema_version: 4 as const, backend_id: "local", backend_kind: "local" as const, autonomy_mode: "supervised" as const, approval_policy: "risk_based" as const, environment: "system", network_policy: "host_inherited" as const, container_image: null };
+  const frozen = { model_profile_id: stateModel.id, model_configuration_hash: "hash", compute_selection: computeSelection, conversation_preferences: { delegation_enabled: true, auto_review: true, memory_enabled: true }, service_tier: {}, delegated_model: null, reviewer_model: null };
+  vi.spyOn(queueApi, "reconcileComposerQueue").mockImplementation(async () => [{
+    request_id: "old-request", message_id: "old-message", run_id: runId, project_id: stateProject.id, conversation_id: conversationId,
+    mode: "agent", message_markdown: "Inspect the remote environment", references: [], attachments: [], attachment_receipts: [], frozen,
+    position: 1, revision: reconciled ? 3 : stopped ? 2 : 1, status: reconciled ? "failed" : stopped ? "uncertain" : "running", created_at: "now", updated_at: "now",
+  }]);
+  const enqueue = vi.spyOn(queueApi, "enqueueComposerTurn").mockImplementation(async (request) => ({ ...request, frozen, attachment_receipts: [], position: 2, revision: 1, status: "pending", created_at: "now", updated_at: "now" }));
+  const requestStop = vi.spyOn(api, "agentV4RequestStop").mockImplementation(async () => {
+    stopped = true;
+    events.push(
+      agentEvent(conversationId, runId, 3, { kind: "tool_dispatch_uncertain", call_id: "remote-cell", tool_id: "runtime.execute" }),
+      agentEvent(conversationId, runId, 4, { kind: "run_needs_attention", message: "Stopped with an unresolved remote dispatch" }),
+    );
+    return stopReceipt(stateProject.id, conversationId, runId);
+  });
+  const ActualWorkspaceShell = workspaceShell.WorkspaceShell;
+  const shell = vi.spyOn(workspaceShell, "WorkspaceShell").mockImplementation((props) => <ActualWorkspaceShell {...props} />);
+  Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: { invoke: vi.fn().mockResolvedValue([]) } });
+  const view = render(<DesktopApp />);
+  try {
+    fireEvent.click(await screen.findByRole("button", { name: "停止当前运行" }));
+    await waitFor(() => expect(requestStop).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(shell.mock.calls.at(-1)![0]).toMatchObject({ activeRunId: null, runStarted: false, conversationLocked: false }));
+    await act(async () => { await shell.mock.calls.at(-1)![0].onQueueRefresh!(); });
+    expect(await screen.findByRole("button", { name: "待核实" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "停止当前运行" })).not.toBeInTheDocument();
+    const input = screen.getByRole("textbox", { name: /描述研究目标/ });
+    expect(input).toBeEnabled();
+    fireEvent.change(input, { target: { value: "核实后继续下一项检查" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(input).toHaveValue("核实后继续下一项检查");
+    for (const button of screen.getAllByRole("button", { name: "新建会话" })) expect(button).toBeEnabled();
+    reconciled = true;
+    await act(async () => { await shell.mock.calls.at(-1)![0].onQueueRefresh!(); });
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(enqueue).toHaveBeenCalledTimes(1));
+    expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({ conversation_id: conversationId, message_markdown: "核实后继续下一项检查" }));
+    await waitFor(() => expect(input).toHaveValue(""));
+    expect(events.at(-1)?.event.kind).toBe("run_needs_attention");
+  } finally { view.unmount(); Reflect.deleteProperty(window, "__TAURI_INTERNALS__"); }
+});
+
+it("restores Send when a stale uncertain queue receipt settles for an already-resolved historical run", async () => {
+  const { stateSpy } = setupConversationStateHarness();
+  const conversationId = stateConversations[0].id;
+  const runId = "resolved-historical-dispatch";
+  let reconciled = false;
+  const events = [
+    agentEvent(conversationId, runId, 1, { kind: "run_created", mode: "execute" }),
+    agentEvent(conversationId, runId, 2, { kind: "tool_dispatch_uncertain", call_id: "remote-cell", tool_id: "runtime.execute" }),
+    agentEvent(conversationId, runId, 3, { kind: "tool_dispatch_resolved", call_id: "remote-cell", resolution: "side_effect_not_observed", evidence: "The host verified that the cell produced no side effect before the run ended." }),
+    agentEvent(conversationId, runId, 4, { kind: "run_needs_attention", message: "The run ended after dispatch verification." }),
+  ];
+  stateSpy.mockImplementation(async (_projectId, id) => stateSnapshot(id, {
+    latest_run: { ...stateRun(runId, "needs_attention", null, null, null), session_mode: "agent" },
+  }));
+  vi.mocked(api.agentV4EventsForConversation).mockResolvedValue(events);
+  vi.mocked(api.agentV4Events).mockResolvedValue(events);
+  for (const name of ["onConversationEvent", "onConversationUpdated", "onSyncEvent", "onKernelEvent", "onAgentV4Event", "onAgentV4TextPreview", "onAgentV4ReasoningPreview", "onAgentV4ModelActivity"] as const) vi.spyOn(api, name).mockResolvedValue(() => {});
+  vi.spyOn(api, "getConversationCapabilitiesV4").mockResolvedValue({ project_id: stateProject.id, conversation_id: conversationId, skills: [], mcp_servers: [], memory_count: 0 });
+  vi.spyOn(preferencesApi, "getConversationAgentPreferencesV4").mockResolvedValue({ delegation_enabled: true, auto_review: true, memory_enabled: true });
+  const computeSelection = { schema_version: 4 as const, backend_id: "local", backend_kind: "local" as const, autonomy_mode: "supervised" as const, approval_policy: "risk_based" as const, environment: "system", network_policy: "host_inherited" as const, container_image: null };
+  const frozen = { model_profile_id: stateModel.id, model_configuration_hash: "hash", compute_selection: computeSelection, conversation_preferences: { delegation_enabled: true, auto_review: true, memory_enabled: true }, service_tier: {}, delegated_model: null, reviewer_model: null };
+  vi.spyOn(queueApi, "reconcileComposerQueue").mockImplementation(async () => [{
+    request_id: "old-request", message_id: "old-message", run_id: runId, project_id: stateProject.id, conversation_id: conversationId,
+    mode: "agent", message_markdown: "Inspect the environment", references: [], attachments: [], attachment_receipts: [], frozen,
+    position: 1, revision: reconciled ? 2 : 1, status: reconciled ? "failed" : "uncertain", created_at: "now", updated_at: "now",
+  }]);
+  const enqueue = vi.spyOn(queueApi, "enqueueComposerTurn").mockImplementation(async (request) => ({ ...request, frozen, attachment_receipts: [], position: 2, revision: 1, status: "pending", created_at: "now", updated_at: "now" }));
+  const ActualWorkspaceShell = workspaceShell.WorkspaceShell;
+  const shell = vi.spyOn(workspaceShell, "WorkspaceShell").mockImplementation((props) => <ActualWorkspaceShell {...props} />);
+  Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: { invoke: vi.fn().mockResolvedValue([]) } });
+  const view = render(<DesktopApp />);
+  try {
+    expect(await screen.findByRole("button", { name: "待核实" })).toBeDisabled();
+    await waitFor(() => expect(shell.mock.calls.at(-1)![0]).toMatchObject({ activeRunId: null, runStarted: false }));
+    const input = screen.getByRole("textbox", { name: /描述研究目标/ });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: "核实后继续下一项检查" } });
+    reconciled = true;
+    await act(async () => { await shell.mock.calls.at(-1)![0].onQueueRefresh!(); });
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+    expect(screen.queryByRole("button", { name: "待核实" })).not.toBeInTheDocument();
+    expect(input).toHaveValue("核实后继续下一项检查");
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(enqueue).toHaveBeenCalledTimes(1));
+    expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({ conversation_id: conversationId, message_markdown: "核实后继续下一项检查" }));
+    await waitFor(() => expect(input).toHaveValue(""));
+  } finally { view.unmount(); Reflect.deleteProperty(window, "__TAURI_INTERNALS__"); }
+});
+
+describe("host composer dispatch state", () => {
+  function setup(blockingRunIds: string[]) {
+    const { stateSpy } = setupConversationStateHarness();
+    const conversationId = stateConversations[0].id;
+    const runId = "old-direct-run";
+    const events = [
+      agentEvent(conversationId, runId, 1, { kind: "tool_dispatch_uncertain", call_id: "old-call", tool_id: "runtime.execute" }),
+      agentEvent(conversationId, runId, 2, { kind: "run_needs_attention", message: "An old stopped dispatch remains in history." }),
+    ];
+    const snapshot = (ids: string[]) => stateSnapshot(conversationId, { composer_blocking_run_ids: ids, latest_run: { ...stateRun(runId, "needs_attention", null, null, null), session_mode: "agent" } });
+    stateSpy.mockResolvedValue(snapshot(blockingRunIds));
+    vi.mocked(api.agentV4EventsForConversation).mockResolvedValue(events);
+    vi.mocked(api.agentV4Events).mockResolvedValue(events);
+    for (const name of ["onConversationEvent", "onConversationUpdated", "onSyncEvent", "onKernelEvent", "onAgentV4TextPreview", "onAgentV4ReasoningPreview", "onAgentV4ModelActivity"] as const) vi.spyOn(api, name).mockResolvedValue(() => {});
+    let emit!: Parameters<typeof api.onAgentV4Event>[0];
+    vi.spyOn(api, "onAgentV4Event").mockImplementation(async (listener) => { emit = listener; return () => {}; });
+    vi.spyOn(api, "getConversationCapabilitiesV4").mockResolvedValue({ project_id: stateProject.id, conversation_id: conversationId, skills: [], mcp_servers: [], memory_count: 0 });
+    vi.spyOn(preferencesApi, "getConversationAgentPreferencesV4").mockResolvedValue({ delegation_enabled: true, auto_review: true, memory_enabled: true });
+    vi.spyOn(queueApi, "reconcileComposerQueue").mockResolvedValue([]);
+    const enqueue = vi.spyOn(queueApi, "enqueueComposerTurn").mockImplementation(async (request) => ({ ...request,
+      frozen: { model_profile_id: request.model_profile_id, model_configuration_hash: "hash", compute_selection: request.compute_selection, conversation_preferences: { delegation_enabled: true, auto_review: true, memory_enabled: true }, service_tier: {}, delegated_model: null, reviewer_model: null },
+      attachment_receipts: [], position: 1, revision: 1, status: "pending", created_at: "now", updated_at: "now",
+    }));
+    const ActualWorkspaceShell = workspaceShell.WorkspaceShell;
+    const shell = vi.spyOn(workspaceShell, "WorkspaceShell").mockImplementation((props) => <ActualWorkspaceShell {...props} />);
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: { invoke: vi.fn().mockResolvedValue([]) } });
+    const view = render(<DesktopApp />);
+    return { stateSpy, conversationId, runId, snapshot, shell, enqueue, emit: (event: AgentRunEventV4) => emit(event), close: () => { view.unmount(); Reflect.deleteProperty(window, "__TAURI_INTERNALS__"); } };
+  }
+
+  it("restores ordinary sending on reload for a stopped direct run with no queue row", async () => {
+    const test = setup([]);
+    try {
+      const input = await screen.findByRole("textbox", { name: /描述研究目标/ });
+      await waitFor(() => expect(input).toBeEnabled());
+      fireEvent.change(input, { target: { value: "新的环境检查" } });
+      await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+      fireEvent.keyDown(input, { key: "Enter" });
+      await waitFor(() => expect(test.enqueue).toHaveBeenCalledTimes(1));
+      expect(test.enqueue).toHaveBeenCalledWith(expect.objectContaining({ conversation_id: test.conversationId, message_markdown: "新的环境检查" }));
+      expect(screen.getByText("An old stopped dispatch remains in history.")).toBeInTheDocument();
+    } finally { test.close(); }
+  });
+
+  it("refreshes host clearance for an empty queue and retains the blocked draft after a failed state read", async () => {
+    const test = setup(["old-direct-run"]);
+    try {
+      expect(await screen.findByRole("button", { name: "待核实" })).toBeDisabled();
+      const input = screen.getByRole("textbox", { name: /描述研究目标/ });
+      await waitFor(() => expect(input).toBeEnabled());
+      fireEvent.change(input, { target: { value: "刷新后发送" } });
+      test.stateSpy.mockRejectedValueOnce(new Error("state read unavailable"));
+      fireEvent.click(screen.getByRole("button", { name: "刷新发送状态" }));
+      await screen.findByRole("alert", { name: "发送状态刷新失败" });
+      expect(screen.getByRole("button", { name: "待核实" })).toBeDisabled();
+      expect(input).toHaveValue("刷新后发送");
+      test.stateSpy.mockResolvedValue(test.snapshot([]));
+      fireEvent.click(screen.getByRole("button", { name: "刷新发送状态" }));
+      await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+      expect(screen.queryByRole("alert", { name: "发送状态刷新失败" })).not.toBeInTheDocument();
+      fireEvent.keyDown(input, { key: "Enter" });
+      await waitFor(() => expect(test.enqueue).toHaveBeenCalledTimes(1));
+    } finally { test.close(); }
+  });
+
+  it("invalidates old host clearance on a new unresolved terminal event and rejects a delayed older snapshot", async () => {
+    const test = setup([]);
+    try {
+      const input = await screen.findByRole("textbox", { name: /描述研究目标/ });
+      await waitFor(() => expect(input).toBeEnabled());
+      fireEvent.change(input, { target: { value: "等待新的宿主状态" } });
+      await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled());
+      const oldState = deferred<ConversationAgentStateV4>();
+      const newState = deferred<ConversationAgentStateV4>();
+      test.stateSpy.mockReturnValueOnce(oldState.promise).mockReturnValueOnce(newState.promise);
+      const readsBefore = test.stateSpy.mock.calls.length;
+      let refresh!: Promise<void>;
+      await act(async () => { refresh = test.shell.mock.calls.at(-1)![0].onQueueRefresh!(); });
+      await waitFor(() => expect(test.stateSpy).toHaveBeenCalledTimes(readsBefore + 1));
+      await act(async () => {
+        test.emit(agentEvent(test.conversationId, "new-unresolved-run", 1, { kind: "tool_dispatch_uncertain", call_id: "new-call", tool_id: "runtime.execute" }));
+        test.emit(agentEvent(test.conversationId, "new-unresolved-run", 2, { kind: "run_needs_attention", message: "A new dispatch requires review." }));
+      });
+      expect(screen.getByRole("button", { name: "待核实" })).toBeDisabled();
+      await act(async () => newState.resolve(test.snapshot(["new-unresolved-run"])));
+      await act(async () => { oldState.resolve(test.snapshot([])); await refresh; });
+      expect(screen.getByRole("button", { name: "待核实" })).toBeDisabled();
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(test.enqueue).not.toHaveBeenCalled();
+      expect(input).toHaveValue("等待新的宿主状态");
+    } finally { test.close(); }
+  });
+
+  it("retries the same settled queue snapshot after a live event supersedes its host clearance read", async () => {
+    const intervals = vi.spyOn(window, "setInterval");
+    const test = setup(["old-direct-run"]);
+    try {
+      expect(await screen.findByRole("button", { name: "待核实" })).toBeDisabled();
+      await waitFor(() => expect(queueApi.reconcileComposerQueue).toHaveBeenCalled());
+      const poll = intervals.mock.calls.find(([, delay]) => delay === 3000)![0] as () => void;
+      const selection = { schema_version: 4 as const, backend_id: "local", backend_kind: "local" as const, autonomy_mode: "supervised" as const, approval_policy: "risk_based" as const, environment: "system", network_policy: "host_inherited" as const, container_image: null };
+      vi.mocked(queueApi.reconcileComposerQueue).mockResolvedValue([{
+        request_id: "settled-stop", message_id: "old-message", run_id: test.runId, project_id: stateProject.id, conversation_id: test.conversationId,
+        mode: "agent", message_markdown: "Old request", references: [], attachments: [], attachment_receipts: [],
+        frozen: { model_profile_id: stateModel.id, model_configuration_hash: "hash", compute_selection: selection, conversation_preferences: { delegation_enabled: true, auto_review: true, memory_enabled: true }, service_tier: {}, delegated_model: null, reviewer_model: null },
+        position: 1, revision: 3, status: "failed", created_at: "now", updated_at: "now",
+      }]);
+      const delayed = deferred<ConversationAgentStateV4>();
+      const clear = stateSnapshot(test.conversationId, { composer_blocking_run_ids: [], latest_run: { ...stateRun("next-running-turn", "running", null, null, null), session_mode: "agent" } });
+      test.stateSpy.mockReturnValueOnce(delayed.promise).mockResolvedValue(clear);
+      const readsBefore = test.stateSpy.mock.calls.length;
+      await act(async () => poll());
+      await waitFor(() => expect(test.stateSpy).toHaveBeenCalledTimes(readsBefore + 1));
+      await act(async () => test.emit(agentEvent(test.conversationId, "next-running-turn", 2, { kind: "model_text", text: "A newly dispatched turn is making progress." })));
+      await act(async () => delayed.resolve(clear));
+      expect(test.shell.mock.calls.at(-1)![0].composerBlockingRunIds).toEqual([test.runId]);
+      await act(async () => poll());
+      await waitFor(() => expect(test.stateSpy).toHaveBeenCalledTimes(readsBefore + 2));
+      await waitFor(() => expect(test.shell.mock.calls.at(-1)![0].composerBlockingRunIds).toEqual([]));
+      expect(screen.queryByRole("button", { name: "待核实" })).not.toBeInTheDocument();
+      const input = screen.getByRole("textbox", { name: /描述研究目标/ });
+      fireEvent.change(input, { target: { value: "新的请求" } });
+      await waitFor(() => expect(screen.getByRole("button", { name: "加入队列" })).toBeEnabled());
+    } finally { test.close(); }
+  });
+});
+
 it("retains pending compaction through Back to projects and reopening the same paused run", async () => {
   const { stateSpy } = setupConversationStateHarness();
   const runId = "compaction-library-remount";

@@ -450,6 +450,7 @@ async fn run_live_subscription_acceptance(expected: ModelProviderKind) -> Result
         "[]",
         BTreeSet::from(["project.read".into()]),
         DirectRunSnapshotV4 {
+            stopped_run_ids: vec![],
             model_configuration_hash: profile.execution_configuration_hash(),
             conversation_preferences: preferences,
             service_tier,

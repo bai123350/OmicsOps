@@ -126,6 +126,7 @@ interface Props {
   onRefreshContextUsage?: () => Promise<void>;
   sideChat?: SideChatController;
   queueItems?: ComposerQueueItemV4[];
+  composerBlockingRunIds?: string[];
   queueError?: boolean;
   queueLoading?: boolean;
   onQueueRefresh?: () => Promise<void>;
@@ -244,7 +245,7 @@ function parseComposerCommand(text: string): ComposerCommandInvocation | null {
   return { id: match[1].toLowerCase(), args: match[2] ?? "", raw };
 }
 
-export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSettings, onBackToProjects, onOpenSourceConversation, onRegisterNavigationGuard, conversations = [], activeConversationId, activeConversationTitle, activeConversationVisibility, pendingVisibilityTarget, onRetryConversationVisibility, onSetVisibility, onOpenShelvedConversations, capabilitySummary, capabilitiesLoading, capabilitiesError, onRefreshCapabilities, onSelectConversation, onNewConversation, onDeleteConversation, onOpenBranch, onBranchSend, branchSendOriginalMarkdown, branchSendBusy = false, branchSendPending = false, branchSendError = false, onRetryBranchSend, onSend, onQueue, replacement, sideChat, contextUsage = null, contextUsageError = false, onRefreshContextUsage, queueItems = [], queueError = false, queueLoading = false, onQueueRefresh, referenceCatalog, workflowCatalogVersion = 0, referenceCatalogVersion = 0, onOpenSearch, globalSearchOpen = false, searchRequest, onSearchRequestHandled, onSuggestFollowUps, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", runPollingError = "", workspaceDataError = "", onRefreshWorkspaceData, conversationLoadError = "", onRetryConversationLoad, agentRetryNotice = "", modelLabel, activeModelProfile, modelProfiles = [], modelPicker, composerBusy = false, modelOptions = [], modelId, onModelChange, agentMode, onAgentModeChange, conversationLocked = false, conversationHydrating = false, planActionBusy = false, v4Plan, latestPlanRevision, computeBackends = [], runtimeDraftSelection = null, computeSelectionReady = true, computeBackendId = "", containerImage = "", autonomyMode = "supervised", approvalPolicy = "auto_approve_except_local_deletion", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onApprovalPolicyChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onRequestPlanRevision, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, activeRunLastActivityAt, agentRunEventsV4 = [], agentTextPreview, agentReasoningPreview, agentModelActivity, guidanceAvailable = false, onAnswerAgentQuestionV4, onDecideToolApprovalV4, onResolveUncertainV4, onResumeAgentRunV4, onCancelRuntimeRecoveryV4, onCloseBrowserRunTabsV4, remoteFiles, remoteFilesStatus, remoteFilesError, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
+export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSettings, onBackToProjects, onOpenSourceConversation, onRegisterNavigationGuard, conversations = [], activeConversationId, activeConversationTitle, activeConversationVisibility, pendingVisibilityTarget, onRetryConversationVisibility, onSetVisibility, onOpenShelvedConversations, capabilitySummary, capabilitiesLoading, capabilitiesError, onRefreshCapabilities, onSelectConversation, onNewConversation, onDeleteConversation, onOpenBranch, onBranchSend, branchSendOriginalMarkdown, branchSendBusy = false, branchSendPending = false, branchSendError = false, onRetryBranchSend, onSend, onQueue, replacement, sideChat, contextUsage = null, contextUsageError = false, onRefreshContextUsage, queueItems = [], composerBlockingRunIds, queueError = false, queueLoading = false, onQueueRefresh, referenceCatalog, workflowCatalogVersion = 0, referenceCatalogVersion = 0, onOpenSearch, globalSearchOpen = false, searchRequest, onSearchRequestHandled, onSuggestFollowUps, messages = [], streamingAssistant = "", agentBusy = false, agentNotice = "", runPollingError = "", workspaceDataError = "", onRefreshWorkspaceData, conversationLoadError = "", onRetryConversationLoad, agentRetryNotice = "", modelLabel, activeModelProfile, modelProfiles = [], modelPicker, composerBusy = false, modelOptions = [], modelId, onModelChange, agentMode, onAgentModeChange, conversationLocked = false, conversationHydrating = false, planActionBusy = false, v4Plan, latestPlanRevision, computeBackends = [], runtimeDraftSelection = null, computeSelectionReady = true, computeBackendId = "", containerImage = "", autonomyMode = "supervised", approvalPolicy = "auto_approve_except_local_deletion", computeEnvironment = "system", computeBusy = false, onComputeBackendChange, onContainerImageChange, onAutonomyModeChange, onApprovalPolicyChange, onComputeEnvironmentChange, planLoading = false, planApproved = false, onRequestPlan, onRequestPlanRevision, onApprovePlan, onStartRun, onCancelRun, runStopping = false, canStartRun = false, runStarted = false, activeRunId, activeRunLastActivityAt, agentRunEventsV4 = [], agentTextPreview, agentReasoningPreview, agentModelActivity, guidanceAvailable = false, onAnswerAgentQuestionV4, onDecideToolApprovalV4, onResolveUncertainV4, onResumeAgentRunV4, onCancelRuntimeRecoveryV4, onCloseBrowserRunTabsV4, remoteFiles, remoteFilesStatus, remoteFilesError, filesBusy = false, onUploadFiles, onRefreshFiles, onDownloadFile, onPreviewImage, fileNotice, kernelSessions = [], kernelEvents = [], kernelBusy = false, kernelNotice, onStartKernel, onExecuteKernel, onInterruptKernel, onStopKernel, onPromoteKernelCell, memoryFacts = [], notebookEntries = [], projectArtifacts = [], onSearchMemory, onExportNotebook, syncEntries = [], onPauseSync, onCancelSync, onRetrySync }: Props) {
   const visibilityScope = useRef(0);
   const visibilityOperation = useRef<object | null>(null);
   const [visibilityBusy, setVisibilityBusy] = useState(false);
@@ -570,6 +571,24 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
   const [sendBusy, setSendBusy] = useState(false);
   const sendBusyRef = useRef(false);
   const sendGenerationRef = useRef(0);
+  const queueRefreshInFlight = useRef(false);
+  const [queueRefreshBusy, setQueueRefreshBusy] = useState(false);
+  const [queueRefreshError, setQueueRefreshError] = useState(false);
+  async function refreshQueueState() {
+    if (!onQueueRefresh || queueRefreshInFlight.current) return;
+    const generation = sendGenerationRef.current;
+    queueRefreshInFlight.current = true;
+    setQueueRefreshBusy(true);
+    setQueueRefreshError(false);
+    try { await onQueueRefresh(); }
+    catch { if (generation === sendGenerationRef.current) setQueueRefreshError(true); }
+    finally {
+      if (generation === sendGenerationRef.current) {
+        queueRefreshInFlight.current = false;
+        setQueueRefreshBusy(false);
+      }
+    }
+  }
   const [approvePlanBusy, setApprovePlanBusy] = useState(false);
   const approvePlanBusyRef = useRef(false);
   const [selectedImagePath, setSelectedImagePath] = useState("");
@@ -638,9 +657,15 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
   const fastModeLocked = existingComposerDisabled || agentPreferences.blocked || !activeConversationId;
   const fastModeButtonDisabled = fastModeLocked || (!fastModeAvailable && fastMode !== true && profileFastMode !== true);
   const fastModeOption = fastMode === true ? "fast" : fastMode === false ? "standard" : "default";
-  const queueBacklog = queueItems.some((item) => item.project_id === project.id && item.conversation_id === activeConversationId && !["completed", "failed", "cancelled"].includes(item.status));
+  const scopedQueueItems = queueItems.filter((item) => item.project_id === project.id && item.conversation_id === activeConversationId);
+  // A new host projects every historical barrier, including old direct runs.
+  // Legacy hosts have no projection, so retain the conservative event fallback.
+  const historicalRunBlocked = composerBlockingRunIds !== undefined ? composerBlockingRunIds.length > 0 : trajectoryRuns.some((run) =>
+    run.events.some(({ event }) => event.kind === "run_needs_attention") && hasUnresolvedSideEffectDispatchV4(run.events));
+  const queueBlocked = scopedQueueItems.some((item) => item.status === "uncertain") || historicalRunBlocked;
+  const queueBacklog = scopedQueueItems.some((item) => ["pending", "dispatching", "running"].includes(item.status));
   const headerTerminal = effectiveTerminalAgentEventV4(activeRunEventsV4)?.event.kind;
-  const headerStatus = headerTerminal === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention")
+  const headerStatus = queueBlocked || headerTerminal === "run_needs_attention" ? (zh ? "需要处理" : "Needs attention")
     : headerTerminal === "run_completed" ? (zh ? "已完成" : "Completed")
     : headerTerminal === "run_cancelled" ? (zh ? "已终止" : "Cancelled")
     : headerTerminal === "run_failed" ? (zh ? "失败" : "Failed")
@@ -648,7 +673,7 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
     : runActive || agentBusy ? (zh ? "运行中" : "Running")
     : queueBacklog ? (zh ? "队列待处理" : "Queued")
     : (zh ? "就绪" : "Ready");
-  const queuedSend = Boolean(onQueue && (agentBusy || conversationLocked || (runStarted && !runFinished) || reviewBusy || planLoading || queueBacklog));
+  const queuedSend = Boolean(onQueue && !queueBlocked && (agentBusy || conversationLocked || (runStarted && !runFinished) || reviewBusy || planLoading || queueBacklog));
   const composerDisabled = onQueue ? fileReferenceBusy || composerBusy || conversationHydrating || sendBusy || queueLoading : existingComposerDisabled;
   const preferenceError = agentPreferences.unconfirmed
     ? (zh ? "会话偏好保存结果未确认。核对完成前不能发送或再次修改偏好。" : "The preference save is unconfirmed. Reconcile it before sending or changing preferences.")
@@ -657,7 +682,8 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
     : agentPreferences.saveError
       ? (zh ? "会话偏好保存失败，请重试。" : agentPreferences.saveError)
       : "";
-  const sendLabel = fileReferenceBusy ? (zh ? "校验路径中…" : "Checking paths…") : queuedSend ? (zh ? "加入队列" : "Add to queue") : reviewBusy ? (zh ? "审核中…" : "Reviewing…") : composerDisabled || planLoading ? (planModeEnabled ? (zh ? "规划中…" : "Planning…") : (zh ? "执行中…" : "Running…")) : queuedSend ? (zh ? "加入队列" : "Add to queue") : t.send;
+  const sendActionLabel = queueBlocked ? (zh ? "待核实" : "Needs verification") : queuedSend ? (zh ? "加入队列" : "Add to queue") : t.send;
+  const sendLabel = queueBlocked ? sendActionLabel : fileReferenceBusy ? (zh ? "校验路径中…" : "Checking paths…") : queuedSend ? sendActionLabel : reviewBusy ? (zh ? "审核中…" : "Reviewing…") : composerDisabled || planLoading ? (planModeEnabled ? (zh ? "规划中…" : "Planning…") : (zh ? "执行中…" : "Running…")) : t.send;
   const activeConversation = conversations.find((item) => item.id === activeConversationId);
   const conversationTitle = (activeConversationTitle ?? activeConversation?.title) || (zh ? "新会话" : "New conversation");
   const historicalAgentRunEventsV4 = effectiveActiveRunId
@@ -858,6 +884,9 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
   useEffect(() => {
     sendGenerationRef.current += 1;
     sendBusyRef.current = false;
+    queueRefreshInFlight.current = false;
+    setQueueRefreshBusy(false);
+    setQueueRefreshError(false);
     setSendBusy(false);
     setSendError(false);
     setSharing(false);
@@ -994,6 +1023,7 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
     const submittedDraft = draft;
     const message = submittedDraft.trim() || (attachments.receipts.length ? (zh ? "请查看附件。" : "Please inspect the attached files.") : "");
     if (typedComposerCommand) { typedComposerCommand.onSelect(); return; }
+    if (queueBlocked) return;
     if (!message || fileReferenceOperation.current || attachmentsBlocked || composerDisabled || (!onQueue && reviewBusy) || agentPreferences.blocked || (!onQueue && planLoading) || ((onSend || onQueue) && !computeReady) || sendBusyRef.current) return;
     const sendGeneration = sendGenerationRef.current;
     const receipt = draftStore.capture(draftScope);
@@ -1291,10 +1321,17 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
         if (pendingExcerpt.current?.key === key) pendingExcerpt.current = null;
       } : undefined} />
       <footer className="composer">
+        {queueBlocked && <div className="composer-error" role="status" aria-label={zh ? "发送受阻" : "Sending blocked"}>
+          <p>{zh ? "此前任务的执行结果尚未核实，本会话暂时无法发送。草稿已保留。分叉会保留对话文本，但不会重试旧任务；远端计算是否停止仍需核实。" : "A previous task has an unverified execution result, so sending in this conversation is blocked. Your draft is preserved. A branch keeps the conversation text without retrying the old task; whether remote computation has stopped still needs verification."}</p>
+          {onQueueRefresh && <button type="button" disabled={queueRefreshBusy || conversationHydrating} onClick={() => void refreshQueueState()}>{zh ? "刷新发送状态" : "Refresh sending state"}</button>}
+          {onBranchSend && onOpenBranch && lastBranchAnchor ? <button type="button" disabled={branchDisabled || composerDisabled || agentPreferences.blocked || attachmentsBlocked || !computeReady || (!draft.trim() && !attachments.receipts.length)} onClick={() => void branchAt(lastBranchAnchor.id, "after_response", draft)}>{zh ? "分叉并发送" : "Branch and send"}</button>
+            : onNewConversation && <button type="button" disabled={conversationHydrating || agentBusy || conversationLocked} onClick={() => leaveGuard.current(() => { void onNewConversation(); })}>{zh ? "新建会话" : "New conversation"}</button>}
+        </div>}
+        {queueRefreshError && <p className="composer-error" role="alert" aria-label={zh ? "发送状态刷新失败" : "Sending state refresh failed"}>{zh ? "无法刷新发送状态，草稿已保留，请重试。" : "Could not refresh sending state. Your draft is preserved; please retry."}</p>}
         {branchSendError && <p role="alert">{zh ? "分支发送或打开未确认，原始消息和材料已保留。" : "Branch sending or opening was not confirmed; the original message and material are retained."}</p>}
         {branchSendPending && onRetryBranchSend && <button type="button" disabled={branchSendBusy} onClick={() => void retryBranchSend()}>{zh ? "重试原分支发送" : "Retry original branch send"}</button>}
         {replacement?.error && <p role="alert" className="composer-error">{replacement.pending ? (zh ? "替换请求状态待核对，原草稿已保留。" : "Replacement status is unconfirmed; the original draft is retained.") : (zh ? "替换请求未接收，请刷新运行状态后重试。" : "Replacement was not accepted. Refresh the run before trying again.")}{replacement.pending && <><span>{replacement.originalMarkdown}</span><button type="button" disabled={replacement.busy || conversationHydrating} onClick={() => void retryReplacement()}>{zh ? "核对原替换请求" : "Reconcile original replacement"}</button></>}</p>}
-         {queueError && <p role="alert" className="composer-error">{zh ? "队列状态未能确认，请刷新后重试。" : "Queue state could not be confirmed. Refresh and retry."}<button type="button" onClick={() => void onQueueRefresh?.()}>{zh ? "刷新队列" : "Refresh queue"}</button></p>}
+         {queueError && <p role="alert" className="composer-error">{zh ? "队列状态未能确认，请刷新后重试。" : "Queue state could not be confirmed. Refresh and retry."}<button type="button" disabled={queueRefreshBusy} onClick={() => void refreshQueueState()}>{zh ? "刷新队列" : "Refresh queue"}</button></p>}
          {sendError && <p role="alert" className="composer-error">{zh ? "消息未能发送，草稿已保留。请重试。" : "Your message could not be sent. The draft is preserved; please retry."}</p>}
          {composerCommandNotice && <p role="alert" className="composer-error">{composerCommandNotice}</p>}
          {(agentPreferences.loading || agentPreferences.saving) && <p className="agent-preferences-status" role="status">{agentPreferences.loading ? agentPreferences.unconfirmed ? (zh ? "正在核对会话偏好…" : "Reconciling conversation preferences…") : (zh ? "正在加载会话偏好…" : "Loading conversation preferences…") : (zh ? "正在保存会话偏好…" : "Saving conversation preferences…")}</p>}
@@ -1363,7 +1400,7 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
              {modelPicker ? <div onClickCapture={closeComposerMenus}>{modelPicker}</div> : <div className="composer-menu-anchor model-anchor"><button className="composer-model" disabled={composerDisabled} aria-label={zh ? "选择模型" : "Choose model"} aria-expanded={modelMenuOpen} onClick={() => { const next = !modelMenuOpen; closeComposerMenus(); setModelMenuOpen(next); }}><span>{modelLabel || (zh ? "选择模型" : "Choose model")}</span><ChevronDown size={12} /></button>{modelMenuOpen && <div className="model-menu" role="menu">{modelOptions.map((model) => <button role="menuitemradio" aria-checked={model.id === modelId} key={model.id} disabled={!onModelChange} onClick={() => { onModelChange?.(model.id); setModelMenuOpen(false); }}>{model.label}{model.id === modelId && <Check size={14} />}</button>)}<button role="menuitem" disabled={!onOpenSettings} onClick={() => { setModelMenuOpen(false); onOpenSettings?.(); }}>{zh ? "管理模型" : "Manage models"}<Settings size={14} /></button></div>}</div>}
             <div className="composer-send-group">
              {stopAvailable && !showStopButton && <button type="button" className="composer-tool" aria-label={stopLabel} title={stopLabel} disabled={runStopping} onClick={() => void onCancelRun?.()}><Square size={16} fill="currentColor" /></button>}
-             <button className={`send-button ${showStopButton ? "is-stop" : ""}`} aria-label={showStopButton ? stopLabel : sendLabel} title={showStopButton ? stopLabel : sendLabel} aria-busy={showStopButton && runStopping} disabled={showStopButton ? runStopping : composerDisabled || (!onQueue && reviewBusy) || agentPreferences.blocked || (!onQueue && planLoading) || attachmentsBlocked || (!draft.trim() && !attachments.receipts.length) || Boolean((onSend || onQueue) && !computeReady && !typedComposerCommand)} onClick={showStopButton ? () => { void onCancelRun?.(); } : send}>{showStopButton ? <Square size={16} fill="currentColor" /> : <span>{queuedSend ? (zh ? "加入队列" : "Add to queue") : t.send}</span>}</button>
+             <button className={`send-button ${showStopButton ? "is-stop" : ""}`} aria-label={showStopButton ? stopLabel : sendLabel} title={showStopButton ? stopLabel : sendLabel} aria-busy={showStopButton && runStopping} disabled={showStopButton ? runStopping : queueBlocked || composerDisabled || (!onQueue && reviewBusy) || agentPreferences.blocked || (!onQueue && planLoading) || attachmentsBlocked || (!draft.trim() && !attachments.receipts.length) || Boolean((onSend || onQueue) && !computeReady && !typedComposerCommand)} onClick={showStopButton ? () => { void onCancelRun?.(); } : send}>{showStopButton ? <Square size={16} fill="currentColor" /> : <span>{sendActionLabel}</span>}</button>
             <div className="composer-menu-anchor"><button ref={sendOptionsRef} className="send-options" aria-label={zh ? "发送选项" : "Send options"} aria-expanded={sendMenuOpen} onClick={() => { const next = !sendMenuOpen; closeComposerMenus(); setSendMenuOpen(next); }}><ChevronDown size={17} /></button>{sendMenuOpen && <div className="model-menu send-menu" role="menu">{replacement && <button type="button" role="menuitem" disabled={replacementDisabled} onClick={() => void replaceCurrentTurn()}><span>{zh ? "中断并替换" : "Interrupt and replace"}</span><small>{zh ? "停止当前运行，安全结束后优先发送此草稿" : "Stop the current run, then send this draft first after safe settlement"}</small></button>}{sideChat && <button type="button" role="menuitem" onClick={() => void sendSideQuestion()}><span>{zh ? "独立旁聊" : "Side chat"}</span><small>{zh ? "根据证据回答，不打断主任务" : "Ask about evidence while the main task continues"}</small></button>}{onOpenBranch && <button type="button" role="menuitem" disabled={branchDisabled || !lastBranchAnchor} onClick={() => { if (lastBranchAnchor) branchAt(lastBranchAnchor.id, "after_response", draft); }}><span>{zh ? "分叉会话" : "Branch conversation"}</span><small>{onBranchSend && (draft.trim() || attachments.receipts.length) ? (zh ? "创建分支并发送完整草稿" : "Create a branch and send the complete draft") : (zh ? "从最近一轮创建分支" : "Branch from the latest turn")}</small></button>}{guidanceDialogAvailable && <button type="button" role="menuitem" className="guidance-menu-item" onClick={openGuidanceDialog}><span>{zh ? "追加指导" : "Add guidance"}</span><small>{guidanceEnabled ? (zh ? "追加到当前运行" : "Append to the current run") : (zh ? "仅查看已接收历史" : "View received history only")}</small></button>}{(["agent", "plan"] as const).map((mode) => <button key={mode} role="menuitemradio" aria-checked={effectiveMode === mode} disabled={modeLocked} onClick={() => { chooseMode(mode); setSendMenuOpen(false); }}>{mode === "plan" ? (zh ? "先做计划" : "Plan first") : (zh ? "直接执行" : "Execute directly")}{effectiveMode === mode && <Check size={14} />}</button>)}</div>}</div>
             </div>
             </div>
@@ -1599,6 +1636,20 @@ function isV4ApprovalDecided(events: AgentRunEventV4[], approvalId: string) {
 }
 function isV4UncertainResolved(events: AgentRunEventV4[], callId: string) {
   return events.some((event) => event.event.kind === "tool_dispatch_resolved" && event.event.call_id === callId);
+}
+// Match the host's side-effect classification; an unclassified legacy
+// uncertainty marker must not make a stopped conversation look sendable.
+function hasUnresolvedSideEffectDispatchV4(events: AgentRunEventV4[]) {
+  const effects = new Map<string, string>();
+  const resolved = new Set<string>();
+  for (const { event } of events) {
+    if (event.kind === "tool_dispatch_started") effects.set(event.call_id, event.effect);
+    else if (event.kind === "tool_finished" || event.kind === "tool_outcome_reused") resolved.add(event.outcome.call_id);
+    else if (event.kind === "tool_dispatch_resolved") resolved.add(event.call_id);
+  }
+  return events.some(({ event }) =>
+    (event.kind === "tool_dispatch_started" || event.kind === "tool_dispatch_uncertain")
+      && !resolved.has(event.call_id) && effects.get(event.call_id) !== "read_only");
 }
 function isV4QuestionAnswered(events: AgentRunEventV4[], questionId: string) {
   return events.some((event) => event.event.kind === "user_input_answered" && event.event.question_id === questionId);

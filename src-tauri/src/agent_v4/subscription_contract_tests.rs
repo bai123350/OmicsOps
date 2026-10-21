@@ -747,6 +747,7 @@ async fn subscription_v4_local_delete_requires_host_approval_and_resumes_without
             "[]",
             BTreeSet::from(["project.read".into(), "runtime.execute".into()]),
             DirectRunSnapshotV4 {
+                stopped_run_ids: vec![],
                 model_configuration_hash: profile.execution_configuration_hash(),
                 conversation_preferences: Default::default(),
                 service_tier: omicsops_protocol::RunServiceTierV4 { fast_mode: None },

@@ -950,6 +950,7 @@ fn conversation_agent_state_contract_is_snake_case_and_backward_compatible() {
         conversation_id,
         mode: SessionAgentModeV4::Plan,
         locked: true,
+        composer_blocking_run_ids: Vec::new(),
         latest_plan_revision: None,
         latest_run: None,
     };
@@ -960,6 +961,7 @@ fn conversation_agent_state_contract_is_snake_case_and_backward_compatible() {
             "conversation_id": conversation_id,
             "mode": "plan",
             "locked": true,
+            "composer_blocking_run_ids": [],
             "latest_plan_revision": null,
             "latest_run": null
         })
@@ -974,6 +976,7 @@ fn conversation_agent_state_contract_is_snake_case_and_backward_compatible() {
     .unwrap();
     assert_eq!(legacy.latest_plan_revision, None);
     assert_eq!(legacy.latest_run, None);
+    assert!(legacy.composer_blocking_run_ids.is_empty());
 }
 
 #[test]

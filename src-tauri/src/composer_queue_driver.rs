@@ -53,13 +53,14 @@ async fn drive(
     project_id: Uuid,
     conversation_id: Uuid,
 ) -> Result<(), String> {
-    state
-        .repository
-        .reconcile_composer_queue(project_id, conversation_id, Utc::now())
-        .await
-        .map_err(|error| error.to_string())?;
-
     'drive: loop {
+        // Stop observation can commit after the terminal event projection.
+        // Reconcile each iteration before attempting to claim the next turn.
+        state
+            .repository
+            .reconcile_composer_queue(project_id, conversation_id, Utc::now())
+            .await
+            .map_err(|error| error.to_string())?;
         // An accepted replacement must progress without a visible window's
         // polling. Observe only its already committed Stop; OS ownership
         // protects a live driver and recovery never replays provider work.
@@ -129,10 +130,9 @@ async fn drive(
         // target. It is included once in the predecessor lease set above.
         match crate::agent_v4::dispatch_composer_queue(app.clone(), state, lease.clone()).await {
             Ok(item) => {
-                // Approval, input-wait, and needs-attention states deliberately
-                // yield the queue. A stop advances FIFO only after its
-                // cancellation has a durable terminal event; an uncertain or
-                // incomplete settlement remains fenced for reconciliation.
+                // New requests may follow an observed local Stop while old
+                // effects remain unknown. Predecessor leases still prevent
+                // dispatch until the old driver has released ownership.
                 if !wait_for_run_settlement(state, &item).await? {
                     return Ok(());
                 }
@@ -226,7 +226,11 @@ async fn wait_for_run_settlement(
             || async {
                 state
                     .repository
-                    .safe_needs_attention_run(item.project_id, item.conversation_id, item.run_id)
+                    .can_advance_after_attention_run(
+                        item.project_id,
+                        item.conversation_id,
+                        item.run_id,
+                    )
                     .await
                     .map_err(|error| error.to_string())
             },
@@ -242,7 +246,7 @@ async fn wait_for_run_settlement(
 async fn probe_run_settlement<F, Fut, G, AttentionFut>(
     status: Option<&str>,
     read_events: F,
-    check_safe_attention: G,
+    check_attention_can_advance: G,
 ) -> Result<Option<bool>, String>
 where
     F: FnOnce() -> Fut,
@@ -267,28 +271,25 @@ where
         omicsops_protocol::AgentEventKindV4::RunNeedsAttention { .. } => Some("needs_attention"),
         _ => None,
     });
-    // Wisp's Stop action is scoped to the active turn: it leaves pending
-    // queue rows intact and its FIFO driver proceeds once the cancelled
-    // turn has a durable terminal event.  Do not treat the stop receipt
-    // itself as a queue pause; an observed receipt remains stored for
-    // restart reconciliation.
-    let safe_attention =
+    // Stop is scoped to the old turn. The Store distinguishes permission to
+    // schedule a new request from whether the old effects have been resolved.
+    let attention_can_advance =
         if status == Some("needs_attention") && terminal_event_status == Some("needs_attention") {
-            check_safe_attention().await?
+            check_attention_can_advance().await?
         } else {
             false
         };
     Ok(settlement_decision(
         status,
         terminal_event_status,
-        safe_attention,
+        attention_can_advance,
     ))
 }
 
 fn settlement_decision(
     status: Option<&str>,
     terminal_event_status: Option<&str>,
-    safe_attention: bool,
+    attention_can_advance: bool,
 ) -> Option<bool> {
     match status {
         Some(status @ ("completed" | "failed" | "cancelled")) => match terminal_event_status {
@@ -297,7 +298,7 @@ fn settlement_decision(
             None => None,
         },
         Some("needs_attention") => match terminal_event_status {
-            Some("needs_attention") => Some(safe_attention),
+            Some("needs_attention") => Some(attention_can_advance),
             Some(_) => Some(false),
             None => None,
         },

@@ -485,6 +485,14 @@ export default function DesktopApp() {
   }
 
   function mergeAgentRunEvents(incoming: AgentRunEventV4[]) {
+    // New terminal evidence invalidates earlier host clearance until the
+    // matching durable snapshot arrives. Text/progress events do not.
+    if (incoming.some((event) => event.event.kind === "run_needs_attention"
+      && !agentRunEventsRef.current.some((known) => known.run_id === event.run_id && known.sequence === event.sequence))) {
+      agentEventGeneration.current += 1;
+      setConversationState((current) => current && !current.composer_blocking_run_ids?.length
+        ? { ...current, composer_blocking_run_ids: undefined } : current);
+    }
     const merged = mergeAgentRunEventsV4(agentRunEventsRef.current, incoming);
     agentRunEventsRef.current = merged;
     setAgentRunEventsV4(merged);
@@ -979,8 +987,7 @@ export default function DesktopApp() {
         setRunId((current) => current ?? event.run_id);
         setRunStartedAt((current) => current ?? event.occurred_at);
       }
-      agentRunEventsRef.current = mergeAgentRunEventsV4(agentRunEventsRef.current, [event]);
-      setAgentRunEventsV4(agentRunEventsRef.current);
+      mergeAgentRunEvents([event]);
       if (eventChangesConversationState(event.event.kind)) {
         // Event rendering above remains immediate. Snapshot reconciliation is
         // best-effort and deliberately cannot replace the primary event
@@ -1011,6 +1018,7 @@ export default function DesktopApp() {
           agentStop.markTerminal(activeRunId);
           setRunStartedAt(null);
           setRunId((current) => current === activeRunId ? null : current);
+          await refreshConversationState();
         }
       } catch (error) {
         if (!disposed) reportRunPollingFailure(error);
@@ -1269,21 +1277,26 @@ export default function DesktopApp() {
     if (offlineExampleProjectId.current !== projectId) setSearchRequest({ key: crypto.randomUUID(), kind: "reveal", projectId });
   }
 
-  async function refreshQueuedConversation() {
+  async function refreshQueuedConversation(): Promise<boolean> {
     const action = captureConversationAction();
-    if (!action || conversationHydratingRef.current) return;
+    if (!action || conversationHydratingRef.current) return false;
     const events = await api.agentV4EventsForConversation(action.projectId, action.conversationId);
-    if (!isCurrentConversationAction(action)) return;
-    agentRunEventsRef.current = mergeAgentRunEventsV4(agentRunEventsRef.current, events);
-    setAgentRunEventsV4(agentRunEventsRef.current);
+    if (!isCurrentConversationAction(action)) return false;
+    mergeAgentRunEvents(events);
     const saved = await api.listMessages(action.conversationId);
-    if (!isCurrentConversationAction(action)) return;
+    if (!isCurrentConversationAction(action)) return false;
     const merged = mergeWorkspaceMessages(messagesRef.current, saved);
     messagesRef.current = merged; setMessages(merged);
     const next = merged.reduce((maximum, message) => Math.max(maximum, message.sequence + 1), 1);
     messageSequenceRef.current = Math.max(messageSequenceRef.current, next);
     setMessageSequence(messageSequenceRef.current);
-    await refreshConversationState(action.projectId, action.conversationId, action.token);
+    return await refreshConversationState(action.projectId, action.conversationId, action.token) !== null;
+  }
+
+  async function refreshComposerState() {
+    const action = captureConversationAction();
+    await queue.refresh();
+    if (action && isCurrentConversationAction(action)) await refreshQueuedConversation();
   }
 
   async function openCreatedBranch(branch: import("./types").ConversationBranchV4): Promise<boolean> {
@@ -1881,7 +1894,8 @@ export default function DesktopApp() {
     } : undefined}
     contextUsage={contextUsage.value} contextUsageError={contextUsage.error} onRefreshContextUsage={contextUsage.refresh}
     sideChat={nativeQueueAvailable ? sideChat : undefined}
-    queueItems={queue.items} queueError={queue.error} queueLoading={queue.loading} onQueueRefresh={queue.refresh} onQueueUpdate={queue.update} onQueueAction={queue.action}
+    queueItems={queue.items} queueError={queue.error} queueLoading={queue.loading} onQueueRefresh={refreshComposerState} onQueueUpdate={queue.update} onQueueAction={queue.action}
+    composerBlockingRunIds={nativeQueueAvailable ? conversationState?.composer_blocking_run_ids : undefined}
     replacement={nativeQueueAvailable ? { busy: replacement.busy, pending: replacement.pending, error: replacement.error, originalMarkdown: replacement.originalTurn?.message_markdown, retry: replacement.retry, send: async (markdown, mode, target, references, attachments) => {
       if (!selected || !conversation || !activeModel) return false;
       return replacement.send({ project_id: selected.id, conversation_id: conversation.id, mode: mode === "plan" ? "plan" : "agent", message_markdown: markdown, model_profile_id: activeModel.id, compute_selection: currentComputeSelection(), references, attachments }, target);
