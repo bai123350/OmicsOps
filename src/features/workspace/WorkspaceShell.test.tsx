@@ -2053,6 +2053,7 @@ beforeEach(() => {
 describe("run diagnostics entry", () => {
   it("opens diagnostics above trajectory and immediately Escape closes only the top layer", () => {
     render(<WorkspaceShell project={project} locale="en-US" activeConversationId="current" />);
+    expect(screen.queryByRole("button", { name: "Run diagnostics" })).not.toBeInTheDocument();
     fireEvent.change(screen.getByRole("textbox", { name: /Describe a research goal/ }), { target: { value: "/trajectory" } });
     fireEvent.click(screen.getByRole("option", { name: /\/trajectory/ }));
     const trajectory = screen.getByRole("dialog", { name: "Run trajectory" });
@@ -2070,7 +2071,9 @@ describe("exact diagnostic source location", () => {
   const row = { run_id: source.run_id, sequence: source.sequence, event_hash: source.event_hash, previous_hash: source.previous_hash, occurred_at: source.occurred_at, event_kind: "model_text", status: null, tool_label: null, call_ref: null, duration_ms: null };
   const snapshot: import("../../types").RunDiagnosticsSnapshotV4 = { schema_version: 1, project_id: project.id, conversation_id: "current", source_heads: [{ run_id: "run-a", event_count: 3, last_sequence: 3, event_hash: "hash-a" }], filter_summary: { run_id: null, tool_label: null, failures_only: false }, source_chain_validated: true, filtered: false, total_event_count: 3, selected_event_count: 1, events: [row], usage: [] };
   async function openAndLocate() {
-    fireEvent.click(screen.getByRole("button", { name: "Run diagnostics" }));
+    fireEvent.change(screen.getByRole("textbox", { name: /Describe a research goal/ }), { target: { value: "/trajectory" } });
+    fireEvent.click(screen.getByRole("option", { name: /\/trajectory/ }));
+    fireEvent.click(within(screen.getByRole("dialog", { name: "Run trajectory" })).getByRole("button", { name: "Run diagnostics" }));
     fireEvent.click(screen.getByRole("button", { name: "Refresh diagnostics" }));
     fireEvent.click(await screen.findByRole("button", { name: "Locate event 3" }));
   }

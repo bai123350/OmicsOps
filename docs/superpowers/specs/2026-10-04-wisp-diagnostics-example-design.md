@@ -74,6 +74,8 @@ JSON 文件保留该 DTO 的全部版本化诊断投影字段与 `schema_version
 无扩展名路径不会覆盖旁边同名的带后缀文件；取消不写文件。既有会话 HTML/PNG
 保存采用相同边界，保持原序列化和显式合法目标（2026-10-19 最终审阅修正）。
 
+运行诊断从运行轨迹对话框中的入口打开；会话标题栏不显示该按钮（2026-10-21 界面调整）。
+
 `RunDiagnosticsDialog` 通过 `src/run-diagnostics-api.ts` 调宿主命令；browser 开发态用受控测试 mock，不把 browser 下载视为宿主已校验导出。工作区作用域变化使未完成查询过期；晚响应不得填入另一 project/conversation。保存进行时禁止重复提交，取消或失败保留筛选/预览并显示对应状态。
 
 点击定位向 WorkspaceShell 发出 `{run_id, sequence, event_hash}`，展开对应 run 与诊断折叠区，滚动并 focus 精确行。该区覆盖所有事件 kind，包括只有元数据的 ModelText 行，不能因现有 UI 排除 ModelText 而丢失定位目标。行标记用这三个字段，不只按 call_id、index 或 sequence 查找。源行暂时不在当前缓存时使用新的只读诊断命令刷新后再查，不调用带 reconciliation 的旧命令；hash 不一致或仍缺失则明确“源事件已不可定位”，不得选择相邻行替代。`ActivityWindow` 的裁剪不用于这个定位目标。对话框进入窗口级 Escape 堆栈，打开后立即 Escape 可关闭顶层，一次按键不关闭父级覆盖层。
