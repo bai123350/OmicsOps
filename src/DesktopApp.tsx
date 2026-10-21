@@ -10,7 +10,7 @@ import { canAttachSearchEntry, type WorkspaceSearchEntry, type WorkspaceSearchRe
 import { WorkspaceSearchDialog } from "./features/workspace/WorkspaceSearchDialog";
 import { referenceKey } from "./features/workspace/ComposerReferences";
 import type { ComposerReference } from "./types";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "./tauri-api";
 import type { ConversationVisibilityRecordV1, ConversationVisibilityV1, SetConversationVisibilityRequestV1 } from "./workspace-navigation-types";
 import { ShelvedConversationsDialog } from "./features/workspace/ShelvedConversationsDialog";
@@ -242,6 +242,9 @@ export default function DesktopApp() {
   const [messages, setMessages] = useState<WorkspaceMessage[]>([]);
   const [agentBusy, setAgentBusy] = useState(false);
   const [agentNotice, setAgentNotice] = useState("");
+  const [runPollingError, setRunPollingError] = useState("");
+  const [workspaceDataError, setWorkspaceDataError] = useState("");
+  const refreshWorkspaceData = useRef<() => void>(() => {});
   useRunNotifications((message) => setAgentNotice(message));
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>([]);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
@@ -302,7 +305,6 @@ export default function DesktopApp() {
     ]),
   );
   const runActionGuards = useRef(new Set<string>());
-  const runPollingNotice = useRef("");
   // Every asynchronous conversation read/action captures both this token and
   // the ids below. A late response from a previous session must never hydrate
   // the currently selected conversation.
@@ -407,15 +409,11 @@ export default function DesktopApp() {
 
   function reportRunPollingFailure(error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
-    runPollingNotice.current = message;
-    setAgentNotice(message);
+    setRunPollingError(message);
   }
 
   function clearRecoveredRunPollingFailure() {
-    const recovered = runPollingNotice.current;
-    if (!recovered) return;
-    runPollingNotice.current = "";
-    setAgentNotice((current) => current === recovered ? "" : current);
+    setRunPollingError("");
   }
 
   function isCurrentConversation(projectId: string, conversationId: string, token: number) {
@@ -655,11 +653,53 @@ export default function DesktopApp() {
     }
   }, [computeBackendId, computeBackends]);
   useEffect(() => {
-    if (!selected) { setMemoryFacts([]); setNotebookEntries([]); setProjectArtifacts([]); return; }
-    void Promise.all([api.searchAgentMemory(selected.id), api.listNotebookEntries(selected.id), api.listProjectArtifacts(selected.id), api.listSyncEntries(selected.id)])
-      .then(([facts, notebook, artifacts, transfers]) => { setMemoryFacts(facts); setNotebookEntries(notebook); setProjectArtifacts(artifacts); setSyncEntries(transfers); })
-      .catch((error) => setAgentNotice(error instanceof Error ? error.message : String(error)));
-  }, [selected?.id, agentRunEventsV4.at(-1)?.sequence]);
+    const projectId = selected?.id;
+    let disposed = false;
+    let inFlight = false;
+    let pending = false;
+    setMemoryFacts([]); setNotebookEntries([]); setProjectArtifacts([]); setSyncEntries([]); setWorkspaceDataError("");
+    refreshWorkspaceData.current = () => {};
+    if (!projectId) return;
+    const current = () => !disposed && currentConversationIdentity.current.projectId === projectId;
+    const refresh = () => {
+      if (!current()) return;
+      pending = true;
+      if (inFlight) return;
+      inFlight = true;
+      void (async () => {
+        try {
+          do {
+            pending = false;
+            // Wait for every read, even after a failure, before starting the
+            // one coalesced follow-up. A rejected sibling cannot release the
+            // guard while the other queries still occupy the database pool.
+            const [facts, notebook, artifacts, transfers] = await Promise.allSettled([
+              api.searchAgentMemory(projectId), api.listNotebookEntries(projectId),
+              api.listProjectArtifacts(projectId), api.listSyncEntries(projectId),
+            ]);
+            if (!current()) return;
+            if (facts.status === "fulfilled" && notebook.status === "fulfilled"
+              && artifacts.status === "fulfilled" && transfers.status === "fulfilled") {
+              setMemoryFacts(facts.value); setNotebookEntries(notebook.value);
+              setProjectArtifacts(artifacts.value); setSyncEntries(transfers.value);
+              setWorkspaceDataError("");
+            } else {
+              const failure = [facts, notebook, artifacts, transfers].find((result) => result.status === "rejected");
+              if (failure?.status === "rejected") setWorkspaceDataError(failure.reason instanceof Error ? failure.reason.message : String(failure.reason));
+            }
+          } while (pending && current());
+        } finally { inFlight = false; }
+      })();
+    };
+    refreshWorkspaceData.current = refresh;
+    refresh();
+    return () => { disposed = true; };
+  }, [selected?.id]);
+  const workspaceDataRevision = useMemo(() => {
+    const changed = [...agentRunEventsV4].reverse().find((event) => event.project_id === selected?.id && eventChangesWorkspaceData(event.event.kind));
+    return changed ? `${changed.run_id}:${changed.sequence}` : null;
+  }, [agentRunEventsV4, selected?.id]);
+  useEffect(() => { if (workspaceDataRevision) refreshWorkspaceData.current(); }, [workspaceDataRevision]);
   useEffect(() => {
     setFileNotice("");
   }, [selected?.id, selected?.connection_id, selected?.remote_root]);
@@ -693,6 +733,7 @@ export default function DesktopApp() {
     const hydrationEventGeneration = agentEventGeneration.current;
     let disposed = false;
     setHydrationState(true);
+    setRunPollingError("");
     setConversationState(null);
     messagesRef.current = [];
     messageSequenceRef.current = 1;
@@ -1663,7 +1704,7 @@ export default function DesktopApp() {
     onSetVisibility={setConversationVisibility} onOpenShelvedConversations={() => setShelvedOpen(true)}
     locale={locale} onOpenSettings={(section = "models") => { setSettingsSection(section); setSettingsOpen(true); }} onBackToProjects={backToProjectLibrary}
     conversations={conversations} activeConversationId={conversation?.id} onSelectConversation={selectConversation} onNewConversation={newConversation} onOpenBranch={openCreatedBranch} onDeleteConversation={deleteConversation}
-    messages={messages} agentBusy={agentBusy} agentNotice={agentNotice} conversationLoadError={conversationLoadError} onRetryConversationLoad={() => setConversationLoadRetry((value) => value + 1)} modelLabel={activeModel?.model} activeModelProfile={activeModel} modelProfiles={modelProfiles}
+    messages={messages} agentBusy={agentBusy} agentNotice={agentNotice} runPollingError={runPollingError} workspaceDataError={workspaceDataError} onRefreshWorkspaceData={() => refreshWorkspaceData.current()} conversationLoadError={conversationLoadError} onRetryConversationLoad={() => setConversationLoadRetry((value) => value + 1)} modelLabel={activeModel?.model} activeModelProfile={activeModel} modelProfiles={modelProfiles}
     composerBusy={modelSelectionBusy || !conversation}
     modelPicker={<ApiModelPicker zh={locale === "zh-CN"} profiles={modelProfiles} activeProfileId={activeModelProfileId} disabled={agentBusy || conversationLocked || conversationHydrating || modelSelectionBusy || planLoading} onProfileChange={(id) => { if (!modelSelectionInFlight.current) setActiveModelProfileId(id); }} onManage={() => { setSettingsSection("models"); setSettingsOpen(true); }} onModelSelect={async (profile, model) => {
       if (modelSelectionInFlight.current || conversationLocked || conversationHydrating || agentBusy || profile.id !== activeModelProfileId) throw new Error("Model selection is currently locked");
@@ -1974,6 +2015,12 @@ function eventChangesConversationState(kind: AgentRunEventV4["event"]["kind"]) {
     || kind === "run_failed"
     || kind === "run_cancelled"
     || kind === "run_needs_attention";
+}
+
+function eventChangesWorkspaceData(kind: AgentRunEventV4["event"]["kind"]) {
+  return kind === "run_created" || kind === "tool_finished" || kind === "tool_outcome_reused"
+    || kind === "scientific_state_changed" || kind === "run_completed" || kind === "run_failed"
+    || kind === "run_cancelled" || kind === "run_needs_attention";
 }
 
 function isActivePlanRevisionStatus(status: ProposedPlanRevisionV4["status"] | undefined) {

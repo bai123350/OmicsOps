@@ -120,6 +120,102 @@ function setupConversationStateHarness() {
   return { stateSpy: vi.spyOn(api, "agentV4ConversationState") };
 }
 
+describe("project data refresh", () => {
+  function harness() {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (projectId, id) => ({ ...stateSnapshot(id), project_id: projectId }));
+    const memory = vi.spyOn(api, "searchAgentMemory").mockResolvedValue([]);
+    const notebook = vi.spyOn(api, "listNotebookEntries").mockResolvedValue([]);
+    const artifacts = vi.spyOn(api, "listProjectArtifacts").mockResolvedValue([]);
+    const transfers = vi.spyOn(api, "listSyncEntries").mockResolvedValue([]);
+    const shell = vi.spyOn(workspaceShell, "WorkspaceShell");
+    let listener!: (event: AgentRunEventV4) => void;
+    vi.spyOn(api, "onAgentV4Event").mockImplementation(async (callback) => { listener = callback; return () => {}; });
+    return { memory, notebook, artifacts, transfers, shell, emit: (sequence: number, event: AgentRunEventV4["event"]) => listener(agentEvent(stateConversations[0].id, "data-run", sequence, event)) };
+  }
+
+  const finished = { kind: "tool_finished" as const, outcome: { call_id: "save", tool_id: "artifact.record", succeeded: true, model_content: "saved", data: {}, provenance: [] } };
+  const artifact = (projectId: string) => ({ id: `artifact-${projectId}`, project_id: projectId, run_id: null, relative_path: "result.tsv", remote_path: null, media_type: "text/tab-separated-values", size_bytes: 10, sha256: "hash", verified: true, created_at: "2026-10-21T00:00:00Z" });
+
+  it("does not query all project data for model progress events", async () => {
+    const test = harness();
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: "Agent 会话" });
+    const reads = [test.memory, test.notebook, test.artifacts, test.transfers];
+    reads.forEach((read) => expect(read).toHaveBeenCalledTimes(1));
+    for (let sequence = 1; sequence <= 12; sequence++) {
+      await act(async () => test.emit(sequence, { kind: "model_text", text: `progress ${sequence}` }));
+    }
+    reads.forEach((read) => expect(read).toHaveBeenCalledTimes(1));
+  });
+
+  it("coalesces pending data refreshes and still reads changes arriving during the request", async () => {
+    const test = harness();
+    const pending = deferred<import("./types").ProjectArtifact[]>();
+    const latest = artifact(stateProject.id);
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: "Agent 会话" });
+    test.artifacts.mockReturnValueOnce(pending.promise).mockResolvedValue([latest]);
+    await act(async () => test.emit(1, finished));
+    for (let sequence = 2; sequence <= 12; sequence++) await act(async () => test.emit(sequence, finished));
+    const reads = [test.memory, test.notebook, test.artifacts, test.transfers];
+    reads.forEach((read) => expect(read).toHaveBeenCalledTimes(2));
+    await act(async () => pending.resolve([]));
+    await waitFor(() => expect(test.shell.mock.calls.at(-1)?.[0].projectArtifacts).toEqual([latest]));
+    reads.forEach((read) => expect(read).toHaveBeenCalledTimes(3));
+  });
+
+  it("waits for the whole read batch after one query fails before retrying pending changes", async () => {
+    const test = harness();
+    const pending = deferred<import("./types").ProjectArtifact[]>();
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: "Agent 会话" });
+    test.memory.mockRejectedValueOnce(new Error("memory read failed"));
+    test.artifacts.mockReturnValueOnce(pending.promise);
+    await act(async () => test.emit(1, finished));
+    await act(async () => test.emit(2, finished));
+    expect(test.artifacts).toHaveBeenCalledTimes(2);
+    expect(test.memory).toHaveBeenCalledTimes(2);
+    await act(async () => pending.resolve([]));
+    await waitFor(() => expect(test.artifacts).toHaveBeenCalledTimes(3));
+    expect(test.memory).toHaveBeenCalledTimes(3);
+    expect(screen.queryByText("memory read failed")).not.toBeInTheDocument();
+    expect(screen.queryByText("对话未完成")).not.toBeInTheDocument();
+  });
+
+  it.each(["success", "failure"] as const)("discards a project data %s after changing projects", async (result) => {
+    const test = harness();
+    const projectB = { ...stateProject, id: "project-data-b", name: "项目 B" };
+    const conversationB = { ...stateConversations[0], id: "conversation-data-b", project_id: projectB.id, title: "项目 B 会话" };
+    vi.mocked(api.listProjects).mockResolvedValue([stateProject, projectB]);
+    vi.mocked(api.listConversations).mockImplementation(async (projectId) => projectId === projectB.id ? [conversationB] : stateConversations);
+    vi.mocked(api.latestUsedConversation).mockImplementation(async (projectId) => projectId === projectB.id ? conversationB : stateConversations[0]);
+    const old = deferred<import("./types").ProjectArtifact[]>();
+    test.artifacts.mockImplementation((projectId) => projectId === stateProject.id ? old.promise : Promise.resolve([artifact(projectB.id)]));
+    render(<DesktopApp />);
+    await screen.findByRole("heading", { name: "Agent 会话" });
+    fireEvent.click(screen.getByRole("button", { name: "返回项目主页" }));
+    fireEvent.click(await screen.findByRole("button", { name: "打开项目：项目 B" }));
+    await screen.findByRole("heading", { name: "项目 B 会话" });
+    await waitFor(() => expect(test.shell.mock.calls.at(-1)?.[0].projectArtifacts).toEqual([artifact(projectB.id)]));
+    await act(async () => result === "success" ? old.resolve([artifact(stateProject.id)]) : old.reject(new Error("old project failure")));
+    expect(test.shell.mock.calls.at(-1)?.[0].projectArtifacts).toEqual([artifact(projectB.id)]);
+    expect(screen.queryByText("old project failure")).not.toBeInTheDocument();
+  });
+
+  it("shows a recoverable project data error separately from a failed conversation", async () => {
+    const test = harness();
+    test.artifacts.mockRejectedValueOnce(new Error("project data pool timeout"));
+    render(<DesktopApp />);
+    await screen.findByText("project data pool timeout");
+    expect(screen.getByText("项目资料暂时无法刷新")).toBeInTheDocument();
+    expect(screen.queryByText("对话未完成")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重试加载项目资料" }));
+    await waitFor(() => expect(screen.queryByText("project data pool timeout")).not.toBeInTheDocument());
+    expect(test.artifacts).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("remote file listing state", () => {
   it("keeps listing failures out of transfer notices and clears the error after a successful retry", async () => {
     const { stateSpy } = setupConversationStateHarness();
@@ -2014,14 +2110,33 @@ describe("DesktopApp", () => {
       });
       expect(screen.getByRole("main", { name: "科研对话" })).toBeInTheDocument();
       expect(screen.getByText("temporary event verification failure")).toBeInTheDocument();
+      expect(screen.getByText("运行状态暂时无法刷新")).toBeInTheDocument();
+      expect(screen.queryByText("对话未完成")).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "终止运行" })).toBeEnabled();
       const readsBeforeInterval = readEvents.mock.calls.length;
       await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
       expect(readEvents.mock.calls.length).toBeGreaterThan(readsBeforeInterval);
       expect(screen.getByText("轮询恢复了进度。")).toBeInTheDocument();
       expect(screen.queryByText("temporary event verification failure")).not.toBeInTheDocument();
+      expect(screen.queryByText("运行状态暂时无法刷新")).not.toBeInTheDocument();
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("clears a run polling failure when switching conversations", async () => {
+    const { stateSpy } = setupConversationStateHarness();
+    stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    const started = agentEvent(stateConversations[0].id, "run-poll-scope", 1, { kind: "run_created", mode: "execute" });
+    vi.mocked(api.agentV4EventsForConversation).mockImplementation(async (_projectId, conversationId) => conversationId === stateConversations[0].id ? [started] : []);
+    vi.mocked(api.agentV4Events).mockRejectedValue(new Error("old conversation pool timeout"));
+    const shell = vi.spyOn(workspaceShell, "WorkspaceShell");
+    render(<DesktopApp />);
+    await screen.findByText("old conversation pool timeout");
+    await act(async () => { await shell.mock.calls.at(-1)![0].onSelectConversation?.(stateConversations[1].id); });
+    await waitFor(() => expect(shell.mock.calls.at(-1)?.[0].activeConversationId).toBe(stateConversations[1].id));
+    expect(screen.queryByText("old conversation pool timeout")).not.toBeInTheDocument();
+    expect(screen.queryByText("运行状态暂时无法刷新")).not.toBeInTheDocument();
   });
 
   it("starts planning from the Agent controls Plan mode and continues execution after approval", async () => {

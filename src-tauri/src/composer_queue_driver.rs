@@ -214,41 +214,75 @@ async fn wait_for_run_settlement(
             return Ok(false);
         };
         let status = value.get("status").and_then(serde_json::Value::as_str);
-        let events = state
-            .repository
-            .agent_events_v4(item.run_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let terminal_event_status = events.iter().find_map(|event| match event.event {
-            omicsops_protocol::AgentEventKindV4::RunCompleted => Some("completed"),
-            omicsops_protocol::AgentEventKindV4::RunFailed { .. } => Some("failed"),
-            omicsops_protocol::AgentEventKindV4::RunCancelled => Some("cancelled"),
-            omicsops_protocol::AgentEventKindV4::RunNeedsAttention { .. } => {
-                Some("needs_attention")
-            }
-            _ => None,
-        });
-        // Wisp's Stop action is scoped to the active turn: it leaves pending
-        // queue rows intact and its FIFO driver proceeds once the cancelled
-        // turn has a durable terminal event.  Do not treat the stop receipt
-        // itself as a queue pause; an observed receipt remains stored for
-        // restart reconciliation.
-        let safe_attention = if status == Some("needs_attention")
-            && terminal_event_status == Some("needs_attention")
-        {
-            state
-                .repository
-                .safe_needs_attention_run(item.project_id, item.conversation_id, item.run_id)
-                .await
-                .map_err(|error| error.to_string())?
-        } else {
-            false
-        };
-        if let Some(advance) = settlement_decision(status, terminal_event_status, safe_attention) {
+        let decision = probe_run_settlement(
+            status,
+            || async {
+                state
+                    .repository
+                    .agent_events_v4(item.run_id)
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+            || async {
+                state
+                    .repository
+                    .safe_needs_attention_run(item.project_id, item.conversation_id, item.run_id)
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await?;
+        if let Some(advance) = decision {
             return Ok(advance);
         }
         tokio::time::sleep(RUN_POLL_INTERVAL).await;
     }
+}
+
+async fn probe_run_settlement<F, Fut, G, AttentionFut>(
+    status: Option<&str>,
+    read_events: F,
+    check_safe_attention: G,
+) -> Result<Option<bool>, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<omicsops_protocol::AgentEventV4>, String>>,
+    G: FnOnce() -> AttentionFut,
+    AttentionFut: std::future::Future<Output = Result<bool, String>>,
+{
+    // Running rows cannot settle even when a terminal event has just been
+    // appended. Avoid reloading and hashing their growing history at every
+    // 250 ms poll; the driver must still persist its terminal status first.
+    if !matches!(
+        status,
+        Some("completed" | "failed" | "cancelled" | "needs_attention")
+    ) {
+        return Ok(settlement_decision(status, None, false));
+    }
+    let events = read_events().await?;
+    let terminal_event_status = events.iter().find_map(|event| match event.event {
+        omicsops_protocol::AgentEventKindV4::RunCompleted => Some("completed"),
+        omicsops_protocol::AgentEventKindV4::RunFailed { .. } => Some("failed"),
+        omicsops_protocol::AgentEventKindV4::RunCancelled => Some("cancelled"),
+        omicsops_protocol::AgentEventKindV4::RunNeedsAttention { .. } => Some("needs_attention"),
+        _ => None,
+    });
+    // Wisp's Stop action is scoped to the active turn: it leaves pending
+    // queue rows intact and its FIFO driver proceeds once the cancelled
+    // turn has a durable terminal event.  Do not treat the stop receipt
+    // itself as a queue pause; an observed receipt remains stored for
+    // restart reconciliation.
+    let safe_attention =
+        if status == Some("needs_attention") && terminal_event_status == Some("needs_attention") {
+            check_safe_attention().await?
+        } else {
+            false
+        };
+    Ok(settlement_decision(
+        status,
+        terminal_event_status,
+        safe_attention,
+    ))
 }
 
 fn settlement_decision(
@@ -306,6 +340,90 @@ pub(crate) fn try_scope_lease(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn active_or_waiting_runs_do_not_load_the_event_history() {
+        for (status, expected) in [
+            (Some("running"), None),
+            (Some("planning"), None),
+            (Some("waiting_for_input"), Some(false)),
+            (Some("waiting_for_approval"), Some(false)),
+            (Some("awaiting_approval"), Some(false)),
+            (Some("unknown"), Some(false)),
+            (None, Some(false)),
+        ] {
+            let decision = probe_run_settlement(
+                status,
+                || async { Err("event history should not be loaded".into()) },
+                || async { Err("attention history should not be loaded".into()) },
+            )
+            .await;
+            assert_eq!(decision, Ok(expected), "status {status:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_rows_still_require_validated_matching_events() {
+        use omicsops_protocol::{AgentEventKindV4, AgentEventV4};
+        for status in ["completed", "failed", "cancelled", "needs_attention"] {
+            assert_eq!(
+                probe_run_settlement(
+                    Some(status),
+                    || async { Err("broken event chain".into()) },
+                    || async { Ok(true) },
+                )
+                .await,
+                Err("broken event chain".into())
+            );
+            assert_eq!(
+                probe_run_settlement(
+                    Some(status),
+                    || async { Ok(vec![]) },
+                    || async { Err("attention checked without its terminal event".into()) },
+                )
+                .await,
+                Ok(None)
+            );
+        }
+        let cancelled = AgentEventV4::first(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Utc::now(),
+            AgentEventKindV4::RunCancelled,
+        );
+        for (status, expected) in [("cancelled", true), ("completed", false)] {
+            assert_eq!(
+                probe_run_settlement(
+                    Some(status),
+                    || async { Ok(vec![cancelled.clone()]) },
+                    || async { Err("unexpected attention check".into()) },
+                )
+                .await,
+                Ok(Some(expected))
+            );
+        }
+        let attention = AgentEventV4::first(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Utc::now(),
+            AgentEventKindV4::RunNeedsAttention {
+                message: "fixture".into(),
+            },
+        );
+        for safe in [false, true] {
+            assert_eq!(
+                probe_run_settlement(
+                    Some("needs_attention"),
+                    || async { Ok(vec![attention.clone()]) },
+                    || async { Ok(safe) },
+                )
+                .await,
+                Ok(Some(safe))
+            );
+        }
+    }
 
     #[tokio::test]
     async fn replacement_waits_then_wakes_without_a_ui_kick() {

@@ -1370,6 +1370,16 @@ describe("WorkspaceShell", () => {
     await waitFor(() => expect(onSend).toHaveBeenCalledWith("检查 hg19 数据", "chat"));
   });
 
+  it("keeps a conversation error visible when a separate run status read recovers", () => {
+    const props = { project, locale: "en-US" as const, onSend: () => true, agentNotice: "Send failed", runPollingError: "Database read unavailable" };
+    const view = render(<WorkspaceShell {...props} />);
+    expect(screen.getByText("Run status is temporarily unavailable")).toBeInTheDocument();
+    expect(screen.getByText("Conversation did not complete")).toBeInTheDocument();
+    view.rerender(<WorkspaceShell {...props} runPollingError="" />);
+    expect(screen.queryByText("Run status is temporarily unavailable")).not.toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("Send failed");
+  });
+
   it("keeps the composer available with a long multiline assistant response", () => {
     const markdown = Array.from({ length: 80 }, (_, index) => `步骤 ${index + 1}\n\`gene_${index}\``).join("\n");
     render(<WorkspaceShell project={project} locale="zh-CN" onSend={() => true} messages={[{ id: "assistant-long", role: "assistant", markdown }]} />);
