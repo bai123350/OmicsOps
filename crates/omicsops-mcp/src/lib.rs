@@ -545,7 +545,10 @@ impl McpSessionManager {
     ) -> Result<Arc<McpSession>, McpRuntimeError> {
         let key = McpSessionKey::new(config.project_id, config.server_id);
         let fingerprint = config.fingerprint();
-        if let Some(session) = self.sessions.lock().await.get(&key).cloned() {
+        // Release the pool lock before awaiting state or invalidation, which
+        // acquires the same lock when a resolved configuration has changed.
+        let existing = { self.sessions.lock().await.get(&key).cloned() };
+        if let Some(session) = existing {
             if session.config_fingerprint == fingerprint
                 && !matches!(
                     session.state().await,

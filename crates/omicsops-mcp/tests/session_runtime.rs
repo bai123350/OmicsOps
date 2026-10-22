@@ -1,6 +1,6 @@
 #![cfg(feature = "test-fixtures")]
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, time::Duration};
 
 use omicsops_mcp::{McpRuntimeError, McpServerConfig, McpSessionManager};
 use serde_json::json;
@@ -106,6 +106,62 @@ async fn calls_reuse_one_process_and_projects_are_isolated() {
         .unwrap();
     assert_eq!(count(&counter, "start"), 2);
     manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn environment_rotation_reconnects_only_the_matching_project_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let counter = temp.path().join("rotated-project.txt");
+    let other_counter = temp.path().join("other-project.txt");
+    let manager = McpSessionManager::new();
+    let mut first = config(Uuid::new_v4(), &counter, 5);
+    first.env.push((
+        "OMICSOPS_MCP_TEST_CREDENTIAL".into(),
+        "before-rotation".into(),
+    ));
+    let mut other = config(Uuid::new_v4(), &other_counter, 5);
+    other.server_id = first.server_id;
+    manager
+        .call(first.clone(), "echo", json!({"value":"before"}), None, None)
+        .await
+        .unwrap();
+    manager
+        .call(
+            other.clone(),
+            "echo",
+            json!({"value":"other before"}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    first.env.last_mut().unwrap().1 = "after-rotation".into();
+    let rotated = tokio::time::timeout(
+        Duration::from_secs(5),
+        manager.call(first, "echo", json!({"value":"after"}), None, None),
+    )
+    .await;
+    let unaffected = tokio::time::timeout(
+        Duration::from_secs(5),
+        manager.call(other, "echo", json!({"value":"other after"}), None, None),
+    )
+    .await;
+    let shutdown = tokio::time::timeout(Duration::from_secs(5), manager.shutdown()).await;
+
+    let rotated = rotated
+        .expect("rotating resolved environment must reconnect without locking the session pool")
+        .unwrap();
+    assert_eq!(rotated.result["content"][0]["text"], "after");
+    let unaffected = unaffected
+        .expect("another project's session must remain callable")
+        .unwrap();
+    assert_eq!(unaffected.result["content"][0]["text"], "other after");
+    assert_eq!(count(&counter, "start"), 2);
+    assert_eq!(count(&counter, "echo"), 2);
+    assert_eq!(count(&other_counter, "start"), 1);
+    assert_eq!(count(&other_counter, "echo"), 2);
+    shutdown.expect("shutdown must finish after replacing a session");
 }
 
 #[tokio::test]
