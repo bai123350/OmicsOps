@@ -1,7 +1,70 @@
 //! Launch boundary shared by the desktop tool and deterministic fake-backend tests.
-use omicsops_protocol::{ExecutionContextKeyV4, RuntimeJobV4, RuntimeResultV4, ToolCallV4};
+use omicsops_protocol::{
+    ExecutionContextKeyV4, RuntimeInitializationFailureCodeV4, RuntimeInitializationFailureV4,
+    RuntimeJobV4, RuntimeResultV4, ToolCallV4, ToolOutcomeV4,
+};
 use omicsops_runtime::RuntimeManagerV4;
 use omicsops_store::Store;
+
+#[derive(Debug)]
+pub(crate) enum RuntimeExecutionV4 {
+    Completed {
+        job: RuntimeJobV4,
+        result: RuntimeResultV4,
+    },
+    InitializationFailed(ToolOutcomeV4),
+}
+
+fn initialization_failure_outcome(
+    call: &ToolCallV4,
+    job: &RuntimeJobV4,
+) -> Result<ToolOutcomeV4, String> {
+    let failure = job
+        .initialization_failure
+        .as_ref()
+        .ok_or("runtime initialization receipt is missing")?;
+    let reason = match failure.code {
+        RuntimeInitializationFailureCodeV4::KernelInitializationFailed => {
+            "The selected runtime could not initialize its kernel."
+        }
+        RuntimeInitializationFailureCodeV4::SshDriverUploadFailed => {
+            "The SSH kernel driver could not be uploaded. Check the remote filesystem's free space, user quota, and write permissions."
+        }
+    };
+    Ok(ToolOutcomeV4 {
+        call_id: call.call_id.clone(),
+        tool_id: call.tool_id.clone(),
+        succeeded: false,
+        model_content: format!(
+            "{reason} This request's code was not submitted. Setup files or idle processes may exist. This call will not be retried automatically; use existing observations to report the limitation, or correct the initialization problem before a new request."
+        ),
+        data: serde_json::json!({
+            "error_kind":"runtime_initialization_failed",
+            "initialization_failure":failure,
+            "code_dispatched":false,
+            "setup_effects_possible":true,
+            "automatic_retry":false,
+            "backend_id":job.context.backend_id,
+            "environment":job.context.environment,
+            "language":job.context.language,
+            "job_id":job.job_id,
+        }),
+        provenance: vec![format!("runtime-job:{}", job.job_id)],
+    })
+}
+
+pub(crate) async fn recover_initialization_failure(
+    repository: &Store,
+    key: &ExecutionContextKeyV4,
+    call: &ToolCallV4,
+) -> Result<Option<ToolOutcomeV4>, String> {
+    repository
+        .recover_runtime_initialization_failure_v4(key, call)
+        .await
+        .map_err(|error| error.to_string())?
+        .map(|job| initialization_failure_outcome(call, &job))
+        .transpose()
+}
 
 pub(crate) async fn execute_reserved(
     repository: &Store,
@@ -10,7 +73,7 @@ pub(crate) async fn execute_reserved(
     call: &ToolCallV4,
     code: String,
     captures: Vec<String>,
-) -> Result<(RuntimeJobV4, RuntimeResultV4), String> {
+) -> Result<RuntimeExecutionV4, String> {
     let recorded_captures = call
         .arguments
         .get("capture_paths")
@@ -35,6 +98,9 @@ pub(crate) async fn execute_reserved(
         .await
         .map_err(|error| error.to_string())?;
     if !acquired {
+        if let Some(outcome) = recover_initialization_failure(repository, key, call).await? {
+            return Ok(RuntimeExecutionV4::InitializationFailed(outcome));
+        }
         return Err(format!(
             "runtime job {} already exists ({:?}); reconcile its original dispatch before retrying",
             reserved.job_id, reserved.state
@@ -43,16 +109,18 @@ pub(crate) async fn execute_reserved(
     let session = match runtime.acquire(&key).await {
         Ok(session) => session,
         Err(error) => {
-            repository
-                .advance_runtime_job_v4(
-                    &reserved,
-                    omicsops_protocol::RuntimeJobStateV4::Unknown,
-                    None,
-                    None,
-                )
+            let code = if error.starts_with("ssh_kernel_driver_upload_failed:") {
+                RuntimeInitializationFailureCodeV4::SshDriverUploadFailed
+            } else {
+                RuntimeInitializationFailureCodeV4::KernelInitializationFailed
+            };
+            let failed = repository
+                .fail_runtime_initialization_v4(&reserved, RuntimeInitializationFailureV4 { code })
                 .await
                 .map_err(|error| error.to_string())?;
-            return Err(error);
+            return Ok(RuntimeExecutionV4::InitializationFailed(
+                initialization_failure_outcome(call, &failed)?,
+            ));
         }
     };
     let running = repository
@@ -87,7 +155,10 @@ pub(crate) async fn execute_reserved(
             return Err(error);
         }
     };
-    Ok((running, result))
+    Ok(RuntimeExecutionV4::Completed {
+        job: running,
+        result,
+    })
 }
 
 #[cfg(test)]
@@ -113,6 +184,37 @@ mod tests {
     struct FakeBackend {
         process: Arc<FakeProcess>,
         launches: AtomicUsize,
+    }
+    struct InitializationFailureBackend {
+        launches: AtomicUsize,
+        message: &'static str,
+        entered: Option<Arc<tokio::sync::Notify>>,
+    }
+    #[async_trait]
+    impl KernelBackendV4 for InitializationFailureBackend {
+        fn descriptor(&self) -> ComputeBackendDescriptorV4 {
+            ComputeBackendDescriptorV4 {
+                schema_version: 4,
+                backend_id: "local".into(),
+                kind: ComputeBackendKindV4::Local,
+                isolation: IsolationStrengthV4::Process,
+                available: true,
+                supports_python: true,
+                supports_r: false,
+                supports_network_policy: false,
+            }
+        }
+        async fn launch(
+            &self,
+            _: &ExecutionContextKeyV4,
+        ) -> Result<Arc<dyn KernelProcessV4>, String> {
+            self.launches.fetch_add(1, Ordering::SeqCst);
+            if let Some(entered) = &self.entered {
+                entered.notify_one();
+                std::future::pending::<()>().await;
+            }
+            Err(self.message.into())
+        }
     }
     #[async_trait]
     impl KernelBackendV4 for FakeBackend {
@@ -250,6 +352,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initialization_failure_is_durable_and_never_relaunches_the_same_call() {
+        for (message, expected_code) in [
+            (
+                "I/O failed: Failure private-server-marker",
+                "kernel_initialization_failed",
+            ),
+            (
+                "ssh_kernel_driver_upload_failed: private-server-marker",
+                "ssh_driver_upload_failed",
+            ),
+        ] {
+            let store = Store::open_in_memory().await.unwrap();
+            let (key, call) = fixture(&store).await;
+            let backend = Arc::new(InitializationFailureBackend {
+                launches: AtomicUsize::new(0),
+                message,
+                entered: None,
+            });
+            let runtime = RuntimeManagerV4::new(backend.clone());
+            let first =
+                execute_reserved(&store, &runtime, &key, &call, "print(42)".into(), vec![]).await;
+            assert!(
+                first.is_ok(),
+                "initialization failure must be a known failed outcome, not an uncertain dispatch"
+            );
+            let job = store
+                .runtime_job_v4(&key, &call.call_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&job).unwrap()["state"],
+                "initialization_failed"
+            );
+            assert!(
+                job.session_id.is_none()
+                    && job.result_request_id.is_none()
+                    && job.result_sha256.is_none()
+            );
+            assert!(
+                !serde_json::to_string(&job)
+                    .unwrap()
+                    .contains("private-server-marker")
+            );
+            let RuntimeExecutionV4::InitializationFailed(first) = first.unwrap() else {
+                panic!("expected initialization failure");
+            };
+            assert!(!first.succeeded);
+            assert_eq!(first.data["code_dispatched"], false);
+            assert_eq!(first.data["setup_effects_possible"], true);
+            assert_eq!(first.data["automatic_retry"], false);
+            assert_eq!(first.data["initialization_failure"]["code"], expected_code);
+            assert!(
+                !serde_json::to_string(&first)
+                    .unwrap()
+                    .contains("private-server-marker")
+            );
+            let restarted = RuntimeManagerV4::new(backend.clone());
+            let restored =
+                execute_reserved(&store, &restarted, &key, &call, "print(42)".into(), vec![]).await;
+            let RuntimeExecutionV4::InitializationFailed(restored) = restored.unwrap() else {
+                panic!("expected restored initialization failure");
+            };
+            assert_eq!(first, restored);
+            assert_eq!(
+                recover_initialization_failure(&store, &key, &call)
+                    .await
+                    .unwrap(),
+                Some(first)
+            );
+            assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_initialization_remains_unknown_and_does_not_relaunch() {
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let (key, call) = fixture(&store).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let backend = Arc::new(InitializationFailureBackend {
+            launches: AtomicUsize::new(0),
+            message: "unused",
+            entered: Some(entered.clone()),
+        });
+        let task = {
+            let store = store.clone();
+            let backend = backend.clone();
+            let key = key.clone();
+            let call = call.clone();
+            tokio::spawn(async move {
+                execute_reserved(
+                    &store,
+                    &RuntimeManagerV4::new(backend),
+                    &key,
+                    &call,
+                    "print(42)".into(),
+                    vec![],
+                )
+                .await
+            })
+        };
+        entered.notified().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let previous = store
+            .agent_events_v4(key.run_id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        store
+            .append_agent_event_v4(&AgentEventV4::next(
+                &previous,
+                Utc::now(),
+                AgentEventKindV4::RunCancelled,
+            ))
+            .await
+            .unwrap();
+        let job = store
+            .runtime_job_v4(&key, &call.call_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.state, RuntimeJobStateV4::Unknown);
+        assert!(job.initialization_failure.is_none());
+        assert!(
+            recover_initialization_failure(&store, &key, &call)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            execute_reserved(
+                &store,
+                &RuntimeManagerV4::new(backend.clone()),
+                &key,
+                &call,
+                "print(42)".into(),
+                vec![]
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(backend.launches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn duplicate_dispatch_never_executes_twice_even_after_connection_loss() {
         for fail in [false, true] {
             let store = Store::open_in_memory().await.unwrap();
@@ -288,7 +537,13 @@ mod tests {
                 }
             );
             if !fail {
-                let (running, result) = a.as_ref().or(b.as_ref()).unwrap();
+                let RuntimeExecutionV4::Completed {
+                    job: running,
+                    result,
+                } = a.as_ref().or(b.as_ref()).unwrap()
+                else {
+                    panic!("expected completed execution");
+                };
                 let expected = outcome(&call, running, result).unwrap();
                 store
                     .advance_runtime_job_v4(

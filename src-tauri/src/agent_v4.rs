@@ -7724,7 +7724,7 @@ impl DesktopToolExecutorV4 {
                         provenance: vec![],
                     });
                 }
-                let (running, mut result) = crate::runtime_jobs_v4::execute_reserved(
+                let execution = crate::runtime_jobs_v4::execute_reserved(
                     &self.repository,
                     &self.resources.get()?.runtime,
                     &key,
@@ -7733,6 +7733,14 @@ impl DesktopToolExecutorV4 {
                     captures,
                 )
                 .await?;
+                let (running, mut result) = match execution {
+                    crate::runtime_jobs_v4::RuntimeExecutionV4::Completed { job, result } => {
+                        (job, result)
+                    }
+                    crate::runtime_jobs_v4::RuntimeExecutionV4::InitializationFailed(outcome) => {
+                        return Ok(outcome);
+                    }
+                };
                 result.software_versions = self
                     .software_versions(
                         language,
@@ -8148,6 +8156,12 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
             .and_then(Value::as_str)
             .unwrap_or("system");
         let key = self.key(language, environment)?;
+        if let Some(outcome) =
+            crate::runtime_jobs_v4::recover_initialization_failure(&self.repository, &key, call)
+                .await?
+        {
+            return Ok(Some(outcome));
+        }
         self.repository
             .recover_runtime_result_v4(&key, call)
             .await
@@ -8250,7 +8264,10 @@ impl KernelBackendV4 for SshKernelBackendV4 {
         self.session
             .upload_text(&driver, kernel_driver(driver_language))
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|_| {
+                "ssh_kernel_driver_upload_failed: the remote server did not acknowledge the kernel driver upload"
+                    .to_owned()
+            })?;
         let executable = if key.environment == "system" {
             executable.to_owned()
         } else {
@@ -9284,8 +9301,11 @@ impl ScientificStateStoreV4 for RepositoryScientificStateStoreV4 {
             }) else {
                 continue;
             };
-            if !serde_json::from_value::<RuntimeResultV4>(outcome.data.clone())
+            if !(serde_json::from_value::<RuntimeResultV4>(outcome.data.clone())
                 .is_ok_and(|result| !result.succeeded)
+                || (outcome.data.get("error_kind").and_then(Value::as_str)
+                    == Some("runtime_initialization_failed")
+                    && outcome.data.get("code_dispatched") == Some(&Value::Bool(false))))
             {
                 continue;
             }
@@ -9354,7 +9374,7 @@ impl ScientificStateStoreV4 for RepositoryScientificStateStoreV4 {
     async fn after_tool(
         &self,
         project_id: Uuid,
-        _run_id: Uuid,
+        run_id: Uuid,
         call: &ToolCallV4,
         outcome: &ToolOutcomeV4,
     ) -> Result<Option<ScientificUpdateV4>, String> {
@@ -9425,6 +9445,59 @@ impl ScientificStateStoreV4 for RepositoryScientificStateStoreV4 {
                         && analysis.status == AnalysisStatusV4::Running
                 }) {
                     return Ok(None);
+                }
+                if !outcome.succeeded
+                    && outcome.data.get("error_kind").and_then(Value::as_str)
+                        == Some("runtime_initialization_failed")
+                {
+                    let analysis = state
+                        .analyses
+                        .values()
+                        .find(|analysis| analysis.source_call_id == call.call_id)
+                        .ok_or("initialization failure analysis is missing")?;
+                    let key = ExecutionContextKeyV4 {
+                        project_id,
+                        run_id,
+                        backend_id: self.backend_id.clone(),
+                        language: parse_language(required(&call.arguments, "language")?)?,
+                        environment: call
+                            .arguments
+                            .get("environment")
+                            .and_then(Value::as_str)
+                            .unwrap_or("system")
+                            .to_owned(),
+                    };
+                    if analysis.run_id != run_id
+                        || analysis.project_id != project_id
+                        || analysis.runtime.backend_id != key.backend_id
+                        || analysis.runtime.environment != key.environment
+                        || !analysis
+                            .runtime
+                            .language
+                            .eq_ignore_ascii_case(required(&call.arguments, "language")?)
+                    {
+                        return Err("initialization failure analysis scope mismatch".into());
+                    }
+                    let recorded = crate::runtime_jobs_v4::recover_initialization_failure(
+                        &self.repository,
+                        &key,
+                        call,
+                    )
+                    .await?;
+                    if recorded.as_ref() != Some(outcome) {
+                        return Err(
+                            "initialization failure requires its exact durable receipt".into()
+                        );
+                    }
+                    let analysis = state
+                        .fail_analysis_initialization(&call.call_id, Utc::now())
+                        .map_err(|error| error.to_string())?;
+                    return self
+                        .save_update(
+                            &state,
+                            vec![format!("analysis_initialization_failed:{}", analysis.id,)],
+                        )
+                        .await;
                 }
                 let result: RuntimeResultV4 = serde_json::from_value(outcome.data.clone())
                     .map_err(|error| format!("invalid runtime result: {error}"))?;
@@ -10011,6 +10084,8 @@ mod go_live_acceptance_tests;
 mod reviewer_schema_tests;
 #[cfg(test)]
 mod scientific_failure_contract_tests;
+#[cfg(test)]
+mod ssh_startup_acceptance_tests;
 #[cfg(test)]
 mod stopped_turn_tests;
 #[cfg(test)]

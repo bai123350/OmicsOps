@@ -135,6 +135,208 @@ async fn concurrent_reservations_grant_one_launch_and_survive_reopen() {
 }
 
 #[tokio::test]
+async fn initialization_failure_survives_reopen_without_a_fabricated_runtime_result() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("initialization.sqlite");
+    let store = Store::open(&path).await.unwrap();
+    let (key, call) = fixture(&store).await;
+    let (reserved, _) = store
+        .reserve_runtime_job_v4(&key, &call.call_id, &call.canonical_hash().unwrap())
+        .await
+        .unwrap();
+    let failure = RuntimeInitializationFailureV4 {
+        code: RuntimeInitializationFailureCodeV4::SshDriverUploadFailed,
+    };
+    let failed = store
+        .fail_runtime_initialization_v4(&reserved, failure.clone())
+        .await
+        .unwrap();
+    assert_eq!(failed.state, RuntimeJobStateV4::InitializationFailed);
+    assert!(
+        failed.session_id.is_none()
+            && failed.result_request_id.is_none()
+            && failed.result_sha256.is_none()
+    );
+    assert!(
+        store
+            .fail_runtime_initialization_v4(&reserved, failure.clone())
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .advance_runtime_job_v4(
+                &failed,
+                RuntimeJobStateV4::Running,
+                Some(Uuid::new_v4()),
+                None
+            )
+            .await
+            .is_err()
+    );
+    let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_job_results_v4")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(receipts, 0);
+    append(
+        &store,
+        key.run_id,
+        AgentEventKindV4::RunFailed {
+            message: "later unrelated failure".into(),
+        },
+    )
+    .await;
+    store.pool().close().await;
+    let reopened = Store::open(&path).await.unwrap();
+    assert_eq!(
+        reopened
+            .recover_runtime_initialization_failure_v4(&key, &call)
+            .await
+            .unwrap(),
+        Some(failed)
+    );
+    assert!(
+        reopened
+            .recover_runtime_result_v4(&key, &call)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn initialization_failure_cannot_replace_running_unknown_or_detached_jobs() {
+    for state in [RuntimeJobStateV4::Running, RuntimeJobStateV4::Unknown] {
+        let store = Store::open_in_memory().await.unwrap();
+        let (key, call) = fixture(&store).await;
+        let (reserved, _) = store
+            .reserve_runtime_job_v4(&key, &call.call_id, &call.canonical_hash().unwrap())
+            .await
+            .unwrap();
+        let previous = store
+            .advance_runtime_job_v4(
+                &reserved,
+                state,
+                (state == RuntimeJobStateV4::Running).then(Uuid::new_v4),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .fail_runtime_initialization_v4(
+                    &previous,
+                    RuntimeInitializationFailureV4 {
+                        code: RuntimeInitializationFailureCodeV4::KernelInitializationFailed
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .fail_runtime_initialization_v4(
+                    &reserved,
+                    RuntimeInitializationFailureV4 {
+                        code: RuntimeInitializationFailureCodeV4::KernelInitializationFailed
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .recover_runtime_initialization_failure_v4(&key, &call)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    let store = Store::open_in_memory().await.unwrap();
+    let (key, call) = fixture(&store).await;
+    let (mut reserved, _) = store
+        .reserve_runtime_job_v4(&key, &call.call_id, &call.canonical_hash().unwrap())
+        .await
+        .unwrap();
+    reserved.remote_root = Some("/synthetic/job".into());
+    assert!(
+        store
+            .fail_runtime_initialization_v4(
+                &reserved,
+                RuntimeInitializationFailureV4 {
+                    code: RuntimeInitializationFailureCodeV4::KernelInitializationFailed
+                }
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn initialization_failure_recovery_rejects_mismatched_request_and_receipt() {
+    let store = Store::open_in_memory().await.unwrap();
+    let (key, call) = fixture(&store).await;
+    let (reserved, _) = store
+        .reserve_runtime_job_v4(&key, &call.call_id, &call.canonical_hash().unwrap())
+        .await
+        .unwrap();
+    let failed = store
+        .fail_runtime_initialization_v4(
+            &reserved,
+            RuntimeInitializationFailureV4 {
+                code: RuntimeInitializationFailureCodeV4::KernelInitializationFailed,
+            },
+        )
+        .await
+        .unwrap();
+    let mut wrong_call = call.clone();
+    wrong_call.arguments["code"] = json!("changed");
+    assert!(
+        store
+            .recover_runtime_initialization_failure_v4(&key, &wrong_call)
+            .await
+            .is_err()
+    );
+    let mut wrong_context = key.clone();
+    wrong_context.environment = "other".into();
+    assert!(
+        store
+            .recover_runtime_initialization_failure_v4(&wrong_context, &call)
+            .await
+            .is_err()
+    );
+    for (field, value) in [
+        ("initialization_failure", json!(null)),
+        (
+            "initialization_failure",
+            json!({"code":"private-server-error"}),
+        ),
+        ("session_id", json!(Uuid::new_v4())),
+        ("result_request_id", json!(Uuid::new_v4())),
+        ("result_sha256", json!("a".repeat(64))),
+        ("remote_root", json!("/unexpected")),
+        ("call_id", json!("other")),
+    ] {
+        let mut forged = serde_json::to_value(&failed).unwrap();
+        forged[field] = value;
+        sqlx::query("UPDATE runtime_jobs_v4 SET value_json=?1 WHERE job_id=?2")
+            .bind(forged.to_string())
+            .bind(failed.job_id.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .recover_runtime_initialization_failure_v4(&key, &call)
+                .await
+                .is_err(),
+            "accepted invalid {field}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn identities_and_recorded_dispatch_are_required() {
     let store = Store::open_in_memory().await.unwrap();
     let (key, call) = fixture(&store).await;
@@ -527,6 +729,113 @@ async fn receipt_failure_and_size_limit_never_commit_terminal_metadata() {
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn initialization_failure_receipt_offers_recovery_after_crash_before_tool_finished() {
+    let store = Store::open_in_memory().await.unwrap();
+    let (key, call) = fixture(&store).await;
+    let (reserved, _) = store
+        .reserve_runtime_job_v4(&key, &call.call_id, &call.canonical_hash().unwrap())
+        .await
+        .unwrap();
+    store
+        .fail_runtime_initialization_v4(
+            &reserved,
+            RuntimeInitializationFailureV4 {
+                code: RuntimeInitializationFailureCodeV4::KernelInitializationFailed,
+            },
+        )
+        .await
+        .unwrap();
+    let recovered = store.prepare_runtime_recovery_v4(key.run_id).await.unwrap();
+    assert!(
+        matches!(recovered.map(|event| event.event), Some(AgentEventKindV4::RuntimeRecoveryAvailable { call_ids }) if call_ids == vec![call.call_id.clone()])
+    );
+    assert!(
+        store
+            .recover_runtime_initialization_failure_v4(&key, &call)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .prepare_runtime_recovery_v4(key.run_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn initialization_failure_recovery_offer_rejects_uncertain_and_malformed_receipts() {
+    for invalid in [
+        "uncertain",
+        "missing_failure",
+        "session",
+        "remote",
+        "result",
+        "job_id",
+    ] {
+        let store = Store::open_in_memory().await.unwrap();
+        let (key, call) = fixture(&store).await;
+        let (reserved, _) = store
+            .reserve_runtime_job_v4(&key, &call.call_id, &call.canonical_hash().unwrap())
+            .await
+            .unwrap();
+        let failed = store
+            .fail_runtime_initialization_v4(
+                &reserved,
+                RuntimeInitializationFailureV4 {
+                    code: RuntimeInitializationFailureCodeV4::KernelInitializationFailed,
+                },
+            )
+            .await
+            .unwrap();
+        let mut serialized = serde_json::to_value(&failed).unwrap();
+        match invalid {
+            "uncertain" => {
+                append(
+                    &store,
+                    key.run_id,
+                    AgentEventKindV4::ToolDispatchUncertain {
+                        call_id: call.call_id,
+                        tool_id: call.tool_id,
+                    },
+                )
+                .await
+            }
+            "missing_failure" => serialized["initialization_failure"] = json!(null),
+            "session" => serialized["session_id"] = json!(Uuid::new_v4()),
+            "remote" => serialized["remote_root"] = json!("/synthetic"),
+            "job_id" => serialized["job_id"] = json!(Uuid::new_v4()),
+            "result" => {
+                sqlx::query(
+                    "INSERT INTO runtime_job_results_v4(job_id,result_json) VALUES (?1,'{}')",
+                )
+                .bind(failed.job_id.to_string())
+                .execute(store.pool())
+                .await
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        sqlx::query("UPDATE runtime_jobs_v4 SET value_json=?1 WHERE job_id=?2")
+            .bind(serialized.to_string())
+            .bind(failed.job_id.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .prepare_runtime_recovery_v4(key.run_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "accepted {invalid}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -8,8 +8,25 @@ pub enum RuntimeJobStateV4 {
     Reserved,
     Running,
     Unknown,
+    /// Kernel setup failed before this invocation's code was submitted.
+    /// Setup files or idle processes may nevertheless have been created.
+    InitializationFailed,
     Succeeded,
     Failed,
+}
+
+/// Closed host-owned classifications; never persist arbitrary transport errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeInitializationFailureCodeV4 {
+    KernelInitializationFailed,
+    SshDriverUploadFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeInitializationFailureV4 {
+    pub code: RuntimeInitializationFailureCodeV4,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -19,6 +36,8 @@ pub struct RuntimeJobV4 {
     pub call_id: String,
     pub request_sha256: String,
     pub state: RuntimeJobStateV4,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initialization_failure: Option<RuntimeInitializationFailureV4>,
     /// Detached SSH job root, frozen at dispatch; absent for legacy kernels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_root: Option<String>,

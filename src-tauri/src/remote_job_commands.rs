@@ -155,7 +155,9 @@ fn summary(
             RuntimeJobStateV4::Running => RemoteJobRecordedStateV4::Running,
             RuntimeJobStateV4::Unknown => RemoteJobRecordedStateV4::Unknown,
             RuntimeJobStateV4::Succeeded => RemoteJobRecordedStateV4::Succeeded,
-            RuntimeJobStateV4::Failed => RemoteJobRecordedStateV4::Failed,
+            RuntimeJobStateV4::Failed | RuntimeJobStateV4::InitializationFailed => {
+                RemoteJobRecordedStateV4::Failed
+            }
         },
         query_eligibility: eligibility,
         recorded_at: None,

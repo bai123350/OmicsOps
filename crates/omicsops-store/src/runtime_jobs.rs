@@ -1,7 +1,10 @@
 //! Durable launch reservations. Never persist code, output, or credential values
 //! here; the existing tool event/archive path owns results and provenance.
 use super::*;
-use omicsops_protocol::{ExecutionContextKeyV4, RuntimeJobStateV4, RuntimeJobV4, RuntimeResultV4};
+use omicsops_protocol::{
+    ExecutionContextKeyV4, RuntimeInitializationFailureV4, RuntimeJobStateV4, RuntimeJobV4,
+    RuntimeResultV4, ToolCallV4,
+};
 
 /// Internal metadata only; the desktop owns the bounded public projection.
 #[derive(Debug, Clone, PartialEq)]
@@ -29,6 +32,16 @@ pub struct StoredRemoteJobV4 {
 // Valid non-detached rows retain their existing exclusion before the limit.
 fn remote_job_integrity_error() -> StoreError {
     StoreError::InvalidInput("remote job record integrity mismatch".into())
+}
+
+fn valid_initialization_failure_receipt(job: &RuntimeJobV4) -> bool {
+    job.state == RuntimeJobStateV4::InitializationFailed
+        && job.initialization_failure.is_some()
+        && job.session_id.is_none()
+        && job.result_request_id.is_none()
+        && job.result_sha256.is_none()
+        && job.remote_root.is_none()
+        && job.remote_host_key.is_none()
 }
 
 fn remote_job_from_row(
@@ -341,21 +354,38 @@ impl Store {
             let Some(call) = requested.get(call_id) else {
                 return Ok(None);
             };
-            let row = sqlx::query("SELECT j.value_json,r.result_json FROM runtime_jobs_v4 j JOIN runtime_job_results_v4 r ON j.job_id=r.job_id WHERE j.run_id=?1 AND j.call_id=?2")
+            let row = sqlx::query("SELECT j.value_json,r.result_json,j.job_id FROM runtime_jobs_v4 j LEFT JOIN runtime_job_results_v4 r ON j.job_id=r.job_id WHERE j.run_id=?1 AND j.call_id=?2")
                 .bind(run_id.to_string()).bind(call_id).fetch_optional(&mut *tx).await?;
             let Some(row) = row else {
                 return Ok(None);
             };
             let job: RuntimeJobV4 = serde_json::from_str(&row.try_get::<String, _>(0)?)?;
-            let serialized: String = row.try_get(1)?;
+            let serialized: Option<String> = row.try_get(1)?;
             if job.context.project_id != spec.project_id
                 || job.context.run_id != run_id
                 || job.call_id != *call_id
-                || !matches!(
-                    job.state,
-                    RuntimeJobStateV4::Succeeded | RuntimeJobStateV4::Failed
-                )
+                || job.job_id.to_string() != row.try_get::<String, _>(2)?
                 || call.canonical_hash().ok().as_deref() != Some(job.request_sha256.as_str())
+                || spec.compute_selection.as_ref().is_some_and(|selection| {
+                    selection.backend_id != job.context.backend_id
+                        || selection.environment != job.context.environment
+                })
+            {
+                return Ok(None);
+            }
+            if job.state == RuntimeJobStateV4::InitializationFailed {
+                if !valid_initialization_failure_receipt(&job) || serialized.is_some() {
+                    return Ok(None);
+                }
+                continue;
+            }
+            let Some(serialized) = serialized else {
+                return Ok(None);
+            };
+            if !matches!(
+                job.state,
+                RuntimeJobStateV4::Succeeded | RuntimeJobStateV4::Failed
+            ) || job.initialization_failure.is_some()
                 || serialized.len() > 1024 * 1024
                 || Some(hex::encode(Sha256::digest(serialized.as_bytes()))) != job.result_sha256
             {
@@ -366,12 +396,6 @@ impl Store {
                 || Some(result.request_id) != job.result_request_id
                 || result.succeeded != (job.state == RuntimeJobStateV4::Succeeded)
             {
-                return Ok(None);
-            }
-            if spec.compute_selection.as_ref().is_some_and(|selection| {
-                selection.backend_id != job.context.backend_id
-                    || selection.environment != job.context.environment
-            }) {
                 return Ok(None);
             }
         }
@@ -548,6 +572,7 @@ impl Store {
             call_id: call_id.into(),
             request_sha256: request_sha256.into(),
             state: RuntimeJobStateV4::Reserved,
+            initialization_failure: None,
             remote_root: remote_root.map(str::to_owned),
             remote_host_key: remote_host_key.map(str::to_owned),
             session_id: None,
@@ -588,6 +613,72 @@ impl Store {
             ));
         }
         Ok(job)
+    }
+
+    /// Record only a completed kernel initialization failure, before any invocation
+    /// code was submitted. Interrupted initialization is still uncertain.
+    pub async fn fail_runtime_initialization_v4(
+        &self,
+        previous: &RuntimeJobV4,
+        failure: RuntimeInitializationFailureV4,
+    ) -> Result<RuntimeJobV4, StoreError> {
+        if previous.state != RuntimeJobStateV4::Reserved
+            || previous.initialization_failure.is_some()
+            || previous.session_id.is_some()
+            || previous.result_request_id.is_some()
+            || previous.result_sha256.is_some()
+            || previous.remote_root.is_some()
+            || previous.remote_host_key.is_some()
+        {
+            return Err(StoreError::InvalidInput(
+                "runtime initialization failure requires an unstarted foreground reservation"
+                    .into(),
+            ));
+        }
+        let mut next = previous.clone();
+        next.state = RuntimeJobStateV4::InitializationFailed;
+        next.initialization_failure = Some(failure);
+        let changed = sqlx::query(
+            "UPDATE runtime_jobs_v4 SET value_json=?1 WHERE job_id=?2 AND value_json=?3",
+        )
+        .bind(serde_json::to_string(&next)?)
+        .bind(previous.job_id.to_string())
+        .bind(serde_json::to_string(previous)?)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Err(StoreError::InvalidInput(
+                "runtime job changed concurrently".into(),
+            ));
+        }
+        Ok(next)
+    }
+
+    pub async fn recover_runtime_initialization_failure_v4(
+        &self,
+        context: &ExecutionContextKeyV4,
+        call: &ToolCallV4,
+    ) -> Result<Option<RuntimeJobV4>, StoreError> {
+        let Some(job) = self.runtime_job_v4(context, &call.call_id).await? else {
+            return Ok(None);
+        };
+        if job.state != RuntimeJobStateV4::InitializationFailed {
+            return Ok(None);
+        }
+        if call.tool_id != "runtime.execute"
+            || job.call_id != call.call_id
+            || call
+                .canonical_hash()
+                .map_err(|error| StoreError::InvalidInput(error.to_string()))?
+                != job.request_sha256
+            || !valid_initialization_failure_receipt(&job)
+        {
+            return Err(StoreError::InvalidInput(
+                "runtime initialization receipt mismatch".into(),
+            ));
+        }
+        Ok(Some(job))
     }
 
     /// Compare-and-swap prevents late workers from changing terminal metadata.

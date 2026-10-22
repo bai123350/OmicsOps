@@ -137,6 +137,54 @@ OMICSOPS_LIVE_MODEL_NAME
 OMICSOPS_LIVE_MODEL_CREDENTIAL         # omitted only for Ollama
 ```
 
+## SSH kernel startup acceptance (Windows, opt-in)
+
+After the default build, workspace and frontend checks, this ignored test uses
+exactly one explicitly selected saved SSH connection. Set
+`OMICSOPS_LIVE_SSH_CONNECTION_ID` to its UUID and
+`OMICSOPS_LIVE_SSH_DISPOSABLE_PARENT` to an existing absolute Linux directory.
+The parent may contain existing files: the test exclusively creates one new
+`.omicsops-startup-acceptance-<UUID>` direct child with `mkdir` (without `-p`),
+then verifies its canonical path before launching anything inside it.
+
+```powershell
+$env:OMICSOPS_LIVE_SSH_CONNECTION_ID = '<selected saved connection UUID>'
+$env:OMICSOPS_LIVE_SSH_DISPOSABLE_PARENT = '<existing absolute Linux parent>'
+cargo test -p omicsops-desktop --lib agent_v4::ssh_startup_acceptance_tests::live_ssh_kernel_startup_preserves_two_python_cells -- --ignored --exact --nocapture
+Remove-Item Env:OMICSOPS_LIVE_SSH_CONNECTION_ID
+Remove-Item Env:OMICSOPS_LIVE_SSH_DISPOSABLE_PARENT
+```
+
+Only the selected connection row is read from the desktop SQLite database using
+a read-only connection; the real database is never opened through `Store`.
+Authentication uses its existing system keyring reference and pinned host key.
+There is no model request, original project code, dependency installation,
+Micromamba change, R execution or scientific workflow. The production
+`SshKernelBackendV4` and `RuntimeManagerV4` must upload the real Python driver,
+start the system Python JSONL kernel, assign a random nonce in one cell, and
+return that nonce from a second cell in the same session.
+
+The work deadline is 65 seconds with a 90-second overall deadline including
+normal runtime interrupt and cleanup. Cleanup rechecks the canonical child,
+refuses symlinks, deletes only the exact driver and output files identified by
+returned session/request IDs, then removes the known empty fixture directories.
+There is no recursive deletion or wildcard cleanup. An unconfirmed creation,
+partial launch/output, leftover file or unavailable cleanup fails acceptance;
+the generated fixture UUID is reported for manual review without host output
+or credentials. A stopped local wait is not proof of remote cancellation.
+
+Record actual command, elapsed time and PASS/FAIL separately after an explicit
+run. Compilation and the default ignored result are not live acceptance. A
+pass verifies this isolated production upload/startup/two-cell path only; it
+does not rerun the original environment inspection, prove R availability or
+establish native UI or scientific end-to-end acceptance.
+
+On 2026-10-22 the exact command above passed 1/1 in 24.89 seconds with the
+explicitly selected saved connection. Both cells shared one production Python
+kernel and fixture cleanup completed. The original intermittent driver-write
+failure was not reproduced; this does not establish storage/quota remediation
+or acceptance of the original model-driven environment inspection.
+
 ## OpenCode Go public model discovery (opt-in, no API key)
 
 After the deterministic checks, this exact ignored test exercises production

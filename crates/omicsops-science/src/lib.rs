@@ -286,6 +286,30 @@ impl ScientificStateV4 {
         Ok(record)
     }
 
+    /// Close a declared analysis after the host confirms kernel initialization
+    /// failed before its code was submitted. This is not execution provenance.
+    pub fn fail_analysis_initialization(
+        &mut self,
+        source_call_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<AnalysisRecordV4, ScienceErrorV4> {
+        let analysis = self
+            .analyses
+            .values_mut()
+            .find(|analysis| {
+                analysis.source_call_id == source_call_id
+                    && analysis.status == AnalysisStatusV4::Running
+                    && analysis.runtime.session_id.is_none()
+                    && analysis.runtime.process_identity.is_none()
+            })
+            .ok_or_else(|| ScienceErrorV4::AnalysisNotRunning(source_call_id.into()))?;
+        analysis.status = AnalysisStatusV4::Failed;
+        analysis.ended_at = Some(now);
+        let snapshot = analysis.clone();
+        self.revision += 1;
+        Ok(snapshot)
+    }
+
     pub fn finish_analysis(
         &mut self,
         source_call_id: &str,
@@ -576,6 +600,41 @@ mod tests {
             session_id: None,
             process_identity: None,
         }
+    }
+
+    #[test]
+    fn initialization_failure_does_not_fabricate_runtime_or_provenance() {
+        let mut state = ScientificStateV4::new(Uuid::new_v4());
+        let data = state.register_dataset(dataset("data/raw.h5ad", "a"), Utc::now());
+        let started = state
+            .start_analysis(
+                Uuid::new_v4(),
+                "initialization".into(),
+                declaration(data.id),
+                runtime(),
+                Utc::now(),
+            )
+            .unwrap();
+        let revision = state.revision;
+        let failed = state
+            .fail_analysis_initialization("initialization", Utc::now())
+            .unwrap();
+        assert_eq!(failed.id, started.id);
+        assert_eq!(failed.status, AnalysisStatusV4::Failed);
+        assert!(failed.ended_at.is_some());
+        assert_eq!(failed.runtime, started.runtime);
+        assert!(failed.runtime.session_id.is_none());
+        assert!(failed.runtime.process_identity.is_none());
+        assert_eq!(state.revision, revision + 1);
+        assert!(state.artifacts.is_empty());
+        assert!(state.provenance.is_empty());
+        let completed_state = state.clone();
+        assert!(
+            state
+                .fail_analysis_initialization("initialization", Utc::now())
+                .is_err()
+        );
+        assert_eq!(state, completed_state);
     }
 
     #[test]

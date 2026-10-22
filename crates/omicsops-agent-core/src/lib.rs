@@ -6463,8 +6463,13 @@ fn scientific_outcome_requires_update(call: &ToolCallV4, outcome: &ToolOutcomeV4
             && outcome.call_id == call.call_id
             && outcome.tool_id == call.tool_id
             && outcome.data.get("operation_dispatched") != Some(&Value::Bool(false))
-            && serde_json::from_value::<omicsops_protocol::RuntimeResultV4>(outcome.data.clone())
-                .is_ok_and(|result| !result.succeeded))
+            && (serde_json::from_value::<omicsops_protocol::RuntimeResultV4>(outcome.data.clone())
+                .is_ok_and(|result| !result.succeeded)
+                // The scientific host validates the exact durable receipt before
+                // closing an unstarted analysis; this only routes the callback.
+                || (outcome.data.get("error_kind").and_then(Value::as_str)
+                    == Some("runtime_initialization_failed")
+                    && outcome.data.get("code_dispatched") == Some(&Value::Bool(false)))))
 }
 
 fn cancelled_read_outcome(call: &ToolCallV4) -> ToolOutcomeV4 {
