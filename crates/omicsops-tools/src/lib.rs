@@ -559,7 +559,7 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "project.read",
-            "Read a project-relative text file. Use a relative path, such as one returned by project.list; absolute paths and parent traversal are forbidden.",
+            "Read the UTF-8 prefix of a project-relative text file, limited to 400 lines and 64 KiB including any truncation notice. A truncation notice means the result is not the complete file. Use a relative path, such as one returned by project.list; absolute paths and parent traversal are forbidden.",
             ToolEffectV4::ReadOnly,
             json!({"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}),
         ),

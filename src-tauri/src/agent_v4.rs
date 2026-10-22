@@ -19,7 +19,7 @@ use omicsops_adapters::{
     kernel::{kernel_driver, validate_capture_paths, validate_kernel_code},
     llm::{ProviderProtocol, RequestBudget, RequestBudgetMetrics},
     model_client::ModelClient,
-    ssh::{SshJsonlProcess, SshSession},
+    ssh::{RemoteFilePrefix, SshJsonlProcess, SshSession},
 };
 use omicsops_agent::provider::{
     ProviderRequest, ProviderStreamEvent, ProviderToolCallAccumulator, ProviderToolSpec,
@@ -6140,6 +6140,55 @@ trait RuntimeEnvironmentPortV4: Send + Sync {
     -> Result<String, String>;
 }
 
+const PROJECT_READ_MAX_BYTES: usize = 64 * 1024;
+const PROJECT_READ_MAX_LINES: usize = 400;
+const PROJECT_READ_TRUNCATED: &str = "[project.read truncated: prefix only; limited to 400 lines and 65536 output bytes. Remaining content is not shown.]\n";
+
+fn read_project_text_prefix(reader: impl Read) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    reader
+        .take((PROJECT_READ_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let eof = bytes.len() <= PROJECT_READ_MAX_BYTES;
+    bytes.truncate(PROJECT_READ_MAX_BYTES);
+    render_project_text_prefix(&bytes, eof)
+}
+
+fn render_project_text_prefix(bytes: &[u8], eof: bool) -> Result<String, String> {
+    if bytes.len() > PROJECT_READ_MAX_BYTES {
+        return Err("project read exceeded its byte budget".into());
+    }
+    let invalid_utf8 = |_| "project read is not valid UTF-8".to_string();
+    let text = match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        // A bounded prefix can split the last code point. Never repair an
+        // invalid interior byte or an incomplete code point at the true EOF.
+        Err(error) if !eof && error.error_len().is_none() => {
+            std::str::from_utf8(&bytes[..error.valid_up_to()]).map_err(invalid_utf8)?
+        }
+        Err(error) => return Err(invalid_utf8(error)),
+    };
+    let mut lines = text.lines();
+    let mut output = lines
+        .by_ref()
+        .take(PROJECT_READ_MAX_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !eof || lines.next().is_some() {
+        let mut end = output
+            .len()
+            .min(PROJECT_READ_MAX_BYTES - PROJECT_READ_TRUNCATED.len());
+        while !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.truncate(end);
+        // Put the notice first so downstream excerpts cannot hide truncation.
+        output.insert_str(0, PROJECT_READ_TRUNCATED);
+    }
+    Ok(output)
+}
+
 struct LocalProjectFilesystemV4 {
     root: PathBuf,
 }
@@ -6238,8 +6287,8 @@ impl ProjectFilesystemPortV4 for LocalProjectFilesystemV4 {
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err("project read target is not a regular file".into());
         }
-        let content = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
-        Ok(content.lines().take(400).collect::<Vec<_>>().join("\n"))
+        let file = File::open(path).map_err(|error| error.to_string())?;
+        read_project_text_prefix(file)
     }
 
     async fn verify_file(&self, path: &str) -> Result<VerifiedProjectFileV4, String> {
@@ -6281,6 +6330,47 @@ struct SshProjectFilesystemV4 {
     root: String,
 }
 
+#[async_trait]
+trait ProjectReadSessionV4: Sync {
+    async fn check_file(&self, command: &str) -> Result<(), String>;
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<RemoteFilePrefix, String>;
+}
+
+#[async_trait]
+impl ProjectReadSessionV4 for SshSession {
+    async fn check_file(&self, command: &str) -> Result<(), String> {
+        self.execute_checked(command)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<RemoteFilePrefix, String> {
+        self.read_file_prefix(path, max_bytes)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+async fn read_remote_project_text_prefix(
+    session: &impl ProjectReadSessionV4,
+    raw: &str,
+    resolved: &str,
+) -> Result<String, String> {
+    // realpath hides a leaf symlink, so check the original spelling as well.
+    session
+        .check_file(&format!(
+            "test ! -L {} && test -f {}",
+            shell_quote(raw),
+            shell_quote(resolved),
+        ))
+        .await?;
+    let read = session
+        .read_prefix(resolved, PROJECT_READ_MAX_BYTES as u64)
+        .await?;
+    render_project_text_prefix(&read.bytes, read.eof)
+}
+
 impl SshProjectFilesystemV4 {
     async fn resolve_existing(&self, path: &str) -> Result<String, String> {
         let remote = project_path(&self.root, path)?;
@@ -6316,15 +6406,7 @@ impl ProjectFilesystemPortV4 for SshProjectFilesystemV4 {
     async fn read(&self, path: &str) -> Result<String, String> {
         let raw = project_path(&self.root, path)?;
         let remote = self.resolve_existing(path).await?;
-        self.session
-            .execute_checked(&format!(
-                "test ! -L {0} && test -f {1} && sed -n '1,400p' {1}",
-                shell_quote(&raw),
-                shell_quote(&remote),
-            ))
-            .await
-            .map(|output| output.stdout)
-            .map_err(|error| error.to_string())
+        read_remote_project_text_prefix(self.session.as_ref(), &raw, &remote).await
     }
 
     async fn verify_file(&self, path: &str) -> Result<VerifiedProjectFileV4, String> {
@@ -13682,6 +13764,236 @@ mod tests {
         assert_eq!(fact.size_bytes, b"metric\tvalue\nrows\t1\n".len() as u64);
         assert_eq!(fact.sha256.len(), 64);
         assert!(filesystem.read("../outside.txt").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn project_read_bounds_large_single_lines_and_marks_line_truncation() {
+        let directory = tempfile::tempdir().unwrap();
+        let filesystem = LocalProjectFilesystemV4::new(directory.path()).unwrap();
+        std::fs::write(directory.path().join("large.txt"), "x".repeat(128 * 1024)).unwrap();
+        let output = filesystem.read("large.txt").await.unwrap();
+        assert!(output.len() <= 64 * 1024);
+        assert!(output.starts_with("[project.read truncated:"));
+        assert!(output.ends_with("xxx"));
+
+        std::fs::write(directory.path().join("lines.txt"), "row\r\n".repeat(401)).unwrap();
+        let output = filesystem.read("lines.txt").await.unwrap();
+        assert!(output.starts_with("[project.read truncated:"));
+        assert_eq!(output.lines().filter(|line| *line == "row").count(), 400);
+        assert!(!output.contains('\r'));
+    }
+
+    #[tokio::test]
+    async fn project_read_does_not_decode_the_unread_suffix() {
+        let directory = tempfile::tempdir().unwrap();
+        let filesystem = LocalProjectFilesystemV4::new(directory.path()).unwrap();
+        let mut bytes = vec![b'x'; 128 * 1024];
+        bytes.push(0xff);
+        std::fs::write(directory.path().join("large.txt"), bytes).unwrap();
+        let output = filesystem.read("large.txt").await.unwrap();
+        assert!(output.starts_with("[project.read truncated:"));
+        assert!(output.len() <= 64 * 1024);
+    }
+
+    #[tokio::test]
+    async fn project_read_handles_exact_limits_empty_files_and_utf8_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let filesystem = LocalProjectFilesystemV4::new(directory.path()).unwrap();
+        for (source, expected) in [
+            (String::new(), String::new()),
+            ("first\r\n第二行\r\n".into(), "first\n第二行".into()),
+            ("first\r\n\r\nlast\n".into(), "first\n\nlast".into()),
+            ("x".repeat(64 * 1024), "x".repeat(64 * 1024)),
+            ("row\n".repeat(400), vec!["row"; 400].join("\n")),
+        ] {
+            std::fs::write(directory.path().join("text.txt"), source).unwrap();
+            assert_eq!(filesystem.read("text.txt").await.unwrap(), expected);
+        }
+        for character in ['中', '🧬'] {
+            let source = format!("{}{}tail", "x".repeat(64 * 1024 - 1), character);
+            std::fs::write(directory.path().join("text.txt"), source).unwrap();
+            let output = filesystem.read("text.txt").await.unwrap();
+            assert!(output.starts_with("[project.read truncated:"));
+            assert!(output.len() <= 64 * 1024);
+            assert!(!output.contains('\u{fffd}'));
+            assert!(!output.contains("tail"));
+
+            std::fs::write(
+                directory.path().join("text.txt"),
+                character.to_string().repeat(65_536),
+            )
+            .unwrap();
+            let output = filesystem.read("text.txt").await.unwrap();
+            assert!(output.starts_with("[project.read truncated:"));
+            assert!(output.len() <= 65_536);
+            assert!(output.ends_with(character));
+        }
+        for invalid in [vec![0xff], vec![b'x', 0xe4, 0xb8], vec![0xff; 128 * 1024]] {
+            std::fs::write(directory.path().join("text.txt"), invalid).unwrap();
+            assert!(filesystem.read("text.txt").await.is_err());
+        }
+    }
+
+    #[test]
+    fn project_read_consumes_only_the_prefix_and_one_eof_probe_byte() {
+        let mut reader = std::io::Cursor::new(vec![b'x'; 128 * 1024]);
+        let output = read_project_text_prefix(&mut reader).unwrap();
+        assert_eq!(reader.position(), 65_537);
+        assert!(output.starts_with("[project.read truncated:"));
+        assert!(output.len() <= 65_536);
+
+        let mut reader = std::io::Cursor::new(vec![b'x'; 65_537]);
+        assert!(
+            read_project_text_prefix(&mut reader)
+                .unwrap()
+                .starts_with("[project.read truncated:")
+        );
+        assert_eq!(reader.position(), 65_537);
+    }
+
+    struct ProjectReadSessionFixture {
+        calls: std::sync::Mutex<Vec<String>>,
+        check_error: bool,
+        prefix: std::sync::Mutex<Option<Result<RemoteFilePrefix, String>>>,
+    }
+
+    impl ProjectReadSessionFixture {
+        fn new(bytes: Vec<u8>, eof: bool) -> Self {
+            Self {
+                calls: Default::default(),
+                check_error: false,
+                prefix: std::sync::Mutex::new(Some(Ok(RemoteFilePrefix {
+                    bytes,
+                    eof,
+                    size_bytes: None,
+                    metadata_stable: false,
+                }))),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ProjectReadSessionV4 for ProjectReadSessionFixture {
+        async fn check_file(&self, command: &str) -> Result<(), String> {
+            self.calls.lock().unwrap().push(command.into());
+            if self.check_error {
+                return Err("not a safe regular file".into());
+            }
+            Ok(())
+        }
+
+        async fn read_prefix(&self, path: &str, budget: u64) -> Result<RemoteFilePrefix, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("read {budget} {path}"));
+            self.prefix.lock().unwrap().take().unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn project_read_remote_preserves_raw_checks_then_reads_the_canonical_prefix() {
+        let session = ProjectReadSessionFixture::new("gene\r\n细胞\r\n".as_bytes().to_vec(), true);
+        let output =
+            read_remote_project_text_prefix(&session, "/project/raw name", "/project/real name")
+                .await
+                .unwrap();
+        assert_eq!(output, "gene\n细胞");
+        assert_eq!(
+            *session.calls.lock().unwrap(),
+            [
+                "test ! -L '/project/raw name' && test -f '/project/real name'",
+                "read 65536 /project/real name",
+            ]
+        );
+
+        let mut session = ProjectReadSessionFixture::new(b"never read".to_vec(), true);
+        session.check_error = true;
+        assert!(
+            read_remote_project_text_prefix(&session, "/project/link", "/project/file")
+                .await
+                .is_err()
+        );
+        assert_eq!(session.calls.lock().unwrap().len(), 1);
+        assert!(session.prefix.lock().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn project_read_remote_uses_the_same_byte_line_and_encoding_bounds() {
+        for (bytes, eof) in [
+            (vec![b'x'; 65_536], false),
+            ("row\r\n".repeat(401).into_bytes(), true),
+            ([vec![b'x'; 65_535], vec![0xe4]].concat(), false),
+        ] {
+            let session = ProjectReadSessionFixture::new(bytes, eof);
+            let output =
+                read_remote_project_text_prefix(&session, "/project/file", "/project/file")
+                    .await
+                    .unwrap();
+            assert!(output.starts_with("[project.read truncated:"));
+            assert!(output.len() <= 65_536);
+            assert!(!output.contains('\u{fffd}'));
+            assert!(!output.contains('\r'));
+        }
+        for (bytes, eof) in [
+            (vec![0xff], false),
+            (vec![0xe4], true),
+            (vec![b'x'; 65_537], false),
+        ] {
+            let session = ProjectReadSessionFixture::new(bytes, eof);
+            assert!(
+                read_remote_project_text_prefix(&session, "/project/file", "/project/file")
+                    .await
+                    .is_err()
+            );
+        }
+        let session = ProjectReadSessionFixture::new(Vec::new(), true);
+        *session.prefix.lock().unwrap() = Some(Err("source changed".into()));
+        assert_eq!(
+            read_remote_project_text_prefix(&session, "/project/file", "/project/file")
+                .await
+                .unwrap_err(),
+            "source changed"
+        );
+        // A read failure has no unbounded shell fallback or automatic retry.
+        assert_eq!(session.calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn project_read_executor_returns_the_bounded_notice_in_agent_and_plan_modes() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("large.txt"), "x".repeat(128 * 1024)).unwrap();
+        let executor = project_filesystem_executor(directory.path()).await;
+        let call = ToolCallV4 {
+            call_id: "bounded-read".into(),
+            tool_id: "project.read".into(),
+            arguments: json!({"path":"large.txt"}),
+        };
+        for outcome in [
+            executor.execute(&call).await,
+            executor.execute_plan(&call).await,
+        ] {
+            let outcome = outcome.unwrap();
+            assert!(outcome.succeeded);
+            assert!(
+                outcome
+                    .model_content
+                    .starts_with("[project.read truncated:")
+            );
+            assert!(outcome.model_content.len() <= 65_536);
+            assert_eq!(outcome.data["path"], "large.txt");
+            assert_eq!(outcome.provenance, ["project:large.txt"]);
+        }
+        std::fs::write(directory.path().join("large.txt"), [0xff]).unwrap();
+        for outcome in [
+            executor.execute(&call).await,
+            executor.execute_plan(&call).await,
+        ] {
+            let outcome = outcome.unwrap();
+            assert!(!outcome.succeeded);
+            assert_eq!(outcome.data["error_kind"], "project_filesystem");
+            assert!(outcome.provenance.is_empty());
+        }
     }
 
     async fn project_filesystem_executor(root: &Path) -> DesktopToolExecutorV4 {
