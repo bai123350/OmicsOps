@@ -22,9 +22,94 @@ const session = (projectId: string, id: string): ComposerCatalogItem => ({
   description: "Saved transcript",
 });
 
+function deferredCatalog() {
+  let resolve!: (items: ComposerCatalogItem[]) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<ComposerCatalogItem[]>((complete, fail) => {
+    resolve = complete;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
 afterEach(() => vi.restoreAllMocks());
 
 describe("useWorkspaceSearch", () => {
+  it("publishes a completed project catalog while another project is still loading", async () => {
+    const first = deferredCatalog();
+    const second = deferredCatalog();
+    vi.spyOn(referenceApi, "composerReferenceCatalog")
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    const { result } = renderHook(() => useWorkspaceSearch(true, projects));
+
+    await act(async () => first.resolve([artifact("p1", "a1")]));
+    expect(result.current.entries.some((entry) => entry.key === "artifact:p1:a1")).toBe(true);
+    expect(result.current.loading).toBe(true);
+    expect(result.current.failedProjects).toBe(0);
+
+    await act(async () => second.resolve([session("p2", "s2")]));
+    expect(result.current.entries.map((entry) => entry.kind)).toEqual(["project", "artifact", "project", "session"]);
+    expect(result.current.loading).toBe(false);
+  });
+
+  it("reports a failed project while another is loading and finishes after an empty catalog", async () => {
+    const first = deferredCatalog();
+    const second = deferredCatalog();
+    vi.spyOn(referenceApi, "composerReferenceCatalog")
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    const { result } = renderHook(() => useWorkspaceSearch(true, projects));
+
+    await act(async () => first.reject(new Error("p1 unavailable")));
+    expect(result.current.failedProjects).toBe(1);
+    expect(result.current.loading).toBe(true);
+    expect(result.current.entries.map((entry) => entry.kind)).toEqual(["project", "project"]);
+
+    await act(async () => second.resolve([]));
+    expect(result.current.failedProjects).toBe(1);
+    expect(result.current.loading).toBe(false);
+    expect(result.current.entries.map((entry) => entry.kind)).toEqual(["project", "project"]);
+  });
+
+  it.each(["retry", "close", "switch"] as const)("discards late success and failure after partial results and %s", async (change) => {
+    const first = deferredCatalog();
+    const lateSuccess = deferredCatalog();
+    const lateFailure = deferredCatalog();
+    const fresh = deferredCatalog();
+    const currentProjects = [...projects, { id: "p3", name: "Methods" }];
+    vi.spyOn(referenceApi, "composerReferenceCatalog")
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(lateSuccess.promise)
+      .mockReturnValueOnce(lateFailure.promise)
+      .mockReturnValueOnce(fresh.promise)
+      .mockResolvedValue([]);
+    const { result, rerender } = renderHook(
+      ({ open, items }) => useWorkspaceSearch(open, items),
+      { initialProps: { open: true, items: currentProjects } },
+    );
+
+    await act(async () => first.resolve([artifact("p1", "initial")]));
+    expect(result.current.entries.some((entry) => entry.key === "artifact:p1:initial")).toBe(true);
+    if (change === "retry") act(() => result.current.retry());
+    else rerender({ open: change !== "close", items: change === "switch" ? [projects[0]] : currentProjects });
+
+    await act(async () => {
+      lateSuccess.resolve([artifact("p2", "stale")]);
+      lateFailure.reject(new Error("stale failure"));
+    });
+    expect(result.current.entries.every((entry) => entry.kind === "project")).toBe(true);
+    expect(result.current.failedProjects).toBe(0);
+    expect(result.current.loading).toBe(change !== "close");
+
+    if (change !== "close") {
+      await act(async () => fresh.resolve([artifact("p1", "fresh")]));
+      expect(result.current.entries.filter((entry) => entry.kind === "artifact").map((entry) => entry.key)).toEqual(["artifact:p1:fresh"]);
+      expect(result.current.failedProjects).toBe(0);
+      expect(result.current.loading).toBe(false);
+    }
+  });
+
   it("visibility_catalog_refresh removes and restores Session discovery on retry", async () => {
     const catalog = vi.spyOn(referenceApi, "composerReferenceCatalog").mockResolvedValue([session("p1", "historical")]);
     const { result } = renderHook(() => useWorkspaceSearch(true, [projects[0]]));

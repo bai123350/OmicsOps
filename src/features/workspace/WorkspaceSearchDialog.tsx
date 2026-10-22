@@ -68,7 +68,8 @@ export function WorkspaceSearchDialog({
   canAttach,
 }: WorkspaceSearchDialogProps) {
   const [query, setQuery] = useState("");
-  const [activeIndex, setActiveIndex] = useState(0);
+  // Catalogs arrive independently; preserve the user's selection as rows move.
+  const [activeKey, setActiveKey] = useState<string | null>(null);
   const [pendingKey, setPendingKey] = useState<string | null>(null);
   const [localError, setLocalError] = useState("");
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -126,7 +127,8 @@ export function WorkspaceSearchDialog({
     () => visibleEntries.map((entry) => `${entry.key}\u0000${entry.label}\u0000${entry.description}`).join("\u0001"),
     [visibleEntries],
   );
-  const selectedIndex = visibleEntries.length === 0 ? -1 : Math.min(activeIndex, visibleEntries.length - 1);
+  const activeIndex = visibleEntries.findIndex((entry) => entry.key === activeKey);
+  const selectedIndex = visibleEntries.length === 0 ? -1 : Math.max(activeIndex, 0);
   const actionPending = pendingKey !== null;
   const actionDisabled = busy || actionPending;
   const dialogLabel = zh ? "搜索工作区" : "Search workspace";
@@ -139,8 +141,8 @@ export function WorkspaceSearchDialog({
   }, [selectedIndex, matchingSignature]);
 
   useEffect(() => {
-    setActiveIndex(0);
-  }, [query, matchingSignature]);
+    if (activeKey !== null && activeIndex < 0) setActiveKey(null);
+  }, [activeKey, activeIndex]);
 
   function canAttachEntry(entry: WorkspaceSearchEntry): boolean {
     if (!onAttach || !canAttach) return false;
@@ -179,12 +181,12 @@ export function WorkspaceSearchDialog({
     if (isImeEvent(event)) return;
     if (event.key === "ArrowDown" && visibleEntries.length > 0) {
       event.preventDefault();
-      setActiveIndex((index) => (index + 1) % visibleEntries.length);
+      setActiveKey(visibleEntries[(selectedIndex + 1) % visibleEntries.length].key);
       return;
     }
     if (event.key === "ArrowUp" && visibleEntries.length > 0) {
       event.preventDefault();
-      setActiveIndex((index) => (index - 1 + visibleEntries.length) % visibleEntries.length);
+      setActiveKey(visibleEntries[(selectedIndex - 1 + visibleEntries.length) % visibleEntries.length].key);
       return;
     }
     if (event.key === "Enter" && selectedIndex >= 0 && !actionDisabled) {
@@ -234,7 +236,7 @@ export function WorkspaceSearchDialog({
               spellCheck={false}
               value={query}
               disabled={busy}
-              onChange={(event) => { setQuery(event.target.value); setLocalError(""); }}
+              onChange={(event) => { setQuery(event.target.value); setActiveKey(null); setLocalError(""); }}
               onKeyDown={handleSearchKeyDown}
             />
             <kbd>Esc</kbd>

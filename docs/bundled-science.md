@@ -29,6 +29,13 @@ Memory 是当前本地项目 `.omicsops/memory/` 目录第一层的 `.md` 文件
 3. 启动时自动注册全部 23 个内置科学 MCP，并从编译目录加载工具定义；新增服务默认启用，可被 Agent 检索。已有启停选择、自定义配置和凭据引用保留。旧版内置声明缺少工具目录时补齐目录，不自动开启被停用的服务。
 4. 自动导入不启动进程、不联网，也不授予启动或工具执行权限。实际调用前仍需批准检查及调用；设置中保留添加入口，用于恢复缺失配置。原有 PubMed MCP 配置保留，因此全部默认启用时可能显示 24 个服务（23 个内置 + 1 个原有服务）。
 
+Agent 的 `search_skills` 与 `search_memory` 在查询和被检索文本两侧统一大小写与
+分隔符：`rna-seq`、`rna_seq` 和 `rna seq` 使用相同词项，技能章节中的
+`quality_control` 也可用 `quality control` 找到。英文仍按完整词项匹配，
+`sequence` 不会因包含 `seq` 而命中；中文保留连续文本的二元／三元匹配，
+不跨空格或标点拼词。这是本地词法检索，不自动翻译、调用 embedding 服务或
+执行 Skill，也不改变启停、冻结哈希及实际工具调用审批。
+
 ## Skill 清单
 
 默认启用：`analysis-workflow`、`audit-biomedical-paper-evidence`、

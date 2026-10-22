@@ -91,6 +91,39 @@ describe("WorkspaceSearchDialog", () => {
     expect(onOpen).toHaveBeenCalledWith(entries[0]);
   });
 
+  it("keeps the selected result when another project adds earlier groups", () => {
+    const onOpen = vi.fn();
+    const props = { zh: false, onRetry: vi.fn(), onClose: vi.fn(), onOpen, loading: true };
+    const view = render(<WorkspaceSearchDialog {...props} entries={[entries[0], entries[2]]} />);
+    const search = screen.getByRole("searchbox", { name: "Search workspace content" });
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    expect(screen.getByRole("option", { selected: true })).toHaveTextContent("QC report");
+
+    view.rerender(<WorkspaceSearchDialog {...props} entries={entries.slice(0, 3)} />);
+    expect(screen.getByRole("option", { selected: true })).toHaveTextContent("QC report");
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(onOpen).toHaveBeenCalledWith(entries[2]);
+  });
+
+  it("selects the first match after query changes or the selected result disappears", () => {
+    const props = { zh: false, onRetry: vi.fn(), onClose: vi.fn(), onOpen: vi.fn() };
+    const view = render(<WorkspaceSearchDialog {...props} entries={entries.slice(0, 3)} />);
+    const search = screen.getByRole("searchbox", { name: "Search workspace content" });
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    expect(screen.getByRole("option", { selected: true })).toHaveTextContent("QC report");
+    fireEvent.change(search, { target: { value: "quality" } });
+    expect(screen.getByRole("option", { selected: true })).toHaveTextContent("Earlier discussion");
+
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    view.rerender(<WorkspaceSearchDialog {...props} entries={entries.slice(0, 2)} />);
+    expect(screen.getByRole("option", { selected: true })).toHaveTextContent("Earlier discussion");
+    view.rerender(<WorkspaceSearchDialog {...props} entries={entries.slice(0, 3)} />);
+    expect(screen.getByRole("option", { selected: true })).toHaveTextContent("Earlier discussion");
+    fireEvent.change(search, { target: { value: "no such result" } });
+    expect(screen.queryByRole("option", { selected: true })).not.toBeInTheDocument();
+  });
+
   it("keeps Open and Attach as separate actions and only offers Attach when allowed", async () => {
     const onOpen = vi.fn().mockResolvedValue(false);
     const onAttach = vi.fn().mockResolvedValue(true);

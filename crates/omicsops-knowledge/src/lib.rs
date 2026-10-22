@@ -432,7 +432,10 @@ fn lexical_terms(value: &str) -> BTreeSet<String> {
             cjk.push(character);
         } else {
             flush_cjk(&mut cjk, &mut terms);
-            if character.is_alphanumeric() || character == '_' || character == '-' {
+            // Skill names and MCP identifiers commonly use '-' or '_', while
+            // natural-language queries use spaces. Treat each as a word boundary
+            // on both sides; keep whole-word matching instead of substring search.
+            if character.is_alphanumeric() {
                 word.push(character);
             } else {
                 flush_word(&mut word, &mut terms);
@@ -461,6 +464,103 @@ fn weighted_overlap(query: &BTreeSet<String>, document: &BTreeSet<String>) -> f6
 mod tests {
     use super::*;
     use chrono::Duration;
+
+    #[test]
+    fn skill_search_matches_separator_variants_without_substring_matches() {
+        let skill = SkillDocumentV4 {
+            skill_id: Uuid::new_v4(),
+            name: "rna-seq".into(),
+            version: "1.0.0".into(),
+            package_sha256: "package".into(),
+            enabled: true,
+            sections: markdown_sections("# Quality_control\n单细胞质控"),
+        };
+        let documents = [
+            skill.clone(),
+            SkillDocumentV4 {
+                skill_id: Uuid::new_v4(),
+                enabled: false,
+                ..skill.clone()
+            },
+        ];
+        for query in ["RNA seq", "rna_seq", "rna-seq", "rna/seq", "rna.seq"] {
+            let hits = search_skills(query, &documents, 5);
+            assert_eq!(hits.len(), 1, "query: {query}");
+            assert_eq!(hits[0].skill_id, skill.skill_id);
+            assert_eq!(hits[0].score, 6.0, "query: {query}");
+        }
+        let hits = search_skills("quality control", &documents, 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].matching_sections, ["Quality_control"]);
+        assert_eq!(search_skills("帮我做单细胞质控", &documents, 5).len(), 1);
+        for query in ["rnaseq", "sequence", "_- / .", "单_细"] {
+            assert!(
+                search_skills(query, &documents, 5).is_empty(),
+                "query: {query}"
+            );
+        }
+        assert!(search_skills("rna seq", &documents, 0).is_empty());
+    }
+
+    #[test]
+    fn mcp_search_finds_identifier_words_without_granting_permission() {
+        let tool = McpToolIndexV4 {
+            tool_name: "fetch_geo_series".into(),
+            launch_approved: false,
+            tool_approved: false,
+            ..read_only_mcp_fixture()
+        };
+        let tools = [
+            tool.clone(),
+            McpToolIndexV4 {
+                enabled: false,
+                ..tool.clone()
+            },
+            McpToolIndexV4 {
+                configured: false,
+                ..tool.clone()
+            },
+        ];
+        for query in [
+            "GEO",
+            "fetch geo series",
+            "fetch-geo-series",
+            "fetch_geo_series",
+        ] {
+            let hits = search_mcp_tools(query, &tools, 20);
+            assert_eq!(hits.len(), 1, "query: {query}");
+            assert_eq!(hits[0].tool.tool_name, "fetch_geo_series");
+            assert_eq!(
+                authorize_mcp_use(&hits[0].tool, "catalog", "schema"),
+                Err(KnowledgeErrorV4::McpLaunchNotApproved),
+            );
+        }
+        assert!(search_mcp_tools("geography", &tools, 20).is_empty());
+        assert!(search_mcp_tools("geo", &tools, 0).is_empty());
+    }
+
+    #[test]
+    fn memory_search_matches_compound_keys_across_separators() {
+        let now = Utc::now();
+        let document = MemoryDocumentV4 {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            conversation_id: None,
+            dimension: "decision".into(),
+            key: "batch_correction".into(),
+            statement: "保留批次校正参数".into(),
+            source_kind: "user".into(),
+            source_id: "source".into(),
+            conflicted_with: BTreeSet::new(),
+            created_at: now,
+        };
+        for query in ["batch correction", "batch-correction", "BATCH_CORRECTION"] {
+            let hits = search_memory(query, std::slice::from_ref(&document), now, 10);
+            assert_eq!(hits.len(), 1, "query: {query}");
+            assert_eq!(hits[0].document.id, document.id);
+            assert_eq!(hits[0].document.source_id, "source");
+        }
+    }
 
     #[test]
     fn unmatched_skills_are_not_returned_and_selected_sections_are_frozen() {

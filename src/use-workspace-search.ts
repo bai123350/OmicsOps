@@ -31,9 +31,10 @@ function projectSignature(projects: WorkspaceSearchProject[]): string {
  * Build the shared workspace search index and lazily hydrate project-owned
  * references while the search surface is open.
  *
- * Project rows are available during the asynchronous catalog load. Each
- * request batch is identified by the current open state, project signature,
- * and retry generation so late results cannot overwrite a newer search.
+ * Project rows are available immediately, and each completed catalog is
+ * published while other projects are still loading. Each request batch is
+ * identified by the current open state, project signature, and retry generation
+ * so late results cannot overwrite a newer search.
  */
 export function useWorkspaceSearch(
   open: boolean,
@@ -79,22 +80,26 @@ export function useWorkspaceSearch(
     }
     setLoadingState(true);
 
-    void Promise.allSettled(projectIds.map((projectId) => composerReferenceCatalog(projectId))).then((results) => {
-      if (!current()) return;
-
-      const catalogs = new Map<string, Awaited<ReturnType<typeof composerReferenceCatalog>>>();
-      let failedProjects = 0;
-      results.forEach((result, index) => {
-        if (result.status === "fulfilled") {
-          catalogs.set(projectIds[index], result.value);
-        } else {
-          failedProjects += 1;
-        }
-      });
-      setSnapshot({ signature, catalogs });
+    const catalogs = new Map<string, Awaited<ReturnType<typeof composerReferenceCatalog>>>();
+    let pendingProjects = projectIds.length;
+    let failedProjects = 0;
+    const publish = () => {
+      pendingProjects -= 1;
+      setSnapshot({ signature, catalogs: new Map(catalogs) });
       setFailedProjectsState(failedProjects);
-      setLoadingState(false);
-    });
+      setLoadingState(pendingProjects > 0);
+    };
+    for (const projectId of projectIds) {
+      void composerReferenceCatalog(projectId).then((items) => {
+        if (!current()) return;
+        catalogs.set(projectId, items);
+        publish();
+      }, () => {
+        if (!current()) return;
+        failedProjects += 1;
+        publish();
+      });
+    }
 
     return () => {
       disposed = true;
