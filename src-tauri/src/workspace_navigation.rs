@@ -462,7 +462,8 @@ pub(crate) fn record_snapshot(
             )
         }
         SourceKind::Evidence => {
-            // Evidence has only a call ID, which is not unique across runs. Never guess the run.
+            // This view does not yet expose evidence's optional origin run.
+            // Legacy evidence has only a call ID; never infer a run from it.
             run_id = None;
             (
                 text_field(&record, "claim").to_owned(),

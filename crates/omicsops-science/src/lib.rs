@@ -112,6 +112,8 @@ pub struct EvidenceRecordV4 {
     pub schema_version: u8,
     pub id: Uuid,
     pub project_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<Uuid>,
     pub source_call_id: String,
     pub claim: String,
     pub sources: Vec<EvidenceSourceV4>,
@@ -290,6 +292,7 @@ impl ScientificStateV4 {
     /// failed before its code was submitted. This is not execution provenance.
     pub fn fail_analysis_initialization(
         &mut self,
+        run_id: Uuid,
         source_call_id: &str,
         now: DateTime<Utc>,
     ) -> Result<AnalysisRecordV4, ScienceErrorV4> {
@@ -297,7 +300,8 @@ impl ScientificStateV4 {
             .analyses
             .values_mut()
             .find(|analysis| {
-                analysis.source_call_id == source_call_id
+                analysis.run_id == run_id
+                    && analysis.source_call_id == source_call_id
                     && analysis.status == AnalysisStatusV4::Running
                     && analysis.runtime.session_id.is_none()
                     && analysis.runtime.process_identity.is_none()
@@ -312,6 +316,7 @@ impl ScientificStateV4 {
 
     pub fn finish_analysis(
         &mut self,
+        run_id: Uuid,
         source_call_id: &str,
         succeeded: bool,
         runtime_session_id: Option<Uuid>,
@@ -332,7 +337,8 @@ impl ScientificStateV4 {
             .analyses
             .values()
             .find(|analysis| {
-                analysis.source_call_id == source_call_id
+                analysis.run_id == run_id
+                    && analysis.source_call_id == source_call_id
                     && analysis.status == AnalysisStatusV4::Running
             })
             .map(|analysis| analysis.id)
@@ -429,6 +435,7 @@ impl ScientificStateV4 {
 
     pub fn record_evidence(
         &mut self,
+        run_id: Uuid,
         source_call_id: String,
         declaration: EvidenceDeclarationV4,
         now: DateTime<Utc>,
@@ -458,6 +465,7 @@ impl ScientificStateV4 {
             schema_version: 4,
             id: Uuid::new_v4(),
             project_id: self.project_id,
+            run_id: Some(run_id),
             source_call_id,
             claim: declaration.claim,
             sources: declaration.sources,
@@ -602,6 +610,203 @@ mod tests {
         }
     }
 
+    fn analyses_with_shared_call_id() -> (ScientificStateV4, AnalysisRecordV4, AnalysisRecordV4) {
+        let mut state = ScientificStateV4::new(Uuid::new_v4());
+        let data = state.register_dataset(dataset("data/raw.h5ad", "a"), Utc::now());
+        let mut first = state
+            .start_analysis(
+                Uuid::from_u128(11),
+                "shared-call".into(),
+                declaration(data.id),
+                runtime(),
+                Utc::now(),
+            )
+            .unwrap();
+        let mut second = state
+            .start_analysis(
+                Uuid::from_u128(22),
+                "shared-call".into(),
+                declaration(data.id),
+                runtime(),
+                Utc::now(),
+            )
+            .unwrap();
+        state.analyses.clear();
+        first.id = Uuid::from_u128(1);
+        second.id = Uuid::from_u128(2);
+        state.analyses.insert(first.id, first.clone());
+        state.analyses.insert(second.id, second.clone());
+        (state, first, second)
+    }
+
+    #[test]
+    fn finishing_shared_call_id_changes_only_the_target_run() {
+        let (mut state, first, second) = analyses_with_shared_call_id();
+        let revision = state.revision;
+        let (finished, artifacts, manifest) = state
+            .finish_analysis(
+                second.run_id,
+                "shared-call",
+                true,
+                Some(Uuid::new_v4()),
+                Some("second-process".into()),
+                vec![VerifiedArtifactFactV4 {
+                    artifact_type: "table".into(),
+                    relative_path: "results/second.csv".into(),
+                    size_bytes: 10,
+                    sha256: "second-artifact".into(),
+                    preview: None,
+                    metadata: json!({}),
+                }],
+                BTreeMap::from([("scanpy".into(), "1.11".into())]),
+                "print('second')".into(),
+                Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(finished.id, second.id);
+        assert_eq!(finished.run_id, second.run_id);
+        assert_eq!(finished.status, AnalysisStatusV4::Succeeded);
+        assert_eq!(state.analyses[&first.id], first);
+        assert_eq!(artifacts[0].producer_analysis_id, second.id);
+        assert_eq!(manifest.analysis_id, second.id);
+        assert_eq!(manifest.run_id, second.run_id);
+        assert_eq!(state.revision, revision + 1);
+    }
+
+    #[test]
+    fn initialization_failure_with_shared_call_id_changes_only_the_target_run() {
+        let (mut state, first, second) = analyses_with_shared_call_id();
+        let revision = state.revision;
+        let failed = state
+            .fail_analysis_initialization(second.run_id, "shared-call", Utc::now())
+            .unwrap();
+        assert_eq!(failed.id, second.id);
+        assert_eq!(failed.run_id, second.run_id);
+        assert_eq!(failed.status, AnalysisStatusV4::Failed);
+        assert_eq!(failed.runtime, second.runtime);
+        assert_eq!(state.analyses[&first.id], first);
+        assert!(state.artifacts.is_empty());
+        assert!(state.provenance.is_empty());
+        assert_eq!(state.revision, revision + 1);
+    }
+
+    #[test]
+    fn unknown_analysis_scope_does_not_change_state() {
+        let (mut state, _, second) = analyses_with_shared_call_id();
+        for (run_id, call_id) in [
+            (Uuid::from_u128(33), "shared-call"),
+            (second.run_id, "missing-call"),
+        ] {
+            let unchanged = state.clone();
+            assert!(matches!(
+                state.finish_analysis(
+                    run_id,
+                    call_id,
+                    true,
+                    Some(Uuid::new_v4()),
+                    Some("unknown-process".into()),
+                    vec![],
+                    BTreeMap::new(),
+                    "print('unknown')".into(),
+                    Utc::now(),
+                ),
+                Err(ScienceErrorV4::AnalysisNotRunning(_))
+            ));
+            assert_eq!(state, unchanged);
+            assert!(matches!(
+                state.fail_analysis_initialization(run_id, call_id, Utc::now()),
+                Err(ScienceErrorV4::AnalysisNotRunning(_))
+            ));
+            assert_eq!(state, unchanged);
+        }
+    }
+
+    #[test]
+    fn completed_analysis_scope_does_not_fall_back_to_another_run() {
+        let (mut state, first, second) = analyses_with_shared_call_id();
+        state
+            .fail_analysis_initialization(second.run_id, "shared-call", Utc::now())
+            .unwrap();
+        let unchanged = state.clone();
+        assert!(matches!(
+            state.finish_analysis(
+                second.run_id,
+                "shared-call",
+                true,
+                None,
+                None,
+                vec![],
+                BTreeMap::new(),
+                "code".into(),
+                Utc::now(),
+            ),
+            Err(ScienceErrorV4::AnalysisNotRunning(_))
+        ));
+        assert_eq!(state, unchanged);
+        assert!(matches!(
+            state.fail_analysis_initialization(second.run_id, "shared-call", Utc::now()),
+            Err(ScienceErrorV4::AnalysisNotRunning(_))
+        ));
+        assert_eq!(state, unchanged);
+        assert_eq!(state.analyses[&first.id], first);
+    }
+
+    #[test]
+    fn newly_recorded_evidence_retains_the_origin_run_with_shared_call_ids() {
+        let mut state = ScientificStateV4::new(Uuid::new_v4());
+        for run_id in [Uuid::from_u128(11), Uuid::from_u128(22)] {
+            let evidence = state
+                .record_evidence(
+                    run_id,
+                    "shared-evidence-call".into(),
+                    EvidenceDeclarationV4 {
+                        claim: "Published observation".into(),
+                        sources: vec![EvidenceSourceV4::Literature {
+                            source_id: "paper-1".into(),
+                            citation: "Example et al.".into(),
+                        }],
+                        strength: EvidenceStrengthV4::Supporting,
+                        conflicts_with: BTreeSet::new(),
+                    },
+                    Utc::now(),
+                )
+                .unwrap();
+            assert_eq!(evidence.run_id, Some(run_id));
+            assert_eq!(state.evidence[&evidence.id].run_id, Some(run_id));
+            let serialized = serde_json::to_value(&evidence).unwrap();
+            assert_eq!(serialized["run_id"], json!(run_id));
+            assert_eq!(
+                serde_json::from_value::<EvidenceRecordV4>(serialized).unwrap(),
+                evidence
+            );
+        }
+        assert_eq!(state.evidence.len(), 2);
+    }
+
+    #[test]
+    fn legacy_evidence_round_trip_preserves_json_and_scientific_digest() {
+        let legacy_evidence = concat!(
+            "{\"schema_version\":4,\"id\":\"00000000-0000-0000-0000-000000000002\",",
+            "\"project_id\":\"00000000-0000-0000-0000-000000000001\",",
+            "\"source_call_id\":\"legacy-call\",\"claim\":\"Published observation\",",
+            "\"sources\":[{\"kind\":\"literature\",\"source_id\":\"paper-1\",\"citation\":\"Example et al.\"}],",
+            "\"strength\":\"supporting\",\"conflicts_with\":[],\"valid\":true,",
+            "\"invalid_reason\":null,\"recorded_at\":\"2026-10-01T00:00:00Z\"}"
+        );
+        let evidence: EvidenceRecordV4 = serde_json::from_str(legacy_evidence).unwrap();
+        assert_eq!(evidence.run_id, None);
+        assert_eq!(serde_json::to_string(&evidence).unwrap(), legacy_evidence);
+        let legacy_state = format!(
+            "{{\"schema_version\":4,\"runtime_id\":\"omicsops.scientific-state@4.0.0\",\"project_id\":\"00000000-0000-0000-0000-000000000001\",\"revision\":1,\"datasets\":{{}},\"analyses\":{{}},\"artifacts\":{{}},\"evidence\":{{\"00000000-0000-0000-0000-000000000002\":{legacy_evidence}}},\"provenance\":{{}}}}"
+        );
+        let state: ScientificStateV4 = serde_json::from_str(&legacy_state).unwrap();
+        assert_eq!(serde_json::to_string(&state).unwrap(), legacy_state);
+        assert_eq!(
+            state.digest(),
+            hex::encode(Sha256::digest(legacy_state.as_bytes()))
+        );
+    }
+
     #[test]
     fn initialization_failure_does_not_fabricate_runtime_or_provenance() {
         let mut state = ScientificStateV4::new(Uuid::new_v4());
@@ -617,7 +822,7 @@ mod tests {
             .unwrap();
         let revision = state.revision;
         let failed = state
-            .fail_analysis_initialization("initialization", Utc::now())
+            .fail_analysis_initialization(started.run_id, "initialization", Utc::now())
             .unwrap();
         assert_eq!(failed.id, started.id);
         assert_eq!(failed.status, AnalysisStatusV4::Failed);
@@ -631,7 +836,7 @@ mod tests {
         let completed_state = state.clone();
         assert!(
             state
-                .fail_analysis_initialization("initialization", Utc::now())
+                .fail_analysis_initialization(started.run_id, "initialization", Utc::now())
                 .is_err()
         );
         assert_eq!(state, completed_state);
@@ -653,6 +858,7 @@ mod tests {
             .unwrap();
         let (_, artifacts, manifest) = state
             .finish_analysis(
+                analysis.run_id,
                 "call",
                 true,
                 Some(Uuid::new_v4()),
@@ -691,6 +897,7 @@ mod tests {
             .unwrap();
         let (_, artifacts, _) = state
             .finish_analysis(
+                analysis.run_id,
                 "call",
                 true,
                 Some(Uuid::new_v4()),
@@ -710,6 +917,7 @@ mod tests {
             .unwrap();
         let evidence = state
             .record_evidence(
+                analysis.run_id,
                 "evidence-call".into(),
                 EvidenceDeclarationV4 {
                     claim: "QC passed".into(),
@@ -747,7 +955,7 @@ mod tests {
 
         let mut missing = declaration(data.id);
         missing.random_seed = None;
-        state
+        let analysis = state
             .start_analysis(
                 Uuid::new_v4(),
                 "missing".into(),
@@ -758,6 +966,7 @@ mod tests {
             .unwrap();
         let (_, _, manifest) = state
             .finish_analysis(
+                analysis.run_id,
                 "missing",
                 true,
                 None,
@@ -790,7 +999,7 @@ mod tests {
             let data = state.register_dataset(dataset("data.h5ad", "a"), Utc::now());
             let mut analysis = declaration(data.id);
             analysis.software_requirements = requirements;
-            state
+            let started = state
                 .start_analysis(
                     Uuid::new_v4(),
                     "call".into(),
@@ -801,6 +1010,7 @@ mod tests {
                 .unwrap();
             state
                 .finish_analysis(
+                    started.run_id,
                     "call",
                     true,
                     None,

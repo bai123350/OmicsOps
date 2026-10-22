@@ -9416,7 +9416,7 @@ impl ScientificStateStoreV4 for RepositoryScientificStateStoreV4 {
         if state
             .analyses
             .values()
-            .any(|analysis| analysis.source_call_id == call.call_id)
+            .any(|analysis| analysis.run_id == run_id && analysis.source_call_id == call.call_id)
         {
             return Ok(None);
         }
@@ -9523,7 +9523,8 @@ impl ScientificStateStoreV4 for RepositoryScientificStateStoreV4 {
             }
             "runtime.execute" if call.arguments.get("analysis").is_some() => {
                 if !state.analyses.values().any(|analysis| {
-                    analysis.source_call_id == call.call_id
+                    analysis.run_id == run_id
+                        && analysis.source_call_id == call.call_id
                         && analysis.status == AnalysisStatusV4::Running
                 }) {
                     return Ok(None);
@@ -9535,7 +9536,11 @@ impl ScientificStateStoreV4 for RepositoryScientificStateStoreV4 {
                     let analysis = state
                         .analyses
                         .values()
-                        .find(|analysis| analysis.source_call_id == call.call_id)
+                        .find(|analysis| {
+                            analysis.run_id == run_id
+                                && analysis.source_call_id == call.call_id
+                                && analysis.status == AnalysisStatusV4::Running
+                        })
                         .ok_or("initialization failure analysis is missing")?;
                     let key = ExecutionContextKeyV4 {
                         project_id,
@@ -9572,7 +9577,7 @@ impl ScientificStateStoreV4 for RepositoryScientificStateStoreV4 {
                         );
                     }
                     let analysis = state
-                        .fail_analysis_initialization(&call.call_id, Utc::now())
+                        .fail_analysis_initialization(run_id, &call.call_id, Utc::now())
                         .map_err(|error| error.to_string())?;
                     return self
                         .save_update(
@@ -9597,6 +9602,7 @@ impl ScientificStateStoreV4 for RepositoryScientificStateStoreV4 {
                     .collect();
                 let (analysis, created, manifest) = state
                     .finish_analysis(
+                        run_id,
                         &call.call_id,
                         outcome.succeeded && result.succeeded,
                         Some(result.session_id),
@@ -9618,18 +9624,16 @@ impl ScientificStateStoreV4 for RepositoryScientificStateStoreV4 {
                 .await
             }
             "science.record_evidence" if outcome.succeeded => {
-                if state
-                    .evidence
-                    .values()
-                    .any(|evidence| evidence.source_call_id == call.call_id)
-                {
+                if state.evidence.values().any(|evidence| {
+                    evidence.run_id == Some(run_id) && evidence.source_call_id == call.call_id
+                }) {
                     return Ok(None);
                 }
                 let declaration: EvidenceDeclarationV4 =
                     serde_json::from_value(call.arguments.clone())
                         .map_err(|error| format!("invalid evidence declaration: {error}"))?;
                 let evidence = state
-                    .record_evidence(call.call_id.clone(), declaration, Utc::now())
+                    .record_evidence(run_id, call.call_id.clone(), declaration, Utc::now())
                     .map_err(|error| error.to_string())?;
                 self.save_update(&state, vec![format!("evidence_recorded:{}", evidence.id)])
                     .await

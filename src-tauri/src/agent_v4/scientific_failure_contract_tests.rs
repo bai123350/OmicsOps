@@ -357,6 +357,255 @@ async fn initialization_receipt(fixture: &Fixture, call: &ToolCallV4) -> ToolOut
 }
 
 #[tokio::test]
+async fn scientific_calls_in_different_runs_create_distinct_analyses() {
+    let fixture = Fixture::new().await;
+    let project_id = fixture.spec.project_id;
+    let first_run = fixture.spec.run_id;
+    let second_run = Uuid::new_v4();
+    let call = analysis_call("ollama-0");
+    fixture
+        .science
+        .before_tool(project_id, first_run, &call)
+        .await
+        .unwrap();
+    fixture
+        .science
+        .after_tool(
+            project_id,
+            first_run,
+            &call,
+            &outcome(&call, &runtime_result(true)),
+        )
+        .await
+        .unwrap();
+    let original = fixture
+        .repository
+        .scientific_state_v4(project_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        fixture
+            .science
+            .before_tool(project_id, second_run, &call)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        fixture
+            .science
+            .before_tool(project_id, second_run, &call)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    fixture
+        .science
+        .after_tool(
+            project_id,
+            second_run,
+            &call,
+            &outcome(&call, &runtime_result(false)),
+        )
+        .await
+        .unwrap();
+    let state = fixture
+        .repository
+        .scientific_state_v4(project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.analyses.len(), 2);
+    for (id, analysis) in &original.analyses {
+        assert_eq!(state.analyses[id], *analysis);
+    }
+    let second = state
+        .analyses
+        .values()
+        .find(|analysis| analysis.run_id == second_run)
+        .unwrap();
+    assert_eq!(second.status, AnalysisStatusV4::Failed);
+    let manifest = state
+        .provenance
+        .values()
+        .find(|manifest| manifest.run_id == second_run)
+        .unwrap();
+    assert_eq!(manifest.analysis_id, second.id);
+    assert!(
+        manifest
+            .output_artifact_ids
+            .iter()
+            .all(|id| state.artifacts[id].producer_analysis_id == second.id
+                && !state.artifacts[id].valid)
+    );
+    assert!(
+        fixture
+            .science
+            .after_tool(
+                project_id,
+                second_run,
+                &call,
+                &outcome(&call, &runtime_result(false))
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        fixture
+            .repository
+            .scientific_state_v4(project_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        state
+    );
+}
+
+#[tokio::test]
+async fn scientific_completion_cannot_finish_another_runs_pending_analysis() {
+    let fixture = Fixture::new().await;
+    let project_id = fixture.spec.project_id;
+    let call = analysis_call("shared-call");
+    fixture
+        .science
+        .before_tool(project_id, fixture.spec.run_id, &call)
+        .await
+        .unwrap();
+    let original = fixture
+        .repository
+        .scientific_state_v4(project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        fixture
+            .science
+            .after_tool(
+                project_id,
+                Uuid::new_v4(),
+                &call,
+                &outcome(&call, &runtime_result(true))
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        fixture
+            .repository
+            .scientific_state_v4(project_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        original
+    );
+}
+
+#[tokio::test]
+async fn scientific_evidence_deduplication_is_scoped_to_the_run() {
+    let fixture = Fixture::new().await;
+    let project_id = fixture.spec.project_id;
+    let call = ToolCallV4 {
+        call_id: "ollama-0".into(),
+        tool_id: "science.record_evidence".into(),
+        arguments: json!({"claim":"synthetic source claim","sources":[{"kind":"literature","source_id":"fixture","citation":"synthetic fixture"}],"strength":"supporting","conflicts_with":[]}),
+    };
+    let result = ToolOutcomeV4 {
+        call_id: call.call_id.clone(),
+        tool_id: call.tool_id.clone(),
+        succeeded: true,
+        model_content: "fixture".into(),
+        data: json!({}),
+        provenance: vec![],
+    };
+    let first_run = fixture.spec.run_id;
+    let second_run = Uuid::new_v4();
+    assert!(
+        fixture
+            .science
+            .after_tool(project_id, first_run, &call, &result)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        fixture
+            .science
+            .after_tool(project_id, first_run, &call, &result)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fixture
+            .science
+            .after_tool(project_id, second_run, &call, &result)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let state = fixture
+        .repository
+        .scientific_state_v4(project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.evidence.len(), 2);
+    let runs = state
+        .evidence
+        .values()
+        .map(|record| {
+            serde_json::to_value(record).unwrap()["run_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        runs,
+        BTreeSet::from([first_run.to_string(), second_run.to_string()])
+    );
+
+    // Legacy evidence lacks a run identity and cannot suppress a new run's record.
+    let mut legacy_json = serde_json::to_value(&state).unwrap();
+    for record in legacy_json["evidence"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+    {
+        record.as_object_mut().unwrap().remove("run_id");
+    }
+    let legacy: ScientificStateV4 = serde_json::from_value(legacy_json).unwrap();
+    fixture
+        .repository
+        .save_scientific_state_v4(&legacy)
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .science
+            .after_tool(project_id, first_run, &call, &result)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        fixture
+            .repository
+            .scientific_state_v4(project_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .evidence
+            .len(),
+        3
+    );
+}
+
+#[tokio::test]
 async fn initialization_failure_finishes_analysis_without_fabricated_execution() {
     let fixture = Fixture::new().await;
     let call = analysis_call("failed-initialization");
@@ -404,6 +653,76 @@ async fn initialization_failure_finishes_analysis_without_fabricated_execution()
         fixture.science.load(fixture.spec.project_id).await.unwrap(),
         state
     );
+}
+
+#[tokio::test]
+async fn scientific_snapshot_recovery_preserves_other_runs_with_the_same_call_id() {
+    for initialization_failed in [false, true] {
+        let fixture = Fixture::new().await;
+        let project_id = fixture.spec.project_id;
+        let call = analysis_call("shared-recovery-call");
+        fixture.start(&call).await;
+        let other_run = Uuid::new_v4();
+        fixture
+            .science
+            .before_tool(project_id, other_run, &call)
+            .await
+            .unwrap();
+        let original = fixture.science.load(project_id).await.unwrap();
+        assert_eq!(original.analyses.len(), 2);
+        let other = original
+            .analyses
+            .values()
+            .find(|analysis| analysis.run_id == other_run)
+            .unwrap()
+            .clone();
+        let receipt = if initialization_failed {
+            initialization_receipt(&fixture, &call).await
+        } else {
+            outcome(&call, &runtime_result(false))
+        };
+        fixture
+            .append(AgentEventKindV4::ToolFinished { outcome: receipt })
+            .await;
+        let recovered = fixture.science.snapshot(project_id).await.unwrap();
+        assert_eq!(recovered.analyses[&other.id], other);
+        let finished = recovered
+            .analyses
+            .values()
+            .find(|analysis| analysis.run_id == fixture.spec.run_id)
+            .unwrap();
+        assert_eq!(finished.status, AnalysisStatusV4::Failed);
+        assert!(finished.ended_at.is_some());
+        assert!(
+            recovered
+                .provenance
+                .values()
+                .all(|manifest| manifest.run_id == fixture.spec.run_id
+                    && manifest.analysis_id == finished.id)
+        );
+        if initialization_failed {
+            assert!(recovered.provenance.is_empty());
+            assert!(recovered.artifacts.is_empty());
+        } else {
+            assert_eq!(recovered.provenance.len(), 1);
+            assert!(recovered.artifacts.values().all(|artifact| artifact.producer_analysis_id == finished.id && !artifact.valid));
+        }
+        assert_eq!(
+            fixture.science.snapshot(project_id).await.unwrap(),
+            recovered
+        );
+        let reopened = Store::open(fixture._directory.path().join("science-contract.sqlite"))
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .scientific_state_v4(project_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            recovered
+        );
+    }
 }
 
 #[tokio::test]
@@ -471,14 +790,16 @@ async fn untrusted_initialization_metadata_cannot_finish_an_analysis() {
         } else {
             fixture.spec.run_id
         };
-        assert!(
-            fixture
-                .science
-                .after_tool(fixture.spec.project_id, run_id, &call, &receipt)
-                .await
-                .is_err(),
-            "{case}"
-        );
+        let result = fixture
+            .science
+            .after_tool(fixture.spec.project_id, run_id, &call, &receipt)
+            .await;
+        if case == "wrong_run" {
+            // No analysis belongs to this run, so the hook has nothing to update.
+            assert!(result.unwrap().is_none());
+        } else {
+            assert!(result.is_err(), "{case}");
+        }
         let state = fixture.science.load(fixture.spec.project_id).await.unwrap();
         assert_eq!(
             state.analyses.values().next().unwrap().status,

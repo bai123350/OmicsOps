@@ -14665,6 +14665,7 @@ mod tests {
                 schema_version: 4,
                 id,
                 project_id,
+                run_id: None,
                 source_call_id: "retained-evidence".into(),
                 claim: format!("{}数据🧬", "x".repeat(bytes)),
                 sources: vec![],
@@ -17335,6 +17336,7 @@ mod tests {
             .unwrap();
         state
             .finish_analysis(
+                run_id,
                 "analysis-call",
                 true,
                 Some(Uuid::new_v4()),
@@ -18851,6 +18853,7 @@ mod tests {
             .unwrap();
         state
             .finish_analysis(
+                spec.run_id,
                 "environment-check",
                 true,
                 None,

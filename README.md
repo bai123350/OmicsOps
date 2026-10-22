@@ -150,6 +150,7 @@ npm run build:desktop
 - [Wisp Science 可借鉴改进清单与优先级](docs/superpowers/specs/2026-10-04-wisp-science-improvement-backlog.md)
 - [检索可发现性与逐项目搜索结果](docs/superpowers/specs/2026-10-22-wisp-search-usability.md)
 - [Agent 本地与 SSH 文件读取上限](docs/superpowers/specs/2026-10-22-bounded-agent-file-read.md)
+- [科学运行身份隔离与 MCP 会话生命周期](docs/superpowers/specs/2026-10-22-wisp-run-identity-and-mcp-lifecycle.md)
 - [最初批准设计（历史背景）](docs/superpowers/specs/2026-07-29-omicsops-agent-design.md)
 - [真实环境验收流程](acceptance/README.md)
 
