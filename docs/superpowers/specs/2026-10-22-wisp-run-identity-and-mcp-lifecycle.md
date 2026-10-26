@@ -69,12 +69,12 @@
 
 | 优先级 | 已核实边界 | 后续最小范围 |
 | --- | --- | --- |
-| P1 | 自动压缩先独立写 archive，再追加 Archived/Checkpointed，最终准入失败仍改变持久 checkpoint；现有注入测试明确断言失败后增加两条事件和一份 archive | 固定最终事件身份后纯准入，再原子提交；独立设计运行中/批准计划边界和 SQLite 逐点回滚测试 |
+| P1（后续已落实） | 自动压缩先独立写 archive，再追加 Archived/Checkpointed，最终准入失败仍改变持久 checkpoint；原有注入测试明确断言失败后增加两条事件和一份 archive | 已由[自动上下文原子提交设计](2026-10-22-automatic-context-atomicity.md)落实，验证记录见该文档 |
 | P1 | 同 Run 重复 call ID 会命中既有结果缓存；本轮仅处理跨 Run 科学身份 | 单独明确调用身份冲突与幂等复用条件，并覆盖参数、工具或调用来源不一致的回归 |
 | P1 | MCP stderr 的持久化脱敏仍有缺口 | 独立梳理 stderr 到持久化、日志和公开错误的路径，以合成敏感标记验证脱敏 |
 | P2 | 原生 replay 从完整事件链累积，不随 checkpoint 缩小；只缩小 JSON context 无法消除 replay 自身的预算占用 | 设计保留完整 call/result 配对与 provider continuation 的 replay 压缩边界，不直接截断历史 |
 | P2 | MCP 实际目录搜索的分词仍有缺口 | 用真实目录搜索入口的确定性 fixture 明确分词行为，再做局部修复 |
 
-自动压缩的具体证据在 `omicsops-agent-core/src/lib.rs` 的 `context_for_internal`、`automatic_full_context_postarchive_refusal_returns_error`，以及 Store 的 `archive_agent_context_v4`。原始事件和工具证据没有被删除；缺口是失败仍改变恢复投影及可能留下部分写入，不能表述为原始科研证据已丢失。W05 计划已明确保留这一非原子边界。
+自动压缩的原始证据在本轮提交时 `omicsops-agent-core/src/lib.rs` 的 `context_for_internal`、`automatic_full_context_postarchive_refusal_returns_error`，以及 Store 的 `archive_agent_context_v4`。原始事件和工具证据没有被删除；缺口是失败仍改变恢复投影及可能留下部分写入，不能表述为原始科研证据已丢失。W05 计划当时明确保留这一非原子边界；后续原子提交变更替换了自动路径和相应回归断言。
 
 原生 replay 结论来自 `model_replay.rs` 的 `project_replay` 与 `shape_request` 源码；当前未进行真实 provider 长对话复现，也未测量生产性能。两项上下文后续需要独立设计与测试，不混入本轮身份和锁生命周期修复。

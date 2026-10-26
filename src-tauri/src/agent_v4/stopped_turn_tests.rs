@@ -53,16 +53,16 @@ impl EventStoreV4 for TestEvents {
             .map_err(|e| e.to_string())
     }
 
-    async fn archive_context(
+    async fn commit_context_compaction(
         &self,
-        run_id: Uuid,
+        spec: &RunSpecV4,
         transcript: &str,
-        checkpoint: &omicsops_protocol::ContextCheckpointV4,
-    ) -> Result<omicsops_protocol::ContextArchiveV4, String> {
+        events: &[AgentEventV4; 2],
+    ) -> Result<(), ContextCompactionCommitErrorV4> {
         self.0
-            .archive_agent_context_v4(run_id, transcript, checkpoint)
+            .commit_automatic_context_compaction_v4(spec, transcript, events)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(context_compaction_commit_error_v4)
     }
 }
 

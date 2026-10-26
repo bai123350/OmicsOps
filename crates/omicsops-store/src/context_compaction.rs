@@ -1,7 +1,8 @@
-//! Durable, idempotent manual context compaction.
+//! Durable context compaction with atomic archive/checkpoint commits.
 //!
-//! The Store owns the compaction transaction because an archive, its
-//! checkpoint events, and the bounded receipt must become visible together.
+//! The Store owns the compaction transaction because an archive and its
+//! checkpoint events must become visible together. Manual compaction also
+//! commits its bounded receipt in the same transaction.
 //! The complete event transcript is retained in `agent_context_archives_v4`;
 //! the receipt only contains scope, status, sizes, and hashes.
 
@@ -39,6 +40,28 @@ pub struct CompactionSnapshotV4 {
 }
 
 impl Store {
+    /// Commit the exact automatic archive/checkpoint events admitted by Core.
+    /// The source and frozen execution identity are rechecked under the same
+    /// write lock as all three inserts; no partial projection can escape.
+    pub async fn commit_automatic_context_compaction_v4(
+        &self,
+        spec: &RunSpecV4,
+        transcript: &str,
+        events: &[AgentEventV4; 2],
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        match commit_automatic_in_tx(&mut tx, spec, transcript, events).await {
+            Ok(()) => {
+                tx.commit().await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = tx.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
     /// Capture one read-consistent source without reconciliation or writes.
     /// The desktop host must hold its run lease and exclude active drivers.
     pub async fn context_compaction_snapshot_v4(
@@ -126,6 +149,145 @@ impl Store {
 
 fn invalid(message: &str) -> StoreError {
     StoreError::InvalidInput(message.into())
+}
+
+async fn commit_automatic_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    spec: &RunSpecV4,
+    transcript: &str,
+    events: &[AgentEventV4; 2],
+) -> Result<(), StoreError> {
+    if spec.schema_version != 4
+        || spec.run_id.is_nil()
+        || spec.project_id.is_nil()
+        || spec.conversation_id.is_nil()
+    {
+        return Err(invalid("invalid automatic context compaction scope"));
+    }
+    spec.validate_integrity()
+        .map_err(|_| invalid("invalid frozen run specification"))?;
+    ensure_conversation_owner_executor(&mut *tx, spec.project_id, spec.conversation_id).await?;
+    ensure_run_owner_executor(&mut *tx, spec.project_id, spec.conversation_id, spec.run_id).await?;
+    let row = sqlx::query("SELECT status,value_json FROM agent_runs_v4 WHERE run_id=?1")
+        .bind(spec.run_id.to_string())
+        .fetch_one(&mut **tx)
+        .await?;
+    let run_value: Value = serde_json::from_str(&row.try_get::<String, _>(1)?)?;
+    if row.try_get::<String, _>(0)? != "running"
+        || run_value.get("status").and_then(Value::as_str) != Some("running")
+    {
+        return Err(invalid(
+            "automatic context compaction requires a running run",
+        ));
+    }
+    let durable_spec: RunSpecV4 = serde_json::from_value(
+        run_value
+            .get("spec")
+            .cloned()
+            .ok_or_else(|| invalid("automatic context compaction requires a frozen spec"))?,
+    )?;
+    if durable_spec != *spec {
+        return Err(invalid(
+            "automatic context compaction frozen specification changed",
+        ));
+    }
+    let source = load_agent_events_in_tx(&mut *tx, spec.run_id).await?;
+    if serde_json::to_string(&source)? != transcript {
+        return Err(invalid(
+            "automatic context compaction source event chain changed",
+        ));
+    }
+    if source.iter().chain(events).any(|event| {
+        event.schema_version != 4
+            || event.run_id != spec.run_id
+            || event.project_id != spec.project_id
+            || event.conversation_id != spec.conversation_id
+            || super::is_terminal_event(event)
+    }) {
+        return Err(invalid(
+            "invalid automatic compaction event scope or terminal chain",
+        ));
+    }
+    let frozen_hash = spec
+        .spec_hash
+        .as_deref()
+        .ok_or_else(|| invalid("automatic context compaction requires an anchored spec"))?;
+    let approval_hash = spec
+        .approval_hash
+        .as_deref()
+        .ok_or_else(|| invalid("automatic context compaction requires an approval identity"))?;
+    let anchor = source.iter().rev().find_map(|event| match &event.event {
+        AgentEventKindV4::RunSpecFrozen {
+            spec_hash,
+            approval_hash,
+        } => Some((spec_hash.as_str(), approval_hash.as_str())),
+        _ => None,
+    });
+    if anchor != Some((frozen_hash, approval_hash)) {
+        return Err(invalid(
+            "frozen specification differs from its event anchor",
+        ));
+    }
+    let head = source
+        .last()
+        .ok_or_else(|| invalid("automatic compaction requires an event head"))?;
+    let mut previous = head;
+    for event in events {
+        event
+            .verify()
+            .map_err(|_| invalid("invalid automatic compaction event hash"))?;
+        if previous.sequence.checked_add(1) != Some(event.sequence)
+            || event.previous_hash != previous.event_hash
+        {
+            return Err(invalid(
+                "automatic compaction does not continue the source event chain",
+            ));
+        }
+        previous = event;
+    }
+    let AgentEventKindV4::ContextArchived { archive } = &events[0].event else {
+        return Err(invalid(
+            "automatic compaction requires an archive event first",
+        ));
+    };
+    let AgentEventKindV4::ContextCheckpointed { checkpoint } = &events[1].event else {
+        return Err(invalid(
+            "automatic compaction requires a checkpoint event second",
+        ));
+    };
+    if archive.archive_id.is_nil()
+        || archive.through_sequence != head.sequence
+        || checkpoint.through_sequence != head.sequence
+        || checkpoint.schema_version != 4
+        || archive.size_bytes != transcript.len() as u64
+        || archive.sha256 != hex::encode(Sha256::digest(transcript.as_bytes()))
+        || checkpoint.completion_criteria != spec.plan.completion_criteria
+        || checkpoint.scientific_state
+            != serde_json::to_value(science_in_tx(tx, spec.project_id).await?)?
+    {
+        return Err(invalid(
+            "automatic compaction archive or checkpoint differs from its source",
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO agent_context_archives_v4
+         (archive_id,run_id,through_sequence,size_bytes,sha256,transcript_json,checkpoint_json,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+    )
+    .bind(archive.archive_id.to_string())
+    .bind(spec.run_id.to_string())
+    .bind(optional_i64(Some(archive.through_sequence), "archive sequence")?)
+    .bind(optional_i64(Some(archive.size_bytes), "archive size")?)
+    .bind(&archive.sha256)
+    .bind(transcript)
+    .bind(serde_json::to_string(checkpoint)?)
+    .bind(timestamp(events[0].occurred_at))
+    .execute(&mut **tx)
+    .await?;
+    for event in events {
+        insert_agent_event_in_tx(&mut *tx, event).await?;
+    }
+    Ok(())
 }
 
 async fn snapshot_in_tx(
@@ -1624,6 +1786,19 @@ mod manual_tests {
     use omicsops_science::ScientificStateV4;
 
     async fn fixture(store: Store) -> (Store, ContextCompactionSnapshotV4) {
+        fixture_for_execution(
+            store,
+            RunExecutionKindV4::OrdinaryAgent,
+            "waiting_for_input",
+        )
+        .await
+    }
+
+    async fn fixture_for_execution(
+        store: Store,
+        execution_kind: RunExecutionKindV4,
+        status: &str,
+    ) -> (Store, ContextCompactionSnapshotV4) {
         let project = Project::new(
             Uuid::new_v4(),
             "manual fixture",
@@ -1690,14 +1865,16 @@ mod manual_tests {
             configuration_hash: reviewer.execution_configuration_hash(),
             service_tier: RunServiceTierV4 { fast_mode: None },
         });
+        spec.execution_kind = execution_kind;
         spec.spec_hash = Some(spec.calculate_spec_hash().unwrap());
+        spec.validate_integrity().unwrap();
         store
             .save_agent_run_v4(
                 run_id,
                 project.id,
                 conversation.id,
-                "waiting_for_input",
-                &json!({"status":"waiting_for_input","spec":spec}),
+                status,
+                &json!({"status":status,"spec":spec}),
             )
             .await
             .unwrap();
@@ -1719,10 +1896,16 @@ mod manual_tests {
             AgentEventKindV4::ModelText {
                 text: "evidence ".repeat(3000),
             },
-            AgentEventKindV4::InputRequested {
-                question_id: "q".into(),
-                question: "Next?".into(),
-                reason: AgentInputReasonV4::Decision,
+            if status == "waiting_for_input" {
+                AgentEventKindV4::InputRequested {
+                    question_id: "q".into(),
+                    question: "Next?".into(),
+                    reason: AgentInputReasonV4::Decision,
+                }
+            } else {
+                AgentEventKindV4::ModelText {
+                    text: "Continue the analysis".into(),
+                }
             },
         ] {
             events.push(AgentEventV4::next(events.last().unwrap(), Utc::now(), kind));
@@ -1850,6 +2033,395 @@ mod manual_tests {
 
     async fn counts(store: &Store) -> (i64, i64, i64) {
         sqlx::query_as("SELECT (SELECT count(*) FROM agent_context_compactions_v4),(SELECT count(*) FROM agent_context_archives_v4),(SELECT count(*) FROM agent_events_v4)").fetch_one(&store.pool).await.unwrap()
+    }
+
+    fn automatic_events(source: &ContextCompactionSnapshotV4) -> [AgentEventV4; 2] {
+        let candidate = prepared(source);
+        let archived = AgentEventV4::next(
+            source.events.last().unwrap(),
+            Utc::now(),
+            AgentEventKindV4::ContextArchived {
+                archive: candidate.archive.unwrap(),
+            },
+        );
+        let checkpointed = AgentEventV4::next(
+            &archived,
+            Utc::now(),
+            AgentEventKindV4::ContextCheckpointed {
+                checkpoint: candidate.checkpoint.unwrap(),
+            },
+        );
+        [archived, checkpointed]
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_succeeds_after_paused_execution_starts() {
+        for kind in [
+            RunExecutionKindV4::OrdinaryAgent,
+            RunExecutionKindV4::ApprovedPlan,
+        ] {
+            for status in ["waiting_for_input", "waiting_for_approval"] {
+                let (store, source) =
+                    fixture_for_execution(Store::open_in_memory().await.unwrap(), kind, status)
+                        .await;
+                let transcript = serde_json::to_string(&source.events).unwrap();
+                let events = automatic_events(&source);
+                assert!(
+                    store
+                        .commit_automatic_context_compaction_v4(&source.spec, &transcript, &events)
+                        .await
+                        .is_err()
+                );
+                store
+                    .start_agent_execution_v4(&source.spec, status, &source.source_head_hash)
+                    .await
+                    .unwrap();
+                store
+                    .commit_automatic_context_compaction_v4(&source.spec, &transcript, &events)
+                    .await
+                    .unwrap();
+                let mut expected = source.events.clone();
+                expected.extend(events);
+                assert_eq!(
+                    store.agent_events_v4(source.spec.run_id).await.unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_commit_rolls_back_every_write_and_preserves_exact_events() {
+        for kind in [
+            RunExecutionKindV4::OrdinaryAgent,
+            RunExecutionKindV4::ApprovedPlan,
+        ] {
+            let (store, source) =
+                fixture_for_execution(Store::open_in_memory().await.unwrap(), kind, "running")
+                    .await;
+            let events = automatic_events(&source);
+            let transcript = serde_json::to_string(&source.events).unwrap();
+            let before = counts(&store).await;
+            let original_run = store.agent_run_v4(source.spec.run_id).await.unwrap();
+            for (table, condition) in [
+                ("agent_context_archives_v4", "1".to_owned()),
+                (
+                    "agent_events_v4",
+                    format!("NEW.sequence={}", events[0].sequence),
+                ),
+                (
+                    "agent_events_v4",
+                    format!("NEW.sequence={}", events[1].sequence),
+                ),
+            ] {
+                sqlx::query(&format!("CREATE TEMP TRIGGER automatic_compaction_failure BEFORE INSERT ON {table} WHEN {condition} BEGIN SELECT RAISE(ABORT,'injected automatic compaction failure'); END")).execute(&store.pool).await.unwrap();
+                let error = store
+                    .commit_automatic_context_compaction_v4(&source.spec, &transcript, &events)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("injected automatic compaction failure"),
+                    "{error}"
+                );
+                assert_eq!(counts(&store).await, before);
+                assert_eq!(
+                    store.agent_events_v4(source.spec.run_id).await.unwrap(),
+                    source.events
+                );
+                sqlx::query("DROP TRIGGER automatic_compaction_failure")
+                    .execute(&store.pool)
+                    .await
+                    .unwrap();
+            }
+            store
+                .commit_automatic_context_compaction_v4(&source.spec, &transcript, &events)
+                .await
+                .unwrap();
+            assert_eq!(counts(&store).await, (0, 1, before.2 + 2));
+            let mut expected = source.events.clone();
+            expected.extend(events.clone());
+            assert_eq!(
+                store.agent_events_v4(source.spec.run_id).await.unwrap(),
+                expected
+            );
+            assert_eq!(
+                store.agent_run_v4(source.spec.run_id).await.unwrap(),
+                original_run
+            );
+            assert!(
+                store
+                    .commit_automatic_context_compaction_v4(&source.spec, &transcript, &events)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(counts(&store).await, (0, 1, before.2 + 2));
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_rejects_changed_sources_without_writes() {
+        for change in [
+            "head",
+            "science",
+            "science_header",
+            "spec",
+            "status_column",
+            "status_json",
+            "terminal",
+            "anchor",
+            "approval_anchor",
+        ] {
+            let (store, mut source) = fixture_for_execution(
+                Store::open_in_memory().await.unwrap(),
+                RunExecutionKindV4::OrdinaryAgent,
+                "running",
+            )
+            .await;
+            let transcript = serde_json::to_string(&source.events).unwrap();
+            let events = automatic_events(&source);
+            match change {
+                "head" | "terminal" => {
+                    let event = AgentEventV4::next(
+                        source.events.last().unwrap(),
+                        Utc::now(),
+                        if change == "terminal" {
+                            AgentEventKindV4::RunCancelled
+                        } else {
+                            AgentEventKindV4::ModelText {
+                                text: "new evidence".into(),
+                            }
+                        },
+                    );
+                    store.append_agent_event_v4(&event).await.unwrap();
+                    if change == "terminal" {
+                        source.events.push(event);
+                        source.source_through_sequence = source.events.last().unwrap().sequence;
+                        source.source_head_hash = source.events.last().unwrap().event_hash.clone();
+                    }
+                }
+                "science" | "science_header" => {
+                    let mut state = ScientificStateV4::new(source.spec.project_id);
+                    state.revision = 1;
+                    store.save_scientific_state_v4(&state).await.unwrap();
+                    if change == "science_header" {
+                        sqlx::query("UPDATE scientific_states_v4 SET state_sha256='changed'")
+                            .execute(&store.pool)
+                            .await
+                            .unwrap();
+                    }
+                }
+                "spec" => {
+                    let mut changed = source.spec.clone();
+                    changed.plan.objective = "changed objective".into();
+                    sqlx::query("UPDATE agent_runs_v4 SET value_json=?1")
+                        .bind(json!({"status":"running", "spec":changed}).to_string())
+                        .execute(&store.pool)
+                        .await
+                        .unwrap();
+                }
+                "status_column" => {
+                    sqlx::query("UPDATE agent_runs_v4 SET status='waiting_for_input'")
+                        .execute(&store.pool)
+                        .await
+                        .unwrap();
+                }
+                "status_json" => {
+                    sqlx::query("UPDATE agent_runs_v4 SET value_json=json_set(value_json,'$.status','waiting_for_input')").execute(&store.pool).await.unwrap();
+                }
+                "anchor" | "approval_anchor" => {
+                    let anchor = AgentEventV4::next(
+                        source.events.last().unwrap(),
+                        Utc::now(),
+                        AgentEventKindV4::RunSpecFrozen {
+                            spec_hash: if change == "anchor" {
+                                "c".repeat(64)
+                            } else {
+                                source.spec.spec_hash.clone().unwrap()
+                            },
+                            approval_hash: if change == "approval_anchor" {
+                                "c".repeat(64)
+                            } else {
+                                source.spec.approval_hash.clone().unwrap()
+                            },
+                        },
+                    );
+                    store.append_agent_event_v4(&anchor).await.unwrap();
+                    source.events.push(anchor);
+                    source.source_through_sequence = source.events.last().unwrap().sequence;
+                    source.source_head_hash = source.events.last().unwrap().event_hash.clone();
+                }
+                _ => unreachable!(),
+            }
+            // The terminal and malformed anchor cases use a current source, so rejection
+            // cannot be attributed merely to a stale transcript/head.
+            let (transcript, events) =
+                if matches!(change, "terminal" | "anchor" | "approval_anchor") {
+                    (
+                        serde_json::to_string(&source.events).unwrap(),
+                        automatic_events(&source),
+                    )
+                } else {
+                    (transcript, events)
+                };
+            let before = counts(&store).await;
+            let original = store.agent_events_v4(source.spec.run_id).await.unwrap();
+            assert!(
+                store
+                    .commit_automatic_context_compaction_v4(&source.spec, &transcript, &events)
+                    .await
+                    .is_err(),
+                "accepted {change}"
+            );
+            assert_eq!(counts(&store).await, before, "wrote on {change}");
+            assert_eq!(
+                store.agent_events_v4(source.spec.run_id).await.unwrap(),
+                original
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_rejects_invalid_admitted_payloads() {
+        let (store, source) = fixture_for_execution(
+            Store::open_in_memory().await.unwrap(),
+            RunExecutionKindV4::ApprovedPlan,
+            "running",
+        )
+        .await;
+        let original_transcript = serde_json::to_string(&source.events).unwrap();
+        let original = automatic_events(&source);
+        let before = counts(&store).await;
+        for change in [
+            "transcript",
+            "archive_id",
+            "archive_sha",
+            "archive_size",
+            "archive_sequence",
+            "checkpoint_schema",
+            "checkpoint_sequence",
+            "science",
+            "criteria",
+            "scope",
+            "first_gap",
+            "second_gap",
+            "hash",
+            "kind",
+            "spec",
+        ] {
+            let mut transcript = original_transcript.clone();
+            let mut spec = source.spec.clone();
+            let mut events = original.clone();
+            match change {
+                "transcript" => transcript.push(' '),
+                "archive_id" | "archive_sha" | "archive_size" | "archive_sequence" => {
+                    let AgentEventKindV4::ContextArchived { archive } = &mut events[0].event else {
+                        unreachable!()
+                    };
+                    match change {
+                        "archive_id" => archive.archive_id = Uuid::nil(),
+                        "archive_sha" => archive.sha256 = "b".repeat(64),
+                        "archive_size" => archive.size_bytes += 1,
+                        _ => archive.through_sequence -= 1,
+                    }
+                }
+                "checkpoint_schema" | "checkpoint_sequence" | "science" | "criteria" => {
+                    let AgentEventKindV4::ContextCheckpointed { checkpoint } = &mut events[1].event
+                    else {
+                        unreachable!()
+                    };
+                    match change {
+                        "checkpoint_schema" => checkpoint.schema_version = 3,
+                        "checkpoint_sequence" => checkpoint.through_sequence -= 1,
+                        "science" => checkpoint.scientific_state = Value::Null,
+                        _ => checkpoint.completion_criteria.clear(),
+                    }
+                }
+                "kind" => {
+                    events[0].event = AgentEventKindV4::ModelText {
+                        text: "wrong event".into(),
+                    }
+                }
+                "spec" => {
+                    spec.plan.objective = "tampered approval".into();
+                }
+                _ => {}
+            }
+            let mut previous = source.events.last().unwrap().clone();
+            if change == "scope" {
+                previous.project_id = Uuid::new_v4();
+            }
+            if change == "first_gap" {
+                previous.sequence += 1;
+            }
+            events[0] =
+                AgentEventV4::next(&previous, events[0].occurred_at, events[0].event.clone());
+            previous = events[0].clone();
+            if change == "second_gap" {
+                previous.sequence += 1;
+            }
+            events[1] =
+                AgentEventV4::next(&previous, events[1].occurred_at, events[1].event.clone());
+            if change == "hash" {
+                events[1].event_hash = "f".repeat(64);
+            }
+            assert!(
+                store
+                    .commit_automatic_context_compaction_v4(&spec, &transcript, &events)
+                    .await
+                    .is_err(),
+                "accepted {change}"
+            );
+            assert_eq!(counts(&store).await, before, "wrote on {change}");
+        }
+        assert_eq!(
+            store.agent_events_v4(source.spec.run_id).await.unwrap(),
+            source.events
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_restart_preserves_archive_and_original_hashes() {
+        for kind in [
+            RunExecutionKindV4::OrdinaryAgent,
+            RunExecutionKindV4::ApprovedPlan,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("automatic.sqlite");
+            let (store, source) =
+                fixture_for_execution(Store::open(&path).await.unwrap(), kind, "running").await;
+            let events = automatic_events(&source);
+            let transcript = serde_json::to_string(&source.events).unwrap();
+            store
+                .commit_automatic_context_compaction_v4(&source.spec, &transcript, &events)
+                .await
+                .unwrap();
+            store.pool.close().await;
+            drop(store);
+            let store = Store::open(&path).await.unwrap();
+            let AgentEventKindV4::ContextArchived { archive } = &events[0].event else {
+                unreachable!()
+            };
+            let AgentEventKindV4::ContextCheckpointed { checkpoint } = &events[1].event else {
+                unreachable!()
+            };
+            assert_eq!(
+                store
+                    .agent_context_archive_v4(archive.archive_id)
+                    .await
+                    .unwrap(),
+                Some((transcript, checkpoint.clone()))
+            );
+            let mut expected = source.events;
+            expected.extend(events);
+            assert_eq!(
+                store.agent_events_v4(source.spec.run_id).await.unwrap(),
+                expected
+            );
+            assert_eq!(counts(&store).await, (0, 1, expected.len() as i64));
+            store.pool.close().await;
+        }
     }
 
     #[tokio::test]

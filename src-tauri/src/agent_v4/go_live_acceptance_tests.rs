@@ -10,20 +10,25 @@ use std::{
 
 use async_trait::async_trait;
 use omicsops_adapters::credentials::{CredentialVault, SystemCredentialVault};
-use omicsops_agent_core::{AgentCoreV4, AgentLimitsV4, EventStoreV4};
+use omicsops_agent_core::{
+    AgentCoreV4, AgentLimitsV4, ContextCompactionCommitErrorV4, EventStoreV4,
+};
 use omicsops_core::workspace::{
     Conversation, ModelProfile, ModelProviderKind, Project, ProjectTemplate,
 };
 use omicsops_protocol::{
     AgentEventKindV4, AgentEventV4, ApprovalPolicyV4, AutonomyModeV4, ComputeBackendKindV4,
-    ComputeSelectionV4, ContextArchiveV4, ContextCheckpointV4, ConversationAgentPreferencesV4,
-    NetworkPolicyV4, RunModeV4, RunServiceTierV4, ToolEffectV4,
+    ComputeSelectionV4, ConversationAgentPreferencesV4, NetworkPolicyV4, RunModeV4,
+    RunServiceTierV4, RunSpecV4, ToolEffectV4,
 };
 use omicsops_store::Store;
 use sqlx::{Connection, sqlite::SqliteConnectOptions};
 use uuid::Uuid;
 
-use super::{AppState, DirectRunSnapshotV4, StartDirectV4Request, compose, prepare_direct_run_v4};
+use super::{
+    AppState, DirectRunSnapshotV4, StartDirectV4Request, compose,
+    context_compaction_commit_error_v4, prepare_direct_run_v4,
+};
 
 const GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 const GO_MODELS: [&str; 3] = ["glm-5.3", "glm-5.3-flash", "deepseek-v4.1-flash"];
@@ -184,16 +189,16 @@ impl EventStoreV4 for TemporaryEventStore {
             .map_err(|error| error.to_string())
     }
 
-    async fn archive_context(
+    async fn commit_context_compaction(
         &self,
-        run_id: Uuid,
+        spec: &RunSpecV4,
         transcript: &str,
-        checkpoint: &ContextCheckpointV4,
-    ) -> Result<ContextArchiveV4, String> {
+        events: &[AgentEventV4; 2],
+    ) -> Result<(), ContextCompactionCommitErrorV4> {
         self.repository
-            .archive_agent_context_v4(run_id, transcript, checkpoint)
+            .commit_automatic_context_compaction_v4(spec, transcript, events)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(context_compaction_commit_error_v4)
     }
 }
 

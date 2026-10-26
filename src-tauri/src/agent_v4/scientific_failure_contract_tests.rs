@@ -3,8 +3,8 @@ use super::*;
 use omicsops_agent_core::verify_completion_v4;
 use omicsops_core::workspace::{Conversation, ProjectTemplate};
 use omicsops_protocol::{
-    CompletionCriterionEvidenceV4, CompletionEvidenceRefV4, CompletionProposalV4, RunModeV4,
-    RuntimeJobStateV4,
+    CompletionCriterionEvidenceV4, CompletionEvidenceRefV4, CompletionProposalV4, ContextArchiveV4,
+    ContextCheckpointV4, RunModeV4, RuntimeJobStateV4,
 };
 use std::sync::Mutex as StdMutex;
 
@@ -26,16 +26,16 @@ impl EventStoreV4 for TestEvents {
             .map_err(|error| error.to_string())
     }
 
-    async fn archive_context(
+    async fn commit_context_compaction(
         &self,
-        run_id: Uuid,
+        spec: &RunSpecV4,
         transcript: &str,
-        checkpoint: &ContextCheckpointV4,
-    ) -> Result<ContextArchiveV4, String> {
+        events: &[AgentEventV4; 2],
+    ) -> Result<(), ContextCompactionCommitErrorV4> {
         self.0
-            .archive_agent_context_v4(run_id, transcript, checkpoint)
+            .commit_automatic_context_compaction_v4(spec, transcript, events)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(context_compaction_commit_error_v4)
     }
 }
 
@@ -194,7 +194,7 @@ impl Fixture {
                 spec.project_id,
                 spec.conversation_id,
                 "running",
-                &json!({"spec":spec}),
+                &json!({"status":"running", "spec":spec}),
             )
             .await
             .unwrap();
@@ -207,6 +207,18 @@ impl Fixture {
                 Utc::now(),
                 AgentEventKindV4::RunCreated {
                     mode: RunModeV4::Execute,
+                },
+            ))
+            .await
+            .unwrap();
+        let first = events.load(spec.run_id).await.unwrap().pop().unwrap();
+        events
+            .append(&AgentEventV4::next(
+                &first,
+                Utc::now(),
+                AgentEventKindV4::RunSpecFrozen {
+                    approval_hash: spec.approval_hash.clone().unwrap(),
+                    spec_hash: spec.spec_hash.clone().unwrap(),
                 },
             ))
             .await
@@ -252,6 +264,157 @@ impl Fixture {
         })
         .await;
     }
+
+    async fn compaction_candidate(&self) -> (String, [AgentEventV4; 2]) {
+        let source = self.events.load(self.spec.run_id).await.unwrap();
+        let transcript = serde_json::to_string(&source).unwrap();
+        let head = source.last().unwrap();
+        let archived = AgentEventV4::next(
+            head,
+            Utc::now(),
+            AgentEventKindV4::ContextArchived {
+                archive: ContextArchiveV4 {
+                    archive_id: Uuid::new_v4(),
+                    through_sequence: head.sequence,
+                    size_bytes: transcript.len() as u64,
+                    sha256: hex::encode(sha2::Sha256::digest(transcript.as_bytes())),
+                },
+            },
+        );
+        let checkpointed = AgentEventV4::next(
+            &archived,
+            Utc::now(),
+            AgentEventKindV4::ContextCheckpointed {
+                checkpoint: ContextCheckpointV4 {
+                    schema_version: 4,
+                    through_sequence: head.sequence,
+                    completion_criteria: self.spec.plan.completion_criteria.clone(),
+                    unresolved_errors: vec![],
+                    recent_steps: vec![],
+                    scientific_state: serde_json::to_value(
+                        self.science.load(self.spec.project_id).await.unwrap(),
+                    )
+                    .unwrap(),
+                    task_shape: None,
+                    phase: None,
+                    task_revision: None,
+                    tasks: vec![],
+                    cycle_id: None,
+                },
+            },
+        );
+        (transcript, [archived, checkpointed])
+    }
+}
+
+#[tokio::test]
+async fn automatic_compaction_host_publishes_exact_events_only_after_commit() {
+    let fixture = Fixture::new().await;
+    let before = fixture.events.load(fixture.spec.run_id).await.unwrap();
+    let (transcript, events) = fixture.compaction_candidate().await;
+    let mut published = vec![];
+    commit_context_compaction_and_publish_v4(
+        &fixture.repository,
+        &fixture.spec,
+        &transcript,
+        &events,
+        |event| {
+            // Read through an independent connection at publication time, so a
+            // publish moved before commit cannot pass on uncommitted rows.
+            let path = fixture._directory.path().join("science-contract.sqlite");
+            let durable_count = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async move {
+                        use sqlx::Connection;
+                        let mut connection = sqlx::SqliteConnection::connect_with(
+                            &sqlx::sqlite::SqliteConnectOptions::new()
+                                .filename(path)
+                                .read_only(true),
+                        )
+                        .await
+                        .unwrap();
+                        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM agent_events_v4")
+                            .fetch_one(&mut connection)
+                            .await
+                            .unwrap()
+                    })
+            })
+            .join()
+            .unwrap();
+            assert_eq!(durable_count as usize, before.len() + 2);
+            published.push(event.clone());
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(published, events);
+    let durable = fixture.events.load(fixture.spec.run_id).await.unwrap();
+    assert_eq!(&durable[..before.len()], &before);
+    assert_eq!(&durable[before.len()..], &events);
+}
+
+#[tokio::test]
+async fn automatic_compaction_host_rejection_never_publishes_or_archives() {
+    let fixture = Fixture::new().await;
+    let (transcript, events) = fixture.compaction_candidate().await;
+    fixture
+        .append(AgentEventKindV4::ModelText {
+            text: "source advanced before commit".into(),
+        })
+        .await;
+    let before = fixture.events.load(fixture.spec.run_id).await.unwrap();
+    let mut published = vec![];
+    let error = commit_context_compaction_and_publish_v4(
+        &fixture.repository,
+        &fixture.spec,
+        &transcript,
+        &events,
+        |event| published.push(event.clone()),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, ContextCompactionCommitErrorV4::Rejected(_)));
+    assert!(published.is_empty());
+    assert_eq!(
+        fixture.events.load(fixture.spec.run_id).await.unwrap(),
+        before
+    );
+    let AgentEventKindV4::ContextArchived { archive } = &events[0].event else {
+        panic!("missing archive event")
+    };
+    assert!(
+        fixture
+            .repository
+            .agent_context_archive_v4(archive.archive_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn automatic_compaction_store_errors_distinguish_rejection_and_unavailability() {
+    assert!(matches!(
+        context_compaction_commit_error_v4(omicsops_store::StoreError::InvalidInput(
+            "source changed".into()
+        )),
+        ContextCompactionCommitErrorV4::Rejected(_)
+    ));
+    assert!(matches!(
+        context_compaction_commit_error_v4(omicsops_store::StoreError::Database(
+            sqlx::Error::PoolClosed
+        )),
+        ContextCompactionCommitErrorV4::Unavailable(_)
+    ));
+    assert!(matches!(
+        context_compaction_commit_error_v4(omicsops_store::StoreError::Io(std::io::Error::other(
+            "storage unavailable"
+        ))),
+        ContextCompactionCommitErrorV4::Unavailable(_)
+    ));
 }
 
 fn analysis_call(call_id: &str) -> ToolCallV4 {

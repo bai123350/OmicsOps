@@ -557,6 +557,16 @@ pub trait ExternalExecutorPortV4: Send + Sync {
     ) -> Result<ExternalExecutorOutcomeV4, String>;
 }
 
+/// Validation conflicts must stop a compaction even when its code view is
+/// optional; only storage unavailability may fall back to admitted full input.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ContextCompactionCommitErrorV4 {
+    #[error("{0}")]
+    Rejected(String),
+    #[error("{0}")]
+    Unavailable(String),
+}
+
 #[async_trait]
 pub trait EventStoreV4: Send + Sync {
     /// Payload-free live provider activity. This never enters the audit chain.
@@ -586,12 +596,15 @@ pub trait EventStoreV4: Send + Sync {
         self.append(event).await?;
         Ok(true)
     }
-    async fn archive_context(
+    /// Atomically persist the admitted archive and exact checkpoint events.
+    /// The host must reject stale source/science/frozen identity and leave no
+    /// writes on failure. Sequential archive/append fallbacks are not safe.
+    async fn commit_context_compaction(
         &self,
-        run_id: Uuid,
+        spec: &RunSpecV4,
         transcript: &str,
-        checkpoint: &ContextCheckpointV4,
-    ) -> Result<ContextArchiveV4, String>;
+        events: &[AgentEventV4; 2],
+    ) -> Result<(), ContextCompactionCommitErrorV4>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5446,39 +5459,44 @@ impl AgentCoreV4<'_> {
             scientific_value.clone(),
             use_views,
         );
-        // Preflight the complete future request before writing an archive.
-        // Management UUIDs/timestamps are absent from the model view. Only
-        // the checkpoint's exact sequence and fixed-width SHA256 appear in
-        // its reference. These private prospective references never escape.
+        // Allocate the real archive identity before admission. Native replay
+        // closures and scientific views must refer to the exact event hashes
+        // that the Store will persist, not same-width placeholder hashes.
+        use sha2::{Digest, Sha256};
         let previous = events
             .last()
             .ok_or_else(|| AgentCoreErrorV4::Store("run has no first event".into()))?;
-        let archived = AgentEventV4::next(
-            previous,
-            previous.occurred_at,
-            AgentEventKindV4::ContextArchived {
-                archive: ContextArchiveV4 {
-                    archive_id: Uuid::nil(),
-                    through_sequence: checkpoint.through_sequence,
-                    size_bytes: transcript.len() as u64,
-                    sha256: "0".repeat(64),
+        let timestamp = Utc::now();
+        let archive = ContextArchiveV4 {
+            archive_id: Uuid::new_v4(),
+            through_sequence: checkpoint.through_sequence,
+            size_bytes: transcript.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(transcript.as_bytes())),
+        };
+        let prepare_events = |checkpoint: &ContextCheckpointV4| {
+            let archived = AgentEventV4::next(
+                previous,
+                timestamp,
+                AgentEventKindV4::ContextArchived {
+                    archive: archive.clone(),
                 },
-            },
-        );
-        let checkpointed = AgentEventV4::next(
-            &archived,
-            previous.occurred_at,
-            AgentEventKindV4::ContextCheckpointed {
-                checkpoint: checkpoint.clone(),
-            },
-        );
-        let mut prospective = events.clone();
-        prospective.extend([archived, checkpointed]);
+            );
+            let checkpointed = AgentEventV4::next(
+                &archived,
+                timestamp,
+                AgentEventKindV4::ContextCheckpointed {
+                    checkpoint: checkpoint.clone(),
+                },
+            );
+            [archived, checkpointed]
+        };
         // A fixed number of recent steps is not a byte budget: tool JSON can
         // expand again when embedded in checkpoint strings. Fit the actual
         // serialized request, keeping the newest steps and immutable state.
         let original_recent_steps = checkpoint.recent_steps.clone();
-        let mut validation = loop {
+        let validation = loop {
+            let mut prospective = events.clone();
+            prospective.extend(prepare_events(&checkpoint));
             let compacted = render_context(Some(&checkpoint), &[], &scientific_value)?;
             let validation =
                 self.validate_execution_context(spec, &compacted, &prospective, limits);
@@ -5494,6 +5512,11 @@ impl AgentCoreV4<'_> {
             checkpoint.recent_steps = original_recent_steps;
         }
         let needs_projection = (validation.is_err() || want_code_view) && use_views;
+        // Fitting may trim or restore recent_steps. Rebuild the final event
+        // payload before either projection or full-context admission.
+        let planned_events = prepare_events(&checkpoint);
+        let mut prospective = events.clone();
+        prospective.extend(planned_events.clone());
         let fit_archived_projection = |request_events: &[AgentEventV4]| {
             if want_code_view {
                 if let Some(view) = request_events.iter().rev().find_map(|event| {
@@ -5519,40 +5542,38 @@ impl AgentCoreV4<'_> {
                 })?;
             fit_scientific_view(&checkpoint, &[], &view, request_events)
         };
-        if needs_projection {
-            fit_archived_projection(&prospective)?;
-            validation = Ok(());
-        }
         // Predictable failures, including fixed guidance/system/replay overhead,
         // must not create an archive merely to discover that no view fits.
-        validation?;
-        let archive = match self
+        if needs_projection {
+            fit_archived_projection(&prospective)?;
+        } else {
+            validation?;
+        }
+        match self
             .events
-            .archive_context(spec.run_id, &transcript, &checkpoint)
+            .commit_context_compaction(spec, &transcript, &planned_events)
             .await
         {
-            Ok(archive) => archive,
-            Err(_) if want_code_view && candidate_fits => return Ok(candidate),
-            Err(error) => return Err(AgentCoreErrorV4::Store(error)),
-        };
-        self.push(spec.run_id, AgentEventKindV4::ContextArchived { archive })
-            .await?;
-        self.push(
-            spec.run_id,
-            AgentEventKindV4::ContextCheckpointed {
-                checkpoint: checkpoint.clone(),
-            },
-        )
-        .await?;
+            Ok(()) => {}
+            Err(ContextCompactionCommitErrorV4::Unavailable(_))
+                if want_code_view && candidate_fits =>
+            {
+                return Ok(candidate);
+            }
+            Err(error) => return Err(AgentCoreErrorV4::Store(error.to_string())),
+        }
         let persisted = self
             .events
             .load(spec.run_id)
             .await
             .map_err(AgentCoreErrorV4::Store)?;
-        // Admit every archive branch again with the durable event head: even
-        // full science can have native closures whose hashes changed on write.
-        // Unexpected Store races or semantic Port failures may retain the
-        // archive, but no rejected request is returned to the model path.
+        // No port may silently regenerate the admitted events. Preserve the
+        // final admission guard before returning a request to the model path.
+        if persisted != prospective {
+            return Err(AgentCoreErrorV4::Store(
+                "context compaction committed an unexpected event chain".into(),
+            ));
+        }
         let compacted = if needs_projection {
             fit_archived_projection(&persisted)?
         } else {
@@ -8365,6 +8386,7 @@ mod tests {
         activities: Mutex<Vec<ModelActivityPhaseV4>>,
         events: Mutex<Vec<AgentEventV4>>,
         archives: Mutex<Vec<String>>,
+        compaction_failure: Mutex<Option<ContextCompactionCommitErrorV4>>,
     }
     impl MemoryStore {
         fn append_direct(&self, event: &AgentEventV4) -> Result<(), String> {
@@ -8409,19 +8431,30 @@ mod tests {
         async fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String> {
             self.load_direct(run_id)
         }
-        async fn archive_context(
+        async fn commit_context_compaction(
             &self,
-            _: Uuid,
+            spec: &RunSpecV4,
             transcript: &str,
-            checkpoint: &ContextCheckpointV4,
-        ) -> Result<ContextArchiveV4, String> {
-            self.archives.lock().unwrap().push(transcript.to_owned());
-            Ok(ContextArchiveV4 {
-                archive_id: Uuid::new_v4(),
-                through_sequence: checkpoint.through_sequence,
-                size_bytes: transcript.len() as u64,
-                sha256: "memory".into(),
-            })
+            planned_events: &[AgentEventV4; 2],
+        ) -> Result<(), ContextCompactionCommitErrorV4> {
+            if let Some(error) = self.compaction_failure.lock().unwrap().clone() {
+                return Err(error);
+            }
+            let mut events = self.events.lock().unwrap();
+            let current = events
+                .iter()
+                .filter(|event| event.run_id == spec.run_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            if serde_json::to_string(&current).unwrap() != transcript {
+                return Err(ContextCompactionCommitErrorV4::Rejected(
+                    "compaction source changed".into(),
+                ));
+            }
+            let mut archives = self.archives.lock().unwrap();
+            archives.push(transcript.to_owned());
+            events.extend(planned_events.clone());
+            Ok(())
         }
     }
     #[tokio::test]
@@ -13330,13 +13363,15 @@ mod tests {
         async fn load(&self, id: Uuid) -> Result<Vec<AgentEventV4>, String> {
             self.inner.load(id).await
         }
-        async fn archive_context(
+        async fn commit_context_compaction(
             &self,
-            id: Uuid,
+            spec: &RunSpecV4,
             text: &str,
-            checkpoint: &ContextCheckpointV4,
-        ) -> Result<ContextArchiveV4, String> {
-            self.inner.archive_context(id, text, checkpoint).await
+            events: &[AgentEventV4; 2],
+        ) -> Result<(), ContextCompactionCommitErrorV4> {
+            self.inner
+                .commit_context_compaction(spec, text, events)
+                .await
         }
         async fn has_pending_guidance(&self, _: Uuid) -> Result<bool, String> {
             if self.fail_next_poll.swap(false, Ordering::SeqCst) {
@@ -15033,6 +15068,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn optional_code_view_never_masks_a_rejected_compaction_source() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let original = store.load_direct(spec.run_id).unwrap();
+        let science = SnapshotScience(Mutex::new(science_with_code(
+            spec.project_id,
+            "x".repeat(16_385),
+        )));
+        let model = BudgetOnlyModel {
+            request_limit: 400_000,
+            requests: Mutex::new(vec![]),
+        };
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &ResultReadTools,
+            events: &store,
+            science: Some(&science),
+        };
+        for reason in [
+            "source event chain changed",
+            "frozen specification changed",
+            "scientific state changed",
+        ] {
+            *store.compaction_failure.lock().unwrap() =
+                Some(ContextCompactionCommitErrorV4::Rejected(reason.into()));
+            assert!(matches!(
+                core.context_for(&spec, AgentLimitsV4::default()).await,
+                Err(AgentCoreErrorV4::Store(message)) if message == reason
+            ));
+            assert_eq!(store.load_direct(spec.run_id).unwrap(), original);
+            assert!(store.archives.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn code_view_over_budget_falls_back_to_retrievable_directory() {
         let spec = execution_spec(Uuid::new_v4());
         let store = MemoryStore::default();
@@ -15898,10 +15969,9 @@ mod tests {
                 assert_eq!(prewrite.tools, actual.tools);
                 assert_eq!(prewrite.image_refs, actual.image_refs);
                 assert_eq!(prewrite.replay, actual.replay);
-                let mut expected: Value = serde_json::from_str(&prewrite.context).unwrap();
+                let expected: Value = serde_json::from_str(&prewrite.context).unwrap();
                 let actual_context: Value = serde_json::from_str(&actual.context).unwrap();
-                // Only the Store-generated checkpoint hash changes; its width
-                // and exact sequence keep the complete provider byte shape.
+                // The admitted checkpoint identity is persisted verbatim.
                 let prospective_hash =
                     expected["scientific_state"]["result_reference"]["event_hash"]
                         .as_str()
@@ -15915,17 +15985,16 @@ mod tests {
                     actual_reference["sequence"],
                     events.last().unwrap().sequence
                 );
-                assert_ne!(actual_reference["event_hash"], prospective_hash);
-                assert!(!actual.context.contains(prospective_hash));
+                assert_eq!(actual_reference["event_hash"], prospective_hash);
+                assert!(actual.context.contains(prospective_hash));
                 assert!(
                     model
                         .usage_request_metadata(&actual)
                         .serialized_request_bytes
                         .is_some()
                 );
-                expected["scientific_state"]["result_reference"]["event_hash"] =
-                    actual_context["scientific_state"]["result_reference"]["event_hash"].clone();
                 assert_eq!(expected, actual_context);
+                assert_eq!(*prewrite, actual);
             }
             assert!(model.validate_request(&actual).is_ok());
             assert_eq!(store.archives.lock().unwrap().len(), 1);
@@ -16307,12 +16376,6 @@ mod tests {
         let result = core
             .context_for_internal(&spec, AgentLimitsV4::default(), true)
             .await;
-        if reject_changed_hash {
-            assert!(
-                matches!(&result, Err(AgentCoreErrorV4::NeedsAttention(message)) if message == "actual postarchive closure refused"),
-                "postarchive refusal must fail context admission before returning"
-            );
-        }
         let persisted = store.load_direct(spec.run_id).unwrap();
         assert_eq!(&persisted[..original.len()], original);
         assert_eq!(persisted.len(), original.len() + 2);
@@ -16322,9 +16385,9 @@ mod tests {
         let actual = requests.last().unwrap();
         let first_reference = pending_closure_reference(prospective);
         let actual_reference = pending_closure_reference(actual);
-        assert_ne!(
+        assert_eq!(
             actual_reference["event_hash"], first_reference["event_hash"],
-            "context admission must validate again against the persisted event head"
+            "context admission and persistence must use the exact same event head"
         );
         assert_eq!(first_reference["sequence"], 11);
         assert_eq!(actual_reference["sequence"], 11);
@@ -16335,25 +16398,81 @@ mod tests {
         let actual_context: Value = serde_json::from_str(&actual.context).unwrap();
         assert_eq!(actual_context["scientific_state"], json!(state));
         assert_eq!(*science.0.lock().unwrap(), state);
-        if !reject_changed_hash {
-            let context = result.unwrap();
-            assert!(!context.contains(first_reference["event_hash"].as_str().unwrap()));
-            assert_eq!(
-                core.budget_execution_request(&spec, context, &persisted)
-                    .unwrap(),
-                *actual
-            );
-        }
+        let context = result.expect("admitted identity must not change during persistence");
+        assert_eq!(prospective, actual);
+        assert_eq!(
+            core.budget_execution_request(&spec, context, &persisted)
+                .unwrap(),
+            *actual
+        );
     }
 
     #[tokio::test]
-    async fn automatic_full_context_postarchive_refusal_returns_error() {
+    async fn automatic_full_context_preserves_admitted_native_closure_identity() {
         assert_full_context_postarchive_admission(true).await;
     }
 
     #[tokio::test]
     async fn automatic_full_context_postarchive_admits_actual_native_closure() {
         assert_full_context_postarchive_admission(false).await;
+    }
+
+    struct RejectCheckpointModel(Mutex<Vec<ModelRequestV4>>);
+
+    #[async_trait]
+    impl ModelPortV4 for RejectCheckpointModel {
+        fn validate_request(&self, request: &ModelRequestV4) -> Result<(), ModelFailureV4> {
+            self.0.lock().unwrap().push(request.clone());
+            let context: Value = serde_json::from_str(&request.context).unwrap();
+            if !context["checkpoint"].is_null() {
+                return Err(ModelFailureV4::permanent(
+                    omicsops_protocol::ModelErrorClassV4::InvalidRequest,
+                    "compacted request refused",
+                ));
+            }
+            Ok(())
+        }
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            panic!("compaction admission must not dispatch a model request")
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_admission_refusal_keeps_full_and_projected_sources_unchanged() {
+        for ordinary in [false, true] {
+            for science_bytes in [0, 300_000] {
+                let spec = if ordinary {
+                    ordinary_execution_spec(Uuid::new_v4())
+                } else {
+                    execution_spec(Uuid::new_v4())
+                };
+                let store = MemoryStore::default();
+                seed_execution(&store, &spec);
+                let original = store.load_direct(spec.run_id).unwrap();
+                let state = large_science(spec.project_id, science_bytes);
+                let science = SnapshotScience(Mutex::new(state.clone()));
+                let model = RejectCheckpointModel(Mutex::new(vec![]));
+                let core = AgentCoreV4 {
+                    model: &model,
+                    tools: &ResultReadTools,
+                    events: &store,
+                    science: Some(&science),
+                };
+                assert!(matches!(
+                    core.context_for_internal(&spec, AgentLimitsV4::default(), true)
+                        .await,
+                    Err(AgentCoreErrorV4::NeedsAttention(_))
+                ));
+                assert!(!model.0.lock().unwrap().is_empty());
+                assert_eq!(store.load_direct(spec.run_id).unwrap(), original);
+                assert!(store.archives.lock().unwrap().is_empty());
+                assert_eq!(*science.0.lock().unwrap(), state);
+            }
+        }
     }
 
     #[tokio::test]
@@ -16956,6 +17075,24 @@ mod tests {
             original.as_slice()
         );
         assert_eq!(store.archives.lock().unwrap().len(), 1);
+        let persisted = store.load_direct(spec.run_id).unwrap();
+        let AgentEventKindV4::ContextCheckpointed { checkpoint } = &persisted.last().unwrap().event
+        else {
+            panic!("compaction must persist its admitted checkpoint");
+        };
+        assert!(checkpoint.recent_steps.len() < limits.checkpoint_recent_events);
+        assert_eq!(
+            value["checkpoint"]["recent_steps"],
+            json!(checkpoint.recent_steps)
+        );
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests[requests.len() - 2], *requests.last().unwrap());
+        assert_eq!(
+            core.budget_execution_request(&spec, context, &persisted)
+                .unwrap(),
+            *requests.last().unwrap()
+        );
+        drop(requests);
         let resumed = core.context_for(&spec, limits).await.unwrap();
         assert!(resumed.len() <= 30_000);
         assert_eq!(store.archives.lock().unwrap().len(), 1);
@@ -17212,13 +17349,15 @@ mod tests {
         async fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String> {
             self.0.load(run_id).await
         }
-        async fn archive_context(
+        async fn commit_context_compaction(
             &self,
-            _: Uuid,
+            _: &RunSpecV4,
             _: &str,
-            _: &ContextCheckpointV4,
-        ) -> Result<ContextArchiveV4, String> {
-            Err("archive unavailable".into())
+            _: &[AgentEventV4; 2],
+        ) -> Result<(), ContextCompactionCommitErrorV4> {
+            Err(ContextCompactionCommitErrorV4::Unavailable(
+                "archive unavailable".into(),
+            ))
         }
     }
 
@@ -19023,14 +19162,14 @@ mod tests {
         async fn load(&self, run_id: Uuid) -> Result<Vec<AgentEventV4>, String> {
             self.inner.load(run_id).await
         }
-        async fn archive_context(
+        async fn commit_context_compaction(
             &self,
-            run_id: Uuid,
+            spec: &RunSpecV4,
             transcript: &str,
-            checkpoint: &ContextCheckpointV4,
-        ) -> Result<ContextArchiveV4, String> {
+            events: &[AgentEventV4; 2],
+        ) -> Result<(), ContextCompactionCommitErrorV4> {
             self.inner
-                .archive_context(run_id, transcript, checkpoint)
+                .commit_context_compaction(spec, transcript, events)
                 .await
         }
     }

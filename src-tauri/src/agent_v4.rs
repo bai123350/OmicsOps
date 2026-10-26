@@ -29,9 +29,9 @@ use omicsops_agent::{
     KernelEvent, KernelEventDecoder, KernelEventKind, KernelLanguage, KernelRequest,
 };
 use omicsops_agent_core::{
-    AgentCoreErrorV4, AgentCoreV4, AgentLimitsV4, EventStoreV4, ModelActivityPhaseV4,
-    ModelImageRefV4, ModelPortV4, ModelRequestV4, ModelStreamEventV4, ModelTurnV4,
-    ModelUsageMetadataV4, ModelUsageRequestMetadataV4, PlanApprovalScopeV4,
+    AgentCoreErrorV4, AgentCoreV4, AgentLimitsV4, ContextCompactionCommitErrorV4, EventStoreV4,
+    ModelActivityPhaseV4, ModelImageRefV4, ModelPortV4, ModelRequestV4, ModelStreamEventV4,
+    ModelTurnV4, ModelUsageMetadataV4, ModelUsageRequestMetadataV4, PlanApprovalScopeV4,
     PlanToolAuthorizationV4, PromptLayersV4, ReviewerRequestV4, ScientificStateStoreV4,
     ScientificUpdateV4, ToolPortV4,
 };
@@ -55,13 +55,13 @@ use omicsops_protocol::{
     AgentEventKindV4, AgentEventV4, AgentRequestRouteV4, ApprovalPolicyV4, AutonomyModeV4,
     BrowserApprovalBindingV4, BrowserApprovalScopeV4, BrowserAuthorizationV4, BrowserSessionKindV4,
     BrowserTabSummaryV4, ComputeBackendDescriptorV4, ComputeBackendKindV4, ComputeSelectionV4,
-    ContextArchiveV4, ContextBudgetV4, ContextCheckpointV4, ContextLimitSourceV4,
-    ContextUsageRowV4, ContextUsageSnapshotV4, ContextWindowUsageV4, ExecutionContextKeyV4,
-    ExecutionPlanV4, IsolationStrengthV4, KernelLanguageV4, ModelErrorClassV4, ModelFailureV4,
-    ModelUsageObservationV4, ModelUsageSampleV4, NetworkPolicyV4, OutputCaptureV4,
-    ReviewerReportV4, RunExecutionKindV4, RunSpecV4, RuntimeArtifactV4, RuntimeResultV4,
-    ToolApprovalDecisionV4, ToolCallV4, ToolDescriptorV4, ToolEffectV4, ToolOutcomeV4,
-    UncertainResolutionV4, UsageAggregationV4, UsageObservationStateV4, UsageTotalsV4,
+    ContextBudgetV4, ContextLimitSourceV4, ContextUsageRowV4, ContextUsageSnapshotV4,
+    ContextWindowUsageV4, ExecutionContextKeyV4, ExecutionPlanV4, IsolationStrengthV4,
+    KernelLanguageV4, ModelErrorClassV4, ModelFailureV4, ModelUsageObservationV4,
+    ModelUsageSampleV4, NetworkPolicyV4, OutputCaptureV4, ReviewerReportV4, RunExecutionKindV4,
+    RunSpecV4, RuntimeArtifactV4, RuntimeResultV4, ToolApprovalDecisionV4, ToolCallV4,
+    ToolDescriptorV4, ToolEffectV4, ToolOutcomeV4, UncertainResolutionV4, UsageAggregationV4,
+    UsageObservationStateV4, UsageTotalsV4,
 };
 use omicsops_runtime::{
     ContainerKernelBackendV4, KernelBackendV4, KernelProcessV4, LocalKernelBackendV4,
@@ -4197,13 +4197,15 @@ impl EventStoreV4 for ManualCompactionEventsV4 {
     async fn load(&self, _: Uuid) -> Result<Vec<AgentEventV4>, String> {
         Err("manual preparation uses only its captured snapshot".into())
     }
-    async fn archive_context(
+    async fn commit_context_compaction(
         &self,
-        _: Uuid,
+        _: &RunSpecV4,
         _: &str,
-        _: &ContextCheckpointV4,
-    ) -> Result<ContextArchiveV4, String> {
-        Err("manual preparation cannot write archives".into())
+        _: &[AgentEventV4; 2],
+    ) -> Result<(), ContextCompactionCommitErrorV4> {
+        Err(ContextCompactionCommitErrorV4::Rejected(
+            "manual preparation cannot commit context compaction".into(),
+        ))
     }
 }
 
@@ -9149,6 +9151,35 @@ impl RepositoryEventStoreV4 {
         }
     }
 }
+
+fn context_compaction_commit_error_v4(
+    error: omicsops_store::StoreError,
+) -> ContextCompactionCommitErrorV4 {
+    match error {
+        omicsops_store::StoreError::Database(_) | omicsops_store::StoreError::Io(_) => {
+            ContextCompactionCommitErrorV4::Unavailable(error.to_string())
+        }
+        _ => ContextCompactionCommitErrorV4::Rejected(error.to_string()),
+    }
+}
+
+async fn commit_context_compaction_and_publish_v4(
+    repository: &Store,
+    spec: &RunSpecV4,
+    transcript: &str,
+    events: &[AgentEventV4; 2],
+    mut publish: impl FnMut(&AgentEventV4),
+) -> Result<(), ContextCompactionCommitErrorV4> {
+    repository
+        .commit_automatic_context_compaction_v4(spec, transcript, events)
+        .await
+        .map_err(context_compaction_commit_error_v4)?;
+    for event in events {
+        publish(event);
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl EventStoreV4 for RepositoryEventStoreV4 {
     fn preview_model_reasoning(&self, run_id: Uuid, attempt_id: Uuid, text: Option<&str>) {
@@ -9227,16 +9258,20 @@ impl EventStoreV4 for RepositoryEventStoreV4 {
             .map_err(|e| e.to_string())
     }
 
-    async fn archive_context(
+    async fn commit_context_compaction(
         &self,
-        run_id: Uuid,
+        spec: &RunSpecV4,
         transcript: &str,
-        checkpoint: &ContextCheckpointV4,
-    ) -> Result<ContextArchiveV4, String> {
-        self.repository
-            .archive_agent_context_v4(run_id, transcript, checkpoint)
-            .await
-            .map_err(|error| error.to_string())
+        events: &[AgentEventV4; 2],
+    ) -> Result<(), ContextCompactionCommitErrorV4> {
+        commit_context_compaction_and_publish_v4(
+            &self.repository,
+            spec,
+            transcript,
+            events,
+            |event| self.publish(event, None),
+        )
+        .await
     }
 }
 
@@ -10794,18 +10829,14 @@ mod tests {
                 .cloned()
                 .collect())
         }
-        async fn archive_context(
+        async fn commit_context_compaction(
             &self,
-            _: Uuid,
-            transcript: &str,
-            checkpoint: &ContextCheckpointV4,
-        ) -> Result<ContextArchiveV4, String> {
-            Ok(ContextArchiveV4 {
-                archive_id: Uuid::new_v4(),
-                through_sequence: checkpoint.through_sequence,
-                size_bytes: transcript.len() as u64,
-                sha256: "fixture".into(),
-            })
+            _: &RunSpecV4,
+            _: &str,
+            events: &[AgentEventV4; 2],
+        ) -> Result<(), ContextCompactionCommitErrorV4> {
+            self.0.lock().unwrap().extend_from_slice(events);
+            Ok(())
         }
     }
 
@@ -16396,12 +16427,12 @@ pub(crate) mod manual_compaction_host_tests {
                 .await
                 .map_err(|e| e.to_string())
         }
-        async fn archive_context(
+        async fn commit_context_compaction(
             &self,
-            _: Uuid,
+            _: &RunSpecV4,
             _: &str,
-            _: &ContextCheckpointV4,
-        ) -> Result<ContextArchiveV4, String> {
+            _: &[AgentEventV4; 2],
+        ) -> Result<(), ContextCompactionCommitErrorV4> {
             panic!("explicit resume must reuse the durable manual checkpoint")
         }
     }

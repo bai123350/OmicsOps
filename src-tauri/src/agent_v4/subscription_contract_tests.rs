@@ -35,18 +35,14 @@ impl EventStoreV4 for Events {
             .cloned()
             .collect())
     }
-    async fn archive_context(
+    async fn commit_context_compaction(
         &self,
-        _: Uuid,
-        transcript: &str,
-        checkpoint: &ContextCheckpointV4,
-    ) -> Result<ContextArchiveV4, String> {
-        Ok(ContextArchiveV4 {
-            archive_id: Uuid::new_v4(),
-            through_sequence: checkpoint.through_sequence,
-            size_bytes: transcript.len() as u64,
-            sha256: hex::encode(sha2::Sha256::digest(transcript)),
-        })
+        _: &RunSpecV4,
+        _: &str,
+        events: &[AgentEventV4; 2],
+    ) -> Result<(), ContextCompactionCommitErrorV4> {
+        self.0.lock().unwrap().extend_from_slice(events);
+        Ok(())
     }
 }
 fn proposal(index: usize) -> (&'static str, Value) {
