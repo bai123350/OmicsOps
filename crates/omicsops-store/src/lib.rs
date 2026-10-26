@@ -1852,6 +1852,90 @@ impl Store {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Start a frozen execution under the caller's exclusive driver lease.
+    /// Recheck the captured source and Stop fence atomically; preserve every
+    /// other run field and all events when changing the status to running.
+    pub async fn start_agent_execution_v4(
+        &self,
+        spec: &RunSpecV4,
+        expected_status: &str,
+        expected_head: &str,
+    ) -> Result<(), StoreError> {
+        let invalid =
+            || StoreError::InvalidInput("execution source changed or is not resumable".into());
+        if !matches!(
+            expected_status,
+            "running" | "waiting_for_input" | "waiting_for_approval"
+        ) {
+            return Err(invalid());
+        }
+        spec.validate_integrity().map_err(|_| invalid())?;
+        let (Some(frozen_hash), Some(approval_hash)) = (&spec.spec_hash, &spec.approval_hash)
+        else {
+            return Err(invalid());
+        };
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        ensure_run_owner_executor(&mut tx, spec.project_id, spec.conversation_id, spec.run_id)
+            .await?;
+        ensure_conversation_unlocked_executor(&mut tx, spec.project_id, spec.conversation_id)
+            .await?;
+        let has_stop: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_run_stop_requests_v4 WHERE run_id=?1)",
+        )
+        .bind(spec.run_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        if has_stop != 0 {
+            return Err(invalid());
+        }
+        let row = sqlx::query("SELECT status,value_json FROM agent_runs_v4 WHERE run_id=?1")
+            .bind(spec.run_id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+        let mut value: Value = serde_json::from_str(&row.try_get::<String, _>(1)?)?;
+        if row.try_get::<String, _>(0)? != expected_status
+            || value.get("status").and_then(Value::as_str) != Some(expected_status)
+            || serde_json::from_value::<RunSpecV4>(value.get("spec").cloned().ok_or_else(invalid)?)?
+                != *spec
+        {
+            return Err(invalid());
+        }
+        let events = load_agent_events_in_tx(&mut tx, spec.run_id).await?;
+        if events.last().map(|event| event.event_hash.as_str()) != Some(expected_head)
+            || events.iter().any(|event| {
+                is_terminal_event(event)
+                    || event.project_id != spec.project_id
+                    || event.conversation_id != spec.conversation_id
+            })
+        {
+            return Err(invalid());
+        }
+        let anchor = events.iter().rev().find_map(|event| match &event.event {
+            AgentEventKindV4::RunSpecFrozen {
+                spec_hash,
+                approval_hash,
+            } => Some((spec_hash, approval_hash)),
+            _ => None,
+        });
+        if anchor != Some((frozen_hash, approval_hash)) {
+            return Err(invalid());
+        }
+        value
+            .as_object_mut()
+            .ok_or_else(invalid)?
+            .insert("status".into(), Value::String("running".into()));
+        sqlx::query(
+            "UPDATE agent_runs_v4 SET status='running',value_json=?1,updated_at=?2 WHERE run_id=?3",
+        )
+        .bind(serde_json::to_string(&value)?)
+        .bind(timestamp(Utc::now()))
+        .bind(spec.run_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn save_agent_run_v4(
         &self,
         run_id: Uuid,

@@ -4327,13 +4327,25 @@ async fn spawn_execution(
         // running for this run ID.
         return Ok(());
     }
-    // Cancellation may have committed while compose was awaiting resources.
-    // Recheck under ownership so a delayed resume cannot overwrite its status.
-    let recheck = reject_cancelled_execution(&state.repository, spec.run_id).await;
+    // Composition awaits resources. Under the driver lease, atomically
+    // recheck its source and Stop fence before publishing running state.
+    let recheck = state
+        .repository
+        .start_agent_execution_v4(
+            &spec,
+            &record.status,
+            current_events
+                .last()
+                .map(|event| event.event_hash.as_str())
+                .unwrap_or_default(),
+        )
+        .await
+        .map_err(|error| error.to_string());
     if let Err(error) = recheck {
         remove_active_run(&state.active_runs, spec.run_id, &cancelled);
         return Err(error);
     }
+    record.status = "running".into();
     if let Some(slot) = model.resources.as_ref() {
         tools._runtime_registration = Some(
             state
