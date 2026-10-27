@@ -35,8 +35,7 @@ import { messageLibrarySource } from "./librarySources";
 import { saveWorkspaceLibraryItem } from "../../workspace-navigation-api";
 import type { SaveWorkspaceLibraryItemRequest } from "../../workspace-navigation-types";
 import type { ConversationVisibilityRecordV1, ConversationVisibilityV1 } from "../../workspace-navigation-types";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { ProjectMarkdown, ProjectMarkdownImages } from "./ProjectMarkdown";
 import {
   Activity, Bot, Check, ChevronRight, ClipboardList, Copy, Expand, FileBarChart, FileText,
   Folder, Hand, NotebookPen, Plus,
@@ -1251,7 +1250,7 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
     }
   }
 
-  return <div className={`science-shell ${sidebarOpen ? "sidebar-open" : "sidebar-collapsed"} ${navigationCollapsed ? "navigation-collapsed" : ""} ${workspacePage !== "conversation" ? "research-page-open" : ""}`}>
+  return <ProjectMarkdownImages scopeKey={JSON.stringify([project.id, activeConversationId, project.connection_id, project.remote_root])} remoteRoot={project.remote_root} onPreviewImage={onPreviewImage} zh={zh}><div className={`science-shell ${sidebarOpen ? "sidebar-open" : "sidebar-collapsed"} ${navigationCollapsed ? "navigation-collapsed" : ""} ${workspacePage !== "conversation" ? "research-page-open" : ""}`}>
     <WorkspaceNavigation key={`navigation:${project.id}`} projectId={project.id} projectName={project.name} locale={locale} conversations={conversations} activeConversationId={activeConversationId} onSetVisibility={onSetVisibility} onOpenShelvedConversations={onOpenShelvedConversations} collapsed={navigationCollapsed} onToggleCollapsed={() => setNavigationCollapsed((value) => { try { localStorage.setItem("omicsops.workspaceNavigationCollapsed", String(!value)); } catch { /* Keep usable in restricted storage. */ } return !value; })} page={workspacePage === "conversation" && sidebarOpen && tab === "files" ? "files" : workspacePage} onNavigate={navigateWorkspace} onNewConversation={onNewConversation ? () => leaveGuard.current(() => { setWorkspacePage("conversation"); void onNewConversation(); }) : undefined} newConversationDisabled={conversationHydrating || agentBusy || conversationLocked} onSelectConversation={(id) => leaveGuard.current(() => { setWorkspacePage("conversation"); void onSelectConversation?.(id); })} onDeleteConversation={onDeleteConversation ? (item) => leaveGuard.current(() => { void deleteConversation(item); }) : undefined} deleteDisabled={(item) => deletingConversationId !== null || conversationHydrating || conversationLocked || (item.id === activeConversationId && (agentBusy || runActive))} onOpenSearch={onOpenSearch} onBack={() => leaveGuard.current(() => onBackToProjects?.())}>
       <ConversationCapabilities projectId={project.id} conversationId={activeConversationId} summary={capabilitySummary} loading={capabilitiesLoading} error={capabilitiesError} onRefresh={onRefreshCapabilities} locale={locale} onOpenSettings={onOpenSettings} />
     </WorkspaceNavigation>
@@ -1447,7 +1446,7 @@ export function WorkspaceShell({ project, composerDraftStore, locale, onOpenSett
     {expanded && <div className="preview-overlay" role="dialog" aria-modal="true" aria-label={t.artifactPreview}><header><div><small>{project.name}</small><h2>{t.artifactPreview}</h2></div><button aria-label="Close" onClick={() => setExpanded(false)}><X /></button></header>{preview}</div>}
     {trajectoryOpen && <div ref={trajectoryRef} className="preview-overlay" role="dialog" aria-modal="true" aria-label={zh ? "运行轨迹" : "Run trajectory"}><header><div><small>{project.name}</small><h2>{zh ? "运行轨迹" : "Run trajectory"}</h2></div>{activeConversationId && <button onClick={openDiagnostics}>{zh ? "运行诊断" : "Run diagnostics"}</button>}<button aria-label={zh ? "关闭运行轨迹" : "Close run trajectory"} onClick={closeTrajectory}><X /></button></header><div style={{ minHeight: 0, overflow: "auto", padding: "16px 20px" }}>{diagnosticNotice && <p role="status">{diagnosticNotice === "loading" ? (zh ? "正在读取源事件元数据…" : "Reading source event metadata…") : (zh ? "精确源事件不可用。" : "The exact source event is unavailable.")}</p>}{diagnosticSource && <div><p>{zh ? "已只读刷新元数据；原始内容未载入当前缓存。" : "Source metadata refreshed read-only; original content is absent from the current buffer."}</p><ol className="v4-diagnostic-events"><li tabIndex={-1} data-diagnostic-run-id={diagnosticSource.run_id} data-diagnostic-sequence={diagnosticSource.sequence} data-diagnostic-event-hash={diagnosticSource.event_hash}><span>#{diagnosticSource.sequence}</span><code>{diagnosticSource.event_kind}</code><time>{diagnosticSource.occurred_at}</time></li></ol></div>}{trajectoryRuns.length > 0 ? trajectoryRuns.map((run) => <V4RunTrace key={run.runId} locale={locale} events={run.events} onOpenRuntime={openRunRuntime} historical />) : <p role="status">{zh ? "当前会话暂无已记录的运行轨迹。" : "No recorded run trajectory is available for this conversation."}</p>}</div></div>}
     {diagnosticsScope === diagnosticScope && activeConversationId && <RunDiagnosticsDialog projectId={project.id} conversationId={activeConversationId} locale={locale} onLocate={(target) => void locateDiagnostic(target)} onClose={() => setDiagnosticsScope(null)} />}
-  </div>;
+  </div></ProjectMarkdownImages>;
 }
 
 function ComputeBackendSelector({ locale, backends, backendId, containerImage, autonomyMode: _autonomyMode, environment, busy, onBackendChange, onImageChange, onAutonomyChange: _onAutonomyChange, onEnvironmentChange }: { locale: Locale; backends: ComputeBackendAvailabilityV4[]; backendId: string; containerImage: string; autonomyMode: AutonomyModeV4; environment: string; busy: boolean; onBackendChange?: (value: string) => void; onImageChange?: (value: string) => void; onAutonomyChange?: (value: AutonomyModeV4) => void; onEnvironmentChange?: (value: string) => void }) {
@@ -1704,7 +1703,7 @@ function MarkdownContent({ markdown, selectionScope }: { markdown: string; selec
     data-message-role={selectionScope?.role}
     data-project-id={selectionScope?.projectId}
     data-conversation-id={selectionScope?.conversationId}
-  ><ReactMarkdown remarkPlugins={[remarkGfm]} components={{ table: ({ children }) => <div className="markdown-table-scroll" role="region" aria-label="表格 / Table" tabIndex={0}><table>{children}</table></div> }}>{markdown}</ReactMarkdown></div>;
+  ><ProjectMarkdown markdown={markdown} /></div>;
 }
 function coalesceV4ModelText(events: AgentRunEventV4[]): Array<{ event: AgentRunEventV4; lastEvent: AgentRunEventV4; modelText?: string }> {
   const entries: Array<{ event: AgentRunEventV4; lastEvent: AgentRunEventV4; modelText?: string }> = [];

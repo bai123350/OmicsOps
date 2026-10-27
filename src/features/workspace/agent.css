@@ -488,6 +488,10 @@
 .markdown-content > :first-child { margin-top: 0; }
 .markdown-content > :last-child { margin-bottom: 0; }
 .markdown-content p { white-space: normal; }
+.markdown-content img { max-width: 100%; height: auto; }
+.project-markdown-image { display: block; margin: 8px 0; }
+.markdown-image-status { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; max-width: 100%; padding: 8px 12px; border: 1px solid #d0d5dd; border-radius: 8px; color: #667085; font-family: var(--font-sans, system-ui, sans-serif); font-size: 12px; overflow-wrap: anywhere; }
+.markdown-image-status button { padding: 3px 8px; border: 1px solid #d0d5dd; border-radius: 5px; background: transparent; color: inherit; cursor: pointer; }
 .markdown-content ul, .markdown-content ol { margin: 6px 0; padding-left: 20px; }
 .markdown-content li { margin: 3px 0; }
 .markdown-content h1, .markdown-content h2, .markdown-content h3 { margin: 10px 0 5px; line-height: 1.3; }

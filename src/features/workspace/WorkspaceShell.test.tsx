@@ -26,6 +26,14 @@ const project = {
   template: "single_cell_rna_seq" as const,
 };
 
+it("loads a remote Markdown image through the project preview instead of the webview origin", async () => {
+  const path = "results/hcc/figures/umap_stage3_umap_final.png";
+  const preview = vi.fn().mockResolvedValue({ relative_path: path, mime_type: "image/png", size_bytes: 8, sha256: "a".repeat(64), data_url: "data:image/png;base64,iVBORw0KGgo=" });
+  render(<WorkspaceShell project={{ ...project, connection_id: "ssh-1", remote_root: "/research/hcc" }} locale="zh-CN" activeConversationId="chat-1" onPreviewImage={preview} messages={[{ id: "answer", role: "assistant", markdown: `![GSE149614 UMAP 最终注释](${path})` }]} />);
+  await waitFor(() => expect(screen.getByRole("img", { name: "GSE149614 UMAP 最终注释" })).toHaveAttribute("src", "data:image/png;base64,iVBORw0KGgo="));
+  expect(preview).toHaveBeenCalledWith(path);
+});
+
 it("visibility_catalog_refresh invalidates an open # request without clearing a selected historical chip", async () => {
   const item = { reference: { kind: "session" as const, project_id: project.id, id: "old-session" }, label: "Historical session", description: "Saved source" };
   let finishOld!: (items: typeof item[]) => void;
