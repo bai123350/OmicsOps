@@ -301,3 +301,12 @@ all repeat/new-request checks. The targeted desktop test passed after failing wi
 old assertion; production code is unchanged. The intermediate release run `40666710825`
 was cancelled because it still contained this known failing assertion; no release tag or
 draft had been created. All native targets must pass together in the next full run.
+
+Ordinary CI `40667792891` passed all three platforms at `26fb00c`, confirming the
+path fixes. The parallel no-tag release run `40667794698` exposed an intermittent
+Windows Claude stderr-drain test: its PowerShell-based child exceeded the 3-second
+I/O guard. The overflow fixture now compiles a fixed offline Rust child with Cargo's
+own toolchain before starting the request timer, then uses the real managed-child
+stdin/stderr pipes. It still consumes stdin, writes 65,537 stderr bytes, and requires
+the same overflow error within the unchanged 3-second limit; identity-change checks
+remain intact. All 9 Claude contract tests passed locally after this test-only fix.

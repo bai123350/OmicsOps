@@ -307,8 +307,13 @@ fn claude_stream_bounds_io_and_counts_only_content_progress() {
     }
 }
 #[cfg(windows)]
+enum ScriptFixture {
+    PowerShell(String),
+    StderrOverflow,
+}
+#[cfg(windows)]
 struct ScriptRunner {
-    script: String,
+    script: ScriptFixture,
     spawns: AtomicUsize,
     inspections: AtomicUsize,
     change_identity: bool,
@@ -335,17 +340,44 @@ impl ClaudeProcessRunner for ScriptRunner {
     }
     async fn spawn(&self, mut spec: BackgroundLaunchSpec) -> AdapterResult<ManagedBackgroundChild> {
         self.spawns.fetch_add(1, Ordering::SeqCst);
-        spec.program = std::path::PathBuf::from(std::env::var_os("SYSTEMROOT").unwrap())
-            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
-        spec.args = [
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &self.script,
-        ]
-        .map(std::ffi::OsString::from)
-        .to_vec();
+        let system_root = std::path::PathBuf::from(std::env::var_os("SYSTEMROOT").unwrap());
+        match &self.script {
+            ScriptFixture::PowerShell(script) => {
+                spec.program = system_root.join("System32/WindowsPowerShell/v1.0/powershell.exe");
+                spec.args = [
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    script,
+                ]
+                .map(std::ffi::OsString::from)
+                .to_vec();
+            }
+            ScriptFixture::StderrOverflow => {
+                // Keep the short deadlock guard about pipe draining, not PowerShell's
+                // cold startup. Compile the fixed offline helper before the client
+                // starts its request timer, then retain the real managed-child pipes.
+                let source = spec.cwd.join("claude_stderr_fixture.rs");
+                std::fs::write(&source, include_str!("fixtures/claude_stderr.rs"))
+                    .map_err(omicsops_adapters::AdapterError::Io)?;
+                spec.program = spec.cwd.join("claude_stderr_fixture.exe");
+                let rustc = Path::new(env!("CARGO")).with_file_name("rustc.exe");
+                let output = std::process::Command::new(rustc)
+                    .args(["--edition=2024", "--crate-name=claude_stderr_fixture"])
+                    .arg(&source)
+                    .arg("-o")
+                    .arg(&spec.program)
+                    .output()
+                    .expect("Cargo's Rust compiler must compile the fixture");
+                assert!(
+                    output.status.success(),
+                    "native stderr fixture compilation failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                spec.args.clear();
+            }
+        }
         ManagedBackgroundChild::spawn(spec).map_err(omicsops_adapters::AdapterError::Io)
     }
 }
@@ -365,7 +397,7 @@ fn success_script() -> String {
 async fn claude_stream_publishes_validated_success_after_one_dispatch() {
     use omicsops_agent::provider::ProviderStreamEvent;
     let runner = std::sync::Arc::new(ScriptRunner {
-        script: success_script(),
+        script: ScriptFixture::PowerShell(success_script()),
         spawns: AtomicUsize::new(0),
         inspections: AtomicUsize::new(0),
         change_identity: false,
@@ -402,7 +434,7 @@ async fn claude_stream_publishes_validated_success_after_one_dispatch() {
 async fn claude_stream_drains_stderr_concurrently_and_rejects_identity_change() {
     use omicsops_agent::provider::ProviderStreamEvent;
     let runner = std::sync::Arc::new(ScriptRunner {
-        script: "$null=[Console]::In.ReadToEnd(); [Console]::Error.Write(('x'*65537));".into(),
+        script: ScriptFixture::StderrOverflow,
         spawns: AtomicUsize::new(0),
         inspections: AtomicUsize::new(0),
         change_identity: false,
@@ -422,7 +454,7 @@ async fn claude_stream_drains_stderr_concurrently_and_rejects_identity_change() 
     );
     assert_eq!(runner.spawns.load(Ordering::SeqCst), 1);
     let runner = std::sync::Arc::new(ScriptRunner {
-        script: success_script(),
+        script: ScriptFixture::PowerShell(success_script()),
         spawns: AtomicUsize::new(0),
         inspections: AtomicUsize::new(0),
         change_identity: true,
