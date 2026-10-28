@@ -43,9 +43,10 @@ python -B -m unittest discover -s scripts -p "test_bundled_skill_helpers.py" -v
 python -B -m unittest discover -s scripts -p "test_*.py" -v
 ```
 
-The unified command includes model catalog, remote job bridge, kernel inspection
-and bundled helper tests. Windows CI uses Python 3.12 after `npm ci` and before
-`npm run build`, then `cargo test --workspace` and `npm test` on Node 22.
+The unified command includes model catalog, remote job bridge, kernel inspection,
+bundled helper and release validation tests. Use Python 3.12+ for this suite. CI on
+Windows, Linux and macOS uses Python 3.12 after `npm ci` and before `npm run build`,
+then `cargo test --locked --workspace` and `npm test` on Node 22.
 The Web build generates `dist`, required when compiling the desktop crate; CI
 also retains the V4 scenario gate and always-upload report before these gates.
 The Python tests use the standard library; no pip install, real credentials,
@@ -69,3 +70,38 @@ mean the updated GitHub CI has run or that all 26 Skills, scientific dependencie
 or scientific conclusions have been validated. Real model/SSH/R/PBMC acceptance
 remains opt-in and unexecuted for this increment; follow
 [`acceptance/README.md`](../acceptance/README.md) separately.
+
+# Desktop release helpers
+
+`build_desktop.cjs` is the `npm run build:desktop` entry point. It removes credential-like
+environment inputs, remaps local Rust paths, builds the application without installers,
+and only runs the native bundler after privacy checks pass. It requires Python 3.12+
+(`OMICSOPS_BUILD_PYTHON` can select the executable). Its tests include an actual Vite
+build with synthetic environment secrets, plus the audit-before-packaging boundary.
+
+`check_release_privacy.py` checks the approved, tracked resource set and optionally
+`--dist dist --binary target/release/omicsops-desktop.exe`. It rejects private file types,
+known credential forms and current build-machine paths without printing matching values.
+It never reads the OS credential vault or user database. These deterministic rules do not
+identify every possible personal text; use clean CI builds and review new resources.
+
+`release.py` validates repository versions, stages native installers, and assembles
+the complete four-target release with SHA-256 checksums. It uses only Python 3.12's
+standard library and does not contact GitHub. Run `python -B scripts/release.py --help`
+for its three commands and `python -B -m unittest discover -s scripts -p test_release.py`
+for offline fixture tests.
+
+`release-assets.json` defines the shared Tauri-style filename suffixes used by staging,
+publisher validation and download tables. `release_notes.cjs` reads
+`.github/release-notes/vX.Y.Z.md`, resolves its optional `release-title` comment, and
+renders download links for the specified repository. Use `--tag vX.Y.Z --repository owner/repo`
+to validate notes, with optional `--output <new-file>` to preview the rendered body offline.
+Tagged workflows also run `check_release_privacy.py --document <notes-file>` before native builds.
+
+`github_release.cjs` is the GitHub Actions publisher. It validates the prepared files
+and existing tag, and only creates/resumes a draft prerelease for the same commit.
+`npm run test:release` runs its Node tests against a simulated GitHub client; these are
+also part of `npm test` and excluded from the browser-oriented Vitest runner.
+
+See [desktop releasing](../docs/releasing.md) for native prerequisites, manual builds,
+tag/version rules, draft recovery, signing limitations and installed-app checks.

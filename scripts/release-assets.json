@@ -1,0 +1,16 @@
+{
+  "windows-x64": [
+    {"folder": "nsis", "extension": ".exe", "suffix": "x64-setup.exe"},
+    {"folder": "msi", "extension": ".msi", "suffix": "x64_en-US.msi"}
+  ],
+  "linux-x64": [
+    {"folder": "deb", "extension": ".deb", "suffix": "amd64.deb"},
+    {"folder": "appimage", "extension": ".AppImage", "suffix": "amd64.AppImage"}
+  ],
+  "macos-arm64": [
+    {"folder": "dmg", "extension": ".dmg", "suffix": "aarch64.dmg"}
+  ],
+  "macos-x64": [
+    {"folder": "dmg", "extension": ".dmg", "suffix": "x64.dmg"}
+  ]
+}

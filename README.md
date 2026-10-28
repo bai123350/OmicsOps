@@ -64,7 +64,7 @@ Busy、会话已改变、未启动和不可观察均需手动处理，不自动�
 - **本地 Python/R**：当前 Local 后端仅使用 `system` 环境，通过应用进程的 PATH 查找 `python` 和 `Rscript`。Windows 和 macOS 均需预先安装所用解释器及依赖；界面探测成功仅说明发现解释器，不保证科研包齐全。运行时面板不提供解释器路径编辑；内核元数据查看仅针对已有 V4 运行，不检查依赖。
 - **远程 Python/R**：先配置 SSH、完成主机密钥信任并绑定项目。可选择远端 `system` 或项目 Micromamba 环境名；Python/R 及科研包必须在远端可用。独立后台作业要求 Linux SSH 主机具备 Python 3 并允许分离进程组。
 - **模型与文献服务**：需配置可用模型；在线文献检索和外部 MCP 需要相应服务连接。本文不承诺所有功能可离线使用。
-- **平台**：以 Windows 为主要开发和验证平台。Windows 启动解释器和 MCP 等控制台子进程时使用后台进程策略；macOS 不设置 Windows 创建标志。下方打包命令面向 Windows NSIS，不代表已有 macOS 发布包。
+- **平台**：以 Windows 为主要开发和验证平台。提供 Windows x64、Linux x64、macOS Apple Silicon/Intel 的桌面构建流程，Linux/macOS 暂为实验平台；构建配置不等于已完成安装或真实科研验收。Windows 启动控制台子进程时使用后台进程策略。平台功能差异与安装检查见[桌面发布文档](docs/releasing.md)。
 
 本地分析在本地项目中执行，SSH 分析的输入和完整计算输出可留在远端。发送给模型的对话、代码、工具结果片段，以及发给文献服务或 MCP 的查询和参数，仍会按配置的服务与授权范围传输。选择远程计算不等于所有内容都不会离开服务器。
 
@@ -124,21 +124,25 @@ OpenAI-compatible 配置提供 **Requested reasoning effort**：选择明确值�
 
 ```powershell
 npm ci
+npm run build
 cargo test --workspace
 npm test
-npm run build
 npm run tauri:dev
 ```
 
-构建 Windows 应用和 NSIS 安装包：
+在目标操作系统构建桌面应用和安装包（Windows：NSIS/MSI；Linux：DEB/AppImage；macOS：APP/DMG）：
 
 ```powershell
 npm run build:desktop
 ```
 
-生产程序输出到 `target/release/omicsops-desktop.exe`，安装包位于 `target/release/bundle/nsis/`。不要分发 `target/debug/omicsops-desktop.exe`；默认 Tauri 配置嵌入 `dist`，不指向 localhost。Vite 开发地址仅由 `src-tauri/tauri.dev.conf.json` 提供，并通过 `npm run tauri:dev` 使用。
+本机构建的安装包位于 `target/release/bundle/`；显式传入 Rust target 时位于 `target/<target>/release/bundle/`。不要分发 debug 可执行文件；默认 Tauri 配置嵌入 `dist`，不指向 localhost。Vite 开发地址仅由 `src-tauri/tauri.dev.conf.json` 提供，并通过 `npm run tauri:dev` 使用。
 
-确定性测试不需要真实 SSH、GPU、WSL 或 API key。真实模型、SSH、R、Micromamba 和 PBMC 等验收需另按验收文档，在一次性环境中显式执行对应 ignored 测试。测试通过或构建成功不等于真实科研流程端到端验收。仓库尚无正式发布流程，不自动创建 tag、GitHub Release 或分发安装包。
+确定性测试不需要真实 SSH、GPU、WSL 或 API key。真实模型、SSH、R、Micromamba 和 PBMC 等验收需另按验收文档，在一次性环境中显式执行对应 ignored 测试。测试通过或构建成功不等于真实科研流程端到端验收。
+
+GitHub **Desktop release** 工作流支持手动构建产物，以及维护者推送 `vX.Y.Z` 标签后生成完整的 Release 草稿。全部四个目标通过测试和安装包校验后才进入草稿步骤；公开发布由维护者完成。Windows 安装器暂未签名，macOS 仅 ad-hoc 签名且未公证。操作步骤、版本校验和签名限制见[桌面构建与发布](docs/releasing.md)。
+
+发布文件参考 wisp-science 的平台命名；每次发版先准备 `.github/release-notes/vX.Y.Z.md`，包含变更、下载选择和实际验收情况。首版说明见 [v0.1.0 发布说明](.github/release-notes/v0.1.0.md)。工作流检查说明隐私并自动生成当前仓库的下载链接，重跑保留人工编辑过的草稿标题和正文。
 
 ## 参考文档
 

@@ -1,0 +1,227 @@
+name: Desktop release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing vX.Y.Z tag for a draft release; leave empty to build artifacts only'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+concurrency:
+  group: desktop-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      create_release: ${{ steps.version.outputs.create_release }}
+      commit: ${{ steps.commit.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check release resource privacy
+        run: python -B scripts/check_release_privacy.py
+      - name: Validate versions and release tag
+        id: version
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          tag="$INPUT_TAG"
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            tag="$GITHUB_REF_NAME"
+          fi
+          python -B scripts/release.py check-version --tag "$tag" --github-output "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        if: steps.version.outputs.create_release == 'true'
+        with:
+          node-version: 22
+      - name: Require reviewed versioned release notes
+        if: steps.version.outputs.create_release == 'true'
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          python -B scripts/check_release_privacy.py --document ".github/release-notes/$RELEASE_TAG.md"
+          node scripts/release_notes.cjs --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY"
+      - name: Freeze the source commit
+        id: commit
+        shell: bash
+        run: printf 'commit=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    name: Build ${{ matrix.id }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - id: linux-x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - id: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+          - id: macos-x64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl wget file libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils libdbus-1-dev libfuse2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Cargo.toml and target/ belong to the repository root workspace.
+          workspaces: '. -> target'
+          key: desktop-${{ matrix.target }}
+      - run: npm ci
+      - run: python -B -m unittest discover -s scripts -p "test_*.py"
+      - run: npm run build
+      - name: V4 scenario evaluation
+        run: cargo test --locked -p omicsops-agent-core scenario_evaluation_suite -- --nocapture
+        env:
+          OMICSOPS_EVAL_REPORT_PATH: target/evaluation/v4-scenarios.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v4-scenarios-${{ matrix.id }}
+          path: target/evaluation/v4-scenarios.json
+          if-no-files-found: warn
+          overwrite: true
+      - run: cargo test --locked --workspace
+      - run: npm test
+      - name: Build desktop installers
+        run: npm run build:desktop -- --target ${{ matrix.target }} -- --locked
+      - name: Stage and fingerprint installers
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+          RELEASE_TARGET: ${{ matrix.id }}
+          RUST_TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          python -B scripts/release.py stage \
+            --target "$RELEASE_TARGET" \
+            --bundle-dir "target/$RUST_TARGET/release/bundle" \
+            --output-dir "target/release-assets/$RELEASE_TARGET" \
+            --version "$RELEASE_VERSION" --commit "$RELEASE_COMMIT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-target-${{ matrix.id }}
+          path: target/release-assets/${{ matrix.id }}/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+          overwrite: true
+
+  assemble:
+    needs: [prepare, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-target-*
+          path: target/downloaded-installers
+          merge-multiple: true
+      - name: Require all platforms and verify installer checksums
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+        run: |
+          python -B scripts/release.py assemble \
+            --input-dir target/downloaded-installers \
+            --output-dir target/release-complete \
+            --version "$RELEASE_VERSION" --commit "$RELEASE_COMMIT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-complete
+          path: target/release-complete/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+          overwrite: true
+
+  draft:
+    needs: [prepare, assemble]
+    if: needs.prepare.outputs.create_release == 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-complete
+          path: target/release-complete
+      - name: Create or resume a draft prerelease
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+        with:
+          script: |
+            const publishDraft = require('./scripts/github_release.cjs');
+            const { loadReleaseNotes } = require('./scripts/release_notes.cjs');
+            const notes = loadReleaseNotes({
+              tag: process.env.RELEASE_TAG,
+              repository: `${context.repo.owner}/${context.repo.repo}`,
+            });
+            await publishDraft({
+              github, context, core,
+              tag: process.env.RELEASE_TAG,
+              version: process.env.RELEASE_VERSION,
+              commit: process.env.RELEASE_COMMIT,
+              assetDir: 'target/release-complete',
+              title: notes.title,
+              body: notes.body
+                + '\n\nSource commit: `' + process.env.RELEASE_COMMIT + '`\n',
+            });
