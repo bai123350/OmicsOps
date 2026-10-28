@@ -349,3 +349,17 @@ assertions are retained; production code and test deadlines are unchanged. The f
 red/green runs and all 177 desktop UI tests passed on Node 22 after the test-only change.
 The original cloud event's closure state was not captured, so this is a controlled
 readiness fix rather than a claim about a macOS-specific runtime defect.
+
+Windows job `122785926073` in the preceding `aba258a` run subsequently passed both
+privacy gates, generated the NSIS/MSI installers and uploaded them. Its optimized
+compilation took 16m 58s; no diagnostic exception or scanner bypass was required.
+
+At `23427cd913f92df80cfa5298e6cef834519fc511`, ordinary CI `40681993751` passed all three
+platforms, and no-tag Desktop release `40682015470` passed all four native targets and
+the assembly job. This includes Python, Web, V4, Rust workspace, frontend, extension,
+release-script, resource/raw-executable privacy, installer and checksum gates. The
+`desktop-complete` artifact contains six installers plus the manifest and checksum file.
+The no-tag run intentionally skipped the draft job. Version notes now record these cloud
+results while leaving clean-account installation/upgrade, credential persistence and
+real model/SSH/R/PBMC acceptance unverified. The reviewed version notes passed rendering
+validation and the document privacy gate before preparing the version tag.
