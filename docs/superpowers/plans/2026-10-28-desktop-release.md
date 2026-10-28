@@ -263,3 +263,23 @@ and model configuration, native platform support, build privacy, and release aut
   raw-executable privacy gates, followed by both Windows NSIS EXE and MSI bundles.
   The release compilation completed in 4m 54s. Native Linux/macOS builds, installation,
   and real model/SSH acceptance remain unexecuted locally.
+
+## First cloud execution — 2026-10-28
+
+The user requested execution of the cloud build and Release workflow after `main`
+was pushed. The first CI run (`40660363376`, commit `4693d07`) exposed two native
+runner assumptions before a release tag was created:
+
+- Windows/macOS Python privacy tests passed an aliased temporary root while the
+  scanner canonicalized only its root. Build inputs now map the caller's root alias
+  to the canonical root without resolving away descendant symlinks/junctions.
+  External inputs and parent traversal remain rejected. Fixtures use canonical roots;
+  three new regressions cover alias scanning, linked descendants, and traversal.
+- The HTTP feature contract forced offline Windows dependency resolution on Linux,
+  requiring an uncached Windows-only crate. The test now queries its Cargo toolchain's
+  native host and resolves that platform, retaining the offline/locked and system-proxy
+  feature assertions for both desktop and adapter clients.
+
+Local focused validation: Python 3.12 full suite PASS (99 tests, 2 existing symlink
+privilege skips); native HTTP feature contract PASS (1 test); resource/release-notes
+privacy and diff checks PASS. The next cloud run must verify the fixes on real runners.

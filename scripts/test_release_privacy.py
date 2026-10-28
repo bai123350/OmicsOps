@@ -20,7 +20,8 @@ class PrivacyTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        # Windows short names and macOS /var aliases may differ from resolve().
+        self.root = Path(self.temp.name).resolve()
         self.resource = self.root / "skills/single-cell/example/SKILL.md"
         self.resource.parent.mkdir(parents=True)
         self.resource.write_text("# Generic skill\n", encoding="utf-8")
@@ -188,6 +189,46 @@ class PrivacyTests(unittest.TestCase):
     def test_missing_dist_or_binary_fails(self):
         self.assertIn("missing-input", self.rules(self.audit(dist=self.root / "missing")))
         self.assertIn("missing-input", self.rules(self.audit(binaries=[self.root / "missing.exe"])))
+
+    def test_root_alias_preserves_relative_build_inputs_and_missing_files(self):
+        alias = self.root.parent / "repository-alias"
+        dist = self.root / "dist"
+        dist.mkdir()
+        (dist / "app.js").write_text('api_key="synthetic-dist-secret"', encoding="utf-8")
+        binary = self.root / "app.exe"
+        binary.write_bytes(b"ghp_" + b"Z7" * 20)
+        real_resolve = Path.resolve
+        with mock.patch.object(Path, "resolve", autospec=True, side_effect=lambda path, **kwargs:
+                               self.root if path == alias else real_resolve(path, **kwargs)):
+            findings = privacy.audit_repo(alias, dist=alias / "dist", binaries=[
+                alias / "app.exe", alias / "missing.exe",
+            ], tracked_files={"skills/single-cell/example/SKILL.md"}, forbidden_prefixes=[])
+        self.assertEqual(set(findings), {
+            ("dist/app.js", "credential-literal"),
+            ("app.exe", "credential-token"),
+            ("missing.exe", "missing-input"),
+        })
+
+    def test_root_alias_does_not_resolve_away_descendant_links(self):
+        alias = self.root.parent / "repository-alias"
+        linked = self.root / "dist"
+        real_resolve = Path.resolve
+        real_link = privacy.is_link
+        with mock.patch.object(Path, "resolve", autospec=True, side_effect=lambda path, **kwargs:
+                               self.root if path == alias else real_resolve(path, **kwargs)), \
+             mock.patch.object(privacy, "is_link", side_effect=lambda path:
+                               path == linked or real_link(path)):
+            findings = privacy.audit_repo(alias, dist=alias / "dist", binaries=[alias / "dist/app.exe"],
+                tracked_files={"skills/single-cell/example/SKILL.md"}, forbidden_prefixes=[])
+        self.assertEqual(set(findings), {
+            ("dist", "resource-link"), ("dist/app.exe", "resource-link"),
+        })
+
+    def test_external_and_parent_traversal_inputs_are_rejected(self):
+        for candidate in (self.root.parent / "outside", self.root / ".." / "outside"):
+            with self.subTest(candidate=candidate.name):
+                self.assertEqual(self.rules(self.audit(dist=candidate)), {"external-input"})
+                self.assertEqual(self.rules(self.audit(binaries=[candidate])), {"external-input"})
 
     def test_cli_never_echoes_secret_or_personal_absolute_path(self):
         subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True)

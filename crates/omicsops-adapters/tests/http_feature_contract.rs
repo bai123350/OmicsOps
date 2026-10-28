@@ -1,17 +1,32 @@
 //! Guard the resolved client capabilities, rather than a particular manifest spelling.
 //! Without system-proxy, reqwest ignores Windows' proxy and login can take a
 //! different route from the system browser even when HTTP(S)_PROXY is unset.
+//! Resolve the native runner's dependencies: an offline Linux/macOS test must not
+//! require Windows-only crates that its build never downloaded.
 #[test]
 fn desktop_http_client_resolves_system_proxy_support() {
+    let rustc = std::path::Path::new(env!("CARGO"))
+        .with_file_name(format!("rustc{}", std::env::consts::EXE_SUFFIX));
+    let version = std::process::Command::new(rustc)
+        .arg("-vV")
+        .output()
+        .expect("the Cargo toolchain must include rustc");
+    assert!(version.status.success(), "rustc version query must succeed");
+    let version = String::from_utf8(version.stdout).unwrap();
+    let host = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .expect("rustc must report its native host triple");
     let output = std::process::Command::new(env!("CARGO"))
         .args([
             "metadata",
             "--format-version=1",
             "--offline",
             "--locked",
-            "--filter-platform=x86_64-pc-windows-msvc",
-            "--manifest-path",
+            "--filter-platform",
         ])
+        .arg(host)
+        .arg("--manifest-path")
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
         .output()
         .expect("Cargo metadata must be available to the test runner");

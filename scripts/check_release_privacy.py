@@ -146,16 +146,26 @@ def allowed_fields(value, schema):
 
 def audit_repo(root, *, dist=None, binaries=(), forbidden_prefixes=None, tracked_files=None):
     """Check only release inputs. Findings are (safe relative file label, rule ID)."""
-    root = Path(root).resolve()
+    input_root = Path(root).absolute()
+    root = input_root.resolve()
     prefixes = default_prefixes(root) if forbidden_prefixes is None else forbidden_prefixes
     findings = set()
     inspected = set()
 
     def label(path):
         try:
-            return path.relative_to(root).as_posix()
+            relative = path.relative_to(root)
+            return "<external-input>" if ".." in relative.parts else relative.as_posix()
         except ValueError:
             return "<external-input>"
+
+    def build_input(value):
+        # Canonicalize only the caller's root (e.g. a Windows short name or macOS
+        # /var alias). Resolving the whole input would conceal descendant links.
+        path = Path(value).absolute()
+        if path.is_relative_to(input_root):
+            path = root / path.relative_to(input_root)
+        return path
 
     def add(path, rule):
         findings.add((label(path), rule))
@@ -192,7 +202,7 @@ def audit_repo(root, *, dist=None, binaries=(), forbidden_prefixes=None, tracked
             add(path, "unreadable-input")
 
     def walk(path, *, resource=False):
-        if not path.is_relative_to(root):
+        if not path.is_relative_to(root) or ".." in path.parts:
             add(path, "external-input")
             return
         if any(is_link(parent) for parent in (path, *path.parents) if parent.is_relative_to(root)):
@@ -264,10 +274,10 @@ def audit_repo(root, *, dist=None, binaries=(), forbidden_prefixes=None, tracked
         except (OSError, ValueError, TypeError, AttributeError):
             add(config_path, "invalid-configuration")
     if dist is not None:
-        walk(Path(dist).absolute())
+        walk(build_input(dist))
     for binary in binaries:
-        path = Path(binary).absolute()
-        if not path.is_relative_to(root):
+        path = build_input(binary)
+        if not path.is_relative_to(root) or ".." in path.parts:
             add(path, "external-input")
         elif path.is_dir():
             add(path, "expected-binary-file")
