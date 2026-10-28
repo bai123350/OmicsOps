@@ -165,19 +165,11 @@ async fn browser_settings_response(
     app: &AppHandle,
     runtime: &BrowserRuntime,
 ) -> Result<BrowserSettingsResponse, String> {
-    let packaged = app
+    let resource_root = app
         .path()
         .resource_dir()
-        .map_err(|error| error.to_string())?
-        .join("browser-extension");
-    let development = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("browser-extension");
-    let extension = if packaged.is_dir() {
-        packaged
-    } else {
-        development
-    };
+        .map_err(|error| error.to_string())?;
+    let extension = crate::bundled_resources::directory(&resource_root, "browser-extension");
     Ok(BrowserSettingsResponse {
         config: runtime.config().await,
         shared: runtime.status(BrowserSessionKind::Shared).await,

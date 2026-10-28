@@ -4,6 +4,7 @@ pub mod agent_v4;
 pub mod bio_mcp;
 pub mod browser_commands;
 pub mod bundled_mcp_commands;
+mod bundled_resources;
 pub mod capability_commands;
 pub mod commands;
 pub mod composer_attachments;
@@ -100,34 +101,14 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir)?;
             let skills_root = data_dir.join("skills");
             std::fs::create_dir_all(&skills_root)?;
-            let packaged_skills_root = app
+            let resource_root = app
                 .path()
                 .resource_dir()
-                .map_err(|error| error.to_string())?
-                .join("skills")
-                .join("single-cell");
-            let development_skills_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("skills")
-                .join("single-cell");
-            let bundled_skills_root = if packaged_skills_root.is_dir() {
-                packaged_skills_root
-            } else {
-                development_skills_root
-            };
-            let packaged_browser_extension = app
-                .path()
-                .resource_dir()
-                .map_err(|error| error.to_string())?
-                .join("browser-extension");
-            let development_browser_extension = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("browser-extension");
-            let browser_extension_root = if packaged_browser_extension.is_dir() {
-                packaged_browser_extension
-            } else {
-                development_browser_extension
-            };
+                .map_err(|error| error.to_string())?;
+            let bundled_skills_root =
+                bundled_resources::directory(&resource_root, "skills/single-cell");
+            let browser_extension_root =
+                bundled_resources::directory(&resource_root, "browser-extension");
             let browser =
                 omicsops_browser::BrowserRuntime::new(data_dir.clone(), browser_extension_root);
             let repository = tauri::async_runtime::block_on(async {
@@ -143,21 +124,7 @@ pub fn run() {
                     &bundled_skills_root,
                 )
                 .await?;
-                let packaged_wisp = app
-                    .path()
-                    .resource_dir()
-                    .map_err(|error| error.to_string())?
-                    .join("skills")
-                    .join("wisp-science");
-                let development_wisp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("..")
-                    .join("skills")
-                    .join("wisp-science");
-                let wisp_root = if packaged_wisp.is_dir() {
-                    packaged_wisp
-                } else {
-                    development_wisp
-                };
+                let wisp_root = bundled_resources::directory(&resource_root, "skills/wisp-science");
                 skill_commands::install_bundled_skills(&repository, &skills_root, &wisp_root)
                     .await?;
                 bundled_mcp_commands::install_bundled_mcp_servers(

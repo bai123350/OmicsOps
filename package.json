@@ -6,9 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "build:desktop": "tauri build --bundles nsis",
+    "build:desktop": "node scripts/build_desktop.cjs",
     "tauri:dev": "tauri dev --config src-tauri/tauri.dev.conf.json",
-    "test": "vitest run && node --test browser-extension/tests/*.test.js",
+    "test": "vitest run && node --test browser-extension/tests/*.test.js && npm run test:release",
+    "test:release": "node --test scripts/*.test.cjs",
     "test:watch": "vitest",
     "tauri": "tauri"
   },

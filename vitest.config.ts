@@ -7,6 +7,7 @@ export default defineConfig({
     exclude: [
       ...configDefaults.exclude,
       "browser-extension/tests/**",
+      "scripts/**",
       "target/**",
     ],
   },

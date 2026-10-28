@@ -8,5 +8,7 @@ export default defineConfig({
     port: 1420,
     strictPort: true,
   },
-  envPrefix: ["VITE_", "TAURI_"],
+  // Credentials are runtime inputs held by the OS vault, never build inputs.
+  envDir: false,
+  envPrefix: [],
 });
