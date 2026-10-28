@@ -158,6 +158,73 @@ class PrivacyTests(unittest.TestCase):
             with self.subTest(text=text.split(":")[0]):
                 self.assertTrue(privacy.scan_bytes(text.encode(), []))
 
+    def test_authenticated_urls_preserve_unicode_percent_colon_and_empty_user(self):
+        values = [
+            "https://fixture-user:fixture-pass@service.invalid/api",
+            "ssh://fixture%3Auser:fixture%40pass@service.invalid",
+            "postgresql://fixture-user:part:two'!$&()*+,;=@service.invalid/db",
+            "mysql://fixture-user:合成口令🙂@service.invalid/db",
+            "redis://:fixture-pass@service.invalid",
+            "http://fixture-user:fixture-pass@",
+            "PoStGrEs://fixture-user:fixture-pass@service.invalid/db",
+        ]
+        for value in values:
+            for encoding in ("utf-8", "utf-16le", "utf-16be"):
+                with self.subTest(index=values.index(value), encoding=encoding):
+                    self.assertIn("authenticated-url", privacy.scan_bytes(value.encode(encoding), []))
+
+    def test_authenticated_urls_do_not_join_binary_strings_or_cross_url_boundaries(self):
+        for separator in (b"\x00", b"\x01", b"\x1f", b"\x7f", b"?", b"#", b'"', b"\\"):
+            value = b"https://fixture-user:" + separator + b"fixture-pass@service.invalid"
+            with self.subTest(separator=separator.hex()):
+                self.assertNotIn("authenticated-url", privacy.scan_bytes(value, []))
+        self.assertNotIn("authenticated-url", privacy.scan_bytes(
+            b"https://service.invalid?query:piece@tail.invalid", []))
+        for encoding in ("utf-16le", "utf-16be"):
+            for boundary in ("\x00", "\x01", "\x7f", "?", "#"):
+                value = ("https://fixture-user:" + boundary + "fixture-pass@service.invalid").encode(encoding)
+                with self.subTest(encoding=encoding, boundary=ord(boundary)):
+                    self.assertNotIn("authenticated-url", privacy.scan_bytes(value, []))
+
+    def test_authenticated_url_diagnostics_report_structure_only_and_are_bounded(self):
+        value = "https://fixture-user:合成口令🙂@service.invalid"
+        for encoding in ("utf-16le", "utf-16be"):
+            data = b"MZ\x81" + value.encode(encoding) + b"\x00\x00"
+            diagnostics = []
+            self.assertIn("authenticated-url", privacy.scan_bytes(data, [], diagnostics=diagnostics))
+            self.assertTrue(diagnostics)
+            self.assertTrue(any(item["view"] == encoding and item["offset"] == 3 for item in diagnostics))
+            for item in diagnostics:
+                self.assertEqual(set(item), {"view", "offset", "length", "control_count", "query_fragment_count", "non_ascii_count", "utf8_valid"})
+                self.assertEqual(item["control_count"], 0)
+                self.assertEqual(item["query_fragment_count"], 0)
+                self.assertGreater(item["length"], 0)
+                self.assertTrue(item["utf8_valid"])
+            self.assertNotIn(value, str(diagnostics))
+            self.assertNotIn("fixture-user", str(diagnostics))
+            self.assertNotIn("service.invalid", str(diagnostics))
+        invalid_utf8 = []
+        privacy.scan_bytes(b"http://fixture-user:fixture-\xff-pass@", [], diagnostics=invalid_utf8)
+        self.assertFalse(invalid_utf8[0]["utf8_valid"])
+        bounded = []
+        privacy.scan_bytes((b"https://fixture-user:fixture-pass@service.invalid\x00" * 100), [], diagnostics=bounded)
+        self.assertEqual(len(bounded), 20)
+
+    def test_authenticated_url_cli_diagnostics_never_echo_credentials_or_hostname(self):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.root), "add", "skills"], check=True, capture_output=True)
+        secret = "https://fixture-user:fixture-pass@service.invalid/api"
+        self.resource.write_text(secret, encoding="utf-8")
+        result = subprocess.run([sys.executable, "-B", str(SCRIPT), "--root", str(self.root)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        output = result.stdout + result.stderr
+        for value in (secret, "fixture-user", "fixture-pass", "service.invalid", str(self.root)):
+            self.assertNotIn(value, output)
+        rows = [json.loads(line.removeprefix("privacy detail: ")) for line in output.splitlines() if line.startswith("privacy detail: ")]
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["path"], "skills/single-cell/example/SKILL.md")
+        self.assertEqual(rows[0]["view"], "raw")
+
     def test_examples_public_attribution_and_variable_access_are_allowed(self):
         text = '\n'.join([
             '"ZOTERO_API_KEY": "<your zotero.org API key with library write access>"',

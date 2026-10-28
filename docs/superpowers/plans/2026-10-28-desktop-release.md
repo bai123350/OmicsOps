@@ -319,3 +319,21 @@ retaining the expected revision and restored-list assertions. Node 22 reproduced
 original failure and then passed all 177 tests in `DesktopApp.test.tsx`. Production UI
 code, test timeouts, and skip rules are unchanged. A new four-target run must validate
 both test-stability fixes together before tagging.
+
+Run `40671789347` at `e414ed7` passed all tests on all four targets and successfully
+packaged Linux and both macOS architectures. Windows release compilation succeeded
+(16m 34s), but the raw EXE privacy gate reported `authenticated-url` before NSIS/MSI
+creation. The failed binary was not uploaded and the matched value was not logged;
+the exact cloud occurrence is not claimed to be a proven false positive.
+
+Independent synthetic tests demonstrated that the URL rule could cross control bytes,
+query/fragment boundaries, and separately NUL-terminated UTF-16 strings. Authentication
+URL scanning now uses the raw bytes plus bounded UTF-16 decoding from encoded scheme
+prefixes, without joining separate strings. Positive regressions retain ASCII/UTF-16,
+Unicode/emoji, percent encoding, colon-containing passwords, empty usernames, mixed-case
+schemes, and truncated credential URLs. Other secret and path detectors are unchanged.
+Failure diagnostics are capped at 20 structural records and never print the matched
+URL, credentials, hostname, or a credential hash. New cases failed before the fix;
+29 privacy tests and the full 103-test Python suite passed (2 existing symlink privilege
+skips). Current local dist/EXE/notes passed the gate; the updated cloud gate still must
+confirm the Windows outcome before any version tag or Release is created.

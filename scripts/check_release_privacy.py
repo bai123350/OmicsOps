@@ -52,8 +52,14 @@ LITERAL = re.compile(
 )
 AUTH_URL = re.compile(
     rb"(?i)\b(?:https?|ssh|postgres(?:ql)?|mysql|redis)://"
-    rb"([^:/\s@]{1,128}):([^@\s/]{1,256})@"
+    rb'([^:/@\x00-\x20\x7f?#"\\]{0,128}):([^/@\x00-\x20\x7f?#"\\]{1,256})@'
 )
+URL_SCHEMES = ("https://", "http://", "ssh://", "postgresql://", "postgres://", "mysql://", "redis://")
+UTF16_URL_STARTS = tuple((encoding, re.compile(
+    b"|".join(re.escape(scheme.encode(encoding)) for scheme in URL_SCHEMES), re.IGNORECASE,
+)) for encoding in ("utf-16le", "utf-16be"))
+MAX_URL_CODE_UNITS = 1024
+MAX_DIAGNOSTICS = 20
 BUNDLE_FIELDS = {
     "active": None, "targets": None, "category": None, "shortDescription": None,
     "resources": None, "icon": None,
@@ -80,7 +86,51 @@ def placeholder(value):
     )
 
 
-def scan_bytes(data, forbidden_prefixes):
+def authenticated_urls(data):
+    """Yield only structural metadata; never concatenate NUL-terminated strings."""
+    def detail(view, offset, length, value):
+        try:
+            value.decode("utf-8")
+            utf8_valid = True
+        except UnicodeError:
+            utf8_valid = False
+        return {
+            "view": view, "offset": offset, "length": length,
+            "control_count": sum(byte < 32 or byte == 127 for byte in value),
+            "query_fragment_count": value.count(b"?") + value.count(b"#"),
+            "non_ascii_count": sum(byte >= 128 for byte in value),
+            "utf8_valid": utf8_valid,
+        }
+
+    for match in AUTH_URL.finditer(data):
+        if not placeholder(match.group(2)):
+            yield detail("raw", match.start(), match.end() - match.start(), match.group())
+    # Decode only bounded candidates beginning at an encoded URL scheme. Keeping
+    # real UTF-16 code units preserves Unicode passwords and surrogate pairs; a
+    # NUL/control terminator ends a candidate instead of joining the next string.
+    for encoding, starts in UTF16_URL_STARTS:
+        byteorder = "little" if encoding.endswith("le") else "big"
+        for start in starts.finditer(data):
+            offset = start.start()
+            limit = min(len(data) - 1, offset + MAX_URL_CODE_UNITS * 2)
+            for position in range(start.end(), limit, 2):
+                unit = int.from_bytes(data[position:position + 2], byteorder)
+                if unit < 32 or unit == 127:
+                    break
+                if unit != ord("@"):
+                    continue
+                end = position + 2
+                try:
+                    value = data[offset:end].decode(encoding).encode("utf-8")
+                except UnicodeError:
+                    break
+                match = AUTH_URL.match(value)
+                if match and not placeholder(match.group(2)):
+                    yield detail(encoding, offset, end - offset, match.group())
+                break
+
+
+def scan_bytes(data, forbidden_prefixes, *, diagnostics=None):
     """Return rule IDs only, never values; also recognize UTF-16 ASCII literals."""
     findings = set()
     views = [data]
@@ -104,14 +154,17 @@ def scan_bytes(data, forbidden_prefixes):
             value = match.group("value")
             if len(value) >= (16 if key.lower() == b"token" else 6) and not placeholder(value):
                 findings.add("credential-literal")
-        for match in AUTH_URL.finditer(view):
-            if not placeholder(match.group(2)):
-                findings.add("authenticated-url")
         lowered = view.lower()
         for prefix in forbidden_prefixes:
             variants = {prefix, prefix.replace("\\", "/"), prefix.replace("\\", "\\\\")}
             if any(variant.encode("utf-8").lower() in lowered for variant in variants if len(variant) > 3):
                 findings.add("local-build-path")
+    # The legacy zero-stripped view above is retained for the other detectors.
+    # URL authority parsing must never use it: it merges unrelated binary strings.
+    for detail in authenticated_urls(data):
+        findings.add("authenticated-url")
+        if diagnostics is not None and len(diagnostics) < MAX_DIAGNOSTICS:
+            diagnostics.append(detail)
     return findings
 
 
@@ -144,7 +197,7 @@ def allowed_fields(value, schema):
     )
 
 
-def audit_repo(root, *, dist=None, binaries=(), forbidden_prefixes=None, tracked_files=None):
+def audit_repo(root, *, dist=None, binaries=(), forbidden_prefixes=None, tracked_files=None, diagnostics=None):
     """Check only release inputs. Findings are (safe relative file label, rule ID)."""
     input_root = Path(root).absolute()
     root = input_root.resolve()
@@ -169,6 +222,16 @@ def audit_repo(root, *, dist=None, binaries=(), forbidden_prefixes=None, tracked
 
     def add(path, rule):
         findings.add((label(path), rule))
+
+    def scan_content(path, content):
+        details = []
+        for rule in scan_bytes(content, prefixes, diagnostics=details):
+            add(path, rule)
+        if diagnostics is not None:
+            for detail in details:
+                if len(diagnostics) >= MAX_DIAGNOSTICS:
+                    break
+                diagnostics.append({"path": label(path), **detail})
 
     if tracked_files is None:
         result = subprocess.run(
@@ -196,8 +259,7 @@ def audit_repo(root, *, dist=None, binaries=(), forbidden_prefixes=None, tracked
             add(path, "untracked-resource")
             return
         try:
-            for rule in scan_bytes(path.read_bytes(), prefixes):
-                add(path, rule)
+            scan_content(path, path.read_bytes())
         except OSError:
             add(path, "unreadable-input")
 
@@ -240,8 +302,7 @@ def audit_repo(root, *, dist=None, binaries=(), forbidden_prefixes=None, tracked
             continue
         try:
             raw_config = config_path.read_bytes()
-            for rule in scan_bytes(raw_config, prefixes):
-                add(config_path, rule)
+            scan_content(config_path, raw_config)
             config = json.loads(raw_config.decode("utf-8"))
             bundle = config.get("bundle", {})
             build = config.get("build", {})
@@ -295,10 +356,12 @@ def main():
                         help="also scan a release notes document before publication")
     parser.add_argument("--forbid-prefix", action="append", default=[])
     args = parser.parse_args()
+    diagnostics = []
     try:
         findings = audit_repo(
             args.root, dist=args.dist, binaries=args.binary + args.document,
             forbidden_prefixes=default_prefixes(args.root) + args.forbid_prefix,
+            diagnostics=diagnostics,
         )
     except (OSError, ValueError):
         print("privacy error: <inputs>: inspection-failed", file=sys.stderr)
@@ -306,6 +369,8 @@ def main():
     if findings:
         for path, rule in findings:
             print(f"privacy error: {path}: {rule}", file=sys.stderr)
+        for detail in diagnostics:
+            print("privacy detail: " + json.dumps(detail, sort_keys=True), file=sys.stderr)
         return 1
     print("Privacy checks passed for configured resources and requested build outputs.")
     return 0
