@@ -1363,10 +1363,20 @@ describe("DesktopApp", () => {
   it("creates one session with Ctrl+N and suppresses the shortcut while a dialog is open", async () => {
     const { stateSpy } = setupConversationStateHarness();
     stateSpy.mockImplementation(async (_projectId, conversationId) => stateSnapshot(conversationId));
+    const hydration = deferred<ConversationAgentStateV4>();
+    stateSpy.mockReturnValueOnce(hydration.promise);
     const create = vi.spyOn(api, "createConversation").mockResolvedValue({ ...stateConversations[0], id: "shortcut-session", title: "Shortcut session" });
     render(<DesktopApp />);
     const input = await screen.findByRole("textbox", { name: /描述研究目标/ });
-    await waitFor(() => expect(input).toBeEnabled());
+    await waitFor(() => expect(stateSpy).toHaveBeenCalledWith(stateProject.id, stateConversations[0].id));
+    expect(input).toBeDisabled();
+    expect(screen.getByRole("button", { name: "新建会话" })).toBeDisabled();
+    fireEvent.keyDown(window, { key: "n", ctrlKey: true });
+    expect(create).not.toHaveBeenCalled();
+    // Finish startup hydration and its passive shortcut effect before dispatching.
+    await act(async () => hydration.resolve(stateSnapshot(stateConversations[0].id)));
+    await waitFor(() => expect(screen.getByRole("button", { name: "新建会话" })).toBeEnabled());
+    expect(input).toBeEnabled();
     fireEvent.keyDown(window, { key: "n", ctrlKey: true, repeat: true });
     expect(create).not.toHaveBeenCalled();
     fireEvent.keyDown(window, { key: "n", ctrlKey: true });

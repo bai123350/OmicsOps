@@ -337,3 +337,15 @@ URL, credentials, hostname, or a credential hash. New cases failed before the fi
 29 privacy tests and the full 103-test Python suite passed (2 existing symlink privilege
 skips). Current local dist/EXE/notes passed the gate; the updated cloud gate still must
 confirm the Windows outcome before any version tag or Release is created.
+
+Ordinary CI `40679373277` at `aba258a` passed Windows, Linux and macOS. The no-tag
+release run `40679377207` exposed another frontend startup race on macOS Apple Silicon:
+the Ctrl+N test dispatched its one key event before the shortcut's hydration gate was
+ready, receiving zero create calls. A deferred initial state response reproduced that
+failure deterministically. The test now verifies Ctrl+N is ignored while hydration is
+pending, resolves the response inside awaited React `act`, and waits for the New
+conversation action to become enabled. Repeat-key, single-create and dialog suppression
+assertions are retained; production code and test deadlines are unchanged. The focused
+red/green runs and all 177 desktop UI tests passed on Node 22 after the test-only change.
+The original cloud event's closure state was not captured, so this is a controlled
+readiness fix rather than a claim about a macOS-specific runtime defect.
