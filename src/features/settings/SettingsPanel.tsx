@@ -4,7 +4,7 @@ import { isOpenCodeGo, openCodeGoModels, openCodeGoProtocol, reviewedGoEfforts, 
 import type { ModelDiscoveryResult, SaveModelProfileRequest } from "../../types";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowLeft, Bot, Brain, CheckCircle2, ClipboardList, Cloud, Database, FolderOpen, Gauge, Globe2, KeyRound, Languages, Layers3, LoaderCircle, Monitor, PackageOpen, Palette, PlugZap, Search, Server, ShieldCheck, Sparkles, Trash2, Wrench, XCircle } from "lucide-react";
+import { ArrowLeft, Bot, Brain, ChevronRight, Eye, EyeOff, Plus, X, CheckCircle2, ClipboardList, Cloud, Database, FolderOpen, Gauge, Globe2, KeyRound, Languages, Layers3, LoaderCircle, Monitor, PackageOpen, Palette, PlugZap, Search, Server, ShieldCheck, Sparkles, Trash2, Wrench, XCircle } from "lucide-react";
 import type { ConnectionProfile, ConnectionTestResult, McpEnvBinding, McpServerProfile, ModelProbeResult, ModelProfile, SaveMcpEnvBindingRequest, SkillPackage, SkillRemovalOperation, SystemInterpreterDiagnostics, WorkspaceProject } from "../../types";
 import type { Locale } from "../workspace/copy";
 import { supportsFastMode } from "../../fast-mode";
@@ -87,13 +87,38 @@ function isDeepSeek(profile: Pick<ModelProfile, "provider" | "base_url">): boole
   return matchesModelProviderPreset(profile, modelProviderPresets.find((preset) => preset.id === "deepseek")!);
 }
 
+function modelProviderLabel(profile: ModelProfile, zh: boolean): string {
+  if (profile.provider === "open_ai_codex" || profile.provider === "claude_code") return modelBackendLabel(profile, zh);
+  const preset = modelProviderPresets.find(candidate => candidate.id !== "custom" && matchesModelProviderPreset(profile, candidate));
+  if (preset) return preset.label;
+  switch (profile.provider) {
+    case "anthropic": return zh ? "Anthropic 兼容 API" : "Anthropic-compatible API";
+    case "open_ai_responses": return "Responses API";
+    case "ollama": return "Ollama";
+    default: return zh ? "OpenAI 兼容 API" : "OpenAI-compatible API";
+  }
+}
+
 export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection = "models", onClose, modelProfiles = [], onSaveModel, onDeleteModel, onProbeModel, onListModels, onModelDiscovery, onSubscriptionSaved, skillPackages = [], onImportSkill, onSetSkillEnabled, onSkillsChanged, mcpServers = [], onSaveMcpServer, onInspectMcpServer, onSetMcpServerEnabled, onSetMcpLaunchApproval, onSetMcpToolApproval, onListBundledMcpPresets, onConfigurePubMedMcp, onAddBundledMcp, connections = [], projects = [], selectedProject, onOpenUsageConversation, onSaveConnection, onTestConnection, onConfirmHostKey, onBindProjectRemote, onWorkflowsChanged, onMemoryChanged, onPluginsChanged }: Props) {
   const zh = locale === "zh-CN";
   const [form, setForm] = useState<FormState | null>(null);
   const [subscriptionForm, setSubscriptionForm] = useState<{ provider: "open_ai_codex" | "claude_code"; profile: ModelProfile | null } | null>(null);
   const modelFormRef = useRef<HTMLElement>(null);
+  const savedModelsRef = useRef<HTMLElement>(null);
   const [modelFormRevealRequest, setModelFormRevealRequest] = useState(0);
   const [saving, setSaving] = useState(false);
+  const formGeneration = useRef(0);
+  const profileGenerations = useRef<Record<string, number>>({});
+  const [providerQuery, setProviderQuery] = useState("");
+  const [providerCategory, setProviderCategory] = useState<"all" | "api" | "subscription" | "local">("all");
+  const [showCredential, setShowCredential] = useState(false);
+  const [modelSaveNotice, setModelSaveNotice] = useState("");
+  const [modelChoiceQueries, setModelChoiceQueries] = useState<Record<string, string>>({});
+  const filteredPresets = modelProviderPresets.filter(preset => {
+    const category = preset.provider === "open_ai_codex" || preset.provider === "claude_code" ? "subscription" : preset.id === "ollama" || preset.id === "lm-studio" ? "local" : "api";
+    return (providerCategory === "all" || category === providerCategory) && `${preset.label} ${preset.detailZh} ${preset.detailEn}`.toLocaleLowerCase().includes(providerQuery.trim().toLocaleLowerCase());
+  });
+  const closeModelForm = () => { ++formGeneration.current; setForm(null); setModelSaveError(""); setShowCredential(false); };
   const [modelSaveError, setModelSaveError] = useState("");
   const [section, setSection] = useState<SettingsSection>(initialSection);
   const [skillsBusy, setSkillsBusy] = useState(false);
@@ -107,31 +132,48 @@ export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection
   const fastModeAvailable = form ? supportsFastMode(form) : false;
   const budgetError = form ? contextWindowError(form.contextWindowDraft, form.contextWindowDirty, zh) : "";
   useWindowEscapeLayer(true, onClose);
-  useWindowEscapeLayer(form !== null && section === "models", () => setForm(null));
+  useWindowEscapeLayer(form !== null && section === "models", closeModelForm);
   useWindowEscapeLayer(deleteTarget !== null, () => { if (!deleting) { setDeleteTarget(null); setDeleteError(""); } });
   useEffect(() => {
     if (modelFormRevealRequest > 0) modelFormRef.current?.scrollIntoView?.({ block: "start" });
   }, [modelFormRevealRequest]);
+  useEffect(() => {
+    if (modelSaveNotice) savedModelsRef.current?.scrollIntoView?.({ block: "start" });
+  }, [modelSaveNotice]);
   const showModelForm = (next: FormState) => {
+    ++formGeneration.current;
+    setModelSaveError("");
+    setModelSaveNotice("");
+    setShowCredential(false);
     setSubscriptionForm(null);
     setForm(next);
     setModelFormRevealRequest((request) => request + 1);
   };
   const configurePreset = (preset: ModelProviderPreset) => {
-    if (preset.provider === "open_ai_codex" || preset.provider === "claude_code") { setForm(null); setSubscriptionForm({ provider: preset.provider, profile: null }); return; }
+    if (preset.provider === "open_ai_codex" || preset.provider === "claude_code") { closeModelForm(); setModelSaveNotice(""); setSubscriptionForm({ provider: preset.provider, profile: null }); setModelFormRevealRequest(request => request + 1); return; }
     showModelForm({
     provider: preset.provider, label: preset.label, base_url: preset.base_url,
     model: preset.id === "deepseek" ? "deepseek-v4-flash" : preset.id === "opencode-go" ? "glm-5.3-flash" : "",
     credential: "", contextWindowDraft: "", contextWindowDirty: false,
   }); };
   const navigate = (nextSection: SettingsSection) => {
-    setForm(null);
+    closeModelForm();
     setSubscriptionForm(null);
     setSection(nextSection);
   };
 
+  function invalidateProfile(profileId: string) {
+    profileGenerations.current[profileId] = (profileGenerations.current[profileId] ?? 0) + 1;
+    setModelTests(current => { const next = { ...current }; delete next[profileId]; return next; });
+    setModelChoices(current => { const next = { ...current }; delete next[profileId]; return next; });
+    setModelDiscoveries(current => { const next = { ...current }; delete next[profileId]; return next; });
+    setModelChoiceQueries(current => { const next = { ...current }; delete next[profileId]; return next; });
+  }
+
   async function saveProvider() {
-    if (!form || !onSaveModel || budgetError) return;
+    if (!form || !onSaveModel || budgetError || saving) return;
+    const generation = formGeneration.current;
+    const savedProfileId = form.id;
     setSaving(true);
     setModelSaveError("");
     try {
@@ -141,9 +183,14 @@ export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection
         credential: form.provider === "ollama" || (isLocalLmStudioEndpoint(form) && !form.credential.trim()) ? undefined : form.credential,
         ...(contextWindowDirty && contextWindowDraft.trim() ? { context_window_tokens: Number(contextWindowDraft.trim()) } : {}),
       });
-      setForm(null);
+      if (savedProfileId) invalidateProfile(savedProfileId);
+      if (formGeneration.current === generation) {
+        setForm(null);
+        setShowCredential(false);
+        setModelSaveNotice(zh ? "模型配置已保存。" : "Model profile saved.");
+      }
     } catch {
-      setModelSaveError(zh ? "保存失败，请检查模型配置后重试。" : "Could not save. Check the model configuration and retry.");
+      if (formGeneration.current === generation) setModelSaveError(zh ? "保存失败，请检查模型配置后重试。" : "Could not save. Check the model configuration and retry.");
     } finally {
       setSaving(false);
     }
@@ -164,24 +211,30 @@ export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection
 
   async function testModel(profileId: string) {
     if (!onProbeModel) return;
+    const generation = profileGenerations.current[profileId] ?? 0;
     setModelTests((current) => ({ ...current, [profileId]: { state: "testing" } }));
     try {
       const result = await onProbeModel(profileId);
+      if ((profileGenerations.current[profileId] ?? 0) !== generation) return;
       setModelTests((current) => ({ ...current, [profileId]: { state: "success", result } }));
     } catch (error) {
+      if ((profileGenerations.current[profileId] ?? 0) !== generation) return;
       setModelTests((current) => ({ ...current, [profileId]: { state: "error", message: error instanceof Error ? error.message : String(error) } }));
     }
   }
 
   async function discoverModels(profileId: string) {
     if ((!onListModels && !onModelDiscovery) || modelDiscoveries[profileId]?.state === "loading") return;
+    const generation = profileGenerations.current[profileId] ?? 0;
     setModelDiscoveries((current) => ({ ...current, [profileId]: { state: "loading" } }));
     try {
       const result = onModelDiscovery ? await onModelDiscovery(profileId) : { models: await onListModels!(profileId), source: "provider" as const, can_refresh: true };
+      if ((profileGenerations.current[profileId] ?? 0) !== generation) return;
       const models = result.models;
       setModelChoices((current) => ({ ...current, [profileId]: models }));
       setModelDiscoveries((current) => ({ ...current, [profileId]: { state: models.length ? "success" : "empty", source: result.source, can_refresh: result.can_refresh } }));
     } catch {
+      if ((profileGenerations.current[profileId] ?? 0) !== generation) return;
       setModelChoices((current) => ({ ...current, [profileId]: [] }));
       setModelDiscoveries((current) => ({ ...current, [profileId]: { state: "error" } }));
     }
@@ -212,21 +265,28 @@ export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection
     <header><button className="settings-back" aria-label="Close" onClick={onClose}><ArrowLeft size={18} /><span>{zh ? "返回工作区" : "Back to workspace"}</span></button><div><small>OmicsOps Desktop</small><h2>{zh ? "设置" : "Settings"}</h2></div></header>
     <div className="settings-layout">
       <SettingsNavigation locale={locale} section={section} onNavigate={navigate} />
-      {section === "plugins" ? <PluginsSettings locale={locale} onOpenConnections={() => navigate("connections")} onChanged={onPluginsChanged} /> : section === "models" ? <main><div className="settings-heading"><h3>{zh ? "模型提供方" : "Model providers"}</h3><p>{zh ? "密钥保存在 Windows Credential Manager，项目只记录引用。" : "Keys stay in Windows Credential Manager; projects store references only."}</p></div>
-        <div className="provider-grid">
-          {modelProviderPresets.map((preset) => <Provider key={preset.id} icon={preset.id === "custom" ? KeyRound : preset.id === "ollama" || preset.id === "lm-studio" ? Monitor : preset.id === "opencode-go" ? Globe2 : Cloud} name={preset.label} detail={zh ? preset.detailZh : preset.detailEn} configured={modelProfiles.some((profile) => preset.id === "custom" ? profile.provider === "open_ai_compatible" && !modelProviderPresets.some((candidate) => candidate.id !== "custom" && matchesModelProviderPreset(profile, candidate)) : matchesModelProviderPreset(profile, preset))} onConfigure={() => configurePreset(preset)} />)}
-        </div>
-        {subscriptionForm && <SubscriptionModelForm key={`${subscriptionForm.provider}:${subscriptionForm.profile?.id ?? "new"}`} {...subscriptionForm} modelProfiles={modelProfiles} zh={zh} onCancel={() => setSubscriptionForm(null)} onSaved={profile => { onSubscriptionSaved?.(profile); setSubscriptionForm(null); }} />}
-        {form && <section ref={modelFormRef} className="model-form" aria-label={zh ? "模型配置" : "Model configuration"}>
-          <div className="model-form-grid">
+      {section === "plugins" ? <PluginsSettings locale={locale} onOpenConnections={() => navigate("connections")} onChanged={onPluginsChanged} /> : section === "models" ? <main className="models-settings-page"><div className="settings-heading models-page-heading"><h3>{zh ? "模型提供方" : "Model providers"}</h3><p>{zh ? "密钥保存在 Windows Credential Manager，项目只记录引用。" : "Keys stay in Windows Credential Manager; projects store references only."}</p></div>
+        <section ref={savedModelsRef} className="saved-model-section" aria-labelledby="saved-model-heading">
+          <div className="model-section-heading"><div><h4 id="saved-model-heading">{zh ? "我的模型" : "Your models"}<span className="model-count">{modelProfiles.length}</span></h4><p>{zh ? "管理已保存的配置，查询模型或测试连接。" : "Manage saved profiles, discover models, or test a connection."}</p></div></div>
+          {modelSaveNotice && <p className="model-save-notice" role="status"><CheckCircle2 size={16} />{modelSaveNotice}</p>}
+          {modelProfiles.length === 0 && <div className="model-empty-state"><span><Bot size={23} /></span><div><b>{zh ? "连接你的第一个模型" : "Connect your first model"}</b><p>{zh ? "从下方选择服务，填写连接信息并保存。" : "Choose a provider below, enter its connection details, and save."}</p></div></div>}
+        {modelProfiles.length > 0 && <div className="configured-models">{modelProfiles.map((profile) => { const probe = modelTests[profile.id]; const discovery = modelDiscoveries[profile.id]; const choices = modelChoices[profile.id] ?? []; const editProfile = (model: string) => { if (profile.provider === "open_ai_codex" || profile.provider === "claude_code") { closeModelForm(); setModelSaveNotice(""); setSubscriptionForm({ provider: profile.provider, profile: { ...profile, model } }); setModelFormRevealRequest(request => request + 1); return; } const provider = isOpenCodeGo(profile) ? openCodeGoProtocol(model) ?? profile.provider : profile.provider; showModelForm({ id: profile.id, label: profile.label, provider, base_url: profile.base_url, model, credential: "", contextWindowDraft: model === profile.model ? String(profile.context_window_tokens ?? "") : "", contextWindowDirty: false, reasoning_effort: model !== profile.model || provider === "anthropic" ? null : profile.reasoning_effort ?? null, delegated_model_profile_id: profile.delegated_model_profile_id ?? null, ...(profile.fast_mode !== undefined ? { fast_mode: profile.fast_mode } : {}) }); }; return <div className="configured-model-card" key={profile.id}><span className="configured-model-identity"><b>{profile.label}</b><small>{profile.model} · {modelProviderLabel(profile, zh)}</small>{profile.catalog_capabilities && <small>{zh ? "目录快照" : "Catalog snapshot"} (models.dev / {profile.catalog_capabilities.source_provider}) · {zh ? "上下文上限" : "Context limit"} {profile.catalog_capabilities.context_limit} · {zh ? "输出上限" : "Output limit"} {profile.catalog_capabilities.output_limit}</small>}</span><button onClick={() => editProfile(profile.model)}>{zh ? "编辑" : "Edit"}</button><button disabled={(!onListModels && !onModelDiscovery) || discovery?.state === "loading" || discovery?.can_refresh === false} onClick={() => void discoverModels(profile.id)}>{discovery?.state === "loading" ? <><LoaderCircle className="spin" size={13} />{zh ? "正在查询模型" : "Loading models"}</> : discovery?.state === "error" ? (zh ? "重试查询模型" : "Retry models") : (zh ? "可用模型" : "Models")}</button><button disabled={probe?.state === "testing" || !onProbeModel} onClick={() => void testModel(profile.id)}>{probe?.state === "testing" ? <><LoaderCircle className="spin" size={13} />{zh ? "测试中" : "Testing"}</> : (zh ? "测试" : "Test")}</button>{onDeleteModel && <button className="model-delete-button" aria-label={zh ? `删除 ${profile.label}` : `Delete ${profile.label}`} onClick={() => { setDeleteTarget(profile); setDeleteError(""); }}><Trash2 size={13} />{zh ? "删除" : "Delete"}</button>}{discovery?.state === "error" && <div className="model-discovery-state error" role="alert">{zh ? "无法查询可用模型，请重试。" : "Could not list models. Retry the query."}</div>}{discovery?.state === "empty" && <div className="model-discovery-state" role="status">{zh ? "提供方未返回任何模型。" : "The provider returned no models."}</div>}{discovery?.source === "configured_only" && <p role="status">{zh ? "仅显示已配置模型；完整 ID 可在编辑中手填。" : "Configured models only; enter a full ID in Edit."}</p>}{choices.length > 0 && <div className="model-choices"><label className="model-discovery-search"><Search size={15} /><input type="search" aria-label={zh ? `搜索 ${profile.label} 的可用模型` : `Search available models for ${profile.label}`} placeholder={zh ? "搜索模型 ID" : "Search model IDs"} value={modelChoiceQueries[profile.id] ?? ""} onChange={event => setModelChoiceQueries(current => ({ ...current, [profile.id]: event.target.value }))} /></label><small>{discovery?.source === "configured_only" ? (zh ? "已配置模型：" : "Configured models:") : (zh ? "服务端返回，点击后编辑：" : "Returned by provider; click to edit:")}</small>{choices.filter(model => model.toLocaleLowerCase().includes((modelChoiceQueries[profile.id] ?? "").trim().toLocaleLowerCase())).map(model => <button key={model} aria-label={model} onClick={() => editProfile(model)}>{model}</button>)}{!choices.some(model => model.toLocaleLowerCase().includes((modelChoiceQueries[profile.id] ?? "").trim().toLocaleLowerCase())) && <small>{zh ? "没有匹配的模型" : "No matching models"}</small>}</div>}{probe?.state === "success" && probe.result && <div className="model-probe-result success" role="status"><CheckCircle2 size={15} /><span><b>{zh ? "连接成功" : "Connection succeeded"}</b><small>{probe.result.model} · {probe.result.latency_ms} ms · {probe.result.endpoint}</small><code>{probe.result.response_preview}</code></span></div>}{probe?.state === "error" && <div className="model-probe-result error" role="alert"><XCircle size={15} /><span><b>{zh ? "测试失败" : "Test failed"}</b><small>{probe.message}</small></span></div>}</div>; })}</div>}
+        </section>
+        {subscriptionForm && <section ref={modelFormRef} className="subscription-model-editor"><SubscriptionModelForm key={`${subscriptionForm.provider}:${subscriptionForm.profile?.id ?? "new"}`} {...subscriptionForm} modelProfiles={modelProfiles} zh={zh} onCancel={() => setSubscriptionForm(null)} onSaved={profile => { invalidateProfile(profile.id); onSubscriptionSaved?.(profile); setSubscriptionForm(null); setModelSaveNotice(zh ? "模型配置已保存。" : "Model profile saved."); }} /></section>}
+        {form && <section key={modelFormRevealRequest} ref={modelFormRef} className="model-form" aria-label={zh ? "模型配置" : "Model configuration"}>
+          <div className="model-editor-heading"><div><span>{form.id ? (zh ? "编辑配置" : "Edit profile") : (zh ? "新建配置" : "New profile")}</span><h4>{form.label || (zh ? "模型配置" : "Model configuration")}</h4></div><button type="button" aria-label={zh ? "关闭模型编辑器" : "Close model editor"} onClick={closeModelForm}><X size={18} /></button></div>
+          <fieldset className="model-edit-fields" disabled={saving}>
+          <div className="model-form-grid model-basic-fields">
             <label>{zh ? "配置名称" : "Profile label"}<input aria-label="Profile label" value={form.label} onChange={(event) => setForm({ ...form, label: event.target.value })} /></label>
             <label>{zh ? "模型" : "Model"}<input aria-label="Model" list={isDeepSeek(form) ? "deepseek-models" : isOpenCodeGo(form) ? "opencode-go-models" : undefined} value={form.model} onChange={(event) => { const model = event.target.value; const protocol = isOpenCodeGo(form) ? openCodeGoProtocol(model) : null; const next = { ...form, model, contextWindowDraft: "", contextWindowDirty: false }; setForm(protocol ? withModelProtocol(next, protocol) : next); }} />{isDeepSeek(form) && <><datalist id="deepseek-models">{deepSeekModels.map((model) => <option key={model} value={model} />)}</datalist><small>{zh ? "可选择预设或输入模型 ID；保存后可查询当前可用模型。" : "Choose a preset or enter a model ID; discover available models after saving."}</small></>}{isOpenCodeGo(form) && <><datalist id="opencode-go-models">{openCodeGoModels.map((model) => <option key={model} value={model} />)}</datalist><small>{zh ? "已审核模型会自动选择协议；自定义模型可手动选择。" : "Reviewed models select their protocol automatically; choose a protocol for custom models."}</small></>}</label>
             {isOpenCodeGo(form) && <label>{zh ? "API 协议" : "API protocol"}<select aria-label="API protocol" value={form.provider} disabled={openCodeGoProtocol(form.model) !== null} onChange={(event) => setForm(withModelProtocol(form, event.target.value as ModelProfile["provider"]))}><option value="open_ai_compatible">Chat Completions</option><option value="anthropic">Anthropic Messages</option><option value="open_ai_responses">Responses</option></select></label>}
             <label className="wide">Base URL<input aria-label="Base URL" value={form.base_url} onChange={(event) => { const base_url = event.target.value; const next = { ...form, base_url, contextWindowDraft: "", contextWindowDirty: false }; const protocol = isOpenCodeGo(next) ? openCodeGoProtocol(form.model) : null; setForm(protocol ? withModelProtocol(next, protocol) : next); }} /></label>
-            {form.provider !== "ollama" && <label className="wide">API key<input aria-label="API key" type="password" autoComplete="new-password" value={form.credential} onChange={(event) => setForm({ ...form, credential: event.target.value })} /></label>}
+            {form.provider !== "ollama" && <label className="wide">API key<span className="model-credential-input"><input aria-label="API key" type={showCredential ? "text" : "password"} autoComplete="new-password" placeholder={form.id ? (zh ? "留空保留已保存的密钥" : "Leave blank to keep saved key") : "sk-…"} value={form.credential} onChange={(event) => setForm({ ...form, credential: event.target.value })} /><button type="button" aria-label={showCredential ? (zh ? "隐藏 API key" : "Hide API key") : (zh ? "显示 API key" : "Show API key")} onClick={() => setShowCredential(value => !value)}>{showCredential ? <EyeOff size={17} /> : <Eye size={17} />}</button></span><small>{form.id ? (zh ? "留空保留已保存的密钥。" : "Leave blank to keep the saved key.") : (zh ? "密钥仅存入系统凭据库。" : "The key is stored only in the system keyring.")}</small></label>}
             {isLocalLmStudioEndpoint(form) && <small className="wide">{zh ? "本机 LM Studio 默认无需密钥；密钥可选，设置后保存在系统凭据库。" : "For local LM Studio, the API key is optional; a supplied key is stored in the system keyring."}</small>}
             {(modelProviderPresets.filter((preset) => preset.id === "kimi-coding" || preset.id === "glm-coding").some((preset) => matchesModelProviderPreset(form, preset))) && <small className="wide">{zh ? "Coding 套餐需使用专属密钥，并受服务方客户端适用范围限制；OmicsOps 未获该服务方认证为支持客户端。" : "Coding plans need a dedicated subscription key and are subject to provider client eligibility; OmicsOps is not certified as a supported client."}</small>}
             {form.provider !== "ollama" && !isDeepSeek(form) && !isOpenCodeGo(form) && <small className="wide">{zh ? "请输入账户可用的完整模型 ID；保存后可查询服务端模型列表。预设不代表模型能力已验证。" : "Enter a full model ID available to your account; discover server models after saving. A preset does not verify model capabilities."}</small>}
+          </div>
+          <details className="model-advanced-options"><summary><span>{zh ? "高级选项" : "Advanced options"}</span><small>{zh ? "上下文、推理与子 Agent" : "Context, reasoning, and subagents"}</small><ChevronRight size={16} /></summary><div className="model-form-grid">
             <label className="wide">{zh ? "配置上下文预算" : "Configured context budget"}<input aria-label={zh ? "配置上下文预算" : "Configured context budget"} inputMode="numeric" value={form.contextWindowDraft} onChange={(event) => setForm({ ...form, contextWindowDraft: event.target.value, contextWindowDirty: true })} /><small>{zh ? "手动填写时优先使用该值。编辑现有模型时，留空或不修改会保留原预算；更新目录或更换模型后留空，会采用新目录的默认预算。实际可用输入额度还受模型能力限制。" : "A value entered here takes priority. When editing a model, leave it blank or unchanged to keep its budget. After refreshing the catalog or changing models, leave it blank to use the new catalog default. The effective input allowance also depends on model capabilities."}</small>{budgetError && <small className="field-error" role="alert">{budgetError}</small>}</label>
             {isOpenCodeGo(form) && <small className="wide">{zh ? "捆绑目录已包含审核过的 OpenCode Go 模型精确能力。此前版本保存的配置：点击“编辑”，勾选“保存时采用当前目录能力”并保存，然后开始新对话；现有运行不会更新，恢复时可能需要还原原配置。" : "The bundled catalog includes exact capabilities for reviewed OpenCode Go models. For profiles saved before this update, choose Edit, select Adopt current catalog capabilities, save, then start a new conversation. Existing runs are not updated and may require the original configuration to resume."}</small>}
 
@@ -246,11 +306,23 @@ export function SettingsPanel({ locale = "zh-CN", onLocaleChange, initialSection
               {form.delegated_model_profile_id && !modelProfiles.some((profile) => profile.id === form.delegated_model_profile_id && profile.supports_tools) && <option value={form.delegated_model_profile_id}>{zh ? "配置不可用，请重新选择" : "Profile unavailable; select again"}</option>}
             </select><small>{zh ? "用于新建普通 Agent 任务的只读委派；运行中任务保留原配置。" : "Used for read-only delegation in new ordinary Agent runs; existing runs keep their configuration."}</small></label>
           </div>
+          </details>
+          </fieldset>
           {isOpenCodeGo(form) && form.model.startsWith("muse-spark-") && <p role="status">{zh ? "Muse Spark Contributor 的提示词和回复可能用于模型训练。" : "Muse Spark Contributor prompts and completions may be used for model training."} <SubscriptionResourceLink resource="go_privacy" zh={zh}>{zh ? "服务方隐私说明" : "Provider privacy details"}</SubscriptionResourceLink></p>}
           {modelSaveError && <p role="alert">{modelSaveError}</p>}
-          <div className="model-form-actions"><button onClick={() => setForm(null)}>{zh ? "取消" : "Cancel"}</button><button className="primary" disabled={saving || Boolean(budgetError) || !form.label.trim() || !form.model.trim()} onClick={saveProvider}>{zh ? "保存提供方" : "Save provider"}</button></div>
+          <div className="model-form-actions model-editor-footer"><small>{zh ? "保存后可在上方查询可用模型和测试连接。" : "After saving, discover models and test the connection above."}</small><button onClick={closeModelForm}>{zh ? "取消" : "Cancel"}</button><button className="primary" aria-label={zh ? "保存提供方" : "Save provider"} disabled={saving || Boolean(budgetError) || !form.label.trim() || !form.model.trim()} onClick={saveProvider}>{saving && <LoaderCircle size={15} className="spin" />}{saving ? (zh ? "保存中…" : "Saving…") : (zh ? "保存提供方" : "Save provider")}</button></div>
         </section>}
-        {modelProfiles.length > 0 && <div className="configured-models">{modelProfiles.map((profile) => { const probe = modelTests[profile.id]; const discovery = modelDiscoveries[profile.id]; const choices = modelChoices[profile.id] ?? []; const editProfile = (model: string) => { if (profile.provider === "open_ai_codex" || profile.provider === "claude_code") { setForm(null); setSubscriptionForm({ provider: profile.provider, profile: { ...profile, model } }); return; } const provider = isOpenCodeGo(profile) ? openCodeGoProtocol(model) ?? profile.provider : profile.provider; showModelForm({ id: profile.id, label: profile.label, provider, base_url: profile.base_url, model, credential: "", contextWindowDraft: model === profile.model ? String(profile.context_window_tokens ?? "") : "", contextWindowDirty: false, reasoning_effort: model !== profile.model || provider === "anthropic" ? null : profile.reasoning_effort ?? null, delegated_model_profile_id: profile.delegated_model_profile_id ?? null, ...(profile.fast_mode !== undefined ? { fast_mode: profile.fast_mode } : {}) }); }; return <div key={profile.id}><span><b>{profile.label}</b><small>{profile.model} · {modelBackendLabel(profile, zh)}</small>{profile.catalog_capabilities && <small>{zh ? "目录快照" : "Catalog snapshot"} (models.dev / {profile.catalog_capabilities.source_provider}) · {zh ? "上下文上限" : "Context limit"} {profile.catalog_capabilities.context_limit} · {zh ? "输出上限" : "Output limit"} {profile.catalog_capabilities.output_limit}</small>}</span><button onClick={() => editProfile(profile.model)}>{zh ? "编辑" : "Edit"}</button><button disabled={(!onListModels && !onModelDiscovery) || discovery?.state === "loading" || discovery?.can_refresh === false} onClick={() => void discoverModels(profile.id)}>{discovery?.state === "loading" ? <><LoaderCircle className="spin" size={13} />{zh ? "正在查询模型" : "Loading models"}</> : discovery?.state === "error" ? (zh ? "重试查询模型" : "Retry models") : (zh ? "可用模型" : "Models")}</button><button disabled={probe?.state === "testing" || !onProbeModel} onClick={() => void testModel(profile.id)}>{probe?.state === "testing" ? <><LoaderCircle className="spin" size={13} />{zh ? "测试中" : "Testing"}</> : (zh ? "测试" : "Test")}</button>{onDeleteModel && <button className="model-delete-button" aria-label={zh ? `删除 ${profile.label}` : `Delete ${profile.label}`} onClick={() => { setDeleteTarget(profile); setDeleteError(""); }}><Trash2 size={13} />{zh ? "删除" : "Delete"}</button>}{discovery?.state === "error" && <div className="model-discovery-state error" role="alert">{zh ? "无法查询可用模型，请重试。" : "Could not list models. Retry the query."}</div>}{discovery?.state === "empty" && <div className="model-discovery-state" role="status">{zh ? "提供方未返回任何模型。" : "The provider returned no models."}</div>}{discovery?.source === "configured_only" && <p role="status">{zh ? "仅显示已配置模型；完整 ID 可在编辑中手填。" : "Configured models only; enter a full ID in Edit."}</p>}{choices.length > 0 && <div className="model-choices"><small>{discovery?.source === "configured_only" ? (zh ? "已配置模型：" : "Configured models:") : (zh ? "服务端返回，点击后编辑：" : "Returned by provider; click to edit:")}</small>{choices.map(model => <button key={model} aria-label={model} onClick={() => editProfile(model)}>{model}</button>)}</div>}{probe?.state === "success" && probe.result && <div className="model-probe-result success" role="status"><CheckCircle2 size={15} /><span><b>{zh ? "连接成功" : "Connection succeeded"}</b><small>{probe.result.model} · {probe.result.latency_ms} ms · {probe.result.endpoint}</small><code>{probe.result.response_preview}</code></span></div>}{probe?.state === "error" && <div className="model-probe-result error" role="alert"><XCircle size={15} /><span><b>{zh ? "测试失败" : "Test failed"}</b><small>{probe.message}</small></span></div>}</div>; })}</div>}
+        <section className="provider-catalog" aria-labelledby="provider-catalog-heading">
+          <div className="model-section-heading"><div><h4 id="provider-catalog-heading">{zh ? "添加模型服务" : "Add a model provider"}</h4><p>{zh ? "选择 API 服务、订阅账户或本地模型。" : "Choose an API service, subscription, or local model."}</p></div></div>
+          <div className="provider-catalog-toolbar">
+            <div className="provider-category-tabs" role="group" aria-label={zh ? "服务类型" : "Provider category"}>{(["all", "api", "subscription", "local"] as const).map(category => <button type="button" key={category} aria-pressed={providerCategory === category} onClick={() => setProviderCategory(category)}>{category === "all" ? (zh ? "全部" : "All") : category === "api" ? "API" : category === "subscription" ? (zh ? "订阅" : "Subscriptions") : (zh ? "本地" : "Local")}</button>)}</div>
+            <label className="provider-search"><Search size={16} /><input type="search" aria-label={zh ? "搜索提供方" : "Search providers"} placeholder={zh ? "搜索提供方…" : "Search providers…"} value={providerQuery} onChange={event => setProviderQuery(event.target.value)} /></label>
+          </div>
+        <div className="provider-grid">
+          {filteredPresets.map((preset) => <Provider zh={zh} key={preset.id} icon={preset.id === "custom" ? KeyRound : preset.id === "ollama" || preset.id === "lm-studio" ? Monitor : preset.id === "opencode-go" ? Globe2 : Cloud} name={preset.label} detail={zh ? preset.detailZh : preset.detailEn} configured={modelProfiles.some((profile) => preset.id === "custom" ? profile.provider === "open_ai_compatible" && !modelProviderPresets.some((candidate) => candidate.id !== "custom" && matchesModelProviderPreset(profile, candidate)) : matchesModelProviderPreset(profile, preset))} onConfigure={() => configurePreset(preset)} />)}
+        </div>
+          {filteredPresets.length === 0 && <p className="provider-search-empty">{zh ? "没有匹配的提供方" : "No matching providers"}</p>}
+        </section>
         <div className="settings-note"><ShieldCheck size={18} /><span><b>{zh ? "外部服务边界" : "External service boundary"}</b><small>{zh ? "模型与外部服务可能接收提示词、结果或元数据；使用前请确认目标服务。" : "Models and external services may receive prompts, results, or metadata. Review the destination before use."}</small></span></div>
       </main> : section === "remote" ? <RemoteSettings locale={locale} connections={connections} selectedProject={selectedProject} onSave={onSaveConnection} onTest={onTestConnection} onConfirm={onConfirmHostKey} onBind={onBindProjectRemote} /> : section === "remote-access" ? <RemoteAccessSettings locale={locale} selectedProject={selectedProject ?? null} onOpenEnvironments={() => navigate("remote")} /> : section === "skills" || section === "connections" ? <SkillsAndMcpSettings page={section} locale={locale} skillPackages={skillPackages} skillsBusy={skillsBusy} skillError={skillError} onImportSkill={onImportSkill ? importSkill : undefined} onSetSkillEnabled={onSetSkillEnabled} onSkillsChanged={onSkillsChanged} onNavigatePlugins={() => navigate("plugins")} mcpServers={mcpServers} selectedProject={selectedProject} onSaveMcpServer={onSaveMcpServer} onInspectMcpServer={onInspectMcpServer} onSetMcpServerEnabled={onSetMcpServerEnabled} onSetMcpLaunchApproval={onSetMcpLaunchApproval} onSetMcpToolApproval={onSetMcpToolApproval} onListBundledMcpPresets={onListBundledMcpPresets} onAddBundledMcp={onAddBundledMcp} onConfigurePubMedMcp={onConfigurePubMedMcp} /> : section === "workflows" ? <WorkflowSettings locale={locale} selectedProject={selectedProject} onClose={onClose} onChanged={onWorkflowsChanged} /> : section === "quick-actions" ? <QuickActionsSettings selectedProject={selectedProject ?? null} locale={locale} /> : section === "specialists" ? <SpecialistsSettings selectedProject={selectedProject ?? null} locale={locale} /> : section === "memory" ? <MemorySettings locale={locale} selectedProject={selectedProject ?? null} onChanged={onMemoryChanged} /> : section === "agent" ? <AgentSettings locale={locale} /> : section === "appearance" ? <AppearanceSettings locale={locale} /> : section === "pet" ? <PetSettings locale={locale} /> : section === "storage" ? <StorageSettings locale={locale} selectedProject={selectedProject ?? null} /> : section === "usage" ? <UsageSettings locale={locale} projects={projects} selectedProjectId={selectedProject?.id} onOpenConversation={onOpenUsageConversation} /> : section === "browser" ? <BrowserSettings locale={locale} /> : section === "permissions" ? <PermissionsSettings locale={locale} mcpServers={mcpServers} onSetMcpLaunchApproval={onSetMcpLaunchApproval} onSetMcpToolApproval={onSetMcpToolApproval} /> : section === "credentials" ? <CredentialsSettings locale={locale} onOpenOwner={(owner) => navigate(owner)} /> : section === "privacy" ? <PrivacySettings locale={locale} selectedProject={selectedProject} onNavigate={navigate} /> : <GeneralSettings locale={locale} onLocaleChange={onLocaleChange} onNavigate={navigate} />}
     </div>
@@ -268,6 +340,7 @@ function SettingsNavigation({ locale, section, onNavigate }: { locale: Locale; s
       label: zh ? "工作区" : "Workspace",
       items: [
         { section: "general" as const, zh: "常规", en: "General", keywords: ["语言", "language", "shortcut", "快捷键"], icon: Languages },
+        { section: "models" as const, zh: "模型提供方", en: "Model providers", keywords: ["model", "models", "模型", "provider"], icon: Bot },
         { section: "agent" as const, zh: "会话", en: "Session", keywords: ["agent", "迭代", "上下文"], icon: Bot },
         { section: "appearance" as const, zh: "外观", en: "Appearance", keywords: ["theme", "主题", "font", "字体", "zoom", "缩放"], icon: Palette },
         { section: "pet" as const, zh: "研究伴侣", en: "Pet", keywords: ["pet", "companion", "研究伴侣", "宠物", "preview", "预览"], icon: Sparkles },
@@ -283,7 +356,6 @@ function SettingsNavigation({ locale, section, onNavigate }: { locale: Locale; s
       id: "capabilities",
       label: zh ? "能力" : "Capabilities",
       items: [
-        { section: "models" as const, zh: "模型提供方", en: "Model providers", keywords: ["model", "models", "模型", "provider"], icon: Bot },
         { section: "skills" as const, zh: "Skills", en: "Skills", keywords: ["skill", "skills", "技能"], icon: Wrench },
         { section: "plugins" as const, zh: "插件", en: "Plugins", keywords: ["plugin", "plugins", "扩展", "插件", "package"], icon: PackageOpen },
         { section: "connections" as const, zh: "连接", en: "Connections", keywords: ["mcp", "MCP", "connection", "connections", "连接", "server"], icon: PlugZap },
@@ -669,6 +741,6 @@ function RemoteSettings({ locale, connections, selectedProject, onSave, onTest, 
   </main>;
 }
 
-function Provider({ icon: Icon, name, detail, configured, onConfigure }: { icon: typeof Cloud; name: string; detail: string; configured: boolean; onConfigure: () => void }) {
-  return <article><span><Icon size={19} /></span><div><b>{name}</b><small>{detail}{configured ? " · configured" : ""}</small></div><button aria-label={`Configure ${name}`} onClick={onConfigure}>Configure</button></article>;
+function Provider({ icon: Icon, name, detail, configured, onConfigure, zh }: { zh: boolean; icon: typeof Cloud; name: string; detail: string; configured: boolean; onConfigure: () => void }) {
+  return <article><span><Icon size={19} /></span><div><b>{name}</b><small>{detail}</small>{configured && <em className="provider-configured">{zh ? "已配置" : "configured"}</em>}</div><button aria-label={`Configure ${name}`} onClick={onConfigure}><Plus size={14} /><span>{zh ? "添加" : "Add"}</span></button></article>;
 }

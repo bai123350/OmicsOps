@@ -30,6 +30,177 @@ afterEach(() => {
 });
 
 describe("SettingsPanel model providers", () => {
+  it("keeps model setup next to General in workspace navigation", () => {
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} />);
+    const navigation = screen.getByRole("navigation", { name: "Settings pages" });
+    const buttons = within(navigation).getAllByRole("button");
+    expect(buttons.slice(0, 3).map(button => button.textContent)).toEqual(["General", "Model providers", "Session"]);
+    expect(within(screen.getByRole("region", { name: "Capabilities" })).getByRole("button", { name: "Skills" })).toBeInTheDocument();
+  });
+
+  it("puts saved models first and filters the provider catalog without hiding saved profiles", () => {
+    const profile = { id: "saved", label: "Lab gateway", provider: "open_ai_compatible" as const, base_url: "https://gateway.example/v1", model: "vendor/model", credential_reference: "model/saved", supports_tools: true, supports_vision: false };
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[profile]} />);
+    const saved = screen.getByRole("heading", { name: /^Your models/ });
+    const catalog = screen.getByRole("heading", { name: "Add a model provider" });
+    expect(saved.compareDocumentPosition(catalog) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByText("vendor/model · OpenAI-compatible API")).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search providers" }), { target: { value: "deepseek" } });
+    expect(screen.getByRole("button", { name: "Configure DeepSeek" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Configure Anthropic" })).not.toBeInTheDocument();
+    expect(screen.getByText("Lab gateway")).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search providers" }), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Local" }));
+    expect(screen.getByRole("button", { name: "Configure LM Studio" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Configure OpenAI" })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search providers" }), { target: { value: "no-such-provider" } });
+    expect(screen.getByText("No matching providers")).toBeInTheDocument();
+  });
+
+  it("starts with a simple editor and reveals only the newly entered API key", () => {
+    const profile = { id: "saved", label: "Lab gateway", provider: "open_ai_compatible" as const, base_url: "https://gateway.example/v1", model: "vendor/model", credential_reference: "model/saved", supports_tools: true, supports_vision: false };
+    const close = vi.fn();
+    render(<SettingsPanel locale="en-US" onClose={close} modelProfiles={[profile]} />);
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByText("Leave blank to keep the saved key.")).toBeInTheDocument();
+    const advanced = screen.getByText("Advanced options").closest("details")!;
+    expect(advanced).not.toHaveAttribute("open");
+    const key = screen.getByLabelText("API key");
+    expect(key).toHaveValue("");
+    fireEvent.change(key, { target: { value: "new-test-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "Show API key" }));
+    expect(key).toHaveAttribute("type", "text");
+    fireEvent.click(screen.getByRole("button", { name: "Hide API key" }));
+    expect(key).toHaveAttribute("type", "password");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByLabelText("API key")).not.toBeInTheDocument();
+    expect(close).not.toHaveBeenCalled();
+  });
+
+  it("does not let a completed save close a newer editor or retain a previous save error", async () => {
+    const pending = deferred<void>();
+    const save = vi.fn().mockReturnValueOnce(pending.promise).mockRejectedValueOnce(new Error("private detail"));
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} onSaveModel={save} />);
+    fireEvent.click(screen.getByRole("button", { name: "Configure DeepSeek" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    expect(screen.getByLabelText("Model")).toBeDisabled();
+    expect(screen.getByLabelText("API key")).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(screen.getByRole("button", { name: "Configure Kimi" }));
+    await act(async () => pending.resolve());
+    expect(screen.getByLabelText("Profile label")).toHaveValue("Kimi");
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "test-model" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not save");
+    fireEvent.click(screen.getByRole("button", { name: "Configure Kimi" }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("reveals saved-model feedback only for the editor whose save completes", async () => {
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    const scrollIntoView = vi.fn();
+    Element.prototype.scrollIntoView = scrollIntoView;
+    try {
+      const first = deferred<void>();
+      const second = deferred<void>();
+      const save = vi.fn().mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+      render(<SettingsPanel locale="en-US" onClose={() => undefined} onSaveModel={save} />);
+      fireEvent.click(screen.getByRole("button", { name: "Configure DeepSeek" }));
+      fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+      expect(scrollIntoView).toHaveBeenCalledTimes(1);
+      await act(async () => first.resolve());
+      expect(scrollIntoView).toHaveBeenCalledTimes(2);
+      expect(scrollIntoView.mock.instances[1]).toBe(screen.getByRole("region", { name: /^Your models/ }));
+
+      fireEvent.click(screen.getByRole("button", { name: "Configure DeepSeek" }));
+      fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      fireEvent.click(screen.getByRole("button", { name: "Configure Kimi" }));
+      expect(scrollIntoView).toHaveBeenCalledTimes(4);
+      await act(async () => second.resolve());
+      expect(scrollIntoView).toHaveBeenCalledTimes(4);
+      expect(screen.getByLabelText("Profile label")).toHaveValue("Kimi");
+    } finally {
+      Element.prototype.scrollIntoView = originalScrollIntoView;
+    }
+  });
+
+  it("filters returned models and clears old diagnostics after saving a changed profile", async () => {
+    const profile = { id: "saved", label: "Lab gateway", provider: "open_ai_compatible" as const, base_url: "https://gateway.example/v1", model: "vendor/old", credential_reference: "model/saved", supports_tools: true, supports_vision: false };
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[profile]} onSaveModel={vi.fn().mockResolvedValue(undefined)} onListModels={vi.fn().mockResolvedValue(["vendor/old", "vendor/new"])} onProbeModel={vi.fn().mockResolvedValue({ endpoint: "https://gateway.example/v1", model: "vendor/old", latency_ms: 12, response_preview: "OK" })} />);
+    fireEvent.click(screen.getByRole("button", { name: "Test" }));
+    await screen.findByText("Connection succeeded");
+    fireEvent.click(screen.getByRole("button", { name: "Models" }));
+    await screen.findByRole("button", { name: "vendor/new" });
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search available models for Lab gateway" }), { target: { value: "new" } });
+    expect(screen.queryByRole("button", { name: "vendor/old" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "vendor/new" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    await waitFor(() => expect(screen.queryByLabelText("Model")).not.toBeInTheDocument());
+    expect(screen.queryByText("Connection succeeded")).not.toBeInTheDocument();
+    expect(screen.queryByRole("searchbox", { name: "Search available models for Lab gateway" })).not.toBeInTheDocument();
+    expect(screen.getByText("Model profile saved.")).toBeInTheDocument();
+  });
+
+  it("ignores old discovery and probe responses that arrive after a profile save", async () => {
+    const profile = { id: "saved", label: "Lab gateway", provider: "open_ai_compatible" as const, base_url: "https://gateway.example/v1", model: "vendor/old", credential_reference: null, supports_tools: true, supports_vision: false };
+    const probe = deferred<import("../../types").ModelProbeResult>();
+    const models = deferred<string[]>();
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[profile]} onSaveModel={vi.fn().mockResolvedValue(undefined)} onListModels={() => models.promise} onProbeModel={() => probe.promise} />);
+    fireEvent.click(screen.getByRole("button", { name: "Models" }));
+    fireEvent.click(screen.getByRole("button", { name: "Test" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "vendor/new" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
+    await waitFor(() => expect(screen.queryByLabelText("Model")).not.toBeInTheDocument());
+    await act(async () => {
+      models.resolve(["old-discovered-model"]);
+      probe.resolve({ endpoint: "https://gateway.example/v1", protocol: "OpenAiCompatible", model: "vendor/old", latency_ms: 12, response_preview: "old result" });
+    });
+    expect(screen.queryByText("Connection succeeded")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "old-discovered-model" })).not.toBeInTheDocument();
+  });
+
+  it.each(["save", "disconnect"])("invalidates subscription diagnostics after %s and ignores late responses", async (action) => {
+    const profile = { id: "subscription", label: "Lab Codex", provider: "open_ai_codex" as const, base_url: "https://chatgpt.com/backend-api", model: "full-model-id", credential_reference: null, subscription_account_ref: "host-account", supports_tools: true, supports_vision: false };
+    const updated = action === "disconnect" ? { ...profile, subscription_account_ref: null } : profile;
+    vi.spyOn(api, "subscriptionModelStatus").mockResolvedValue({ provider: "open_ai_codex", authenticated: true, masked_account_label: null, cli_version: null, error_code: null });
+    vi.spyOn(api, "saveModelProfile").mockResolvedValue(updated);
+    vi.spyOn(api, "disconnectCodex").mockResolvedValue(updated);
+    const lateProbe = deferred<import("../../types").ModelProbeResult>();
+    const lateDiscovery = deferred<import("../../types").ModelDiscoveryResult>();
+    const result = { endpoint: "https://chatgpt.com/backend-api", protocol: "OpenAiCodex", model: "full-model-id", latency_ms: 15, response_preview: "OK" };
+    const probe = vi.fn().mockResolvedValueOnce(result).mockReturnValueOnce(lateProbe.promise);
+    const discover = vi.fn().mockResolvedValueOnce({ models: [profile.model], source: "configured_only", can_refresh: false }).mockReturnValueOnce(lateDiscovery.promise);
+    render(<SettingsPanel locale="en-US" onClose={() => undefined} modelProfiles={[profile]} onProbeModel={probe} onModelDiscovery={discover} />);
+    fireEvent.click(screen.getByRole("button", { name: "Test" }));
+    expect(await screen.findByText("Connection succeeded")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Models" }));
+    expect(await screen.findByText("Configured models only; enter a full ID in Edit.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Models" })).toBeDisabled();
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search available models for Lab Codex" }), { target: { value: "old-filter" } });
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.click(screen.getByRole("button", { name: action === "save" ? "Save profile" : "Disconnect this subscription profile" }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Subscription model configuration" })).not.toBeInTheDocument());
+    expect(screen.queryByText("Connection succeeded")).not.toBeInTheDocument();
+    expect(screen.queryByText("Configured models only; enter a full ID in Edit.")).not.toBeInTheDocument();
+    expect(screen.queryByRole("searchbox", { name: "Search available models for Lab Codex" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Models" })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Test" }));
+    fireEvent.click(screen.getByRole("button", { name: "Models" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.click(screen.getByRole("button", { name: action === "save" ? "Save profile" : "Disconnect this subscription profile" }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Subscription model configuration" })).not.toBeInTheDocument());
+    await act(async () => {
+      lateProbe.resolve(result);
+      lateDiscovery.resolve({ models: ["late-subscription-model"], source: "configured_only", can_refresh: false });
+    });
+    expect(screen.queryByText("Connection succeeded")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "late-subscription-model" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Models" })).toBeEnabled();
+  });
+
   it("reveals the model form only when configuring or editing a profile", () => {
     const originalScrollIntoView = Element.prototype.scrollIntoView;
     const scrollIntoView = vi.fn();
