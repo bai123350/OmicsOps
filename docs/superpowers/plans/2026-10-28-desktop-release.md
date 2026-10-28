@@ -283,3 +283,11 @@ runner assumptions before a release tag was created:
 Local focused validation: Python 3.12 full suite PASS (99 tests, 2 existing symlink
 privilege skips); native HTTP feature contract PASS (1 test); resource/release-notes
 privacy and diff checks PASS. The next cloud run must verify the fixes on real runners.
+
+The next ordinary CI (`40664597955`, `da459b8`) passed on Linux. macOS progressed past
+Python and exposed the same runner temporary-directory alias in 85 desktop Rust tests:
+the application's intentional ancestor-link checks rejected those fixture paths before
+their read/budget assertions. CI and release setup now export the canonical existing
+macOS temporary directory as `TMPDIR` before the unchanged suites run. No runtime path
+policy, symlink rejection test, or test timeout is relaxed. Native reruns remain the
+confirmation for this environment-only adjustment.

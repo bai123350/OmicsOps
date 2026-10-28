@@ -35,6 +35,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Use a canonical temporary directory on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          python -c 'import pathlib, tempfile; print("TMPDIR=" + str(pathlib.Path(tempfile.gettempdir()).resolve(strict=True)))' >> "$GITHUB_ENV"
       - run: python -B -m unittest discover -s scripts -p "test_*.py"
       - run: python -B scripts/release.py check-version
       - run: python -B scripts/check_release_privacy.py

@@ -112,6 +112,11 @@ jobs:
           # Cargo.toml and target/ belong to the repository root workspace.
           workspaces: '. -> target'
           key: desktop-${{ matrix.target }}
+      - name: Use a canonical temporary directory on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          python -c 'import pathlib, tempfile; print("TMPDIR=" + str(pathlib.Path(tempfile.gettempdir()).resolve(strict=True)))' >> "$GITHUB_ENV"
       - run: npm ci
       - run: python -B -m unittest discover -s scripts -p "test_*.py"
       - run: npm run build
