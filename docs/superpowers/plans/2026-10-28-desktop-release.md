@@ -291,3 +291,13 @@ their read/budget assertions. CI and release setup now export the canonical exis
 macOS temporary directory as `TMPDIR` before the unchanged suites run. No runtime path
 policy, symlink rejection test, or test timeout is relaxed. Native reruns remain the
 confirmation for this environment-only adjustment.
+
+The first no-tag release run (`40664623262`) built and uploaded Linux DEB/AppImage
+successfully. Windows exposed one further fixture assertion: the offline-example
+test compared the canonical output path with its raw short-name temporary directory.
+A Windows case-alias fixture reproduced the same failure locally. The test now compares
+canonical direct-parent identity (stricter than the old string-prefix assertion), retaining
+all repeat/new-request checks. The targeted desktop test passed after failing with the
+old assertion; production code is unchanged. The intermediate release run `40666710825`
+was cancelled because it still contained this known failing assertion; no release tag or
+draft had been created. All native targets must pass together in the next full run.

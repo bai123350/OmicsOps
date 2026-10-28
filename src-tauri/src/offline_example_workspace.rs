@@ -1732,7 +1732,11 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn offline_example_create_fixed_files_retry_and_new_request() {
-        let dir = tempfile::tempdir().unwrap();
+        let fixture_root = tempfile::tempdir().unwrap();
+        // Exercise a valid Windows spelling that differs from the canonical path,
+        // as happens with hosted runners' short TEMP paths.
+        let parent_alias = fixture_root.path().to_string_lossy().to_ascii_uppercase();
+        let dir = tempfile::tempdir_in(parent_alias).unwrap();
         let request = request(dir.path());
         let fixture = load_bundled_example().unwrap();
         let first =
@@ -1742,7 +1746,10 @@ mod tests {
             child.file_name().unwrap(),
             format!("omicsops-example-{}", request.request_id).as_str()
         );
-        assert!(child.starts_with(dir.path()));
+        assert_eq!(
+            fs::canonicalize(child.parent().unwrap()).unwrap(),
+            fs::canonicalize(dir.path()).unwrap()
+        );
         let repeated =
             materialize_offline_example(&request, &fixture, write_new_example_file).unwrap();
         assert_eq!(first.project, repeated.project);
