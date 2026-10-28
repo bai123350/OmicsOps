@@ -477,8 +477,13 @@ mod tests {
 
     #[test]
     fn subscription_profile_validation_preserves_omitted_cli_and_rejects_wrong_fields() {
+        // Profile validation checks a native absolute path. Runtime execution still
+        // enforces the Windows-only Claude Code policy separately.
+        let fixture_root = tempfile::tempdir().unwrap();
+        let executable = fixture_root.path().join("claude.exe");
+        let executable = executable.to_string_lossy().into_owned();
         let mut value = request("claude_code", "claude-code://local", "sonnet");
-        value.cli_executable = Some(Some("C:\\Tools\\claude.exe".into()));
+        value.cli_executable = Some(Some(executable.clone()));
         let saved = model_profile_from_request(value.clone()).unwrap();
         assert_eq!(saved.credential_reference, None);
         let mut omitted =
@@ -495,11 +500,14 @@ mod tests {
             true,
         );
         assert_eq!(omitted.cli_executable, saved.cli_executable);
-        assert_eq!(
-            saved.cli_executable.as_deref(),
-            Some("C:\\Tools\\claude.exe")
-        );
-        value.cli_executable = Some(Some("C:\\Tools\\claude.cmd".into()));
+        assert_eq!(saved.cli_executable.as_deref(), Some(executable.as_str()));
+        value.cli_executable = Some(Some(
+            fixture_root
+                .path()
+                .join("claude.cmd")
+                .to_string_lossy()
+                .into_owned(),
+        ));
         assert!(model_profile_from_request(value).is_err());
         let mut codex = request(
             "open_ai_codex",

@@ -25,7 +25,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "msi"],
+    "targets": "all",
+    "category": "Education",
+    "shortDescription": "A desktop workbench for computational biology",
     "resources": {
       "../skills/single-cell/": "skills/single-cell/",
       "../skills/wisp-science/": "skills/wisp-science/",
@@ -47,6 +49,12 @@
       "../browser-extension/url-policy.js": "browser-extension/url-policy.js",
       "../browser-extension/websocket-client.js": "browser-extension/websocket-client.js"
     },
-    "icon": []
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
   }
 }

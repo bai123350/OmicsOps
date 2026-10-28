@@ -30,7 +30,7 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 hex = "0.4"
-keyring = { version = "3", features = ["windows-native"] }
+keyring = { version = "3", default-features = false }
 pdf-extract = "0.10"
 quick-xml = "0.38"
 regex = "1"

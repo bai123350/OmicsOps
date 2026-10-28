@@ -1358,7 +1358,7 @@ fn discover_browser(explicit: Option<&Path>) -> Result<PathBuf, BrowserError> {
         }
         return Err(BrowserError::BrowserNotFound);
     }
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<PathBuf> = Vec::new();
     #[cfg(target_os = "windows")]
     {
         for root in ["PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"] {
@@ -1409,6 +1409,31 @@ fn downloads_directory() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_browser_discovery_requires_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("browser-fixture");
+        assert!(matches!(
+            discover_browser(Some(&executable)),
+            Err(BrowserError::BrowserNotFound)
+        ));
+        std::fs::write(&executable, b"not launched by discovery").unwrap();
+        assert_eq!(discover_browser(Some(&executable)).unwrap(), executable);
+        assert!(matches!(
+            discover_browser(Some(directory.path())),
+            Err(BrowserError::BrowserNotFound)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_browser_discovery_requires_an_explicit_executable() {
+        assert!(matches!(
+            discover_browser(None),
+            Err(BrowserError::BrowserNotFound)
+        ));
+    }
 
     #[test]
     fn rejects_non_http_urls_and_web_ai_scripts() {

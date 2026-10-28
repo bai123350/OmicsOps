@@ -15,7 +15,6 @@ base64.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 hex.workspace = true
-keyring.workspace = true
 omicsops-core = { path = "../omicsops-core" }
 omicsops-dto = { path = "../omicsops-dto" }
 pdf-extract.workspace = true
@@ -33,6 +32,15 @@ tokio.workspace = true
 url.workspace = true
 uuid.workspace = true
 zip.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { workspace = true, features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { workspace = true, features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { workspace = true, features = ["sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
 tempfile = "3"

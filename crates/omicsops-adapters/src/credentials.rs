@@ -94,3 +94,38 @@ impl CredentialVault for SystemCredentialVault {
 fn keyring_error(error: keyring::Error) -> AdapterError {
     AdapterError::Credential(error.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn system_credential_backend_never_defaults_to_mock() {
+        // Inspect the same default builder used by Entry::new without constructing an
+        // entry: the Linux builder may access D-Bus when building a credential.
+        let builder = keyring::default::default_credential_builder();
+        assert!(
+            !builder
+                .as_any()
+                .is::<keyring::mock::MockCredentialBuilder>(),
+            "system credentials must use a persistent OS credential store"
+        );
+
+        #[cfg(target_os = "windows")]
+        assert!(
+            builder
+                .as_any()
+                .is::<keyring::windows::WinCredentialBuilder>()
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            builder
+                .as_any()
+                .is::<keyring::macos::MacCredentialBuilder>()
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            builder
+                .as_any()
+                .is::<keyring::secret_service::SsCredentialBuilder>()
+        );
+    }
+}
