@@ -709,15 +709,27 @@ describe("DesktopApp", () => {
   it("opens a collection exact ID and restores using its current banner revision", async () => {
     const { change, get, set } = visibilityHarness();
     change({ ...get(), visibility: "shelved", revision: 5 });
+    const activeRead = deferred<ConversationVisibilityRecordV1>();
+    const visibilityRead = vi.mocked(api.getConversationVisibility).getMockImplementation()!;
+    let activeReads = 0;
+    vi.mocked(api.getConversationVisibility).mockImplementation((projectId, id) => {
+      if (id === stateConversations[0].id && ++activeReads === 2) return activeRead.promise;
+      return visibilityRead(projectId, id);
+    });
     vi.mocked(api.latestUsedConversation).mockResolvedValue(stateConversations[1]);
     render(<DesktopApp />); await screen.findByRole("heading", { name: stateConversations[1].title });
     fireEvent.click(screen.getByRole("button", { name: "收起的会话" }));
     const dialog = await screen.findByRole("dialog", { name: "收起的会话" });
     fireEvent.click(await within(dialog).findByRole("button", { name: "打开" }));
     await screen.findByRole("heading", { name: stateConversations[0].title });
+    await waitFor(() => expect(activeReads).toBe(2));
     expect(set).not.toHaveBeenCalled();
     fireEvent.keyDown(window, { key: "Escape" });
-    fireEvent.click(screen.getByRole("button", { name: "恢复会话" }));
+    expect(screen.queryByRole("dialog", { name: "收起的会话" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "恢复会话" })).toBeNull();
+    // The selected title renders before its authoritative visibility read finishes.
+    await act(async () => activeRead.resolve({ ...get() }));
+    fireEvent.click(await screen.findByRole("button", { name: "恢复会话" }));
     await waitFor(() => expect(set).toHaveBeenCalledWith(expect.objectContaining({ visibility: "visible", expected_revision: 5 })));
     await waitFor(() => expect(screen.queryByRole("button", { name: "恢复会话" })).toBeNull());
     expect(screen.getByRole("button", { name: stateConversations[0].title })).toBeVisible();

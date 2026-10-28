@@ -310,3 +310,12 @@ own toolchain before starting the request timer, then uses the real managed-chil
 stdin/stderr pipes. It still consumes stdin, writes 65,537 stderr bytes, and requires
 the same overflow error within the unchanged 3-second limit; identity-change checks
 remain intact. All 9 Claude contract tests passed locally after this test-only fix.
+
+That release run successfully uploaded the Linux and macOS Apple Silicon installers.
+Intel macOS passed Rust but exposed a frontend test race: the selected conversation
+title appeared before its authoritative visibility read completed. The regression now
+controls that read with a deferred response and waits for the actual Restore button,
+retaining the expected revision and restored-list assertions. Node 22 reproduced the
+original failure and then passed all 177 tests in `DesktopApp.test.tsx`. Production UI
+code, test timeouts, and skip rules are unchanged. A new four-target run must validate
+both test-stability fixes together before tagging.
