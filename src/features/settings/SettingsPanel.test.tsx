@@ -1047,8 +1047,8 @@ describe("SettingsPanel model providers", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Skills" }));
     expect(screen.getByText(/固定 GitHub 快照/)).toBeInTheDocument();
-    expect(screen.getByText("组学技能")).toBeInTheDocument();
-    expect(screen.getByText("单细胞组学")).toBeInTheDocument();
+    expect(screen.queryByText("组学技能")).not.toBeInTheDocument();
+    expect(screen.queryByText("单细胞组学")).not.toBeInTheDocument();
     expect(screen.getByText("scrna-qc")).toBeInTheDocument();
     expect(screen.getByText("read_project_files")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "导入技能目录" }));
@@ -1056,6 +1056,25 @@ describe("SettingsPanel model providers", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "启用" })).not.toBeDisabled());
     fireEvent.click(screen.getByRole("button", { name: "启用" }));
     expect(onSetSkillEnabled).toHaveBeenCalledWith("skill-1", true);
+  });
+
+  it.each(["zh-CN", "en-US"] as const)("shows every skill in one flat list regardless of saved category (%s)", (locale) => {
+    const skillPackages: SkillPackage[] = [
+      { id: "skill-1", name: "scrna-qc", version: "1.2.0", source_path: "skills/scrna-qc", sha256: "a".repeat(64), enabled: false, capabilities: [], category: "single_cell" },
+      { id: "skill-2", name: "literature-review", version: "1.0.0", source_path: "skills/literature-review", sha256: "b".repeat(64), enabled: true, capabilities: [], category: null },
+      { id: "skill-3", name: "pathway-analysis", version: "1.0.0", source_path: "skills/pathway-analysis", sha256: "c".repeat(64), enabled: false, capabilities: [], category: "analysis" },
+    ];
+    render(<SettingsPanel locale={locale} initialSection="skills" onClose={() => undefined} skillPackages={skillPackages} onSetSkillEnabled={vi.fn()} />);
+
+    const list = screen.getByRole("list", { name: locale === "zh-CN" ? "所有 Skills" : "All Skills" });
+    const items = within(list).getAllByRole("listitem");
+    expect(items).toHaveLength(3);
+    expect(items.map((item) => within(item).getByText(/^(scrna-qc|literature-review|pathway-analysis)$/).textContent)).toEqual(["scrna-qc", "literature-review", "pathway-analysis"]);
+    expect(list.querySelector("details")).toBeNull();
+    expect(screen.queryByRole("region", { name: /^(组学技能|Omics skills|未分组技能|Uncategorized skills)$/ })).not.toBeInTheDocument();
+    expect(within(items[0]).getByRole("button", { name: locale === "zh-CN" ? "启用" : "Enable" })).toBeEnabled();
+    expect(within(items[1]).getByRole("button", { name: locale === "zh-CN" ? "停用" : "Disable" })).toBeEnabled();
+    expect(within(list).getAllByRole("button", { name: locale === "zh-CN" ? "详情" : "Details" })).toHaveLength(3);
   });
 
   it("opens host-backed skill details and closes them before Settings", async () => {

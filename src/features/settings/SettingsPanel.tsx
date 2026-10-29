@@ -4,7 +4,7 @@ import { isOpenCodeGo, openCodeGoModels, openCodeGoProtocol, reviewedGoEfforts, 
 import type { ModelDiscoveryResult, SaveModelProfileRequest } from "../../types";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowLeft, Bot, Brain, ChevronRight, Eye, EyeOff, Plus, X, CheckCircle2, ClipboardList, Cloud, Database, FolderOpen, Gauge, Globe2, KeyRound, Languages, Layers3, LoaderCircle, Monitor, PackageOpen, Palette, PlugZap, Search, Server, ShieldCheck, Sparkles, Trash2, Wrench, XCircle } from "lucide-react";
+import { ArrowLeft, Bot, Brain, ChevronRight, Eye, EyeOff, Plus, X, CheckCircle2, ClipboardList, Cloud, Database, FolderOpen, Gauge, Globe2, KeyRound, Languages, LoaderCircle, Monitor, PackageOpen, Palette, PlugZap, Search, Server, ShieldCheck, Sparkles, Trash2, Wrench, XCircle } from "lucide-react";
 import type { ConnectionProfile, ConnectionTestResult, McpEnvBinding, McpServerProfile, ModelProbeResult, ModelProfile, SaveMcpEnvBindingRequest, SkillPackage, SkillRemovalOperation, SystemInterpreterDiagnostics, WorkspaceProject } from "../../types";
 import type { Locale } from "../workspace/copy";
 import { supportsFastMode } from "../../fast-mode";
@@ -458,11 +458,6 @@ function SkillsAndMcpSettings({ page, locale, skillPackages, skillsBusy, skillEr
   const [removalOperationsError, setRemovalOperationsError] = useState(false);
   const [removalOperationBusy, setRemovalOperationBusy] = useState<string | null>(null);
   const [removalOperationMessage, setRemovalOperationMessage] = useState("");
-  const categorizedSkills = skillPackages.filter((skill) => skill.category);
-  const ungroupedSkills = skillPackages.filter((skill) => !skill.category);
-  const skillGroups = Array.from(new Set(categorizedSkills.map((skill) => skill.category!)))
-    .sort()
-    .map((category) => [category, categorizedSkills.filter((skill) => skill.category === category)] as const);
 
   const loadRemovalOperations = useCallback(async () => {
     try {
@@ -599,18 +594,8 @@ function SkillsAndMcpSettings({ page, locale, skillPackages, skillsBusy, skillEr
       {removalOperationMessage && <p role="status">{removalOperationMessage}</p>}
       {removalOperations.map((operation) => <article key={operation.operation_id}><span><b>{operation.name}</b><small>{operation.phase}{operation.preserved_files ? (zh ? " · 文件已保留" : " · files preserved") : ""}</small></span><button type="button" disabled={removalOperationBusy !== null} onClick={() => void retryRemoval(operation.operation_id)}>{removalOperationBusy === operation.operation_id ? (zh ? "重试中…" : "Retrying…") : (zh ? "重试已验证清理" : "Retry verified cleanup")}</button></article>)}
     </section>}
-    {skillPackages.length === 0 ? <div className="skill-empty skill-library-empty">{zh ? "尚未导入科研技能" : "No research skills imported"}</div> : <div className="skill-library">
-      {skillGroups.length > 0 && <section className="skill-domain" aria-label={zh ? "组学技能" : "Omics skills"}>
-        <div className="skill-domain-title"><Layers3 size={18} /><span><b>{zh ? "组学技能" : "Omics skills"}</b><small>{zh ? `${skillGroups.length} 个分区 · ${categorizedSkills.length} Skills` : `${skillGroups.length} categories · ${categorizedSkills.length} Skills`}</small></span></div>
-        <div className="skill-category-list">{skillGroups.map(([category, skills]) => <details className="skill-category" key={category} open>
-          <summary><FolderOpen size={17} /><span><b>{skillCategoryLabel(category, zh)}</b><small>{skills.length} Skills · {skills.filter((skill) => skill.enabled).length} {zh ? "已启用" : "enabled"}</small></span></summary>
-          <div className="skill-list">{skills.map((skill) => <SkillCard key={skill.id} skill={skill} zh={zh} busy={skillsBusy || skillActionBusy !== null} active={skillActionBusy === skill.id} canToggle={Boolean(onSetSkillEnabled)} onToggle={() => void toggleSkill(skill)} onOpen={() => setDetailSkillId(skill.id)} />)}</div>
-        </details>)}</div>
-      </section>}
-      {ungroupedSkills.length > 0 && <section className="skill-domain ungrouped" aria-label={zh ? "未分组技能" : "Uncategorized skills"}>
-        <div className="skill-domain-title"><FolderOpen size={18} /><span><b>{zh ? "未分组技能" : "Uncategorized skills"}</b><small>{zh ? "手动导入或尚未分类" : "Imported manually or not yet categorized"}</small></span></div>
-        <div className="skill-list">{ungroupedSkills.map((skill) => <SkillCard key={skill.id} skill={skill} zh={zh} busy={skillsBusy || skillActionBusy !== null} active={skillActionBusy === skill.id} canToggle={Boolean(onSetSkillEnabled)} onToggle={() => void toggleSkill(skill)} onOpen={() => setDetailSkillId(skill.id)} />)}</div>
-      </section>}
+    {skillPackages.length === 0 ? <div className="skill-empty skill-library-empty">{zh ? "尚未导入科研技能" : "No research skills imported"}</div> : <div className="skill-list" role="list" aria-label={zh ? "所有 Skills" : "All Skills"}>
+      {skillPackages.map((skill) => <SkillCard key={skill.id} skill={skill} zh={zh} busy={skillsBusy || skillActionBusy !== null} active={skillActionBusy === skill.id} canToggle={Boolean(onSetSkillEnabled)} onToggle={() => void toggleSkill(skill)} onOpen={() => setDetailSkillId(skill.id)} />)}
     </div>}
     <div className="settings-note"><ShieldCheck size={18} /><span><b>{zh ? "Skills 默认不启用" : "Skills are disabled by default"}</b><small>{zh ? "导入后请先检查来源、能力声明和使用说明，再决定是否启用。" : "Review the source, declared capabilities, and usage guide after import before enabling a Skill."}</small></span></div>
     {detailSkillId && <SkillDetails key={detailSkillId} skillId={detailSkillId} locale={locale} onClose={() => setDetailSkillId(null)} onRemoved={onSkillsChanged} onOperationsChanged={loadRemovalOperations} onNavigatePlugins={() => { setDetailSkillId(null); onNavigatePlugins(); }} />}
@@ -651,13 +636,8 @@ function mcpStatusLabel(server: McpServerProfile, zh: boolean) {
   return server.last_inspected_at ? (zh ? "已检查，默认停用" : "Inspected; disabled by default") : (zh ? "未检查" : "Not inspected");
 }
 
-function skillCategoryLabel(category: string, zh: boolean) {
-  if (category === "single_cell") return zh ? "单细胞组学" : "Single-cell omics";
-  return category.replace(/_/g, " ");
-}
-
 function SkillCard({ skill, zh, busy, active, canToggle, onToggle, onOpen }: { skill: SkillPackage; zh: boolean; busy: boolean; active: boolean; canToggle: boolean; onToggle: () => void; onOpen: () => void }) {
-  return <article><div className="skill-title"><span><b>{skill.name}</b><small>v{skill.version} · SHA-256 {skill.sha256.slice(0, 12)}</small></span><span className="skill-card-actions"><button type="button" onClick={onOpen}>{zh ? "详情" : "Details"}</button><button type="button" disabled={busy || !canToggle} onClick={onToggle}>{active ? (zh ? "更新中…" : "Updating…") : skill.enabled ? (zh ? "停用" : "Disable") : (zh ? "启用" : "Enable")}</button></span></div><div className="skill-capabilities">{skill.capabilities.length === 0 ? <em>{zh ? "无额外能力" : "No additional capabilities"}</em> : skill.capabilities.map((capability) => <em key={capability}>{capability}</em>)}</div><small className="skill-state">{skill.enabled ? (zh ? "已启用" : "Enabled") : (zh ? "已安装，等待启用" : "Installed, awaiting enablement")}</small></article>;
+  return <article role="listitem"><div className="skill-title"><span><b>{skill.name}</b><small>v{skill.version} · SHA-256 {skill.sha256.slice(0, 12)}</small></span><span className="skill-card-actions"><button type="button" onClick={onOpen}>{zh ? "详情" : "Details"}</button><button type="button" disabled={busy || !canToggle} onClick={onToggle}>{active ? (zh ? "更新中…" : "Updating…") : skill.enabled ? (zh ? "停用" : "Disable") : (zh ? "启用" : "Enable")}</button></span></div><div className="skill-capabilities">{skill.capabilities.length === 0 ? <em>{zh ? "无额外能力" : "No additional capabilities"}</em> : skill.capabilities.map((capability) => <em key={capability}>{capability}</em>)}</div><small className="skill-state">{skill.enabled ? (zh ? "已启用" : "Enabled") : (zh ? "已安装，等待启用" : "Installed, awaiting enablement")}</small></article>;
 }
 
 type RemoteConnectionForm = { id: string; label: string; host: string; port: number; username: string; authentication: ConnectionProfile["authentication"]; secret: string; keyPath: string; passphrase: string };
