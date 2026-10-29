@@ -5,3 +5,6 @@
 
 .file-source-options{display:flex;gap:6px;padding:10px 12px;border-bottom:1px solid #e5e7eb}.file-source-options button{padding:5px 12px;border:1px solid #d6dedb;border-radius:7px;background:#fff;color:#64706b}.file-source-options button[aria-pressed="true"]{background:#e8f7f4;border-color:#0d9488;color:#0f766e}.file-source-options button:disabled{opacity:.45}
 .file-list-limit{display:block;padding:0 14px 10px;color:#667085;font-size:10px;line-height:1.5}
+.remote-tree-file>input[type="checkbox"]{width:14px;min-width:14px;height:14px;flex:0 0 14px;margin:0;padding:0}
+.file-tree{container-type:inline-size}
+@container (max-width:320px){.remote-file-tree{--remote-tree-indent:4px}.remote-tree-file{gap:4px}.remote-tree-file button{width:20px;height:24px}}

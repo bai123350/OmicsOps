@@ -89,15 +89,15 @@ function fileListingErrorMessage(source: "local" | "remote", locale: Locale, err
 function RemoteTreeItem({ baselineSelectedPaths, onToggleBaselineFile, node, depth, locale, expandedPaths, busy, onToggle, onDownload, onPreviewText, onPreviewTable, onAttach, dragReference }: { baselineSelectedPaths: string[]; onToggleBaselineFile?: (relativePath: string) => void; onPreviewTable?: (relativePath: string) => void; onPreviewText?: (relativePath: string) => void; onAttach?: (relativePath: string) => void; dragReference?: (relativePath: string) => WorkspaceFileReference; node: RemoteTreeNode; depth: number; locale: Locale; expandedPaths: Set<string>; busy: boolean; onToggle: (relativePath: string) => void; onDownload?: (relativePath: string) => Promise<void> | void }) {
   const zh = locale === "zh-CN";
   const expanded = expandedPaths.has(node.relativePath);
-  const paddingLeft = 10 + depth * 16;
+  const indentation = `${Math.min(depth, 8)} * var(--remote-tree-indent, 16px)`;
   const table = /\.(csv|tsv)$/i.test(node.relativePath);
   const preview = table ? onPreviewTable : onPreviewText;
   if (node.directory) {
     return <>
-      <button className="remote-tree-directory" role="treeitem" aria-level={depth + 1} aria-expanded={expanded} aria-label={`${expanded ? (zh ? "折叠文件夹" : "Collapse folder") : (zh ? "展开文件夹" : "Expand folder")}：${node.name}`} title={node.relativePath} style={{ paddingLeft }} onClick={() => onToggle(node.relativePath)}>
+      <button className="remote-tree-directory" role="treeitem" aria-level={depth + 1} aria-expanded={expanded} aria-label={`${expanded ? (zh ? "折叠文件夹" : "Collapse folder") : (zh ? "展开文件夹" : "Expand folder")}：${node.name}`} title={node.relativePath} style={{ paddingLeft: `calc(10px + ${indentation})` }} onClick={() => onToggle(node.relativePath)}>
         {expanded ? <ChevronDown className="remote-tree-chevron" size={15} /> : <ChevronRight className="remote-tree-chevron" size={15} />}
         {expanded ? <FolderOpen className="remote-tree-folder-icon" size={16} /> : <Folder className="remote-tree-folder-icon" size={16} />}
-        <span>{node.name}</span>
+        <span className="remote-tree-name" title={node.relativePath}>{node.name}</span>
       </button>
       {expanded && node.children.length > 0 && <div role="group">{node.children.map((child) => <RemoteTreeItem key={child.relativePath} node={child} depth={depth + 1} locale={locale} expandedPaths={expandedPaths} busy={busy} onToggle={onToggle} onDownload={onDownload} onPreviewText={onPreviewText} onPreviewTable={onPreviewTable} onAttach={onAttach} dragReference={dragReference} baselineSelectedPaths={baselineSelectedPaths} onToggleBaselineFile={onToggleBaselineFile} />)}</div>}
     </>;
@@ -106,10 +106,10 @@ function RemoteTreeItem({ baselineSelectedPaths, onToggleBaselineFile, node, dep
     if (!dragReference || busy) { event.preventDefault(); return; }
     event.dataTransfer.setData(WORKSPACE_FILE_DRAG_TYPE, JSON.stringify(dragReference(node.relativePath)));
     event.dataTransfer.effectAllowed = "copy";
-  }} className="remote-tree-file" role="treeitem" aria-level={depth + 1} title={node.relativePath} style={{ paddingLeft: paddingLeft + 20 }}>
+  }} className="remote-tree-file" role="treeitem" aria-label={node.relativePath} aria-level={depth + 1} title={node.relativePath} style={{ paddingLeft: `calc(30px + ${indentation})` }}>
     {onToggleBaselineFile && <input type="checkbox" aria-label={`${zh ? "选择基线文件" : "Select for baseline"} ${node.relativePath}`} checked={baselineSelectedPaths.includes(node.relativePath)} disabled={busy || (!baselineSelectedPaths.includes(node.relativePath) && baselineSelectedPaths.length >= 32)} onChange={() => onToggleBaselineFile(node.relativePath)} />}
     <RemoteFileIcon relativePath={node.relativePath} />
-    <span>{node.name}</span>
+    <span className="remote-tree-name" title={node.relativePath}>{node.name}</span>
     <em>{formatBytes(node.sizeBytes)}</em>
     {preview && <button aria-label={`${table ? (zh ? "预览表格" : "Preview table") : (zh ? "预览文本" : "Preview text")} ${node.relativePath}`} disabled={busy} onClick={() => preview(node.relativePath)}><Eye size={13} /></button>}
     {onAttach && <button aria-label={`${zh ? "附加引用" : "Attach reference"} ${node.relativePath}`} disabled={busy} onClick={() => onAttach(node.relativePath)}><Paperclip size={13} /></button>}

@@ -2,6 +2,9 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { RemoteFileTree, type FileListingError } from "./RemoteFileTree";
+const { readFileSync } = await vi.importActual<{ readFileSync: (path: string, encoding: "utf8") => string }>("node:fs");
+const baseStyles = readFileSync("src/styles.css", "utf8");
+const fileStyles = readFileSync("src/features/workspace/file-actions.css", "utf8");
 
 const files = [
   { relative_path: "src", directory: true, size_bytes: 0, modified_unix_seconds: 0 },
@@ -9,6 +12,20 @@ const files = [
   { relative_path: "results/scrna_qc_annotation/summary.json", directory: false, size_bytes: 2048, modified_unix_seconds: 0 },
   { relative_path: "README.md", directory: false, size_bytes: 512, modified_unix_seconds: 0 },
 ];
+
+it("keeps the baseline checkbox compact under the real form styles and exposes the full file path", () => {
+  const path = "analysis-with-a-long-readable-file-name.py";
+  render(<><style>{baseStyles}{fileStyles}</style><input aria-label="Unrelated form field" /><div style={{ width: 260 }}><RemoteFileTree locale="en-US" remoteFiles={[{ relative_path: path, directory: false, size_bytes: 7168, modified_unix_seconds: 0 }]} busy={false} onToggleBaselineFile={vi.fn()} onPreviewText={vi.fn()} onAttach={vi.fn()} onDownload={vi.fn()} /></div></>);
+  const checkbox = screen.getByRole("checkbox", { name: `Select for baseline ${path}` });
+  const style = getComputedStyle(checkbox);
+  expect(style.width).toMatch(/px$/);
+  expect(parseFloat(style.width)).toBeLessThanOrEqual(20);
+  expect(style.padding).toBe("0px");
+  expect(style.flexShrink).toBe("0");
+  expect(getComputedStyle(screen.getByRole("textbox", { name: "Unrelated form field" })).width).toBe("100%");
+  expect(screen.getByRole("treeitem", { name: path })).toHaveAttribute("title", path);
+  expect(screen.getByText(path)).toHaveAttribute("title", path);
+});
 
 it("selects only explicit baseline file leaves without attachment, transfer or directory selection", () => {
   const select = vi.fn(); const attach = vi.fn(); const download = vi.fn();
