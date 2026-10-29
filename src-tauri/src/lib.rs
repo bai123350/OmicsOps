@@ -29,9 +29,9 @@ mod conversation_state_tests;
 mod conversation_visibility_tests;
 pub mod credential_settings;
 pub mod dto;
-mod environment_probe_v4;
 #[cfg(test)]
 mod dto_contract_tests;
+mod environment_probe_v4;
 mod follow_up_questions;
 pub mod general_settings;
 pub mod inspection;
