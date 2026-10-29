@@ -78,6 +78,19 @@ mod project_prefix_regression_tests {
         }
     }
 
+    #[test]
+    fn r_version_probe_argv_uses_frontend_version_only_locally_and_remotely() {
+        assert_eq!(version_arguments(KernelLanguageV4::R), ["--version"]);
+        for environment in ["system", "analysis-r", "envs:r443", "envs:python311:r443"] {
+            let command = remote_probe_command(KernelLanguageV4::R, "/project", environment);
+            assert!(
+                command.contains("\"$p\" --version 2>&1; rc=$?"),
+                "{environment}"
+            );
+            assert!(!command.contains("--vanilla --version"));
+        }
+    }
+
     #[cfg_attr(
         not(target_os = "linux"),
         ignore = "requires an explicit POSIX shell for manual syntax validation"
@@ -135,12 +148,29 @@ mod project_prefix_regression_tests {
             let bin = project.join(relative).join("bin");
             std::fs::create_dir_all(&bin).unwrap();
             let executable = bin.join(program);
+            let check_arguments = if program == "Rscript" {
+                "if test \"$#\" -ne 1 || test \"$1\" != --version; then printf 'file name is missing\\n' >&2; exit 1; fi\n"
+            } else {
+                ""
+            };
             std::fs::write(
                 &executable,
-                format!("#!/bin/sh\nprintf '%s\\n' {}\n", shell_quote(expected)),
+                format!(
+                    "#!/bin/sh\n{check_arguments}printf '%s\\n' {}\n",
+                    shell_quote(expected)
+                ),
             )
             .unwrap();
             std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if program == "Rscript" {
+                let rejected = std::process::Command::new(&executable)
+                    .args(["--vanilla", "--version"])
+                    .output()
+                    .unwrap();
+                assert!(!rejected.status.success());
+                assert!(rejected.stdout.is_empty());
+                assert!(String::from_utf8_lossy(&rejected.stderr).contains("file name is missing"));
+            }
         }
         for (environment, language, expected) in [
             ("envs:python311:r443", KernelLanguageV4::Python, "3.11.18"),
@@ -276,7 +306,9 @@ fn version_arguments(language: KernelLanguageV4) -> Vec<&'static str> {
             "-c",
             "import sys; print('.'.join(map(str, sys.version_info[:3])))",
         ],
-        KernelLanguageV4::R => vec!["--vanilla", "--version"],
+        // Rscript handles its version flag only as the sole argument. Adding
+        // --vanilla enters script parsing and fails because no file was given.
+        KernelLanguageV4::R => vec!["--version"],
     }
 }
 
@@ -332,7 +364,7 @@ fn remote_probe_command(language: KernelLanguageV4, root: &str, environment: &st
         KernelLanguageV4::Python => {
             format!("-I -S -c {}", shell_quote(version_arguments(language)[3]))
         }
-        KernelLanguageV4::R => "--vanilla --version".into(),
+        KernelLanguageV4::R => version_arguments(language).join(" "),
     };
     // The cap is applied on the remote side, before SshSession buffers output.
     // A full/truncated frame is rejected; timeout still bounds the producer
@@ -668,7 +700,7 @@ mod tests {
             );
             assert!(system.contains(match language {
                 KernelLanguageV4::Python => "-I -S",
-                KernelLanguageV4::R => "--vanilla --version",
+                KernelLanguageV4::R => "--version",
             }));
         }
     }
