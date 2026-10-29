@@ -1,0 +1,28 @@
+# Preserve Wisp snapshot bytes and their recorded SHA-256 hashes.
+# The other packages retain their previous default text attributes.
+agent-infini/** -text
+analysis-workflow/** -text
+audit-biomedical-paper-evidence/** -text
+browser-use/** -text
+compute-env-setup/** -text
+custom-theme/** -text
+customize/** -text
+distill-concept-books/** -text
+figure-composer/** -text
+figure-duplicate-audit/** -text
+figure-style/** -text
+indication-dossier/** -text
+journal-club-ppt/** -text
+literature-review/** -text
+local-env-setup/** -text
+paper-narrative/** -text
+pdf-explore/** -text
+pixi-environment-builder/** -text
+probe-compute-environment/** -text
+public-data-access/** -text
+remote-compute-ssh/** -text
+self-awareness/** -text
+singlecell-qc/** -text
+skill-creator/** -text
+social-note/** -text
+word-zotero-citations/** -text

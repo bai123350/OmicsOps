@@ -19,7 +19,7 @@ from contextlib import ExitStack, contextmanager, redirect_stdout
 from unittest.mock import Mock, patch
 
 
-_BUNDLE = Path(__file__).resolve().parents[1] / "skills" / "wisp-science"
+_BUNDLE = Path(__file__).resolve().parents[1] / "skills"
 _HELPERS = {
     "paper-narrative": _BUNDLE / "paper-narrative" / "runtime.py",
     "literature-review": _BUNDLE / "literature-review" / "runtime.py",

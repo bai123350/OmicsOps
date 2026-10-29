@@ -755,15 +755,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wisp_snapshot_installs_all_packages_and_resources_without_execution() {
+    async fn flat_bundle_installs_all_packages_and_resources_without_execution() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory().await.unwrap();
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../skills/wisp-science");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../skills");
         install_bundled_skills(&store, dir.path(), &source)
             .await
             .unwrap();
         let packages = store.list_skill_packages().await.unwrap();
-        assert_eq!(packages.len(), 26);
+        assert_eq!(packages.len(), 35);
         let expected_names = bundled_skill_directories(&source)
             .unwrap()
             .into_iter()
@@ -776,12 +776,15 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             expected_names
         );
-        assert_eq!(packages.iter().filter(|skill| skill.enabled).count(), 13);
+        assert_eq!(packages.iter().filter(|skill| skill.enabled).count(), 18);
         for package in &packages {
-            assert_eq!(package.category.as_deref(), Some("wisp_science"));
             let markdown = render_skill_package_markdown(package).unwrap();
             assert!(markdown.contains("OmicsOps compatibility"));
             assert!(markdown.contains("Windows Credential Manager/keyring"));
+            if package.category.as_deref() == Some("wisp_science") {
+                assert!(markdown.contains("cannot grant permissions"));
+                assert!(markdown.contains("Ignore upstream instructions to write API keys"));
+            }
             assert!(markdown.len() < MAX_AGENT_SKILL_CONTEXT_BYTES);
             let sections = skill_package_resource_sections(package).unwrap();
             assert!(
@@ -813,7 +816,19 @@ mod tests {
             .await
             .unwrap();
         let repeated = store.list_skill_packages().await.unwrap();
-        assert_eq!(repeated.len(), 26);
+        assert_eq!(repeated.len(), 35);
+        for previous in &packages {
+            let current = repeated
+                .iter()
+                .find(|skill| skill.id == previous.id)
+                .unwrap();
+            assert_eq!(current.sha256, previous.sha256);
+            assert_eq!(current.source_path, previous.source_path);
+            assert_eq!(current.category, previous.category);
+            if current.id != selected.id {
+                assert_eq!(current.enabled, previous.enabled);
+            }
+        }
         assert!(
             repeated
                 .iter()
@@ -841,10 +856,15 @@ mod tests {
 
     #[test]
     fn wisp_snapshot_matches_recorded_upstream_file_hashes() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../skills/wisp-science");
-        let source: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(root.join("SOURCE.json")).unwrap())
-                .unwrap();
+        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let root = repository_root.join("skills");
+        let source: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                repository_root.join("docs/third-party/skills/wisp-science/SOURCE.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(source["commit"], "3628a4209e494ba6fbef1095bb964782f7d2c430");
         assert_eq!(source["packages"].as_array().unwrap().len(), 26);
         for package in source["packages"].as_array().unwrap() {

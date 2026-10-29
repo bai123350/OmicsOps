@@ -22,12 +22,12 @@ class PrivacyTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         # Windows short names and macOS /var aliases may differ from resolve().
         self.root = Path(self.temp.name).resolve()
-        self.resource = self.root / "skills/single-cell/example/SKILL.md"
+        self.resource = self.root / "skills/example/SKILL.md"
         self.resource.parent.mkdir(parents=True)
         self.resource.write_text("# Generic skill\n", encoding="utf-8")
         self.config = self.root / "src-tauri/tauri.conf.json"
         self.config.parent.mkdir()
-        self.write_config({"../skills/single-cell/": "skills/single-cell/"})
+        self.write_config({"../skills/": "skills/"})
 
     def write_config(self, resources):
         self.config.write_text(json.dumps({
@@ -37,7 +37,7 @@ class PrivacyTests(unittest.TestCase):
 
     def audit(self, **kwargs):
         return privacy.audit_repo(self.root, tracked_files={
-            "skills/single-cell/example/SKILL.md",
+            "skills/example/SKILL.md",
         }, forbidden_prefixes=[], **kwargs)
 
     def rules(self, findings):
@@ -45,6 +45,23 @@ class PrivacyTests(unittest.TestCase):
 
     def test_clean_resource_passes(self):
         self.assertEqual(self.audit(), [])
+
+    def test_skill_provenance_mapping_is_scanned_and_requires_tracking(self):
+        notice = self.root / "docs/third-party/skills/source/LICENSE.txt"
+        notice.parent.mkdir(parents=True)
+        notice.write_text("An upstream license notice.\n", encoding="utf-8")
+        self.write_config({
+            "../skills/": "skills/",
+            "../docs/third-party/skills/": "licenses/skills/",
+        })
+        tracked = {"skills/example/SKILL.md"}
+        findings = privacy.audit_repo(self.root, tracked_files=tracked, forbidden_prefixes=[])
+        self.assertIn("untracked-resource", self.rules(findings))
+        tracked.add("docs/third-party/skills/source/LICENSE.txt")
+        self.assertEqual(privacy.audit_repo(self.root, tracked_files=tracked, forbidden_prefixes=[]), [])
+        notice.write_text("sk-proj-" + "K7" * 30, encoding="utf-8")
+        findings = privacy.audit_repo(self.root, tracked_files=tracked, forbidden_prefixes=[])
+        self.assertIn("credential-token", self.rules(findings))
 
     def test_release_notes_document_is_scanned_without_echoing_credentials(self):
         subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True)
@@ -69,7 +86,7 @@ class PrivacyTests(unittest.TestCase):
                 self.assertIn("resource-mapping", self.rules(self.audit()))
 
     def test_redirected_destination_rejected(self):
-        self.write_config({"../skills/single-cell/": "user-data/"})
+        self.write_config({"../skills/": "user-data/"})
         self.assertIn("resource-mapping", self.rules(self.audit()))
 
     def test_platform_override_cannot_add_personal_files_or_external_binary(self):
@@ -222,7 +239,7 @@ class PrivacyTests(unittest.TestCase):
             self.assertNotIn(value, output)
         rows = [json.loads(line.removeprefix("privacy detail: ")) for line in output.splitlines() if line.startswith("privacy detail: ")]
         self.assertTrue(rows)
-        self.assertEqual(rows[0]["path"], "skills/single-cell/example/SKILL.md")
+        self.assertEqual(rows[0]["path"], "skills/example/SKILL.md")
         self.assertEqual(rows[0]["view"], "raw")
 
     def test_examples_public_attribution_and_variable_access_are_allowed(self):
@@ -269,7 +286,7 @@ class PrivacyTests(unittest.TestCase):
                                self.root if path == alias else real_resolve(path, **kwargs)):
             findings = privacy.audit_repo(alias, dist=alias / "dist", binaries=[
                 alias / "app.exe", alias / "missing.exe",
-            ], tracked_files={"skills/single-cell/example/SKILL.md"}, forbidden_prefixes=[])
+            ], tracked_files={"skills/example/SKILL.md"}, forbidden_prefixes=[])
         self.assertEqual(set(findings), {
             ("dist/app.js", "credential-literal"),
             ("app.exe", "credential-token"),
@@ -286,7 +303,7 @@ class PrivacyTests(unittest.TestCase):
              mock.patch.object(privacy, "is_link", side_effect=lambda path:
                                path == linked or real_link(path)):
             findings = privacy.audit_repo(alias, dist=alias / "dist", binaries=[alias / "dist/app.exe"],
-                tracked_files={"skills/single-cell/example/SKILL.md"}, forbidden_prefixes=[])
+                tracked_files={"skills/example/SKILL.md"}, forbidden_prefixes=[])
         self.assertEqual(set(findings), {
             ("dist", "resource-link"), ("dist/app.exe", "resource-link"),
         })

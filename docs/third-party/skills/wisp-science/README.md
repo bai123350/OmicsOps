@@ -1,19 +1,22 @@
 # Wisp Science skill snapshot
 
-All 26 skill directories are copied byte-for-byte from
+All 26 skill directories now stored directly in the repository's `skills/`
+folder are copied byte-for-byte from
 https://github.com/xuzhougeng/wisp-science at commit
 `3628a4209e494ba6fbef1095bb964782f7d2c430` (retrieved 2026-09-11).
 See `SOURCE.json` for file hashes and license declarations. Upstream's root
 AGPL-3.0 license, Apache-2.0 text and third-party notices are retained here.
 Individual explicit upstream license declarations remain in each SKILL.md.
-OmicsOps-owned files in this directory are BUNDLE.json, SOURCE.json,
-.gitattributes and this README. Snapshot bytes are preserved across checkouts.
+OmicsOps-owned files retained in this provenance directory are BUNDLE.json,
+SOURCE.json and this README. `skills/.gitattributes` preserves snapshot bytes
+across checkouts. `SOURCE.json` file paths are relative to `skills/`.
 
 Installing a skill copies guidance and resources; it never installs Python/R,
 third-party CLIs, Word, Zotero or environments, configures credentials, executes
 code, enables an MCP server or grants permissions.
 
-The 13 research-oriented defaults are listed in BUNDLE.json. The remaining 13
+The original 13 research-oriented defaults are listed in the BUNDLE.json
+retained here, and included in the active merged `skills/BUNDLE.json`. The remaining 13
 are available in Settings but disabled initially: they depend on Wisp-specific
 host features, optional external tools or unusually large workflows. Enabling
 them does not provide those capabilities. Existing user enable/disable choices

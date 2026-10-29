@@ -21,8 +21,8 @@ EXTENSION_FILES = (
     "websocket-client.js",
 )
 RESOURCE_MAPPINGS = {
-    "../skills/single-cell/": "skills/single-cell/",
-    "../skills/wisp-science/": "skills/wisp-science/",
+    "../skills/": "skills/",
+    "../docs/third-party/skills/": "licenses/skills/",
     "../LICENSE": "licenses/AGPL-3.0.txt",
     "../crates/omicsops-bio/UPSTREAM.md": "licenses/omicsops-bio-UPSTREAM.md",
     **{f"../browser-extension/{name}": f"browser-extension/{name}" for name in EXTENSION_FILES},

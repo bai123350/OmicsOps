@@ -105,8 +105,7 @@ pub fn run() {
                 .path()
                 .resource_dir()
                 .map_err(|error| error.to_string())?;
-            let bundled_skills_root =
-                bundled_resources::directory(&resource_root, "skills/single-cell");
+            let bundled_skills_root = bundled_resources::directory(&resource_root, "skills");
             let browser_extension_root =
                 bundled_resources::directory(&resource_root, "browser-extension");
             let browser =
@@ -124,9 +123,6 @@ pub fn run() {
                     &bundled_skills_root,
                 )
                 .await?;
-                let wisp_root = bundled_resources::directory(&resource_root, "skills/wisp-science");
-                skill_commands::install_bundled_skills(&repository, &skills_root, &wisp_root)
-                    .await?;
                 bundled_mcp_commands::install_bundled_mcp_servers(
                     &repository,
                     &std::env::current_exe().map_err(|error| error.to_string())?,
