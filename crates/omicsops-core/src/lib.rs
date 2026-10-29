@@ -2,6 +2,7 @@ pub mod domain;
 pub mod preview;
 pub mod project;
 pub mod redaction;
+pub mod ssh_environment;
 pub mod sync;
 pub mod workspace;
 

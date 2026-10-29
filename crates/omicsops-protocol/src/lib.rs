@@ -1030,12 +1030,7 @@ impl ComputeSelectionV4 {
     pub fn validate(&self) -> Result<(), ProtocolErrorV4> {
         if self.schema_version != 4
             || self.backend_id.trim().is_empty()
-            || self.environment.trim().is_empty()
-            || self.environment.len() > 128
-            || !self
-                .environment
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+            || !omicsops_core::ssh_environment::valid_compute_environment(&self.environment)
         {
             return Err(ProtocolErrorV4::InvalidComputeSelection);
         }
@@ -2401,6 +2396,46 @@ mod tests {
             network_policy: NetworkPolicyV4::HostInherited,
             container_image: None,
         }
+    }
+
+    #[test]
+    fn compute_selection_accepts_only_bounded_project_environment_tokens() {
+        let mut selection = local_selection();
+        selection.backend_id = "ssh:fixture".into();
+        selection.backend_kind = ComputeBackendKindV4::Ssh;
+        for environment in [
+            "envs:python311",
+            "envs:python311:r443",
+            "envs:python311:",
+            "envs::r443",
+            &format!("envs:{}:{}", "p".repeat(64), "r".repeat(64)),
+        ] {
+            selection.environment = environment.into();
+            assert!(selection.validate().is_ok(), "{environment}");
+        }
+        for environment in [
+            "envs:",
+            "envs::",
+            "envs:..",
+            "envs:.",
+            "envs:../outside",
+            "envs:a:b:c",
+            "envs:a:/outside",
+            "envs:a:bad\\name",
+            "envs:a:r\n",
+            &format!("envs:{}", "p".repeat(65)),
+        ] {
+            selection.environment = environment.into();
+            assert!(selection.validate().is_err(), "{environment:?}");
+        }
+        selection.environment = "x".repeat(128);
+        assert!(selection.validate().is_ok());
+        selection.environment = "x".repeat(129);
+        assert!(selection.validate().is_err());
+        selection.environment = "envs:python311:r443".into();
+        selection.backend_kind = ComputeBackendKindV4::Local;
+        selection.backend_id = "local".into();
+        assert!(selection.validate().is_err());
     }
 
     #[test]
