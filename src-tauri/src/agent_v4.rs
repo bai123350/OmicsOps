@@ -32,8 +32,8 @@ use omicsops_agent_core::{
     AgentCoreErrorV4, AgentCoreV4, AgentLimitsV4, ContextCompactionCommitErrorV4, EventStoreV4,
     ModelActivityPhaseV4, ModelImageRefV4, ModelPortV4, ModelRequestV4, ModelStreamEventV4,
     ModelTurnV4, ModelUsageMetadataV4, ModelUsageRequestMetadataV4, PlanApprovalScopeV4,
-    PlanToolAuthorizationV4, PromptLayersV4, ReviewerRequestV4, ScientificStateStoreV4,
-    ScientificUpdateV4, ToolPortV4,
+    PlanToolAuthorizationV4, PromptLayersV4, ReviewerRecoveryV4, ReviewerRequestV4,
+    ScientificStateStoreV4, ScientificUpdateV4, ToolPortV4,
 };
 use omicsops_core::{
     project::{require_remote_descendant, shell_quote},
@@ -5948,10 +5948,22 @@ impl ModelPortV4 for DesktopModelPortV4 {
         request: ReviewerRequestV4,
         on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
     ) -> Result<ReviewerReportV4, ModelFailureV4> {
+        self.review_with_recovery(request, &mut ReviewerRecoveryV4::default(), on_event)
+            .await
+    }
+
+    async fn review_with_recovery(
+        &self,
+        request: ReviewerRequestV4,
+        recovery: &mut ReviewerRecoveryV4,
+        on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+    ) -> Result<ReviewerReportV4, ModelFailureV4> {
         if let Some(reviewer) = &self.reviewer {
-            return reviewer.review_with_progress(request, on_event).await;
+            return reviewer
+                .review_with_recovery(request, recovery, on_event)
+                .await;
         }
-        reviewer_context::review(self, request, on_event).await
+        reviewer_context::review(self, request, recovery, on_event).await
     }
 }
 

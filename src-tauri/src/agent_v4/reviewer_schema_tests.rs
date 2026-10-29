@@ -33,6 +33,224 @@ struct ReviewTransport {
     report: Value,
     requests: Mutex<Vec<Value>>,
 }
+
+#[derive(Clone, Copy)]
+enum RepairStep {
+    Read,
+    Malformed,
+    Truncated,
+    BadSchema,
+    Submit,
+}
+
+struct RepairReviewTransport {
+    steps: Vec<RepairStep>,
+    requests: Mutex<Vec<Value>>,
+}
+
+#[async_trait]
+impl ResponsesTransport for RepairReviewTransport {
+    async fn post(
+        &self,
+        _: url::Url,
+        _: reqwest::header::HeaderMap,
+        body: Value,
+        _: Duration,
+    ) -> AdapterResult<ResponsesHttpStream> {
+        let mut requests = self.requests.lock().unwrap();
+        let index = requests.len();
+        let step = self.steps[index];
+        requests.push(body.clone());
+        let mut name = body["tools"][0]["name"].clone();
+        let arguments = match step {
+            RepairStep::Read => {
+                let context: Value = serde_json::from_str(body["input"][0]["content"].as_str().unwrap()).unwrap();
+                let source = context["_review_projection"]["sources"].as_array().unwrap().iter().find(|item| item["citation"] == "event:7").unwrap();
+                name = body["tools"][1]["name"].clone();
+                json!({"source_id":source["source_id"],"pointer":"/outcome/data/answer","offset":0,"limit":8192}).to_string()
+            }
+            RepairStep::Malformed => r#"{"schema_version":4,"summary":"PRIVATE_BAD_REPORT "unescaped"","findings":[]}"#.into(),
+            RepairStep::Truncated => r#"{"schema_version":4,"summary":"PRIVATE_TRUNCATED_REPORT"#.into(),
+            RepairStep::BadSchema => json!({"summary":"PRIVATE_BAD_SCHEMA","findings":[]}).to_string(),
+            RepairStep::Submit => json!({"schema_version":4,"summary":"Reviewed the supplied observations","findings":[]}).to_string(),
+        };
+        let event = if matches!(step, RepairStep::Truncated) {
+            json!({"type":"response.incomplete","response":{"id":format!("repair-{index}"),"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}})
+        } else {
+            json!({"type":"response.completed","response":{"id":format!("repair-{index}"),"status":"completed","output":[{"id":format!("repair-item-{index}"),"type":"function_call","call_id":format!("repair-call-{index}"),"name":name,"arguments":arguments}]}})
+        };
+        Ok(ResponsesHttpStream {
+            status: 200,
+            body: Box::pin(stream::iter([
+                Ok(format!("data: {event}\n\n").into_bytes()),
+            ])),
+        })
+    }
+}
+
+#[tokio::test]
+async fn desktop_reviewer_repairs_malformed_report_in_place_with_the_read_evidence() {
+    let transport = Arc::new(RepairReviewTransport {
+        steps: vec![RepairStep::Read, RepairStep::Malformed, RepairStep::Submit],
+        requests: Mutex::new(vec![]),
+    });
+    let input = read_review_request();
+    let original = input.clone();
+    let report = reviewer(transport.clone())
+        .review(input.clone())
+        .await
+        .unwrap();
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == "review_evidence_partial")
+    );
+    assert_eq!(input, original);
+    let requests = transport.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[1]["input"], requests[2]["input"],
+        "repair must retain the admitted page and its coverage, without restarting the review"
+    );
+    assert!(
+        requests[2]["input"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("verified-fact-731")
+    );
+    assert_ne!(
+        requests[1]["instructions"], requests[2]["instructions"],
+        "the invalid response needs actionable format feedback"
+    );
+    for key in ["model", "tools", "max_output_tokens"] {
+        assert_eq!(requests[1][key], requests[2][key]);
+    }
+    let replacement = requests[2].to_string();
+    assert!(!replacement.contains("PRIVATE_BAD_REPORT"));
+    assert!(!replacement.contains("repair-call-1"));
+}
+
+#[tokio::test]
+async fn desktop_reviewer_output_errors_share_one_in_place_repair() {
+    for steps in [
+        vec![RepairStep::Malformed, RepairStep::BadSchema],
+        vec![RepairStep::Truncated, RepairStep::Malformed],
+        vec![RepairStep::BadSchema, RepairStep::Truncated],
+    ] {
+        let transport = Arc::new(RepairReviewTransport {
+            steps,
+            requests: Mutex::new(vec![]),
+        });
+        let error = reviewer(transport.clone())
+            .review(request())
+            .await
+            .unwrap_err();
+        assert_eq!(error.class, ModelErrorClassV4::InvalidResponse);
+        assert!(!error.retryable);
+        assert!(
+            error
+                .message
+                .starts_with("reviewer_output_repair_exhausted:")
+        );
+        assert!(!error.message.contains("PRIVATE_"));
+        assert_eq!(transport.requests.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn desktop_reviewer_final_turn_repair_keeps_reader_disabled() {
+    let mut steps = vec![RepairStep::Read; 7];
+    steps.extend([RepairStep::Malformed, RepairStep::Submit]);
+    let transport = Arc::new(RepairReviewTransport {
+        steps,
+        requests: Mutex::new(vec![]),
+    });
+    reviewer(transport.clone())
+        .review(read_review_request())
+        .await
+        .unwrap();
+    let requests = transport.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        9,
+        "eight steps plus one replacement, not a new review"
+    );
+    for wire in &requests[7..] {
+        assert_eq!(wire["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            wire["tools"][0]["parameters"]["properties"]["findings"]["maxItems"],
+            7
+        );
+    }
+    assert_eq!(requests[7]["input"], requests[8]["input"]);
+}
+
+#[tokio::test]
+async fn desktop_selected_reviewer_preserves_the_host_recovery_allowance() {
+    let selected = Arc::new(RepairReviewTransport {
+        steps: vec![RepairStep::Malformed],
+        requests: Mutex::new(vec![]),
+    });
+    let executor = Arc::new(ReviewTransport {
+        report: json!({"schema_version":4,"summary":"executor must not review","findings":[]}),
+        requests: Mutex::new(vec![]),
+    });
+    let mut model = reviewer(executor.clone());
+    model.reviewer = Some(Box::new(reviewer(selected.clone())));
+    let mut recovery = ReviewerRecoveryV4::default();
+    assert!(recovery.try_output_repair());
+    let error = model
+        .review_with_recovery(request(), &mut recovery, &mut |_| {})
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .message
+            .starts_with("reviewer_output_repair_exhausted:")
+    );
+    assert_eq!(selected.requests.lock().unwrap().len(), 1);
+    assert!(executor.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn desktop_reviewer_repair_instruction_must_fit_the_actual_wire_budget() {
+    let baseline = Arc::new(ReviewTransport {
+        report: json!({"schema_version":4,"summary":"Checked","findings":[]}),
+        requests: Mutex::new(vec![]),
+    });
+    let input = request();
+    reviewer(baseline.clone())
+        .review(input.clone())
+        .await
+        .unwrap();
+    // This is the compact, serialized provider payload actually dispatched
+    // by Desktop, not the smaller internal ModelRequestV4 representation.
+    let wire_bytes = u32::try_from(
+        serde_json::to_vec(&baseline.requests.lock().unwrap()[0])
+            .unwrap()
+            .len(),
+    )
+    .unwrap();
+    let transport = Arc::new(RepairReviewTransport {
+        steps: vec![RepairStep::Malformed],
+        requests: Mutex::new(vec![]),
+    });
+    let mut model = reviewer(transport.clone());
+    model.client = model.client.with_request_budget(RequestBudget {
+        context_window_tokens: wire_bytes + 16_384 + 1_024 + 16,
+        reserved_output_tokens: 16_384,
+        safety_margin_tokens: 1_024,
+    });
+    let error = model.review(input).await.unwrap_err();
+    assert_eq!(error.class, ModelErrorClassV4::InvalidRequest);
+    assert!(error.message.contains("request budget:"));
+    assert_eq!(
+        transport.requests.lock().unwrap().len(),
+        1,
+        "expanded repair request must be rejected before the second RPC"
+    );
+}
 #[async_trait]
 impl ResponsesTransport for ReviewTransport {
     async fn post(
@@ -122,8 +340,8 @@ fn request() -> ReviewerRequestV4 {
 }
 
 #[tokio::test]
-async fn desktop_reviewer_report_schema_failures_are_classified_without_defaulting_or_nested_retries()
- {
+async fn desktop_reviewer_report_schema_failures_are_bounded_without_defaulting_or_nested_retries()
+{
     for report in [
         json!({"summary":"Checked", "findings":[]}),
         json!({"schema_version":null, "summary":"Checked", "findings":[]}),
@@ -143,15 +361,17 @@ async fn desktop_reviewer_report_schema_failures_are_classified_without_defaulti
         assert_eq!(failure.class, ModelErrorClassV4::InvalidResponse);
         assert!(
             !failure.retryable,
-            "the core owns the single shared regeneration budget"
+            "the review has consumed its single shared regeneration budget"
         );
         assert!(
-            failure.message.starts_with("reviewer_report_schema:"),
+            failure
+                .message
+                .starts_with("reviewer_output_repair_exhausted:"),
             "{}",
             failure.message
         );
         assert!(!failure.message.contains("PRIVATE_MODEL_SENTINEL"));
-        assert_eq!(transport.requests.lock().unwrap().len(), 1);
+        assert_eq!(transport.requests.lock().unwrap().len(), 2);
     }
 }
 
@@ -893,5 +1113,138 @@ async fn desktop_reviewer_http_reasoning_content_reaches_supervisor_before_repor
     assert!(report.findings.is_empty());
     assert!(kinds.contains(&"reasoning"));
     assert!(kinds.contains(&"arguments"));
+    assert!(unused.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn desktop_reviewer_http_malformed_arguments_retry_keeps_the_frozen_request() {
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = url::Url::parse(&format!("http://{}/v1", listener.local_addr().unwrap())).unwrap();
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for round in 0..2 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "missing HTTP review request {round}"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("loopback reviewer accept failed: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request: Value = {
+                let mut reader = BufReader::new(&mut socket);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with("POST /v1/chat/completions "));
+                let mut content_length = None;
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = Some(value.trim().parse::<usize>().unwrap());
+                        }
+                    }
+                }
+                let mut body = vec![0; content_length.unwrap()];
+                reader.read_exact(&mut body).unwrap();
+                serde_json::from_slice(&body).unwrap()
+            };
+            let arguments = if round == 0 {
+                let malformed = r#"{"schema_version":4,"summary":"PRIVATE_HTTP_BAD_REPORT "unescaped"","findings":[]}"#;
+                assert!(serde_json::from_str::<Value>(malformed).is_err());
+                malformed.to_string()
+            } else {
+                json!({"schema_version":4,"summary":"Reviewed the supplied observations","findings":[]}).to_string()
+            };
+            let mut events = Vec::new();
+            if round == 0 {
+                events.push(json!({"choices":[{"delta":{"reasoning_content":"PRIVATE_HTTP_PARTIAL_REASONING"}}]}));
+            }
+            events.push(json!({"choices":[{"delta":{"tool_calls":[{
+                "index":0,"id":format!("http-repair-{round}"),"type":"function",
+                "function":{"name":request["tools"][0]["function"]["name"],"arguments":arguments}
+            }]}}]}));
+            events.push(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}));
+            let mut wire = events
+                .into_iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            wire.push_str("data: [DONE]\n\n");
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{wire}", wire.len()).unwrap();
+            socket.flush().unwrap();
+            requests.push(request);
+        }
+        requests
+    });
+    let unused = Arc::new(ReviewTransport {
+        report: json!({}),
+        requests: Mutex::new(vec![]),
+    });
+    let mut model = reviewer(unused.clone());
+    model.client = ModelClient::Http(
+        UnifiedModelClient::new(
+            model.usage_metadata.model_profile_id,
+            ProviderProtocol::OpenAiCompatible,
+            base,
+            "deepseek-fixture",
+            Some("not-a-real-key".into()),
+        )
+        .unwrap()
+        .with_request_budget(RequestBudget {
+            context_window_tokens: 100_000,
+            reserved_output_tokens: 16_384,
+            safety_margin_tokens: 1_024,
+        }),
+    );
+    let input = request();
+    let original = input.clone();
+    let outcome = model.review_with_progress(input.clone(), &mut |_| {}).await;
+    let requests = server.join().unwrap();
+    let report = outcome.unwrap();
+    assert_eq!(report.summary, "Reviewed the supplied observations");
+    assert!(report.findings.is_empty());
+    assert_eq!(input, original);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["model"], "deepseek-fixture");
+    assert_eq!(requests[0]["max_tokens"], 16_384);
+    assert_eq!(requests[0]["tools"].as_array().unwrap().len(), 1);
+    let first_system = requests[0]["messages"][0]["content"].as_str().unwrap();
+    let repair_system = requests[1]["messages"][0]["content"].as_str().unwrap();
+    assert_ne!(repair_system, first_system);
+    assert!(repair_system.contains("The previous output was discarded because it was not a complete valid review-tool response."));
+    assert!(
+        repair_system.contains("Return at most ONE complete tool call with strict JSON arguments")
+    );
+    let mut repaired_request = requests[1].clone();
+    repaired_request["messages"][0]["content"] = requests[0]["messages"][0]["content"].clone();
+    assert_eq!(
+        requests[0], repaired_request,
+        "only the system's format guidance may change; frozen context, tools, schema, model and output budget must remain identical"
+    );
+    let replacement = requests[1].to_string();
+    for discarded in [
+        "PRIVATE_HTTP_BAD_REPORT",
+        "PRIVATE_HTTP_PARTIAL_REASONING",
+        "http-repair-0",
+    ] {
+        assert!(!replacement.contains(discarded));
+    }
     assert!(unused.requests.lock().unwrap().is_empty());
 }

@@ -183,6 +183,20 @@ pub struct ReviewerRequestV4 {
     pub verified_evidence: Vec<ReviewerEvidenceV4>,
 }
 
+/// Host-owned, in-memory allowance shared by all attempts of one review.
+/// It is never serialized into evidence or sent to the model. Dropping a timed
+/// out attempt must not restore a repair already consumed inside that attempt.
+#[derive(Debug, Default)]
+pub struct ReviewerRecoveryV4 {
+    output_repair_attempted: bool,
+}
+
+impl ReviewerRecoveryV4 {
+    pub fn try_output_repair(&mut self) -> bool {
+        !std::mem::replace(&mut self.output_repair_attempted, true)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReviewerEvidenceV4 {
     pub reference: CompletionEvidenceRefV4,
@@ -422,6 +436,17 @@ pub trait ModelPortV4: Send + Sync {
         _on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
     ) -> Result<ReviewerReportV4, ModelFailureV4> {
         self.review(request).await
+    }
+
+    /// Ports with a multi-step review can repair the failing step in place.
+    /// Legacy ports use the same allowance through the host's outer recovery.
+    async fn review_with_recovery(
+        &self,
+        request: ReviewerRequestV4,
+        _recovery: &mut ReviewerRecoveryV4,
+        on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+    ) -> Result<ReviewerReportV4, ModelFailureV4> {
+        self.review_with_progress(request, on_event).await
     }
 }
 
@@ -3528,7 +3553,7 @@ impl AgentCoreV4<'_> {
         cancelled: Option<&AtomicBool>,
     ) -> Result<ReviewerReportV4, AgentCoreErrorV4> {
         let mut attempt = 0_u8;
-        let mut output_regenerated = false;
+        let mut recovery = ReviewerRecoveryV4::default();
         // A review can contain several provider turns. The idle bound applies
         // to meaningful generation, while every retry/regeneration/backoff
         // shares one immutable absolute deadline for the whole review.
@@ -3576,10 +3601,11 @@ impl AgentCoreV4<'_> {
                         }
                     }
                 };
-                let mut completion = Box::pin(
-                    self.model
-                        .review_with_progress(request.clone(), &mut on_event),
-                );
+                let mut completion = Box::pin(self.model.review_with_recovery(
+                    request.clone(),
+                    &mut recovery,
+                    &mut on_event,
+                ));
                 let idle_deadline = tokio::time::sleep(attempt_timeout);
                 let hard_deadline = tokio::time::sleep_until(hard_at);
                 tokio::pin!(idle_deadline, hard_deadline);
@@ -3635,14 +3661,13 @@ impl AgentCoreV4<'_> {
                         && (error.message.contains("returned malformed JSON arguments:")
                             || error.message.contains("truncated_output:")
                             || error.message.starts_with("reviewer_report_schema:"))
-                        && !output_regenerated =>
+                        && recovery.try_output_repair() =>
                 {
                     // Regenerate only the read-only report from the same frozen
                     // evidence. This does not consume a transport retry or replay
                     // any executor call. Malformed, truncated and schema-invalid
                     // reports share one regeneration; a second invalid report
                     // still fails without weakening review validation.
-                    output_regenerated = true;
                     let reason = if error.message.starts_with("reviewer_report_schema:") {
                         "report did not match the required review schema"
                     } else if error.message.contains("truncated_output:") {
@@ -18401,6 +18426,97 @@ mod tests {
             omicsops_protocol::ModelErrorClassV4::InvalidResponse,
             "tool call review-call returned malformed JSON arguments: expected comma at line 1 column 3134",
         )
+    }
+
+    struct InPlaceRepairReviewer {
+        attempts: AtomicUsize,
+        idle_after_repair: bool,
+    }
+
+    #[async_trait]
+    impl ModelPortV4 for InPlaceRepairReviewer {
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            panic!("review repair must not call the executor");
+        }
+
+        async fn review_with_recovery(
+            &self,
+            _: ReviewerRequestV4,
+            recovery: &mut ReviewerRecoveryV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ReviewerReportV4, ModelFailureV4> {
+            match self.attempts.fetch_add(1, AtomicOrdering::SeqCst) {
+                0 => {
+                    assert!(recovery.try_output_repair());
+                    if self.idle_after_repair {
+                        std::future::pending::<()>().await;
+                    }
+                    Err(ModelFailureV4::transient(
+                        omicsops_protocol::ModelErrorClassV4::Transport,
+                        "synthetic connection ended after a local format repair",
+                    ))
+                }
+                1 => {
+                    assert!(
+                        !recovery.try_output_repair(),
+                        "a new transport attempt must retain the consumed allowance"
+                    );
+                    // Even a legacy error spelling must not trigger outer
+                    // regeneration after the port consumed the shared slot.
+                    Err(malformed_reviewer_arguments())
+                }
+                _ => panic!("nested recovery reset the review repair allowance"),
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reviewer_in_place_repair_allowance_survives_transport_and_idle_retries() {
+        for idle_after_repair in [false, true] {
+            let spec = execution_spec(Uuid::new_v4());
+            let store = MemoryStore::default();
+            seed_execution(&store, &spec);
+            let model = InPlaceRepairReviewer {
+                attempts: AtomicUsize::new(0),
+                idle_after_repair,
+            };
+            let result = AgentCoreV4 {
+                model: &model,
+                tools: &FakeTools,
+                events: &store,
+                science: None,
+            }
+            .review_with_retry(
+                spec.run_id,
+                frozen_reviewer_request(&spec),
+                1,
+                Duration::from_secs(180),
+                None,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(AgentCoreErrorV4::Model(message)) if message.contains("malformed JSON"))
+            );
+            assert_eq!(model.attempts.load(AtomicOrdering::SeqCst), 2);
+            let events = store.load_direct(spec.run_id).unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event.event, AgentEventKindV4::ModelRetrying { .. }))
+                    .count(),
+                1
+            );
+            assert!(!events.iter().any(|event| matches!(
+                event.event,
+                AgentEventKindV4::ToolRequested { .. }
+                    | AgentEventKindV4::ReviewerFinished { .. }
+                    | AgentEventKindV4::RunCompleted
+            )));
+        }
     }
 
     fn truncated_reviewer_output() -> ModelFailureV4 {

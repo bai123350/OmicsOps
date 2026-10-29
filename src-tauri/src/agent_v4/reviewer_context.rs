@@ -746,6 +746,23 @@ fn report_schema_failure() -> ModelFailureV4 {
     )
 }
 
+fn output_format_failure(error: &ModelFailureV4) -> bool {
+    if error.retryable || error.class != ModelErrorClassV4::InvalidResponse {
+        return false;
+    }
+    let message = error
+        .message
+        .strip_prefix("model endpoint failed: ")
+        .unwrap_or(&error.message);
+    message == "responses_arguments_invalid"
+        || message.starts_with("truncated_output:")
+        || message.starts_with("reviewer_report_schema:")
+        || (message.starts_with("tool call ")
+            && message.contains(" returned malformed JSON arguments:"))
+}
+
+const OUTPUT_REPAIR_INSTRUCTION: &str = " The previous output was discarded because it was not a complete valid review-tool response. Regenerate only this step using the unchanged frozen evidence and already supplied read pages. Return at most ONE complete tool call with strict JSON arguments, never markdown or JSON fragments. Keep all strings concise and properly JSON-escaped. Prefer agent.submit_review with schema_version 4, a short non-empty summary and only necessary findings; leave one finding slot for the Host's evidence limitation. Preserve all substantive evidence-supported errors and warnings: format repair does not ask you to approve the proposal. Do not repeat successful reads, invent evidence, concatenate rejected arguments, or reproduce the discarded output.";
+
 fn submit_tool() -> ToolDescriptorV4 {
     ToolDescriptorV4 {
         id:"agent.submit_review".into(),
@@ -772,8 +789,9 @@ fn read_tool(source_ids: &[String]) -> ToolDescriptorV4 {
 }
 
 pub(super) async fn review(
-    model: &DesktopModelPortV4,
+    model: &dyn ModelPortV4,
     request: ReviewerRequestV4,
+    recovery: &mut ReviewerRecoveryV4,
     on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
 ) -> Result<ReviewerReportV4, ModelFailureV4> {
     let mut snapshot = Snapshot::new(request)?;
@@ -790,8 +808,12 @@ pub(super) async fn review(
         }
         tools
     };
-    let request_for = |context: &str, reader: bool| ModelRequestV4 {
-        system: system.clone(),
+    let request_for = |context: &str, reader: bool, repair: bool| ModelRequestV4 {
+        system: if repair {
+            format!("{system}{OUTPUT_REPAIR_INSTRUCTION}")
+        } else {
+            system.clone()
+        },
         context: context.into(),
         tools: {
             let mut tools = tools_for(reader);
@@ -810,27 +832,56 @@ pub(super) async fn review(
         if context.len() > CONTEXT_BYTES {
             return Err(failure("reviewer_context_budget_exceeded"));
         }
-        model.validate_request(&request_for(context, reader))
+        model.validate_request(&request_for(context, reader, false))
     };
     let mut window = ReviewWindow::new(snapshot.initial_views()?, &validate)?;
     snapshot.omitted = window.views[window.current].omitted.clone();
+    // This flag controls guidance only. The allowance belongs to the Host's
+    // recovery state, including across transport/idle retries of this review.
+    let mut repair_instruction = false;
     for index in 0..MAX_TURNS {
         if index + 1 == MAX_TURNS && window.reader_enabled() {
             window.disable("reviewer_read_turn_limit", snapshot.pages);
         }
-        let context = window.context()?;
+        let turn = loop {
+            let context = window.context()?;
+            let reader = window.reader_enabled();
+            if context.len() > CONTEXT_BYTES {
+                return Err(failure("reviewer_context_budget_exceeded"));
+            }
+            let request = request_for(&context, reader, repair_instruction);
+            // The replacement instruction is part of this exact admission.
+            // No partial output or provider continuation enters the snapshot.
+            model.validate_request(&request)?;
+            let result = match model.stream(request, on_event).await {
+                Ok(turn)
+                    if turn.tool_calls.len() == 1
+                        && turn.tool_calls[0].tool_id == "agent.submit_review" =>
+                {
+                    serde_json::from_value(turn.tool_calls[0].arguments.clone())
+                        .map_err(|_| report_schema_failure())
+                        .and_then(|report| snapshot.finish(report))
+                }
+                Ok(turn) => break turn,
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(report) => return Ok(report),
+                Err(error) if output_format_failure(&error) => {
+                    if !recovery.try_output_repair() {
+                        return Err(ModelFailureV4::permanent(
+                            ModelErrorClassV4::InvalidResponse,
+                            "reviewer_output_repair_exhausted: no valid independent report was produced within the shared output-repair allowance",
+                        ));
+                    }
+                    // Retry this step, not the review: counters, coverage,
+                    // admitted pages, final-turn tool grants all stay intact.
+                    repair_instruction = true;
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let reader = window.reader_enabled();
-        validate(&context, reader)?;
-        // DesktopModelPortV4::stream applies the same final provider JSON
-        // budget as execution. No ToolRegistry, network tool or SSH is called.
-        let turn = model
-            .stream(request_for(&context, reader), on_event)
-            .await?;
-        if turn.tool_calls.len() == 1 && turn.tool_calls[0].tool_id == "agent.submit_review" {
-            let report = serde_json::from_value(turn.tool_calls[0].arguments.clone())
-                .map_err(|_| report_schema_failure())?;
-            return snapshot.finish(report);
-        }
         if !reader
             || turn.tool_calls.is_empty()
             || turn.tool_calls.len() > 4
@@ -838,6 +889,12 @@ pub(super) async fn review(
         {
             return Err(failure("reviewer_tool_batch_invalid"));
         }
+        let validate = |context: &str, reader: bool| {
+            if context.len() > CONTEXT_BYTES {
+                return Err(failure("reviewer_context_budget_exceeded"));
+            }
+            model.validate_request(&request_for(context, reader, repair_instruction))
+        };
         for call in turn.tool_calls {
             match snapshot.prepare_read(&call.arguments)? {
                 PreparedRead::Page(prepared) => match window.admit(&prepared, &validate)? {
@@ -909,6 +966,257 @@ mod tests {
             schema_version: 4,
             summary: "Read-only review".into(),
             findings: vec![],
+        }
+    }
+
+    enum OutputStep {
+        Reads(usize),
+        Error(&'static str),
+        Submit(Value),
+    }
+
+    struct OutputModel {
+        steps: std::sync::Mutex<std::collections::VecDeque<OutputStep>>,
+        requests: std::sync::Mutex<Vec<ModelRequestV4>>,
+        budget_after_first: bool,
+    }
+
+    impl OutputModel {
+        fn new(steps: Vec<OutputStep>) -> Self {
+            Self {
+                steps: std::sync::Mutex::new(steps.into()),
+                requests: std::sync::Mutex::new(vec![]),
+                budget_after_first: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelPortV4 for OutputModel {
+        fn validate_request(&self, request: &ModelRequestV4) -> Result<(), ModelFailureV4> {
+            if self.budget_after_first {
+                let requests = self.requests.lock().unwrap();
+                if let Some(first) = requests.first() {
+                    if serde_json::to_vec(request).unwrap().len()
+                        > serde_json::to_vec(first).unwrap().len()
+                    {
+                        return Err(failure("fixture_final_wire_budget_exceeded"));
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        async fn stream(
+            &self,
+            request: ModelRequestV4,
+            on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            self.requests.lock().unwrap().push(request.clone());
+            on_event(ModelStreamEventV4::ContentProgress { bytes: 1 });
+            let step = self
+                .steps
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("bounded RPCs");
+            let calls = match step {
+                OutputStep::Error(message) => {
+                    return Err(ModelFailureV4::permanent(
+                        ModelErrorClassV4::InvalidResponse,
+                        message,
+                    ));
+                }
+                OutputStep::Reads(count) => {
+                    let context: Value = serde_json::from_str(&request.context).unwrap();
+                    let source = context["_review_projection"]["sources"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|source| source["citation"] == "event:7")
+                        .unwrap();
+                    (0..count)
+                        .map(|i| ToolCallV4 {
+                            call_id: format!("read-{i}"),
+                            tool_id: READ_TOOL.into(),
+                            arguments: json!({"source_id":source["source_id"],"pointer":"/outcome/data/answer","offset":0,"limit":8192}),
+                        })
+                        .collect()
+                }
+                OutputStep::Submit(arguments) => vec![ToolCallV4 {
+                    call_id: "submit".into(),
+                    tool_id: "agent.submit_review".into(),
+                    arguments,
+                }],
+            };
+            Ok(ModelTurnV4 {
+                public_text: "private review output must not become evidence".into(),
+                tool_calls: calls,
+                provider_continuation: None,
+            })
+        }
+    }
+
+    fn valid_submit() -> OutputStep {
+        OutputStep::Submit(serde_json::to_value(report()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn reviewer_output_repair_keeps_delivered_pages_and_progress() {
+        let model = OutputModel::new(vec![
+            OutputStep::Reads(1),
+            OutputStep::Error("tool call bad returned malformed JSON arguments: PRIVATE_REJECTED"),
+            valid_submit(),
+        ]);
+        let mut progress = 0;
+        let report = review(
+            &model,
+            request(),
+            &mut ReviewerRecoveryV4::default(),
+            &mut |_| progress += 1,
+        )
+        .await
+        .unwrap();
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.code == "review_evidence_partial")
+        );
+        assert_eq!(progress, 3);
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1].context, requests[2].context);
+        let context: Value = serde_json::from_str(&requests[2].context).unwrap();
+        assert_eq!(context["_review_reads"].as_array().unwrap().len(), 1);
+        assert!(
+            context["_review_reads"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("observed value")
+        );
+        assert_ne!(requests[1].system, requests[2].system);
+        assert_eq!(requests[1].tools, requests[2].tools);
+        for sent in requests.iter() {
+            assert!(sent.replay.is_empty());
+            assert!(
+                !serde_json::to_string(sent)
+                    .unwrap()
+                    .contains("PRIVATE_REJECTED")
+            );
+            assert!(
+                !sent
+                    .context
+                    .contains("private review output must not become evidence")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reviewer_output_errors_share_one_repair_across_steps_and_invocations() {
+        for first in [
+            "tool call bad returned malformed JSON arguments: expected comma",
+            "model endpoint failed: responses_arguments_invalid",
+            "model endpoint failed: truncated_output: responses_output_limit",
+        ] {
+            let model = OutputModel::new(vec![
+                OutputStep::Error(first),
+                OutputStep::Reads(1),
+                OutputStep::Submit(json!({"summary":"missing schema version","findings":[]})),
+                valid_submit(),
+            ]);
+            let mut recovery = ReviewerRecoveryV4::default();
+            let error = review(&model, request(), &mut recovery, &mut |_| {})
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .message
+                    .starts_with("reviewer_output_repair_exhausted:")
+            );
+            assert!(!error.retryable);
+            assert_eq!(model.requests.lock().unwrap().len(), 3);
+            let other = OutputModel::new(vec![OutputStep::Error(first), valid_submit()]);
+            let error = review(&other, request(), &mut recovery, &mut |_| {})
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .message
+                    .starts_with("reviewer_output_repair_exhausted:")
+            );
+            assert_eq!(other.requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn reviewer_final_step_repair_preserves_read_attempts_and_submit_only_tools() {
+        let mut steps: Vec<_> = (0..7).map(|_| OutputStep::Reads(2)).collect();
+        steps.extend([
+            OutputStep::Submit(json!({"schema_version":4,"summary":"","findings":[]})),
+            valid_submit(),
+        ]);
+        let model = OutputModel::new(steps);
+        review(
+            &model,
+            request(),
+            &mut ReviewerRecoveryV4::default(),
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 9);
+        assert_eq!(requests[7].context, requests[8].context);
+        let context: Value = serde_json::from_str(&requests[8].context).unwrap();
+        assert_eq!(context["_review_read_feedback"]["read_attempt"], 14);
+        for request in &requests[7..] {
+            assert_eq!(request.tools.len(), 1);
+            assert_eq!(request.tools[0].id, "agent.submit_review");
+            assert_eq!(
+                request.tools[0].input_schema["properties"]["findings"]["maxItems"],
+                7
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reviewer_replacement_is_preflighted_before_another_rpc() {
+        let mut model = OutputModel::new(vec![
+            OutputStep::Error("model endpoint failed: responses_arguments_invalid"),
+            valid_submit(),
+        ]);
+        model.budget_after_first = true;
+        let error = review(
+            &model,
+            request(),
+            &mut ReviewerRecoveryV4::default(),
+            &mut |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.message, "fixture_final_wire_budget_exceeded");
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reviewer_does_not_repair_policy_or_unrecognized_provider_failures() {
+        for message in [
+            "model endpoint failed: responses_tool_not_granted",
+            "responses_arguments_invalid suffix",
+            "unrelated truncated_output: quoted source",
+        ] {
+            let model = OutputModel::new(vec![OutputStep::Error(message), valid_submit()]);
+            let mut recovery = ReviewerRecoveryV4::default();
+            let error = review(&model, request(), &mut recovery, &mut |_| {})
+                .await
+                .unwrap_err();
+            assert_eq!(error.message, message);
+            assert!(
+                recovery.try_output_repair(),
+                "unrelated errors must not consume output repair"
+            );
+            assert_eq!(model.requests.lock().unwrap().len(), 1);
         }
     }
 
