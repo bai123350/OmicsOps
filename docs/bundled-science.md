@@ -18,8 +18,9 @@ Memory 是当前本地项目 `.omicsops/memory/` 目录第一层的 `.md` 文件
 切换对话、改变配置和新增消息/运行结束后会刷新数量；加载失败显示占位并允许
 重试，不展示另一对话的旧数值。查看面板不会启动 MCP、联网或授予调用权限。
 
-1. 打开设置的 Skills 与 MCP 页面。原有 9 个单细胞包继续保留，新包位于
-   `wisp_science` 分类；默认启用 13 个科研技能，其他 13 个可手动启用。
+1. 打开设置的 Skills 与 MCP 页面。35 个捆绑包全部以平铺列表显示，资源统一在
+   `skills/<技能名>/SKILL.md`，没有来源或分类上级目录。原有 9 个单细胞包继续保留；
+   Wisp 来源的包默认启用 13 个科研技能，其他 13 个可手动启用。
    首次安装后的用户启停选择在重启后保留。
 2. Agent 用 `search_skills` 找到已启用技能，再以返回的 UUID 调用 `use_skill`。
    默认结果包含指南、OmicsOps 兼容性说明和资源目录。读取脚本时传入例如
@@ -102,8 +103,9 @@ HTTP POST 失败不会自动重试，避免重复派发。
 
 ## 来源与许可
 
-Skills 的原始文件哈希见 `skills/wisp-science/SOURCE.json`，原许可与第三方
-声明随包分发。`crates/omicsops-bio/UPSTREAM.md` 记录原生实现的来源与适配。
+Skills 的原始文件哈希见 `docs/third-party/skills/wisp-science/SOURCE.json`，
+原许可与第三方声明随安装包的 `licenses/skills/` 目录分发。
+`crates/omicsops-bio/UPSTREAM.md` 记录原生实现的来源与适配。
 用户明确同意直接引入后的 AGPL-3.0-only 组合许可，根目录 `LICENSE` 和 Cargo
 许可声明已更新。单独声明 Apache/MIT 等许可的组件继续保留原声明；本次调整
 不撤销此前版本已授予的许可。
