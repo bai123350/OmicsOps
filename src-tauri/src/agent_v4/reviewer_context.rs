@@ -774,6 +774,7 @@ fn read_tool(source_ids: &[String]) -> ToolDescriptorV4 {
 pub(super) async fn review(
     model: &DesktopModelPortV4,
     request: ReviewerRequestV4,
+    on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
 ) -> Result<ReviewerReportV4, ModelFailureV4> {
     let mut snapshot = Snapshot::new(request)?;
     let system = format!(
@@ -823,7 +824,7 @@ pub(super) async fn review(
         // DesktopModelPortV4::stream applies the same final provider JSON
         // budget as execution. No ToolRegistry, network tool or SSH is called.
         let turn = model
-            .stream(request_for(&context, reader), &mut |_| {})
+            .stream(request_for(&context, reader), on_event)
             .await?;
         if turn.tool_calls.len() == 1 && turn.tool_calls[0].tool_id == "agent.submit_review" {
             let report = serde_json::from_value(turn.tool_calls[0].arguments.clone())

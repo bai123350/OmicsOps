@@ -226,6 +226,17 @@ impl ModelActivityPhaseV4 {
     }
 }
 
+fn meaningful_model_progress(event: &ModelStreamEventV4) -> bool {
+    matches!(event,
+        ModelStreamEventV4::TextDelta(text) | ModelStreamEventV4::ReasoningDelta(text)
+            if !text.is_empty()
+    ) || matches!(
+        event,
+        ModelStreamEventV4::Activity(ModelActivityPhaseV4::ToolCall)
+            | ModelStreamEventV4::ContentProgress { bytes: 1.. }
+    )
+}
+
 /// Frozen model metadata used to qualify usage observations. Unknown values
 /// remain unknown so byte budgets or default windows cannot masquerade as
 /// provider token counts or exact catalog limits.
@@ -400,6 +411,17 @@ pub trait ModelPortV4: Send + Sync {
             omicsops_protocol::ModelErrorClassV4::InvalidRequest,
             "an independent V4 reviewer is not configured",
         ))
+    }
+
+    /// Private review progress lets the host supervise a multi-turn review.
+    /// It is not executor output and must not be persisted or shown as such.
+    /// Existing non-streaming ports retain their original review behavior.
+    async fn review_with_progress(
+        &self,
+        request: ReviewerRequestV4,
+        _on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+    ) -> Result<ReviewerReportV4, ModelFailureV4> {
+        self.review(request).await
     }
 }
 
@@ -2312,6 +2334,10 @@ impl AgentCoreV4<'_> {
                 review
                     .validate()
                     .map_err(|error| AgentCoreErrorV4::Model(error.to_string()))?;
+                if cancelled.load(Ordering::SeqCst) {
+                    self.stop_if_cancelled(spec.run_id, cancelled).await?;
+                    return Err(AgentCoreErrorV4::Cancelled);
+                }
                 self.push(
                     spec.run_id,
                     AgentEventKindV4::ReviewerFinished {
@@ -2348,6 +2374,10 @@ impl AgentCoreV4<'_> {
                     )
                     .await?;
                     continue;
+                }
+                if cancelled.load(Ordering::SeqCst) {
+                    self.stop_if_cancelled(spec.run_id, cancelled).await?;
+                    return Err(AgentCoreErrorV4::Cancelled);
                 }
                 if self.complete_if_no_guidance(spec.run_id).await? {
                     return Ok(());
@@ -3108,14 +3138,7 @@ impl AgentCoreV4<'_> {
             let mut on_event = |event| {
                 // Only provider content advances the stream idle deadline.
                 // Retry/usage/activity previews can occur without generation.
-                if matches!(&event,
-                    ModelStreamEventV4::TextDelta(text) | ModelStreamEventV4::ReasoningDelta(text)
-                        if !text.is_empty()
-                ) || matches!(
-                    event,
-                    ModelStreamEventV4::Activity(ModelActivityPhaseV4::ToolCall)
-                        | ModelStreamEventV4::ContentProgress { bytes: 1.. }
-                ) {
+                if meaningful_model_progress(&event) {
                     progress_tx.send_replace(tokio::time::Instant::now());
                 }
                 let phase = match event {
@@ -3484,6 +3507,19 @@ impl AgentCoreV4<'_> {
     ) -> Result<ReviewerReportV4, AgentCoreErrorV4> {
         let mut attempt = 0_u8;
         let mut output_regenerated = false;
+        // A review can contain several provider turns. The idle bound applies
+        // to meaningful generation, while every retry/regeneration/backoff
+        // shares one immutable absolute deadline for the whole review.
+        let hard_at = tokio::time::Instant::now() + MODEL_STREAM_HARD_TIMEOUT;
+        let hard_timeout = || {
+            ModelFailureV4::permanent(
+                omicsops_protocol::ModelErrorClassV4::Timeout,
+                format!(
+                    "reviewer hard timeout after {} seconds total; no completed report was accepted",
+                    MODEL_STREAM_HARD_TIMEOUT.as_secs()
+                ),
+            )
+        };
         loop {
             if cancelled.is_some_and(|token| token.load(Ordering::SeqCst)) {
                 if let Some(token) = cancelled {
@@ -3491,17 +3527,84 @@ impl AgentCoreV4<'_> {
                 }
                 return Err(AgentCoreErrorV4::Cancelled);
             }
-            let review = tokio::time::timeout(attempt_timeout, self.model.review(request.clone()))
-                .await
-                .unwrap_or_else(|_| {
-                    Err(ModelFailureV4::transient(
+            if tokio::time::Instant::now() >= hard_at {
+                return Err(AgentCoreErrorV4::Model(hard_timeout().message));
+            }
+            let review = {
+                // This private channel carries timestamps only. Reviewer text,
+                // reasoning and usage never enter executor previews/events.
+                let started = tokio::time::Instant::now();
+                let idle_timeout = || {
+                    ModelFailureV4::transient(
                         omicsops_protocol::ModelErrorClassV4::Timeout,
                         format!(
-                            "reviewer produced no completed report within {} seconds",
-                            attempt_timeout.as_secs()
+                            "reviewer idle timeout after {} seconds without meaningful output (attempt elapsed {} seconds)",
+                            attempt_timeout.as_secs(),
+                            started.elapsed().as_secs()
                         ),
-                    ))
-                });
+                    )
+                };
+                let (progress_tx, mut progress_rx) = tokio::sync::watch::channel(started);
+                let mut on_event = |event| {
+                    if meaningful_model_progress(&event) {
+                        let at = tokio::time::Instant::now();
+                        let last = *progress_tx.borrow();
+                        if at < last + attempt_timeout {
+                            progress_tx.send_replace(at);
+                        }
+                    }
+                };
+                let mut completion = Box::pin(
+                    self.model
+                        .review_with_progress(request.clone(), &mut on_event),
+                );
+                let idle_deadline = tokio::time::sleep(attempt_timeout);
+                let hard_deadline = tokio::time::sleep_until(hard_at);
+                tokio::pin!(idle_deadline, hard_deadline);
+                let mut cancellation_poll = tokio::time::interval(Duration::from_millis(50));
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut hard_deadline => break Err(hard_timeout()),
+                        _ = cancellation_poll.tick(), if cancelled.is_some() => {
+                            if let Some(token) = cancelled.filter(|token| token.load(Ordering::SeqCst)) {
+                                self.stop_if_cancelled(run_id, token).await?;
+                                return Err(AgentCoreErrorV4::Cancelled);
+                            }
+                        }
+                        result = &mut completion => {
+                            let now = tokio::time::Instant::now();
+                            let last = *progress_rx.borrow();
+                            // Polling the provider may itself produce progress
+                            // and a result after an expired timer is ready.
+                            break if now >= hard_at {
+                                Err(hard_timeout())
+                            } else if now >= last + attempt_timeout {
+                                Err(idle_timeout())
+                            } else {
+                                result
+                            };
+                        }
+                        changed = progress_rx.changed() => {
+                            if changed.is_ok() {
+                                let at = *progress_rx.borrow_and_update();
+                                // The callback already rejects late progress;
+                                // a watch may coalesce several valid updates.
+                                idle_deadline.as_mut().reset(at + attempt_timeout);
+                            }
+                        }
+                        _ = &mut idle_deadline => {
+                            break Err(idle_timeout());
+                        }
+                    }
+                }
+            };
+            // Stop may arrive between the polling tick and a completed report.
+            // Drop that report rather than admitting it as a successful review.
+            if let Some(token) = cancelled.filter(|token| token.load(Ordering::SeqCst)) {
+                self.stop_if_cancelled(run_id, token).await?;
+                return Err(AgentCoreErrorV4::Cancelled);
+            }
             match review {
                 Ok(report) => return Ok(report),
                 Err(error)
@@ -3546,10 +3649,25 @@ impl AgentCoreV4<'_> {
                         },
                     )
                     .await?;
-                    tokio::time::sleep(Duration::from_millis(
+                    let backoff = tokio::time::sleep(Duration::from_millis(
                         250 * (1_u64 << u32::from(attempt.saturating_sub(1))),
-                    ))
-                    .await;
+                    ));
+                    let hard_deadline = tokio::time::sleep_until(hard_at);
+                    tokio::pin!(backoff, hard_deadline);
+                    let mut cancellation_poll = tokio::time::interval(Duration::from_millis(50));
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = &mut hard_deadline => return Err(AgentCoreErrorV4::Model(hard_timeout().message)),
+                            _ = cancellation_poll.tick(), if cancelled.is_some() => {
+                                if let Some(token) = cancelled.filter(|token| token.load(Ordering::SeqCst)) {
+                                    self.stop_if_cancelled(run_id, token).await?;
+                                    return Err(AgentCoreErrorV4::Cancelled);
+                                }
+                            }
+                            _ = &mut backoff => break,
+                        }
+                    }
                 }
                 Err(error) => return Err(AgentCoreErrorV4::Model(error.message)),
             }
@@ -3687,6 +3805,10 @@ impl AgentCoreV4<'_> {
         review
             .validate()
             .map_err(|error| AgentCoreErrorV4::Model(error.to_string()))?;
+        if cancelled.load(Ordering::SeqCst) {
+            self.stop_if_cancelled(spec.run_id, cancelled).await?;
+            return Err(AgentCoreErrorV4::Cancelled);
+        }
         self.push(
             spec.run_id,
             AgentEventKindV4::ReviewerFinished {
@@ -3723,6 +3845,10 @@ impl AgentCoreV4<'_> {
             )
             .await?;
             return Ok(false);
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            self.stop_if_cancelled(spec.run_id, cancelled).await?;
+            return Err(AgentCoreErrorV4::Cancelled);
         }
         self.complete_if_no_guidance(spec.run_id).await
     }
@@ -17756,6 +17882,463 @@ mod tests {
                 evidence: vec!["deterministic_verification_v4".into()],
             }],
         }
+    }
+
+    struct TimedReviewer {
+        steps: Vec<(Duration, ModelStreamEventV4)>,
+        final_delay: Duration,
+        fail_attempts: usize,
+        failure: ModelFailureV4,
+        requests: Mutex<Vec<ReviewerRequestV4>>,
+        active: AtomicUsize,
+    }
+
+    struct ActiveReviewGuard<'a>(&'a AtomicUsize);
+
+    impl Drop for ActiveReviewGuard<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl ModelPortV4 for TimedReviewer {
+        async fn stream(
+            &self,
+            _: ModelRequestV4,
+            _: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            unreachable!("review supervision must not dispatch the executor")
+        }
+
+        async fn review(
+            &self,
+            request: ReviewerRequestV4,
+        ) -> Result<ReviewerReportV4, ModelFailureV4> {
+            self.review_with_progress(request, &mut |_| {}).await
+        }
+
+        async fn review_with_progress(
+            &self,
+            request: ReviewerRequestV4,
+            on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ReviewerReportV4, ModelFailureV4> {
+            let attempt = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request);
+                requests.len()
+            };
+            self.active.fetch_add(1, AtomicOrdering::SeqCst);
+            let _active = ActiveReviewGuard(&self.active);
+            for (delay, event) in &self.steps {
+                tokio::time::sleep(*delay).await;
+                on_event(event.clone());
+            }
+            if !self.final_delay.is_zero() {
+                tokio::time::sleep(self.final_delay).await;
+            }
+            if attempt <= self.fail_attempts {
+                Err(self.failure.clone())
+            } else {
+                Ok(review(VerificationSeverityV4::Warn))
+            }
+        }
+    }
+
+    fn timed_reviewer(
+        steps: Vec<(Duration, ModelStreamEventV4)>,
+        final_delay: Duration,
+        fail_attempts: usize,
+    ) -> TimedReviewer {
+        TimedReviewer {
+            steps,
+            final_delay,
+            fail_attempts,
+            failure: ModelFailureV4::transient(
+                omicsops_protocol::ModelErrorClassV4::Transport,
+                "controlled review transport failure",
+            ),
+            requests: Mutex::new(vec![]),
+            active: AtomicUsize::new(0),
+        }
+    }
+
+    async fn timed_review_result(
+        model: &TimedReviewer,
+        max_retries: u8,
+        idle: Duration,
+        cancelled: Option<&AtomicBool>,
+    ) -> (
+        Result<ReviewerReportV4, AgentCoreErrorV4>,
+        Duration,
+        Vec<AgentEventV4>,
+    ) {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let core = AgentCoreV4 {
+            model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let started = tokio::time::Instant::now();
+        let result = core
+            .review_with_retry(
+                spec.run_id,
+                frozen_reviewer_request(&spec),
+                max_retries,
+                idle,
+                cancelled,
+            )
+            .await;
+        let elapsed = started.elapsed();
+        assert_eq!(model.active.load(AtomicOrdering::SeqCst), 0);
+        let events = store.load_direct(spec.run_id).unwrap();
+        assert!(!events.iter().any(|event| matches!(
+            event.event,
+            AgentEventKindV4::ReviewerFinished { .. }
+                | AgentEventKindV4::RunCompleted
+                | AgentEventKindV4::ToolRequested { .. }
+        )));
+        (result, elapsed, events)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reviewer_progress_allows_multiturn_completion_after_old_absolute_limit() {
+        let model = timed_reviewer(
+            vec![
+                (
+                    Duration::from_secs(70),
+                    ModelStreamEventV4::ReasoningDelta("private-review-reasoning".into()),
+                ),
+                (
+                    Duration::from_secs(70),
+                    ModelStreamEventV4::ContentProgress { bytes: 100 },
+                ),
+                (
+                    Duration::from_secs(70),
+                    ModelStreamEventV4::Activity(ModelActivityPhaseV4::ToolCall),
+                ),
+            ],
+            Duration::from_secs(1),
+            0,
+        );
+        let (result, elapsed, events) =
+            timed_review_result(&model, 0, Duration::from_secs(180), None).await;
+        assert_eq!(result.unwrap(), review(VerificationSeverityV4::Warn));
+        assert_eq!(elapsed, Duration::from_secs(211));
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+        assert!(
+            !serde_json::to_string(&events)
+                .unwrap()
+                .contains("private-review-reasoning")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reviewer_noise_and_empty_content_do_not_extend_idle_deadline() {
+        let noise = vec![
+            ModelStreamEventV4::TextDelta(String::new()),
+            ModelStreamEventV4::ReasoningDelta(String::new()),
+            ModelStreamEventV4::ContentProgress { bytes: 0 },
+            ModelStreamEventV4::Activity(ModelActivityPhaseV4::Responding),
+            ModelStreamEventV4::ProviderRetrying {
+                attempt: 1,
+                delay_ms: 1,
+                message: "noise".into(),
+            },
+            ModelStreamEventV4::Usage(ModelUsageSampleV4 {
+                sample_index: 0,
+                state: UsageObservationStateV4::Partial,
+                aggregation: UsageAggregationV4::Cumulative,
+                input_tokens: Some(1),
+                context_tokens: None,
+                output_tokens: Some(1),
+                reasoning_tokens: None,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+                reported_total_tokens: None,
+            }),
+        ];
+        let model = timed_reviewer(
+            noise
+                .into_iter()
+                .map(|event| (Duration::from_secs(20), event))
+                .collect(),
+            Duration::from_secs(100),
+            0,
+        );
+        let (result, elapsed, _) =
+            timed_review_result(&model, 0, Duration::from_secs(180), None).await;
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::Model(message)) if message.contains("reviewer idle timeout") && message.contains("180 seconds"))
+        );
+        assert_eq!(elapsed, Duration::from_secs(180));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reviewer_stall_times_out_since_last_meaningful_content() {
+        let model = timed_reviewer(
+            vec![(
+                Duration::from_secs(100),
+                ModelStreamEventV4::TextDelta("private-review".into()),
+            )],
+            Duration::from_secs(181),
+            0,
+        );
+        let (result, elapsed, _) =
+            timed_review_result(&model, 0, Duration::from_secs(180), None).await;
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::Model(message)) if message.contains("reviewer idle timeout"))
+        );
+        assert_eq!(elapsed, Duration::from_secs(280));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reviewer_late_progress_and_report_cannot_revive_an_expired_idle_deadline() {
+        let model = timed_reviewer(
+            vec![(
+                Duration::from_secs(181),
+                ModelStreamEventV4::TextDelta("late private review".into()),
+            )],
+            Duration::ZERO,
+            0,
+        );
+        let review = timed_review_result(&model, 0, Duration::from_secs(180), None);
+        tokio::pin!(review);
+        assert!(futures_util::poll!(&mut review).is_pending());
+        // Keep the host future unpolled until both its idle timer and a late
+        // provider result are ready, as can happen after scheduler starvation.
+        tokio::time::advance(Duration::from_secs(181)).await;
+        let (result, elapsed, _) = review.await;
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::Model(message)) if message.contains("reviewer idle timeout"))
+        );
+        assert_eq!(elapsed, Duration::from_secs(181));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reviewer_continuous_progress_cannot_extend_shared_hard_deadline() {
+        let model = timed_reviewer(
+            (0..10)
+                .map(|_| {
+                    (
+                        Duration::from_secs(100),
+                        ModelStreamEventV4::ReasoningDelta("private-review".into()),
+                    )
+                })
+                .collect(),
+            Duration::from_secs(1),
+            0,
+        );
+        let (result, elapsed, events) =
+            timed_review_result(&model, 3, Duration::from_secs(180), None).await;
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::Model(message)) if message.contains("reviewer hard timeout") && message.contains("900 seconds"))
+        );
+        assert_eq!(elapsed, Duration::from_secs(900));
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.event, AgentEventKindV4::ModelRetrying { .. }))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reviewer_transport_retries_share_one_absolute_deadline_and_frozen_input() {
+        let model = timed_reviewer(
+            (0..4)
+                .map(|_| {
+                    (
+                        Duration::from_secs(100),
+                        ModelStreamEventV4::ContentProgress { bytes: 1 },
+                    )
+                })
+                .collect(),
+            Duration::ZERO,
+            usize::MAX,
+        );
+        let (result, elapsed, events) =
+            timed_review_result(&model, 5, Duration::from_secs(180), None).await;
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::Model(message)) if message.contains("reviewer hard timeout"))
+        );
+        assert_eq!(elapsed, Duration::from_secs(900));
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| request == &requests[0]));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, AgentEventKindV4::ModelRetrying { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reviewer_stop_interrupts_an_active_request_without_a_completed_report() {
+        let model = timed_reviewer(vec![], Duration::from_secs(1000), 0);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&cancelled);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            setter.store(true, AtomicOrdering::SeqCst);
+        });
+        let (result, elapsed, events) =
+            timed_review_result(&model, 1, Duration::from_secs(180), Some(&cancelled)).await;
+        assert!(matches!(result, Err(AgentCoreErrorV4::Cancelled)));
+        assert!(
+            elapsed <= Duration::from_millis(125),
+            "Stop must interrupt the active review, elapsed={elapsed:?}"
+        );
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, AgentEventKindV4::RunCancelled))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reviewer_stop_interrupts_transport_backoff_before_another_attempt() {
+        let model = timed_reviewer(vec![], Duration::ZERO, usize::MAX);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&cancelled);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            setter.store(true, AtomicOrdering::SeqCst);
+        });
+        let (result, elapsed, _) =
+            timed_review_result(&model, 3, Duration::from_secs(180), Some(&cancelled)).await;
+        assert!(matches!(result, Err(AgentCoreErrorV4::Cancelled)));
+        assert!(
+            elapsed <= Duration::from_millis(125),
+            "Stop must interrupt backoff, elapsed={elapsed:?}"
+        );
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reviewer_hard_deadline_wins_over_a_report_finishing_at_the_same_instant() {
+        let model = timed_reviewer(
+            (0..8)
+                .map(|_| {
+                    (
+                        Duration::from_secs(100),
+                        ModelStreamEventV4::ContentProgress { bytes: 1 },
+                    )
+                })
+                .collect(),
+            Duration::from_secs(100),
+            0,
+        );
+        let (result, elapsed, _) =
+            timed_review_result(&model, 0, Duration::from_secs(180), None).await;
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::Model(message)) if message.contains("reviewer hard timeout"))
+        );
+        assert_eq!(elapsed, Duration::from_secs(900));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reviewer_format_regeneration_does_not_reset_the_shared_hard_deadline() {
+        let mut model = timed_reviewer(
+            (0..5)
+                .map(|_| {
+                    (
+                        Duration::from_secs(100),
+                        ModelStreamEventV4::ContentProgress { bytes: 1 },
+                    )
+                })
+                .collect(),
+            Duration::ZERO,
+            1,
+        );
+        model.failure = truncated_reviewer_output();
+        let (result, elapsed, events) =
+            timed_review_result(&model, 0, Duration::from_secs(180), None).await;
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::Model(message)) if message.contains("reviewer hard timeout"))
+        );
+        assert_eq!(elapsed, Duration::from_secs(900));
+        assert_eq!(model.requests.lock().unwrap().len(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, AgentEventKindV4::ModelRetrying { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reviewer_hard_deadline_also_bounds_backoff_without_starting_a_new_attempt() {
+        let model = timed_reviewer(
+            (0..8)
+                .map(|_| {
+                    (
+                        Duration::from_secs(100),
+                        ModelStreamEventV4::ContentProgress { bytes: 1 },
+                    )
+                })
+                .collect(),
+            Duration::from_millis(99_900),
+            usize::MAX,
+        );
+        let (result, elapsed, _) =
+            timed_review_result(&model, 3, Duration::from_secs(180), None).await;
+        assert!(
+            matches!(result, Err(AgentCoreErrorV4::Model(message)) if message.contains("reviewer hard timeout"))
+        );
+        assert_eq!(elapsed, Duration::from_secs(900));
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reviewer_stop_before_returning_a_complete_report_discards_the_report() {
+        let spec = execution_spec(Uuid::new_v4());
+        let store = MemoryStore::default();
+        seed_execution(&store, &spec);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let model = ScriptedReviewer {
+            outcomes: Mutex::new(vec![Ok(review(VerificationSeverityV4::Warn))]),
+            requests: Mutex::new(vec![]),
+            cancel_after_review: Some(Arc::clone(&cancelled)),
+        };
+        let result = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        }
+        .review_with_retry(
+            spec.run_id,
+            frozen_reviewer_request(&spec),
+            0,
+            Duration::from_secs(180),
+            Some(&cancelled),
+        )
+        .await;
+        assert!(matches!(result, Err(AgentCoreErrorV4::Cancelled)));
+        let events = store.load_direct(spec.run_id).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, AgentEventKindV4::RunCancelled))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event.event,
+            AgentEventKindV4::ReviewerFinished { .. }
+                | AgentEventKindV4::RunCompleted
+                | AgentEventKindV4::ToolRequested { .. }
+        )));
     }
 
     struct RetryingReviewer {

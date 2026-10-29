@@ -1,6 +1,6 @@
 //! Reviewer schema errors are recoverable reports, never executor tool retries.
 use super::*;
-use futures_util::stream;
+use futures_util::{StreamExt, stream};
 use omicsops_adapters::{
     AdapterResult,
     claude_code::{ClaudePreflight, ClaudeProcessRunner},
@@ -10,7 +10,13 @@ use omicsops_adapters::{
     responses::{ResponsesHttpStream, ResponsesTransport},
 };
 use omicsops_process::managed_child::{BackgroundLaunchSpec, ManagedBackgroundChild};
-use std::{sync::Mutex, time::Duration};
+use std::{
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 struct NoProcess;
 #[async_trait]
@@ -681,4 +687,211 @@ async fn desktop_reviewer_cannot_read_after_the_final_submit_only_boundary() {
         "model endpoint failed: responses_tool_not_granted"
     );
     assert_eq!(transport.requests.lock().unwrap().len(), 8);
+}
+
+struct ProgressReviewTransport {
+    inner: Arc<ReadReviewTransport>,
+    observed: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ResponsesTransport for ProgressReviewTransport {
+    async fn post(
+        &self,
+        endpoint: url::Url,
+        headers: reqwest::header::HeaderMap,
+        body: Value,
+        timeout: Duration,
+    ) -> AdapterResult<ResponsesHttpStream> {
+        let response = self.inner.post(endpoint, headers, body, timeout).await?;
+        let mut body = response.body;
+        let mut wire = Vec::new();
+        while let Some(chunk) = body.next().await {
+            wire.extend(chunk?);
+        }
+        let text = std::str::from_utf8(&wire).unwrap();
+        let terminal: Value =
+            serde_json::from_str(text.trim().strip_prefix("data:").unwrap().trim()).unwrap();
+        let call = &terminal["response"]["output"][0];
+        let prefix=[
+            json!({"type":"response.reasoning_text.delta","delta":"private review fixture reasoning"}),
+            json!({"type":"response.output_item.added","output_index":0,"item":{"id":call["id"],"type":"function_call","call_id":call["call_id"],"name":call["name"],"arguments":""}}),
+            json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":call["id"],"delta":call["arguments"]}),
+        ].into_iter().map(|event|Ok(format!("data: {event}\n\n").into_bytes()));
+        let observed = self.observed.clone();
+        let before = self.observed.load(Ordering::SeqCst);
+        let terminal = stream::once(async move {
+            assert!(
+                observed.load(Ordering::SeqCst) > before,
+                "review stream progress must reach its caller before the terminal report chunk"
+            );
+            Ok(wire)
+        });
+        Ok(ResponsesHttpStream {
+            status: response.status,
+            body: Box::pin(stream::iter(prefix).chain(terminal)),
+        })
+    }
+}
+
+#[tokio::test]
+async fn desktop_reviewer_progress_bridges_live_selected_reviewer_pages_and_final_submission() {
+    let observed = Arc::new(AtomicUsize::new(0));
+    let selected_requests = Arc::new(ReadReviewTransport {
+        scenario: ReadScenario::ReadThenSubmit,
+        requests: Mutex::new(vec![]),
+    });
+    let selected = reviewer(Arc::new(ProgressReviewTransport {
+        inner: selected_requests.clone(),
+        observed: observed.clone(),
+    }));
+    let executor_requests = Arc::new(ReviewTransport {
+        report: json!({"schema_version":4,"summary":"executor must not review","findings":[]}),
+        requests: Mutex::new(vec![]),
+    });
+    let mut executor = reviewer(executor_requests.clone());
+    executor.reviewer = Some(Box::new(selected));
+    let mut kinds = Vec::new();
+    let mut progress_bytes = Vec::new();
+    let report = executor
+        .review_with_progress(read_review_request(), &mut |event| match event {
+            ModelStreamEventV4::ReasoningDelta(_) => {
+                observed.fetch_add(1, Ordering::SeqCst);
+                kinds.push("reasoning");
+            }
+            ModelStreamEventV4::ContentProgress { bytes } if bytes > 0 => {
+                progress_bytes.push(bytes);
+                observed.fetch_add(1, Ordering::SeqCst);
+                kinds.push("arguments");
+            }
+            ModelStreamEventV4::Activity(ModelActivityPhaseV4::ToolCall) => kinds.push("tool"),
+            _ => {}
+        })
+        .await
+        .unwrap();
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == "review_evidence_partial")
+    );
+    assert_eq!(
+        selected_requests.requests.lock().unwrap().len(),
+        2,
+        "one page request and one final submission"
+    );
+    assert!(
+        executor_requests.requests.lock().unwrap().is_empty(),
+        "the frozen independent reviewer must receive the request"
+    );
+    assert!(
+        !kinds.contains(&"reasoning"),
+        "Responses normalizes private reasoning to byte progress, not reasoning text"
+    );
+    assert_eq!(
+        progress_bytes.len(),
+        4,
+        "reasoning and argument progress for both review turns"
+    );
+    for round in progress_bytes.chunks_exact(2) {
+        assert_eq!(round[0], "private review fixture reasoning".len() as u32);
+        assert!(round[1] > 0);
+    }
+    assert!(kinds.iter().filter(|kind| **kind == "tool").count() >= 2);
+}
+
+#[tokio::test]
+async fn desktop_reviewer_http_reasoning_content_reaches_supervisor_before_report_completion() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = url::Url::parse(&format!("http://{}/v1", listener.local_addr().unwrap())).unwrap();
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let header_end = loop {
+            let count = socket.read(&mut buffer).unwrap();
+            assert!(count > 0);
+            bytes.extend_from_slice(&buffer[..count]);
+            if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
+        let length: usize = headers
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().unwrap())
+            })
+            .unwrap();
+        while bytes.len() - header_end < length {
+            let count = socket.read(&mut buffer).unwrap();
+            assert!(count > 0);
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+        let request: Value =
+            serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+        let report = json!({"schema_version":4,"summary":"Reviewed the supplied observations","findings":[]});
+        let reasoning = format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"reasoning_content":"private HTTP reviewer fixture reasoning"}}]})
+        );
+        let arguments = format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"tool_calls":[{
+                "index":0,"id":"http-review","type":"function","function":{"name":request["tools"][0]["function"]["name"],"arguments":report.to_string()}
+            }]}}]})
+        );
+        let terminal = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+        write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",reasoning.len()+arguments.len()+terminal.len(),reasoning).unwrap();
+        socket.flush().unwrap();
+        progress_rx.recv_timeout(Duration::from_secs(5)).expect(
+            "HTTP reasoning delta must reach review supervisor while the report is still streaming",
+        );
+        socket.write_all(arguments.as_bytes()).unwrap();
+        socket.write_all(terminal.as_bytes()).unwrap();
+    });
+    let unused = Arc::new(ReviewTransport {
+        report: json!({}),
+        requests: Mutex::new(vec![]),
+    });
+    let mut model = reviewer(unused.clone());
+    model.client = ModelClient::Http(
+        UnifiedModelClient::new(
+            model.usage_metadata.model_profile_id,
+            ProviderProtocol::OpenAiCompatible,
+            base,
+            "deepseek-fixture",
+            Some("not-a-real-key".into()),
+        )
+        .unwrap()
+        .with_request_budget(RequestBudget {
+            context_window_tokens: 100_000,
+            reserved_output_tokens: 16_384,
+            safety_margin_tokens: 1_024,
+        }),
+    );
+    let mut kinds = Vec::new();
+    let report = model
+        .review_with_progress(request(), &mut |event| match event {
+            ModelStreamEventV4::ReasoningDelta(_) => {
+                let _ = progress_tx.send(());
+                kinds.push("reasoning");
+            }
+            ModelStreamEventV4::Activity(ModelActivityPhaseV4::ToolCall) => kinds.push("arguments"),
+            _ => {}
+        })
+        .await
+        .unwrap();
+    server.join().unwrap();
+    assert!(report.findings.is_empty());
+    assert!(kinds.contains(&"reasoning"));
+    assert!(kinds.contains(&"arguments"));
+    assert!(unused.requests.lock().unwrap().is_empty());
 }

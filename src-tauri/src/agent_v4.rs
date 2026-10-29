@@ -5940,10 +5940,18 @@ impl ModelPortV4 for DesktopModelPortV4 {
     }
 
     async fn review(&self, request: ReviewerRequestV4) -> Result<ReviewerReportV4, ModelFailureV4> {
+        self.review_with_progress(request, &mut |_| {}).await
+    }
+
+    async fn review_with_progress(
+        &self,
+        request: ReviewerRequestV4,
+        on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+    ) -> Result<ReviewerReportV4, ModelFailureV4> {
         if let Some(reviewer) = &self.reviewer {
-            return reviewer.review(request).await;
+            return reviewer.review_with_progress(request, on_event).await;
         }
-        reviewer_context::review(self, request).await
+        reviewer_context::review(self, request, on_event).await
     }
 }
 
