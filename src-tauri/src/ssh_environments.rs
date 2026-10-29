@@ -209,6 +209,45 @@ fn failed_observations(status: SshInterpreterStatusV4) -> Vec<SshInterpreterObse
         .collect()
 }
 
+async fn inspect_option_with_deadline(
+    runner: &impl RemoteProbeRunner,
+    root: &str,
+    environment: String,
+    label: String,
+    deadline: Instant,
+) -> (SshEnvironmentOptionV4, bool) {
+    if Instant::now() >= deadline {
+        return (
+            SshEnvironmentOptionV4 {
+                environment,
+                label,
+                interpreters: failed_observations(SshInterpreterStatusV4::Timeout),
+            },
+            true,
+        );
+    }
+    let observation =
+        tokio::time::timeout_at(deadline, inspect_remote_with(runner, root, &environment)).await;
+    let deadline_exhausted = observation.is_err();
+    let interpreters = match observation {
+        Ok(Ok(report)) => report.interpreters,
+        Ok(Err(error)) => failed_observations(if error == InspectionErrorV4::Timeout {
+            SshInterpreterStatusV4::Timeout
+        } else {
+            SshInterpreterStatusV4::Error
+        }),
+        Err(_) => failed_observations(SshInterpreterStatusV4::Timeout),
+    };
+    (
+        SshEnvironmentOptionV4 {
+            environment,
+            label,
+            interpreters,
+        },
+        deadline_exhausted,
+    )
+}
+
 async fn inspect_project_with(
     runner: &impl RemoteProbeRunner,
     root: &str,
@@ -224,43 +263,23 @@ async fn inspect_project_with(
     if output.status != 0 {
         return Err(InspectionErrorV4::Transport);
     }
-    let (canonical_root, mut candidates, mut truncated) = parse_discovery(&output.stdout)?;
-    if requested != "system" && !candidates.iter().any(|(token, _)| token == requested) {
-        candidates.insert(0, (requested.to_owned(), environment_label(requested)));
-        if candidates.len() > MAX_CANDIDATES {
-            candidates.pop();
-            truncated = true;
-        }
-    }
-    candidates.insert(0, ("system".into(), "system".into()));
+    let (canonical_root, candidates, mut truncated) = parse_discovery(&output.stdout)?;
     let mut options = Vec::new();
+    // Only discovered project candidates determine recommendation completeness.
+    // The parser orders .envs before the legacy project-managed directory.
     for (environment, label) in candidates {
         if Instant::now() >= deadline {
             truncated = true;
             break;
         }
-        let observation = tokio::time::timeout_at(
-            deadline,
-            inspect_remote_with(runner, &canonical_root, &environment),
-        )
-        .await;
-        let interpreters = match observation {
-            Ok(Ok(report)) => report.interpreters,
-            Ok(Err(error)) => failed_observations(if error == InspectionErrorV4::Timeout {
-                SshInterpreterStatusV4::Timeout
-            } else {
-                SshInterpreterStatusV4::Error
-            }),
-            Err(_) => {
-                truncated = true;
-                failed_observations(SshInterpreterStatusV4::Timeout)
-            }
-        };
-        options.push(SshEnvironmentOptionV4 {
-            environment,
-            label,
-            interpreters,
-        });
+        let (option, deadline_exhausted) =
+            inspect_option_with_deadline(runner, &canonical_root, environment, label, deadline)
+                .await;
+        options.push(option);
+        if deadline_exhausted {
+            truncated = true;
+            break;
+        }
     }
     let suggestion = if truncated {
         None
@@ -268,14 +287,43 @@ async fn inspect_project_with(
         suggested_option(&options)
     };
     let suggested_environment = suggestion.as_ref().map(|option| option.environment.clone());
-    if let Some(suggestion) = suggestion {
-        if !options
-            .iter()
-            .any(|option| option.environment == suggestion.environment)
-        {
-            options.push(suggestion);
-        }
+    // A stale or undiscovered explicit request is supplementary: inspect it
+    // after inventory candidates without displacing or poisoning their result.
+    if requested != "system"
+        && !options.iter().any(|option| option.environment == requested)
+        && suggested_environment.as_deref() != Some(requested)
+    {
+        let (option, _) = inspect_option_with_deadline(
+            runner,
+            &canonical_root,
+            requested.into(),
+            environment_label(requested),
+            deadline,
+        )
+        .await;
+        options.push(option);
     }
+    options.sort_by_key(|option| !option.environment.starts_with("envs:"));
+    if let Some(suggestion) = suggestion {
+        if let Some(index) = options
+            .iter()
+            .position(|option| option.environment == suggestion.environment)
+        {
+            options.remove(index);
+        }
+        options.insert(0, suggestion);
+    }
+    // System remains selectable, but consumes only the remaining budget. Its
+    // timeout/error does not make a complete project inventory truncated.
+    let (system, _) = inspect_option_with_deadline(
+        runner,
+        &canonical_root,
+        "system".into(),
+        "system".into(),
+        deadline,
+    )
+    .await;
+    options.push(system);
     Ok(SshEnvironmentReportV4 {
         project_id: uuid::Uuid::nil(),
         connection_id: uuid::Uuid::nil(),
@@ -441,17 +489,240 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum SystemProbe {
+        Available,
+        Error,
+        Timeout,
+    }
+
+    struct ProjectFirstRunner {
+        discovery: String,
+        commands: Mutex<Vec<String>>,
+        project_delay: Duration,
+        system: SystemProbe,
+    }
+
+    impl ProjectFirstRunner {
+        fn new(system: SystemProbe) -> Self {
+            Self {
+                discovery: "READY\nROOT\t/project\nenvs\tpython311\nenvs\tr443\nDONE\n".into(),
+                commands: Mutex::new(Vec::new()),
+                project_delay: Duration::ZERO,
+                system,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RemoteProbeRunner for ProjectFirstRunner {
+        async fn run(&self, command: &str) -> Result<ProbeCommandOutput, InspectionErrorV4> {
+            self.commands.lock().unwrap().push(command.into());
+            let stdout = if command.contains("-mindepth 1 -maxdepth 1") {
+                self.discovery.clone()
+            } else if command.contains("p=$(command -v ") {
+                match self.system {
+                    SystemProbe::Error => return Err(InspectionErrorV4::Transport),
+                    SystemProbe::Timeout => {
+                        tokio::time::sleep(Duration::from_secs(300)).await;
+                        unreachable!()
+                    }
+                    SystemProbe::Available if command.contains("command -v python)") => {
+                        "PATH\t/usr/bin/python\n3.12.10\nEXIT\t0\n".into()
+                    }
+                    SystemProbe::Available => "NOT_FOUND\n".into(),
+                }
+            } else {
+                if command.contains("/.envs/oldpy/bin/") || command.contains("/.envs/oldr/bin/") {
+                    return Err(InspectionErrorV4::Transport);
+                }
+                tokio::time::sleep(self.project_delay).await;
+                if command.contains("p='/project/.envs/python311/bin/python'") {
+                    "PATH\t/project/.envs/python311/bin/python\n3.11.18\nEXIT\t0\n".into()
+                } else if command.contains("p='/project/.envs/r443/bin/Rscript'") {
+                    "PATH\t/project/.envs/r443/bin/Rscript\nRscript (R) version 4.4.3 (2025-02-28)\nEXIT\t0\n".into()
+                } else {
+                    "NOT_FOUND\n".into()
+                }
+            };
+            Ok(ProbeCommandOutput { status: 0, stdout })
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_project_priority_inspects_envs_before_managed_and_system_and_displays_recommendation_first()
+     {
+        let mut runner = ProjectFirstRunner::new(SystemProbe::Available);
+        runner.discovery =
+            "READY\nROOT\t/project\nmanaged\tanalysis-r\nenvs\tpython311\nenvs\tr443\nDONE\n"
+                .into();
+        let report = inspect_project_with(&runner, "/project", "analysis-r")
+            .await
+            .unwrap();
+        assert_eq!(
+            report.suggested_environment.as_deref(),
+            Some("envs:python311:r443")
+        );
+        assert_eq!(
+            report
+                .environments
+                .iter()
+                .map(|option| option.environment.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "envs:python311:r443",
+                "envs:python311",
+                "envs:r443",
+                "analysis-r",
+                "system"
+            ]
+        );
+        let commands = runner.commands.lock().unwrap();
+        assert!(commands[1].contains("p='/project/.envs/python311/bin/python'"));
+        assert!(commands[3].contains("p='/project/.envs/r443/bin/python'"));
+        assert!(commands[5].contains(".omicsops/environments/analysis-r/bin/python"));
+        assert!(commands[7].contains("p=$(command -v python)"));
+    }
+
+    #[tokio::test]
+    async fn ssh_project_priority_system_failure_cannot_clear_reliable_project_recommendation() {
+        let runner = ProjectFirstRunner::new(SystemProbe::Error);
+        let report = inspect_project_with(&runner, "/project", "system")
+            .await
+            .unwrap();
+        assert_eq!(report.environments[0].environment, "envs:python311:r443");
+        assert_eq!(
+            report.suggested_environment.as_deref(),
+            Some("envs:python311:r443")
+        );
+        assert!(!report.truncated);
+        let system = report.environments.last().unwrap();
+        assert_eq!(system.environment, "system");
+        assert!(
+            system
+                .interpreters
+                .iter()
+                .all(|item| item.status == SshInterpreterStatusV4::Error)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ssh_project_priority_system_deadline_keeps_complete_project_results_and_system_option()
+    {
+        let mut runner = ProjectFirstRunner::new(SystemProbe::Timeout);
+        runner.project_delay = Duration::from_millis(4_800);
+        let started = Instant::now();
+        let report = inspect_project_with(&runner, "/project", "system")
+            .await
+            .unwrap();
+        assert_eq!(started.elapsed(), REPORT_TIMEOUT);
+        assert!(
+            !report.truncated,
+            "the project candidates all finished before system's remaining budget expired"
+        );
+        assert_eq!(
+            report.suggested_environment.as_deref(),
+            Some("envs:python311:r443")
+        );
+        assert_eq!(report.environments[0].environment, "envs:python311:r443");
+        let system = report.environments.last().unwrap();
+        assert_eq!(system.environment, "system");
+        assert!(
+            system
+                .interpreters
+                .iter()
+                .all(|item| item.status == SshInterpreterStatusV4::Timeout)
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_project_priority_unknown_requested_environment_does_not_displace_discovered_candidates()
+     {
+        let mut runner = ProjectFirstRunner::new(SystemProbe::Available);
+        runner.discovery = format!(
+            "READY\nROOT\t/project\n{}DONE\n",
+            (0..8)
+                .map(|index| format!("envs\tenv{index}\n"))
+                .collect::<String>()
+        );
+        let report = inspect_project_with(&runner, "/project", "custom-env")
+            .await
+            .unwrap();
+        assert!(!report.truncated);
+        for index in 0..8 {
+            assert!(
+                report
+                    .environments
+                    .iter()
+                    .any(|option| option.environment == format!("envs:env{index}"))
+            );
+        }
+        let commands = runner.commands.lock().unwrap();
+        let explicit = commands
+            .iter()
+            .position(|command| {
+                command.contains("p='/project/.omicsops/environments/custom-env/bin/python'")
+            })
+            .unwrap();
+        assert_eq!(
+            explicit, 17,
+            "the explicit request follows all eight discovered candidates"
+        );
+        assert_eq!(report.environments.last().unwrap().environment, "system");
+    }
+
+    #[tokio::test]
+    async fn ssh_project_priority_incomplete_inventory_still_prevents_recommendation() {
+        let mut runner = ProjectFirstRunner::new(SystemProbe::Available);
+        runner.discovery =
+            "READY\nROOT\t/project\nenvs\tpython311\nenvs\tr443\nTRUNCATED\nDONE\n".into();
+        let report = inspect_project_with(&runner, "/project", "system")
+            .await
+            .unwrap();
+        assert!(report.truncated);
+        assert!(report.suggested_environment.is_none());
+        assert_eq!(report.environments[0].environment, "envs:python311");
+        assert_eq!(report.environments.last().unwrap().environment, "system");
+    }
+
+    #[tokio::test]
+    async fn ssh_project_priority_stale_requested_pair_cannot_poison_new_project_recommendation() {
+        let runner = ProjectFirstRunner::new(SystemProbe::Available);
+        let report = inspect_project_with(&runner, "/project", "envs:oldpy:oldr")
+            .await
+            .unwrap();
+        assert_eq!(
+            report.suggested_environment.as_deref(),
+            Some("envs:python311:r443")
+        );
+        assert_eq!(report.environments[0].environment, "envs:python311:r443");
+        assert!(!report.truncated);
+        let stale = report
+            .environments
+            .iter()
+            .find(|option| option.environment == "envs:oldpy:oldr")
+            .unwrap();
+        assert!(
+            stale
+                .interpreters
+                .iter()
+                .all(|item| item.status == SshInterpreterStatusV4::Error)
+        );
+        let commands = runner.commands.lock().unwrap();
+        assert!(commands[1].contains("p='/project/.envs/python311/bin/python'"));
+    }
+
     #[tokio::test]
     async fn ssh_project_probe_binds_separate_actual_python_and_r_without_marking_system_available()
     {
         let runner = runner(&[
             "READY\nROOT\t/project\nenvs\tpython311\nenvs\tr443\nDONE\n",
-            "NOT_FOUND\n",
-            "NOT_FOUND\n",
             "PATH\t/project/.envs/python311/bin/python\n3.11.18\nEXIT\t0\n",
             "NOT_FOUND\n",
             "PATH\t/project/.envs/r443/bin/python\n3.12.2\nEXIT\t0\n",
             "PATH\t/project/.envs/r443/bin/Rscript\nRscript (R) version 4.4.3 (2025-02-28)\nEXIT\t0\n",
+            "NOT_FOUND\n",
+            "NOT_FOUND\n",
         ]);
         let report = inspect_project_with(&runner, "/project", "system")
             .await
@@ -460,14 +731,17 @@ mod tests {
             report.suggested_environment.as_deref(),
             Some("envs:python311:r443")
         );
-        assert_eq!(report.environments[0].environment, "system");
+        assert_eq!(report.environments.last().unwrap().environment, "system");
         assert!(
-            report.environments[0]
+            report
+                .environments
+                .last()
+                .unwrap()
                 .interpreters
                 .iter()
                 .all(|observation| observation.status == SshInterpreterStatusV4::NotFound)
         );
-        let combined = report.environments.last().unwrap();
+        let combined = &report.environments[0];
         assert_eq!(combined.interpreters[0].version.as_deref(), Some("3.11.18"));
         assert_eq!(combined.interpreters[1].version.as_deref(), Some("4.4.3"));
         assert_eq!(runner.commands.lock().unwrap().len(), 7);
@@ -653,9 +927,9 @@ mod tests {
     async fn ssh_project_probe_uses_canonical_root_but_retains_the_requested_scope() {
         let runner = runner(&[
             "READY\nROOT\t/canonical\nenvs\tpython311\nDONE\n",
-            "NOT_FOUND\n",
-            "NOT_FOUND\n",
             "PATH\t/canonical/.envs/python311/bin/python\n3.11.18\nEXIT\t0\n",
+            "NOT_FOUND\n",
+            "NOT_FOUND\n",
             "NOT_FOUND\n",
         ]);
         let report = inspect_project_with(&runner, "/project-alias", "system")
@@ -663,7 +937,7 @@ mod tests {
             .unwrap();
         assert_eq!(report.remote_root, "/project-alias");
         let commands = runner.commands.lock().unwrap();
-        assert!(commands[3].contains("/canonical/.envs/python311"));
-        assert!(!commands[3].contains("/project-alias"));
+        assert!(commands[1].contains("/canonical/.envs/python311"));
+        assert!(!commands[1].contains("/project-alias"));
     }
 }
