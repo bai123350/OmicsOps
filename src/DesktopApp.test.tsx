@@ -153,6 +153,44 @@ describe("project compute selection", () => {
     expect(screen.getByRole("region", { name: "SSH 解释器检测" })).toHaveTextContent("R 4.4.3");
   });
 
+  it("updates an automatically selected project prefix after refresh discovers the missing R environment", async () => {
+    const shell = harness(); let rInstalled = false;
+    const pythonOnly = "envs:python311:";
+    const pythonOption = { environment: pythonOnly, label: "Python .envs/python311 · R not bound", interpreters: [{ language: "python" as const, status: "available" as const, version: "Python 3.11.18" }, { language: "r" as const, status: "not_found" as const }] };
+    const query = vi.spyOn(api, "probeSshProjectEnvironments").mockImplementation(async (_id, environment) => {
+      const report = projectObservation(environment);
+      return { ...report, suggested_environment: rInstalled ? projectEnvironment : pythonOnly, environments: rInstalled ? [...report.environments, pythonOption] : [report.environments[0], pythonOption] };
+    });
+    render(<DesktopApp />);
+    await screen.findByText(/Agent 模式：SSH/);
+    fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
+    await waitFor(() => expect(shell.mock.calls.at(-1)?.[0].runtimeDraftSelection?.environment).toBe(pythonOnly));
+    await waitFor(() => expect(screen.getByRole("button", { name: "刷新远程环境" })).toBeEnabled());
+    rInstalled = true;
+    fireEvent.click(screen.getByRole("button", { name: "刷新远程环境" }));
+    await waitFor(() => expect(shell.mock.calls.at(-1)?.[0].runtimeDraftSelection?.environment).toBe(projectEnvironment));
+    await waitFor(() => expect(query).toHaveBeenLastCalledWith(remoteProject.id, projectEnvironment));
+    await waitFor(() => expect(screen.getByRole("button", { name: "R 环境" })).toHaveTextContent(/^R可用$/));
+    expect(query).toHaveBeenCalledTimes(4);
+  });
+
+  it.each(["system", "envs:manual"])("does not replace an explicit %s choice with a project recommendation on refresh", async (choice) => {
+    const shell = harness();
+    const manual = { environment: "envs:manual", label: ".envs/manual", interpreters: [{ language: "python" as const, status: "available" as const, version: "Python 3.10.0" }] };
+    const query = vi.spyOn(api, "probeSshProjectEnvironments").mockImplementation(async (_id, environment) => {
+      const report = projectObservation(environment); return { ...report, environments: [...report.environments, manual] };
+    });
+    render(<DesktopApp />);
+    await screen.findByText(/Agent 模式：SSH/);
+    act(() => shell.mock.calls.at(-1)![0].onComputeEnvironmentChange?.(choice));
+    fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "刷新远程环境" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "刷新远程环境" }));
+    await waitFor(() => expect(query).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByRole("button", { name: "刷新远程环境" })).toBeEnabled());
+    expect(shell.mock.calls.at(-1)?.[0].runtimeDraftSelection?.environment).toBe(choice);
+  });
+
   it("retains an explicit system choice and keeps ordinary send enabled while detection is pending", async () => {
     const shell = harness(); const pending = deferred<ReturnType<typeof projectObservation>>();
     vi.spyOn(api, "probeSshProjectEnvironments").mockReturnValue(pending.promise);

@@ -63,7 +63,7 @@ function useDialogFocus(active: boolean) {
     const dialog = dialogRef.current; if (activeRef.current) closeRef.current?.focus();
     function trap(event: KeyboardEvent) {
       if (event.key !== "Tab" || !activeRef.current) return;
-      const elements = Array.from(dialog?.querySelectorAll<HTMLElement>('button:not([disabled]), summary, [tabindex="0"]') ?? []).filter((item) => !item.hidden && window.getComputedStyle(item).display !== "none" && window.getComputedStyle(item).visibility !== "hidden");
+      const elements = Array.from(dialog?.querySelectorAll<HTMLElement>('button:not([disabled]), select:not([disabled]), summary, [tabindex="0"]') ?? []).filter((item) => !item.hidden && window.getComputedStyle(item).display !== "none" && window.getComputedStyle(item).visibility !== "hidden");
       event.preventDefault(); event.stopImmediatePropagation();
       const index = elements.indexOf(document.activeElement as HTMLElement);
       (elements[index < 0 ? (event.shiftKey ? elements.length - 1 : 0) : (index + (event.shiftKey ? -1 : 1) + elements.length) % elements.length] ?? closeRef.current)?.focus();

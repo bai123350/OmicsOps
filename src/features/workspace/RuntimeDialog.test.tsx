@@ -66,6 +66,8 @@ describe("RuntimeDialog", () => {
     renderDialog({ backend: sshBackend, boundary, sshEnvironments: probe, onEnvironmentChange });
     const choices = screen.getByRole("combobox", { name: "Discovered SSH environments" });
     expect(choices).toHaveValue("system");
+    for (let index = 0; index < 4; index++) fireEvent.keyDown(window, { key: "Tab" });
+    expect(choices).toHaveFocus();
     expect(screen.getByRole("region", { name: "SSH interpreter detection" })).toHaveTextContent("Python 3.12.10");
     expect(screen.getByRole("region", { name: "SSH interpreter detection" })).toHaveTextContent("Interpreter not found");
     fireEvent.change(choices, { target: { value: "envs:r443" } });

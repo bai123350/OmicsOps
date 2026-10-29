@@ -30,16 +30,28 @@ export function sshInterpreterStatus(observation: SshInterpreterObservationV4 | 
 
 export function SshEnvironmentObservations({ probe, environment, zh, onEnvironmentChange }: { probe: SshEnvironmentProbe; environment: string; zh: boolean; onEnvironmentChange?: (value: string) => void }) {
   const selected = probe.selected?.environment === environment ? probe.selected : null;
+  const recommendation = probe.report?.truncated ? null : probe.report?.suggested_environment;
+  const interpreterPath = (observation: SshInterpreterObservationV4 | undefined) => {
+    const executable = observation?.executable;
+    if (!executable) return null;
+    const root = probe.report?.remote_root.replace(/\/+$/, "");
+    return root && executable.startsWith(`${root}/`) ? executable.slice(root.length + 1) : executable;
+  };
   return <section className="ssh-environment-observations" aria-label={zh ? "SSH 解释器检测" : "SSH interpreter detection"}>
     <button type="button" disabled={probe.loading} onClick={probe.refresh}>{probe.loading ? (zh ? "检测中…" : "Detecting…") : probe.report ? (zh ? "刷新远程环境" : "Refresh remote environments") : (zh ? "检测远程环境" : "Detect remote environments")}</button>
     {probe.loading && <p role="status">{zh ? "正在检查远端项目的解释器…" : "Checking remote project interpreters…"}</p>}
     {probe.error && <p role="alert">{zh ? "远端环境检测失败，请检查 SSH 连接后重试。" : "Remote detection failed. Check the SSH connection and retry."}</p>}
+    <small>{zh ? "优先使用项目目录中的 Python / R；system 可按需选择。" : "Prefer project Python / R environments; system is optional."}</small>
     {probe.report && <>
       {onEnvironmentChange && <label>{zh ? "已发现的 SSH 环境" : "Discovered SSH environments"}<select aria-label={zh ? "已发现的 SSH 环境" : "Discovered SSH environments"} value={environment} onChange={(event) => onEnvironmentChange(event.target.value)}>
         {!probe.report.environments.some((option) => option.environment === environment) && <option value={environment}>{environment}</option>}
-        {probe.report.environments.map((option) => <option key={option.environment} value={option.environment}>{option.label}</option>)}
+        {probe.report.environments.map((option) => <option key={option.environment} value={option.environment}>{option.environment === recommendation && option.environment.startsWith("envs:") ? `${zh ? "项目推荐" : "Project recommended"} · ` : ""}{option.environment === "system" ? (zh ? "system（可选）" : "system (optional)") : option.label}</option>)}
       </select></label>}
-      {selected && <><small>{selected.label}</small><ul>{(["python", "r"] as const).map((language) => <li key={language}><b>{language === "python" ? "Python" : "R"}</b>: {sshInterpreterStatus(selected.interpreters.find((item) => item.language === language), zh)}</li>)}</ul></>}
+      {selected && <><small>{selected.label}</small><ul>{(["python", "r"] as const).map((language) => {
+        const observation = selected.interpreters.find((item) => item.language === language);
+        const path = interpreterPath(observation);
+        return <li key={language}><b>{language === "python" ? "Python" : "R"}</b>: {sshInterpreterStatus(observation, zh)}{path && <> · <code>{path}</code></>}</li>;
+      })}</ul></>}
       <small>{zh ? "解释器观察时间" : "Interpreters observed"}: <time>{probe.report.observed_at}</time></small>
       {probe.report.truncated && <p>{zh ? "环境列表已达检测上限；可返回左下角计算配置菜单，手动指定环境后刷新。" : "Environment discovery reached its limit; return to the compute configuration menu at the lower left to enter an environment and refresh."}</p>}
     </>}

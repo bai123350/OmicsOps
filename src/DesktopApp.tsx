@@ -273,9 +273,10 @@ export default function DesktopApp() {
   useEffect(() => {
     const report = sshEnvironments.report;
     const suggestion = report?.suggested_environment;
-    if (computeEnvironment === "system" && manualEnvironmentChoice.current !== environmentChoiceScope && !report?.truncated && suggestion
+    if (!sshEnvironments.loading && !sshEnvironments.error && report?.requested_environment === computeEnvironment
+      && manualEnvironmentChoice.current !== environmentChoiceScope && !report.truncated && suggestion && suggestion !== computeEnvironment
       && report.environments.some((option) => option.environment === suggestion && option.interpreters.some((item) => item.status === "available"))) setComputeEnvironment(suggestion);
-  }, [sshEnvironments.report, computeEnvironment, environmentChoiceScope]);
+  }, [sshEnvironments.report, sshEnvironments.loading, sshEnvironments.error, computeEnvironment, environmentChoiceScope]);
   function chooseComputeEnvironment(environment: string) {
     manualEnvironmentChoice.current = environmentChoiceScope;
     setComputeEnvironment(environment);
