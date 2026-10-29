@@ -59,8 +59,10 @@ crate。捆绑的 Skills 位于根目录 `skills/`，同步逻辑在
 ## 执行与数据边界
 
 - 本地 `process_backend.rs` 只从 system `PATH` 启动 `python`/`Rscript`，且
-  当前本地内核只接受 `system` 环境。SSH 执行可选远端 system 环境或项目绑定
-  的 Micromamba 环境。探测到解释器只表示可找到可执行文件，不表示项目依赖已
+  当前本地内核只接受 `system` 环境。SSH 执行可选远端 system、项目绑定
+  的 Micromamba 环境或明确冻结的项目 `.envs` 解释器绑定；Python/R 可以分别
+  绑定不同子目录。目录发现与版本探测有候选、输出和时间上限，不持续后台轮询。
+  探测到解释器只表示可执行，不表示项目依赖已
   安装或工作流一定可运行。
 - Windows 是首要支持目标；涉及 macOS 时必须明确说明行为，不能把未验证的
   路径或已发布安装包当作保证。除非通过 SSH/WSL 控制，代码和测试不得只假设
