@@ -50,8 +50,16 @@ def worker(directory):
     succeeded = False
     with stdout.open('wb') as out, stderr.open('wb') as err:
         try:
+            environment = None
+            if request.get('environment_bin'):
+                bin_path = pathlib.Path(request['environment_bin'])
+                bin_path.relative_to(root / '.envs')
+                if bin_path.resolve(strict=True) != bin_path or bin_path.parent.resolve(strict=True) != bin_path.parent:
+                    raise ValueError('project environment changed')
+                environment = os.environ.copy()
+                environment['PATH'] = str(bin_path) + os.pathsep + environment.get('PATH', '')
             completed = subprocess.run(request['argv'], cwd=root, stdin=subprocess.DEVNULL,
-                                       stdout=out, stderr=err, check=False)
+                                       stdout=out, stderr=err, check=False, env=environment)
             succeeded = completed.returncode == 0
             if succeeded:
                 for relative in request['captures']:
@@ -128,26 +136,69 @@ def status(identity):
     return dict(identity=identity, status='unknown')
 
 
+def environment_execution(identity):
+    """Resolve only a frozen system/managed/project token; never discover here."""
+    language = identity['context']['language']
+    if language not in ('python', 'r'):
+        raise ValueError('invalid runtime language')
+    executable = ['python', '-u'] if language == 'python' else ['Rscript', '--vanilla']
+    token = identity['context']['environment']
+    if token == 'system':
+        if language == 'python':
+            executable[0] = sys.executable
+        return executable, None
+
+    def safe_name(name):
+        return (bool(name) and len(name) <= 64 and name not in ('.', '..')
+                and all(c.isascii() and (c.isalnum() or c in '._-') for c in name))
+
+    root = pathlib.Path(identity['remote_root'])
+    if token.startswith('envs:'):
+        parts = token[5:].split(':')
+        if len(parts) not in (1, 2) or not any(parts) or any(part and not safe_name(part) for part in parts):
+            raise ValueError('invalid project environment token')
+        name = parts[0] if language == 'python' or len(parts) == 1 else parts[1]
+        if not name:
+            raise ValueError('no frozen project binding for this language')
+        prefix = root / '.envs' / name
+        bin_path = prefix / 'bin'
+        try:
+            if prefix.resolve(strict=True) != prefix or bin_path.resolve(strict=True) != bin_path:
+                raise ValueError('project environment redirected')
+        except OSError as error:
+            raise ValueError('project environment unavailable') from error
+        program = bin_path / executable[0]
+        if not program.is_file() or not os.access(program, os.X_OK):
+            raise ValueError('project interpreter unavailable')
+        executable[0] = str(program)
+        return executable, str(bin_path)
+
+    if not safe_name(token):
+        raise ValueError('invalid managed environment token')
+    prefix = root / '.omicsops' / 'environments' / token
+    if not (prefix / 'conda-meta').is_dir():
+        raise ValueError('environment unavailable')
+    return ['micromamba', 'run', '--prefix', str(prefix)] + executable, None
+
+
 def submit(payload):
     identity = payload['identity']
+    directory = job_directory(identity)
+    if directory.exists():
+        return status(identity)  # Existing identities only observe, even if the environment changed.
+    executable, environment_bin = environment_execution(identity)
     directory = job_directory(identity, create=True)
     try:
         directory.mkdir(mode=0o700)
     except FileExistsError:
         return status(identity)  # Never relaunch an existing identity, even if incomplete.
-    extension, executable = ('py', ['python', '-u']) if identity['context']['language'] == 'python' else ('R', ['Rscript', '--vanilla'])
+    extension = 'py' if identity['context']['language'] == 'python' else 'R'
     code_path = directory / ('code.' + extension)
     code_path.write_text(payload['code'], encoding='utf-8')
     argv = executable + [str(code_path)]
-    environment = identity['context']['environment']
-    if environment == 'system' and extension == 'py':
-        argv[0] = sys.executable
-    if environment != 'system':
-        prefix = pathlib.Path(identity['remote_root']) / '.omicsops' / 'environments' / environment
-        if not (prefix / 'conda-meta').is_dir():
-            raise ValueError('environment unavailable')
-        argv = ['micromamba', 'run', '--prefix', str(prefix)] + argv
     request = dict(identity=identity, argv=argv, captures=payload['captures'])
+    if environment_bin:
+        request['environment_bin'] = environment_bin
     (directory / 'request.json').write_text(json.dumps(request), encoding='utf-8')
     driver = directory / 'worker.py'
     driver.write_text(WORKER, encoding='utf-8')

@@ -45,6 +45,9 @@ pub use publication_evidence::*;
 mod runtime_boundary;
 pub use runtime_boundary::*;
 
+mod ssh_environments;
+pub use ssh_environments::*;
+
 mod project_table;
 pub use project_table::*;
 

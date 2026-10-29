@@ -728,7 +728,7 @@ pub fn builtin_tool_definitions_v4() -> Vec<ToolDescriptorV4> {
         ),
         descriptor(
             "runtime.environment.ensure",
-            "Verify an immutable system environment, or create/reuse the exact frozen project-scoped SSH Micromamba environment",
+            "Verify an immutable system or frozen project .envs interpreter binding without installing or changing it; only a frozen managed SSH Micromamba environment may be created or reused. Keep the exact frozen environment token, including per-language envs bindings.",
             ToolEffectV4::Runtime,
             json!({"type":"object","required":["environment","language"],"properties":{"environment":{"type":"string"},"language":{"type":"string"}}}),
         ),

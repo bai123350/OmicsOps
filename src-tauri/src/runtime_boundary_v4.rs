@@ -100,7 +100,7 @@ pub(crate) fn format_runtime_boundary(view: &RuntimeBoundaryViewV4) -> String {
             "Current-user host process; system PATH interpreters; project cwd is not access control; host network inherited."
         }
         RuntimeExecutionLocationV4::SshHost => {
-            "Remote SSH-user process; system or frozen project Micromamba environment; project cwd is not access control; remote network inherited."
+            "Remote SSH-user process; system, frozen project Micromamba environment, or explicit project .envs interpreter bindings; project cwd is not access control; remote network inherited."
         }
         RuntimeExecutionLocationV4::LocalContainer => {
             "Compute container has read-only rootfs, dropped capabilities, no-new-privileges, PID limit 256, and project mount read-write; shared kernel, not a VM. network none applies only to the compute container; model/MCP may use network. No CPU or memory quota is asserted."

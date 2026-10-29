@@ -2,7 +2,14 @@ use std::{io, path::PathBuf, process::Stdio, time::Duration};
 
 use async_trait::async_trait;
 use omicsops_adapters::ssh::SshSession;
-use omicsops_core::project::shell_quote;
+use omicsops_core::{
+    project::shell_quote,
+    ssh_environment::{SshEnvironment, SshEnvironmentLanguage},
+};
+pub(crate) use omicsops_dto::{
+    SshInterpreterObservationV4 as InterpreterObservationV4,
+    SshInterpreterStatusV4 as ProbeStatusV4,
+};
 use omicsops_process::background_command;
 use omicsops_protocol::KernelLanguageV4;
 use serde::Serialize;
@@ -12,39 +19,49 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const INSPECTION_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_OUTPUT_BYTES: usize = 4096;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum ProbeStatusV4 {
-    Available,
-    NotFound,
-    Timeout,
-    Error,
-}
+#[cfg(test)]
+mod project_prefix_regression_tests {
+    use super::*;
 
-#[derive(Debug, Clone, Serialize)]
-pub(super) struct InterpreterObservationV4 {
-    language: KernelLanguageV4,
-    status: ProbeStatusV4,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    executable: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    version: Option<String>,
+    #[test]
+    fn envs_probe_uses_the_frozen_language_prefix() {
+        let python =
+            remote_probe_command(KernelLanguageV4::Python, "/project", "envs:python311:r443");
+        let r = remote_probe_command(KernelLanguageV4::R, "/project", "envs:python311:r443");
+        assert!(python.contains("/project/.envs/python311"));
+        assert!(r.contains("/project/.envs/r443"));
+        assert!(!python.contains(".omicsops/environments/envs:"));
+        assert!(!r.contains("micromamba run"));
+    }
+
+    #[test]
+    fn envs_probe_missing_language_never_falls_back_to_system_or_another_prefix() {
+        let missing = remote_probe_command(KernelLanguageV4::R, "/project", "envs:python311:");
+        assert_eq!(missing, "printf 'NOT_FOUND\\n'");
+        assert!(!missing.contains("command -v Rscript"));
+        for token in ["envs:..", "envs:outside/name", "envs:py:r;id"] {
+            assert_eq!(
+                remote_probe_command(KernelLanguageV4::Python, "/project", token),
+                "printf 'ERROR\\n'"
+            );
+        }
+    }
+
+    #[test]
+    fn envs_probe_allows_interpreter_file_symlinks_but_keeps_directory_scope() {
+        let command = remote_probe_command(KernelLanguageV4::Python, "/project", "envs:python311");
+        assert!(command.contains("test ! -L '/project/.envs/python311/bin'"));
+        assert!(command.contains("prefix_real=$(realpath -e"));
+        assert!(command.contains("test -f \"$p\""));
+        assert!(command.contains("test -x \"$p\""));
+        assert!(!command.contains("p_real="));
+        assert!(!command.contains("test -L \"$p\""));
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct EnvironmentInspectionV4 {
     pub(super) interpreters: Vec<InterpreterObservationV4>,
-}
-
-impl InterpreterObservationV4 {
-    pub(super) fn new(language: KernelLanguageV4, status: ProbeStatusV4) -> Self {
-        Self {
-            language,
-            status,
-            executable: None,
-            version: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,17 +72,17 @@ pub(super) enum InspectionErrorV4 {
     Protocol,
 }
 
-struct ProbeCommandOutput {
-    status: u32,
-    stdout: String,
+pub(crate) struct ProbeCommandOutput {
+    pub(crate) status: u32,
+    pub(crate) stdout: String,
 }
 
 #[async_trait]
-trait RemoteProbeRunner: Sync {
+pub(crate) trait RemoteProbeRunner: Sync {
     async fn run(&self, command: &str) -> Result<ProbeCommandOutput, InspectionErrorV4>;
 }
 
-struct SshProbeRunner<'a>(&'a SshSession);
+pub(crate) struct SshProbeRunner<'a>(pub(crate) &'a SshSession);
 
 #[async_trait]
 impl RemoteProbeRunner for SshProbeRunner<'_> {
@@ -90,21 +107,39 @@ pub(super) async fn inspect_remote(
     inspect_remote_with(&SshProbeRunner(session), root, environment).await
 }
 
-async fn inspect_remote_with(
+pub(crate) async fn inspect_remote_language(
+    session: &SshSession,
+    root: &str,
+    environment: &str,
+    language: KernelLanguageV4,
+) -> Result<InterpreterObservationV4, InspectionErrorV4> {
+    inspect_remote_language_with(&SshProbeRunner(session), root, environment, language).await
+}
+
+async fn inspect_remote_language_with(
+    runner: &impl RemoteProbeRunner,
+    root: &str,
+    environment: &str,
+    language: KernelLanguageV4,
+) -> Result<InterpreterObservationV4, InspectionErrorV4> {
+    let command = remote_probe_command(language, root, environment);
+    let output = tokio::time::timeout(PROBE_TIMEOUT, runner.run(&command))
+        .await
+        .map_err(|_| InspectionErrorV4::Timeout)??;
+    if output.status != 0 {
+        return Err(InspectionErrorV4::Transport);
+    }
+    parse_remote_probe(language, &output.stdout)
+}
+
+pub(crate) async fn inspect_remote_with(
     runner: &impl RemoteProbeRunner,
     root: &str,
     environment: &str,
 ) -> Result<EnvironmentInspectionV4, InspectionErrorV4> {
     let mut interpreters = Vec::new();
     for language in [KernelLanguageV4::Python, KernelLanguageV4::R] {
-        let command = remote_probe_command(language, root, environment);
-        let output = tokio::time::timeout(PROBE_TIMEOUT, runner.run(&command))
-            .await
-            .map_err(|_| InspectionErrorV4::Timeout)??;
-        if output.status != 0 {
-            return Err(InspectionErrorV4::Transport);
-        }
-        interpreters.push(parse_remote_probe(language, &output.stdout)?);
+        interpreters.push(inspect_remote_language_with(runner, root, environment, language).await?);
     }
     Ok(EnvironmentInspectionV4 { interpreters })
 }
@@ -130,16 +165,39 @@ fn interpreter_program(language: KernelLanguageV4) -> &'static str {
 
 fn remote_probe_command(language: KernelLanguageV4, root: &str, environment: &str) -> String {
     let program = interpreter_program(language);
-    let lookup = if environment == "system" {
-        format!("p=$(command -v {program}) || {{ printf 'NOT_FOUND\\n'; exit 0; }}")
-    } else {
+    let parsed = match SshEnvironment::parse(environment) {
+        Ok(value) => value,
+        Err(_) => return "printf 'ERROR\\n'".into(),
+    };
+    let prefix = match parsed.prefix(
+        root,
+        match language {
+            KernelLanguageV4::Python => SshEnvironmentLanguage::Python,
+            KernelLanguageV4::R => SshEnvironmentLanguage::R,
+        },
+    ) {
+        Ok(value) => value,
+        Err(_) => return "printf 'NOT_FOUND\\n'".into(),
+    };
+    let lookup = if let Some(prefix) = prefix {
+        let guard = if parsed.is_project() {
+            format!(
+                "root_real=$(realpath -e -- {root}) || {{ printf 'ERROR\\n'; exit 0; }}; base_real=$(realpath -e -- {base}) || {{ printf 'ERROR\\n'; exit 0; }}; test ! -L {base} && test \"$base_real\" = \"$root_real/.envs\" && test ! -L {prefix} && test ! -L {bin} || {{ printf 'ERROR\\n'; exit 0; }}; prefix_real=$(realpath -e -- {prefix}) || {{ printf 'ERROR\\n'; exit 0; }}; test \"$prefix_real\" = \"$base_real/{}\" || {{ printf 'ERROR\\n'; exit 0; }}; export PATH={bin}:\"$PATH\"; ",
+                prefix.rsplit('/').next().unwrap_or(""),
+                root = shell_quote(root),
+                base = shell_quote(&format!("{}/.envs", root.trim_end_matches('/'))),
+                prefix = shell_quote(&prefix),
+                bin = shell_quote(&format!("{prefix}/bin")),
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "p={}; if ! test -e \"$p\"; then printf 'ERROR\\n'; exit 0; fi",
-            shell_quote(&format!(
-                "{}/bin/{program}",
-                super::environment_path(root, environment)
-            ))
+            "p={}; if ! test -e \"$p\"; then printf 'NOT_FOUND\\n'; exit 0; fi; {guard}",
+            shell_quote(&format!("{prefix}/bin/{program}"))
         )
+    } else {
+        format!("p=$(command -v {program}) || {{ printf 'NOT_FOUND\\n'; exit 0; }}")
     };
     let arguments = match language {
         KernelLanguageV4::Python => {

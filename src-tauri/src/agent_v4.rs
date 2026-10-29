@@ -88,8 +88,7 @@ use crate::p1_commands::{
     McpServerProfile, MemorySearchRequest, invoke_configured_mcp_tool_v4, memory_facts,
 };
 
-#[path = "environment_probe_v4.rs"]
-mod environment_probe_v4;
+use crate::environment_probe_v4;
 
 static PROJECT_SIDE_EFFECT_LOCKS_V4: OnceLock<std::sync::Mutex<HashMap<Uuid, Weak<Mutex<()>>>>> =
     OnceLock::new();
@@ -6591,14 +6590,23 @@ impl RuntimeEnvironmentPortV4 for SshEnvironmentPortV4 {
             KernelLanguageV4::Python => "python",
             KernelLanguageV4::R => "Rscript",
         };
-        let command = if environment == "system" {
+        let binding = omicsops_core::ssh_environment::SshEnvironment::parse(environment)?;
+        let prefix = ssh_environment_prefix(&self.root, environment, language)?;
+        let command = if binding.is_project() {
+            let prefix = prefix.as_deref().ok_or("project environment prefix is missing")?;
+            format!(
+                "{} && test -f {1} && test -x {1}",
+                project_environment_path_guard(prefix),
+                shell_quote(&format!("{prefix}/bin/{program}"))
+            )
+        } else if environment == "system" {
             format!("command -v {program} >/dev/null")
         } else {
             format!(
                 "command -v micromamba >/dev/null && test -x {}",
                 shell_quote(&format!(
                     "{}/bin/{program}",
-                    environment_path(&self.root, environment)
+                    prefix.as_deref().ok_or("managed environment prefix is missing")?
                 ))
             )
         };
@@ -6615,8 +6623,9 @@ impl RuntimeEnvironmentPortV4 for SshEnvironmentPortV4 {
         environment: &str,
         requirements: Vec<String>,
     ) -> Result<BTreeMap<String, String>, String> {
-        let prefix = (environment != "system").then(|| environment_path(&self.root, environment));
-        let command = software_version_command(language, prefix.as_deref(), &requirements)?;
+        let binding = omicsops_core::ssh_environment::SshEnvironment::parse(environment)?;
+        let prefix = ssh_environment_prefix(&self.root, environment, language)?;
+        let command = software_version_command(language, prefix.as_deref(), binding.is_project(), &requirements)?;
         let output = self
             .session
             .execute_checked(&command)
@@ -6630,6 +6639,17 @@ impl RuntimeEnvironmentPortV4 for SshEnvironmentPortV4 {
         language: KernelLanguageV4,
         environment: &str,
     ) -> Result<String, String> {
+        let binding = omicsops_core::ssh_environment::SshEnvironment::parse(environment)?;
+        if binding.is_project() {
+            // A discovered prefix is existing user-managed state. Readiness may
+            // inspect it, but must never create, install or activate anything.
+            let observation = environment_probe_v4::inspect_remote_language(&self.session, &self.root, environment, language)
+                .await.map_err(|_| "project environment readiness could not be verified".to_owned())?;
+            if observation.status != environment_probe_v4::ProbeStatusV4::Available || observation.version.is_none() {
+                return Err("project environment interpreter version could not be verified".into());
+            }
+            return Ok(json!({"environment":environment,"language":language,"status":"ready","interpreter":observation,"mutated":false}).to_string());
+        }
         if environment == "system" {
             let versions = self
                 .software_versions(language, environment, vec![])
@@ -7969,24 +7989,27 @@ impl DesktopToolExecutorV4 {
                     .await
                 {
                     Ok(excerpt) => excerpt,
-                    // System readiness only probes versions; it never installs or
-                    // changes the selected environment. A failed probe must not
-                    // inherit the uncertainty of managed environment creation.
-                    Err(_) if environment == "system" => {
+                    // System/project readiness only probes versions; a failed
+                    // read must not inherit managed-install dispatch uncertainty.
+                    Err(_) if environment_is_read_only(environment) => {
                         return Ok(ToolOutcomeV4 {
                             call_id: call.call_id.clone(),
                             tool_id: call.tool_id.clone(),
                             succeeded: false,
-                            model_content: "The selected system environment readiness check was attempted but could not verify the interpreter. No environment was created or changed. This failure does not prove the interpreter or its dependencies are absent. Do not install software, switch the frozen backend, or repeat this failed check. Use runtime.environment.inspect once to obtain bounded read-only observations if it has not already been checked; otherwise report the existing observations and limitations without additional scans.".into(),
+                            model_content: "The selected read-only environment readiness check was attempted but could not verify the interpreter. No environment was created or changed. This failure does not prove the interpreter or its dependencies are absent. Do not install software, switch the frozen backend, or repeat this failed check. Use runtime.environment.inspect once to obtain bounded read-only observations if it has not already been checked; otherwise report the existing observations and limitations without additional scans.".into(),
                             data: json!({"error_kind":"environment_check_failed","recoverable":true,"check_attempted":true,"mutated":false,"backend_id":self.backend_id,"environment":environment,"language":language}),
                             provenance: vec![],
                         });
                     }
                     Err(error) => return Err(error),
                 };
+                let mut data = json!({"environment":environment,"language":language});
+                if omicsops_core::ssh_environment::SshEnvironment::parse(environment).is_ok_and(|binding| binding.is_project()) {
+                    data["mutated"] = json!(false);
+                }
                 (
                     excerpt,
-                    json!({"environment":environment,"language":language}),
+                    data,
                     vec![format!("environment:{environment}")],
                 )
             }
@@ -8215,7 +8238,7 @@ impl ToolExecutorV4 for DesktopToolExecutorV4 {
                 .and_then(Value::as_str)
                 .unwrap_or("system");
             self.key(language, environment)?;
-            if (call.tool_id != "runtime.environment.ensure" || environment == "system")
+            if (call.tool_id != "runtime.environment.ensure" || environment_is_read_only(environment))
                 && self
                     .resources
                     .get()?
@@ -8346,16 +8369,38 @@ impl KernelBackendV4 for SshKernelBackendV4 {
             return Err("SSH backend received a mismatched backend id".into());
         }
         validate_environment_name(&key.environment)?;
+        let (driver_language, extension, program, arguments) = match key.language {
+            KernelLanguageV4::Python => (KernelLanguage::Python, "py", "python", "-u"),
+            KernelLanguageV4::R => (KernelLanguage::R, "R", "Rscript", "--vanilla"),
+        };
+        let binding = omicsops_core::ssh_environment::SshEnvironment::parse(&key.environment)?;
+        let prefix = ssh_environment_prefix(&self.root, &key.environment, key.language)?;
+        let executable = if binding.is_project() {
+            let prefix = prefix.as_deref().ok_or("project environment prefix is missing")?;
+            self.session.execute_checked(&format!(
+                "{} && test -f {1} && test -x {1}",
+                project_environment_path_guard(prefix),
+                shell_quote(&format!("{prefix}/bin/{program}"))
+            )).await.map_err(|_| "the frozen project interpreter is unavailable or redirected".to_owned())?;
+            format!("{} {arguments}", project_environment_executable(prefix, program))
+        } else if let Some(prefix) = prefix {
+            let probe = self.session.execute_checked(&format!(
+                "test -d {0}/conda-meta && command -v micromamba >/dev/null",
+                shell_quote(&prefix)
+            )).await;
+            if probe.is_err() {
+                return Err(format!("project environment {} is missing; call runtime.environment.ensure first", key.environment));
+            }
+            format!("micromamba run --prefix {} {program} {arguments}", shell_quote(&prefix))
+        } else {
+            format!("{program} {arguments}")
+        };
         let session_id = Uuid::new_v4();
         let dir = format!("{}/.omicsops/kernels", self.root.trim_end_matches('/'));
         self.session
             .execute_checked(&format!("mkdir -p {}", shell_quote(&dir)))
             .await
             .map_err(|e| e.to_string())?;
-        let (driver_language, extension, executable) = match key.language {
-            KernelLanguageV4::Python => (KernelLanguage::Python, "py", "python -u"),
-            KernelLanguageV4::R => (KernelLanguage::R, "R", "Rscript --vanilla"),
-        };
         let driver = format!("{dir}/v4-{session_id}.driver.{extension}");
         self.session
             .upload_text(&driver, kernel_driver(driver_language))
@@ -8364,28 +8409,6 @@ impl KernelBackendV4 for SshKernelBackendV4 {
                 "ssh_kernel_driver_upload_failed: the remote server did not acknowledge the kernel driver upload"
                     .to_owned()
             })?;
-        let executable = if key.environment == "system" {
-            executable.to_owned()
-        } else {
-            let prefix = environment_path(&self.root, &key.environment);
-            let probe = self
-                .session
-                .execute_checked(&format!(
-                    "test -d {0}/conda-meta && command -v micromamba >/dev/null",
-                    shell_quote(&prefix)
-                ))
-                .await;
-            if probe.is_err() {
-                return Err(format!(
-                    "project environment {} is missing; call runtime.environment.ensure first",
-                    key.environment
-                ));
-            }
-            format!(
-                "micromamba run --prefix {} {executable}",
-                shell_quote(&prefix)
-            )
-        };
         let command = format!(
             "{executable} {} {} {} {}",
             shell_quote(&driver),
@@ -10002,11 +10025,21 @@ fn software_version_program(
 fn software_version_command(
     language: KernelLanguageV4,
     environment_prefix: Option<&str>,
+    project_direct: bool,
     requirements: &[String],
 ) -> Result<String, String> {
-    let executable_prefix = environment_prefix
-        .map(|prefix| format!("micromamba run --prefix {} ", shell_quote(prefix)))
-        .unwrap_or_default();
+    let program = match language {
+        KernelLanguageV4::Python => "python",
+        KernelLanguageV4::R => "Rscript",
+    };
+    let executable = if project_direct {
+        let prefix = environment_prefix.ok_or("project environment prefix is missing")?;
+        format!("{} && {}", project_environment_path_guard(prefix), project_environment_executable(prefix, program))
+    } else if let Some(prefix) = environment_prefix {
+        format!("micromamba run --prefix {} {program}", shell_quote(prefix))
+    } else {
+        program.into()
+    };
     match language {
         KernelLanguageV4::Python => {
             let names = serde_json::to_string(requirements).map_err(|error| error.to_string())?;
@@ -10014,7 +10047,7 @@ fn software_version_command(
                 "import importlib.metadata as m,platform\nnames={names}\nprint('python\\t'+platform.python_version())\nfor n in names:\n try: print(n+'\\t'+m.version(n))\n except m.PackageNotFoundError: pass"
             );
             Ok(format!(
-                "{executable_prefix}python -c {}",
+                "{executable} -c {}",
                 shell_quote(&code)
             ))
         }
@@ -10027,10 +10060,8 @@ fn software_version_command(
             let code = format!(
                 "cat('R\\t',R.version.string,'\\n',sep=''); for (n in c({names})) if (requireNamespace(n,quietly=TRUE)) cat(n,'\\t',as.character(packageVersion(n)),'\\n',sep='')"
             );
-            Ok(format!(
-                "{executable_prefix}Rscript -e {}",
-                shell_quote(&code)
-            ))
+            let flags = if project_direct { "--vanilla -e" } else { "-e" };
+            Ok(format!("{executable} {flags} {}", shell_quote(&code)))
         }
     }
 }
@@ -10137,17 +10168,32 @@ pub(crate) fn parse_language(value: &str) -> Result<KernelLanguageV4, String> {
 }
 
 fn validate_environment_name(value: &str) -> Result<(), String> {
-    if value == "system"
-        || (!value.is_empty()
-            && value.len() <= 64
-            && value
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character)))
-    {
-        Ok(())
-    } else {
-        Err("environment must be 'system' or a safe project environment name".into())
-    }
+    omicsops_core::ssh_environment::SshEnvironment::parse(value)
+        .map(|_| ())
+        .map_err(str::to_owned)
+}
+
+fn environment_is_read_only(value: &str) -> bool {
+    use omicsops_core::ssh_environment::SshEnvironment;
+    matches!(SshEnvironment::parse(value), Ok(SshEnvironment::System | SshEnvironment::Project { .. }))
+}
+
+fn ssh_environment_prefix(root: &str, environment: &str, language: KernelLanguageV4) -> Result<Option<String>, String> {
+    use omicsops_core::ssh_environment::{SshEnvironment, SshEnvironmentLanguage};
+    SshEnvironment::parse(environment)?
+        .prefix(root, match language { KernelLanguageV4::Python => SshEnvironmentLanguage::Python, KernelLanguageV4::R => SshEnvironmentLanguage::R })
+        .map_err(str::to_owned)
+}
+
+/// Root has already been canonicalized by the SSH resource factory. Reject
+/// redirected `.envs`, prefix or bin directories before running their programs.
+fn project_environment_path_guard(prefix: &str) -> String {
+    let bin = format!("{prefix}/bin");
+    format!("test \"$(realpath -- {0})\" = {0} && test \"$(realpath -- {1})\" = {1}", shell_quote(prefix), shell_quote(&bin))
+}
+
+fn project_environment_executable(prefix: &str, program: &str) -> String {
+    format!("PATH={}:\"$PATH\" {}", shell_quote(&format!("{prefix}/bin")), shell_quote(&format!("{prefix}/bin/{program}")))
 }
 
 fn environment_path(root: &str, environment: &str) -> String {
@@ -13586,7 +13632,7 @@ mod tests {
             environment: &str,
         ) -> Result<(), String> {
             assert_eq!(language, KernelLanguageV4::R);
-            assert_eq!(environment, "system");
+            assert!(environment_is_read_only(environment));
             self.checks.fetch_add(1, Ordering::SeqCst);
             if self.interpreter_available {
                 Ok(())
@@ -13683,6 +13729,38 @@ mod tests {
             assert!(outcome.provenance.is_empty());
             assert_eq!(probe.checks.load(Ordering::SeqCst), 1);
             assert_eq!(probe.attempts.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn project_environment_ensure_read_only_failures_are_recoverable_and_completed() {
+        let directory = tempfile::tempdir().unwrap();
+        for environment in ["envs:python311:r443", "envs::r443"] {
+            for available in [false, true] {
+                let (executor, probe) = environment_ensure_executor(directory.path(), ComputeBackendKindV4::Ssh, environment, available).await;
+                let call = environment_ensure_call(environment);
+                let before = std::fs::read_dir(directory.path()).unwrap().count();
+                let prepared = executor.prepare_call(&call).await.unwrap();
+                let outcome = if available {
+                    assert!(prepared.is_none());
+                    executor.execute(&call).await.unwrap()
+                } else {
+                    prepared.expect("missing interpreter must fail before dispatch")
+                };
+                assert!(!outcome.succeeded);
+                assert_eq!(outcome.data["recoverable"], true);
+                assert_eq!(outcome.data["environment"], environment);
+                assert!(!outcome.model_content.contains("PRIVATE_SENTINEL"));
+                assert_eq!(probe.checks.load(Ordering::SeqCst), 1);
+                assert_eq!(probe.attempts.load(Ordering::SeqCst), usize::from(available));
+                if available {
+                    assert_eq!(outcome.data["error_kind"], "environment_check_failed");
+                    assert_eq!(outcome.data["mutated"], false);
+                } else {
+                    assert_eq!(outcome.data["operation_dispatched"], false);
+                }
+                assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), before);
+            }
         }
     }
 
@@ -14349,6 +14427,33 @@ mod tests {
         assert!(validate_environment_name("system").is_ok());
         assert!(validate_environment_name("../outside").is_err());
         assert!(validate_environment_name("bad/name").is_err());
+        assert!(validate_environment_name("envs:python311:r443").is_ok());
+        assert!(validate_environment_name("envs:..:r443").is_err());
+        assert!(validate_environment_name("envs:python311:../r443").is_err());
+    }
+
+    #[test]
+    fn v4_project_environment_commands_resolve_frozen_languages_without_activation() {
+        for (language, expected) in [
+            (KernelLanguageV4::Python, "/project with spaces/.envs/python311"),
+            (KernelLanguageV4::R, "/project with spaces/.envs/r443"),
+        ] {
+            let prefix = ssh_environment_prefix("/project with spaces", "envs:python311:r443", language).unwrap().unwrap();
+            assert_eq!(prefix, expected);
+            let command = software_version_command(language, Some(&prefix), true, &[]).unwrap();
+            assert!(command.contains("realpath --"));
+            assert!(command.contains(&format!("PATH={}:", shell_quote(&format!("{expected}/bin")))));
+            assert!(command.contains(&shell_quote(&format!("{expected}/bin/{}", if language == KernelLanguageV4::Python { "python" } else { "Rscript" }))));
+            assert!(!command.contains("micromamba"));
+            assert!(!command.contains("activate"));
+            assert!(!command.contains("mkdir"));
+        }
+        assert!(ssh_environment_prefix("/project", "envs::r443", KernelLanguageV4::Python).is_err());
+        assert!(ssh_environment_prefix("/project", "envs:python311:", KernelLanguageV4::R).is_err());
+        let legacy = software_version_command(KernelLanguageV4::Python, Some("/project/.omicsops/environments/old"), false, &[]).unwrap();
+        assert!(legacy.starts_with("micromamba run --prefix"));
+        let system = software_version_command(KernelLanguageV4::Python, None, false, &[]).unwrap();
+        assert!(system.starts_with("python -c"));
     }
 
     #[test]

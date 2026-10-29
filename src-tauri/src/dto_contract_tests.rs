@@ -6,6 +6,28 @@ use crate::dto::{
 use serde_json::json;
 
 #[test]
+fn ssh_environment_probe_contract_preserves_scoped_language_bindings() {
+    use omicsops_dto::{ProbeSshProjectEnvironmentsRequestV4, SshEnvironmentReportV4};
+    let request = json!({"project_id":uuid::Uuid::nil(),"environment":"envs:python311:r443"});
+    let parsed: ProbeSshProjectEnvironmentsRequestV4 =
+        serde_json::from_value(request.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+    let mut forbidden = request;
+    forbidden["executable"] = json!("/unselected/bin/python");
+    assert!(serde_json::from_value::<ProbeSshProjectEnvironmentsRequestV4>(forbidden).is_err());
+    let report = json!({
+        "project_id":uuid::Uuid::nil(),"connection_id":uuid::Uuid::nil(),
+        "remote_root":"/project","requested_environment":"system","observed_at":"2026-10-29T00:00:00Z",
+        "environments":[{"environment":"envs:python311:r443","label":"Python: .envs/python311; R: .envs/r443",
+            "interpreters":[{"language":"python","status":"available","executable":"/project/.envs/python311/bin/python","version":"3.11.18"},
+                {"language":"r","status":"timeout"}]}],
+        "suggested_environment":"envs:python311:r443","truncated":false
+    });
+    let parsed: SshEnvironmentReportV4 = serde_json::from_value(report.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), report);
+}
+
+#[test]
 fn migration_preview_contracts() {
     use omicsops_dto::*;
     let request = json!({"project_id":uuid::Uuid::nil(),"categories":[],"files":[]});

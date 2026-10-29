@@ -29,6 +29,7 @@ mod conversation_state_tests;
 mod conversation_visibility_tests;
 pub mod credential_settings;
 pub mod dto;
+mod environment_probe_v4;
 #[cfg(test)]
 mod dto_contract_tests;
 mod follow_up_questions;
@@ -66,6 +67,7 @@ pub mod session_reviews;
 pub mod side_chat;
 pub mod skill_commands;
 pub mod skill_settings;
+pub mod ssh_environments;
 pub mod storage_settings;
 pub mod subscription_models;
 pub mod sync_commands;
@@ -202,6 +204,7 @@ pub fn run() {
             composer_attachments::validate_composer_attachments,
             composer_reference_validation::validate_composer_references,
             commands::list_connections,
+            ssh_environments::probe_ssh_project_environments,
             commands::save_connection,
             commands::test_connection,
             commands::confirm_host_key,
