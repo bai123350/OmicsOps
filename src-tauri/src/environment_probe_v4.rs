@@ -57,6 +57,130 @@ mod project_prefix_regression_tests {
         assert!(!command.contains("p_real="));
         assert!(!command.contains("test -L \"$p\""));
     }
+
+    #[test]
+    fn remote_probe_prefix_commands_have_one_statement_separator() {
+        for language in [KernelLanguageV4::Python, KernelLanguageV4::R] {
+            for environment in [
+                "system",
+                "analysis-r",
+                "envs:shared",
+                "envs:python311:r443",
+                "envs:python311:",
+                "envs::r443",
+            ] {
+                let command = remote_probe_command(language, "/project", environment);
+                assert!(
+                    !command.contains("; ;"),
+                    "duplicate separator for {language:?}/{environment}"
+                );
+            }
+        }
+    }
+
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "requires an explicit POSIX shell for manual syntax validation"
+    )]
+    #[test]
+    fn remote_probe_commands_pass_real_posix_shell_syntax_validation() {
+        let shell = if cfg!(target_os = "linux") {
+            "sh".to_owned()
+        } else {
+            std::env::var("OMICSOPS_PROBE_SYNTAX_SHELL").expect("set the explicit POSIX shell path")
+        };
+        for language in [KernelLanguageV4::Python, KernelLanguageV4::R] {
+            for environment in [
+                "system",
+                "analysis-r",
+                "envs:shared",
+                "envs:python311:r443",
+                "envs:python311:",
+                "envs::r443",
+            ] {
+                let command = remote_probe_command(language, "/project with 'quotes'", environment);
+                let output = std::process::Command::new(&shell)
+                    .args(["-n", "-c", &command])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "invalid shell syntax for {language:?}/{environment}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_probe_shell_fixture_executes_fake_project_and_managed_interpreters() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("study 'with spaces'");
+        for (relative, program, expected) in [
+            (".envs/python311", "python", "3.11.18"),
+            (
+                ".envs/r443",
+                "Rscript",
+                "Rscript (R) version 4.4.3 (2025-02-28)",
+            ),
+            (".omicsops/environments/analysis-r", "python", "3.12.10"),
+            (
+                ".omicsops/environments/analysis-r",
+                "Rscript",
+                "Rscript (R) version 4.5.0 (2025-04-11)",
+            ),
+        ] {
+            let bin = project.join(relative).join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let executable = bin.join(program);
+            std::fs::write(
+                &executable,
+                format!("#!/bin/sh\nprintf '%s\\n' {}\n", shell_quote(expected)),
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for (environment, language, expected) in [
+            ("envs:python311:r443", KernelLanguageV4::Python, "3.11.18"),
+            ("envs:python311:r443", KernelLanguageV4::R, "4.4.3"),
+            ("analysis-r", KernelLanguageV4::Python, "3.12.10"),
+            ("analysis-r", KernelLanguageV4::R, "4.5.0"),
+        ] {
+            let command = remote_probe_command(language, project.to_str().unwrap(), environment);
+            let output = std::process::Command::new("sh")
+                .args(["-c", &command])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let observation =
+                parse_remote_probe(language, &String::from_utf8(output.stdout).unwrap()).unwrap();
+            assert_eq!(
+                observation.status,
+                ProbeStatusV4::Available,
+                "{environment}/{language:?}"
+            );
+            assert_eq!(observation.version.as_deref(), Some(expected));
+        }
+        let output = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &remote_probe_command(
+                    KernelLanguageV4::R,
+                    project.to_str().unwrap(),
+                    "envs:python311:",
+                ),
+            ])
+            .output()
+            .unwrap();
+        let observation = parse_remote_probe(
+            KernelLanguageV4::R,
+            &String::from_utf8(output.stdout).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(observation.status, ProbeStatusV4::NotFound);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -182,7 +306,7 @@ fn remote_probe_command(language: KernelLanguageV4, root: &str, environment: &st
     let lookup = if let Some(prefix) = prefix {
         let guard = if parsed.is_project() {
             format!(
-                "root_real=$(realpath -e -- {root}) || {{ printf 'ERROR\\n'; exit 0; }}; base_real=$(realpath -e -- {base}) || {{ printf 'ERROR\\n'; exit 0; }}; test ! -L {base} && test \"$base_real\" = \"$root_real/.envs\" && test ! -L {prefix} && test ! -L {bin} || {{ printf 'ERROR\\n'; exit 0; }}; prefix_real=$(realpath -e -- {prefix}) || {{ printf 'ERROR\\n'; exit 0; }}; test \"$prefix_real\" = \"$base_real/{}\" || {{ printf 'ERROR\\n'; exit 0; }}; export PATH={bin}:\"$PATH\"; ",
+                "root_real=$(realpath -e -- {root}) || {{ printf 'ERROR\\n'; exit 0; }}; base_real=$(realpath -e -- {base}) || {{ printf 'ERROR\\n'; exit 0; }}; test ! -L {base} && test \"$base_real\" = \"$root_real/.envs\" && test ! -L {prefix} && test ! -L {bin} || {{ printf 'ERROR\\n'; exit 0; }}; prefix_real=$(realpath -e -- {prefix}) || {{ printf 'ERROR\\n'; exit 0; }}; test \"$prefix_real\" = \"$base_real/{}\" || {{ printf 'ERROR\\n'; exit 0; }}; export PATH={bin}:\"$PATH\"",
                 prefix.rsplit('/').next().unwrap_or(""),
                 root = shell_quote(root),
                 base = shell_quote(&format!("{}/.envs", root.trim_end_matches('/'))),
@@ -192,10 +316,15 @@ fn remote_probe_command(language: KernelLanguageV4, root: &str, environment: &st
         } else {
             String::new()
         };
-        format!(
-            "p={}; if ! test -e \"$p\"; then printf 'NOT_FOUND\\n'; exit 0; fi; {guard}",
+        let mut lookup = format!(
+            "p={}; if ! test -e \"$p\"; then printf 'NOT_FOUND\\n'; exit 0; fi",
             shell_quote(&format!("{prefix}/bin/{program}"))
-        )
+        );
+        if !guard.is_empty() {
+            lookup.push_str("; ");
+            lookup.push_str(&guard);
+        }
+        lookup
     } else {
         format!("p=$(command -v {program}) || {{ printf 'NOT_FOUND\\n'; exit 0; }}")
     };
