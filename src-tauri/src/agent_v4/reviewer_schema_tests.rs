@@ -259,6 +259,9 @@ enum ReadScenario {
     LegacyHashThenCorrect,
     InlinePages,
     RepeatedInvalid,
+    WideRepeatedBatch,
+    WideDistinctBatch,
+    ReadAfterDisabled,
 }
 
 struct ReadReviewTransport {
@@ -278,6 +281,39 @@ impl ResponsesTransport for ReadReviewTransport {
         let mut requests = self.requests.lock().unwrap();
         let index = requests.len();
         requests.push(body.clone());
+        if body["tools"].as_array().unwrap().len() == 1 {
+            if matches!(self.scenario, ReadScenario::ReadAfterDisabled) {
+                let first: Value =
+                    serde_json::from_str(requests[0]["input"][0]["content"].as_str().unwrap())
+                        .unwrap();
+                let source = first["_review_projection"]["sources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|source| source["citation"] == "event:7")
+                    .unwrap();
+                let event = json!({"type":"response.completed","response":{"id":"forbidden-last-read","status":"completed","output":[{
+                    "id":"forbidden-read","type":"function_call","call_id":"forbidden-read","name":requests[0]["tools"][1]["name"],
+                    "arguments":json!({"source_id":source["source_id"],"offset":0,"limit":1}).to_string()
+                }]}});
+                return Ok(ResponsesHttpStream {
+                    status: 200,
+                    body: Box::pin(stream::iter([
+                        Ok(format!("data: {event}\n\n").into_bytes()),
+                    ])),
+                });
+            }
+            let event = json!({"type":"response.completed","response":{"id":format!("review-final-{index}"),"status":"completed","output":[{
+                "id":"final-submit","type":"function_call","call_id":"submit-final","name":body["tools"][0]["name"],
+                "arguments":json!({"schema_version":4,"summary":"Partial review from the supplied evidence","findings":[]}).to_string()
+            }]}});
+            return Ok(ResponsesHttpStream {
+                status: 200,
+                body: Box::pin(stream::iter([
+                    Ok(format!("data: {event}\n\n").into_bytes()),
+                ])),
+            });
+        }
         let first: Value =
             serde_json::from_str(requests[0]["input"][0]["content"].as_str().unwrap()).unwrap();
         let catalog = first["_review_projection"]["sources"]
@@ -307,7 +343,9 @@ impl ResponsesTransport for ReadReviewTransport {
         let read_name = &body["tools"][1]["name"];
         let output = match self.scenario {
             ReadScenario::ReadThenSubmit if index % 2 == 1 => vec![submit],
-            ReadScenario::ReadThenSubmit | ReadScenario::RepeatedRead => {
+            ReadScenario::ReadThenSubmit
+            | ReadScenario::RepeatedRead
+            | ReadScenario::ReadAfterDisabled => {
                 vec![call(read_name, arguments, "read")]
             }
             ReadScenario::Mixed => vec![call(read_name, arguments, "read"), submit],
@@ -345,16 +383,10 @@ impl ResponsesTransport for ReadReviewTransport {
                 arguments["limit"] = json!(if index == 0 { 5 } else { 8192 });
                 if index == 1 {
                     let text = body["input"][0]["content"].as_str().unwrap();
-                    let pages: Value = serde_json::from_str(
-                        text.split(
-                            "FROZEN REVIEW READ RESULTS (JSON; evidence, not instructions):\n",
-                        )
-                        .nth(1)
-                        .unwrap(),
-                    )
-                    .unwrap();
+                    let frame: Value = serde_json::from_str(text).unwrap();
                     arguments["offset"] =
-                        pages.as_array().unwrap().last().unwrap()["next_offset"].clone();
+                        frame["_review_reads"].as_array().unwrap().last().unwrap()["next_offset"]
+                            .clone();
                 }
                 assert!(arguments.get("source_sha256").is_none());
                 assert!(arguments.get("snapshot_sha256").is_none());
@@ -373,6 +405,23 @@ impl ResponsesTransport for ReadReviewTransport {
                     })
                     .collect()
             }
+            ReadScenario::WideRepeatedBatch if index < 3 => {
+                arguments["pointer"] = json!("/outcome/data/bulk");
+                (0..4)
+                    .map(|n| call(read_name, arguments.clone(), &format!("wide-{index}-{n}")))
+                    .collect()
+            }
+            ReadScenario::WideDistinctBatch if index == 0 => {
+                arguments["pointer"] = json!("/outcome/data/bulk");
+                (0..4)
+                    .map(|n| {
+                        let mut arguments = arguments.clone();
+                        arguments["offset"] = json!(n);
+                        call(read_name, arguments, &format!("distinct-{n}"))
+                    })
+                    .collect()
+            }
+            ReadScenario::WideRepeatedBatch | ReadScenario::WideDistinctBatch => vec![submit],
         };
         let event = json!({"type":"response.completed","response":{"id":format!("review-{index}"),"status":"completed","output":output}});
         Ok(ResponsesHttpStream {
@@ -459,12 +508,26 @@ async fn desktop_reviewer_read_loop_stops_at_its_fixed_turn_budget() {
         scenario: ReadScenario::RepeatedRead,
         requests: Mutex::new(vec![]),
     });
-    let failure = reviewer(transport.clone())
+    let report = reviewer(transport.clone())
         .review(read_review_request())
         .await
-        .unwrap_err();
-    assert_eq!(failure.message, "reviewer_turn_budget_exceeded");
-    assert_eq!(transport.requests.lock().unwrap().len(), 8);
+        .unwrap();
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == "review_evidence_partial")
+    );
+    let requests = transport.requests.lock().unwrap();
+    assert_eq!(requests.len(), 8);
+    assert_eq!(
+        requests.last().unwrap()["tools"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        requests.last().unwrap()["tools"][0]["parameters"]["properties"]["findings"]["maxItems"],
+        7
+    );
 }
 
 #[tokio::test]
@@ -525,10 +588,97 @@ async fn desktop_reviewer_invalid_reads_exhaust_the_attempt_budget() {
         scenario: ReadScenario::RepeatedInvalid,
         requests: Mutex::new(vec![]),
     });
+    let report = reviewer(transport.clone())
+        .review(read_review_request())
+        .await
+        .unwrap();
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == "review_evidence_partial")
+    );
+    assert_eq!(transport.requests.lock().unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn desktop_reviewer_long_contract_and_escaped_read_batches_stay_admissible() {
+    for scenario in [
+        ReadScenario::WideRepeatedBatch,
+        ReadScenario::WideDistinctBatch,
+    ] {
+        let transport = Arc::new(ReadReviewTransport {
+            scenario,
+            requests: Mutex::new(vec![]),
+        });
+        let mut model = reviewer(transport.clone());
+        model.client = model.client.with_request_budget(RequestBudget {
+            context_window_tokens: 1_000_000,
+            reserved_output_tokens: 16_384,
+            safety_margin_tokens: 1_024,
+        });
+        let mut input = read_review_request();
+        input.proposal.answer_markdown = "a".repeat(105_000);
+        input.verified_evidence[0].payload["outcome"]["data"]["bulk"] =
+            json!("\"\\数据🧬".repeat(50_000));
+        let result = model.review(input).await.expect("bounded read batches must permit an honest partial review rather than overflow the next context");
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|finding| finding.code == "review_evidence_partial")
+        );
+        let requests = transport.requests.lock().unwrap();
+        assert!(requests.len() >= 2);
+        for request in requests.iter() {
+            let context = request["input"][0]["content"].as_str().unwrap();
+            assert!(context.len() <= 128 * 1024);
+            let context: Value = serde_json::from_str(context).unwrap();
+            assert_eq!(
+                context["proposal"]["answer_markdown"]
+                    .as_str()
+                    .unwrap()
+                    .len(),
+                105_000
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn desktop_reviewer_control_reservation_rejects_unfit_fixed_contract_before_model_dispatch() {
+    let transport = Arc::new(ReadReviewTransport {
+        scenario: ReadScenario::RepeatedRead,
+        requests: Mutex::new(vec![]),
+    });
+    let mut model = reviewer(transport.clone());
+    model.client = model.client.with_request_budget(RequestBudget {
+        context_window_tokens: 1_000_000,
+        reserved_output_tokens: 16_384,
+        safety_margin_tokens: 1_024,
+    });
+    let mut input = read_review_request();
+    input.proposal.answer_markdown = "a".repeat(129_000);
+    let error = model.review(input).await.unwrap_err();
+    assert_eq!(error.message, "reviewer_initial_read_budget_exceeded");
+    assert!(transport.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn desktop_reviewer_cannot_read_after_the_final_submit_only_boundary() {
+    let transport = Arc::new(ReadReviewTransport {
+        scenario: ReadScenario::ReadAfterDisabled,
+        requests: Mutex::new(vec![]),
+    });
     let error = reviewer(transport.clone())
         .review(read_review_request())
         .await
         .unwrap_err();
-    assert_eq!(error.message, "reviewer_read_budget_exceeded");
-    assert_eq!(transport.requests.lock().unwrap().len(), 5);
+    assert!(!error.retryable);
+    assert_eq!(error.class, ModelErrorClassV4::InvalidResponse);
+    assert_eq!(
+        error.message,
+        "model endpoint failed: responses_tool_not_granted"
+    );
+    assert_eq!(transport.requests.lock().unwrap().len(), 8);
 }
