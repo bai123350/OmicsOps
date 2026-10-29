@@ -114,4 +114,32 @@ describe("PluginsSettings", () => {
     expect(screen.queryByRole("dialog", { name: "Plugin package preview" })).not.toBeInTheDocument();
     expect(parentClose).not.toHaveBeenCalled();
   });
+
+  it("registers an asynchronously inspected preview before the first visible-frame Escape", async () => {
+    let finishInspection!: (value: PluginInspection) => void;
+    vi.mocked(api.settingsInspectPlugin).mockReturnValueOnce(new Promise((resolve) => { finishInspection = resolve; }));
+    const parentClose = vi.fn(); let escapes = 0;
+    function Host() {
+      useWindowEscapeLayer(true, parentClose);
+      return <PluginsSettings locale="en-US" onOpenConnections={vi.fn()} />;
+    }
+    render(<Host />);
+    await screen.findByText("No local plugins installed");
+    fireEvent.click(screen.getByRole("button", { name: "Choose local package" }));
+    await waitFor(() => expect(api.settingsInspectPlugin).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("dialog", { name: "Plugin package preview" })).not.toBeInTheDocument();
+    const observer = new MutationObserver(() => {
+      if (!screen.queryByRole("dialog", { name: "Plugin package preview" })) return;
+      observer.disconnect();
+      escapes += 1;
+      fireEvent.keyDown(window, { key: "Escape" });
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    try {
+      finishInspection(inspection);
+      await waitFor(() => expect(escapes).toBe(1));
+      expect(parentClose).not.toHaveBeenCalled();
+      expect(screen.queryByRole("dialog", { name: "Plugin package preview" })).not.toBeInTheDocument();
+    } finally { observer.disconnect(); }
+  });
 });

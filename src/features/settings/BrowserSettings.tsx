@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -84,7 +84,8 @@ export function useWindowEscapeLayer(active: boolean, onEscape: () => void) {
   const callbackRef = useRef(onEscape);
   callbackRef.current = onEscape;
 
-  useEffect(() => {
+  // Async surfaces must enter the stack in the same commit as their visible DOM.
+  useLayoutEffect(() => {
     if (!active || typeof window === "undefined") return undefined;
 
     const layer: EscapeLayer = { close: () => callbackRef.current() };
