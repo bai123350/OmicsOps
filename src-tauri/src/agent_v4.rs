@@ -5943,70 +5943,7 @@ impl ModelPortV4 for DesktopModelPortV4 {
         if let Some(reviewer) = &self.reviewer {
             return reviewer.review(request).await;
         }
-        let context = serde_json::to_string(&request).map_err(|error| {
-            ModelFailureV4::permanent(ModelErrorClassV4::InvalidRequest, error.to_string())
-        })?;
-        let submit = ToolDescriptorV4 {
-            id: "agent.submit_review".into(),
-            description: "Submit the independent read-only ReviewerReportV4 with all required fields: schema_version must be the integer 4, summary must be non-empty, and findings must be an array (empty when there are no findings). Every finding must cite evidence present in the frozen review context.".into(),
-            input_schema: json!({
-                "type":"object",
-                "required":["schema_version","summary","findings"],
-                "properties":{
-                    "schema_version":{"type":"integer","const":4},
-                    "summary":{"type":"string"},
-                    "findings":{"type":"array","maxItems":8,"items":{
-                        "type":"object",
-                        "required":["severity","code","message","evidence"],
-                        "properties":{
-                            "severity":{"type":"string","enum":["error","warn","ok"]},
-                            "code":{"type":"string"},
-                            "message":{"type":"string"},
-                            "evidence":{"type":"array","minItems":1,"items":{"type":"string"}}
-                        }
-                    }}
-                }
-            }),
-            effect: ToolEffectV4::ReadOnly,
-        };
-        let turn = self
-            .stream(
-                ModelRequestV4 {
-                    system: "You are an independent read-only scientific Reviewer. You receive only the frozen objective, completion criteria, Host-verified Scientific State, completion proposal, and deterministic verification report. You cannot modify the run. Check sample completeness, numerical/report consistency, evidence support, provenance, seed, versions, and statistical fields. Call agent.submit_review exactly once with a strict JSON object shaped as {\"schema_version\":4,\"summary\":\"Non-empty review summary\",\"findings\":[]}. Always include all three top-level fields; schema_version must be the integer 4. Use an empty findings array if no findings are warranted. Each finding must include severity (error, warn, or ok), non-empty code and message, and a non-empty evidence array citing only supplied evidence. Do not invent evidence or omit required fields.".into(),
-                    context,
-                    tools: vec![submit],
-                    image_refs: vec![],
-                    replay: Vec::new(),
-                },
-                &mut |_| {},
-            )
-            .await?;
-        let arguments = turn
-            .tool_calls
-            .into_iter()
-            .find(|call| call.tool_id == "agent.submit_review")
-            .map(|call| call.arguments)
-            .ok_or_else(|| {
-                ModelFailureV4::permanent(
-                    ModelErrorClassV4::InvalidResponse,
-                    "reviewer did not call agent.submit_review",
-                )
-            })?;
-        let report: ReviewerReportV4 = serde_json::from_value(arguments).map_err(|_| {
-            // The core owns one shared report-regeneration allowance. Do not
-            // echo serde errors: invalid enum/type values may contain model text.
-            ModelFailureV4::permanent(
-                ModelErrorClassV4::InvalidResponse,
-                "reviewer_report_schema: report fields or types do not match ReviewerReportV4; include schema_version 4, summary, and findings",
-            )
-        })?;
-        report.validate().map_err(|_| {
-            ModelFailureV4::permanent(
-                ModelErrorClassV4::InvalidResponse,
-                "reviewer_report_schema: report requires schema_version 4, a non-empty summary, and valid findings with evidence",
-            )
-        })?;
-        Ok(report)
+        reviewer_context::review(self, request).await
     }
 }
 
@@ -10316,6 +10253,7 @@ fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
 
 #[cfg(test)]
 mod go_live_acceptance_tests;
+mod reviewer_context;
 #[cfg(test)]
 mod reviewer_schema_tests;
 #[cfg(test)]
