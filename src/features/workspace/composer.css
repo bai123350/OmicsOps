@@ -67,6 +67,17 @@
 .fast-mode-select select { min-width: 112px; border: 1px solid #d8dcd5; border-radius: 7px; padding: 6px 7px; color: #3d4945; background: #fff; font-size: 11px; }
 .compute-anchor .composer-compute-menu { left: 0; z-index: 10; width: min(530px, calc(100vw - 60px)); }
 .compute-settings-link { border: 0; background: transparent; color: #39897e; padding: 12px; display: flex; gap: 10px; align-items: center; font-size: 12px; }
+.ssh-environment-observations { display: grid; gap: 8px; min-width: 0; padding: 12px; border: 1px solid var(--omicsops-border, #d9e6e0); border-radius: 10px; background: var(--omicsops-surface, #f6faf8); color: var(--omicsops-text, #364d44); font-size: 12px; }
+.ssh-environment-observations button { justify-self: start; border: 1px solid var(--omicsops-border, #b8cec4); border-radius: 7px; padding: 6px 9px; background: var(--omicsops-surface, #fff); color: var(--omicsops-text, #246f58); }
+.ssh-environment-observations button:disabled { opacity: .6; }
+.ssh-environment-observations label { display: grid; gap: 5px; }
+.ssh-environment-observations select { width: 100%; min-width: 0; padding: 7px; border: 1px solid var(--omicsops-border, #cbd9d1); border-radius: 7px; color: inherit; background: var(--omicsops-surface, #fff); }
+.ssh-environment-observations ul { margin: 0; padding-left: 18px; }
+.ssh-environment-observations li { overflow-wrap: anywhere; }
+.ssh-environment-observations p { margin: 0; }
+.ssh-environment-observations small { color: #647a6e; overflow-wrap: anywhere; }
+.ssh-environment-observations [role="alert"] { color: #a14a38; }
+.runtime-details > .ssh-environment-observations { margin-bottom: 16px; }
 .model-menu { position: absolute; bottom: calc(100% + 12px); right: 0; padding: 8px; width: 240px; max-height: 45vh; overflow-y: auto; }
 .model-menu button { display: flex; align-items: center; justify-content: space-between; width: 100%; gap: 10px; padding: 10px; border: 0; border-radius: 8px; background: transparent; text-align: left; font-size: 12px; color: #4b5a54; }
 .model-menu button:hover { background: #edf6f3; }

@@ -26,6 +26,7 @@ import { ApiModelPicker } from "./features/workspace/ApiModelPicker";
 import { SettingsPanel, type SettingsSection } from "./features/settings/SettingsPanel";
 import { usePersistentLocale } from "./use-persistent-locale";
 import { useConversationCapabilities } from "./features/workspace/useConversationCapabilities";
+import { useSshProjectEnvironments } from "./features/workspace/useSshProjectEnvironments";
 import { useComposerQueue } from "./features/workspace/useComposerQueue";
 import { useComposerReplacement } from "./features/workspace/useComposerReplacement";
 import { useAgentStop } from "./features/workspace/useAgentStop";
@@ -262,6 +263,23 @@ export default function DesktopApp() {
   const [autonomyMode, setAutonomyMode] = useState<AutonomyModeV4>("supervised");
   const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicyV4>("auto_approve_except_local_deletion");
   const [computeEnvironment, setComputeEnvironment] = useState("system");
+  const manualEnvironmentChoice = useRef<string | null>(null);
+  const [sshConnectionRevision, setSshConnectionRevision] = useState(0);
+  const [sshRunRevision, setSshRunRevision] = useState(0);
+  const environmentChoiceScope = JSON.stringify([selected?.id, selected?.connection_id, selected?.remote_root, sshConnectionRevision]);
+  const sshEnvironments = useSshProjectEnvironments(selected?.connection_id && selected.remote_root && computeBackendId === `ssh:${selected.connection_id}` ? {
+    project_id: selected.id, connection_id: selected.connection_id, remote_root: selected.remote_root, backend_id: computeBackendId, connection_revision: sshConnectionRevision,
+  } : null, computeEnvironment, sshRunRevision);
+  useEffect(() => {
+    const report = sshEnvironments.report;
+    const suggestion = report?.suggested_environment;
+    if (computeEnvironment === "system" && manualEnvironmentChoice.current !== environmentChoiceScope && !report?.truncated && suggestion
+      && report.environments.some((option) => option.environment === suggestion && option.interpreters.some((item) => item.status === "available"))) setComputeEnvironment(suggestion);
+  }, [sshEnvironments.report, computeEnvironment, environmentChoiceScope]);
+  function chooseComputeEnvironment(environment: string) {
+    manualEnvironmentChoice.current = environmentChoiceScope;
+    setComputeEnvironment(environment);
+  }
   const [computeBusy, setComputeBusy] = useState(false);
   const [planLoading, setPlanLoading] = useState(false);
   const [planApproved, setPlanApproved] = useState(false);
@@ -272,6 +290,27 @@ export default function DesktopApp() {
   const [agentModelActivity, setAgentModelActivity] = useState<AgentModelActivityReceiptV4 | null>(null);
   const [agentRunEventsV4, setAgentRunEventsV4] = useState<AgentRunEventV4[]>([]);
   const [conversationHydrating, setConversationHydrating] = useState(false);
+  const sshObservedRuns = useRef<{ scope: string; ready: boolean; active: Set<string>; terminal: Set<string> }>({ scope: "", ready: false, active: new Set(), terminal: new Set() });
+  useEffect(() => {
+    const scope = JSON.stringify([selected?.id, conversation?.id]);
+    const ready = Boolean(selected && conversation?.project_id === selected.id && !conversationHydrating);
+    const terminals = agentRunEventsV4.filter((event) => event.project_id === selected?.id && event.conversation_id === conversation?.id && isTerminalAgentEventV4(event));
+    const identity = (event: AgentRunEventV4) => JSON.stringify([event.project_id, event.conversation_id, event.run_id, event.sequence, event.event_hash]);
+    const previous = sshObservedRuns.current;
+    if (previous.scope !== scope || !ready || !previous.ready) {
+      // Hydrated history establishes a baseline. Only a run observed active in
+      // this window can cause an automatic environment recheck at termination.
+      sshObservedRuns.current = { scope, ready, active: new Set(runId && !terminals.some((event) => event.run_id === runId) ? [runId] : []), terminal: new Set(terminals.map(identity)) };
+      return;
+    }
+    if (runId && !terminals.some((event) => event.run_id === runId)) previous.active.add(runId);
+    let changed = false;
+    for (const event of terminals) {
+      if (!previous.terminal.has(identity(event)) && previous.active.delete(event.run_id)) changed = true;
+      previous.terminal.add(identity(event));
+    }
+    if (changed) setSshRunRevision((value) => value + 1);
+  }, [selected?.id, conversation?.id, conversationHydrating, agentRunEventsV4, runId]);
   const [conversationLoadError, setConversationLoadError] = useState("");
   const [conversationLoadRetry, setConversationLoadRetry] = useState(0);
   const [resumeLastSession] = useResumeLastSessionPreference();
@@ -636,6 +675,7 @@ export default function DesktopApp() {
       computeSelectionScope.current = scopeKey;
       setComputeBackendId("");
       setComputeEnvironment("system");
+      manualEnvironmentChoice.current = null;
     }
     const responseKey = JSON.stringify([selected.id, selected.connection_id, selected.remote_root, containerImage]);
     setComputeBackendsResponseKey(null);
@@ -1513,7 +1553,7 @@ export default function DesktopApp() {
     setSearchRequest({ key: crypto.randomUUID(), kind: "attach", projectId: selected.id, conversationId: conversation.id, item: entry.item });
     return true;
   }} /> : null;
-  const settings = settingsOpen ? <SettingsPanel key={settingsNavigationKey} initialSection={settingsSection} locale={locale} onLocaleChange={setLocale} onClose={closeSettings} modelProfiles={modelProfiles} skillPackages={skillPackages} mcpServers={mcpServers} connections={connections} projects={projects} selectedProject={selected} onOpenUsageConversation={openGuardedUsageConversation} onWorkflowsChanged={() => setWorkflowCatalogVersion((value) => value + 1)} onMemoryChanged={capabilities.refresh} onSaveConnection={async (profile, secret) => { await api.saveConnection(profile, secret); setConnections(await api.listConnections()); }} onTestConnection={api.testConnection} onConfirmHostKey={async (profileId, fingerprint) => { await api.confirmHostKey(profileId, fingerprint); setConnections(await api.listConnections()); }} onBindProjectRemote={async (connectionId, remoteRoot) => { if (!selected) return; const generation = projectOpenGeneration.current; const updated = await api.updateProjectRemote(selected.id, connectionId, remoteRoot); setProjects((current) => current.map((project) => project.id === updated.id ? updated : project)); if (generation === projectOpenGeneration.current && currentConversationIdentity.current.projectId === updated.id) await openProjectWorkspace(updated); }} onSaveModel={async (request) => {
+  const settings = settingsOpen ? <SettingsPanel key={settingsNavigationKey} initialSection={settingsSection} locale={locale} onLocaleChange={setLocale} onClose={closeSettings} modelProfiles={modelProfiles} skillPackages={skillPackages} mcpServers={mcpServers} connections={connections} projects={projects} selectedProject={selected} onOpenUsageConversation={openGuardedUsageConversation} onWorkflowsChanged={() => setWorkflowCatalogVersion((value) => value + 1)} onMemoryChanged={capabilities.refresh} onSaveConnection={async (profile, secret) => { setSshConnectionRevision((value) => value + 1); try { await api.saveConnection(profile, secret); setConnections(await api.listConnections()); } finally { setSshConnectionRevision((value) => value + 1); } }} onTestConnection={api.testConnection} onConfirmHostKey={async (profileId, fingerprint) => { setSshConnectionRevision((value) => value + 1); try { await api.confirmHostKey(profileId, fingerprint); setConnections(await api.listConnections()); } finally { setSshConnectionRevision((value) => value + 1); } }} onBindProjectRemote={async (connectionId, remoteRoot) => { if (!selected) return; const generation = projectOpenGeneration.current; const updated = await api.updateProjectRemote(selected.id, connectionId, remoteRoot); setProjects((current) => current.map((project) => project.id === updated.id ? updated : project)); if (generation === projectOpenGeneration.current && currentConversationIdentity.current.projectId === updated.id) await openProjectWorkspace(updated); }} onSaveModel={async (request) => {
     if (modelSelectionInFlight.current) throw new Error("Model selection is currently locked");
     modelSelectionInFlight.current = true;
     setModelSelectionBusy(true);
@@ -1757,7 +1797,7 @@ export default function DesktopApp() {
     latestPlanRevision={latestPlanRevision} v4Plan={v4Plan} planLoading={planLoading} planApproved={planApproved} canStartRun={false} runStarted={Boolean(runId && !currentRunAwaitsPlanApproval)} activeRunId={runId} activeRunLastActivityAt={activeRunLastActivityAt} agentRunEventsV4={agentRunEventsV4} agentTextPreview={agentTextPreview} agentReasoningPreview={agentReasoningPreview} agentModelActivity={agentModelActivity}
     guidanceAvailable={v4Plan?.session_mode === "agent" && !planApproved && latestPlanRevision?.run_id !== v4Plan?.run_id}
     computeBackends={computeBackends} runtimeDraftSelection={runtimeDraftSelection} computeSelectionReady={Boolean(runtimeDraftSelection)} computeBackendId={computeBackendId} containerImage={containerImage} autonomyMode={autonomyMode} approvalPolicy={approvalPolicy} computeEnvironment={computeEnvironment} computeBusy={computeBusy}
-    onComputeBackendChange={setComputeBackendId} onContainerImageChange={setContainerImage} onAutonomyModeChange={setAutonomyMode} onApprovalPolicyChange={setApprovalPolicy} onComputeEnvironmentChange={setComputeEnvironment}
+    onComputeBackendChange={setComputeBackendId} onContainerImageChange={setContainerImage} onAutonomyModeChange={setAutonomyMode} onApprovalPolicyChange={setApprovalPolicy} onComputeEnvironmentChange={chooseComputeEnvironment} sshEnvironments={sshEnvironments}
     onAnswerAgentQuestionV4={async (answerRunId, questionId, answer) => {
       const action = currentConversationAction;
       if (!action || !isCurrentConversationAction(action)) return;

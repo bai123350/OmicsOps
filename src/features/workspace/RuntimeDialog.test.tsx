@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { ComputeBackendAvailabilityV4, RuntimeBoundaryViewV4 } from "../../types";
 import { RuntimeDialog } from "./RuntimeDialog";
+import * as api from "../../tauri-api";
 
 const localBackend: ComputeBackendAvailabilityV4 = {
   descriptor: {
@@ -56,6 +57,25 @@ function renderDialog(overrides: Partial<React.ComponentProps<typeof RuntimeDial
 }
 
 describe("RuntimeDialog", () => {
+  it("renders frozen per-language project environment paths and their exact identity without probing SSH", () => {
+    const query = vi.spyOn(api, "probeSshProjectEnvironments");
+    renderDialog({ frozen: true, backend: sshBackend, boundary: { ...localBoundary, source: { kind: "frozen_run", run_id: "historical" }, execution_location: "ssh_host", compute_selection: { ...localBoundary.compute_selection, backend_id: "ssh:lab", backend_kind: "ssh", environment: "envs:python311:r443" } } });
+    const dialog = screen.getByRole("dialog", { name: "Runtimes" });
+    expect(dialog).toHaveTextContent("Python .envs/python311");
+    expect(dialog).toHaveTextContent("R .envs/r443");
+    fireEvent.click(screen.getByText("Full compute identity"));
+    expect(screen.getByText("envs:python311:r443")).toBeInTheDocument();
+    expect(query).not.toHaveBeenCalled();
+  });
+  it("shows project interpreter versions only for the matching draft SSH environment", () => {
+    const selected = { environment: "envs:python311:r443", label: "Python .envs/python311 · R .envs/r443", interpreters: [{ language: "python" as const, status: "available" as const, version: "Python 3.11.18" }] };
+    const probe = { selected, refresh: vi.fn(), loading: false, error: false, report: { project_id: "project-1", connection_id: "lab", remote_root: "/work/project", requested_environment: selected.environment, observed_at: "now", suggested_environment: selected.environment, truncated: false, environments: [selected] } };
+    const boundary = { ...localBoundary, compute_selection: { ...localBoundary.compute_selection, backend_id: "ssh:lab", backend_kind: "ssh" as const, environment: selected.environment }, execution_location: "ssh_host" as const };
+    const view = renderDialog({ backend: sshBackend, boundary, sshEnvironments: probe });
+    expect(screen.getByRole("region", { name: "SSH interpreter detection" })).toHaveTextContent("Python 3.11.18");
+    view.rerender(<RuntimeDialog zh={false} language="python" environment="system" boundaryLoading={false} boundaryError="" onRetryBoundary={vi.fn()} onLanguageChange={vi.fn()} onClose={vi.fn()} backend={sshBackend} boundary={{ ...boundary, compute_selection: { ...boundary.compute_selection, environment: "system" } }} sshEnvironments={probe} />);
+    expect(screen.queryByText("Python 3.11.18")).not.toBeInTheDocument();
+  });
   it("keeps parent focus owned when a loading transition removes controls and traps Tab from body", () => {
     const { rerender } = renderDialog();
     const prepare = screen.getByRole("button", { name: "Ask Agent to prepare environment" }); prepare.focus();

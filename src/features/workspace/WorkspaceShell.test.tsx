@@ -26,6 +26,25 @@ const project = {
   template: "single_cell_rna_seq" as const,
 };
 
+it("detects SSH interpreters on menu open, shows independent project prefixes and closes with immediate Escape", () => {
+  const refresh = vi.fn(); const onEnvironmentChange = vi.fn();
+  const selected = { environment: "envs:python311:r443", label: "Python .envs/python311 · R .envs/r443", interpreters: [
+    { language: "python" as const, status: "available" as const, version: "Python 3.11.18" },
+    { language: "r" as const, status: "available" as const, version: "R 4.4.3" },
+  ] };
+  const report = { project_id: project.id, connection_id: "lab", remote_root: "/work/project", requested_environment: selected.environment, observed_at: "2026-10-29T00:00:00Z", suggested_environment: selected.environment, truncated: false, environments: [selected] };
+  const backend = { descriptor: { schema_version: 4 as const, backend_id: "ssh:lab", kind: "ssh" as const, isolation: "process" as const, available: false, supports_python: true, supports_r: true, supports_network_policy: false }, selectable: true, reason: null, python_status: "unverified" as const, r_status: "unverified" as const, resolved_image_id: null };
+  render(<WorkspaceShell project={{ ...project, connection_id: "lab", remote_root: "/work/project" }} locale="zh-CN" computeBackends={[backend]} computeBackendId="ssh:lab" computeEnvironment={selected.environment} onComputeEnvironmentChange={onEnvironmentChange} sshEnvironments={{ report, selected, refresh, loading: false, error: false }} />);
+  expect(screen.getByRole("button", { name: "Python 环境" })).toHaveTextContent("可用");
+  fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
+  expect(refresh).toHaveBeenCalledOnce();
+  expect(screen.getByRole("region", { name: "SSH 解释器检测" })).toHaveTextContent("Python 3.11.18");
+  expect(screen.getByRole("region", { name: "SSH 解释器检测" })).toHaveTextContent("R 4.4.3");
+  fireEvent.click(screen.getByRole("button", { name: "刷新远程环境" })); expect(refresh).toHaveBeenCalledTimes(2);
+  fireEvent.keyDown(window, { key: "Escape" });
+  expect(screen.queryByRole("region", { name: "V4 计算后端" })).not.toBeInTheDocument();
+});
+
 it("loads a remote Markdown image through the project preview instead of the webview origin", async () => {
   const path = "results/hcc/figures/umap_stage3_umap_final.png";
   const preview = vi.fn().mockResolvedValue({ relative_path: path, mime_type: "image/png", size_bytes: 8, sha256: "a".repeat(64), data_url: "data:image/png;base64,iVBORw0KGgo=" });

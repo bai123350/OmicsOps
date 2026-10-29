@@ -461,6 +461,10 @@ export async function agentV4ComputeBackends(projectId: string, containerImage?:
   return invoke("agent_v4_compute_backends", { request: { project_id: projectId, container_image: containerImage || null } });
 }
 
+export async function probeSshProjectEnvironments(projectId: string, environment: string): Promise<import("./types").SshEnvironmentReportV4> {
+  return invoke("probe_ssh_project_environments", { request: { project_id: projectId, environment } });
+}
+
 export async function agentV4RuntimeBoundary(request: RuntimeBoundaryRequestV4): Promise<RuntimeBoundaryViewV4> {
   if (!isTauri()) throw new Error("Runtime boundaries require the desktop app");
   return invoke("agent_v4_runtime_boundary", { request });

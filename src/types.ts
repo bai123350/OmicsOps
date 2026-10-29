@@ -306,6 +306,30 @@ export interface ComputeBackendAvailabilityV4 {
   resolved_image_id: string | null;
 }
 
+export interface SshInterpreterObservationV4 {
+  language: "python" | "r";
+  status: "available" | "not_found" | "timeout" | "error";
+  executable?: string | null;
+  version?: string | null;
+}
+
+export interface SshEnvironmentOptionV4 {
+  environment: string;
+  label: string;
+  interpreters: SshInterpreterObservationV4[];
+}
+
+export interface SshEnvironmentReportV4 {
+  project_id: string;
+  connection_id: string;
+  remote_root: string;
+  requested_environment: string;
+  observed_at: string;
+  environments: SshEnvironmentOptionV4[];
+  suggested_environment: string | null;
+  truncated: boolean;
+}
+
 export interface RunSummaryV4 {
   run_id: string;
   status: string;

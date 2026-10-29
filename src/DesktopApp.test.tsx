@@ -132,6 +132,119 @@ describe("project compute selection", () => {
     return vi.spyOn(workspaceShell, "WorkspaceShell");
   }
 
+  const projectEnvironment = "envs:python311:r443";
+  const projectObservation = (environment = "system") => ({ project_id: remoteProject.id, connection_id: "remote-a", remote_root: "/work/project", requested_environment: environment, observed_at: "2026-10-29T00:00:00Z", suggested_environment: projectEnvironment, truncated: false, environments: [
+    { environment: "system", label: "system", interpreters: [{ language: "python" as const, status: "not_found" as const }, { language: "r" as const, status: "not_found" as const }] },
+    { environment: projectEnvironment, label: "Python .envs/python311 · R .envs/r443", interpreters: [{ language: "python" as const, status: "available" as const, version: "Python 3.11.18" }, { language: "r" as const, status: "available" as const, version: "R 4.4.3" }] },
+  ] });
+
+  it("detects only when opened and adopts real project interpreter bindings in the next frozen selection", async () => {
+    const shell = harness();
+    const query = vi.spyOn(api, "probeSshProjectEnvironments").mockImplementation(async (_id, environment) => projectObservation(environment));
+    render(<DesktopApp />);
+    await screen.findByText(/Agent 模式：SSH/);
+    expect(query).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
+    await waitFor(() => expect(shell.mock.calls.at(-1)?.[0].runtimeDraftSelection?.environment).toBe(projectEnvironment));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Python 环境" })).toHaveTextContent(/^Python可用$/));
+    expect(query).toHaveBeenNthCalledWith(1, remoteProject.id, "system");
+    expect(query).toHaveBeenLastCalledWith(remoteProject.id, projectEnvironment);
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("region", { name: "SSH 解释器检测" })).toHaveTextContent("R 4.4.3");
+  });
+
+  it("retains an explicit system choice and keeps ordinary send enabled while detection is pending", async () => {
+    const shell = harness(); const pending = deferred<ReturnType<typeof projectObservation>>();
+    vi.spyOn(api, "probeSshProjectEnvironments").mockReturnValue(pending.promise);
+    render(<DesktopApp />);
+    await screen.findByText(/Agent 模式：SSH/);
+    act(() => shell.mock.calls.at(-1)![0].onComputeEnvironmentChange?.("system"));
+    fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
+    fireEvent.change(screen.getByRole("textbox", { name: /描述研究目标/ }), { target: { value: "检索相关文献" } });
+    expect(screen.getByRole("button", { name: "发送" })).toBeEnabled();
+    await act(async () => pending.resolve(projectObservation()));
+    expect(shell.mock.calls.at(-1)?.[0].runtimeDraftSelection?.environment).toBe("system");
+    expect(screen.getByRole("button", { name: "Python 环境" })).toHaveTextContent("不可用");
+  });
+
+  it.each(["ambiguous", "truncated"] as const)("keeps the current environment when discovery is %s", async (kind) => {
+    const shell = harness();
+    vi.spyOn(api, "probeSshProjectEnvironments").mockResolvedValue({ ...projectObservation(), suggested_environment: kind === "ambiguous" ? null : projectEnvironment, truncated: kind === "truncated" });
+    render(<DesktopApp />);
+    await screen.findByText(/Agent 模式：SSH/);
+    fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "刷新远程环境" })).toBeEnabled());
+    expect(shell.mock.calls.at(-1)?.[0].runtimeDraftSelection?.environment).toBe("system");
+    expect(screen.getByRole("combobox", { name: "已发现的 SSH 环境" })).toHaveValue("system");
+  });
+
+  it("refreshes an enabled SSH probe once when polling supplies terminal evidence and deduplicates its later live copy", async () => {
+    harness();
+    const pending = deferred<AgentRunEventV4[]>(); let terminal = false;
+    const completed = agentEvent(stateConversations[0].id, "environment-install", 2, { kind: "run_completed" });
+    vi.mocked(api.agentV4ConversationState).mockImplementation(async (_id, id) => stateSnapshot(id, { latest_run: stateRun("environment-install", terminal ? "completed" : "running") }));
+    vi.mocked(api.agentV4Events).mockReturnValue(pending.promise);
+    let listener!: (event: AgentRunEventV4) => void;
+    vi.spyOn(api, "onAgentV4Event").mockImplementation(async (callback) => { listener = callback; return () => {}; });
+    const query = vi.spyOn(api, "probeSshProjectEnvironments").mockImplementation(async (_id, environment) => projectObservation(environment));
+    render(<DesktopApp />);
+    await screen.findByText(/Agent 模式：SSH/);
+    fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
+    await waitFor(() => expect(query).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Python 环境" })).toHaveTextContent(/^Python可用$/));
+    terminal = true;
+    await act(async () => pending.resolve([completed]));
+    await waitFor(() => expect(query).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Python 环境" })).toHaveTextContent(/^Python可用$/));
+    await act(async () => { listener(completed); listener(completed); });
+    expect(query).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not reconnect SSH when a historical completed conversation is hydrated", async () => {
+    const shell = harness();
+    const oldEvent = agentEvent(stateConversations[1].id, "old-install", 2, { kind: "run_completed" });
+    vi.mocked(api.agentV4EventsForConversation).mockImplementation(async (_projectId, id) => id === stateConversations[1].id ? [oldEvent] : []);
+    vi.mocked(api.agentV4ConversationState).mockImplementation(async (_projectId, id) => stateSnapshot(id, { latest_run: id === stateConversations[1].id ? stateRun("old-install", "completed") : null }));
+    const query = vi.spyOn(api, "probeSshProjectEnvironments").mockImplementation(async (_id, environment) => projectObservation(environment));
+    render(<DesktopApp />);
+    await screen.findByText(/Agent 模式：SSH/);
+    fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Python 环境" })).toHaveTextContent(/^Python可用$/));
+    expect(query).toHaveBeenCalledTimes(2);
+    fireEvent.keyDown(window, { key: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: stateConversations[1].title }));
+    await screen.findByRole("heading", { name: stateConversations[1].title });
+    await waitFor(() => expect(shell.mock.calls.at(-1)?.[0].conversationHydrating).toBe(false));
+    await waitFor(() => expect(shell.mock.calls.at(-1)?.[0].agentRunEventsV4).toEqual([oldEvent]));
+    expect(query).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["save", "confirm"] as const)("invalidates observations obtained while SSH %s is pending once that mutation settles", async (kind) => {
+    const shell = harness(); const settings = vi.spyOn(settingsPanel, "SettingsPanel");
+    const pending = deferred<void>();
+    vi.spyOn(api, kind === "save" ? "saveConnection" : "confirmHostKey").mockReturnValue(pending.promise);
+    const query = vi.spyOn(api, "probeSshProjectEnvironments").mockImplementation(async (_id, environment) => projectObservation(environment));
+    render(<DesktopApp />);
+    await screen.findByText(/Agent 模式：SSH/);
+    fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Python 环境" })).toHaveTextContent(/^Python可用$/));
+    fireEvent.keyDown(window, { key: "Escape" });
+    act(() => shell.mock.calls.at(-1)![0].onOpenSettings?.("remote"));
+    let mutation!: Promise<void>;
+    act(() => {
+      const props = settings.mock.calls.at(-1)![0];
+      mutation = kind === "save" ? props.onSaveConnection!({ id: "remote-a", label: "Fixture SSH", host: "example.invalid", port: 22, username: "fixture", authentication: "password", authentication_reference: "fixture-ref", host_key_fingerprint: "SHA256:fixture" }, "")
+        : props.onConfirmHostKey!("remote-a", "SHA256:fixture");
+      props.onClose();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "选择计算后端" }));
+    await waitFor(() => expect(query).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Python 环境" })).toHaveTextContent(/^Python可用$/));
+    await act(async () => { pending.resolve(); await mutation; });
+    expect(screen.getByRole("button", { name: "Python 环境" })).toHaveTextContent("待检测");
+    expect(query).toHaveBeenCalledTimes(3);
+  });
+
   it("defaults a newly opened SSH-bound project to SSH instead of the initial local backend", async () => {
     const shell = harness();
     render(<DesktopApp />);
