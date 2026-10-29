@@ -299,6 +299,7 @@ describe("project compute selection", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     fireEvent.click(screen.getByRole("button", { name: stateConversations[1].title }));
     await screen.findByRole("heading", { name: stateConversations[1].title });
+    await waitFor(() => expect(shell.mock.calls.at(-1)?.[0].conversationHydrating).toBe(false));
     const pending = deferred<Awaited<ReturnType<typeof api.agentV4ComputeBackends>>>();
     vi.mocked(api.agentV4ComputeBackends).mockReturnValueOnce(pending.promise);
     act(() => shell.mock.calls.at(-1)![0].onContainerImageChange?.("catalog-refresh"));
