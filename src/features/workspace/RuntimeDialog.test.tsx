@@ -57,6 +57,40 @@ function renderDialog(overrides: Partial<React.ComponentProps<typeof RuntimeDial
 }
 
 describe("RuntimeDialog", () => {
+  it("lets a draft select a discovered R environment even when system is selected and no automatic suggestion exists", () => {
+    const onEnvironmentChange = vi.fn();
+    const system = { environment: "system", label: "system", interpreters: [{ language: "python" as const, status: "available" as const, version: "Python 3.12.10" }, { language: "r" as const, status: "not_found" as const }] };
+    const r = { environment: "envs:r443", label: ".envs/r443", interpreters: [{ language: "r" as const, status: "available" as const, version: "R 4.4.3" }] };
+    const probe = { selected: system, refresh: vi.fn(), loading: false, error: false, report: { project_id: "project-1", connection_id: "lab", remote_root: "/work/project", requested_environment: "system", observed_at: "now", suggested_environment: null, truncated: true, environments: [system, r] } };
+    const boundary = { ...localBoundary, execution_location: "ssh_host" as const, compute_selection: { ...localBoundary.compute_selection, backend_id: "ssh:lab", backend_kind: "ssh" as const } };
+    renderDialog({ backend: sshBackend, boundary, sshEnvironments: probe, onEnvironmentChange });
+    const choices = screen.getByRole("combobox", { name: "Discovered SSH environments" });
+    expect(choices).toHaveValue("system");
+    expect(screen.getByRole("region", { name: "SSH interpreter detection" })).toHaveTextContent("Python 3.12.10");
+    expect(screen.getByRole("region", { name: "SSH interpreter detection" })).toHaveTextContent("Interpreter not found");
+    fireEvent.change(choices, { target: { value: "envs:r443" } });
+    expect(onEnvironmentChange).toHaveBeenCalledWith("envs:r443");
+    expect(screen.getByText(/compute configuration menu/)).toBeInTheDocument();
+  });
+
+  it("does not offer a live environment selector or probe on a frozen SSH run even when callbacks are supplied", () => {
+    const onEnvironmentChange = vi.fn(); const refresh = vi.fn();
+    const system = { environment: "system", label: "system", interpreters: [] };
+    const probe = { selected: system, refresh, loading: false, error: false, report: { project_id: "project-1", connection_id: "lab", remote_root: "/work/project", requested_environment: "system", observed_at: "now", suggested_environment: null, truncated: false, environments: [system] } };
+    renderDialog({ frozen: true, backend: sshBackend, boundary: { ...localBoundary, source: { kind: "frozen_run", run_id: "historical" }, execution_location: "ssh_host", compute_selection: { ...localBoundary.compute_selection, backend_id: "ssh:lab", backend_kind: "ssh" } }, sshEnvironments: probe, onEnvironmentChange });
+    expect(screen.queryByRole("combobox", { name: "Discovered SSH environments" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "SSH interpreter detection" })).not.toBeInTheDocument();
+    expect(onEnvironmentChange).not.toHaveBeenCalled(); expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it.each(["error", "timeout"] as const)("reports an R interpreter %s without claiming that no interpreter exists", (status) => {
+    const system = { environment: "system", label: "system", interpreters: [{ language: "r" as const, status }] };
+    const probe = { selected: system, refresh: vi.fn(), loading: false, error: false, report: { project_id: "project-1", connection_id: "lab", remote_root: "/work/project", requested_environment: "system", observed_at: "now", suggested_environment: null, truncated: false, environments: [system] } };
+    renderDialog({ backend: sshBackend, boundary: { ...localBoundary, execution_location: "ssh_host", compute_selection: { ...localBoundary.compute_selection, backend_id: "ssh:lab", backend_kind: "ssh" } }, sshEnvironments: probe, onEnvironmentChange: vi.fn() });
+    const observations = screen.getByRole("region", { name: "SSH interpreter detection" });
+    expect(observations).toHaveTextContent(status === "error" ? "Detection failed" : "Detection timed out");
+    expect(observations).not.toHaveTextContent("Interpreter not found");
+  });
   it("renders frozen per-language project environment paths and their exact identity without probing SSH", () => {
     const query = vi.spyOn(api, "probeSshProjectEnvironments");
     renderDialog({ frozen: true, backend: sshBackend, boundary: { ...localBoundary, source: { kind: "frozen_run", run_id: "historical" }, execution_location: "ssh_host", compute_selection: { ...localBoundary.compute_selection, backend_id: "ssh:lab", backend_kind: "ssh", environment: "envs:python311:r443" } } });

@@ -45,6 +45,24 @@ it("detects SSH interpreters on menu open, shows independent project prefixes an
   expect(screen.queryByRole("region", { name: "V4 计算后端" })).not.toBeInTheDocument();
 });
 
+it("wires a draft Runtime environment choice back to the compute selection", async () => {
+  const selection = { schema_version: 4 as const, backend_id: "ssh:lab", backend_kind: "ssh" as const, autonomy_mode: "supervised" as const, environment: "system", network_policy: "host_inherited" as const };
+  vi.spyOn(guidanceApi, "agentV4RuntimeBoundary").mockResolvedValue({ project_id: project.id, source: { kind: "draft_selection" }, compute_selection: selection, execution_location: "ssh_host", isolation: "process", limits: ["same_user_permissions"], interactive_lifecycle: "run_scoped_no_restart_reconnect", detached_job_lifecycle: "ssh_linux_only", verification: "not_checked_by_this_view" });
+  const selected = { environment: "system", label: "system", interpreters: [{ language: "python" as const, status: "available" as const, version: "Python 3.12.10" }, { language: "r" as const, status: "not_found" as const }] };
+  const r = { environment: "envs:r443", label: ".envs/r443", interpreters: [{ language: "r" as const, status: "available" as const, version: "R 4.4.3" }] };
+  const report = { project_id: project.id, connection_id: "lab", remote_root: "/work/project", requested_environment: "system", observed_at: "now", suggested_environment: null, truncated: false, environments: [selected, r] };
+  const backend = { descriptor: { schema_version: 4 as const, backend_id: "ssh:lab", kind: "ssh" as const, isolation: "process" as const, available: false, supports_python: true, supports_r: true, supports_network_policy: false }, selectable: true, reason: null, python_status: "unverified" as const, r_status: "unverified" as const, resolved_image_id: null };
+  const choose = vi.fn(); const refresh = vi.fn();
+  render(<WorkspaceShell project={{ ...project, connection_id: "lab", remote_root: "/work/project" }} locale="en-US" computeBackends={[backend]} computeBackendId="ssh:lab" computeEnvironment="system" runtimeDraftSelection={selection} onComputeEnvironmentChange={choose} sshEnvironments={{ selected, report, loading: false, error: false, refresh }} />);
+  fireEvent.click(screen.getByRole("button", { name: "R environment" }));
+  const candidates = await screen.findByRole("combobox", { name: "Discovered SSH environments" });
+  expect(candidates).toHaveValue("system");
+  fireEvent.change(candidates, { target: { value: "envs:r443" } });
+  expect(choose).toHaveBeenCalledWith("envs:r443");
+  fireEvent.keyDown(window, { key: "Escape" });
+  expect(screen.queryByRole("dialog", { name: "Runtimes" })).not.toBeInTheDocument();
+});
+
 it("loads a remote Markdown image through the project preview instead of the webview origin", async () => {
   const path = "results/hcc/figures/umap_stage3_umap_final.png";
   const preview = vi.fn().mockResolvedValue({ relative_path: path, mime_type: "image/png", size_bytes: 8, sha256: "a".repeat(64), data_url: "data:image/png;base64,iVBORw0KGgo=" });

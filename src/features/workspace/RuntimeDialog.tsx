@@ -11,6 +11,7 @@ export interface RuntimeDialogProps {
   onLanguageChange: (language: KernelLanguage) => void;
   backend?: ComputeBackendAvailabilityV4;
   sshEnvironments?: SshEnvironmentProbe;
+  onEnvironmentChange?: (environment: string) => void;
   environment: string;
   boundary: RuntimeBoundaryViewV4 | null;
   boundaryLoading: boolean;
@@ -103,7 +104,7 @@ function KernelInspectionDialog({ zh, language, value, loading, error, refresh, 
   </div>;
 }
 
-export function RuntimeDialog({ zh, language, onLanguageChange, backend, sshEnvironments, boundary, boundaryLoading, boundaryError, onRetryBoundary, onClose, onSettings, onPrepare, onOpenRemoteJobs, kernelInspection = null, kernelInspectionLoading = false, kernelInspectionError = false, onRefreshKernelInspection, kernelInspectionOpen = false, onOpenKernelInspection, onCloseKernelInspection, focusActive = true, frozen = false }: RuntimeDialogProps) {
+export function RuntimeDialog({ zh, language, onLanguageChange, backend, sshEnvironments, onEnvironmentChange, boundary, boundaryLoading, boundaryError, onRetryBoundary, onClose, onSettings, onPrepare, onOpenRemoteJobs, kernelInspection = null, kernelInspectionLoading = false, kernelInspectionError = false, onRefreshKernelInspection, kernelInspectionOpen = false, onOpenKernelInspection, onCloseKernelInspection, focusActive = true, frozen = false }: RuntimeDialogProps) {
   // Runtime covers the lower trajectory regardless of sibling DOM order;
   // its child, remote jobs and global Search can suspend its focus ownership.
   const { dialogRef, closeRef } = useDialogFocus(focusActive && !kernelInspectionOpen);
@@ -136,7 +137,7 @@ export function RuntimeDialog({ zh, language, onLanguageChange, backend, sshEnvi
           {matchingProbe && <p className="runtime-language-hint">{zh ? "最近探测仅反映当前计算后端。找到解释器不代表科研依赖已安装。" : "Recent probe of the current compute backend. Finding an interpreter does not verify research dependencies."}</p>}
         </nav>
         <main className="runtime-details" aria-live="polite">
-          {!isFrozen && selection?.backend_kind === "ssh" && sshEnvironments && (matchingSshProbe || !sshEnvironments.selected) && <SshEnvironmentObservations probe={sshEnvironments} environment={selection.environment} zh={zh} />}
+          {!isFrozen && selection?.backend_kind === "ssh" && sshEnvironments && (matchingSshProbe || !sshEnvironments.selected) && <SshEnvironmentObservations probe={sshEnvironments} environment={selection.environment} zh={zh} onEnvironmentChange={matchingProbe ? onEnvironmentChange : undefined} />}
           <header className="runtime-details-header"><div className="runtime-details-title"><span className="runtime-details-icon"><LocationIcon size={20} /></span><div><h3>{language === "python" ? "Python" : "R"} {zh ? "运行环境" : "environment"}</h3><small>{sourceLabel}{boundary?.source.kind === "frozen_run" ? ` · ${boundary.source.run_id}` : ""}</small></div></div></header>
           {boundaryError ? <div className="runtime-boundary-message" role="alert"><CircleHelp size={16} /><p>{zh ? "运行边界加载失败：" : "Could not load runtime boundary: "}{boundaryError}</p><button type="button" onClick={onRetryBoundary}>{zh ? "重试" : "Retry boundary"}</button></div>
             : boundaryLoading ? <p className="runtime-boundary-message" role="status">{zh ? "正在加载运行边界…" : "Loading runtime boundary…"}</p>

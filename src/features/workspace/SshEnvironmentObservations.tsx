@@ -41,7 +41,7 @@ export function SshEnvironmentObservations({ probe, environment, zh, onEnvironme
       </select></label>}
       {selected && <><small>{selected.label}</small><ul>{(["python", "r"] as const).map((language) => <li key={language}><b>{language === "python" ? "Python" : "R"}</b>: {sshInterpreterStatus(selected.interpreters.find((item) => item.language === language), zh)}</li>)}</ul></>}
       <small>{zh ? "解释器观察时间" : "Interpreters observed"}: <time>{probe.report.observed_at}</time></small>
-      {probe.report.truncated && <p>{zh ? "环境列表已达检测上限；可手动指定环境后刷新。" : "Environment discovery reached its limit; enter an environment and refresh."}</p>}
+      {probe.report.truncated && <p>{zh ? "环境列表已达检测上限；可返回左下角计算配置菜单，手动指定环境后刷新。" : "Environment discovery reached its limit; return to the compute configuration menu at the lower left to enter an environment and refresh."}</p>}
     </>}
     <small>{zh ? "仅检查解释器，不验证科研依赖是否齐全。" : "Checks interpreters; research dependencies are not verified."}</small>
   </section>;
