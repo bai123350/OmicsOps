@@ -3427,6 +3427,28 @@ impl AgentCoreV4<'_> {
                 }
                 Err(error)
                     if error.class == omicsops_protocol::ModelErrorClassV4::InvalidResponse
+                        && error.message.contains("truncated_output:")
+                        && persist_text
+                        && !request.tools.is_empty()
+                        && !output_repair_attempted =>
+                {
+                    // This is the same single output-repair allowance used for
+                    // malformed/unknown tool proposals. Discard the failed
+                    // response whole; optional text continuation has its own
+                    // explicit per-run allowance below.
+                    output_repair_attempted = true;
+                    request.system.push_str("\nThe previous response was discarded because it reached its output allowance. No tool calls from that response executed. Regenerate one concise complete response from the existing verified evidence, with brief public text and at most ONE complete tool call with strict JSON arguments. Never splice partial arguments or assume a partial call executed. Preserve the frozen plan, compute binding, granted tools and approval boundaries. Never repeat already successful tools. Split large writes or code into smaller complete operations in later turns; do not embed long documents. Keep the final answer concise with key evidence and limitations.");
+                    self.model
+                        .validate_request(&request)
+                        .map_err(|error| AgentCoreErrorV4::NeedsAttention(error.message))?;
+                    self.push(run_id, AgentEventKindV4::ModelRetrying {
+                        attempt: 1,
+                        class: error.class,
+                        message: "Model output reached its allowance; regenerating one concise complete response once from existing verified evidence. No call from the rejected response was dispatched.".into(),
+                    }).await?;
+                }
+                Err(error)
+                    if error.class == omicsops_protocol::ModelErrorClassV4::InvalidResponse
                         && error.message.contains("truncated_output:") =>
                 {
                     if !persist_text || *continuation_remaining == 0 {
@@ -22232,8 +22254,452 @@ mod tests {
             })
         }
     }
+    struct ToolRepairModel<'a> {
+        failures: Vec<&'static str>,
+        requests: Mutex<Vec<ModelRequestV4>>,
+        native: bool,
+        with_call: bool,
+        request_budget: Option<usize>,
+        cancel: Option<&'a AtomicBool>,
+        guidance: Option<&'a Mutex<Option<(Uuid, String)>>>,
+    }
+    impl ToolRepairModel<'_> {
+        fn new(failures: Vec<&'static str>) -> Self {
+            Self {
+                failures,
+                requests: Mutex::new(vec![]),
+                native: false,
+                with_call: false,
+                request_budget: None,
+                cancel: None,
+                guidance: None,
+            }
+        }
+    }
+    #[async_trait]
+    impl ModelPortV4 for ToolRepairModel<'_> {
+        fn supports_native_replay(&self) -> bool {
+            self.native
+        }
+        fn usage_metadata(&self) -> ModelUsageMetadataV4 {
+            ModelUsageMetadataV4 {
+                model_profile_id: Uuid::from_u128(77),
+                model_configuration_hash: Some("fixture".into()),
+                ..Default::default()
+            }
+        }
+        fn validate_request(&self, request: &ModelRequestV4) -> Result<(), ModelFailureV4> {
+            if self
+                .request_budget
+                .is_some_and(|limit| serde_json::to_vec(request).unwrap().len() > limit)
+            {
+                return Err(ModelFailureV4::permanent(
+                    omicsops_protocol::ModelErrorClassV4::InvalidRequest,
+                    "request budget: complete request exceeds fixture allowance",
+                ));
+            }
+            Ok(())
+        }
+        async fn stream(
+            &self,
+            request: ModelRequestV4,
+            on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            let index = {
+                let mut requests = self.requests.lock().unwrap();
+                let index = requests.len();
+                requests.push(request.clone());
+                index
+            };
+            if let Some(message) = self.failures.get(index) {
+                on_event(ModelStreamEventV4::TextDelta(
+                    "discarded partial tool output".into(),
+                ));
+                on_event(ModelStreamEventV4::Activity(ModelActivityPhaseV4::ToolCall));
+                if let Some(cancel) = self.cancel {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+                if let Some(guidance) = self.guidance {
+                    *guidance.lock().unwrap() = Some((Uuid::new_v4(), "new user guidance".into()));
+                }
+                return Err(ModelFailureV4::permanent(
+                    omicsops_protocol::ModelErrorClassV4::InvalidResponse,
+                    *message,
+                ));
+            }
+            let calls = if self.with_call && !request.tools.is_empty() {
+                vec![ToolCallV4 {
+                    call_id: "valid-repaired-call".into(),
+                    tool_id: "project.list".into(),
+                    arguments: json!({"path":"verified"}),
+                }]
+            } else {
+                vec![]
+            };
+            let public_text = if calls.is_empty() {
+                "Recovered".to_owned()
+            } else {
+                String::new()
+            };
+            let provider_continuation =
+                self.native
+                    .then(|| omicsops_protocol::ModelProviderContinuationV4 {
+                        items: if calls.is_empty() {
+                            vec![omicsops_protocol::ModelReplayItemV4::AssistantText {
+                                text: public_text.clone(),
+                            }]
+                        } else {
+                            calls
+                                .iter()
+                                .cloned()
+                                .map(|call| omicsops_protocol::ModelReplayItemV4::ToolCall { call })
+                                .collect()
+                        },
+                    });
+            Ok(ModelTurnV4 {
+                public_text,
+                tool_calls: calls,
+                provider_continuation,
+            })
+        }
+    }
+    fn tool_repair_request() -> ModelRequestV4 {
+        ModelRequestV4 {
+            system: "frozen system rules".into(),
+            context: "verified evidence".into(),
+            tools: FakeTools.descriptors(RunModeV4::Execute),
+            image_refs: vec![ModelImageRefV4 {
+                relative_path: "fixture.png".into(),
+                media_type: "image/png".into(),
+                size_bytes: 1,
+                sha256: "a".repeat(64),
+            }],
+            replay: vec![omicsops_protocol::ModelReplayItemV4::AssistantText {
+                text: "prior verified replay".into(),
+            }],
+        }
+    }
+
     #[tokio::test]
-    async fn malformed_arguments_retry_once_but_default_truncation_does_not_retry() {
+    async fn tool_enabled_truncation_regenerates_once_without_optional_continuation() {
+        let model = TruncatedModel {
+            failure_message: "truncated_output: output allowance",
+            second_failure_message: None,
+            attempts: AtomicUsize::new(0),
+            always_fail: false,
+        };
+        let store = MemoryStore::default();
+        let run_id = Uuid::new_v4();
+        seed_model_turn(&store, run_id);
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let result = core
+            .model_turn(
+                run_id,
+                ModelRequestV4 {
+                    system: "system".into(),
+                    context: "verified evidence".into(),
+                    tools: FakeTools.descriptors(RunModeV4::Execute),
+                    image_refs: vec![],
+                    replay: vec![],
+                },
+                0,
+                Duration::from_secs(1),
+                None,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "a tool-enabled truncated response needs one bounded regeneration even when optional continuation is disabled"
+        );
+        assert_eq!(model.attempts.load(AtomicOrdering::SeqCst), 2);
+        let events = store.events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, AgentEventKindV4::ModelRetrying { .. }))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event|matches!(&event.event,AgentEventKindV4::ModelText {text} if text.contains("discard partial"))));
+    }
+
+    #[tokio::test]
+    async fn tool_output_repair_preserves_request_and_shares_one_slot_across_invalid_responses() {
+        let truncated = "truncated_output: output allowance";
+        let malformed = "tool call c1 returned malformed JSON arguments: expected comma";
+        let unknown = "unknown_provider_tool: absent from this request";
+        for failures in [
+            vec![truncated],
+            vec![truncated, truncated],
+            vec![truncated, malformed],
+            vec![malformed, truncated],
+            vec![unknown, truncated],
+            vec![truncated, unknown],
+        ] {
+            let model = ToolRepairModel::new(failures.clone());
+            let store = MemoryStore::default();
+            let run_id = Uuid::new_v4();
+            seed_model_turn(&store, run_id);
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &FakeTools,
+                events: &store,
+                science: None,
+            };
+            let original = tool_repair_request();
+            let result = core
+                .model_turn(run_id, original.clone(), 0, Duration::from_secs(1), None)
+                .await;
+            assert_eq!(result.is_ok(), failures.len() == 1);
+            let requests = model.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[1].context, original.context);
+            assert_eq!(requests[1].tools, original.tools);
+            assert_eq!(requests[1].image_refs, original.image_refs);
+            assert_eq!(requests[1].replay, original.replay);
+            assert!(requests[1].system.starts_with(&original.system));
+            assert!(
+                requests[1]
+                    .system
+                    .contains("at most ONE complete tool call")
+            );
+            assert!(!requests[1].context.contains("discarded partial"));
+            let events = store.events.lock().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event.event, AgentEventKindV4::ModelRetrying { .. }))
+                    .count(),
+                1
+            );
+            assert!(!events.iter().any(|event|matches!(&event.event,AgentEventKindV4::ModelText {text} if text.contains("discarded partial"))));
+            assert!(!events.iter().any(|event| matches!(
+                event.event,
+                AgentEventKindV4::ToolRequested { .. }
+                    | AgentEventKindV4::ToolDispatchStarted { .. }
+                    | AgentEventKindV4::ModelReplayRecorded { .. }
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_output_repair_checks_complete_request_budget_before_second_request() {
+        let original = tool_repair_request();
+        let mut model = ToolRepairModel::new(vec!["truncated_output: output allowance"]);
+        model.request_budget = Some(serde_json::to_vec(&original).unwrap().len());
+        let store = MemoryStore::default();
+        let run_id = Uuid::new_v4();
+        seed_model_turn(&store, run_id);
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let error = core
+            .model_turn(run_id, original, 0, Duration::from_secs(1), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error,AgentCoreErrorV4::NeedsAttention(ref message) if message.contains("complete request"))
+        );
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+        assert!(!store.events.lock().unwrap().iter().any(|event| matches!(
+            event.event,
+            AgentEventKindV4::ModelRetrying { .. } | AgentEventKindV4::ToolRequested { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn tool_output_repair_respects_cancel_and_new_guidance_before_another_request() {
+        for cancel in [true, false] {
+            let store = GuidanceTestStore::default();
+            let run_id = Uuid::new_v4();
+            seed_model_turn(&store.inner, run_id);
+            let cancelled = AtomicBool::new(false);
+            let mut model = ToolRepairModel::new(vec!["truncated_output: output allowance"]);
+            model.cancel = cancel.then_some(&cancelled);
+            model.guidance = (!cancel).then_some(&store.pending);
+            let core = AgentCoreV4 {
+                model: &model,
+                tools: &FakeTools,
+                events: &store,
+                science: None,
+            };
+            let error = core
+                .model_turn(
+                    run_id,
+                    tool_repair_request(),
+                    0,
+                    Duration::from_secs(1),
+                    Some(&cancelled),
+                )
+                .await
+                .unwrap_err();
+            assert!(if cancel {
+                matches!(error, AgentCoreErrorV4::Cancelled)
+            } else {
+                matches!(error, AgentCoreErrorV4::GuidancePending)
+            });
+            assert_eq!(model.requests.lock().unwrap().len(), 1);
+            assert!(
+                !store
+                    .inner
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(
+                        event.event,
+                        AgentEventKindV4::ToolRequested { .. }
+                            | AgentEventKindV4::ModelReplayRecorded { .. }
+                    ))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_output_repair_records_only_successful_native_continuation() {
+        let mut model = ToolRepairModel::new(vec!["truncated_output: output allowance"]);
+        model.native = true;
+        model.with_call = true;
+        let store = MemoryStore::default();
+        let run_id = Uuid::new_v4();
+        seed_model_turn(&store, run_id);
+        let prior = SubscriptionReplayModel {
+            calls: AtomicUsize::new(1),
+            invalid: false,
+            cancel: None,
+            requests: Mutex::new(vec![]),
+            delegated: false,
+        };
+        let prior_core = AgentCoreV4 {
+            model: &prior,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        prior_core
+            .model_turn(
+                run_id,
+                subscription_request(),
+                0,
+                Duration::from_secs(1),
+                None,
+            )
+            .await
+            .unwrap();
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let turn = core
+            .model_turn(
+                run_id,
+                subscription_request(),
+                0,
+                Duration::from_secs(1),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(turn.tool_calls.len(), 1);
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            !requests[0].replay.is_empty(),
+            "previous validated continuation must remain available"
+        );
+        assert_eq!(requests[0].replay, requests[1].replay);
+        assert_eq!(requests[0].context, requests[1].context);
+        let events = store.events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, AgentEventKindV4::ModelReplayRecorded { .. }))
+                .count(),
+            2,
+            "only the prior validated response and repaired response are recorded"
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event.event,
+            AgentEventKindV4::ToolRequested { .. } | AgentEventKindV4::ToolFinished { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn tool_output_repair_dispatches_the_complete_replacement_only_once() {
+        let mut model = ToolRepairModel::new(vec!["truncated_output: output allowance"]);
+        model.with_call = true;
+        let store = MemoryStore::default();
+        let spec = ordinary_execution_spec(Uuid::new_v4());
+        seed_execution(&store, &spec);
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        let error = core
+            .execute_with_limits(&spec, AgentLimitsV4::ordinary(1), &AtomicBool::new(false))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AgentCoreErrorV4::NeedsAttention(_)));
+        let events = store.events.lock().unwrap();
+        assert_eq!(events.iter().filter(|event|matches!(&event.event,AgentEventKindV4::ToolRequested {call} if call.call_id=="valid-repaired-call")).count(),1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, AgentEventKindV4::ToolDispatchStarted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, AgentEventKindV4::ToolFinished { .. }))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event|matches!(&event.event,AgentEventKindV4::ModelText {text} if text.contains("discarded partial"))));
+    }
+
+    #[tokio::test]
+    async fn tool_output_repair_does_not_apply_to_nonpersisted_auxiliary_requests() {
+        let model = ToolRepairModel::new(vec!["truncated_output: output allowance"]);
+        let store = MemoryStore::default();
+        let run_id = Uuid::new_v4();
+        seed_model_turn(&store, run_id);
+        let core = AgentCoreV4 {
+            model: &model,
+            tools: &FakeTools,
+            events: &store,
+            science: None,
+        };
+        assert!(
+            core.model_turn_with_output(
+                run_id,
+                tool_repair_request(),
+                0,
+                Duration::from_secs(1),
+                None,
+                false
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_arguments_retry_once_but_tool_free_truncation_does_not_retry() {
         for (always_fail, failure_message, second_failure_message) in [
             (false, "truncated_output: output allowance", None),
             (true, "truncated_output: output allowance", None),
@@ -22352,7 +22818,18 @@ mod tests {
             on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
         ) -> Result<ModelTurnV4, ModelFailureV4> {
             let attempt = self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
-            if attempt % 2 == 0 {
+            // Each logical request first uses its single format repair, then
+            // needs an explicitly enabled continuation to recover again.
+            if attempt % 3 != 2 {
+                if attempt % 3 == 1 {
+                    assert!(request.system.contains("at most ONE complete tool call"));
+                    assert!(
+                        !request
+                            .context
+                            .contains("Untrusted truncated response (JSON string):")
+                    );
+                    assert!(!request.context.contains("partial untrusted text"));
+                }
                 on_event(ModelStreamEventV4::TextDelta(
                     "partial untrusted text { incomplete tool arguments".into(),
                 ));
@@ -22394,11 +22871,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_continuations_are_opt_in_bounded_across_turns_and_never_dispatch_partials() {
+    async fn session_format_repair_and_opt_in_continuations_are_bounded_without_partial_dispatch() {
         for (enabled, limit, cancel, expected_attempts, expected_calls) in [
-            (false, 2, false, 1, 0),
-            (true, 0, false, 1, 0),
-            (true, 2, false, 5, 2),
+            (false, 2, false, 2, 0),
+            (true, 0, false, 2, 0),
+            (true, 2, false, 8, 2),
             (true, 2, true, 1, 0),
         ] {
             let cancelled = Arc::new(AtomicBool::new(false));

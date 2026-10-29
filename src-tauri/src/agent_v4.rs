@@ -11386,6 +11386,105 @@ mod tests {
         }
     }
 
+    struct TruncatedRepairBudgetModel {
+        window: std::sync::Mutex<Option<u32>>,
+        requests: std::sync::Mutex<Vec<ModelRequestV4>>,
+        rejected: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl ModelPortV4 for TruncatedRepairBudgetModel {
+        fn validate_request(&self, request: &ModelRequestV4) -> Result<(), ModelFailureV4> {
+            let window = {
+                let mut slot = self.window.lock().unwrap();
+                *slot.get_or_insert_with(|| {
+                    let probe = budget_test_model(false, 100_000);
+                    let prepared = probe.prepare_request(request.clone(), false).unwrap();
+                    let measured = probe.client.measure_model_request(&prepared).unwrap();
+                    u32::try_from(measured.serialized_request_bytes).unwrap() + 110
+                })
+            };
+            let result = budget_test_model(false, window).validate_request(request);
+            if result.is_err() {
+                self.rejected.fetch_add(1, Ordering::SeqCst);
+            }
+            result
+        }
+        async fn stream(
+            &self,
+            request: ModelRequestV4,
+            on_event: &mut (dyn FnMut(ModelStreamEventV4) + Send),
+        ) -> Result<ModelTurnV4, ModelFailureV4> {
+            // Fix the synthetic window before the first simulated dispatch.
+            // The unchanged window admits that request, but not extra repair
+            // instructions in the actual serialized provider payload.
+            if self.requests.lock().unwrap().is_empty() {
+                self.validate_request(&request)?;
+            }
+            self.requests.lock().unwrap().push(request);
+            on_event(ModelStreamEventV4::TextDelta(
+                "discarded repair-budget partial".into(),
+            ));
+            Err(ModelFailureV4::permanent(
+                ModelErrorClassV4::InvalidResponse,
+                "truncated_output: controlled output allowance",
+            ))
+        }
+    }
+    struct RepairBudgetTools;
+    #[async_trait]
+    impl omicsops_agent_core::ToolPortV4 for RepairBudgetTools {
+        fn descriptors(&self, _: RunModeV4) -> Vec<ToolDescriptorV4> {
+            vec![ToolDescriptorV4 {
+                id: "project.read".into(),
+                description: "Read one synthetic file".into(),
+                input_schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+                effect: ToolEffectV4::ReadOnly,
+            }]
+        }
+        fn effect(&self, _: &str) -> Option<ToolEffectV4> {
+            Some(ToolEffectV4::ReadOnly)
+        }
+        async fn execute(&self, _: RunModeV4, _: ToolCallV4) -> Result<ToolOutcomeV4, String> {
+            panic!("an over-budget repair must not dispatch tools")
+        }
+    }
+    #[tokio::test]
+    async fn truncated_tool_repair_uses_desktop_wire_budget_before_a_second_request() {
+        let model = TruncatedRepairBudgetModel {
+            window: Default::default(),
+            requests: Default::default(),
+            rejected: 0.into(),
+        };
+        let events = ApprovalRunEvents::default();
+        let result = AgentCoreV4 {
+            model: &model,
+            tools: &RepairBudgetTools,
+            events: &events,
+            science: None,
+        }
+        .plan(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "Inspect synthetic files",
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(AgentCoreErrorV4::NeedsAttention(message)) if message.contains("request budget")),
+            "{result:?}"
+        );
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+        assert_eq!(model.rejected.load(Ordering::SeqCst), 1);
+        assert!(!events.0.lock().unwrap().iter().any(|event| matches!(
+            event.event,
+            AgentEventKindV4::ToolRequested { .. }
+                | AgentEventKindV4::ToolFinished { .. }
+                | AgentEventKindV4::ModelText { .. }
+                | AgentEventKindV4::ModelReplayRecorded { .. }
+                | AgentEventKindV4::RunCompleted
+        )));
+    }
+
     #[tokio::test]
     async fn runtime_boundary_lazy_and_ready_model_prompts_reuse_frozen_summary() {
         let dir = tempfile::tempdir().unwrap();

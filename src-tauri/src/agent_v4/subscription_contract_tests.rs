@@ -363,8 +363,8 @@ async fn subscription_responses_output_limit_replaces_partial_attempt_without_si
         AgentLimitsV4 {
             max_turns: 1,
             max_model_retries: 0,
-            auto_continue: true,
-            auto_continue_limit: 1,
+            auto_continue: false,
+            auto_continue_limit: 0,
             ..Default::default()
         },
         &AtomicBool::new(false),
@@ -379,12 +379,11 @@ async fn subscription_responses_output_limit_replaces_partial_attempt_without_si
     );
     let requests = transport.requests.lock().unwrap();
     assert_eq!(requests.len(), 3);
-    assert!(
-        requests[1]["instructions"]
-            .as_str()
-            .unwrap()
-            .contains("previous response reached its output limit")
-    );
+    assert_ne!(requests[1]["instructions"], requests[0]["instructions"]);
+    for field in ["model", "input", "tools", "max_output_tokens"] {
+        assert_eq!(requests[1][field], requests[0][field], "{field}");
+    }
+    assert!(!requests[1].to_string().contains("discarded_partial"));
     let stored = events.load(run).await.unwrap();
     assert!(
         stored
