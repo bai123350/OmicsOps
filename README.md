@@ -104,7 +104,7 @@ Linux SSH 支持独立后台作业的后续查询；停止 Agent 不会取消已
 | --- | --- |
 | 使用 Agent / Plan、选择环境 | [会话模式与环境选择](docs/agent-modes.md) |
 | 使用内置 Skills 和科学数据库工具 | [内置科学工具说明](docs/bundled-science.md) |
-| 查看运行机制、限制与开发命令 | [技术说明与开发指南（原 README 完整保留）](README-TECHNICAL.md) |
+| 查看运行机制、限制与开发命令 | [技术说明与开发指南](README-TECHNICAL.md) |
 | 构建安装包、了解签名与发布规则 | [桌面构建与发布](docs/releasing.md) |
 | 验证真实模型或 SSH 科研流程 | [真实环境验收](acceptance/README.md) |
 | 提交问题或功能建议 | [GitHub Issues](https://github.com/bai123350/OmicsOps/issues) |
