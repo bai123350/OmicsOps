@@ -111,10 +111,6 @@ Linux SSH 支持独立后台作业的后续查询；停止 Agent 不会取消已
 
 OmicsOps 使用 **Tauri 2 + Rust + React + TypeScript**。参与开发前请阅读 [开发约定](AGENTS.md)。欢迎提交问题复现、文档改进和聚焦的 Pull Request；分享日志或截图前，请移除凭据、私人路径和未公开数据。
 
-## 许可与致谢
+## 许可
 
 项目使用 [AGPL-3.0-only](LICENSE) 许可，第三方组件保留各自的许可与声明。
-
-感谢 [Wisp Science](https://github.com/xuzhougeng/wisp-science) 提供科研工作台的设计参考，以及本项目采用的科学 Skills 和原生工具实现。捆绑技能的来源、固定版本与许可记录见 [第三方 Skills 说明](docs/third-party/skills/)。
-
-本页的信息组织参考了 [Wisp Science](https://github.com/xuzhougeng/wisp-science)、[Cherry Studio](https://github.com/CherryHQ/cherry-studio) 与 [Jan](https://github.com/janhq/jan) 的项目介绍。
